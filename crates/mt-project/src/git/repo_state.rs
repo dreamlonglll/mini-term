@@ -19,17 +19,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Result, bail};
 use git2::{Repository, RepositoryState};
 
-use super::branch::{NO_EDITOR, failure_text};
-use super::run_git_output_env;
 use super::stash::stash_entries;
-
-/// 中止 / 继续都只动本地仓库;继续时可能跑 pre-commit hook,给足 120s。
-const OP_TIMEOUT: Duration = Duration::from_secs(120);
+use super::{NO_EDITOR, WORKTREE_OP_TIMEOUT, failure_text, run_git_output_env};
 
 /// 进行中的操作种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -102,7 +97,7 @@ pub fn abort_operation(repo_path: &Path, kind: RepoOpKind) -> Result<()> {
         &[kind.command(), "--abort"],
         &[],
         "abort",
-        OP_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     if !out.success {
@@ -130,7 +125,14 @@ pub fn continue_operation(repo_path: &Path, kind: RepoOpKind) -> Result<RepoOpSt
         RepoOpKind::Merge => &["commit", "--no-edit"],
         _ => &[kind.command(), "--continue"],
     };
-    let out = run_git_output_env(repo_path, args, NO_EDITOR, "continue", OP_TIMEOUT, "")?;
+    let out = run_git_output_env(
+        repo_path,
+        args,
+        NO_EDITOR,
+        "continue",
+        WORKTREE_OP_TIMEOUT,
+        "",
+    )?;
     let after = repo_operation_state(repo_path)?;
     if !out.success && !(after.kind.is_some() && after.conflicted > 0) {
         bail!("{}", failure_text(&out));
@@ -338,10 +340,11 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
-    use super::super::branch::test_cli::{cleanup, commit_file, current, git, repo_with_origin};
-    use super::super::test_support::init_repo_with_file;
+    use super::super::test_support::{
+        cleanup, commit_file, current, git, init_repo_with_file, repo_with_origin,
+    };
     use super::*;
 
     /// 造一个停在合并冲突上的仓库。

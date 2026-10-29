@@ -26,19 +26,16 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Oid, Repository, RepositoryState, Status, StatusOptions};
 
-use super::branch::{WORKTREE_TIMEOUT, failure_text, head_branch_name, run_checked};
+use super::branch::head_branch_name;
 use super::{
-    CommitFileInfo, GitDiffResult, checkout_branch, get_commit_file_diff, get_commit_files,
-    invalidate_repo_cache, is_commit_hash, list_conflicts, run_git_output, validate_branch_name,
+    CommitFileInfo, GitDiffResult, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, checkout_branch,
+    failure_text, get_commit_file_diff, get_commit_files, invalidate_repo_cache, is_commit_hash,
+    list_conflicts, run_checked, run_git_output, validate_branch_name,
 };
-
-/// 只动引用的操作(`stash drop` / `stash clear`):毫秒级,30s 兜底。
-const REF_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // 列表
@@ -238,7 +235,7 @@ pub fn stash_save(repo_path: &Path, options: &StashSaveOptions) -> Result<StashS
         args.extend(["-m", message]);
     }
     // 操作名写死:args 里带着用户的消息文本,不该被拼进「超时 / 启动失败」的报错
-    let out = run_git_output(repo_path, &args, "stash push", WORKTREE_TIMEOUT, "")?;
+    let out = run_git_output(repo_path, &args, "stash push", WORKTREE_OP_TIMEOUT, "")?;
     let after = stash_tip(repo_path)?;
     let created = after.is_some() && after != before;
     let reference = || "stash@{0}".to_string();
@@ -289,7 +286,7 @@ fn apply_like(
         repo_path,
         &args,
         &format!("stash {op}"),
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     if out.success {
@@ -332,7 +329,7 @@ pub fn stash_drop(repo_path: &Path, index: usize, expected_hash: Option<&str>) -
         repo_path,
         &["stash", "drop", &reference],
         "stash drop",
-        REF_TIMEOUT,
+        QUICK_OP_TIMEOUT,
         "",
     )?;
     Ok(())
@@ -344,7 +341,7 @@ pub fn stash_clear(repo_path: &Path) -> Result<()> {
         repo_path,
         &["stash", "clear"],
         "stash clear",
-        REF_TIMEOUT,
+        QUICK_OP_TIMEOUT,
         "",
     )?;
     Ok(())
@@ -372,7 +369,7 @@ pub fn stash_branch(
         repo_path,
         &["stash", "branch", name, &reference],
         "stash branch",
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     // 分支可能已经建好并检出(随后的应用才失败),仓库栏的分支名要重新发现
@@ -514,7 +511,7 @@ fn try_restore(repo_path: &Path, stash_hash: &str) -> Result<Restore> {
             args.push("--index");
         }
         args.push(&reference);
-        run_git_output(repo_path, &args, "stash pop", WORKTREE_TIMEOUT, "")
+        run_git_output(repo_path, &args, "stash pop", WORKTREE_OP_TIMEOUT, "")
     };
 
     // 先连暂存状态一起恢复
@@ -670,10 +667,9 @@ pub fn local_changes_conflict_with(repo_path: &Path, branch: &str) -> Result<Vec
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
-    use super::super::branch::test_cli::{cleanup, commit_file, current, git};
-    use super::super::test_support::init_repo_with_file;
+    use super::super::test_support::{cleanup, commit_file, current, git, init_repo_with_file};
     use super::*;
 
     fn opts(message: Option<&str>, keep_index: bool, include_untracked: bool) -> StashSaveOptions {

@@ -1,4 +1,4 @@
-//! 带条件的提交历史:文本 / 作者过滤(历史区过滤栏)与单文件历史(Show History),
+//! 带条件的提交历史:文本 / 作者 / 路径过滤(历史区过滤栏)与单文件历史(Show History),
 //! 外加提交详情区要的完整元信息。
 //!
 //! # 分页怎么保证不漏不重
@@ -34,20 +34,39 @@ use super::{
 /// 两万个在百毫秒量级,足够让「换个条件」的响应跟得上手。
 pub const SCAN_BUDGET: usize = 20_000;
 
-/// 历史区过滤条件。两项同时给时取交集。
+/// 历史区过滤条件。几项同时给时取交集。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogFilter {
     /// 匹配提交标题 / 正文、哈希前缀、作者名 / 邮箱(忽略大小写)。空串 = 不按文本过滤。
     pub text: String,
     /// 只要这个邮箱的提交(「仅我的」= 仓库的 `user.email`)。比对忽略大小写。
     pub author_email: Option<String>,
+    /// 只要改动了这个路径的提交:仓库内相对路径(`/` 或 `\` 分隔均可),可以是文件,也可以是
+    /// 目录(改动了它下面任一文件都算)。判定与单文件历史([`get_file_log`])同一条:相对
+    /// **第一个父提交**改动了该路径,根提交里存在也算;不跟随重命名。规范化见
+    /// [`normalize_log_path`],规范化后为空(`""` / `/` / `.`)= 不按路径过滤。
+    pub path: Option<String>,
 }
 
 impl LogFilter {
     /// 有没有任何实际生效的条件。
     pub fn is_active(&self) -> bool {
-        !self.text.trim().is_empty() || self.author_email.is_some()
+        !self.text.trim().is_empty()
+            || self.author_email.is_some()
+            || self.path.as_deref().and_then(normalize_log_path).is_some()
     }
+}
+
+/// 把用户输入的路径规范成仓库内相对路径:`\` 换成 `/`,去掉开头的 `./` 与 `/`、结尾的
+/// `/`,合并连续的分隔符,丢掉 `.` 段。剩下空串(仓库根)时返回 `None` —— 按根过滤等于
+/// 不过滤。`..` 段原样留着:仓库树里不会有这一段,结果自然是一条都不中。
+pub fn normalize_log_path(input: &str) -> Option<String> {
+    let parts: Vec<&str> = input
+        .trim()
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 /// 一页带条件的历史。
@@ -60,12 +79,14 @@ pub struct LogPage {
     pub scanned: usize,
 }
 
-/// 预处理好的匹配器:小写化只做一次。
+/// 预处理好的匹配器:小写化 / 路径规范化只做一次。
 struct Matcher {
     needle: Option<String>,
     /// 关键词本身是十六进制 → 也按哈希前缀匹配。
     hex: bool,
     email: Option<String>,
+    /// 规范化后的路径过滤(见 [`normalize_log_path`])。
+    path: Option<PathBuf>,
 }
 
 impl Matcher {
@@ -81,9 +102,15 @@ impl Matcher {
                 .author_email
                 .as_deref()
                 .map(|e| e.trim().to_lowercase()),
+            path: filter
+                .path
+                .as_deref()
+                .and_then(normalize_log_path)
+                .map(PathBuf::from),
         }
     }
 
+    /// 便宜的条件先比(邮箱、文本只看提交对象本身),路径要读两棵树,放最后。
     fn matches(&self, commit: &Commit<'_>) -> bool {
         let author = commit.author();
         if let Some(email) = &self.email {
@@ -92,14 +119,18 @@ impl Matcher {
                 return false;
             }
         }
-        let Some(needle) = &self.needle else {
-            return true;
-        };
-        if self.hex && commit.id().to_string().starts_with(needle.as_str()) {
-            return true;
+        if let Some(needle) = &self.needle {
+            let hash_hit = self.hex && commit.id().to_string().starts_with(needle.as_str());
+            let hit =
+                |s: Option<&str>| s.is_some_and(|s| s.to_lowercase().contains(needle.as_str()));
+            if !(hash_hit || hit(author.name()) || hit(author.email()) || hit(commit.message())) {
+                return false;
+            }
         }
-        let hit = |s: Option<&str>| s.is_some_and(|s| s.to_lowercase().contains(needle.as_str()));
-        hit(author.name()) || hit(author.email()) || hit(commit.message())
+        match &self.path {
+            Some(path) => file_change(commit, path).is_some(),
+            None => true,
+        }
     }
 }
 
@@ -203,8 +234,11 @@ pub fn config_user_email(repo_path: &Path) -> Option<String> {
 
 // ─── 单文件历史 ───────────────────────────────────────────────
 
-/// 文件在某次提交里的变动类型(相对第一个父提交)。字符串口径与
+/// 路径在某次提交里的变动类型(相对第一个父提交)。字符串口径与
 /// [`CommitFileInfo::status`] 一致。
+///
+/// `path` 是目录时比的是子树的对象 id:目录下任一文件变了,子树 id 就变 —— 所以单文件
+/// 历史与历史区的路径过滤([`LogFilter::path`])共用这一个判定。
 fn file_change(commit: &Commit<'_>, path: &Path) -> Option<&'static str> {
     let tree = commit.tree().ok()?;
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
@@ -415,7 +449,29 @@ mod tests {
             Self { root, repo }
         }
 
-        /// `files` 是这个提交的**完整**文件表(路径, 内容)。
+        /// 按 `/` 分隔的完整文件表建树(子目录递归建子树)。
+        fn tree(&self, files: &[(&str, &str)]) -> Oid {
+            let mut builder = self.repo.treebuilder(None).unwrap();
+            let mut dirs: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+            for &(path, content) in files {
+                match path.split_once('/') {
+                    Some((dir, rest)) => match dirs.iter_mut().find(|(d, _)| *d == dir) {
+                        Some((_, inner)) => inner.push((rest, content)),
+                        None => dirs.push((dir, vec![(rest, content)])),
+                    },
+                    None => {
+                        let blob = self.repo.blob(content.as_bytes()).unwrap();
+                        builder.insert(path, blob, 0o100644).unwrap();
+                    }
+                }
+            }
+            for (dir, inner) in dirs {
+                builder.insert(dir, self.tree(&inner), 0o040000).unwrap();
+            }
+            builder.write().unwrap()
+        }
+
+        /// `files` 是这个提交的**完整**文件表(路径, 内容),路径可以带子目录。
         fn commit(
             &self,
             msg: &str,
@@ -424,12 +480,7 @@ mod tests {
             parents: &[Oid],
             files: &[(&str, &str)],
         ) -> Oid {
-            let mut builder = self.repo.treebuilder(None).unwrap();
-            for (path, content) in files {
-                let blob = self.repo.blob(content.as_bytes()).unwrap();
-                builder.insert(path, blob, 0o100644).unwrap();
-            }
-            let tree = self.repo.find_tree(builder.write().unwrap()).unwrap();
+            let tree = self.repo.find_tree(self.tree(files)).unwrap();
             let sig = git2::Signature::new("tester", email, &git2::Time::new(time, 0)).unwrap();
             let parents: Vec<_> = parents
                 .iter()
@@ -530,14 +581,17 @@ mod tests {
             LogFilter {
                 text: "FIX".into(),
                 author_email: None,
+                path: None,
             },
             LogFilter {
                 text: String::new(),
                 author_email: Some("bob@example.com".into()),
+                path: None,
             },
             LogFilter {
                 text: "feat".into(),
                 author_email: Some(a.into()),
+                path: None,
             },
         ] {
             let expected: Vec<String> = everything
@@ -580,6 +634,7 @@ mod tests {
         let matcher = Matcher::new(&LogFilter {
             text: "needle".into(),
             author_email: None,
+            path: None,
         });
         let mut found = Vec::new();
         let mut after = None;
@@ -624,6 +679,7 @@ mod tests {
             &LogFilter {
                 text: prefix,
                 author_email: None,
+                path: None,
             },
             30,
         );
@@ -635,6 +691,7 @@ mod tests {
             &LogFilter {
                 text: "dev@example".into(),
                 author_email: None,
+                path: None,
             },
             30,
         );
@@ -645,6 +702,7 @@ mod tests {
             &LogFilter {
                 text: String::new(),
                 author_email: Some("dev@example.COM".into()),
+                path: None,
             },
             30,
         );
@@ -653,7 +711,8 @@ mod tests {
         assert!(
             !LogFilter {
                 text: "  ".into(),
-                author_email: None
+                author_email: None,
+                path: None
             }
             .is_active()
         );
@@ -674,12 +733,177 @@ mod tests {
             &LogFilter {
                 text: "zzz".into(),
                 author_email: None,
+                path: None,
             },
         )
         .unwrap();
         assert!(page.commits.is_empty());
         assert!(page.next.is_none(), "走完了就没有下文");
         assert_eq!(page.scanned, 1);
+    }
+
+    fn path_filter(path: &str, text: &str) -> LogFilter {
+        LogFilter {
+            text: text.into(),
+            author_email: None,
+            path: Some(path.into()),
+        }
+    }
+
+    /// 路径过滤:文件与目录都认(目录 = 下面任一文件变了),相对第一个父提交判定(合并
+    /// 带进来的改动算、旁支上的提交照样认),删除也算;写法不同但规范化后相同的路径结果
+    /// 一致;与文本过滤取交集;任意页大小、任意扫描预算下跨页不漏不重、顺序与全量一致。
+    #[test]
+    fn 过滤_按路径_文件与目录跨页不漏不重() {
+        let s = Synth::new("filter-path");
+        let a = "a@b.c";
+        let base = [
+            ("README.md", "1"),
+            ("src/a.rs", "a1"),
+            ("src/b.rs", "b1"),
+            ("docs/x.md", "x1"),
+        ];
+        let c1 = s.commit("init", a, 1, &[], &base);
+        let f2 = [
+            ("README.md", "1"),
+            ("src/a.rs", "a2"),
+            ("src/b.rs", "b1"),
+            ("docs/x.md", "x1"),
+        ];
+        let c2 = s.commit("fix a", a, 2, &[c1], &f2);
+        let f3 = [
+            ("README.md", "1"),
+            ("src/a.rs", "a2"),
+            ("src/b.rs", "b1"),
+            ("docs/x.md", "x2"),
+        ];
+        let c3 = s.commit("docs", a, 4, &[c2], &f3);
+        // 旁支(时间比主线早:时钟偏移下也得认出来)
+        let fs = [
+            ("README.md", "1"),
+            ("src/a.rs", "a2"),
+            ("src/b.rs", "b2"),
+            ("docs/x.md", "x1"),
+        ];
+        let side = s.commit("side b", a, 3, &[c2], &fs);
+        let f4 = [
+            ("README.md", "2"),
+            ("src/a.rs", "a2"),
+            ("src/b.rs", "b1"),
+            ("docs/x.md", "x2"),
+        ];
+        let c4 = s.commit("readme", a, 5, &[c3], &f4);
+        let fm = [
+            ("README.md", "2"),
+            ("src/a.rs", "a2"),
+            ("src/b.rs", "b2"),
+            ("docs/x.md", "x2"),
+        ];
+        let m = s.commit("merge", a, 6, &[c4, side], &fm);
+        let f5 = [("README.md", "2"), ("src/b.rs", "b2"), ("docs/x.md", "x2")];
+        let c5 = s.commit("rm a", a, 7, &[m], &f5);
+        let f6 = [
+            ("README.md", "2"),
+            ("src/b.rs", "b2"),
+            ("src/sub/y.md", "y"),
+            ("docs/x.md", "x2"),
+        ];
+        let c6 = s.commit("add sub", a, 8, &[c5], &f6);
+        s.head_to(c6);
+
+        let everything = load_all(&s.root, &LogFilter::default(), 1000);
+        assert_eq!(everything.len(), 8);
+        let order = msgs(&s, &everything);
+
+        // 写死几组,确认判定口径本身
+        let pick = |filter: &LogFilter| msgs(&s, &load_all(&s.root, filter, 30));
+        assert_eq!(
+            pick(&path_filter("src/a.rs", "")),
+            ["rm a", "fix a", "init"],
+            "文件:新增 / 修改 / 删除都算"
+        );
+        assert_eq!(
+            pick(&path_filter("src", "")),
+            ["add sub", "rm a", "merge", "side b", "fix a", "init"],
+            "目录:下面任一文件变了都算,合并相对第一个父提交带进了 b.rs"
+        );
+        assert_eq!(pick(&path_filter("src/sub", "")), ["add sub"]);
+        assert_eq!(pick(&path_filter("src", "FIX")), ["fix a"], "与文本取交集");
+        assert!(pick(&path_filter("nope", "")).is_empty());
+        assert!(
+            pick(&path_filter("src/../docs", "")).is_empty(),
+            "`..` 不解析"
+        );
+        // 同一个路径的不同写法
+        for spelled in ["./src/", "src\\", "/src", "src//"] {
+            assert_eq!(
+                pick(&path_filter(spelled, "")),
+                pick(&path_filter("src", "")),
+                "{spelled}"
+            );
+        }
+
+        for filter in [
+            path_filter("src", ""),
+            path_filter("src/a.rs", ""),
+            path_filter("docs", "d"),
+        ] {
+            let matcher = Matcher::new(&filter);
+            let expected: Vec<String> = everything
+                .iter()
+                .filter(|c| {
+                    let commit = s.repo.find_commit(Oid::from_str(&c.hash).unwrap()).unwrap();
+                    matcher.matches(&commit)
+                })
+                .map(|c| s.msg(&c.hash))
+                .collect();
+            assert!(!expected.is_empty(), "{filter:?}");
+            for page in [1, 2, 3, 100] {
+                assert_eq!(
+                    msgs(&s, &load_all(&s.root, &filter, page)),
+                    expected,
+                    "{filter:?} 页大小 {page}"
+                );
+            }
+            // 扫描预算很小(每批只走两个提交)时照样找全、不重
+            let repo = Repository::open(&s.root).unwrap();
+            let mut tip = log_tip(&repo, None).unwrap();
+            let mut after = None;
+            let mut found = Vec::new();
+            loop {
+                let page = walk_page(&repo, after.take(), tip.take(), 100, 2, |c| {
+                    matcher.matches(c)
+                });
+                assert!(page.scanned <= 2);
+                found.extend(page.commits.iter().map(|c| s.msg(&c.hash)));
+                match page.next {
+                    Some(next) => after = Some(next),
+                    None => break,
+                }
+            }
+            assert_eq!(found, expected, "{filter:?} 小预算");
+            let mut it = order.iter();
+            for msg in &expected {
+                assert!(it.any(|o| o == msg), "{msg} 顺序与全量不一致");
+            }
+        }
+    }
+
+    #[test]
+    fn 过滤路径的规范化() {
+        assert_eq!(normalize_log_path("src").as_deref(), Some("src"));
+        assert_eq!(normalize_log_path(" ./src/ui/ ").as_deref(), Some("src/ui"));
+        assert_eq!(
+            normalize_log_path("src\\ui\\a.rs").as_deref(),
+            Some("src/ui/a.rs")
+        );
+        assert_eq!(normalize_log_path("a//./b").as_deref(), Some("a/b"));
+        for root in ["", "  ", "/", ".", "./", "\\"] {
+            assert_eq!(normalize_log_path(root), None, "{root:?}");
+        }
+        assert!(path_filter("src", "").is_active());
+        assert!(!path_filter("/", "").is_active(), "仓库根 = 不过滤");
+        assert!(!path_filter("  ", "").is_active());
     }
 
     /// 文件历史:只列改动了该路径的提交(相对第一个父),变动类型对得上;

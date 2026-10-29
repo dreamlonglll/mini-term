@@ -5,12 +5,11 @@
 //! [`super::git_commit`] 同一条理由);其余全是只读查询,走 git2。
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use git2::{BranchType, Oid, Repository, Sort};
 
-use super::run_git_command_labeled;
+use super::{LOCAL_OP_TIMEOUT, run_git_command_labeled};
 
 /// 一次成功提交的结果(给「已提交 abc1234:标题」那条 toast 用)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +24,7 @@ pub struct CommitOutcome {
 /// 一律当消息本身),错误信息里的操作名固定写 `commit`,不把整条消息灌进去。
 /// amend 允许暂存区为空 —— 那就是只改消息。
 ///
-/// **阻塞最多 60s**(pre-commit hook / gpg),必须在后台线程上调用。
+/// **阻塞最多 [`LOCAL_OP_TIMEOUT`]**(pre-commit hook / gpg),必须在后台线程上调用。
 pub fn git_commit_with(repo_path: &Path, message: &str, amend: bool) -> Result<CommitOutcome> {
     let mut args = vec!["commit"];
     if amend {
@@ -36,7 +35,7 @@ pub fn git_commit_with(repo_path: &Path, message: &str, amend: bool) -> Result<C
         repo_path,
         &args,
         if amend { "commit --amend" } else { "commit" },
-        Duration::from_secs(60),
+        LOCAL_OP_TIMEOUT,
         ",可能卡在 pre-commit hook 或 gpg 签名上",
     )?;
     head_outcome(repo_path)

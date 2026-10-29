@@ -1,5 +1,6 @@
-//! 「推送」对话框:仓库栏推送按钮 / 分支菜单「推送」(当前分支)打开。对标 IDEA 的
-//! Push 对话框。
+//! 「推送」对话框,对标 IDEA 的 Push 对话框。三个入口:仓库栏推送按钮(当前分支)、
+//! 分支弹窗的「推送」(预选那一行的本地分支,可以不是当前分支)、更改区的「提交并推送」
+//! (提交成功之后打开,当前分支)—— 都是先看清待推送的提交与目标,确认了才推。
 //!
 //! ```text
 //! ┌ 推送提交                                  ✕ ┐
@@ -18,6 +19,7 @@
 //! 还没有远程跟踪引用时取「不在任何远程分支上」的(最多 100 条)。
 //! 没有待推送提交也能打开(没上游时推送仍有意义:在远程建分支并设上游)。
 //! detached HEAD / 没有远程时推送按钮禁用并说明原因。强推要再确认一次。
+//! 推送占着仓库的写操作闸(`git_ui::gate`);别的区正在写这个仓库时推送键禁用并写明原因。
 
 use std::path::Path;
 
@@ -42,6 +44,8 @@ const OUTGOING_LIMIT: usize = 100;
 struct PushDialog {
     panel: Entity<GitPanel>,
     repo: String,
+    /// 要推的本地分支;`None` = 当前分支。
+    branch: Option<String>,
     /// `None` = 还在加载。
     plan: Option<PushPlan>,
     outgoing: Option<OutgoingCommits>,
@@ -105,17 +109,24 @@ pub(crate) fn upstream_note(target: &PushTarget) -> Option<String> {
     ))
 }
 
-/// 打开推送对话框(当前分支)。已经开着时是空操作。
+/// 打开推送对话框,预选本地分支 `branch`(`None` = 当前分支)。已经开着时是空操作。
 ///
 /// `repo` 由调用方给:调用点在 Git 面板自己的 update 里,这时再 `panel.read` 会撞上
 /// 「实体正被更新」的借用。
-pub(crate) fn open(panel: Entity<GitPanel>, repo: String, window: &mut Window, cx: &mut App) {
+pub(crate) fn open(
+    panel: Entity<GitPanel>,
+    repo: String,
+    branch: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if prompt::is_open(kind::GIT_PUSH) || repo.is_empty() {
         return;
     }
     let state = cx.new(|_| PushDialog {
         panel,
         repo,
+        branch,
         plan: None,
         outgoing: None,
         load_error: None,
@@ -129,7 +140,9 @@ pub(crate) fn open(panel: Entity<GitPanel>, repo: String, window: &mut Window, c
         let s = state.read(cx);
         let pushing = s.pushing;
         let force = s.force;
-        let can_push = !pushing && matches!(s.plan, Some(PushPlan::Ready(_)));
+        // 别的区正在写这个仓库(推送自己在跑时闸也占着,那由 `pushing` 管)
+        let gated = !pushing && git_ui::gate::is_busy(&s.repo);
+        let can_push = !pushing && !gated && matches!(s.plan, Some(PushPlan::Ready(_)));
         let push_label = if pushing {
             t("gitBranch", "pushing")
         } else if force {
@@ -161,15 +174,19 @@ pub(crate) fn open(panel: Entity<GitPanel>, repo: String, window: &mut Window, c
 
 /// 后台读推送计划与待推送提交。
 fn load(state: &Entity<PushDialog>, cx: &mut App) {
-    let repo = state.read(cx).repo.clone();
+    let (repo, branch) = {
+        let s = state.read(cx);
+        (s.repo.clone(), s.branch.clone())
+    };
     let state = state.clone();
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
             .spawn(async move {
                 let path = Path::new(&repo);
-                let plan = mt_project::git::push_plan(path, None)?;
-                let outgoing = mt_project::git::outgoing_commits(path, None, OUTGOING_LIMIT)?;
+                let branch = branch.as_deref();
+                let plan = mt_project::git::push_plan(path, branch)?;
+                let outgoing = mt_project::git::outgoing_commits(path, branch, OUTGOING_LIMIT)?;
                 anyhow::Ok((plan, outgoing))
             })
             .await;
@@ -215,7 +232,7 @@ fn start_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
 }
 
 fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
-    let (panel, repo, force, count, truncated, expected_oid) = {
+    let (panel, repo, branch, force, count, truncated, expected_oid) = {
         let s = state.read(cx);
         let (count, truncated) = s
             .outgoing
@@ -230,75 +247,85 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
         (
             s.panel.clone(),
             s.repo.clone(),
+            s.branch.clone(),
             s.force,
             count,
             truncated,
             expected_oid,
         )
     };
+    let options = PushOptions {
+        branch,
+        force_with_lease: force,
+        expected_oid,
+    };
+    let done_state = state.clone();
+    let done_panel = panel.clone();
+    // ⚠️ 网络操作,最多阻塞 120s(后台执行器上跑,占着仓库的写操作闸)
+    let started = git_ui::spawn_gated(
+        &repo,
+        move |repo| mt_project::git::git_push_with(repo, &options),
+        move |result, window, cx| {
+            let (state, panel) = (done_state, done_panel);
+            panel.update(cx, |p, cx| p.set_push_busy(false, cx));
+            let failure = match result {
+                Ok(PushOutcome::Pushed(target)) => {
+                    close_guarded(kind::GIT_PUSH, window, cx);
+                    let message = pushed_summary(&target, count, truncated, force);
+                    panel.update(cx, |p, cx| {
+                        p.notify_result(message, Tone::Info, cx);
+                        p.refresh_all(cx);
+                    });
+                    None
+                }
+                Ok(PushOutcome::Rejected { detail }) => Some((detail, true)),
+                Err(err) => Some((git_ui::error_text(&err), false)),
+            };
+            let Some((detail, rejected)) = failure else {
+                return;
+            };
+            eprintln!("[git] 推送失败: {detail}");
+            // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
+            if !prompt::is_open(kind::GIT_PUSH) {
+                let text = if rejected {
+                    format!("{}\n\n{detail}", t("gitBranch", "rejectedHint"))
+                } else {
+                    detail
+                };
+                git_ui::show_git_error(
+                    tr!("gitBranch", "opFailed", op = t("gitBranch", "opPush")),
+                    text,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            let text_state = git_ui::error_text_state(&detail, 8, window, cx);
+            state.update(cx, |s, cx| {
+                s.pushing = false;
+                s.error = Some((text_state, rejected));
+                cx.notify();
+            });
+            panel.update(cx, |p, cx| p.refresh_all(cx));
+        },
+        window,
+        cx,
+    );
+    if !started {
+        // 别的区刚占上闸(按钮禁用之前点进来的):就地说明,不推
+        let text_state = git_ui::error_text_state(git_ui::gate_busy_text(), 2, window, cx);
+        state.update(cx, |s, cx| {
+            s.error = Some((text_state, false));
+            cx.notify();
+        });
+        return;
+    }
     state.update(cx, |s, cx| {
         s.pushing = true;
         s.error = None;
         cx.notify();
     });
     panel.update(cx, |p, cx| p.set_push_busy(true, cx));
-    let state = state.clone();
-    window
-        .spawn(cx, async move |cx| {
-            let options = PushOptions {
-                branch: None,
-                force_with_lease: force,
-                expected_oid,
-            };
-            let result = cx
-                .background_executor()
-                // ⚠️ 网络操作,最多阻塞 120s
-                .spawn(async move { mt_project::git::git_push_with(Path::new(&repo), &options) })
-                .await;
-            let _ = cx.update(|window, cx| {
-                panel.update(cx, |p, cx| p.set_push_busy(false, cx));
-                let failure = match result {
-                    Ok(PushOutcome::Pushed(target)) => {
-                        close_guarded(kind::GIT_PUSH, window, cx);
-                        let message = pushed_summary(&target, count, truncated, force);
-                        panel.update(cx, |p, cx| {
-                            p.notify_result(message, Tone::Info, cx);
-                            p.refresh_all(cx);
-                        });
-                        None
-                    }
-                    Ok(PushOutcome::Rejected { detail }) => Some((detail, true)),
-                    Err(err) => Some((format!("{err:#}"), false)),
-                };
-                let Some((detail, rejected)) = failure else {
-                    return;
-                };
-                eprintln!("[git] 推送失败: {detail}");
-                // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
-                if !prompt::is_open(kind::GIT_PUSH) {
-                    let text = if rejected {
-                        format!("{}\n\n{detail}", t("gitBranch", "rejectedHint"))
-                    } else {
-                        detail
-                    };
-                    git_ui::show_git_error(
-                        tr!("gitBranch", "opFailed", op = t("gitBranch", "opPush")),
-                        text,
-                        window,
-                        cx,
-                    );
-                    return;
-                }
-                let text_state = git_ui::error_text_state(&detail, 8, window, cx);
-                state.update(cx, |s, cx| {
-                    s.pushing = false;
-                    s.error = Some((text_state, rejected));
-                    cx.notify();
-                });
-                panel.update(cx, |p, cx| p.refresh_all(cx));
-            });
-        })
-        .detach();
 }
 
 /// 点一条待推送提交:取文件列表,开提交 diff 弹窗(叠在推送对话框之上)。
@@ -313,27 +340,7 @@ fn view_commit(
         let s = state.read(cx);
         (s.repo.clone(), s.panel.read(cx).store().clone())
     };
-    let (repo_for_task, hash_for_task) = (repo.clone(), hash.clone());
-    window
-        .spawn(cx, async move |cx| {
-            let files = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::git::get_commit_files(Path::new(&repo_for_task), &hash_for_task)
-                })
-                .await;
-            let _ = cx.update(|window, cx| match files {
-                Ok(files) => {
-                    crate::git_diff::open_commit_diff(store, repo, hash, message, files, window, cx)
-                }
-                Err(err) => git_ui::show_git_error(
-                    t("gitBranch", "viewCommitFailed"),
-                    format!("{err:#}"),
-                    window,
-                    cx,
-                ),
-            });
-        })
+    crate::git_diff::open_commit_diff_loading(store, repo, hash, message, None, window, cx)
         .detach();
 }
 
@@ -366,6 +373,12 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         PushPlan::Ready(target) => Some(target.clone()),
         _ => None,
     };
+    // 预选的是别的本地分支(分支弹窗里推的):胶囊按「其它本地分支」上色
+    let branch_kind = if s.branch.is_some() {
+        git_ui::RefKind::Local
+    } else {
+        git_ui::RefKind::Head
+    };
     root = root.child(match &plan {
         PushPlan::Ready(target) => {
             let remote = target.label();
@@ -380,12 +393,8 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
                     ui::text_muted(),
                 ))
                 .child(
-                    git_ui::ref_pill(
-                        "git-push-branch",
-                        target.branch.clone(),
-                        git_ui::RefKind::Head,
-                    )
-                    .tip(target.branch.clone()),
+                    git_ui::ref_pill("git-push-branch", target.branch.clone(), branch_kind)
+                        .tip(target.branch.clone()),
                 )
                 .child(git_ui::icon(
                     git_ui::ICON_ARROW_RIGHT,
@@ -575,6 +584,12 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     )
     .when(pushing, |el| {
         el.child(git_ui::busy_line(t("gitBranch", "pushing")))
+    })
+    .when(!pushing && git_ui::gate::is_busy(&s.repo), |el| {
+        el.child(git_ui::notice_line(
+            git_ui::gate_busy_text(),
+            ui::color_warning(),
+        ))
     })
     .into_any_element()
 }

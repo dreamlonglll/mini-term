@@ -414,8 +414,8 @@ fn icon_color(kind: ToastKind) -> gpui::Hsla {
     match kind {
         ToastKind::Completion => ui::color_success(),
         ToastKind::Attention => ui::color_warning(),
-        ToastKind::PasteError => ui::color_error(),
-        ToastKind::WslInfo | ToastKind::MobileSession => ui::color_info(),
+        ToastKind::PasteError | ToastKind::Error => ui::color_error(),
+        ToastKind::WslInfo | ToastKind::MobileSession | ToastKind::Info => ui::color_info(),
     }
 }
 

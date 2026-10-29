@@ -17,54 +17,15 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Oid, Repository};
 
 use super::repo_state::conflicted_file_count;
-use super::{GitOutput, invalidate_repo_cache, run_git_output, run_git_output_env};
-
-/// 只动引用的操作(`branch` / `branch -m` / `branch -d`):毫秒级,30s 足够兜底。
-const REF_TIMEOUT: Duration = Duration::from_secs(30);
-/// 要改写工作区的操作(检出 / 合并 / 变基):大仓库一次 checkout 能到几十秒,
-/// 还可能跑 post-checkout hook,给到 120s。
-pub(super) const WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
-/// 网络操作(删远程分支)的超时与提示,与 pull/push 同一口径。
-pub(super) const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
-pub(super) const NETWORK_HINT: &str = ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key";
-/// 会拉起编辑器的命令(合并提交、`rebase` / `pull --rebase` 续跑)一律带上:
-/// 沿用 git 生成的提交信息,不等一个永远不会有人操作的编辑器。
-pub(super) const NO_EDITOR: &[(&str, &str)] = &[("GIT_EDITOR", "true")];
-
-/// git 失败时给用户看的原文:优先 stderr,空的话退 stdout(`merge` 的冲突说明
-/// 打在 stdout 上),两者都空才给一句兜底。
-pub(super) fn failure_text(out: &GitOutput) -> String {
-    let stderr = out.stderr.trim();
-    if !stderr.is_empty() {
-        return stderr.to_string();
-    }
-    let stdout = out.stdout.trim();
-    if !stdout.is_empty() {
-        return stdout.to_string();
-    }
-    "git 执行失败(没有输出)".to_string()
-}
-
-/// 跑一条 git 命令,非零退出即把原文装进错误。
-pub(super) fn run_checked(
-    repo_path: &Path,
-    args: &[&str],
-    op_label: &str,
-    timeout: Duration,
-    timeout_hint: &str,
-) -> Result<GitOutput> {
-    let out = run_git_output(repo_path, args, op_label, timeout, timeout_hint)?;
-    if !out.success {
-        bail!("{}", failure_text(&out));
-    }
-    Ok(out)
-}
+use super::{
+    NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, failure_text,
+    invalidate_repo_cache, run_checked, run_git_output, run_git_output_env,
+};
 
 // ---------------------------------------------------------------------------
 // 分支名校验
@@ -221,7 +182,7 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
         repo_path,
         &["checkout", name, "--"],
         "checkout",
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     invalidate_repo_cache();
@@ -255,7 +216,7 @@ pub fn checkout_remote_branch(repo_path: &Path, remote_branch: &str) -> Result<R
         repo_path,
         &["checkout", "-b", &local, "--track", remote_branch],
         "checkout -b",
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     invalidate_repo_cache();
@@ -288,9 +249,9 @@ pub fn create_branch(
     };
     args.extend(start);
     let timeout = if checkout {
-        WORKTREE_TIMEOUT
+        WORKTREE_OP_TIMEOUT
     } else {
-        REF_TIMEOUT
+        QUICK_OP_TIMEOUT
     };
     run_checked(repo_path, &args, "branch", timeout, "")?;
     invalidate_repo_cache();
@@ -310,7 +271,7 @@ pub fn rename_branch(repo_path: &Path, old: &str, new: &str) -> Result<()> {
         repo_path,
         &["branch", "-m", old, new],
         "branch -m",
-        REF_TIMEOUT,
+        QUICK_OP_TIMEOUT,
         "",
     )?;
     invalidate_repo_cache();
@@ -340,7 +301,7 @@ pub fn delete_branch(repo_path: &Path, name: &str, force: bool) -> Result<Delete
         repo_path,
         &["branch", flag, name],
         "branch -d",
-        REF_TIMEOUT,
+        QUICK_OP_TIMEOUT,
         "",
     )?;
     if out.success {
@@ -422,7 +383,7 @@ pub fn merge_branch(repo_path: &Path, name: &str) -> Result<MergeOutcome> {
         &["merge", "--no-edit", name],
         NO_EDITOR,
         "merge",
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     let repo = Repository::open(repo_path)?;
@@ -468,7 +429,7 @@ pub fn rebase_onto(repo_path: &Path, onto: &str) -> Result<RebaseOutcome> {
         &["rebase", onto],
         NO_EDITOR,
         "rebase",
-        WORKTREE_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
         "",
     )?;
     let repo = Repository::open(repo_path)?;
@@ -589,107 +550,11 @@ pub fn ahead_behind(repo_path: &Path) -> Result<Option<BranchTracking>> {
     Ok(tracking_of(&repo, &branch))
 }
 
-// ---------------------------------------------------------------------------
-// 单测共用的 git CLI 小件(sync / repo_state 的单测也用)
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-pub(super) mod test_cli {
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-
-    use super::super::test_support::init_repo_with_file;
-
-    /// 跑一条 git 命令,失败直接 panic(带上 stderr)。身份与签名用 `-c` 钉死,
-    /// 不依赖跑测试那台机器的全局配置。
-    ///
-    /// ⚠️ **不**在这里钉 `core.autocrlf`:被测函数走的 git 读的是机器的全局配置,
-    /// 两边换行口径不一致的话,一边 LF 检出、一边 CRLF 比对,干净的工作区会被认成
-    /// 「有改动」挡住检出。读文件内容做断言时自己归一换行。
-    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args([
-                "-c",
-                "user.name=mini-term",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_EDITOR", "true")
-            .output()
-            .expect("git 起不来");
-        assert!(
-            out.status.success(),
-            "git {args:?} 失败: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// 写文件并提交一次。
-    pub(crate) fn commit_file(dir: &Path, rel: &str, content: &str, message: &str) {
-        std::fs::write(dir.join(rel), content).unwrap();
-        git(dir, &["add", rel]);
-        git(dir, &["commit", "-q", "-m", message]);
-    }
-
-    /// 当前分支名。
-    pub(crate) fn current(dir: &Path) -> String {
-        git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])
-    }
-
-    /// 带 `origin` 的仓库:工作区仓库 + 同级的裸仓库当远程,当前分支已推上去并设好上游。
-    /// 返回 `(工作区, 裸仓库, 分支名)`。不联网。
-    pub(crate) fn repo_with_origin(tag: &str) -> (PathBuf, PathBuf, String) {
-        let work = init_repo_with_file(tag, "a.txt", "a\n");
-        let bare = work.with_file_name(format!(
-            "{}-origin.git",
-            work.file_name().unwrap().to_string_lossy()
-        ));
-        let parent = work.parent().unwrap().to_path_buf();
-        git(&parent, &["init", "-q", "--bare", &bare.to_string_lossy()]);
-        git(&work, &["remote", "add", "origin", &bare.to_string_lossy()]);
-        let branch = current(&work);
-        git(&work, &["push", "-q", "-u", "origin", &branch]);
-        (work, bare, branch)
-    }
-
-    /// 从裸仓库再克隆一份「别人的工作区」,用来往远程上推新提交。
-    pub(crate) fn clone_of(bare: &Path, branch: &str) -> PathBuf {
-        let dest = bare.with_file_name(format!(
-            "{}-other",
-            bare.file_name().unwrap().to_string_lossy()
-        ));
-        let parent = bare.parent().unwrap().to_path_buf();
-        git(
-            &parent,
-            &[
-                "clone",
-                "-q",
-                "-b",
-                branch,
-                &bare.to_string_lossy(),
-                &dest.to_string_lossy(),
-            ],
-        );
-        dest
-    }
-
-    pub(crate) fn cleanup(dirs: &[&Path]) {
-        for dir in dirs {
-            std::fs::remove_dir_all(dir).ok();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::init_repo_with_file;
-    use super::test_cli::{cleanup, clone_of, commit_file, current, git, repo_with_origin};
+    use super::super::test_support::{
+        cleanup, clone_of, commit_file, current, git, init_repo_with_file, repo_with_origin,
+    };
     use super::*;
 
     /// 校验:合法名放行,各类非法名给出各自的原因。

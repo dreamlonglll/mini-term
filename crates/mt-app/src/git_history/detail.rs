@@ -18,8 +18,10 @@ use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::CommitDetail;
 use mt_ui::tooltip::TooltipExt as _;
 
-use super::{GitHistoryContent, error_text, format_absolute_time, format_relative_time, grow};
-use crate::git_ui::{self, ICON_COPY, SectionHeader, commit_file_row, icon_button, mono, ref_pill};
+use super::{GitHistoryContent, format_absolute_time, format_relative_time, grow};
+use crate::git_ui::{
+    self, ICON_COPY, SectionHeader, commit_file_row, error_text, icon_button, mono, ref_pill,
+};
 use crate::i18n::{t, tr};
 use crate::ui;
 

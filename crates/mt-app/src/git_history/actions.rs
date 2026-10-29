@@ -8,14 +8,17 @@
 //!
 //! # 失败可见
 //!
-//! 菜单直接触发的操作失败走 toast(错误档,正文是 git 的 stderr 原文);对话框里的操作
-//! 失败写回对话框就地红字 —— toast 在弹窗遮罩下看不见。等待期间对话框被 Esc 关掉的话,
-//! 退到提示框。
+//! 菜单直接触发的操作失败弹可选中复制原文的详情框(与面板上的操作同一口径,见
+//! `git_ui::show_git_error`;toast 5s 就收,装不下 hook 的多行输出);对话框里的操作
+//! 失败写回对话框就地红字 —— 详情框与 toast 叠在对话框上都不顺手。等待期间对话框被
+//! Esc 关掉的话,退到提示框。
 //!
 //! # 防重复
 //!
 //! 同一时刻只跑一个改写操作([`GitHistoryContent::busy`]):进行中菜单里的改写项置灰,
 //! 过滤栏右侧显示「拣选中…」这类状态;对话框的确认键在等待期间换成「执行中…」并禁用。
+//! 跨区的防重入走仓库的写操作闸(`git_ui::gate`):面板在拉取、更改区在提交时,菜单里的
+//! 改写项同样置灰并写明原因,点进来也不执行。
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -29,8 +32,8 @@ use gpui_component::dialog::{Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use mt_project::git::{self, CommitRelation, GitCommitInfo, PickOutcome, ResetMode};
 
-use super::{GitHistoryContent, GitHistoryEvent, error_text};
-use crate::git_ui;
+use super::{GitHistoryContent, GitHistoryEvent};
+use crate::git_ui::{self, FormOp, error_text};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, close_guarded, is_open, kind, open_guarded, show_alert};
@@ -44,25 +47,28 @@ gpui::actions!(
     ]
 );
 
+/// 「修改提交消息」对话框正文的键位上下文(`hotkeys.rs` 按它绑 Ctrl/Cmd+Enter)。
+pub(crate) const REWORD_CONTEXT: &str = "GitLogReword";
+
 /// 对话框的表单状态。Dialog 的 builder 每帧重跑,可变状态得放实体里。
 struct DialogForm {
-    /// 确认后、结果回来之前:确认键禁用,防重复提交。
-    busy: bool,
-    /// 上一次执行失败的原文(git 的 stderr),就地红字。
-    error: Option<String>,
+    /// 执行中 / 上一次失败的原文(git 的 stderr,就地红字)。
+    op: FormOp,
     /// 新建分支:创建后检出(默认勾)。
     checkout: bool,
     /// 重置:选中的模式(默认 mixed,与 `git reset` 缺省一致)。
     mode: ResetMode,
+    /// 重置:会不会丢掉已推送的提交(后台判定,回来之前按不会)。
+    drops_pushed: bool,
 }
 
 impl DialogForm {
     fn new() -> Self {
         Self {
-            busy: false,
-            error: None,
+            op: FormOp::default(),
             checkout: true,
             mode: ResetMode::Mixed,
+            drops_pushed: false,
         }
     }
 }
@@ -135,7 +141,10 @@ fn commit_menu(
     cx: &mut Context<GitHistoryContent>,
 ) -> Vec<MenuEntry> {
     let entity = cx.entity();
-    let busy = this.busy.and_then(|_| reason("reason.busy"));
+    // 自己的改写还在跑 → 另一区的写操作占着这个仓库的闸
+    let busy = this.busy.and_then(|_| reason("reason.busy")).or_else(|| {
+        git_ui::gate::is_busy(&this.repo_path).then(|| git_ui::gate_busy_text().to_string())
+    });
     let (rel, rel_error) = match relation {
         Ok(rel) => (Some(rel), None),
         Err(err) => (
@@ -354,8 +363,8 @@ fn commit_menu(
 // ─── 执行器 ───────────────────────────────────────────────────
 
 impl GitHistoryContent {
-    /// 跑一个由菜单直接触发的改写操作:防重复 → 后台执行 → 成功回调(toast / 选中)
-    /// 或失败 toast → 重载历史并通知容器。
+    /// 跑一个由菜单直接触发的改写操作:防重复 → 占闸、后台执行([`git_ui::spawn_gated`])
+    /// → 成功回调(toast / 选中)或失败详情框 → 重载历史并通知容器。
     fn run_op<T: Send + 'static>(
         &mut self,
         action: &'static str,
@@ -374,28 +383,40 @@ impl GitHistoryContent {
             );
             return;
         }
+        let this = cx.entity().downgrade();
+        let started = git_ui::spawn_gated(
+            &self.repo_path,
+            op,
+            move |result, window, cx| {
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.busy = None;
+                    match result {
+                        Ok(value) => on_ok(this, value, window, cx),
+                        Err(err) => this.show_failure(action, &err, window, cx),
+                    }
+                    // 失败也可能动过仓库(拣选停在半路之类):一律重载
+                    this.finish_mutation(cx);
+                });
+            },
+            window,
+            cx,
+        );
+        if !started {
+            git_ui::toast(
+                &self.store,
+                git_ui::gate_busy_text().to_string(),
+                git_ui::Tone::Attention,
+                cx,
+            );
+            return;
+        }
         self.busy = Some(action);
         cx.notify();
-        let repo = PathBuf::from(&self.repo_path);
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                this.busy = None;
-                match result {
-                    Ok(value) => on_ok(this, value, window, cx),
-                    Err(err) => this.toast_failure(action, &err, cx),
-                }
-                // 失败也可能动过仓库(拣选停在半路之类):一律重载
-                this.finish_mutation(cx);
-            });
-        })
-        .detach();
     }
 
     /// 同 [`Self::run_op`],但由对话框触发:成功关框,失败把原因写回表单、框留着。
+    /// 调用方已把表单置成执行中([`FormOp::begin`]);没能开始(上一个还在跑、闸被占)
+    /// 时同样把原因写回表单。
     #[allow(clippy::too_many_arguments)]
     fn run_dialog_op<T: Send + 'static>(
         &mut self,
@@ -407,48 +428,58 @@ impl GitHistoryContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(running) = self.busy {
-            let message = tr!("gitLog", "toast.busy", action = t("gitLog", running));
+        let refuse = |message: String, cx: &mut Context<Self>| {
             form.update(cx, |f, cx| {
-                f.busy = false;
-                f.error = Some(message);
+                f.op.fail(message);
                 cx.notify();
             });
+        };
+        if let Some(running) = self.busy {
+            refuse(
+                tr!("gitLog", "toast.busy", action = t("gitLog", running)),
+                cx,
+            );
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let form_done = form.clone();
+        let started = git_ui::spawn_gated(
+            &self.repo_path,
+            op,
+            move |result, window, cx| {
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.busy = None;
+                    match result {
+                        Ok(value) => {
+                            form_done.update(cx, |f, _| f.op.finish());
+                            close_guarded(dialog, window, cx);
+                            on_ok(this, value, window, cx);
+                        }
+                        Err(err) => {
+                            eprintln!("[git] {action} 失败: {err:#}");
+                            let message = error_text(&err);
+                            form_done.update(cx, |f, cx| {
+                                f.op.fail(message.clone());
+                                cx.notify();
+                            });
+                            // 等待期间框被 Esc 关了:原因不能丢,退到提示框
+                            if !is_open(dialog) {
+                                show_alert(t("gitLog", action), message, window, cx);
+                            }
+                        }
+                    }
+                    this.finish_mutation(cx);
+                });
+            },
+            window,
+            cx,
+        );
+        if !started {
+            refuse(git_ui::gate_busy_text().to_string(), cx);
             return;
         }
         self.busy = Some(action);
         cx.notify();
-        let repo = PathBuf::from(&self.repo_path);
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                this.busy = None;
-                match result {
-                    Ok(value) => {
-                        close_guarded(dialog, window, cx);
-                        on_ok(this, value, window, cx);
-                    }
-                    Err(err) => {
-                        eprintln!("[git] {action} 失败: {err:#}");
-                        let message = error_text(&err);
-                        form.update(cx, |f, cx| {
-                            f.busy = false;
-                            f.error = Some(message.clone());
-                            cx.notify();
-                        });
-                        // 等待期间框被 Esc 关了:原因不能丢,退到提示框
-                        if !is_open(dialog) {
-                            show_alert(t("gitLog", action), message, window, cx);
-                        }
-                    }
-                }
-                this.finish_mutation(cx);
-            });
-        })
-        .detach();
     }
 
     /// 改写之后:历史重载(保留旧列表不闪),容器重载分支 / 更改。
@@ -765,7 +796,7 @@ impl GitHistoryContent {
                 let name = input.read(cx).value().trim().to_string();
                 let invalid = validate_branch(&name, &existing);
                 let f = form.read(cx);
-                let (busy, error, checkout) = (f.busy, f.error.clone(), f.checkout);
+                let (busy, error, checkout) = (f.op.busy, f.op.error.clone(), f.checkout);
                 let form_toggle = form.clone();
                 // 名字一边打一边校验(空名不报,等点「创建」再说)
                 let name_field = field_group(t("gitLog", "branch.nameLabel"))
@@ -805,23 +836,21 @@ impl GitHistoryContent {
                             .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
-                        if form_ok.read(cx).busy {
+                        if form_ok.read(cx).op.busy {
                             return false;
                         }
                         let name = input_ok.read(cx).value().trim().to_string();
                         if let Some(msg) = validate_branch(&name, &existing) {
                             form_ok.update(cx, |f, cx| {
-                                f.error = Some(msg);
+                                f.op.fail(msg);
                                 cx.notify();
                             });
                             return false;
                         }
                         let checkout = form_ok.read(cx).checkout;
-                        form_ok.update(cx, |f, cx| {
-                            f.busy = true;
-                            f.error = None;
-                            cx.notify();
-                        });
+                        if !begin(&form_ok, cx) {
+                            return false;
+                        }
                         let (op_name, op_hash) = (name.clone(), hash.clone());
                         let form = form_ok.clone();
                         entity.update(cx, |this, cx| {
@@ -889,7 +918,7 @@ impl GitHistoryContent {
                 let name = name_input.read(cx).value().trim().to_string();
                 let invalid = validate_tag(&name, &existing);
                 let f = form.read(cx);
-                let (busy, error) = (f.busy, f.error.clone());
+                let (busy, error) = (f.op.busy, f.op.error.clone());
                 let (entity, form_ok, name_ok, message_ok, hash, existing) = (
                     entity.clone(),
                     form.clone(),
@@ -920,23 +949,21 @@ impl GitHistoryContent {
                             .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
-                        if form_ok.read(cx).busy {
+                        if form_ok.read(cx).op.busy {
                             return false;
                         }
                         let name = name_ok.read(cx).value().trim().to_string();
                         if let Some(msg) = validate_tag(&name, &existing) {
                             form_ok.update(cx, |f, cx| {
-                                f.error = Some(msg);
+                                f.op.fail(msg);
                                 cx.notify();
                             });
                             return false;
                         }
                         let message = message_ok.read(cx).value().trim().to_string();
-                        form_ok.update(cx, |f, cx| {
-                            f.busy = true;
-                            f.error = None;
-                            cx.notify();
-                        });
+                        if !begin(&form_ok, cx) {
+                            return false;
+                        }
                         let (op_name, op_hash) = (name.clone(), hash.clone());
                         let form = form_ok.clone();
                         entity.update(cx, |this, cx| {
@@ -996,7 +1023,7 @@ impl GitHistoryContent {
             cx,
             move |dialog, _window, cx| {
                 let f = form.read(cx);
-                let (busy, error) = (f.busy, f.error.clone());
+                let (busy, error) = (f.op.busy, f.op.error.clone());
                 let empty = input.read(cx).value().trim().is_empty();
                 let (entity, form_ok, input_ok, hash) =
                     (entity.clone(), form.clone(), input.clone(), hash.clone());
@@ -1007,7 +1034,7 @@ impl GitHistoryContent {
                     .footer(form_footer(t("gitLog", "reword.ok"), false, busy))
                     .child(
                         git_ui::form_body()
-                            .key_context("GitLogReword")
+                            .key_context(REWORD_CONTEXT)
                             .on_action(|_: &GitLogRewordConfirm, window, cx| {
                                 window.dispatch_action(
                                     Box::new(DialogConfirm { secondary: false }),
@@ -1037,18 +1064,16 @@ impl GitHistoryContent {
                             .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
-                        if form_ok.read(cx).busy {
+                        if form_ok.read(cx).op.busy {
                             return false;
                         }
                         let message = input_ok.read(cx).value().trim().to_string();
                         if message.is_empty() {
                             return false;
                         }
-                        form_ok.update(cx, |f, cx| {
-                            f.busy = true;
-                            f.error = None;
-                            cx.notify();
-                        });
+                        if !begin(&form_ok, cx) {
+                            return false;
+                        }
                         let op_hash = hash.clone();
                         let form = form_ok.clone();
                         entity.update(cx, |this, cx| {
@@ -1103,6 +1128,25 @@ impl GitHistoryContent {
         );
         let off_history = !rel.in_head_history;
         let (hash, short) = (commit.hash.clone(), commit.short_hash.clone());
+        // 会不会丢掉已推送的提交:要走图可达判定,放后台;回来之前不显示警告
+        {
+            let (repo, target, form) = (PathBuf::from(&self.repo_path), hash.clone(), form.clone());
+            cx.spawn(async move |_, cx| {
+                let drops = cx
+                    .background_executor()
+                    .spawn(async move { git::reset_drops_pushed(&repo, &target) })
+                    .await;
+                let drops = drops.unwrap_or_else(|err| {
+                    eprintln!("[git] 重置前的推送判定失败(不显示警告): {err:#}");
+                    false
+                });
+                form.update(cx, |f, cx| {
+                    f.drops_pushed = drops;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
 
         open_guarded(
             kind::GIT_LOG_RESET,
@@ -1110,7 +1154,8 @@ impl GitHistoryContent {
             cx,
             move |dialog, _window, cx| {
                 let f = form.read(cx);
-                let (busy, error, mode) = (f.busy, f.error.clone(), f.mode);
+                let (busy, error, mode) = (f.op.busy, f.op.error.clone(), f.mode);
+                let drops_pushed = f.drops_pushed;
                 let mut modes = div().flex().flex_col().gap(px(4.0));
                 for (m, key) in [
                     (ResetMode::Soft, "reset.soft"),
@@ -1122,7 +1167,7 @@ impl GitHistoryContent {
                     modes = modes.child(mode_row(m, key, m == mode, move |_window, cx| {
                         form.update(cx, |f, cx| {
                             f.mode = m;
-                            f.error = None;
+                            f.op.error = None;
                             cx.notify();
                         });
                     }));
@@ -1151,6 +1196,10 @@ impl GitHistoryContent {
                                     .text_color(ui::text_primary())
                                     .child(target.clone()),
                             )
+                            // 会改写已推送的历史:四种模式都要看见(Hard 另有二次确认)
+                            .when(drops_pushed, |el| {
+                                el.child(pushed_warning(t("gitLog", "reset.pushedWarn")))
+                            })
                             .when(off_history, |el| {
                                 el.child(git_ui::notice_line(
                                     t("gitLog", "reset.notInHistory"),
@@ -1161,7 +1210,7 @@ impl GitHistoryContent {
                             .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
-                        if form_ok.read(cx).busy {
+                        if form_ok.read(cx).op.busy {
                             return false;
                         }
                         let mode = form_ok.read(cx).mode;
@@ -1174,11 +1223,9 @@ impl GitHistoryContent {
                             branch.clone(),
                         );
                         let start = move |window: &mut Window, cx: &mut App| {
-                            form.update(cx, |f, cx| {
-                                f.busy = true;
-                                f.error = None;
-                                cx.notify();
-                            });
+                            if !begin(&form, cx) {
+                                return;
+                            }
                             let (op_hash, hash, short, branch) =
                                 (hash.clone(), hash.clone(), short.clone(), branch.clone());
                             let form = form.clone();
@@ -1259,7 +1306,29 @@ fn validate_tag(name: &str, existing: &[String]) -> Option<String> {
 // ─── 对话框小件 ───────────────────────────────────────────────
 
 // 正文骨架、说明行、警告 / 错误行、复选框、页脚都走 `git_ui` 的共用件(与分支弹窗、
-// 推送对话框同一套);这里只剩本模块特有的两件。
+// 推送对话框同一套);这里只剩本模块特有的几件。
+
+/// 确认之后、交给执行器之前把表单置成执行中([`FormOp::begin`])。已在执行中返回 `false`。
+fn begin(form: &Entity<DialogForm>, cx: &mut App) -> bool {
+    form.update(cx, |f, cx| {
+        let started = f.op.begin();
+        cx.notify();
+        started
+    })
+}
+
+/// 「将改写已推送的历史」:警告色淡底的醒目块(比普通说明行更扎眼,四种模式都显示)。
+fn pushed_warning(text: &'static str) -> gpui::Div {
+    let color = ui::color_warning();
+    div()
+        .px(px(10.0))
+        .py(px(8.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(ui::with_alpha(color, 0.45))
+        .bg(ui::with_alpha(color, 0.10))
+        .child(git_ui::notice_line(text, color).font_weight(gpui::FontWeight::SEMIBOLD))
+}
 
 /// 「取消 / 确认」页脚(共用的 [`git_ui::dialog_footer`]):确认键在等待期间换成
 /// 「执行中…」并禁用(防重复提交);`danger` 时确认键用危险色(Hard 重置)。

@@ -10,18 +10,19 @@
 //!
 //! 全部是**阻塞**调用(最长 120s),调用方自己放到后台执行器上跑。
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Oid, Repository, RepositoryState};
 
-use super::{run_git_command_labeled, run_git_output};
-
-/// 纯本地、但会跑 hook 的操作(拣选 / 还原 / 改消息)的超时。口径同 `git_commit`。
-const LOCAL_OP_TIMEOUT: Duration = Duration::from_secs(60);
-/// 会改写工作区的操作(检出 / 重置)。大仓库 checkout 可能很慢,与 worktree add 同档。
-const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(120);
+// 超时口径:拣选 / 还原 / 改消息会跑 hook,走 LOCAL_OP_TIMEOUT(同 `git_commit`);
+// 检出 / 重置改写工作区,走 WORKTREE_OP_TIMEOUT
+use super::{
+    LOCAL_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, failure_text, run_checked, run_git_command_labeled,
+    run_git_output,
+};
 
 /// `git reset` 的四种模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +134,7 @@ pub fn commit_relation(repo_path: &Path, hash: &str) -> Result<CommitRelation> {
     let oid = resolve_commit(&repo, hash)?;
     let commit = repo.find_commit(oid)?;
     let head = head_oid(&repo);
-    let head_branch = repo
-        .head()
-        .ok()
-        .filter(|h| h.is_branch())
-        .and_then(|h| h.shorthand().map(str::to_string));
+    let head_branch = head_branch_of(&repo);
     Ok(CommitRelation {
         is_head: head == Some(oid),
         in_head_history: head.is_some_and(|h| contains(&repo, h, oid)),
@@ -152,11 +149,7 @@ pub fn commit_relation(repo_path: &Path, hash: &str) -> Result<CommitRelation> {
 pub fn is_commit_pushed(repo_path: &Path, hash: &str) -> Result<bool> {
     let repo = Repository::open(repo_path)?;
     let oid = resolve_commit(&repo, hash)?;
-    let head_branch = repo
-        .head()
-        .ok()
-        .filter(|h| h.is_branch())
-        .and_then(|h| h.shorthand().map(str::to_string));
+    let head_branch = head_branch_of(&repo);
     Ok(pushed_in(&repo, oid, head_branch.as_deref()))
 }
 
@@ -167,31 +160,69 @@ pub fn is_ancestor_of_head(repo_path: &Path, hash: &str) -> Result<bool> {
     Ok(head_oid(&repo).is_some_and(|h| contains(&repo, h, oid)))
 }
 
-fn pushed_in(repo: &Repository, oid: Oid, head_branch: Option<&str>) -> bool {
-    // 先看当前分支的上游:绝大多数情况一次就有结论
+/// 把当前分支重置到 `target` 会不会丢掉**已推送**的提交(重置对话框据此警告「之后需要
+/// 强制推送」)。
+///
+/// 重置丢掉的是「HEAD 能走到、`target` 走不到」的那些提交。对「已推送」口径里的每个
+/// 远程端点([`pushed_tips`]:当前分支的上游 + 全部远程跟踪分支)取它与 HEAD 的合并基 ——
+/// 那是 HEAD 这一侧已推送那段的顶端;它不在 `target` 的历史上,就有已推送的提交被移出
+/// 当前分支。HEAD 自己已推送时合并基就是 HEAD,判据退化成「`target` 不是 HEAD 也不是
+/// 它的后代」;HEAD 只领先几个本地提交、却重置到上游之前时同样认得出。
+/// 空仓库 / 一个远程分支都没有时恒 `false`。
+pub fn reset_drops_pushed(repo_path: &Path, target: &str) -> Result<bool> {
+    let repo = Repository::open(repo_path)?;
+    let target = resolve_commit(&repo, target)?;
+    let Some(head) = head_oid(&repo) else {
+        return Ok(false);
+    };
+    // 重置到 HEAD 自己或它的后代:什么都不丢
+    if contains(&repo, target, head) {
+        return Ok(false);
+    }
+    let head_branch = head_branch_of(&repo);
+    let mut seen = HashSet::new();
+    Ok(pushed_tips(&repo, head_branch.as_deref())
+        .into_iter()
+        .filter(|tip| seen.insert(*tip))
+        .filter_map(|tip| repo.merge_base(head, tip).ok())
+        .any(|base| !contains(&repo, target, base)))
+}
+
+/// HEAD 所在的本地分支名;detached / 空仓库为 `None`。
+fn head_branch_of(repo: &Repository) -> Option<String> {
+    repo.head()
+        .ok()
+        .filter(|h| h.is_branch())
+        .and_then(|h| h.shorthand().map(str::to_string))
+}
+
+/// 「已推送」口径里的远程端点:当前分支的上游排在最前(绝大多数情况一次就有结论),
+/// 其后是全部远程跟踪分支。`origin/HEAD` 是符号引用,target() 为 None,天然跳过。
+fn pushed_tips(repo: &Repository, head_branch: Option<&str>) -> Vec<Oid> {
+    let mut tips = Vec::new();
     if let Some(name) = head_branch
         && let Ok(branch) = repo.find_branch(name, BranchType::Local)
         && let Ok(upstream) = branch.upstream()
         && let Some(tip) = upstream.get().target()
-        && contains(repo, tip, oid)
     {
-        return true;
+        tips.push(tip);
     }
-    let Ok(remotes) = repo.branches(Some(BranchType::Remote)) else {
-        return false;
-    };
-    remotes.flatten().any(|(branch, _)| {
-        // `origin/HEAD` 是符号引用,target() 为 None,天然跳过
-        branch
-            .get()
-            .target()
-            .is_some_and(|tip| contains(repo, tip, oid))
-    })
+    if let Ok(remotes) = repo.branches(Some(BranchType::Remote)) {
+        tips.extend(remotes.flatten().filter_map(|(b, _)| b.get().target()));
+    }
+    tips
 }
 
-/// 跑一条会改仓库状态的 git 命令,失败时把 stderr 原样交回(工作区脏、hook 拒绝…)。
+fn pushed_in(repo: &Repository, oid: Oid, head_branch: Option<&str>) -> bool {
+    pushed_tips(repo, head_branch)
+        .into_iter()
+        .any(|tip| contains(repo, tip, oid))
+}
+
+/// 跑一条会改仓库状态的 git 命令,失败时把 git 的原文交回(工作区脏、hook 拒绝…,
+/// 口径见 [`failure_text`])。
 fn run_mutation(repo_path: &Path, args: &[&str], label: &str, timeout: Duration) -> Result<()> {
-    run_git_command_labeled(repo_path, args, label, timeout, "").map(|_| ())
+    run_checked(repo_path, args, label, timeout, "").map(|_| ())
 }
 
 /// 检出某个提交(进入分离头指针状态)。工作区有会被覆盖的改动时 git 拒绝执行,
@@ -208,7 +239,7 @@ pub fn checkout_commit(repo_path: &Path, hash: &str) -> Result<()> {
             hash,
         ],
         "checkout --detach",
-        CHECKOUT_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
     )
 }
 
@@ -224,7 +255,7 @@ pub fn create_branch_at(repo_path: &Path, name: &str, hash: &str, checkout: bool
             repo_path,
             &["checkout", "-b", name, hash],
             "checkout -b",
-            CHECKOUT_TIMEOUT,
+            WORKTREE_OP_TIMEOUT,
         )
     } else {
         run_mutation(
@@ -270,7 +301,7 @@ fn pick_like(repo_path: &Path, op: &'static str, hash: &str) -> Result<PickOutco
         // 不留半截状态给用户:中止回到原样,把 git 的原话交出去
         let _ = run_git_output(repo_path, &[op, "--abort"], op, LOCAL_OP_TIMEOUT, "");
     }
-    bail!("{}", output.stderr.trim());
+    bail!("{}", failure_text(&output));
 }
 
 /// 拣选一个提交到当前分支。合并提交以第一个父为主线(`-m 1`)。**阻塞最多 60s**。
@@ -291,7 +322,7 @@ pub fn reset_to(repo_path: &Path, hash: &str, mode: ResetMode) -> Result<()> {
         repo_path,
         &["reset", mode.flag(), hash],
         "reset",
-        CHECKOUT_TIMEOUT,
+        WORKTREE_OP_TIMEOUT,
     )
 }
 
@@ -761,6 +792,63 @@ mod tests {
         assert!(is_ancestor_of_head(&root, &first).unwrap());
         // 短哈希也认
         assert!(is_ancestor_of_head(&root, &first[..8]).unwrap());
+        cleanup(root);
+    }
+
+    /// 重置警告:只在重置会把**已推送**的提交移出当前分支时才报 —— 重置到 HEAD / 后代、
+    /// 只丢本地提交都不报;HEAD 已推送退回父提交、只领先几个本地提交却退到上游之前、
+    /// 跳到别的分支上都要报。
+    #[test]
+    fn 重置警告_只认丢掉已推送的提交() {
+        let root = init_repo_with_file("log-reset-pushed", "a.txt", "1\n");
+        let c1 = head(&root);
+        let c2 = commit_file(&root, "a.txt", "2\n", "c2");
+        let c3 = commit_file(&root, "a.txt", "3\n", "c3");
+        let main_branch = commit_relation(&root, &c3).unwrap().head_branch.unwrap();
+        // 一条从 c3 往前走的分支(c3 的后代)与一条从 c1 分出去的旁支
+        branch(&root, "ahead", &c3);
+        switch(&root, "ahead");
+        let c4 = commit_file(&root, "a.txt", "4\n", "c4");
+        branch(&root, "side", &c1);
+        switch(&root, "side");
+        let side = commit_file(&root, "a.txt", "side\n", "side");
+        switch(&root, &main_branch);
+        let push_to = |at: &str| {
+            Repository::open(&root)
+                .unwrap()
+                .reference(
+                    "refs/remotes/origin/main",
+                    Oid::from_str(at).unwrap(),
+                    true,
+                    "test",
+                )
+                .unwrap();
+        };
+
+        // 一个远程分支都没有:怎么重置都不丢已推送的
+        assert!(!reset_drops_pushed(&root, &c1).unwrap());
+
+        // 远程停在 c2,HEAD = c3 领先一个本地提交
+        push_to(&c2);
+        assert!(!reset_drops_pushed(&root, &c3).unwrap(), "重置到 HEAD 自己");
+        assert!(
+            !reset_drops_pushed(&root, &c4).unwrap(),
+            "重置到 HEAD 的后代"
+        );
+        assert!(!reset_drops_pushed(&root, &c2).unwrap(), "只丢本地的 c3");
+        assert!(
+            reset_drops_pushed(&root, &c1).unwrap(),
+            "退到上游之前:已推送的 c2 被丢掉"
+        );
+        assert!(
+            reset_drops_pushed(&root, &side).unwrap(),
+            "跳到旁支:c2 不在旁支历史上"
+        );
+
+        // HEAD 自己已推送:退回父提交就要强推
+        push_to(&c3);
+        assert!(reset_drops_pushed(&root, &c2).unwrap());
+        assert!(!reset_drops_pushed(&root, &c3[..8]).unwrap(), "短哈希也认");
         cleanup(root);
     }
 }

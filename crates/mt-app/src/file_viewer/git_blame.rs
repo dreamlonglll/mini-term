@@ -546,7 +546,8 @@ impl FileViewer {
         cx.notify();
     }
 
-    /// 点注解:取该提交的文件列表,打开提交 diff。
+    /// 点注解:取该提交的文件列表,打开提交 diff(与历史区同一条路,取文件失败弹详情框)。
+    /// 取的这段时间里 `opening` 挡住连点。
     fn open_blame_commit(&mut self, commit: u32, window: &mut Window, cx: &mut Context<Self>) {
         if self.annotate.opening {
             return;
@@ -564,39 +565,20 @@ impl FileViewer {
         self.annotate.clear_hover();
         cx.notify();
         let store = crate::store::AppStore::global(cx);
-        let root = view.repo.root.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let (task_root, hash) = (root.clone(), info.hash.clone());
-            let files = cx
-                .background_executor()
-                .spawn(async move { mt_project::git::get_commit_files(&task_root, &hash) })
-                .await;
-            let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+        let root = view.repo.root.to_string_lossy().into_owned();
+        let opening = crate::git_diff::open_commit_diff_loading(
+            store,
+            root,
+            info.hash,
+            info.summary,
+            None,
+            window,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            opening.await;
+            let _ = this.update(cx, |view: &mut FileViewer, cx| {
                 view.annotate.opening = false;
-                match files {
-                    Ok(files) => {
-                        let root = root.to_string_lossy().into_owned();
-                        // 开的是弹窗:等本实体这次 update 收口再开
-                        window.defer(cx, move |window, cx| {
-                            crate::git_diff::open_commit_diff(
-                                store,
-                                root,
-                                info.hash,
-                                info.summary,
-                                files,
-                                window,
-                                cx,
-                            );
-                        });
-                    }
-                    Err(err) => {
-                        view.annotate.notice = Some(BlameNotice::Failed(format!(
-                            "{}: {}",
-                            t("gitGutter", "openCommitFailed"),
-                            first_line(&err)
-                        )));
-                    }
-                }
                 cx.notify();
             });
         })

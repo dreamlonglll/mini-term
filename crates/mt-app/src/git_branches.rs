@@ -25,9 +25,11 @@
 //! # 动作
 //!
 //! 行上单击 / 右键 / → 弹出该分支的动作菜单;选了动作先收弹窗、再交给 Git 面板的
-//! [`GitPanel::run_write_op`](忙碌态、结果摘要 toast、失败详情框、整面板刷新都在那)。
-//! 改写历史与删除类动作先确认。检出本地分支前先在后台预检会不会被本地改动挡住,
-//! 挡住就转「贮藏后检出」确认框(见 [`checkout`])。
+//! [`GitPanel::run_write_op`](忙碌态、写操作闸、结果摘要 toast、失败详情框、整面板刷新
+//! 都在那)。改写历史与删除类动作先确认。检出本地分支前先在后台预检会不会被本地改动
+//! 挡住,挡住就转「贮藏后检出」确认框(见 [`checkout`])。「推送」打开推送对话框并预选
+//! 这一行的分支,先看清待推送的提交再推。面板在跑写操作、或别的区占着仓库的写操作闸时,
+//! 写类动作一律禁用。
 
 use std::cell::Cell;
 use std::path::Path;
@@ -40,14 +42,14 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_project::git::{
-    BranchInfo, BranchNameIssue, DeleteOutcome, MergeOutcome, PushOptions, PushOutcome,
-    RebaseOutcome, RemoteCheckout, split_remote_branch, validate_branch_name,
+    BranchInfo, BranchNameIssue, DeleteOutcome, MergeOutcome, RebaseOutcome, RemoteCheckout,
+    split_remote_branch, validate_branch_name,
 };
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_panel::{BranchSnapshot, GitBusy, GitPanel};
-use crate::git_ui::{self, Tone};
+use crate::git_ui::{self, FormOp, Tone};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{self, Confirm, autofocus, close_guarded, kind, open_guarded};
@@ -64,6 +66,10 @@ actions!(
         BranchPopupMenu,
     ]
 );
+
+/// 分支弹窗的键位上下文。`hotkeys.rs` 的谓词是 `"<它> > Input"` —— 为什么非这么写
+/// 见模块注释「键盘」。
+pub(crate) const BRANCH_POPUP_CONTEXT: &str = "GitBranchPopup";
 
 /// 弹窗宽度。
 const POPUP_WIDTH: f32 = 348.0;
@@ -362,7 +368,7 @@ impl BranchPopup {
         else {
             return;
         };
-        if row.is_head || self.panel.read(cx).branch_snapshot().busy.is_some() {
+        if row.is_head || !self.panel.read(cx).branch_snapshot().writable() {
             return;
         }
         let panel = self.panel.clone();
@@ -531,6 +537,7 @@ impl Render for BranchPopup {
         // 候选变少之后游标可能越界
         let cursor = self.cursor.min(rows.len().saturating_sub(1));
         let busy = snap.busy;
+        let writable = snap.writable();
         let fetching = busy == Some(GitBusy::Fetch);
 
         let header = div().px(px(12.0)).pt(px(12.0)).pb(px(8.0)).child(
@@ -559,9 +566,9 @@ impl Render for BranchPopup {
                     git_ui::ICON_PLUS,
                     t("gitBranch", "newBranch"),
                     false,
-                    busy.is_some() || snap.repo.is_empty(),
+                    !writable || snap.repo.is_empty(),
                 )
-                .when(busy.is_none() && !snap.repo.is_empty(), |el| {
+                .when(writable && !snap.repo.is_empty(), |el| {
                     el.on_click(move |_: &ClickEvent, window, cx| {
                         close_guarded(kind::GIT_BRANCHES, window, cx);
                         open_name_dialog(
@@ -583,10 +590,14 @@ impl Render for BranchPopup {
                         t("gitBranch", "fetch").to_string()
                     },
                     fetching,
-                    busy.is_some() && !fetching,
+                    !writable && !fetching,
                 )
-                .tip(t("gitBranch", "fetchTip"))
-                .when(busy.is_none(), |el| {
+                .tip(if snap.gated {
+                    git_ui::gate_busy_text()
+                } else {
+                    t("gitBranch", "fetchTip")
+                })
+                .when(writable, |el| {
                     // Fetch 不收弹窗:回来之后列表就地更新
                     el.on_click(move |_: &ClickEvent, window, cx| {
                         panel_for_fetch.update(cx, |p, cx| p.fetch(window, cx));
@@ -691,7 +702,7 @@ impl Render for BranchPopup {
         div()
             // 方向键的上下文锚点。键位表在 `hotkeys.rs`,谓词是
             // `"GitBranchPopup > Input"` —— 为什么非这么写见模块注释
-            .key_context("GitBranchPopup")
+            .key_context(BRANCH_POPUP_CONTEXT)
             .on_action(cx.listener(Self::on_prev))
             .on_action(cx.listener(Self::on_next))
             .on_action(cx.listener(Self::on_menu_key))
@@ -710,19 +721,26 @@ impl Render for BranchPopup {
 // ─── 分支动作 ─────────────────────────────────────────────────
 
 /// 一行的动作菜单。HEAD 行去掉不适用的(检出 / 合并 / 变基到自己 / 删除);
-/// 远程行没有推送 / 重命名;有写操作在跑时写类动作一律禁用。
+/// 远程行没有推送 / 重命名;有写操作在跑(面板自己的,或别的区占着写操作闸)时写类动作
+/// 一律禁用,后者在 detail 行写明原因。
 fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<MenuEntry> {
-    let busy = snap.busy.is_some();
+    let busy = !snap.writable();
+    let gated = snap.gated;
     let current = snap.head.clone();
     // 每个动作:先收弹窗,再交给面板
     let action = |label: String, f: fn(&Entity<GitPanel>, &Row, &mut Window, &mut App)| {
         let (panel, row) = (panel.clone(), row.clone());
-        MenuItem::new(label)
+        let item = MenuItem::new(label)
             .disabled(busy)
             .on_click(move |window, cx| {
                 close_guarded(kind::GIT_BRANCHES, window, cx);
                 f(&panel, &row, window, cx);
-            })
+            });
+        if gated {
+            item.detail(git_ui::gate_busy_text())
+        } else {
+            item
+        }
     };
 
     let mut entries: Vec<MenuEntry> = vec![MenuEntry::Header(row.name.clone().into())];
@@ -815,9 +833,9 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
 }
 
 /// 检出前的后台预检结果(见 [`checkout`])。
-enum CheckoutStep<T> {
-    /// 没被挡住,已照常检出。
-    Done(T),
+enum CheckoutStep {
+    /// 没被挡住,已照常检出。本地行是 `None`;远程行是建了跟踪分支还是检出了本地已有的。
+    Done(Option<RemoteCheckout>),
     /// 本地分支 `branch` 的检出会被这些本地改动挡住:转给「贮藏后检出」。
     Blocked {
         branch: String,
@@ -839,95 +857,78 @@ fn blocking_changes(repo: &Path, branch: &str) -> Vec<String> {
 /// 检出**本地**分支(含远程行在本地已有同名分支的情况)之前,先在后台用
 /// [`blocking_changes`] 预检:会被本地改动挡住就不去撞 git 的拒绝,转开「贮藏后检出」
 /// 确认框(`git_stash::open_smart_checkout`)。预检与检出在同一个后台任务里,忙碌态 /
-/// 防重入沿用 [`GitPanel::run_write_op`]。本地没有同名分支的远程行照旧直接
+/// 防重入沿用 [`GitPanel::run_write_op`]。本地没有同名分支的远程行不预检,直接
 /// `checkout_remote_branch`(它新建跟踪分支;被本地改动挡住时报 git 原文)。
 fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
     let name = row.name.clone();
-    if row.is_remote {
-        // 本地已有同名分支时,检出的其实是它:预检也对它做
+    let remote = row.is_remote;
+    // 要预检的本地分支:本地行就是它自己;远程行在本地已有同名分支时,检出的其实是那个
+    let local = if remote {
         let snap = panel.read(cx).branch_snapshot();
-        let local = split_remote_branch(&snap.remotes, &name)
+        split_remote_branch(&snap.remotes, &name)
             .map(|(_, local)| local)
             .filter(|local| {
                 snap.branches
                     .iter()
                     .any(|b| !b.is_remote && &b.name == local)
-            });
-        panel.update(cx, |p, cx| {
-            let remote_branch = name.clone();
-            p.run_write_op(
-                GitBusy::Checkout,
-                move |repo| {
-                    if let Some(local) = local {
-                        let conflicts = blocking_changes(repo, &local);
-                        if !conflicts.is_empty() {
-                            return Ok(CheckoutStep::Blocked {
-                                branch: local,
-                                conflicts,
-                            });
-                        }
-                    }
-                    mt_project::git::checkout_remote_branch(repo, &name).map(CheckoutStep::Done)
-                },
-                move |p, step, window, cx| {
-                    let outcome = match step {
-                        CheckoutStep::Done(outcome) => outcome,
-                        CheckoutStep::Blocked { branch, conflicts } => {
-                            p.open_smart_checkout(branch, conflicts, window, cx);
-                            return;
-                        }
-                    };
-                    p.set_view_branch(None, cx);
-                    let (message, tone) = match outcome {
-                        RemoteCheckout::Created { local } => (
-                            tr!(
-                                "gitBranch",
-                                "checkedOutTracking",
-                                name = local,
-                                remote = remote_branch.as_str()
-                            ),
-                            Tone::Info,
-                        ),
-                        RemoteCheckout::Existing { local } => (
-                            tr!(
-                                "gitBranch",
-                                "checkedOutExisting",
-                                name = local,
-                                remote = remote_branch.as_str()
-                            ),
-                            Tone::Attention,
-                        ),
-                    };
-                    p.notify_result(message, tone, cx);
-                },
-                window,
-                cx,
-            );
-        });
-        return;
-    }
+            })
+    } else {
+        Some(name.clone())
+    };
     panel.update(cx, |p, cx| {
         let shown = name.clone();
         p.run_write_op(
             GitBusy::Checkout,
             move |repo| {
-                let conflicts = blocking_changes(repo, &name);
-                if !conflicts.is_empty() {
-                    return Ok(CheckoutStep::Blocked {
-                        branch: name,
-                        conflicts,
-                    });
+                if let Some(local) = local {
+                    let conflicts = blocking_changes(repo, &local);
+                    if !conflicts.is_empty() {
+                        return Ok(CheckoutStep::Blocked {
+                            branch: local,
+                            conflicts,
+                        });
+                    }
                 }
-                mt_project::git::checkout_branch(repo, &name).map(CheckoutStep::Done)
+                if remote {
+                    mt_project::git::checkout_remote_branch(repo, &name)
+                        .map(|outcome| CheckoutStep::Done(Some(outcome)))
+                } else {
+                    mt_project::git::checkout_branch(repo, &name).map(|()| CheckoutStep::Done(None))
+                }
             },
-            move |p, step, window, cx| match step {
-                CheckoutStep::Done(()) => {
-                    p.set_view_branch(None, cx);
-                    p.notify_result(tr!("gitBranch", "checkedOut", name = shown), Tone::Info, cx);
-                }
-                CheckoutStep::Blocked { branch, conflicts } => {
-                    p.open_smart_checkout(branch, conflicts, window, cx)
-                }
+            move |p, step, window, cx| {
+                let outcome = match step {
+                    CheckoutStep::Done(outcome) => outcome,
+                    CheckoutStep::Blocked { branch, conflicts } => {
+                        p.open_smart_checkout(branch, conflicts, window, cx);
+                        return;
+                    }
+                };
+                p.set_view_branch(None, cx);
+                // 本地行:检出的分支名;远程行:那条远程分支的全名
+                let shown = shown.as_str();
+                let (message, tone) = match outcome {
+                    None => (tr!("gitBranch", "checkedOut", name = shown), Tone::Info),
+                    Some(RemoteCheckout::Created { local }) => (
+                        tr!(
+                            "gitBranch",
+                            "checkedOutTracking",
+                            name = local,
+                            remote = shown
+                        ),
+                        Tone::Info,
+                    ),
+                    Some(RemoteCheckout::Existing { local }) => (
+                        tr!(
+                            "gitBranch",
+                            "checkedOutExisting",
+                            name = local,
+                            remote = shown
+                        ),
+                        Tone::Attention,
+                    ),
+                };
+                p.notify_result(message, tone, cx);
             },
             window,
             cx,
@@ -1041,45 +1042,11 @@ fn confirm_rebase(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
     );
 }
 
-/// 推送本地分支。当前分支走推送对话框(能看到待推送的提交、可选强推);
-/// 别的分支直接推(没上游时顺带 `-u`),摘要里带推了几个提交。
+/// 推送本地分支:打开推送对话框并预选这一行的分支(当前分支即「当前」),先看清待推送的
+/// 提交、推送目标(可勾强推)再确认 —— 与仓库栏推送按钮同一个对话框。
 fn push_branch(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
-    if row.is_head {
-        panel.update(cx, |p, cx| p.open_push_dialog(window, cx));
-        return;
-    }
-    let name = row.name.clone();
-    panel.update(cx, |p, cx| {
-        p.run_write_op(
-            GitBusy::Push,
-            move |repo: &Path| {
-                let count = mt_project::git::outgoing_commits(repo, Some(&name), 1000)
-                    .map(|o| o.commits.len())
-                    .unwrap_or(0);
-                let options = PushOptions {
-                    branch: Some(name.clone()),
-                    ..PushOptions::default()
-                };
-                Ok((count, mt_project::git::git_push_with(repo, &options)?))
-            },
-            |p, (count, outcome), window, cx| match outcome {
-                PushOutcome::Pushed(target) => {
-                    let message = crate::git_push::pushed_summary(&target, count, false, false);
-                    p.notify_result(message, Tone::Info, cx);
-                }
-                PushOutcome::Rejected { detail } => {
-                    git_ui::show_git_error(
-                        tr!("gitBranch", "opFailed", op = GitBusy::Push.label()),
-                        format!("{}\n\n{detail}", t("gitBranch", "rejectedHint")),
-                        window,
-                        cx,
-                    );
-                }
-            },
-            window,
-            cx,
-        );
-    });
+    let branch = (!row.is_head).then(|| row.name.clone());
+    panel.update(cx, |p, cx| p.open_push_dialog(branch, window, cx));
 }
 
 /// 删除:本地先 `-d`,未合并时二次确认 `-D`;远程删除是危险操作,确认文案说清后果。
@@ -1199,9 +1166,8 @@ struct NameForm {
     input: Entity<InputState>,
     /// 「创建后检出」,默认勾上。
     checkout: bool,
-    busy: bool,
-    /// 上一次提交失败的 git 原文(就地显示,下次修改时清掉)。
-    error: Option<String>,
+    /// 执行中 / 上一次提交失败的 git 原文(就地显示,下次修改时清掉)。
+    op: FormOp,
     /// 用户动过输入框:空名字的提示在这之后才显示(一打开就红一行不友好)。
     touched: bool,
     /// 已有的本地分支名(「已存在」就地校验)。
@@ -1251,7 +1217,7 @@ pub(crate) fn open_name_dialog(
         let sub = cx.subscribe(&input, |form: &mut NameForm, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 form.touched = true;
-                form.error = None;
+                form.op.error = None;
                 cx.notify();
             }
         });
@@ -1260,8 +1226,7 @@ pub(crate) fn open_name_dialog(
             mode,
             input: input.clone(),
             checkout: true,
-            busy: false,
-            error: None,
+            op: FormOp::default(),
             touched: false,
             existing,
             _sub: sub,
@@ -1294,7 +1259,7 @@ pub(crate) fn open_name_dialog(
             let (title, ok_label) = match &f.mode {
                 NameMode::Create { .. } => (
                     t("gitBranch", "newBranchTitle"),
-                    if f.busy {
+                    if f.op.busy {
                         t("gitBranch", "creating")
                     } else {
                         t("gitBranch", "create")
@@ -1302,7 +1267,7 @@ pub(crate) fn open_name_dialog(
                 ),
                 NameMode::Rename { .. } => (
                     t("gitBranch", "renameTitle"),
-                    if f.busy {
+                    if f.op.busy {
                         t("gitBranch", "renaming")
                     } else {
                         t("gitBranch", "rename")
@@ -1376,7 +1341,7 @@ pub(crate) fn open_name_dialog(
                     }),
                 );
             }
-            if let Some(err) = &f.error {
+            if let Some(err) = &f.op.error {
                 body = body.child(git_ui::error_block(err.clone()));
             }
 
@@ -1389,7 +1354,7 @@ pub(crate) fn open_name_dialog(
                     ok_label,
                     Some(t("gitBranch", "cancel").into()),
                     false,
-                    f.busy,
+                    f.op.busy,
                 ))
                 .child(body)
                 .on_ok(move |_: &ClickEvent, window, cx| submit_name(&form_for_ok, window, cx))
@@ -1409,7 +1374,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
         let f = form.read(cx);
         let value = f.input.read(cx).value().trim().to_string();
         (
-            f.busy,
+            f.op.busy,
             name_issue(&f.mode, &value, &f.existing).is_some(),
             value,
             f.panel.clone(),
@@ -1432,77 +1397,76 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
         return true;
     }
     form.update(cx, |f, cx| {
-        f.busy = true;
-        f.error = None;
+        f.op.begin();
         cx.notify();
     });
-    let form = form.clone();
-    window
-        .spawn(cx, async move |cx| {
-            let (name, mode_for_task) = (value.clone(), mode.clone());
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let repo = Path::new(&repo);
-                    match &mode_for_task {
-                        NameMode::Create { start } => {
-                            mt_project::git::create_branch(repo, &name, start.as_deref(), checkout)
-                        }
-                        NameMode::Rename { old } => {
-                            mt_project::git::rename_branch(repo, old, &name)
-                        }
+    let (name, mode_for_task) = (value.clone(), mode.clone());
+    let done_form = form.clone();
+    let started = git_ui::spawn_gated(
+        &repo,
+        move |repo| match &mode_for_task {
+            NameMode::Create { start } => {
+                mt_project::git::create_branch(repo, &name, start.as_deref(), checkout)
+            }
+            NameMode::Rename { old } => mt_project::git::rename_branch(repo, old, &name),
+        },
+        move |result, window, cx| match result {
+            Ok(()) => {
+                done_form.update(cx, |f, _| f.op.finish());
+                close_guarded(kind::GIT_BRANCH_NAME, window, cx);
+                let message = match &mode {
+                    NameMode::Create { .. } if checkout => {
+                        tr!("gitBranch", "createdAndCheckedOut", name = value.as_str())
                     }
-                })
-                .await;
-            let _ = cx.update(|window, cx| match result {
-                Ok(()) => {
-                    close_guarded(kind::GIT_BRANCH_NAME, window, cx);
-                    let message = match &mode {
-                        NameMode::Create { .. } if checkout => {
-                            tr!("gitBranch", "createdAndCheckedOut", name = value.as_str())
-                        }
-                        NameMode::Create { .. } => {
-                            tr!("gitBranch", "created", name = value.as_str())
-                        }
-                        NameMode::Rename { old } => tr!(
-                            "gitBranch",
-                            "renamed",
-                            old = old.as_str(),
-                            new = value.as_str()
-                        ),
+                    NameMode::Create { .. } => {
+                        tr!("gitBranch", "created", name = value.as_str())
+                    }
+                    NameMode::Rename { old } => tr!(
+                        "gitBranch",
+                        "renamed",
+                        old = old.as_str(),
+                        new = value.as_str()
+                    ),
+                };
+                panel.update(cx, |p, cx| {
+                    if checkout || matches!(mode, NameMode::Rename { .. }) {
+                        p.set_view_branch(None, cx);
+                    }
+                    p.notify_result(message, Tone::Info, cx);
+                    p.refresh_all(cx);
+                });
+            }
+            Err(err) => {
+                let message = git_ui::error_text(&err);
+                done_form.update(cx, |f, cx| {
+                    f.op.fail(message.clone());
+                    cx.notify();
+                });
+                // 等结果期间弹窗被 Esc 关了:原因不能丢,退到详情框
+                if !prompt::is_open(kind::GIT_BRANCH_NAME) {
+                    let op = match mode {
+                        NameMode::Create { .. } => GitBusy::Create,
+                        NameMode::Rename { .. } => GitBusy::Rename,
                     };
-                    panel.update(cx, |p, cx| {
-                        if checkout || matches!(mode, NameMode::Rename { .. }) {
-                            p.set_view_branch(None, cx);
-                        }
-                        p.notify_result(message, Tone::Info, cx);
-                        p.refresh_all(cx);
-                    });
+                    git_ui::show_git_error(
+                        tr!("gitBranch", "opFailed", op = op.label()),
+                        message,
+                        window,
+                        cx,
+                    );
                 }
-                Err(err) => {
-                    let message = format!("{err:#}");
-                    form.update(cx, |f, cx| {
-                        f.busy = false;
-                        f.error = Some(message.clone());
-                        cx.notify();
-                    });
-                    // 等结果期间弹窗被 Esc 关了:原因不能丢,退到详情框
-                    if !prompt::is_open(kind::GIT_BRANCH_NAME) {
-                        let op = match mode {
-                            NameMode::Create { .. } => GitBusy::Create,
-                            NameMode::Rename { .. } => GitBusy::Rename,
-                        };
-                        git_ui::show_git_error(
-                            tr!("gitBranch", "opFailed", op = op.label()),
-                            message,
-                            window,
-                            cx,
-                        );
-                    }
-                }
-            });
-        })
-        .detach();
+            }
+        },
+        window,
+        cx,
+    );
+    if !started {
+        // 别的区正在写这个仓库:就地说明,框留着
+        form.update(cx, |f, cx| {
+            f.op.fail(git_ui::gate_busy_text().to_string());
+            cx.notify();
+        });
+    }
     false
 }
 
@@ -1546,6 +1510,7 @@ mod tests {
             detached: None,
             loading: false,
             busy: None,
+            gated: false,
         }
     }
 

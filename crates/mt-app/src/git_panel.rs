@@ -39,6 +39,10 @@
 //! 5 个提交」),失败弹可选中复制原文的详情框([`git_ui::show_git_error`] —— toast
 //! 5s 就收,装不下 git 的多行报错);完了一律整面板刷新。
 //!
+//! 跨区的防重入靠仓库的写操作闸(`git_ui::gate`,经 [`git_ui::spawn_gated`] 占 / 放):
+//! 更改区在提交、历史区在拣选、推送 / 贮藏弹窗在执行时,仓库栏的写按钮与分支弹窗的动作
+//! 一并禁用,tooltip 写明「另一项 Git 操作正在进行」;只读刷新不受影响。
+//!
 //! # 自动刷新
 //!
 //! 两路:原有的 pty 输出旁路([`git_watch`]),外加 `.git` 目录监听
@@ -225,6 +229,16 @@ pub(crate) struct BranchSnapshot {
     pub detached: Option<String>,
     pub loading: bool,
     pub busy: Option<GitBusy>,
+    /// 面板自己没在跑,但仓库的写操作闸被别的区占着(更改区在提交、历史区在拣选…):
+    /// 写类动作同样禁用。
+    pub gated: bool,
+}
+
+impl BranchSnapshot {
+    /// 写类动作现在能不能点。
+    pub fn writable(&self) -> bool {
+        self.busy.is_none() && !self.gated
+    }
 }
 
 /// 中缝拖拽的一次会话。
@@ -279,19 +293,23 @@ impl GitPanel {
         let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
 
         let mut subs = Vec::new();
-        subs.push(
-            cx.subscribe(&changes, |this: &mut Self, _entity, event, cx| {
-                match event {
-                    // 提交成功:历史整体重来 + 重载分支(分支头已前移)
-                    GitChangesEvent::Committed => {
-                        this.history.update(cx, |h, cx| h.reload(cx));
-                        this.load_branches(cx);
+        subs.push(cx.subscribe_in(
+            &changes,
+            window,
+            |this: &mut Self, _entity, event, window, cx| match event {
+                // 提交成功:历史整体重来 + 重载分支(分支头已前移)。「提交并推送」接着开
+                // 推送对话框(预选当前分支),在那里看清待推送的提交再确认
+                GitChangesEvent::Committed { open_push } => {
+                    this.history.update(cx, |h, cx| h.reload(cx));
+                    this.load_branches(cx);
+                    if *open_push {
+                        this.open_push_dialog(None, window, cx);
                     }
-                    // 更改区里贮藏了改动:工作区与贮藏数都变了,整面板刷新
-                    GitChangesEvent::Stashed => this.refresh_all(cx),
                 }
-            }),
-        );
+                // 更改区里贮藏了改动:工作区与贮藏数都变了,整面板刷新
+                GitChangesEvent::Stashed => this.refresh_all(cx),
+            },
+        ));
         subs.push(cx.subscribe_in(
             &history,
             window,
@@ -638,7 +656,13 @@ impl GitPanel {
                 .map(str::to_string),
             loading: self.branches_loading,
             busy: self.busy,
+            gated: self.gated(),
         }
+    }
+
+    /// 面板自己没在跑写操作,但仓库的写操作闸被别的区占着(见模块注释「写操作」)。
+    fn gated(&self) -> bool {
+        self.busy.is_none() && git_ui::gate::is_busy(&self.selected_repo)
     }
 
     pub(crate) fn repo_path(&self) -> &str {
@@ -663,9 +687,10 @@ impl GitPanel {
 
     /// 跑一个 git 写操作(见模块注释「写操作」)。
     ///
-    /// `op` 在后台执行器上跑(阻塞 CLI);`done` 拿到成功结果后在主线程上推摘要 /
-    /// 接着开下一个确认框。失败统一弹详情框,标题是「{动作}失败」。无论成败都整面板
-    /// 刷新 —— 失败也可能已经改了一半(合并停在冲突上之类)。
+    /// `op` 占着仓库的写操作闸在后台执行器上跑(阻塞 CLI,见 [`git_ui::spawn_gated`]);
+    /// `done` 拿到成功结果后在主线程上推摘要 / 接着开下一个确认框。失败统一弹详情框,
+    /// 标题是「{动作}失败」。无论成败都整面板刷新 —— 失败也可能已经改了一半(合并停在
+    /// 冲突上之类)。闸被别的区占着时不执行,推一条 toast 说明。
     pub(crate) fn run_write_op<T: Send + 'static>(
         &mut self,
         busy: GitBusy,
@@ -677,34 +702,38 @@ impl GitPanel {
         if self.selected_repo.is_empty() || self.busy.is_some() {
             return;
         }
+        let this = cx.entity().downgrade();
+        let started = git_ui::spawn_gated(
+            &self.selected_repo,
+            op,
+            move |result, window, cx| {
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.busy = None;
+                    match result {
+                        Ok(value) => done(this, value, window, cx),
+                        Err(err) => {
+                            eprintln!("[git] {}失败: {err:#}", busy.label());
+                            git_ui::show_git_error(
+                                tr!("gitBranch", "opFailed", op = busy.label()),
+                                git_ui::error_text(&err),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    this.refresh_all(cx);
+                    cx.notify();
+                });
+            },
+            window,
+            cx,
+        );
+        if !started {
+            self.notify_result(git_ui::gate_busy_text().to_string(), Tone::Attention, cx);
+            return;
+        }
         self.busy = Some(busy);
         cx.notify();
-        let repo = PathBuf::from(&self.selected_repo);
-        cx.spawn_in(window, async move |this, cx| {
-            // ⚠️ 全是阻塞 CLI(网络操作最多 120s),必须后台执行器
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                this.busy = None;
-                match result {
-                    Ok(value) => done(this, value, window, cx),
-                    Err(err) => {
-                        eprintln!("[git] {}失败: {err:#}", busy.label());
-                        git_ui::show_git_error(
-                            tr!("gitBranch", "opFailed", op = busy.label()),
-                            format!("{err:#}"),
-                            window,
-                            cx,
-                        );
-                    }
-                }
-                this.refresh_all(cx);
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// `git fetch --all`。
@@ -768,12 +797,18 @@ impl GitPanel {
         );
     }
 
-    /// 打开「推送」对话框(当前分支)。
-    pub(crate) fn open_push_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 打开「推送」对话框,预选 `branch`(`None` = 当前分支)。仓库栏推送按钮、分支弹窗的
+    /// 「推送」、「提交并推送」提交成功之后都走这里。
+    pub(crate) fn open_push_dialog(
+        &mut self,
+        branch: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_repo.is_empty() || self.busy.is_some() {
             return;
         }
-        crate::git_push::open(cx.entity(), self.selected_repo.clone(), window, cx);
+        crate::git_push::open(cx.entity(), self.selected_repo.clone(), branch, window, cx);
     }
 
     /// 打开贮藏列表(仓库栏贮藏按钮)。有写操作在跑时不开 —— 贮藏的改写同样要抢
@@ -1502,17 +1537,23 @@ impl GitPanel {
     /// 右段图标按钮组:Fetch / 拉取 / 推送 / 贮藏 / 刷新。
     fn render_bar_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy;
+        // 别的区占着写操作闸:写按钮一律禁用,tooltip 换成说明(见模块注释「写操作」)
+        let gated = self.gated();
+        let idle = busy.is_none() && !gated;
         let is = |op: GitBusy| busy == Some(op);
-        let blocked = |op: GitBusy| busy.is_some() && busy != Some(op);
+        let blocked = |op: GitBusy| (busy.is_some() && busy != Some(op)) || gated;
         let head = self.head_branch().map(str::to_string);
         let detached = self.current_branch().is_some_and(is_detached_label);
         let upstream = self.meta.head_tracking.as_ref().map(|t| t.upstream.clone());
         let mode = self.pull_mode_label();
         let busy_tip =
             |op: GitBusy| -> SharedString { tr!("gitBranch", "busyTip", op = op.label()).into() };
+        let gate_tip = || -> SharedString { git_ui::gate_busy_text().into() };
 
         let fetch_tip: SharedString = if is(GitBusy::Fetch) {
             busy_tip(GitBusy::Fetch)
+        } else if gated {
+            gate_tip()
         } else {
             t("gitBranch", "fetchTip").into()
         };
@@ -1523,12 +1564,14 @@ impl GitPanel {
             is(GitBusy::Fetch),
             blocked(GitBusy::Fetch),
         )
-        .when(busy.is_none(), |el| {
+        .when(idle, |el| {
             el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fetch(window, cx)))
         });
 
         let pull_tip: SharedString = if is(GitBusy::Pull) {
             busy_tip(GitBusy::Pull)
+        } else if gated {
+            gate_tip()
         } else {
             match &upstream {
                 Some(upstream) => tr!(
@@ -1548,7 +1591,7 @@ impl GitPanel {
             is(GitBusy::Pull),
             blocked(GitBusy::Pull) || detached,
         )
-        .when(busy.is_none() && !detached, |el| {
+        .when(idle && !detached, |el| {
             el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.pull(window, cx)))
         })
         // 右键选拉取方式(会话级,不落盘)
@@ -1563,6 +1606,8 @@ impl GitPanel {
 
         let push_tip: SharedString = if is(GitBusy::Push) {
             busy_tip(GitBusy::Push)
+        } else if gated {
+            gate_tip()
         } else if detached {
             t("gitBranch", "pushTipDetached").into()
         } else {
@@ -1594,31 +1639,34 @@ impl GitPanel {
             is(GitBusy::Push),
             blocked(GitBusy::Push) || detached,
         )
-        .when(busy.is_none() && !detached, |el| {
-            el.on_click(
-                cx.listener(|this, _: &ClickEvent, window, cx| this.open_push_dialog(window, cx)),
-            )
+        .when(idle && !detached, |el| {
+            el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.open_push_dialog(None, window, cx)
+            }))
         });
 
         // 贮藏:开贮藏列表;有贮藏时旁边挂数量胶囊(数量随分支快照一起读),tooltip 带数
         let stash_count = self.meta.stash_count;
-        let stash_tip: SharedString = if stash_count > 0 {
+        let stash_tip: SharedString = if gated {
+            gate_tip()
+        } else if stash_count > 0 {
             tr!("gitStash", "countTip", count = stash_count).into()
         } else {
             t("gitStash", "title").into()
         };
+        let stash_button = git_ui::icon_button("git-stash", git_ui::ICON_STASH, stash_tip, idle)
+            .when(idle, |el| {
+                el.on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_stash_list(window, cx)
+                    }),
+                )
+            });
         let stash = div()
             .flex()
             .flex_none()
             .items_center()
-            .child(
-                git_ui::icon_button("git-stash", git_ui::ICON_STASH, stash_tip, busy.is_none())
-                    .when(busy.is_none(), |el| {
-                        el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.open_stash_list(window, cx)
-                        }))
-                    }),
-            )
+            .child(stash_button)
             .when(stash_count > 0, |el| {
                 el.child(git_ui::count_pill(stash_count, ui::text_muted()))
             });
@@ -1699,9 +1747,10 @@ impl GitPanel {
             },
         );
         let busy = self.busy;
+        let idle = busy.is_none() && !self.gated();
         let continuing = busy == Some(GitBusy::Continue);
         let aborting = busy == Some(GitBusy::Abort);
-        let can_continue = conflicted == 0 && busy.is_none();
+        let can_continue = conflicted == 0 && idle;
 
         let status = if conflicted > 0 {
             git_ui::pill(tr!("gitBranch", "conflictCount", count = conflicted), color)
@@ -1740,17 +1789,13 @@ impl GitPanel {
         } else {
             t("gitBranch", "abort").to_string()
         };
-        let abort_button = git_ui::action_button(
-            "git-op-abort",
-            abort_label,
-            git_ui::ButtonKind::Ghost,
-            busy.is_none(),
-        )
-        .when(busy.is_none(), |el| {
-            el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.confirm_abort(kind, window, cx)
-            }))
-        });
+        let abort_button =
+            git_ui::action_button("git-op-abort", abort_label, git_ui::ButtonKind::Ghost, idle)
+                .when(idle, |el| {
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.confirm_abort(kind, window, cx)
+                    }))
+                });
 
         Some(
             div()

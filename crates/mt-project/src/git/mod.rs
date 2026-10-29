@@ -14,8 +14,10 @@
 //! 否则 30s/120s 的超时等待会卡住 UI 线程。
 //!
 //! 本文件之外的能力按主题拆成子模块(`git/<主题>.rs`,在这里 `mod` + `pub use`
-//! 摊平,调用方照旧 `mt_project::git::xxx`)。子模块直接用本模块私有的 CLI 执行器
-//! `run_git_command` / `run_git_command_labeled` / `run_git_output`。
+//! 摊平,调用方照旧 `mt_project::git::xxx`)。子模块直接用本模块私有的 CLI 共用件:
+//! 执行器 `run_git_command` / `run_git_command_labeled` / `run_git_output`、
+//! 非零即错的 [`run_checked`] 与失败原文 [`failure_text`]、超时档位
+//! ([`QUICK_OP_TIMEOUT`] 等四档)与 [`NO_EDITOR`] / [`NETWORK_HINT`]。
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -1540,8 +1542,89 @@ fn hide_console_window(_cmd: &mut std::process::Command) {
     }
 }
 
+// ── 超时档位 ──────────────────────────────────────────────────
+//
+// 全部 git CLI 调用按「最慢会慢在哪」分四档,子模块一律取这里的名字,不再各写各的秒数。
+
+/// 只动引用 / 只读的快操作(建删改名分支、删贮藏、删标签、冲突取一侧、blame、
+/// worktree prune):本身毫秒级,30s 只是兜底。
+const QUICK_OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// 纯本地、但会同步跑 hook / gpg 签名的操作(提交、拣选、还原、改消息、附注标签、
+/// 删 worktree):pre-commit hook 可能跑格式化 / lint / 测试,30s 对大仓库偏紧;真卡死的
+/// 形态是 hook 死循环或 gpg 等口令(stdin 已置 null,不会永久挂起),60s 兜底。
+const LOCAL_OP_TIMEOUT: Duration = Duration::from_secs(60);
+/// 改写工作区 / 暂存区的操作(检出、合并、变基、重置、贮藏、继续 / 中止、暂存类、
+/// 建 worktree):大仓库一次 checkout 能到几十秒,还可能跑 post-checkout hook 与
+/// clean 过滤器(git-lfs 给大文件算哈希),给到 120s。
+const WORKTREE_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// 网络操作(fetch / pull / push / 删远程分支 / 推标签):120s,超时提示用 [`NETWORK_HINT`]。
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+/// 网络操作超时时补在错误后面的提示。
+const NETWORK_HINT: &str = ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key";
+
+/// 会拉起编辑器的命令(合并提交、`rebase` / `pull --rebase` 续跑、标签)一律带上:
+/// 沿用 git 生成的提交信息,不等一个永远不会有人操作的编辑器。
+const NO_EDITOR: &[(&str, &str)] = &[("GIT_EDITOR", "true")];
+
+/// git 失败时给用户看的原文:**stderr 优先,空了退 stdout**,两者都空才给一句兜底。
+///
+/// 不把两者拼在一起:git 的报错本来就写在 stderr,stdout 上多半是进度 / porcelain 这类
+/// 与失败无关的输出,拼上只会把原因埋进噪声。但有几类命令把说明写在 stdout 上(`merge`
+/// 的冲突说明、`commit` 的「没有可提交的内容」),stderr 为空时只取 stderr 等于什么都
+/// 没告诉用户,所以退一步取 stdout。
+fn failure_text(out: &GitOutput) -> String {
+    let stderr = out.stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    let stdout = out.stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.to_string();
+    }
+    "git 执行失败(没有输出)".to_string()
+}
+
+/// 跑一条 git 命令,非零退出即把原文([`failure_text`])装进错误。
+fn run_checked(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<GitOutput> {
+    run_checked_env(repo_path, args, &[], op_label, timeout, timeout_hint)
+}
+
+/// 同 [`run_checked`],另给子进程补几条环境变量(见 [`run_git_output_env`])。
+fn run_checked_env(
+    repo_path: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<GitOutput> {
+    let out = run_git_output_env(repo_path, args, envs, op_label, timeout, timeout_hint)?;
+    if !out.success {
+        bail!("{}", failure_text(&out));
+    }
+    Ok(out)
+}
+
+/// 执行器的前置校验:`repo_path` 是目录,且下面有 `.git`(避免在任意目录上跑 git)。
+/// worktree 目录下 `.git` 是文件而非目录,`exists()` 两者皆真。
+fn ensure_repo_dir(repo_path: &Path) -> Result<()> {
+    if !repo_path.is_dir() {
+        bail!("不是有效目录:{}", repo_path.display());
+    }
+    if !repo_path.join(".git").exists() {
+        bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
+    }
+    Ok(())
+}
+
 /// 通用 git CLI 执行器(pull/push/worktree 系列共用):
-/// - 校验 `repo_path` 是目录并且包含 `.git`(避免在任意目录上跑 git)
+/// - 校验 `repo_path` 是目录并且包含 `.git`([`ensure_repo_dir`])
 /// - `GIT_TERMINAL_PROMPT=0`:没有终端可问,要账号密码时立刻失败,不干等到超时
 ///   (凭证管理器的 GUI 弹窗不受影响)
 /// - 到达上限即 kill 子进程并返回超时错误;stdout/stderr 由独立线程读,
@@ -1569,12 +1652,7 @@ fn run_git_command_labeled(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<String> {
-    let output = run_git_output(repo_path, args, op_label, timeout, timeout_hint)?;
-    if output.success {
-        Ok(output.stdout)
-    } else {
-        bail!("{}", output.stderr);
-    }
+    run_checked(repo_path, args, op_label, timeout, timeout_hint).map(|out| out.stdout)
 }
 
 /// 同 `run_git_command_labeled`,但退出码非零也返回 `Ok`,交调用方按 stdout/stderr
@@ -1602,13 +1680,7 @@ fn run_git_output_env(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<GitOutput> {
-    if !repo_path.is_dir() {
-        bail!("不是有效目录:{}", repo_path.display());
-    }
-    // worktree 目录下 `.git` 是文件而非目录,exists() 两者皆真
-    if !repo_path.join(".git").exists() {
-        bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
-    }
+    ensure_repo_dir(repo_path)?;
     spawn_git(repo_path, args, envs, op_label, timeout, timeout_hint)
 }
 
@@ -1623,12 +1695,7 @@ fn run_git_command_with_input(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<String> {
-    if !repo_path.is_dir() {
-        bail!("不是有效目录:{}", repo_path.display());
-    }
-    if !repo_path.join(".git").exists() {
-        bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
-    }
+    ensure_repo_dir(repo_path)?;
     let output = spawn_git_with_input(
         repo_path,
         args,
@@ -1641,7 +1708,7 @@ fn run_git_command_with_input(
     if output.success {
         Ok(output.stdout)
     } else {
-        bail!("{}", output.stderr);
+        bail!("{}", failure_text(&output));
     }
 }
 
@@ -1921,20 +1988,17 @@ fn spawn_git_with_input(
 }
 
 fn run_git_network_command(repo_path: &Path, op: &'static str) -> Result<String> {
-    run_git_command(
-        repo_path,
-        &[op],
-        Duration::from_secs(30),
-        ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
-    )
+    run_git_command(repo_path, &[op], NETWORK_TIMEOUT, NETWORK_HINT)
 }
 
-/// **阻塞最多 30s**,必须在后台线程上调用。
+/// 无参 `git pull`(旧接口;面板走 `sync` 里的 `git_pull_with` / `git_pull_by_config`)。
+/// **阻塞最多 [`NETWORK_TIMEOUT`]**,必须在后台线程上调用。
 pub fn git_pull(repo_path: &Path) -> Result<String> {
     run_git_network_command(repo_path, "pull")
 }
 
-/// **阻塞最多 30s**,必须在后台线程上调用。
+/// 无参 `git push`(旧接口;面板走 `sync` 里的 `git_push_with`)。
+/// **阻塞最多 [`NETWORK_TIMEOUT`]**,必须在后台线程上调用。
 pub fn git_push(repo_path: &Path) -> Result<String> {
     run_git_network_command(repo_path, "push")
 }
@@ -1952,8 +2016,9 @@ pub fn git_push(repo_path: &Path) -> Result<String> {
 //   (libgit2 的 `reset_default` 就把它们当 glob),`-` 开头的不许被当选项。
 // ---------------------------------------------------------------------------
 
-/// 暂存类操作的超时:本身毫秒级,但 clean 过滤器(git-lfs 给大文件算哈希)可能很慢。
-const INDEX_OP_TIMEOUT: Duration = Duration::from_secs(120);
+/// 暂存类操作的超时:本身毫秒级,但 clean 过滤器(git-lfs 给大文件算哈希)可能很慢,
+/// 与改写工作区的操作同档。
+const INDEX_OP_TIMEOUT: Duration = WORKTREE_OP_TIMEOUT;
 
 /// 一次带太多路径会撞上 Windows 命令行 32K 的上限,分批跑(与 `conflict.rs` 同口径)。
 const PATHS_PER_CALL: usize = 64;
@@ -2034,16 +2099,13 @@ pub fn git_unstage_all(repo_path: &Path) -> Result<()> {
 
 /// 走 git CLI 而非 git2:提交要继承用户的 hooks / gpg 签名 / user.name 配置。
 ///
-/// **阻塞最多 60s**,必须在后台线程上调用。取值取 pull/push(30s)与 worktree add
-/// (120s)的中段:提交本身是本地操作、毫秒级,但会同步跑 pre-commit hook(格式化 /
-/// lint / 测试),30s 对大仓库的 hook 偏紧;真卡死的形态是 hook 死循环或 gpg 等口令
-/// 输入(stdin 已置 null,不会永久挂起但仍可能拖很久),给 60s 兜底足够。
+/// **阻塞最多 [`LOCAL_OP_TIMEOUT`]**(会同步跑 pre-commit hook),必须在后台线程上调用。
 pub fn git_commit(repo_path: &Path, message: &str) -> Result<String> {
     run_git_command_labeled(
         repo_path,
         &["commit", "-m", message],
         "commit",
-        Duration::from_secs(60),
+        LOCAL_OP_TIMEOUT,
         ",可能卡在 pre-commit hook 或 gpg 签名上",
     )
 }
@@ -2211,7 +2273,7 @@ pub fn add_worktree(
     let result = run_git_command(
         repo_path,
         &args,
-        Duration::from_secs(120),
+        WORKTREE_OP_TIMEOUT,
         ",大仓库 checkout 可能较慢,请稍后刷新查看",
     );
     if result.is_ok() {
@@ -2228,7 +2290,7 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &str, force: bool) -> Re
         args.push("--force");
     }
     args.push(worktree_path);
-    let result = run_git_command(repo_path, &args, Duration::from_secs(60), "");
+    let result = run_git_command(repo_path, &args, LOCAL_OP_TIMEOUT, "");
     if result.is_ok() {
         invalidate_repo_cache();
     }
@@ -2237,12 +2299,7 @@ pub fn remove_worktree(repo_path: &Path, worktree_path: &str, force: bool) -> Re
 
 /// 清理失效的 worktree 元数据(目录已被手动删除的条目)。
 pub fn prune_worktrees(repo_path: &Path) -> Result<String> {
-    let result = run_git_command(
-        repo_path,
-        &["worktree", "prune"],
-        Duration::from_secs(30),
-        "",
-    );
+    let result = run_git_command(repo_path, &["worktree", "prune"], QUICK_OP_TIMEOUT, "");
     if result.is_ok() {
         invalidate_repo_cache();
     }

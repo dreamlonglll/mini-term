@@ -26,7 +26,9 @@
 //!
 //! # 防重入与迟到
 //!
-//! 同一时刻只跑一个改写操作(`busy`;进行中按钮置灰、菜单项禁用);列表与文件列表的读取
+//! 同一时刻只跑一个改写操作(`busy`;进行中按钮置灰、菜单项禁用)。改写操作都占着仓库的
+//! 写操作闸(`git_ui::gate`):面板在拉取、更改区在提交时这里的按钮同样置灰,硬点进来
+//! 也只就地说明、不执行。列表与文件列表的读取
 //! 各带请求令牌,迟到的旧结果直接丢弃(连按刷新、快速 ↑↓ 切换贮藏时不会被旧结果盖掉)。
 //! 改写操作都带上所选贮藏的哈希,后端核对 `stash@{n}` 没有漂移(终端里又贮藏过)。
 //!
@@ -56,8 +58,8 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::git_diff::{self, CommitFileDiffPane};
 use crate::git_history::{format_absolute_time, format_relative_time};
 use crate::git_ui::{
-    self, ButtonKind, ICON_ALERT, ICON_CHECK, ICON_CLEAN, ICON_PLUS, ICON_REFRESH, ICON_STASH,
-    ICON_TRASH, SectionHeader, Tone, mono,
+    self, ButtonKind, FormOp, ICON_ALERT, ICON_CHECK, ICON_CLEAN, ICON_PLUS, ICON_REFRESH,
+    ICON_STASH, ICON_TRASH, SectionHeader, Tone, error_text, mono,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -182,14 +184,17 @@ impl StashDialog {
     fn selected_stash(&self) -> Option<&StashInfo> {
         self.selected.and_then(|i| self.stashes.get(i))
     }
+
+    /// 改写类按钮要不要锁住:自己有操作在跑,或别的区占着仓库的写操作闸。
+    fn locked(&self) -> bool {
+        self.busy.is_some() || git_ui::gate::is_busy(&self.repo_path)
+    }
 }
 
 /// 小弹窗(新建贮藏 / 新建分支 / 贮藏后检出)的表单状态。
 struct Form {
-    /// 确认后、结果回来之前:确认键禁用,防重复提交。
-    busy: bool,
-    /// 上一次执行失败的 git 原文(可选中复制)。
-    error: Option<Entity<TextareaState>>,
+    /// 执行中 / 上一次执行失败的 git 原文(可选中复制)。
+    op: FormOp<Entity<TextareaState>>,
     /// 非错误的就地提示(「没有可贮藏的改动」)。
     hint: Option<String>,
     /// 点过确认(此后空的必填项才报错)。
@@ -203,8 +208,7 @@ struct Form {
 impl Form {
     fn new() -> Self {
         Self {
-            busy: false,
-            error: None,
+            op: FormOp::default(),
             hint: None,
             submitted: false,
             keep_index: false,
@@ -357,7 +361,7 @@ pub fn open_smart_checkout(
                     )
                     .on_ok(|_, _, _| true);
             }
-            let (busy, error) = (f.busy, f.error.clone());
+            let (busy, error) = (f.op.busy, f.op.error.clone());
             let lead = if conflicts.is_empty() {
                 t("gitStash", "checkout.leadUnknown")
             } else {
@@ -375,11 +379,11 @@ pub fn open_smart_checkout(
                 .title(title)
                 .w(px(git_ui::DIALOG_W_LG))
                 // 执行中(贮藏 → 检出 → 恢复,三条改仓库的命令)框一律关不掉:遮罩、Esc、
-                // 「取消」都不行。框一关,面板的按钮就又能点了(这一段不经面板的 busy),
-                // 并发的 git 命令会撞 index.lock、把贮藏 / 恢复截在半路
+                // 「取消」都不行 —— 结局(恢复冲突 / 失败)要留在框里给人看。并发的写操作
+                // 由仓库的写操作闸挡住(这一段不经面板的 busy,但占着闸),不会撞 index.lock
                 .overlay_closable(!busy)
                 .keyboard(!busy)
-                .on_cancel(move |_: &ClickEvent, _window, cx| !form_cancel.read(cx).busy)
+                .on_cancel(move |_: &ClickEvent, _window, cx| !form_cancel.read(cx).op.busy)
                 .footer(git_ui::dialog_footer(
                     if busy {
                         t("gitStash", "checkout.working")
@@ -617,7 +621,8 @@ fn refocus(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App) {
 
 // ─── 列表弹窗:操作 ───────────────────────────────────────────
 
-/// 跑一个改写操作:防重入 → 后台执行 → 结果写成 [`Notice`] → 通知面板、重读列表。
+/// 跑一个改写操作:防重入 → 占闸、后台执行([`git_ui::spawn_gated`])→ 结果写成
+/// [`Notice`] → 通知面板、重读列表。闸被别的区占着时不执行,结果行就地说明。
 fn run_op<T: Send + 'static>(
     state: &Entity<StashDialog>,
     busy: Busy,
@@ -626,62 +631,74 @@ fn run_op<T: Send + 'static>(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(repo) = state.update(cx, |s, cx| {
-        if s.busy.is_some() {
-            return None;
-        }
-        s.busy = Some(busy);
-        s.notice = None;
-        cx.notify();
-        Some(PathBuf::from(&s.repo_path))
-    }) else {
-        return;
+    let (running, repo) = {
+        let s = state.read(cx);
+        (s.busy.is_some(), s.repo_path.clone())
     };
-    refocus(state, window, cx);
-    let state = state.clone();
-    window
-        .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = cx.update(|window, cx| {
-                let notice = match result {
-                    Ok(value) => on_ok(value),
-                    Err(err) => {
-                        let detail = error_text(&err);
-                        eprintln!("[git] 贮藏操作 {busy:?} 失败: {detail}");
-                        // 等待期间弹窗被关掉了:原因不能丢
-                        if !is_open(kind::GIT_STASH) {
-                            git_ui::show_git_error(
-                                t("gitStash", "result.failedTitle"),
-                                detail.clone(),
-                                window,
-                                cx,
-                            );
-                        }
-                        Notice::Error(git_ui::error_text_state(&detail, 8, window, cx))
+    if running {
+        return;
+    }
+    let done_state = state.clone();
+    let started = git_ui::spawn_gated(
+        &repo,
+        op,
+        move |result, window, cx| {
+            let state = done_state;
+            let notice = match result {
+                Ok(value) => on_ok(value),
+                Err(err) => {
+                    let detail = error_text(&err);
+                    eprintln!("[git] 贮藏操作 {busy:?} 失败: {detail}");
+                    // 等待期间弹窗被关掉了:原因不能丢
+                    if !is_open(kind::GIT_STASH) {
+                        git_ui::show_git_error(
+                            t("gitStash", "result.failedTitle"),
+                            detail.clone(),
+                            window,
+                            cx,
+                        );
                     }
-                };
-                // 等待期间弹窗被关掉了:冲突(贮藏已保留)这句不能丢,退到 toast
-                if !is_open(kind::GIT_STASH)
-                    && let Notice::Attention { text, .. } = &notice
-                {
-                    let store = state.read(cx).store.clone();
-                    git_ui::toast(&store, text.clone(), Tone::Attention, cx);
+                    Notice::Error(git_ui::error_text_state(&detail, 8, window, cx))
                 }
-                let on_changed = state.update(cx, |s, cx| {
-                    s.busy = None;
-                    s.notice = Some(notice);
-                    cx.notify();
-                    s.on_changed.clone()
-                });
-                // 失败也可能动过工作区(应用到一半):面板一律重载
-                on_changed(cx);
-                reload(&state, cx);
+            };
+            // 等待期间弹窗被关掉了:冲突(贮藏已保留)这句不能丢,退到 toast
+            if !is_open(kind::GIT_STASH)
+                && let Notice::Attention { text, .. } = &notice
+            {
+                let store = state.read(cx).store.clone();
+                git_ui::toast(&store, text.clone(), Tone::Attention, cx);
+            }
+            let on_changed = state.update(cx, |s, cx| {
+                s.busy = None;
+                s.notice = Some(notice);
+                cx.notify();
+                s.on_changed.clone()
             });
-        })
-        .detach();
+            // 失败也可能动过工作区(应用到一半):面板一律重载
+            on_changed(cx);
+            reload(&state, cx);
+        },
+        window,
+        cx,
+    );
+    let notice = if started {
+        None
+    } else {
+        Some(Notice::Error(git_ui::error_text_state(
+            git_ui::gate_busy_text(),
+            2,
+            window,
+            cx,
+        )))
+    };
+    state.update(cx, |s, cx| {
+        if started {
+            s.busy = Some(busy);
+        }
+        s.notice = notice;
+        cx.notify();
+    });
+    refocus(state, window, cx);
 }
 
 /// 应用 / 弹出所选贮藏。
@@ -916,7 +933,7 @@ fn render_empty_dialog(dialog: Dialog, state: &Entity<StashDialog>, cx: &mut App
 fn render_list_column(state: &Entity<StashDialog>, cx: &mut App) -> AnyElement {
     let s = state.read(cx);
     let count = s.stashes.len();
-    let busy = s.busy.is_some();
+    let busy = s.locked();
     let can_clear = !busy && count > 0;
 
     // 头部与右栏工具栏同高(48):图标 + 14px 半粗标题 + 数量胶囊,右端三颗图标按钮
@@ -1073,7 +1090,7 @@ fn render_row(state: &Entity<StashDialog>, index: usize, now: i64, cx: &mut App)
         return div().into_any_element();
     };
     let selected = s.selected == Some(index);
-    let busy = s.busy.is_some();
+    let busy = s.locked();
     let mut meta = vec![stash.reference.clone()];
     meta.extend(stash.branch.clone());
     meta.push(format_relative_time(stash.timestamp, now));
@@ -1181,7 +1198,7 @@ fn render_detail_column(state: &Entity<StashDialog>, cx: &mut App) -> AnyElement
     let s = state.read(cx);
     let stash = s.selected_stash().cloned();
     let busy = s.busy;
-    let enabled = busy.is_none() && stash.is_some();
+    let enabled = !s.locked() && stash.is_some();
 
     // ── 工具栏:所选贮藏 + 右上角 diff 工具组(含 ✕),与单文件历史 / 提交 diff 同高同距
     let title = div()
@@ -1575,7 +1592,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
                 Err(_) => f.submitted.then(|| t("gitBranch", "nameEmpty")),
                 Ok(()) => None,
             };
-            let (busy, error) = (f.busy, f.error.clone());
+            let (busy, error) = (f.op.busy, f.op.error.clone());
             let (form_ok, input_ok, list, repo, stash, settled) = (
                 form.clone(),
                 input.clone(),
@@ -1689,8 +1706,9 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
         cx,
         move |dialog, _window, cx| {
             let f = form.read(cx);
-            let (busy, keep_index, include_untracked) = (f.busy, f.keep_index, f.include_untracked);
-            let (error, hint) = (f.error.clone(), f.hint.clone());
+            let (busy, keep_index, include_untracked) =
+                (f.op.busy, f.keep_index, f.include_untracked);
+            let (error, hint) = (f.op.error.clone(), f.hint.clone());
             let (keep_form, untracked_form) = (form.clone(), form.clone());
             let (form_ok, input_ok, repo, on_saved) = (
                 form.clone(),
@@ -1918,9 +1936,10 @@ fn submit_smart_checkout(
 
 // ─── 小弹窗的执行器 ───────────────────────────────────────────
 
-/// 小弹窗的操作:防重复提交 → 后台执行 → 成功交给 `on_ok`(关框 / 改表单由它定);
-/// 失败把 git 原文写回表单(框还开着)或退到失败详情框(框已被关掉)。`on_settled`
-/// 不论成败都在最后调一次(面板 / 列表重载:失败也可能动过工作区)。
+/// 小弹窗的操作:防重复提交 → 占闸、后台执行([`git_ui::spawn_gated`])→ 成功交给
+/// `on_ok`(关框 / 改表单由它定);失败把 git 原文写回表单(框还开着)或退到失败详情框
+/// (框已被关掉)。`on_settled` 不论成败都在最后调一次(面板 / 列表重载:失败也可能动过
+/// 工作区)。闸被别的区占着时不执行,原因就地写回表单。
 #[allow(clippy::too_many_arguments)]
 fn run_form_op<T: Send + 'static>(
     form: &Entity<Form>,
@@ -1933,63 +1952,60 @@ fn run_form_op<T: Send + 'static>(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let started = form.update(cx, |f, cx| {
-        if f.busy {
-            return false;
+    let began = form.update(cx, |f, cx| {
+        let began = f.op.begin();
+        if began {
+            f.hint = None;
+            cx.notify();
         }
-        f.busy = true;
-        f.error = None;
-        f.hint = None;
-        cx.notify();
-        true
+        began
     });
-    if !started {
+    if !began {
         return;
     }
-    let form = form.clone();
-    window
-        .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = cx.update(|window, cx| {
-                form.update(cx, |f, cx| {
-                    f.busy = false;
-                    cx.notify();
-                });
-                match result {
-                    Ok(value) => on_ok(value, &form, window, cx),
-                    Err(err) => {
-                        let detail = error_text(&err);
-                        eprintln!("[git] {dialog} 失败: {detail}");
-                        if is_open(dialog) {
-                            let state = git_ui::error_text_state(&detail, 8, window, cx);
-                            form.update(cx, |f, cx| {
-                                f.error = Some(state);
-                                cx.notify();
-                            });
-                        } else {
-                            git_ui::show_git_error(
-                                t("gitStash", failed_title_key),
-                                detail,
-                                window,
-                                cx,
-                            );
-                        }
+    let done_form = form.clone();
+    let started = git_ui::spawn_gated(
+        &repo.to_string_lossy(),
+        op,
+        move |result, window, cx| {
+            let form = done_form;
+            match result {
+                Ok(value) => {
+                    form.update(cx, |f, cx| {
+                        f.op.finish();
+                        cx.notify();
+                    });
+                    on_ok(value, &form, window, cx);
+                }
+                Err(err) => {
+                    let detail = error_text(&err);
+                    eprintln!("[git] {dialog} 失败: {detail}");
+                    if is_open(dialog) {
+                        let state = git_ui::error_text_state(&detail, 8, window, cx);
+                        form.update(cx, |f, cx| {
+                            f.op.fail(state);
+                            cx.notify();
+                        });
+                    } else {
+                        form.update(cx, |f, _| f.op.finish());
+                        git_ui::show_git_error(t("gitStash", failed_title_key), detail, window, cx);
                     }
                 }
-                if let Some(on_settled) = on_settled {
-                    on_settled(cx);
-                }
-            });
-        })
-        .detach();
-}
-
-/// 失败的可展示原因:git 的 stderr 原文收掉首尾空白。
-fn error_text(err: &anyhow::Error) -> String {
-    format!("{err:#}").trim().to_string()
+            }
+            if let Some(on_settled) = on_settled {
+                on_settled(cx);
+            }
+        },
+        window,
+        cx,
+    );
+    if !started {
+        let state = git_ui::error_text_state(git_ui::gate_busy_text(), 2, window, cx);
+        form.update(cx, |f, cx| {
+            f.op.fail(state);
+            cx.notify();
+        });
+    }
 }
 
 // ─── 小件 ─────────────────────────────────────────────────────

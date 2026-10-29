@@ -16,17 +16,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 
-use super::run_git_command_with_input;
+use super::{QUICK_OP_TIMEOUT, run_git_command_with_input};
 
 /// 超过这么多行就不注解(列表画得动,但 git 跑得久、porcelain 输出也大)。
 pub const BLAME_MAX_LINES: usize = 20_000;
-
-/// 单次 blame 的超时。历史很长的大文件也就几秒,30s 足够分辨「卡死」。
-const BLAME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// blame 里出现的一个提交(porcelain 每个提交只给一次详情)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -85,7 +81,8 @@ pub fn blame_file(repo_root: &Path, rel_path: &str, contents: &str) -> Result<Bl
         &["blame", "--porcelain", "--contents", "-", "--", rel_path],
         "blame",
         contents.as_bytes().to_vec(),
-        BLAME_TIMEOUT,
+        // 历史很长的大文件也就几秒,30s 足够分辨「卡死」
+        QUICK_OP_TIMEOUT,
         ",文件历史可能过长",
     )?;
     parse_blame_porcelain(&out)

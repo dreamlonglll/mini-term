@@ -1,7 +1,7 @@
 //! 两个 diff 弹窗:
 //!
 //! - [`open_file_diff`] —— 工作区 / 暂存区的**单文件** diff(`src/components/DiffModal.tsx`)
-//! - [`open_commit_diff`] —— 某次 commit 的**多文件** diff(`src/components/CommitDiffModal.tsx`)
+//! - [`open_commit_diff_loading`] —— 某次 commit 的**多文件** diff(`src/components/CommitDiffModal.tsx`)
 //!
 //! 两个视图(`InlineView` / `SideBySideView`)在原版是 `DiffModal.tsx` 导出、
 //! 由 `CommitDiffModal` 复用的;这里同样只有一份([`render_inline`] / [`render_side_by_side`])。
@@ -1354,6 +1354,16 @@ fn run_hunk_op(
         }
         (c.repo_path.clone(), c.file().path.clone())
     };
+    // 按块操作同样写暂存区 / 工作区:与面板上的其它写操作共用一道闸,被占时就地说明
+    let Some(guard) = git_ui::gate::try_acquire(&repo) else {
+        ctl.update(cx, |c, cx| {
+            c.op_error = Some(git_ui::gate_busy_text().to_string());
+            c.stale = false;
+            cx.notify();
+        });
+        return;
+    };
+    cx.refresh_windows();
     ctl.update(cx, |c, cx| {
         c.busy = Some(hunk);
         c.op_error = None;
@@ -1373,6 +1383,8 @@ fn run_hunk_op(
                 }
             })
             .await;
+        drop(guard);
+        cx.update(|cx| cx.refresh_windows());
         cx.update(|cx| match result {
             Ok(()) => {
                 if let Some(on_changed) = ctl.read(cx).on_changed.clone() {
@@ -1876,32 +1888,57 @@ impl Render for CommitPick {
     }
 }
 
-/// 打开某次 commit 的多文件 diff。
-pub fn open_commit_diff(
+/// 后台取某个提交的改动文件,回来再打开它的多文件 diff(`initial` = 先选中哪个文件)。
+///
+/// 历史区(双击 / 详情区点文件)、推送对话框的待推送提交、单文件历史「在完整提交 diff
+/// 中查看」、文件页注解列点提交,四处同一条路。取文件失败弹可选中复制的详情框
+/// ([`git_ui::show_git_error`]):这几处多半开在弹窗里,toast 在遮罩下看不见。
+///
+/// 返回的任务在弹窗开出来(或失败框弹出)之后结束,要「打开中」防连点的调用方可以等它,
+/// 其余直接 `detach`。
+pub fn open_commit_diff_loading(
     store: Entity<AppStore>,
     repo_path: String,
     commit_hash: String,
     commit_message: String,
-    files: Vec<CommitFileInfo>,
+    initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
-) {
-    open_commit_diff_at(
-        store,
-        repo_path,
-        commit_hash,
-        commit_message,
-        files,
-        None,
-        window,
-        cx,
-    );
+) -> gpui::Task<()> {
+    let (task_repo, task_hash) = (std::path::PathBuf::from(&repo_path), commit_hash.clone());
+    window.spawn(cx, async move |cx| {
+        let files = cx
+            .background_executor()
+            .spawn(async move { mt_project::git::get_commit_files(&task_repo, &task_hash) })
+            .await;
+        let _ = cx.update(|window, cx| match files {
+            Ok(files) => open_commit_diff_at(
+                store,
+                repo_path,
+                commit_hash,
+                commit_message,
+                files,
+                initial,
+                window,
+                cx,
+            ),
+            Err(err) => {
+                eprintln!("[git] 取提交 {commit_hash} 的文件失败: {err:#}");
+                git_ui::show_git_error(
+                    t("gitBranch", "viewCommitFailed"),
+                    git_ui::error_text(&err),
+                    window,
+                    cx,
+                );
+            }
+        });
+    })
 }
 
-/// 同 [`open_commit_diff`],但打开时先选中 `initial` 这个文件(提交详情区点文件、
-/// 单文件历史「在完整提交 diff 中查看」用)。`None` 或不在列表里时选第一个。
+/// 拿着已取到的文件列表打开某次 commit 的多文件 diff,先选中 `initial` 这个文件(提交
+/// 详情区点文件、单文件历史「在完整提交 diff 中查看」用)。`None` 或不在列表里时选第一个。
 #[allow(clippy::too_many_arguments)]
-pub fn open_commit_diff_at(
+fn open_commit_diff_at(
     store: Entity<AppStore>,
     repo_path: String,
     commit_hash: String,
@@ -2194,7 +2231,7 @@ fn load_commit_file_at(
 
 /// 「某个提交里的某一个文件」的 diff 面板,给别的弹窗嵌进去用(单文件历史)。
 ///
-/// 只是把 [`open_commit_diff`] 右栏那一套(状态 + 取数 + 正文 + 右上角工具组)
+/// 只是把 [`open_commit_diff_loading`] 右栏那一套(状态 + 取数 + 正文 + 右上角工具组)
 /// 包了一层,行为与那边一致;文案沿用 `commitDiff` 命名空间。
 #[derive(Clone)]
 pub(crate) struct CommitFileDiffPane {

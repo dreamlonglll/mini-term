@@ -16,7 +16,7 @@ export const gitChanges = {
     committing: "提交中...",
     commitFailed: "提交失败：{detail}",
     loadFailed: "读取变更失败：{detail}",
-    operationFailed: "Git 操作失败：{detail}",
+    operationFailedTitle: "Git 操作失败",
   },
   en: {
     discardConfirm: "Discard changes to {count} file(s)?\nThis action cannot be undone.",
@@ -35,6 +35,6 @@ export const gitChanges = {
     committing: "Committing...",
     commitFailed: "Commit failed: {detail}",
     loadFailed: "Failed to read changes: {detail}",
-    operationFailed: "Git operation failed: {detail}",
+    operationFailedTitle: "Git operation failed",
   },
 } as const;

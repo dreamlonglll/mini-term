@@ -14,6 +14,8 @@ export const gitBranch = {
     opAbort: "中止",
     opFailed: "{op}失败",
     busyTip: "{op}中…",
+    // 写操作闸被占(另一区的写操作正在跑这个仓库)
+    gateBusy: "另一项 Git 操作正在进行，请等它结束后再试",
     // 失败详情框
     errorLead: "git 返回了以下信息（可选中复制）：",
     errorNoOutput: "git 执行失败，但没有输出任何信息。",
@@ -186,6 +188,7 @@ export const gitBranch = {
     opAbort: "Abort",
     opFailed: "{op} failed",
     busyTip: "{op} in progress…",
+    gateBusy: "Another Git operation is in progress; try again when it finishes",
     errorLead: "git reported the following (selectable, copyable):",
     errorNoOutput: "git failed without printing anything.",
     copy: "Copy",

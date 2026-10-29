@@ -19,7 +19,7 @@
 //! # 深浅主题
 //!
 //! 颜色全部从 [`ui`] 的色板派生,不写死 rgb。两处按底色明暗微调(判据
-//! [`light_ground`] 与 `git_graph::adapt_to_ground` 同一个阈值):
+//! [`is_light`],`git_graph::adapt_to_ground` 也用它):
 //!
 //! - 语义色写在自己淡底上的字([`soft_fg`]):浅底上同色字与 15% 淡底拉不开对比,
 //!   亮度压一截(色相不变),11px 的胶囊字才读得清;
@@ -32,10 +32,20 @@
 //! 这里叠两枚图标(常态色 / 悬停色),用 `group_hover` 切可见性 —— 纯样式,不必给每颗
 //! 按钮记悬停态;被隐藏的那枚 `Visibility::Hidden` 整个跳过绘制。组名是固定的
 //! [`BUTTON_GROUP`]:gpui 按最近的祖先认组,每颗按钮各用各的同名组互不串。
+//!
+//! # 写操作的公共骨架
+//!
+//! 会写仓库的操作一律经 [`spawn_gated`]:占按仓库的写操作闸([`gate`])→ 后台执行 →
+//! 放闸 → 回 UI 线程交给调用方。各区自己的「进行中」标记(按钮转圈、确认键换「执行中…」)
+//! 与失败怎么展示仍由各区定:面板上的操作失败走可选中复制的详情框([`show_git_error`]),
+//! 弹窗里的就地红字(toast 在遮罩下看不见),成功走 toast([`toast`])。
 
+pub mod gate;
 mod icons;
 
 pub use icons::*;
+
+use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla,
@@ -58,9 +68,17 @@ use crate::ui;
 
 // ─── 颜色 ─────────────────────────────────────────────────────
 
-/// 面板底色是不是亮的(浅色主题 / 浅色主题包)。阈值与 `git_graph::adapt_to_ground` 一致。
+/// 「亮底」的亮度阈值:底色亮于它就按浅色主题微调(胶囊字压暗、拓扑图线色压暗)。
+const LIGHT_GROUND_L: f32 = 0.6;
+
+/// 这个亮度的底色算不算亮的(`git_graph::adapt_to_ground` 也按它判)。
+pub fn is_light(lightness: f32) -> bool {
+    lightness > LIGHT_GROUND_L
+}
+
+/// 面板底色是不是亮的(浅色主题 / 浅色主题包)。
 pub fn light_ground() -> bool {
-    ui::bg_surface().l > 0.6
+    is_light(ui::bg_surface().l)
 }
 
 /// 语义色的淡底(胶囊、计数、横幅里的标记)。
@@ -1172,10 +1190,103 @@ pub fn error_text_box(state: &Entity<TextareaState>) -> AnyElement {
         .into_any_element()
 }
 
+/// 失败的可展示原因:错误链原文收掉首尾空白;空的(git 没吭声就非零退出)给句兜底。
+/// Git 界面里唯一的一份(历史区、贮藏弹窗、更改区都用它)。
+pub fn error_text(err: &anyhow::Error) -> String {
+    let text = format!("{err:#}");
+    match text.trim() {
+        "" => t("gitBranch", "errorNoOutput").to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
+/// 写操作闸被占时的提示(「另一项 Git 操作正在进行」):面板上的入口推 toast,弹窗里的
+/// 就地显示,按钮的禁用原因也是它。
+pub fn gate_busy_text() -> &'static str {
+    t("gitBranch", "gateBusy")
+}
+
+/// 写操作的公共骨架(见模块注释):占 `repo` 的写操作闸 → 后台执行 `op` → 放闸 → 回 UI
+/// 线程把结果交给 `done`。闸被占时什么都不做、返回 `false`,由调用方就地提示。
+///
+/// 占闸与放闸后各请求一次整窗重画:别的区按 [`gate::is_busy`] 画的禁用态要跟着变。
+/// 窗口在等待期间关掉的话 `done` 不再调,闸照样随任务结束放掉。
+pub fn spawn_gated<T: Send + 'static>(
+    repo: &str,
+    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    done: impl FnOnce(anyhow::Result<T>, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let Some(guard) = gate::try_acquire(repo) else {
+        return false;
+    };
+    cx.refresh_windows();
+    let path = PathBuf::from(repo);
+    window
+        .spawn(cx, async move |cx| {
+            // ⚠️ 全是阻塞调用(git CLI 最多 120s),必须后台执行器
+            let result = cx
+                .background_executor()
+                .spawn(async move { op(&path) })
+                .await;
+            drop(guard);
+            let _ = cx.update(|window, cx| {
+                cx.refresh_windows();
+                done(result, window, cx);
+            });
+        })
+        .detach();
+    true
+}
+
+/// 弹窗表单的「执行中 / 上次失败」两态(历史区的新建分支 / 标签 / 改消息 / 重置、分支弹窗
+/// 的名称弹窗、贮藏的小弹窗共用)。`E` 是失败原文的形态:就地红字是 `String`,可选中复制
+/// 的原文框是 `Entity<TextareaState>`。
+pub struct FormOp<E = String> {
+    /// 确认后、结果回来之前:确认键禁用,防重复提交。
+    pub busy: bool,
+    /// 上一次执行失败的原因(就地显示)。
+    pub error: Option<E>,
+}
+
+impl<E> Default for FormOp<E> {
+    fn default() -> Self {
+        Self {
+            busy: false,
+            error: None,
+        }
+    }
+}
+
+impl<E> FormOp<E> {
+    /// 开始执行:已在执行时返回 `false`(防重复提交);否则置忙并清掉上次的错误。
+    pub fn begin(&mut self) -> bool {
+        if self.busy {
+            return false;
+        }
+        self.busy = true;
+        self.error = None;
+        true
+    }
+
+    /// 执行结束(成功;失败用 [`Self::fail`])。
+    pub fn finish(&mut self) {
+        self.busy = false;
+    }
+
+    /// 失败(含没能开始,比如写操作闸被占):复位并记下原因。
+    pub fn fail(&mut self, error: E) {
+        self.busy = false;
+        self.error = Some(error);
+    }
+}
+
 /// git 操作失败的详情弹窗:标题 + 一句说明 + **可选中复制**的完整原文 +「复制」「知道了」。
 ///
-/// 面板上的操作(Fetch / 拉取 / 检出…)失败走这里而不是 toast:toast 5s 就收,
-/// 而 git 的报错常是多行(哪些文件挡住了检出、hook 的输出),得留给人读、能复制。
+/// 面板上的操作(Fetch / 拉取 / 检出 / 历史区的拣选 / 更改区的暂存…)失败走这里而不是
+/// toast:toast 5s 就收,而 git 的报错常是多行(哪些文件挡住了检出、hook 的输出),
+/// 得留给人读、能复制。弹窗里的操作失败就地红字,不走这里(除非等待期间弹窗被关了)。
 pub fn show_git_error(
     title: impl Into<SharedString>,
     detail: String,
@@ -1261,8 +1372,8 @@ pub fn toast(store: &Entity<AppStore>, message: String, tone: Tone, cx: &mut App
         .map(|p| (p.id.clone(), p.name.clone()))
         .unwrap_or_else(|| (String::new(), "Git".to_string()));
     let kind = match tone {
-        Tone::Info => ToastKind::WslInfo,
-        Tone::Attention => ToastKind::PasteError,
+        Tone::Info => ToastKind::Info,
+        Tone::Attention => ToastKind::Error,
     };
     crate::toast::push_message(kind, project_id, project_name, message, cx);
 }
@@ -1270,6 +1381,41 @@ pub fn toast(store: &Entity<AppStore>, message: String, tone: Tone, cx: &mut App
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 表单两态:执行中不许再开始;失败复位并记原因;再开始时清掉上次的原因。
+    #[test]
+    fn 表单执行态() {
+        let mut op: FormOp = FormOp::default();
+        assert!(!op.busy && op.error.is_none());
+        assert!(op.begin());
+        assert!(op.busy);
+        assert!(!op.begin(), "执行中不许重复提交");
+        op.fail("hook 拒绝".into());
+        assert!(!op.busy);
+        assert_eq!(op.error.as_deref(), Some("hook 拒绝"));
+        assert!(op.begin());
+        assert!(op.error.is_none(), "重新开始时清掉上次的原因");
+        op.finish();
+        assert!(!op.busy && op.error.is_none());
+    }
+
+    /// 错误原文:收掉首尾空白,空的给兜底(不再写死英文 `git failed`)。
+    #[test]
+    fn 错误原文与兜底() {
+        assert_eq!(error_text(&anyhow::anyhow!("  fatal: x\n")), "fatal: x");
+        assert_eq!(
+            error_text(&anyhow::anyhow!("  ")),
+            t("gitBranch", "errorNoOutput")
+        );
+    }
+
+    /// 亮底阈值:git_ui 与拓扑图共用一个判据。
+    #[test]
+    fn 亮底判据() {
+        assert!(is_light(0.97));
+        assert!(!is_light(0.08));
+        assert!(!is_light(LIGHT_GROUND_L), "等于阈值不算亮");
+    }
 
     #[test]
     fn 头像取首字() {

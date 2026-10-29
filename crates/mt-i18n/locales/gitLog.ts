@@ -30,7 +30,6 @@ export const gitLog = {
       noRemote: "没有配置远程仓库",
     },
     action: {
-      viewChanges: "查看变更",
       checkout: "检出",
       createBranch: "新建分支",
       createTag: "新建标签",
@@ -43,7 +42,6 @@ export const gitLog = {
       reword: "修改提交消息",
     },
     toast: {
-      failed: "{action}失败:{detail}",
       busy: "「{action}」还在进行中,请稍候",
       checkedOut: "已检出 {hash}(分离头指针)",
       branchCreated: "已创建分支 {name}",
@@ -112,12 +110,14 @@ export const gitLog = {
       keep: "Keep —— 同 Hard,但本地改动与目标冲突时中止,不会丢改动",
       hard: "Hard —— 工作区与暂存区完全回到目标提交,未提交的改动全部丢失",
       notInHistory: "目标提交不在当前分支的历史上:重置后当前分支独有的提交将不再被引用",
+      pushedWarn: "将改写已推送的历史,之后需要强制推送",
       ok: "重置",
       hardTitle: "确认 Hard 重置",
       hardMessage: "Hard 重置会永久丢弃所有未提交的改动,以及 {hash} 之后、未被其他分支引用的提交。\n此操作无法撤销。",
     },
     filter: {
-      placeholder: "过滤:标题 / 哈希 / 作者",
+      placeholder: "过滤:标题 / 哈希 / 作者,path:路径",
+      syntaxTip: "关键词匹配标题 / 正文 / 哈希前缀 / 作者\n加一段 path:<路径> 只看改动了该文件或目录的提交(仓库内相对路径),路径带空格时加引号:path:\"a b/c\"",
       onlyMine: "仅我的",
       onlyMineTip: "只看 {email} 的提交",
       noEmail: "仓库未配置 user.email,无法筛选我的提交",
@@ -204,7 +204,6 @@ export const gitLog = {
       noRemote: "No remote configured",
     },
     action: {
-      viewChanges: "View changes",
       checkout: "Checkout",
       createBranch: "Create branch",
       createTag: "Create tag",
@@ -217,7 +216,6 @@ export const gitLog = {
       reword: "Edit message",
     },
     toast: {
-      failed: "{action} failed: {detail}",
       busy: "\"{action}\" is still running, please wait",
       checkedOut: "Checked out {hash} (detached HEAD)",
       branchCreated: "Created branch {name}",
@@ -286,12 +284,14 @@ export const gitLog = {
       keep: "Keep: like Hard, but aborts if local changes conflict with the target, so nothing is lost",
       hard: "Hard: index and working tree match the target exactly; all uncommitted changes are lost",
       notInHistory: "The target is not in the current branch: commits unique to this branch will no longer be referenced",
+      pushedWarn: "This rewrites history that is already pushed; you will need to force push afterwards",
       ok: "Reset",
       hardTitle: "Confirm Hard Reset",
       hardMessage: "A hard reset permanently discards all uncommitted changes and the commits after {hash} that no other branch references.\nThis cannot be undone.",
     },
     filter: {
-      placeholder: "Filter: message / hash / author",
+      placeholder: "Filter: message / hash / author, path:<path>",
+      syntaxTip: "Keywords match the subject / body / hash prefix / author\nAdd path:<path> to keep only commits that changed that file or directory (relative to the repository root); quote paths with spaces: path:\"a b/c\"",
       onlyMine: "Mine",
       onlyMineTip: "Only commits by {email}",
       noEmail: "user.email is not configured for this repository",

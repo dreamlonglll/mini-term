@@ -8,12 +8,11 @@
 //! pathspec 魔法(名叫 `:(top)x` 的文件真存在,丢弃它不能变成丢弃整个仓库)。
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use git2::Repository;
 
-use super::run_git_command;
+use super::{QUICK_OP_TIMEOUT, run_git_command};
 
 /// 冲突里取哪一侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +62,10 @@ fn conflict_of(repo_path: &Path, file: &str) -> Result<ConflictInfo> {
         .ok_or_else(|| anyhow!("{file} 已不在冲突中,请刷新"))
 }
 
-const TIMEOUT: Duration = Duration::from_secs(30);
-
 fn git(repo_path: &Path, args: &[&str]) -> Result<String> {
     let mut full = vec!["--literal-pathspecs"];
     full.extend_from_slice(args);
-    run_git_command(repo_path, &full, TIMEOUT, "")
+    run_git_command(repo_path, &full, QUICK_OP_TIMEOUT, "")
 }
 
 /// 采用一侧的版本并标记为已解决。
@@ -171,6 +168,8 @@ pub fn discard_unstaged(repo_path: &Path, files: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::super::test_support::init_repo_with_file;
     use super::super::{DiffSide, get_changes_status, get_git_diff, git_stage};
     use super::*;

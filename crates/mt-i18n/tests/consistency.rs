@@ -142,8 +142,15 @@ use mt_i18n::{
 /// （`gitBranch.{modeFollowConfig,modeFollowConfigItem,modeRebaseMerges}`）、变基中冲突
 /// 「采用 ours / theirs」写清方向的四条（`gitCommit.take{Ours,Theirs}Rebase{,Deleted}`）、
 /// 贮藏已生成但有文件清不掉的两条（`gitStash.{save.savedWithWarnings,checkout.cancelled}`）。
+/// 1419 → 1417：Git 集成评审整改 —— 新增跨区写操作闸被占的提示（`gitBranch.gateBusy`）、
+/// 重置会改写已推送历史的警告（`gitLog.reset.pushedWarn`）、历史过滤框的语法说明
+/// （`gitLog.filter.syntaxTip`，路径过滤 `path:`）、「提交并推送」改为先开推送对话框的说明
+/// （`gitCommit.commitAndPushDetail`）；更改区失败改走详情框，`gitChanges.operationFailed`
+/// （带原文）换成标题 `gitChanges.operationFailedTitle`；随之下线不再使用的
+/// `gitCommit.{pushing,pushedToast,pushFailedAfterCommit}`、`gitLog.toast.failed`、
+/// `gitGutter.openCommitFailed`、`gitLog.action.viewChanges`。净减两条。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1419;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1417;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

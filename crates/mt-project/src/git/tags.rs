@@ -10,9 +10,10 @@ use anyhow::{Result, bail};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 
-use super::branch::{NO_EDITOR, failure_text};
 use super::log_ops::is_commit_hash;
-use super::run_git_output_env;
+use super::{
+    LOCAL_OP_TIMEOUT, NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, QUICK_OP_TIMEOUT, run_checked_env,
+};
 
 /// 跑一条 `git tag` / `git push`,非零退出即把原文装进错误。
 ///
@@ -25,11 +26,7 @@ fn run_tag_command(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<()> {
-    let out = run_git_output_env(repo_path, args, NO_EDITOR, op_label, timeout, timeout_hint)?;
-    if !out.success {
-        bail!("{}", failure_text(&out));
-    }
-    Ok(())
+    run_checked_env(repo_path, args, NO_EDITOR, op_label, timeout, timeout_hint).map(|_| ())
 }
 
 /// 指向某个提交的标签。
@@ -85,7 +82,7 @@ pub fn list_tags(repo_path: &Path) -> Result<Vec<TagInfo>> {
 }
 
 /// 在某个提交上打标签。`message` 非空 = 附注标签(`-a -m`,继承用户的 `tag.gpgSign`),
-/// 否则轻量标签。**阻塞最多 60s**(附注标签可能要 gpg 签名)。
+/// 否则轻量标签。**阻塞最多 [`LOCAL_OP_TIMEOUT`]**(附注标签可能要 gpg 签名)。
 pub fn create_tag(repo_path: &Path, name: &str, hash: &str, message: Option<&str>) -> Result<()> {
     if !is_valid_tag_name(name) {
         bail!("不是合法的标签名:{name}");
@@ -107,7 +104,7 @@ pub fn create_tag(repo_path: &Path, name: &str, hash: &str, message: Option<&str
         repo_path,
         &args,
         "tag",
-        Duration::from_secs(60),
+        LOCAL_OP_TIMEOUT,
         ",可能卡在 gpg 签名上",
     )
 }
@@ -121,13 +118,14 @@ pub fn delete_tag(repo_path: &Path, name: &str) -> Result<()> {
         repo_path,
         &["tag", "-d", name],
         "tag -d",
-        Duration::from_secs(30),
+        QUICK_OP_TIMEOUT,
         "",
     )
 }
 
 /// 把一个标签推到远程(`git push <remote> refs/tags/<name>`)。写全引用名,
-/// 免得与同名分支撞车。**阻塞最多 60s**,必须在后台线程上调用。
+/// 免得与同名分支撞车。**阻塞最多 [`NETWORK_TIMEOUT`]**(与 pull / push 同档),
+/// 必须在后台线程上调用。
 pub fn push_tag(repo_path: &Path, remote: &str, name: &str) -> Result<()> {
     if !is_valid_remote_name(remote) {
         bail!("不是合法的远程名:{remote}");
@@ -140,8 +138,8 @@ pub fn push_tag(repo_path: &Path, remote: &str, name: &str) -> Result<()> {
         repo_path,
         &["push", remote, &refspec],
         "push tag",
-        Duration::from_secs(60),
-        ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
+        NETWORK_TIMEOUT,
+        NETWORK_HINT,
     )
 }
 

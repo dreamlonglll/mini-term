@@ -1,7 +1,6 @@
 //! 同步:Fetch / 带模式的 Pull / 带选项的 Push / 待推送提交。
 //!
-//! 与 [`super::git_pull`] / [`super::git_push`](无参、30s)并存 —— 那两个另一条线
-//! 的「提交并推送」可能还在用,这里的是新起的名字。
+//! 与 [`super::git_pull`] / [`super::git_push`](无参的旧接口)并存,这里的是新起的名字。
 //!
 //! 结果判定照旧只看结构化信号:HEAD 与远程跟踪引用前后的变化、`repo.state()`、
 //! `git push --porcelain` 的标志位(机器可读格式,不随界面语言变)。
@@ -13,13 +12,13 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Direction, Oid, Repository};
 
-use super::branch::{
-    NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, failure_text, head_branch_name, remote_names,
-    run_checked,
-};
+use super::branch::{head_branch_name, remote_names};
 use super::log_ops::is_commit_hash;
 use super::repo_state::{conflicted_file_count, op_kind_of};
-use super::{GIT_USAGE_ERROR, GitCommitInfo, commit_info, run_git_output, run_git_output_env};
+use super::{
+    GIT_USAGE_ERROR, GitCommitInfo, NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, commit_info,
+    failure_text, run_checked, run_git_output, run_git_output_env,
+};
 
 /// 全部远程跟踪引用 → 指向的提交。
 fn remote_refs(repo: &Repository) -> HashMap<String, Oid> {
@@ -580,10 +579,9 @@ pub fn git_push_with(repo_path: &Path, options: &PushOptions) -> Result<PushOutc
 
 #[cfg(test)]
 mod tests {
-    use super::super::branch::test_cli::{
-        cleanup, clone_of, commit_file, current, git, repo_with_origin,
+    use super::super::test_support::{
+        cleanup, clone_of, commit_file, current, git, init_repo_with_file, repo_with_origin,
     };
-    use super::super::test_support::init_repo_with_file;
     use super::*;
 
     #[test]
@@ -769,6 +767,60 @@ mod tests {
         let fresh = outgoing_commits(&work, None, 100).unwrap();
         let titles: Vec<&str> = fresh.commits.iter().map(|c| c.message.as_str()).collect();
         assert_eq!(titles, vec!["three", "two", "one"]);
+        cleanup(&[&work, &bare]);
+    }
+
+    /// 推送对话框预选别的本地分支(分支弹窗的「推送」):计划、待推送、推送都对它算,
+    /// 当前分支不动;没上游的顺带设上;不存在的分支报错。
+    #[test]
+    fn 推送指定的非当前分支() {
+        let (work, bare, main) = repo_with_origin("sync-push-other");
+        git(&work, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&work, "f.txt", "f\n", "feature work");
+        git(&work, &["checkout", "-q", &main]);
+        commit_file(&work, "m.txt", "m\n", "main work");
+
+        let PushPlan::Ready(target) = push_plan(&work, Some("feature")).unwrap() else {
+            panic!("feature 应当可推");
+        };
+        assert_eq!(target.branch, "feature");
+        assert_eq!(target.label(), "origin/feature");
+        assert!(target.sets_upstream());
+        let titles: Vec<String> = outgoing_commits(&work, Some("feature"), 100)
+            .unwrap()
+            .commits
+            .into_iter()
+            .map(|c| c.message)
+            .collect();
+        assert_eq!(
+            titles,
+            ["feature work"],
+            "只算 feature 自己的,不混进 main 的"
+        );
+
+        let options = PushOptions {
+            branch: Some("feature".into()),
+            ..PushOptions::default()
+        };
+        assert!(matches!(
+            git_push_with(&work, &options).unwrap(),
+            PushOutcome::Pushed(_)
+        ));
+        assert_eq!(current(&work), main, "推别的分支不切分支");
+        assert_eq!(
+            git(&bare, &["rev-parse", "refs/heads/feature"]),
+            git(&work, &["rev-parse", "feature"])
+        );
+        // 设了上游;main 那个本地提交没被推上去
+        assert_eq!(
+            git(&work, &["rev-parse", "--abbrev-ref", "feature@{upstream}"]),
+            "origin/feature"
+        );
+        assert_ne!(
+            git(&bare, &["rev-parse", &format!("refs/heads/{main}")]),
+            git(&work, &["rev-parse", "HEAD"])
+        );
+        assert!(push_plan(&work, Some("nope")).is_err());
         cleanup(&[&work, &bare]);
     }
 

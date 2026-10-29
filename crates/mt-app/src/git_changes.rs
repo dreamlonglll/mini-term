@@ -34,14 +34,24 @@
 //! 不照抄 —— 只打日志的结果是「点了没反应」,而提交被 hook 拒掉恰恰是用户最需要
 //! 知道原因的时候。口径按失败出在哪儿分三种(日志照打):
 //!
-//! - **提交 / 推送失败**(hook 拒绝 / GPG 出错 / 60s 超时 / 推送被拒):错误原文**就地**
-//!   挂在提交按钮下方,错误色、可滚动、带复制按钮 —— 提交的错误常是 hook 的多行输出,
-//!   tooltip 装不下。下一次提交、提交成功或换仓库时清掉(hook 输出得留给人读);
-//!   「提交成功、推送失败」明确写成「已提交,但推送失败」;
-//! - **暂存 / 取消暂存 / 丢弃 / 冲突处理失败**:推 toast。抽屉不是弹窗,toast 层画在
-//!   抽屉之上看得见;这几个动作的结果本来就体现在列表上,就地再挂一行反倒挤占列表;
+//! - **提交失败**(hook 拒绝 / GPG 出错 / 60s 超时):错误原文**就地**挂在提交按钮下方,
+//!   错误色、可滚动、带复制按钮 —— 提交的错误常是 hook 的多行输出,tooltip 装不下。
+//!   下一次提交、提交成功或换仓库时清掉(hook 输出得留给人读);
+//! - **暂存 / 取消暂存 / 丢弃 / 冲突处理失败**:弹可选中复制原文的详情框
+//!   (`git_ui::show_git_error`,与面板上的 Fetch / 检出同一口径)—— toast 5s 就收,
+//!   装不下「哪些文件被 hook / 过滤器挡住」这类多行原文;
 //! - **取变更失败**:列表区的空态换成错误原文 —— 否则读失败会被误认成
-//!   「工作区是干净的」。它随 pty 输出每 500ms 去抖重取,推 toast 会刷屏,所以就地。
+//!   「工作区是干净的」。它随 pty 输出每 500ms 去抖重取,弹框会刷屏,所以就地。
+//!
+//! # 提交并推送
+//!
+//! 与 IDEA 的 Commit and Push 一致:提交成功后**打开推送对话框**(预选当前分支),在那里
+//! 看清待推送的提交与推送目标再确认;提交失败就不打开。这里不直接推。
+//!
+//! # 防重入
+//!
+//! 暂存 / 丢弃 / 提交都写暂存区,经仓库的写操作闸(`git_ui::gate`)执行:面板在拉取、
+//! 历史区在拣选时,行内按钮、组操作与提交按钮一并禁用并写明原因。
 //!
 //! # 阻塞调用
 //!
@@ -99,6 +109,9 @@ gpui::actions!(
     ]
 );
 
+/// 「更改」区整体的 key context(提交框里的 Ctrl/Cmd+Enter 等,键位见 `hotkeys.rs`)。
+pub(crate) const CHANGES_CONTEXT: &str = "GitChanges";
+
 /// 更改列表的 key context(列表获得焦点时生效,键位见 `hotkeys.rs` 表外段)。
 pub const LIST_CONTEXT: &str = "GitChangesList";
 
@@ -111,8 +124,9 @@ const HISTORY_LIMIT: usize = 20;
 
 /// 「更改」区往上冒的事件。原版是 `onCommitSuccess` 这个 prop。
 pub enum GitChangesEvent {
-    /// 提交(或提交后的推送)成功 —— 容器要刷新历史与分支(分支头已前移)。
-    Committed,
+    /// 提交成功 —— 容器要刷新历史与分支(分支头已前移)。`open_push` = 这是「提交并推送」,
+    /// 接着打开推送对话框(预选当前分支,见模块注释「提交并推送」)。
+    Committed { open_push: bool },
     /// ▾ 菜单「贮藏当前改动…」贮藏成功 —— 工作区与贮藏数都变了,容器整面板刷新。
     Stashed,
 }
@@ -383,9 +397,8 @@ pub struct GitChanges {
     amend_prefill: Option<String>,
     amend_request: u64,
     committing: bool,
-    pushing: bool,
     history_loading: bool,
-    /// 上一次提交 / 推送失败的说明(已格式化好的整句),挂在提交按钮下方。
+    /// 上一次提交失败的说明(已格式化好的整句),挂在提交按钮下方。
     commit_error: Option<String>,
     _subs: Vec<Subscription>,
 }
@@ -435,7 +448,6 @@ impl GitChanges {
             amend_prefill: None,
             amend_request: 0,
             committing: false,
-            pushing: false,
             history_loading: false,
             commit_error: None,
             _subs: subs,
@@ -766,7 +778,7 @@ impl GitChanges {
     fn on_toggle_stage(
         &mut self,
         _: &GitChangesToggleStage,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // 上一次操作还在跑:连按 Space 不叠第二次(与按钮在 busy 时禁用同一口径)
@@ -778,8 +790,8 @@ impl GitChanges {
         };
         let pos = self.selection_anchor_pos(area, cx).unwrap_or(0);
         match area {
-            Area::Staged => self.unstage(paths, Some((area, pos)), cx),
-            Area::Unstaged | Area::Untracked => self.stage(paths, Some((area, pos)), cx),
+            Area::Staged => self.unstage(paths, Some((area, pos)), window, cx),
+            Area::Unstaged | Area::Untracked => self.stage(paths, Some((area, pos)), window, cx),
             Area::Conflicts => {}
         }
     }
@@ -815,52 +827,74 @@ impl GitChanges {
 
     // ── 整文件操作 ──
 
-    /// 跑一件阻塞的 git 动作(暂存 / 取消暂存 / 丢弃 / 冲突处理),完成后重取列表。
-    /// 失败推 toast(口径见模块注释)。`reselect` 是完成后要落回的位置。
+    /// 仓库的写操作闸被别的区占着(面板在拉取、历史区在拣选…):行内 / 组操作与提交
+    /// 按钮按它禁用。自己在跑的那一件由 `busy_ops` / `committing` 管。
+    fn gated(&self) -> bool {
+        git_ui::gate::is_busy(&self.repo_path)
+    }
+
+    /// 整文件操作能不能点:自己没在跑、闸也没被别人占。
+    fn ops_enabled(&self) -> bool {
+        self.busy_ops == 0 && !self.gated()
+    }
+
+    /// 跑一件阻塞的 git 动作(暂存 / 取消暂存 / 丢弃 / 冲突处理),占闸、后台执行,完成后
+    /// 重取列表。失败弹详情框(口径见模块注释);闸被占时推 toast、不执行。`reselect` 是
+    /// 完成后要落回的位置。
     fn run_op(
         &mut self,
         op: impl FnOnce(&Path) -> anyhow::Result<()> + Send + 'static,
         reselect: Option<(Area, usize)>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.repo_path.is_empty() {
             return;
         }
+        let this = cx.entity().downgrade();
+        let started = git_ui::spawn_gated(
+            &self.repo_path,
+            op,
+            move |result, window, cx| {
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.busy_ops = this.busy_ops.saturating_sub(1);
+                    match result {
+                        Ok(()) => this.reselect = reselect,
+                        Err(err) => {
+                            eprintln!("[git] 变更操作失败: {err:#}");
+                            git_ui::show_git_error(
+                                t("gitChanges", "operationFailedTitle"),
+                                git_ui::error_text(&err),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    this.load(cx);
+                });
+            },
+            window,
+            cx,
+        );
+        if !started {
+            self.notify_gate_busy(cx);
+            return;
+        }
         self.busy_ops += 1;
         cx.notify();
-        let repo = PathBuf::from(&self.repo_path);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&repo) })
-                .await;
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                this.busy_ops = this.busy_ops.saturating_sub(1);
-                match result {
-                    Ok(()) => this.reselect = reselect,
-                    Err(err) => {
-                        eprintln!("[git] 变更操作失败: {err:#}");
-                        this.notify_op_failure(format!("{err:#}"), cx);
-                    }
-                }
-                this.load(cx);
-            });
-        })
-        .detach();
     }
 
-    /// 暂存 / 丢弃这类动作失败的 toast(需要留意那一档:`!` 图标、点击只关闭),
-    /// 正文带错误原文。走 Git 面板共用的结果 toast。
-    fn notify_op_failure(&self, detail: String, cx: &mut Context<Self>) {
+    /// 写操作闸被占:推一条 toast(列表与按钮已画成禁用,走到这里多半是键盘快捷键)。
+    fn notify_gate_busy(&self, cx: &mut Context<Self>) {
         git_ui::toast(
             &self.store,
-            tr!("gitChanges", "operationFailed", detail = detail),
+            git_ui::gate_busy_text().to_string(),
             Tone::Attention,
             cx,
         );
     }
 
-    /// 成功类的提示(已提交 / 已推送)。信息档 toast,点击只关闭。
+    /// 成功类的提示(已提交)。信息档 toast,点击只关闭。
     fn notify_info(&self, message: String, cx: &mut Context<Self>) {
         git_ui::toast(&self.store, message, Tone::Info, cx);
     }
@@ -869,6 +903,7 @@ impl GitChanges {
         &mut self,
         paths: Vec<String>,
         reselect: Option<(Area, usize)>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty() {
@@ -877,6 +912,7 @@ impl GitChanges {
         self.run_op(
             move |repo| mt_project::git::git_stage(repo, &paths),
             reselect,
+            window,
             cx,
         );
     }
@@ -885,6 +921,7 @@ impl GitChanges {
         &mut self,
         paths: Vec<String>,
         reselect: Option<(Area, usize)>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty() {
@@ -893,6 +930,7 @@ impl GitChanges {
         self.run_op(
             move |repo| mt_project::git::git_unstage(repo, &paths),
             reselect,
+            window,
             cx,
         );
     }
@@ -907,13 +945,13 @@ impl GitChanges {
 
     /// 分组标题上的「全部暂存」:**只暂存这一组**。原先未跟踪组的按钮也调
     /// `git_stage_all`(`add_all("*")`),会把已跟踪的改动一起暂存。
-    fn stage_group(&mut self, area: Area, cx: &mut Context<Self>) {
+    fn stage_group(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.area_paths(area);
-        self.stage(paths, None, cx);
+        self.stage(paths, None, window, cx);
     }
 
-    fn unstage_all(&mut self, cx: &mut Context<Self>) {
-        self.run_op(mt_project::git::git_unstage_all, None, cx);
+    fn unstage_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_op(mt_project::git::git_unstage_all, None, window, cx);
     }
 
     /// 丢弃(先确认)。未暂存组只丢未暂存的部分(已暂存的保留),未跟踪组删除文件。
@@ -939,13 +977,14 @@ impl GitChanges {
             .ok_text(t("gitChanges", "discardOk"))
             .cancel_text(t("gitChanges", "discardCancel"))
             .open(
-                move |_window, cx| {
+                move |window, cx| {
                     let paths = paths.clone();
                     this.update(cx, |this, cx| {
                         let reselect = this.selection_anchor_pos(area, cx).map(|pos| (area, pos));
                         this.run_op(
                             move |repo| mt_project::git::discard_unstaged(repo, &paths),
                             reselect,
+                            window,
                             cx,
                         );
                     });
@@ -956,7 +995,13 @@ impl GitChanges {
     }
 
     /// 冲突文件采用一侧。
-    fn take_side(&mut self, paths: Vec<String>, side: ConflictSide, cx: &mut Context<Self>) {
+    fn take_side(
+        &mut self,
+        paths: Vec<String>,
+        side: ConflictSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.run_op(
             move |repo| {
                 for path in &paths {
@@ -965,6 +1010,7 @@ impl GitChanges {
                 Ok(())
             },
             None,
+            window,
             cx,
         );
     }
@@ -989,20 +1035,22 @@ impl GitChanges {
                 })
                 .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                let resolve = move |this: &mut Self, cx: &mut Context<Self>| {
-                    this.run_op(
-                        move |repo| {
-                            for path in &paths {
-                                mt_project::git::mark_conflict_resolved(repo, path)?;
-                            }
-                            Ok(())
-                        },
-                        None,
-                        cx,
-                    );
-                };
+                let resolve =
+                    move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                        this.run_op(
+                            move |repo| {
+                                for path in &paths {
+                                    mt_project::git::mark_conflict_resolved(repo, path)?;
+                                }
+                                Ok(())
+                            },
+                            None,
+                            window,
+                            cx,
+                        );
+                    };
                 if marked.is_empty() {
-                    resolve(this, cx);
+                    resolve(this, window, cx);
                     return;
                 }
                 let entity = cx.entity();
@@ -1018,9 +1066,9 @@ impl GitChanges {
                 .detail(preview_paths(&marked))
                 .ok_text(t("gitCommit", "markResolvedOk"))
                 .open(
-                    move |_window, cx| {
+                    move |window, cx| {
                         if let Some(resolve) = resolve.borrow_mut().take() {
-                            entity.update(cx, resolve);
+                            entity.update(cx, |this, cx| resolve(this, window, cx));
                         }
                     },
                     window,
@@ -1095,8 +1143,11 @@ impl GitChanges {
         if self.repo_path.is_empty() {
             return Some(t("gitCommit", "blockNoRepo").to_string());
         }
-        if self.committing || self.pushing {
+        if self.committing {
             return Some(t("gitCommit", "blockBusy").to_string());
+        }
+        if self.gated() {
+            return Some(git_ui::gate_busy_text().to_string());
         }
         let conflicts = self.conflict_count();
         if conflicts > 0 {
@@ -1128,11 +1179,11 @@ impl GitChanges {
         None
     }
 
-    /// 提交。`push` = 提交成功后接着推送;`stage_first` = 先暂存全部已跟踪改动
-    /// (未暂存组,不含未跟踪文件)。
+    /// 提交。`open_push` = 「提交并推送」:提交成功后让容器打开推送对话框(见模块注释);
+    /// `stage_first` = 先暂存全部已跟踪改动(未暂存组,不含未跟踪文件)。
     fn commit(
         &mut self,
-        push: bool,
+        open_push: bool,
         stage_first: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1147,106 +1198,63 @@ impl GitChanges {
         } else {
             Vec::new()
         };
+        let input = self.commit_input.clone();
+        let this = cx.entity().downgrade();
+        // git_commit 走 git CLI(60s 超时兜底 GPG/pre-commit hook 挂起)——
+        // 即便如此也不上主线程跑,hook 慢的仓库会把 UI 卡满整个超时窗口
+        let started = git_ui::spawn_gated(
+            &self.repo_path,
+            move |repo| {
+                if !stage_paths.is_empty() {
+                    mt_project::git::git_stage(repo, &stage_paths)?;
+                }
+                mt_project::git::git_commit_with(repo, &message, amend)
+            },
+            move |result, window, cx| {
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    this.committing = false;
+                    match result {
+                        Ok(outcome) => {
+                            input.update(cx, |state, cx| state.set_value("", window, cx));
+                            this.amend = false;
+                            this.amend_info = None;
+                            this.amend_prefill = None;
+                            this.notify_info(
+                                tr!(
+                                    "gitCommit",
+                                    "committedToast",
+                                    hash = outcome.short_hash.clone(),
+                                    title = outcome.summary.clone()
+                                ),
+                                cx,
+                            );
+                            this.load(cx);
+                            cx.emit(GitChangesEvent::Committed { open_push });
+                        }
+                        Err(err) => {
+                            // 提交消息留在框里不清,改完(或修好 hook)直接再点;提交失败
+                            // 就不打开推送对话框
+                            eprintln!("[git] 提交失败: {err:#}");
+                            this.commit_error = Some(tr!(
+                                "gitChanges",
+                                "commitFailed",
+                                detail = format!("{err:#}")
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+            window,
+            cx,
+        );
+        if !started {
+            self.notify_gate_busy(cx);
+            return;
+        }
         self.committing = true;
         self.commit_error = None;
         cx.notify();
-        let repo = PathBuf::from(&self.repo_path);
-        let input = self.commit_input.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            // git_commit 走 git CLI(60s 超时兜底 GPG/pre-commit hook 挂起)——
-            // 即便如此也不上主线程跑,hook 慢的仓库会把 UI 卡满整个超时窗口
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    if !stage_paths.is_empty() {
-                        mt_project::git::git_stage(&repo, &stage_paths)?;
-                    }
-                    mt_project::git::git_commit_with(&repo, &message, amend)
-                })
-                .await;
-            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                this.committing = false;
-                match result {
-                    Ok(outcome) => {
-                        input.update(cx, |state, cx| state.set_value("", window, cx));
-                        this.amend = false;
-                        this.amend_info = None;
-                        this.amend_prefill = None;
-                        this.notify_info(
-                            tr!(
-                                "gitCommit",
-                                "committedToast",
-                                hash = outcome.short_hash.clone(),
-                                title = outcome.summary.clone()
-                            ),
-                            cx,
-                        );
-                        this.load(cx);
-                        cx.emit(GitChangesEvent::Committed);
-                        if push {
-                            this.push_after_commit(cx);
-                        }
-                    }
-                    Err(err) => {
-                        // 提交消息留在框里不清,改完(或修好 hook)直接再点
-                        eprintln!("[git] 提交失败: {err:#}");
-                        this.commit_error = Some(tr!(
-                            "gitChanges",
-                            "commitFailed",
-                            detail = format!("{err:#}")
-                        ));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// 提交成功后的推送。失败时提交已经落地,要明确说「已提交,但推送失败」。
-    ///
-    /// 走与推送对话框同一条 `git_push_with`:新分支没有上游时顺带 `-u`(裸 `git push`
-    /// 在这种情况下直接失败),被拒时给出「先拉取」的说明。
-    fn push_after_commit(&mut self, cx: &mut Context<Self>) {
-        use mt_project::git::{PushOptions, PushOutcome};
-
-        self.pushing = true;
-        let repo = PathBuf::from(&self.repo_path);
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(
-                    async move { mt_project::git::git_push_with(&repo, &PushOptions::default()) },
-                )
-                .await;
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                this.pushing = false;
-                let failure = match result {
-                    Ok(PushOutcome::Pushed(target)) => {
-                        this.notify_info(
-                            tr!("gitCommit", "pushedToast", target = target.label()),
-                            cx,
-                        );
-                        // 远程跟踪分支前移了:分支列表 / 历史的远程标记要跟上
-                        cx.emit(GitChangesEvent::Committed);
-                        None
-                    }
-                    Ok(PushOutcome::Rejected { detail }) => Some(format!(
-                        "{}\n{}",
-                        t("gitBranch", "rejectedHint"),
-                        detail.trim()
-                    )),
-                    Err(err) => Some(format!("{err:#}")),
-                };
-                if let Some(detail) = failure {
-                    eprintln!("[git] 提交后推送失败: {detail}");
-                    this.commit_error =
-                        Some(tr!("gitCommit", "pushFailedAfterCommit", detail = detail));
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     fn on_commit_action(
@@ -1371,7 +1379,12 @@ impl GitChanges {
                     Ok(list) => list,
                     Err(err) => {
                         eprintln!("[git] 读取提交消息历史失败: {err:#}");
-                        this.notify_op_failure(format!("{err:#}"), cx);
+                        git_ui::show_git_error(
+                            t("gitChanges", "operationFailedTitle"),
+                            git_ui::error_text(&err),
+                            window,
+                            cx,
+                        );
                         return;
                     }
                 };
@@ -1533,7 +1546,7 @@ impl Render for GitChanges {
             .flex_col()
             // Ctrl/Cmd+Enter 提交、Ctrl/Cmd+Alt+Enter 提交并推送(键位绑在 hotkeys.rs,
             // 谓词 `"GitChanges > Input"` —— 与项目切换器的方向键同一套路)
-            .key_context("GitChanges")
+            .key_context(CHANGES_CONTEXT)
             .on_action(cx.listener(Self::on_commit_action))
             .on_action(cx.listener(Self::on_commit_push_action))
             .child(list)
@@ -1664,7 +1677,7 @@ impl GitChanges {
             Area::Unstaged => (t("panels", "unstagedChanges"), ui::text_muted()),
             Area::Untracked => (t("panels", "untrackedFiles"), ui::text_muted()),
         };
-        let enabled = self.busy_ops == 0;
+        let enabled = self.ops_enabled();
         let key = area.key();
         let mut header = SectionHeader::new(SharedString::from(format!("git-group-{key}")), title)
             .group()
@@ -1685,8 +1698,8 @@ impl GitChanges {
                         enabled,
                     )
                     .when(enabled, |el| {
-                        el.on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.unstage_all(cx);
+                        el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.unstage_all(window, cx);
                         }))
                     }),
                 );
@@ -1716,8 +1729,8 @@ impl GitChanges {
                         enabled,
                     )
                     .when(enabled, |el| {
-                        el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                            this.stage_group(area, cx);
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.stage_group(area, window, cx);
                         }))
                     }),
                 );
@@ -1806,7 +1819,7 @@ impl GitChanges {
         let path = file.path.clone();
         let deleted = matches!(status, Some(GitStatus::Deleted));
         let selected = self.is_selected(area, &path);
-        let enabled = self.busy_ops == 0;
+        let enabled = self.ops_enabled();
 
         // tooltip:完整路径(重命名带旧路径)+ 状态说明(部分暂存另注一句)
         let shown_path = match &file.old_path {
@@ -1866,9 +1879,9 @@ impl GitChanges {
                         enabled,
                     )
                     .when(enabled, |el| {
-                        el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             let paths = this.targets(area, index, cx);
-                            this.unstage(paths, None, cx);
+                            this.unstage(paths, None, window, cx);
                         }))
                     }),
                 );
@@ -1876,9 +1889,9 @@ impl GitChanges {
             Area::Unstaged | Area::Untracked => {
                 let stage = icon_button(id_of("stage"), ICON_PLUS, t("panels", "stage"), enabled);
                 actions = actions.child(stage.when(enabled, |el| {
-                    el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         let paths = this.targets(area, index, cx);
-                        this.stage(paths, None, cx);
+                        this.stage(paths, None, window, cx);
                     }))
                 }));
             }
@@ -1939,7 +1952,7 @@ impl GitChanges {
         let paths = self.targets(area, index, cx);
         let count = paths.len();
         let many = count > 1;
-        let enabled = self.busy_ops == 0;
+        let enabled = self.ops_enabled();
         let counted = |single: &'static str, multi: &'static str| -> String {
             if many {
                 tr!("gitCommit", multi, count = count.to_string())
@@ -1971,9 +1984,9 @@ impl GitChanges {
                     let mut item =
                         MenuItem::new(label)
                             .disabled(!enabled)
-                            .on_click(move |_window, cx| {
+                            .on_click(move |window, cx| {
                                 let paths = paths.clone();
-                                this.update(cx, |this, cx| this.take_side(paths, side, cx));
+                                this.update(cx, |this, cx| this.take_side(paths, side, window, cx));
                             });
                     if deleted {
                         item = item.danger();
@@ -2000,9 +2013,9 @@ impl GitChanges {
                 entries.push(
                     MenuItem::new(counted(t("panels", "unstage"), "unstageSelected"))
                         .disabled(!enabled)
-                        .on_click(move |_window, cx| {
+                        .on_click(move |window, cx| {
                             let paths = paths.clone();
-                            this.update(cx, |this, cx| this.unstage(paths, None, cx));
+                            this.update(cx, |this, cx| this.unstage(paths, None, window, cx));
                         })
                         .into(),
                 );
@@ -2015,9 +2028,9 @@ impl GitChanges {
                     entries.push(
                         MenuItem::new(counted(t("panels", "stage"), "stageSelected"))
                             .disabled(!enabled)
-                            .on_click(move |_window, cx| {
+                            .on_click(move |window, cx| {
                                 let paths = paths.clone();
-                                this.update(cx, |this, cx| this.stage(paths, None, cx));
+                                this.update(cx, |this, cx| this.stage(paths, None, window, cx));
                             })
                             .into(),
                     );
@@ -2080,8 +2093,6 @@ impl GitChanges {
 
         let commit_label = if self.committing {
             t("gitChanges", "committing").to_string()
-        } else if self.pushing {
-            t("gitCommit", "pushing").to_string()
         } else if self.amend {
             t("gitCommit", "amendCommit").to_string()
         } else {
@@ -2180,7 +2191,7 @@ impl GitChanges {
             })
             .when_some(blocker.clone(), |el, reason| el.tip(reason))
             .child(commit_label);
-        let menu_enabled = !self.committing && !self.pushing;
+        let menu_enabled = !self.committing;
         let split = div()
             .id("git-commit-more")
             .flex_none()
@@ -2277,7 +2288,7 @@ impl GitChanges {
             .into_any_element()
     }
 
-    /// ▾ 菜单:提交并推送 / 全部暂存并提交 /(分隔)贮藏当前改动…。
+    /// ▾ 菜单:提交并推送…(提交后打开推送对话框)/ 全部暂存并提交 /(分隔)贮藏当前改动…。
     fn commit_menu(
         &self,
         can_commit: bool,
@@ -2288,6 +2299,7 @@ impl GitChanges {
         let push = {
             let this = this.clone();
             MenuItem::new(t("gitCommit", "commitAndPush"))
+                .detail(t("gitCommit", "commitAndPushDetail"))
                 .shortcut(menu::hotkey_label(true, false, true, "Enter"))
                 .disabled(!can_commit)
                 .on_click(move |window, cx| {

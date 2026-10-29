@@ -1,8 +1,7 @@
 //! 暂存区读写(暂存 / 取消暂存)与 CLI 执行器(超时、进程树、管道)的单测。
 //! 全部走临时仓库,不联网。
 
-use super::branch::test_cli::{cleanup, commit_file, current, git};
-use super::test_support::init_repo_with_file;
+use super::test_support::{cleanup, commit_file, current, git, init_repo_with_file};
 use super::*;
 
 /// 暂存区里有改动的路径(`git diff --cached --name-only`),按 git 的顺序。

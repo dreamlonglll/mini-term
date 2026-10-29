@@ -15,6 +15,11 @@
 //!
 //! # 过滤
 //!
+//! 过滤框里写关键词(标题 / 正文 / 哈希前缀 / 作者),加一段 `path:<路径>` 只看改动了
+//! 这个文件或目录的提交(仓库内相对路径,带空格的写成 `path:"a b/c"`;解析见
+//! [`parse_filter_query`]);「仅我的」胶囊只看自己的提交;分支由分支弹窗的「查看历史」
+//! 决定。几项同时给时取交集。
+//!
 //! 有过滤条件时换走 [`mt_project::git::get_git_log_filtered`]:后端遍历时跳过不命中的
 //! 提交,续页游标由后端原样交回(从已加载列表还原不出「走过但没命中」的那些)。
 //! 后端每次最多扫 `SCAN_BUDGET` 个提交就先交回,这里见「没凑够、还有下文」就接着要,
@@ -40,6 +45,7 @@ mod actions;
 mod detail;
 
 pub use actions::GitLogRewordConfirm;
+pub(crate) use actions::REWORD_CONTEXT;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -98,6 +104,9 @@ const MAX_PILLS: usize = 2;
 /// 历史区窄于这个宽度时,行里只留作者头像、不写作者名。
 const NARROW_WIDTH: f32 = 380.0;
 
+/// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Enter / Ctrl+C / Ctrl+F / Esc)。
+pub(crate) const HISTORY_CONTEXT: &str = "GitHistory";
+
 /// 往上冒的事件。
 pub enum GitHistoryEvent {
     /// pty-output 嗅探命中 → 容器要重新发现仓库(原版的 `refreshRepos()`)。
@@ -113,8 +122,10 @@ pub enum GitHistoryEvent {
 /// 过滤栏的状态。
 struct FilterState {
     input: Entity<InputState>,
-    /// 已生效(去抖后)的关键词。
+    /// 已生效(去抖后)的关键词(过滤框里去掉 `path:` 那一段之后的部分)。
     text: String,
+    /// 已生效的路径过滤(过滤框里 `path:` 那一段,原样;规范化由后端做)。
+    path: Option<String>,
     /// 「仅我的」开关。
     only_mine: bool,
     /// 「仅我的」对应的邮箱(开关打开 / 换仓库时查一次 `user.email`)。
@@ -130,14 +141,70 @@ struct FilterState {
     debounce: Option<Task<()>>,
 }
 
-/// 过滤条件有没有实际生效。「仅我的」查不到邮箱时不算。
-fn filter_active(text: &str, only_mine: bool, email: Option<&str>) -> bool {
-    !text.is_empty() || (only_mine && email.is_some())
+/// 过滤条件有没有实际生效。「仅我的」查不到邮箱时不算;路径规范化后是仓库根也不算。
+fn filter_active(text: &str, path: Option<&str>, only_mine: bool, email: Option<&str>) -> bool {
+    !text.is_empty()
+        || path.and_then(mt_project::git::normalize_log_path).is_some()
+        || (only_mine && email.is_some())
+}
+
+/// 过滤框的输入 → `(关键词, 路径)`。
+///
+/// 以 `path:` 开头的那一段(不分大小写,前面得是开头或空白)是路径过滤,其余是关键词:
+/// - 值到下一个空白为止;以 `"` 开头时到下一个 `"` 为止(路径里带空格);
+/// - 写了几段 `path:` 取最后一段,值为空的那段不算;
+/// - 关键词去掉首尾空白,被 `path:` 段隔开的两半用一个空格接上(其余空白原样)。
+///
+/// 关键词里真要搜 `path:` 这几个字的,写在词中间(`xpath:`)不受影响。
+fn parse_filter_query(input: &str) -> (String, Option<String>) {
+    const PREFIX: &str = "path:";
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut path = None;
+    let mut rest = input.trim();
+    loop {
+        let start = rest.char_indices().map(|(i, _)| i).find(|&i| {
+            let at_token = i == 0 || rest[..i].ends_with(char::is_whitespace);
+            at_token
+                && rest
+                    .get(i..i + PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+        });
+        let Some(start) = start else {
+            text_parts.push(rest);
+            break;
+        };
+        text_parts.push(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        let (value, remain) = match after.strip_prefix('"') {
+            Some(quoted) => match quoted.find('"') {
+                Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                None => (quoted, ""),
+            },
+            None => after.split_at(after.find(char::is_whitespace).unwrap_or(after.len())),
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            path = Some(value.to_string());
+        }
+        rest = remain;
+    }
+    let text = text_parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (text, path)
 }
 
 impl FilterState {
     fn active(&self) -> bool {
-        filter_active(&self.text, self.only_mine, self.email.as_deref())
+        filter_active(
+            &self.text,
+            self.path.as_deref(),
+            self.only_mine,
+            self.email.as_deref(),
+        )
     }
 
     fn as_filter(&self) -> LogFilter {
@@ -148,6 +215,7 @@ impl FilterState {
             } else {
                 None
             },
+            path: self.path.clone(),
         }
     }
 }
@@ -235,6 +303,7 @@ impl GitHistoryContent {
             filter: FilterState {
                 input,
                 text: String::new(),
+                path: None,
                 only_mine: false,
                 email: None,
                 no_email: false,
@@ -533,15 +602,16 @@ impl GitHistoryContent {
         }));
     }
 
-    /// 把输入框里的关键词生效。与当前生效的相同就什么都不做(幂等:清空按钮与
+    /// 把输入框里的关键词 / 路径生效。与当前生效的相同就什么都不做(幂等:清空按钮与
     /// 去抖可能先后各来一次)。
     fn apply_filter(&mut self, cx: &mut Context<Self>) {
         self.filter.debounce = None;
-        let text = self.filter.input.read(cx).value().trim().to_string();
-        if text == self.filter.text {
+        let (text, path) = parse_filter_query(&self.filter.input.read(cx).value());
+        if text == self.filter.text && path == self.filter.path {
             return;
         }
         self.filter.text = text;
+        self.filter.path = path;
         self.restart(cx);
     }
 
@@ -561,8 +631,9 @@ impl GitHistoryContent {
             .input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.filter.debounce = None;
-        if !self.filter.text.is_empty() || had_mine {
+        if !self.filter.text.is_empty() || self.filter.path.is_some() || had_mine {
             self.filter.text.clear();
+            self.filter.path = None;
             self.restart(cx);
         }
         cx.notify();
@@ -741,7 +812,8 @@ impl GitHistoryContent {
         );
     }
 
-    /// 取文件列表 → 打开提交 diff(`initial` = 先选中哪个文件)。
+    /// 取文件列表 → 打开提交 diff(`initial` = 先选中哪个文件)。失败口径见
+    /// [`git_diff::open_commit_diff_loading`]。
     fn open_commit_diff(
         &self,
         hash: String,
@@ -750,33 +822,15 @@ impl GitHistoryContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repo = self.repo_path.clone();
-        let store = self.store.clone();
-        let repo_for_task = PathBuf::from(&repo);
-        let hash_for_task = hash.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let files =
-                cx.background_executor()
-                    .spawn(async move {
-                        mt_project::git::get_commit_files(&repo_for_task, &hash_for_task)
-                    })
-                    .await;
-            let files = match files {
-                Ok(files) => files,
-                Err(err) => {
-                    let _ = this.update(cx, |this: &mut Self, cx| {
-                        this.toast_failure("action.viewChanges", &err, cx);
-                    });
-                    return;
-                }
-            };
-            let _ = cx.update(|window, cx| match initial {
-                None => git_diff::open_commit_diff(store, repo, hash, message, files, window, cx),
-                Some(_) => git_diff::open_commit_diff_at(
-                    store, repo, hash, message, files, initial, window, cx,
-                ),
-            });
-        })
+        git_diff::open_commit_diff_loading(
+            self.store.clone(),
+            self.repo_path.clone(),
+            hash,
+            message,
+            initial,
+            window,
+            cx,
+        )
         .detach();
     }
 
@@ -846,37 +900,29 @@ impl GitHistoryContent {
         refs
     }
 
-    // ── toast(走 Git 面板共用的结果 toast) ──────────────
+    // ── 结果展示(成功走 Git 面板共用的结果 toast,失败走详情框) ──
 
     /// 成功摘要(信息档:`i` 图标,点击只关闭)。
     fn toast_info(&self, message: String, cx: &mut App) {
         git_ui::toast(&self.store, message, Tone::Info, cx);
     }
 
-    /// 失败(需要留意那一档,正文带 git 的原文)。`action` 是 `gitLog.action.*` 的 key。
-    fn toast_failure(&self, action: &'static str, err: &anyhow::Error, cx: &mut App) {
+    /// 菜单直接触发的操作失败:弹可选中复制原文的详情框(与面板上的操作同一口径,见
+    /// [`git_ui::show_git_error`])。`action` 是 `gitLog.action.*` 的 key。
+    fn show_failure(
+        &self,
+        action: &'static str,
+        err: &anyhow::Error,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         eprintln!("[git] {action} 失败: {err:#}");
-        let detail = error_text(err);
-        git_ui::toast(
-            &self.store,
-            tr!(
-                "gitLog",
-                "toast.failed",
-                action = t("gitLog", action),
-                detail = detail
-            ),
-            Tone::Attention,
+        git_ui::show_git_error(
+            tr!("gitBranch", "opFailed", op = t("gitLog", action)),
+            git_ui::error_text(err),
+            window,
             cx,
         );
-    }
-}
-
-/// 失败的可展示原因:git 的 stderr 原文收掉首尾空白;空的(git 没吭声就非零退出)给个兜底。
-fn error_text(err: &anyhow::Error) -> String {
-    let text = format!("{err:#}");
-    match text.trim() {
-        "" => "git failed".to_string(),
-        trimmed => trimmed.to_string(),
     }
 }
 
@@ -971,7 +1017,7 @@ impl Render for GitHistoryContent {
         let this = cx.entity();
         let mut root = div()
             .id("git-history")
-            .key_context("GitHistory")
+            .key_context(HISTORY_CONTEXT)
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -1043,13 +1089,15 @@ impl GitHistoryContent {
                 this.clear_filter_text(window, cx);
             }))
         });
+        // 搜索图标上挂完整的语法说明(占位符放不下 `path:` 的全部写法)
+        let syntax_hint = div()
+            .id("git-log-filter-syntax")
+            .pl(px(2.0))
+            .child(icon(ICON_SEARCH, git_ui::ICON_SIZE, ui::text_muted()))
+            .tip(t("gitLog", "filter.syntaxTip"));
         let input = div().flex_1().min_w_0().child(
             Input::new(&self.filter.input)
-                .prefix(div().pl(px(2.0)).child(icon(
-                    ICON_SEARCH,
-                    git_ui::ICON_SIZE,
-                    ui::text_muted(),
-                )))
+                .prefix(syntax_hint)
                 .when_some(clear_text, |el, btn| el.suffix(btn)),
         );
 
@@ -1814,17 +1862,58 @@ mod tests {
         assert!(lines[1].starts_with("tester · ") && lines[1].ends_with("abcdef1"));
     }
 
-    /// 过滤条件:「仅我的」查不到邮箱时不算生效;两项都给时一起带下去。
+    /// 过滤条件:「仅我的」查不到邮箱时不算生效;路径是仓库根不算;几项都给时一起带下去。
     #[test]
     fn 过滤条件是否生效() {
-        assert!(!filter_active("", false, None));
-        assert!(!filter_active("", true, None), "没有邮箱不算");
-        assert!(filter_active("", true, Some("me@x.y")));
+        assert!(!filter_active("", None, false, None));
+        assert!(!filter_active("", None, true, None), "没有邮箱不算");
+        assert!(filter_active("", None, true, Some("me@x.y")));
         assert!(
-            !filter_active("", false, Some("me@x.y")),
+            !filter_active("", None, false, Some("me@x.y")),
             "开关关着邮箱不算"
         );
-        assert!(filter_active("fix", false, None));
+        assert!(filter_active("fix", None, false, None));
+        assert!(filter_active("", Some("src/ui"), false, None));
+        assert!(
+            !filter_active("", Some("./"), false, None),
+            "仓库根 = 不过滤"
+        );
+    }
+
+    /// 过滤框解析:`path:` 段拆出来当路径,其余是关键词;引号包住带空格的路径;
+    /// 多段取最后一段;词中间的 `path:` 不算;空值不算。
+    #[test]
+    fn 过滤框解析路径段() {
+        let parse = |s: &str| {
+            let (text, path) = parse_filter_query(s);
+            (text, path.unwrap_or_default())
+        };
+        let pair = |text: &str, path: &str| (text.to_string(), path.to_string());
+        assert_eq!(parse("fix bug"), pair("fix bug", ""));
+        assert_eq!(
+            parse("  fix  bug  "),
+            pair("fix  bug", ""),
+            "关键词里的空白原样"
+        );
+        assert_eq!(parse("path:src/ui"), pair("", "src/ui"));
+        assert_eq!(parse("fix path:src/ui bug"), pair("fix bug", "src/ui"));
+        assert_eq!(parse("PATH:src fix"), pair("fix", "src"), "前缀不分大小写");
+        assert_eq!(
+            parse(r#"path:"my dir/a b.rs" fix"#),
+            pair("fix", "my dir/a b.rs")
+        );
+        assert_eq!(
+            parse(r#"fix path:"unterminated x"#),
+            pair("fix", "unterminated x")
+        );
+        assert_eq!(parse("path:a path:b"), pair("", "b"), "多段取最后一段");
+        assert_eq!(parse("xpath:abc"), pair("xpath:abc", ""), "词中间的不算");
+        assert_eq!(parse("fix path:"), pair("fix", ""), "空值不算");
+        assert_eq!(
+            parse("中文 path:文档/说明.md"),
+            pair("中文", "文档/说明.md")
+        );
+        assert_eq!(parse(""), pair("", ""));
     }
 
     /// 贝塞尔采样:两端点必须落在路径端点上(渐变分段接得住)。

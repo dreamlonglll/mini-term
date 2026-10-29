@@ -456,44 +456,49 @@ pub fn bind_keys(cx: &mut App) {
     // Git 分支弹窗:↑↓ 移动高亮、→ 弹出高亮分支的操作菜单。与项目切换器同一套理由
     // (谓词与 `Input` 同深度才压得过它自带的 up/down/right);→ 只在光标位于搜索词
     // 末尾时才接管,否则处理器 `propagate()` 让给输入框的 MoveRight(见 git_branches)。
+    let branch_popup = format!("{} > Input", crate::git_branches::BRANCH_POPUP_CONTEXT);
+    let branch_popup = Some(branch_popup.as_str());
     bindings.push(KeyBinding::new(
         "up",
         crate::git_branches::BranchPopupPrev,
-        Some("GitBranchPopup > Input"),
+        branch_popup,
     ));
     bindings.push(KeyBinding::new(
         "down",
         crate::git_branches::BranchPopupNext,
-        Some("GitBranchPopup > Input"),
+        branch_popup,
     ));
     bindings.push(KeyBinding::new(
         "right",
         crate::git_branches::BranchPopupMenu,
-        Some("GitBranchPopup > Input"),
+        branch_popup,
     ));
 
     // Git 提交框的 Ctrl/Cmd+Enter(`GitChanges.tsx:411-415`)。**不进快捷键表** ——
     // 原版它是 textarea 的 onKeyDown,不在 hotkeys.ts 里。谓词同上要与 `Input` 同深度。
+    let commit_box = format!("{} > Input", git_changes::CHANGES_CONTEXT);
+    let commit_box = Some(commit_box.as_str());
     bindings.push(KeyBinding::new(
         "ctrl-enter",
         git_changes::GitCommitMessage,
-        Some("GitChanges > Input"),
+        commit_box,
     ));
     bindings.push(KeyBinding::new(
         "cmd-enter",
         git_changes::GitCommitMessage,
-        Some("GitChanges > Input"),
+        commit_box,
     ));
-    // 提交并推送(Ctrl/Cmd+Alt+Enter),同一个谓词。
+    // 提交并推送(Ctrl/Cmd+Alt+Enter),同一个谓词:提交成功后打开推送对话框(预选当前
+    // 分支),确认了才推 —— 与 IDEA 的 Commit and Push 一致。
     bindings.push(KeyBinding::new(
         "ctrl-alt-enter",
         git_changes::GitCommitAndPush,
-        Some("GitChanges > Input"),
+        commit_box,
     ));
     bindings.push(KeyBinding::new(
         "cmd-alt-enter",
         git_changes::GitCommitAndPush,
-        Some("GitChanges > Input"),
+        commit_box,
     ));
 
     // 更改列表的键盘操作(↑/↓ 选择、Space 暂存切换、Enter 看 diff、Delete 丢弃)。
@@ -554,58 +559,61 @@ pub fn bind_keys(cx: &mut App) {
     // `GitHistory` 比 `Workspace` 深,Ctrl+F 在历史区里归过滤框、出了历史区照旧是
     // 终端查找;过滤框自己的 ↑/↓/Enter/Ctrl+C 绑在更深的 `Input` 上,先轮到它。
     // Esc 要与 `Input` 同深度才压得过输入框自带的那条(理由同项目切换器)。
+    let history = Some(git_history::HISTORY_CONTEXT);
     bindings.push(KeyBinding::new(
         "up",
         git_history::GitLogSelectPrev,
-        Some("GitHistory"),
+        history,
     ));
     bindings.push(KeyBinding::new(
         "down",
         git_history::GitLogSelectNext,
-        Some("GitHistory"),
+        history,
     ));
     bindings.push(KeyBinding::new(
         "enter",
         git_history::GitLogOpenSelected,
-        Some("GitHistory"),
+        history,
     ));
     for keystroke in ["ctrl-c", "cmd-c"] {
         bindings.push(KeyBinding::new(
             keystroke,
             git_history::GitLogCopyHash,
-            Some("GitHistory"),
+            history,
         ));
     }
     for keystroke in ["ctrl-f", "cmd-f"] {
         bindings.push(KeyBinding::new(
             keystroke,
             git_history::GitLogFocusFilter,
-            Some("GitHistory"),
+            history,
         ));
     }
+    let history_input = format!("{} > Input", git_history::HISTORY_CONTEXT);
     bindings.push(KeyBinding::new(
         "escape",
         git_history::GitLogClearFilter,
-        Some("GitHistory > Input"),
+        Some(history_input.as_str()),
     ));
     // 「修改提交消息」多行框里回车是换行,Ctrl/Cmd+Enter 才是确认
+    let reword_input = format!("{} > Input", git_history::REWORD_CONTEXT);
     for keystroke in ["ctrl-enter", "cmd-enter"] {
         bindings.push(KeyBinding::new(
             keystroke,
             git_history::GitLogRewordConfirm,
-            Some("GitLogReword > Input"),
+            Some(reword_input.as_str()),
         ));
     }
     // 单文件历史弹窗:↑/↓ 换提交
     bindings.push(KeyBinding::new(
         "up",
         git_file_history::FileHistoryPrev,
-        Some("GitFileHistory"),
+        Some(git_file_history::FILE_HISTORY_CONTEXT),
     ));
     bindings.push(KeyBinding::new(
         "down",
         git_file_history::FileHistoryNext,
-        Some("GitFileHistory"),
+        Some(git_file_history::FILE_HISTORY_CONTEXT),
     ));
     // 贮藏列表弹窗:↑/↓ 换贮藏,Delete 删除(先确认);Enter 应用走 Dialog 自己的 Confirm
     bindings.push(KeyBinding::new(

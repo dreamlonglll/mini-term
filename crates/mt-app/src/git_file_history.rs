@@ -42,6 +42,9 @@ gpui::actions!(
     ]
 );
 
+/// 单文件历史弹窗的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓)。
+pub(crate) const FILE_HISTORY_CONTEXT: &str = "GitFileHistory";
+
 /// 每页条数。弹窗里一屏能放二十来条,一页给够两屏。
 const PAGE_SIZE: usize = 50;
 /// 左栏行高(两行布局)。uniform_list 要求等高。
@@ -130,7 +133,7 @@ pub fn open(
                     .h(body_h)
                     .flex()
                     .overflow_hidden()
-                    .key_context("GitFileHistory")
+                    .key_context(FILE_HISTORY_CONTEXT)
                     .track_focus(&focus)
                     .on_action(move |_: &FileHistoryPrev, _window, cx| {
                         move_selection(&prev, -1, cx)
@@ -278,34 +281,8 @@ fn open_in_commit_diff(
     let Some((store, repo, hash, message, path)) = target else {
         return;
     };
-    window
-        .spawn(cx, async move |cx| {
-            let (task_repo, task_hash) = (PathBuf::from(&repo), hash.clone());
-            let files = cx
-                .background_executor()
-                .spawn(async move { mt_project::git::get_commit_files(&task_repo, &task_hash) })
-                .await;
-            let _ = cx.update(|window, cx| match files {
-                Ok(files) => git_diff::open_commit_diff_at(
-                    store,
-                    repo,
-                    hash,
-                    message,
-                    files,
-                    Some(path),
-                    window,
-                    cx,
-                ),
-                // 弹窗遮罩下 toast 看不见,失败退到提示框
-                Err(err) => crate::prompt::show_alert(
-                    t("gitLog", "fileHistory.viewInCommit"),
-                    format!("{err:#}"),
-                    window,
-                    cx,
-                ),
-            });
-        })
-        .detach();
+    // 弹窗遮罩下 toast 看不见:取文件失败弹详情框(见 `open_commit_diff_loading`)
+    git_diff::open_commit_diff_loading(store, repo, hash, message, Some(path), window, cx).detach();
 }
 
 // ─── 渲染 ─────────────────────────────────────────────────────
