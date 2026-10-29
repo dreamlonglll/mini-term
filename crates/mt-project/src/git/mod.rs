@@ -1948,7 +1948,11 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::init_repo_with_file;
     use super::*;
 
     #[test]
@@ -2140,33 +2144,6 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("mini-term-git-commit-absent-{ts}"));
         let err = git_commit(&missing, "msg").unwrap_err().to_string();
         assert!(err.contains("不是有效目录"), "实际错误: {err}");
-    }
-
-    /// 用 git2 搭一个只有一次提交、只含 `rel` 一个文件的仓库,返回仓库根。
-    ///
-    /// 对根做 canonicalize(Windows 顺带剥掉 `\\?\` 前缀):libgit2 会对路径做 realpath,
-    /// macOS 的 `/var` → `/private/var`、GitHub Windows runner 临时目录的 8.3 短路径
-    /// (`RUNNER~1` → `runneradmin`)都会让「文件相对 workdir 的路径」算歪。
-    fn init_repo_with_file(tag: &str, rel: &str, content: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("mini-term-git-{tag}-{ts}"));
-        std::fs::create_dir_all(&root).unwrap();
-        let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
-        let repo = Repository::init(&root).unwrap();
-        let abs = root.join(rel);
-        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
-        std::fs::write(&abs, content).unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new(rel)).unwrap();
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = git2::Signature::now("mini-term", "test@example.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
-            .unwrap();
-        root
     }
 
     fn diff_lines(result: &GitDiffResult) -> Vec<(String, String)> {
