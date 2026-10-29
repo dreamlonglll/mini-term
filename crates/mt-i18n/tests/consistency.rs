@@ -131,8 +131,10 @@ use mt_i18n::{
 /// 弹窗的就地校验、推送对话框、Fetch / 拉取方式 / 推送的 tooltip 与结果摘要、
 /// 进行中操作横幅、各类确认框与失败详情框）与 `gitLog` 146 条（提交历史的右键操作 /
 /// 过滤栏 / 提交详情 / 标签 / 单文件历史）。
-const EXPECTED_NAMESPACES: usize = 36;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1315;
+/// 1315 → 1389（36 → 37 个命名空间）：`gitStash` 74 条 —— 贮藏列表弹窗（应用 / 弹出 /
+/// 删除 / 全部清除 / 从贮藏新建分支 / 查看内容）、新建贮藏弹窗与「贮藏后检出」确认框。
+const EXPECTED_NAMESPACES: usize = 37;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1389;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -151,6 +153,7 @@ const TS_NAMESPACES: &[&str] = &[
     "gitHistory",
     "gitHistoryContent",
     "gitLog",
+    "gitStash",
     "markerList",
     "mobileRelay",
     "paneGroup",

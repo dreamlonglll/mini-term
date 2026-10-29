@@ -20,6 +20,7 @@ import { gitChanges } from './gitChanges';
 import { gitBranch } from './gitBranch';
 import { gitCommit } from './gitCommit';
 import { gitLog } from './gitLog';
+import { gitStash } from './gitStash';
 import { worktree } from './worktree';
 import { search } from './search';
 import { sessionList } from './sessionList';
@@ -61,6 +62,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitBranch: gitBranch.zh,
     gitCommit: gitCommit.zh,
     gitLog: gitLog.zh,
+    gitStash: gitStash.zh,
     worktree: worktree.zh,
     search: search.zh,
     sessionList: sessionList.zh,
@@ -99,6 +101,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitBranch: gitBranch.en,
     gitCommit: gitCommit.en,
     gitLog: gitLog.en,
+    gitStash: gitStash.en,
     worktree: worktree.en,
     search: search.en,
     sessionList: sessionList.en,

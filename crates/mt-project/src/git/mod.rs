@@ -2000,6 +2000,7 @@ mod hunk;
 mod log_ops;
 mod log_query;
 mod repo_state;
+mod stash;
 mod sync;
 mod tags;
 pub use branch::*;
@@ -2009,6 +2010,7 @@ pub use hunk::*;
 pub use log_ops::*;
 pub use log_query::*;
 pub use repo_state::*;
+pub use stash::*;
 pub use sync::*;
 pub use tags::*;
 
