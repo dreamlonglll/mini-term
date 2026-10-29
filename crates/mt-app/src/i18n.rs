@@ -570,6 +570,7 @@ const USED_KEYS: &[&str] = &[
     "gitCommit.blockNothingStaged",
     "gitCommit.blockNothingStagedHint",
     "gitCommit.blockNothingToStage",
+    "gitCommit.changeTotal",
     "gitCommit.commitAndPush",
     "gitCommit.commitAndPushDetail",
     "gitCommit.committedToast",

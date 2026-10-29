@@ -95,6 +95,23 @@ fn 改写一行归成一块修改() {
     assert_eq!(hunks, vec![hunk(Modified, 1, 3, 1, 2)]);
 }
 
+/// 末尾追加一个函数、前面另有改动:新增块标在 git 的位置(第 5–8 行,0 起是 4..8),
+/// 不把原来那个没改的 `}` 算进去(E2E 报的 gutter 与 diff 都错一行)。
+#[test]
+fn 尾部追加函数_标在与_git_相同的行() {
+    let old = "x\nfunction a() {\n  return 1;\n}\n";
+    let new = "X\nfunction a() {\n  return 1;\n}\n\nfunction b() {\n  return 2;\n}\n";
+    assert_eq!(
+        line_hunks(old, new),
+        vec![hunk(Modified, 0, 1, 0, 1), hunk(Added, 4, 4, 4, 0)]
+    );
+    // 重复行插在中间:标在下面那一行(git 的 `@@ -2,0 +3 @@`)
+    assert_eq!(
+        line_hunks("a\nb\nc\n", "a\nb\nb\nc\n"),
+        vec![hunk(Added, 2, 1, 2, 0)]
+    );
+}
+
 /// 父模块的 LCS 在这种文件上会越过 `MAX_LCS_CELLS` 退化成整块替换(4000 行首尾各改
 /// 一行,中段 4000×4000 = 1600 万格)。Myers 只看编辑距离,照样给出两块精确的标记。
 #[test]

@@ -862,6 +862,7 @@ impl FileViewer {
         window.defer(cx, move |window, cx| {
             let file = crate::git_diff::DiffFile {
                 path: rel,
+                old_path: None,
                 side: DiffSide::Working,
                 status_label: "M".to_string(),
                 hunk_actions: false,

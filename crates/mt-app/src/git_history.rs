@@ -408,6 +408,18 @@ impl GitHistoryContent {
         }
     }
 
+    /// 全部摊开要多高(过滤栏 44 + 列表上下留白 8 + 全部提交行)。Git 面板分「更改 /
+    /// 提交历史」两块高度时用(`git_panel::section_split`):历史比分到的矮就把富余让给
+    /// 「更改」。还在加载、还有下一页、选中了提交(详情区要地方)、列表为空时说不准,`None`。
+    pub fn natural_height(&self) -> Option<f32> {
+        let unsure = self.repo_path.is_empty()
+            || self.loading
+            || self.has_more
+            || self.selected.is_some()
+            || self.commits.is_empty();
+        (!unsure).then_some(44.0 + 8.0 + 2.0 + self.commits.len() as f32 * GRAPH_ROW_HEIGHT)
+    }
+
     fn load_page(&mut self, first: bool, cx: &mut Context<Self>) {
         if self.repo_path.is_empty() || self.loading {
             return;

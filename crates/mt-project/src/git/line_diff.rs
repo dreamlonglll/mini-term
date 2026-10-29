@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use git2::{ObjectType, Repository};
 
+use super::slide::compact_ops;
 use super::{
     MAX_DIFF_BYTES, MAX_LCS_CELLS, common_affix, discover_repo_for, edit_script, lcs_workload,
     repo_relative_path,
@@ -126,7 +127,9 @@ fn line_ops(old: &[&str], new: &[&str], max_d: usize) -> Vec<(char, usize, usize
         }
     }
     ops.extend((0..tail).map(|k| ('=', old.len() - tail + k, new.len() - tail + k)));
-    ops
+    // 改动块按 git 的口径滑到位(`slide` 模块注释):gutter 的竖条与 diff 弹窗、`git diff`
+    // 标在同几行,剥前后缀把末尾那个没改的 `}` 算进新增块的毛病也一并没了
+    compact_ops(&ops, old, new)
 }
 
 /// Myers 最短编辑脚本(下标相对传入的切片)。编辑距离超过 `max_d` 返回 `None`。

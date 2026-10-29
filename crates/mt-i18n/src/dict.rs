@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1417;
+pub const ZH_ENTRY_COUNT: usize = 1418;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1417;
+pub const EN_ENTRY_COUNT: usize = 1418;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -970,6 +970,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("blockNothingStaged", "暂存区为空：先暂存要提交的改动"),
     ("blockNothingStagedHint", "暂存区为空：先暂存要提交的改动，或用 ▾ 里的「全部暂存并提交」"),
     ("blockNothingToStage", "没有可暂存的已跟踪改动"),
+    ("changeTotal", "共 {count} 处"),
     ("commitAndPush", "提交并推送…"),
     ("commitAndPushDetail", "提交成功后打开推送对话框，确认后才推送"),
     ("committedToast", "已提交 {hash}：{title}"),
@@ -1048,6 +1049,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("blockNothingStaged", "Nothing staged: stage the changes you want to commit"),
     ("blockNothingStagedHint", "Nothing staged: stage the changes you want to commit, or use \"Stage All and Commit\" under ▾"),
     ("blockNothingToStage", "No tracked changes to stage"),
+    ("changeTotal", "{count} change(s)"),
     ("commitAndPush", "Commit and Push…"),
     ("commitAndPushDetail", "Opens the push dialog after committing; nothing is pushed until you confirm"),
     ("committedToast", "Committed {hash}: {title}"),

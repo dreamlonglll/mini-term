@@ -1,5 +1,5 @@
 //! 仓库级状态:进行中的合并 / 变基 / 拣选 / 还原(含继续与中止),以及 Git 面板
-//! 自动刷新要用的 `.git` 目录布局、事件过滤与状态签名。
+//! 自动刷新要用的 `.git` 目录布局、事件过滤与状态签名、工作区监听的目录清单。
 //!
 //! # 进行中的操作
 //!
@@ -337,6 +337,101 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// 工作区监听(「更改」列表跟上外部改动)
+// ---------------------------------------------------------------------------
+
+/// 工作区监听一次最多挂多少个目录。监听器非递归(一个目录一条),Windows 上每条常驻
+/// 一块 16 KB 的变更缓冲 —— 256 条约 4 MB。按广度优先挂,超出时丢的是最深的那些目录,
+/// 它们里面的变化由 `.git` 监听 / 终端输出嗅探 / 手动刷新兜底。
+pub const WORKTREE_WATCH_DIR_LIMIT: usize = 256;
+
+/// 不论写没写进 `.gitignore` 都不挂的目录:git 自己的目录与依赖 / 构建产物(文件数常以万计)。
+const WORKTREE_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
+
+/// [`worktree_watch_dirs`] 的结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeWatchDirs {
+    /// 工作区根在第一个,其余广度优先(浅的在前)
+    pub dirs: Vec<PathBuf>,
+    /// 目录比 [`WORKTREE_WATCH_DIR_LIMIT`] 多,没挂全
+    pub truncated: bool,
+}
+
+/// 「更改」列表要盯的工作区目录:工作区根 + 没被忽略的子目录,广度优先。
+///
+/// 跳过 `.git`、嵌套仓库 / 子模块(目录里有 `.git`,改动不归这个仓库的状态管)、忽略规则
+/// 命中的目录(`.gitignore` / `info/exclude` / 全局排除,由 libgit2 判)、
+/// [`WORKTREE_SKIP_DIRS`] 与符号链接(不顺着它跳出工作区)。路径以 `repo_path` 为根拼出来,
+/// 事件回来时按同一个根求相对路径([`any_unignored_change`])。
+///
+/// **阻塞**(逐层读目录,最多读 [`WORKTREE_WATCH_DIR_LIMIT`] 个),调用方放后台执行器。
+pub fn worktree_watch_dirs(repo_path: &Path) -> Result<WorktreeWatchDirs> {
+    let repo = Repository::open(repo_path)?;
+    let root = trim_dir(repo_path);
+    let mut out = WorktreeWatchDirs {
+        dirs: vec![root.clone()],
+        truncated: false,
+    };
+    let mut queue = std::collections::VecDeque::from([(root, String::new())]);
+    'walk: while let Some((dir, rel)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // `DirEntry::file_type` 不跟随符号链接:链接出去的目录不算
+        let mut children: Vec<(PathBuf, String)> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                (!WORKTREE_SKIP_DIRS.contains(&name.as_str()))
+                    .then(|| (e.path(), format!("{rel}{name}/")))
+            })
+            .collect();
+        children.sort();
+        for (abs, child_rel) in children {
+            if abs.join(".git").exists() || repo.is_path_ignored(&child_rel).unwrap_or(false) {
+                continue;
+            }
+            if out.dirs.len() >= WORKTREE_WATCH_DIR_LIMIT {
+                out.truncated = true;
+                break 'walk;
+            }
+            out.dirs.push(abs.clone());
+            queue.push_back((abs, child_rel));
+        }
+    }
+    Ok(out)
+}
+
+/// 一批工作区变化里有没有**没被忽略**的路径。全是被忽略的(构建日志、编辑器的临时
+/// 文件)就不必重取「更改」列表。
+///
+/// `paths` 是监听报上来的绝对路径(以 `repo_path` 为根拼的,见 [`worktree_watch_dirs`]);
+/// `.git` 下的一律不算;求不出相对路径的按「没被忽略」算 —— 宁可多刷一次。
+pub fn any_unignored_change(repo_path: &Path, paths: &[PathBuf]) -> Result<bool> {
+    let repo = Repository::open(repo_path)?;
+    let root = trim_dir(repo_path);
+    for path in paths {
+        let Ok(rel) = path.strip_prefix(&root) else {
+            return Ok(true);
+        };
+        let parts: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        match parts.first() {
+            None => continue,
+            Some(first) if first == ".git" => continue,
+            Some(_) => {}
+        }
+        if !repo.is_path_ignored(parts.join("/")).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -628,6 +723,54 @@ mod tests {
         cleanup(&[&root]);
     }
 
+    /// 工作区监听目录:根在第一个、其余广度优先;`.git`、被忽略的目录、node_modules /
+    /// target、嵌套仓库都不挂。变化过滤:被忽略的路径与 `.git` 下的不算,其余算。
+    #[test]
+    fn 工作区监听目录与变化过滤() {
+        let root = init_repo_with_file("state-worktree", "src/a.txt", "a\n");
+        for dir in [
+            "src/deep/er",
+            "docs",
+            "build/out",
+            "node_modules/x",
+            "target/debug",
+            "nested/.git",
+            "logs",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "build/\n*.log\n").unwrap();
+
+        let watch = worktree_watch_dirs(&root).unwrap();
+        let rel: Vec<String> = watch
+            .dirs
+            .iter()
+            .map(|d| {
+                d.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(
+            rel,
+            vec!["", "docs", "logs", "src", "src/deep", "src/deep/er"]
+        );
+        assert!(!watch.truncated);
+
+        let ignored_only = [
+            root.join("x.log"),
+            root.join(".git").join("index"),
+            root.join("build").join("o.txt"),
+        ];
+        assert!(!any_unignored_change(&root, &ignored_only).unwrap());
+        assert!(
+            any_unignored_change(&root, &[root.join("x.log"), root.join("src").join("a.txt")])
+                .unwrap()
+        );
+        cleanup(&[&root]);
+    }
+
     /// `.git` 下(objects 除外)每个文件的 (修改时间, 长度)。
     fn snapshot(git_dir: &Path) -> BTreeMap<PathBuf, (SystemTime, u64)> {
         let mut out = BTreeMap::new();
@@ -672,6 +815,8 @@ mod tests {
         super::super::stash_count(&work).unwrap();
         repo_signature(&work).unwrap();
         git_watch_dirs(&git_dir_layout(&work).unwrap());
+        worktree_watch_dirs(&work).unwrap();
+        any_unignored_change(&work, &[work.join("new.txt")]).unwrap();
 
         assert_eq!(
             snapshot(&git_dir),
