@@ -659,32 +659,41 @@ pub fn get_git_log(
             walk.discover(oid);
         }
     } else {
-        let tip = match branch {
-            Some(b) => {
-                // 先找本地 refs/heads/<b>,再找远程 refs/remotes/<b>
-                // worktree 持有的分支也在 refs/heads/ 下(与主 repo 共享 refs 存储),天然支持
-                let local_ref = format!("refs/heads/{}", b);
-                let remote_ref = format!("refs/remotes/{}", b);
-                let reference = repo
-                    .find_reference(&local_ref)
-                    .or_else(|_| repo.find_reference(&remote_ref))
-                    .map_err(|_| anyhow!("未找到分支:{}", b))?;
-                reference
-                    .peel_to_commit()
-                    .map_err(|_| anyhow!("分支 {} 无有效 target", b))?
-                    .id()
-            }
-            None => match repo.head() {
-                Ok(head) => head.peel_to_commit()?.id(),
-                // 空仓库:HEAD 指向还没出生的分支,没有历史可列
-                Err(e) if e.code() == git2::ErrorCode::UnbornBranch => return Ok(Vec::new()),
-                Err(e) => return Err(e.into()),
-            },
-        };
-        walk.discover(tip);
+        match log_tip(&repo, branch)? {
+            Some(tip) => walk.discover(tip),
+            None => return Ok(Vec::new()),
+        }
     }
 
     Ok(walk.take(limit))
+}
+
+/// 首页的起点:`branch`(`None` = HEAD)指向的提交。空仓库(HEAD 未出生)是 `None`。
+fn log_tip(repo: &Repository, branch: Option<&str>) -> Result<Option<Oid>> {
+    match branch {
+        Some(b) => {
+            // 先找本地 refs/heads/<b>,再找远程 refs/remotes/<b>
+            // worktree 持有的分支也在 refs/heads/ 下(与主 repo 共享 refs 存储),天然支持
+            let local_ref = format!("refs/heads/{}", b);
+            let remote_ref = format!("refs/remotes/{}", b);
+            let reference = repo
+                .find_reference(&local_ref)
+                .or_else(|_| repo.find_reference(&remote_ref))
+                .map_err(|_| anyhow!("未找到分支:{}", b))?;
+            Ok(Some(
+                reference
+                    .peel_to_commit()
+                    .map_err(|_| anyhow!("分支 {} 无有效 target", b))?
+                    .id(),
+            ))
+        }
+        None => match repo.head() {
+            Ok(head) => Ok(Some(head.peel_to_commit()?.id())),
+            // 空仓库:HEAD 指向还没出生的分支,没有历史可列
+            Err(e) if e.code() == git2::ErrorCode::UnbornBranch => Ok(None),
+            Err(e) => Err(e.into()),
+        },
+    }
 }
 
 /// 一次取页的遍历现场。见上面「现在的做法」。
@@ -742,8 +751,24 @@ impl<'r> DateTopoWalk<'r> {
     }
 
     fn take(&mut self, limit: usize) -> Vec<GitCommitInfo> {
+        self.take_matching(limit, usize::MAX, |_| true).0
+    }
+
+    /// 同 [`Self::take`],但只把 `keep` 认可的提交放进结果(过滤 / 文件历史用)。
+    /// 不认可的照常推进拓扑 —— 父照样发现、照样就绪,只是不产出。
+    ///
+    /// `budget` 是本次最多**走过**几个提交(产出 + 跳过):条件很少命中时一页可能
+    /// 要走遍大半个历史,分批走、每批把现场交回调用方,UI 才能半路换条件、不被
+    /// 一次全量遍历拖住。返回 `(结果, 走过的个数)`。
+    fn take_matching(
+        &mut self,
+        limit: usize,
+        budget: usize,
+        mut keep: impl FnMut(&Commit<'r>) -> bool,
+    ) -> (Vec<GitCommitInfo>, usize) {
         let mut out = Vec::with_capacity(limit.min(256));
-        while out.len() < limit {
+        let mut walked = 0usize;
+        while out.len() < limit && walked < budget {
             let Some((_, _, oid)) = self.ready.pop() else {
                 break;
             };
@@ -769,9 +794,12 @@ impl<'r> DateTopoWalk<'r> {
                     None => self.discover(parent),
                 }
             }
-            out.push(commit_info(&commit));
+            walked += 1;
+            if keep(&commit) {
+                out.push(commit_info(&commit));
+            }
         }
-        out
+        (out, walked)
     }
 }
 
@@ -1969,14 +1997,20 @@ mod branch;
 mod commit;
 mod conflict;
 mod hunk;
+mod log_ops;
+mod log_query;
 mod repo_state;
 mod sync;
+mod tags;
 pub use branch::*;
 pub use commit::*;
 pub use conflict::*;
 pub use hunk::*;
+pub use log_ops::*;
+pub use log_query::*;
 pub use repo_state::*;
 pub use sync::*;
+pub use tags::*;
 
 #[cfg(test)]
 mod test_support;

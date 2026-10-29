@@ -75,7 +75,7 @@ fn 远程下载上下文要求项目根目录和连接身份完全一致() {
 #[test]
 fn 文件菜单项序与原版一致() {
     assert_eq!(
-        file_menu_actions(false, true, false),
+        file_menu_actions(false, true, true, false),
         vec![
             Some(OpenWithDefault),
             Some(CopyEntry),
@@ -90,11 +90,31 @@ fn 文件菜单项序与原版一致() {
             Some(Delete),
             None,
             Some(ViewDiff),
+            Some(GitHistory),
         ]
     );
-    // 干净文件:一项不多(原版 `entryGitStatus && !entry.isDir`)
+    // 仓库里的干净文件:没有「查看变更」,但有「Git 历史」(没改动也有历史)
     assert_eq!(
-        file_menu_actions(false, false, false),
+        file_menu_actions(false, false, true, false),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(GitHistory),
+        ]
+    );
+    // 不在仓库里的干净文件:一项不多(原版 `entryGitStatus && !entry.isDir`)
+    assert_eq!(
+        file_menu_actions(false, false, false, false),
         vec![
             Some(OpenWithDefault),
             Some(CopyEntry),
@@ -114,8 +134,9 @@ fn 文件菜单项序与原版一致() {
 /// 目录的菜单:没有「默认工具打开」,末尾多一段「新建文件 / 新建文件夹」。
 #[test]
 fn 目录菜单项序与原版一致() {
+    // 仓库里的目录也不给「Git 历史」(单文件历史)
     assert_eq!(
-        file_menu_actions(true, false, false),
+        file_menu_actions(true, false, true, false),
         vec![
             Some(CopyEntry),
             Some(Paste),
@@ -140,11 +161,11 @@ fn 目录菜单项序与原版一致() {
 /// 而「默认工具打开」只对文件出现。
 #[test]
 fn 目录与文件的差别只在两处() {
-    let file: Vec<_> = file_menu_actions(false, false, false)
+    let file: Vec<_> = file_menu_actions(false, false, false, false)
         .into_iter()
         .flatten()
         .collect();
-    let dir: Vec<_> = file_menu_actions(true, false, false)
+    let dir: Vec<_> = file_menu_actions(true, false, false, false)
         .into_iter()
         .flatten()
         .collect();
@@ -153,18 +174,19 @@ fn 目录与文件的差别只在两处() {
     assert!(dir.contains(&NewFile) && dir.contains(&NewFolder));
     assert!(!file.contains(&NewFile) && !file.contains(&NewFolder));
     // 有状态的目录同样不给 ViewDiff
-    let dirty_dir: Vec<_> = file_menu_actions(true, true, false)
+    let dirty_dir: Vec<_> = file_menu_actions(true, true, true, false)
         .into_iter()
         .flatten()
         .collect();
     assert!(!dirty_dir.contains(&ViewDiff));
+    assert!(!dirty_dir.contains(&GitHistory));
     assert_eq!(dirty_dir, dir);
 }
 
 #[test]
 fn 远程菜单不暴露本机动作并提供传输入口() {
     assert_eq!(
-        file_menu_actions(false, true, true),
+        file_menu_actions(false, true, true, true),
         vec![
             Some(CopyEntry),
             Some(Download),
@@ -179,7 +201,7 @@ fn 远程菜单不暴露本机动作并提供传输入口() {
         ]
     );
     assert_eq!(
-        file_menu_actions(true, false, true),
+        file_menu_actions(true, false, true, true),
         vec![
             Some(CopyEntry),
             Some(Paste),

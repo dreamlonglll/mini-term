@@ -261,7 +261,7 @@ pub struct GitPanel {
 impl GitPanel {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
-        let history = cx.new(|_| GitHistoryContent::new(store.clone()));
+        let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
 
         let mut subs = Vec::new();
         subs.push(cx.subscribe(&changes, |this: &mut Self, _entity, event, cx| {
@@ -276,6 +276,12 @@ impl GitPanel {
         subs.push(cx.subscribe(&history, |this: &mut Self, _entity, event, cx| {
             match event {
                 GitHistoryEvent::RefreshRepos => this.refresh_repo_meta(cx),
+                // 历史区的改写操作(检出 / 重置 / 拣选…)动了 HEAD、分支或工作区:
+                // 分支徽章与「更改」列表都要重取(历史区自己已重载)
+                GitHistoryEvent::RepoChanged => {
+                    this.refresh_repo_meta(cx);
+                    this.changes.update(cx, |c, cx| c.load(cx));
+                }
             }
         }));
         // render 读活动项目(空态 / 远程)与更改视图模式,任何变化都照旧重画
