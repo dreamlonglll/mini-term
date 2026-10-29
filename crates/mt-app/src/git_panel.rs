@@ -4,7 +4,8 @@
 //! ① 仓库栏(repos 非空时才画)h36
 //!    ├ 左段:仓库图标 + 名称 ▾          右键 = 「在终端中打开」/「Worktree 管理」
 //!    │       分支图标 + 分支胶囊 + ↑n / ↓m 计数胶囊   点开 = 分支弹窗(git_branches)
-//!    └ 右段:Fetch / 拉取(右键选方式)/ 推送(开推送对话框)/ 刷新
+//!    └ 右段:Fetch / 拉取(右键选方式)/ 推送(开推送对话框)/ 贮藏(开贮藏列表,
+//!            有贮藏时旁边挂数量胶囊)/ 刷新
 //! ①' 进行中操作横幅(合并 / 变基 / 拣选 / 还原时才画)h36
 //! ② SectionHeader「更改」  h30   右侧挂 视图切换(树 / 列表)
 //! ③ GitChanges           .git-section-body
@@ -49,6 +50,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
@@ -181,6 +183,8 @@ struct RepoMeta {
     signature: Option<RepoSignature>,
     /// 仓库 git 配置里的拉取方式(`pull.rebase` / `pull.ff`),没手选时按它拉。
     pull_default: PullMode,
+    /// 贮藏条数(仓库栏贮藏按钮旁的数量胶囊)。
+    stash_count: usize,
 }
 
 /// 后台读一份分支快照。只读;除分支列表外,单项查询失败不拖垮整份。
@@ -196,6 +200,7 @@ fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMet
         op: g::repo_operation_state(repo).unwrap_or_default(),
         signature: g::repo_signature(repo).ok(),
         pull_default: PullMode::from_config(repo),
+        stash_count: g::stash_count(repo).unwrap_or_default(),
     };
     Ok((branches, meta))
 }
@@ -268,15 +273,19 @@ impl GitPanel {
         let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
 
         let mut subs = Vec::new();
-        subs.push(cx.subscribe(&changes, |this: &mut Self, _entity, event, cx| {
-            match event {
-                // 提交成功:历史整体重来 + 重载分支(分支头已前移)
-                GitChangesEvent::Committed => {
-                    this.history.update(cx, |h, cx| h.reload(cx));
-                    this.load_branches(cx);
+        subs.push(
+            cx.subscribe(&changes, |this: &mut Self, _entity, event, cx| {
+                match event {
+                    // 提交成功:历史整体重来 + 重载分支(分支头已前移)
+                    GitChangesEvent::Committed => {
+                        this.history.update(cx, |h, cx| h.reload(cx));
+                        this.load_branches(cx);
+                    }
+                    // 更改区里贮藏了改动:工作区与贮藏数都变了,整面板刷新
+                    GitChangesEvent::Stashed => this.refresh_all(cx),
                 }
-            }
-        }));
+            }),
+        );
         subs.push(cx.subscribe_in(
             &history,
             window,
@@ -749,6 +758,60 @@ impl GitPanel {
             return;
         }
         crate::git_push::open(cx.entity(), self.selected_repo.clone(), window, cx);
+    }
+
+    /// 打开贮藏列表(仓库栏贮藏按钮)。有写操作在跑时不开 —— 贮藏的改写同样要抢
+    /// `index.lock`。
+    pub(crate) fn open_stash_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_repo.is_empty() || self.busy.is_some() {
+            return;
+        }
+        let on_changed = self.stash_on_changed(false, cx);
+        crate::git_stash::open_list(
+            self.store.clone(),
+            self.selected_repo.clone(),
+            on_changed,
+            window,
+            cx,
+        );
+    }
+
+    /// 检出 `branch` 会被本地改动挡住(分支弹窗检出前的预检,见 `git_branches::checkout`):
+    /// 开「贮藏后检出」确认框。
+    pub(crate) fn open_smart_checkout(
+        &mut self,
+        branch: String,
+        conflicts: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_repo.is_empty() {
+            return;
+        }
+        let on_changed = self.stash_on_changed(true, cx);
+        crate::git_stash::open_smart_checkout(
+            self.store.clone(),
+            self.selected_repo.clone(),
+            branch,
+            conflicts,
+            on_changed,
+            window,
+            cx,
+        );
+    }
+
+    /// 贮藏弹窗操作之后的回调:整面板刷新。`follow_head` = 顺带回到跟随 HEAD(检出类,
+    /// 同普通检出)。弱引用:回调跟着弹窗走,面板没了就什么都不做。
+    fn stash_on_changed(&self, follow_head: bool, cx: &mut Context<Self>) -> Rc<dyn Fn(&mut App)> {
+        let panel = cx.entity().downgrade();
+        Rc::new(move |cx: &mut App| {
+            let _ = panel.update(cx, |p, cx| {
+                if follow_head {
+                    p.set_view_branch(None, cx);
+                }
+                p.refresh_all(cx);
+            });
+        })
     }
 
     /// 推送对话框里推送进行中 / 结束时同步一下按钮状态。
@@ -1411,7 +1474,7 @@ impl GitPanel {
         )
     }
 
-    /// 右段图标按钮组:Fetch / 拉取 / 推送 / 刷新。
+    /// 右段图标按钮组:Fetch / 拉取 / 推送 / 贮藏 / 刷新。
     fn render_bar_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy;
         let is = |op: GitBusy| busy == Some(op);
@@ -1502,6 +1565,29 @@ impl GitPanel {
             )
         });
 
+        // 贮藏:开贮藏列表;有贮藏时旁边挂数量胶囊(数量随分支快照一起读),tooltip 带数
+        let stash_count = self.meta.stash_count;
+        let stash_tip: SharedString = if stash_count > 0 {
+            tr!("gitStash", "countTip", count = stash_count).into()
+        } else {
+            t("gitStash", "title").into()
+        };
+        let stash = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .child(
+                git_ui::icon_button("git-stash", git_ui::ICON_STASH, stash_tip, busy.is_none())
+                    .when(busy.is_none(), |el| {
+                        el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.open_stash_list(window, cx)
+                        }))
+                    }),
+            )
+            .when(stash_count > 0, |el| {
+                el.child(git_ui::count_pill(stash_count, ui::text_muted()))
+            });
+
         // 刷新:后台重载期间转小圈(列表保留旧内容,不清空)
         let refreshing = self.branches_loading;
         let refresh = git_ui::busy_icon_button(
@@ -1523,6 +1609,7 @@ impl GitPanel {
             .child(fetch)
             .child(pull)
             .child(push)
+            .child(stash)
             .child(refresh)
             .into_any_element()
     }

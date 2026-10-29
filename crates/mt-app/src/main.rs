@@ -77,6 +77,7 @@ mod git_graph;
 mod git_history;
 mod git_panel;
 mod git_push;
+mod git_stash;
 mod git_ui;
 mod git_watch;
 mod git_worktree;

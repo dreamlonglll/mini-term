@@ -26,7 +26,8 @@
 //!
 //! 行上单击 / 右键 / → 弹出该分支的动作菜单;选了动作先收弹窗、再交给 Git 面板的
 //! [`GitPanel::run_write_op`](忙碌态、结果摘要 toast、失败详情框、整面板刷新都在那)。
-//! 改写历史与删除类动作先确认。
+//! 改写历史与删除类动作先确认。检出本地分支前先在后台预检会不会被本地改动挡住,
+//! 挡住就转「贮藏后检出」确认框(见 [`checkout`])。
 
 use std::cell::Cell;
 use std::path::Path;
@@ -813,16 +814,69 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
     entries
 }
 
+/// 检出前的后台预检结果(见 [`checkout`])。
+enum CheckoutStep<T> {
+    /// 没被挡住,已照常检出。
+    Done(T),
+    /// 本地分支 `branch` 的检出会被这些本地改动挡住:转给「贮藏后检出」。
+    Blocked {
+        branch: String,
+        conflicts: Vec<String>,
+    },
+}
+
+/// 检出本地分支 `branch` 会被哪些本地改动挡住(后台跑)。预检只是提示性的:读失败就当
+/// 没挡住,照常交给 git —— 真挡住时它自己会拒绝并给出原文。
+fn blocking_changes(repo: &Path, branch: &str) -> Vec<String> {
+    mt_project::git::local_changes_conflict_with(repo, branch).unwrap_or_else(|err| {
+        eprintln!("[git] 检出前预检失败(照常检出): {err:#}");
+        Vec::new()
+    })
+}
+
 /// 检出(本地直接检出;远程:本地无同名则建跟踪分支,有则检出本地那个并提示)。
+///
+/// 检出**本地**分支(含远程行在本地已有同名分支的情况)之前,先在后台用
+/// [`blocking_changes`] 预检:会被本地改动挡住就不去撞 git 的拒绝,转开「贮藏后检出」
+/// 确认框(`git_stash::open_smart_checkout`)。预检与检出在同一个后台任务里,忙碌态 /
+/// 防重入沿用 [`GitPanel::run_write_op`]。本地没有同名分支的远程行照旧直接
+/// `checkout_remote_branch`(它新建跟踪分支;被本地改动挡住时报 git 原文)。
 fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
     let name = row.name.clone();
     if row.is_remote {
+        // 本地已有同名分支时,检出的其实是它:预检也对它做
+        let snap = panel.read(cx).branch_snapshot();
+        let local = split_remote_branch(&snap.remotes, &name)
+            .map(|(_, local)| local)
+            .filter(|local| {
+                snap.branches
+                    .iter()
+                    .any(|b| !b.is_remote && &b.name == local)
+            });
         panel.update(cx, |p, cx| {
             let remote_branch = name.clone();
             p.run_write_op(
                 GitBusy::Checkout,
-                move |repo| mt_project::git::checkout_remote_branch(repo, &name),
-                move |p, outcome, _window, cx| {
+                move |repo| {
+                    if let Some(local) = local {
+                        let conflicts = blocking_changes(repo, &local);
+                        if !conflicts.is_empty() {
+                            return Ok(CheckoutStep::Blocked {
+                                branch: local,
+                                conflicts,
+                            });
+                        }
+                    }
+                    mt_project::git::checkout_remote_branch(repo, &name).map(CheckoutStep::Done)
+                },
+                move |p, step, window, cx| {
+                    let outcome = match step {
+                        CheckoutStep::Done(outcome) => outcome,
+                        CheckoutStep::Blocked { branch, conflicts } => {
+                            p.open_smart_checkout(branch, conflicts, window, cx);
+                            return;
+                        }
+                    };
                     p.set_view_branch(None, cx);
                     let (message, tone) = match outcome {
                         RemoteCheckout::Created { local } => (
@@ -856,10 +910,24 @@ fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut A
         let shown = name.clone();
         p.run_write_op(
             GitBusy::Checkout,
-            move |repo| mt_project::git::checkout_branch(repo, &name),
-            move |p, (), _window, cx| {
-                p.set_view_branch(None, cx);
-                p.notify_result(tr!("gitBranch", "checkedOut", name = shown), Tone::Info, cx);
+            move |repo| {
+                let conflicts = blocking_changes(repo, &name);
+                if !conflicts.is_empty() {
+                    return Ok(CheckoutStep::Blocked {
+                        branch: name,
+                        conflicts,
+                    });
+                }
+                mt_project::git::checkout_branch(repo, &name).map(CheckoutStep::Done)
+            },
+            move |p, step, window, cx| match step {
+                CheckoutStep::Done(()) => {
+                    p.set_view_branch(None, cx);
+                    p.notify_result(tr!("gitBranch", "checkedOut", name = shown), Tone::Info, cx);
+                }
+                CheckoutStep::Blocked { branch, conflicts } => {
+                    p.open_smart_checkout(branch, conflicts, window, cx)
+                }
             },
             window,
             cx,

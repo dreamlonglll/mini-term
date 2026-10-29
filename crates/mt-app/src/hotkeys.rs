@@ -33,7 +33,7 @@ use crate::{
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
     SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
     ToggleSessions, ToggleUsage, command_library, git_changes, git_diff, git_file_history,
-    git_history, project_switcher,
+    git_history, git_stash, project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -606,6 +606,22 @@ pub fn bind_keys(cx: &mut App) {
         "down",
         git_file_history::FileHistoryNext,
         Some("GitFileHistory"),
+    ));
+    // 贮藏列表弹窗:↑/↓ 换贮藏,Delete 删除(先确认);Enter 应用走 Dialog 自己的 Confirm
+    bindings.push(KeyBinding::new(
+        "up",
+        git_stash::GitStashPrev,
+        Some(git_stash::STASH_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        git_stash::GitStashNext,
+        Some(git_stash::STASH_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "delete",
+        git_stash::GitStashDrop,
+        Some(git_stash::STASH_CONTEXT),
     ));
 
     // 文件查看器源码态的「上一处 / 下一处 Git 变更」(IDEA 键位 Ctrl+Alt+Shift+↑/↓)。

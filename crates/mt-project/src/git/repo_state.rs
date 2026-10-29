@@ -13,7 +13,7 @@
 //! 面板监听 `.git` 目录,变化后去抖刷新;刷新本身只读(git2 的 status 不带
 //! `UPDATE_INDEX` 就不回写索引,单测钉住了这一条)。但别的程序(IDE 的 git 插件、
 //! 终端里的 `git status`)会顺手刷新索引里的 stat 缓存 —— 索引文件变了、内容没变。
-//! 所以刷新前先算一个 [`repo_signature`]:HEAD、全部引用、仓库状态、索引条目
+//! 所以刷新前先算一个 [`repo_signature`]:HEAD、全部引用、贮藏条数、仓库状态、索引条目
 //! (路径 + blob + 暂存号)的摘要,没变就不刷。
 
 use std::collections::hash_map::DefaultHasher;
@@ -26,6 +26,7 @@ use git2::{Repository, RepositoryState};
 
 use super::branch::{NO_EDITOR, failure_text};
 use super::run_git_output_env;
+use super::stash::stash_entries;
 
 /// 中止 / 继续都只动本地仓库;继续时可能跑 pre-commit hook,给足 120s。
 const OP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -187,14 +188,25 @@ fn trim_dir(path: &Path) -> PathBuf {
 /// 把监听器塞爆)。超出的子目录里的变化收不到,手动 ↻ 仍可兜底。
 pub const GIT_WATCH_DIR_LIMIT: usize = 256;
 
+/// 贮藏的 reflog(`<common>/logs/refs/stash`)。删 `stash@{n>0}` 只改它、不动
+/// `refs/stash`,监听要单认这一个文件。
+fn stash_reflog(layout: &GitDirLayout) -> PathBuf {
+    layout.common_dir.join("logs").join("refs").join("stash")
+}
+
 /// 要挂监听的目录(监听器是非递归的,`refs/` 要逐层列出来)。
 ///
 /// git_dir 与 common_dir 各一条;`refs/` 下全部子目录(heads / remotes/<r> / tags,
-/// 以及 `feature/` 这类分支前缀目录)。`objects/`、`logs/`、`hooks/` 不挂 —— 那是噪声。
+/// 以及 `feature/` 这类分支前缀目录)。`objects/`、`hooks/` 不挂 —— 那是噪声;`logs/`
+/// 只挂 `logs/refs` 这一层(为了贮藏的 reflog,见 [`is_relevant_git_change`]),其下
+/// 分支的 reflog 照旧不认。
 pub fn git_watch_dirs(layout: &GitDirLayout) -> Vec<PathBuf> {
     let mut dirs = vec![layout.git_dir.clone()];
     if layout.common_dir != layout.git_dir {
         dirs.push(layout.common_dir.clone());
+    }
+    if let Some(logs) = stash_reflog(layout).parent().filter(|dir| dir.is_dir()) {
+        dirs.push(logs.to_path_buf());
     }
     let mut stack = vec![layout.common_dir.join("refs")];
     while let Some(dir) = stack.pop() {
@@ -239,6 +251,8 @@ const RELEVANT_TOP_LEVEL: &[&str] = &[
 ///
 /// - `*.lock` 一律忽略(git 写文件的中间态,随后的改名才是真变化);
 /// - `refs/` 下的任何变化都算;
+/// - `logs/` 下只认贮藏的 reflog(`logs/refs/stash`):删 `stash@{n>0}` 时只有它变,
+///   分支的 reflog 总与 `refs/` 一起变,不必再认;
 /// - git 目录 / common 目录的直接子项只认 [`RELEVANT_TOP_LEVEL`] 那几个 ——
 ///   Windows 的非递归监听在子目录内容变化时还会报一条「子目录被修改」,
 ///   `objects` / `logs` 这些就是这么混进来的。
@@ -248,6 +262,9 @@ pub fn is_relevant_git_change(layout: &GitDirLayout, path: &Path) -> bool {
     };
     if name.ends_with(".lock") {
         return false;
+    }
+    if path == stash_reflog(layout) {
+        return true;
     }
     [&layout.common_dir, &layout.git_dir].iter().any(|base| {
         let Ok(rel) = path.strip_prefix(base) else {
@@ -265,7 +282,7 @@ pub fn is_relevant_git_change(layout: &GitDirLayout, path: &Path) -> bool {
 
 /// 仓库「面板可见状态」的摘要,分两半:
 ///
-/// - `refs`:HEAD、全部引用、进行中的操作 —— 变了就要重载分支、计数与提交历史;
+/// - `refs`:HEAD、全部引用、贮藏条数、进行中的操作 —— 变了就要重载分支、计数与提交历史;
 /// - `index`:索引条目(路径 + blob + 暂存号,**不含** stat 缓存)—— 只变它的话
 ///   (终端里 `git add`、解决了一个冲突)只需重取「更改」区与冲突数,历史不必重载。
 ///
@@ -299,6 +316,8 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
     }
     refs.sort();
     refs.hash(&mut hasher);
+    // 删 `stash@{n>0}` 时 `refs/stash` 不动、只少一条 reflog:贮藏条数单独算进来
+    stash_entries(&repo).hash(&mut hasher);
     let refs = hasher.finish();
 
     let mut hasher = DefaultHasher::new();
@@ -503,6 +522,10 @@ mod tests {
             "{dirs:?}"
         );
         assert!(!dirs.iter().any(|d| d.ends_with("objects")));
+        // logs 只挂 `logs/refs` 这一层(贮藏的 reflog 在它下面),分支 reflog 的子目录不挂
+        let logs = wt_layout.common_dir.join("logs").join("refs");
+        assert!(dirs.contains(&logs), "{dirs:?}");
+        assert!(!dirs.contains(&logs.join("heads")));
         cleanup(&[&wt, &root]);
     }
 
@@ -523,6 +546,7 @@ mod tests {
             "/r/.git/refs/heads/main",
             "/r/.git/refs/remotes/origin/feature/x",
             "/r/.git/refs",
+            "/r/.git/logs/refs/stash",
         ];
         for p in yes {
             assert!(is_relevant_git_change(&layout, Path::new(p)), "{p}");
@@ -533,6 +557,10 @@ mod tests {
             "/r/.git/objects",
             "/r/.git/logs",
             "/r/.git/worktrees/w/logs",
+            "/r/.git/logs/refs/heads",
+            "/r/.git/logs/refs/heads/main",
+            "/r/.git/logs/refs/stash.lock",
+            "/r/.git/logs/HEAD",
             "/r/.git/COMMIT_EDITMSG",
             "/r/.git/objects/ab/cdef",
             "/elsewhere/HEAD",
@@ -571,6 +599,29 @@ mod tests {
         let s3 = repo_signature(&root).unwrap();
         assert_ne!(s3.refs, s2.refs, "新建分支");
         assert_eq!(s3.index, s2.index);
+        cleanup(&[&root]);
+    }
+
+    /// 贮藏:删 `stash@{1}` 时 `refs/stash` 不动、只少一条 reflog —— 签名照样要变,
+    /// 仓库栏的贮藏数才跟得上。
+    #[test]
+    fn 签名随贮藏条数变化() {
+        let root = init_repo_with_file("state-sig-stash", "a.txt", "a\n");
+        for content in ["1\n", "2\n"] {
+            std::fs::write(root.join("a.txt"), content).unwrap();
+            git(&root, &["stash", "push", "-q"]);
+        }
+        let tip = git(&root, &["rev-parse", "refs/stash"]);
+        let s0 = repo_signature(&root).unwrap();
+        git(&root, &["stash", "drop", "-q", "stash@{1}"]);
+        assert_eq!(
+            git(&root, &["rev-parse", "refs/stash"]),
+            tip,
+            "refs/stash 没动"
+        );
+        let s1 = repo_signature(&root).unwrap();
+        assert_ne!(s1.refs, s0.refs, "少了一条贮藏");
+        assert_eq!(s1.index, s0.index);
         cleanup(&[&root]);
     }
 
@@ -615,6 +666,7 @@ mod tests {
         super::super::outgoing_commits(&work, None, 100).unwrap();
         super::super::push_plan(&work, None).unwrap();
         repo_operation_state(&work).unwrap();
+        super::super::stash_count(&work).unwrap();
         repo_signature(&work).unwrap();
         git_watch_dirs(&git_dir_layout(&work).unwrap());
 

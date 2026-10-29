@@ -17,7 +17,8 @@
 //! # 分工
 //!
 //! - notify 线程上的 sink 只做一件事:按 [`is_relevant_git_change`] 过滤(`*.lock`、
-//!   objects / logs 噪声丢掉),命中就把「最近一次相关变化」的时刻记下;
+//!   objects / logs 噪声丢掉,只留贮藏的 reflog —— 删 `stash@{n>0}` 时只有它变),
+//!   命中就把「最近一次相关变化」的时刻记下;
 //! - 主线程借 Git 面板现成的 100ms 节拍问 [`GitDirWatch::take_due`]:安静满去抖窗口了
 //!   才报一次,由面板去后台算签名、对比、决定刷什么(见 `git_panel.rs`)。
 //!

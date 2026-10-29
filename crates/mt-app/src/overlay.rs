@@ -135,6 +135,16 @@ pub mod kind {
     pub const GIT_LOG_DANGER: &str = "git-log-danger";
     /// 单文件 Git 历史(文件树右键「Git 历史」)。完整提交 diff 能叠在它之上。
     pub const GIT_FILE_HISTORY: &str = "git-file-history";
+    /// 贮藏列表(左列表 + 右侧改动与 diff)。下面四种都能叠在它之上。
+    pub const GIT_STASH: &str = "git-stash";
+    /// 新建贮藏(消息 / 保留暂存区 / 含未跟踪文件)。
+    pub const GIT_STASH_SAVE: &str = "git-stash-save";
+    /// 从贮藏新建分支的名称输入框。
+    pub const GIT_STASH_BRANCH: &str = "git-stash-branch";
+    /// 贮藏的危险操作确认(删除 / 全部清除)。
+    pub const GIT_STASH_DANGER: &str = "git-stash-danger";
+    /// 检出被本地改动挡住时的「贮藏后检出」确认框。
+    pub const GIT_STASH_CHECKOUT: &str = "git-stash-checkout";
 }
 
 /// 栈里的一条。

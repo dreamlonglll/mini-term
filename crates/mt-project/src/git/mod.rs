@@ -2063,6 +2063,7 @@ mod line_diff;
 mod log_ops;
 mod log_query;
 mod repo_state;
+mod stash;
 mod sync;
 mod tags;
 pub use blame::*;
@@ -2074,6 +2075,7 @@ pub use line_diff::*;
 pub use log_ops::*;
 pub use log_query::*;
 pub use repo_state::*;
+pub use stash::*;
 pub use sync::*;
 pub use tags::*;
 

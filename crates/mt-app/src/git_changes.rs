@@ -113,6 +113,8 @@ const HISTORY_LIMIT: usize = 20;
 pub enum GitChangesEvent {
     /// 提交(或提交后的推送)成功 —— 容器要刷新历史与分支(分支头已前移)。
     Committed,
+    /// ▾ 菜单「贮藏当前改动…」贮藏成功 —— 工作区与贮藏数都变了,容器整面板刷新。
+    Stashed,
 }
 
 /// 四个分组。`area` 既决定取哪一个 status,也进 `ElementId` 前缀。
@@ -2246,7 +2248,7 @@ impl GitChanges {
             .into_any_element()
     }
 
-    /// ▾ 菜单:提交并推送 / 全部暂存并提交。
+    /// ▾ 菜单:提交并推送 / 全部暂存并提交 /(分隔)贮藏当前改动…。
     fn commit_menu(
         &self,
         can_commit: bool,
@@ -2263,13 +2265,49 @@ impl GitChanges {
                     this.update(cx, |this, cx| this.commit(true, false, window, cx));
                 })
         };
-        let stage_all = MenuItem::new(t("gitCommit", "stageAllAndCommit"))
-            .detail(t("gitCommit", "stageAllAndCommitDetail"))
-            .disabled(!stage_first_ok)
+        let stage_all = {
+            let this = this.clone();
+            MenuItem::new(t("gitCommit", "stageAllAndCommit"))
+                .detail(t("gitCommit", "stageAllAndCommitDetail"))
+                .disabled(!stage_first_ok)
+                .on_click(move |window, cx| {
+                    this.update(cx, |this, cx| this.commit(false, true, window, cx));
+                })
+        };
+        // 贮藏:有改动(含未跟踪)才可用;没有时禁用并写明原因
+        let has_changes = !self.changes.is_empty();
+        let mut stash = MenuItem::new(t("gitStash", "stashChanges"))
+            .disabled(!has_changes)
             .on_click(move |window, cx| {
-                this.update(cx, |this, cx| this.commit(false, true, window, cx));
+                this.update(cx, |this, cx| this.open_stash_save(window, cx));
             });
-        vec![push.into(), stage_all.into()]
+        if !has_changes {
+            stash = stash.detail(t("gitStash", "save.nothing"));
+        }
+        vec![
+            push.into(),
+            stage_all.into(),
+            menu::separator(),
+            stash.into(),
+        ]
+    }
+
+    /// 「贮藏当前改动…」:开新建贮藏弹窗,成功后让容器整面板刷新(见 [`GitChangesEvent::Stashed`])。
+    fn open_stash_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo_path.is_empty() {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let on_changed: Rc<dyn Fn(&mut App)> = Rc::new(move |cx: &mut App| {
+            let _ = this.update(cx, |_, cx| cx.emit(GitChangesEvent::Stashed));
+        });
+        crate::git_stash::open_save(
+            self.store.clone(),
+            self.repo_path.clone(),
+            on_changed,
+            window,
+            cx,
+        );
     }
 }
 

@@ -61,6 +61,21 @@ const fn ring(cx: f32, cy: f32, r: f32) -> Shape {
     )
 }
 
+/// 描边圆角矩形(Lucide 的 `<rect>`)。
+const fn rect(x: f32, y: f32, w: f32, h: f32, round: f32) -> Shape {
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Rect {
+            x: u(x),
+            y: u(y),
+            w: u(w),
+            h: u(h),
+            round: u(round),
+        },
+    )
+}
+
 /// 实心小圆点(Lucide 里 `h.01` / `r=".5" fill` 那种「点」的替身)。
 const fn dot(cx: f32, cy: f32) -> Shape {
     Shape::fill(
@@ -213,18 +228,22 @@ pub const ICON_UNDO: &[Shape] = &[
 pub const ICON_CLOSE: &[Shape] = &[path("M18 6 6 18"), path("m6 6 12 12")];
 /// 复制(`copy`)。
 pub const ICON_COPY: &[Shape] = &[
-    Shape::line(
-        Ink::Current,
-        STROKE,
-        Geom::Rect {
-            x: u(8.0),
-            y: u(8.0),
-            w: u(14.0),
-            h: u(14.0),
-            round: u(2.0),
-        },
-    ),
+    rect(8.0, 8.0, 14.0, 14.0, 2.0),
     path("M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"),
+];
+/// 贮藏(`archive`):仓库栏的贮藏按钮、贮藏弹窗。
+pub const ICON_STASH: &[Shape] = &[
+    rect(2.0, 3.0, 20.0, 5.0, 1.0),
+    path("M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"),
+    path("M10 12h4"),
+];
+/// 删除 / 全部清除(`trash-2`)。「丢弃改动」是 [`ICON_UNDO`],别混用。
+pub const ICON_TRASH: &[Shape] = &[
+    path("M3 6h18"),
+    path("M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"),
+    path("M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"),
+    path("M10 11v6"),
+    path("M14 11v6"),
 ];
 
 // ─── 方向 ─────────────────────────────────────────────────────
@@ -269,6 +288,8 @@ const ALL_ICONS: &[&[Shape]] = &[
     ICON_UNDO,
     ICON_CLOSE,
     ICON_COPY,
+    ICON_STASH,
+    ICON_TRASH,
     ICON_CHEVRON_DOWN,
     ICON_CHEVRON_RIGHT,
     ICON_CHEVRON_LEFT,

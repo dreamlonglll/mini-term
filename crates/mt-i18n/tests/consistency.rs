@@ -132,8 +132,13 @@ use mt_i18n::{
 /// 进行中操作横幅、各类确认框与失败详情框）、`gitLog` 146 条（提交历史的右键操作 /
 /// 过滤栏 / 提交详情 / 标签 / 单文件历史）与 `gitGutter` 19 条（文件查看器的变更标记
 /// 小窗与注解列）。
-const EXPECTED_NAMESPACES: usize = 37;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1334;
+/// 1334 → 1408（37 → 38 个命名空间）：`gitStash` 74 条 —— 贮藏列表弹窗（应用 / 弹出 /
+/// 删除 / 全部清除 / 从贮藏新建分支 / 查看内容）、新建贮藏弹窗与「贮藏后检出」确认框。
+/// 1408 → 1409：贮藏接入 Git 面板 —— 仓库栏贮藏按钮带数量的 tooltip（`gitStash.countTip`）；
+/// 改动文件的分组标题改用共用的数量胶囊，`gitStash.files.header`（带 `{count}`）换成
+/// 不带数字的 `gitStash.files.title`，一删一增。
+const EXPECTED_NAMESPACES: usize = 38;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1409;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -153,6 +158,7 @@ const TS_NAMESPACES: &[&str] = &[
     "gitHistory",
     "gitHistoryContent",
     "gitLog",
+    "gitStash",
     "markerList",
     "mobileRelay",
     "paneGroup",
