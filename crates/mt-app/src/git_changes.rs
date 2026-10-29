@@ -55,21 +55,22 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
+    FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
     GitStatus,
 };
-use mt_ui::icons::{FileIcon, VectorIcon};
+use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::git_commit_ui::{
-    ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_COPY, ICON_HISTORY,
-    ICON_MINUS, ICON_PLUS, ICON_UNDO, danger_icon_button, icon_button, mono, pill,
+use crate::git_ui::{
+    self, ButtonKind, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_COPY,
+    ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
+    icon_button, mono, status_color, status_label_for,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -168,48 +169,8 @@ pub fn status_in_area(file: &ChangeFileStatus, area: Area) -> Option<&GitStatus>
     }
 }
 
-/// 状态 → 单字符(`statusLabelFor`,`GitChanges.tsx:60-70`)。认不出的是**空格**。
-pub fn status_label_for(status: Option<&GitStatus>) -> &'static str {
-    match status {
-        Some(GitStatus::Modified) => "M",
-        Some(GitStatus::Added) => "A",
-        Some(GitStatus::Deleted) => "D",
-        Some(GitStatus::Renamed) => "R",
-        Some(GitStatus::Untracked) => "?",
-        Some(GitStatus::Conflicted) => "C",
-        None => " ",
-    }
-}
-
-/// 状态 → 颜色。**三条开发线共用的唯一来源**(M 橙 / A、? 绿 / D 红 / R 蓝 / C 醒目)。
-///
-/// 冲突原版落到 default 的 muted —— 冲突恰恰是最需要人处理的状态,改成
-/// `color_attention`(与「等你处理」那一档灯同色)。
-pub fn status_color(status: Option<&GitStatus>) -> gpui::Hsla {
-    match status {
-        Some(GitStatus::Modified) => ui::color_warning(),
-        Some(GitStatus::Added) => ui::color_success(),
-        Some(GitStatus::Deleted) => ui::color_error(),
-        Some(GitStatus::Renamed) => ui::color_info(),
-        Some(GitStatus::Untracked) => ui::color_success(),
-        Some(GitStatus::Conflicted) => ui::color_attention(),
-        None => ui::text_muted(),
-    }
-}
-
-/// 单字符状态 → 颜色(diff 弹窗标题栏的状态胶囊只拿得到字母)。
-pub fn status_color_for_label(label: &str) -> gpui::Hsla {
-    let status = match label.trim() {
-        "M" => Some(GitStatus::Modified),
-        "A" => Some(GitStatus::Added),
-        "D" => Some(GitStatus::Deleted),
-        "R" => Some(GitStatus::Renamed),
-        "?" => Some(GitStatus::Untracked),
-        "C" => Some(GitStatus::Conflicted),
-        _ => None,
-    };
-    status_color(status.as_ref())
-}
+// 状态 → 字母 / 颜色的映射(`status_label_for` / `status_color`)收在 `git_ui`:
+// 提交详情、提交 diff、单文件历史与这里共用一份。
 
 /// 状态 → 一句话(行 tooltip 用)。
 fn status_text(status: Option<&GitStatus>) -> &'static str {
@@ -245,14 +206,6 @@ pub fn message_hints(message: &str) -> MessageHints {
         title_chars,
         title_too_long: title_chars > TITLE_SOFT_LIMIT,
         missing_blank_line,
-    }
-}
-
-/// 文件路径 → `(所在目录, 文件名)`;根目录下的文件目录为空。
-fn split_path(path: &str) -> (&str, &str) {
-    match path.rsplit_once('/') {
-        Some((dir, name)) => (dir, name),
-        None => ("", path),
     }
 }
 
@@ -885,38 +838,20 @@ impl GitChanges {
         .detach();
     }
 
-    /// 当前项目的 `(id, 名字)`,toast 的标题用。
-    fn toast_owner(&self, cx: &App) -> (String, String) {
-        self.store
-            .read(cx)
-            .active_project()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .unwrap_or_else(|| (String::new(), "Git".to_string()))
-    }
-
-    /// 暂存 / 丢弃这类动作失败的 toast。标题是当前项目名(与粘贴失败同一档:
-    /// `!` 图标、点击只关闭),正文带错误原文。
+    /// 暂存 / 丢弃这类动作失败的 toast(需要留意那一档:`!` 图标、点击只关闭),
+    /// 正文带错误原文。走 Git 面板共用的结果 toast。
     fn notify_op_failure(&self, detail: String, cx: &mut Context<Self>) {
-        let (project_id, project_name) = self.toast_owner(cx);
-        crate::toast::push_message(
-            crate::notify::ToastKind::PasteError,
-            project_id,
-            project_name,
+        git_ui::toast(
+            &self.store,
             tr!("gitChanges", "operationFailed", detail = detail),
+            Tone::Attention,
             cx,
         );
     }
 
     /// 成功类的提示(已提交 / 已推送)。信息档 toast,点击只关闭。
     fn notify_info(&self, message: String, cx: &mut Context<Self>) {
-        let (project_id, project_name) = self.toast_owner(cx);
-        crate::toast::push_message(
-            crate::notify::ToastKind::WslInfo,
-            project_id,
-            project_name,
-            message,
-            cx,
-        );
+        git_ui::toast(&self.store, message, Tone::Info, cx);
     }
 
     fn stage(
@@ -1541,38 +1476,13 @@ fn format_date(timestamp: i64) -> String {
 
 // ─── 渲染 ─────────────────────────────────────────────────────
 
-/// 文件行高。
-const ROW_HEIGHT: f32 = 26.0;
+/// 文件行 / 目录行的行高(与分支弹窗、提交详情的文件列表同一口径)。
+const ROW_HEIGHT: f32 = git_ui::ROW_H;
 /// 行右端「状态字母 / hover 时的操作按钮」那一格的宽:两颗图标按钮 + 间隙。
 /// 每行都留同样宽,状态字母竖着对齐。
-const ROW_ACTIONS_W: f32 = 52.0;
+const ROW_ACTIONS_W: f32 = git_ui::ICON_BUTTON * 2.0 + 2.0;
 /// 文件行的组名(行内按钮 hover 才出现)。
 const ROW_GROUP: &str = "git-file-row";
-
-/// 首屏加载的占位(静态文字,不转圈)。
-fn placeholder_text(text: impl Into<SharedString>) -> AnyElement {
-    div()
-        .py(px(24.0))
-        .w_full()
-        .text_center()
-        .text_size(ui::font_px(13.0))
-        .text_color(ui::text_muted())
-        .child(text.into())
-        .into_any_element()
-}
-
-/// 取变更失败时顶替空态的那一段:同一个位置,错误色,左右留边好折行
-/// (错误原文常带路径,居中折行难读,所以左对齐)。
-fn error_text(text: impl Into<SharedString>) -> AnyElement {
-    div()
-        .py(px(24.0))
-        .px(px(8.0))
-        .w_full()
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::color_error())
-        .child(text.into())
-        .into_any_element()
-}
 
 impl Render for GitChanges {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1602,10 +1512,14 @@ impl GitChanges {
         let empty = self.changes.is_empty();
 
         if self.loading && empty && self.load_error.is_none() {
-            rows.push(placeholder_text(t("gitChanges", "loading")));
+            rows.push(git_ui::loading_state(t("gitChanges", "loading")).into_any_element());
             keys.push(RowKey::Other);
         } else if let Some(err) = self.load_error.as_deref().filter(|_| empty) {
-            rows.push(error_text(tr!("gitChanges", "loadFailed", detail = err)));
+            // 取变更失败顶替空态:否则读失败会被误认成「工作区是干净的」
+            rows.push(
+                git_ui::error_state(tr!("gitChanges", "loadFailed", detail = err))
+                    .into_any_element(),
+            );
             keys.push(RowKey::Other);
         } else if empty {
             rows.push(self.render_clean_state(cx));
@@ -1687,25 +1601,22 @@ impl GitChanges {
 
     /// 工作区干净:32px 勾形图标 + 一句说明 + 「刷新」。
     fn render_clean_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .w_full()
-            .py(px(32.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(12.0))
-            .child(VectorIcon::new(ICON_CLEAN, px(32.0)).ink(ui::text_muted()))
-            .child(
-                div()
-                    .text_size(ui::font_px(13.0))
-                    .text_color(ui::text_muted())
-                    .child(t("gitChanges", "empty")),
-            )
-            .child(
-                ui::ghost_button("git-changes-refresh", t("gitChanges", "refresh"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.load(cx))),
-            )
-            .into_any_element()
+        git_ui::empty_state(
+            ICON_CLEAN,
+            t("gitChanges", "empty"),
+            Some(
+                git_ui::action_button(
+                    "git-changes-refresh",
+                    t("gitChanges", "refresh"),
+                    ButtonKind::Ghost,
+                    true,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.load(cx)))
+                .into_any_element(),
+            ),
+        )
+        .py(px(32.0))
+        .into_any_element()
     }
 
     /// 分组标题:折叠箭头 + 标题 + 数量胶囊 + 右对齐的组操作(常显,保证可发现)。
@@ -1719,20 +1630,26 @@ impl GitChanges {
         };
         let enabled = self.busy_ops == 0;
         let key = area.key();
-        let mut actions = div().flex().items_center().gap(px(2.0));
+        let mut header = SectionHeader::new(SharedString::from(format!("git-group-{key}")), title)
+            .group()
+            .collapsible(!collapsed)
+            .count(count);
+        if area == Area::Conflicts {
+            header = header.tone(tone).icon(ICON_ALERT);
+        }
+        // 组操作常显(保证可发现);共用图标按钮自己拦住冒泡,点它们不会顺带折叠
         match area {
             Area::Conflicts => {}
             Area::Staged => {
-                actions = actions.child(
+                header = header.trailing(
                     icon_button(
                         SharedString::from(format!("git-group-{key}-unstage")),
                         ICON_MINUS,
+                        t("gitCommit", "unstageAll"),
                         enabled,
                     )
-                    .tip(t("gitCommit", "unstageAll"))
                     .when(enabled, |el| {
                         el.on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
                             this.unstage_all(cx);
                         }))
                     }),
@@ -1740,32 +1657,30 @@ impl GitChanges {
             }
             Area::Unstaged | Area::Untracked => {
                 if area == Area::Unstaged {
-                    actions = actions.child(
+                    header = header.trailing(
                         danger_icon_button(
                             SharedString::from(format!("git-group-{key}-discard")),
                             ICON_UNDO,
+                            t("gitCommit", "discardAll"),
                             enabled,
                         )
-                        .tip(t("gitCommit", "discardAll"))
                         .when(enabled, |el| {
                             el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
                                 let paths = this.area_paths(area);
                                 this.discard(area, paths, window, cx);
                             }))
                         }),
                     );
                 }
-                actions = actions.child(
+                header = header.trailing(
                     icon_button(
                         SharedString::from(format!("git-group-{key}-stage")),
                         ICON_PLUS,
+                        t("gitCommit", "stageAll"),
                         enabled,
                     )
-                    .tip(t("gitCommit", "stageAll"))
                     .when(enabled, |el| {
                         el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
                             this.stage_group(area, cx);
                         }))
                     }),
@@ -1773,46 +1688,9 @@ impl GitChanges {
             }
         }
 
-        div()
-            .id(SharedString::from(format!("git-group-{key}")))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(28.0))
+        header
+            .build()
             .mt(px(4.0))
-            .pl(px(4.0))
-            .pr(px(4.0))
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .hover(|el| el.bg(ui::border_subtle()))
-            .child(
-                VectorIcon::new(
-                    if collapsed {
-                        ICON_CHEVRON_RIGHT
-                    } else {
-                        ICON_CHEVRON_DOWN
-                    },
-                    px(14.0),
-                )
-                .ink(ui::text_muted()),
-            )
-            .when(area == Area::Conflicts, |el| {
-                el.child(VectorIcon::new(ICON_ALERT, px(14.0)).ink(tone))
-            })
-            .child(
-                div()
-                    .text_size(ui::font_px(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(if area == Area::Conflicts {
-                        tone
-                    } else {
-                        ui::text_secondary()
-                    })
-                    .child(title),
-            )
-            .child(pill(count.to_string(), tone))
-            .child(div().flex_1())
-            .child(actions)
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if !this.collapsed_groups.remove(&area) {
                     this.collapsed_groups.insert(area);
@@ -1843,20 +1721,25 @@ impl GitChanges {
             .rounded(px(4.0))
             .cursor_pointer()
             .text_size(ui::font_px(13.0))
-            .text_color(ui::text_muted())
-            .hover(|el| el.bg(ui::border_subtle()))
+            .text_color(ui::text_secondary())
+            .hover(|el| el.bg(git_ui::hover_bg()))
             .child(
-                VectorIcon::new(
-                    if collapsed {
-                        ICON_CHEVRON_RIGHT
-                    } else {
-                        ICON_CHEVRON_DOWN
-                    },
-                    px(14.0),
-                )
-                .ink(ui::text_muted()),
+                div()
+                    .flex_none()
+                    .w(px(git_ui::ICON_SIZE))
+                    .flex()
+                    .justify_center()
+                    .child(git_ui::icon(
+                        if collapsed {
+                            ICON_CHEVRON_RIGHT
+                        } else {
+                            ICON_CHEVRON_DOWN
+                        },
+                        git_ui::ICON_SIZE_SM,
+                        ui::text_muted(),
+                    )),
             )
-            .child(FileIcon::folder(!collapsed).size(px(14.0)))
+            .child(FileIcon::folder(!collapsed).size(px(git_ui::ICON_SIZE)))
             .child(div().min_w_0().truncate().child(name))
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if !this.collapsed_dirs.remove(&key) {
@@ -1885,8 +1768,6 @@ impl GitChanges {
         let label = status_label_for(status);
         let color = status_color(status);
         let path = file.path.clone();
-        let (dir, name) = split_path(&path);
-        let (dir, name) = (dir.to_string(), name.to_string());
         let deleted = matches!(status, Some(GitStatus::Deleted));
         let selected = self.is_selected(area, &path);
         let enabled = self.busy_ops == 0;
@@ -1921,113 +1802,72 @@ impl GitChanges {
             .group_hover(ROW_GROUP, |s| s.visible());
         if matches!(area, Area::Unstaged | Area::Untracked) {
             actions = actions.child(
-                danger_icon_button(id_of("discard"), ICON_UNDO, enabled)
-                    .tip(if area == Area::Untracked {
+                danger_icon_button(
+                    id_of("discard"),
+                    ICON_UNDO,
+                    if area == Area::Untracked {
                         t("gitCommit", "deleteUntracked")
                     } else {
                         t("gitChanges", "contextDiscard")
-                    })
-                    .when(enabled, |el| {
-                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            let paths = this.targets(area, index, cx);
-                            this.discard(area, paths, window, cx);
-                        }))
-                    }),
+                    },
+                    enabled,
+                )
+                .when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let paths = this.targets(area, index, cx);
+                        this.discard(area, paths, window, cx);
+                    }))
+                }),
             );
         }
         match area {
             Area::Staged => {
                 actions = actions.child(
-                    icon_button(id_of("unstage"), ICON_MINUS, enabled)
-                        .tip(t("panels", "unstage"))
-                        .when(enabled, |el| {
-                            el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                let paths = this.targets(area, index, cx);
-                                this.unstage(paths, None, cx);
-                            }))
-                        }),
+                    icon_button(
+                        id_of("unstage"),
+                        ICON_MINUS,
+                        t("panels", "unstage"),
+                        enabled,
+                    )
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            let paths = this.targets(area, index, cx);
+                            this.unstage(paths, None, cx);
+                        }))
+                    }),
                 );
             }
             Area::Unstaged | Area::Untracked => {
-                actions = actions.child(
-                    icon_button(id_of("stage"), ICON_PLUS, enabled)
-                        .tip(t("panels", "stage"))
-                        .when(enabled, |el| {
-                            el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                let paths = this.targets(area, index, cx);
-                                this.stage(paths, None, cx);
-                            }))
-                        }),
-                );
+                let stage = icon_button(id_of("stage"), ICON_PLUS, t("panels", "stage"), enabled);
+                actions = actions.child(stage.when(enabled, |el| {
+                    el.on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        let paths = this.targets(area, index, cx);
+                        this.stage(paths, None, cx);
+                    }))
+                }));
             }
             Area::Conflicts => {}
         }
 
-        div()
-            .id(row_id)
+        git_ui::list_row(row_id, selected)
             .group(ROW_GROUP)
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(ROW_HEIGHT))
-            .pr(px(8.0))
             .pl(px(depth as f32 * 16.0 + 8.0))
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .text_size(ui::font_px(13.0))
-            .when(selected, |el| {
-                el.bg(ui::accent_subtle()).child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top(px(4.0))
-                        .bottom(px(4.0))
-                        .w(px(2.0))
-                        .rounded(px(1.0))
-                        .bg(ui::accent()),
-                )
-            })
-            .when(!selected, |el| el.hover(|el| el.bg(ui::border_subtle())))
-            .child(FileIcon::new(&name, false, false).size(px(14.0)))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(color)
-                    .when(deleted, |el| el.line_through())
-                    .child(name),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::text_muted())
-                    .when(!tree_mode, |el| el.child(dir)),
-            )
+            .child(git_ui::file_label(&path, color, deleted, !tree_mode))
             .child(
                 div()
                     .relative()
                     .flex_none()
                     .w(px(ROW_ACTIONS_W))
-                    .h(px(24.0))
+                    .h(px(git_ui::ICON_BUTTON))
                     .child(
-                        mono(div())
+                        div()
                             .size_full()
                             .flex()
                             .items_center()
                             .justify_end()
                             .pr(px(4.0))
-                            .text_size(ui::font_px(12.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(color)
                             .group_hover(ROW_GROUP, |s| s.invisible())
-                            .child(label),
+                            .child(git_ui::status_letter(label, color)),
                     )
                     .child(actions),
             )
@@ -2219,36 +2059,35 @@ impl GitChanges {
 
         // ── 工具条 ──
         let amend_enabled = self.has_head && !self.committing;
-        let amend_toggle = div()
-            .id("git-commit-amend")
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(24.0))
-            .text_size(ui::font_px(12.0))
-            .text_color(ui::text_secondary())
-            .child(ui::checkbox("git-commit-amend-box", self.amend))
-            .child(t("gitCommit", "amend"))
-            .when(amend_enabled, |el| {
-                el.cursor_pointer()
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.toggle_amend(window, cx);
-                    }))
-            })
-            .when(!amend_enabled, |el| el.opacity(0.5))
-            .tip(if self.has_head {
-                t("gitCommit", "amendTip")
-            } else {
-                t("gitCommit", "amendNoHead")
-            });
+        let amend_toggle = git_ui::check_row(
+            "git-commit-amend",
+            self.amend,
+            t("gitCommit", "amend"),
+            false,
+        )
+        .when(amend_enabled, |el| {
+            el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.toggle_amend(window, cx);
+            }))
+        })
+        .when(!amend_enabled, |el| el.opacity(0.5).cursor_default())
+        .tip(if self.has_head {
+            t("gitCommit", "amendTip")
+        } else {
+            t("gitCommit", "amendNoHead")
+        });
         let history_enabled = !self.history_loading && !self.repo_path.is_empty();
-        let history = icon_button("git-commit-history", ICON_HISTORY, history_enabled)
-            .tip(t("gitCommit", "messageHistory"))
-            .when(history_enabled, |el| {
-                el.on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    this.show_history(event.position(), window, cx);
-                }))
-            });
+        let history = icon_button(
+            "git-commit-history",
+            ICON_HISTORY,
+            t("gitCommit", "messageHistory"),
+            history_enabled,
+        )
+        .when(history_enabled, |el| {
+            el.on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                this.show_history(event.position(), window, cx);
+            }))
+        });
         let counter = (hints.title_chars >= TITLE_COUNT_FROM).then(|| {
             mono(div())
                 .text_size(ui::font_px(11.0))
@@ -2272,15 +2111,8 @@ impl GitChanges {
         // ── 警告与软提示 ──
         let pushed_warning = (self.amend && self.amend_info.as_ref().is_some_and(|i| i.pushed))
             .then(|| {
-                div()
+                git_ui::notice_line(t("gitCommit", "amendPushedWarning"), ui::color_warning())
                     .mt(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::color_warning())
-                    .child(VectorIcon::new(ICON_ALERT, px(14.0)).ink(ui::color_warning()))
-                    .child(t("gitCommit", "amendPushedWarning"))
             });
         let mut soft_hints: Vec<String> = Vec::new();
         if hints.title_too_long {
@@ -2330,13 +2162,15 @@ impl GitChanges {
             .border_color(ui::with_alpha(ui::bg_base(), 0.35))
             .when(can_commit, |el| el.bg(ui::accent()))
             .when(!can_commit, |el| el.bg(ui::bg_elevated()))
-            .child(
-                VectorIcon::new(ICON_CHEVRON_DOWN, px(14.0)).ink(if can_commit {
+            .child(git_ui::icon(
+                ICON_CHEVRON_DOWN,
+                git_ui::ICON_SIZE,
+                if can_commit {
                     ui::bg_base()
                 } else {
                     ui::text_muted()
-                }),
-            )
+                },
+            ))
             .tip(t("gitCommit", "moreCommitActions"))
             .when(menu_enabled, |el| {
                 el.cursor_pointer()
@@ -2354,6 +2188,7 @@ impl GitChanges {
             .child(main_button)
             .child(split);
 
+        // 错误原文:与弹窗里的 git 失败原文同一套红框淡底,右侧一颗「复制」
         let error = self.commit_error.clone().map(|err| {
             let copy = err.clone();
             div()
@@ -2361,23 +2196,35 @@ impl GitChanges {
                 .flex()
                 .items_start()
                 .gap(px(4.0))
+                .pl(px(10.0))
+                .pr(px(2.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .border_1()
+                .border_color(ui::with_alpha(ui::color_error(), 0.35))
+                .bg(ui::with_alpha(ui::color_error(), 0.06))
                 .child(
                     div()
                         .id("git-commit-error")
                         .flex_1()
                         .min_w_0()
                         .max_h(px(160.0))
+                        .py(px(4.0))
                         .overflow_y_scroll()
                         .text_size(ui::font_px(12.0))
                         .text_color(ui::color_error())
                         .child(err),
                 )
                 .child(
-                    icon_button("git-commit-error-copy", ICON_COPY, true)
-                        .tip(t("gitCommit", "copyError"))
-                        .on_click(move |_: &ClickEvent, _window, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
-                        }),
+                    icon_button(
+                        "git-commit-error-copy",
+                        ICON_COPY,
+                        t("gitCommit", "copyError"),
+                        true,
+                    )
+                    .on_click(move |_: &ClickEvent, _window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                    }),
                 )
         });
 
@@ -2389,13 +2236,11 @@ impl GitChanges {
             .child(Textarea::new(&self.commit_input))
             .child(toolbar)
             .children(pushed_warning)
-            .children(soft_hints.into_iter().map(|hint| {
-                div()
-                    .mt(px(4.0))
-                    .text_size(ui::font_px(11.0))
-                    .text_color(ui::text_muted())
-                    .child(hint)
-            }))
+            .children(
+                soft_hints
+                    .into_iter()
+                    .map(|hint| git_ui::hint_line(hint).mt(px(4.0))),
+            )
             .child(buttons)
             .children(error)
             .into_any_element()
@@ -2490,41 +2335,6 @@ mod tests {
         );
     }
 
-    /// 六种状态 → 单字符。认不出(None)的是**空格**,不是空串。
-    #[test]
-    fn 状态字母表() {
-        use GitStatus::*;
-        let table = [
-            (Modified, "M"),
-            (Added, "A"),
-            (Deleted, "D"),
-            (Renamed, "R"),
-            (Untracked, "?"),
-            (Conflicted, "C"),
-        ];
-        for (status, label) in table {
-            assert_eq!(status_label_for(Some(&status)), label);
-            // 字母 → 颜色与状态 → 颜色同一张表
-            assert_eq!(status_color_for_label(label), status_color(Some(&status)));
-        }
-        assert_eq!(status_label_for(None), " ");
-    }
-
-    /// 状态色:冲突是最需要人处理的状态,走 attention 色(原版落到 muted)。
-    #[test]
-    fn 状态色映射() {
-        use GitStatus::*;
-        ui::set_palette(ui::Palette::dark());
-        assert_eq!(status_color(Some(&Modified)), ui::color_warning());
-        assert_eq!(status_color(Some(&Added)), ui::color_success());
-        assert_eq!(status_color(Some(&Deleted)), ui::color_error());
-        assert_eq!(status_color(Some(&Renamed)), ui::color_info());
-        assert_eq!(status_color(Some(&Untracked)), ui::color_success());
-        assert_eq!(status_color(Some(&Conflicted)), ui::color_attention());
-        assert_eq!(status_color(None), ui::text_muted());
-        assert_eq!(status_color_for_label(" "), ui::text_muted());
-    }
-
     /// 提交消息的轻提示:标题按字符数(中文不按字节),开头空行不算标题,
     /// 正文前缺空行才提示。
     #[test]
@@ -2553,12 +2363,6 @@ mod tests {
             !message_hints("标题\n   \n").missing_blank_line,
             "空白行算空行"
         );
-    }
-
-    #[test]
-    fn 路径拆成目录与文件名() {
-        assert_eq!(split_path("src/a/b.rs"), ("src/a", "b.rs"));
-        assert_eq!(split_path("README.md"), ("", "README.md"));
     }
 
     #[test]

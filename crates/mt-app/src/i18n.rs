@@ -941,6 +941,7 @@ const USED_KEYS: &[&str] = &[
     "projectSwitcher.noMatch",
     "projectSwitcher.placeholder",
     "prompt.cancel",
+    "prompt.close",
     "prompt.confirm",
     "prompt.ok",
     "remoteProject.addConnection",

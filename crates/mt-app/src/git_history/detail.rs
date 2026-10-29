@@ -18,10 +18,8 @@ use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::CommitDetail;
 use mt_ui::tooltip::TooltipExt as _;
 
-use super::icons::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_UP, ICON_COPY, file_row, icon_button, mono, ref_pill,
-};
 use super::{GitHistoryContent, error_text, format_absolute_time, format_relative_time, grow};
+use crate::git_ui::{self, ICON_COPY, SectionHeader, commit_file_row, icon_button, mono, ref_pill};
 use crate::i18n::{t, tr};
 use crate::ui;
 
@@ -167,6 +165,9 @@ fn link(
 }
 
 /// 详情区:标题栏(收起 / 展开、复制消息)+ 内容。`open = false` 时只有标题栏。
+///
+/// 标题栏走共用的区块标题:左侧折叠箭头 + 「提交详情」,整行可点收起 / 展开
+/// (与上面「更改」「提交历史」两块同一手感);右侧短哈希、加载转圈与「复制消息」。
 pub(super) fn render(
     this: &GitHistoryContent,
     open: bool,
@@ -176,69 +177,47 @@ pub(super) fn render(
     let short = data.map(|d| d.hash.chars().take(7).collect::<String>());
     let message_for_copy = data.map(|d| d.message.clone());
 
-    let header = div()
-        .flex_none()
-        .h(px(36.0))
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .pl(px(12.0))
-        .pr(px(6.0))
+    let mut header =
+        SectionHeader::new("git-log-detail-header", t("gitLog", "detail.title")).collapsible(open);
+    if this.detail.loading {
+        header = header.trailing(ui::spinner(px(git_ui::ICON_SIZE_SM), ui::accent()));
+    }
+    if let Some(short) = short {
+        header = header.trailing(
+            mono(div())
+                .px(px(4.0))
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::text_muted())
+                .child(short),
+        );
+    }
+    if let Some(message) = message_for_copy {
+        header = header.trailing(
+            icon_button(
+                "git-log-detail-copy",
+                ICON_COPY,
+                t("gitLog", "detail.copyMessage"),
+                true,
+            )
+            .on_click(move |_: &ClickEvent, _window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(message.clone()));
+            }),
+        );
+    }
+    let header = header
+        .build()
         .border_t_1()
         .border_b_1()
         .border_color(ui::border_subtle())
-        .child(
-            div()
-                .text_size(ui::font_px(12.0))
-                .text_color(ui::text_secondary())
-                .child(t("gitLog", "detail.title")),
-        )
-        .when_some(short, |el, short| {
-            el.child(
-                mono(div())
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::text_muted())
-                    .child(short),
-            )
+        .tip(if open {
+            t("gitLog", "detail.collapse")
+        } else {
+            t("gitLog", "detail.expand")
         })
-        .when(this.detail.loading, |el| {
-            el.child(
-                div()
-                    .text_size(ui::font_px(11.0))
-                    .text_color(ui::text_muted())
-                    .child(t("gitLog", "detail.loading")),
-            )
-        })
-        .child(div().flex_1())
-        .when_some(message_for_copy, |el, message| {
-            el.child(
-                icon_button("git-log-detail-copy", ICON_COPY, true)
-                    .tip(t("gitLog", "detail.copyMessage"))
-                    .on_click(move |_: &ClickEvent, _window, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(message.clone()));
-                    }),
-            )
-        })
-        .child(
-            icon_button(
-                "git-log-detail-toggle",
-                if open {
-                    ICON_CHEVRON_DOWN
-                } else {
-                    ICON_CHEVRON_UP
-                },
-                true,
-            )
-            .tip(if open {
-                t("gitLog", "detail.collapse")
-            } else {
-                t("gitLog", "detail.expand")
-            })
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.detail.open = !this.detail.open;
-                cx.notify();
-            })),
-        );
+        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+            this.detail.open = !this.detail.open;
+            cx.notify();
+        }));
 
     if !open {
         return div()
@@ -261,20 +240,13 @@ pub(super) fn render(
 
     match (data, &this.detail.error) {
         (_, Some(err)) => {
-            body = body.child(
-                div()
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::color_error())
-                    .child(tr!("gitLog", "detail.failed", detail = err.clone())),
-            );
+            body = body.child(git_ui::notice_line(
+                tr!("gitLog", "detail.failed", detail = err.clone()),
+                ui::color_error(),
+            ));
         }
         (None, None) => {
-            body = body.child(
-                div()
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::text_muted())
-                    .child(t("gitLog", "detail.loading")),
-            );
+            body = body.child(git_ui::loading_state(t("gitLog", "detail.loading")));
         }
         (Some(d), None) => {
             body = render_content(this, d, body, cx);
@@ -307,7 +279,7 @@ fn render_content(
     // ① 标题(大一档、加粗)+ 正文(只读、可选中)
     body = body.child(
         div()
-            .text_size(ui::font_px(15.0))
+            .text_size(ui::font_px(14.0))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(ui::text_primary())
             .child(title),
@@ -398,6 +370,7 @@ fn render_content(
                     name.clone(),
                     kind,
                 )
+                .max_w(px(240.0))
                 .tip(name),
             );
         }
@@ -425,13 +398,12 @@ fn render_content(
             file.path.clone(),
         );
         files = files.child(
-            file_row(
+            commit_file_row(
                 SharedString::from(format!("git-log-detail-file-{i}")),
                 &file.path,
                 &file.status,
+                false,
             )
-            .cursor_pointer()
-            .hover(|el| el.bg(ui::bg_elevated()))
             .tip(t("gitLog", "detail.openFile"))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_commit_diff(hash.clone(), title.clone(), Some(path.clone()), window, cx);

@@ -59,9 +59,9 @@ use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult, StaleDi
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::git_commit_ui::{
-    ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_CLOSE,
-    ICON_COPY, ICON_REFRESH, icon_button, mono, pill, text_button,
+use crate::git_ui::{
+    self, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLEAN,
+    ICON_CLOSE, ICON_COPY, ICON_REFRESH, icon_button, mono, pill, text_button,
 };
 use crate::i18n::{t, tr};
 use crate::prompt::{Confirm, kind, open_guarded};
@@ -530,6 +530,8 @@ fn diff_line_row(
         .flex()
         .h(px(line_height))
         .when_some(line_bg(kind), |el, bg| el.bg(bg))
+        // 行号直接用 muted,不再叠 0.6 的透明度:叠上之后深浅两套主题里都只剩
+        // 2:1 上下的对比,行号基本读不出来
         .children(gutters.iter().map(|(no, width)| {
             div()
                 .w(px(*width))
@@ -537,7 +539,6 @@ fn diff_line_row(
                 .pr(px(8.0))
                 .text_right()
                 .text_color(ui::text_muted())
-                .opacity(0.6)
                 .child(no.clone())
         }))
         .child(text)
@@ -602,6 +603,12 @@ fn hunk_row(
 const MODAL_W_RATIO: f32 = 0.8;
 const MODAL_H_RATIO: f32 = 0.85;
 
+/// 三个 diff 弹窗(单文件 / 提交 / 单文件历史)右栏顶部工具栏的统一高度:
+/// 标题区、跳转组、视图段控件、关闭按钮都在这一条上垂直居中。
+pub(crate) const TOOLBAR_H: f32 = 48.0;
+/// 提交 diff / 单文件历史左栏的头部与页脚的左右内边距。
+pub(crate) const SIDE_PAD: f32 = 12.0;
+
 /// 返回 `(面板宽, 正文高)`。builder 每帧重跑,拖窗口改大小时跟着变。
 pub(crate) fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, gpui::Pixels) {
     (
@@ -611,14 +618,17 @@ pub(crate) fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, g
     )
 }
 
-/// 空格子(`DiffModal.tsx:100-107`)。
+/// 空格子(`DiffModal.tsx:100-107`):并排视图里对侧没有行的那一格。
+///
+/// 原先是「`bg_base` + 30% 不透明度」—— 叠在同为 `bg_base` 的正文底上等于什么都没画,
+/// 空格子与上下文行分不出来。改成前景色的一层薄纱(与悬停底同一手法),深浅主题里
+/// 都看得出「这一侧没有内容」。
 fn empty_cell(line_height: f32) -> AnyElement {
     div()
         .w_full()
         .flex()
         .h(px(line_height))
-        .bg(ui::bg_base())
-        .opacity(0.3)
+        .bg(ui::with_alpha(ui::text_primary(), 0.05))
         .child(div().w(px(GUTTER)).flex_none())
         .child(div().flex_1())
         .into_any_element()
@@ -817,10 +827,19 @@ fn render_body(
 ) -> AnyElement {
     let s = state.read(cx);
     if s.loading {
-        return centered(loading, ui::text_muted());
+        return git_ui::loading_state(loading)
+            .size_full()
+            .into_any_element();
     }
     if let Some(err) = &s.error {
-        return centered(err.clone(), ui::color_error());
+        return div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(24.0))
+            .child(git_ui::notice_line(err.clone(), ui::color_error()))
+            .into_any_element();
     }
     let Some(result) = &s.result else {
         return div().into_any_element();
@@ -832,32 +851,15 @@ fn render_body(
         return centered(too_large, ui::text_muted());
     }
     if let Some(empty) = empty.filter(|_| result.hunks.is_empty()) {
-        return empty_state(empty);
+        return git_ui::empty_state(ICON_CLEAN, empty, None)
+            .size_full()
+            .into_any_element();
     }
     let view = match s.view {
         ViewMode::Inline => render_inline(state, hunks, cx),
         ViewMode::SideBySide => render_side_by_side(state, hunks, cx),
     };
     mono_body(view)
-}
-
-/// 「没有更多改动」:32px 的勾形图标 + 一句说明,居中。
-fn empty_state(text: &'static str) -> AnyElement {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(12.0))
-        .child(mt_ui::icons::VectorIcon::new(ICON_CLEAN, px(32.0)).ink(ui::text_muted()))
-        .child(
-            div()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_muted())
-                .child(text),
-        )
-        .into_any_element()
 }
 
 /// diff 正文的等宽字体壳。
@@ -1059,8 +1061,7 @@ fn jump_button(
     delta: isize,
 ) -> AnyElement {
     let state = state.clone();
-    icon_button(id, icon, true)
-        .tip(tip)
+    icon_button(id, icon, tip, true)
         .on_click(move |_: &ClickEvent, _window, cx| {
             state.update(cx, |s, cx| {
                 s.jump_by(delta);
@@ -1129,51 +1130,37 @@ fn view_toggle(
     let (side_label, inline_label) = (labels.side, labels.inline);
     let jumps = jump_group(state, id_prefix, &labels, cx);
     let current = state.read(cx).view;
-    let mut seg = div()
-        .flex()
-        .rounded(px(4.0))
-        .overflow_hidden()
-        .border_1()
-        .border_color(ui::border_default());
+    let mut seg = git_ui::segmented();
     for (mode, label) in [
         (ViewMode::SideBySide, side_label),
         (ViewMode::Inline, inline_label),
     ] {
-        let active = mode == current;
         let state = state.clone();
         seg = seg.child(
-            div()
-                .id(SharedString::from(format!(
+            git_ui::segment(
+                SharedString::from(format!(
                     "{id_prefix}-view-{}",
                     if matches!(mode, ViewMode::Inline) {
                         "inline"
                     } else {
                         "side"
                     }
-                )))
-                .px(px(12.0))
-                .py(px(4.0))
-                .text_size(ui::font_px(13.0))
-                .cursor_pointer()
-                .when(active, |el| {
-                    el.bg(ui::accent_subtle()).text_color(ui::accent())
-                })
-                .when(!active, |el| {
-                    el.text_color(ui::text_muted())
-                        .hover(|el| el.text_color(ui::text_primary()))
-                })
-                .child(label)
-                .on_click(move |_: &ClickEvent, _window, cx| {
-                    state.update(cx, |s, cx| {
-                        s.view = mode;
-                        cx.notify();
-                    });
-                }),
+                )),
+                label,
+                mode == current,
+            )
+            .on_click(move |_: &ClickEvent, _window, cx| {
+                state.update(cx, |s, cx| {
+                    s.view = mode;
+                    cx.notify();
+                });
+            }),
         );
     }
 
     div()
         .flex()
+        .flex_none()
         .items_center()
         .children(jumps)
         .child(seg)
@@ -1181,6 +1168,7 @@ fn view_toggle(
             icon_button(
                 SharedString::from(format!("{id_prefix}-close")),
                 ICON_CLOSE,
+                t("prompt", "close"),
                 true,
             )
             .ml(px(8.0))
@@ -1494,19 +1482,16 @@ fn side_label(side: DiffSide) -> &'static str {
     }
 }
 
-/// 标题栏左半:文件图标 + 文件名 + 弱化的目录 + 状态胶囊 + 「+12 −3」+ 当前侧。
-fn title_block(file: &DiffFile, state: &Entity<DiffState>, cx: &App) -> AnyElement {
-    let (dir, name) = match file.path.rsplit_once(['/', '\\']) {
+/// 提交 diff 左栏的宽度(放得下「文件名 + 弱化目录 + 状态字母」一行)。
+const COMMIT_LIST_W: f32 = 280.0;
+
+/// diff 工具栏左半的文件抬头:文件图标 + 文件名(14px 半粗)+ 弱化的目录 + 状态胶囊。
+/// 三个 diff 弹窗共用(单文件 diff 在后面再接「+12 −3」与当前侧)。
+fn file_heading(path: &str, status: Option<(&str, gpui::Hsla)>) -> gpui::Div {
+    let (dir, name) = match path.rsplit_once(['/', '\\']) {
         Some((dir, name)) => (dir.to_string(), name.to_string()),
-        None => (String::new(), file.path.clone()),
+        None => (String::new(), path.to_string()),
     };
-    let s = state.read(cx);
-    let stats = s
-        .result
-        .as_ref()
-        .filter(|r| !r.is_binary && !r.too_large)
-        .map(|_| (s.flat.adds, s.flat.deletes));
-    let status_color = crate::git_changes::status_color_for_label(&file.status_label);
     div()
         .flex()
         .items_center()
@@ -1516,8 +1501,10 @@ fn title_block(file: &DiffFile, state: &Entity<DiffState>, cx: &App) -> AnyEleme
         .child(FileIcon::new(&name, false, false).size(px(16.0)))
         .child(
             div()
-                .flex_none()
-                .text_size(ui::font_px(15.0))
+                .min_w_0()
+                .truncate()
+                .text_size(ui::font_px(14.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(ui::text_primary())
                 .child(name),
         )
@@ -1531,9 +1518,22 @@ fn title_block(file: &DiffFile, state: &Entity<DiffState>, cx: &App) -> AnyEleme
                     .child(dir),
             )
         })
-        .when(!file.status_label.trim().is_empty(), |el| {
-            el.child(pill(file.status_label.clone(), status_color))
-        })
+        .when_some(
+            status.filter(|(letter, _)| !letter.trim().is_empty()),
+            |el, (letter, color)| el.child(pill(letter.to_string(), color)),
+        )
+}
+
+/// 标题栏左半:[`file_heading`] +「+12 −3」+ 当前侧。
+fn title_block(file: &DiffFile, state: &Entity<DiffState>, cx: &App) -> AnyElement {
+    let s = state.read(cx);
+    let stats = s
+        .result
+        .as_ref()
+        .filter(|r| !r.is_binary && !r.too_large)
+        .map(|_| (s.flat.adds, s.flat.deletes));
+    let status_color = git_ui::status_color_for_label(&file.status_label);
+    file_heading(&file.path, Some((file.status_label.as_str(), status_color)))
         .when_some(stats, |el, (adds, deletes)| {
             el.child(
                 mono(div())
@@ -1575,13 +1575,11 @@ fn file_nav(
     }
     let nav = |id: &'static str, icon, tip: String, delta: isize, enabled: bool| {
         let (state, ctl) = (state.clone(), ctl.clone());
-        icon_button(id, icon, enabled)
-            .tip(tip)
-            .when(enabled, move |el| {
-                el.on_click(move |_: &ClickEvent, _window, cx| {
-                    switch_file(&state, &ctl, delta, cx);
-                })
+        icon_button(id, icon, tip, enabled).when(enabled, move |el| {
+            el.on_click(move |_: &ClickEvent, _window, cx| {
+                switch_file(&state, &ctl, delta, cx);
             })
+        })
     };
     Some(
         div()
@@ -1638,13 +1636,19 @@ fn error_bar(
         .items_start()
         .gap(px(8.0))
         .px(px(16.0))
-        .py(px(8.0))
+        .py(px(4.0))
         .bg(ui::with_alpha(ui::color_error(), 0.08))
         .border_b_1()
-        .border_color(ui::border_subtle())
+        .border_color(ui::with_alpha(ui::color_error(), 0.35))
+        .child(div().flex_none().pt(px(6.0)).child(git_ui::icon(
+            git_ui::ICON_ALERT,
+            git_ui::ICON_SIZE,
+            ui::color_error(),
+        )))
         .child(
             div()
                 .id("git-diff-op-error")
+                .py(px(4.0))
                 .flex_1()
                 .min_w_0()
                 .max_h(px(120.0))
@@ -1654,37 +1658,49 @@ fn error_bar(
                 .child(err),
         )
         .child(
-            icon_button("git-diff-op-error-copy", ICON_COPY, true)
-                .tip(t("gitCommit", "copyError"))
-                .on_click(move |_: &ClickEvent, _window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
-                }),
+            icon_button(
+                "git-diff-op-error-copy",
+                ICON_COPY,
+                t("gitCommit", "copyError"),
+                true,
+            )
+            .on_click(move |_: &ClickEvent, _window, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+            }),
         )
         .when(stale, |el| {
             el.child(
-                icon_button("git-diff-op-error-refresh", ICON_REFRESH, true)
-                    .tip(t("gitCommit", "refresh"))
-                    .on_click(move |_: &ClickEvent, _window, cx| {
-                        refresh_ctl.update(cx, |c, cx| {
-                            c.op_error = None;
-                            c.stale = false;
-                            cx.notify();
-                        });
-                        let at = refresh_state.read(cx).jump.unwrap_or(0);
-                        load_file(&refresh_state, &refresh_ctl, Some(at), cx);
-                    }),
-            )
-        })
-        .child(
-            icon_button("git-diff-op-error-close", ICON_CLOSE, true)
-                .tip(t("gitCommit", "dismiss"))
+                icon_button(
+                    "git-diff-op-error-refresh",
+                    ICON_REFRESH,
+                    t("gitCommit", "refresh"),
+                    true,
+                )
                 .on_click(move |_: &ClickEvent, _window, cx| {
-                    dismiss.update(cx, |c, cx| {
+                    refresh_ctl.update(cx, |c, cx| {
                         c.op_error = None;
                         c.stale = false;
                         cx.notify();
                     });
+                    let at = refresh_state.read(cx).jump.unwrap_or(0);
+                    load_file(&refresh_state, &refresh_ctl, Some(at), cx);
                 }),
+            )
+        })
+        .child(
+            icon_button(
+                "git-diff-op-error-close",
+                ICON_CLOSE,
+                t("gitCommit", "dismiss"),
+                true,
+            )
+            .on_click(move |_: &ClickEvent, _window, cx| {
+                dismiss.update(cx, |c, cx| {
+                    c.op_error = None;
+                    c.stale = false;
+                    cx.notify();
+                });
+            }),
         )
         .into_any_element()
 }
@@ -1759,8 +1775,8 @@ pub fn open_file_diff(
             .items_center()
             .justify_between()
             .gap(px(16.0))
+            .h(px(TOOLBAR_H))
             .px(px(16.0))
-            .py(px(10.0))
             .flex_none()
             .border_b_1()
             .border_color(ui::border_subtle())
@@ -1846,17 +1862,8 @@ pub fn open_file_diff(
 
 // ─── CommitDiffModal(某次 commit 的多文件) ──────────────────
 
-/// 左栏文件列表的状态字母表(`CommitDiffModal.tsx:21-26`)。
-/// 查不到(conflicted / untracked 之类)回落 `?` + muted。
-fn commit_file_badge(status: &str) -> (&'static str, gpui::Hsla) {
-    match status {
-        "added" => ("A", ui::color_success()),
-        "modified" => ("M", ui::color_warning()),
-        "deleted" => ("D", ui::color_error()),
-        "renamed" => ("R", ui::color_info()),
-        _ => ("?", ui::text_muted()),
-    }
-}
+// 左栏文件列表的状态字母表(`CommitDiffModal.tsx:21-26`)收在
+// `git_ui::commit_file_status`:提交详情与单文件历史用的是同一张表。
 
 /// 左栏选中项。放进实体是因为 Dialog 的 builder 每帧重跑。
 struct CommitPick {
@@ -1942,21 +1949,17 @@ pub fn open_commit_diff_at(
             let selected = pick.read(cx).selected.clone();
 
             // 左栏
+            // 左栏文件列表:与提交详情同一种文件行(FileIcon + 状态色文件名 + 弱化目录
+            // + 状态字母),选中 = accent 淡底 + 左侧竖条
             let mut file_list = div()
                 .id("git-commit-files")
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
-                .track_scroll(&file_scroll);
+                .track_scroll(&file_scroll)
+                .p(px(4.0));
             for (idx, file) in files.iter().enumerate() {
-                let (letter, color) = commit_file_badge(&file.status);
                 let active = file.path == selected;
-                let name = file
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&file.path)
-                    .to_string();
                 let (pick, state) = (pick.clone(), state.clone());
                 let (repo, hash, files_for_click, path) = (
                     repo_path.clone(),
@@ -1964,46 +1967,34 @@ pub fn open_commit_diff_at(
                     files.clone(),
                     file.path.clone(),
                 );
+                let tip = match &file.old_path {
+                    Some(old) => format!("{old} → {}", file.path),
+                    None => file.path.clone(),
+                };
                 file_list = file_list.child(
-                    div()
-                        .id(SharedString::from(format!("git-commit-file-{idx}")))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .cursor_pointer()
-                        .text_size(ui::font_px(13.0))
-                        .when(active, |el| {
-                            el.bg(ui::accent_subtle()).text_color(ui::accent())
-                        })
-                        .when(!active, |el| {
-                            el.text_color(ui::text_primary())
-                                .hover(|el| el.bg(ui::border_subtle()))
-                        })
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(ui::font_px(11.0))
-                                .text_color(color)
-                                .child(letter),
-                        )
-                        .child(div().min_w(px(0.0)).truncate().child(name))
-                        .on_click(move |_: &ClickEvent, _window, cx| {
-                            if pick.read(cx).selected == path {
-                                return;
-                            }
-                            pick.update(cx, |p, cx| {
-                                p.selected = path.clone();
-                                cx.notify();
-                            });
-                            load_commit_file(&state, &repo, &hash, &files_for_click, &path, cx);
-                        }),
+                    git_ui::commit_file_row(
+                        SharedString::from(format!("git-commit-file-{idx}")),
+                        &file.path,
+                        &file.status,
+                        active,
+                    )
+                    .tip(tip)
+                    .on_click(move |_: &ClickEvent, _window, cx| {
+                        if pick.read(cx).selected == path {
+                            return;
+                        }
+                        pick.update(cx, |p, cx| {
+                            p.selected = path.clone();
+                            cx.notify();
+                        });
+                        load_commit_file(&state, &repo, &hash, &files_for_click, &path, cx);
+                    }),
                 );
             }
 
+            // 左栏头部:提交标题(与单文件历史左栏头部同一档:14px 半粗)+ 等宽短哈希
             let left = div()
-                .w(px(224.0))
+                .w(px(COMMIT_LIST_W))
                 .flex_none()
                 .h_full()
                 .flex()
@@ -2013,22 +2004,26 @@ pub fn open_commit_diff_at(
                 .bg(ui::bg_elevated())
                 .child(
                     div()
-                        .px(px(12.0))
-                        .py(px(12.0))
+                        .px(px(SIDE_PAD))
+                        .py(px(10.0))
                         .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
                         .border_b_1()
                         .border_color(ui::border_subtle())
                         .child(
                             div()
+                                .min_w_0()
                                 .truncate()
-                                .text_size(ui::font_px(13.0))
-                                .text_color(ui::accent())
+                                .text_size(ui::font_px(14.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(ui::text_primary())
                                 .child(commit_message.clone()),
                         )
                         .child(
-                            div()
-                                .mt(px(4.0))
-                                .text_size(ui::font_px(11.0))
+                            mono(div())
+                                .text_size(ui::font_px(12.0))
                                 .text_color(ui::text_muted())
                                 .child(short_hash.clone()),
                         ),
@@ -2036,7 +2031,7 @@ pub fn open_commit_diff_at(
                 .child(file_list)
                 .child(
                     div()
-                        .px(px(12.0))
+                        .px(px(SIDE_PAD))
                         .py(px(8.0))
                         .flex_none()
                         .border_t_1()
@@ -2051,8 +2046,14 @@ pub fn open_commit_diff_at(
                 );
 
             // 右栏
+            let selected_status = files
+                .iter()
+                .find(|f| f.path == selected)
+                .map(|f| git_ui::commit_file_status(&f.status));
             let body = if files.is_empty() {
-                centered(t("commitDiff", "noChanges"), ui::text_muted())
+                git_ui::empty_state(ICON_CLEAN, t("commitDiff", "noChanges"), None)
+                    .size_full()
+                    .into_any_element()
             } else {
                 render_body(
                     &state,
@@ -2075,20 +2076,13 @@ pub fn open_commit_diff_at(
                         .flex()
                         .items_center()
                         .justify_between()
+                        .gap(px(16.0))
+                        .h(px(TOOLBAR_H))
                         .px(px(16.0))
-                        .py(px(12.0))
                         .flex_none()
                         .border_b_1()
                         .border_color(ui::border_subtle())
-                        .child(
-                            div()
-                                .min_w(px(0.0))
-                                .max_w(px(400.0))
-                                .text_size(ui::font_px(13.0))
-                                .text_color(ui::text_primary())
-                                .truncate()
-                                .child(selected.clone()),
-                        )
+                        .child(file_heading(&selected, selected_status))
                         .child(view_toggle(
                             &state,
                             "git-commit-diff",
@@ -2481,17 +2475,5 @@ mod tests {
         assert_eq!(text_cols("abc"), 3);
         assert_eq!(text_cols("中文"), 4);
         assert_eq!(text_cols(""), 0);
-    }
-
-    /// commit 文件的状态字母表:四种已知 + 回落 `?`。
-    #[test]
-    fn commit_文件状态字母() {
-        ui::set_palette(ui::Palette::dark());
-        assert_eq!(commit_file_badge("added").0, "A");
-        assert_eq!(commit_file_badge("modified").0, "M");
-        assert_eq!(commit_file_badge("deleted").0, "D");
-        assert_eq!(commit_file_badge("renamed").0, "R");
-        assert_eq!(commit_file_badge("conflicted").0, "?");
-        assert_eq!(commit_file_badge("").1, ui::text_muted());
     }
 }

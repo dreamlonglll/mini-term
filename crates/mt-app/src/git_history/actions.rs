@@ -25,13 +25,12 @@ use gpui::{
     InteractiveElement, IntoElement, ParentElement, Pixels, Point, Render, SharedString,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::Disableable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::{Cancel, Confirm as DialogConfirm, DialogFooter};
+use gpui_component::dialog::{Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Input, InputState, Textarea, TextareaState};
 use mt_project::git::{self, CommitRelation, GitCommitInfo, PickOutcome, ResetMode};
 
 use super::{GitHistoryContent, GitHistoryEvent, error_text};
+use crate::git_ui;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, close_guarded, is_open, kind, open_guarded, show_alert};
@@ -569,17 +568,15 @@ impl GitHistoryContent {
                         this.select_after(new_head, window, cx);
                     }
                     PickOutcome::Conflicts => {
-                        let (id, name) = this.project_ident(cx);
-                        crate::toast::push_message(
-                            crate::notify::ToastKind::PasteError,
-                            id,
-                            name,
+                        git_ui::toast(
+                            &this.store,
                             tr!(
                                 "gitLog",
                                 "toast.conflicts",
                                 action = t("gitLog", action),
                                 hash = short
                             ),
+                            git_ui::Tone::Attention,
                             cx,
                         );
                     }
@@ -770,6 +767,24 @@ impl GitHistoryContent {
                 let f = form.read(cx);
                 let (busy, error, checkout) = (f.busy, f.error.clone(), f.checkout);
                 let form_toggle = form.clone();
+                // 名字一边打一边校验(空名不报,等点「创建」再说)
+                let name_field = field_group(t("gitLog", "branch.nameLabel"))
+                    .child(Input::new(&input))
+                    .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
+                        el.child(git_ui::notice_line(msg, ui::color_error()))
+                    });
+                let checkout_row = git_ui::check_row(
+                    "git-log-branch-checkout",
+                    checkout,
+                    t("gitLog", "branch.checkout"),
+                    false,
+                )
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    form_toggle.update(cx, |f, cx| {
+                        f.checkout = !f.checkout;
+                        cx.notify();
+                    });
+                });
                 let (entity, form_ok, input_ok, hash, existing) = (
                     entity.clone(),
                     form.clone(),
@@ -779,30 +794,15 @@ impl GitHistoryContent {
                 );
                 dialog
                     .title(t("gitLog", "branch.title"))
-                    .w(px(440.0))
+                    .w(px(git_ui::DIALOG_W_MD))
                     .overlay_closable(true)
                     .footer(form_footer(t("gitLog", "branch.ok"), false, busy))
                     .child(
-                        form_body()
-                            .child(muted_line(base.clone()))
-                            .child(field_label(t("gitLog", "branch.nameLabel")))
-                            .child(Input::new(&input))
-                            // 名字一边打一边校验(空名不报,等点「创建」再说)
-                            .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
-                                el.child(error_line(msg))
-                            })
-                            .child(checkbox_row(
-                                "git-log-branch-checkout",
-                                checkout,
-                                t("gitLog", "branch.checkout"),
-                                move |_window, cx| {
-                                    form_toggle.update(cx, |f, cx| {
-                                        f.checkout = !f.checkout;
-                                        cx.notify();
-                                    });
-                                },
-                            ))
-                            .when_some(error, |el, msg| el.child(error_line(msg))),
+                        git_ui::form_body()
+                            .child(git_ui::hint_line(base.clone()))
+                            .child(name_field)
+                            .child(checkout_row)
+                            .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
                         if form_ok.read(cx).busy {
@@ -900,20 +900,24 @@ impl GitHistoryContent {
                 );
                 dialog
                     .title(t("gitLog", "tag.title"))
-                    .w(px(440.0))
+                    .w(px(git_ui::DIALOG_W_MD))
                     .overlay_closable(true)
                     .footer(form_footer(t("gitLog", "branch.ok"), false, busy))
                     .child(
-                        form_body()
-                            .child(muted_line(base.clone()))
-                            .child(field_label(t("gitLog", "tag.nameLabel")))
-                            .child(Input::new(&name_input))
-                            .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
-                                el.child(error_line(msg))
-                            })
-                            .child(field_label(t("gitLog", "tag.messageLabel")))
-                            .child(Textarea::new(&message_input))
-                            .when_some(error, |el, msg| el.child(error_line(msg))),
+                        git_ui::form_body()
+                            .child(git_ui::hint_line(base.clone()))
+                            .child(
+                                field_group(t("gitLog", "tag.nameLabel"))
+                                    .child(Input::new(&name_input))
+                                    .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
+                                        el.child(git_ui::notice_line(msg, ui::color_error()))
+                                    }),
+                            )
+                            .child(
+                                field_group(t("gitLog", "tag.messageLabel"))
+                                    .child(Textarea::new(&message_input)),
+                            )
+                            .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
                         if form_ok.read(cx).busy {
@@ -998,11 +1002,11 @@ impl GitHistoryContent {
                     (entity.clone(), form.clone(), input.clone(), hash.clone());
                 dialog
                     .title(t("gitLog", "reword.title"))
-                    .w(px(520.0))
+                    .w(px(git_ui::DIALOG_W_LG))
                     .overlay_closable(true)
                     .footer(form_footer(t("gitLog", "reword.ok"), false, busy))
                     .child(
-                        form_body()
+                        git_ui::form_body()
                             .key_context("GitLogReword")
                             .on_action(|_: &GitLogRewordConfirm, window, cx| {
                                 window.dispatch_action(
@@ -1010,15 +1014,27 @@ impl GitHistoryContent {
                                     cx,
                                 );
                             })
-                            .child(muted_line(hint.clone()))
+                            .child(git_ui::hint_line(hint.clone()))
                             .when(pushed, |el| {
-                                el.child(warn_line(t("gitLog", "reword.pushedWarn")))
+                                el.child(git_ui::notice_line(
+                                    t("gitLog", "reword.pushedWarn"),
+                                    ui::color_warning(),
+                                ))
                             })
-                            .child(Textarea::new(&input))
-                            .when(empty, |el| {
-                                el.child(error_line(t("gitLog", "reword.errEmpty")))
-                            })
-                            .when_some(error, |el, msg| el.child(error_line(msg))),
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .child(Textarea::new(&input))
+                                    .when(empty, |el| {
+                                        el.child(git_ui::notice_line(
+                                            t("gitLog", "reword.errEmpty"),
+                                            ui::color_error(),
+                                        ))
+                                    }),
+                            )
+                            .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
                         if form_ok.read(cx).busy {
@@ -1120,7 +1136,7 @@ impl GitHistoryContent {
                 );
                 dialog
                     .title(t("gitLog", "reset.title"))
-                    .w(px(520.0))
+                    .w(px(git_ui::DIALOG_W_LG))
                     .overlay_closable(true)
                     .footer(form_footer(
                         t("gitLog", "reset.ok"),
@@ -1128,7 +1144,7 @@ impl GitHistoryContent {
                         busy,
                     ))
                     .child(
-                        form_body()
+                        git_ui::form_body()
                             .child(
                                 div()
                                     .text_size(ui::font_px(13.0))
@@ -1136,10 +1152,13 @@ impl GitHistoryContent {
                                     .child(target.clone()),
                             )
                             .when(off_history, |el| {
-                                el.child(warn_line(t("gitLog", "reset.notInHistory")))
+                                el.child(git_ui::notice_line(
+                                    t("gitLog", "reset.notInHistory"),
+                                    ui::color_warning(),
+                                ))
                             })
                             .child(modes)
-                            .when_some(error, |el, msg| el.child(error_line(msg))),
+                            .when_some(error, |el, msg| el.child(git_ui::error_block(msg))),
                     )
                     .on_ok(move |_: &ClickEvent, window, cx| {
                         if form_ok.read(cx).busy {
@@ -1239,87 +1258,28 @@ fn validate_tag(name: &str, existing: &[String]) -> Option<String> {
 
 // ─── 对话框小件 ───────────────────────────────────────────────
 
-/// 「取消 / 确认」页脚。确认键在等待期间换成「执行中…」并禁用(防重复提交);
-/// `danger` 时确认键用危险色(Hard 重置)。按钮派发 Dialog 自己的 Confirm / Cancel,
-/// 与回车 / Esc 走同一条路(见 `prompt::confirm_footer`)。
+// 正文骨架、说明行、警告 / 错误行、复选框、页脚都走 `git_ui` 的共用件(与分支弹窗、
+// 推送对话框同一套);这里只剩本模块特有的两件。
+
+/// 「取消 / 确认」页脚(共用的 [`git_ui::dialog_footer`]):确认键在等待期间换成
+/// 「执行中…」并禁用(防重复提交);`danger` 时确认键用危险色(Hard 重置)。
 fn form_footer(ok: &'static str, danger: bool, busy: bool) -> DialogFooter {
     let label = if busy { t("gitLog", "working") } else { ok };
-    let ok_button = Button::new("ok")
-        .label(label)
-        .cursor_pointer()
-        .disabled(busy)
-        .on_click(|_, window, cx| {
-            window.dispatch_action(Box::new(DialogConfirm { secondary: false }), cx)
-        });
-    let ok_button = if danger {
-        ok_button.danger()
-    } else {
-        ok_button.primary()
-    };
-    DialogFooter::new()
-        .child(
-            Button::new("cancel")
-                .label(t("gitLog", "confirm.cancel"))
-                .cursor_pointer()
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
-        )
-        .child(ok_button)
+    git_ui::dialog_footer(
+        label,
+        Some(t("gitLog", "confirm.cancel").into()),
+        danger,
+        busy,
+    )
 }
 
-fn form_body() -> gpui::Div {
-    div().px(px(20.0)).flex().flex_col().gap(px(8.0))
-}
-
-fn field_label(text: &'static str) -> gpui::Div {
+/// 一个表单字段:标签 + 控件 + 就地校验,三者靠得近(6px),字段之间才是正文的 12px。
+fn field_group(label: &'static str) -> gpui::Div {
     div()
-        .mt(px(4.0))
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::text_secondary())
-        .child(text)
-}
-
-fn muted_line(text: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::text_muted())
-        .child(text.into())
-}
-
-fn warn_line(text: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::color_warning())
-        .child(text.into())
-}
-
-fn error_line(text: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::color_error())
-        .child(text.into())
-}
-
-fn checkbox_row(
-    id: &'static str,
-    checked: bool,
-    label: &'static str,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .mt(px(4.0))
         .flex()
-        .items_center()
-        .gap(px(8.0))
-        .cursor_pointer()
-        .text_size(ui::font_px(13.0))
-        .text_color(ui::text_primary())
-        .child(ui::checkbox(
-            SharedString::from(format!("{id}-box")),
-            checked,
-        ))
-        .child(label)
-        .on_click(move |_: &ClickEvent, window, cx| on_click(window, cx))
+        .flex_col()
+        .gap(px(6.0))
+        .child(git_ui::field_label(label))
 }
 
 /// 重置模式的一行:单选圈 + 说明。Hard 的说明用危险色。
@@ -1342,16 +1302,16 @@ fn mode_row(
         .gap(px(10.0))
         .px(px(10.0))
         .py(px(8.0))
-        .rounded(px(6.0))
+        .rounded(px(4.0))
         .cursor_pointer()
         .border_1()
         .border_color(if selected {
             ui::with_alpha(ui::accent(), 0.5)
         } else {
-            ui::border_subtle()
+            ui::border_default()
         })
         .when(selected, |el| el.bg(ui::accent_subtle()))
-        .when(!selected, |el| el.hover(|el| el.bg(ui::bg_elevated())))
+        .when(!selected, |el| el.hover(|el| el.bg(git_ui::hover_bg())))
         .child(
             div()
                 .flex_none()
@@ -1398,9 +1358,10 @@ fn danger_confirm(
         cx,
         move |dialog, _window, _cx| {
             let on_ok = on_ok.clone();
-            let mut body = form_body();
+            // 一行一个块(原文里的空行保留成空行),行距紧凑,别吃正文的 12px 间距
+            let mut lines = div().flex().flex_col().gap(px(2.0));
             for line in message.split('\n') {
-                body = body.child(
+                lines = lines.child(
                     div()
                         .text_size(ui::font_px(13.0))
                         .text_color(ui::text_primary())
@@ -1413,32 +1374,15 @@ fn danger_confirm(
             }
             dialog
                 .title(title.clone())
-                .w(px(420.0))
+                .w(px(git_ui::DIALOG_W_SM))
                 .overlay_closable(true)
-                .footer(
-                    DialogFooter::new()
-                        .child(
-                            Button::new("cancel")
-                                .label(t("gitLog", "confirm.cancel"))
-                                .cursor_pointer()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(Cancel), cx)
-                                }),
-                        )
-                        .child(
-                            Button::new("ok")
-                                .label(ok.clone())
-                                .danger()
-                                .cursor_pointer()
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(DialogConfirm { secondary: false }),
-                                        cx,
-                                    )
-                                }),
-                        ),
-                )
-                .child(body)
+                .footer(git_ui::dialog_footer(
+                    ok.clone(),
+                    Some(t("gitLog", "confirm.cancel").into()),
+                    true,
+                    false,
+                ))
+                .child(git_ui::form_body().child(lines))
                 .on_ok(move |_: &ClickEvent, window, cx| {
                     on_ok(window, cx);
                     true

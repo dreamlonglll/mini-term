@@ -7,9 +7,9 @@
 //! │ ┌──────────────────────────────────────┐ │
 //! │ │ 1a2b3c4  修复登录页      张三 · 3 分钟前 │ │   点击看该提交的改动
 //! │ └──────────────────────────────────────┘ │
-//! │ ☐ 强制推送(--force-with-lease)             │   勾上:底部按钮区整体换危险色 + 警告
+//! │ ☐ 强制推送(--force-with-lease)             │   勾上:选项区转红 + 警告,确认键换危险色
 //! │ (失败原文,可选中复制 / 被拒时提示先拉取)     │
-//! │                         [取消]  [推送]     │
+//! │                         [取消]  [推送]     │   共用页脚(`git_ui::dialog_footer`)
 //! └─────────────────────────────────────────┘
 //! ```
 //!
@@ -26,11 +26,12 @@ use gpui::{
 };
 use gpui_component::input::TextareaState;
 use mt_project::git::{OutgoingCommits, PushOptions, PushOutcome, PushPlan, PushTarget};
+use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_panel::GitPanel;
 use crate::git_ui::{self, Tone};
 use crate::i18n::{t, tr};
-use crate::prompt::{self, Confirm, close_guarded, dialog_title, kind, open_guarded};
+use crate::prompt::{self, Confirm, close_guarded, kind, open_guarded};
 use crate::ui;
 
 /// 最多列出多少条待推送提交。
@@ -108,13 +109,30 @@ pub(crate) fn open(panel: Entity<GitPanel>, repo: String, window: &mut Window, c
     load(&state, cx);
     open_guarded(kind::GIT_PUSH, window, cx, move |dialog, _window, cx| {
         let body = render_body(&state, cx);
-        let pushing = state.read(cx).pushing;
+        let s = state.read(cx);
+        let pushing = s.pushing;
+        let force = s.force;
+        let can_push = !pushing && matches!(s.plan, Some(PushPlan::Ready(_)));
+        let push_label = if pushing {
+            t("gitBranch", "pushing")
+        } else if force {
+            t("gitBranch", "forcePushOk")
+        } else {
+            t("gitBranch", "push")
+        };
         let state_for_ok = state.clone();
         dialog
-            .title(dialog_title(kind::GIT_PUSH, t("gitBranch", "pushTitle")))
-            .w(px(560.0))
+            .title(t("gitBranch", "pushTitle"))
+            .w(px(git_ui::DIALOG_W_LG))
             // 推送进行中别让一下误点遮罩把框收了(结果回来要在框里显示)
             .overlay_closable(!pushing)
+            // 勾上强推:确认键整颗换危险色(正文里那块选项区同时转红并给警告)
+            .footer(git_ui::dialog_footer(
+                push_label,
+                Some(t("gitBranch", "cancel").into()),
+                force,
+                !can_push,
+            ))
             .child(body)
             // Enter = 推送(条件不满足时 `start_push` 自己什么都不做)
             .on_ok(move |_: &ClickEvent, window, cx| {
@@ -295,44 +313,20 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn hint_line(text: impl Into<SharedString>, color: gpui::Hsla) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .text_size(ui::font_px(12.0))
-        .text_color(color)
-        .child(git_ui::icon(git_ui::ICON_ALERT, 12.0, color))
-        .child(text.into())
-        .into_any_element()
-}
-
 fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     let s = state.read(cx);
-    let mono = git_ui::mono_font(s.panel.read(cx).store(), cx);
     let force = s.force;
     let pushing = s.pushing;
-    let mut root = div()
-        .px(px(16.0))
-        .pb(px(16.0))
-        .flex()
-        .flex_col()
-        .gap(px(12.0));
+    let mut root = git_ui::form_body();
 
     if let Some(err) = &s.load_error {
         return root
-            .child(hint_line(err.clone(), ui::color_error()))
+            .child(git_ui::notice_line(err.clone(), ui::color_error()))
             .into_any_element();
     }
     let (Some(plan), Some(outgoing)) = (s.plan.clone(), s.outgoing.clone()) else {
         return root
-            .child(
-                div()
-                    .py(px(24.0))
-                    .flex()
-                    .justify_center()
-                    .child(git_ui::busy_line(t("gitBranch", "loading"))),
-            )
+            .child(git_ui::loading_state(t("gitBranch", "loading")))
             .into_any_element();
     };
 
@@ -342,36 +336,54 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         _ => None,
     };
     root = root.child(match &plan {
-        PushPlan::Ready(target) => div()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .child(git_ui::icon(
-                git_ui::ICON_BRANCH,
-                git_ui::ICON_SIZE,
-                ui::text_muted(),
-            ))
-            .child(git_ui::pill(target.branch.clone(), ui::accent()))
-            .child(git_ui::icon(
-                git_ui::ICON_ARROW_RIGHT,
-                git_ui::ICON_SIZE,
-                ui::text_muted(),
-            ))
-            .child(git_ui::pill(
-                format!("{}/{}", target.remote, target.remote_branch),
-                ui::color_info(),
-            ))
-            .when(!target.has_upstream, |el| {
-                el.child(
-                    div()
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .child(t("gitBranch", "willSetUpstream")),
+        PushPlan::Ready(target) => {
+            let remote = format!("{}/{}", target.remote, target.remote_branch);
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .min_w_0()
+                .child(git_ui::icon(
+                    git_ui::ICON_BRANCH,
+                    git_ui::ICON_SIZE,
+                    ui::text_muted(),
+                ))
+                .child(
+                    git_ui::ref_pill(
+                        "git-push-branch",
+                        target.branch.clone(),
+                        git_ui::RefKind::Head,
+                    )
+                    .tip(target.branch.clone()),
                 )
-            })
-            .into_any_element(),
-        PushPlan::Detached => hint_line(t("gitBranch", "pushDetached"), ui::color_warning()),
-        PushPlan::NoRemote { .. } => hint_line(t("gitBranch", "pushNoRemote"), ui::color_warning()),
+                .child(git_ui::icon(
+                    git_ui::ICON_ARROW_RIGHT,
+                    git_ui::ICON_SIZE,
+                    ui::text_muted(),
+                ))
+                .child(
+                    git_ui::ref_pill("git-push-remote", remote.clone(), git_ui::RefKind::Remote)
+                        .tip(remote),
+                )
+                .when(!target.has_upstream, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(t("gitBranch", "willSetUpstream")),
+                    )
+                })
+                .into_any_element()
+        }
+        PushPlan::Detached => {
+            git_ui::notice_line(t("gitBranch", "pushDetached"), ui::color_warning())
+                .into_any_element()
+        }
+        PushPlan::NoRemote { .. } => {
+            git_ui::notice_line(t("gitBranch", "pushNoRemote"), ui::color_warning())
+                .into_any_element()
+        }
     });
 
     // ── 待推送提交 ──
@@ -380,10 +392,10 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         .id("git-push-commits")
         .max_h(px(300.0))
         .overflow_y_scroll()
-        .py(px(4.0));
+        .p(px(4.0));
     if outgoing.commits.is_empty() {
         list = list.child(git_ui::empty_state(
-            git_ui::ICON_CHECK,
+            git_ui::ICON_CLEAN,
             if target.as_ref().is_some_and(|t| !t.has_upstream) {
                 t("gitBranch", "noOutgoingNewUpstream")
             } else {
@@ -396,48 +408,42 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         let (state_for_click, hash, message) =
             (state.clone(), commit.hash.clone(), commit.message.clone());
         list = list.child(
-            div()
-                .id(SharedString::from(format!("git-push-commit-{index}")))
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .h(px(28.0))
-                .mx(px(4.0))
-                .px(px(8.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .hover(|el| el.bg(ui::bg_elevated()))
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(mono.clone())
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .child(commit.short_hash.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(ui::font_px(13.0))
-                        .text_color(ui::text_primary())
-                        .child(commit.message.clone()),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::text_muted())
-                        .child(format!(
-                            "{} · {}",
-                            commit.author,
-                            crate::git_history::format_relative_time(commit.timestamp, now)
-                        )),
-                )
-                .on_click(move |_: &ClickEvent, window, cx| {
-                    view_commit(&state_for_click, hash.clone(), message.clone(), window, cx);
-                }),
+            git_ui::list_row(
+                SharedString::from(format!("git-push-commit-{index}")),
+                false,
+            )
+            .child(
+                git_ui::mono(div())
+                    .flex_none()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(commit.short_hash.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::font_px(13.0))
+                    .text_color(ui::text_primary())
+                    .child(commit.message.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(180.0))
+                    .truncate()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(format!(
+                        "{} · {}",
+                        commit.author,
+                        crate::git_history::format_relative_time(commit.timestamp, now)
+                    )),
+            )
+            .on_click(move |_: &ClickEvent, window, cx| {
+                view_commit(&state_for_click, hash.clone(), message.clone(), window, cx);
+            }),
         );
     }
     let count_line = if outgoing.commits.is_empty() {
@@ -460,20 +466,13 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
             .flex()
             .flex_col()
             .gap(px(6.0))
-            .when_some(count_line, |el, line| {
-                el.child(
-                    div()
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .child(line),
-                )
-            })
+            .when_some(count_line, |el, line| el.child(git_ui::hint_line(line)))
             .child(
                 div()
                     .rounded(px(6.0))
                     .border_1()
                     .border_color(ui::border_subtle())
-                    .bg(ui::bg_base())
+                    .bg(ui::bg_surface())
                     .child(list),
             ),
     );
@@ -486,7 +485,7 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
                 .flex_col()
                 .gap(px(6.0))
                 .when(*rejected, |el| {
-                    el.child(hint_line(
+                    el.child(git_ui::notice_line(
                         t("gitBranch", "rejectedHint"),
                         ui::color_warning(),
                     ))
@@ -495,22 +494,10 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         );
     }
 
-    // ── 底部:强推选项 + 按钮。勾上强推时整块换危险色并给警告 ──
-    let ready = target.is_some();
-    let can_push = ready && !pushing;
+    // ── 强推选项。勾上时整块换危险色并给警告,页脚确认键同时转危险色 ──
     let danger = ui::color_error();
     let state_for_force = state.clone();
-    let state_for_push = state.clone();
-    let force_row = div()
-        .id("git-push-force")
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .cursor_pointer()
-        .text_size(ui::font_px(12.0))
-        .text_color(if force { danger } else { ui::text_secondary() })
-        .child(git_ui::check_box(force, danger))
-        .child(t("gitBranch", "forcePush"))
+    let force_row = git_ui::check_row("git-push-force", force, t("gitBranch", "forcePush"), true)
         .on_click(move |_: &ClickEvent, _window, cx| {
             state_for_force.update(cx, |s, cx| {
                 if !s.pushing {
@@ -519,26 +506,8 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
                 }
             });
         });
-    let push_label = if pushing {
-        t("gitBranch", "pushing")
-    } else if force {
-        t("gitBranch", "forcePushOk")
-    } else {
-        t("gitBranch", "push")
-    };
-    let push_button = ui::primary_button("git-push-ok", push_label)
-        .when(force, |el| el.bg(danger))
-        .when(!can_push, |el| el.opacity(0.5).cursor_default())
-        .when(can_push, |el| {
-            el.on_click(move |_: &ClickEvent, window, cx| start_push(&state_for_push, window, cx))
-        });
-    let cancel_button = ui::ghost_button("git-push-cancel", t("gitBranch", "cancel")).on_click(
-        |_: &ClickEvent, window, cx| {
-            close_guarded(kind::GIT_PUSH, window, cx);
-        },
-    );
     let warning = target.as_ref().filter(|_| force).map(|target| {
-        hint_line(
+        git_ui::notice_line(
             tr!(
                 "gitBranch",
                 "forceWarning",
@@ -552,9 +521,9 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         div()
             .flex()
             .flex_col()
-            .gap(px(10.0))
+            .gap(px(8.0))
             .px(px(12.0))
-            .py(px(10.0))
+            .py(px(8.0))
             .rounded(px(6.0))
             .border_1()
             .border_color(if force {
@@ -564,24 +533,11 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
             })
             .when(force, |el| el.bg(ui::with_alpha(danger, 0.08)))
             .child(force_row)
-            .children(warning)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .when(pushing, |el| {
-                        el.child(
-                            div()
-                                .mr_auto()
-                                .child(git_ui::busy_line(t("gitBranch", "pushing"))),
-                        )
-                    })
-                    .child(cancel_button)
-                    .child(push_button),
-            ),
+            .children(warning),
     )
+    .when(pushing, |el| {
+        el.child(git_ui::busy_line(t("gitBranch", "pushing")))
+    })
     .into_any_element()
 }
 
