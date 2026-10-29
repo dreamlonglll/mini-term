@@ -31,6 +31,12 @@
 //!    GPUI 侧字族不自己挂就会继承界面字体,列对不齐。
 //! 8. **两个弹窗的外框与用量统计面板同尺寸**(见 [`modal_size`])。原版是
 //!    `90vw×80vh` / `92vw×85vh` 两个值。
+//! 9. **单文件 diff 能按块暂存 / 取消暂存 / 丢弃**(hunk 头上的按钮,见 [`HunkUi`]):
+//!    后端 `mt_project::git::{stage_hunk, unstage_hunk, discard_hunk}` 拿 diff 两侧全文
+//!    与该块的精确行号做文本拼接,执行前重读两侧防陈旧。操作后弹窗**原地**重取 diff、
+//!    视图模式不变、滚到原位置上的下一块;同时回调 `on_changed` 让更改列表重载。
+//! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮),
+//!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。
 //!
 //! # 判定顺序不能换
 //!
@@ -39,23 +45,46 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, HighlightStyle,
-    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Pixels, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
+    HighlightStyle, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement,
+    Pixels, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText,
     UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 pub use mt_project::git::DiffSide;
-use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
+use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult, StaleDiff};
+use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::git_commit_ui::{
+    ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_CLOSE,
+    ICON_COPY, ICON_REFRESH, icon_button, mono, pill, text_button,
+};
 use crate::i18n::{t, tr};
-use crate::prompt::{kind, open_guarded};
+use crate::prompt::{Confirm, kind, open_guarded};
 use crate::store::AppStore;
 use crate::tab_expansion::{TAB_WIDTH, expand_line};
 use crate::ui;
+
+gpui::actions!(
+    mini_term,
+    [
+        /// 单文件 diff:下一处改动(F7)
+        GitDiffNextChange,
+        /// 单文件 diff:上一处改动(Shift+F7)
+        GitDiffPrevChange,
+        /// 单文件 diff:分组里的下一个文件(Alt+→)
+        GitDiffNextFile,
+        /// 单文件 diff:分组里的上一个文件(Alt+←)
+        GitDiffPrevFile,
+    ]
+);
+
+/// 单文件 diff 弹窗的 key context(键位绑在 `hotkeys.rs` 的表外段)。
+pub const FILE_DIFF_CONTEXT: &str = "GitFileDiff";
 
 /// 视图模式。**组件态,不落盘**;默认 side-by-side(`DiffModal.tsx:158`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +353,9 @@ struct Flat {
     widest_inline: usize,
     widest_left: usize,
     widest_right: usize,
+    /// 标题栏「+12 −3」的两个数
+    adds: usize,
+    deletes: usize,
 }
 
 /// 行宽的近似列数:CJK/全角按 2,其余按 1。
@@ -413,6 +445,8 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
     f.widest_inline = inline_ix;
     f.widest_left = left_ix;
     f.widest_right = right_ix;
+    f.adds = f.lines.iter().filter(|l| l.kind == "add").count();
+    f.deletes = f.lines.iter().filter(|l| l.kind == "delete").count();
     f
 }
 
@@ -442,6 +476,12 @@ fn line_fg(kind: &str) -> gpui::Hsla {
 /// 行号列宽(`DiffModal.tsx:38,116` 的 `w-[48px]`)。
 const GUTTER: f32 = 48.0;
 
+/// inline 视图的两列行号(旧 / 新)各自的宽度与 `+`/`-` 符号列宽。
+/// 两列合起来与 hunk 头的留白一致,头里的 `@@` 才与正文左缘对齐。
+const INLINE_NUM: f32 = 44.0;
+const INLINE_SIGN: f32 = 16.0;
+const INLINE_GUTTER: f32 = INLINE_NUM * 2.0 + INLINE_SIGN;
+
 /// 行内高亮的底色(与整行底色叠在一起,所以要更实)。
 fn word_bg(kind: &str) -> gpui::Hsla {
     if kind == "add" {
@@ -451,11 +491,15 @@ fn word_bg(kind: &str) -> gpui::Hsla {
     }
 }
 
-/// 一行:行号列 + 内容列。`gutter` 是行号列要显示的文本,`marks` 是这一行里
-/// **真正变了的片段**(空 = 整行一个底色,与原版一致)。
+/// 一行:若干行号列 + 内容列。`gutters` 是各行号列的 `(文本, 宽)`(并排视图一列,
+/// inline 视图旧 / 新两列 + 符号列),`marks` 是这一行里**真正变了的片段**
+/// (空 = 整行一个底色,与原版一致)。
+///
+/// 行根 `w_full()`:横向不受限的 uniform_list 里行宽 = 内容区宽,少了它增删行的底色
+/// 只涂到文字为止,长短行参差不齐。
 fn diff_line_row(
     line: &DiffLine,
-    gutter: String,
+    gutters: &[(String, f32)],
     line_height: f32,
     marks: &[Range<usize>],
 ) -> AnyElement {
@@ -482,42 +526,63 @@ fn diff_line_row(
     }
 
     div()
+        .w_full()
         .flex()
         .h(px(line_height))
         .when_some(line_bg(kind), |el, bg| el.bg(bg))
-        .child(
+        .children(gutters.iter().map(|(no, width)| {
             div()
-                .w(px(GUTTER))
+                .w(px(*width))
                 .flex_none()
                 .pr(px(8.0))
                 .text_right()
                 .text_color(ui::text_muted())
-                .opacity(0.5)
-                .child(gutter),
-        )
+                .opacity(0.6)
+                .child(no.clone())
+        }))
         .child(text)
         .into_any_element()
 }
 
-/// hunk 头(`@@ -a,b +c,d @@`)。
+/// hunk 头(`@@ -a,b +c,d @@`),后面可以跟一组块操作按钮。
+///
+/// 按钮紧跟在 `@@` 文字后面而不是贴右缘:横向不受限的列表里「右缘」是最长那一行的
+/// 尽头,长行文件里按钮会被挤到视野外,得先横向滚过去才点得到。
 ///
 /// ⚠️ 高度必须**恰好**是 `line_height`:uniform_list 按「量到的那一行」的高度
-/// 摆所有行,这里多一像素边框,整份 diff 的行位就会与滚动条对不上。分隔靠底色。
-fn hunk_row(text: SharedString, line_height: f32) -> AnyElement {
+/// 摆所有行,这里多一像素边框,整份 diff 的行位就会与滚动条对不上。分隔靠底色;
+/// 按钮比行高矮 4px、居中摆。
+fn hunk_row(
+    text: SharedString,
+    line_height: f32,
+    gutter: f32,
+    actions: Option<AnyElement>,
+) -> AnyElement {
     div()
+        .w_full()
         .flex()
+        .items_center()
         .h(px(line_height))
         .bg(ui::bg_elevated())
-        .child(div().w(px(GUTTER)).flex_none())
+        .child(div().w(px(gutter)).flex_none())
         .child(
             div()
-                .flex_1()
+                .flex_none()
                 .px(px(8.0))
                 .whitespace_nowrap()
-                .text_color(ui::accent())
-                .opacity(0.7)
+                .text_color(ui::text_muted())
                 .child(text),
         )
+        .children(actions.map(|actions| {
+            div()
+                .flex_none()
+                .h(px((line_height - 4.0).max(16.0)))
+                .ml(px(8.0))
+                .flex()
+                .items_stretch()
+                .gap(px(8.0))
+                .child(actions)
+        }))
         .into_any_element()
 }
 
@@ -549,6 +614,7 @@ fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, gpui::Pixels
 /// 空格子(`DiffModal.tsx:100-107`)。
 fn empty_cell(line_height: f32) -> AnyElement {
     div()
+        .w_full()
         .flex()
         .h(px(line_height))
         .bg(ui::bg_base())
@@ -659,6 +725,18 @@ impl DiffState {
         self.synced_y = target;
     }
 
+    /// 三个列表都回到顶部(换文件时用,否则新文件一进来停在上一份的偏移上)。
+    fn reset_scroll(&mut self) {
+        for handle in [&self.inline_scroll, &self.left_scroll, &self.right_scroll] {
+            handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(px(0.0), px(0.0)));
+        }
+        self.synced_y = px(0.0);
+    }
+
     /// 跳到上/下一处改动(= 上/下一个 hunk 头)。`delta` 取 ±1,到头绕回。
     fn jump_by(&mut self, delta: isize) {
         let total = self.flat.heads.len();
@@ -670,6 +748,17 @@ impl DiffState {
             None => total - 1,
             Some(cur) => (cur as isize + delta).rem_euclid(total as isize) as usize,
         };
+        self.jump_to(next);
+    }
+
+    /// 直接落到第 `ix` 个 hunk 头;越界取最后一块。按块操作后原地重取 diff 时用它
+    /// 停在「原位置上的下一块」(刚处理掉的那块消失了,后面的块顶上来占了它的号)。
+    fn jump_to(&mut self, ix: usize) {
+        let total = self.flat.heads.len();
+        if total == 0 {
+            return;
+        }
+        let next = ix.min(total - 1);
         self.jump = Some(next);
         match self.view {
             // strict:哪怕目标已在视野里也要把它顶到最上面 —— 连着点「下一处」
@@ -712,11 +801,18 @@ fn centered(text: impl Into<SharedString>, color: gpui::Hsla) -> AnyElement {
 
 /// 内容区的五选一(顺序不能换,见模块注释)。`labels` 是四条文案
 /// (loading / binary / tooLarge / 额外的空态),两个弹窗各给各的命名空间。
+///
+/// `empty` 是「没有任何 hunk」时的空态文案(单文件 diff 按块处理完最后一块就落到这里);
+/// `None` 时照旧画一张空列表(提交 diff 的口径不变)。`hunks` 是块操作按钮的上下文,
+/// 只有单文件 diff 且该文件支持按块操作时才给。
+#[allow(clippy::too_many_arguments)]
 fn render_body(
     state: &Entity<DiffState>,
     loading: &'static str,
     binary: &'static str,
     too_large: &'static str,
+    empty: Option<&'static str>,
+    hunks: Option<HunkUi>,
     cx: &mut App,
 ) -> AnyElement {
     let s = state.read(cx);
@@ -735,11 +831,33 @@ fn render_body(
     if result.too_large {
         return centered(too_large, ui::text_muted());
     }
+    if let Some(empty) = empty.filter(|_| result.hunks.is_empty()) {
+        return empty_state(empty);
+    }
     let view = match s.view {
-        ViewMode::Inline => render_inline(state, cx),
-        ViewMode::SideBySide => render_side_by_side(state, cx),
+        ViewMode::Inline => render_inline(state, hunks, cx),
+        ViewMode::SideBySide => render_side_by_side(state, hunks, cx),
     };
     mono_body(view)
+}
+
+/// 「没有更多改动」:32px 的勾形图标 + 一句说明,居中。
+fn empty_state(text: &'static str) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(12.0))
+        .child(mt_ui::icons::VectorIcon::new(ICON_CLEAN, px(32.0)).ink(ui::text_muted()))
+        .child(
+            div()
+                .text_size(ui::font_px(13.0))
+                .text_color(ui::text_muted())
+                .child(text),
+        )
+        .into_any_element()
 }
 
 /// diff 正文的等宽字体壳。
@@ -765,7 +883,10 @@ fn mono_body(body: AnyElement) -> AnyElement {
 }
 
 /// `InlineView`(`DiffModal.tsx:22-58`),外加 hunk 头与横向滚动。
-fn render_inline(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
+///
+/// 行号是旧 / 新两列(原版只有一列:增删行在那一列里显示 `+` / `-`,上下文行显示旧行号,
+/// 改了一段之后新文件的行号就对不上了);符号单独一列。
+fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App) -> AnyElement {
     let s = state.read(cx);
     let count = s.flat.inline_rows.len();
     let line_height = s.line_height();
@@ -780,15 +901,30 @@ fn render_inline(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
             let s = state.read(cx);
             range
                 .map(|i| match s.flat.inline_rows[i] {
-                    InlineRow::Head(h) => hunk_row(s.flat.heads[h].inline.clone(), line_height),
+                    InlineRow::Head(h) => hunk_row(
+                        s.flat.heads[h].inline.clone(),
+                        line_height,
+                        INLINE_GUTTER,
+                        hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                    ),
                     InlineRow::Line(ix) => {
                         let line = &s.flat.lines[ix];
-                        let gutter = match line.kind.as_str() {
-                            "add" => "+".to_string(),
-                            "delete" => "-".to_string(),
-                            _ => line.old_lineno.map(|n| n.to_string()).unwrap_or_default(),
+                        let no = |n: Option<u32>| n.map(|n| n.to_string()).unwrap_or_default();
+                        let sign = match line.kind.as_str() {
+                            "add" => "+",
+                            "delete" => "-",
+                            _ => "",
                         };
-                        diff_line_row(line, gutter, line_height, &s.flat.marks[ix])
+                        diff_line_row(
+                            line,
+                            &[
+                                (no(line.old_lineno), INLINE_NUM),
+                                (no(line.new_lineno), INLINE_NUM),
+                                (sign.to_string(), INLINE_SIGN),
+                            ],
+                            line_height,
+                            &s.flat.marks[ix],
+                        )
                     }
                 })
                 .collect::<Vec<_>>()
@@ -804,7 +940,12 @@ fn render_inline(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
 }
 
 /// `SideBySideView`(`DiffModal.tsx:62-152`),外加 hunk 头、横向滚动与纵向同步。
-fn render_side_by_side(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
+/// 块操作按钮只挂在右栏的 hunk 头上(两栏各一份会让同一块出现两组按钮)。
+fn render_side_by_side(
+    state: &Entity<DiffState>,
+    hunks: Option<HunkUi>,
+    cx: &mut App,
+) -> AnyElement {
     // 每帧一次:上一帧谁滚了,另一边这一帧跟上(见 [`DiffState::sync_columns`])
     state.update(cx, |s, _| s.sync_columns());
 
@@ -818,6 +959,7 @@ fn render_side_by_side(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
 
     let column = |side_left: bool, widest_ix: usize, scroll: UniformListScrollHandle| {
         let state = state.clone();
+        let hunks = if side_left { None } else { hunks.clone() };
         uniform_list(
             if side_left {
                 "git-diff-left"
@@ -837,7 +979,12 @@ fn render_side_by_side(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
                             } else {
                                 head.right.clone()
                             };
-                            hunk_row(text, line_height)
+                            hunk_row(
+                                text,
+                                line_height,
+                                GUTTER,
+                                hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                            )
                         }
                         PairRow::Line(left, right) => {
                             let index = if side_left { left } else { right };
@@ -853,7 +1000,7 @@ fn render_side_by_side(state: &Entity<DiffState>, cx: &mut App) -> AnyElement {
                                     };
                                     diff_line_row(
                                         line,
-                                        no.map(|n| n.to_string()).unwrap_or_default(),
+                                        &[(no.map(|n| n.to_string()).unwrap_or_default(), GUTTER)],
                                         line_height,
                                         &s.flat.marks[index],
                                     )
@@ -907,25 +1054,13 @@ struct ToolbarLabels {
 fn jump_button(
     state: &Entity<DiffState>,
     id: SharedString,
-    glyph: &'static str,
+    icon: &'static [mt_ui::icons::Shape],
     tip: &'static str,
     delta: isize,
 ) -> AnyElement {
     let state = state.clone();
-    div()
-        .id(id)
-        .w(px(22.0))
-        .h(px(22.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(4.0))
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::text_muted())
-        .cursor_pointer()
-        .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+    icon_button(id, icon, true)
         .tip(tip)
-        .child(glyph)
         .on_click(move |_: &ClickEvent, _window, cx| {
             state.update(cx, |s, cx| {
                 s.jump_by(delta);
@@ -961,21 +1096,21 @@ fn jump_group(
             .child(jump_button(
                 state,
                 SharedString::from(format!("{id_prefix}-jump-prev")),
-                "↑",
+                ICON_ARROW_UP,
                 labels.prev,
                 -1,
             ))
             .child(
-                div()
+                mono(div())
                     .px(px(2.0))
-                    .text_size(ui::font_px(11.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(counter),
             )
             .child(jump_button(
                 state,
                 SharedString::from(format!("{id_prefix}-jump-next")),
-                "↓",
+                ICON_ARROW_DOWN,
                 labels.next,
                 1,
             ))
@@ -1043,130 +1178,616 @@ fn view_toggle(
         .children(jumps)
         .child(seg)
         .child(
-            div()
-                .id(SharedString::from(format!("{id_prefix}-close")))
-                .ml(px(8.0))
-                .text_size(ui::font_px(18.0))
-                .text_color(ui::text_muted())
-                .cursor_pointer()
-                .hover(|el| el.text_color(ui::color_error()))
-                .child("✕")
-                .on_click(move |_: &ClickEvent, window, cx| {
-                    crate::prompt::close_guarded(close_kind, window, cx);
-                }),
+            icon_button(
+                SharedString::from(format!("{id_prefix}-close")),
+                ICON_CLOSE,
+                true,
+            )
+            .ml(px(8.0))
+            .on_click(move |_: &ClickEvent, window, cx| {
+                crate::prompt::close_guarded(close_kind, window, cx);
+            }),
         )
         .into_any_element()
 }
 
 // ─── DiffModal(工作区/暂存区单文件) ──────────────────────────
 
-/// 打开单文件 diff。`side` 决定比的是哪两侧(见 [`DiffSide`])。
-pub fn open_file_diff(
-    store: Entity<AppStore>,
+/// 单文件 diff 弹窗里能前后切换的一个文件。
+#[derive(Debug, Clone)]
+pub struct DiffFile {
+    /// 相对 `repo_path` 的路径
+    pub path: String,
+    pub side: DiffSide,
+    /// 标题栏状态胶囊里的字母(`M` / `A` / …)
+    pub status_label: String,
+    /// 支不支持按块操作。由调用方按状态判(未跟踪 / 冲突 / 重命名 / 删除只支持整文件
+    /// 操作);[`DiffSide::Working`] 一律不支持。二进制 / 过大由 diff 结果自己挡掉。
+    pub hunk_actions: bool,
+}
+
+/// 按块操作成功后的回调(更改列表据此重载)。
+pub type OnChanged = Rc<dyn Fn(&mut App)>;
+
+/// 三种块操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkOp {
+    Stage,
+    Unstage,
+    Discard,
+}
+
+/// 单文件 diff 弹窗的控制面:文件序列、当前下标、进行中的块操作与就地错误。
+///
+/// 与 [`DiffState`] 分开:后者是两个弹窗共用的「diff 内容」,这些是单文件弹窗独有的。
+struct FileDiff {
     repo_path: String,
-    file_path: String,
+    files: Vec<DiffFile>,
+    current: usize,
+    on_changed: Option<OnChanged>,
+    /// 进行中的块操作(第几块)。`Some` 时全部块按钮禁用,防重复点击
+    busy: Option<usize>,
+    /// 块操作失败的原文。就地显示在工具栏下方 —— toast 画在弹窗遮罩底下,看不见
+    op_error: Option<String>,
+    /// 失败是因为 diff 过期:错误条上给「刷新」
+    stale: bool,
+    /// 弹窗正文的焦点:F7 / Alt+← 这些键位挂在它的 key context 上
+    focus: FocusHandle,
+}
+
+impl FileDiff {
+    fn file(&self) -> &DiffFile {
+        &self.files[self.current]
+    }
+}
+
+impl Render for FileDiff {
+    /// 同 [`DiffState`]:只当状态盒子用。
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// 块操作按钮要的上下文。只有单文件 diff 且该文件支持按块操作时才有。
+#[derive(Clone)]
+struct HunkUi {
+    state: Entity<DiffState>,
+    ctl: Entity<FileDiff>,
     side: DiffSide,
-    status_label: String,
+    /// 进行中的块操作(第几块)
+    busy: Option<usize>,
+}
+
+/// hunk 头上的块操作按钮:未暂存侧「暂存此块 / 丢弃此块」,已暂存侧「取消暂存此块」。
+/// 正在处理的那一块换成「处理中…」,其余块的按钮一并禁用。
+fn hunk_actions(hunk_ui: &HunkUi, hunk: usize) -> AnyElement {
+    if hunk_ui.busy == Some(hunk) {
+        return div()
+            .flex()
+            .items_center()
+            .px(px(8.0))
+            .text_size(ui::font_px(11.0))
+            .text_color(ui::text_muted())
+            .child(t("gitCommit", "hunkWorking"))
+            .into_any_element();
+    }
+    let enabled = hunk_ui.busy.is_none();
+    let button = |key: &str, label: &'static str, op: HunkOp, danger: bool| {
+        let (state, ctl) = (hunk_ui.state.clone(), hunk_ui.ctl.clone());
+        text_button(
+            SharedString::from(format!("git-hunk-{key}-{hunk}")),
+            label,
+            enabled,
+            danger,
+        )
+        .when(enabled, move |el| {
+            el.on_click(move |_: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                request_hunk_op(&state, &ctl, op, hunk, window, cx);
+            })
+        })
+    };
+    let mut row = div().h_full().flex().items_stretch().gap(px(8.0));
+    match hunk_ui.side {
+        DiffSide::Unstaged => {
+            row = row
+                .child(button(
+                    "stage",
+                    t("gitCommit", "stageHunk"),
+                    HunkOp::Stage,
+                    false,
+                ))
+                .child(button(
+                    "discard",
+                    t("gitCommit", "discardHunk"),
+                    HunkOp::Discard,
+                    true,
+                ));
+        }
+        DiffSide::Staged => {
+            row = row.child(button(
+                "unstage",
+                t("gitCommit", "unstageHunk"),
+                HunkOp::Unstage,
+                false,
+            ));
+        }
+        DiffSide::Working => {}
+    }
+    row.into_any_element()
+}
+
+/// 点了块操作按钮。丢弃先确认(不可恢复);确认框种类与 diff 弹窗不同,能叠在它上面。
+fn request_hunk_op(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    op: HunkOp,
+    hunk: usize,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() {
+    if ctl.read(cx).busy.is_some() {
         return;
     }
-    let font_size = store.read(cx).config().terminal_font_size as f32;
-    let state = cx.new(|cx| DiffState::new(font_size, cx));
+    if op != HunkOp::Discard {
+        run_hunk_op(state, ctl, op, hunk, cx);
+        return;
+    }
+    let (state, ctl) = (state.clone(), ctl.clone());
+    Confirm::new(
+        t("gitCommit", "discardHunkTitle"),
+        t("gitCommit", "discardHunkConfirm"),
+    )
+    .ok_text(t("gitChanges", "discardOk"))
+    .open(
+        move |_window, cx| run_hunk_op(&state, &ctl, op, hunk, cx),
+        window,
+        cx,
+    );
+}
 
-    // 取数:`(repo, path, side)` 三元组一次到位(原版漏了 staged,见模块注释)
-    {
-        let (repo, path) = (repo_path.clone(), file_path.clone());
-        let state = state.clone();
-        cx.spawn(async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::git::get_git_diff(std::path::Path::new(&repo), &path, side)
-                })
-                .await;
-            let _ = state.update(cx, |s: &mut DiffState, cx| {
-                s.apply(result);
+/// 真正执行块操作:拿**当前显示的这份 diff**(两侧全文 + 块)交给后端,后端重读两侧
+/// 比对,对不上就拒绝(见 `mt_project::git::hunk` 模块注释)。成功后通知更改列表并
+/// 原地重取 diff;失败就地红字。
+fn run_hunk_op(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    op: HunkOp,
+    hunk: usize,
+    cx: &mut App,
+) {
+    let Some(diff) = state.read(cx).result.clone() else {
+        return;
+    };
+    let (repo, path) = {
+        let c = ctl.read(cx);
+        if c.busy.is_some() {
+            return;
+        }
+        (c.repo_path.clone(), c.file().path.clone())
+    };
+    ctl.update(cx, |c, cx| {
+        c.busy = Some(hunk);
+        c.op_error = None;
+        c.stale = false;
+        cx.notify();
+    });
+    let (state, ctl) = (state.clone(), ctl.clone());
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                let repo = std::path::Path::new(&repo);
+                match op {
+                    HunkOp::Stage => mt_project::git::stage_hunk(repo, &path, &diff, hunk),
+                    HunkOp::Unstage => mt_project::git::unstage_hunk(repo, &path, &diff, hunk),
+                    HunkOp::Discard => mt_project::git::discard_hunk(repo, &path, &diff, hunk),
+                }
+            })
+            .await;
+        cx.update(|cx| match result {
+            Ok(()) => {
+                if let Some(on_changed) = ctl.read(cx).on_changed.clone() {
+                    on_changed(cx);
+                }
+                // `busy` 留到重取的 diff 落地才清(见 `load_file`):这中间屏幕上还是
+                // 操作前的那份,放开按钮的话下一次点击拿的就是过期的块
+                load_file(&state, &ctl, Some(hunk), cx);
+            }
+            Err(err) => ctl.update(cx, |c, cx| {
+                eprintln!("[git] 按块操作失败: {err:#}");
+                c.busy = None;
+                c.stale = err.is::<StaleDiff>();
+                c.op_error = Some(if c.stale {
+                    t("gitCommit", "hunkStale").to_string()
+                } else {
+                    tr!("gitCommit", "hunkFailed", detail = format!("{err:#}"))
+                });
+                cx.notify();
+            }),
+        });
+    })
+    .detach();
+}
+
+/// 取当前文件的 diff。
+///
+/// `after_op = Some(k)`:按块操作后原地重取 —— 不清空旧内容、不回「加载中」(否则整页
+/// 闪一下),结果到了视图模式不变、落到第 k 块(原位置上的下一块),并清掉块操作的
+/// `busy`。`None` 是换文件 / 首次打开:清空并回到顶部。
+fn load_file(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    after_op: Option<usize>,
+    cx: &mut App,
+) {
+    let (repo, file) = {
+        let c = ctl.read(cx);
+        (c.repo_path.clone(), c.file().clone())
+    };
+    let req = state.update(cx, |s, cx| {
+        if after_op.is_none() {
+            s.loading = true;
+            s.error = None;
+            s.result = None;
+            s.flat = Flat::default();
+            s.jump = None;
+            s.reset_scroll();
+        }
+        s.request += 1;
+        cx.notify();
+        s.request
+    });
+    let (state, ctl) = (state.clone(), ctl.clone());
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                mt_project::git::get_git_diff(std::path::Path::new(&repo), &file.path, file.side)
+            })
+            .await;
+        state.update(cx, |s: &mut DiffState, cx| {
+            if s.request != req {
+                return;
+            }
+            s.apply(result);
+            if let Some(next) = after_op {
+                s.jump_to(next);
+            }
+            cx.notify();
+        });
+        // 被更新的请求顶掉了也照样放开:最坏是下一次点击拿到过期的块,后端会按陈旧拒绝
+        if after_op.is_some() {
+            ctl.update(cx, |c, cx| {
+                c.busy = None;
                 cx.notify();
             });
-        })
-        .detach();
-    }
+        }
+    })
+    .detach();
+}
 
-    let file_name = file_path
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(&file_path)
-        .to_string();
+/// 在文件序列里前后换一个(到头不绕回)。块操作进行中不换 —— 回包会落到别的文件上。
+fn switch_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, delta: isize, cx: &mut App) {
+    let moved = ctl.update(cx, |c, cx| {
+        let next = c.current as isize + delta;
+        if c.busy.is_some() || next < 0 || next as usize >= c.files.len() {
+            return false;
+        }
+        c.current = next as usize;
+        c.op_error = None;
+        c.stale = false;
+        cx.notify();
+        true
+    });
+    if moved {
+        load_file(state, ctl, None, cx);
+    }
+}
+
+/// 当前侧的说明(「暂存区 → 工作区」这类)。
+fn side_label(side: DiffSide) -> &'static str {
+    match side {
+        DiffSide::Staged => t("gitCommit", "sideStaged"),
+        DiffSide::Unstaged => t("gitCommit", "sideUnstaged"),
+        DiffSide::Working => t("gitCommit", "sideWorking"),
+    }
+}
+
+/// 标题栏左半:文件图标 + 文件名 + 弱化的目录 + 状态胶囊 + 「+12 −3」+ 当前侧。
+fn title_block(file: &DiffFile, state: &Entity<DiffState>, cx: &App) -> AnyElement {
+    let (dir, name) = match file.path.rsplit_once(['/', '\\']) {
+        Some((dir, name)) => (dir.to_string(), name.to_string()),
+        None => (String::new(), file.path.clone()),
+    };
+    let s = state.read(cx);
+    let stats = s
+        .result
+        .as_ref()
+        .filter(|r| !r.is_binary && !r.too_large)
+        .map(|_| (s.flat.adds, s.flat.deletes));
+    let status_color = crate::git_changes::status_color_for_label(&file.status_label);
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .flex_1()
+        .min_w_0()
+        .child(FileIcon::new(&name, false, false).size(px(16.0)))
+        .child(
+            div()
+                .flex_none()
+                .text_size(ui::font_px(15.0))
+                .text_color(ui::text_primary())
+                .child(name),
+        )
+        .when(!dir.is_empty(), |el| {
+            el.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(dir),
+            )
+        })
+        .when(!file.status_label.trim().is_empty(), |el| {
+            el.child(pill(file.status_label.clone(), status_color))
+        })
+        .when_some(stats, |el, (adds, deletes)| {
+            el.child(
+                mono(div())
+                    .flex_none()
+                    .flex()
+                    .gap(px(6.0))
+                    .text_size(ui::font_px(12.0))
+                    .child(
+                        div()
+                            .text_color(ui::color_success())
+                            .child(format!("+{adds}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(ui::color_error())
+                            .child(format!("−{deletes}")),
+                    ),
+            )
+        })
+        .child(
+            div()
+                .flex_none()
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::text_muted())
+                .child(side_label(file.side)),
+        )
+        .into_any_element()
+}
+
+/// 「上一个文件 / 2 / 7 / 下一个文件」。只有一个文件时不画。
+fn file_nav(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    current: usize,
+    total: usize,
+) -> Option<AnyElement> {
+    if total <= 1 {
+        return None;
+    }
+    let nav = |id: &'static str, icon, tip: String, delta: isize, enabled: bool| {
+        let (state, ctl) = (state.clone(), ctl.clone());
+        icon_button(id, icon, enabled)
+            .tip(tip)
+            .when(enabled, move |el| {
+                el.on_click(move |_: &ClickEvent, _window, cx| {
+                    switch_file(&state, &ctl, delta, cx);
+                })
+            })
+    };
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .mr(px(16.0))
+            .child(nav(
+                "git-diff-prev-file",
+                ICON_CHEVRON_LEFT,
+                tr!(
+                    "gitCommit",
+                    "prevFile",
+                    shortcut = crate::menu::hotkey_label(false, false, true, "←")
+                ),
+                -1,
+                current > 0,
+            ))
+            .child(
+                mono(div())
+                    .px(px(2.0))
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(format!("{} / {}", current + 1, total)),
+            )
+            .child(nav(
+                "git-diff-next-file",
+                ICON_CHEVRON_RIGHT,
+                tr!(
+                    "gitCommit",
+                    "nextFile",
+                    shortcut = crate::menu::hotkey_label(false, false, true, "→")
+                ),
+                1,
+                current + 1 < total,
+            ))
+            .into_any_element(),
+    )
+}
+
+/// 块操作失败的就地错误条:红字原文 + 复制 + (过期时)刷新 + 关掉。
+fn error_bar(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    err: String,
+    stale: bool,
+) -> AnyElement {
+    let copy_text = err.clone();
+    let (refresh_state, refresh_ctl) = (state.clone(), ctl.clone());
+    let dismiss = ctl.clone();
+    div()
+        .flex_none()
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .px(px(16.0))
+        .py(px(8.0))
+        .bg(ui::with_alpha(ui::color_error(), 0.08))
+        .border_b_1()
+        .border_color(ui::border_subtle())
+        .child(
+            div()
+                .id("git-diff-op-error")
+                .flex_1()
+                .min_w_0()
+                .max_h(px(120.0))
+                .overflow_y_scroll()
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::color_error())
+                .child(err),
+        )
+        .child(
+            icon_button("git-diff-op-error-copy", ICON_COPY, true)
+                .tip(t("gitCommit", "copyError"))
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }),
+        )
+        .when(stale, |el| {
+            el.child(
+                icon_button("git-diff-op-error-refresh", ICON_REFRESH, true)
+                    .tip(t("gitCommit", "refresh"))
+                    .on_click(move |_: &ClickEvent, _window, cx| {
+                        refresh_ctl.update(cx, |c, cx| {
+                            c.op_error = None;
+                            c.stale = false;
+                            cx.notify();
+                        });
+                        let at = refresh_state.read(cx).jump.unwrap_or(0);
+                        load_file(&refresh_state, &refresh_ctl, Some(at), cx);
+                    }),
+            )
+        })
+        .child(
+            icon_button("git-diff-op-error-close", ICON_CLOSE, true)
+                .tip(t("gitCommit", "dismiss"))
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    dismiss.update(cx, |c, cx| {
+                        c.op_error = None;
+                        c.stale = false;
+                        cx.notify();
+                    });
+                }),
+        )
+        .into_any_element()
+}
+
+/// 打开单文件 diff。
+///
+/// `files` 是打开它的那个分组的文件序列(更改列表传整组,文件树传单元素),`current`
+/// 是点开的那一个;Alt+← / Alt+→ 在序列里前后换。`on_changed` 在按块操作成功后调用
+/// (更改列表传自己的重载,文件树传 `None`)。
+pub fn open_file_diff(
+    store: Entity<AppStore>,
+    repo_path: String,
+    files: Vec<DiffFile>,
+    current: usize,
+    on_changed: Option<OnChanged>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // 守卫要在建实体之前判:已经开着一个的话,下面的取数与聚焦都是白干
+    // (聚焦还会把焦点送给一个永远不会画出来的元素,见 `prompt::autofocus`)
+    if repo_path.is_empty() || files.is_empty() || crate::prompt::is_open(kind::GIT_DIFF) {
+        return;
+    }
+    let current = current.min(files.len() - 1);
+    let font_size = store.read(cx).config().terminal_font_size as f32;
+    let state = cx.new(|cx| DiffState::new(font_size, cx));
+    let ctl = cx.new(|cx| FileDiff {
+        repo_path,
+        files,
+        current,
+        on_changed,
+        busy: None,
+        op_error: None,
+        stale: false,
+        focus: cx.focus_handle(),
+    });
+    // 取数:`(repo, path, side)` 三元组一次到位(原版漏了 staged,见模块注释)
+    load_file(&state, &ctl, None, cx);
+    let focus = ctl.read(cx).focus.clone();
+    let initial_focus = focus.clone();
 
     open_guarded(kind::GIT_DIFF, window, cx, move |dialog, window, cx| {
         let viewport = window.viewport_size();
+        let (file, current, total, busy, op_error, stale) = {
+            let c = ctl.read(cx);
+            (
+                c.file().clone(),
+                c.current,
+                c.files.len(),
+                c.busy,
+                c.op_error.clone(),
+                c.stale,
+            )
+        };
+        let hunk_ui = (file.hunk_actions && file.side != DiffSide::Working).then(|| HunkUi {
+            state: state.clone(),
+            ctl: ctl.clone(),
+            side: file.side,
+            busy,
+        });
         let body = render_body(
             &state,
             t("diffModal", "loading"),
             t("diffModal", "binaryNotSupported"),
             t("diffModal", "tooLarge"),
+            Some(t("gitCommit", "noMoreChanges")),
+            hunk_ui,
             cx,
         );
         let toolbar = div()
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(16.0))
             .px(px(16.0))
-            .py(px(12.0))
+            .py(px(10.0))
             .flex_none()
             .border_b_1()
             .border_color(ui::border_subtle())
+            .child(title_block(&file, &state, cx))
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .items_center()
-                    .gap(px(8.0))
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .text_size(ui::font_px(15.0))
-                            .text_color(ui::accent())
-                            .child(file_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .max_w(px(300.0))
-                            .text_size(ui::font_px(13.0))
-                            .text_color(ui::text_muted())
-                            .truncate()
-                            .child(file_path.clone()),
-                    )
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .py(px(2.0))
-                            .rounded(px(4.0))
-                            .bg(ui::bg_elevated())
-                            .border_1()
-                            .border_color(ui::border_subtle())
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(status_label.clone()),
-                    ),
-            )
-            .child(view_toggle(
-                &state,
-                "git-diff",
-                ToolbarLabels {
-                    side: t("diffModal", "sideBySide"),
-                    inline: t("diffModal", "inline"),
-                    prev: t("diffModal", "prevChange"),
-                    next: t("diffModal", "nextChange"),
-                },
-                kind::GIT_DIFF,
-                cx,
-            ));
+                    .children(file_nav(&state, &ctl, current, total))
+                    .child(view_toggle(
+                        &state,
+                        "git-diff",
+                        ToolbarLabels {
+                            side: t("diffModal", "sideBySide"),
+                            inline: t("diffModal", "inline"),
+                            prev: t("gitCommit", "prevChange"),
+                            next: t("gitCommit", "nextChange"),
+                        },
+                        kind::GIT_DIFF,
+                        cx,
+                    )),
+            );
 
         let (width, body_h) = modal_size(viewport);
+        let (next_change, prev_change) = (state.clone(), state.clone());
+        let (next_file, prev_file) = ((state.clone(), ctl.clone()), (state.clone(), ctl.clone()));
         dialog
             .w(width)
             // 见 [`modal_size`]:不清零内边距的话面板会比统计弹窗高出 48px
@@ -1179,6 +1800,27 @@ pub fn open_file_diff(
             .close_button(false)
             .child(
                 div()
+                    // F7 / Shift+F7 / Alt+← / Alt+→ 挂在这里;Esc 冒泡到 Dialog 关窗
+                    .track_focus(&focus)
+                    .key_context(FILE_DIFF_CONTEXT)
+                    .on_action(move |_: &GitDiffNextChange, _window, cx| {
+                        next_change.update(cx, |s, cx| {
+                            s.jump_by(1);
+                            cx.notify();
+                        });
+                    })
+                    .on_action(move |_: &GitDiffPrevChange, _window, cx| {
+                        prev_change.update(cx, |s, cx| {
+                            s.jump_by(-1);
+                            cx.notify();
+                        });
+                    })
+                    .on_action(move |_: &GitDiffNextFile, _window, cx| {
+                        switch_file(&next_file.0, &next_file.1, 1, cx);
+                    })
+                    .on_action(move |_: &GitDiffPrevFile, _window, cx| {
+                        switch_file(&prev_file.0, &prev_file.1, -1, cx);
+                    })
                     .w_full()
                     .h(body_h)
                     .flex()
@@ -1186,6 +1828,7 @@ pub fn open_file_diff(
                     // 工具栏/正文各自有底色,不裁会盖掉面板的圆角
                     .overflow_hidden()
                     .child(toolbar)
+                    .children(op_error.map(|err| error_bar(&state, &ctl, err, stale)))
                     .child(
                         div()
                             .flex_1()
@@ -1196,6 +1839,9 @@ pub fn open_file_diff(
                     ),
             )
     });
+
+    // 打开即可按 F7 / Alt+→,不必先点一下正文(时机讲究见 `prompt::autofocus`)
+    window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
 }
 
 // ─── CommitDiffModal(某次 commit 的多文件) ──────────────────
@@ -1375,6 +2021,8 @@ pub fn open_commit_diff(
                     t("commitDiff", "loading"),
                     t("commitDiff", "binaryFile"),
                     t("commitDiff", "tooLarge"),
+                    None,
+                    None,
                     cx,
                 )
             };

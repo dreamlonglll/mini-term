@@ -32,7 +32,7 @@ use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
     SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
-    ToggleSessions, ToggleUsage, command_library, git_changes, project_switcher,
+    ToggleSessions, ToggleUsage, command_library, git_changes, git_diff, project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -463,6 +463,71 @@ pub fn bind_keys(cx: &mut App) {
         "cmd-enter",
         git_changes::GitCommitMessage,
         Some("GitChanges > Input"),
+    ));
+    // 提交并推送(Ctrl/Cmd+Alt+Enter),同一个谓词。
+    bindings.push(KeyBinding::new(
+        "ctrl-alt-enter",
+        git_changes::GitCommitAndPush,
+        Some("GitChanges > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-alt-enter",
+        git_changes::GitCommitAndPush,
+        Some("GitChanges > Input"),
+    ));
+
+    // 更改列表的键盘操作(↑/↓ 选择、Space 暂存切换、Enter 看 diff、Delete 丢弃)。
+    // 只在列表自己持有焦点时生效(点过列表行才会),终端 / 输入框里按这些键照旧归它们 ——
+    // 谓词是列表自己的 context,与 `Terminal` / `Input` 都不在一条派发链上。
+    let list = Some(git_changes::LIST_CONTEXT);
+    bindings.push(KeyBinding::new(
+        "up",
+        git_changes::GitChangesSelectPrev,
+        list,
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        git_changes::GitChangesSelectNext,
+        list,
+    ));
+    bindings.push(KeyBinding::new(
+        "space",
+        git_changes::GitChangesToggleStage,
+        list,
+    ));
+    bindings.push(KeyBinding::new(
+        "enter",
+        git_changes::GitChangesOpenDiff,
+        list,
+    ));
+    bindings.push(KeyBinding::new(
+        "delete",
+        git_changes::GitChangesDiscard,
+        list,
+    ));
+
+    // 单文件 diff 弹窗:F7 / Shift+F7 跳改动,Alt+← / Alt+→ 换文件(IDEA 的键位)。
+    // 谓词是弹窗正文自己的 context;弹窗画在 Workspace 之外,与全局的 Alt+方向键
+    // (切 pane 焦点)不在一条派发链上,互不抢。
+    bindings.push(KeyBinding::new(
+        "f7",
+        git_diff::GitDiffNextChange,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "shift-f7",
+        git_diff::GitDiffPrevChange,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "alt-right",
+        git_diff::GitDiffNextFile,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "alt-left",
+        git_diff::GitDiffPrevFile,
+        Some(git_diff::FILE_DIFF_CONTEXT),
     ));
 
     // 终端里的裸 Tab / Shift+Tab 必须归终端(shell 补全、Claude 的 Tab 切模式全靠它)。
