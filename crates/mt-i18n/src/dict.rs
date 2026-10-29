@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1419;
+pub const ZH_ENTRY_COUNT: usize = 1420;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1419;
+pub const EN_ENTRY_COUNT: usize = 1420;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1009,6 +1009,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("prevChange", "上一处改动（Shift+F7）"),
     ("prevFile", "上一个文件（{shortcut}）"),
     ("refresh", "刷新"),
+    ("renameOnly", "仅重命名，内容无改动"),
     ("sideStaged", "HEAD → 暂存区"),
     ("sideUnstaged", "暂存区 → 工作区"),
     ("sideWorking", "HEAD → 工作区"),
@@ -1088,6 +1089,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("prevChange", "Previous change (Shift+F7)"),
     ("prevFile", "Previous file ({shortcut})"),
     ("refresh", "Refresh"),
+    ("renameOnly", "Renamed only, no content changes"),
     ("sideStaged", "HEAD → Index"),
     ("sideUnstaged", "Index → Working tree"),
     ("sideWorking", "HEAD → Working tree"),

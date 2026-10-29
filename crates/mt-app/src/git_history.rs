@@ -103,6 +103,11 @@ const PREFETCH_ROWS: usize = 5;
 const MAX_PILLS: usize = 2;
 /// 历史区窄于这个宽度时,行里只留作者头像、不写作者名。
 const NARROW_WIDTH: f32 = 380.0;
+/// 提交标题与引用胶囊抢宽度时,标题至少先留这么多个全角字宽(约 104px)再让胶囊截断。
+/// 不是硬性最小宽:胶囊都缩到保底还放不下时标题照样往下缩,行不会撑破。
+const TITLE_FLOOR_EM: f32 = 8.0;
+/// 引用胶囊的收缩权重(标题是 1):悬殊到行放不下时几乎只缩胶囊。
+const PILL_SHRINK: f32 = 1000.0;
 
 /// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Enter / Ctrl+C / Ctrl+F / Esc)。
 pub(crate) const HISTORY_CONTEXT: &str = "GitHistory";
@@ -1152,6 +1157,9 @@ impl GitHistoryContent {
             )
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.clear_filter_text(window, cx);
+                // 焦点交回输入框(同 gpui-component 自带清空钮的做法):点 × 时焦点落在
+                // 输入框外壳上,外壳照样画聚焦环,按键却进不了输入框
+                this.filter.input.update(cx, |s, cx| s.focus(window, cx));
             }))
         });
         // 搜索图标上挂完整的语法说明(占位符放不下 `path:` 的全部写法)
@@ -1410,9 +1418,16 @@ impl GitHistoryContent {
                 selected,
             });
         }
+        // 标题与引用胶囊抢宽度时胶囊先让:标题的基准宽给到 TITLE_FLOOR_EM 个全角字(短标题
+        // 按自己的字数估,不白占),胶囊的收缩权重悬殊(权重 × 基准宽分摊),行放不下时
+        // 几乎只缩胶囊、缩到 `name_pill` 的 40px 保底为止,之后才轮到标题
+        let title_font = f32::from(ui::font_px(13.0));
+        let title_basis = (TITLE_FLOOR_EM * title_font)
+            .min(git_ui::estimate_text_width(&commit.message, title_font));
         row = row.child(
             div()
                 .flex_1()
+                .flex_basis(px(title_basis))
                 .min_w_0()
                 .truncate()
                 .text_size(ui::font_px(13.0))
@@ -1428,15 +1443,15 @@ impl GitHistoryContent {
         // 引用胶囊:最多 MAX_PILLS 个(窄时 1 个),其余收进「+N」,全名挂 tooltip
         let max_pills = if narrow { 1 } else { MAX_PILLS };
         for (i, (name, kind)) in refs.iter().take(max_pills).enumerate() {
-            row = row.child(
-                ref_pill(
-                    SharedString::from(format!("git-ref-{short_hash}-{i}")),
-                    name.clone(),
-                    *kind,
-                )
-                .max_w(px(160.0))
-                .tip(name.clone()),
-            );
+            let mut pill = ref_pill(
+                SharedString::from(format!("git-ref-{short_hash}-{i}")),
+                name.clone(),
+                *kind,
+            )
+            .max_w(px(160.0))
+            .tip(name.clone());
+            pill.style().flex_shrink = Some(PILL_SHRINK);
+            row = row.child(pill);
         }
         if refs.len() > max_pills {
             let all = refs
@@ -1829,6 +1844,28 @@ mod tests {
             names(&pick_shown_branches(&pushed, Some("main"), None, "c2")),
             vec!["main", "origin/main"]
         );
+    }
+
+    /// 刚新建的分支与 main 同一提交:只挂 HEAD 指着的那条(`is_head` 按名字认,见
+    /// `get_repo_branches`)。main 既不冒充当前分支,也不把真正的当前分支挤进「+1」;
+    /// 当前分支没配上游时 main 的上游也不挂。游离 HEAD 时没有分支是 `is_head`,一条不挂
+    /// (行上只有 `row_refs` 补的那枚 HEAD)。
+    #[test]
+    fn 同一提交上只挂当前分支() {
+        let branches = vec![
+            branch("main", "c1", false, Some("origin/main")),
+            branch("feature", "c1", true, None),
+            branch("origin/main", "c1", false, None),
+        ];
+        assert_eq!(
+            names(&pick_shown_branches(&branches, Some("feature"), None, "c1")),
+            vec!["feature"]
+        );
+        let detached = vec![
+            branch("main", "c1", false, Some("origin/main")),
+            branch("feature", "c1", false, None),
+        ];
+        assert!(pick_shown_branches(&detached, Some("(c1)"), None, "c1").is_empty());
     }
 
     /// 查看别的本地分支:挂它自己 + 它的上游,HEAD 胶囊照旧保留;

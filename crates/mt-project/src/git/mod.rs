@@ -982,8 +982,6 @@ fn stable_topo_reorder(loaded: &mut Vec<GitCommitInfo>) {
 pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
     let repo = Repository::open(repo_path)?;
 
-    let head_target = repo.head().ok().and_then(|h| h.target());
-
     let mut branches = Vec::new();
 
     // 本地分支
@@ -999,7 +997,9 @@ pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
                 .and_then(|u| u.name().ok().flatten().map(str::to_string));
             branches.push(BranchInfo {
                 name,
-                is_head: head_target == Some(target),
+                // 按「HEAD 这个符号引用指着谁」判,不按提交比:新建的分支与 main 同一提交时
+                // 两条都会被认成当前分支。游离 HEAD 不指向任何分支,一条都不是
+                is_head: branch.is_head(),
                 is_remote: false,
                 commit_hash: target.to_string(),
                 upstream,
@@ -2836,6 +2836,53 @@ mod tests {
         assert_eq!(remote.name, format!("origin/{name}"));
         assert_eq!(remote.upstream, None, "远程分支自己没有上游");
         assert_eq!(remote.commit_hash, local.commit_hash);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 当前分支按名字认:新建的分支与原分支指着同一提交时,只有 HEAD 指着的那条是
+    /// `is_head`(按提交比的话两条都是,历史行会把原分支画成当前分支);游离 HEAD 时
+    /// 一条都不是。
+    #[test]
+    fn 当前分支按名字认_同一提交的其它分支不算() {
+        let root = init_repo_with_file("is-head", "a.txt", "a\n");
+        let repo = Repository::open(&root).unwrap();
+        let first = repo
+            .head()
+            .unwrap()
+            .shorthand()
+            .expect("初始分支")
+            .to_string();
+        let tip = {
+            let commit = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("feature", &commit, false).unwrap();
+            commit.id()
+        };
+        // 先只建不切:HEAD 还在初始分支上
+        let current = |root: &Path| -> Vec<String> {
+            get_repo_branches(root)
+                .unwrap()
+                .into_iter()
+                .filter(|b| b.is_head)
+                .map(|b| b.name)
+                .collect()
+        };
+        assert_eq!(current(&root), vec![first.clone()]);
+
+        // 切到新分支:两条仍指着同一提交,当前分支跟着 HEAD 换过去
+        repo.set_head("refs/heads/feature").unwrap();
+        assert_eq!(current(&root), vec!["feature".to_string()]);
+        let all = get_repo_branches(&root).unwrap();
+        assert!(
+            all.iter()
+                .filter(|b| !b.is_remote)
+                .all(|b| b.commit_hash == tip.to_string()),
+            "{all:?}"
+        );
+
+        // 游离 HEAD:即便与两条分支同一提交,也没有当前分支
+        repo.set_head_detached(tip).unwrap();
+        assert!(current(&root).is_empty());
+        drop(repo);
         std::fs::remove_dir_all(&root).ok();
     }
 

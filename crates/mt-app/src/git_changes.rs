@@ -365,6 +365,9 @@ pub struct GitChanges {
     collapsed_groups: HashSet<Area>,
     /// 迟到响应丢弃。
     request: u64,
+    /// diff 弹窗按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
+    /// 序列交回去(见 `git_diff::ReloadFiles`)。换仓库时以 `None` 交回。
+    diff_waiters: Vec<(Area, git_diff::FilesDone)>,
     /// pty-output 嗅探的 500ms 去抖终点。
     debounce_until: Option<Instant>,
     /// 进行中的整文件操作数(暂存 / 丢弃 / 冲突处理)。`> 0` 时行内与组操作按钮禁用
@@ -434,6 +437,7 @@ impl GitChanges {
             collapsed_dirs: HashSet::new(),
             collapsed_groups: HashSet::new(),
             request: 0,
+            diff_waiters: Vec::new(),
             debounce_until: None,
             busy_ops: 0,
             sel_area: None,
@@ -497,6 +501,8 @@ impl GitChanges {
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
+        // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
+        self.flush_diff_waiters(false, cx);
         self.load(cx);
         cx.notify();
     }
@@ -519,6 +525,7 @@ impl GitChanges {
 
     pub fn load(&mut self, cx: &mut Context<Self>) {
         if self.repo_path.is_empty() {
+            self.flush_diff_waiters(false, cx);
             return;
         }
         self.loading = true;
@@ -536,6 +543,7 @@ impl GitChanges {
                     return;
                 }
                 this.loading = false;
+                let loaded = result.is_ok();
                 match result {
                     Ok(snap) => {
                         this.changes = snap.changes;
@@ -562,11 +570,26 @@ impl GitChanges {
                     }
                 }
                 this.after_reload(cx);
+                this.flush_diff_waiters(loaded, cx);
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// 把在等序列的 diff 弹窗回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
+    /// `None`(弹窗沿用旧序列)。回执改的是弹窗的实体、还可能回调本列表(换了文件时让
+    /// 选中项跟过去),延到这一轮更新之后再调,免得本实体正被借着时重入。
+    fn flush_diff_waiters(&mut self, loaded: bool, cx: &mut Context<Self>) {
+        if self.diff_waiters.is_empty() {
+            return;
+        }
+        let tree_mode = self.tree_mode(cx);
+        for (area, done) in std::mem::take(&mut self.diff_waiters) {
+            let files = loaded.then(|| self.diff_files(area, tree_mode));
+            cx.defer(move |cx| done(files, cx));
+        }
     }
 
     fn tree_mode(&self, cx: &App) -> bool {
@@ -1105,46 +1128,58 @@ impl GitChanges {
         .detach();
     }
 
+    /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序。
+    fn diff_files(&self, area: Area, tree_mode: bool) -> Vec<git_diff::DiffFile> {
+        self.area_order(area, tree_mode)
+            .into_iter()
+            .map(|i| self.diff_file(i, area))
+            .collect()
+    }
+
+    fn diff_file(&self, index: usize, area: Area) -> git_diff::DiffFile {
+        let file = &self.changes[index];
+        let status = status_in_area(file, area);
+        // 只有「两侧都是普通文本、能写回」的状态才给块操作:未跟踪 / 冲突 /
+        // 重命名 / 删除都只支持整文件操作
+        let hunk_actions = match area {
+            Area::Staged => matches!(status, Some(GitStatus::Modified | GitStatus::Added)),
+            Area::Unstaged => matches!(status, Some(GitStatus::Modified)),
+            Area::Untracked | Area::Conflicts => false,
+        };
+        git_diff::DiffFile {
+            path: file.path.clone(),
+            // 已暂存的重命名:HEAD 那一侧按旧路径取(暂存侧才比 HEAD)
+            old_path: file
+                .old_path
+                .clone()
+                .filter(|_| matches!(status, Some(GitStatus::Renamed))),
+            side: if area == Area::Staged {
+                git_diff::DiffSide::Staged
+            } else {
+                git_diff::DiffSide::Unstaged
+            },
+            status_label: status_label_for(status).to_string(),
+            hunk_actions,
+        }
+    }
+
     /// 打开某一行的 diff,文件序列 = 它所在分组的显示顺序(弹窗里 Alt+←/→ 前后换)。
+    /// 按块操作之后序列跟着重载过的列表走(取消暂存最后一块,文件就离开了「已暂存」)。
     fn view_diff(&self, index: usize, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.area_order(area, self.tree_mode(cx));
-        let side = if area == Area::Staged {
-            git_diff::DiffSide::Staged
-        } else {
-            git_diff::DiffSide::Unstaged
-        };
-        let files: Vec<git_diff::DiffFile> = order
-            .iter()
-            .map(|&i| {
-                let file = &self.changes[i];
-                let status = status_in_area(file, area);
-                // 只有「两侧都是普通文本、能写回」的状态才给块操作:未跟踪 / 冲突 /
-                // 重命名 / 删除都只支持整文件操作
-                let hunk_actions = match area {
-                    Area::Staged => {
-                        matches!(status, Some(GitStatus::Modified | GitStatus::Added))
-                    }
-                    Area::Unstaged => matches!(status, Some(GitStatus::Modified)),
-                    Area::Untracked | Area::Conflicts => false,
-                };
-                git_diff::DiffFile {
-                    path: file.path.clone(),
-                    // 已暂存的重命名:HEAD 那一侧按旧路径取(暂存侧才比 HEAD)
-                    old_path: file
-                        .old_path
-                        .clone()
-                        .filter(|_| matches!(status, Some(GitStatus::Renamed))),
-                    side,
-                    status_label: status_label_for(status).to_string(),
-                    hunk_actions,
-                }
-            })
-            .collect();
+        let files: Vec<git_diff::DiffFile> =
+            order.iter().map(|&i| self.diff_file(i, area)).collect();
         let current = order.iter().position(|&i| i == index).unwrap_or(0);
         let weak = cx.entity().downgrade();
-        let on_changed: git_diff::OnChanged = Rc::new(move |cx: &mut App| {
-            let _ = weak.update(cx, |this, cx| this.load(cx));
-        });
+        let reload_files: git_diff::ReloadFiles = Rc::new(
+            move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
+                Some(this) => this.update(cx, |this, cx| {
+                    this.diff_waiters.push((area, done));
+                    this.load(cx);
+                }),
+                None => done(None, cx),
+            },
+        );
         let weak = cx.entity().downgrade();
         let on_switch: git_diff::OnSwitch =
             Rc::new(move |file: &git_diff::DiffFile, cx: &mut App| {
@@ -1157,8 +1192,9 @@ impl GitChanges {
             files,
             current,
             git_diff::FileDiffHooks {
-                on_changed: Some(on_changed),
                 on_switch: Some(on_switch),
+                reload_files: Some(reload_files),
+                ..git_diff::FileDiffHooks::default()
             },
             window,
             cx,

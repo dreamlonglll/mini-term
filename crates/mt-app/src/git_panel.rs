@@ -82,7 +82,7 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_dir_watch::{GitDirWatch, WorktreeBatch, WorktreeWatch};
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
-use crate::git_ui::{self, Tone};
+use crate::git_ui::{self, Tone, estimate_text_width};
 use crate::git_watch;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
@@ -1326,15 +1326,6 @@ enum SyncBadge {
 /// 左段只有 170px 上下,仓库 + 分支两段的图标、留白就占去八十多,保底只能给这么多。
 const REPO_NAME_FLOOR: f32 = 36.0;
 
-/// 估一段界面文字的宽:全角按 1em、其余按 0.6em。只用来定截断的保底,不求精确 ——
-/// 估宽了只是计数早一点收紧,左段本身 `overflow_hidden`,怎么估都不会压到按钮组。
-fn estimate_text_width(text: &str, font: f32) -> f32 {
-    text.chars()
-        .map(|c| if c.is_ascii() { 0.6 } else { 1.0 })
-        .sum::<f32>()
-        * font
-}
-
 /// 仓库栏左段在「仓库名、分支名都截到保底」时的宽度构成。
 #[derive(Debug, Clone, Copy)]
 struct BarFloor {
@@ -1531,26 +1522,31 @@ impl Render for GitPanel {
             ))
             .child(section_box(changes_grow).child(self.changes.clone()));
 
-        if both_open {
-            root = root.child(self.render_section_handle(cx));
-        }
-
+        let history_header = section_header(
+            "git-section-history",
+            t("panels", "history"),
+            section.history_open,
+            true,
+            None,
+            cx.listener(|this, _: &ClickEvent, _window, cx| {
+                SECTION_UI.with(|s| {
+                    let mut s = s.borrow_mut();
+                    s.history_open = !s.history_open;
+                });
+                let _ = this;
+                cx.notify();
+            }),
+        );
+        // 中缝手柄与「提交历史」标题包在一起、画在标题**之后**(见 `render_section_handle`)
+        let handle = both_open.then(|| self.render_section_handle(cx));
         root = root
-            .child(section_header(
-                "git-section-history",
-                t("panels", "history"),
-                section.history_open,
-                true,
-                None,
-                cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    SECTION_UI.with(|s| {
-                        let mut s = s.borrow_mut();
-                        s.history_open = !s.history_open;
-                    });
-                    let _ = this;
-                    cx.notify();
-                }),
-            ))
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(history_header)
+                    .children(handle),
+            )
             .child(section_box(history_grow).child(self.history.clone()))
             // 量一次两块内容区加起来的高度:中缝拖拽要按它换算比例。顺带看两块「想要的
             // 高度」与这一帧用的是不是同一份 —— 内容变了(多了一行变更、历史翻了页)
@@ -1638,37 +1634,40 @@ fn section_header(
 }
 
 impl GitPanel {
-    /// 中缝拖拽手柄(`GitHistory.tsx:516-523`):零高包裹 + 内部 6px 绝对定位条。
+    /// 中缝拖拽手柄(`GitHistory.tsx:516-523`):骑在「提交历史」标题上沿的 6px 绝对定位条
+    /// (上下各 3px)。
+    ///
+    /// ⚠️ 它必须是标题容器里**排在标题之后**的子元素:下半截压在标题上,gpui 的冒泡
+    /// 按绘制顺序倒着派,后画的先拿到。原先手柄先画、标题后画 —— 按下时标题先记下一次
+    /// 待定点击(手柄的 `stop_propagation` 轮到时已经晚了),拖拽时标题跟着光标走,松手
+    /// 仍在标题上,于是「提交历史」被折叠(E2E 截到过)。现在手柄先拿到按下、就地拦住。
+    ///
+    /// 不用 `occlude` / `block_mouse_except_scroll` 挡身后的命中:拖拽期间光标一直骑在
+    /// 手柄上,面板根上那对移动 / 松手监听要「根被悬停」才触发,挡掉就拖不动、也松不开。
     fn render_section_handle(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .relative()
-            .h(px(0.0))
-            .flex_none()
-            .child(
-                div()
-                    .id("git-section-handle")
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .top(px(-3.0))
-                    .h(px(6.0))
-                    .cursor_row_resize()
-                    .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this: &mut Self, event: &MouseDownEvent, _window, cx| {
-                            cx.stop_propagation();
-                            // 从中缝**眼下**的位置起算:按内容让过位时它不在 `ratio` 那儿,
-                            // 按 `ratio` 起算的话一按就跳
-                            let ratio = clamp_ratio(this.effective_ratio);
-                            SECTION_UI.with(|s| s.borrow_mut().ratio = ratio);
-                            this.drag = Some(SectionDrag {
-                                start_y: event.position.y,
-                                start_ratio: ratio,
-                                total: this.sections_height,
-                            });
-                        }),
-                    ),
+            .id("git-section-handle")
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(-3.0))
+            .h(px(6.0))
+            .cursor_row_resize()
+            .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, event: &MouseDownEvent, _window, cx| {
+                    cx.stop_propagation();
+                    // 从中缝**眼下**的位置起算:按内容让过位时它不在 `ratio` 那儿,
+                    // 按 `ratio` 起算的话一按就跳
+                    let ratio = clamp_ratio(this.effective_ratio);
+                    SECTION_UI.with(|s| s.borrow_mut().ratio = ratio);
+                    this.drag = Some(SectionDrag {
+                        start_y: event.position.y,
+                        start_ratio: ratio,
+                        total: this.sections_height,
+                    });
+                }),
             )
             .into_any_element()
     }
@@ -1686,6 +1685,7 @@ impl GitPanel {
             self.meta.head_tracking.as_ref()
         };
         BarFloor {
+            // 估宽了只是计数早一点收紧:左段本身 `overflow_hidden`,怎么估都不会压到按钮组
             repo_name: REPO_NAME_FLOOR.min(estimate_text_width(name, 13.0 * scale)),
             detail: info.is_some_and(|r| {
                 repo_detail(&r.path.to_string_lossy(), self.project_path.as_deref()).is_some()
@@ -2154,9 +2154,15 @@ impl GitPanel {
         let aborting = busy == Some(GitBusy::Abort);
         let can_continue = conflicted == 0 && idle;
 
+        // 横幅底已经染过一层 attention,冲突数胶囊的字色按染过的底算对比度
+        let banner_bg = ui::with_alpha(color, 0.12);
         let status = if conflicted > 0 {
-            git_ui::pill(tr!("gitBranch", "conflictCount", count = conflicted), color)
-                .into_any_element()
+            git_ui::pill_on(
+                tr!("gitBranch", "conflictCount", count = conflicted),
+                color,
+                git_ui::ground_with(banner_bg),
+            )
+            .into_any_element()
         } else {
             div()
                 .min_w_0()
@@ -2209,7 +2215,7 @@ impl GitPanel {
                 .h(px(BAR_HEIGHT))
                 .pl(px(12.0))
                 .pr(px(8.0))
-                .bg(ui::with_alpha(color, 0.12))
+                .bg(banner_bg)
                 .border_b_1()
                 .border_color(ui::border_subtle())
                 .child(

@@ -62,7 +62,7 @@
 //! 计数照记 —— 调用方的 unwatch 照常配对;对同一路径再 watch 一次会重新排队重试。
 //! 被监听目录自己被删、被改名、被重建时(见 [`reshapes_dir`]),后端那一条摘掉重挂:
 //! 句柄/wd 还指着旧目录对象,不重挂的话共享这一条的所有订阅者都跟着失聪;目录已经
-//! 不在就落到「失败」态。
+//! 不在就落到「失败」态(不打日志:目录被删是常事,订阅方重列清单时自会撤掉它)。
 //!
 //! # 注册晚到的窗口
 //!
@@ -819,8 +819,16 @@ fn worker_loop(shared: Arc<Shared>, mut factory: BackendFactory) {
                 st.registered.remove(dir);
             }
         }
-        // ② 再挂
+        // ② 再挂。目录已经不在了就不碰后端:多半是被监听目录自己被删之后的重挂(删掉
+        // 某个前缀下最后一个分支时 git 连空目录 `refs/heads/bugfix` 一起删),或解析完才
+        // 被删。订阅照样落「失败」,但这不是故障 —— 订阅方下一次重列清单时自会撤掉它,
+        // 不打日志
         for dir in additions {
+            if !dir.is_dir() {
+                let vanished = Err(anyhow::anyhow!("目录已不存在: {}", dir.display()));
+                let _ = shared.state.lock().apply_registration(&dir, vanished);
+                continue;
+            }
             let result = match backend.as_mut() {
                 Some(backend) => backend.watch(&dir),
                 None => match factory(dispatcher.clone()) {
@@ -1519,7 +1527,7 @@ mod tests {
         fake.idle();
         assert_eq!(fake.log.lock().watch_calls.len(), 2);
 
-        // 真删了:重挂失败 → 落「失败」态,后端不残留
+        // 真删了:重挂时目录已不在 → 不碰后端、落「失败」态(不打日志),后端不残留
         std::fs::remove_dir_all(&dir).unwrap();
         fake.emit(
             EventKind::Remove(RemoveKind::Folder),

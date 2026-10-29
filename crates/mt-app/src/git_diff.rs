@@ -39,6 +39,8 @@
 //!    后端 `mt_project::git::{stage_hunk, unstage_hunk, discard_hunk}` 拿 diff 两侧全文
 //!    与该块的精确行号做文本拼接,执行前重读两侧防陈旧。操作后弹窗**原地**重取 diff、
 //!    视图模式不变、滚到原位置上的下一块;同时回调 `on_changed` 让更改列表重载。
+//!    从更改列表打开的走 `reload_files`:列表重载落地后文件序列跟着换,当前文件离开了
+//!    分组(取消暂存 / 丢弃了最后一块)就换到原位置上的下一个(见 [`resync_index`])。
 //! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮),
 //!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。
 //!
@@ -1288,11 +1290,20 @@ pub type OnChanged = Rc<dyn Fn(&mut App)>;
 /// Alt+← / Alt+→(或标题栏按钮)换到了序列里的另一个文件(更改列表据此把选中项跟过去)。
 pub type OnSwitch = Rc<dyn Fn(&DiffFile, &mut App)>;
 
+/// 按块操作成功后重取文件序列:打开方重载自己的列表,落地后把**打开时那个分组**的新
+/// 序列交给回执(见 [`FilesDone`])。给了它就不必再给 `on_changed`(重载就是它)。
+pub type ReloadFiles = Rc<dyn Fn(FilesDone, &mut App)>;
+
+/// [`ReloadFiles`] 的回执:`None` = 没取到(重载失败、换了仓库),沿用旧序列。
+/// **必须调一次** —— 弹窗的块操作按钮等它回来才放开。
+pub type FilesDone = Box<dyn FnOnce(Option<Vec<DiffFile>>, &mut App)>;
+
 /// [`open_file_diff_with`] 的回调。
 #[derive(Default)]
 pub struct FileDiffHooks {
     pub on_changed: Option<OnChanged>,
     pub on_switch: Option<OnSwitch>,
+    pub reload_files: Option<ReloadFiles>,
 }
 
 /// 三种块操作。
@@ -1312,6 +1323,7 @@ struct FileDiff {
     current: usize,
     on_changed: Option<OnChanged>,
     on_switch: Option<OnSwitch>,
+    reload_files: Option<ReloadFiles>,
     /// 进行中的块操作(第几块)。`Some` 时全部块按钮禁用,防重复点击
     busy: Option<usize>,
     /// 块操作失败的原文。就地显示在工具栏下方 —— toast 画在弹窗遮罩底下,看不见
@@ -1487,12 +1499,24 @@ fn run_hunk_op(
         cx.update(|cx| cx.refresh_windows());
         cx.update(|cx| match result {
             Ok(()) => {
-                if let Some(on_changed) = ctl.read(cx).on_changed.clone() {
+                let (on_changed, reload_files) = {
+                    let c = ctl.read(cx);
+                    (c.on_changed.clone(), c.reload_files.clone())
+                };
+                if let Some(on_changed) = on_changed {
                     on_changed(cx);
                 }
                 // `busy` 留到重取的 diff 落地才清(见 `load_file`):这中间屏幕上还是
                 // 操作前的那份,放开按钮的话下一次点击拿的就是过期的块
-                load_file(&state, &ctl, Some(hunk), cx);
+                match reload_files {
+                    // 文件序列跟着更改列表走:取消暂存最后一块后文件就离开了「已暂存」组,
+                    // 序号与 Alt+←/→ 不能还按打开时的快照
+                    Some(reload) => reload(
+                        Box::new(move |files, cx| resync_files(&state, &ctl, files, hunk, cx)),
+                        cx,
+                    ),
+                    None => load_file(&state, &ctl, Some(hunk), cx),
+                }
             }
             Err(err) => ctl.update(cx, |c, cx| {
                 eprintln!("[git] 按块操作失败: {err:#}");
@@ -1572,6 +1596,68 @@ fn load_file(
     .detach();
 }
 
+/// 块操作后的新序列里该停在哪(下标进 `new`):
+///
+/// - 当前文件还在组里 → 还是它(序列里别的文件进出了,下标跟着变);
+/// - 离开了(取消暂存 / 丢弃了最后一块)→ 原位置上的下一个:旧序列里排在它后面、
+///   还留在组里的第一个;后面一个都不剩就取前面最近的那个;
+/// - 组空了 → `None`。
+fn resync_index(old: &[DiffFile], current: usize, new: &[DiffFile]) -> Option<usize> {
+    let find = |file: &DiffFile| new.iter().position(|f| f.path == file.path);
+    old.get(current)
+        .and_then(find)
+        .or_else(|| old.iter().skip(current + 1).find_map(find))
+        .or_else(|| old.iter().take(current).rev().find_map(find))
+        // 旧序列里的一个都不在了(外部又改过一轮):按原位置落,越界取末尾
+        .or_else(|| new.len().checked_sub(1).map(|last| current.min(last)))
+}
+
+/// 块操作后打开方重载出了新序列(见 [`ReloadFiles`]):换上它,按 [`resync_index`]
+/// 决定停在哪。当前文件还在 → 原地重取(落到原位置上的下一块);换了文件 → 告诉打开方、
+/// 从头取那个文件;组空了 → 留下当前文件原地重取,正文是「没有更多改动」的空态、换文件
+/// 的按钮随之收起。`None`(没取到)沿用旧序列原地重取。
+fn resync_files(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    files: Option<Vec<DiffFile>>,
+    hunk: usize,
+    cx: &mut App,
+) {
+    let Some(files) = files else {
+        load_file(state, ctl, Some(hunk), cx);
+        return;
+    };
+    let switched = ctl.update(cx, |c, cx| {
+        let path = c.file().path.clone();
+        match resync_index(&c.files, c.current, &files) {
+            Some(index) => {
+                c.files = files;
+                c.current = index;
+            }
+            None => {
+                c.files = vec![c.file().clone()];
+                c.current = 0;
+            }
+        }
+        cx.notify();
+        let file = c.file().clone();
+        (file.path != path).then(|| {
+            // 换了文件:不走 `load_file` 的「操作后」分支,块按钮在这里放开
+            c.busy = None;
+            (file, c.on_switch.clone())
+        })
+    });
+    match switched {
+        Some((file, on_switch)) => {
+            if let Some(on_switch) = on_switch {
+                on_switch(&file, cx);
+            }
+            load_file(state, ctl, None, cx);
+        }
+        None => load_file(state, ctl, Some(hunk), cx),
+    }
+}
+
 /// 在文件序列里前后换一个(到头不绕回)。块操作进行中不换 —— 回包会落到别的文件上。
 /// 换成了就告诉打开方(更改列表让选中项跟过去)。
 fn switch_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, delta: isize, cx: &mut App) {
@@ -1591,6 +1677,16 @@ fn switch_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, delta: isize, 
             on_switch(&file, cx);
         }
         load_file(state, ctl, None, cx);
+    }
+}
+
+/// 单文件 diff 没有改动块时的空态文案。纯重命名(内容一字未动)单说一句 —— 写「没有
+/// 更多改动」读着像刚把改动处理完了。
+fn empty_text(file: &DiffFile) -> &'static str {
+    if file.old_path.as_deref().is_some_and(|old| old != file.path) {
+        t("gitCommit", "renameOnly")
+    } else {
+        t("gitCommit", "noMoreChanges")
     }
 }
 
@@ -1842,13 +1938,13 @@ pub fn open_file_diff(
 ) {
     let hooks = FileDiffHooks {
         on_changed,
-        on_switch: None,
+        ..FileDiffHooks::default()
     };
     open_file_diff_with(store, repo_path, files, current, hooks, window, cx);
 }
 
-/// 同 [`open_file_diff`],回调多一个 `on_switch`(弹窗里换了文件时调,更改列表让选中项
-/// 跟着走)。
+/// 同 [`open_file_diff`],回调多两个:`on_switch`(弹窗里换了文件时调,更改列表让选中项
+/// 跟着走)与 `reload_files`(块操作后按重载过的更改列表换文件序列,见 [`ReloadFiles`])。
 pub fn open_file_diff_with(
     store: Entity<AppStore>,
     repo_path: String,
@@ -1872,6 +1968,7 @@ pub fn open_file_diff_with(
         current,
         on_changed: hooks.on_changed,
         on_switch: hooks.on_switch,
+        reload_files: hooks.reload_files,
         busy: None,
         op_error: None,
         stale: false,
@@ -1906,7 +2003,7 @@ pub fn open_file_diff_with(
             t("diffModal", "loading"),
             t("diffModal", "binaryNotSupported"),
             t("diffModal", "tooLarge"),
-            Some(t("gitCommit", "noMoreChanges")),
+            Some(empty_text(&file)),
             hunk_ui,
             cx,
         );
@@ -2211,10 +2308,12 @@ fn open_commit_diff_at(
                 );
 
             // 右栏
-            let selected_status = files
-                .iter()
-                .find(|f| f.path == selected)
-                .map(|f| git_ui::commit_file_status(&f.status));
+            let selected_file = files.iter().find(|f| f.path == selected);
+            let selected_status = selected_file.map(|f| git_ui::commit_file_status(&f.status));
+            // 纯重命名的文件没有改动块:与单文件 diff 同一句说明,别留一片空白
+            let rename_only = selected_file
+                .filter(|f| f.status == "renamed")
+                .map(|_| t("gitCommit", "renameOnly"));
             let body = if files.is_empty() {
                 git_ui::empty_state(ICON_CLEAN, t("commitDiff", "noChanges"), None)
                     .size_full()
@@ -2225,7 +2324,7 @@ fn open_commit_diff_at(
                     t("commitDiff", "loading"),
                     t("commitDiff", "binaryFile"),
                     t("commitDiff", "tooLarge"),
-                    None,
+                    rename_only,
                     None,
                     cx,
                 )
@@ -2442,6 +2541,59 @@ mod tests {
             new_lines: 0,
             lines,
         }
+    }
+
+    fn staged(paths: &[&str]) -> Vec<DiffFile> {
+        paths
+            .iter()
+            .map(|p| DiffFile {
+                path: p.to_string(),
+                old_path: None,
+                side: DiffSide::Staged,
+                status_label: "M".into(),
+                hunk_actions: true,
+            })
+            .collect()
+    }
+
+    /// 块操作后换序列:当前文件还在就停在它(下标跟着别的文件进出变);离开了就落到原
+    /// 位置上的下一个,后面没有了取前面最近的;组空了是 `None`。
+    #[test]
+    fn 块操作后序列跟着更改列表走() {
+        let old = staged(&["a", "app.ts", "c", "d", "e"]);
+        // 还在:前面的 a 走了,app.ts 从第 2 个变成第 1 个
+        assert_eq!(
+            resync_index(&old, 1, &staged(&["app.ts", "c", "d", "e"])),
+            Some(0)
+        );
+        // app.ts 离开了已暂存组:停在原位置上的下一个 c(新序列里第 2 个)
+        assert_eq!(
+            resync_index(&old, 1, &staged(&["a", "c", "d", "e"])),
+            Some(1)
+        );
+        // 原位置后面的也一起走了:跳过不在组里的,落到 e
+        assert_eq!(resync_index(&old, 1, &staged(&["a", "e"])), Some(1));
+        // 末尾那个离开:后面没有了,取前面最近的 d
+        assert_eq!(
+            resync_index(&old, 4, &staged(&["a", "app.ts", "c", "d"])),
+            Some(3)
+        );
+        // 旧序列里一个都不剩(外部又改过一轮):按原位置落,越界取末尾
+        assert_eq!(resync_index(&old, 3, &staged(&["x", "y"])), Some(1));
+        // 组空了
+        assert_eq!(resync_index(&old, 1, &[]), None);
+    }
+
+    /// 没有改动块时的空态:纯重命名单说一句,其余照旧「没有更多改动」。
+    #[test]
+    fn 纯重命名的空态文案() {
+        let mut file = staged(&["new.ts"]).remove(0);
+        assert_eq!(empty_text(&file), t("gitCommit", "noMoreChanges"));
+        file.old_path = Some("old.ts".into());
+        assert_eq!(empty_text(&file), t("gitCommit", "renameOnly"));
+        // 重命名前后同名(不该出现,防御):不当重命名说
+        file.old_path = Some("new.ts".into());
+        assert_eq!(empty_text(&file), t("gitCommit", "noMoreChanges"));
     }
 
     /// context 行左右同格。

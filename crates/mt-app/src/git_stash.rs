@@ -1587,12 +1587,16 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
             let name = input.read(cx).value().trim().to_string();
             let f = form.read(cx);
             // 边打边校验;空名不报,点过「创建」才报
-            let invalid = match git::validate_branch_name(&name) {
+            let check = git::validate_branch_name(&name);
+            let invalid = match check {
                 Err(issue) if !name.is_empty() => Some(t("gitBranch", branch_issue_key(issue))),
                 Err(_) => f.submitted.then(|| t("gitBranch", "nameEmpty")),
                 Ok(()) => None,
             };
             let (busy, error) = (f.op.busy, f.op.error.clone());
+            // 与分支弹窗的新建 / 重命名同一口径:名字不合法(含空名)确认键就禁用,红字仍按
+            // 上面的时机出(一打开不红);回车照样走 `on_ok`,那时空名才报出来
+            let can_submit = check.is_ok();
             let (form_ok, input_ok, list, repo, stash, settled) = (
                 form.clone(),
                 input.clone(),
@@ -1613,7 +1617,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
                     },
                     Some(t("gitStash", "confirm.cancel").into()),
                     false,
-                    busy,
+                    busy || !can_submit,
                 ))
                 .child(
                     git_ui::form_body()

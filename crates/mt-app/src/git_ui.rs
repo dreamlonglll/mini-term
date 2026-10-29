@@ -76,11 +76,6 @@ pub fn is_light(lightness: f32) -> bool {
     lightness > LIGHT_GROUND_L
 }
 
-/// 面板底色是不是亮的(浅色主题 / 浅色主题包)。
-pub fn light_ground() -> bool {
-    is_light(ui::bg_surface().l)
-}
-
 /// 语义色的淡底(胶囊、计数、横幅里的标记)。
 pub fn soft_bg(color: Hsla) -> Hsla {
     ui::with_alpha(color, 0.15)
@@ -115,10 +110,23 @@ pub(crate) fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
 /// 的对比度还不到 [`SOFT_FG_MIN_CONTRAST`] 就继续压 —— 黄 / 琥珀一类本身很亮的
 /// 语义色(attention、warning)固定 0.8 倍远远不够。
 pub fn soft_fg(color: Hsla) -> Hsla {
-    if !light_ground() {
+    soft_fg_on(color, ui::bg_surface())
+}
+
+/// 面板底上叠一层半透明 `tint` 之后的实际底色(不透明)。胶囊放在染过色的条带里时,
+/// 拿它给 [`soft_fg_on`] / [`pill_on`]。
+pub fn ground_with(tint: Hsla) -> Hsla {
+    opaque(ui::bg_surface().blend(tint))
+}
+
+/// 同 [`soft_fg`],但胶囊不是直接放在面板底上,而是放在不透明的 `ground` 上(进行中
+/// 操作横幅那种已经染过一层 attention 的条带):对比度按 `ground` + 15% 淡底算。
+/// 染过的底比面板底深,按面板底算出来的字色在那里不够 AA(「2 个冲突」踩过 4.32)。
+pub fn soft_fg_on(color: Hsla, ground: Hsla) -> Hsla {
+    if !is_light(ground.l) {
         return color;
     }
-    let ground = opaque(ui::bg_surface().blend(soft_bg(color)));
+    let ground = opaque(ground.blend(soft_bg(color)));
     let mut fg = Hsla {
         l: color.l * 0.8,
         ..color
@@ -162,6 +170,15 @@ pub fn mono<E: Styled>(mut el: E) -> E {
         "Microsoft YaHei".into(),
     ]));
     el
+}
+
+/// 估一段界面文字的宽:全角按 1em、其余按 0.6em。只用来定截断 / 让位的保底(仓库栏的
+/// 仓库名、历史行的提交标题),不求精确。
+pub fn estimate_text_width(text: &str, font: f32) -> f32 {
+    text.chars()
+        .map(|c| if c.is_ascii() { 0.6 } else { 1.0 })
+        .sum::<f32>()
+        * font
 }
 
 // ─── 按钮 ─────────────────────────────────────────────────────
@@ -467,6 +484,11 @@ pub const PILL_H: f32 = 18.0;
 
 /// 胶囊的底子:18px 高、全圆角、语义色淡底 + 语义色字,字号比正文小一档。
 fn pill_base(color: Hsla) -> Div {
+    pill_base_on(color, ui::bg_surface())
+}
+
+/// 同 [`pill_base`],字色按胶囊实际所在的底 `ground` 定(见 [`soft_fg_on`])。
+fn pill_base_on(color: Hsla, ground: Hsla) -> Div {
     div()
         .flex()
         .flex_none()
@@ -476,13 +498,19 @@ fn pill_base(color: Hsla) -> Div {
         .px(px(7.0))
         .rounded_full()
         .bg(soft_bg(color))
-        .text_color(soft_fg(color))
+        .text_color(soft_fg_on(color, ground))
         .text_size(ui::font_px(11.0))
 }
 
 /// 语义胶囊(状态字母、冲突数、起点分支…)。
 pub fn pill(text: impl Into<SharedString>, color: Hsla) -> Div {
     pill_base(color).child(text.into())
+}
+
+/// 放在染过色的条带里的语义胶囊:`ground` 是条带的实际底色(用 [`ground_with`] 求),
+/// 字色按它压到够 AA。直接放在面板底上的用 [`pill`]。
+pub fn pill_on(text: impl Into<SharedString>, color: Hsla, ground: Hsla) -> Div {
+    pill_base_on(color, ground).child(text.into())
 }
 
 /// 带前缀小图标的胶囊(worktree 行上的分支名)。
@@ -1561,6 +1589,34 @@ mod tests {
         ui::set_palette(ui::Palette::dark());
     }
 
+    /// 染过色的条带上的胶囊(进行中操作横幅 = 面板底 + 12% attention,「2 个冲突」按面板底
+    /// 算字色时只有 4.32):按条带的实际底算,浅色主题下仍够 AA。直接放在面板底上的
+    /// 胶囊不受影响 —— 底给面板底时与 [`soft_fg`] 逐位相同。
+    #[test]
+    fn 染色底上的胶囊字对比度够() {
+        ui::set_palette(ui::Palette::light());
+        for color in [
+            ui::color_attention(),
+            ui::color_warning(),
+            ui::color_success(),
+            ui::color_info(),
+            ui::color_error(),
+            ui::accent(),
+        ] {
+            let banner = ground_with(ui::with_alpha(color, 0.12));
+            assert!(banner.l < ui::bg_surface().l, "染过的底更深");
+            let fg = soft_fg_on(color, banner);
+            let ratio = contrast_ratio(fg, opaque(banner.blend(soft_bg(color))));
+            assert!(ratio >= SOFT_FG_MIN_CONTRAST - 1e-3, "{color:?}: {ratio}");
+            assert_eq!(fg.h, color.h, "色相不变");
+            assert_eq!(soft_fg_on(color, ui::bg_surface()), soft_fg(color));
+        }
+        // 暗色主题:底不亮,字色原样(与 `soft_fg` 同一口径)
+        ui::set_palette(ui::Palette::dark());
+        let c = ui::color_attention();
+        assert_eq!(soft_fg_on(c, ground_with(ui::with_alpha(c, 0.12))), c);
+    }
+
     /// 对比度的两个端点:同色 1:1,黑白 21:1。
     #[test]
     fn 对比度端点() {
@@ -1642,13 +1698,13 @@ mod tests {
     fn 语义色随底色明暗调整() {
         ui::set_palette(ui::Palette::dark());
         let c = ui::color_warning();
-        assert!(!light_ground());
+        assert!(!is_light(ui::bg_surface().l));
         assert_eq!(soft_fg(c), c);
         assert!((soft_bg(c).a - 0.15).abs() < 1e-6);
 
         ui::set_palette(ui::Palette::light());
         let c = ui::color_warning();
-        assert!(light_ground());
+        assert!(is_light(ui::bg_surface().l));
         assert!(soft_fg(c).l < c.l, "浅色主题下胶囊字要压暗");
         assert_eq!(soft_fg(c).h, c.h, "色相不变");
         ui::set_palette(ui::Palette::dark());

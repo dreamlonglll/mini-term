@@ -180,10 +180,15 @@ pub fn git_dir_layout(repo_path: &Path) -> Result<GitDirLayout> {
 }
 
 /// libgit2 给的目录带尾部分隔符(`D:/x/.git/`),去掉以免与拼出来的路径对不上。
+/// Windows 上它一律写正斜杠,顺手换成反斜杠:监听目录是在它后面 `join` 出来的,
+/// 不换的话日志里的路径一半正斜杠一半反斜杠(`D:/x/.git\refs\heads`)。
 fn trim_dir(path: &Path) -> PathBuf {
-    PathBuf::from(mt_core::path_key::trim_trailing_separators(
-        &path.to_string_lossy(),
-    ))
+    let trimmed = mt_core::path_key::trim_trailing_separators(&path.to_string_lossy()).to_string();
+    if cfg!(windows) {
+        PathBuf::from(trimmed.replace('/', "\\"))
+    } else {
+        PathBuf::from(trimmed)
+    }
 }
 
 /// 一次最多监听多少个目录(`refs/` 下按分支前缀分了上百个子目录的仓库也不至于
@@ -578,6 +583,13 @@ mod tests {
         let layout = git_dir_layout(&root).unwrap();
         assert_eq!(layout.git_dir, layout.common_dir);
         assert!(layout.git_dir.ends_with(".git"), "{layout:?}");
+        // Windows 上与 `join` 出来的部分同一种分隔符(日志里的路径不再正反斜杠混写)
+        if cfg!(windows) {
+            assert!(
+                !layout.git_dir.to_string_lossy().contains('/'),
+                "{layout:?}"
+            );
+        }
 
         let wt = root.with_file_name(format!(
             "{}-wt",
