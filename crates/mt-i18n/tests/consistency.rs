@@ -152,8 +152,12 @@ use mt_i18n::{
 /// 1417 → 1419:diff 弹窗还没跳过改动时,跳转组只报总数(`gitCommit.changeTotal`),
 /// 不再显示成「–/N」;推送进行中对话框左键不再叫「取消」（推送撤不回，点它只是收框），
 /// 换成「在后台继续」（`gitBranch.pushInBackground`）。
+/// 1420 → 1423：第四轮 E2E 整改 —— 游离 HEAD 提示拆成前后两截排（`gitBranch.detachedNoteTail`，
+/// 免得末字单独成行）、分支弹窗「新建分支…」的常规提示（`gitBranch.newBranchTip`，置灰时换成
+/// 「另一项 Git 操作正在进行」）、强推因期望值过期被拒时的指引（`gitBranch.rejectedStaleHint`，
+/// 不再劝「确认风险后强制推送」）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1420;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1423;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

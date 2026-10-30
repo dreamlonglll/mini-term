@@ -127,10 +127,29 @@ pub fn soft_fg_on(color: Hsla, ground: Hsla) -> Hsla {
         return color;
     }
     let ground = opaque(ground.blend(soft_bg(color)));
-    let mut fg = Hsla {
-        l: color.l * 0.8,
-        ..color
-    };
+    darken_to_contrast(
+        Hsla {
+            l: color.l * 0.8,
+            ..color
+        },
+        ground,
+    )
+}
+
+/// 语义色直接当**字色**写在面板底上(文件名 / 状态字母 / 冲突组标题):浅底上亮度压到与
+/// 面板底的对比度够 [`SOFT_FG_MIN_CONTRAST`](色相不变);暗色主题原样。浅色主题的
+/// attention / warning(#B08620)写在 #F5F5F5 上只有 3.07(E2E r4 C10),取色思路与
+/// 胶囊字([`soft_fg`])同一套,只是不垫淡底。
+pub fn text_fg(color: Hsla) -> Hsla {
+    let ground = ui::bg_surface();
+    if !is_light(ground.l) {
+        return color;
+    }
+    darken_to_contrast(color, ground)
+}
+
+/// 把 `fg` 的亮度一档档往下压,直到与不透明的 `ground` 对比度够 AA。
+fn darken_to_contrast(mut fg: Hsla, ground: Hsla) -> Hsla {
     while fg.l > 0.05 && contrast_ratio(fg, ground) < SOFT_FG_MIN_CONTRAST {
         fg.l -= 0.02;
     }
@@ -697,8 +716,11 @@ impl SectionHeader {
     }
 
     pub fn build(self) -> Stateful<Div> {
+        // 强调色当字色 / 图标色用:浅色主题下压到够 AA(冲突组标题,见 [`text_fg`]);
+        // 数量胶囊另按自己的淡底取色,仍传原色
         let tone = self.tone;
-        let title_color = tone.unwrap_or(if self.group {
+        let ink = tone.map(text_fg);
+        let title_color = ink.unwrap_or(if self.group {
             ui::text_secondary()
         } else {
             ui::text_primary()
@@ -732,7 +754,7 @@ impl SectionHeader {
                 )
             })
             .when_some(self.icon, |el, shapes| {
-                el.child(icon(shapes, ICON_SIZE, tone.unwrap_or(ui::text_muted())))
+                el.child(icon(shapes, ICON_SIZE, ink.unwrap_or(ui::text_muted())))
             })
             .child(
                 div()
@@ -971,16 +993,20 @@ pub fn status_label_for(status: Option<&GitStatus>) -> &'static str {
 ///
 /// 冲突原版落到 default 的 muted —— 冲突恰恰是最需要人处理的状态,改成
 /// `color_attention`(与「等你处理」那一档灯同色)。
+///
+/// 这些颜色都是当**字色**用的(文件名、状态字母):浅色主题下按 [`text_fg`] 压到对比度
+/// 够 AA,暗色主题原样。
 pub fn status_color(status: Option<&GitStatus>) -> Hsla {
-    match status {
+    let color = match status {
         Some(GitStatus::Modified) => ui::color_warning(),
         Some(GitStatus::Added) => ui::color_success(),
         Some(GitStatus::Deleted) => ui::color_error(),
         Some(GitStatus::Renamed) => ui::color_info(),
         Some(GitStatus::Untracked) => ui::color_success(),
         Some(GitStatus::Conflicted) => ui::color_attention(),
-        None => ui::text_muted(),
-    }
+        None => return ui::text_muted(),
+    };
+    text_fg(color)
 }
 
 /// 单字符状态 → 颜色(diff 弹窗标题栏的状态胶囊只拿得到字母)。
@@ -1175,6 +1201,11 @@ pub fn hint_line(text: impl Into<SharedString>) -> Div {
 
 /// 带警告号的提示行(校验失败 = 错误色、需要留意 = 警告色)。
 pub fn notice_line(text: impl Into<SharedString>, color: Hsla) -> Div {
+    notice_row(text.into(), color)
+}
+
+/// 同 [`notice_line`],正文是现成的元素(要分段排版的说明,如分支弹窗的游离 HEAD 提示)。
+pub fn notice_row(content: impl IntoElement, color: Hsla) -> Div {
     div()
         .flex()
         .items_start()
@@ -1187,7 +1218,7 @@ pub fn notice_line(text: impl Into<SharedString>, color: Hsla) -> Div {
                 .pt(px(1.0))
                 .child(icon(ICON_ALERT, ICON_SIZE_SM, color)),
         )
-        .child(div().flex_1().min_w_0().child(text.into()))
+        .child(div().flex_1().min_w_0().child(content))
 }
 
 /// git 失败原文的就地展示:红框淡底、可折行。要能选中复制的用 [`error_text_box`]。
@@ -1615,6 +1646,40 @@ mod tests {
         ui::set_palette(ui::Palette::dark());
         let c = ui::color_attention();
         assert_eq!(soft_fg_on(c, ground_with(ui::with_alpha(c, 0.12))), c);
+    }
+
+    /// 浅色主题下状态色当字色(冲突文件名、冲突组标题、M / A 文件名)直接写在面板底上,
+    /// 对比度够 AA(E2E r4 C10:#B08620 on #F5F5F5 只有 3.07);色相不变。暗色主题原样
+    /// —— 不能被改坏。
+    #[test]
+    fn 浅色主题状态字色对比度够() {
+        use GitStatus::*;
+        ui::set_palette(ui::Palette::light());
+        let ground = ui::bg_surface();
+        let raw = ui::color_attention();
+        assert!(
+            contrast_ratio(raw, ground) < SOFT_FG_MIN_CONTRAST,
+            "前提:原色不够"
+        );
+        for status in [Modified, Added, Deleted, Renamed, Untracked, Conflicted] {
+            let fg = status_color(Some(&status));
+            let ratio = contrast_ratio(fg, ground);
+            assert!(ratio >= SOFT_FG_MIN_CONTRAST - 1e-3, "{status:?}: {ratio}");
+        }
+        let conflict = status_color(Some(&Conflicted));
+        assert_eq!(conflict, text_fg(raw), "冲突组标题与冲突文件名同色");
+        assert_eq!(conflict.h, raw.h, "色相不变");
+        // 原本就够的颜色不动(D 红 #C0392B 约 4.99)
+        assert_eq!(text_fg(ui::color_error()), ui::color_error());
+
+        ui::set_palette(ui::Palette::dark());
+        for color in [
+            ui::color_attention(),
+            ui::color_warning(),
+            ui::color_success(),
+        ] {
+            assert_eq!(text_fg(color), color, "暗色主题原样");
+        }
     }
 
     /// 对比度的两个端点:同色 1:1,黑白 21:1。

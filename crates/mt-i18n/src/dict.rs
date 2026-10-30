@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1420;
+pub const ZH_ENTRY_COUNT: usize = 1423;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1420;
+pub const EN_ENTRY_COUNT: usize = 1423;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -616,7 +616,8 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("deleteTitle", "删除分支"),
     ("deleted", "已删除分支 {name}"),
     ("deletedRemote", "已删除远程分支 {name}"),
-    ("detachedNote", "当前处于分离 HEAD（{commit}），不在任何分支上"),
+    ("detachedNote", "当前处于分离 HEAD（{commit}），"),
+    ("detachedNoteTail", "不在任何分支上"),
     ("errorLead", "git 返回了以下信息（可选中复制）："),
     ("errorNoOutput", "git 执行失败，但没有输出任何信息。"),
     ("fetch", "Fetch"),
@@ -680,6 +681,7 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("nameUnchanged", "与原名相同"),
     ("nameWhitespace", "分支名不能包含空格"),
     ("newBranch", "新建分支…"),
+    ("newBranchTip", "从当前 HEAD 新建分支"),
     ("newBranchTitle", "新建分支"),
     ("noBranches", "还没有任何分支"),
     ("noMatch", "没有匹配「{query}」的分支"),
@@ -729,6 +731,7 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("rebased", "已将 {current} 变基到 {name}"),
     ("refreshTip", "刷新"),
     ("rejectedHint", "远程有本地没有的提交，推送被拒绝。请先拉取（或确认风险后强制推送）。"),
+    ("rejectedStaleHint", "远程分支上有本地还没获取的新提交，强制推送已被拒绝（以免覆盖它们）。请先 Fetch 查看这些提交，再决定是否重新推送。"),
     ("rename", "重命名"),
     ("renameTitle", "重命名分支"),
     ("renamed", "已将 {old} 重命名为 {new}"),
@@ -782,7 +785,8 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("deleteTitle", "Delete branch"),
     ("deleted", "Deleted branch {name}"),
     ("deletedRemote", "Deleted remote branch {name}"),
-    ("detachedNote", "Detached HEAD ({commit}) — not on any branch"),
+    ("detachedNote", "Detached HEAD ({commit}) —"),
+    ("detachedNoteTail", "not on any branch"),
     ("errorLead", "git reported the following (selectable, copyable):"),
     ("errorNoOutput", "git failed without printing anything."),
     ("fetch", "Fetch"),
@@ -846,6 +850,7 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("nameUnchanged", "Same as the current name"),
     ("nameWhitespace", "Branch names cannot contain spaces"),
     ("newBranch", "New branch…"),
+    ("newBranchTip", "Create a branch from the current HEAD"),
     ("newBranchTitle", "New branch"),
     ("noBranches", "No branches yet"),
     ("noMatch", "No branch matches “{query}”"),
@@ -895,6 +900,7 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("rebased", "Rebased {current} onto {name}"),
     ("refreshTip", "Refresh"),
     ("rejectedHint", "The remote has commits you don't have, so the push was rejected. Pull first (or force-push if you accept the risk)."),
+    ("rejectedStaleHint", "The remote branch has commits you haven't fetched, so the force push was rejected to avoid overwriting them. Fetch first to review them, then decide whether to push again."),
     ("rename", "Rename"),
     ("renameTitle", "Rename branch"),
     ("renamed", "Renamed {old} to {new}"),

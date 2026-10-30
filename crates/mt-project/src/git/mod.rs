@@ -1041,7 +1041,12 @@ pub fn get_commit_files(repo_path: &Path, commit_hash: &str) -> Result<Vec<Commi
         None
     };
 
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    // 树对树的 diff 默认不做相似度配对:纯重命名会拆成一删一增,下游「仅重命名」的
+    // 分支永远走不到。按 `git show` 的默认口径配对(只认重命名、不认复制,相似度 50%)
+    let mut find = git2::DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))?;
 
     let mut files = Vec::new();
     for delta in diff.deltas() {
@@ -1588,8 +1593,23 @@ const LOCAL_OP_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKTREE_OP_TIMEOUT: Duration = Duration::from_secs(120);
 /// 网络操作(fetch / pull / push / 删远程分支 / 推标签):120s,超时提示用 [`NETWORK_HINT`]。
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
-/// 网络操作超时时补在错误后面的提示。
-const NETWORK_HINT: &str = ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key";
+/// 网络操作超时时补在错误后面的提示。各处超时提示一律以全角「，」开头、不带句末标点
+/// (句号由 [`timeout_message`] 统一补),整句全角标点、不与半角混排。
+const NETWORK_HINT: &str = "，可能在等待凭证或网络故障，请确认已配置凭证管理器或 SSH key";
+
+/// git 命令超时的说明:「git push 超时（120s），可能在等待凭证…。」,删过残留的
+/// `index.lock` 时另起一行写明。展示给用户看的整句,标点全用全角(E2E r4 A10:原先
+/// 「超时(120s),可能…。请确认…SSH key」半角括号 / 逗号混排、句末无句号)。
+fn timeout_message(op_label: &str, secs: u64, hint: &str, removed_lock: Option<&Path>) -> String {
+    let mut message = format!("git {op_label} 超时（{secs}s）{hint}。");
+    if let Some(lock) = removed_lock {
+        message.push_str(&format!(
+            "\n已终止 git 及其子进程，并删除了它留下的 {}",
+            lock.display()
+        ));
+    }
+    message
+}
 
 /// 会拉起编辑器的命令(合并提交、`rebase` / `pull --rebase` 续跑、标签)一律带上:
 /// 沿用 git 生成的提交信息,不等一个永远不会有人操作的编辑器。
@@ -1985,20 +2005,10 @@ fn spawn_git_with_input(
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
                 tree.kill(&mut child);
-                let lock_note = remove_fresh_index_lock(repo_path, started)
-                    .map(|lock| {
-                        format!(
-                            "\n已终止 git 及其子进程,并删除了它留下的 {}",
-                            lock.display()
-                        )
-                    })
-                    .unwrap_or_default();
+                let lock = remove_fresh_index_lock(repo_path, started);
                 bail!(
-                    "git {} 超时({}s){}{}",
-                    op_label,
-                    timeout.as_secs(),
-                    timeout_hint,
-                    lock_note
+                    "{}",
+                    timeout_message(op_label, timeout.as_secs(), timeout_hint, lock.as_deref())
                 );
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(15)),
@@ -2162,7 +2172,7 @@ pub fn git_commit(repo_path: &Path, message: &str) -> Result<String> {
         &["commit", "-m", message],
         "commit",
         LOCAL_OP_TIMEOUT,
-        ",可能卡在 pre-commit hook 或 gpg 签名上",
+        "，可能卡在 pre-commit hook 或 gpg 签名上",
     )
 }
 
@@ -2330,7 +2340,7 @@ pub fn add_worktree(
         repo_path,
         &args,
         WORKTREE_OP_TIMEOUT,
-        ",大仓库 checkout 可能较慢,请稍后刷新查看",
+        "，大仓库 checkout 可能较慢，请稍后刷新查看",
     );
     if result.is_ok() {
         invalidate_repo_cache();
@@ -2786,6 +2796,32 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// 超时说明整句全角标点、句末有句号(E2E r4 A10:「超时(120s),…。请确认…SSH key」
+    /// 半角括号 / 逗号混排、句末无句号);删过 index.lock 时另起一行。
+    #[test]
+    fn 超时说明全角标点() {
+        let push = timeout_message("push", 120, NETWORK_HINT, None);
+        assert_eq!(
+            push,
+            "git push 超时（120s），可能在等待凭证或网络故障，请确认已配置凭证管理器或 SSH key。"
+        );
+        let bare = timeout_message("commit", 60, "", None);
+        assert_eq!(bare, "git commit 超时（60s）。");
+        let locked = timeout_message("add", 30, "", Some(Path::new("/r/.git/index.lock")));
+        assert!(
+            locked.starts_with("git add 超时（30s）。\n已终止 git 及其子进程，"),
+            "{locked}"
+        );
+        for text in [&push, &bare, &locked] {
+            // 写给人看的部分不出现半角括号与逗号(git 原文与路径不在其中)
+            let prose = text.split("index.lock").next().unwrap();
+            assert!(
+                !prose.contains('(') && !prose.contains(')') && !prose.contains(','),
+                "{text}"
+            );
+        }
+    }
+
     #[test]
     fn nth_parent_stops_at_root() {
         let p = Path::new("/a/b/c");
@@ -2836,6 +2872,81 @@ mod tests {
         assert_eq!(remote.name, format!("origin/{name}"));
         assert_eq!(remote.upstream, None, "远程分支自己没有上游");
         assert_eq!(remote.commit_hash, local.commit_hash);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 提交的改动文件按 `git show` 口径配对重命名:纯重命名是一条 renamed(带旧路径、
+    /// diff 无改动行),改名又小改也是 renamed(diff 只有改的那行);内容毫不相干的
+    /// 一删一增仍是两条。
+    #[test]
+    fn 提交里的重命名配对成一条() {
+        use super::test_support::git;
+
+        let body = "1\n2\n3\n4\n5\n6\n7\n8\n";
+        let root = init_repo_with_file("commit-rename", "old.txt", body);
+        std::fs::write(root.join("gone.txt"), "x\n").unwrap();
+        git(&root, &["add", "gone.txt"]);
+        git(&root, &["commit", "-q", "-m", "add gone"]);
+
+        let commit_of = |root: &Path| git(root, &["rev-parse", "HEAD"]);
+        let shape = |files: &[CommitFileInfo]| -> Vec<(String, String, Option<String>)> {
+            files
+                .iter()
+                .map(|f| (f.path.clone(), f.status.clone(), f.old_path.clone()))
+                .collect()
+        };
+
+        // 纯重命名
+        git(&root, &["mv", "old.txt", "new.txt"]);
+        git(&root, &["commit", "-q", "-m", "pure rename"]);
+        let pure = commit_of(&root);
+        let files = get_commit_files(&root, &pure).unwrap();
+        assert_eq!(
+            shape(&files),
+            vec![("new.txt".into(), "renamed".into(), Some("old.txt".into()))]
+        );
+        let diff = get_commit_file_diff(&root, &pure, "new.txt", Some("old.txt")).unwrap();
+        assert!(diff.hunks.is_empty(), "{:?}", diff.hunks);
+
+        // 改名又改一行:仍配成重命名,diff 只剩那一行
+        git(&root, &["mv", "new.txt", "moved.txt"]);
+        std::fs::write(root.join("moved.txt"), body.replace("5\n", "five\n")).unwrap();
+        git(&root, &["add", "moved.txt"]);
+        git(&root, &["commit", "-q", "-m", "rename and edit"]);
+        let edited = commit_of(&root);
+        let files = get_commit_files(&root, &edited).unwrap();
+        assert_eq!(
+            shape(&files),
+            vec![("moved.txt".into(), "renamed".into(), Some("new.txt".into()))]
+        );
+        let diff = get_commit_file_diff(&root, &edited, "moved.txt", Some("new.txt")).unwrap();
+        let changed: Vec<(String, String)> = diff_lines(&diff)
+            .into_iter()
+            .filter(|(kind, _)| kind != "context")
+            .collect();
+        assert_eq!(
+            changed,
+            vec![
+                ("delete".to_string(), "5".to_string()),
+                ("add".to_string(), "five".to_string()),
+            ]
+        );
+
+        // 内容不相干的一删一增不配对
+        git(&root, &["rm", "-q", "gone.txt"]);
+        std::fs::write(root.join("fresh.txt"), "完全不同的内容\n").unwrap();
+        git(&root, &["add", "fresh.txt"]);
+        git(&root, &["commit", "-q", "-m", "delete and add"]);
+        let files = get_commit_files(&root, &commit_of(&root)).unwrap();
+        let mut got = shape(&files);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("fresh.txt".into(), "added".into(), None),
+                ("gone.txt".into(), "deleted".into(), None),
+            ]
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

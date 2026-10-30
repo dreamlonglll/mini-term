@@ -514,6 +514,19 @@ pub fn push_was_rejected(porcelain: &str) -> bool {
         .any(|line| line.starts_with('!') && line.contains("[rejected]"))
 }
 
+/// 被拒的是不是强推的 lease 没过:远端已不是预览时的样子(`stale info`),或
+/// `--force-if-includes` 发现远端有本地没整合过的提交(`remote ref updated since
+/// checkout`)。这种情形再劝「确认风险后强制推送」只会被同样拒掉,该先 Fetch 看清远端
+/// 的新提交。`detail` 是 [`PushOutcome::Rejected`] 带的原文(porcelain 行在里面)。
+pub fn push_rejected_by_lease(detail: &str) -> bool {
+    detail.lines().any(|line| {
+        line.starts_with('!')
+            && line.contains("[rejected]")
+            && (line.contains("(stale info)")
+                || line.contains("(remote ref updated since checkout)"))
+    })
+}
+
 /// 按选项推送。完全没有上游时带 `-u` 顺带设上游;refspec 写全 `refs/heads/`,本地恰好有
 /// 同名 tag 也不会推错。
 ///
@@ -596,6 +609,24 @@ mod tests {
         assert!(!push_was_rejected(hook));
         let ok = "To ../o.git\n \trefs/heads/main:refs/heads/main\t1a2b..3c4d\nDone\n";
         assert!(!push_was_rejected(ok));
+    }
+
+    /// 强推被 lease 拦下(期望值过期 / 远端在检出之后更新过)与普通的非快进被拒分开认:
+    /// 前者不能再劝强推(E2E r4 A9)。
+    #[test]
+    fn porcelain_强推期望值过期判定() {
+        let stale = "To ../o.git\n!\trefs/heads/x:refs/heads/x\t[rejected] (stale info)\nDone";
+        assert!(push_was_rejected(stale) && push_rejected_by_lease(stale));
+        let includes =
+            "!\trefs/heads/x:refs/heads/x\t[rejected] (remote ref updated since checkout)";
+        assert!(push_rejected_by_lease(includes));
+        for plain in [
+            "!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)",
+            "!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)",
+            "!\trefs/heads/main:refs/heads/main\t[remote rejected] (stale info)",
+        ] {
+            assert!(!push_rejected_by_lease(plain), "{plain}");
+        }
     }
 
     /// 没手选拉取方式时跟随用户配置:rebase 用户不该被 `--no-rebase` 压成合并。
@@ -857,7 +888,10 @@ mod tests {
         git(&other, &["push", "-q", "origin", &branch]);
         commit_file(&work, "w.txt", "w\n", "mine");
         match git_push_with(&work, &PushOptions::default()).unwrap() {
-            PushOutcome::Rejected { detail } => assert!(detail.contains("[rejected]"), "{detail}"),
+            PushOutcome::Rejected { detail } => {
+                assert!(detail.contains("[rejected]"), "{detail}");
+                assert!(!push_rejected_by_lease(&detail), "普通推送被拒是要先拉取");
+            }
             other => panic!("应被拒: {other:?}"),
         }
 
@@ -980,7 +1014,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(out, PushOutcome::Rejected { .. }), "{out:?}");
+        let PushOutcome::Rejected { detail } = &out else {
+            panic!("应被拒: {out:?}");
+        };
+        // 这是 lease 没过(不是普通的非快进):界面不能再劝「确认风险后强制推送」
+        assert!(push_rejected_by_lease(detail), "{detail}");
         assert_eq!(
             git(&bare, &["rev-parse", &branch]),
             theirs,

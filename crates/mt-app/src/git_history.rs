@@ -47,8 +47,10 @@ mod detail;
 pub use actions::GitLogRewordConfirm;
 pub(crate) use actions::REWORD_CONTEXT;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -97,6 +99,8 @@ gpui::actions!(
 const PAGE_SIZE: usize = 30;
 /// 过滤框输入去抖。
 const FILTER_DEBOUNCE_MS: u64 = 300;
+/// 过滤框最窄留多宽(连左右图标):右侧的计数 / 状态先截断让位,框里至少还看得见十来个字。
+const FILTER_INPUT_MIN_W: f32 = 140.0;
 /// 键盘往下走时,离已加载末尾还剩几行就预取下一页。
 const PREFETCH_ROWS: usize = 5;
 /// 行里直接显示几个引用胶囊,其余收进「+N」。
@@ -144,6 +148,9 @@ struct FilterState {
     /// 这一轮想要凑满的条数:首屏一页,每触底一次加一页。
     want: usize,
     debounce: Option<Task<()>>,
+    /// 上一帧过滤框外壳的宽(canvas 量的):变了就把光标拉回可见区(见
+    /// [`keep_caret_in_view`])。
+    input_w: Rc<Cell<f32>>,
 }
 
 /// 过滤条件有没有实际生效。「仅我的」查不到邮箱时不算;路径规范化后是仓库根也不算。
@@ -236,6 +243,10 @@ pub struct GitHistoryContent {
     head_branch: Option<String>,
     /// HEAD 指向的提交(由分支列表 / detached 短 hash 推出来;画 HEAD 圆环、HEAD 胶囊用)。
     head_hash: Option<String>,
+    /// 首页在途:分支胶囊随首页一起换(见 [`Self::sync`])。
+    refs_in_flight: bool,
+    /// 首页在途期间容器透下来的分支列表与 HEAD 名(首页没读到引用时退回用它)。
+    deferred_refs: Option<HistoryRefs>,
     /// 正在查看(未 checkout)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
     tags: Vec<TagInfo>,
@@ -275,6 +286,49 @@ fn grow<E: Styled>(mut el: E, value: f32) -> E {
     el
 }
 
+/// 行上挂分支胶囊要的引用:分支列表 + HEAD 显示名(detached 是 `"(1a2b3c4)"`)。
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryRefs {
+    branches: Vec<BranchInfo>,
+    head: Option<String>,
+}
+
+/// 过滤框变窄之后把光标拉回可见区。
+///
+/// 单行输入只在**选区变了**的那一帧按光标位置横向滚动:过滤生效、右侧冒出「匹配 N 条」
+/// 把框挤窄时选区没动,停在末尾的光标(连同后半段文字)就留在可见区外,之后不再打字
+/// 它也不回来(E2E r4 C4)。这里在框的宽度变过之后按上一帧画出来的光标与可视区补一次。
+fn keep_caret_in_view(input: &Entity<InputState>, cx: &mut App) {
+    input.update(cx, |state, cx| {
+        let Some((caret, _)) = state.cursor_layout() else {
+            return;
+        };
+        let view = state.input_bounds();
+        if view.size.width <= px(0.0) {
+            return;
+        }
+        // 光标右边留一点余量,别贴着框沿
+        let margin = px(4.0);
+        let dx = if caret.right() + margin > view.right() {
+            view.right() - margin - caret.right()
+        } else if caret.left() < view.left() {
+            view.left() - caret.left()
+        } else {
+            return;
+        };
+        let offset = state.scroll_offset();
+        state.set_scroll_offset(point(offset.x + dx, offset.y), cx);
+    });
+}
+
+/// 与历史首页同一时刻读的引用(见 [`GitHistoryContent::sync`])。读不到给 `None`,
+/// 沿用容器透下来的那份。纯 git2 只读。
+fn read_history_refs(repo: &std::path::Path) -> Option<HistoryRefs> {
+    let branches = mt_project::git::get_repo_branches(repo).ok()?;
+    let head = mt_project::git::current_head_label(repo).ok().flatten();
+    Some(HistoryRefs { branches, head })
+}
+
 impl GitHistoryContent {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input =
@@ -296,6 +350,8 @@ impl GitHistoryContent {
             branches: Vec::new(),
             head_branch: None,
             head_hash: None,
+            refs_in_flight: false,
+            deferred_refs: None,
             view_branch: None,
             tags: Vec::new(),
             tags_by_commit: HashMap::new(),
@@ -318,6 +374,7 @@ impl GitHistoryContent {
                 scanned: 0,
                 want: PAGE_SIZE,
                 debounce: None,
+                input_w: Rc::new(Cell::new(0.0)),
             },
             selected: None,
             verify_selection: false,
@@ -335,6 +392,11 @@ impl GitHistoryContent {
     ///
     /// ⚠️ 分支列表要**整条**比,不能只比名字:提交 / 推送后分支名一个没变、
     /// 只有 `commit_hash` 前移,只比名字会把新列表丢掉,胶囊就钉死在旧 commit 上。
+    ///
+    /// 首页在途时(外部 `reset` / 提交之后的刷新)分支列表先压着:首页自己带着同一时刻读的
+    /// 引用回来,与提交列表一起换。容器的分支快照与历史首页是两趟查询、先后不定 ——
+    /// 分开换的话,中间那一帧胶囊挂在不存在的提交上(重置后首行只剩 origin/main,
+    /// E2E r4 A12)。
     pub fn sync(
         &mut self,
         repo_path: &str,
@@ -349,10 +411,16 @@ impl GitHistoryContent {
         self.repo_path = repo_path.to_string();
         self.view_branch = view_branch.map(str::to_string);
         if tags_changed {
-            self.branches = branches.to_vec();
-            self.head_branch = head_branch.map(str::to_string);
-            self.refresh_head_hash();
-            cx.notify();
+            let refs = HistoryRefs {
+                branches: branches.to_vec(),
+                head: head_branch.map(str::to_string),
+            };
+            if self.refs_in_flight && !reload {
+                self.deferred_refs = Some(refs);
+            } else {
+                self.apply_refs(refs);
+                cx.notify();
+            }
         }
         if repo_changed {
             // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
@@ -396,9 +464,16 @@ impl GitHistoryContent {
         self.verify_selection = true;
         // ⚠️ loading 必须复位:令牌已 +1,在途响应注定被丢弃,而丢弃分支
         // 不会走到 `loading = false` —— 不复位的话这次 load_page 被 loading
-        // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷
+        // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷。引用的在途标记同理
         self.loading = false;
+        self.refs_in_flight = false;
         self.load_page(true, cx);
+        // 首页没发出去(没有仓库):压着的引用不会再有首页来换,当场换上
+        if !self.refs_in_flight
+            && let Some(refs) = self.deferred_refs.take()
+        {
+            self.apply_refs(refs);
+        }
         cx.notify();
     }
 
@@ -454,8 +529,9 @@ impl GitHistoryContent {
                 }
             };
             self.loading = true;
+            self.refs_in_flight |= first;
             cx.spawn(async move |this, cx| {
-                let result = cx
+                let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
                         let page = mt_project::git::get_git_log_filtered(
@@ -467,7 +543,8 @@ impl GitHistoryContent {
                         );
                         let tags =
                             first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
-                        page.map(|page| (page, tags))
+                        let refs = first.then(|| read_history_refs(&repo)).flatten();
+                        (page.map(|page| (page, tags)), refs)
                     })
                     .await;
                 let _ = this.update(cx, |this: &mut Self, cx| {
@@ -475,6 +552,9 @@ impl GitHistoryContent {
                         return;
                     }
                     this.loading = false;
+                    if first {
+                        this.settle_refs(refs);
+                    }
                     match result {
                         Ok((page, tags)) => this.merge_filtered(first, page, tags, cx),
                         Err(err) => this.load_failed(err),
@@ -485,9 +565,10 @@ impl GitHistoryContent {
             .detach();
         } else {
             self.loading = true;
+            self.refs_in_flight |= first;
             let after = (!first).then(|| GitLogCursor::from_loaded(&self.commits));
             cx.spawn(async move |this, cx| {
-                let result = cx
+                let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
                         let page = mt_project::git::get_git_log(
@@ -498,7 +579,8 @@ impl GitHistoryContent {
                         );
                         let tags =
                             first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
-                        page.map(|page| (page, tags))
+                        let refs = first.then(|| read_history_refs(&repo)).flatten();
+                        (page.map(|page| (page, tags)), refs)
                     })
                     .await;
                 let _ = this.update(cx, |this: &mut Self, cx| {
@@ -506,6 +588,9 @@ impl GitHistoryContent {
                         return;
                     }
                     this.loading = false;
+                    if first {
+                        this.settle_refs(refs);
+                    }
                     match result {
                         Ok((page, tags)) => this.merge_page(first, page, tags),
                         Err(err) => this.load_failed(err),
@@ -603,6 +688,23 @@ impl GitHistoryContent {
                 self.filter.want = self.commits.len() + PAGE_SIZE;
             }
             self.load_page(false, cx);
+        }
+    }
+
+    /// 换上一份引用(分支胶囊、HEAD 圆环跟着变)。
+    fn apply_refs(&mut self, refs: HistoryRefs) {
+        self.branches = refs.branches;
+        self.head_branch = refs.head;
+        self.refresh_head_hash();
+    }
+
+    /// 首页落定(成败都算):引用与提交列表一起换。首页没读到引用时退回在途期间容器透下来
+    /// 的那份(见 [`Self::sync`])。在合并首页**之前**调,`refresh_head_hash` 才按新引用算。
+    fn settle_refs(&mut self, refs: Option<HistoryRefs>) {
+        self.refs_in_flight = false;
+        let deferred = self.deferred_refs.take();
+        if let Some(refs) = refs.or(deferred) {
+            self.apply_refs(refs);
         }
     }
 
@@ -1145,9 +1247,13 @@ impl Render for GitHistoryContent {
 
 impl GitHistoryContent {
     /// 过滤栏:输入框(左搜索图标、右清空)+「仅我的」胶囊 + 计数 / 进行中状态 + 清除。
+    ///
+    /// 过滤框按剩余宽度伸缩、保底 [`FILTER_INPUT_MIN_W`],右侧计数 / 状态先截断让位。
+    /// 「清除」只在开着「仅我的」时出(一下清掉文字与开关);只有文字时框里的 × 就是清除,
+    /// 再挂一颗只会把框挤窄(E2E r4 C4:默认宽度过滤生效后框里只剩约 7 个字)。
     fn render_filter_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let has_text = !self.filter.input.read(cx).value().is_empty();
-        let active = self.filter.active() || self.filter.only_mine;
+        let show_clear = self.filter.only_mine;
         let clear_text = has_text.then(|| {
             icon_button(
                 "git-log-filter-clear-text",
@@ -1168,11 +1274,31 @@ impl GitHistoryContent {
             .pl(px(2.0))
             .child(icon(ICON_SEARCH, git_ui::ICON_SIZE, ui::text_muted()))
             .tip(t("gitLog", "filter.syntaxTip"));
-        let input = div().flex_1().min_w_0().child(
-            Input::new(&self.filter.input)
-                .prefix(syntax_hint)
-                .when_some(clear_text, |el, btn| el.suffix(btn)),
-        );
+        // 外壳的宽一变(右侧冒出 / 收起计数),当帧画完后把光标拉回可见区
+        let input_w = self.filter.input_w.clone();
+        let input_state = self.filter.input.clone();
+        let input = div()
+            .relative()
+            .flex_1()
+            .min_w(px(FILTER_INPUT_MIN_W))
+            .child(
+                Input::new(&self.filter.input)
+                    .prefix(syntax_hint)
+                    .when_some(clear_text, |el, btn| el.suffix(btn)),
+            )
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, cx| {
+                        let width = f32::from(bounds.size.width);
+                        if (input_w.replace(width) - width).abs() > 0.5 {
+                            cx.defer(move |cx| keep_caret_in_view(&input_state, cx));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
 
         let mine = self.filter.only_mine;
         let mine_color = if self.filter.no_email {
@@ -1265,7 +1391,8 @@ impl GitHistoryContent {
                 el.child(
                     mono(div())
                         .id("git-log-status")
-                        .flex_none()
+                        // 挤不下时先截它(可收缩到 0;过滤框有保底宽,见方法注释)
+                        .min_w(px(0.0))
                         .max_w(px(160.0))
                         .truncate()
                         .text_size(ui::font_px(12.0))
@@ -1275,7 +1402,7 @@ impl GitHistoryContent {
                         .child(status),
                 )
             })
-            .when(active, |el| {
+            .when(show_clear, |el| {
                 let clear = git_ui::action_button(
                     "git-log-filter-clear",
                     t("gitLog", "filter.clear"),

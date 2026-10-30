@@ -568,6 +568,18 @@ impl Render for BranchPopup {
                     false,
                     !writable || snap.repo.is_empty(),
                 )
+                // 置灰时说明原因(推送在后台跑着之类);忙闲会变,提示现读
+                .tip_live({
+                    let panel = self.panel.downgrade();
+                    move |cx| {
+                        let snap = panel.upgrade().map(|p| p.read(cx).branch_snapshot());
+                        if snap.is_some_and(|s| !s.writable()) {
+                            git_ui::gate_busy_text().into()
+                        } else {
+                            t("gitBranch", "newBranchTip").into()
+                        }
+                    }
+                })
                 .when(writable && !snap.repo.is_empty(), |el| {
                     el.on_click(move |_: &ClickEvent, window, cx| {
                         close_guarded(kind::GIT_BRANCHES, window, cx);
@@ -592,14 +604,15 @@ impl Render for BranchPopup {
                     fetching,
                     !writable && !fetching,
                 )
-                // 闸的忙闲随别的区的写操作变:提示现读(见 `TooltipExt::tip_live`)
+                // 忙闲随写操作变(面板自己的,或别的区占着闸):提示现读(见
+                // `TooltipExt::tip_live`)。Fetch 自己在跑时标签已写「Fetch 中…」
                 .tip_live({
                     let panel = self.panel.downgrade();
                     move |cx| {
-                        let gated = panel
-                            .upgrade()
-                            .is_some_and(|p| p.read(cx).branch_snapshot().gated);
-                        if gated {
+                        let snap = panel.upgrade().map(|p| p.read(cx).branch_snapshot());
+                        let waiting =
+                            snap.is_some_and(|s| !s.writable() && s.busy != Some(GitBusy::Fetch));
+                        if waiting {
                             git_ui::gate_busy_text().into()
                         } else {
                             t("gitBranch", "fetchTip").into()
@@ -663,8 +676,11 @@ impl Render for BranchPopup {
             list = list.child(self.render_row(index, row, index == cursor, cx));
         }
 
-        // detached HEAD 时置顶一句说明(它不是分支,列表里没有它)
+        // detached HEAD 时置顶一句说明(它不是分支,列表里没有它)。显示名本身带括号
+        // (`(1a2b3c4)`),文案里另有一层,只取哈希。前后半句分两段排、后半句整段不断:
+        // 放不下时整段换到第二行,不会只剩末字单独成行
         let detached_note = snap.detached.as_ref().map(|label| {
+            let commit = crate::git_panel::detached_hash(label);
             div()
                 .mx(px(12.0))
                 .mb(px(8.0))
@@ -673,8 +689,18 @@ impl Render for BranchPopup {
                 .rounded(px(4.0))
                 .bg(ui::with_alpha(ui::color_warning(), 0.12))
                 .child(
-                    git_ui::notice_line(
-                        tr!("gitBranch", "detachedNote", commit = label.as_str()),
+                    git_ui::notice_row(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_x(px(4.0))
+                            .child(tr!("gitBranch", "detachedNote", commit = commit))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .child(t("gitBranch", "detachedNoteTail")),
+                            ),
                         ui::color_warning(),
                     )
                     .text_color(ui::text_secondary()),
@@ -731,10 +757,9 @@ impl Render for BranchPopup {
 
 /// 一行的动作菜单。HEAD 行去掉不适用的(检出 / 合并 / 变基到自己 / 删除);
 /// 远程行没有推送 / 重命名;有写操作在跑(面板自己的,或别的区占着写操作闸)时写类动作
-/// 一律禁用,后者在 detail 行写明原因。
+/// 一律禁用,并在 detail 行写明原因(与仓库栏按钮、提交按钮同一句)。
 fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<MenuEntry> {
     let busy = !snap.writable();
-    let gated = snap.gated;
     let current = snap.head.clone();
     // 每个动作:先收弹窗,再交给面板
     let action = |label: String, f: fn(&Entity<GitPanel>, &Row, &mut Window, &mut App)| {
@@ -745,7 +770,7 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
                 close_guarded(kind::GIT_BRANCHES, window, cx);
                 f(&panel, &row, window, cx);
             });
-        if gated {
+        if busy {
             item.detail(git_ui::gate_busy_text())
         } else {
             item

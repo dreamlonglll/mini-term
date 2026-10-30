@@ -52,8 +52,19 @@ struct PushDialog {
     load_error: Option<String>,
     force: bool,
     pushing: bool,
-    /// 上一次推送失败的原文(可选中复制)+ 是不是「被拒、应先拉取」那种。
-    error: Option<(Entity<TextareaState>, bool)>,
+    /// 上一次推送失败的原文(可选中复制)+ 被拒时原文上方那句指引(见 [`rejected_hint`])。
+    error: Option<(Entity<TextareaState>, Option<&'static str>)>,
+}
+
+/// 推送被拒时的指引:强推的 lease 没过(远端有本地没获取的新提交)只能先 Fetch 看清再说,
+/// 再劝「确认风险后强制推送」只会被同样拒掉(E2E r4 A9);其余被拒(非快进 / 要先 fetch)
+/// 劝先拉取。
+fn rejected_hint(detail: &str) -> &'static str {
+    if mt_project::git::push_rejected_by_lease(detail) {
+        t("gitBranch", "rejectedStaleHint")
+    } else {
+        t("gitBranch", "rejectedHint")
+    }
 }
 
 impl Render for PushDialog {
@@ -293,19 +304,21 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                     });
                     None
                 }
-                Ok(PushOutcome::Rejected { detail }) => Some((detail, true)),
-                Err(err) => Some((git_ui::error_text(&err), false)),
+                Ok(PushOutcome::Rejected { detail }) => {
+                    let hint = rejected_hint(&detail);
+                    Some((detail, Some(hint)))
+                }
+                Err(err) => Some((git_ui::error_text(&err), None)),
             };
-            let Some((detail, rejected)) = failure else {
+            let Some((detail, hint)) = failure else {
                 return;
             };
             eprintln!("[git] 推送失败: {detail}");
             // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
             if !prompt::is_open(kind::GIT_PUSH) {
-                let text = if rejected {
-                    format!("{}\n\n{detail}", t("gitBranch", "rejectedHint"))
-                } else {
-                    detail
+                let text = match hint {
+                    Some(hint) => format!("{hint}\n\n{detail}"),
+                    None => detail,
                 };
                 git_ui::show_git_error(
                     tr!("gitBranch", "opFailed", op = t("gitBranch", "opPush")),
@@ -318,7 +331,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
             let text_state = git_ui::error_text_state(&detail, 8, window, cx);
             state.update(cx, |s, cx| {
                 s.pushing = false;
-                s.error = Some((text_state, rejected));
+                s.error = Some((text_state, hint));
                 cx.notify();
             });
             panel.update(cx, |p, cx| p.refresh_all(cx));
@@ -330,7 +343,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
         // 别的区刚占上闸(按钮禁用之前点进来的):就地说明,不推
         let text_state = git_ui::error_text_state(git_ui::gate_busy_text(), 2, window, cx);
         state.update(cx, |s, cx| {
-            s.error = Some((text_state, false));
+            s.error = Some((text_state, None));
             cx.notify();
         });
         return;
@@ -544,17 +557,14 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     );
 
     // ── 失败原文 ──
-    if let Some((text, rejected)) = &s.error {
+    if let Some((text, hint)) = &s.error {
         root = root.child(
             div()
                 .flex()
                 .flex_col()
                 .gap(px(6.0))
-                .when(*rejected, |el| {
-                    el.child(git_ui::notice_line(
-                        t("gitBranch", "rejectedHint"),
-                        ui::color_warning(),
-                    ))
+                .when_some(*hint, |el, hint| {
+                    el.child(git_ui::notice_line(hint, ui::color_warning()))
                 })
                 .child(git_ui::error_text_box(text)),
         );
@@ -639,6 +649,23 @@ mod tests {
             t("gitBranch", dismiss_key(true)),
             t("gitBranch", "cancel"),
             "进行中的文案不能还是「取消」"
+        );
+    }
+
+    /// 强推因期望值过期被拒时不再劝「确认风险后强制推送」,改劝先 Fetch;普通的非快进
+    /// 被拒照旧劝先拉取(E2E r4 A9)。两种语言的过期指引都不提强推这条出路。
+    #[test]
+    fn 强推期望值过期被拒不再劝强推() {
+        let stale = "!\trefs/heads/x:refs/heads/x\t[rejected] (stale info)";
+        let plain = "!\trefs/heads/x:refs/heads/x\t[rejected] (non-fast-forward)";
+        assert_eq!(rejected_hint(stale), t("gitBranch", "rejectedStaleHint"));
+        assert_eq!(rejected_hint(plain), t("gitBranch", "rejectedHint"));
+        let zh = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitBranch", "rejectedStaleHint");
+        assert!(zh.contains("Fetch") && !zh.contains("确认风险"), "{zh}");
+        let en = mt_i18n::t_in(mt_i18n::Locale::En, "gitBranch", "rejectedStaleHint");
+        assert!(
+            en.contains("Fetch") && !en.contains("if you accept the risk"),
+            "{en}"
         );
     }
 

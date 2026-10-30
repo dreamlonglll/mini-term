@@ -98,6 +98,7 @@ export const gitBranch = {
     // 分支弹窗
     searchPlaceholder: "搜索分支",
     newBranch: "新建分支…",
+    newBranchTip: "从当前 HEAD 新建分支",
     fetch: "Fetch",
     groupCurrent: "当前分支",
     groupRecent: "最近",
@@ -106,7 +107,9 @@ export const gitBranch = {
     noMatch: "没有匹配「{query}」的分支",
     clearSearch: "清除搜索",
     noBranches: "还没有任何分支",
-    detachedNote: "当前处于分离 HEAD（{commit}），不在任何分支上",
+    // 游离 HEAD 提示分前后两截排(后半句整段换行,不会只剩末字成行)
+    detachedNote: "当前处于分离 HEAD（{commit}），",
+    detachedNoteTail: "不在任何分支上",
     hintMove: "选择",
     hintCheckout: "检出",
     hintActions: "操作",
@@ -174,6 +177,8 @@ export const gitBranch = {
     // 推送进行中左键的文案：推送撤不回，点它只是收起对话框
     pushInBackground: "在后台继续",
     rejectedHint: "远程有本地没有的提交，推送被拒绝。请先拉取（或确认风险后强制推送）。",
+    // 强推带的期望值过期(远程已有本地没获取的提交):再劝强推只会被同样拒掉
+    rejectedStaleHint: "远程分支上有本地还没获取的新提交，强制推送已被拒绝（以免覆盖它们）。请先 Fetch 查看这些提交，再决定是否重新推送。",
     viewCommitFailed: "读取提交改动失败",
   },
   en: {
@@ -267,6 +272,7 @@ export const gitBranch = {
     opStillRunning: "Continued — the {op} is not finished yet",
     searchPlaceholder: "Search branches",
     newBranch: "New branch…",
+    newBranchTip: "Create a branch from the current HEAD",
     fetch: "Fetch",
     groupCurrent: "Current branch",
     groupRecent: "Recent",
@@ -275,7 +281,8 @@ export const gitBranch = {
     noMatch: "No branch matches “{query}”",
     clearSearch: "Clear search",
     noBranches: "No branches yet",
-    detachedNote: "Detached HEAD ({commit}) — not on any branch",
+    detachedNote: "Detached HEAD ({commit}) —",
+    detachedNoteTail: "not on any branch",
     hintMove: "Select",
     hintCheckout: "Checkout",
     hintActions: "Actions",
@@ -339,6 +346,7 @@ export const gitBranch = {
     pushing: "Pushing…",
     pushInBackground: "Continue in Background",
     rejectedHint: "The remote has commits you don't have, so the push was rejected. Pull first (or force-push if you accept the risk).",
+    rejectedStaleHint: "The remote branch has commits you haven't fetched, so the force push was rejected to avoid overwriting them. Fetch first to review them, then decide whether to push again.",
     viewCommitFailed: "Failed to read the commit's changes",
   },
 } as const;
