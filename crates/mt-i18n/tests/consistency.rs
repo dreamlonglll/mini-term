@@ -154,8 +154,12 @@ use mt_i18n::{
 /// 换成「在后台继续」（`gitBranch.pushInBackground`）。
 /// 1420 → 1421：文件页签回落页（二进制 / 过大 / 解不出）在「使用默认工具打开」旁加
 /// 「打开文件所在文件夹」（`fileViewer.openContainingFolder`）。
+/// 1421 → 1428：终端控制条查找 / 左右分屏 / 上下分屏 / 关整组四颗按钮补悬停提示
+/// （`paneGroup.{searchTooltip,splitRightTooltip,splitDownTooltip,closePaneTooltip}`）；
+/// 删 worktree 前识别占用：停在里面的终端先关的说明（`worktree.removeBusyTerminals`）、
+/// 被占用未动手与删到一半目录残留两种失败的原因与下一步（`worktree.{removeInUse,removeLeftover}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1421;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1428;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

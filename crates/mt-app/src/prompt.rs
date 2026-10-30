@@ -551,7 +551,10 @@ pub fn show_file_conflict_choice(
 ///
 /// 左右**不另加内边距**:Dialog 已给标题、正文、页脚同一份 16px,正文再套一层
 /// 20px 就比标题右缩一截(看着像给图标留了位却没有图标)。
-fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
+///
+/// 「移除项目」这类自己拼弹窗、却只是「一句正文 + 几行灰字」的确认框也走这里
+/// (见 `modal::open_confirm_remove_project`),左缘才与其它确认框对齐。
+pub(crate) fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
     let mut el = div().flex().flex_col().gap(px(4.0));
     for line in message.split('\n') {
         el = el.child(

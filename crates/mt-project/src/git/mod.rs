@@ -2223,10 +2223,26 @@ pub struct WorktreeInfo {
     pub is_locked: bool,
 }
 
-/// 去掉路径尾部分隔符:git2 的 workdir() 带尾杠,而项目配置里的路径不带,
-/// 统一后才能做「该 worktree 是否已是项目」的对比。
+/// worktree 路径的对外形态:去掉尾部分隔符、换成本机原生分隔符。
+///
+/// git2 的 workdir() 与 worktree 路径一律是 `D:/x/proj/` 这种正斜杠带尾杠的写法,而
+/// 项目配置里的路径不带尾杠、Windows 上扫盘得到的是反斜杠。这串既拿来展示,也被当成
+/// 终端 cwd、「设为项目」的项目路径落盘 —— 不归一的话同一目录会出现两种斜杠
+/// (Git 面板两个入口开出的终端 cwd 一正一反,第四轮 E2E)。
 fn display_path(p: &Path) -> String {
-    mt_core::path_key::trim_trailing_separators(&p.to_string_lossy()).to_string()
+    let raw = p.to_string_lossy();
+    let trimmed = mt_core::path_key::trim_trailing_separators(&raw);
+    let native = if cfg!(windows) {
+        trimmed.replace('/', "\\")
+    } else {
+        trimmed.to_string()
+    };
+    // 盘符根(`D:`)要留住分隔符,否则是「D 盘的当前目录」
+    if native.len() == 2 && native.ends_with(':') {
+        format!("{native}{}", std::path::MAIN_SEPARATOR)
+    } else {
+        native
+    }
 }
 
 fn head_branch(repo: &Repository) -> Option<String> {
@@ -2338,19 +2354,202 @@ pub fn add_worktree(
     result
 }
 
+/// [`remove_worktree`] 里要界面区别对待的两种失败(其余失败是 git 的原文)。
+/// 调用方用 `err.downcast_ref::<WorktreeRemoveError>()` 认出来,换成说清原因与下一步的文案。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeRemoveError {
+    /// 目录里有东西被别的进程占着(终端停在里面、编辑器独占开着文件……),预检拦下,
+    /// **git 一步都没做**:登记与目录都还在。`busy` 是查到的第一处占用。
+    InUse { path: String, busy: String },
+    /// git 摘掉了登记、目录却没删干净(预检之后才被占上),收尾补删也没成功:
+    /// 登记已无、目录残留。`detail` 是补删失败的原因。
+    Leftover { path: String, detail: String },
+}
+
+impl std::fmt::Display for WorktreeRemoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InUse { path, busy } => {
+                write!(
+                    f,
+                    "worktree 目录正被占用,未做任何改动: {path}(占用处: {busy})"
+                )
+            }
+            Self::Leftover { path, detail } => {
+                write!(f, "worktree 登记已删除,但目录未能删除: {path}: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorktreeRemoveError {}
+
+/// 删除前等占用放开的宽限:调用方刚关掉停在 worktree 里的终端时,shell 进程还在退出,
+/// 当前目录句柄要等它真正退出才放掉。
+const REMOVE_IN_USE_GRACE: Duration = Duration::from_secs(3);
+/// git 删到一半之后,补删残留目录的宽限(占用方可能正在退出)。
+const REMOVE_LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+/// 两档宽限内的轮询间隔。
+const REMOVE_POLL: Duration = Duration::from_millis(100);
+
 /// 删除 worktree(工作目录 + 主仓库里的元数据)。
 /// 有未提交改动 / 已锁定时 git 会拒绝,`force=true` 对应 `--force` 强制删除。
+///
+/// # 不留半删状态
+///
+/// `git worktree remove` 先删目录,**删目录失败也照样摘掉登记**(git 源码注释原话
+/// 「there's no going back from here」)。Windows 上目录里只要有一样东西被别的进程以
+/// 不许删除的方式占着 —— 终端的当前目录停在里面、编辑器独占开着文件 —— 就删不掉,
+/// 落下「登记没了、目录还在、界面只报 Permission denied」的半删状态(第四轮 E2E A14)。
+/// 所以分两步兜:
+///
+/// 1. 调 git 之前先预检占用([`wait_until_deletable`]),给 [`REMOVE_IN_USE_GRACE`]
+///    的宽限;过了还占着就返回 [`WorktreeRemoveError::InUse`],git 一步不做;
+/// 2. git 仍然失败、且**这一次**把登记摘掉了而目录还在(预检之后才被占上):把剩下的
+///    目录删掉收尾,删得掉按成功算;删不掉返回 [`WorktreeRemoveError::Leftover`]。
+///
+/// **阻塞调用线程**(预检要遍历整个目录,另加最多两档宽限)。
 pub fn remove_worktree(repo_path: &Path, worktree_path: &str, force: bool) -> Result<String> {
+    let dir = Path::new(worktree_path);
+    if dir.is_dir()
+        && let Err(busy) = wait_until_deletable(dir, REMOVE_IN_USE_GRACE)
+    {
+        return Err(WorktreeRemoveError::InUse {
+            path: worktree_path.to_string(),
+            busy: busy.to_string_lossy().to_string(),
+        }
+        .into());
+    }
+    let was_registered = worktree_registered(repo_path, dir);
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
     }
     args.push(worktree_path);
     let result = run_git_command(repo_path, &args, LOCAL_OP_TIMEOUT, "");
-    if result.is_ok() {
-        invalidate_repo_cache();
+    match result {
+        Ok(out) => {
+            invalidate_repo_cache();
+            Ok(out)
+        }
+        // 只收拾「这一次」git 摘掉了登记的情形:本来就不是登记在册的 worktree 时
+        // git 一开头就拒绝,目录不归这里删
+        Err(err) if was_registered && dir.exists() && !worktree_registered(repo_path, dir) => {
+            invalidate_repo_cache();
+            match remove_leftover_dir(dir, REMOVE_LEFTOVER_GRACE) {
+                Ok(()) => Ok(String::new()),
+                Err(detail) => {
+                    eprintln!("[git] worktree 删到一半: {err:#}");
+                    Err(WorktreeRemoveError::Leftover {
+                        path: worktree_path.to_string(),
+                        detail,
+                    }
+                    .into())
+                }
+            }
+        }
+        Err(err) => Err(err),
     }
-    result
+}
+
+/// `dir` 是不是 `repo_path` 所属仓库登记在册的 linked worktree。列不出来时按「不是」
+/// 算 —— 调用方据此决定要不要替 git 收尾删目录,宁可不删。
+fn worktree_registered(repo_path: &Path, dir: &Path) -> bool {
+    let key = mt_core::path_key::windows_eq_key(&dir.to_string_lossy());
+    list_worktrees(repo_path).is_ok_and(|list| {
+        list.iter()
+            .any(|wt| !wt.is_main && mt_core::path_key::windows_eq_key(&wt.path) == key)
+    })
+}
+
+/// 等 `dir` 整棵子树都能删:有占用就盯着那一处等它放开,放开了再整棵复查,直到全部
+/// 可删(`Ok`)或宽限用完(`Err(仍被占用的那一处)`)。非 Windows 上删除不受打开的
+/// 句柄影响,直接 `Ok`。
+fn wait_until_deletable(dir: &Path, grace: Duration) -> std::result::Result<(), PathBuf> {
+    let deadline = Instant::now() + grace;
+    loop {
+        let Some(busy) = first_locked_entry(dir) else {
+            return Ok(());
+        };
+        // 盯着已知的那一处等(只开一个句柄,便宜);它放开了才值得再走一遍整棵树
+        loop {
+            if Instant::now() >= deadline {
+                return Err(busy);
+            }
+            std::thread::sleep(REMOVE_POLL);
+            if !is_locked_against_delete(&busy) {
+                break;
+            }
+        }
+    }
+}
+
+/// 子树里第一处删不掉的(目录自身算在内)。只往真目录里走:符号链接 / 目录联接
+/// 不跟进去 —— git 删的是链接本身,链接那头的东西与这次删除无关。
+fn first_locked_entry(root: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if is_locked_against_delete(&path) {
+            return Some(path);
+        }
+        let is_real_dir = std::fs::symlink_metadata(&path)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink());
+        if !is_real_dir {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&path) {
+            stack.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    None
+}
+
+/// 这一项现在删得掉吗(Windows)。以 DELETE 访问权、三种共享全开的方式试开一下:
+/// 只和「没给 FILE_SHARE_DELETE」的既有句柄冲突(报共享冲突)—— 正好是会让删除失败的
+/// 那一类:进程的当前目录、独占打开的文件。本应用自己的目录监听句柄给了
+/// FILE_SHARE_DELETE,不算占用(它不挡删除)。其余错误(不存在、无权限)不归
+/// 「占用」管,交给 git 自己报。
+#[cfg(windows)]
+fn is_locked_against_delete(path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    // winnt.h / winbase.h 的原值(windows-sys 没开 Storage_FileSystem 这组 feature)
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+    // 开目录必须带;链接只开它本身,不跟到目标
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(_) => false,
+        Err(err) => err.raw_os_error() == Some(ERROR_SHARING_VIOLATION),
+    }
+}
+
+#[cfg(not(windows))]
+fn is_locked_against_delete(_path: &Path) -> bool {
+    false
+}
+
+/// git 删到一半留下的目录:在宽限内反复删,删掉(或已经没了)返回 `Ok`,
+/// 宽限用完返回最后一次的错误原文。
+fn remove_leftover_dir(dir: &Path, grace: Duration) -> std::result::Result<(), String> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if Instant::now() >= deadline => return Err(err.to_string()),
+            Err(_) => std::thread::sleep(REMOVE_POLL),
+        }
+    }
 }
 
 /// 清理失效的 worktree 元数据(目录已被手动删除的条目)。
@@ -2570,7 +2769,169 @@ mod tests {
     #[test]
     fn display_path_trims_trailing_separators() {
         assert_eq!(display_path(Path::new(r"C:\proj\")), r"C:\proj");
+        #[cfg(not(windows))]
         assert_eq!(display_path(Path::new("/home/u/proj/")), "/home/u/proj");
+    }
+
+    /// libgit2 给的 `D:/x/proj/` 在 Windows 上换成原生反斜杠(展示、终端 cwd、
+    /// 「设为项目」都用这一串);盘符根留住分隔符。
+    #[cfg(windows)]
+    #[test]
+    fn display_path_uses_native_separators_on_windows() {
+        assert_eq!(
+            display_path(Path::new("D:/Git/repo-wt/")),
+            r"D:\Git\repo-wt"
+        );
+        assert_eq!(
+            display_path(Path::new("//wsl.localhost/Ubuntu/home/u/p/")),
+            r"\\wsl.localhost\Ubuntu\home\u\p"
+        );
+        assert_eq!(display_path(Path::new("D:/")), r"D:\");
+    }
+
+    /// 一个主仓库 + 一个 linked worktree(`<主仓库>-wt`,分支 `wt-branch`),
+    /// worktree 里带一个子目录。返回 `(主仓库, worktree)`。
+    fn repo_with_worktree(tag: &str) -> (PathBuf, PathBuf) {
+        use super::test_support::git;
+        let main = init_repo_with_file(tag, "a.txt", "a\n");
+        let wt = main.with_file_name(format!(
+            "{}-wt",
+            main.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt-branch",
+                &wt.to_string_lossy(),
+            ],
+        );
+        std::fs::create_dir_all(wt.join("sub").join("deep")).unwrap();
+        (main, wt)
+    }
+
+    /// 正常删除:登记与目录一起没了,`list_worktrees` 只剩主仓库。
+    #[test]
+    fn remove_worktree_removes_registration_and_dir() {
+        let (main, wt) = repo_with_worktree("wt-remove");
+        let wt_str = display_path(&wt);
+        assert!(worktree_registered(&main, &wt));
+        remove_worktree(&main, &wt_str, true).unwrap();
+        assert!(!wt.exists(), "目录应已删除");
+        assert!(!worktree_registered(&main, &wt), "登记应已摘除");
+        super::test_support::cleanup(&[&main]);
+    }
+
+    /// 被占用时(这里用一个当前目录停在 worktree 子目录里的进程,与「终端开在里面」
+    /// 同形)预检拦下:不调 git,登记与目录都还在,错误能认出是 `InUse`;
+    /// 占用放开后再删就成功(第四轮 E2E A14 的半删状态)。
+    #[cfg(windows)]
+    #[test]
+    fn remove_worktree_in_use_leaves_everything_intact() {
+        let (main, wt) = repo_with_worktree("wt-busy");
+        let wt_str = display_path(&wt);
+        // 直接起 ping(不经 cmd):经 cmd 的话杀掉 cmd 后孙进程 ping 还攥着当前目录
+        let mut holder = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .current_dir(wt.join("sub").join("deep"))
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("起不了占位进程");
+        // 进程起来、当前目录句柄挂上之前预检可能还看不到占用 —— 等它真被认出来
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while first_locked_entry(&wt).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            first_locked_entry(&wt).is_some(),
+            "当前目录停在里面的进程应被认作占用"
+        );
+
+        let err = remove_worktree(&main, &wt_str, true).unwrap_err();
+        match err.downcast_ref::<WorktreeRemoveError>() {
+            Some(WorktreeRemoveError::InUse { path, busy }) => {
+                assert_eq!(path, &wt_str);
+                assert!(busy.contains("sub"), "占用处应指到子目录: {busy}");
+            }
+            other => panic!("应为 InUse,实际 {other:?} / {err:#}"),
+        }
+        assert!(wt.join("a.txt").exists(), "git 一步都不该做:文件还在");
+        assert!(worktree_registered(&main, &wt), "登记还在");
+
+        holder.kill().ok();
+        holder.wait().ok();
+        remove_worktree(&main, &wt_str, true).unwrap();
+        assert!(!wt.exists());
+        assert!(!worktree_registered(&main, &wt));
+        super::test_support::cleanup(&[&main]);
+    }
+
+    /// 本应用自己的目录监听句柄(给了 FILE_SHARE_DELETE)不挡删除,不能算占用;
+    /// 独占打开(不给 FILE_SHARE_DELETE)的文件才算。
+    #[cfg(windows)]
+    #[test]
+    fn share_delete_handles_are_not_in_use() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (main, wt) = repo_with_worktree("wt-share");
+        let shared = std::fs::File::open(wt.join("a.txt")).unwrap();
+        assert_eq!(first_locked_entry(&wt), None, "Rust 默认共享模式含 DELETE");
+        drop(shared);
+        let exclusive = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1)
+            .open(wt.join("a.txt"))
+            .unwrap();
+        assert_eq!(first_locked_entry(&wt), Some(wt.join("a.txt")));
+        drop(exclusive);
+        assert_eq!(first_locked_entry(&wt), None);
+        super::test_support::cleanup(&[&main, &wt]);
+    }
+
+    /// git 删到一半(登记已摘、目录残留)时的收尾:目录删得掉就删。这里直接摆出
+    /// 「登记没了、目录还在」的局面,验证收尾那一步本身。
+    #[test]
+    fn remove_leftover_dir_finishes_or_reports() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-wt-leftover-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("x.txt"), "x").unwrap();
+        assert_eq!(
+            remove_leftover_dir(&root, Duration::from_millis(200)),
+            Ok(())
+        );
+        assert!(!root.exists());
+        // 已经没了也算收尾成功
+        assert_eq!(
+            remove_leftover_dir(&root, Duration::from_millis(200)),
+            Ok(())
+        );
+    }
+
+    /// 两种失败的原文要带上路径(日志里看得出是哪个目录)。
+    #[test]
+    fn worktree_remove_error_display_mentions_path() {
+        let in_use = WorktreeRemoveError::InUse {
+            path: "D:/repo-wt".into(),
+            busy: "D:/repo-wt/sub".into(),
+        };
+        assert!(in_use.to_string().contains("D:/repo-wt/sub"));
+        let leftover = WorktreeRemoveError::Leftover {
+            path: "D:/repo-wt".into(),
+            detail: "拒绝访问".into(),
+        };
+        let text = leftover.to_string();
+        assert!(text.contains("D:/repo-wt") && text.contains("拒绝访问"));
+        // 走 anyhow 之后还认得出来
+        let err: anyhow::Error = leftover.clone().into();
+        assert_eq!(err.downcast_ref::<WorktreeRemoveError>(), Some(&leftover));
     }
 
     #[test]

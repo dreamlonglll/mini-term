@@ -79,13 +79,18 @@ pub fn open_rename_pane(
         let input_for_ok = input.clone();
         dialog
             .title(t("paneGroup", "renameTerminal"))
-            // 与 `showPrompt` 同宽:原版这条就是走 `.prompt-dialog`(360px)
-            .w(px(360.0))
+            // 与 `showPrompt` 同宽同排版(原版这条就是走 `.prompt-dialog`):左右不另加
+            // 内边距、上下留出聚焦环的余量,见 `prompt::show_prompt`
+            .w(px(crate::prompt::DIALOG_W))
             .footer(confirm_footer(
                 t("prompt", "confirm"),
                 Some(t("prompt", "cancel")),
             ))
-            .child(div().px(px(20.0)).child(Input::new(&input)))
+            .child(
+                div()
+                    .py(px(crate::prompt::FOCUS_RING_ROOM))
+                    .child(Input::new(&input)),
+            )
             .on_ok(move |_: &ClickEvent, _window, cx| {
                 let title = input_for_ok.read(cx).value().to_string();
                 store.update(cx, |store, cx| {
@@ -119,40 +124,28 @@ pub fn open_confirm_remove_project(
         move |dialog, _window, _cx| {
             let store = store.clone();
             let project_id = project_id.clone();
+            // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句已经把
+            // "只从列表移除、不删文件"说清楚了,不必另起一行),路径作灰字补充行
+            let message = format!(
+                "{}{}{}",
+                t("projectList", "removeConfirm.messagePrefix"),
+                project_name,
+                t("projectList", "removeConfirm.messageSuffix"),
+            );
             dialog
                 .title(t("projectList", "removeConfirm.title"))
-                // 原版 `ProjectList.tsx` 的删除确认是 `w-[320px]`
-                .w(px(320.0))
+                // 与三件套(prompt / confirm / alert)同宽同排版:原版的 320px 让中文
+                // 正文折成三行、项目名单独占一行;正文走共用的 `prompt::body`,不另加
+                // 左右内边距(此前套的 20px 让整段比标题右缩一截,第四轮 E2E A14)
+                .w(px(crate::prompt::DIALOG_W))
                 .footer(confirm_footer(
                     t("projectList", "removeConfirm.confirm"),
                     Some(t("projectList", "removeConfirm.cancel")),
                 ))
-                .child(
-                    div()
-                        .px(px(20.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句
-                        // 已经把"只从列表移除、不删文件"说清楚了,不必另起一行)
-                        .child(
-                            div()
-                                .text_size(ui::font_px(13.0))
-                                .text_color(ui::text_primary())
-                                .child(format!(
-                                    "{}{}{}",
-                                    t("projectList", "removeConfirm.messagePrefix"),
-                                    project_name,
-                                    t("projectList", "removeConfirm.messageSuffix"),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .text_size(ui::font_px(11.0))
-                                .text_color(ui::text_muted())
-                                .child(project_path.clone()),
-                        ),
-                )
+                .child(crate::prompt::body(
+                    &message,
+                    std::slice::from_ref(&project_path),
+                ))
                 .on_ok(move |_: &ClickEvent, window, cx| {
                     if crate::workbench_area::project_has_dirty_documents(&project_id, cx) {
                         window.defer(cx, |window, cx| {

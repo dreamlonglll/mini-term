@@ -359,15 +359,16 @@ impl FileTree {
         .detach();
 
         // 丢过去的是**变动文件的完整路径**:重列只要它的父目录,但技术栈缓存的
-        // 失效判据要看文件名本身(`Cargo.toml` / `package.json` 之类)
-        let (tx, mut rx) = mpsc::unbounded::<PathBuf>();
+        // 失效判据要看文件名本身(`Cargo.toml` / `package.json` 之类)。另带一位
+        // 「这一项本身出现 / 消失了」(见 `FsChange::structural`)
+        let (tx, mut rx) = mpsc::unbounded::<(PathBuf, bool)>();
         let watcher = Arc::new(FsWatcher::with_label("files", move |change| {
             // notify 自己的线程:只把「什么变了」丢过去,重列在主线程排。
-            let _ = tx.unbounded_send(change.path);
+            let _ = tx.unbounded_send((change.path, change.structural));
         }));
 
         let fs_task = cx.spawn(async move |this, cx| {
-            while let Some(path) = rx.next().await {
+            while let Some((path, structural)) = rx.next().await {
                 let dir = match path.parent() {
                     Some(parent) => parent.to_path_buf(),
                     None => path.clone(),
@@ -376,6 +377,9 @@ impl FileTree {
                     .update(cx, |tree: &mut FileTree, cx| {
                         if tree.path_is_suppressed(&path) {
                             return;
+                        }
+                        if structural {
+                            tree.forget_reshaped_dir(&path, cx);
                         }
                         tree.invalidate(&dir, cx);
                         // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
@@ -790,6 +794,18 @@ impl FileTree {
                         if is_root {
                             tree.root_error = None;
                         }
+                        // 上一趟还在、这一趟没了的子目录(被删 / 改名 / 换成同名文件):
+                        // 它名下的监听与缓存一并作废。事件那一路([`Self::forget_reshaped_dir`])
+                        // 漏了的(notify 缓冲溢出、事件被合并)在这里兜住,否则同名目录
+                        // 再建回来时旧子项还挂着、新文件也没人监听
+                        let vanished = tree
+                            .entries
+                            .get(&dir)
+                            .map(|old| vanished_child_dirs(&dir, old, &rows))
+                            .unwrap_or_default();
+                        for child in vanished {
+                            tree.detach_subtree(&child);
+                        }
                         // 这一趟列出来的压缩链先整份作废,再按新结果登记 ——
                         // 链缩短/消失时旧的中段登记不能留着
                         tree.chain_owner.retain(|_, owner| owner != &dir);
@@ -1039,6 +1055,39 @@ impl FileTree {
         cx.notify();
     }
 
+    /// 被监听 / 已列过的目录**自身**被建、删或改名了(结构变化落在它身上,见
+    /// `FsChange::structural`):整棵子树的监听与缓存作废,父目录(压缩链则是产出
+    /// 这条链的那次列目录)里指向它的那一行先摘掉。随后调用方照常重列父目录,按磁盘
+    /// 实况把行补回来;它若仍是展开态,下一帧的展开态补列(`missing_expanded_dirs`)
+    /// 会重新挂监听、重新列内容。
+    ///
+    /// 不作废会怎样(第四轮 E2E C12):展开着的目录被外部删掉,它在监听单例那边重挂
+    /// 失败、落「失败」态且不会自愈,这边 `watched` 却还记着它、`entries` 还缓存着旧子项。
+    /// 同名目录建回来后父目录重列让它以展开态重新出现 —— `entries` 有内容就不补列,
+    /// `watched` 有记录就不重挂,旧子项一直挂着,新文件也再没有事件,只能折叠再展开。
+    ///
+    /// 只认「本来就在跟踪」的目录(挂着监听或列过内容);文件与没展开过的目录上的
+    /// 建 / 删交给父目录重列就够了。项目根不在此列(它没有父目录那一行可摘,
+    /// 被删了由根目录的加载失败态接手)。
+    fn forget_reshaped_dir(&mut self, path: &Path, cx: &App) {
+        if self.project_root(cx).as_deref() == Some(path) {
+            return;
+        }
+        if !self.watched.contains(path) && !self.entries.contains_key(path) {
+            return;
+        }
+        // 先摘行再脱挂:`detach_subtree` 会把这条路径的链登记一并清掉
+        let owner = self
+            .chain_owner
+            .get(path)
+            .cloned()
+            .or_else(|| path.parent().map(Path::to_path_buf));
+        if let Some(rows) = owner.and_then(|owner| self.entries.get_mut(&owner)) {
+            rows.retain(|row| !row.path.starts_with(path));
+        }
+        self.detach_subtree(path);
+    }
+
     /// 删除前解除目标子树 watcher 并清掉缓存，避免大目录逐文件事件洪泛；远程树虽
     /// 没 watcher，也共用缓存清理。失败后父目录重列会按展开状态逐层恢复。
     /// unwatch 当场摘掉事件路由（此后不再有事件进来），notify 句柄随即由监听单例的
@@ -1147,6 +1196,36 @@ fn missing_expanded_dirs(
             out.push(entry.path.clone());
         }
     }
+}
+
+/// 重列 `dir` 前后对账:上一趟列出来、这一趟不再是目录的**直接子目录**(被删、改名,
+/// 或换成了同名文件)。它们名下的监听与缓存要作废(见 [`FileTree::load_dir_with`])。
+///
+/// 按 `dir` 的直接子项比,不按行路径比:压缩链的行路径是链尾(`src/main/java`),链变长
+/// 变短时行路径会变,而直接子项(链头 `src`)没变 —— 按行路径比会把仍在的链误判成
+/// 消失。旧行的链头从行路径往上找(父目录正是 `dir` 的那一级),新行的链头就是链的第一段。
+fn vanished_child_dirs(
+    dir: &Path,
+    old: &[FileEntry],
+    fresh: &[(FileEntry, Vec<PathBuf>)],
+) -> Vec<PathBuf> {
+    let alive: HashSet<&Path> = fresh
+        .iter()
+        .filter(|(entry, _)| entry.is_dir)
+        .map(|(entry, chain)| chain.first().unwrap_or(&entry.path).as_path())
+        .collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for entry in old.iter().filter(|entry| entry.is_dir) {
+        let head = entry
+            .path
+            .ancestors()
+            .find(|ancestor| ancestor.parent() == Some(dir))
+            .unwrap_or(&entry.path);
+        if !alive.contains(head) && !out.iter().any(|seen| seen == head) {
+            out.push(head.to_path_buf());
+        }
+    }
+    out
 }
 
 #[derive(Clone)]

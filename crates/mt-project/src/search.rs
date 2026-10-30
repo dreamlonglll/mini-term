@@ -224,13 +224,11 @@ fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel 
         .hidden(false)
         .max_filesize(max_filesize)
         .threads(worker_threads());
+    // 与文件树同一把尺子:黑名单目录 + worktree 根下的 `.git` 指针文件
     builder.filter_entry(|entry| {
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            let name = entry.file_name().to_str().unwrap_or("");
-            !crate::fs::ALWAYS_IGNORE.contains(&name)
-        } else {
-            true
-        }
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        let name = entry.file_name().to_str().unwrap_or("");
+        !crate::fs::is_always_hidden(name, is_dir)
     });
     builder.build_parallel()
 }
