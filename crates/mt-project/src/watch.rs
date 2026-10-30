@@ -62,7 +62,7 @@
 //! 计数照记 —— 调用方的 unwatch 照常配对;对同一路径再 watch 一次会重新排队重试。
 //! 被监听目录自己被删、被改名、被重建时(见 [`reshapes_dir`]),后端那一条摘掉重挂:
 //! 句柄/wd 还指着旧目录对象,不重挂的话共享这一条的所有订阅者都跟着失聪;目录已经
-//! 不在就落到「失败」态。
+//! 不在就落到「失败」态(不打日志:目录被删是常事,订阅方重列清单时自会撤掉它)。
 //!
 //! # 注册晚到的窗口
 //!
@@ -115,6 +115,10 @@ pub struct FsChange {
     /// 变更路径,形态是订阅者注册时的字面目录 + 子项名(见模块注释「分发规则」)。
     pub path: PathBuf,
     pub kind: String,
+    /// `path` 这一项**本身**出现或消失了:建、删、改名(走了 / 来了)。只是内容或
+    /// 元数据变了为 `false`。判据与后端重挂同一个([`reshapes_dir`]),订阅方拿它
+    /// 认「我缓存着的那个目录是不是已经换了一个」,不必再去解析 `kind` 的调试串。
+    pub structural: bool,
 }
 
 /// 变更 sink。在 notify 后端线程上调用,故要求 `Send + Sync`;调用时不持有本模块的锁。
@@ -526,7 +530,15 @@ impl Shared {
                         wake = true;
                     }
                     for route in routes {
-                        push_change(&st.subs, &mut out, start, route, route.key.clone(), &kind);
+                        push_change(
+                            &st.subs,
+                            &mut out,
+                            start,
+                            route,
+                            route.key.clone(),
+                            &kind,
+                            reshapes,
+                        );
                     }
                 }
                 if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
@@ -540,6 +552,7 @@ impl Shared {
                             route,
                             route.key.join(name),
                             &kind,
+                            reshapes,
                         );
                     }
                 }
@@ -564,6 +577,7 @@ fn push_change(
     route: &Route,
     path: PathBuf,
     kind: &str,
+    structural: bool,
 ) {
     if out[start..]
         .iter()
@@ -581,6 +595,7 @@ fn push_change(
             project_path: route.project_path.clone(),
             path,
             kind: kind.to_string(),
+            structural,
         },
     ));
 }
@@ -819,8 +834,16 @@ fn worker_loop(shared: Arc<Shared>, mut factory: BackendFactory) {
                 st.registered.remove(dir);
             }
         }
-        // ② 再挂
+        // ② 再挂。目录已经不在了就不碰后端:多半是被监听目录自己被删之后的重挂(删掉
+        // 某个前缀下最后一个分支时 git 连空目录 `refs/heads/bugfix` 一起删),或解析完才
+        // 被删。订阅照样落「失败」,但这不是故障 —— 订阅方下一次重列清单时自会撤掉它,
+        // 不打日志
         for dir in additions {
+            if !dir.is_dir() {
+                let vanished = Err(anyhow::anyhow!("目录已不存在: {}", dir.display()));
+                let _ = shared.state.lock().apply_registration(&dir, vanished);
+                continue;
+            }
             let result = match backend.as_mut() {
                 Some(backend) => backend.watch(&dir),
                 None => match factory(dispatcher.clone()) {
@@ -1519,7 +1542,7 @@ mod tests {
         fake.idle();
         assert_eq!(fake.log.lock().watch_calls.len(), 2);
 
-        // 真删了:重挂失败 → 落「失败」态,后端不残留
+        // 真删了:重挂时目录已不在 → 不碰后端、落「失败」态(不打日志),后端不残留
         std::fs::remove_dir_all(&dir).unwrap();
         fake.emit(
             EventKind::Remove(RemoveKind::Folder),
@@ -1532,6 +1555,90 @@ mod tests {
         // 失败的订阅照样能配对撤销
         w.unwatch(&dir);
         assert!(!w.is_failed(&dir));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn structural_flag_marks_create_remove_and_rename_only() {
+        let fake = Fake::new();
+        let root = temp_dir("structural");
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sink, rx) = channel_sink();
+        let w = fake.hub.subscribe("w", sink);
+        for ready in [w.watch(&root, &proj(&root)), w.watch(&dir, &proj(&root))] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+        let flags = |rx: &Receiver<FsChange>| -> Vec<(PathBuf, bool)> {
+            rx.try_iter().map(|c| (c.path, c.structural)).collect()
+        };
+
+        // 建 / 删 / 改名:不论经父目录路由还是目录自身路由,都标结构变化
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Remove(RemoveKind::Folder),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+        ] {
+            fake.emit(kind, &[canon(&dir)]);
+            assert_eq!(flags(&rx), vec![(dir.clone(), true)], "{kind:?}");
+            fake.idle();
+        }
+        // 子项的建也是结构变化(落在子项自己身上)
+        fake.emit(
+            EventKind::Create(CreateKind::File),
+            &[canon(&dir).join("a.txt")],
+        );
+        assert_eq!(flags(&rx), vec![(dir.join("a.txt"), true)]);
+        // 只是内容 / 元数据变了:不标
+        fake.emit(EventKind::Modify(ModifyKind::Any), &[canon(&dir)]);
+        assert_eq!(flags(&rx), vec![(dir.clone(), false)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 文件树的恢复路径(第四轮 E2E C12):展开着的目录被外部删掉、又建回同名目录。
+    /// 它自己那条订阅在后端重挂时落「失败」(目录已不在),之后**不会**自愈 —— 订阅方
+    /// 要凭父目录交来的结构变化把它撤掉、重新 watch。这里用真 notify 后端把这条路走一遍:
+    /// 父目录订阅收得到删与建两条结构变化,撤掉重挂之后新目录里的变化照常有事件。
+    #[test]
+    fn recreated_dir_resumes_after_rewatch() {
+        let hub = Hub::real();
+        let root = temp_dir("recreate");
+        let dir = root.join("e2e-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        let (sink, rx) = channel_sink();
+        let w = hub.subscribe("files", sink);
+        let project = proj(&root);
+        for ready in [w.watch(&root, &project), w.watch(&dir, &project)] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            recv_matching(&rx, |c| c.path == dir && c.structural).is_some(),
+            "父目录订阅应收到目录自身被删的结构变化"
+        );
+        assert!(hub.wait_idle(BUDGET));
+        assert!(w.is_failed(&dir), "目录已不在:原订阅重挂失败");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            recv_matching(&rx, |c| c.path == dir && c.structural).is_some(),
+            "同名目录建回来也是结构变化"
+        );
+        // 订阅方的处置:撤掉旧订阅、重新 watch —— 新目录挂上后变化照常上报
+        w.unwatch(&dir);
+        assert_eq!(
+            w.watch(&dir, &project).wait(BUDGET),
+            Some(WatchOutcome::Active)
+        );
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        assert!(
+            recv_matching(&rx, |c| c.path == dir.join("b.txt")).is_some(),
+            "重新挂上之后新目录里的变化要有事件"
+        );
+
+        drop(w);
         std::fs::remove_dir_all(&root).ok();
     }
 

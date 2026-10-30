@@ -124,10 +124,46 @@ use mt_i18n::{
 /// 934 → 939：设置页新增「环境变量」页（全局终端环境变量），侧栏项
 /// `settings.menu.envVars` 与页内四条（`settings.envVars.{section,addVar,hint,hasErrors}`）；
 /// 表格本身复用项目环境变量弹窗的 `envVars.*`。
-/// 939 → 940：文件页签回落页（二进制 / 过大 / 解不出）在「使用默认工具打开」旁加
+/// 939 → 1334（33 → 37 个命名空间）：Git 对标 IDEA 新增四个命名空间 ——
+/// `gitCommit` 73 条（diff 弹窗的按块暂存 / 取消暂存 / 丢弃与前后换文件，更改列表的
+/// 冲突分组 / 多选批量操作 / 只丢未暂存的丢弃，提交区的 Amend / 消息历史 / 提交并推送 /
+/// 消息软提示）、`gitBranch` 157 条（分支弹窗的搜索 / 分组 / 动作菜单、新建与重命名
+/// 弹窗的就地校验、推送对话框、Fetch / 拉取方式 / 推送的 tooltip 与结果摘要、
+/// 进行中操作横幅、各类确认框与失败详情框）、`gitLog` 146 条（提交历史的右键操作 /
+/// 过滤栏 / 提交详情 / 标签 / 单文件历史）与 `gitGutter` 19 条（文件查看器的变更标记
+/// 小窗与注解列）。
+/// 1334 → 1408（37 → 38 个命名空间）：`gitStash` 74 条 —— 贮藏列表弹窗（应用 / 弹出 /
+/// 删除 / 全部清除 / 从贮藏新建分支 / 查看内容）、新建贮藏弹窗与「贮藏后检出」确认框。
+/// 1408 → 1409：贮藏接入 Git 面板 —— 仓库栏贮藏按钮带数量的 tooltip（`gitStash.countTip`）；
+/// 改动文件的分组标题改用共用的数量胶囊，`gitStash.files.header`（带 `{count}`）换成
+/// 不带数字的 `gitStash.files.title`，一删一增。
+/// 1409 → 1419：Git 集成一批修复补的可见说明 —— 推送目标与上游不同时的一行
+/// （`gitBranch.pushOtherThanUpstream`）、拉取「跟随配置」的显示与菜单项及「变基（保留合并）」
+/// （`gitBranch.{modeFollowConfig,modeFollowConfigItem,modeRebaseMerges}`）、变基中冲突
+/// 「采用 ours / theirs」写清方向的四条（`gitCommit.take{Ours,Theirs}Rebase{,Deleted}`）、
+/// 贮藏已生成但有文件清不掉的两条（`gitStash.{save.savedWithWarnings,checkout.cancelled}`）。
+/// 1419 → 1417：Git 集成评审整改 —— 新增跨区写操作闸被占的提示（`gitBranch.gateBusy`）、
+/// 重置会改写已推送历史的警告（`gitLog.reset.pushedWarn`）、历史过滤框的语法说明
+/// （`gitLog.filter.syntaxTip`，路径过滤 `path:`）、「提交并推送」改为先开推送对话框的说明
+/// （`gitCommit.commitAndPushDetail`）；更改区失败改走详情框，`gitChanges.operationFailed`
+/// （带原文）换成标题 `gitChanges.operationFailedTitle`；随之下线不再使用的
+/// `gitCommit.{pushing,pushedToast,pushFailedAfterCommit}`、`gitLog.toast.failed`、
+/// `gitGutter.openCommitFailed`、`gitLog.action.viewChanges`。净减两条。
+/// 1417 → 1419:diff 弹窗还没跳过改动时,跳转组只报总数(`gitCommit.changeTotal`),
+/// 不再显示成「–/N」;推送进行中对话框左键不再叫「取消」（推送撤不回，点它只是收框），
+/// 换成「在后台继续」（`gitBranch.pushInBackground`）。
+/// 1420 → 1421：文件页签回落页（二进制 / 过大 / 解不出）在「使用默认工具打开」旁加
 /// 「打开文件所在文件夹」（`fileViewer.openContainingFolder`）。
-const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 940;
+/// 1421 → 1428：终端控制条查找 / 左右分屏 / 上下分屏 / 关整组四颗按钮补悬停提示
+/// （`paneGroup.{searchTooltip,splitRightTooltip,splitDownTooltip,closePaneTooltip}`）；
+/// 删 worktree 前识别占用：停在里面的终端先关的说明（`worktree.removeBusyTerminals`）、
+/// 被占用未动手与删到一半目录残留两种失败的原因与下一步（`worktree.{removeInUse,removeLeftover}`）。
+/// 1428 → 1431：第四轮 E2E 整改 —— 游离 HEAD 提示拆成前后两截排（`gitBranch.detachedNoteTail`，
+/// 免得末字单独成行）、分支弹窗「新建分支…」的常规提示（`gitBranch.newBranchTip`，置灰时换成
+/// 「另一项 Git 操作正在进行」）、强推因期望值过期被拒时的指引（`gitBranch.rejectedStaleHint`，
+/// 不再劝「确认风险后强制推送」）。
+const EXPECTED_NAMESPACES: usize = 38;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1431;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -140,9 +176,14 @@ const TS_NAMESPACES: &[&str] = &[
     "externalLink",
     "fileTree",
     "fileViewer",
+    "gitBranch",
     "gitChanges",
+    "gitCommit",
+    "gitGutter",
     "gitHistory",
     "gitHistoryContent",
+    "gitLog",
+    "gitStash",
     "markerList",
     "mobileRelay",
     "paneGroup",

@@ -75,7 +75,7 @@ fn 远程下载上下文要求项目根目录和连接身份完全一致() {
 #[test]
 fn 文件菜单项序与原版一致() {
     assert_eq!(
-        file_menu_actions(false, true, false),
+        file_menu_actions(false, true, true, false),
         vec![
             Some(OpenWithDefault),
             Some(CopyEntry),
@@ -90,11 +90,31 @@ fn 文件菜单项序与原版一致() {
             Some(Delete),
             None,
             Some(ViewDiff),
+            Some(GitHistory),
         ]
     );
-    // 干净文件:一项不多(原版 `entryGitStatus && !entry.isDir`)
+    // 仓库里的干净文件:没有「查看变更」,但有「Git 历史」(没改动也有历史)
     assert_eq!(
-        file_menu_actions(false, false, false),
+        file_menu_actions(false, false, true, false),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(GitHistory),
+        ]
+    );
+    // 不在仓库里的干净文件:一项不多(原版 `entryGitStatus && !entry.isDir`)
+    assert_eq!(
+        file_menu_actions(false, false, false, false),
         vec![
             Some(OpenWithDefault),
             Some(CopyEntry),
@@ -114,8 +134,9 @@ fn 文件菜单项序与原版一致() {
 /// 目录的菜单:没有「默认工具打开」,末尾多一段「新建文件 / 新建文件夹」。
 #[test]
 fn 目录菜单项序与原版一致() {
+    // 仓库里的目录也不给「Git 历史」(单文件历史)
     assert_eq!(
-        file_menu_actions(true, false, false),
+        file_menu_actions(true, false, true, false),
         vec![
             Some(CopyEntry),
             Some(Paste),
@@ -140,11 +161,11 @@ fn 目录菜单项序与原版一致() {
 /// 而「默认工具打开」只对文件出现。
 #[test]
 fn 目录与文件的差别只在两处() {
-    let file: Vec<_> = file_menu_actions(false, false, false)
+    let file: Vec<_> = file_menu_actions(false, false, false, false)
         .into_iter()
         .flatten()
         .collect();
-    let dir: Vec<_> = file_menu_actions(true, false, false)
+    let dir: Vec<_> = file_menu_actions(true, false, false, false)
         .into_iter()
         .flatten()
         .collect();
@@ -153,18 +174,19 @@ fn 目录与文件的差别只在两处() {
     assert!(dir.contains(&NewFile) && dir.contains(&NewFolder));
     assert!(!file.contains(&NewFile) && !file.contains(&NewFolder));
     // 有状态的目录同样不给 ViewDiff
-    let dirty_dir: Vec<_> = file_menu_actions(true, true, false)
+    let dirty_dir: Vec<_> = file_menu_actions(true, true, true, false)
         .into_iter()
         .flatten()
         .collect();
     assert!(!dirty_dir.contains(&ViewDiff));
+    assert!(!dirty_dir.contains(&GitHistory));
     assert_eq!(dirty_dir, dir);
 }
 
 #[test]
 fn 远程菜单不暴露本机动作并提供传输入口() {
     assert_eq!(
-        file_menu_actions(false, true, true),
+        file_menu_actions(false, true, true, true),
         vec![
             Some(CopyEntry),
             Some(Download),
@@ -179,7 +201,7 @@ fn 远程菜单不暴露本机动作并提供传输入口() {
         ]
     );
     assert_eq!(
-        file_menu_actions(true, false, true),
+        file_menu_actions(true, false, true, true),
         vec![
             Some(CopyEntry),
             Some(Paste),
@@ -852,6 +874,109 @@ fn 根没列出来时什么都不补() {
         &mut out,
     );
     assert!(out.is_empty());
+}
+
+// ─── 重列前后的子目录对账 ─────────────────────────────────
+
+/// 不压缩的新一趟列目录结果(链只有自己一段)。
+fn plain_rows(entries: Vec<FileEntry>) -> Vec<(FileEntry, Vec<PathBuf>)> {
+    entries
+        .into_iter()
+        .map(|e| {
+            let chain = vec![e.path.clone()];
+            (e, chain)
+        })
+        .collect()
+}
+
+/// 上一趟在、这一趟没了的子目录要交出去作废;文件与仍在的目录不掺和。
+#[test]
+fn 消失的子目录要作废() {
+    let old = vec![
+        entry("docs", "/p/docs", true, false),
+        entry("src", "/p/src", true, false),
+        entry("gone.txt", "/p/gone.txt", false, false),
+    ];
+    let fresh = plain_rows(vec![entry("src", "/p/src", true, false)]);
+    assert_eq!(
+        vanished_child_dirs(Path::new("/p"), &old, &fresh),
+        vec![PathBuf::from("/p/docs")]
+    );
+}
+
+/// 目录被换成同名文件:路径还在,但已不是目录 —— 它名下的缓存同样作废。
+#[test]
+fn 目录换成同名文件也算消失() {
+    let old = vec![entry("x", "/p/x", true, false)];
+    let fresh = plain_rows(vec![entry("x", "/p/x", false, false)]);
+    assert_eq!(
+        vanished_child_dirs(Path::new("/p"), &old, &fresh),
+        vec![PathBuf::from("/p/x")]
+    );
+}
+
+/// 压缩链变长 / 变短时行路径变了,但链头(`dir` 的直接子项)还在 —— 不算消失,
+/// 否则链上仍在用的监听会被误摘。整条链连头一起没了才算。
+#[test]
+fn 压缩链伸缩不算消失() {
+    let dir = Path::new("/p");
+    // 旧:src/main 一行(链尾 /p/src/main);新:链长到 /p/src/main/java
+    let old = vec![entry("src/main", "/p/src/main", true, false)];
+    let fresh = vec![(
+        entry("src/main/java", "/p/src/main/java", true, false),
+        vec![
+            PathBuf::from("/p/src"),
+            PathBuf::from("/p/src/main"),
+            PathBuf::from("/p/src/main/java"),
+        ],
+    )];
+    assert!(vanished_child_dirs(dir, &old, &fresh).is_empty());
+    // 反过来链缩回只剩 src 一段
+    let old = vec![entry("src/main/java", "/p/src/main/java", true, false)];
+    let fresh = plain_rows(vec![entry("src", "/p/src", true, false)]);
+    assert!(vanished_child_dirs(dir, &old, &fresh).is_empty());
+    // 整条链没了:交出链头
+    assert_eq!(
+        vanished_child_dirs(dir, &old, &[]),
+        vec![PathBuf::from("/p/src")]
+    );
+}
+
+/// 第四轮 E2E C12 的整条路:展开着的 e2e-dir 被外部删掉 → 父目录重列时它消失,
+/// 名下缓存作废 → 同名目录建回来、父目录再列出它 → 展开态补列把它重新列一遍
+/// (而不是一直挂着已删除的 a.txt)。
+#[test]
+fn 删后重建的展开目录会被重新列出() {
+    let src = Path::new("/p/src");
+    let mut entries = listed(vec![
+        ("/p", vec![entry("src", "/p/src", true, false)]),
+        (
+            "/p/src",
+            vec![entry("e2e-dir", "/p/src/e2e-dir", true, false)],
+        ),
+        (
+            "/p/src/e2e-dir",
+            vec![entry("a.txt", "/p/src/e2e-dir/a.txt", false, false)],
+        ),
+    ]);
+    let expanded = expanded_set(&["/p/src", "/p/src/e2e-dir"]);
+
+    // 外部删掉:父目录重列不再有它 → 交出来作废(与 `detach_subtree` 同口径清缓存)
+    let vanished = vanished_child_dirs(src, &entries[src], &[]);
+    assert_eq!(vanished, vec![PathBuf::from("/p/src/e2e-dir")]);
+    for gone in &vanished {
+        entries.retain(|path, _| !path.starts_with(gone));
+    }
+    entries.insert(src.to_path_buf(), Vec::new());
+
+    // 建回来:父目录重列又出现,仍是展开态 → 补列它(旧的 a.txt 不会再冒出来)
+    entries.insert(
+        src.to_path_buf(),
+        vec![entry("e2e-dir", "/p/src/e2e-dir", true, false)],
+    );
+    let mut missing = Vec::new();
+    missing_expanded_dirs(&entries, Path::new("/p"), &expanded, &mut missing);
+    assert_eq!(missing, vec![PathBuf::from("/p/src/e2e-dir")]);
 }
 
 /// 优先级表逐条(`PRIORITY = {C:6, D:5, M:4, A:3, R:2, '?':1}`)。

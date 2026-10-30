@@ -27,6 +27,8 @@ use super::{FileTree, Row};
 /// 非目录、且这个文件在 git 状态表里有条目,前置一条分隔线接在最末。
 /// 「移动到 ▸」(`MoveTo`)原版没有,GPUI 版补的,紧跟「重命名」——
 /// 两者都是「换路径」的操作,本地/远程、文件/目录一律有。
+/// 「Git 历史」(`GitHistory`,IDEA 的 Show History)也是 GPUI 版补的,与「查看变更」
+/// 同组:本地、非目录、文件落在 git 仓库里就给 —— **不要求有改动**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileMenuAction {
     OpenWithDefault,
@@ -45,11 +47,13 @@ pub(super) enum FileMenuAction {
     NewFile,
     NewFolder,
     ViewDiff,
+    GitHistory,
 }
 
 pub(super) fn file_menu_actions(
     is_dir: bool,
     has_git_status: bool,
+    in_git_repo: bool,
     remote: bool,
 ) -> Vec<Option<FileMenuAction>> {
     use FileMenuAction::*;
@@ -81,9 +85,16 @@ pub(super) fn file_menu_actions(
     if is_dir {
         actions.extend([None, Some(NewFile), Some(NewFolder)]);
     }
-    // 目录没有单文件 diff 可看 —— 原版这条判定是 `entryGitStatus && !entry.isDir`
-    if !remote && !is_dir && has_git_status {
-        actions.extend([None, Some(ViewDiff)]);
+    // 目录没有单文件 diff 可看 —— 原版这条判定是 `entryGitStatus && !entry.isDir`。
+    // 「Git 历史」与它同组:只要文件在仓库里就给(没改动也有历史)
+    if !remote && !is_dir && (has_git_status || in_git_repo) {
+        actions.push(None);
+        if has_git_status {
+            actions.push(Some(ViewDiff));
+        }
+        if in_git_repo {
+            actions.push(Some(GitHistory));
+        }
     }
     actions
 }
@@ -100,7 +111,10 @@ pub(super) fn file_menu(
     let root = context.root.clone();
     let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
     let mut entries = Vec::new();
-    for action in file_menu_actions(row.is_dir, row.git.is_some(), remote) {
+    // 只做 stat、不开仓库(菜单是右键当场在 UI 线程上建的),远程 / 目录不查
+    let in_git_repo =
+        !remote && !row.is_dir && mt_project::git::is_inside_git_repo(&root, &row.path);
+    for action in file_menu_actions(row.is_dir, row.git.is_some(), in_git_repo, remote) {
         let Some(action) = action else {
             entries.push(menu::separator());
             continue;
@@ -374,18 +388,39 @@ pub(super) fn file_menu(
             FileMenuAction::ViewDiff => {
                 // 原版 `DiffModal` 收的是 (projectPath, GitFileStatus):仓库那一侧
                 // 传的就是**项目根**,文件那一侧是状态表里的相对路径 —— 照抄。
-                // 工作区侧(staged=false)与原版一致:文件树里看的是「改了什么还没提交」
+                // HEAD → 工作区:文件树里看的是「相对上次提交改了什么」,暂存与否都算
                 let store = store.clone();
                 let repo = root.to_string_lossy().to_string();
                 let rel = row.rel.clone();
                 let label = row.git.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
                 menu::item(t("fileTree", "menu.viewDiff"), move |window, cx| {
+                    // 单元素序列、不支持按块操作(HEAD → 工作区两侧都不是能写回的那一侧)
                     crate::git_diff::open_file_diff(
                         store.clone(),
                         repo.clone(),
+                        vec![crate::git_diff::DiffFile {
+                            path: rel.clone(),
+                            old_path: None,
+                            side: crate::git_diff::DiffSide::Working,
+                            status_label: label.clone(),
+                            hunk_actions: false,
+                        }],
+                        0,
+                        None,
+                        window,
+                        cx,
+                    );
+                })
+            }
+            FileMenuAction::GitHistory => {
+                // 项目根 + 相对路径;所属仓库(可能在项目根之上 / 嵌套子仓库)由后端就近发现
+                let store = store.clone();
+                let rel = row.rel.clone();
+                menu::item(t("gitLog", "fileHistory.menu"), move |window, cx| {
+                    crate::git_file_history::open(
+                        store.clone(),
+                        root.clone(),
                         rel.clone(),
-                        false,
-                        label.clone(),
                         window,
                         cx,
                     );

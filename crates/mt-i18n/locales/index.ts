@@ -17,6 +17,10 @@ import { terminalArea } from './terminalArea';
 import { gitHistory } from './gitHistory';
 import { gitHistoryContent } from './gitHistoryContent';
 import { gitChanges } from './gitChanges';
+import { gitBranch } from './gitBranch';
+import { gitCommit } from './gitCommit';
+import { gitLog } from './gitLog';
+import { gitStash } from './gitStash';
 import { worktree } from './worktree';
 import { search } from './search';
 import { sessionList } from './sessionList';
@@ -38,6 +42,7 @@ import { terminalSearch } from './terminalSearch';
 import { projectSwitcher } from './projectSwitcher';
 import { usageStats } from './usageStats';
 import { commandLibrary } from './commandLibrary';
+import { gitGutter } from './gitGutter';
 
 type Dict = Record<string, unknown>;
 
@@ -55,6 +60,10 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.zh,
     gitHistoryContent: gitHistoryContent.zh,
     gitChanges: gitChanges.zh,
+    gitBranch: gitBranch.zh,
+    gitCommit: gitCommit.zh,
+    gitLog: gitLog.zh,
+    gitStash: gitStash.zh,
     worktree: worktree.zh,
     search: search.zh,
     sessionList: sessionList.zh,
@@ -76,6 +85,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     projectSwitcher: projectSwitcher.zh,
     usageStats: usageStats.zh,
     commandLibrary: commandLibrary.zh,
+    gitGutter: gitGutter.zh,
   },
   en: {
     app: app.en,
@@ -90,6 +100,10 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.en,
     gitHistoryContent: gitHistoryContent.en,
     gitChanges: gitChanges.en,
+    gitBranch: gitBranch.en,
+    gitCommit: gitCommit.en,
+    gitLog: gitLog.en,
+    gitStash: gitStash.en,
     worktree: worktree.en,
     search: search.en,
     sessionList: sessionList.en,
@@ -111,5 +125,6 @@ export const dicts: { zh: Dict; en: Dict } = {
     projectSwitcher: projectSwitcher.en,
     usageStats: usageStats.en,
     commandLibrary: commandLibrary.en,
+    gitGutter: gitGutter.en,
   },
 };

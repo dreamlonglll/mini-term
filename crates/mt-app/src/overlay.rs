@@ -83,6 +83,15 @@ pub mod kind {
     /// worktree 删除确认。**与 [`GIT_WORKTREE`] 不同种类**,所以能叠在它之上
     /// (原版就是嵌套弹窗,`GitWorktreeModal.tsx:779` 的「Esc 归栈顶,不会误关外层」)。
     pub const GIT_WORKTREE_REMOVE: &str = "git-worktree-remove";
+    /// Git 分支弹窗(仓库栏分支徽章点开的那个:搜索 + 最近 / 本地 / 远程)。
+    pub const GIT_BRANCHES: &str = "git-branches";
+    /// 新建 / 重命名分支的名称输入弹窗。与分支弹窗**不同种类**(动作会先收分支弹窗,
+    /// 不同种类只是为了将来叠开也合法)。
+    pub const GIT_BRANCH_NAME: &str = "git-branch-name";
+    /// 「推送」对话框(待推送提交 + 强推选项)。
+    pub const GIT_PUSH: &str = "git-push";
+    /// git 操作失败的详情弹窗(可选中复制的原文)。种类独立,能叠在推送对话框之上。
+    pub const GIT_ERROR: &str = "git-error";
     /// 「移动端」面板(中转地址 / 配对二维码 / AI 启动器)。原版没有防叠开,
     /// 是 audit 记的缺口;重置配对的确认框是**另一种类**,照样能叠在它之上。
     pub const MOBILE_RELAY: &str = "mobile-relay";
@@ -113,6 +122,29 @@ pub mod kind {
     /// 「新增 / 编辑命令」弹窗。与浮层**不共存**(宿主先关浮层再开它),
     /// 但仍是独立种类 —— 分组的新建 / 改名走通用 [`PROMPT`],三者互不叠。
     pub const COMMAND_EDITOR: &str = "command-editor";
+    /// 提交历史右键「从此提交新建分支…」。
+    pub const GIT_LOG_NEW_BRANCH: &str = "git-log-new-branch";
+    /// 提交历史右键「在此提交新建标签…」。
+    pub const GIT_LOG_NEW_TAG: &str = "git-log-new-tag";
+    /// 提交历史右键「修改提交消息…」。
+    pub const GIT_LOG_REWORD: &str = "git-log-reword";
+    /// 提交历史右键「将当前分支重置到此处…」。
+    pub const GIT_LOG_RESET: &str = "git-log-reset";
+    /// 提交历史的危险操作二次确认(Hard 重置 / 删标签 / 撤销已推送的提交)。
+    /// 与 [`GIT_LOG_RESET`] **不同种类**:Hard 的二次确认叠在重置框之上。
+    pub const GIT_LOG_DANGER: &str = "git-log-danger";
+    /// 单文件 Git 历史(文件树右键「Git 历史」)。完整提交 diff 能叠在它之上。
+    pub const GIT_FILE_HISTORY: &str = "git-file-history";
+    /// 贮藏列表(左列表 + 右侧改动与 diff)。下面四种都能叠在它之上。
+    pub const GIT_STASH: &str = "git-stash";
+    /// 新建贮藏(消息 / 保留暂存区 / 含未跟踪文件)。
+    pub const GIT_STASH_SAVE: &str = "git-stash-save";
+    /// 从贮藏新建分支的名称输入框。
+    pub const GIT_STASH_BRANCH: &str = "git-stash-branch";
+    /// 贮藏的危险操作确认(删除 / 全部清除)。
+    pub const GIT_STASH_DANGER: &str = "git-stash-danger";
+    /// 检出被本地改动挡住时的「贮藏后检出」确认框。
+    pub const GIT_STASH_CHECKOUT: &str = "git-stash-checkout";
 }
 
 /// 栈里的一条。
@@ -210,8 +242,15 @@ thread_local! {
 }
 
 /// 压入一层。返回 `false` = 同一层已经开着(调用方应当直接放弃这次打开)。
+///
+/// 真压进去了就顺带打断 tooltip(`mt_ui::tooltip::interrupt`):还在等待中的提示
+/// 不再弹出、已弹出的收起 —— 气泡画在所有覆盖物之上,不收就叠在弹窗 / 菜单上。
 pub fn push(key: OverlayKey) -> bool {
-    CURRENT.with(|s| s.borrow_mut().push(key))
+    let pushed = CURRENT.with(|s| s.borrow_mut().push(key));
+    if pushed {
+        mt_ui::tooltip::interrupt();
+    }
+    pushed
 }
 
 /// 弹出一层(幂等)。

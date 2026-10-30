@@ -29,3 +29,11 @@ pathdiff = "0.2"
 # 版本跟 gpui-pre-windows 已经在用的那份对齐(此前是 0.2,依赖树里同时编
 # 0.2 / 0.4 / 0.6 三份;0.4 是 zed-reqwest 带进来的,对不齐)。
 windows-registry = "0.6"
+# git CLI 超时要连孙进程一起杀(`git.exe` 只是启动器,hook / ssh 都是它的后代):
+# spawn 后挂进 Job Object,超时 `TerminateJobObject`。版本与 mt-secret 那份对齐
+# (根 Cargo.toml 的 workspace.dependencies 里没有它,mt-secret 也是直接写版本)。
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+] }

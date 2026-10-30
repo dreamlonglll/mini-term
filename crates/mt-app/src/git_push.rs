@@ -1,0 +1,710 @@
+//! 「推送」对话框,对标 IDEA 的 Push 对话框。三个入口:仓库栏推送按钮(当前分支)、
+//! 分支弹窗的「推送」(预选那一行的本地分支,可以不是当前分支)、更改区的「提交并推送」
+//! (提交成功之后打开,当前分支)—— 都是先看清待推送的提交与目标,确认了才推。
+//!
+//! ```text
+//! ┌ 推送提交                                  ✕ ┐
+//! │ [main] → [origin/main]   (将设置上游)       │   两枚胶囊 + 箭头
+//! │ ┌──────────────────────────────────────┐ │
+//! │ │ 1a2b3c4  修复登录页      张三 · 3 分钟前 │ │   点击看该提交的改动
+//! │ └──────────────────────────────────────┘ │
+//! │ ☐ 强制推送(--force-with-lease)             │   勾上:选项区转红 + 警告,确认键换危险色
+//! │ (失败原文,可选中复制 / 被拒时提示先拉取)     │
+//! │                         [取消]  [推送]     │   共用页脚(`git_ui::dialog_footer`)
+//! └─────────────────────────────────────────┘
+//! ```
+//!
+//! 待推送 = 分支有、**推送目标**的远程分支没有的提交(目标可以不是上游:从 origin/main
+//! 拉出来的 feature 推到 origin/feature,这时目标行下面多一句说明上游不动);目标在本地
+//! 还没有远程跟踪引用时取「不在任何远程分支上」的(最多 100 条)。
+//! 没有待推送提交也能打开(没上游时推送仍有意义:在远程建分支并设上游)。
+//! detached HEAD / 没有远程时推送按钮禁用并说明原因。强推要再确认一次。
+//! 推送占着仓库的写操作闸(`git_ui::gate`);别的区正在写这个仓库时推送键禁用并写明原因。
+
+use std::path::Path;
+
+use gpui::{
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
+};
+use gpui_component::input::TextareaState;
+use mt_project::git::{OutgoingCommits, PushOptions, PushOutcome, PushPlan, PushTarget};
+use mt_ui::tooltip::TooltipExt as _;
+
+use crate::git_panel::GitPanel;
+use crate::git_ui::{self, Tone};
+use crate::i18n::{t, tr};
+use crate::prompt::{self, Confirm, close_guarded, kind, open_guarded};
+use crate::ui;
+
+/// 最多列出多少条待推送提交。
+const OUTGOING_LIMIT: usize = 100;
+
+struct PushDialog {
+    panel: Entity<GitPanel>,
+    repo: String,
+    /// 要推的本地分支;`None` = 当前分支。
+    branch: Option<String>,
+    /// `None` = 还在加载。
+    plan: Option<PushPlan>,
+    outgoing: Option<OutgoingCommits>,
+    load_error: Option<String>,
+    force: bool,
+    pushing: bool,
+    /// 上一次推送失败的原文(可选中复制)+ 被拒时原文上方那句指引(见 [`rejected_hint`])。
+    error: Option<(Entity<TextareaState>, Option<&'static str>)>,
+}
+
+/// 推送被拒时的指引:强推的 lease 没过(远端有本地没获取的新提交)只能先 Fetch 看清再说,
+/// 再劝「确认风险后强制推送」只会被同样拒掉(E2E r4 A9);其余被拒(非快进 / 要先 fetch)
+/// 劝先拉取。
+fn rejected_hint(detail: &str) -> &'static str {
+    if mt_project::git::push_rejected_by_lease(detail) {
+        t("gitBranch", "rejectedStaleHint")
+    } else {
+        t("gitBranch", "rejectedHint")
+    }
+}
+
+impl Render for PushDialog {
+    /// 状态盒子。真正的画面由 Dialog 的 builder 每帧重建。
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+
+/// 推送成功的摘要:「已推送 3 个提交到 origin/main」,没上游时补「并设为上游」。
+pub(crate) fn pushed_summary(
+    target: &PushTarget,
+    count: usize,
+    truncated: bool,
+    forced: bool,
+) -> String {
+    let remote = target.label();
+    let mut message = if forced {
+        tr!("gitBranch", "forcePushed", target = remote.as_str())
+    } else if count == 0 {
+        tr!("gitBranch", "pushedNothing", target = remote.as_str())
+    } else {
+        let count = if truncated {
+            format!("{count}+")
+        } else {
+            count.to_string()
+        };
+        tr!(
+            "gitBranch",
+            "pushed",
+            count = count,
+            target = remote.as_str()
+        )
+    };
+    if target.sets_upstream() {
+        message.push_str(t("gitBranch", "upstreamSetSuffix"));
+    }
+    message
+}
+
+/// 目标与上游不同时目标行下面那句说明:「将推送到 origin/feature;当前上游是
+/// origin/main,不会修改」。其余情况(没上游 / 推的就是上游)为 `None`。
+pub(crate) fn upstream_note(target: &PushTarget) -> Option<String> {
+    let upstream = target
+        .upstream
+        .as_deref()
+        .filter(|_| target.upstream_differs)?;
+    Some(tr!(
+        "gitBranch",
+        "pushOtherThanUpstream",
+        target = target.label(),
+        upstream = upstream
+    ))
+}
+
+/// 打开推送对话框,预选本地分支 `branch`(`None` = 当前分支)。已经开着时是空操作。
+///
+/// `repo` 由调用方给:调用点在 Git 面板自己的 update 里,这时再 `panel.read` 会撞上
+/// 「实体正被更新」的借用。
+pub(crate) fn open(
+    panel: Entity<GitPanel>,
+    repo: String,
+    branch: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if prompt::is_open(kind::GIT_PUSH) || repo.is_empty() {
+        return;
+    }
+    let state = cx.new(|_| PushDialog {
+        panel,
+        repo,
+        branch,
+        plan: None,
+        outgoing: None,
+        load_error: None,
+        force: false,
+        pushing: false,
+        error: None,
+    });
+    load(&state, cx);
+    open_guarded(kind::GIT_PUSH, window, cx, move |dialog, _window, cx| {
+        let body = render_body(&state, cx);
+        let s = state.read(cx);
+        let pushing = s.pushing;
+        let force = s.force;
+        // 别的区正在写这个仓库(推送自己在跑时闸也占着,那由 `pushing` 管)
+        let gated = !pushing && git_ui::gate::is_busy(&s.repo);
+        let can_push = !pushing && !gated && matches!(s.plan, Some(PushPlan::Ready(_)));
+        let push_label = if pushing {
+            t("gitBranch", "pushing")
+        } else if force {
+            t("gitBranch", "forcePushOk")
+        } else {
+            t("gitBranch", "push")
+        };
+        let state_for_ok = state.clone();
+        dialog
+            .title(t("gitBranch", "pushTitle"))
+            .w(px(git_ui::DIALOG_W_LG))
+            // 推送进行中别让一下误点遮罩把框收了(结果回来要在框里显示)
+            .overlay_closable(!pushing)
+            // 勾上强推:确认键整颗换危险色(正文里那块选项区同时转红并给警告)
+            .footer(git_ui::dialog_footer(
+                push_label,
+                Some(t("gitBranch", dismiss_key(pushing)).into()),
+                force,
+                !can_push,
+            ))
+            .child(body)
+            // Enter = 推送(条件不满足时 `start_push` 自己什么都不做)
+            .on_ok(move |_: &ClickEvent, window, cx| {
+                start_push(&state_for_ok, window, cx);
+                false
+            })
+    });
+}
+
+/// 左边那颗按钮的文案 key。
+///
+/// 推送一旦发出去就撤不回(`git push` 的子进程不受这个框管),这时点它只是把框收起、
+/// 推送在后台接着跑(结果走 toast / 失败详情框)—— 再叫「取消」就是误导。没改成
+/// 「进行中不许关」:网络推送最长 120s,把人困在框里更糟;关掉后仓库栏的推送键
+/// 照样转着圈,看得出还在推。
+fn dismiss_key(pushing: bool) -> &'static str {
+    if pushing {
+        "pushInBackground"
+    } else {
+        "cancel"
+    }
+}
+
+/// 后台读推送计划与待推送提交。
+fn load(state: &Entity<PushDialog>, cx: &mut App) {
+    let (repo, branch) = {
+        let s = state.read(cx);
+        (s.repo.clone(), s.branch.clone())
+    };
+    let state = state.clone();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move {
+                let path = Path::new(&repo);
+                let branch = branch.as_deref();
+                let plan = mt_project::git::push_plan(path, branch)?;
+                let outgoing = mt_project::git::outgoing_commits(path, branch, OUTGOING_LIMIT)?;
+                anyhow::Ok((plan, outgoing))
+            })
+            .await;
+        state.update(cx, |s: &mut PushDialog, cx| {
+            match result {
+                Ok((plan, outgoing)) => {
+                    s.plan = Some(plan);
+                    s.outgoing = Some(outgoing);
+                }
+                Err(err) => s.load_error = Some(format!("{err:#}")),
+            }
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// 「推送」:强推先再确认一次,其余直接推。
+fn start_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
+    let s = state.read(cx);
+    if s.pushing {
+        return;
+    }
+    let Some(PushPlan::Ready(target)) = s.plan.clone() else {
+        return;
+    };
+    if !s.force {
+        do_push(state, window, cx);
+        return;
+    }
+    let state = state.clone();
+    Confirm::new(
+        t("gitBranch", "forceConfirmTitle"),
+        tr!(
+            "gitBranch",
+            "forceConfirmMessage",
+            branch = target.branch.as_str(),
+            target = target.label()
+        ),
+    )
+    .ok_text(t("gitBranch", "forcePushOk"))
+    .danger()
+    .open(move |window, cx| do_push(&state, window, cx), window, cx);
+}
+
+fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
+    let (panel, repo, branch, force, count, truncated, expected_oid) = {
+        let s = state.read(cx);
+        let (count, truncated) = s
+            .outgoing
+            .as_ref()
+            .map_or((0, false), |o| (o.commits.len(), o.truncated));
+        // 强推的 lease 期望值取**预览这一刻**的远程跟踪值:对话框开着期间点过 Fetch 的话,
+        // 别人刚推上去、本地还没整合的提交不能被当成「见过的」覆盖掉
+        let expected_oid = match &s.plan {
+            Some(PushPlan::Ready(target)) => target.tracking_oid.clone(),
+            _ => None,
+        };
+        (
+            s.panel.clone(),
+            s.repo.clone(),
+            s.branch.clone(),
+            s.force,
+            count,
+            truncated,
+            expected_oid,
+        )
+    };
+    let options = PushOptions {
+        branch,
+        force_with_lease: force,
+        expected_oid,
+    };
+    let done_state = state.clone();
+    let done_panel = panel.clone();
+    // ⚠️ 网络操作,最多阻塞 120s(后台执行器上跑,占着仓库的写操作闸)
+    let started = git_ui::spawn_gated(
+        &repo,
+        move |repo| mt_project::git::git_push_with(repo, &options),
+        move |result, window, cx| {
+            let (state, panel) = (done_state, done_panel);
+            panel.update(cx, |p, cx| p.set_push_busy(false, cx));
+            let failure = match result {
+                Ok(PushOutcome::Pushed(target)) => {
+                    close_guarded(kind::GIT_PUSH, window, cx);
+                    let message = pushed_summary(&target, count, truncated, force);
+                    panel.update(cx, |p, cx| {
+                        p.notify_result(message, Tone::Info, cx);
+                        p.refresh_all(cx);
+                    });
+                    None
+                }
+                Ok(PushOutcome::Rejected { detail }) => {
+                    let hint = rejected_hint(&detail);
+                    Some((detail, Some(hint)))
+                }
+                Err(err) => Some((git_ui::error_text(&err), None)),
+            };
+            let Some((detail, hint)) = failure else {
+                return;
+            };
+            eprintln!("[git] 推送失败: {detail}");
+            // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
+            if !prompt::is_open(kind::GIT_PUSH) {
+                let text = match hint {
+                    Some(hint) => format!("{hint}\n\n{detail}"),
+                    None => detail,
+                };
+                git_ui::show_git_error(
+                    tr!("gitBranch", "opFailed", op = t("gitBranch", "opPush")),
+                    text,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            let text_state = git_ui::error_text_state(&detail, 8, window, cx);
+            state.update(cx, |s, cx| {
+                s.pushing = false;
+                s.error = Some((text_state, hint));
+                cx.notify();
+            });
+            panel.update(cx, |p, cx| p.refresh_all(cx));
+        },
+        window,
+        cx,
+    );
+    if !started {
+        // 别的区刚占上闸(按钮禁用之前点进来的):就地说明,不推
+        let text_state = git_ui::error_text_state(git_ui::gate_busy_text(), 2, window, cx);
+        state.update(cx, |s, cx| {
+            s.error = Some((text_state, None));
+            cx.notify();
+        });
+        return;
+    }
+    state.update(cx, |s, cx| {
+        s.pushing = true;
+        s.error = None;
+        cx.notify();
+    });
+    panel.update(cx, |p, cx| p.set_push_busy(true, cx));
+}
+
+/// 点一条待推送提交:取文件列表,开提交 diff 弹窗(叠在推送对话框之上)。
+fn view_commit(
+    state: &Entity<PushDialog>,
+    hash: String,
+    message: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (repo, store) = {
+        let s = state.read(cx);
+        (s.repo.clone(), s.panel.read(cx).store().clone())
+    };
+    crate::git_diff::open_commit_diff_loading(store, repo, hash, message, None, window, cx)
+        .detach();
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
+    let s = state.read(cx);
+    let force = s.force;
+    let pushing = s.pushing;
+    let mut root = git_ui::form_body();
+
+    if let Some(err) = &s.load_error {
+        return root
+            .child(git_ui::notice_line(err.clone(), ui::color_error()))
+            .into_any_element();
+    }
+    let (Some(plan), Some(outgoing)) = (s.plan.clone(), s.outgoing.clone()) else {
+        return root
+            .child(git_ui::loading_state(t("gitBranch", "loading")))
+            .into_any_element();
+    };
+
+    // ── 目标行 ──
+    let target = match &plan {
+        PushPlan::Ready(target) => Some(target.clone()),
+        _ => None,
+    };
+    // 预选的是别的本地分支(分支弹窗里推的):胶囊按「其它本地分支」上色
+    let branch_kind = if s.branch.is_some() {
+        git_ui::RefKind::Local
+    } else {
+        git_ui::RefKind::Head
+    };
+    root = root.child(match &plan {
+        PushPlan::Ready(target) => {
+            let remote = target.label();
+            let row = div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .min_w_0()
+                .child(git_ui::icon(
+                    git_ui::ICON_BRANCH,
+                    git_ui::ICON_SIZE,
+                    ui::text_muted(),
+                ))
+                .child(
+                    git_ui::ref_pill("git-push-branch", target.branch.clone(), branch_kind)
+                        .tip(target.branch.clone()),
+                )
+                .child(git_ui::icon(
+                    git_ui::ICON_ARROW_RIGHT,
+                    git_ui::ICON_SIZE,
+                    ui::text_muted(),
+                ))
+                .child(
+                    git_ui::ref_pill("git-push-remote", remote.clone(), git_ui::RefKind::Remote)
+                        .tip(remote),
+                )
+                .when(target.sets_upstream(), |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(t("gitBranch", "willSetUpstream")),
+                    )
+                });
+            // 目标不是上游(从 origin/main 拉出来的 feature 推到 origin/feature):说清楚
+            // 推到哪、上游保持原样 —— 不然用户会以为在往 main 上推
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .min_w_0()
+                .child(row)
+                .when_some(upstream_note(target), |el, note| {
+                    el.child(git_ui::hint_line(note))
+                })
+                .into_any_element()
+        }
+        PushPlan::Detached => {
+            git_ui::notice_line(t("gitBranch", "pushDetached"), ui::color_warning())
+                .into_any_element()
+        }
+        PushPlan::NoRemote { .. } => {
+            git_ui::notice_line(t("gitBranch", "pushNoRemote"), ui::color_warning())
+                .into_any_element()
+        }
+    });
+
+    // ── 待推送提交 ──
+    let now = now_secs();
+    let mut list = div()
+        .id("git-push-commits")
+        .max_h(px(300.0))
+        .overflow_y_scroll()
+        .p(px(4.0));
+    if outgoing.commits.is_empty() {
+        list = list.child(git_ui::empty_state(
+            git_ui::ICON_CLEAN,
+            if target.as_ref().is_some_and(PushTarget::sets_upstream) {
+                t("gitBranch", "noOutgoingNewUpstream")
+            } else {
+                t("gitBranch", "noOutgoing")
+            },
+            None,
+        ));
+    }
+    for (index, commit) in outgoing.commits.iter().enumerate() {
+        let (state_for_click, hash, message) =
+            (state.clone(), commit.hash.clone(), commit.message.clone());
+        list = list.child(
+            git_ui::list_row(
+                SharedString::from(format!("git-push-commit-{index}")),
+                false,
+            )
+            .child(
+                git_ui::mono(div())
+                    .flex_none()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(commit.short_hash.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::font_px(13.0))
+                    .text_color(ui::text_primary())
+                    .child(commit.message.clone()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .max_w(px(180.0))
+                    .truncate()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(format!(
+                        "{} · {}",
+                        commit.author,
+                        crate::git_history::format_relative_time(commit.timestamp, now)
+                    )),
+            )
+            .on_click(move |_: &ClickEvent, window, cx| {
+                view_commit(&state_for_click, hash.clone(), message.clone(), window, cx);
+            }),
+        );
+    }
+    let count_line = if outgoing.commits.is_empty() {
+        None
+    } else if outgoing.truncated {
+        Some(tr!(
+            "gitBranch",
+            "outgoingTruncated",
+            count = outgoing.commits.len()
+        ))
+    } else {
+        Some(tr!(
+            "gitBranch",
+            "outgoingCount",
+            count = outgoing.commits.len()
+        ))
+    };
+    root = root.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .when_some(count_line, |el, line| el.child(git_ui::hint_line(line)))
+            .child(
+                div()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(ui::border_subtle())
+                    .bg(ui::bg_surface())
+                    .child(list),
+            ),
+    );
+
+    // ── 失败原文 ──
+    if let Some((text, hint)) = &s.error {
+        root = root.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .when_some(*hint, |el, hint| {
+                    el.child(git_ui::notice_line(hint, ui::color_warning()))
+                })
+                .child(git_ui::error_text_box(text)),
+        );
+    }
+
+    // ── 强推选项。勾上时整块换危险色并给警告,页脚确认键同时转危险色 ──
+    let danger = ui::color_error();
+    let state_for_force = state.clone();
+    let force_row = git_ui::check_row("git-push-force", force, t("gitBranch", "forcePush"), true)
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            state_for_force.update(cx, |s, cx| {
+                if !s.pushing {
+                    s.force = !s.force;
+                    cx.notify();
+                }
+            });
+        });
+    let warning = target.as_ref().filter(|_| force).map(|target| {
+        git_ui::notice_line(
+            tr!("gitBranch", "forceWarning", target = target.label()),
+            danger,
+        )
+    });
+
+    root.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(if force {
+                ui::with_alpha(danger, 0.45)
+            } else {
+                ui::border_subtle()
+            })
+            .when(force, |el| el.bg(ui::with_alpha(danger, 0.08)))
+            .child(force_row)
+            .children(warning),
+    )
+    .when(pushing, |el| {
+        el.child(git_ui::busy_line(t("gitBranch", "pushing")))
+    })
+    .when(!pushing && git_ui::gate::is_busy(&s.repo), |el| {
+        el.child(git_ui::notice_line(
+            git_ui::gate_busy_text(),
+            ui::color_warning(),
+        ))
+    })
+    .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(has_upstream: bool) -> PushTarget {
+        PushTarget {
+            branch: "main".into(),
+            remote: "origin".into(),
+            remote_branch: "main".into(),
+            upstream: has_upstream.then(|| "origin/main".to_string()),
+            upstream_differs: false,
+            tracking_oid: None,
+        }
+    }
+
+    /// 推送进行中左键不叫「取消」(撤不回,只是收框),说清推送在后台继续;
+    /// 两个 key 中英文案都在。
+    #[test]
+    fn 推送中左键说明在后台继续() {
+        assert_eq!(dismiss_key(false), "cancel");
+        assert_eq!(dismiss_key(true), "pushInBackground");
+        for pushing in [false, true] {
+            for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+                assert!(mt_i18n::lookup(locale, "gitBranch", dismiss_key(pushing)).is_some());
+            }
+        }
+        assert_ne!(
+            t("gitBranch", dismiss_key(true)),
+            t("gitBranch", "cancel"),
+            "进行中的文案不能还是「取消」"
+        );
+    }
+
+    /// 强推因期望值过期被拒时不再劝「确认风险后强制推送」,改劝先 Fetch;普通的非快进
+    /// 被拒照旧劝先拉取(E2E r4 A9)。两种语言的过期指引都不提强推这条出路。
+    #[test]
+    fn 强推期望值过期被拒不再劝强推() {
+        let stale = "!\trefs/heads/x:refs/heads/x\t[rejected] (stale info)";
+        let plain = "!\trefs/heads/x:refs/heads/x\t[rejected] (non-fast-forward)";
+        assert_eq!(rejected_hint(stale), t("gitBranch", "rejectedStaleHint"));
+        assert_eq!(rejected_hint(plain), t("gitBranch", "rejectedHint"));
+        let zh = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitBranch", "rejectedStaleHint");
+        assert!(zh.contains("Fetch") && !zh.contains("确认风险"), "{zh}");
+        let en = mt_i18n::t_in(mt_i18n::Locale::En, "gitBranch", "rejectedStaleHint");
+        assert!(
+            en.contains("Fetch") && !en.contains("if you accept the risk"),
+            "{en}"
+        );
+    }
+
+    /// 只有「配了上游、但这次推的不是它」才出那行说明,且写明目标与上游。
+    #[test]
+    fn 目标与上游不同时才有说明() {
+        assert_eq!(upstream_note(&target(true)), None);
+        assert_eq!(upstream_note(&target(false)), None);
+        let feature = PushTarget {
+            branch: "feature".into(),
+            remote_branch: "feature".into(),
+            upstream_differs: true,
+            ..target(true)
+        };
+        let note = upstream_note(&feature).expect("应有说明");
+        assert!(
+            note.contains("origin/feature") && note.contains("origin/main"),
+            "{note}"
+        );
+        // 已有上游:推完不补「并设为上游」
+        let summary = pushed_summary(&feature, 1, false, false);
+        assert!(
+            !summary.ends_with(t("gitBranch", "upstreamSetSuffix")),
+            "{summary}"
+        );
+    }
+
+    /// 推送摘要:带提交数与目标;截断时写 `100+`;没上游时补「设为上游」;强推单独一句。
+    #[test]
+    fn 推送摘要() {
+        let msg = pushed_summary(&target(true), 3, false, false);
+        assert!(msg.contains('3') && msg.contains("origin/main"), "{msg}");
+        let msg = pushed_summary(&target(true), 100, true, false);
+        assert!(msg.contains("100+"), "{msg}");
+        let plain = pushed_summary(&target(true), 0, false, false);
+        let with_upstream = pushed_summary(&target(false), 0, false, false);
+        assert!(with_upstream.starts_with(&plain), "{with_upstream}");
+        assert!(with_upstream.len() > plain.len());
+        let forced = pushed_summary(&target(true), 2, false, true);
+        assert_ne!(forced, pushed_summary(&target(true), 2, false, false));
+    }
+}

@@ -1,4 +1,6 @@
-//! Git 面板的「提交历史」区。对应 `src/components/GitHistoryContent.tsx`(399 行)。
+//! Git 面板的「提交历史」区。对应 `src/components/GitHistoryContent.tsx`(399 行),
+//! 之后按 JetBrains IDEA 的 Log 工具窗补了一圈:选中 + 提交详情、键盘导航、过滤栏、
+//! 标签胶囊、右键改写操作(见 [`actions`])。
 //!
 //! # 分页与请求作废(`GitHistoryContent.tsx:234-290`)
 //!
@@ -11,43 +13,223 @@
 //!   拓扑图要求父永远在子之后。`has_more = 本页 >= 30 && 真的新增了`;
 //! - **请求令牌**:换仓库 / 换分支时令牌 +1,迟到响应直接丢弃。
 //!
+//! # 过滤
+//!
+//! 过滤框里写关键词(标题 / 正文 / 哈希前缀 / 作者),加一段 `path:<路径>` 只看改动了
+//! 这个文件或目录的提交(仓库内相对路径,带空格的写成 `path:"a b/c"`;解析见
+//! [`parse_filter_query`]);「仅我的」胶囊只看自己的提交;分支由分支弹窗的「查看历史」
+//! 决定。几项同时给时取交集。
+//!
+//! 有过滤条件时换走 [`mt_project::git::get_git_log_filtered`]:后端遍历时跳过不命中的
+//! 提交,续页游标由后端原样交回(从已加载列表还原不出「走过但没命中」的那些)。
+//! 后端每次最多扫 `SCAN_BUDGET` 个提交就先交回,这里见「没凑够、还有下文」就接着要,
+//! 凑满 [`FilterState::want`] 为止 —— 换条件时令牌一换,在扫的那批作废,不会被一次
+//! 全量遍历拖住。过滤后拓扑线没有意义,**图列隐藏**。
+//!
+//! # 刷新不闪
+//!
+//! 手动刷新 / 提交后 / 改写操作后的重载([`GitHistoryContent::reload`])**保留旧列表**,
+//! 首页回来时整体替换,期间只在过滤栏右侧标一个「刷新中…」。换仓库 / 换分支 / 换过滤
+//! 条件([`GitHistoryContent::restart`])内容本就不同,才当场清空。
+//!
 //! # 拓扑图为什么自绘
 //!
 //! gpui 的 `svg()` 是单色 alpha 掩膜(丢色),Image 的 SVG 分支有 BGRA 交换 bug ——
 //! 两条都不能用(K 批记档)。这里走 [`gpui::PathBuilder`] 自绘:贝塞尔用
 //! `cubic_bezier_to`,渐变用**分段近似**(见 [`GraphCell`] 的注释)。
 //!
-//! ⚠️ 行高必须恒为 [`GRAPH_ROW_HEIGHT`](crate::git_graph::GRAPH_ROW_HEIGHT) = 48px,
-//! 否则连线跨行接不上。
+//! ⚠️ 行高必须恒为 [`GRAPH_ROW_HEIGHT`](crate::git_graph::GRAPH_ROW_HEIGHT),
+//! 否则连线跨行接不上(过滤时图列隐藏,行高照旧,uniform_list 才量得准)。
 
+mod actions;
+mod detail;
+
+pub use actions::GitLogRewordConfirm;
+pub(crate) use actions::REWORD_CONTEXT;
+
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Element, Entity,
-    EventEmitter, GlobalElementId, Hsla, InspectorElementId, InteractiveElement, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, ParentElement, PathBuilder, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Style, Styled, Window, div,
-    point, px, uniform_list,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element, Entity,
+    EventEmitter, FocusHandle, Focusable as _, GlobalElementId, Hsla, InspectorElementId,
+    InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, ParentElement,
+    PathBuilder, Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement,
+    Style, Styled, Subscription, Task, UniformListScrollHandle, Window, canvas, div, point,
+    prelude::FluentBuilder as _, px, uniform_list,
 };
-use mt_project::git::{BranchInfo, GitCommitInfo, GitLogCursor};
+use gpui_component::input::{Input, InputEvent, InputState};
+use mt_project::git::{BranchInfo, GitCommitInfo, GitLogCursor, LogFilter, LogPage, TagInfo};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
 };
+use crate::git_ui::{
+    self, ButtonKind, ICON_CLOSE, ICON_COMMIT, ICON_SEARCH, ICON_USER, RefKind, Tone, avatar,
+    empty_state, icon, icon_button, mono, more_pill, ref_pill,
+};
 use crate::i18n::{t, tr};
-use crate::menu;
 use crate::store::AppStore;
-use crate::{git_diff, git_watch};
 use crate::ui;
+use crate::{git_diff, git_watch};
+
+gpui::actions!(
+    mini_term,
+    [
+        /// 历史列表选中上一条(↑,焦点在历史区)
+        GitLogSelectPrev,
+        /// 历史列表选中下一条(↓)
+        GitLogSelectNext,
+        /// 打开选中提交的 diff(Enter;焦点在过滤框时 = 立即应用过滤)
+        GitLogOpenSelected,
+        /// 复制选中提交的完整哈希(Ctrl/Cmd+C)
+        GitLogCopyHash,
+        /// 聚焦过滤框(Ctrl/Cmd+F,历史区上下文内)
+        GitLogFocusFilter,
+        /// 清空过滤框并把焦点还给列表(过滤框里按 Esc)
+        GitLogClearFilter,
+    ]
+);
 
 /// 每页条数(`GitHistoryContent.tsx:244`)。
 const PAGE_SIZE: usize = 30;
+/// 过滤框输入去抖。
+const FILTER_DEBOUNCE_MS: u64 = 300;
+/// 过滤框最窄留多宽(连左右图标):右侧的计数 / 状态先截断让位,框里至少还看得见十来个字。
+const FILTER_INPUT_MIN_W: f32 = 140.0;
+/// 键盘往下走时,离已加载末尾还剩几行就预取下一页。
+const PREFETCH_ROWS: usize = 5;
+/// 行里直接显示几个引用胶囊,其余收进「+N」。
+const MAX_PILLS: usize = 2;
+/// 历史区窄于这个宽度时,行里只留作者头像、不写作者名。
+const NARROW_WIDTH: f32 = 380.0;
+/// 提交标题与引用胶囊抢宽度时,标题至少先留这么多个全角字宽(约 104px)再让胶囊截断。
+/// 不是硬性最小宽:胶囊都缩到保底还放不下时标题照样往下缩,行不会撑破。
+const TITLE_FLOOR_EM: f32 = 8.0;
+/// 引用胶囊的收缩权重(标题是 1):悬殊到行放不下时几乎只缩胶囊。
+const PILL_SHRINK: f32 = 1000.0;
+
+/// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Enter / Ctrl+C / Ctrl+F / Esc)。
+pub(crate) const HISTORY_CONTEXT: &str = "GitHistory";
 
 /// 往上冒的事件。
 pub enum GitHistoryEvent {
     /// pty-output 嗅探命中 → 容器要重新发现仓库(原版的 `refreshRepos()`)。
     RefreshRepos,
+    /// 右键菜单里的改写操作动了仓库(HEAD / 分支 / 标签 / 暂存区 / 工作区):容器要
+    /// 重载仓库与分支,并让「更改」区重取。历史区自己已经重载过了。
+    RepoChanged,
+    /// 撤销了最近一次提交:它的完整消息交给提交框回填(IDEA 的 Undo Commit 口径),
+    /// 改完直接再提交即可。
+    CommitUndone { message: String },
+}
+
+/// 过滤栏的状态。
+struct FilterState {
+    input: Entity<InputState>,
+    /// 已生效(去抖后)的关键词(过滤框里去掉 `path:` 那一段之后的部分)。
+    text: String,
+    /// 已生效的路径过滤(过滤框里 `path:` 那一段,原样;规范化由后端做)。
+    path: Option<String>,
+    /// 「仅我的」开关。
+    only_mine: bool,
+    /// 「仅我的」对应的邮箱(开关打开 / 换仓库时查一次 `user.email`)。
+    email: Option<String>,
+    /// 「仅我的」开着但仓库没配 `user.email`。
+    no_email: bool,
+    /// 续页游标(后端交回的那个,见模块注释)。`None` = 到底 / 还没开始。
+    cursor: Option<GitLogCursor>,
+    /// 这一轮至今扫过的提交数(「搜索中…已扫描 N 个」)。
+    scanned: usize,
+    /// 这一轮想要凑满的条数:首屏一页,每触底一次加一页。
+    want: usize,
+    debounce: Option<Task<()>>,
+    /// 上一帧过滤框外壳的宽(canvas 量的):变了就把光标拉回可见区(见
+    /// [`keep_caret_in_view`])。
+    input_w: Rc<Cell<f32>>,
+}
+
+/// 过滤条件有没有实际生效。「仅我的」查不到邮箱时不算;路径规范化后是仓库根也不算。
+fn filter_active(text: &str, path: Option<&str>, only_mine: bool, email: Option<&str>) -> bool {
+    !text.is_empty()
+        || path.and_then(mt_project::git::normalize_log_path).is_some()
+        || (only_mine && email.is_some())
+}
+
+/// 过滤框的输入 → `(关键词, 路径)`。
+///
+/// 以 `path:` 开头的那一段(不分大小写,前面得是开头或空白)是路径过滤,其余是关键词:
+/// - 值到下一个空白为止;以 `"` 开头时到下一个 `"` 为止(路径里带空格);
+/// - 写了几段 `path:` 取最后一段,值为空的那段不算;
+/// - 关键词去掉首尾空白,被 `path:` 段隔开的两半用一个空格接上(其余空白原样)。
+///
+/// 关键词里真要搜 `path:` 这几个字的,写在词中间(`xpath:`)不受影响。
+fn parse_filter_query(input: &str) -> (String, Option<String>) {
+    const PREFIX: &str = "path:";
+    let mut text_parts: Vec<&str> = Vec::new();
+    let mut path = None;
+    let mut rest = input.trim();
+    loop {
+        let start = rest.char_indices().map(|(i, _)| i).find(|&i| {
+            let at_token = i == 0 || rest[..i].ends_with(char::is_whitespace);
+            at_token
+                && rest
+                    .get(i..i + PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+        });
+        let Some(start) = start else {
+            text_parts.push(rest);
+            break;
+        };
+        text_parts.push(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        let (value, remain) = match after.strip_prefix('"') {
+            Some(quoted) => match quoted.find('"') {
+                Some(end) => (&quoted[..end], &quoted[end + 1..]),
+                None => (quoted, ""),
+            },
+            None => after.split_at(after.find(char::is_whitespace).unwrap_or(after.len())),
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            path = Some(value.to_string());
+        }
+        rest = remain;
+    }
+    let text = text_parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (text, path)
+}
+
+impl FilterState {
+    fn active(&self) -> bool {
+        filter_active(
+            &self.text,
+            self.path.as_deref(),
+            self.only_mine,
+            self.email.as_deref(),
+        )
+    }
+
+    fn as_filter(&self) -> LogFilter {
+        LogFilter {
+            text: self.text.clone(),
+            author_email: if self.only_mine {
+                self.email.clone()
+            } else {
+                None
+            },
+            path: self.path.clone(),
+        }
+    }
 }
 
 pub struct GitHistoryContent {
@@ -59,34 +241,148 @@ pub struct GitHistoryContent {
     /// HEAD 所在的分支名;detached 时是 `"(1a2b3c4)"` 那种短 hash,查不到分支就当没有。
     /// 只用来找「跟随 HEAD 时正在展示的是哪条本地分支」,进而挂它的上游胶囊。
     head_branch: Option<String>,
+    /// HEAD 指向的提交(由分支列表 / detached 短 hash 推出来;画 HEAD 圆环、HEAD 胶囊用)。
+    head_hash: Option<String>,
+    /// 首页在途:分支胶囊随首页一起换(见 [`Self::sync`])。
+    refs_in_flight: bool,
+    /// 首页在途期间容器透下来的分支列表与 HEAD 名(首页没读到引用时退回用它)。
+    deferred_refs: Option<HistoryRefs>,
     /// 正在查看(未 checkout)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
+    tags: Vec<TagInfo>,
+    /// 提交 → 指向它的标签名(行渲染逐行查表,不在每帧里扫全部标签)。
+    tags_by_commit: HashMap<String, Vec<String>>,
     commits: Vec<GitCommitInfo>,
     graph: GraphLayout,
     loading: bool,
     has_more: bool,
+    /// 保留旧列表的重载在途(过滤栏右侧标「刷新中…」)。
+    refreshing: bool,
+    load_error: Option<String>,
     /// 请求令牌:换仓库 / 换分支后的迟到响应丢弃。
     request: u64,
     /// pty-output 嗅探的 500ms 去抖终点(与「更改」区各算各的)。
     debounce_until: Option<Instant>,
+    filter: FilterState,
+    /// 选中的提交(按 hash 记:分页 / 刷新后照样认得出)。
+    selected: Option<String>,
+    /// 这一轮重载回来之后要核对选中还在不在列表里(见 [`Self::verify_selection`])。
+    verify_selection: bool,
+    detail: detail::DetailState,
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    /// 进行中的改写操作(防重复触发),值是 `gitLog.action.*` 的 key。
+    busy: Option<&'static str>,
+    /// 历史区当前宽度(canvas 量的),决定行里写不写作者名。
+    width: f32,
+    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<GitHistoryEvent> for GitHistoryContent {}
 
+/// 任意 flex-grow(gpui 的 `flex_grow()` 只会设成 1)。
+fn grow<E: Styled>(mut el: E, value: f32) -> E {
+    el.style().flex_grow = Some(value);
+    el
+}
+
+/// 行上挂分支胶囊要的引用:分支列表 + HEAD 显示名(detached 是 `"(1a2b3c4)"`)。
+#[derive(Debug, Clone, PartialEq)]
+struct HistoryRefs {
+    branches: Vec<BranchInfo>,
+    head: Option<String>,
+}
+
+/// 过滤框变窄之后把光标拉回可见区。
+///
+/// 单行输入只在**选区变了**的那一帧按光标位置横向滚动:过滤生效、右侧冒出「匹配 N 条」
+/// 把框挤窄时选区没动,停在末尾的光标(连同后半段文字)就留在可见区外,之后不再打字
+/// 它也不回来(E2E r4 C4)。这里在框的宽度变过之后按上一帧画出来的光标与可视区补一次。
+fn keep_caret_in_view(input: &Entity<InputState>, cx: &mut App) {
+    input.update(cx, |state, cx| {
+        let Some((caret, _)) = state.cursor_layout() else {
+            return;
+        };
+        let view = state.input_bounds();
+        if view.size.width <= px(0.0) {
+            return;
+        }
+        // 光标右边留一点余量,别贴着框沿
+        let margin = px(4.0);
+        let dx = if caret.right() + margin > view.right() {
+            view.right() - margin - caret.right()
+        } else if caret.left() < view.left() {
+            view.left() - caret.left()
+        } else {
+            return;
+        };
+        let offset = state.scroll_offset();
+        state.set_scroll_offset(point(offset.x + dx, offset.y), cx);
+    });
+}
+
+/// 与历史首页同一时刻读的引用(见 [`GitHistoryContent::sync`])。读不到给 `None`,
+/// 沿用容器透下来的那份。纯 git2 只读。
+fn read_history_refs(repo: &std::path::Path) -> Option<HistoryRefs> {
+    let branches = mt_project::git::get_repo_branches(repo).ok()?;
+    let head = mt_project::git::current_head_label(repo).ok().flatten();
+    Some(HistoryRefs { branches, head })
+}
+
 impl GitHistoryContent {
-    pub fn new(store: Entity<AppStore>) -> Self {
+    pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "filter.placeholder")));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => this.schedule_filter(cx),
+                // 回车不等去抖,立刻生效
+                InputEvent::PressEnter { .. } => this.apply_filter(cx),
+                _ => {}
+            },
+        );
         Self {
+            detail: detail::DetailState::new(window, cx),
             store,
             repo_path: String::new(),
             branches: Vec::new(),
             head_branch: None,
+            head_hash: None,
+            refs_in_flight: false,
+            deferred_refs: None,
             view_branch: None,
+            tags: Vec::new(),
+            tags_by_commit: HashMap::new(),
             commits: Vec::new(),
             graph: git_graph::compute(&[]),
             loading: false,
             has_more: false,
+            refreshing: false,
+            load_error: None,
             request: 0,
             debounce_until: None,
+            filter: FilterState {
+                input,
+                text: String::new(),
+                path: None,
+                only_mine: false,
+                email: None,
+                no_email: false,
+                cursor: None,
+                scanned: 0,
+                want: PAGE_SIZE,
+                debounce: None,
+                input_w: Rc::new(Cell::new(0.0)),
+            },
+            selected: None,
+            verify_selection: false,
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            busy: None,
+            width: 0.0,
+            _subs: vec![sub],
         }
     }
 
@@ -96,6 +392,11 @@ impl GitHistoryContent {
     ///
     /// ⚠️ 分支列表要**整条**比,不能只比名字:提交 / 推送后分支名一个没变、
     /// 只有 `commit_hash` 前移,只比名字会把新列表丢掉,胶囊就钉死在旧 commit 上。
+    ///
+    /// 首页在途时(外部 `reset` / 提交之后的刷新)分支列表先压着:首页自己带着同一时刻读的
+    /// 引用回来,与提交列表一起换。容器的分支快照与历史首页是两趟查询、先后不定 ——
+    /// 分开换的话,中间那一帧胶囊挂在不存在的提交上(重置后首行只剩 origin/main,
+    /// E2E r4 A12)。
     pub fn sync(
         &mut self,
         repo_path: &str,
@@ -105,33 +406,75 @@ impl GitHistoryContent {
         cx: &mut Context<Self>,
     ) {
         let tags_changed = self.branches != branches || self.head_branch.as_deref() != head_branch;
-        let reload = self.repo_path != repo_path || self.view_branch.as_deref() != view_branch;
+        let repo_changed = self.repo_path != repo_path;
+        let reload = repo_changed || self.view_branch.as_deref() != view_branch;
         self.repo_path = repo_path.to_string();
         self.view_branch = view_branch.map(str::to_string);
         if tags_changed {
-            self.branches = branches.to_vec();
-            self.head_branch = head_branch.map(str::to_string);
-            cx.notify();
+            let refs = HistoryRefs {
+                branches: branches.to_vec(),
+                head: head_branch.map(str::to_string),
+            };
+            if self.refs_in_flight && !reload {
+                self.deferred_refs = Some(refs);
+            } else {
+                self.apply_refs(refs);
+                cx.notify();
+            }
+        }
+        if repo_changed {
+            // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
+            self.selected = None;
+            self.detail.clear();
+            self.tags.clear();
+            self.tags_by_commit.clear();
+            if self.filter.only_mine {
+                self.resolve_my_email(cx);
+            }
         }
         if reload {
-            self.reload(cx);
+            self.restart(cx);
         }
     }
 
-    /// 整体重来(换仓库 / 换分支 / 提交成功 / 手动刷新)。
+    /// 刷新:**保留旧列表**,首页回来再整体替换(提交成功 / 手动刷新 / 改写操作后)。
     ///
-    /// 原版是给 `GitHistoryContent` 换 `key` 整体重建,滚动位置与已加载分页
-    /// 全部丢弃 —— 这里的效果一致(规格 §11 第 26 条,原版行为,照抄)。
+    /// 原版是给 `GitHistoryContent` 换 `key` 整体重建,列表会白一下;这里只在过滤栏
+    /// 右侧标「刷新中…」,内容不闪。
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refreshing = !self.commits.is_empty();
+        self.begin_load(cx);
+    }
+
+    /// 整体重来并**当场清空**(换仓库 / 换分支 / 换过滤条件:内容本来就不同)。
+    fn restart(&mut self, cx: &mut Context<Self>) {
         self.commits.clear();
         self.graph = git_graph::compute(&[]);
+        self.refreshing = false;
+        self.begin_load(cx);
+    }
+
+    fn begin_load(&mut self, cx: &mut Context<Self>) {
         self.has_more = false;
+        self.load_error = None;
+        self.filter.cursor = None;
+        self.filter.scanned = 0;
+        self.filter.want = PAGE_SIZE;
         self.request += 1;
+        self.verify_selection = true;
         // ⚠️ loading 必须复位:令牌已 +1,在途响应注定被丢弃,而丢弃分支
         // 不会走到 `loading = false` —— 不复位的话这次 load_page 被 loading
-        // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷
+        // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷。引用的在途标记同理
         self.loading = false;
+        self.refs_in_flight = false;
         self.load_page(true, cx);
+        // 首页没发出去(没有仓库):压着的引用不会再有首页来换,当场换上
+        if !self.refs_in_flight
+            && let Some(refs) = self.deferred_refs.take()
+        {
+            self.apply_refs(refs);
+        }
+        cx.notify();
     }
 
     /// 容器的 pty-output 嗅探命中了。
@@ -149,93 +492,493 @@ impl GitHistoryContent {
         }
     }
 
+    /// 全部摊开要多高(过滤栏 44 + 列表上下留白 8 + 全部提交行)。Git 面板分「更改 /
+    /// 提交历史」两块高度时用(`git_panel::section_split`):历史比分到的矮就把富余让给
+    /// 「更改」。还在加载、还有下一页、选中了提交(详情区要地方)、列表为空时说不准,`None`。
+    pub fn natural_height(&self) -> Option<f32> {
+        let unsure = self.repo_path.is_empty()
+            || self.loading
+            || self.has_more
+            || self.selected.is_some()
+            || self.commits.is_empty();
+        (!unsure).then_some(44.0 + 8.0 + 2.0 + self.commits.len() as f32 * GRAPH_ROW_HEIGHT)
+    }
+
     fn load_page(&mut self, first: bool, cx: &mut Context<Self>) {
         if self.repo_path.is_empty() || self.loading {
             return;
         }
-        self.loading = true;
         let req = self.request;
-        let repo = std::path::PathBuf::from(&self.repo_path);
+        let repo = PathBuf::from(&self.repo_path);
         // 首页带 branch;续页的游标由已加载列表还原(见模块注释),不需要 branch
         let branch = if first {
             self.view_branch.clone()
         } else {
             None
         };
-        let after = (!first).then(|| GitLogCursor::from_loaded(&self.commits));
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::git::get_git_log(
-                        &repo,
-                        after.as_ref(),
-                        Some(PAGE_SIZE),
-                        branch.as_deref(),
-                    )
-                })
-                .await;
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                if this.request != req {
-                    return;
+
+        if self.filter.active() {
+            let filter = self.filter.as_filter();
+            let after = if first {
+                None
+            } else {
+                // 续页却没有游标 = 已经走完
+                match self.filter.cursor.take() {
+                    Some(cursor) => Some(cursor),
+                    None => return,
                 }
-                this.loading = false;
-                match result {
-                    Ok(page) => this.merge_page(page),
-                    Err(err) => eprintln!("[git] 取提交历史失败: {err:#}"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+            };
+            self.loading = true;
+            self.refs_in_flight |= first;
+            cx.spawn(async move |this, cx| {
+                let (result, refs) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let page = mt_project::git::get_git_log_filtered(
+                            &repo,
+                            after,
+                            PAGE_SIZE,
+                            branch.as_deref(),
+                            &filter,
+                        );
+                        let tags =
+                            first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
+                        let refs = first.then(|| read_history_refs(&repo)).flatten();
+                        (page.map(|page| (page, tags)), refs)
+                    })
+                    .await;
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    if this.request != req {
+                        return;
+                    }
+                    this.loading = false;
+                    if first {
+                        this.settle_refs(refs);
+                    }
+                    match result {
+                        Ok((page, tags)) => this.merge_filtered(first, page, tags, cx),
+                        Err(err) => this.load_failed(err),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        } else {
+            self.loading = true;
+            self.refs_in_flight |= first;
+            let after = (!first).then(|| GitLogCursor::from_loaded(&self.commits));
+            cx.spawn(async move |this, cx| {
+                let (result, refs) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let page = mt_project::git::get_git_log(
+                            &repo,
+                            after.as_ref(),
+                            Some(PAGE_SIZE),
+                            branch.as_deref(),
+                        );
+                        let tags =
+                            first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
+                        let refs = first.then(|| read_history_refs(&repo)).flatten();
+                        (page.map(|page| (page, tags)), refs)
+                    })
+                    .await;
+                let _ = this.update(cx, |this: &mut Self, cx| {
+                    if this.request != req {
+                        return;
+                    }
+                    this.loading = false;
+                    if first {
+                        this.settle_refs(refs);
+                    }
+                    match result {
+                        Ok((page, tags)) => this.merge_page(first, page, tags),
+                        Err(err) => this.load_failed(err),
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
+    fn load_failed(&mut self, err: anyhow::Error) {
+        eprintln!("[git] 取提交历史失败: {err:#}");
+        // 没拿到新列表就无从核对,别留到之后的续页去误判
+        self.verify_selection = false;
+        self.refreshing = false;
+        self.load_error = Some(format!("{err:#}"));
+    }
+
+    fn set_tags(&mut self, tags: Vec<TagInfo>) {
+        self.tags_by_commit.clear();
+        for tag in &tags {
+            self.tags_by_commit
+                .entry(tag.target_hash.clone())
+                .or_default()
+                .push(tag.name.clone());
+        }
+        self.tags = tags;
+    }
+
     /// 合并一页。去重 + 拓扑修正 + `has_more` 判定,见模块注释。
-    fn merge_page(&mut self, page: Vec<GitCommitInfo>) {
+    fn merge_page(&mut self, first: bool, page: Vec<GitCommitInfo>, tags: Option<Vec<TagInfo>>) {
+        if first {
+            // 刷新保留的旧列表到这里才换掉
+            self.commits.clear();
+            self.refreshing = false;
+        }
+        if let Some(tags) = tags {
+            self.set_tags(tags);
+        }
         self.has_more = merge_into(&mut self.commits, page);
         self.graph = git_graph::compute(&self.commits);
+        self.refresh_head_hash();
+        self.verify_selection();
+    }
+
+    /// 重载回来(首页落定)之后核对选中:新列表里找不到它(切了分支 / 重置 / 改写掉了),
+    /// 选中与详情一起清掉 —— 否则「提交详情」还挂着别的分支上的提交。找得到就留着。
+    ///
+    /// 只在每轮重载落定时核一次(`verify_selection` 由 [`Self::begin_load`] 置上),
+    /// 之后触底续页不再核:那时选中的多半就是刚滚到的行。
+    fn verify_selection(&mut self) {
+        if !std::mem::take(&mut self.verify_selection) {
+            return;
+        }
+        if !selection_survives(self.selected.as_deref(), &self.commits) {
+            self.selected = None;
+            self.detail.clear();
+        }
+    }
+
+    /// 合并一页过滤结果;没凑够 [`FilterState::want`] 且还有下文就接着扫。
+    fn merge_filtered(
+        &mut self,
+        first: bool,
+        page: LogPage,
+        tags: Option<Vec<TagInfo>>,
+        cx: &mut Context<Self>,
+    ) {
+        if first {
+            self.commits.clear();
+            self.refreshing = false;
+        }
+        if let Some(tags) = tags {
+            self.set_tags(tags);
+        }
+        self.filter.scanned += page.scanned;
+        mt_project::git::merge_log_page(&mut self.commits, page.commits);
+        self.filter.cursor = page.next;
+        self.has_more = self.filter.cursor.is_some();
+        self.refresh_head_hash();
+        if self.has_more && self.commits.len() < self.filter.want {
+            self.load_page(false, cx);
+        } else {
+            // 过滤要连扫好几页才凑够首屏,凑够了才算这一轮落定
+            self.verify_selection();
+        }
     }
 
     /// 触底:再要一页。
     fn load_more(&mut self, cx: &mut Context<Self>) {
         if self.has_more && !self.loading {
+            if self.filter.active() {
+                self.filter.want = self.commits.len() + PAGE_SIZE;
+            }
             self.load_page(false, cx);
         }
     }
 
-    /// 双击行 / 右键「查看变更」:先取文件列表,再开 CommitDiffModal。
-    fn view_commit(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(commit) = self.commits.get(index) else {
+    /// 换上一份引用(分支胶囊、HEAD 圆环跟着变)。
+    fn apply_refs(&mut self, refs: HistoryRefs) {
+        self.branches = refs.branches;
+        self.head_branch = refs.head;
+        self.refresh_head_hash();
+    }
+
+    /// 首页落定(成败都算):引用与提交列表一起换。首页没读到引用时退回在途期间容器透下来
+    /// 的那份(见 [`Self::sync`])。在合并首页**之前**调,`refresh_head_hash` 才按新引用算。
+    fn settle_refs(&mut self, refs: Option<HistoryRefs>) {
+        self.refs_in_flight = false;
+        let deferred = self.deferred_refs.take();
+        if let Some(refs) = refs.or(deferred) {
+            self.apply_refs(refs);
+        }
+    }
+
+    /// HEAD 指向的提交:跟随分支时查分支列表,detached 时按括号里的短 hash 在已加载里找。
+    fn refresh_head_hash(&mut self) {
+        let Some(head) = self.head_branch.as_deref() else {
+            self.head_hash = None;
             return;
         };
-        let repo = self.repo_path.clone();
-        let hash = commit.hash.clone();
-        let message = commit.message.clone();
-        let store = self.store.clone();
-        let repo_for_task = std::path::PathBuf::from(&repo);
-        let hash_for_task = hash.clone();
-        cx.spawn_in(window, async move |_this, cx| {
-            let files = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::git::get_commit_files(&repo_for_task, &hash_for_task)
-                })
+        self.head_hash = match head.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            Some(short) => self
+                .commits
+                .iter()
+                .find(|c| c.hash.starts_with(short))
+                .map(|c| c.hash.clone()),
+            None => self
+                .branches
+                .iter()
+                .find(|b| !b.is_remote && b.name == head)
+                .map(|b| b.commit_hash.clone()),
+        };
+    }
+
+    /// HEAD 是不是分离头指针。
+    fn head_detached(&self) -> bool {
+        self.head_branch
+            .as_deref()
+            .is_some_and(|h| h.starts_with('('))
+    }
+
+    // ── 过滤 ──────────────────────────────────────────────
+
+    fn schedule_filter(&mut self, cx: &mut Context<Self>) {
+        self.filter.debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FILTER_DEBOUNCE_MS))
                 .await;
-            let files = match files {
-                Ok(files) => files,
-                Err(err) => {
-                    // 原版 `console.error` 静默
-                    eprintln!("[git] 取 commit 文件列表失败: {err:#}");
+            let _ = this.update(cx, |this: &mut Self, cx| this.apply_filter(cx));
+        }));
+    }
+
+    /// 把输入框里的关键词 / 路径生效。与当前生效的相同就什么都不做(幂等:清空按钮与
+    /// 去抖可能先后各来一次)。
+    fn apply_filter(&mut self, cx: &mut Context<Self>) {
+        self.filter.debounce = None;
+        let (text, path) = parse_filter_query(&self.filter.input.read(cx).value());
+        if text == self.filter.text && path == self.filter.path {
+            return;
+        }
+        self.filter.text = text;
+        self.filter.path = path;
+        self.restart(cx);
+    }
+
+    fn clear_filter_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter
+            .input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.apply_filter(cx);
+    }
+
+    /// 关键词 + 「仅我的」一起清掉。
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let had_mine = self.filter.only_mine;
+        self.filter.only_mine = false;
+        self.filter.no_email = false;
+        self.filter
+            .input
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.filter.debounce = None;
+        if !self.filter.text.is_empty() || self.filter.path.is_some() || had_mine {
+            self.filter.text.clear();
+            self.filter.path = None;
+            self.restart(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_only_mine(&mut self, cx: &mut Context<Self>) {
+        self.filter.only_mine = !self.filter.only_mine;
+        if self.filter.only_mine {
+            self.resolve_my_email(cx);
+        } else {
+            self.filter.no_email = false;
+            if self.filter.email.is_some() {
+                self.restart(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 查当前仓库的 `user.email`,查完按新条件重来。
+    fn resolve_my_email(&mut self, cx: &mut Context<Self>) {
+        if self.repo_path.is_empty() {
+            return;
+        }
+        let repo = PathBuf::from(&self.repo_path);
+        let repo_key = self.repo_path.clone();
+        cx.spawn(async move |this, cx| {
+            let email = cx
+                .background_executor()
+                .spawn(async move { mt_project::git::config_user_email(&repo) })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.repo_path != repo_key || !this.filter.only_mine {
                     return;
                 }
-            };
-            let _ = cx.update(|window, cx| {
-                git_diff::open_commit_diff(store, repo, hash, message, files, window, cx);
+                this.filter.no_email = email.is_none();
+                this.filter.email = email;
+                this.restart(cx);
             });
         })
         .detach();
     }
+
+    // ── 选中 / 键盘 ───────────────────────────────────────
+
+    fn selected_index(&self) -> Option<usize> {
+        let hash = self.selected.as_deref()?;
+        self.commits.iter().position(|c| c.hash == hash)
+    }
+
+    /// 选中某个提交并拉它的详情。
+    fn select_hash(&mut self, hash: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.as_deref() != Some(hash.as_str()) {
+            self.selected = Some(hash.clone());
+            self.load_detail(hash, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 选中第 `index` 行,滚到看得见,接近末尾时预取下一页。
+    fn select_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hash) = self.commits.get(index).map(|c| c.hash.clone()) else {
+            return;
+        };
+        self.select_hash(hash, window, cx);
+        self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        if index + PREFETCH_ROWS >= self.commits.len() {
+            self.load_more(cx);
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commits.is_empty() {
+            return;
+        }
+        let last = self.commits.len() as isize - 1;
+        let next = match self.selected_index() {
+            None => 0,
+            Some(cur) => (cur as isize + delta).clamp(0, last),
+        };
+        self.select_index(next as usize, window, cx);
+    }
+
+    fn on_select_prev(
+        &mut self,
+        _: &GitLogSelectPrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(-1, window, cx);
+    }
+
+    fn on_select_next(
+        &mut self,
+        _: &GitLogSelectNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(1, window, cx);
+    }
+
+    fn filter_focused(&self, window: &Window, cx: &App) -> bool {
+        self.filter
+            .input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }
+
+    fn on_open_selected(
+        &mut self,
+        _: &GitLogOpenSelected,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.filter_focused(window, cx) {
+            self.apply_filter(cx);
+            return;
+        }
+        // 焦点在详情区的只读文本里时,回车归它自己
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        if let Some(index) = self.selected_index() {
+            self.view_commit(index, window, cx);
+        }
+    }
+
+    fn on_copy_hash(&mut self, _: &GitLogCopyHash, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        if let Some(hash) = self.selected.clone() {
+            cx.write_to_clipboard(ClipboardItem::new_string(hash));
+        }
+    }
+
+    fn on_focus_filter(
+        &mut self,
+        _: &GitLogFocusFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.filter.input.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    fn on_clear_filter(
+        &mut self,
+        _: &GitLogClearFilter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 谓词 `GitHistory > Input` 也罩着详情区的只读正文:那里的 Esc 不归过滤框
+        if !self.filter_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        self.clear_filter_text(window, cx);
+        window.focus(&self.focus, cx);
+    }
+
+    // ── 打开 diff ─────────────────────────────────────────
+
+    /// 双击行 / Enter / 右键「查看变更」:先取文件列表,再开 CommitDiffModal。
+    fn view_commit(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(commit) = self.commits.get(index) else {
+            return;
+        };
+        self.open_commit_diff(
+            commit.hash.clone(),
+            commit.message.clone(),
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// 取文件列表 → 打开提交 diff(`initial` = 先选中哪个文件)。失败口径见
+    /// [`git_diff::open_commit_diff_loading`]。
+    fn open_commit_diff(
+        &self,
+        hash: String,
+        message: String,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        git_diff::open_commit_diff_loading(
+            self.store.clone(),
+            self.repo_path.clone(),
+            hash,
+            message,
+            initial,
+            window,
+            cx,
+        )
+        .detach();
+    }
+
+    // ── 引用 ──────────────────────────────────────────────
 
     /// 该行要标注的分支胶囊。
     ///
@@ -253,6 +996,77 @@ impl GitHistoryContent {
             self.view_branch.as_deref(),
             hash,
         )
+    }
+
+    fn branch_kind(&self, branch: &BranchInfo) -> RefKind {
+        if branch.is_remote {
+            RefKind::Remote
+        } else if Some(branch.name.as_str()) == self.head_branch.as_deref() {
+            RefKind::Head
+        } else {
+            RefKind::Local
+        }
+    }
+
+    /// 行上的引用胶囊:detached 的 HEAD → 分支(展示口径见 [`Self::shown_branches`])→ 标签。
+    fn row_refs(&self, hash: &str) -> Vec<(String, RefKind)> {
+        let mut refs = Vec::new();
+        if self.head_detached() && self.head_hash.as_deref() == Some(hash) {
+            refs.push((t("gitLog", "ref.head").to_string(), RefKind::Head));
+        }
+        for branch in self.shown_branches(hash) {
+            refs.push((branch.name.clone(), self.branch_kind(branch)));
+        }
+        if let Some(tags) = self.tags_by_commit.get(hash) {
+            refs.extend(tags.iter().map(|t| (t.clone(), RefKind::Tag)));
+        }
+        refs
+    }
+
+    /// 详情区的引用:指向它的**全部**分支(本地在前)+ 标签 —— 详情是查证用的,不做展示裁剪。
+    fn all_refs(&self, hash: &str) -> Vec<(String, RefKind)> {
+        let mut refs = Vec::new();
+        if self.head_detached() && self.head_hash.as_deref() == Some(hash) {
+            refs.push((t("gitLog", "ref.head").to_string(), RefKind::Head));
+        }
+        for branch in self.branches.iter().filter(|b| b.commit_hash == hash) {
+            refs.push((branch.name.clone(), self.branch_kind(branch)));
+        }
+        refs.sort_by_key(|(_, kind)| match kind {
+            RefKind::Head => 0,
+            RefKind::Local => 1,
+            RefKind::Remote => 2,
+            RefKind::Tag => 3,
+        });
+        if let Some(tags) = self.tags_by_commit.get(hash) {
+            refs.extend(tags.iter().map(|t| (t.clone(), RefKind::Tag)));
+        }
+        refs
+    }
+
+    // ── 结果展示(成功走 Git 面板共用的结果 toast,失败走详情框) ──
+
+    /// 成功摘要(信息档:`i` 图标,点击只关闭)。
+    fn toast_info(&self, message: String, cx: &mut App) {
+        git_ui::toast(&self.store, message, Tone::Info, cx);
+    }
+
+    /// 菜单直接触发的操作失败:弹可选中复制原文的详情框(与面板上的操作同一口径,见
+    /// [`git_ui::show_git_error`])。`action` 是 `gitLog.action.*` 的 key。
+    fn show_failure(
+        &self,
+        action: &'static str,
+        err: &anyhow::Error,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        eprintln!("[git] {action} 失败: {err:#}");
+        git_ui::show_git_error(
+            tr!("gitBranch", "opFailed", op = t("gitLog", action)),
+            git_ui::error_text(err),
+            window,
+            cx,
+        );
     }
 }
 
@@ -296,6 +1110,22 @@ fn tracked_upstream<'a>(
         .as_deref()
 }
 
+/// 「仅我的」开关的提示:查不到邮箱时说原因,开着时写出按哪个邮箱筛。
+fn only_mine_tip(filter: &FilterState) -> SharedString {
+    if filter.no_email {
+        t("gitLog", "filter.noEmail").into()
+    } else if let Some(email) = filter.email.as_deref().filter(|_| filter.only_mine) {
+        tr!("gitLog", "filter.onlyMineTip", email = email).into()
+    } else {
+        t("gitLog", "filter.onlyMine").into()
+    }
+}
+
+/// 重载之后选中还算不算数:没选中,或选中的提交还在新列表里。
+fn selection_survives(selected: Option<&str>, commits: &[GitCommitInfo]) -> bool {
+    selected.is_none_or(|hash| commits.iter().any(|c| c.hash == hash))
+}
+
 /// 相对时间(`src/utils/timeFormat.ts:3-18`)。
 ///
 /// ⚠️ 命名空间是 **`time`**,不是 `session_panel` 用的 `sessionList.time.*` ——
@@ -322,223 +1152,520 @@ pub fn format_relative_time(timestamp: i64, now: i64) -> String {
     }
 }
 
+/// 绝对时间(本地时区,精确到分):行 tooltip、详情区用。
+pub(crate) fn format_absolute_time(timestamp: i64) -> String {
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_opt(timestamp, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => timestamp.to_string(),
+    }
+}
+
+/// 详情区的时间:绝对时间 + 括号里的相对时间。30 天以上相对时间退成纯日期,
+/// 与绝对时间的日期部分一模一样(「2026-07-19 14:03  (2026-07-19)」),这时只写绝对时间。
+pub(crate) fn format_detail_time(timestamp: i64, now: i64) -> String {
+    let absolute = format_absolute_time(timestamp);
+    let relative = format_relative_time(timestamp, now);
+    if absolute.starts_with(relative.as_str()) {
+        absolute
+    } else {
+        format!("{absolute}  ({relative})")
+    }
+}
+
+/// 行 tooltip:完整标题 + 作者 · 绝对时间 · 短哈希(标题被截断时尤其需要)。
+fn row_tooltip(commit: &GitCommitInfo) -> String {
+    format!(
+        "{}\n{} · {} · {}",
+        commit.message,
+        commit.author,
+        format_absolute_time(commit.timestamp),
+        commit.short_hash
+    )
+}
+
 impl Render for GitHistoryContent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut body = div()
-            .id("git-history-body")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_hidden()
-            .px(px(4.0))
-            .py(px(4.0));
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let this = cx.entity();
+        let mut root = div()
+            .id("git-history")
+            .key_context(HISTORY_CONTEXT)
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(ui::bg_surface())
+            .on_action(cx.listener(Self::on_select_prev))
+            .on_action(cx.listener(Self::on_select_next))
+            .on_action(cx.listener(Self::on_open_selected))
+            .on_action(cx.listener(Self::on_copy_hash))
+            .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_clear_filter))
+            // 量宽度:窄的时候行里只留作者头像
+            .child({
+                let this = this.clone();
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, cx| {
+                        this.update(cx, |h: &mut GitHistoryContent, _cx| {
+                            h.width = f32::from(bounds.size.width);
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            });
 
         if self.repo_path.is_empty() {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(ui::bg_surface())
-                .child(body.child(hint(t("gitHistoryContent", "noRepos"), 13.0)));
-        }
-
-        if self.commits.is_empty() {
-            return div().size_full().flex().flex_col().bg(ui::bg_surface()).child(
-                body.child(hint(
-                    if self.loading {
-                        t("gitHistoryContent", "loading")
-                    } else {
-                        t("gitHistoryContent", "noCommits")
-                    },
-                    11.0,
-                )),
+            return root.child(
+                empty_state(ICON_COMMIT, t("gitHistoryContent", "noRepos"), None).size_full(),
             );
         }
 
-        let count = self.commits.len();
+        root = root.child(self.render_filter_bar(cx));
+
+        let list = self.render_list(window, cx);
+        let has_detail = self.selected.is_some();
+        let detail_open = has_detail && self.detail.open;
+        root = root.child(grow(
+            div()
+                .flex_basis(px(0.0))
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .px(px(4.0))
+                .py(px(4.0))
+                .child(list),
+            if detail_open { 0.58 } else { 1.0 },
+        ));
+        if has_detail {
+            root = root.child(detail::render(self, detail_open, cx));
+        }
+        root
+    }
+}
+
+impl GitHistoryContent {
+    /// 过滤栏:输入框(左搜索图标、右清空)+「仅我的」胶囊 + 计数 / 进行中状态 + 清除。
+    ///
+    /// 过滤框按剩余宽度伸缩、保底 [`FILTER_INPUT_MIN_W`],右侧计数 / 状态先截断让位。
+    /// 「清除」只在开着「仅我的」时出(一下清掉文字与开关);只有文字时框里的 × 就是清除,
+    /// 再挂一颗只会把框挤窄(E2E r4 C4:默认宽度过滤生效后框里只剩约 7 个字)。
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let has_text = !self.filter.input.read(cx).value().is_empty();
+        let show_clear = self.filter.only_mine;
+        let clear_text = has_text.then(|| {
+            icon_button(
+                "git-log-filter-clear-text",
+                ICON_CLOSE,
+                t("gitLog", "filter.clearText"),
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.clear_filter_text(window, cx);
+                // 焦点交回输入框(同 gpui-component 自带清空钮的做法):点 × 时焦点落在
+                // 输入框外壳上,外壳照样画聚焦环,按键却进不了输入框
+                this.filter.input.update(cx, |s, cx| s.focus(window, cx));
+            }))
+        });
+        // 搜索图标上挂完整的语法说明(占位符放不下 `path:` 的全部写法)
+        let syntax_hint = div()
+            .id("git-log-filter-syntax")
+            .pl(px(2.0))
+            .child(icon(ICON_SEARCH, git_ui::ICON_SIZE, ui::text_muted()))
+            .tip(t("gitLog", "filter.syntaxTip"));
+        // 外壳的宽一变(右侧冒出 / 收起计数),当帧画完后把光标拉回可见区
+        let input_w = self.filter.input_w.clone();
+        let input_state = self.filter.input.clone();
+        let input = div()
+            .relative()
+            .flex_1()
+            .min_w(px(FILTER_INPUT_MIN_W))
+            .child(
+                Input::new(&self.filter.input)
+                    .prefix(syntax_hint)
+                    .when_some(clear_text, |el, btn| el.suffix(btn)),
+            )
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, cx| {
+                        let width = f32::from(bounds.size.width);
+                        if (input_w.replace(width) - width).abs() > 0.5 {
+                            cx.defer(move |cx| keep_caret_in_view(&input_state, cx));
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
+
+        let mine = self.filter.only_mine;
+        let mine_color = if self.filter.no_email {
+            ui::color_warning()
+        } else if mine {
+            ui::accent()
+        } else {
+            ui::text_secondary()
+        };
+        // 点一下就切状态的开关:提示文案在气泡渲染时现读(见 `TooltipExt::tip_live`)
+        let view = cx.entity().downgrade();
+        let mine_pill = div()
+            .id("git-log-only-mine")
+            .flex_none()
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .rounded_full()
+            .border_1()
+            .cursor_pointer()
+            .text_size(ui::font_px(12.0))
+            .text_color(mine_color)
+            .map(|el| {
+                if mine {
+                    el.bg(git_ui::soft_bg(mine_color))
+                        .text_color(git_ui::soft_fg(mine_color))
+                        .border_color(ui::with_alpha(mine_color, 0.5))
+                } else {
+                    el.border_color(ui::border_default())
+                        .hover(|el| el.bg(git_ui::button_hover_bg()))
+                }
+            })
+            .child(icon(ICON_USER, git_ui::ICON_SIZE_SM, mine_color))
+            .child(t("gitLog", "filter.onlyMine"))
+            .tip_live(move |cx| {
+                view.upgrade()
+                    .map(|v| only_mine_tip(&v.read(cx).filter))
+                    .unwrap_or_default()
+            })
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.toggle_only_mine(cx);
+            }));
+
+        // 右侧状态位:进行中的改写操作 > 刷新失败(旧列表还留着时) > 过滤计数 > 刷新中
+        let refresh_error = self
+            .load_error
+            .as_deref()
+            .filter(|_| !self.commits.is_empty());
+        let status: Option<String> = if let Some(action) = self.busy {
+            Some(tr!("gitLog", "busy", action = t("gitLog", action)))
+        } else if let Some(err) = refresh_error {
+            Some(tr!("gitLog", "loadFailed", detail = err))
+        } else if self.filter.active() {
+            // 首批还没回来时不写「匹配 0 条」(列表区已经在说「搜索中…」)
+            let count = self.commits.len().to_string();
+            (!self.commits.is_empty() || !(self.loading || self.has_more)).then(|| {
+                if self.has_more {
+                    tr!("gitLog", "filter.countLoaded", count = count)
+                } else {
+                    tr!("gitLog", "filter.count", count = count)
+                }
+            })
+        } else if self.refreshing {
+            Some(t("gitLog", "refreshing").to_string())
+        } else {
+            None
+        };
+
+        div()
+            .flex_none()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(input)
+            .child(mine_pill)
+            .when_some(status, |el, status| {
+                let color = if self.busy.is_some() {
+                    ui::accent()
+                } else if refresh_error.is_some() {
+                    ui::color_error()
+                } else {
+                    ui::text_muted()
+                };
+                el.child(
+                    mono(div())
+                        .id("git-log-status")
+                        // 挤不下时先截它(可收缩到 0;过滤框有保底宽,见方法注释)
+                        .min_w(px(0.0))
+                        .max_w(px(160.0))
+                        .truncate()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(color)
+                        // 截断时全文挂 tooltip(刷新失败的 git 原文可能很长)
+                        .tip(status.clone())
+                        .child(status),
+                )
+            })
+            .when(show_clear, |el| {
+                let clear = git_ui::action_button(
+                    "git-log-filter-clear",
+                    t("gitLog", "filter.clear"),
+                    ButtonKind::Ghost,
+                    true,
+                );
+                el.child(
+                    clear.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.clear_filter(window, cx);
+                    })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 列表区:空态 / uniform_list(末尾可能挂一行「加载中 / 搜索中」)。
+    fn render_list(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.commits.is_empty() {
+            return self.render_empty(cx);
+        }
+        // 刷新(保留旧列表)期间不挂这一行:那一趟取的是首页,状态已标在过滤栏右侧
+        let footer: Option<String> = (self.loading && !self.refreshing).then(|| {
+            if self.filter.active() {
+                tr!(
+                    "gitLog",
+                    "filter.searching",
+                    count = self.filter.scanned.to_string()
+                )
+            } else {
+                t("gitLog", "loadingMore").to_string()
+            }
+        });
+        let commits = self.commits.len();
+        let count = commits + usize::from(footer.is_some());
         let this = cx.entity();
-        let list = uniform_list(
+        uniform_list(
             "git-commit-list",
             count,
             move |range, _window, cx: &mut App| {
                 // 触底再要一页。**延到下一拍**执行:这里还在窗口的 prepaint 里,
                 // 直接 update 自己会与正在进行的渲染打架。
-                if range.end >= count {
+                if range.end >= commits {
                     let this = this.clone();
                     cx.spawn(async move |cx| {
-                        let _ = this.update(cx, |this: &mut GitHistoryContent, cx| {
-                            this.load_more(cx)
-                        });
+                        this.update(cx, |this: &mut GitHistoryContent, cx| this.load_more(cx));
                     })
                     .detach();
                 }
                 let this = this.clone();
+                let footer = footer.clone();
                 range
-                    .map(|i| this.update(cx, |this, cx| this.render_commit(i, cx)))
+                    .map(|i| {
+                        if i >= commits {
+                            return footer_row(footer.clone().unwrap_or_default());
+                        }
+                        this.update(cx, |this, cx| this.render_commit(i, cx))
+                    })
                     .collect::<Vec<_>>()
             },
         )
-        .size_full();
-
-        body = body.child(list);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(ui::bg_surface())
-            .child(body)
-    }
-}
-
-fn hint(text: &'static str, size: f32) -> AnyElement {
-    div()
-        .py(px(if size > 12.0 { 24.0 } else { 8.0 }))
-        .w_full()
-        .text_center()
-        .text_size(ui::font_px(size))
-        .text_color(ui::text_muted())
-        .child(text)
+        .track_scroll(&self.scroll)
+        .size_full()
         .into_any_element()
-}
+    }
 
-impl GitHistoryContent {
+    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(err) = &self.load_error {
+            return git_ui::error_state(tr!("gitLog", "loadFailed", detail = err.clone()))
+                .into_any_element();
+        }
+        if self.filter.active() {
+            if self.loading || self.has_more {
+                return git_ui::loading_state(tr!(
+                    "gitLog",
+                    "filter.searching",
+                    count = self.filter.scanned.to_string()
+                ))
+                .size_full()
+                .into_any_element();
+            }
+            let clear = git_ui::action_button(
+                "git-log-empty-clear",
+                t("gitLog", "filter.clearFilter"),
+                ButtonKind::Primary,
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.clear_filter(window, cx);
+            }))
+            .into_any_element();
+            return empty_state(ICON_SEARCH, t("gitLog", "filter.noMatch"), Some(clear))
+                .size_full()
+                .into_any_element();
+        }
+        if self.loading {
+            return git_ui::loading_state(t("gitHistoryContent", "loading"))
+                .size_full()
+                .into_any_element();
+        }
+        empty_state(ICON_COMMIT, t("gitHistoryContent", "noCommits"), None)
+            .size_full()
+            .into_any_element()
+    }
+
     fn render_commit(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(commit) = self.commits.get(index) else {
             return div().into_any_element();
         };
-        let Some(row) = self.graph.rows.get(index).cloned() else {
-            return div().into_any_element();
+        let show_graph = !self.filter.active();
+        let graph_row = if show_graph {
+            self.graph.rows.get(index).cloned()
+        } else {
+            None
         };
+        let selected = self.selected.as_deref() == Some(commit.hash.as_str());
+        let is_head = self.head_hash.as_deref() == Some(commit.hash.as_str());
+        let is_merge = commit.parent_hashes.len() >= 2;
         let now = chrono::Utc::now().timestamp();
+        let relative = format_relative_time(commit.timestamp, now);
+        let narrow = self.width > 0.0 && self.width < NARROW_WIDTH;
         let hash_full = commit.hash.clone();
         let short_hash = commit.short_hash.clone();
-        let author = commit.author.clone();
-        let message = commit.message.clone();
-        let relative = format_relative_time(commit.timestamp, now);
+        let refs = self.row_refs(&commit.hash);
 
-        let mut first_line = div()
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .min_w(px(0.0))
-            .text_size(ui::font_px(13.0))
-            .text_color(ui::text_primary());
-        // 胶囊与提交说明按各自宽度比例收缩、各自截断:胶囊不设 `flex_none`,否则
-        // `feature/MT-1234-…` 这种长名一个就把说明整个挤出行外。胶囊保底一截
-        // 宽度好认出 `origin/` 前缀,全名挂 tooltip。
-        for branch in self.shown_branches(&commit.hash) {
-            let (bg, fg) = if branch.is_head {
-                (palette_color(0), gpui::white())
-            } else if branch.is_remote {
-                (ui::border_subtle(), ui::text_muted())
-            } else {
-                (
-                    ui::with_alpha(mt_ui::rgb8(63, 185, 80), 0.2),
-                    mt_ui::rgb8(63, 185, 80),
+        // 共用列表行(选中 = accent 淡底 + 左侧竖条、悬停薄纱底)。
+        // ⚠️ `w_full` 不能省(`list_row` 已带):行是 uniform_list 的 item,单独
+        // `layout_as_root`,而 taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、
+        // 不吃 available space。没有它整行只有内容那么宽,`flex_1` 的标题是 0。
+        let mut row = git_ui::list_row(
+            SharedString::from(format!("git-commit-{hash_full}")),
+            selected,
+        )
+        .h(px(GRAPH_ROW_HEIGHT))
+        .pl(px(if graph_row.is_some() { 4.0 } else { 10.0 }));
+        if let Some(graph_row) = graph_row {
+            row = row.child(GraphCell {
+                row: graph_row,
+                width: self.graph.width,
+                is_head,
+                selected,
+            });
+        }
+        // 标题与引用胶囊抢宽度时胶囊先让:标题的基准宽给到 TITLE_FLOOR_EM 个全角字(短标题
+        // 按自己的字数估,不白占),胶囊的收缩权重悬殊(权重 × 基准宽分摊),行放不下时
+        // 几乎只缩胶囊、缩到 `name_pill` 的 40px 保底为止,之后才轮到标题
+        let title_font = f32::from(ui::font_px(13.0));
+        let title_basis = (TITLE_FLOOR_EM * title_font)
+            .min(git_ui::estimate_text_width(&commit.message, title_font));
+        row = row.child(
+            div()
+                .flex_1()
+                .flex_basis(px(title_basis))
+                .min_w_0()
+                .truncate()
+                .text_size(ui::font_px(13.0))
+                // 合并提交降低存在感
+                .text_color(if is_merge {
+                    ui::text_muted()
+                } else {
+                    ui::text_primary()
+                })
+                .child(commit.message.clone()),
+        );
+
+        // 引用胶囊:最多 MAX_PILLS 个(窄时 1 个),其余收进「+N」,全名挂 tooltip
+        let max_pills = if narrow { 1 } else { MAX_PILLS };
+        for (i, (name, kind)) in refs.iter().take(max_pills).enumerate() {
+            let mut pill = ref_pill(
+                SharedString::from(format!("git-ref-{short_hash}-{i}")),
+                name.clone(),
+                *kind,
+            )
+            .max_w(px(160.0))
+            .tip(name.clone());
+            pill.style().flex_shrink = Some(PILL_SHRINK);
+            row = row.child(pill);
+        }
+        if refs.len() > max_pills {
+            let all = refs
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            row = row.child(
+                more_pill(
+                    SharedString::from(format!("git-ref-more-{short_hash}")),
+                    refs.len() - max_pills,
                 )
-            };
-            let tip: SharedString = branch.name.clone().into();
-            first_line = first_line.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "git-tag-{short_hash}-{}",
-                        branch.name
-                    )))
-                    .min_w(px(56.0))
-                    .px(px(6.0))
-                    .rounded(px(3.0))
-                    .bg(bg)
-                    .text_color(fg)
-                    .truncate()
-                    .child(branch.name.clone())
-                    .tip(tip),
+                .tip(all),
             );
         }
-        first_line = first_line.child(div().min_w_0().truncate().child(message));
 
-        // ⚠️ `w_full` 不能省:行是 uniform_list 的 item,单独 `layout_as_root`,而
-        // taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、不吃 available
-        // space。没有它整行只有拓扑图那么宽,`flex_1` 容器是 0 —— 以前胶囊
-        // `flex_none`、说明 nowrap,谁都收不下去只是溢出着显示,看不出来;
-        // 一旦允许收缩,胶囊与说明就一起塌到最小宽度。
-        div()
-            .id(SharedString::from(format!("git-commit-{hash_full}")))
-            .w_full()
-            .flex()
-            .items_center()
-            .h(px(GRAPH_ROW_HEIGHT))
-            .px(px(8.0))
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .hover(|el| el.bg(ui::border_subtle()))
-            .child(GraphCell {
-                row,
-                width: self.graph.width,
-            })
+        row = row
             .child(
                 div()
-                    .flex_1()
-                    .min_w(px(0.0))
+                    .flex_none()
                     .flex()
-                    .flex_col()
-                    .justify_center()
-                    .pl(px(4.0))
-                    .child(first_line)
-                    .child(
-                        div()
-                            .mt(px(2.0))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .max_w(px(140.0))
-                                    .truncate()
-                                    .child(author),
-                            )
-                            .child("·")
-                            .child(div().flex_none().child(relative))
-                            .child("·")
-                            .child(div().flex_none().child(short_hash)),
-                    ),
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(avatar(&commit.author))
+                    .when(!narrow, |el| {
+                        el.child(
+                            div()
+                                .w(px(72.0))
+                                .min_w_0()
+                                .truncate()
+                                .text_size(ui::font_px(12.0))
+                                .text_color(ui::text_muted())
+                                .child(commit.author.clone()),
+                        )
+                    }),
             )
-            // ⚠️ 是**双击**不是单击(`GitHistoryContent.tsx:105`)
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    this.view_commit(index, window, cx);
-                }
-            }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |_this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    let entity = cx.entity();
-                    let hash = hash_full.clone();
-                    let entries = vec![
-                        menu::item(
-                            t("gitHistoryContent", "copyCommitHash"),
-                            move |_window, cx| {
-                                // 完整 hash,不是 shortHash
-                                cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()));
-                            },
-                        ),
-                        menu::separator(),
-                        menu::item(t("gitHistoryContent", "viewChanges"), move |window, cx| {
-                            entity.update(cx, |this, cx| this.view_commit(index, window, cx));
-                        }),
-                    ];
-                    menu::show(event.position, entries, window, cx);
-                }),
+            .child(
+                mono(div())
+                    .flex_none()
+                    .w(px(76.0))
+                    .text_right()
+                    .truncate()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(relative),
             )
-            .into_any_element()
+            .tip(row_tooltip(commit));
+
+        let hash_for_click = hash_full.clone();
+        row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            window.focus(&this.focus, cx);
+            // ⚠️ 双击打开 diff(`GitHistoryContent.tsx:105`);单击 = 选中
+            if event.click_count() >= 2 {
+                this.view_commit(index, window, cx);
+            } else {
+                this.select_hash(hash_for_click.clone(), window, cx);
+            }
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.focus(&this.focus, cx);
+                this.select_hash(hash_full.clone(), window, cx);
+                actions::open_commit_menu(this, index, event.position, window, cx);
+            }),
+        )
+        .into_any_element()
     }
+}
+
+/// 列表末尾那一行「加载更多… / 搜索中…」(共用的加载提示行)。高度与提交行一致
+/// (uniform_list 按行等高排)。
+fn footer_row(text: String) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(GRAPH_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(git_ui::busy_line(text))
+        .into_any_element()
 }
 
 // ─── 拓扑图单元格(自绘) ─────────────────────────────────────
 
-/// 一行的拓扑图。宽度 = [`GraphLayout::width`],高度恒为 48px。
+/// 一行的拓扑图。宽度 = [`GraphLayout::width`],高度恒为 [`GRAPH_ROW_HEIGHT`]。
 ///
 /// # 渐变的取舍
 ///
@@ -549,10 +1676,18 @@ impl GitHistoryContent {
 struct GraphCell {
     row: GraphRow,
     width: f32,
+    /// HEAD 所在的提交:节点外加一圈 accent 环。
+    is_head: bool,
+    /// 行被选中(合并节点的空心底要跟着行底换色)。
+    selected: bool,
 }
 
-/// 渐变分段数。段与段之间留一点重叠(见 `paint`),8 段在 48px 行高上已看不出台阶。
+/// 渐变分段数。段与段之间留一点重叠(见 `paint`),8 段在行高上已看不出台阶。
 const GRADIENT_STEPS: usize = 8;
+/// 连线线宽。
+const GRAPH_STROKE: f32 = 1.75;
+/// 节点半径。
+const NODE_RADIUS: f32 = 4.5;
 
 impl IntoElement for GraphCell {
     type Element = Self;
@@ -579,12 +1714,7 @@ fn sample(path: &SegPath, t: f32) -> (f32, f32) {
         SegPath::Line { x, y0, y1 } => (*x, y0 + (y1 - y0) * t),
         SegPath::Cubic { p0, c1, c2, p1 } => {
             let u = 1.0 - t;
-            let (b0, b1, b2, b3) = (
-                u * u * u,
-                3.0 * u * u * t,
-                3.0 * u * t * t,
-                t * t * t,
-            );
+            let (b0, b1, b2, b3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
             (
                 b0 * p0.0 + b1 * c1.0 + b2 * c2.0 + b3 * p1.0,
                 b0 * p0.1 + b1 * c1.1 + b2 * c2.1 + b3 * p1.1,
@@ -641,9 +1771,8 @@ impl Element for GraphCell {
         _cx: &mut App,
     ) {
         let origin = bounds.origin;
-        let map = |(x, y): (f32, f32)| -> Point<Pixels> {
-            point(origin.x + px(x), origin.y + px(y))
-        };
+        let map =
+            |(x, y): (f32, f32)| -> Point<Pixels> { point(origin.x + px(x), origin.y + px(y)) };
 
         for seg in &self.row.segments {
             let Some(path) = segment_path(seg, self.row.lane) else {
@@ -651,7 +1780,7 @@ impl Element for GraphCell {
             };
             let color = palette_color(seg.color);
             if !git_graph::needs_gradient(seg) {
-                let mut builder = PathBuilder::stroke(px(1.5));
+                let mut builder = PathBuilder::stroke(px(GRAPH_STROKE));
                 match path {
                     SegPath::Line { x, y0, y1 } => {
                         builder.move_to(map((x, y0)));
@@ -680,7 +1809,7 @@ impl Element for GraphCell {
                 } else {
                     lerp_color(color, end, (mid - 0.7) / 0.3)
                 };
-                let mut builder = PathBuilder::stroke(px(1.5));
+                let mut builder = PathBuilder::stroke(px(GRAPH_STROKE));
                 builder.move_to(map(sample(&path, t0)));
                 // 分段本身用折线近似:一段只占整条曲线的 1/8,直线误差 < 0.5px
                 builder.line_to(map(sample(&path, mid)));
@@ -695,16 +1824,28 @@ impl Element for GraphCell {
         let cx_pos = git_graph::lane_x(self.row.lane as i32);
         let cy = GRAPH_ROW_HEIGHT / 2.0;
         let color = palette_color(self.row.color);
+        if self.is_head {
+            // HEAD:节点外一圈 accent 环(外沿 7.25px,不压到相邻 lane 的线)
+            paint_circle(
+                window,
+                map,
+                (cx_pos, cy),
+                NODE_RADIUS + 2.0,
+                None,
+                ui::accent(),
+            );
+        }
         if self.row.is_merge {
-            // 合并:空心大圈(半透明)+ 实心小点
-            paint_circle(window, map, (cx_pos, cy), 5.5, None, {
-                let mut c = color;
-                c.a *= 0.55;
-                c
-            });
-            paint_circle(window, map, (cx_pos, cy), 3.0, Some(()), color);
+            // 合并:空心圈。先垫一层与行底同色的实心,免得连线从圈里穿过;
+            // 选中行的底是面板底 + accent_subtle 叠加,这里照样叠两层
+            for ground in
+                std::iter::once(ui::bg_surface()).chain(self.selected.then(ui::accent_subtle))
+            {
+                paint_circle(window, map, (cx_pos, cy), NODE_RADIUS, Some(()), ground);
+            }
+            paint_circle(window, map, (cx_pos, cy), NODE_RADIUS - 0.75, None, color);
         } else {
-            paint_circle(window, map, (cx_pos, cy), 4.0, Some(()), color);
+            paint_circle(window, map, (cx_pos, cy), NODE_RADIUS, Some(()), color);
         }
     }
 }
@@ -718,7 +1859,7 @@ fn paint_circle(
     fill: Option<()>,
     color: Hsla,
 ) {
-    const SEGMENTS: usize = 20;
+    const SEGMENTS: usize = 24;
     let mut builder = match fill {
         Some(()) => PathBuilder::fill(),
         None => PathBuilder::stroke(px(1.5)),
@@ -832,6 +1973,28 @@ mod tests {
         );
     }
 
+    /// 刚新建的分支与 main 同一提交:只挂 HEAD 指着的那条(`is_head` 按名字认,见
+    /// `get_repo_branches`)。main 既不冒充当前分支,也不把真正的当前分支挤进「+1」;
+    /// 当前分支没配上游时 main 的上游也不挂。游离 HEAD 时没有分支是 `is_head`,一条不挂
+    /// (行上只有 `row_refs` 补的那枚 HEAD)。
+    #[test]
+    fn 同一提交上只挂当前分支() {
+        let branches = vec![
+            branch("main", "c1", false, Some("origin/main")),
+            branch("feature", "c1", true, None),
+            branch("origin/main", "c1", false, None),
+        ];
+        assert_eq!(
+            names(&pick_shown_branches(&branches, Some("feature"), None, "c1")),
+            vec!["feature"]
+        );
+        let detached = vec![
+            branch("main", "c1", false, Some("origin/main")),
+            branch("feature", "c1", false, None),
+        ];
+        assert!(pick_shown_branches(&detached, Some("(c1)"), None, "c1").is_empty());
+    }
+
     /// 查看别的本地分支:挂它自己 + 它的上游,HEAD 胶囊照旧保留;
     /// 查看的是远程分支 / 分支没配上游 / detached HEAD 都不再多挂。
     #[test]
@@ -912,6 +2075,102 @@ mod tests {
         let date = format_relative_time(now - 2_592_000, now);
         assert_eq!(date.len(), 10, "{date}");
         assert_eq!(date.matches('-').count(), 2, "{date}");
+    }
+
+    /// 绝对时间精确到分;行 tooltip 三段齐全。
+    #[test]
+    fn 绝对时间与行提示() {
+        let abs = format_absolute_time(1_700_000_000);
+        assert_eq!(abs.len(), 16, "{abs}");
+        let mut c = test_commit("abcdef1234", &[]);
+        c.message = "fix: something".into();
+        let tip = row_tooltip(&c);
+        let lines: Vec<_> = tip.lines().collect();
+        assert_eq!(lines[0], "fix: something");
+        assert!(lines[1].starts_with("tester · ") && lines[1].ends_with("abcdef1"));
+    }
+
+    /// 详情区时间:30 天以上相对时间就是日期本身,不再括号里重复一遍;
+    /// 近期的照旧「绝对  (相对)」。
+    #[test]
+    fn 详情时间不重复日期() {
+        let ts = 1_700_000_000;
+        let old = format_detail_time(ts, ts + 90 * 86_400);
+        assert_eq!(old, format_absolute_time(ts));
+        assert!(!old.contains('('), "{old}");
+        let recent = format_detail_time(ts, ts + 3 * 3600);
+        assert_eq!(
+            recent,
+            format!(
+                "{}  ({})",
+                format_absolute_time(ts),
+                format_relative_time(ts, ts + 3 * 3600)
+            )
+        );
+    }
+
+    /// 切分支 / 重置后重载:选中的提交不在新列表里就作废,还在就留着;没选中不算作废。
+    #[test]
+    fn 重载后选中不在列表里就作废() {
+        let commits = vec![test_commit("aaa", &["bbb"]), test_commit("bbb", &[])];
+        assert!(selection_survives(None, &commits));
+        assert!(selection_survives(Some("bbb"), &commits));
+        assert!(!selection_survives(Some("ccc"), &commits));
+        assert!(!selection_survives(Some("aaa"), &[]));
+    }
+
+    /// 过滤条件:「仅我的」查不到邮箱时不算生效;路径是仓库根不算;几项都给时一起带下去。
+    #[test]
+    fn 过滤条件是否生效() {
+        assert!(!filter_active("", None, false, None));
+        assert!(!filter_active("", None, true, None), "没有邮箱不算");
+        assert!(filter_active("", None, true, Some("me@x.y")));
+        assert!(
+            !filter_active("", None, false, Some("me@x.y")),
+            "开关关着邮箱不算"
+        );
+        assert!(filter_active("fix", None, false, None));
+        assert!(filter_active("", Some("src/ui"), false, None));
+        assert!(
+            !filter_active("", Some("./"), false, None),
+            "仓库根 = 不过滤"
+        );
+    }
+
+    /// 过滤框解析:`path:` 段拆出来当路径,其余是关键词;引号包住带空格的路径;
+    /// 多段取最后一段;词中间的 `path:` 不算;空值不算。
+    #[test]
+    fn 过滤框解析路径段() {
+        let parse = |s: &str| {
+            let (text, path) = parse_filter_query(s);
+            (text, path.unwrap_or_default())
+        };
+        let pair = |text: &str, path: &str| (text.to_string(), path.to_string());
+        assert_eq!(parse("fix bug"), pair("fix bug", ""));
+        assert_eq!(
+            parse("  fix  bug  "),
+            pair("fix  bug", ""),
+            "关键词里的空白原样"
+        );
+        assert_eq!(parse("path:src/ui"), pair("", "src/ui"));
+        assert_eq!(parse("fix path:src/ui bug"), pair("fix bug", "src/ui"));
+        assert_eq!(parse("PATH:src fix"), pair("fix", "src"), "前缀不分大小写");
+        assert_eq!(
+            parse(r#"path:"my dir/a b.rs" fix"#),
+            pair("fix", "my dir/a b.rs")
+        );
+        assert_eq!(
+            parse(r#"fix path:"unterminated x"#),
+            pair("fix", "unterminated x")
+        );
+        assert_eq!(parse("path:a path:b"), pair("", "b"), "多段取最后一段");
+        assert_eq!(parse("xpath:abc"), pair("xpath:abc", ""), "词中间的不算");
+        assert_eq!(parse("fix path:"), pair("fix", ""), "空值不算");
+        assert_eq!(
+            parse("中文 path:文档/说明.md"),
+            pair("中文", "文档/说明.md")
+        );
+        assert_eq!(parse(""), pair("", ""));
     }
 
     /// 贝塞尔采样:两端点必须落在路径端点上(渐变分段接得住)。

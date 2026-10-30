@@ -81,11 +81,11 @@ pub struct NotifyPrefs {
     pub attention_notify: bool,
 }
 
-/// toast 的五种口径,与旧版 `AiCompletionNotification['kind']` 同集
+/// toast 的口径。前五种与旧版 `AiCompletionNotification['kind']` 同集
 /// (旧版 `kind` 缺省即 [`Completion`](Self::Completion),`store.ts:1035` 的判据
-/// 显式把 `undefined` 算进完成态)。
+/// 显式把 `undefined` 算进完成态);末两种是 GPUI 版加的通用档(Git 面板的结果 toast)。
 ///
-/// [`AlertPlan`] 只会产出前两种 —— 后三种由别处直接推(见 [`crate::toast`])。
+/// [`AlertPlan`] 只会产出前两种 —— 其余由别处直接推(见 [`crate::toast`])。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     /// AI 任务完成。
@@ -98,6 +98,12 @@ pub enum ToastKind {
     MobileSession,
     /// 长文本转存 / 远程上传失败(`terminalCache.ts:690-695`)。
     PasteError,
+    /// 通用的信息提示(`i` 图标、点击只关闭、正文取 `message`)。外观同 [`Self::WslInfo`],
+    /// 名字不再借用 WSL 的语义。
+    Info,
+    /// 通用的失败 / 需要留意(`!` 图标、错误色、点击只关闭、正文取 `message`)。外观同
+    /// [`Self::PasteError`]。
+    Error,
 }
 
 impl ToastKind {
@@ -108,8 +114,8 @@ impl ToastKind {
     pub fn icon_char(self) -> &'static str {
         match self {
             Self::Completion => "✓",
-            Self::Attention | Self::PasteError => "!",
-            Self::WslInfo | Self::MobileSession => "i",
+            Self::Attention | Self::PasteError | Self::Error => "!",
+            Self::WslInfo | Self::MobileSession | Self::Info => "i",
         }
     }
 
@@ -128,7 +134,10 @@ impl ToastKind {
     /// 正文取自 `message` 字段吗(`false` = 按 kind 取固定文案)。
     /// 判定链照抄 `ToastContainer.tsx:57-63`。
     pub fn uses_message(self) -> bool {
-        matches!(self, Self::WslInfo | Self::MobileSession | Self::PasteError)
+        matches!(
+            self,
+            Self::WslInfo | Self::MobileSession | Self::PasteError | Self::Info | Self::Error
+        )
     }
 }
 
@@ -664,12 +673,18 @@ mod toast_kind_tests {
             "wsl-info 的 projectId 是占位串"
         );
         assert!(!PasteError.jumps_to_project(), "粘贴失败的项目就在眼前");
+        assert!(!Info.jumps_to_project() && !Error.jumps_to_project());
 
         assert!(!Completion.uses_message());
         assert!(!Attention.uses_message());
         assert!(WslInfo.uses_message());
         assert!(MobileSession.uses_message());
         assert!(PasteError.uses_message());
+
+        // 通用两档与借用的那两档外观一致
+        assert_eq!(Info.icon_char(), WslInfo.icon_char());
+        assert_eq!(Error.icon_char(), PasteError.icon_char());
+        assert!(Info.uses_message() && Error.uses_message());
     }
 }
 

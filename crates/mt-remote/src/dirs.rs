@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use mt_config::SshConnection;
 use mt_core::path_key::posix_ci_eq_key;
-use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
+use mt_project::fs::{FileEntry, TextGitignore, is_always_hidden, natural_cmp};
 
 use super::{
     DEFAULT_REMOTE_PASTE_DIR, GITIGNORE_MAX_BYTES, expand_tilde, join_posix, lock, open_sftp,
@@ -96,7 +96,7 @@ pub(super) fn paste_file_name(local_path: &str) -> Result<String, String> {
 /// [`FileEntry`] 列表。
 ///
 /// 忽略过滤 = 项目根 `.gitignore`(读一次、按 connId+projectRoot 缓存)
-/// + [`ALWAYS_IGNORE`] 固定黑名单(目录直接隐藏)。
+/// + [`is_always_hidden`] 固定黑名单(目录与 `.git` 指针文件直接隐藏)。
 ///
 /// `refresh_ignore=true` 强制重读 .gitignore(树顶手动刷新按钮用)。
 ///
@@ -146,8 +146,8 @@ pub fn list_directory(
                     if !valid_remote_name(&e.name) {
                         return None;
                     }
-                    // ALWAYS_IGNORE 目录完全隐藏(与本地树一致)
-                    if e.is_dir && ALWAYS_IGNORE.contains(&e.name.as_str()) {
+                    // ALWAYS_IGNORE 目录与 worktree 根下的 `.git` 文件完全隐藏(与本地树一致)
+                    if is_always_hidden(&e.name, e.is_dir) {
                         return None;
                     }
                     let full = join_posix(path, &e.name);
