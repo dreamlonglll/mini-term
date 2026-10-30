@@ -2429,6 +2429,12 @@ impl TerminalArea {
                 gpui::SharedString::from(format!("term-search-{leaf_id}")),
                 ICON_SEARCH,
             )
+            // 快捷键取自键位表(与设置页 / 首启引导同一份),改键位不必改这里
+            .tip(tr!(
+                "paneGroup",
+                "searchTooltip",
+                shortcut = crate::hotkeys::hotkey_label("terminalSearch")
+            ))
             .on_click(cx.listener(move |this, _event, window, cx| {
                 cx.stop_propagation();
                 let pane = this.store.read(cx).terminal(pty_id).cloned();
@@ -2537,6 +2543,11 @@ impl TerminalArea {
                     gpui::SharedString::from(format!("split-right-{leaf_id}")),
                     ICON_SPLIT_RIGHT,
                 )
+                .tip(tr!(
+                    "paneGroup",
+                    "splitRightTooltip",
+                    shortcut = crate::hotkeys::hotkey_label("splitRight")
+                ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
                     this.store.update(cx, |store, cx| {
@@ -2555,6 +2566,11 @@ impl TerminalArea {
                     gpui::SharedString::from(format!("split-down-{leaf_id}")),
                     ICON_SPLIT_DOWN,
                 )
+                .tip(tr!(
+                    "paneGroup",
+                    "splitDownTooltip",
+                    shortcut = crate::hotkeys::hotkey_label("splitDown")
+                ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
                     this.store.update(cx, |store, cx| {
@@ -2587,6 +2603,11 @@ impl TerminalArea {
                             .bg(ui::border_subtle())
                             .text_color(ui::color_error())
                     })
+                    .tip(tr!(
+                        "paneGroup",
+                        "closePaneTooltip",
+                        shortcut = crate::hotkeys::hotkey_label("closePane")
+                    ))
                     // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         cx.stop_propagation();
@@ -4411,6 +4432,36 @@ mod tests {
         assert_eq!(hotkey_label(true, true, false, "D"), "Ctrl+Shift+D");
         assert_eq!(hotkey_label(true, true, false, "E"), "Ctrl+Shift+E");
         assert_eq!(hotkey_label(true, true, false, "W"), "Ctrl+Shift+W");
+    }
+
+    /// 控制条四颗按钮的悬停提示按 id 取键位表:id 写错会静默变成空串(提示里只剩
+    /// 一对空括号),这里逐个钉住,并确认与 tab 右键菜单显示的是同一组键。
+    #[test]
+    fn 控制条提示里的快捷键取得到() {
+        for id in ["terminalSearch", "splitRight", "splitDown", "closePane"] {
+            assert!(
+                !crate::hotkeys::hotkey_label(id).is_empty(),
+                "键位表里没有 {id}"
+            );
+        }
+        assert_eq!(
+            crate::hotkeys::hotkey_label("splitRight"),
+            hotkey_label(true, true, false, "D")
+        );
+        assert_eq!(
+            crate::hotkeys::hotkey_label("splitDown"),
+            hotkey_label(true, true, false, "E")
+        );
+        assert_eq!(
+            crate::hotkeys::hotkey_label("closePane"),
+            hotkey_label(true, true, false, "W")
+        );
+        let tip = tr!(
+            "paneGroup",
+            "splitRightTooltip",
+            shortcut = crate::hotkeys::hotkey_label("splitRight")
+        );
+        assert!(!tip.contains('{'), "占位符没换干净: {tip}");
     }
 
     /// marker 按钮的锚点由控件簇的布局常量算出(原版是量 DOM 矩形)。

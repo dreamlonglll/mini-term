@@ -443,6 +443,87 @@ fn description(item: &ToastItem) -> SharedString {
     }
 }
 
+// ─── 正文里的路径:整段换行,不在斜杠处断开 ─────────────────────
+
+/// 正文一行里的一段:普通文字,或一个「路径样」的词。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DescSegment {
+    Text(String),
+    Path(String),
+}
+
+/// 汉字 / 假名(全角标点不算):路径样的词里不该有它们。
+fn is_cjk_ideograph(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{3134F}'
+    )
+}
+
+/// 一个以空白分隔的词像不像路径:带 `/` 或 `\`、且没有汉字。
+/// `origin/release/1.0）`、`（D:\x\y）` 这类连着全角括号的也算(括号随路径走,
+/// 不会单独落到下一行行首);`src/a.ts不存在` 这类与中文粘连的不算,照普通文字排。
+fn is_path_like(word: &str) -> bool {
+    word.contains(['/', '\\']) && !word.chars().any(is_cjk_ideograph)
+}
+
+/// 正文一行拆成「普通文字 / 路径」交替的段:路径样的词单独成段(连同它后面的空白),
+/// 相邻的普通词并成一段。没有路径样的词时整行就是一段 `Text`。
+///
+/// 为什么要拆:gpui 的折行把 `/` 当断点,`已推送 3 个提交到 origin/feature/from-remote`
+/// 在 280px 的卡片里会断成 `…origin/feature` + `/from-remote`,读着像两段(第四轮
+/// E2E A4/A9)。拆开后路径是 flex-wrap 行里的一个独立项:放得下就跟在后面,放不下就
+/// **整段**挪到下一行;只有比一整行还长时才在它自己内部折(那时在斜杠处断正合适)。
+fn split_path_segments(line: &str) -> Vec<DescSegment> {
+    let mut out: Vec<DescSegment> = Vec::new();
+    for piece in line.split_inclusive(char::is_whitespace) {
+        if is_path_like(piece.trim_end()) {
+            out.push(DescSegment::Path(piece.to_string()));
+        } else if let Some(DescSegment::Text(text)) = out.last_mut() {
+            text.push_str(piece);
+        } else {
+            out.push(DescSegment::Text(piece.to_string()));
+        }
+    }
+    out
+}
+
+/// toast 正文。不含路径时就是原样一段文字(与以前逐像素相同);含路径时逐行排成
+/// flex-wrap,路径段整段换行(见 [`split_path_segments`])。字号颜色由外层给。
+fn render_description(desc: SharedString) -> gpui::AnyElement {
+    let has_path = desc.split('\n').any(|line| {
+        split_path_segments(line)
+            .iter()
+            .any(|segment| matches!(segment, DescSegment::Path(_)))
+    });
+    if !has_path {
+        return desc.into_any_element();
+    }
+    let mut column = div().flex().flex_col();
+    for line in desc.split('\n') {
+        let mut row = div().flex().flex_wrap();
+        let segments = split_path_segments(line);
+        if segments.is_empty() {
+            // 空行也占一行高
+            row = row.child(div().child(" "));
+        }
+        for segment in segments {
+            let text = match segment {
+                DescSegment::Text(text) | DescSegment::Path(text) => text,
+            };
+            // `min_w_0`:gpui 的文字报给 flex 的最小宽度是整行不折的宽度,不压到 0
+            // 的话长文字段宁可撑破卡片也不折行
+            row = row.child(div().min_w_0().child(text));
+        }
+        column = column.child(row);
+    }
+    column.into_any_element()
+}
+
 impl Render for ToastLayer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 先拍快照:下面每条都要 `cx.listener`,边遍历边借 self 不划算
@@ -544,7 +625,7 @@ impl Render for ToastLayer {
                                         .mt(px(1.0))
                                         .text_size(ui::font_px(10.0))
                                         .text_color(ui::text_secondary())
-                                        .child(desc),
+                                        .child(render_description(desc)),
                                 ),
                         )
                         .child(
@@ -601,6 +682,72 @@ impl Render for ToastLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text(s: &str) -> DescSegment {
+        DescSegment::Text(s.to_string())
+    }
+
+    fn path(s: &str) -> DescSegment {
+        DescSegment::Path(s.to_string())
+    }
+
+    /// 路径样的词单独成段(连着全角括号也算),其余并成普通文字;
+    /// 拼回去与原文逐字相同(空白一个不丢)。
+    #[test]
+    fn 正文里的路径单独成段() {
+        let line = "已检出 release/1.0（跟踪 origin/release/1.0）";
+        let segments = split_path_segments(line);
+        assert_eq!(
+            segments,
+            vec![
+                text("已检出 release/1.0（跟踪 "),
+                path("origin/release/1.0）"),
+            ],
+            "与汉字粘连的 `release/1.0（跟踪` 照普通文字排"
+        );
+        let line = "已推送 3 个提交到 origin/feature/from-remote";
+        assert_eq!(
+            split_path_segments(line),
+            vec![
+                text("已推送 3 个提交到 "),
+                path("origin/feature/from-remote")
+            ]
+        );
+        // Windows 路径、多个路径并列
+        let line = r"overwritten: D:\Git\a.ts src/b.ts done";
+        let segments = split_path_segments(line);
+        assert_eq!(
+            segments,
+            vec![
+                text("overwritten: "),
+                path(r"D:\Git\a.ts "),
+                path("src/b.ts "),
+                text("done"),
+            ]
+        );
+        let rebuilt: String = segments
+            .into_iter()
+            .map(|segment| match segment {
+                DescSegment::Text(piece) | DescSegment::Path(piece) => piece,
+            })
+            .collect();
+        assert_eq!(rebuilt, line);
+    }
+
+    /// 没有路径的正文整行一段 —— 渲染走原来那条「一段文字」的路,版式不变。
+    #[test]
+    fn 无路径的正文不拆() {
+        assert_eq!(
+            split_path_segments("已检出 main"),
+            vec![text("已检出 main")]
+        );
+        assert_eq!(
+            split_path_segments("路径 src/a.ts不存在"),
+            vec![text("路径 src/a.ts不存在")],
+            "与汉字粘连的不算路径"
+        );
+        assert!(split_path_segments("").is_empty());
+    }
 
     fn item(project: &str, kind: ToastKind) -> ToastItem {
         ToastItem {

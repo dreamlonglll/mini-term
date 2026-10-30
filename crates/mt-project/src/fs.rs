@@ -178,6 +178,17 @@ pub const ALWAYS_IGNORE: &[&str] = &[
     ".superpowers",
 ];
 
+/// 这一项要不要从文件树 / 搜索里整个藏掉:[`ALWAYS_IGNORE`] 里的目录,外加名为
+/// `.git` 的**文件** —— linked worktree 与子模块的根下 `.git` 不是目录,而是一行
+/// `gitdir: …` 指针;普通仓库的 `.git` 目录一直是藏着的,它也按同一口径藏。
+pub fn is_always_hidden(name: &str, is_dir: bool) -> bool {
+    if is_dir {
+        ALWAYS_IGNORE.contains(&name)
+    } else {
+        name == ".git"
+    }
+}
+
 /// 纯字符串版剥 Windows verbatim 前缀,跨平台可测:
 /// - `\\?\C:\foo` → `Some("C:\\foo")`
 /// - `\\?\UNC\wsl$\Ubuntu\home` → `Some("\\\\wsl$\\Ubuntu\\home")`
@@ -327,8 +338,8 @@ pub fn list_directory(project_root: &Path, path: &Path) -> Result<Vec<FileEntry>
             let name = entry.file_name().to_string_lossy().to_string();
             let is_dir = entry.file_type().ok()?.is_dir();
             let full_path = entry.path();
-            // ALWAYS_IGNORE 目录仍然完全隐藏
-            if is_dir && ALWAYS_IGNORE.contains(&name.as_str()) {
+            // ALWAYS_IGNORE 目录与 worktree 根下的 `.git` 文件仍然完全隐藏
+            if is_always_hidden(&name, is_dir) {
                 return None;
             }
             let ignored = is_path_ignored(&gitignores, &full_path, is_dir);
@@ -1030,6 +1041,41 @@ mod tests {
         assert!(ALWAYS_IGNORE.contains(&".git"));
         assert!(ALWAYS_IGNORE.contains(&"node_modules"));
         assert!(ALWAYS_IGNORE.contains(&"target"));
+    }
+
+    /// `.git` 不论是目录(普通仓库)还是文件(linked worktree / 子模块)都藏;
+    /// 其余黑名单只认目录 —— 叫 `target` 的文件照常显示。
+    #[test]
+    fn always_hidden_covers_git_file_but_not_other_files() {
+        assert!(is_always_hidden(".git", true));
+        assert!(is_always_hidden(".git", false));
+        assert!(is_always_hidden("node_modules", true));
+        assert!(!is_always_hidden("node_modules", false));
+        assert!(!is_always_hidden("target", false));
+        assert!(!is_always_hidden(".gitignore", false));
+        assert!(!is_always_hidden("src", true));
+    }
+
+    /// worktree 设为项目后,根下那个 `.git` 指针文件不进文件树(第四轮 E2E A14)。
+    #[test]
+    fn list_directory_hides_worktree_git_file() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-fs-gitfile-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(".git"), "gitdir: D:/repo/.git/worktrees/wt\n").unwrap();
+        fs::write(root.join(".gitignore"), "").unwrap();
+        let names: Vec<String> = list_directory(&root, &root)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["src", ".gitignore"]);
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
