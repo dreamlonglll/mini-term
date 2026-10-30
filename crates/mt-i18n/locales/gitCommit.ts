@@ -64,7 +64,7 @@ export const gitCommit = {
 
     // ── 提交区 ──
     placeholderBranch: "提交到 {branch}（{shortcut}）",
-    placeholderDetached: "提交到游离的 HEAD {hash}（{shortcut}）",
+    placeholderDetached: "提交到分离 HEAD {hash}（{shortcut}）",
     amend: "修改上次提交（Amend）",
     amendTip: "改写上次提交：只改消息，或把暂存区并进上次提交",
     amendNoHead: "仓库还没有任何提交，没有可修改的上次提交",

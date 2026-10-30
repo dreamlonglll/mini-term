@@ -29,7 +29,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::dialog::{Confirm as DialogConfirm, DialogFooter};
-use gpui_component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use mt_project::git::{self, CommitRelation, GitCommitInfo, PickOutcome, ResetMode};
 
 use super::{GitHistoryContent, GitHistoryEvent};
@@ -60,6 +60,10 @@ struct DialogForm {
     mode: ResetMode,
     /// 重置:会不会丢掉已推送的提交(后台判定,回来之前按不会)。
     drops_pushed: bool,
+    /// 新建分支 / 标签:名字框动过(或回车提交过)。空名要等它才报,一打开不红。
+    touched: bool,
+    /// 盯名字输入框的改动(置 `touched`)。只有新建分支 / 标签挂。
+    _sub: Option<gpui::Subscription>,
 }
 
 impl DialogForm {
@@ -69,7 +73,25 @@ impl DialogForm {
             checkout: true,
             mode: ResetMode::Mixed,
             drops_pushed: false,
+            touched: false,
+            _sub: None,
         }
+    }
+
+    /// 带名字输入框的表单(新建分支 / 标签):输入框一有改动就置 `touched`。
+    fn watching(input: &Entity<InputState>, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| {
+            let sub = cx.subscribe(input, |form: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) && !form.touched {
+                    form.touched = true;
+                    cx.notify();
+                }
+            });
+            Self {
+                _sub: Some(sub),
+                ..Self::new()
+            }
+        })
     }
 }
 
@@ -770,9 +792,9 @@ impl GitHistoryContent {
             return;
         }
         let entity = cx.entity();
-        let form = cx.new(|_| DialogForm::new());
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "branch.placeholder")));
+        let form = DialogForm::watching(&input, cx);
         let existing: Vec<String> = self
             .branches
             .iter()
@@ -797,11 +819,13 @@ impl GitHistoryContent {
                 let invalid = validate_branch(&name, &existing);
                 let f = form.read(cx);
                 let (busy, error, checkout) = (f.op.busy, f.op.error.clone(), f.checkout);
+                let can_submit = invalid.is_none();
+                let notice = invalid.filter(|_| !name.is_empty() || f.touched);
                 let form_toggle = form.clone();
-                // 名字一边打一边校验(空名不报,等点「创建」再说)
+                // 名字一边打一边校验(空名等动过输入框才报,一打开不红)
                 let name_field = field_group(t("gitLog", "branch.nameLabel"))
                     .child(Input::new(&input))
-                    .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
+                    .when_some(notice, |el, msg| {
                         el.child(git_ui::notice_line(msg, ui::color_error()))
                     });
                 let checkout_row = git_ui::check_row(
@@ -827,7 +851,7 @@ impl GitHistoryContent {
                     .title(t("gitLog", "branch.title"))
                     .w(px(git_ui::DIALOG_W_MD))
                     .overlay_closable(true)
-                    .footer(form_footer(t("gitLog", "branch.ok"), false, busy))
+                    .footer(name_form_footer(t("gitLog", "branch.ok"), busy, can_submit))
                     .child(
                         git_ui::form_body()
                             .child(git_ui::hint_line(base.clone()))
@@ -840,9 +864,10 @@ impl GitHistoryContent {
                             return false;
                         }
                         let name = input_ok.read(cx).value().trim().to_string();
-                        if let Some(msg) = validate_branch(&name, &existing) {
+                        // 不合法(含空名)已在名字框下就地报着;回车提交的空名补上标记让它报出来
+                        if validate_branch(&name, &existing).is_some() {
                             form_ok.update(cx, |f, cx| {
-                                f.op.fail(msg);
+                                f.touched = true;
                                 cx.notify();
                             });
                             return false;
@@ -892,9 +917,9 @@ impl GitHistoryContent {
             return;
         }
         let entity = cx.entity();
-        let form = cx.new(|_| DialogForm::new());
         let name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "tag.placeholder")));
+        let form = DialogForm::watching(&name_input, cx);
         // ⚠️ 高度只认 `auto_grow`:普通多行模式下 `rows` 不参与布局(恒为一行高),
         // 见 `git_ui::error_text_state` 的注释
         let message_input = cx.new(|cx| {
@@ -921,6 +946,8 @@ impl GitHistoryContent {
                 let invalid = validate_tag(&name, &existing);
                 let f = form.read(cx);
                 let (busy, error) = (f.op.busy, f.op.error.clone());
+                let can_submit = invalid.is_none();
+                let notice = invalid.filter(|_| !name.is_empty() || f.touched);
                 let (entity, form_ok, name_ok, message_ok, hash, existing) = (
                     entity.clone(),
                     form.clone(),
@@ -933,14 +960,14 @@ impl GitHistoryContent {
                     .title(t("gitLog", "tag.title"))
                     .w(px(git_ui::DIALOG_W_MD))
                     .overlay_closable(true)
-                    .footer(form_footer(t("gitLog", "branch.ok"), false, busy))
+                    .footer(name_form_footer(t("gitLog", "branch.ok"), busy, can_submit))
                     .child(
                         git_ui::form_body()
                             .child(git_ui::hint_line(base.clone()))
                             .child(
                                 field_group(t("gitLog", "tag.nameLabel"))
                                     .child(Input::new(&name_input))
-                                    .when_some(invalid.filter(|_| !name.is_empty()), |el, msg| {
+                                    .when_some(notice, |el, msg| {
                                         el.child(git_ui::notice_line(msg, ui::color_error()))
                                     }),
                             )
@@ -955,9 +982,10 @@ impl GitHistoryContent {
                             return false;
                         }
                         let name = name_ok.read(cx).value().trim().to_string();
-                        if let Some(msg) = validate_tag(&name, &existing) {
+                        // 不合法(含空名)已在名字框下就地报着;回车提交的空名补上标记让它报出来
+                        if validate_tag(&name, &existing).is_some() {
                             form_ok.update(cx, |f, cx| {
-                                f.op.fail(msg);
+                                f.touched = true;
                                 cx.notify();
                             });
                             return false;
@@ -1346,6 +1374,18 @@ fn form_footer(ok: &'static str, danger: bool, busy: bool) -> DialogFooter {
         Some(t("gitLog", "confirm.cancel").into()),
         danger,
         busy,
+    )
+}
+
+/// 新建分支 / 标签的页脚:名字不合法(含空名)时确认键禁用、文案不变,与分支弹窗的
+/// 新建 / 重命名、从贮藏新建分支同一口径(E2E r5 N2)。
+fn name_form_footer(ok: &'static str, busy: bool, can_submit: bool) -> DialogFooter {
+    let label = if busy { t("gitLog", "working") } else { ok };
+    git_ui::dialog_footer(
+        label,
+        Some(t("gitLog", "confirm.cancel").into()),
+        false,
+        busy || !can_submit,
     )
 }
 

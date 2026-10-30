@@ -1013,7 +1013,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("noMoreChanges", "没有更多改动"),
     ("partiallyStaged", "部分已暂存"),
     ("placeholderBranch", "提交到 {branch}（{shortcut}）"),
-    ("placeholderDetached", "提交到游离的 HEAD {hash}（{shortcut}）"),
+    ("placeholderDetached", "提交到分离 HEAD {hash}（{shortcut}）"),
     ("prevChange", "上一处改动（Shift+F7）"),
     ("prevFile", "上一个文件（{shortcut}）"),
     ("refresh", "刷新"),

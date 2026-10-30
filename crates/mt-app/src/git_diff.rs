@@ -2463,6 +2463,8 @@ fn load_commit_file_at(
 #[derive(Clone)]
 pub(crate) struct CommitFileDiffPane {
     state: Entity<DiffState>,
+    /// 当前这份是不是改了名的文件(各克隆共用):纯重命名没有改动块,正文要说一句
+    renamed: Rc<std::cell::Cell<bool>>,
 }
 
 impl CommitFileDiffPane {
@@ -2470,6 +2472,7 @@ impl CommitFileDiffPane {
         let font_size = store.read(cx).config().terminal_font_size as f32;
         Self {
             state: cx.new(|cx| DiffState::new(font_size, cx)),
+            renamed: Rc::default(),
         }
     }
 
@@ -2482,17 +2485,21 @@ impl CommitFileDiffPane {
         old_path: Option<String>,
         cx: &mut App,
     ) {
+        self.renamed
+            .set(old_path.as_deref().is_some_and(|old| old != path));
         load_commit_file_at(&self.state, repo_path, commit_hash, path, old_path, cx);
     }
 
-    /// 正文(加载中 / 出错 / 二进制 / 过大 / 正常 五选一)。
+    /// 正文(加载中 / 出错 / 二进制 / 过大 / 正常 五选一)。纯重命名与提交 diff 弹窗
+    /// 同一句说明,别留一片空白。
     pub(crate) fn body(&self, cx: &mut App) -> AnyElement {
+        let rename_only = self.renamed.get().then(|| t("gitCommit", "renameOnly"));
         render_body(
             &self.state,
             t("commitDiff", "loading"),
             t("commitDiff", "binaryFile"),
             t("commitDiff", "tooLarge"),
-            None,
+            rename_only,
             None,
             cx,
         )
