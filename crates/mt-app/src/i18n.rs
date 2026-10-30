@@ -356,6 +356,7 @@ const USED_KEYS: &[&str] = &[
     "fileViewer.forceSave",
     "fileViewer.htmlPreviewNote",
     "fileViewer.loading",
+    "fileViewer.openContainingFolder",
     "fileViewer.openInBrowser",
     "fileViewer.openWithDefaultApp",
     "fileViewer.preview",

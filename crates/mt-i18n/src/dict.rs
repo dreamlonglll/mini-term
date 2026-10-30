@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1420;
+pub const ZH_ENTRY_COUNT: usize = 1421;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1420;
+pub const EN_ENTRY_COUNT: usize = 1421;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -509,6 +509,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("mermaidEmptyDiagram", "图表为空或语法不受支持"),
     ("mermaidRenderFailed", "Mermaid 图表渲染失败，已按代码显示"),
     ("mermaidRendering", "Mermaid 图表渲染中…"),
+    ("openContainingFolder", "打开文件所在文件夹"),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("outline", "目录"),
@@ -556,6 +557,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("mermaidEmptyDiagram", "The diagram is empty or uses unsupported syntax"),
     ("mermaidRenderFailed", "Mermaid diagram could not be rendered; showing the source instead"),
     ("mermaidRendering", "Rendering Mermaid diagram…"),
+    ("openContainingFolder", "Open containing folder"),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("outline", "Outline"),
