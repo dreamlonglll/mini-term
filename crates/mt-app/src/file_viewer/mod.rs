@@ -1083,6 +1083,15 @@ impl FileViewer {
         crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::DefaultApp, path, cx);
     }
 
+    /// 「打开文件所在文件夹」:打开父目录并选中该文件(同文件树的「在文件夹中打开」)。
+    fn reveal_in_folder(&self, cx: &mut App) {
+        if self.source.is_remote() {
+            return;
+        }
+        let path = self.current_path.clone();
+        crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::Reveal, path, cx);
+    }
+
     fn download_remote_file(&self, window: &mut Window, cx: &mut App) {
         let DocumentSource::Remote {
             project_id,
@@ -1440,7 +1449,8 @@ impl FileViewer {
             })
     }
 
-    /// 居中一行字 + 一个「使用默认工具打开」按钮(二进制 / 过大 / 图片解不出来)。
+    /// 居中一行字 +「使用默认工具打开」「打开文件所在文件夹」两个按钮
+    /// (二进制 / 过大 / 图片解不出来)。
     fn render_fallback(
         &self,
         id: &'static str,
@@ -1459,12 +1469,27 @@ impl FileViewer {
             .text_color(ui::text_muted())
             .child(message)
             .when(!remote, |el| {
+                // 行内不设 items_center:子项按默认 stretch 拉成同高,
+                // 带边框的 ghost 与无边框的 primary 才不会差 2px
                 el.child(
-                    ui::primary_button(id, t("fileViewer", "openWithDefaultApp")).on_click(
-                        cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.open_with_default_app(cx)
-                        }),
-                    ),
+                    div()
+                        .flex()
+                        .gap(px(12.0))
+                        .child(
+                            ui::primary_button(id, t("fileViewer", "openWithDefaultApp"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.open_with_default_app(cx)
+                                })),
+                        )
+                        .child(
+                            ui::ghost_button(
+                                "file-viewer-reveal-in-folder",
+                                t("fileViewer", "openContainingFolder"),
+                            )
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _window, cx| this.reveal_in_folder(cx),
+                            )),
+                        ),
                 )
             })
             .when(remote, |el| el.child(t("fileViewer", "remoteDownloadHint")))

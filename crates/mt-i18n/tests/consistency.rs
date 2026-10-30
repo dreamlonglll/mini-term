@@ -124,8 +124,10 @@ use mt_i18n::{
 /// 934 → 939：设置页新增「环境变量」页（全局终端环境变量），侧栏项
 /// `settings.menu.envVars` 与页内四条（`settings.envVars.{section,addVar,hint,hasErrors}`）；
 /// 表格本身复用项目环境变量弹窗的 `envVars.*`。
+/// 939 → 940：文件页签回落页（二进制 / 过大 / 解不出）在「使用默认工具打开」旁加
+/// 「打开文件所在文件夹」（`fileViewer.openContainingFolder`）。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 939;
+const EXPECTED_ENTRIES_PER_LANG: usize = 940;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
