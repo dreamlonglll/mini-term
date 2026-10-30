@@ -1526,10 +1526,11 @@ impl FileViewer {
                         .flex()
                         .gap(px(12.0))
                         .child(
-                            ui::primary_button(id, t("fileViewer", "openWithDefaultApp"))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            ui::primary_button(id, t("fileViewer", "openWithDefaultApp")).on_click(
+                                cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.open_with_default_app(cx)
-                                })),
+                                }),
+                            ),
                         )
                         .child(
                             ui::ghost_button(
