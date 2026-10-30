@@ -325,6 +325,45 @@ fn flatten_tree(
     }
 }
 
+/// 列表摊开要多高(见 [`GitChanges::list_content_height`]):上下内边距 + 每个非空分组
+/// 的标题(连上外边距)+ 展开分组里的文件 / 目录行。没有变更(加载中 / 失败 / 空态整块
+/// 占位,高度不定)为 `None`。
+fn list_height(
+    changes: &[ChangeFileStatus],
+    collapsed_groups: &HashSet<Area>,
+    collapsed_dirs: &HashSet<String>,
+    tree_mode: bool,
+) -> Option<f32> {
+    if changes.is_empty() {
+        return None;
+    }
+    let mut height = LIST_PAD_Y;
+    for area in Area::ORDER {
+        let paths: Vec<(usize, &str)> = changes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| in_area(c, area))
+            .map(|(i, c)| (i, c.path.as_str()))
+            .collect();
+        if paths.is_empty() {
+            continue;
+        }
+        height += GROUP_HEADER_GAP + GROUP_HEADER_H;
+        if collapsed_groups.contains(&area) {
+            continue;
+        }
+        let rows = if tree_mode {
+            let mut rows = Vec::new();
+            flatten_tree(&build_file_tree(&paths), area, collapsed_dirs, 0, &mut rows);
+            rows.len()
+        } else {
+            paths.len()
+        };
+        height += rows as f32 * ROW_HEIGHT;
+    }
+    Some(height)
+}
+
 // ─── 组件 ─────────────────────────────────────────────────────
 
 /// 一次后台取数的结果(变更 + 冲突细节 + 提交区要的 HEAD 信息)。
@@ -466,19 +505,54 @@ impl GitChanges {
     }
 
     /// 「更改」区整块摊开(列表不滚动)要多高:列表内容 + 上下留白 + 提交区。面板分配
-    /// 「更改 / 提交历史」两块高度时用(`git_panel::section_split`)。都是上一帧量的;
+    /// 「更改 / 提交历史」两块高度时用(`git_panel::section_split`)。提交区是上一帧量的;
+    /// 列表有分组时按眼下的数据算([`Self::list_content_height`]),否则也取上一帧量的。
     /// 还没画过时为 `None`。
-    pub fn natural_height(&self) -> Option<f32> {
+    pub fn natural_height(&self, cx: &App) -> Option<f32> {
         let commit = self.commit_area_h.get();
-        let last = self.list_scroll.children_count().checked_sub(1)?;
-        let first = self.list_scroll.bounds_for_item(0)?;
-        let last = self.list_scroll.bounds_for_item(last)?;
         if commit <= 0.0 {
             return None;
         }
-        // 列表的上下内边距(4 + 8)+ 首个分组标题的上外边距 4
-        let list = f32::from(last.bottom() - first.top()) + LIST_PAD_Y + 4.0;
+        let list = match self.list_content_height(self.tree_mode(cx)) {
+            Some(list) => list,
+            None => {
+                let last = self.list_scroll.children_count().checked_sub(1)?;
+                let first = self.list_scroll.bounds_for_item(0)?;
+                let last = self.list_scroll.bounds_for_item(last)?;
+                // 列表的上下内边距(4 + 8)+ 首个分组标题的上外边距 4
+                f32::from(last.bottom() - first.top()) + LIST_PAD_Y + GROUP_HEADER_GAP
+            }
+        };
         Some(list + commit)
+    }
+
+    /// 列表摊开要多高,按**眼下的数据**算([`list_height`]),与 [`Self::render_list`] 的
+    /// 排法一一对应。
+    ///
+    /// 不按上一帧量:外部改动多出一组(未暂存)的那一帧,「更改」区还是按旧内容分的高度,
+    /// 排在最后的分组(未跟踪)被挤出可见区、下一帧才回来(E2E r4 A12 的过渡帧)。
+    fn list_content_height(&self, tree_mode: bool) -> Option<f32> {
+        list_height(
+            &self.changes,
+            &self.collapsed_groups,
+            &self.collapsed_dirs,
+            tree_mode,
+        )
+    }
+
+    /// 「更改」区最矮要多高:提交区整块 + 列表至少露出一行(列表本身更矮时按列表)。
+    /// 中缝拖到下限时面板按它兜底,提交按钮整颗露着、点得到(E2E r4 B11)。还没画过时
+    /// 为 `None`。
+    pub fn min_height(&self, cx: &App) -> Option<f32> {
+        let commit = self.commit_area_h.get();
+        if commit <= 0.0 {
+            return None;
+        }
+        let floor = commit + LIST_PAD_Y + GROUP_HEADER_GAP + ROW_HEIGHT;
+        Some(
+            self.natural_height(cx)
+                .map_or(floor, |natural| natural.min(floor)),
+        )
     }
 
     /// 换仓库(容器调)。空串 = 无仓库。
@@ -1632,6 +1706,9 @@ const ROW_HEIGHT: f32 = git_ui::ROW_H;
 const LIST_PAD_TOP: f32 = 4.0;
 const LIST_PAD_BOTTOM: f32 = 8.0;
 const LIST_PAD_Y: f32 = LIST_PAD_TOP + LIST_PAD_BOTTOM;
+/// 分组标题的高(`git_ui::SectionHeader` 的分组档)与上外边距。
+const GROUP_HEADER_H: f32 = 28.0;
+const GROUP_HEADER_GAP: f32 = 4.0;
 /// ▾ 菜单的高度估计(三项、两三项带副标题、一条分隔线;按界面字号缩放)。只用来判断
 /// 按钮下方放不放得下、放不下就往上弹,估大了只是离按钮远一点。
 const COMMIT_MENU_EST_H: f32 = 160.0;
@@ -1850,7 +1927,7 @@ impl GitChanges {
 
         header
             .build()
-            .mt(px(4.0))
+            .mt(px(GROUP_HEADER_GAP))
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if !this.collapsed_groups.remove(&area) {
                     this.collapsed_groups.insert(area);
@@ -2582,6 +2659,39 @@ mod tests {
         assert_eq!(group(&changes, Area::Staged), vec!["a.rs", "b.rs"]);
         assert_eq!(group(&changes, Area::Unstaged), vec!["b.rs", "c.rs"]);
         assert_eq!(group(&changes, Area::Untracked), vec!["d.rs"]);
+    }
+
+    /// 列表高度按眼下的数据算(E2E r4 A12:外部改动多出「未暂存」组的那一帧,按上一帧量的
+    /// 高度分区,「未跟踪」组被挤出可见区)。分组标题 28 + 上边距 4、行 28、内边距 12;
+    /// 折起来的分组只算标题;树形视图把目录行也算上;没有变更时说不准。
+    #[test]
+    fn 列表高度按数据算() {
+        let none_dirs = HashSet::new();
+        let none_groups = HashSet::new();
+        let untracked = vec![change("src/new.ts", None, Some(GitStatus::Untracked))];
+        assert_eq!(
+            list_height(&untracked, &none_groups, &none_dirs, false),
+            Some(12.0 + 32.0 + 28.0)
+        );
+        // 多出一组未暂存:两组标题 + 两行
+        let mut both = untracked.clone();
+        both.insert(0, change("src/api.ts", None, Some(GitStatus::Modified)));
+        assert_eq!(
+            list_height(&both, &none_groups, &none_dirs, false),
+            Some(12.0 + 2.0 * 32.0 + 2.0 * 28.0)
+        );
+        // 折起来的分组只算标题
+        let folded: HashSet<Area> = [Area::Untracked].into_iter().collect();
+        assert_eq!(
+            list_height(&both, &folded, &none_dirs, false),
+            Some(12.0 + 2.0 * 32.0 + 28.0)
+        );
+        // 树形:每组多一行目录 src/
+        assert_eq!(
+            list_height(&both, &none_groups, &none_dirs, true),
+            Some(12.0 + 2.0 * 32.0 + 4.0 * 28.0)
+        );
+        assert_eq!(list_height(&[], &none_groups, &none_dirs, false), None);
     }
 
     /// 取哪一个 status 由所在区决定 —— 部分暂存的文件在两组里显示的字母不同。

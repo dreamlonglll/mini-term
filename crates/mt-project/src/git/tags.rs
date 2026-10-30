@@ -105,7 +105,7 @@ pub fn create_tag(repo_path: &Path, name: &str, hash: &str, message: Option<&str
         &args,
         "tag",
         LOCAL_OP_TIMEOUT,
-        ",可能卡在 gpg 签名上",
+        "，可能卡在 gpg 签名上",
     )
 }
 

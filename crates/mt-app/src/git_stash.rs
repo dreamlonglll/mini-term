@@ -43,11 +43,11 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle,
     FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription,
     UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::dialog::Dialog;
-use gpui_component::input::{Input, InputState, TextareaState};
+use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use mt_project::git::{
     self, BranchNameIssue, GitStatus, SmartCheckoutOutcome, StashApplyOutcome, StashFileInfo,
     StashInfo, StashSaveOptions, StashSaveOutcome,
@@ -199,10 +199,14 @@ struct Form {
     hint: Option<String>,
     /// 点过确认(此后空的必填项才报错)。
     submitted: bool,
+    /// 用户动过名字输入框(此后清空也就地报错,与分支弹窗的新建 / 重命名同一口径)。
+    touched: bool,
     keep_index: bool,
     include_untracked: bool,
     /// 贮藏后检出的终态(已检出、但恢复不顺):说明 + 文件 + 原文。
     outcome: Option<(String, Vec<String>, Option<Entity<TextareaState>>)>,
+    /// 盯名字输入框的改动(置 `touched`)。只有「从贮藏新建分支」挂。
+    _sub: Option<Subscription>,
 }
 
 impl Form {
@@ -211,9 +215,11 @@ impl Form {
             op: FormOp::default(),
             hint: None,
             submitted: false,
+            touched: false,
             keep_index: false,
             include_untracked: true,
             outcome: None,
+            _sub: None,
         }
     }
 }
@@ -1534,7 +1540,7 @@ fn render_notice(notice: &Notice) -> AnyElement {
 
 // ─── 从贮藏新建分支 ───────────────────────────────────────────
 
-/// 分支名的即时校验(空名不报,等点「创建」再说)。复用分支弹窗的文案。
+/// 分支名问题对应的文案 key。复用分支弹窗的文案。
 fn branch_issue_key(issue: BranchNameIssue) -> &'static str {
     match issue {
         BranchNameIssue::Empty => "nameEmpty",
@@ -1543,6 +1549,17 @@ fn branch_issue_key(issue: BranchNameIssue) -> &'static str {
         BranchNameIssue::LeadingDash => "nameLeadingDash",
         BranchNameIssue::Reserved => "nameReserved",
         BranchNameIssue::BadFormat => "nameBadFormat",
+    }
+}
+
+/// 名字框下就地显示的问题(`None` = 显示命名提示)。边打边校验;空名要等用户**动过**
+/// 输入框(打过字又清空)或点过「创建」才报 —— 一打开就红一行不友好。与分支弹窗的新建 /
+/// 重命名同一口径(E2E r4 C9:这里原先清空不报、回车才报,那边清空即红字)。
+fn branch_name_notice(name: &str, touched: bool, submitted: bool) -> Option<&'static str> {
+    match git::validate_branch_name(name) {
+        Err(issue) if !name.is_empty() => Some(branch_issue_key(issue)),
+        Err(_) => (touched || submitted).then_some("nameEmpty"),
+        Ok(()) => None,
     }
 }
 
@@ -1558,9 +1575,20 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
         return;
     };
     let repo = PathBuf::from(&s.repo_path);
-    let form = cx.new(|_| Form::new());
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitBranch", "namePlaceholder")));
+    let form = cx.new(|cx| {
+        let sub = cx.subscribe(&input, |form: &mut Form, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && !form.touched {
+                form.touched = true;
+                cx.notify();
+            }
+        });
+        Form {
+            _sub: Some(sub),
+            ..Form::new()
+        }
+    });
     let base = tr!(
         "gitStash",
         "branch.base",
@@ -1586,17 +1614,12 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
         move |dialog, _window, cx| {
             let name = input.read(cx).value().trim().to_string();
             let f = form.read(cx);
-            // 边打边校验;空名不报,点过「创建」才报
-            let check = git::validate_branch_name(&name);
-            let invalid = match check {
-                Err(issue) if !name.is_empty() => Some(t("gitBranch", branch_issue_key(issue))),
-                Err(_) => f.submitted.then(|| t("gitBranch", "nameEmpty")),
-                Ok(()) => None,
-            };
+            let invalid =
+                branch_name_notice(&name, f.touched, f.submitted).map(|key| t("gitBranch", key));
             let (busy, error) = (f.op.busy, f.op.error.clone());
-            // 与分支弹窗的新建 / 重命名同一口径:名字不合法(含空名)确认键就禁用,红字仍按
-            // 上面的时机出(一打开不红);回车照样走 `on_ok`,那时空名才报出来
-            let can_submit = check.is_ok();
+            // 与分支弹窗的新建 / 重命名同一口径:名字不合法(含空名)确认键就禁用,红字按
+            // 上面的时机出(一打开不红);回车照样走 `on_ok`,那时空名也报出来
+            let can_submit = git::validate_branch_name(&name).is_ok();
             let (form_ok, input_ok, list, repo, stash, settled) = (
                 form.clone(),
                 input.clone(),
@@ -2173,6 +2196,29 @@ mod tests {
     fn 短哈希() {
         assert_eq!(short_hash("0123456789abcdef"), "0123456");
         assert_eq!(short_hash("abc"), "abc");
+    }
+
+    /// 「从贮藏新建分支」的空名口径与分支弹窗的新建 / 重命名一致:一打开不红;动过输入框
+    /// (打字后清空)即就地报「请输入分支名」,不必等回车(E2E r4 C9);点过「创建」也报。
+    /// 不合法的名字不论动没动过都当场报。
+    #[test]
+    fn 清空分支名即就地报错() {
+        assert_eq!(branch_name_notice("", false, false), None, "一打开不红");
+        assert_eq!(branch_name_notice("", true, false), Some("nameEmpty"));
+        assert_eq!(branch_name_notice("", false, true), Some("nameEmpty"));
+        assert_eq!(
+            branch_name_notice("  ".trim(), true, false),
+            Some("nameEmpty")
+        );
+        assert_eq!(
+            branch_name_notice("a b", false, false),
+            Some("nameWhitespace")
+        );
+        assert_eq!(
+            branch_name_notice("a..b", false, false),
+            Some("nameBadFormat")
+        );
+        assert_eq!(branch_name_notice("feature/x", true, true), None);
     }
 
     /// 分支名校验的每种原因都对得上分支弹窗的文案 key(两种语言都在)。

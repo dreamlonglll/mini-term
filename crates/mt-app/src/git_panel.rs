@@ -306,6 +306,8 @@ pub struct GitPanel {
     bar_left_width: f32,
     /// 上一帧画的计数形态(量出来的宽度换了档就再画一帧)。
     sync_badge: SyncBadge,
+    /// 上一帧左段的让位档(同上)。
+    bar_squeeze: BarSqueeze,
     drag: Option<SectionDrag>,
     _tick: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -401,6 +403,7 @@ impl GitPanel {
             effective_ratio: 0.5,
             bar_left_width: 0.0,
             sync_badge: SyncBadge::Full,
+            bar_squeeze: BarSqueeze::None,
             drag: None,
             _tick: None,
             _subs: subs,
@@ -510,6 +513,7 @@ impl GitPanel {
                 if this.repo_request != req {
                     return;
                 }
+                let before = this.selected_repo.clone();
                 match result {
                     Ok(repos) => {
                         // 选中仓库保持原值(若仍在列表里),否则取第一个
@@ -536,7 +540,14 @@ impl GitPanel {
                     }
                 }
                 this.push_repo_down(cx);
-                this.load_branches(cx);
+                if branches_stale_after_discovery(
+                    &before,
+                    &this.selected_repo,
+                    this.branches.is_empty(),
+                    this.branches_loading,
+                ) {
+                    this.load_branches(cx);
+                }
                 this.retarget_watch(cx);
                 cx.notify();
             });
@@ -1126,9 +1137,51 @@ impl GitPanel {
     }
 }
 
+/// 发现仓库回来之后要不要再取一次分支快照:选中的仓库换了,或者还一份都没取过(切项目
+/// 吃了仓库缓存之后的第一轮)且没有在途的那一趟。
+///
+/// 选中仓库没变时不重取:「刷新」本来就同时发了一趟分支快照,这里再发会把它作废(令牌
+/// 前移),横幅 / 计数要等扫盘(深 5 层)做完再从头取一遍 —— 外部 `git merge --abort`
+/// 后冲突横幅拖到约 3.3s 才消失(E2E r4 A11)。
+fn branches_stale_after_discovery(before: &str, after: &str, empty: bool, loading: bool) -> bool {
+    before != after || (empty && !loading)
+}
+
 /// detached HEAD 的显示名是带括号的短 hash(`"(1a2b3c4)"`)。
 fn is_detached_label(label: &str) -> bool {
     label.starts_with('(') && label.ends_with(')')
+}
+
+/// detached 显示名里的短 hash(剥掉两侧括号)。文案自己带括号(「分离 HEAD(…)」),
+/// 直接套显示名会成双层括号;不是 detached 显示名的原样返回。
+pub(crate) fn detached_hash(label: &str) -> &str {
+    label
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(label)
+}
+
+/// 仓库栏写按钮(Fetch / 拉取 / 推送 / 贮藏)的提示该写哪一种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTip {
+    /// 正在跑的就是它:「Fetch 中…」
+    Running,
+    /// 有别的写操作在跑 —— 面板自己的(推送在后台跑着),或别的区占着写操作闸:
+    /// 按钮置灰,提示写「另一项 Git 操作正在进行」,与提交按钮同一句
+    Waiting,
+    /// 闲着:常规说明
+    Normal,
+}
+
+/// `op` = 这颗按钮对应的写操作(贮藏按钮没有自己的进行中态,给 `None`)。
+fn write_tip(busy: Option<GitBusy>, gated: bool, op: Option<GitBusy>) -> WriteTip {
+    if busy.is_some() && busy == op {
+        WriteTip::Running
+    } else if busy.is_some() || gated {
+        WriteTip::Waiting
+    } else {
+        WriteTip::Normal
+    }
 }
 
 /// 进行中操作的名词(「合并」「变基」…),拼进横幅与提示。
@@ -1178,7 +1231,11 @@ fn branch_tip_lines(
     if viewing {
         lines.push(tr!("gitBranch", "tipViewing", branch = branch));
     } else if detached {
-        lines.push(tr!("gitBranch", "tipDetached", commit = branch));
+        lines.push(tr!(
+            "gitBranch",
+            "tipDetached",
+            commit = detached_hash(branch)
+        ));
     } else {
         lines.push(branch.to_string());
         match tracking {
@@ -1299,6 +1356,17 @@ fn section_split(total: f32, ratio: f32, changes: Option<f32>, history: Option<f
     (total * ratio).clamp(lo, hi).clamp(0.0, total) / total
 }
 
+/// 「更改」区不矮于 `floor`(提交区整块 + 一行列表,见 `GitChanges::min_height`):
+/// 比例钳位的 15% 下限按面板总高算,面板不高时还不够放提交区,中缝拖到下限就把提交
+/// 按钮裁掉、滚也滚不出来(E2E r4 B11)。面板矮到连 `floor` 都放不下时整块给「更改」,
+/// 提交按钮优先于历史区。仍对比例单调。
+fn keep_changes_floor(split: f32, total: f32, floor: Option<f32>) -> f32 {
+    match floor {
+        Some(floor) if total > 1.0 => split.max((floor / total).min(1.0)),
+        _ => split,
+    }
+}
+
 /// 两份「想要的高度」算不算同一份(半像素以内当没变,免得量值抖动来回重画)。
 fn same_heights(a: (Option<f32>, Option<f32>), b: (Option<f32>, Option<f32>)) -> bool {
     let same = |x: Option<f32>, y: Option<f32>| match (x, y) {
@@ -1395,6 +1463,34 @@ fn sync_badge_for(width: f32, floor: &BarFloor) -> SyncBadge {
     }
 }
 
+/// 左段连「名字截到保底、计数收进 tooltip」都放不下(抽屉拖到最窄)时的让位,接在
+/// [`SyncBadge`] 三档之后:先把仓库触发器收成只剩文件夹图标,再把分支徽章也收成只剩
+/// 分支图标。两个入口始终露着、点得到,名字都在各自的 tooltip 里 —— 此前最窄 240 时
+/// 仓库触发器按保底宽占满左段,分支徽章被整个裁掉,分支弹窗没了入口(E2E r4 A1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarSqueeze {
+    /// 照常(名字截断到保底)
+    None,
+    /// 仓库触发器只留文件夹图标
+    RepoIcon,
+    /// 仓库触发器、分支徽章都只留图标(徽章转圈时圈顶替图标)
+    Icons,
+}
+
+/// 收成图标的仓库触发器 / 分支徽章的宽:左右 6 + 图标 14。
+const ICON_ONLY_WIDTH: f32 = 26.0;
+
+/// 左段宽 `width` 时取哪一档让位。`width` 还没量出来(0)时先按照常画。
+fn bar_squeeze_for(width: f32, floor: &BarFloor) -> BarSqueeze {
+    if width <= 0.0 || width >= bar_min_width(floor, SyncBadge::Hidden) {
+        BarSqueeze::None
+    } else if width >= ICON_ONLY_WIDTH + 4.0 + branch_floor_width(floor) {
+        BarSqueeze::RepoIcon
+    } else {
+        BarSqueeze::Icons
+    }
+}
+
 /// 仓库路径的展示形态:本机原生分隔符、不带尾部分隔符。libgit2 的 workdir 是
 /// `D:/x/proj/`,扫盘找到的子仓库是 `D:\x\proj\sub` —— 不归一的话同一处 tooltip
 /// 两种写法。
@@ -1466,7 +1562,7 @@ impl Render for GitPanel {
         // 上一帧量的;canvas 发现变了会再要一帧
         let (changes_grow, history_grow) = if both_open {
             self.natural_seen = (
-                self.changes.read(cx).natural_height(),
+                self.changes.read(cx).natural_height(cx),
                 self.history.read(cx).natural_height(),
             );
             let split = section_split(
@@ -1474,6 +1570,11 @@ impl Render for GitPanel {
                 section.ratio,
                 self.natural_seen.0,
                 self.natural_seen.1,
+            );
+            let split = keep_changes_floor(
+                split,
+                self.sections_height,
+                self.changes.read(cx).min_height(cx),
             );
             self.effective_ratio = split;
             (split, 1.0 - split)
@@ -1567,7 +1668,7 @@ impl Render for GitPanel {
                             let resized = (total - panel.sections_height).abs() > 0.5;
                             panel.sections_height = total;
                             let natural = (
-                                panel.changes.read(cx).natural_height(),
+                                panel.changes.read(cx).natural_height(cx),
                                 panel.history.read(cx).natural_height(),
                             );
                             let both_open = SECTION_UI.with(|s| {
@@ -1709,7 +1810,9 @@ impl GitPanel {
     /// 2. 再截分支名(名字胶囊保底 40px,见 `git_ui::name_pill`);
     /// 3. 还放不下:↑↓ 计数从两枚胶囊收成一段紧凑字,再不行就不画(分支徽章的 tooltip
     ///    里逐行写着)。这一档靠 canvas 量左段宽度、按 [`bar_min_width`] 判,量值换档时
-    ///    再画一帧。
+    ///    再画一帧;
+    /// 4. 抽屉拖到最窄还放不下:仓库触发器收成只剩图标,再不行分支徽章也只剩图标
+    ///    ([`BarSqueeze`]),两个入口都点得到。
     ///
     /// 两段的最小宽都**显式**给(名字截到保底之后的宽,见 [`repo_floor_width`] /
     /// [`branch_floor_width`]):自动最小宽按的是名字的完整宽度(截断只管溢出怎么画,
@@ -1717,6 +1820,8 @@ impl GitPanel {
     fn render_repo_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let floor = self.bar_floor();
         self.sync_badge = sync_badge_for(self.bar_left_width, &floor);
+        self.bar_squeeze = bar_squeeze_for(self.bar_left_width, &floor);
+        let repo_icon_only = self.bar_squeeze != BarSqueeze::None;
         let info = self.selected_repo_info();
         let repo_name = info.map(|r| r.name.clone()).unwrap_or_default();
         let is_worktree = info.is_some_and(|r| r.is_worktree);
@@ -1738,46 +1843,54 @@ impl GitPanel {
             .cursor_pointer()
             // 先于分支徽章收缩(权重 × 基准宽分摊,权重悬殊 = 几乎只缩它),缩到保底为止
             .map(|el| shrink(el, 1000.0))
-            .min_w(px(repo_floor_width(&floor)))
+            .min_w(px(if repo_icon_only {
+                ICON_ONLY_WIDTH
+            } else {
+                repo_floor_width(&floor)
+            }))
             .hover(|el| el.bg(git_ui::button_hover_bg()))
             .child(git_ui::icon(
                 git_ui::ICON_REPO,
                 git_ui::ICON_SIZE,
                 ui::color_folder(),
             ))
-            // 父级路径先让位:栏子窄下去时先截它,仓库名与分支徽章保住
-            .when_some(detail, |el, detail| {
-                el.child(
-                    div()
-                        .min_w(px(0.0))
-                        .max_w(px(90.0))
-                        .map(|el| shrink(el, 1000.0))
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .truncate()
-                        .child(format!("{detail}/")),
-                )
+            // 只剩图标时名字、出处、▾ 都不画(完整路径在 tooltip 里)
+            .when(!repo_icon_only, |el| {
+                el
+                    // 父级路径先让位:栏子窄下去时先截它,仓库名与分支徽章保住
+                    .when_some(detail, |el, detail| {
+                        el.child(
+                            div()
+                                .min_w(px(0.0))
+                                .max_w(px(90.0))
+                                .map(|el| shrink(el, 1000.0))
+                                .text_size(ui::font_px(12.0))
+                                .text_color(ui::text_muted())
+                                .truncate()
+                                .child(format!("{detail}/")),
+                        )
+                    })
+                    .child(
+                        div()
+                            .min_w(px(floor.repo_name))
+                            .text_size(ui::font_px(13.0))
+                            .text_color(ui::text_primary())
+                            .truncate()
+                            .child(repo_name),
+                    )
+                    .when(is_worktree, |el| {
+                        el.child(git_ui::icon(
+                            git_ui::ICON_WORKTREE,
+                            git_ui::ICON_SIZE_SM,
+                            ui::text_muted(),
+                        ))
+                    })
+                    .child(git_ui::icon(
+                        git_ui::ICON_CHEVRON_DOWN,
+                        git_ui::ICON_SIZE_SM,
+                        ui::text_muted(),
+                    ))
             })
-            .child(
-                div()
-                    .min_w(px(floor.repo_name))
-                    .text_size(ui::font_px(13.0))
-                    .text_color(ui::text_primary())
-                    .truncate()
-                    .child(repo_name),
-            )
-            .when(is_worktree, |el| {
-                el.child(git_ui::icon(
-                    git_ui::ICON_WORKTREE,
-                    git_ui::ICON_SIZE_SM,
-                    ui::text_muted(),
-                ))
-            })
-            .child(git_ui::icon(
-                git_ui::ICON_CHEVRON_DOWN,
-                git_ui::ICON_SIZE_SM,
-                ui::text_muted(),
-            ))
             .tip(repo_path_tip)
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 let entries = this.repo_menu(cx);
@@ -1799,7 +1912,9 @@ impl GitPanel {
             move |bounds: Bounds<Pixels>, window, cx| {
                 let stale = this.update(cx, |panel: &mut GitPanel, _cx| {
                     panel.bar_left_width = f32::from(bounds.size.width);
-                    sync_badge_for(panel.bar_left_width, &panel.bar_floor()) != panel.sync_badge
+                    let floor = panel.bar_floor();
+                    sync_badge_for(panel.bar_left_width, &floor) != panel.sync_badge
+                        || bar_squeeze_for(panel.bar_left_width, &floor) != panel.bar_squeeze
                 });
                 if stale {
                     window.request_animation_frame();
@@ -1889,7 +2004,21 @@ impl GitPanel {
         let busy = self.busy.is_some_and(GitBusy::touches_branch);
         let full = self.sync_badge == SyncBadge::Full;
         let floor = self.bar_floor();
-        let min_width = branch_floor_width(&floor) + counters_width(&floor, self.sync_badge);
+        // 最窄一档只留图标(名字、计数都在 tooltip 里),转圈时圈顶替图标
+        let icon_only = self.bar_squeeze == BarSqueeze::Icons;
+        let min_width = if icon_only {
+            ICON_ONLY_WIDTH
+        } else {
+            branch_floor_width(&floor) + counters_width(&floor, self.sync_badge)
+        };
+        let lead_icon = if icon_only && busy {
+            ui::spinner(px(git_ui::ICON_SIZE), ui::accent()).into_any_element()
+        } else {
+            sync_dot_over(
+                git_ui::icon(lead, git_ui::ICON_SIZE, lead_color),
+                (self.sync_badge == SyncBadge::Hidden).then_some((ahead, behind)),
+            )
+        };
 
         Some(
             div()
@@ -1904,25 +2033,24 @@ impl GitPanel {
                 .min_w(px(min_width))
                 .cursor_pointer()
                 .hover(|el| el.bg(git_ui::button_hover_bg()))
-                .child(sync_dot_over(
-                    git_ui::icon(lead, git_ui::ICON_SIZE, lead_color),
-                    (self.sync_badge == SyncBadge::Hidden).then_some((ahead, behind)),
-                ))
-                .child(git_ui::name_pill(
-                    "git-branch-badge-name",
-                    branch,
-                    pill_color,
-                    None,
-                ))
-                .when(full && ahead > 0, |el| el.child(git_ui::ahead_pill(ahead)))
-                .when(full && behind > 0, |el| {
-                    el.child(git_ui::behind_pill(behind))
-                })
-                .when(self.sync_badge == SyncBadge::Compact, |el| {
-                    el.children(compact_sync(ahead, behind))
-                })
-                .when(busy, |el| {
-                    el.child(ui::spinner(px(git_ui::ICON_SIZE_SM), ui::accent()))
+                .child(lead_icon)
+                .when(!icon_only, |el| {
+                    el.child(git_ui::name_pill(
+                        "git-branch-badge-name",
+                        branch,
+                        pill_color,
+                        None,
+                    ))
+                    .when(full && ahead > 0, |el| el.child(git_ui::ahead_pill(ahead)))
+                    .when(full && behind > 0, |el| {
+                        el.child(git_ui::behind_pill(behind))
+                    })
+                    .when(self.sync_badge == SyncBadge::Compact, |el| {
+                        el.children(compact_sync(ahead, behind))
+                    })
+                    .when(busy, |el| {
+                        el.child(ui::spinner(px(git_ui::ICON_SIZE_SM), ui::accent()))
+                    })
                 })
                 .tip(tip)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -1939,7 +2067,8 @@ impl GitPanel {
     /// 右段图标按钮组:Fetch / 拉取 / 推送 / 贮藏 / 刷新。
     fn render_bar_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.busy;
-        // 别的区占着写操作闸:写按钮一律禁用,tooltip 换成说明(见模块注释「写操作」)
+        // 有写操作在跑(面板自己的,或别的区占着写操作闸):其余写按钮一律禁用,提示口径
+        // 见 [`write_tip`](见模块注释「写操作」)
         let gated = self.gated();
         let idle = busy.is_none() && !gated;
         let is = |op: GitBusy| busy == Some(op);
@@ -1948,17 +2077,17 @@ impl GitPanel {
         let detached = self.current_branch().is_some_and(is_detached_label);
         let upstream = self.meta.head_tracking.as_ref().map(|t| t.upstream.clone());
         let mode = self.pull_mode_label();
-        let busy_tip =
-            |op: GitBusy| -> SharedString { tr!("gitBranch", "busyTip", op = op.label()).into() };
-        let gate_tip = || -> SharedString { git_ui::gate_busy_text().into() };
-
-        let fetch_tip: SharedString = if is(GitBusy::Fetch) {
-            busy_tip(GitBusy::Fetch)
-        } else if gated {
-            gate_tip()
-        } else {
-            t("gitBranch", "fetchTip").into()
+        let tip = |op: Option<GitBusy>, normal: &dyn Fn() -> SharedString| -> SharedString {
+            match write_tip(busy, gated, op) {
+                WriteTip::Running => {
+                    tr!("gitBranch", "busyTip", op = op.map_or("", GitBusy::label)).into()
+                }
+                WriteTip::Waiting => git_ui::gate_busy_text().into(),
+                WriteTip::Normal => normal(),
+            }
         };
+
+        let fetch_tip = tip(Some(GitBusy::Fetch), &|| t("gitBranch", "fetchTip").into());
         let fetch = git_ui::busy_icon_button(
             "git-fetch",
             git_ui::ICON_FETCH,
@@ -1970,11 +2099,7 @@ impl GitPanel {
             el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fetch(window, cx)))
         });
 
-        let pull_tip: SharedString = if is(GitBusy::Pull) {
-            busy_tip(GitBusy::Pull)
-        } else if gated {
-            gate_tip()
-        } else {
+        let pull_tip = tip(Some(GitBusy::Pull), &|| {
             match &upstream {
                 Some(upstream) => tr!(
                     "gitBranch",
@@ -1985,7 +2110,7 @@ impl GitPanel {
                 None => tr!("gitBranch", "pullTipNoUpstream", mode = mode.as_str()),
             }
             .into()
-        };
+        });
         let pull = git_ui::busy_icon_button(
             "git-pull",
             git_ui::ICON_PULL,
@@ -2006,13 +2131,10 @@ impl GitPanel {
             }),
         );
 
-        let push_tip: SharedString = if is(GitBusy::Push) {
-            busy_tip(GitBusy::Push)
-        } else if gated {
-            gate_tip()
-        } else if detached {
-            t("gitBranch", "pushTipDetached").into()
-        } else {
+        let push_tip = tip(Some(GitBusy::Push), &|| {
+            if detached {
+                return t("gitBranch", "pushTipDetached").into();
+            }
             // 写真实的推送目标(与推送对话框同一份计划):目标可以不是上游 —— 从
             // origin/main 拉出来的 feature 推的是 origin/feature
             let plan = match &self.meta.push_plan {
@@ -2033,7 +2155,7 @@ impl GitPanel {
                 _ => t("gitBranch", "pushTipDetached").to_string(),
             }
             .into()
-        };
+        });
         let push = git_ui::busy_icon_button(
             "git-push",
             git_ui::ICON_PUSH,
@@ -2049,13 +2171,13 @@ impl GitPanel {
 
         // 贮藏:开贮藏列表;有贮藏时旁边挂数量胶囊(数量随分支快照一起读),tooltip 带数
         let stash_count = self.meta.stash_count;
-        let stash_tip: SharedString = if gated {
-            gate_tip()
-        } else if stash_count > 0 {
-            tr!("gitStash", "countTip", count = stash_count).into()
-        } else {
-            t("gitStash", "title").into()
-        };
+        let stash_tip = tip(None, &|| {
+            if stash_count > 0 {
+                tr!("gitStash", "countTip", count = stash_count).into()
+            } else {
+                t("gitStash", "title").into()
+            }
+        });
         let stash_button = git_ui::icon_button("git-stash", git_ui::ICON_STASH, stash_tip, idle)
             .when(idle, |el| {
                 el.on_click(
@@ -2578,6 +2700,65 @@ mod tests {
         assert!(!is_detached_label("(wip"), "只有成对括号才算");
     }
 
+    /// 游离 HEAD 的说明文案自己带括号:套进去的只能是剥掉括号的哈希,否则成
+    /// 「（(1a2b3c4)）」(E2E r4 A6)。两种语言都只剩一层括号。
+    #[test]
+    fn 游离提示只有一层括号() {
+        assert_eq!(detached_hash("(1a2b3c4)"), "1a2b3c4");
+        assert_eq!(
+            detached_hash("main"),
+            "main",
+            "不是 detached 显示名的原样返回"
+        );
+        assert_eq!(detached_hash("(wip"), "(wip");
+        for locale in crate::i18n::Locale::ALL {
+            for key in ["detachedNote", "tipDetached"] {
+                let template = mt_i18n::lookup(locale, "gitBranch", key).expect("文案在");
+                let text =
+                    mt_i18n::interpolate(template, &[("commit", detached_hash("(1a2b3c4)"))]);
+                assert!(text.contains("1a2b3c4"), "{text}");
+                assert!(
+                    !text.contains("((") && !text.contains("（(") && !text.contains(")）"),
+                    "{locale}.{key}: {text}"
+                );
+            }
+        }
+        let tip = branch_tip_lines("(1a2b3c4)", None, true, false);
+        assert!(!tip[0].contains('('), "{tip:?}");
+    }
+
+    /// 发现仓库回来:选中仓库没变、分支快照已有或在途时不再重取 —— 重取会作废「刷新」
+    /// 同时发出的那一趟,横幅要等扫盘做完再从头取(E2E r4 A11 横幅 3.3s 才消失)。
+    #[test]
+    fn 发现仓库后不作废在途的分支快照() {
+        // 刷新:选中没变,分支快照在途 / 已到
+        assert!(!branches_stale_after_discovery("D:/r", "D:/r", false, true));
+        assert!(!branches_stale_after_discovery("D:/r", "D:/r", true, true));
+        assert!(!branches_stale_after_discovery(
+            "D:/r", "D:/r", false, false
+        ));
+        // 切项目吃了缓存:选中没变,但一份都没取过
+        assert!(branches_stale_after_discovery("D:/r", "D:/r", true, false));
+        // 选中仓库换了(原先的不见了 / 第一次发现)
+        assert!(branches_stale_after_discovery("", "D:/r", true, false));
+        assert!(branches_stale_after_discovery("D:/a", "D:/b", false, true));
+    }
+
+    /// 仓库栏写按钮的提示:面板自己在推送时(没占别人的闸,`gated = false`),其余按钮
+    /// 同样写「另一项 Git 操作正在进行」(E2E r4 A10 只有提交按钮写了);正在跑的那颗写
+    /// 「…中」;别的区占着闸时一律等;闲着照常。
+    #[test]
+    fn 写按钮忙时都说明原因() {
+        use GitBusy::*;
+        let push = Some(Push);
+        assert_eq!(write_tip(push, false, Some(Push)), WriteTip::Running);
+        for op in [Some(Fetch), Some(Pull), None] {
+            assert_eq!(write_tip(push, false, op), WriteTip::Waiting, "{op:?}");
+            assert_eq!(write_tip(None, true, op), WriteTip::Waiting, "{op:?}");
+            assert_eq!(write_tip(None, false, op), WriteTip::Normal, "{op:?}");
+        }
+    }
+
     /// 分支徽章 tooltip:有上游时写出上游与 ↑↓ 的含义(为 0 的那项不写),同步时
     /// 说「与上游同步」;没上游 / detached / 查看别的分支各有说法;末行都是操作提示。
     #[test]
@@ -2659,6 +2840,35 @@ mod tests {
         }
     }
 
+    /// 中缝拖到 15% 下限时「更改」区仍不矮于提交区 + 一行列表(E2E r4 B11:总高 700、
+    /// 提交区约 190,15% 只有 105,提交按钮被裁掉)。放得下时不改比例;面板矮到放不下
+    /// 时整块给「更改」;还没量出来时照旧。
+    #[test]
+    fn 更改区不矮于提交区() {
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let floor = Some(234.0);
+        // 每个允许的比例下,「更改」区的高度都 ≥ floor,且对比例单调
+        let mut last = 0.0;
+        for step in 15..=85 {
+            let ratio = clamp_ratio(step as f32 / 100.0);
+            let split = keep_changes_floor(
+                section_split(700.0, ratio, Some(900.0), Some(1200.0)),
+                700.0,
+                floor,
+            );
+            assert!(split * 700.0 + 1e-3 >= 234.0, "ratio {ratio}: {split}");
+            assert!(split + 1e-6 >= last, "ratio {ratio}: {split} < {last}");
+            last = split;
+        }
+        // 比例本来就够:原样
+        assert!(close(keep_changes_floor(0.5, 700.0, floor), 0.5));
+        // 面板矮到放不下 floor:整块给「更改」
+        assert!(close(keep_changes_floor(0.15, 200.0, floor), 1.0));
+        // 还没量出来
+        assert!(close(keep_changes_floor(0.15, 700.0, None), 0.15));
+        assert!(close(keep_changes_floor(0.3, 0.0, floor), 0.3));
+    }
+
     /// 仓库栏计数让位:宽度够放两枚胶囊就画胶囊;不够先收成紧凑字,再不够不画。
     /// 门槛是「仓库名、分支名都截到保底之后」还要的宽。
     #[test]
@@ -2697,6 +2907,34 @@ mod tests {
         // 仓库名本来就短:保底按名字估,不硬撑到 48
         assert!(estimate_text_width("ui", 13.0) < REPO_NAME_FLOOR);
         assert!(estimate_text_width("中文仓库", 13.0) > estimate_text_width("abcd", 13.0));
+    }
+
+    /// 抽屉拖到最窄(240,左段只剩约 67px:按钮组 5 颗 + 贮藏数胶囊占去其余)时左段逐档
+    /// 让位:先把仓库触发器收成图标,再把分支徽章也收成图标 —— 分支弹窗的入口始终在
+    /// (E2E r4 A1:最窄时分支胶囊被整个裁掉)。每一档的内容都放得下左段。
+    #[test]
+    fn 最窄时分支入口仍在() {
+        let floor = BarFloor {
+            repo_name: REPO_NAME_FLOOR,
+            detail: false,
+            worktree: false,
+            busy: false,
+            ahead: 2,
+            behind: 1,
+            scale: 1.0,
+        };
+        let hidden = bar_min_width(&floor, SyncBadge::Hidden);
+        assert_eq!(bar_squeeze_for(0.0, &floor), BarSqueeze::None, "还没量出来");
+        assert_eq!(bar_squeeze_for(hidden, &floor), BarSqueeze::None);
+        let repo_icon = ICON_ONLY_WIDTH + 4.0 + branch_floor_width(&floor);
+        assert!(repo_icon < hidden);
+        assert_eq!(bar_squeeze_for(hidden - 1.0, &floor), BarSqueeze::RepoIcon);
+        assert_eq!(bar_squeeze_for(repo_icon, &floor), BarSqueeze::RepoIcon);
+        assert_eq!(bar_squeeze_for(repo_icon - 1.0, &floor), BarSqueeze::Icons);
+        // 最窄 240 的左段:两颗图标(26 + 间距 4 + 26)放得下
+        let narrowest = 67.0;
+        assert_eq!(bar_squeeze_for(narrowest, &floor), BarSqueeze::Icons);
+        assert!(ICON_ONLY_WIDTH * 2.0 + 4.0 <= narrowest);
     }
 
     /// 仓库路径 tooltip:本机原生分隔符、不带尾部分隔符(libgit2 给的 `D:/x/proj/`

@@ -158,8 +158,12 @@ use mt_i18n::{
 /// （`paneGroup.{searchTooltip,splitRightTooltip,splitDownTooltip,closePaneTooltip}`）；
 /// 删 worktree 前识别占用：停在里面的终端先关的说明（`worktree.removeBusyTerminals`）、
 /// 被占用未动手与删到一半目录残留两种失败的原因与下一步（`worktree.{removeInUse,removeLeftover}`）。
+/// 1428 → 1431：第四轮 E2E 整改 —— 游离 HEAD 提示拆成前后两截排（`gitBranch.detachedNoteTail`，
+/// 免得末字单独成行）、分支弹窗「新建分支…」的常规提示（`gitBranch.newBranchTip`，置灰时换成
+/// 「另一项 Git 操作正在进行」）、强推因期望值过期被拒时的指引（`gitBranch.rejectedStaleHint`，
+/// 不再劝「确认风险后强制推送」）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1428;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1431;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

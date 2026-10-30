@@ -979,6 +979,35 @@ mod tests {
         cleanup(&[&root]);
     }
 
+    /// 贮藏里的纯重命名(`git mv` 后贮藏)配成一条 renamed、带旧路径,diff 无改动行
+    /// —— 不拆成一删一增,「仅重命名」的提示才走得到。
+    #[test]
+    fn 贮藏里的纯重命名识别为重命名() {
+        let root = init_repo_with_file("stash-rename", "old.txt", "1\n2\n3\n4\n5\n");
+        git(&root, &["mv", "old.txt", "new.txt"]);
+        assert_eq!(
+            stash_save(&root, &opts(None, false, false)).unwrap(),
+            saved()
+        );
+        let stash = list_stashes(&root).unwrap().remove(0);
+
+        let files = stash_files(&root, &stash.hash).unwrap();
+        let shape: Vec<(&str, &str, Option<&str>)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.file.path.as_str(),
+                    f.file.status.as_str(),
+                    f.file.old_path.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(shape, vec![("new.txt", "renamed", Some("old.txt"))]);
+        let diff = stash_file_diff(&root, &files[0]).unwrap();
+        assert!(diff.hunks.is_empty(), "{:?}", diff.hunks);
+        cleanup(&[&root]);
+    }
+
     /// other 分支改了 a.txt 第一行、新增了 added.txt;停在 main 上。返回 `(仓库, main)`。
     fn two_branch_repo(tag: &str) -> (PathBuf, String) {
         let root = init_repo_with_file(tag, "a.txt", "1\n2\n3\n4\n5\n");
