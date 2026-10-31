@@ -586,17 +586,7 @@ fn diff_line_row(
             word_bg(kind),
             &row,
             scroll,
-        ))
-        // 行尾换行也在选区里:正文后面补一小块(空行被选中也看得出来)
-        .when_some(row.newline_mark(), |el, bg| {
-            el.child(
-                div()
-                    .flex_none()
-                    .w(px((line_height * 0.3).round()))
-                    .h(px(line_height))
-                    .bg(bg),
-            )
-        });
+        ));
     let numbers = pinned(scroll.x).w(px(gutter_w)).bg(ui::bg_base()).child(
         div()
             .size_full()

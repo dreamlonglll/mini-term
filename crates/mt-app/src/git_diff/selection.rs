@@ -30,7 +30,8 @@
 //!
 //! 选区底色并进 `StyledText` 的高亮(与词级高亮合成一份,见 [`paint_segments`]):高亮底色
 //! 画在字形**之下**、行底色**之上**,选区叠在增删底色与词级高亮上,字照样压在最上面。
-//! 跨行选区里行尾的换行另画一小块(空行被选中也看得出来)。
+//! 跨行选区里行尾的换行在正文末尾补一个涂了底色的空格(空行被选中也看得出来;补在同一段
+//! 文字里,另起元素会因小数宽度漏出 1px 缝)。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -41,8 +42,8 @@ use std::time::Duration;
 use gpui::{
     App, Bounds, ClipboardItem, Context, Div, Element, ElementId, Entity, GlobalElementId,
     HighlightStyle, Hsla, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle,
-    SharedString, Styled, StyledText, Task, TextLayout, Window, canvas, point, px,
+    LineLayout, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba,
+    ScrollHandle, SharedString, Styled, StyledText, Task, TextLayout, Window, canvas, point, px,
 };
 use gpui_component::ActiveTheme as _;
 
@@ -439,6 +440,41 @@ fn row_at(y: f32, item_h: f32, count: usize) -> Option<usize> {
     (row < count).then_some(row)
 }
 
+/// 光标落点:离 `x` 最近的字符边界(显示文本的字节偏移)。
+///
+/// gpui 的 `closest_index_for_x` 指针一越过最后一个字形的起点就直接给行尾,不比中点 ——
+/// 拖到末字的左半边也会把它选进来。这里补上末字的中点判断。
+fn closest_boundary(line: &LineLayout, x: Pixels) -> usize {
+    let last = line
+        .runs
+        .iter()
+        .flat_map(|run| run.glyphs.iter())
+        .last()
+        .map(|glyph| (glyph.index, f32::from(glyph.position.x)));
+    settle_last_glyph(
+        line.closest_index_for_x(x),
+        line.len,
+        last,
+        f32::from(line.width),
+        f32::from(x),
+    )
+}
+
+/// [`closest_boundary`] 的纯算部分:`closest` 是 gpui 给的落点,`last` 是最后一个字形的
+/// (起点偏移, 起点横坐标)。落点给到行尾、而指针还没过末字中点时,改落在末字之前。
+fn settle_last_glyph(
+    closest: usize,
+    len: usize,
+    last: Option<(usize, f32)>,
+    width: f32,
+    x: f32,
+) -> usize {
+    match last {
+        Some((index, start)) if closest == len && x < (start + width) / 2.0 => index,
+        _ => closest,
+    }
+}
+
 /// 指针越出 `[start, end]` 多远 → 自动滚动这一拍滚多少像素(带符号:负 = 往开头滚)。
 /// 区间内是 0。
 fn edge_speed(pos: f32, start: f32, end: f32) -> f32 {
@@ -557,8 +593,8 @@ pub(super) struct RowText {
 }
 
 impl RowText {
-    /// 行尾换行在选区里:正文后面补一小块选区底色(空行被选中也看得出来)。
-    pub(super) fn newline_mark(&self) -> Option<Hsla> {
+    /// 行尾换行在选区里:正文末尾补一格选区底色(空行被选中也看得出来)。
+    fn newline_mark(&self) -> Option<Hsla> {
         self.selected
             .as_ref()
             .is_some_and(|(_, newline)| *newline)
@@ -576,7 +612,11 @@ pub(super) fn line_text(
     scroll: Point<Pixels>,
 ) -> RecordedText {
     let selected = row.selected.as_ref().map(|(range, _)| range);
-    let highlights = paint_segments(marks, selected)
+    let paint_bg = |bg: Hsla| HighlightStyle {
+        background_color: Some(bg),
+        ..Default::default()
+    };
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = paint_segments(marks, selected)
         .into_iter()
         .map(|(range, paint)| {
             let bg = match paint {
@@ -584,12 +624,20 @@ pub(super) fn line_text(
                 Paint::Selected => row.selection_bg,
                 Paint::Both => over(row.selection_bg, word_bg),
             };
-            let style = HighlightStyle {
-                background_color: Some(bg),
-                ..Default::default()
-            };
-            (range, style)
-        });
+            (range, paint_bg(bg))
+        })
+        .collect();
+    // 行尾换行也在选区里:正文末尾补一个空格涂上选区底色(空行被选中也看得出来)。补在
+    // 同一段文字里而不是另起一个元素 —— 正文宽度是小数,另起的元素按整像素排,两块底色
+    // 之间会漏出 1px 缝。多出来的这一格命中时由 `display_to_raw` 钳回行尾
+    let content = match row.newline_mark() {
+        Some(bg) => {
+            let end = content.len();
+            highlights.push((end..end + 1, paint_bg(bg)));
+            SharedString::from(format!("{content} "))
+        }
+        None => content,
+    };
     RecordedText {
         text: StyledText::new(content).with_highlights(highlights),
         sink: row.sink.clone(),
@@ -729,7 +777,7 @@ impl DiffState {
             });
         };
         let line = &line.unwrapped_layout;
-        let caret = line.closest_index_for_x(rel);
+        let caret = closest_boundary(line, rel);
         let under = line.index_for_x(rel).unwrap_or(line.len);
         Some(Hit {
             row,
@@ -1406,6 +1454,18 @@ mod tests {
         assert_eq!(row_at(-5.0, 20.0, 5), Some(0));
         assert_eq!(row_at(100.0, 20.0, 5), None);
         assert_eq!(row_at(10.0, 20.0, 0), None);
+    }
+
+    /// 末字中点:「末尾行」三个全角字各 16px 宽(末字起点 32、行宽 48、中点 40)。gpui
+    /// 越过末字起点就给行尾(9),没过中点要改落在末字之前(6);别处的落点原样放行。
+    #[test]
+    fn 光标落点_末字按中点判断() {
+        let last = Some((6, 32.0));
+        assert_eq!(settle_last_glyph(9, 9, last, 48.0, 35.0), 6, "末字左半边");
+        assert_eq!(settle_last_glyph(9, 9, last, 48.0, 41.0), 9, "末字右半边");
+        assert_eq!(settle_last_glyph(9, 9, last, 48.0, 80.0), 9, "行尾之外");
+        assert_eq!(settle_last_glyph(3, 9, last, 48.0, 20.0), 3, "行中间不动");
+        assert_eq!(settle_last_glyph(0, 0, None, 0.0, 5.0), 0, "空行");
     }
 
     /// 自动滚动:指针在区间内不滚,越出越远滚得越快,封顶;两个方向对称。
