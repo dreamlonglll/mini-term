@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1456;
+pub const ZH_ENTRY_COUNT: usize = 1457;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1456;
+pub const EN_ENTRY_COUNT: usize = 1457;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2383,6 +2383,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("font.ligaturesDescSuffix", " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）"),
     ("font.ligaturesTitle", "启用终端连体字 (ligatures)"),
     ("font.ligaturesUnavailable", "默认的 Cascadia Mono 是去连字版本，开了也看不到效果 —— 需先把上面的终端字体换成 Cascadia Code、Fira Code 这类带连字的字族"),
+    ("font.nerdIconsBuiltin", "终端已内置 Nerd Font 图标：终端字体缺图标时自动补上，不必另装 Nerd Font 补丁版字体"),
     ("font.terminalFont", "终端字体"),
     ("font.terminalFontSize", "终端字体大小"),
     ("font.uiFont", "界面字体"),
@@ -2589,6 +2590,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("font.ligaturesDescSuffix", " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono)"),
     ("font.ligaturesTitle", "Enable terminal ligatures"),
     ("font.ligaturesUnavailable", "The default Cascadia Mono is the ligature-free variant, so enabling this changes nothing — switch the terminal font above to a ligature-carrying family such as Cascadia Code or Fira Code first"),
+    ("font.nerdIconsBuiltin", "Nerd Font icons are built in: icons missing from the terminal font are filled in automatically, no patched Nerd Font required"),
     ("font.terminalFont", "Terminal font"),
     ("font.terminalFontSize", "Terminal font size"),
     ("font.uiFont", "UI font"),

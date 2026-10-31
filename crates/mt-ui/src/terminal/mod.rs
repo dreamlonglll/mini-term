@@ -19,6 +19,7 @@ pub mod scrollbar;
 pub mod search;
 pub mod search_bar;
 pub mod selection_dwell;
+mod symbols;
 mod theme;
 mod view;
 
@@ -44,6 +45,7 @@ pub use search_bar::{
     OnSearchClose, SearchBarEvent, SearchBarLabels, TerminalSearchBar, counter_text,
 };
 pub use selection_dwell::{CopiedTip, DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
+pub use symbols::{SYMBOL_FONT_FAMILY, install_symbol_font};
 pub use mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, mouse_report_bytes,
     mouse_reporting_active, prefers_local_handling,
