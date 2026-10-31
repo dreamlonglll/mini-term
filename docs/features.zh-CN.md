@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.23-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.24-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -205,6 +205,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，设置页卡片直接铺实况缩略图。导入的 `theme.css` 与 `theme.json` 的 `tokens` 覆盖过同一道外链闸：禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与 `image-set("…")` 这类裸字符串双查，`url(\68 ttps://…)` 之类的转义写法同样挡得住
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题；默认字族按平台选择——Windows Cascadia Mono、macOS Menlo、Linux DejaVu Sans Mono，各自带 CJK 与 emoji 回退，主字体缺席时不会回落成比例字体
 - **终端连体字** — 「设置 → 外观 → 字体」的「启用终端连体字」开关（默认关），开启后 `=>` `!=` `->` 等按字体自身的连字规则合并显示。合并段整段一次 shape、段原点钉在 `cell_width × 起始列`，连字总宽守恒时段内字符照旧落在列格上；shape 完若总宽不等于「列数 × 列宽」则退回禁连字重 shape 一次，防住连字不守恒的字体。注意默认字族 Cascadia **Mono** 是去连字版，要换 Cascadia Code / Fira Code 这类才看得见效果
+- **内置 Nerd Font 图标回退** — 随程序内置 Nerd Fonts 官方的 Symbols Nerd Font Mono（MIT），不必另装补丁版字体。终端字体没有真字形的私用区图标（U+E000–F8FF 与补充私用区，含 Material Design）逐格换用它画、按格子缩放：默认占一列，后面紧跟同底色的空格时借成两列按正文字号画（底色 / 选区 / 光标不一致时不借，免得半截图标落在另一种底上）。powerline 分隔符 U+E0B0–E0BF（三角、半圆端帽、斜切与细线）不走字体，按格子几何直接绘制，撑满列宽与行高、与两侧色段无缝衔接——Win11 自带的 Cascadia Mono 2102 连 E0B0 都没有，默认字体下的提示符全靠它。终端字体本身带这些字形、或回退串里配了本机已安装的 Nerd Font 时一律不接管，画面与以前一致。没有走「往回退表里加个名字」的路，是因为 gpui 在 Windows 上造回退表只认系统已装字体，内嵌字体进不去
 - **emoji 序列整簇占一格 2 列** — 呈现序列（`❤️` `⚠️`）、肤色修饰（`👍🏽`）、ZWJ 序列（`👨‍👩‍👧‍👦` `🏳️‍🌈`）、区域指示符成对（`🇨🇳`）与键帽（`1️⃣`）按字位簇落在一个 2 列的格子里，不再沿用 alacritty 逐码点拆成 1 / 4 / 8 / 3 列——与 ConPTY 1.22+ 及 Claude Code 的 string-width 同一口径，它们局部重绘时不会再把 emoji 后面的 `]` 与空格吞掉。单码点刻意不动：`●` `⏺` `·` `✻` `⎿`、制表符、箭头与 `①★■` 仍是 1 列，Claude Code 的状态圆点与 TUI 边框永远不会被顶出自己的列。主字体没有的字形（`⚠` `✔` `⏺`、箭头、框线）改由真实 shape 一次判定而不是信 DirectWrite 的 `.notdef` 步进，回退字形不再把同段后面的每个字符顶歪
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复
 - **关闭确认** — 关闭窗口时只按 AI 会话数量盘点（ai-working / ai-idle 的 pane），裸 shell 终端不计入，仅当存在 AI 会话时才弹确认并列出会话名清单；无论是否弹窗都会 flush 所有项目布局
@@ -231,7 +232,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2731 个 Rust 测试**（35 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **2755 个 Rust 测试**（35 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -372,7 +373,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（35 个测试目标、2731 例）
+# 全工作区 Rust 测试（35 个测试目标、2755 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）

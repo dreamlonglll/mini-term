@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.23-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.24-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -66,6 +66,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **HTML 预览** | 本地 `.html` 用系统 WebView（Windows 为 WebView2）真渲染，CSS 与脚本照跑、效果与浏览器一致，相对路径的样式 / 脚本 / 图片按项目目录加载，改完源码未保存也能切预览看效果；外链先确认再交浏览器，链到本地文件作为新页签打开，页面脚本读不到项目里的其它文件。WebView 不可用或 Linux 上回落简版渲染 |
 | **PDF 预览** | 文件树点开本地 `.pdf` 直接在页签里看，用系统 WebView 自带的阅读器显示（Windows 为 WebView2 内置的 Edge 阅读器），书签目录、页码跳转、搜索、缩放现成可用；文件在盘上被改写后自动重载，工具栏一键「使用默认工具打开」；页面只拿得到这份文档本身。WebView 不可用、Linux 或远程 PDF 时给出打开 / 下载提示 |
 | **终端页签** | 页签最左按 shell 显示图标（pwsh / Windows PowerShell / cmd / bash / zsh / fish / nu / WSL 各一枚），**标题跟随 shell 报的窗口标题**：oh-my-posh 的当前目录直接缀在 shell 名后，几个同名 pwsh 一眼分清；shell 自己的默认标题不显示、AI 会话跑着时只留品牌图标，可在「终端」设置里关闭。**AI 停下来等你**（批权限、填表单、这一轮因 API 错误结束）时状态灯亮橙色叹号，与「做完了」的绿勾、「在跑」的转圈分得开，项目行、悬停预览、边条徽标同一口径；做完了还没看的页签在关闭钮的位置留一颗绿点，点进去才消。工作台页签与终端页签两层分明：只有页级保留强调色顶线，终端页签是圆角胶囊，关闭按钮悬停才现身 |
+| **Nerd Font 图标** | 终端内置 Symbols Nerd Font：终端字体缺图标时自动补上，starship / oh-my-posh / AI CLI 状态栏里的图标不再显示成方块，不必另装 Nerd Font 补丁版字体；powerline 三角、半圆端帽按格子直接绘制，撑满整行、与色段无缝衔接。终端字体本身就是 Nerd Font 时画面不变 |
 | **Git集成** | 对标 JetBrains IDEA 的 Git 面板，更改与提交历史上下同屏：**分支弹窗**（搜索、最近、本地 / 远程分组，检出 / 新建 / 合并 / 变基 / 重命名 / 删除，本地改动与目标分支冲突时「贮藏后检出」）；Fetch、拉取方式（跟随 git 配置 / 合并 / 变基 / 仅快进），推送先列出待推送提交再确认；diff 里**按块暂存 / 取消暂存 / 丢弃**、正文可拖选复制，冲突文件一键采用我方 / 对方，合并 / 变基进行中有状态条可继续或中止；提交历史带拓扑图，右键拣选 / 还原 / 重置 / 撤销提交 / 改消息 / 打标签，可按文本、作者、`path:` 过滤，**可多选提交合并查看改动文件**（对标 IDEA Log）；单击提交在 Git 抽屉左侧展开**提交详情栏**（可拖宽，含提交者、父提交、所在分支与逐文件增删行数）；改动文件按目录分组成树（单链目录压缩、目录带文件数）；单文件历史、贮藏列表、编辑器行号旁的变更标记与 blame 注解列；外部 git 操作自动刷新。另支持 **Worktree 管理**（对项目右键 → Worktree 管理）；十万级提交的大仓库首页也即点即出 |
 | **长文本粘贴** | 剪贴板 ≥10 行或 ≥2000 字符时自动转存临时 `.txt`，粘贴带引号的路径——AI 工具不必硬吞超长内容 |
 | **图片粘贴** | 剪贴板里有截图自动检测，存成临时 PNG 并粘路径，兼容 PinPix 等非标准格式； |
@@ -101,7 +102,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2731 个 Rust 测试**（35 个测试目标） |
+| 测试 | **2755 个 Rust 测试**（35 个测试目标） |
 
 ---
 

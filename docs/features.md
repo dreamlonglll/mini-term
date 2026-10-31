@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.23-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.24-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -205,6 +205,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **External theme packs (Dream Skin-compatible)** — Settings → Appearance → Theme & language can import third-party skins from a folder or a zip into `{app_data_dir}/themes/<themeId>/` (`theme.json` required; `theme.css` / background image optional). "Create example" in the same section writes a ready-to-edit sample skin into `themes/example/` (`theme.json` + `theme.css` + a `README.md` documenting every field; save an edit and it hot-reloads). The sample is literally the **same file** as [`docs/theme-pack-example/`](theme-pack-example/) in the repo (embedded at compile time via `include_str!`, so docs and product can't drift apart), and it errors instead of overwriting when the folder already exists — a copy you've edited is never silently wiped. When the pack ships a `manifest.json`, every file is checked against its bytes + sha256 to catch corruption; imports land in a staging directory first and are swapped in atomically only after validation, so a bad pack can't take out an existing skin of the same name. A pack's light/dark nature is fixed by its author via `appearance` in `theme.json`, and the built-in theme buttons show as unselected while it's active. Editing a file in the pack hot-reloads it. A pack may declare a background image, in which case terminal surfaces turn translucent over that ambient layer, and the settings-page card shows a live thumbnail. An imported `theme.css` and the `tokens` overrides in `theme.json` pass through the same external-reference gate: no `@import`, and any reference pointing outside the pack rejected — the check runs on a sample with comments stripped and CSS escapes resolved, inspecting both `url()` and bare string literals like `image-set("…")`, so escaped forms such as `url(\68 ttps://…)` are caught too.
 - **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme. The default family is chosen per platform — Cascadia Mono on Windows, Menlo on macOS, DejaVu Sans Mono on Linux — each with CJK and emoji fallbacks, so a missing primary font never degrades into a proportional face.
 - **Terminal ligatures** — The "Enable terminal ligatures" toggle under Settings → Appearance → Font (off by default) makes `=>`, `!=`, `->` and friends merge per the font's own ligature rules. Merged runs are shaped in one pass with the run origin pinned to `cell_width × start column`, so as long as the ligature preserves total width the characters still land on the column grid; if the shaped width doesn't equal "columns × column width", the run is reshaped once with ligatures disabled, guarding against fonts whose ligatures don't preserve width. Note the default family, Cascadia **Mono**, is the de-ligatured cut — switch to Cascadia Code, Fira Code, or similar to see any effect.
+- **Built-in Nerd Font icon fallback** — Nerd Fonts' official Symbols Nerd Font Mono (MIT) ships with the app, so no patched font is needed. Private-use-area icons (U+E000–F8FF plus the supplementary planes, Material Design included) that the terminal font has no real glyph for are drawn with it cell by cell, scaled to the grid: one column by default, borrowing a second column at body-text size when followed by a blank of the same background (not when background / selection / cursor differ, so half an icon never lands on a different backdrop). Powerline separators U+E0B0–E0BF (triangles, half-circle caps, diagonal cuts and thin lines) skip the font and are drawn from the cell geometry, filling the column width and row height and meeting the neighbouring colored segments seamlessly — the Cascadia Mono 2102 bundled with Windows 11 lacks even E0B0, so default-font prompts rely on this. Nothing is taken over when the terminal font already carries these glyphs, or when the fallback list names a Nerd Font that is actually installed. It is not done by adding a name to the fallback list because gpui's Windows backend only resolves fallbacks against system-installed fonts, which an embedded font never is.
 - **Emoji sequences occupy one 2-column cell** — Presentation sequences (`❤️` `⚠️`), skin-tone modifiers (`👍🏽`), ZWJ sequences (`👨‍👩‍👧‍👦` `🏳️‍🌈`), regional-indicator pairs (`🇨🇳`) and keycaps (`1️⃣`) are placed as a single grapheme cluster in one 2-column cell instead of alacritty's per-code-point split (1 / 4 / 8 / 3 columns) — the same rule ConPTY 1.22+ and Claude Code's string-width use, so their partial redraws no longer eat the `]` or spaces after an emoji. Single code points are deliberately left alone: `●` `⏺` `·` `✻` `⎿`, box-drawing, arrows and `①★■` stay 1 column so Claude Code's status dot and TUI frames are never pushed off their column. Glyphs missing from the primary font (`⚠` `✔` `⏺`, arrows, box drawing) are now detected by a real shaping pass rather than DirectWrite's `.notdef` advance, so a fallback glyph no longer shifts every character after it in the same run.
 - **Layout persistence** — Split ratios, tabs, and window size / position are saved automatically and restored on restart.
 - **Close confirmation** — Closing the window takes stock of AI sessions only (panes in ai-working / ai-idle); plain shell terminals no longer count, and the confirmation appears only when AI sessions exist, listing their names. All project layouts are flushed either way.
@@ -231,7 +232,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,731 Rust tests** (35 test targets) + relay-server protocol boundary tests |
+| Tests | **2,755 Rust tests** (35 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -372,7 +373,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (35 test targets, 2,731 cases)
+# Workspace-wide Rust tests (35 test targets, 2,755 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
