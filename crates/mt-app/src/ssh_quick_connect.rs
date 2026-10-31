@@ -246,7 +246,10 @@ pub enum AuthBadge {
 
 /// 归一化分组名:trim 后空串视为未分组(与 `ssh_conn::normalize_group` 同)。
 fn group_of(conn: &SshConnection) -> Option<&str> {
-    conn.group.as_deref().map(str::trim).filter(|g| !g.is_empty())
+    conn.group
+        .as_deref()
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
 }
 
 /// 按 `group` 归类,**保持首次出现顺序**且未分组桶留在它自然出现的位置
@@ -471,7 +474,9 @@ impl SshQuickPanel {
         self.store.update(cx, |store, cx| {
             let connections = store.ssh_connections().to_vec();
             store.patch_config(
-                |config| toggle_collapsed(&mut config.ssh_menu_collapsed_groups, &key, &connections),
+                |config| {
+                    toggle_collapsed(&mut config.ssh_menu_collapsed_groups, &key, &connections)
+                },
                 cx,
             );
         });
@@ -625,7 +630,8 @@ impl SshQuickPanel {
                     div()
                         .flex_none()
                         .when(hit, |el| {
-                            el.text_color(ui::accent()).font_weight(FontWeight::SEMIBOLD)
+                            el.text_color(ui::accent())
+                                .font_weight(FontWeight::SEMIBOLD)
                         })
                         .when(!hit, |el| el.text_color(ui::text_primary()))
                         .child(SharedString::from(text)),
@@ -673,11 +679,13 @@ impl SshQuickPanel {
                     } else {
                         ui::border_subtle()
                     })
-                    .child(VectorIcon::new(ICON_SERVER, px(TILE_ICON)).ink(if is_cursor {
-                        ui::accent()
-                    } else {
-                        ui::text_secondary()
-                    })),
+                    .child(
+                        VectorIcon::new(ICON_SERVER, px(TILE_ICON)).ink(if is_cursor {
+                            ui::accent()
+                        } else {
+                            ui::text_secondary()
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -698,11 +706,7 @@ impl SshQuickPanel {
                             .child(SharedString::from(connection_summary(&row.conn))),
                     ),
             )
-            .children(
-                auth_badges(&row.conn)
-                    .into_iter()
-                    .map(Self::render_badge),
-            )
+            .children(auth_badges(&row.conn).into_iter().map(Self::render_badge))
     }
 
     fn text_button(
@@ -736,11 +740,15 @@ impl SshQuickPanel {
             .border_t_1()
             .border_color(ui::border_subtle())
             .child(
-                Self::text_button("ssh-quick-new", ICON_PLUS, t("terminal", "sshNewConnection"))
-                    .on_click(|_: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        Self::open_ssh_panel(true, window, cx);
-                    }),
+                Self::text_button(
+                    "ssh-quick-new",
+                    ICON_PLUS,
+                    t("terminal", "sshNewConnection"),
+                )
+                .on_click(|_: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    Self::open_ssh_panel(true, window, cx);
+                }),
             )
             .child(
                 Self::text_button("ssh-quick-manage", ICON_MANAGE, t("terminal", "sshManage"))
@@ -911,15 +919,11 @@ impl Render for SshQuickPanel {
 
         panel
             .child(
-                div()
-                    .px(px(8.0))
-                    .pt(px(8.0))
-                    .pb(px(4.0))
-                    .child(
-                        Input::new(&self.query)
-                            .cleanable(false)
-                            .prefix(VectorIcon::new(ICON_SEARCH, px(13.0)).ink(ui::text_muted())),
-                    ),
+                div().px(px(8.0)).pt(px(8.0)).pb(px(4.0)).child(
+                    Input::new(&self.query)
+                        .cleanable(false)
+                        .prefix(VectorIcon::new(ICON_SEARCH, px(13.0)).ink(ui::text_muted())),
+                ),
             )
             .child(list)
             .child(self.render_footer())
@@ -981,9 +985,15 @@ mod tests {
         assert_eq!(buckets[0].group, None, "未分组桶先出现就排第一");
         assert_eq!(buckets[1].group.as_deref(), Some("内网"));
         assert_eq!(buckets[2].group.as_deref(), Some("客户A"));
-        assert_eq!(names(&buckets), vec![vec!["a", "c"], vec!["b", "d"], vec!["e"]]);
+        assert_eq!(
+            names(&buckets),
+            vec![vec!["a", "c"], vec!["b", "d"], vec!["e"]]
+        );
         assert!(
-            buckets.iter().flat_map(|b| &b.rows).all(|r| r.hits.is_empty()),
+            buckets
+                .iter()
+                .flat_map(|b| &b.rows)
+                .all(|r| r.hits.is_empty()),
             "空查询不高亮"
         );
     }
@@ -996,7 +1006,10 @@ mod tests {
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].group, None);
         assert!(!shows_group_headers(&list), "全是未分组时一个标题都不画");
-        assert!(shows_group_headers(&[conn("a", None), conn("b", Some("内网"))]));
+        assert!(shows_group_headers(&[
+            conn("a", None),
+            conn("b", Some("内网"))
+        ]));
     }
 
     /// 名字走子序列匹配并带高亮(char 口径)。
@@ -1020,10 +1033,17 @@ mod tests {
         ];
         let buckets = view(&list, "10.0.0");
         assert_eq!(names(&buckets), vec![vec!["甲"]]);
-        assert!(buckets[0].rows[0].hits.is_empty(), "命中在摘要上,不高亮名字");
+        assert!(
+            buckets[0].rows[0].hits.is_empty(),
+            "命中在摘要上,不高亮名字"
+        );
 
         assert_eq!(names(&view(&list, ":2222")), vec![vec!["甲"]]);
-        assert_eq!(names(&view(&list, "DEPLOY@")), vec![vec!["乙"]], "大小写不敏感");
+        assert_eq!(
+            names(&view(&list, "DEPLOY@")),
+            vec![vec!["乙"]],
+            "大小写不敏感"
+        );
         assert_eq!(names(&view(&list, "客户")), vec![vec!["乙"]]);
 
         // 摘要上不做子序列:d..b..e 散落在 deploy@db.example.com 里也不算中
@@ -1052,7 +1072,10 @@ mod tests {
         ];
         let buckets = quick_buckets(&list, "", &["内网".to_string(), String::new()]);
         assert_eq!(
-            buckets.iter().map(|b| (b.key(), b.collapsed, b.count())).collect::<Vec<_>>(),
+            buckets
+                .iter()
+                .map(|b| (b.key(), b.collapsed, b.count()))
+                .collect::<Vec<_>>(),
             vec![("", true, 1), ("内网", true, 2), ("客户A", false, 1)],
             "未分组桶记空串,同样折得起来"
         );

@@ -1718,7 +1718,10 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains(r#""sshMenuCollapsedGroups":["内网",""]"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.ssh_menu_collapsed_groups, vec!["内网".to_string(), String::new()]);
+        assert_eq!(
+            parsed.ssh_menu_collapsed_groups,
+            vec!["内网".to_string(), String::new()]
+        );
     }
 
     /// 终端帧率两项:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。

@@ -1190,97 +1190,6 @@ impl TerminalPane {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn conn(name: &str, group: Option<&str>) -> SshConnection {
-        SshConnection {
-            id: format!("id-{name}"),
-            name: name.to_string(),
-            host: "h".into(),
-            port: 22,
-            user: "u".into(),
-            password: None,
-            identity_file: None,
-            group: group.map(str::to_string),
-            extra: Default::default(),
-        }
-    }
-
-    /// 命令行:默认端口不写 `-p`,私钥路径**反斜杠换正斜杠并加引号**。
-    #[test]
-    fn ssh命令行拼装() {
-        let mut c = conn("x", None);
-        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
-        c.port = 2222;
-        assert_eq!(build_ssh_command(&c, None), "ssh -p 2222 u@h");
-        // 端口 0(配置缺省)按默认端口处理
-        c.port = 0;
-        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
-        c.port = 22;
-        assert_eq!(
-            build_ssh_command(&c, Some(r"C:\keys\id_rsa")),
-            "ssh -i \"C:/keys/id_rsa\" u@h",
-            "双引号里的反斜杠会被 bash/Nushell 当转义符"
-        );
-        // 空白私钥路径等于没配
-        assert_eq!(build_ssh_command(&c, Some("   ")), "ssh u@h");
-    }
-
-    /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。
-    #[test]
-    fn 未上报时右键弹本地菜单() {
-        let mode = TermMode::empty();
-        assert!(allows_local_menu(mode, false, false, false));
-        assert!(allows_local_menu(mode, true, false, false));
-    }
-
-    /// 应用抓着鼠标时右键让位给应用;**按住 Shift 强制借回本地**。
-    #[test]
-    fn 上报模式下只有_shift_能弹() {
-        for mode in [
-            TermMode::MOUSE_REPORT_CLICK,
-            TermMode::MOUSE_DRAG,
-            TermMode::MOUSE_MOTION,
-        ] {
-            assert!(!allows_local_menu(mode, false, false, false), "{mode:?}");
-            assert!(allows_local_menu(mode, true, false, false), "{mode:?}");
-            // Alt / Ctrl 不是借回手势,不许放行
-            assert!(!allows_local_menu(mode, false, true, false), "{mode:?}");
-            assert!(!allows_local_menu(mode, false, false, true), "{mode:?}");
-        }
-    }
-
-    /// 标记跳转把目标行顶到视口**第一行**(不是居中,也不是「已在视口就不动」)。
-    #[test]
-    fn 标记跳转把目标行滚到视口顶部() {
-        // 回看缓冲里第 100 行(line = -100),当前贴底(offset = 0):往回滚 100
-        assert_eq!(scroll_delta_to_top(-100, 0, 500), 100);
-        // 已经滚到位就不动 —— 短路判据
-        assert_eq!(scroll_delta_to_top(-100, 100, 500), 0);
-        // 滚过头了就往回补
-        assert_eq!(scroll_delta_to_top(-100, 300, 500), -200);
-    }
-
-    /// 屏幕内的行(line >= 0)目标偏移是 0:**无条件**滚回底部,
-    /// 哪怕那一行本来就在视口里 —— 原版 `scrollToLine` 就是这个语义。
-    #[test]
-    fn 屏幕内的标记也照样滚() {
-        assert_eq!(scroll_delta_to_top(5, 0, 500), 0, "已在底部,delta 为零");
-        assert_eq!(scroll_delta_to_top(5, 42, 500), -42, "回看态下拉回底部");
-    }
-
-    /// 目标偏移钳在 `[0, history]`:历史比锚点短(热改小了回滚行数)时不越界。
-    #[test]
-    fn 目标偏移钳在历史长度内() {
-        assert_eq!(scroll_delta_to_top(-900, 0, 100), 100, "最多滚到历史顶端");
-        assert_eq!(scroll_delta_to_top(-900, 0, 0), 0, "没有历史就不滚");
-        // history 传了负数(不该发生)也不许算出负的目标偏移
-        assert_eq!(scroll_delta_to_top(-900, 0, -3), 0);
-    }
-}
-
 impl Drop for TerminalPane {
     fn drop(&mut self) {
         // pane 实体被丢弃(项目移除 / 应用退出)时同样要回收 —— 否则后端留一个
@@ -1779,5 +1688,96 @@ impl Render for TerminalPane {
                         .child(crate::i18n::t("paneGroup", "shellExited")),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(name: &str, group: Option<&str>) -> SshConnection {
+        SshConnection {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            identity_file: None,
+            group: group.map(str::to_string),
+            extra: Default::default(),
+        }
+    }
+
+    /// 命令行:默认端口不写 `-p`,私钥路径**反斜杠换正斜杠并加引号**。
+    #[test]
+    fn ssh命令行拼装() {
+        let mut c = conn("x", None);
+        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
+        c.port = 2222;
+        assert_eq!(build_ssh_command(&c, None), "ssh -p 2222 u@h");
+        // 端口 0(配置缺省)按默认端口处理
+        c.port = 0;
+        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
+        c.port = 22;
+        assert_eq!(
+            build_ssh_command(&c, Some(r"C:\keys\id_rsa")),
+            "ssh -i \"C:/keys/id_rsa\" u@h",
+            "双引号里的反斜杠会被 bash/Nushell 当转义符"
+        );
+        // 空白私钥路径等于没配
+        assert_eq!(build_ssh_command(&c, Some("   ")), "ssh u@h");
+    }
+
+    /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。
+    #[test]
+    fn 未上报时右键弹本地菜单() {
+        let mode = TermMode::empty();
+        assert!(allows_local_menu(mode, false, false, false));
+        assert!(allows_local_menu(mode, true, false, false));
+    }
+
+    /// 应用抓着鼠标时右键让位给应用;**按住 Shift 强制借回本地**。
+    #[test]
+    fn 上报模式下只有_shift_能弹() {
+        for mode in [
+            TermMode::MOUSE_REPORT_CLICK,
+            TermMode::MOUSE_DRAG,
+            TermMode::MOUSE_MOTION,
+        ] {
+            assert!(!allows_local_menu(mode, false, false, false), "{mode:?}");
+            assert!(allows_local_menu(mode, true, false, false), "{mode:?}");
+            // Alt / Ctrl 不是借回手势,不许放行
+            assert!(!allows_local_menu(mode, false, true, false), "{mode:?}");
+            assert!(!allows_local_menu(mode, false, false, true), "{mode:?}");
+        }
+    }
+
+    /// 标记跳转把目标行顶到视口**第一行**(不是居中,也不是「已在视口就不动」)。
+    #[test]
+    fn 标记跳转把目标行滚到视口顶部() {
+        // 回看缓冲里第 100 行(line = -100),当前贴底(offset = 0):往回滚 100
+        assert_eq!(scroll_delta_to_top(-100, 0, 500), 100);
+        // 已经滚到位就不动 —— 短路判据
+        assert_eq!(scroll_delta_to_top(-100, 100, 500), 0);
+        // 滚过头了就往回补
+        assert_eq!(scroll_delta_to_top(-100, 300, 500), -200);
+    }
+
+    /// 屏幕内的行(line >= 0)目标偏移是 0:**无条件**滚回底部,
+    /// 哪怕那一行本来就在视口里 —— 原版 `scrollToLine` 就是这个语义。
+    #[test]
+    fn 屏幕内的标记也照样滚() {
+        assert_eq!(scroll_delta_to_top(5, 0, 500), 0, "已在底部,delta 为零");
+        assert_eq!(scroll_delta_to_top(5, 42, 500), -42, "回看态下拉回底部");
+    }
+
+    /// 目标偏移钳在 `[0, history]`:历史比锚点短(热改小了回滚行数)时不越界。
+    #[test]
+    fn 目标偏移钳在历史长度内() {
+        assert_eq!(scroll_delta_to_top(-900, 0, 100), 100, "最多滚到历史顶端");
+        assert_eq!(scroll_delta_to_top(-900, 0, 0), 0, "没有历史就不滚");
+        // history 传了负数(不该发生)也不许算出负的目标偏移
+        assert_eq!(scroll_delta_to_top(-900, 0, -3), 0);
     }
 }
