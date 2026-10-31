@@ -117,6 +117,7 @@ mod shell_ops;
 mod ssh_assoc;
 mod ssh_conn;
 mod ssh_panel;
+mod ssh_quick_connect;
 mod startup_trace;
 mod store;
 mod syntax_languages;

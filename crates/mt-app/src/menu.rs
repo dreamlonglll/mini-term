@@ -76,6 +76,13 @@
 //! 这里闭包活到整个菜单关闭为止,所以调用方缓存的实体在一次菜单生命周期内复用,
 //! 反复悬停不重扫磁盘。
 //!
+//! **借焦点的面板**:自绘面板可以把焦点要走(终端右键「SSH 连接」的快速连接面板
+//! [`crate::ssh_quick_connect`] 要给搜索框接输入法)。菜单为此守两条:焦点不在菜单
+//! 容器上时容器的按键处理**只认 Esc**(其余键是那个输入框的 —— 否则空格 / ↵ 会被
+//! 当成「点选中项」吃掉,见 [`ContextMenu::owns_focus`]);悬停让展开路径一变就把
+//! 焦点收回容器([`ContextMenu::reclaim_focus`]),面板一收起焦点不至于落在没人画
+//! 的元素上、Esc 冒不到菜单。面板要借就在每次画出来时自己再借。
+//!
 //! # 焦点与键盘导航
 //!
 //! 打开时把焦点收到菜单上(Esc 要有人接),关闭时**先还给打开前那个元素、再执行
@@ -142,8 +149,8 @@ pub enum MenuEntry {
     Separator,
     /// 不可交互的分组标题(`.ctx-menu-header`)。
     ///
-    /// 唯一的真实消费方是终端右键的「SSH 连接」子菜单(BB-b 接上):
-    /// 连接按 group 分段,段与段之间靠它隔开。
+    /// 最早的消费方是终端右键的「SSH 连接」子菜单(连接按 group 分段),那里现已
+    /// 换成自绘的快速连接面板;Git 面板的拉取方式、分支操作菜单与启动器段仍在用。
     Header(SharedString),
 }
 
@@ -714,6 +721,23 @@ impl ContextMenu {
         cx.notify();
     }
 
+    /// 焦点在菜单容器自己身上吗。`false` = 被自绘子面板借走了(见模块注释
+    /// 「借焦点的面板」),此时容器的按键处理只认 Esc。
+    fn owns_focus(&self, window: &Window) -> bool {
+        self.open
+            .as_ref()
+            .is_some_and(|open| open.focus.is_focused(window))
+    }
+
+    /// 焦点被借走的话收回菜单容器。展开路径一变就调:借焦点的面板可能刚被收起。
+    fn reclaim_focus(&self, window: &mut Window, cx: &mut App) {
+        if let Some(open) = self.open.as_ref()
+            && !open.focus.is_focused(window)
+        {
+            window.focus(&open.focus, cx);
+        }
+    }
+
     /// 换展开路径。变了才动;有**新面板**出现时顺带重播子面板进场动画。
     /// 悬停与 →/← 都走这一条,免得两边对「什么时候算新面板」有两套看法。
     fn set_open_path(&mut self, next: Vec<usize>) -> bool {
@@ -1047,6 +1071,9 @@ impl ContextMenu {
 
         let hover_ancestors = ancestors.to_vec();
         let submenu_open = has_submenu && is_submenu_open(open_path, ancestors, index);
+        // 子菜单展开期间父项**保持高亮**:鼠标一移进子面板,父项自己的 hover 就掉了,
+        // 不亮着的话看不出旁边那块面板是谁展开的(系统菜单同款)
+        let lit = key_active || (submenu_open && !disabled);
 
         let mut row = div()
             .id(entry_id(ancestors, index))
@@ -1072,7 +1099,7 @@ impl ContextMenu {
                     }
                 })
             })
-            .when(key_active, |el| {
+            .when(lit, |el| {
                 if danger {
                     el.bg(with_alpha(ui::color_error(), 0.15))
                 } else {
@@ -1080,7 +1107,7 @@ impl ContextMenu {
                         .text_color(ui::text_primary())
                 }
             })
-            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
                 // 只认「进入」:子菜单是悬停展开的,移开并不收起(与原版一致 ——
                 // 收起发生在悬停同层的别的项、或整个菜单关闭时)
                 if !*hovered {
@@ -1088,6 +1115,8 @@ impl ContextMenu {
                 }
                 let next = next_open_path(&hover_ancestors, index, has_submenu);
                 if this.set_open_path(next) {
+                    // 借焦点的面板可能刚被收起(见模块注释「借焦点的面板」)
+                    this.reclaim_focus(window, cx);
                     cx.notify();
                 }
             }))
@@ -1208,11 +1237,13 @@ impl Render for ContextMenu {
                                         .mt(px(pop_dy))
                                         .on_key_down(cx.listener(
                                             |this, event: &KeyDownEvent, window, cx| {
-                                                if this.on_key(
-                                                    event.keystroke.key.as_str(),
-                                                    window,
-                                                    cx,
-                                                ) {
+                                                let key = event.keystroke.key.as_str();
+                                                // 焦点被自绘子面板借走时只认 Esc,其余键
+                                                // 是那个输入框的(见模块注释「借焦点的面板」)
+                                                if key != "escape" && !this.owns_focus(window) {
+                                                    return;
+                                                }
+                                                if this.on_key(key, window, cx) {
                                                     cx.stop_propagation();
                                                 }
                                             },

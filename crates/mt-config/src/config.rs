@@ -236,6 +236,10 @@ pub struct AppConfig {
     /// 单一来源，此列表只补充「还没有连接的分组」；空 Vec 时序列化跳过。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_groups: Vec<String>,
+    /// 终端右键「SSH 连接」快速连接面板里**折叠着**的分组(未分组那一桶记空串)。
+    /// 与 SSH 管理面板的折叠态互不相干(那边每次打开都全展开);空 Vec 时序列化跳过。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_menu_collapsed_groups: Vec<String>,
     /// 移动端中转配置(docs/adr/0001)。None = 未启用;序列化时省略保持文件干净。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_relay: Option<MobileRelayConfig>,
@@ -774,6 +778,7 @@ impl Default for AppConfig {
             md_outline_visible: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
+            ssh_menu_collapsed_groups: vec![],
             mobile_relay: None,
             custom_theme_id: None,
             session_list_view: None,
@@ -1701,6 +1706,24 @@ mod tests {
         assert!(json.contains(r#""mdOutlineVisible":false"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.md_outline_visible, Some(false));
+    }
+
+    /// SSH 快速连接面板的折叠分组:纯增量字段,空表不写进 JSON,设过能往返
+    /// (未分组桶记空串,空串也得原样往返),键名 camelCase。
+    #[test]
+    fn ssh_menu_collapsed_groups_是纯增量字段() {
+        let mut config = AppConfig::default();
+        assert!(config.ssh_menu_collapsed_groups.is_empty());
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("sshMenuCollapsedGroups")
+        );
+        config.ssh_menu_collapsed_groups = vec!["内网".into(), String::new()];
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""sshMenuCollapsedGroups":["内网",""]"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ssh_menu_collapsed_groups, vec!["内网".to_string(), String::new()]);
     }
 
     /// 终端帧率两项:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。

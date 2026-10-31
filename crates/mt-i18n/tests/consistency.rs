@@ -168,8 +168,13 @@ use mt_i18n::{
 /// （`gitChanges.{dirFiles,dirFilesOne}`）。
 /// 1444 → 1446：diff 弹窗正文支持拖选复制，右键菜单的两项
 /// （`gitCommit.{copySelection,selectAll}`，三个 diff 弹窗共用）。
+/// 1446 → 1454：终端右键「SSH 连接」换成悬停展开的快速连接面板 —— 搜索框占位 /
+/// 无匹配 / 空态两行 / 新建与管理两颗按钮 / 认证小签两枚 / 底栏键位提示
+/// （`terminal.ssh{SearchPlaceholder,NoMatch,Empty,EmptyHint,NewConnection,Manage,
+/// AuthKey,AuthPassword,FooterHint}`）；空态改成可点的卡片，置灰占位
+/// `terminal.sshConnectEmpty` 随之下线。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1446;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1454;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

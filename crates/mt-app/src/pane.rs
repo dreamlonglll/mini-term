@@ -1208,35 +1208,6 @@ mod tests {
         }
     }
 
-    /// 分桶保持**首次出现顺序**,未分组桶留在它自然出现的位置
-    /// (与三个 SSH 弹窗那份「未分组恒在最后」的口径**不同**,别混用)。
-    #[test]
-    fn ssh子菜单按首次出现顺序分桶() {
-        let list = vec![
-            conn("a", None),
-            conn("b", Some("内网")),
-            conn("c", None),
-            conn("d", Some("内网")),
-            conn("e", Some("客户A")),
-        ];
-        let buckets = ssh_submenu_buckets(&list);
-        assert_eq!(buckets.len(), 3);
-        assert_eq!(buckets[0].0, None, "未分组桶先出现就排第一");
-        assert_eq!(buckets[0].1.len(), 2);
-        assert_eq!(buckets[1].0.as_deref(), Some("内网"));
-        assert_eq!(buckets[1].1.len(), 2);
-        assert_eq!(buckets[2].0.as_deref(), Some("客户A"));
-    }
-
-    /// 空白组名视为未分组(与 `normalizeGroup` 同)。
-    #[test]
-    fn ssh子菜单空白组名算未分组() {
-        let list = vec![conn("a", Some("  ")), conn("b", Some(""))];
-        let buckets = ssh_submenu_buckets(&list);
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].0, None);
-    }
-
     /// 命令行:默认端口不写 `-p`,私钥路径**反斜杠换正斜杠并加引号**。
     #[test]
     fn ssh命令行拼装() {
@@ -1590,29 +1561,9 @@ fn branch_entries_for_pty(pty_id: u32, cx: &mut gpui::App) -> Vec<menu::MenuEntr
     crate::branch_family::branch_menu_entries(&store, &project_id, &pane_id, project_path, &segment)
 }
 
-// ─── 终端右键的「SSH 连接」子菜单(`TerminalInstance.tsx:60-82`) ───
-
-/// 按 `group` 归类,**保持首次出现顺序**且未分组桶留在它自然出现的位置。
-///
-/// ⚠️ 与 [`crate::ssh_conn::build_group_buckets`] **不是同一个口径**:那个是
-/// 三个 SSH 弹窗用的「具名组在前、未分组桶恒在最后」;这里照抄原版
-/// `buildSshSubmenu` 的就地分桶 —— 菜单是按连接表原序读下来的。
-fn ssh_submenu_buckets(connections: &[SshConnection]) -> Vec<(Option<String>, Vec<SshConnection>)> {
-    let mut buckets: Vec<(Option<String>, Vec<SshConnection>)> = Vec::new();
-    for conn in connections {
-        let group = conn
-            .group
-            .as_deref()
-            .map(str::trim)
-            .filter(|g| !g.is_empty())
-            .map(str::to_string);
-        match buckets.iter_mut().find(|(g, _)| *g == group) {
-            Some((_, items)) => items.push(conn.clone()),
-            None => buckets.push((group, vec![conn.clone()])),
-        }
-    }
-    buckets
-}
+// ─── 终端右键「SSH 连接」的连接动作(`TerminalInstance.tsx:60-82`) ───
+//
+// 菜单项本身(悬停展开的快速连接面板)在 [`crate::ssh_quick_connect`]。
 
 /// 把一条连接拼成 `ssh` 命令行(`buildSshCommand`)。
 ///
@@ -1645,7 +1596,7 @@ fn build_ssh_command(conn: &SshConnection, identity_path: Option<&str>) -> Strin
 /// ([`TerminalPane::write_ssh_command`]):以 `disarm_on_input = true` 注册,用户
 /// 此后一打字即解除 —— 公钥 / agent 先认证成功时不会有 SSH 密码提示,旧做法
 /// (先注册、`false`)会让它一直待命,把密码灌进之后任何以 "password:" 结尾的输出。
-fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut App) {
+pub(crate) fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut App) {
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
@@ -1696,39 +1647,6 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
             });
         })
         .detach();
-}
-
-/// 右键菜单里的 SSH 那一项:有连接就是子菜单,没有就是一项置灰的占位
-/// (原版 `sshConnections.length > 0 ? {submenu} : {disabled}`)。
-fn ssh_menu_entry(pty_id: u32, cx: &App) -> menu::MenuEntry {
-    let connections = AppStore::global(cx).read(cx).ssh_connections().to_vec();
-    if connections.is_empty() {
-        return MenuItem::new(t("terminal", "sshConnectEmpty"))
-            .disabled(true)
-            .into();
-    }
-    let buckets = ssh_submenu_buckets(&connections);
-    let has_named = buckets.iter().any(|(g, _)| g.is_some());
-    let mut submenu: Vec<menu::MenuEntry> = Vec::new();
-    for (group, items) in buckets {
-        // 只有一个未分组桶时不画分组标题(原版 `bucket.group || hasNamedGroup`)
-        if group.is_some() || has_named {
-            submenu.push(menu::MenuEntry::Header(
-                group
-                    .clone()
-                    .map(gpui::SharedString::from)
-                    .unwrap_or_else(|| t("terminal", "ungrouped").into()),
-            ));
-        }
-        for conn in items {
-            submenu.push(menu::item(conn.name.clone(), move |window, cx| {
-                connect_ssh(pty_id, conn.clone(), window, cx);
-            }));
-        }
-    }
-    MenuItem::new(t("terminal", "sshConnect"))
-        .submenu(submenu)
-        .into()
 }
 
 /// 终端里的右键该弹**本地菜单**吗。
@@ -1817,10 +1735,13 @@ impl Render for TerminalPane {
                     // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
                     // 右键都找得到),显隐口径与项的实现都是同一份
                     entries.extend(branch_entries_for_pty(this.pty_id, cx));
-                    // SSH 段:**恒在**(一条连接都没有时是一项置灰的
-                    // 「SSH 连接(暂无)」,原版 `TerminalInstance.tsx:392-395`)
+                    // SSH 段:**恒在**,悬停展开快速连接面板(一条连接都没有时
+                    // 面板是带「新建连接」的空态卡,见 `ssh_quick_connect`)
                     entries.push(menu::separator());
-                    entries.push(ssh_menu_entry(this.pty_id, cx));
+                    entries.push(crate::ssh_quick_connect::menu_entry(
+                        AppStore::global(cx),
+                        this.pty_id,
+                    ));
                     menu::show(event.position, entries, window, cx);
                 }),
             )
