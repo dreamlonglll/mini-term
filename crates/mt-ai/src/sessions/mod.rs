@@ -1,8 +1,9 @@
 //! AI CLI 会话记录读取与谱系扫描（原 `src-tauri/src/ai_sessions.rs`）。
 //!
-//! Claude / Codex / Grok 支持历史面板等完整读取；OMP 目前接入移动镜像所需的
-//! 本机会话定位、消息与 ask 问答解析。opencode / pi 只有状态与移动端指令，镜像必须
-//! 跳过启发式绑定，否则会把同项目其它 agent 的最新记录贴到该 pane。
+//! Claude / Codex / Grok / pi 支持历史面板等完整读取；OMP 目前接入移动镜像所需的
+//! 本机会话定位、消息与 ask 问答解析（pi 与 OMP 的记录同形，定位与行解析共用
+//! `omp.rs`）。opencode 只有状态与移动端指令，镜像必须跳过启发式绑定，否则会把
+//! 同项目其它 agent 的最新记录贴到该 pane。
 //!
 //! 原本的 `#[tauri::command]` 全部去掉,函数签名不变;跨模块共享的
 //! `pub(crate)` 项一律放宽成 `pub` —— 原来的消费者(remote_ssh / usage_stats /
@@ -12,6 +13,7 @@ mod codex;
 mod grok;
 mod lineage;
 mod omp;
+mod pi;
 mod tool_activity;
 mod tool_path;
 
@@ -30,12 +32,14 @@ pub use lineage::{
     scan_session_lineage,
 };
 pub use omp::{
-    OmpSessionMeta, find_omp_session_file, newest_omp_session_file, omp_message_from_line,
-    omp_question_answer_from_line, omp_question_from_line, omp_session_meta_from_line,
+    OmpSessionMeta, find_omp_session_file, find_pi_session_file, newest_omp_session_file,
+    newest_pi_session_file, omp_message_from_line, omp_question_answer_from_line,
+    omp_question_from_line, omp_session_meta_from_line,
 };
 pub use tool_activity::{
     AiToolCall, TOOL_TARGET_MAX_CHARS, claude_tool_calls_from_line, codex_tool_calls_from_line,
-    grok_tool_calls_from_line, omp_tool_calls_from_line, summarize_tool_target,
+    grok_tool_calls_from_line, omp_tool_calls_from_line, pi_tool_calls_from_line,
+    summarize_tool_target,
 };
 pub use tool_path::ToolPathScope;
 
@@ -45,6 +49,7 @@ use codex::{
 };
 use grok::{get_grok_sessions, read_grok_session_content};
 use lineage::latest_model_from_file_tail;
+use pi::{get_pi_sessions, read_pi_session_content};
 
 use crate::agent::AgentKind;
 use mt_core::path_key::{posix_ci_eq_key, strip_verbatim_prefix, windows_eq_key};
@@ -86,7 +91,7 @@ pub fn session_cache() -> &'static Mutex<HashMap<String, CachedSessions>> {
 #[serde(rename_all = "camelCase")]
 pub struct AiSession {
     pub id: String,
-    pub session_type: String, // "claude" | "codex" | "grok"
+    pub session_type: String, // "claude" | "codex" | "grok" | "pi"
     pub title: String,
     pub timestamp: String, // ISO 8601
     /// 会话最新使用的模型（Claude: 尾窗反扫 assistant 行 message.model;
@@ -109,9 +114,9 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// 该 agent 是否有对话镜像能解析的本机会话记录（Claude / Codex / Grok / OMP）。
+/// 该 agent 是否有对话镜像能解析的本机会话记录（Claude / Codex / pi / Grok / OMP）。
 ///
-/// 输入检测能认出的 agent 比这宽（pi / opencode 也在 `detect::AI_COMMANDS` 里）。
+/// 输入检测能认出的 agent 比这宽（opencode 也在 `detect::AI_COMMANDS` 里）。
 /// 未支持的 agent 必须跳过启发式绑定，否则会把同项目里别家的最新会话贴到该 pane。
 ///
 /// 识别走 [`AgentKind::parse`](hook 上报的 `claude-code` 与输入检测的 `claude`
@@ -1074,6 +1079,7 @@ pub fn get_ai_session_content(
         Some(AgentKind::Claude) => read_claude_session_content(&session_id, &project_path),
         Some(AgentKind::Codex) => read_codex_session_content(&session_id, &project_path),
         Some(AgentKind::Grok) => read_grok_session_content(&session_id, &project_path),
+        Some(AgentKind::Pi) => read_pi_session_content(&session_id, &project_path),
         _ => Err(format!("不支持的会话类型: {}", session_type)),
     }
 }
@@ -1101,6 +1107,7 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     sessions.extend(get_claude_sessions(&project_path));
     sessions.extend(get_codex_sessions(&project_path));
     sessions.extend(get_grok_sessions(&project_path));
+    sessions.extend(get_pi_sessions(&project_path));
 
     // 按时间戳降序(最新在前)
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1201,7 +1208,7 @@ mod tests {
 
     // ---- 可解析会话记录的白名单 ----
 
-    /// Claude/Codex/Grok/OMP 有可解析的记录；其余 agent 必须落在白名单外，
+    /// Claude/Codex/pi/Grok/OMP 有可解析的记录；其余 agent 必须落在白名单外，
     /// 否则镜像会退启发式绑到同项目别家的会话文件（串台）。
     #[test]
     fn supported_agents_have_session_logs() {
@@ -1214,10 +1221,12 @@ mod tests {
             "Grok",
             "omp",
             "OMP",
+            "pi",
+            "PI",
         ] {
             assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
         }
-        for agent in ["pi", "opencode", "", "gemini"] {
+        for agent in ["opencode", "", "gemini", "pip"] {
             assert!(
                 !agent_has_session_log(agent),
                 "{agent} 不应被认为有会话记录"

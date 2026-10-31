@@ -114,7 +114,7 @@ enum LocateKey {
         agent: Option<String>,
         session_id: String,
     },
-    /// 输入检测认出的 agent 没有可解析的记录(pi / opencode):恒为空镜像,不做 IO
+    /// 输入检测认出的 agent 没有可解析的记录(opencode):恒为空镜像,不做 IO
     NoLog { pty_id: Option<u32>, agent: String },
     /// 无会话身份:项目最新文件 + AI 启动时刻下限的启发式
     Heuristic {
@@ -742,7 +742,7 @@ impl MobileRelayManager {
                 session_id: s.session_id,
             };
         }
-        // 启发式的前提是"这个 agent 会往磁盘写我们认识的会话记录"。pi /
+        // 启发式的前提是"这个 agent 会往磁盘写我们认识的会话记录"。
         // opencode 不写(或格式不认),此时退启发式就会绑到同项目里 Claude/
         // Codex 的最新文件,把别人的对话贴到这个 pane 上——比空镜像更糟。
         let agent = pty_id.and_then(|id| self.host.ai_session_agent(id));
@@ -2628,12 +2628,12 @@ mod tests {
         assert!(loc.sent_initial, "定位落空时给过空快照");
     }
 
-    /// 没有会话记录的 agent(pi / opencode):定位输入是 NoLog,生产定位函数
+    /// 没有会话记录的 agent(opencode):定位输入是 NoLog,生产定位函数
     /// 对它不做任何 IO;输入不变就连这一问都省掉,运行态始终是空的。
     #[test]
     fn nolog_agent_never_binds() {
         let fx = MirrorFixture::new("nolog");
-        *fx.host.agent.lock() = Some("pi".into());
+        *fx.host.agent.lock() = Some("opencode".into());
         assert!(matches!(
             fx.manager.mirror_locate_key("pane-1"),
             LocateKey::NoLog { .. }

@@ -18,7 +18,7 @@
 ; 平铺 $INSTDIR,与便携解压、target\<profile>\ 开发布局同构(「与 exe 同目录」
 ; 定位铁律)。用户数据在 AppData 下,卸载不碰。
 ;
-; 真卸载时顺带摘掉 mini-term 写进四家 AI 工具(Claude / Codex / Grok / oh-my-pi)配置里的
+; 真卸载时顺带摘掉 mini-term 写进五家 AI 工具(Claude / Codex / Grok / oh-my-pi / pi)配置里的
 ; hook 注册(`mini-term.exe --unregister-hooks`),升级时不摘 —— 新安装器调旧卸载器带
 ; /UPGRADE 区分,详见 UNINSTALL_OLD 宏与 Section "Uninstall" 的注释。
 ;
@@ -133,8 +133,8 @@ LangString MSG_CLOSE_UNAVAILABLE ${LANG_ENGLISH} "Could not check for running pr
 LangString MSG_CLOSE_UNAVAILABLE ${LANG_SIMPCHINESE} "没能检查运行中的程序(PowerShell 返回:$1)。如提示文件被占用,请先关闭 ${PRODUCT_NAME} 再重试。"
 
 ; 卸载时摘 AI 工具 hook 注册的进度行(见 Section "Uninstall")。
-LangString MSG_UNREG_HOOKS ${LANG_ENGLISH} "Removing ${PRODUCT_NAME} hook entries from AI tool settings (Claude Code / Codex / Grok / oh-my-pi) ..."
-LangString MSG_UNREG_HOOKS ${LANG_SIMPCHINESE} "正在从 AI 工具配置(Claude Code / Codex / Grok / oh-my-pi)中移除 ${PRODUCT_NAME} 的 hook 注册..."
+LangString MSG_UNREG_HOOKS ${LANG_ENGLISH} "Removing ${PRODUCT_NAME} hook entries from AI tool settings (Claude Code / Codex / Grok / oh-my-pi / pi) ..."
+LangString MSG_UNREG_HOOKS ${LANG_SIMPCHINESE} "正在从 AI 工具配置(Claude Code / Codex / Grok / oh-my-pi / pi)中移除 ${PRODUCT_NAME} 的 hook 注册..."
 LangString MSG_UNREG_HOOKS_FAIL ${LANG_ENGLISH} "Some hook entries could not be removed (result: $1). You can remove the miniterm-hook entries from those settings files by hand."
 LangString MSG_UNREG_HOOKS_FAIL ${LANG_SIMPCHINESE} "部分 hook 注册未能移除(结果:$1),可手动删掉对应配置文件里含 miniterm-hook 的条目。"
 LangString MSG_UNREG_HOOKS_KEEP ${LANG_ENGLISH} "Upgrading: AI tool hook entries are kept."

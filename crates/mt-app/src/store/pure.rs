@@ -446,7 +446,7 @@ fn resolve_resume_cwd_with(
     if let Some(cwd) = session.cwd.as_deref() {
         return Path::new(cwd).is_dir().then(|| cwd.to_string());
     }
-    // 只有 claude 系(含缺省 agent)能按 id 反查:codex 不按目录分桶;omp / grok
+    // 只有 claude 系(含缺省 agent)能按 id 反查:codex 不按目录分桶;omp / pi / grok
     // 按目录分桶但没有反查手段 —— 都不去 `~/.claude/projects` 里翻(那里只会有
     // claude 的桶)。口径见 `mt_ai::CwdBucket`
     if !mt_ai::AgentKind::from_session_agent(session.agent.as_deref())
@@ -1182,6 +1182,11 @@ mod tests {
             resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
             Some("omp --resume 1f9d2a6b9c0d1234")
         );
+        let s = session(Some("pi"), "01a17c02-730e-74db-ab0c-337bb007000f");
+        assert_eq!(
+            resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+            Some("pi --session 01a17c02-730e-74db-ab0c-337bb007000f")
+        );
         for agent in [None, Some(""), Some("claude-code")] {
             let s = session(agent, "abc-123");
             assert_eq!(
@@ -1196,7 +1201,7 @@ mod tests {
     /// `claude --resume <别家的 id>`。
     #[test]
     fn 自动续接认不出的_agent_不续() {
-        for agent in ["opencode", "pi", "gemini"] {
+        for agent in ["opencode", "gemini"] {
             let s = session(Some(agent), "abc-123");
             assert!(
                 resolve_auto_resume_command(true, true, Some(&s), false).is_none(),
@@ -1285,7 +1290,7 @@ mod tests {
             calls.set(calls.get() + 1);
             Some("D:/from-jsonl".to_string())
         };
-        for agent in ["codex", "omp", "grok", "opencode", "gemini"] {
+        for agent in ["codex", "omp", "pi", "grok", "opencode", "gemini"] {
             let s = session(Some(agent), "rollout_9");
             assert_eq!(
                 decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),

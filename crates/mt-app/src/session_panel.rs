@@ -134,7 +134,7 @@ pub(crate) fn jump_to_session(
     }
 
     let Some(command) = session_resume_command(&session) else {
-        // opencode / pi 之类没有 resume 能力的 agent:静默不做
+        // opencode 之类没有 resume 能力的 agent:静默不做
         return Task::ready(());
     };
     let Some(project_id) = store.read(cx).active_project_id.clone() else {
@@ -1414,6 +1414,11 @@ mod tests {
             ("codex", "rollout_9", "codex resume rollout_9"),
             ("grok", "0199-x", "grok --resume 0199-x"),
             ("omp", "1f9d2a6b9c0d1234", "omp --resume 1f9d2a6b9c0d1234"),
+            (
+                "pi",
+                "01a17c02-730e-74db-ab0c-337bb007000f",
+                "pi --session 01a17c02-730e-74db-ab0c-337bb007000f",
+            ),
         ] {
             assert_eq!(
                 session_resume_command(&ai_session(session_type, id)).as_deref(),
@@ -1426,7 +1431,7 @@ mod tests {
     /// 历史面板的「恢复」「复制恢复命令」会给出一条对不上号的命令)。
     #[test]
     fn 不支持续接的_agent_不出命令() {
-        for session_type in ["opencode", "pi", "whatever"] {
+        for session_type in ["opencode", "whatever"] {
             assert_eq!(
                 session_resume_command(&ai_session(session_type, "id1")),
                 None,

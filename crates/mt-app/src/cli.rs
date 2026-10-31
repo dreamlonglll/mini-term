@@ -2,7 +2,7 @@
 //!
 //! # `--unregister-hooks`
 //!
-//! 卸载 mini-term 时把四家 AI 工具(Claude / Codex / Grok / oh-my-pi)配置里 mini-term
+//! 卸载 mini-term 时把五家 AI 工具(Claude / Codex / Grok / oh-my-pi / pi)配置里 mini-term
 //! 写入的 hook 注册摘掉([`mt_ai::hook_registry::purge_all_for_uninstall`])。不摘的话
 //! 卸载之后 AI 每来一个事件都要去跑一个已经不存在的 `miniterm-hook.exe`。
 //!
@@ -13,7 +13,7 @@
 //! - **输出**:每家一行到 stdout,固定文案只用 ASCII —— 卸载器用 `nsExec::ExecToLog`
 //!   把输出逐行贴进详情列表,nsExec 按系统 ANSI 代码页解码,中文会乱码(失败行里的
 //!   错误原文除外,那是少见路径)。
-//! - **退出码**:0 = 四家都处理完(含「没有可摘的」);1 = 至少一家失败。卸载器只拿它
+//! - **退出码**:0 = 各家都处理完(含「没有可摘的」);1 = 至少一家失败。卸载器只拿它
 //!   打一行提示,不因失败中断卸载。
 //! - **升级不走这里**:新安装器调旧卸载器时带 `/UPGRADE`,卸载器据此跳过这一步
 //!   (见 `scripts/windows-installer.nsi` 的 `UNINSTALL_OLD` 与 `Section "Uninstall"`)。

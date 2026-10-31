@@ -100,13 +100,14 @@ impl AiVendor {
 
     /// CLI 类型 → 厂商(前端 `inferVendor.ts` 的 `CLI_VENDOR`)。
     ///
-    /// 会话记录能解析的三家,加上 hook 会上报 agent 名的 omp 在表里;其余 CLI
+    /// 会话记录能解析的四家,加上 hook 会上报 agent 名的 omp 在表里;其余 CLI
     /// 返回 `None`,由调用方走 [`Self::infer`] 或回退通用图标。
     pub fn from_session_type(session_type: &str) -> Option<Self> {
         match session_type {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::OpenAi),
             "grok" => Some(Self::Grok),
+            "pi" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
             _ => None,
         }
@@ -650,6 +651,12 @@ mod tests {
         assert_eq!(AiVendor::for_session("grok", None), Some(AiVendor::Grok));
         // omp 没有会话记录,但 hook 会上报 agent 名 —— pane tab 靠这条认图标
         assert_eq!(AiVendor::for_session("omp", None), Some(AiVendor::Omp));
+        // pi 的历史会话与 hook 上报都带 `pi`;挂 deepseek 时历史行按模型出图标
+        assert_eq!(AiVendor::for_session("pi", None), Some(AiVendor::Pi));
+        assert_eq!(
+            AiVendor::for_session("pi", Some("deepseek-flash")),
+            Some(AiVendor::DeepSeek)
+        );
         // 没有会话记录的 agent 没有 CLI 兜底
         assert_eq!(AiVendor::for_session("opencode", None), None);
     }

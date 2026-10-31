@@ -1,4 +1,4 @@
-//! 工具活动:四家会话记录里的工具调用 → (工具名, 一行目标摘要)。
+//! 工具活动:各家会话记录里的工具调用 → (工具名, 一行目标摘要)。
 //!
 //! 供 mt-relay 对话镜像产出 kind = "tool" 的消息,让移动端看得到 agent 在读哪个
 //! 文件、跑哪条命令;桌面 AI 历史面板不用它。全是行级纯函数,与同目录的提问解析
@@ -16,7 +16,7 @@
 //!   行动辄几 MB)从头解析一遍,不含工具调用判别串的行不必再多付一次全量解析。
 //!   预筛只会放过、不会误杀——判别串是 JSON 里必然逐字出现的键值。
 //!
-//! 目标字段核对过本机真实记录的有 Claude / Codex / Grok(见各段注释);OMP 本机
+//! 目标字段核对过本机真实记录的有 Claude / Codex / Grok / pi(见各段注释);OMP 本机
 //! 没有记录,字段名按 oh-my-pi 源码的工具参数 schema 定。
 
 use serde_json::Value;
@@ -410,6 +410,23 @@ fn grok_target(name: &str, input: &Value, paths: &ToolPathScope) -> Option<Strin
 /// 解析 OMP JSONL 的一行为工具调用(assistant 消息里的 `toolCall` 块,按块序)。
 /// ask → 不产出(走提问卡片)。路径类目标按 `paths` 缩短。
 pub fn omp_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
+    pi_family_tool_calls(line, paths, Some("ask"))
+}
+
+/// pi 的工具调用:行形态与 OMP 相同,内建工具(read / bash / edit / write / grep /
+/// find / ls)与参数名(`path` / `command` / `pattern`)也是同一套——核对过本机记录。
+/// pi 没有内建提问工具、镜像也不给它出提问卡片,所以**不排除**任何工具:第三方扩展
+/// 叫 `ask` 的工具照常出一行工具活动。
+pub fn pi_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
+    pi_family_tool_calls(line, paths, None)
+}
+
+/// `question_tool`:走提问卡片、不出工具行的那个工具名(OMP 的 `ask`)。
+fn pi_family_tool_calls(
+    line: &str,
+    paths: &ToolPathScope,
+    question_tool: Option<&str>,
+) -> Vec<AiToolCall> {
     if !line.contains("\"toolCall\"") {
         return Vec::new();
     }
@@ -431,7 +448,7 @@ pub fn omp_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiTool
         .filter_map(|b| {
             let name = b.get("name").and_then(Value::as_str)?;
             // 提问走提问卡片(判据同 omp_question_from_line)
-            if name.is_empty() || name == "ask" {
+            if name.is_empty() || Some(name) == question_tool {
                 return None;
             }
             Some(AiToolCall {
@@ -933,6 +950,28 @@ mod tests {
         // toolResult / user 行不是工具调用
         let result = r#"{"type":"message","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"\"toolCall\""}]}}"#;
         assert!(omp_tool_calls_from_line(result, &no_paths()).is_empty());
+    }
+
+    // ---- pi ----
+
+    /// 行形态取自本机 pi 1.4.0 的真实记录(id / 参数照抄,正文截短);pi 不出提问卡片,
+    /// 扩展提供的 `ask` 工具照常算一行工具活动。
+    #[test]
+    fn pi_tool_calls_keep_every_tool() {
+        let line = r#"{"type":"message","id":"5627c0dc","parentId":"f2fbd5ae","timestamp":"2026-10-27T06:19:30.311Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"…"},{"type":"toolCall","id":"call_00_fDn7ddWBRBo4wC93RkjO9967","name":"bash","arguments":{"command":"cd \"D:/Projects/本地处理\" && ls"}},{"type":"toolCall","id":"c2","name":"ask","arguments":{"question":"继续?"}}],"api":"openai-completions","provider":"deepseek","model":"deepseek-flash","stopReason":"toolUse"}}"#;
+        assert_eq!(
+            pi_tool_calls_from_line(line, &no_paths()),
+            vec![
+                call(
+                    "bash",
+                    Some("cd \"D:/Projects/本地处理\" && ls"),
+                    "2026-10-27T06:19:30.311Z"
+                ),
+                call("ask", None, "2026-10-27T06:19:30.311Z"),
+            ]
+        );
+        // 同一行按 OMP 口径会吃掉 ask
+        assert_eq!(omp_tool_calls_from_line(line, &no_paths()).len(), 1);
     }
 
     #[test]

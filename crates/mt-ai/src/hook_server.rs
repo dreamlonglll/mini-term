@@ -1,10 +1,10 @@
 //! Hook HTTP 服务器模块
 //!
 //! 在后台线程监听 `127.0.0.1` 的 HTTP 请求，接收 Claude Code / Codex / Grok /
-//! oh-my-pi 的 hook 事件上报，并通过注入的 [`StatusEmitter`] 通知上层。
+//! oh-my-pi / pi 的 hook 事件上报，并通过注入的 [`StatusEmitter`] 通知上层。
 //!
 //! **端口 / 协议 / 路由一个字都不能改**:各家 CLI 里已注册在用户机器上的 hook
-//! 命令（与 omp 的进程内扩展）按当前形态 POST 过来,改了等于让存量用户的 AI 感知
+//! 命令（与 omp / pi 的进程内扩展）按当前形态 POST 过来,改了等于让存量用户的 AI 感知
 //! 集体失灵。
 
 use crate::agent::AgentKind;
@@ -42,7 +42,7 @@ pub struct HookPayload {
     pub pty_id: Option<u32>,
     /// 事件名（如 UserPromptSubmit, PreToolUse 等）
     pub event: Option<String>,
-    /// 来源 agent（claude-code / codex / grok / omp）
+    /// 来源 agent（claude-code / codex / grok / omp / pi）
     pub agent: Option<String>,
     /// 会话 ID
     pub session_id: Option<String>,
@@ -395,10 +395,10 @@ fn event_cause<'a>(event: &'a str, notification_type: Option<&str>, message: Opt
     }
 }
 
-/// 该 `Stop` 是否是用户打断后的回合收尾（omp 上报 `reason: "aborted"`）。
+/// 该 `Stop` 是否是用户打断后的回合收尾（omp / pi 上报 `reason: "aborted"`）。
 ///
 /// omp 在 Esc/Ctrl+C 打断后仍会发 `agent_end`，扩展据 `stopReason == "aborted"`
-/// 标成这样一发。它要把状态收到 ai-idle（回合确实结束了），但 cause 不能是 `Stop`
+/// 标成这样一发（pi 是 `agent_settled` 的 `aborted` 位，同一个上报形态）。它要把状态收到 ai-idle（回合确实结束了），但 cause 不能是 `Stop`
 /// ——UI 的 isAiCompletion 会认成「任务完成」，每次打断都白响一声。cause 改成
 /// `Interrupt`，与输入检测那条打断路径（`note_user_interrupt`）同名：两条路先后
 /// 到达时 `emit_if_changed` 按「状态与 cause 都没变」去重，只发一次。
@@ -1358,6 +1358,33 @@ mod tests {
             map_event("PermissionRequest", Some("omp"), None),
             Some("ai-idle")
         );
+    }
+
+    // ---- pi 特有语义 ----
+
+    /// pi 扩展的上报表同样必须全有状态映射;它沿用 omp 的口径(打断 = Stop+aborted,
+    /// 扩展对话框 = Elicitation 黄灯 / ElicitationResult 熄灯),hook server 不为它开特例。
+    #[test]
+    fn pi_reported_event_set_is_fully_mapped() {
+        for event in crate::hook_registry::PI_REPORTED_EVENTS {
+            if *event == "SessionEnd" {
+                continue;
+            }
+            assert!(
+                map_event(event, Some("pi"), None).is_some(),
+                "{event} 无状态映射"
+            );
+        }
+        assert_eq!(
+            map_event_to_status("Stop", Some("pi"), None, None, Some("aborted")),
+            Some("ai-idle")
+        );
+        assert_eq!(map_event("Elicitation", Some("pi"), None), Some("ai-idle"));
+        assert_eq!(
+            map_event("ElicitationResult", Some("pi"), None),
+            Some("ai-working")
+        );
+        assert!(is_attention_cause(event_cause("StopFailure", None, None)));
     }
 
     // ---- Grok Build 特有语义 ----
