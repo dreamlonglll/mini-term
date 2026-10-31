@@ -91,11 +91,14 @@ const SCHEMA_VERSION: i64 = 1;
 ///
 /// 盘点口径(git log 逐条核过 `AppConfig` 被删的字段):
 /// - `skin`:内置皮肤栏移除(c871442,2026-08-25),晚于配置入库,库里真有;
+/// - `aiAttentionNotify`:「待确认时也提醒」开关移除(2026-10-31),待确认改为
+///   固定随完成通知的三个通道提醒,库里真有;
 /// - 其余下线早于配置入库(3d142eb,2026-08-20)。入库只经 `AppConfig` 序列化,
 ///   库里本不该有,列出来是为了这张表就是完整的历史清单:四个面板显隐开关
 ///   (Activity Bar 改版)、`aiPanelSize`(AI 历史面板移除)、`ccConnect`
 ///   (cc-connect 集成整体移除)。
 const RETIRED_KEYS: &[&str] = &[
+    "aiAttentionNotify",
     "aiPanelSize",
     "ccConnect",
     "filesVisible",

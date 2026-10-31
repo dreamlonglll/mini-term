@@ -77,8 +77,6 @@ pub struct NotifyPrefs {
     pub sound: bool,
     pub flash: bool,
     pub popup: bool,
-    /// 待确认提醒开关独立:它的触发频率远高于完成,想只留完成通知的用户得能单独关。
-    pub attention_notify: bool,
 }
 
 /// toast 的口径。前五种与旧版 `AiCompletionNotification['kind']` 同集
@@ -237,7 +235,8 @@ impl DoneTracker {
                     plan.toast = Some(ToastKind::Completion);
                 }
             }
-        } else if prefs.attention_notify && is_attention_rise(t.old_attention, t.cause) {
+        } else if is_attention_rise(t.old_attention, t.cause) {
+            // 待确认固定随完成通知的三个通道提醒,没有单独的开关
             plan.sound = prefs.sound;
             plan.flash = prefs.flash;
             // 不设 needsAttention:那是项目行上绿色的「完成」标,语义对不上
@@ -697,7 +696,6 @@ mod tests {
             sound: true,
             flash: true,
             popup: true,
-            attention_notify: true,
         }
     }
 
@@ -977,7 +975,6 @@ mod tests {
             sound: false,
             flash: false,
             popup: false,
-            attention_notify: false,
         };
         let plan = tracker.apply(
             &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),

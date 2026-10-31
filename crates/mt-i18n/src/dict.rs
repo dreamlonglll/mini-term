@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1454;
+pub const ZH_ENTRY_COUNT: usize = 1450;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1454;
+pub const EN_ENTRY_COUNT: usize = 1450;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2300,15 +2300,12 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiHook.title", "AI Hook 事件"),
     ("aiHook.unregister", "卸载所选 Hook"),
     ("aiHook.unregistering", "卸载中..."),
-    ("aiNotification.attention", "待确认时也提醒"),
-    ("aiNotification.attentionDesc", "AI 停下来等你批准工具权限、填 MCP 表单，或这一轮因 API 错误结束时，按上面的方式提醒一次（与项目行的黄灯同一判定）"),
-    ("aiNotification.attentionFooter", "同一次待确认只提醒一次；你对该终端键入即视为已在处理，下一次请求才会再响"),
     ("aiNotification.audioFilter", "音频文件"),
     ("aiNotification.chooseFile", "选择文件"),
     ("aiNotification.clear", "清除"),
     ("aiNotification.customSound", "自定义提示音"),
     ("aiNotification.defaultSound", "默认提示音"),
-    ("aiNotification.footer", "以上通知在 AI 任务（Claude / Codex / Grok / oh-my-pi）完成时触发"),
+    ("aiNotification.footer", "以上通知在 AI 任务（Claude / Codex / Grok / oh-my-pi）完成时触发；AI 停下来等你批准工具权限、填 MCP 表单，或这一轮因 API 错误结束时也会提醒一次"),
     ("aiNotification.method", "通知方式"),
     ("aiNotification.popup", "弹框提醒"),
     ("aiNotification.popupDesc", "AI 任务结束时在右下角弹出提醒卡片"),
@@ -2318,7 +2315,6 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiNotification.soundDialogTitle", "选择提示音文件"),
     ("aiNotification.taskbarFlash", "任务栏闪烁"),
     ("aiNotification.taskbarFlashDesc", "窗口失焦时请求用户注意（Windows 闪烁任务栏，macOS 跳动 Dock）"),
-    ("aiNotification.trigger", "触发时机"),
     ("aiNotification.wavOnly", "当前仅支持 .wav 自定义提示音，其它格式会回落到系统提示音"),
     ("appearance.language", "语言"),
     ("appearance.languageLabel", "界面语言"),
@@ -2510,15 +2506,12 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiHook.title", "AI hook events"),
     ("aiHook.unregister", "Uninstall selected hooks"),
     ("aiHook.unregistering", "Uninstalling..."),
-    ("aiNotification.attention", "Also alert when waiting for you"),
-    ("aiNotification.attentionDesc", "Alert once (using the methods above) when the AI stops to ask for tool permission, needs an MCP form filled in, or ends a turn on an API error — same rule as the amber dot on the project row"),
-    ("aiNotification.attentionFooter", "One alert per pending request; typing into that terminal counts as handling it, so only the next request alerts again"),
     ("aiNotification.audioFilter", "Audio file"),
     ("aiNotification.chooseFile", "Choose file"),
     ("aiNotification.clear", "Clear"),
     ("aiNotification.customSound", "Custom sound"),
     ("aiNotification.defaultSound", "Default sound"),
-    ("aiNotification.footer", "The notifications above fire when an AI task (Claude / Codex / Grok / oh-my-pi) completes"),
+    ("aiNotification.footer", "The notifications above fire when an AI task (Claude / Codex / Grok / oh-my-pi) completes; they also fire once when the AI stops to ask for tool permission, needs an MCP form filled in, or ends a turn on an API error"),
     ("aiNotification.method", "Notification method"),
     ("aiNotification.popup", "Popup alert"),
     ("aiNotification.popupDesc", "Show an alert card in the bottom-right corner when an AI task finishes"),
@@ -2528,7 +2521,6 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiNotification.soundDialogTitle", "Select sound file"),
     ("aiNotification.taskbarFlash", "Taskbar flash"),
     ("aiNotification.taskbarFlashDesc", "Request attention when the window is unfocused (flash taskbar on Windows, bounce Dock on macOS)"),
-    ("aiNotification.trigger", "Trigger"),
     ("aiNotification.wavOnly", "Only .wav custom sounds are supported for now; other formats fall back to the system beep"),
     ("appearance.language", "Language"),
     ("appearance.languageLabel", "Interface language"),

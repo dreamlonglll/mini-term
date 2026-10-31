@@ -174,7 +174,7 @@ use mt_i18n::{
 /// AuthKey,AuthPassword,FooterHint}`）；空态改成可点的卡片，置灰占位
 /// `terminal.sshConnectEmpty` 随之下线。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1454;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1450;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -439,7 +439,6 @@ impl AppStore {
             sound: self.config.ai_completion_sound,
             flash: self.config.ai_completion_taskbar_flash,
             popup: self.config.ai_completion_popup,
-            attention_notify: self.config.ai_attention_notify,
         }
     }
 

@@ -129,7 +129,6 @@ def write_config():
         'aiCompletionPopup': True,
         'aiCompletionTaskbarFlash': False,
         'aiCompletionSound': False,
-        'aiAttentionNotify': True,
         'editors': [],
         'gitChangesViewMode': 'list',
         'longPasteToFile': True,

@@ -26,7 +26,6 @@ impl SettingsView {
         let flash = config.ai_completion_taskbar_flash;
         let sound = config.ai_completion_sound;
         let sound_path = config.ai_completion_sound_path.clone();
-        let attention = config.ai_attention_notify;
 
         let path_label = sound_path
             .clone()
@@ -119,23 +118,6 @@ impl SettingsView {
                         ))
                     })
                     .child(ui::hint(t("settings", "aiNotification.footer"))),
-            )
-            .child(
-                section("aiNotification.trigger")
-                    .child(toggle_row(
-                        "notify-attention",
-                        "aiNotification.attention",
-                        "aiNotification.attentionDesc",
-                        attention,
-                        false,
-                        |this, next, _window, cx| {
-                            this.store.update(cx, |store, cx| {
-                                store.patch_config(|c| c.ai_attention_notify = next, cx)
-                            });
-                        },
-                        cx,
-                    ))
-                    .child(ui::hint(t("settings", "aiNotification.attentionFooter"))),
             )
             .into_any_element()
     }
