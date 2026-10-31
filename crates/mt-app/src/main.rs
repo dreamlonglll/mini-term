@@ -302,16 +302,22 @@ struct DrawerExit {
     _timer: Task<()>,
 }
 
-/// 右抽屉左缘拖拽的一次会话。
+/// 右抽屉(或它左侧的提交详情栏)左缘拖拽的一次会话。
 #[derive(Clone, Copy)]
 struct DrawerDrag {
     /// 按下时的鼠标 x(窗口坐标)。
     start_x: gpui::Pixels,
     /// 按下时的宽度。
     start_width: f64,
-    /// 当前宽度(已钳到 240..720)。
+    /// 当前宽度(已钳到可拖范围:抽屉 240..720,详情栏见 `store::GIT_DETAIL_*_WIDTH`)。
     width: f64,
 }
+
+/// 提交详情栏左边至少给终端留多宽(Activity Bar 44 + 一截能看清的终端)。窗口窄时
+/// 详情栏先让,但不窄于 [`GIT_DETAIL_FLOOR_W`]。
+const GIT_DETAIL_TERMINAL_ROOM: f32 = 200.0;
+/// 窗口再窄,详情栏也不窄于这个宽(宁可压住终端左段,也别挤成一条缝)。
+const GIT_DETAIL_FLOOR_W: f32 = 260.0;
 
 /// 上次退出时的窗口几何 → 本次开窗参数。
 ///
@@ -395,6 +401,8 @@ struct Workspace {
     drawer_exit: Option<DrawerExit>,
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
+    /// Git 抽屉左侧「提交详情」栏的左缘正在被拖(同上,松手才落盘)。
+    detail_drag: Option<DrawerDrag>,
     usage_open: bool,
     /// 左侧 Activity Bar 整组按钮共用的 VS Code 式悬停会话。
     activity_bar_hover: activity_bar::HoverSession,
@@ -580,6 +588,7 @@ impl Workspace {
             right_drawer: None,
             drawer_exit: None,
             drawer_drag: None,
+            detail_drag: None,
             usage_open: false,
             activity_bar_hover: activity_bar::HoverSession::default(),
             activity_bar_hover_task: None,
@@ -1145,6 +1154,95 @@ impl Workspace {
             return;
         }
         self.store.update(cx, |store, cx| store.step_marker(1, cx));
+    }
+
+    /// Git 抽屉左侧的「提交详情」栏(内容与开合口径见 `git_history::detail` 模块注释)。
+    ///
+    /// 挂在抽屉层里当子节点、`right` = 抽屉宽:紧贴抽屉左缘往左排,随抽屉一起滑进滑出、
+    /// 随抽屉拖宽一起左移;同样盖在终端之上、不改终端尺寸(PTY 不 resize)。
+    ///
+    /// 进场从抽屉左缘**滑出来**:外壳按栏宽裁剪,里层的 `left` 从栏宽补到 0 —— 方向性
+    /// 位移、零尺寸变化;与抽屉进场同一条时长与缓动,同样不过减弱动效的闸。外壳 `id`
+    /// 不变,换选中的提交不重播,只有栏从无到有(单击打开、抽屉重新打开)才播。
+    ///
+    /// 宽度落 layout.db(左缘拖拽,松手落盘);窗口窄时先给终端留出
+    /// [`GIT_DETAIL_TERMINAL_ROOM`],但不窄于 [`GIT_DETAIL_FLOOR_W`]。
+    fn render_commit_detail_layer(
+        &self,
+        pane: Entity<git_history::CommitDetailPane>,
+        drawer_width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let wanted = self
+            .detail_drag
+            .map(|d| d.width)
+            .unwrap_or_else(|| self.store.read(cx).git_detail_width()) as f32;
+        let room =
+            f32::from(window.viewport_size().width) - drawer_width - GIT_DETAIL_TERMINAL_ROOM;
+        let width = wanted.min(room).max(GIT_DETAIL_FLOOR_W);
+        div()
+            .id("git-detail-layer")
+            .absolute()
+            .top_0()
+            .right(px(drawer_width))
+            .h_full()
+            .w(px(width))
+            .overflow_hidden()
+            .occlude()
+            // 盖在文档页上时,这块同样从 HTML 预览 WebView 的显示与点击里让出来
+            .child(native_view::occluder())
+            .child(
+                div()
+                    .id("git-detail-panel")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h_full()
+                    .w(px(width))
+                    .flex()
+                    .flex_col()
+                    .bg(ui::bg_surface())
+                    .border_l_1()
+                    .border_color(ui::border_default())
+                    .child(pane)
+                    // 左缘拖拽手柄(同抽屉那条:往左拖 = 变宽)
+                    .child(
+                        div()
+                            .id("git-detail-resize-handle")
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(6.0))
+                            .cursor_col_resize()
+                            .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(
+                                    move |this: &mut Self,
+                                          event: &gpui::MouseDownEvent,
+                                          _window,
+                                          cx| {
+                                        cx.stop_propagation();
+                                        this.detail_drag = Some(DrawerDrag {
+                                            start_x: event.position.x,
+                                            start_width: width as f64,
+                                            width: width as f64,
+                                        });
+                                    },
+                                ),
+                            ),
+                    )
+                    .with_animation(
+                        "git-detail-slide-in",
+                        gpui::Animation::new(std::time::Duration::from_millis(
+                            MOTION_OVERLAY_IN_MS,
+                        ))
+                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                        move |el, delta| el.left(px(width * (1.0 - delta))),
+                    ),
+            )
     }
 
     /// 抽屉标题条(`RightDrawer.tsx:80-124`):h-9 的段控件 + ✕。
@@ -1835,6 +1933,12 @@ impl Render for Workspace {
                 DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
                 DrawerPanel::Git => self.git_panel.clone().into_any_element(),
             };
+            // Git 面板选中提交时,抽屉左侧再挂一栏「提交详情」
+            let detail_layer = match panel {
+                DrawerPanel::Git => self.git_panel.read(cx).detail_pane(cx),
+                DrawerPanel::Sessions => None,
+            }
+            .map(|pane| self.render_commit_detail_layer(pane, width, window, cx));
             div()
                 .absolute()
                 .top_0()
@@ -1898,6 +2002,7 @@ impl Render for Workspace {
                             }),
                         ),
                 )
+                .children(detail_layer)
                 .with_animation(
                     SharedString::from(if leaving {
                         "drawer-slide-out"
@@ -2141,6 +2246,32 @@ impl Render for Workspace {
                             .update(cx, |store, cx| store.set_right_drawer_width(drag.width, cx));
                         cx.notify();
                     }),
+                )
+            })
+            // 提交详情栏左缘的拖拽:同一套,栏也贴在右侧(抽屉左边),往左拖 = 变宽
+            .when(self.detail_drag.is_some(), |el| {
+                el.on_mouse_move(cx.listener(
+                    |this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
+                        if let Some(drag) = this.detail_drag.as_mut() {
+                            let delta = f32::from(drag.start_x - event.position.x) as f64;
+                            drag.width = (drag.start_width + delta)
+                                .clamp(store::GIT_DETAIL_MIN_WIDTH, store::GIT_DETAIL_MAX_WIDTH);
+                            cx.notify();
+                        }
+                    },
+                ))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(
+                        |this: &mut Self, _event: &gpui::MouseUpEvent, _window, cx| {
+                            let Some(drag) = this.detail_drag.take() else {
+                                return;
+                            };
+                            this.store
+                                .update(cx, |store, cx| store.set_git_detail_width(drag.width, cx));
+                            cx.notify();
+                        },
+                    ),
                 )
             })
             // ⚠️ 标题栏**不套** [`cached_panel`]:它靠 `.window_control_area(..)`

@@ -76,6 +76,7 @@ const KEY_RIGHT_DRAWER_WIDTH: &str = "rightDrawerWidth";
 const KEY_WINDOW: &str = "window";
 // GPUI 版新增的键(旧 config.json 里没有对应物),沿用 camelCase 命名口径。
 const KEY_TERMINALS_PANEL_VISIBLE: &str = "terminalsPanelVisible";
+const KEY_GIT_DETAIL_WIDTH: &str = "gitDetailWidth";
 
 /// 窗口的开合状态。gpui 的 `WindowBounds` 三个变体的镜像 —— 那个类型不实现
 /// serde,而本 crate 刻意**不依赖 gpui**(布局存储不该把整个 GPU 栈拖进来,
@@ -127,6 +128,8 @@ pub struct GlobalLayout {
     pub right_drawer_width: Option<f64>,
     /// 终端区右缘「终端列表」竖条面板的显隐(GPUI 版新增,无旧 config 对应物)。
     pub terminals_panel_visible: Option<bool>,
+    /// Git 抽屉左侧「提交详情」栏的宽度(GPUI 版新增)。
+    pub git_detail_width: Option<f64>,
     pub window: Option<WindowGeometry>,
 }
 
@@ -269,6 +272,7 @@ impl LayoutStore {
             middle_column_visible: from_kv(&map, KEY_MIDDLE_COLUMN_VISIBLE),
             right_drawer_width: from_kv(&map, KEY_RIGHT_DRAWER_WIDTH),
             terminals_panel_visible: from_kv(&map, KEY_TERMINALS_PANEL_VISIBLE),
+            git_detail_width: from_kv(&map, KEY_GIT_DETAIL_WIDTH),
             window: from_kv(&map, KEY_WINDOW),
         }
     }
@@ -300,6 +304,7 @@ impl LayoutStore {
                 KEY_TERMINALS_PANEL_VISIBLE,
                 to_json(&globals.terminals_panel_visible),
             )?;
+            put(KEY_GIT_DETAIL_WIDTH, to_json(&globals.git_detail_width))?;
             put(KEY_WINDOW, to_json(&globals.window))?;
         }
         tx.commit()?;
@@ -403,6 +408,7 @@ impl LayoutStore {
             // 没有对应物(窗口几何在 Tauri 版存在另一个文件 `.window-state.json`,
             // 格式不兼容,不迁)
             terminals_panel_visible: None,
+            git_detail_width: None,
             window: None,
         };
         if !globals.is_empty() {
@@ -533,6 +539,21 @@ mod tests {
         let got = store.load_globals();
         assert_eq!(got.layout_sizes, Some(vec![25.0, 55.0, 20.0]));
         assert_eq!(got.right_drawer_width, Some(360.0), "没填的字段不该被抹掉");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn 提交详情栏宽度往返() {
+        let dir = temp_dir("git-detail-width");
+        let store = LayoutStore::open_at(&dir).unwrap();
+        assert_eq!(store.load_globals().git_detail_width, None);
+        store
+            .save_globals(&GlobalLayout {
+                git_detail_width: Some(520.0),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.load_globals().git_detail_width, Some(520.0));
         fs::remove_dir_all(&dir).ok();
     }
 

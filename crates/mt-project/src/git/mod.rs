@@ -1043,21 +1043,7 @@ pub(crate) fn commit_files_in(
     repo: &Repository,
     commit: &Commit<'_>,
 ) -> Result<Vec<CommitFileInfo>> {
-    let tree = commit.tree()?;
-
-    let parent_tree = if commit.parent_count() > 0 {
-        Some(commit.parent(0)?.tree()?)
-    } else {
-        None
-    };
-
-    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
-    // 树对树的 diff 默认不做相似度配对:纯重命名会拆成一删一增,下游「仅重命名」的
-    // 分支永远走不到。按 `git show` 的默认口径配对(只认重命名、不认复制,相似度 50%)
-    let mut find = git2::DiffFindOptions::new();
-    find.renames(true);
-    diff.find_similar(Some(&mut find))?;
-
+    let diff = first_parent_diff(repo, commit)?;
     let mut files = Vec::new();
     for delta in diff.deltas() {
         let status = match delta.status() {
@@ -1087,6 +1073,28 @@ pub(crate) fn commit_files_in(
         });
     }
     Ok(files)
+}
+
+/// 提交相对**第一个父**的树对树 diff(根提交对空树比),已按 `git show` 的默认口径配对
+/// 重命名。[`commit_files_in`] 与逐文件增删行数([`get_commit_line_stats`])共用这一份,
+/// 两边的文件与顺序一一对应。
+pub(crate) fn first_parent_diff<'r>(
+    repo: &'r Repository,
+    commit: &Commit<'_>,
+) -> Result<git2::Diff<'r>> {
+    let tree = commit.tree()?;
+    let parent_tree = if commit.parent_count() > 0 {
+        Some(commit.parent(0)?.tree()?)
+    } else {
+        None
+    };
+    let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    // 树对树的 diff 默认不做相似度配对:纯重命名会拆成一删一增,下游「仅重命名」的
+    // 分支永远走不到。按 `git show` 的默认口径配对(只认重命名、不认复制,相似度 50%)
+    let mut find = git2::DiffFindOptions::new();
+    find.renames(true);
+    diff.find_similar(Some(&mut find))?;
+    Ok(diff)
 }
 
 pub fn get_commit_file_diff(
@@ -2636,6 +2644,7 @@ mod blame;
 mod branch;
 mod combined;
 mod commit;
+mod commit_extras;
 mod conflict;
 mod hunk;
 mod line_diff;
@@ -2650,6 +2659,7 @@ pub use blame::*;
 pub use branch::*;
 pub use combined::*;
 pub use commit::*;
+pub use commit_extras::*;
 pub use conflict::*;
 pub use hunk::*;
 pub use line_diff::*;

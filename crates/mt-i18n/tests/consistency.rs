@@ -173,8 +173,12 @@ use mt_i18n::{
 /// （`terminal.ssh{SearchPlaceholder,NoMatch,Empty,EmptyHint,NewConnection,Manage,
 /// AuthKey,AuthPassword,FooterHint}`）；空态改成可点的卡片，置灰占位
 /// `terminal.sshConnectEmpty` 随之下线。
+/// 1450 → 1456：提交详情从历史区底部挪成 Git 抽屉左侧单独一栏 —— 关闭按钮
+/// （`gitLog.detail.close`）、提交时间 / 所在分支四条 / 二进制文件 / 行数说明
+/// （`gitLog.detail.{commitDate,branches,branchesLoading,branchesNone,branchesFailed,binary,statsTip}`）；
+/// 不再能收起，`gitLog.detail.{collapse,expand}` 随之下线。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1450;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1456;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

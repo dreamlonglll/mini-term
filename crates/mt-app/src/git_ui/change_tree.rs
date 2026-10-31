@@ -18,7 +18,8 @@
 use std::cmp::Ordering;
 
 use gpui::{
-    Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful, Styled, div, px,
+    AnyElement, Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful, Styled,
+    div, px,
 };
 use mt_ui::icons::FileIcon;
 
@@ -297,6 +298,18 @@ pub fn commit_file_row_at(
     selected: bool,
     depth: Option<usize>,
 ) -> Stateful<Div> {
+    commit_file_row_with(id, path, status, selected, depth, None)
+}
+
+/// [`commit_file_row_at`],另在状态字母前挂一段附注(提交详情栏的增删行数)。
+pub fn commit_file_row_with(
+    id: impl Into<ElementId>,
+    path: &str,
+    status: &str,
+    selected: bool,
+    depth: Option<usize>,
+    extra: Option<AnyElement>,
+) -> Stateful<Div> {
     let (letter, color) = commit_file_status(status);
     list_row(id, selected)
         .pl(px(tree_row_pad(depth.unwrap_or(0))))
@@ -306,6 +319,7 @@ pub fn commit_file_row_at(
             status == "deleted",
             depth.is_none(),
         ))
+        .children(extra)
         .child(status_letter(letter, color))
 }
 

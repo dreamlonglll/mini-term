@@ -237,6 +237,13 @@ pub const ICON_STASH: &[Shape] = &[
     path("M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"),
     path("M10 12h4"),
 ];
+/// 查看变更(`file-diff`):提交详情栏的「在提交 diff 中查看」。
+pub const ICON_DIFF: &[Shape] = &[
+    path("M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"),
+    path("M9 10h6"),
+    path("M12 13V7"),
+    path("M9 17h6"),
+];
 /// 删除 / 全部清除(`trash-2`)。「丢弃改动」是 [`ICON_UNDO`],别混用。
 pub const ICON_TRASH: &[Shape] = &[
     path("M3 6h18"),
@@ -289,6 +296,7 @@ const ALL_ICONS: &[&[Shape]] = &[
     ICON_CLOSE,
     ICON_COPY,
     ICON_STASH,
+    ICON_DIFF,
     ICON_TRASH,
     ICON_CHEVRON_DOWN,
     ICON_CHEVRON_RIGHT,

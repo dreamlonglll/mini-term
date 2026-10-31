@@ -18,6 +18,12 @@ use super::events::StoreChanged;
 use super::pure::collect_node_ids;
 use super::{AppStore, ConfigSection, StoreEvent};
 
+/// 提交详情栏的缺省宽度:比抽屉缺省的 340 宽一截,正文与带行数的文件行都摆得开。
+pub const GIT_DETAIL_DEFAULT_WIDTH: f64 = 480.0;
+/// 提交详情栏拖到最窄 / 最宽(拖拽与读库都钳在这里)。
+pub const GIT_DETAIL_MIN_WIDTH: f64 = 320.0;
+pub const GIT_DETAIL_MAX_WIDTH: f64 = 960.0;
+
 impl AppStore {
     /// 移动端发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
     /// **不激活、不抢焦点、不切项目**(远程操作不抢桌面现场,
@@ -248,6 +254,25 @@ impl AppStore {
         self.save_layout_soon(cx);
     }
 
+    // === Git 抽屉左侧的「提交详情」栏 ===
+
+    /// 提交详情栏的宽度,钳在 [`GIT_DETAIL_MIN_WIDTH`]~[`GIT_DETAIL_MAX_WIDTH`]。窗口窄时
+    /// 实际画多宽由抽屉层再按剩余空间让(见 `main.rs` 的 `render_commit_detail_layer`)。
+    pub fn git_detail_width(&self) -> f64 {
+        self.git_detail_width
+            .unwrap_or(GIT_DETAIL_DEFAULT_WIDTH)
+            .clamp(GIT_DETAIL_MIN_WIDTH, GIT_DETAIL_MAX_WIDTH)
+    }
+
+    pub fn set_git_detail_width(&mut self, width: f64, cx: &mut Context<Self>) {
+        let width = width.clamp(GIT_DETAIL_MIN_WIDTH, GIT_DETAIL_MAX_WIDTH);
+        if self.git_detail_width == Some(width) {
+            return;
+        }
+        self.git_detail_width = Some(width);
+        self.save_layout_soon(cx);
+    }
+
     // === 文件树展开状态 ===
 
     pub fn is_dir_expanded(&self, project_id: &str, path: &str) -> bool {
@@ -430,6 +455,7 @@ impl AppStore {
                 middle_column_visible: Some(self.config.middle_column_visible),
                 right_drawer_width: self.config.right_drawer_width,
                 terminals_panel_visible: Some(self.terminals_panel_visible),
+                git_detail_width: self.git_detail_width,
                 window: self.window_geometry,
             };
             if let Err(err) = store.save_globals(&globals) {

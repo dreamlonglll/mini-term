@@ -1,6 +1,7 @@
 //! Git 面板的「提交历史」区。对应 `src/components/GitHistoryContent.tsx`(399 行),
-//! 之后按 JetBrains IDEA 的 Log 工具窗补了一圈:选中 + 提交详情、键盘导航、过滤栏、
-//! 标签胶囊、右键改写操作(见 [`actions`])、多选提交合并查看改动(见下)。
+//! 之后按 JetBrains IDEA 的 Log 工具窗补了一圈:选中 + 提交详情(Git 抽屉左侧单独一栏,
+//! 见 [`detail`])、键盘导航、过滤栏、标签胶囊、右键改写操作(见 [`actions`])、多选提交
+//! 合并查看改动(见下)。
 //!
 //! # 多选(issue #84)
 //!
@@ -60,6 +61,7 @@ mod selection;
 
 pub use actions::GitLogRewordConfirm;
 pub(crate) use actions::REWORD_CONTEXT;
+pub use detail::CommitDetailPane;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -112,6 +114,8 @@ gpui::actions!(
         GitLogFocusFilter,
         /// 清空过滤框并把焦点还给列表(过滤框里按 Esc)
         GitLogClearFilter,
+        /// 关上提交详情栏(Esc,焦点在历史列表)
+        GitLogCloseDetail,
     ]
 );
 
@@ -137,7 +141,7 @@ const PILL_SHRINK: f32 = 1000.0;
 const MULTI_LIMIT: usize = 200;
 
 /// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Shift+↑ / Shift+↓ / Enter / Ctrl+C /
-/// Ctrl+F / Esc)。
+/// Ctrl+F / Esc:过滤框里清空过滤,列表上关详情栏)。
 pub(crate) const HISTORY_CONTEXT: &str = "GitHistory";
 
 /// 往上冒的事件。
@@ -304,12 +308,6 @@ pub struct GitHistoryContent {
 
 impl EventEmitter<GitHistoryEvent> for GitHistoryContent {}
 
-/// 任意 flex-grow(gpui 的 `flex_grow()` 只会设成 1)。
-fn grow<E: Styled>(mut el: E, value: f32) -> E {
-    el.style().flex_grow = Some(value);
-    el
-}
-
 /// 行上挂分支胶囊要的引用:分支列表 + HEAD 显示名(detached 是 `"(1a2b3c4)"`)。
 #[derive(Debug, Clone, PartialEq)]
 struct HistoryRefs {
@@ -442,7 +440,7 @@ impl GitHistoryContent {
             if self.refs_in_flight && !reload {
                 self.deferred_refs = Some(refs);
             } else {
-                self.apply_refs(refs);
+                self.apply_refs(refs, cx);
                 cx.notify();
             }
         }
@@ -498,7 +496,7 @@ impl GitHistoryContent {
         if !self.refs_in_flight
             && let Some(refs) = self.deferred_refs.take()
         {
-            self.apply_refs(refs);
+            self.apply_refs(refs, cx);
         }
         cx.notify();
     }
@@ -520,13 +518,11 @@ impl GitHistoryContent {
 
     /// 全部摊开要多高(过滤栏 44 + 列表上下留白 8 + 全部提交行)。Git 面板分「更改 /
     /// 提交历史」两块高度时用(`git_panel::section_split`):历史比分到的矮就把富余让给
-    /// 「更改」。还在加载、还有下一页、选中了提交(详情区要地方)、列表为空时说不准,`None`。
+    /// 「更改」。还在加载、还有下一页、列表为空时说不准,`None`。(提交详情另起一栏画在
+    /// 抽屉左边,不占这里的高度。)
     pub fn natural_height(&self) -> Option<f32> {
-        let unsure = self.repo_path.is_empty()
-            || self.loading
-            || self.has_more
-            || !self.selection.is_empty()
-            || self.commits.is_empty();
+        let unsure =
+            self.repo_path.is_empty() || self.loading || self.has_more || self.commits.is_empty();
         (!unsure).then_some(44.0 + 8.0 + 2.0 + self.commits.len() as f32 * GRAPH_ROW_HEIGHT)
     }
 
@@ -579,7 +575,7 @@ impl GitHistoryContent {
                     }
                     this.loading = false;
                     if first {
-                        this.settle_refs(refs);
+                        this.settle_refs(refs, cx);
                     }
                     match result {
                         Ok((page, tags)) => this.merge_filtered(first, page, tags, cx),
@@ -615,7 +611,7 @@ impl GitHistoryContent {
                     }
                     this.loading = false;
                     if first {
-                        this.settle_refs(refs);
+                        this.settle_refs(refs, cx);
                     }
                     match result {
                         Ok((page, tags)) => this.merge_page(first, page, tags, cx),
@@ -723,20 +719,25 @@ impl GitHistoryContent {
         }
     }
 
-    /// 换上一份引用(分支胶囊、HEAD 圆环跟着变)。
-    fn apply_refs(&mut self, refs: HistoryRefs) {
+    /// 换上一份引用(分支胶囊、HEAD 圆环跟着变)。分支有变(提交 / 推送 / 拉取之后分支头
+    /// 前移)时,详情栏的「所在分支」跟着重查。
+    fn apply_refs(&mut self, refs: HistoryRefs, cx: &mut Context<Self>) {
+        let branches_changed = self.branches != refs.branches;
         self.branches = refs.branches;
         self.head_branch = refs.head;
         self.refresh_head_hash();
+        if branches_changed {
+            self.refresh_containing(cx);
+        }
     }
 
     /// 首页落定(成败都算):引用与提交列表一起换。首页没读到引用时退回在途期间容器透下来
     /// 的那份(见 [`Self::sync`])。在合并首页**之前**调,`refresh_head_hash` 才按新引用算。
-    fn settle_refs(&mut self, refs: Option<HistoryRefs>) {
+    fn settle_refs(&mut self, refs: Option<HistoryRefs>, cx: &mut Context<Self>) {
         self.refs_in_flight = false;
         let deferred = self.deferred_refs.take();
         if let Some(refs) = refs.or(deferred) {
-            self.apply_refs(refs);
+            self.apply_refs(refs, cx);
         }
     }
 
@@ -901,9 +902,11 @@ impl GitHistoryContent {
         }
     }
 
-    /// 单击第 `index` 行:修饰键决定单选 / 切换 / 连选(口径见 [`selection`])。
+    /// 单击第 `index` 行:修饰键决定单选 / 切换 / 连选(口径见 [`selection`])。详情栏
+    /// 被关上过的,单击一行就重新打开(键盘换选中不打开,见 [`detail`] 模块注释)。
     fn click_commit(&mut self, index: usize, mods: ClickMods, cx: &mut Context<Self>) {
         self.selection.click(&self.commits, index, mods);
+        self.detail.open = true;
         self.selection_changed(cx);
     }
 
@@ -981,7 +984,7 @@ impl GitHistoryContent {
             self.apply_filter(cx);
             return;
         }
-        // 焦点在详情区的只读文本里时,回车归它自己
+        // 焦点不在列表本身(过滤框之外的输入框)时,回车归它自己
         if !self.focus.is_focused(window) {
             cx.propagate();
             return;
@@ -1025,13 +1028,27 @@ impl GitHistoryContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 谓词 `GitHistory > Input` 也罩着详情区的只读正文:那里的 Esc 不归过滤框
+        // 只管过滤框;别处的 Esc 放给下一条绑定(列表上 = 关详情栏)
         if !self.filter_focused(window, cx) {
             cx.propagate();
             return;
         }
         self.clear_filter_text(window, cx);
         window.focus(&self.focus, cx);
+    }
+
+    /// 列表上按 Esc:详情栏开着就关上,没开着放行。
+    fn on_close_detail(
+        &mut self,
+        _: &GitLogCloseDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.focus.is_focused(window) || !self.detail_shown() {
+            cx.propagate();
+            return;
+        }
+        self.close_detail(cx);
     }
 
     // ── 打开 diff ─────────────────────────────────────────
@@ -1351,6 +1368,7 @@ impl Render for GitHistoryContent {
             .on_action(cx.listener(Self::on_copy_hash))
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_clear_filter))
+            .on_action(cx.listener(Self::on_close_detail))
             // 量宽度:窄的时候行里只留作者头像
             .child({
                 let this = this.clone();
@@ -1374,25 +1392,17 @@ impl Render for GitHistoryContent {
 
         root = root.child(self.render_filter_bar(cx));
 
-        // 详情区后台取回来的正文这时写进只读框(写框要窗口)
-        self.detail.flush_body(window, cx);
+        // 提交详情不在这里画:它是 Git 抽屉左侧单独一栏(见 [`detail`]),列表独占整块
         let list = self.render_list(window, cx);
-        let has_detail = !self.selection.is_empty();
-        let detail_open = has_detail && self.detail.open;
-        root = root.child(grow(
+        root.child(
             div()
-                .flex_basis(px(0.0))
+                .flex_1()
                 .min_h(px(0.0))
                 .overflow_hidden()
                 .px(px(4.0))
                 .py(px(4.0))
                 .child(list),
-            if detail_open { 0.58 } else { 1.0 },
-        ));
-        if has_detail {
-            root = root.child(detail::render(self, detail_open, cx));
-        }
-        root
+        )
     }
 }
 

@@ -81,7 +81,7 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_dir_watch::{GitDirWatch, WorktreeBatch, WorktreeWatch};
-use crate::git_history::{GitHistoryContent, GitHistoryEvent};
+use crate::git_history::{CommitDetailPane, GitHistoryContent, GitHistoryEvent};
 use crate::git_ui::{self, Tone, estimate_text_width};
 use crate::git_watch;
 use crate::i18n::{t, tr};
@@ -264,6 +264,8 @@ pub struct GitPanel {
     store: Entity<AppStore>,
     changes: Entity<GitChanges>,
     history: Entity<GitHistoryContent>,
+    /// 「提交详情」栏:画在抽屉左侧,由 `main.rs` 的抽屉层经 [`Self::detail_pane`] 取去挂。
+    detail_pane: Entity<CommitDetailPane>,
     repos: Vec<GitRepoInfo>,
     selected_repo: String,
     branches: Vec<BranchInfo>,
@@ -317,6 +319,7 @@ impl GitPanel {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
         let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
+        let detail_pane = cx.new(|cx| CommitDetailPane::new(history.clone(), cx));
 
         let mut subs = Vec::new();
         subs.push(cx.subscribe_in(
@@ -380,6 +383,7 @@ impl GitPanel {
             store,
             changes,
             history,
+            detail_pane,
             repos: Vec::new(),
             selected_repo: String::new(),
             branches: Vec::new(),
@@ -429,6 +433,20 @@ impl GitPanel {
         // 可见 → 按当时选中的仓库挂监听;收起 → 撤掉
         self.retarget_watch(cx);
         cx.notify();
+    }
+
+    /// 抽屉左侧要挂的「提交详情」栏(见 `git_history::detail` 模块注释)。没选中提交、
+    /// 详情被关上、「提交历史」区收着、面板正显示空态(没有项目 / 远程项目)时为 `None`。
+    ///
+    /// 不看 [`Self::visible`]:抽屉收起的退场动画期间面板已置为不可见,详情栏要跟着
+    /// 抽屉一起滑出去,不该先没了。
+    pub fn detail_pane(&self, cx: &App) -> Option<Entity<CommitDetailPane>> {
+        let history_open = SECTION_UI.with(|s| s.borrow().history_open);
+        let shown = history_open
+            && self.store.read(cx).active_project().is_some()
+            && !self.is_remote_project(cx)
+            && self.history.read(cx).detail_shown();
+        shown.then(|| self.detail_pane.clone())
     }
 
     /// pty-output 嗅探的节拍。100ms 一拍:抽干旁路 → 命中就通知两个子面板

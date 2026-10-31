@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1450;
+pub const ZH_ENTRY_COUNT: usize = 1456;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1450;
+pub const EN_ENTRY_COUNT: usize = 1456;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1264,12 +1264,17 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("confirm.undoPushedMessage", "将撤销 {hash}「{title}」\n改动会回到暂存区。\n该提交已推送到远程：撤销后与远程分叉，同步需要强制推送。"),
     ("confirm.undoTitle", "撤销提交"),
     ("detail.author", "作者"),
-    ("detail.collapse", "收起详情"),
+    ("detail.binary", "二进制"),
+    ("detail.branches", "所在分支"),
+    ("detail.branchesFailed", "查找失败：{detail}"),
+    ("detail.branchesLoading", "查找中…"),
+    ("detail.branchesNone", "不在任何分支上"),
+    ("detail.close", "关闭详情（Esc）"),
+    ("detail.commitDate", "提交时间"),
     ("detail.committer", "提交者"),
     ("detail.copyHashTip", "点击复制完整哈希"),
     ("detail.copyMessage", "复制提交消息"),
     ("detail.date", "时间"),
-    ("detail.expand", "展开详情"),
     ("detail.failed", "读取详情失败：{detail}"),
     ("detail.files", "{count} 个文件"),
     ("detail.hash", "哈希"),
@@ -1282,6 +1287,7 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("detail.parentNotLoaded", "该父提交还没加载到列表里"),
     ("detail.parents", "父提交"),
     ("detail.refs", "引用"),
+    ("detail.statsTip", "相对第一个父提交：新增 {added} 行，删除 {removed} 行"),
     ("detail.title", "提交详情"),
     ("fileHistory.count", "{count} 个提交"),
     ("fileHistory.countMore", "{count} 个提交（已加载）"),
@@ -1423,12 +1429,17 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("confirm.undoPushedMessage", "Undo {hash} \"{title}\"; its changes go back to the staging area.\nThis commit is already pushed: undoing it diverges from the remote and syncing will need a force push."),
     ("confirm.undoTitle", "Undo Commit"),
     ("detail.author", "Author"),
-    ("detail.collapse", "Collapse details"),
+    ("detail.binary", "binary"),
+    ("detail.branches", "Branches"),
+    ("detail.branchesFailed", "Lookup failed: {detail}"),
+    ("detail.branchesLoading", "Looking up…"),
+    ("detail.branchesNone", "Not on any branch"),
+    ("detail.close", "Close details (Esc)"),
+    ("detail.commitDate", "Committed"),
     ("detail.committer", "Committer"),
     ("detail.copyHashTip", "Click to copy the full hash"),
     ("detail.copyMessage", "Copy commit message"),
     ("detail.date", "Date"),
-    ("detail.expand", "Expand details"),
     ("detail.failed", "Failed to load details: {detail}"),
     ("detail.files", "{count} files"),
     ("detail.hash", "Hash"),
@@ -1441,6 +1452,7 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("detail.parentNotLoaded", "This parent isn't loaded in the list yet"),
     ("detail.parents", "Parents"),
     ("detail.refs", "Refs"),
+    ("detail.statsTip", "Against the first parent: {added} lines added, {removed} lines removed"),
     ("detail.title", "Commit Details"),
     ("fileHistory.count", "{count} commits"),
     ("fileHistory.countMore", "{count} commits (loaded)"),

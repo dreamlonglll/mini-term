@@ -73,6 +73,7 @@ mod ssh;
 use config_writer::ConfigWriter;
 
 pub use events::{ConfigSection, StoreEvent};
+pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH};
 
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,
 // `crate::store::Xxx` 这条对外路径一字不变(全仓其它文件零改动的前提)。
@@ -392,6 +393,9 @@ pub struct AppStore {
     /// 终端区右缘「终端列表」竖条的显隐。与 [`Self::window_geometry`] 同类:
     /// config 里没有对应字段,只住在 `layout.db` 与这里。
     terminals_panel_visible: bool,
+    /// Git 抽屉左侧「提交详情」栏的宽度(`None` = 没拖过,用缺省)。同上,只住在
+    /// `layout.db` 与这里。
+    git_detail_width: Option<f64>,
     /// 攒着待写的项目 id 与「全局项脏了」标记。防抖窗口内拖十次分隔条只落一次盘,
     /// 且不同项目的改动互不覆盖。
     layout_dirty_projects: HashSet<String>,
@@ -538,8 +542,8 @@ fn layout_migration_fallback(config: &AppConfig, dir: &Path) -> Option<AppConfig
 /// 不是「用户把它设成了默认值」。项目级则相反 —— 逐个赋值(含赋 `None`),
 /// 库才是唯一真相:用户把某项目的终端关光了,config.json 里的残留不该复活。
 ///
-/// 返回窗口几何与终端列表竖条显隐(config 里没有它们的位置 —— 都是 GPUI 版
-/// 新加的能力,只住在 `layout.db` 与 `AppStore` 的字段上,由调用方单独接住)。
+/// 返回窗口几何、终端列表竖条显隐与提交详情栏宽度(config 里没有它们的位置 —— 都是
+/// GPUI 版新加的能力,只住在 `layout.db` 与 `AppStore` 的字段上,由调用方单独接住)。
 ///
 /// `config_loaded = false`(配置加载失败、手上是空默认值)时**不对账**:拿一份
 /// 没有项目的配置去 `retain_projects`,会把布局库里全部项目行当无主行删光 ——
@@ -548,7 +552,7 @@ fn apply_layout_db(
     store: &mt_layout::LayoutStore,
     config: &mut AppConfig,
     config_loaded: bool,
-) -> (Option<mt_layout::WindowGeometry>, Option<bool>) {
+) -> (Option<mt_layout::WindowGeometry>, Option<bool>, Option<f64>) {
     let globals = store.load_globals();
     if globals.layout_sizes.is_some() {
         config.layout_sizes = globals.layout_sizes;
@@ -580,6 +584,7 @@ fn apply_layout_db(
     (
         globals.window.filter(|geo| geo.is_sane()),
         globals.terminals_panel_visible,
+        globals.git_detail_width.filter(|w| w.is_finite()),
     )
 }
 
@@ -617,7 +622,7 @@ impl AppStore {
             Ok(store) => (Some(store), None),
             Err(err) => (None, Some(err)),
         };
-        let (window_geometry, terminals_panel_visible) = layout_store
+        let (window_geometry, terminals_panel_visible, git_detail_width) = layout_store
             .as_ref()
             .map(|store| apply_layout_db(store, &mut config, token != 0))
             .unwrap_or_default();
@@ -693,6 +698,7 @@ impl AppStore {
             window_geometry,
             // 缺省展开:面板是发现型入口,收着的话没人知道它存在
             terminals_panel_visible: terminals_panel_visible.unwrap_or(true),
+            git_detail_width,
             layout_dirty_projects: HashSet::new(),
             layout_globals_dirty: false,
             layout_save_generation: 0,

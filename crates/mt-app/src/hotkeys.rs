@@ -613,6 +613,13 @@ pub fn bind_keys(cx: &mut App) {
             history,
         ));
     }
+    // Esc:列表上关提交详情栏;过滤框里那一条(更深的谓词,先试)清空过滤,不在过滤框时
+    // 它放行,落到这一条
+    bindings.push(KeyBinding::new(
+        "escape",
+        git_history::GitLogCloseDetail,
+        history,
+    ));
     let history_input = format!("{} > Input", git_history::HISTORY_CONTEXT);
     bindings.push(KeyBinding::new(
         "escape",
