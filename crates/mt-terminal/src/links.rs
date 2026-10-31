@@ -278,6 +278,9 @@ pub struct PathCandidate {
     pub path: String,
     /// 1 起算的行号。写成 `:0` 的当没写。
     pub line: Option<u32>,
+    /// 范围写法(`:20-35`、`#L5-L9`)的终点行,宿主拿它选中这几行。没写范围、
+    /// 或终点比起点小时为 `None`。
+    pub end_line: Option<u32>,
     pub column: Option<u32>,
     /// 下划线该盖住哪些字符(含行号后缀),是 [`LogicalLine::chars`] 的下标。
     pub range: Range<usize>,
@@ -343,29 +346,31 @@ pub fn path_candidates(chars: &[char], index: usize) -> Vec<PathCandidate> {
 
     let token = &chars[start..end];
     let mut path_end = end;
-    let mut line = None;
-    let mut column = None;
+    let mut loc = Location::default();
     let mut range_end = end;
 
-    if let Some((hash, l, c)) = github_anchor(token) {
+    if let Some((hash, l)) = github_anchor(token) {
         path_end = start + hash;
-        line = l;
-        column = c;
-    } else if let Some((stripped, l, c)) = split_colon_suffix(token) {
+        loc = l;
+    } else if let Some((stripped, l)) = split_colon_suffix(token) {
         path_end = start + stripped;
-        line = l;
-        column = c;
+        loc = l;
     }
     // 片段里没写行号:再往后看一眼 TypeScript 的 `(行,列)` 与 Python 的 `", line N`
     if path_end == end {
         if let Some((l, c, consumed)) = paren_suffix(&chars[end..]) {
-            line = l;
-            column = c;
+            loc.line = l;
+            loc.column = c;
             range_end = end + consumed;
         } else if let Some(l) = python_line_suffix(&chars[end..]) {
-            line = l;
+            loc.line = l;
         }
     }
+    let Location {
+        line,
+        end_line,
+        column,
+    } = loc;
     if index >= range_end || index < start {
         return Vec::new();
     }
@@ -378,6 +383,7 @@ pub fn path_candidates(chars: &[char], index: usize) -> Vec<PathCandidate> {
     let mut out = vec![PathCandidate {
         path: path.clone(),
         line,
+        end_line,
         column,
         range: start..range_end,
     }];
@@ -388,6 +394,7 @@ pub fn path_candidates(chars: &[char], index: usize) -> Vec<PathCandidate> {
         out.push(PathCandidate {
             path: rest.to_string(),
             line,
+            end_line,
             column,
             range: start + 1..range_end,
         });
@@ -400,11 +407,20 @@ pub fn path_candidates(chars: &[char], index: usize) -> Vec<PathCandidate> {
         out.push(PathCandidate {
             path: anchorless.to_string(),
             line,
+            end_line,
             column,
             range: start..start + anchorless.chars().count(),
         });
     }
     out
+}
+
+/// 从路径后缀里拆出来的位置。
+#[derive(Clone, Copy, Debug, Default)]
+struct Location {
+    line: Option<u32>,
+    end_line: Option<u32>,
+    column: Option<u32>,
 }
 
 /// 剥掉粘在片段两头、不属于路径的标点:句末的 `.` / `:`、Markdown 方括号、
@@ -445,25 +461,34 @@ fn digits_value(digits: &[char]) -> Option<u32> {
     text.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-/// `20` 或 `20-35`(只取起点)。不是这两种形状返回 `None`。
-fn number_or_range(seg: &[char]) -> Option<Option<u32>> {
+/// 范围的终点:比起点小(或起点没写)的当没写。
+fn range_end(start: Option<u32>, end: Option<u32>) -> Option<u32> {
+    end.filter(|&end| start.is_some_and(|start| end >= start))
+}
+
+/// `20` 或 `20-35`,返回 `(起点, 终点)`(终点口径见 [`range_end`])。
+/// 不是这两种形状返回 `None`。
+fn number_or_range(seg: &[char]) -> Option<(Option<u32>, Option<u32>)> {
     let digits = seg.iter().take_while(|c| c.is_ascii_digit()).count();
     if digits == 0 {
         return None;
     }
+    let start = digits_value(&seg[..digits]);
     let rest = &seg[digits..];
-    let ok = rest.is_empty()
-        || (rest[0] == '-' && rest.len() > 1 && rest[1..].iter().all(char::is_ascii_digit));
-    ok.then(|| digits_value(&seg[..digits]))
+    if rest.is_empty() {
+        return Some((start, None));
+    }
+    let ok = rest[0] == '-' && rest.len() > 1 && rest[1..].iter().all(char::is_ascii_digit);
+    ok.then(|| (start, range_end(start, digits_value(&rest[1..]))))
 }
 
-/// 从尾部剥 `:行` / `:行:列`(各自允许写成 `起-止`,只取起点)。
+/// 从尾部剥 `:行` / `:行:列`(各自允许写成 `起-止`:行的终点留作选区,列的终点不要)。
 ///
-/// 返回 `(路径结束下标, 行, 列)`;没有后缀返回 `None`。
+/// 返回 `(路径结束下标, 位置)`;没有后缀返回 `None`。
 /// `D:\a.ts` 的盘符冒号后面不是数字,不会被误剥。
-fn split_colon_suffix(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>)> {
+fn split_colon_suffix(token: &[char]) -> Option<(usize, Location)> {
     let mut end = token.len();
-    let mut numbers: Vec<Option<u32>> = Vec::new();
+    let mut numbers: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     while numbers.len() < 2 {
         let Some(colon) = token[..end].iter().rposition(|&c| c == ':') else {
             break;
@@ -477,15 +502,23 @@ fn split_colon_suffix(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>
         numbers.push(n);
         end = colon;
     }
-    match numbers.as_slice() {
-        [] => None,
-        [line] => Some((end, *line, None)),
-        [column, line, ..] => Some((end, *line, *column)),
-    }
+    let ((line, end_line), column) = match numbers.as_slice() {
+        [] => return None,
+        [line] => (*line, None),
+        [column, line, ..] => (*line, column.0),
+    };
+    Some((
+        end,
+        Location {
+            line,
+            end_line,
+            column,
+        },
+    ))
 }
 
-/// GitHub 风格的 `#L12` / `#L12C5` / `#L12-L20`。返回 `(# 的下标, 行, 列)`。
-fn github_anchor(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>)> {
+/// GitHub 风格的 `#L12` / `#L12C5` / `#L12-L20`。返回 `(# 的下标, 位置)`。
+fn github_anchor(token: &[char]) -> Option<(usize, Location)> {
     let hash = token.iter().rposition(|&c| c == '#')?;
     if hash == 0 || token.get(hash + 1) != Some(&'L') {
         return None;
@@ -506,7 +539,8 @@ fn github_anchor(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>)> {
         column = digits_value(&tail[1..1 + col_digits]);
         tail = &tail[1 + col_digits..];
     }
-    // 范围的终点(`-L20` / `-20` / `-L20C3`)只认形状,不取值
+    // 范围的终点(`-L20` / `-20` / `-L20C3`):形状照旧宽松地认,终点行留作选区,
+    // 终点的列不要
     if !tail.is_empty()
         && !(tail[0] == '-'
             && tail.len() > 1
@@ -516,7 +550,19 @@ fn github_anchor(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>)> {
     {
         return None;
     }
-    Some((hash, line, column))
+    let end_line = tail.get(1..).and_then(|end| {
+        let end = end.strip_prefix(&['L']).unwrap_or(end);
+        let digits = end.iter().take_while(|c| c.is_ascii_digit()).count();
+        range_end(line, digits_value(&end[..digits]))
+    });
+    Some((
+        hash,
+        Location {
+            line,
+            end_line,
+            column,
+        },
+    ))
 }
 
 /// 紧跟在路径后面的 `(行)` / `(行,列)` / `(行, 列)`(tsc / MSBuild 的写法)。
@@ -611,11 +657,36 @@ mod tests {
         );
 
         let cand = first_at("改动见 `src/a.ts:20-35`", "src").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line), ("src/a.ts", Some(20)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.end_line),
+            ("src/a.ts", Some(20), Some(35))
+        );
+
+        // 单行没有终点;从第 1 行起的范围照样认
+        assert_eq!(first_at("a.ts:20", "a.ts").unwrap().end_line, None);
+        let cand = first_at("D:\\proj\\a.rs:1-222", "proj").unwrap();
+        assert_eq!((cand.line, cand.end_line), (Some(1), Some(222)));
+
+        // 行范围 + 列:终点留给行,列的范围只取起点
+        let cand = first_at("a.ts:10-20:5-9", "a.ts").unwrap();
+        assert_eq!(
+            (cand.line, cand.end_line, cand.column),
+            (Some(10), Some(20), Some(5))
+        );
+
+        // 终点比起点小的当没写范围(起点照用)
+        let cand = first_at("a.ts:30-20", "a.ts").unwrap();
+        assert_eq!((cand.line, cand.end_line), (Some(30), None));
 
         // 行号写 0 当没写
         let cand = first_at("a.ts:0", "a.ts").unwrap();
         assert_eq!((cand.path.as_str(), cand.line), ("a.ts", None));
+        let cand = first_at("a.ts:0-5", "a.ts").unwrap();
+        assert_eq!(
+            (cand.line, cand.end_line),
+            (None, None),
+            "起点没写就没有范围"
+        );
     }
 
     #[test]
@@ -661,7 +732,16 @@ mod tests {
             ("docs/a.md", Some(12), Some(3))
         );
         let cand = first_at("src/x.rs#L5-L9", "src").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line), ("src/x.rs", Some(5)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.end_line),
+            ("src/x.rs", Some(5), Some(9))
+        );
+        assert_eq!(first_at("x.rs#L5-9", "x.rs").unwrap().end_line, Some(9));
+        assert_eq!(
+            first_at("x.rs#L5C2-L9C4", "x.rs").unwrap().end_line,
+            Some(9)
+        );
+        assert_eq!(first_at("x.rs#L12", "x.rs").unwrap().end_line, None);
 
         let text = "docs/guide.md#install";
         let all = path_candidates(&chars(text), 0);

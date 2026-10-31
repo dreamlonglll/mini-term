@@ -219,6 +219,8 @@ pub struct TerminalArea {
     tab_focus: HashMap<String, FocusHandle>,
     /// 鼠标停在哪个 tab 上(缩略图计时要它)。
     hovered_tab: Option<String>,
+    /// 上一下单击切过来的 tab:紧跟着的那一下凑成的双击不改名。
+    tab_click: SwitchClickGuard,
     /// 每个 tab 的屏幕矩形(每个 tab 挂一片只量不画的 `canvas`)。
     ///
     /// 两个消费方:① 悬停缩略图的锚点;② tab 栏拖拽插入位要 tab 中线
@@ -826,6 +828,7 @@ impl TerminalArea {
             pane_enter: HashMap::new(),
             tab_focus: HashMap::new(),
             hovered_tab: None,
+            tab_click: SwitchClickGuard::default(),
             tab_rects: HashMap::new(),
             tab_preview: None,
             _tab_preview_task: None,
@@ -2173,27 +2176,31 @@ impl TerminalArea {
                     )
                     // 源 tab 变淡(原版 `el.style.opacity = '0.4'`)
                     .when(is_dragging_self, |el| el.opacity(0.4))
-                    // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」)。
+                    // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」);切过来的
+                    // 那一下凑成的双击不改名(见 `SwitchClickGuard`)。
                     // ⚠️ 必须 `stop_propagation`:tab 栏那层挂着「双击空白处最大化」,
                     // 不截断的话在 tab 上双击会**同时**改名和最大化
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         cx.stop_propagation();
                         this.close_tab_preview(cx);
-                        if click_count(event) >= 2 {
-                            let (label, store) = (label_rename.clone(), this.store.clone());
-                            modal::open_rename_pane(
-                                store,
-                                pid_rename.clone(),
-                                pane_id_rename.clone(),
-                                label,
-                                window,
-                                cx,
-                            );
-                            return;
+                        let count = click_count(event);
+                        match this.tab_click.click(&pane_id, is_active, count) {
+                            SwitchClick::Switch => this.store.update(cx, |store, cx| {
+                                store.activate_pane(&pid_click, &pane_id, window, cx)
+                            }),
+                            SwitchClick::Rename => {
+                                let (label, store) = (label_rename.clone(), this.store.clone());
+                                modal::open_rename_pane(
+                                    store,
+                                    pid_rename.clone(),
+                                    pane_id_rename.clone(),
+                                    label,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            SwitchClick::Ignore => {}
                         }
-                        this.store.update(cx, |store, cx| {
-                            store.activate_pane(&pid_click, &pane_id, window, cx)
-                        });
                     }))
                     // tab 右键菜单(`PaneGroup.tsx` 的 paneContextMenu)
                     .on_mouse_down(
@@ -3485,6 +3492,40 @@ pub(crate) fn click_count(event: &ClickEvent) -> usize {
     }
 }
 
+/// 「单击切换、双击改名」的条目(终端 tab、终端面板竖条)上一次点击该做什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchClick {
+    Switch,
+    Rename,
+    /// 双击的后一下,而前一下是把它切过来的那一下
+    Ignore,
+}
+
+/// 记着上一次单击切过来的是哪个条目,好认出「切过去后顺手又点了一下」。
+///
+/// gpui 的双击是两次单击按时间窗合成的(`click_count` 依次 1、2),第一下已经把条目
+/// 切过来了:切完紧接着再点一下标题,不该被当成双击弹出改名。只有前一下落在**本来
+/// 就激活**的条目上,这一对点击才算双击改名。
+#[derive(Default)]
+pub(crate) struct SwitchClickGuard {
+    switched_to: Option<String>,
+}
+
+impl SwitchClickGuard {
+    /// 点在 `id` 上(`was_active` = 点之前它就是激活的那个)。
+    pub(crate) fn click(&mut self, id: &str, was_active: bool, count: usize) -> SwitchClick {
+        if count >= 2 {
+            return if self.switched_to.as_deref() == Some(id) {
+                SwitchClick::Ignore
+            } else {
+                SwitchClick::Rename
+            };
+        }
+        self.switched_to = (!was_active).then(|| id.to_string());
+        SwitchClick::Switch
+    }
+}
+
 /// 点击位置(弹菜单要它)。键盘触发的「点击」没有坐标,退回当前鼠标位置 ——
 /// 菜单总得有个锚点,而这一条在真机上走不到(那个 `+` 没有键盘入口)。
 pub(crate) fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point<gpui::Pixels> {
@@ -4170,6 +4211,25 @@ impl Render for TerminalArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 切过来那一下凑成的双击不改名() {
+        let mut guard = SwitchClickGuard::default();
+        // 点未激活的 b:第一下切过去,紧跟的第二、三下都不改名
+        assert_eq!(guard.click("b", false, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("b", true, 2), SwitchClick::Ignore);
+        assert_eq!(guard.click("b", true, 3), SwitchClick::Ignore);
+        // 过了双击时窗再双击已激活的 b:改名
+        assert_eq!(guard.click("b", true, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("b", true, 2), SwitchClick::Rename);
+        // 切到 c 之后双击 b(先切回去)仍不改名;双击 c 照常改名
+        assert_eq!(guard.click("c", false, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("b", false, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("b", true, 2), SwitchClick::Ignore);
+        assert_eq!(guard.click("c", false, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("c", true, 1), SwitchClick::Switch);
+        assert_eq!(guard.click("c", true, 2), SwitchClick::Rename);
+    }
 
     /// 存的百分比正常时按它切,和为 1。
     #[test]

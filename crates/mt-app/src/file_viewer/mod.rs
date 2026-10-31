@@ -73,6 +73,7 @@
 //! | [`http`] | 预览用的进程级 HTTP 客户端 [`PreviewHttpClient`] |
 //! | [`git_gutter`] | 源码态的 Git 变更标记(gutter 竖条)、变更小窗、上一处 / 下一处变更 |
 //! | [`git_blame`] | 源码态的 Git 注解列(blame):作者 · 日期、按新旧着色、悬停详情 |
+//! | [`reveal`] | 打开时定位到行:目标行滚到视口顶上、范围写法选中那几行 |
 //!
 //! 各纯逻辑模块的单测在同目录的 `*_tests.rs`,视图层的在 `tests.rs`。
 
@@ -91,7 +92,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::WindowExt as _;
-use gpui_component::input::{EditorState, Escape, InputEvent, Position, Search, TabSize};
+use gpui_component::input::{EditorState, Escape, InputEvent, Search, TabSize};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::{FsWatcher, WATCH_READY_BUDGET, WatchReady};
 use mt_ui::icons::FileIcon;
@@ -112,6 +113,7 @@ mod images;
 mod markdown;
 mod mermaid;
 mod preview;
+mod reveal;
 mod sanitize;
 mod webview;
 
@@ -123,6 +125,7 @@ pub use document::{LineEnding, normalize_to_lf, restore_line_ending};
 pub use file_kind::language_for;
 pub use git_gutter::git_change_key_bindings;
 pub use http::PreviewHttpClient;
+pub use reveal::LineTarget;
 pub use sanitize::sanitize_session_markdown;
 
 use document::{
@@ -141,6 +144,7 @@ use images::{
 };
 use mermaid::{MermaidKey, release_mermaid_assets};
 use preview::MdCache;
+use reveal::PendingReveal;
 
 /// 文档的读写来源。远程来源持有打开时的连接快照；保存前还会与 `AppStore`
 /// 中的当前连接身份复核，避免连接配置原地变化后旧页签写到错误主机。
@@ -191,14 +195,14 @@ impl DocumentSource {
 
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
 
-/// 该把光标放到第几行(1-based),`None` = 不动。
+/// 该定位到哪(1-based),`None` = 不动。
 ///
-/// 越界不动(`CodeEditor.tsx:341` 的 `if (highlightLine > view.state.doc.lines) return`)。
-pub fn highlight_target(highlight_line: Option<u32>, text: &str) -> Option<u32> {
-    let line = highlight_line?;
+/// 起点越界不动(`CodeEditor.tsx:341` 的 `if (highlightLine > view.state.doc.lines) return`),
+/// 范围的终点夹到末行(见 [`LineTarget::clamp`])。
+pub fn highlight_target(highlight: Option<LineTarget>, text: &str) -> Option<LineTarget> {
     // 至少一行:空文件在编辑器里也是「第 1 行」
     let total = text.lines().count().max(1) as u32;
-    (line >= 1 && line <= total).then_some(line)
+    highlight?.clamp(total)
 }
 
 /// 内容区该画哪一支。判定顺序照抄 `FileViewerModal.tsx:409-495` ——
@@ -296,7 +300,11 @@ pub struct FileViewer {
     source: DocumentSource,
     project_root: PathBuf,
     current_path: PathBuf,
-    highlight_line: Option<u32>,
+    /// 内容到位时要定位到的行(打开时带的;编辑器建好、定位一次就消耗掉)。
+    highlight: Option<LineTarget>,
+    /// 还没落定的「滚到目标行」与它是否已排上下一帧(见 [`reveal`])。
+    pending_reveal: Option<PendingReveal>,
+    reveal_scheduled: bool,
 
     /// 文档的读写状态:载入代次、基线投影、脏态、保存、外部改动、远程基线与
     /// 冲突。状态位怎么翻全在 [`DocumentSession`] 里,视图只发起 IO、喂结果。
@@ -380,16 +388,16 @@ pub struct FileViewer {
 impl FileViewer {
     pub fn new_document(
         source: DocumentSource,
-        highlight_line: Option<u32>,
+        highlight: Option<LineTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new(source, highlight_line, window, cx)
+        Self::new(source, highlight, window, cx)
     }
 
     fn new(
         source: DocumentSource,
-        highlight_line: Option<u32>,
+        highlight: Option<LineTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -418,7 +426,9 @@ impl FileViewer {
             source,
             project_root,
             current_path: path,
-            highlight_line,
+            highlight,
+            pending_reveal: None,
+            reveal_scheduled: false,
             doc: DocumentSession::new(),
             editor: None,
             preview_draft: None,
@@ -443,7 +453,7 @@ impl FileViewer {
             web_preview: RefCell::new(webview::WebPreview::Idle),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
-            preview: highlight_line.is_none(),
+            preview: highlight.is_none(),
             watcher,
             watched: None,
             focus: cx.focus_handle(),
@@ -680,6 +690,8 @@ impl FileViewer {
     /// Tab 已展开):建编辑器、定位命中行、摆焦点。
     fn install_editor(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.preview_draft = None;
+        // 换了编辑器,对着旧编辑器的那次定位作废
+        self.pending_reveal = None;
 
         if can_edit(self.is_img(), self.doc.result()) {
             let name = self.file_name();
@@ -714,18 +726,15 @@ impl FileViewer {
                 }
             });
             self._editor_sub = Some(sub);
-            self.editor = Some(editor.clone());
+            self.editor = Some(editor);
             // 本地文档去取 HEAD 版本(标记 / 注解的基准)
             self.git_on_editor_installed(cx);
 
-            // 命中行定位(全局搜索点进来那条路)。`highlight_line` 是 **1-based**,
-            // `Position` 是 0-based;越界直接不动(原版
-            // `if (highlightLine > view.state.doc.lines) return`)。
-            // `set_cursor_position` 内部 `move_to` → `scroll_to`,滚动是白送的。
-            if let Some(line) = highlight_target(self.highlight_line, &text) {
-                editor.update(cx, |state, cx| {
-                    state.set_cursor_position(Position::new(line - 1, 0), window, cx);
-                });
+            // 命中行定位(全局搜索 / 终端文件链接点进来那两条路);越界直接不动(原版
+            // `if (highlightLine > view.state.doc.lines) return`)。只在打开时定位一次:
+            // 外部改动重载出来的新编辑器不再把视口拽回那一行
+            if let Some(target) = highlight_target(self.highlight.take(), &text) {
+                self.reveal(target, window, cx);
             }
         } else {
             // A remote file can change from editable text to binary/oversized
@@ -744,15 +753,16 @@ impl FileViewer {
         cx.notify();
     }
 
-    /// 已经打开的搜索结果再次被点到时，只移动光标，不重建文档或撤销栈。
+    /// 已经打开的文件再次被点到时，只移动光标 / 视口，不重建文档或撤销栈。
     pub fn reveal_line(
         &mut self,
-        highlight_line: Option<u32>,
+        highlight: Option<LineTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.highlight_line = highlight_line;
-        if highlight_line.is_some() && self.has_preview_toggle() && self.preview {
+        // 还在读盘时先记着,内容到位由 `install_editor` 接着定位
+        self.highlight = highlight;
+        if highlight.is_some() && self.has_preview_toggle() && self.preview {
             self.preview = false;
             cx.notify();
         }
@@ -760,10 +770,8 @@ impl FileViewer {
             return;
         };
         let text = editor.read(cx).value().to_string();
-        if let Some(line) = highlight_target(highlight_line, &text) {
-            editor.update(cx, |state, cx| {
-                state.set_cursor_position(Position::new(line - 1, 0), window, cx);
-            });
+        if let Some(target) = highlight_target(self.highlight.take(), &text) {
+            self.reveal(target, window, cx);
         }
     }
 
@@ -1712,6 +1720,8 @@ impl FileViewer {
                         ts.font_size = Some(px(13.0).into());
                         ts.line_height = Some(gpui::relative(1.6));
                         wrap.child(self.render_code_editor(editor, window, cx))
+                            // 透明而不是不画:编辑器得照常排版,定位才量得到行
+                            .when(self.conceals_editor(), |el| el.opacity(0.))
                             .into_any_element()
                     }
                     None => div().into_any_element(),
@@ -1729,6 +1739,7 @@ impl Focusable for FileViewer {
 
 impl Render for FileViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.schedule_reveal(window, cx);
         // 内容区先建:markdown 的分块缓存(含目录条目)在这一步才填好,工具栏的
         // 「目录」按钮要看它
         let content = self.render_content(window, cx);

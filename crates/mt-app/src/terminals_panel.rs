@@ -40,7 +40,7 @@ use crate::menu::{self, MenuItem};
 use crate::pane_actions;
 use crate::prompt;
 use crate::store::AppStore;
-use crate::terminal_area::{click_count, click_position};
+use crate::terminal_area::{SwitchClick, SwitchClickGuard, click_count, click_position};
 use crate::tree::{PaneState, StatusLight};
 use crate::ui;
 
@@ -103,13 +103,18 @@ struct PanelItem {
 
 pub struct TerminalsPanel {
     store: Entity<AppStore>,
+    /// 上一下单击切过来的面板:紧跟着的那一下凑成的双击不改名。
+    item_click: SwitchClickGuard,
 }
 
 impl TerminalsPanel {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
         // 数据全在 store 里,任何变化(切面板/开关终端/状态灯)都只需重画
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self { store }
+        Self {
+            store,
+            item_click: SwitchClickGuard::default(),
+        }
     }
 
     fn render_item(
@@ -203,22 +208,23 @@ impl TerminalsPanel {
                 )
             })
             .tip(title_tip)
-            // 单击切换,双击改名 —— 与 tab 同手感
+            // 单击切换,双击改名 —— 与 tab 同手感(切过来那一下凑成的双击同样不改名)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                if click_count(event) >= 2 {
-                    open_rename_panel(
+                let count = click_count(event);
+                match this.item_click.click(&panel_click, active, count) {
+                    SwitchClick::Switch => this.store.update(cx, |store, cx| {
+                        store.switch_panel(&pid_click, &panel_click, window, cx)
+                    }),
+                    SwitchClick::Rename => open_rename_panel(
                         this.store.clone(),
                         pid_click.clone(),
                         panel_click.clone(),
                         window,
                         cx,
-                    );
-                    return;
+                    ),
+                    SwitchClick::Ignore => {}
                 }
-                this.store.update(cx, |store, cx| {
-                    store.switch_panel(&pid_click, &panel_click, window, cx)
-                });
             }))
             .on_mouse_down(
                 MouseButton::Right,

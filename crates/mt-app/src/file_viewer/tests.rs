@@ -19,15 +19,24 @@ fn 远程_html_只走源码而本地_html_保留预览() {
 #[test]
 fn 命中行定位拒绝越界行号() {
     let text = "a\nb\nc\n";
-    assert_eq!(highlight_target(Some(2), text), Some(2));
-    assert_eq!(highlight_target(Some(3), text), Some(3));
+    let line = |n| Some(LineTarget::line(n));
+    assert_eq!(highlight_target(line(2), text), line(2));
+    assert_eq!(highlight_target(line(3), text), line(3));
     // 越界不动(原版 `highlightLine > doc.lines` 直接 return)
-    assert_eq!(highlight_target(Some(9), text), None);
-    assert_eq!(highlight_target(Some(0), text), None, "行号是 1-based");
+    assert_eq!(highlight_target(line(9), text), None);
+    assert_eq!(highlight_target(line(0), text), None, "行号是 1-based");
     // 文件树那条路压根不给行号
     assert_eq!(highlight_target(None, text), None);
     // 空文件也算有第 1 行
-    assert_eq!(highlight_target(Some(1), ""), Some(1));
+    assert_eq!(highlight_target(line(1), ""), line(1));
+    // 范围的终点夹到末行
+    let range = |line, end| {
+        Some(LineTarget {
+            line,
+            end: Some(end),
+        })
+    };
+    assert_eq!(highlight_target(range(1, 222), text), range(1, 3));
 }
 
 #[test]

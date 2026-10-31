@@ -16,7 +16,7 @@ use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::file_viewer::{DocumentSource, FileViewer};
+use crate::file_viewer::{DocumentSource, FileViewer, LineTarget};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_alert};
@@ -230,7 +230,7 @@ pub fn dirty_document_names(cx: &App) -> Vec<String> {
 pub fn open_active_file(
     store: Entity<AppStore>,
     path: PathBuf,
-    highlight_line: Option<u32>,
+    highlight: Option<LineTarget>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -274,7 +274,7 @@ pub fn open_active_file(
         return;
     };
     area.update(cx, |area, cx| {
-        area.open_document(source, highlight_line, window, cx)
+        area.open_document(source, highlight, window, cx)
     });
 }
 
@@ -457,7 +457,7 @@ impl WorkbenchArea {
     fn open_document(
         &mut self,
         source: DocumentSource,
-        highlight_line: Option<u32>,
+        highlight: Option<LineTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -469,7 +469,7 @@ impl WorkbenchArea {
             project.active = WorkbenchPage::Document(key);
             window.defer(cx, move |window, cx| {
                 document.update(cx, |document, cx| {
-                    document.reveal_line(highlight_line, window, cx);
+                    document.reveal_line(highlight, window, cx);
                     document.on_activated(window, cx);
                 });
             });
@@ -478,7 +478,7 @@ impl WorkbenchArea {
         }
 
         let title = source.file_name();
-        let document = cx.new(|cx| FileViewer::new_document(source, highlight_line, window, cx));
+        let document = cx.new(|cx| FileViewer::new_document(source, highlight, window, cx));
         cx.observe(&document, |_this, _document, cx| cx.notify())
             .detach();
         project.tabs.push(DocumentTab {

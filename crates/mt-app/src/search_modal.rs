@@ -419,7 +419,7 @@ impl SearchModal {
                     self.store.clone(),
                     path,
                     // 内容搜索给命中行,文件名搜索没有行号
-                    item.line_number,
+                    item.line_number.map(crate::file_viewer::LineTarget::line),
                     window,
                     cx,
                 );

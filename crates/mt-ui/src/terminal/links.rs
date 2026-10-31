@@ -30,6 +30,8 @@ pub struct FileLink {
     pub path: PathBuf,
     /// 1 起算的行号 / 列号。
     pub line: Option<u32>,
+    /// 范围写法的终点行(见 [`PathCandidate::end_line`])。
+    pub end_line: Option<u32>,
     pub column: Option<u32>,
 }
 
@@ -120,6 +122,7 @@ pub(crate) fn probe(
             link: FileLink {
                 path,
                 line: cand.line,
+                end_line: cand.end_line,
                 column: cand.column,
             },
             spans: spans(&logical, cand.range),

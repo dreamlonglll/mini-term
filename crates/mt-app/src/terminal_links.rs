@@ -23,6 +23,7 @@ use mt_terminal::links::PathCandidate;
 use mt_ui::terminal::FileLink;
 
 use crate::clipboard::{self, PasteTarget};
+use crate::file_viewer::LineTarget;
 use crate::store::AppStore;
 
 /// 解析路径要看的那一份项目形态。
@@ -85,12 +86,15 @@ pub fn resolve(pty_id: u32, cand: &PathCandidate, cx: &App) -> Option<PathBuf> {
     }
 }
 
-/// Ctrl+单击:在文件页打开(已开过就切过去并定位到行)。
+/// Ctrl+单击:在文件页打开(已开过就切过去),定位到行;范围写法连同选中那几行。
 pub fn open(link: &FileLink, window: &mut Window, cx: &mut App) {
     crate::workbench_area::open_active_file(
         AppStore::global(cx),
         link.path.clone(),
-        link.line,
+        link.line.map(|line| LineTarget {
+            line,
+            end: link.end_line,
+        }),
         window,
         cx,
     );
@@ -269,6 +273,7 @@ mod tests {
         PathCandidate {
             path: path.to_string(),
             line,
+            end_line: None,
             column: None,
             range: 0..path.chars().count(),
         }
