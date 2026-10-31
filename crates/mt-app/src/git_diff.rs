@@ -45,11 +45,17 @@
 //!    分组(取消暂存 / 丢弃了最后一块)就换到原位置上的下一个(见 [`resync_index`])。
 //! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮),
 //!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。
+//! 11. **正文能拖选复制**(对标 IDEA):拖选 / 双击选词 / 三击选行 / Shift+单击延伸,
+//!     拖出视口自动滚动;Ctrl/Cmd+C 复制、Ctrl/Cmd+A 全选、右键「复制 / 全选」。并排视图
+//!     只选起拖的那一栏,行内视图不带行号与 `+`/`-`,tab 按原文复制。原版的行是 DOM,
+//!     浏览器白给选区;这里行是虚拟化的自绘元素,整套在 [`selection`] 里。
 //!
 //! # 判定顺序不能换
 //!
 //! `loading → error → isBinary → tooLarge → 正常`(`DiffModal.tsx:233-259`)。
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
+
+mod selection;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -58,10 +64,9 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
-    HighlightStyle, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement,
-    Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
-    StyledText, UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px,
-    uniform_list,
+    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Pixels, Point,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
@@ -81,6 +86,7 @@ use crate::prompt::{Confirm, kind, open_guarded};
 use crate::store::AppStore;
 use crate::tab_expansion::{TAB_WIDTH, expand_line};
 use crate::ui;
+use selection::{Pane, RowText, SelectState};
 
 gpui::actions!(
     mini_term,
@@ -93,11 +99,18 @@ gpui::actions!(
         GitDiffNextFile,
         /// 单文件 diff:分组里的上一个文件(Alt+←)
         GitDiffPrevFile,
+        /// 三个 diff 弹窗:复制正文选区(Ctrl/Cmd+C)
+        GitDiffCopy,
+        /// 三个 diff 弹窗:全选当前栏(Ctrl/Cmd+A)
+        GitDiffSelectAll,
     ]
 );
 
 /// 单文件 diff 弹窗的 key context(键位绑在 `hotkeys.rs` 的表外段)。
 pub const FILE_DIFF_CONTEXT: &str = "GitFileDiff";
+
+/// 提交 diff 弹窗的 key context(正文的 Ctrl/Cmd+C / A 挂在它上面)。
+pub const COMMIT_DIFF_CONTEXT: &str = "GitCommitDiff";
 
 /// 视图模式。**组件态,不落盘**;默认 side-by-side(`DiffModal.tsx:158`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,8 +376,10 @@ fn head_start(start: u32, lines: u32) -> u32 {
 /// uniform_list 回调里重算。
 #[derive(Default)]
 struct Flat {
-    /// 拍平的行(两个视图共用一份)
+    /// 拍平的行(两个视图共用一份)。`content` 是 **tab 展开后**的显示文本
     lines: Vec<DiffLine>,
+    /// 与 [`Flat::lines`] 等长:含 tab 的行展开前的原文(复制要给它),没有 tab 的是 `None`
+    raw: Vec<Option<String>>,
     /// 与 [`Flat::lines`] 等长:每行的行内改动片段。空 = 整行一个底色
     marks: Vec<Vec<Range<usize>>>,
     heads: Vec<HunkHead>,
@@ -411,14 +426,15 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
         let base = f.lines.len();
         let (lines, pairs) = pair_rows(std::slice::from_ref(hunk));
         // `\t` 在 gpui 文本里是零宽(见 `tab_expansion` 模块注释),显示前按制表位展开。
-        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上
-        let lines: Vec<DiffLine> = lines
+        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上;原文另存一份给复制用
+        let lines: Vec<(DiffLine, Option<String>)> = lines
             .into_iter()
             .map(|mut line| {
+                let mut raw = None;
                 if let Cow::Owned(expanded) = expand_line(&line.content, TAB_WIDTH) {
-                    line.content = expanded;
+                    raw = Some(std::mem::replace(&mut line.content, expanded));
                 }
-                line
+                (line, raw)
             })
             .collect();
 
@@ -431,7 +447,10 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
         f.inline_rows
             .extend((0..lines.len()).map(|i| InlineRow::Line(base + i)));
         f.marks.extend((0..lines.len()).map(|_| Vec::new()));
-        f.lines.extend(lines);
+        for (line, raw) in lines {
+            f.lines.push(line);
+            f.raw.push(raw);
+        }
 
         for (left, right) in pairs {
             let (left, right) = (left.map(|i| i + base), right.map(|i| i + base));
@@ -536,12 +555,17 @@ fn pinned(scroll_x: Pixels) -> gpui::Div {
 ///
 /// 行根 `w_full()`:横向不受限的 uniform_list 里行宽 = 内容区宽,少了它增删行的底色
 /// 只涂到文字为止,长短行参差不齐。
+///
+/// 正文可拖选(见 [`selection`]):`row` 带着这一行的选区与排版登记;正文区是 I 形光标,
+/// 行号列照旧是箭头。行高同时设成文字行高 —— 高亮底色按文字行高画,两者不一致时
+/// 跨行选区的底色会一条压一条、叠出深浅相间的横纹。
 fn diff_line_row(
     line: &DiffLine,
     gutters: &[(String, f32)],
     line_height: f32,
     marks: &[Range<usize>],
-    scroll_x: Pixels,
+    scroll: Point<Pixels>,
+    row: RowText,
 ) -> AnyElement {
     let kind = line.kind.as_str();
     let content = SharedString::from(line.content.clone());
@@ -549,28 +573,36 @@ fn diff_line_row(
     // `whitespace-pre`:diff 行不换行 —— 少了它 gpui 会把长行回绕,而行高是恒定的
     // (uniform_list 的前提),回绕出来的第二行直接被裁掉,看着像「缺了半行」。
     // `flex_none`:宽度就是整行文字的宽,uniform_list 按它量横向可滚范围
-    let mut text = div()
+    let text = div()
         .flex_none()
+        .flex()
         .pl(px(gutter_w + 8.0))
         .pr(px(8.0))
         .whitespace_nowrap()
-        .text_color(line_fg(kind));
-    if marks.is_empty() {
-        text = text.child(content);
-    } else {
-        let style = HighlightStyle {
-            background_color: Some(word_bg(kind)),
-            ..Default::default()
-        };
-        text = text.child(
-            StyledText::new(content)
-                .with_highlights(marks.iter().map(|r| (r.clone(), style))),
-        );
-    }
-    let numbers = pinned(scroll_x).w(px(gutter_w)).bg(ui::bg_base()).child(
+        .text_color(line_fg(kind))
+        .child(selection::line_text(
+            content,
+            marks,
+            word_bg(kind),
+            &row,
+            scroll,
+        ))
+        // 行尾换行也在选区里:正文后面补一小块(空行被选中也看得出来)
+        .when_some(row.newline_mark(), |el, bg| {
+            el.child(
+                div()
+                    .flex_none()
+                    .w(px((line_height * 0.3).round()))
+                    .h(px(line_height))
+                    .bg(bg),
+            )
+        });
+    let numbers = pinned(scroll.x).w(px(gutter_w)).bg(ui::bg_base()).child(
         div()
             .size_full()
             .flex()
+            // 行号列不可选:光标照旧是箭头
+            .cursor_default()
             .when_some(line_bg(kind), |el, bg| el.bg(bg))
             // 行号直接用 muted,不再叠 0.6 的透明度:叠上之后深浅两套主题里都只剩
             // 2:1 上下的对比,行号基本读不出来
@@ -590,6 +622,8 @@ fn diff_line_row(
         .w_full()
         .flex()
         .h(px(line_height))
+        .line_height(px(line_height))
+        .cursor_text()
         .when_some(line_bg(kind), |el, bg| el.bg(bg))
         .child(text)
         .child(numbers)
@@ -685,7 +719,8 @@ fn empty_cell(line_height: f32) -> AnyElement {
         .h(px(line_height))
         .bg(ui::with_alpha(ui::text_primary(), 0.05))
         .child(div().w(px(GUTTER)).flex_none())
-        .child(div().flex_1())
+        // 空格子里也能起拖(复制时这一行跳过),光标与正文一致
+        .child(div().flex_1().cursor_text())
         .into_any_element()
 }
 
@@ -713,6 +748,8 @@ struct DiffState {
     synced_right: Point<Pixels>,
     /// 「上一处/下一处改动」走到第几个 hunk。`None` = 还没跳过。
     jump: Option<usize>,
+    /// 正文的选区、拖选与排版登记(见 [`selection`])
+    select: SelectState,
 }
 
 impl DiffState {
@@ -732,6 +769,7 @@ impl DiffState {
             synced_left: Point::default(),
             synced_right: Point::default(),
             jump: None,
+            select: SelectState::default(),
         }
     }
 
@@ -742,6 +780,8 @@ impl DiffState {
     fn apply(&mut self, result: anyhow::Result<GitDiffResult>) {
         self.loading = false;
         self.jump = None;
+        // 行换了一套(换文件 / 块操作后原地重取):旧选区的行下标已对不上
+        self.clear_selection();
         match result {
             Ok(diff) => {
                 self.flat = flatten(&diff.hunks);
@@ -955,13 +995,15 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
     let font_size = s.font_size;
     let widest_ix = s.flat.widest_inline;
     let scroll = s.inline_scroll.clone();
-    let state = state.clone();
+    let rows_state = state.clone();
     let list = uniform_list(
         "git-diff-inline",
         count,
         move |range, _window, cx: &mut App| {
-            let s = state.read(cx);
-            let scroll_x = s.inline_scroll.0.borrow().base_handle.offset().x;
+            let selection_bg = selection::selection_bg(cx);
+            let s = rows_state.read(cx);
+            s.retain_layouts(Pane::Inline, &range);
+            let scroll = s.inline_scroll.0.borrow().base_handle.offset();
             range
                 .map(|i| match s.flat.inline_rows[i] {
                     InlineRow::Head(h) => hunk_row(
@@ -969,7 +1011,7 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                         line_height,
                         INLINE_GUTTER,
                         hunks.as_ref().map(|ui| hunk_actions(ui, h)),
-                        scroll_x,
+                        scroll.x,
                     ),
                     InlineRow::Line(ix) => {
                         let line = &s.flat.lines[ix];
@@ -988,7 +1030,8 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                             ],
                             line_height,
                             &s.flat.marks[ix],
-                            scroll_x,
+                            scroll,
+                            s.row_text(Pane::Inline, i, ix, selection_bg),
                         )
                     }
                 })
@@ -1002,12 +1045,14 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
     // 字号挂在外面一层:uniform_list 在 prepaint 里先量宽、后才套上自己的样式,
     // 字号挂在它自己身上的话量宽用的是继承来的界面字号,长行滚不到头
-    div()
+    let body = div()
         .relative()
         .size_full()
         .text_size(ui::font_px(font_size))
         .child(list)
-        .child(h_scrollbar("git-diff-inline-hbar", &scroll))
+        .child(h_scrollbar("git-diff-inline-hbar", &scroll));
+    selection::text_mouse(body, state, Pane::Inline)
+        .child(selection::drag_listener(state))
         .into_any_element()
 }
 
@@ -1046,7 +1091,8 @@ fn render_side_by_side(
     let (left_scroll, right_scroll) = (s.left_scroll.clone(), s.right_scroll.clone());
 
     let column = |side_left: bool, widest_ix: usize, scroll: UniformListScrollHandle| {
-        let state = state.clone();
+        let rows_state = state.clone();
+        let pane = if side_left { Pane::Old } else { Pane::New };
         let hunks = if side_left { None } else { hunks.clone() };
         let handle = scroll.clone();
         let list = uniform_list(
@@ -1057,8 +1103,10 @@ fn render_side_by_side(
             },
             count,
             move |range, _window, cx: &mut App| {
-                let s = state.read(cx);
-                let scroll_x = handle.0.borrow().base_handle.offset().x;
+                let selection_bg = selection::selection_bg(cx);
+                let s = rows_state.read(cx);
+                s.retain_layouts(pane, &range);
+                let scroll = handle.0.borrow().base_handle.offset();
                 range
                     .map(|i| match s.flat.pair_rows[i] {
                         // 两栏各显示自己那侧的区间,行数仍一一对应
@@ -1074,7 +1122,7 @@ fn render_side_by_side(
                                 line_height,
                                 GUTTER,
                                 hunks.as_ref().map(|ui| hunk_actions(ui, h)),
-                                scroll_x,
+                                scroll.x,
                             )
                         }
                         PairRow::Line(left, right) => {
@@ -1094,7 +1142,8 @@ fn render_side_by_side(
                                         &[(no.map(|n| n.to_string()).unwrap_or_default(), GUTTER)],
                                         line_height,
                                         &s.flat.marks[index],
-                                        scroll_x,
+                                        scroll,
+                                        s.row_text(pane, i, index, selection_bg),
                                     )
                                 }
                             }
@@ -1107,17 +1156,20 @@ fn render_side_by_side(
         .track_scroll(&scroll)
         .with_width_from_item(Some(widest_ix))
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
-        div().relative().size_full().child(list).child(h_scrollbar(
+        let body = div().relative().size_full().child(list).child(h_scrollbar(
             if side_left {
                 "git-diff-left-hbar"
             } else {
                 "git-diff-right-hbar"
             },
             &scroll,
-        ))
+        ));
+        // 选区限定在起拖的那一栏:两栏各挂各的,按下时记下是哪一栏
+        selection::text_mouse(body, state, pane)
     };
 
     div()
+        .relative()
         .size_full()
         .text_size(ui::font_px(font_size))
         .child(
@@ -1126,6 +1178,7 @@ fn render_side_by_side(
                 .child(resizable_panel().child(column(true, widest_left, left_scroll)))
                 .child(resizable_panel().child(column(false, widest_right, right_scroll))),
         )
+        .child(selection::drag_listener(state))
         .into_any_element()
 }
 
@@ -1243,7 +1296,11 @@ fn view_toggle(
             )
             .on_click(move |_: &ClickEvent, _window, cx| {
                 state.update(cx, |s, cx| {
-                    s.view = mode;
+                    // 两个视图的行下标不是一回事:换视图就清掉选区
+                    if s.view != mode {
+                        s.view = mode;
+                        s.clear_selection();
+                    }
                     cx.notify();
                 });
             }),
@@ -1561,6 +1618,7 @@ fn load_file(
             s.result = None;
             s.flat = Flat::default();
             s.jump = None;
+            s.clear_selection();
             s.reset_scroll();
         }
         s.request += 1;
@@ -2057,8 +2115,9 @@ pub fn open_file_diff_with(
             // 于是从「看不见的可点区」变成「看得见的第二颗 ✕」,照样得关掉)
             .close_button(false)
             .child(
-                div()
-                    // F7 / Shift+F7 / Alt+← / Alt+→ 挂在这里;Esc 冒泡到 Dialog 关窗
+                // F7 / Shift+F7 / Alt+← / Alt+→ 与正文的 Ctrl/Cmd+C / A 挂在这里;
+                // Esc 冒泡到 Dialog 关窗
+                selection::text_actions(div(), &state)
                     .track_focus(&focus)
                     .key_context(FILE_DIFF_CONTEXT)
                     .on_action(move |_: &GitDiffNextChange, _window, cx| {
@@ -2441,6 +2500,12 @@ fn open_files_diff(
     }
 
     let files = Rc::new(files);
+    // 正文的 Ctrl/Cmd+C / A 挂在弹窗的焦点容器上(见下面 builder 末尾)。已经开着一个时
+    // 守卫会拦下这次打开,那就不能再聚焦 —— 焦点会落进一个永远画不出来的元素
+    let focus = cx.focus_handle();
+    let initial_focus = focus.clone();
+    let already_open = crate::prompt::is_open(kind::GIT_COMMIT_DIFF);
+
     open_guarded(
         kind::GIT_COMMIT_DIFF,
         window,
@@ -2609,7 +2674,10 @@ fn open_files_diff(
 
             let (width, body_h) = modal_size(viewport);
             dialog.w(width).p_0().close_button(false).child(
-                div()
+                // 正文的 Ctrl/Cmd+C / A 挂在这里;Esc 冒泡到 Dialog 关窗
+                selection::text_actions(div(), &state)
+                    .track_focus(&focus)
+                    .key_context(COMMIT_DIFF_CONTEXT)
                     .w_full()
                     .h(body_h)
                     .flex()
@@ -2619,6 +2687,10 @@ fn open_files_diff(
             )
         },
     );
+    // 打开即可 Ctrl+A,不必先点一下正文(时机讲究见 `prompt::autofocus`)
+    if !already_open {
+        window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
+    }
 }
 
 /// 取左栏一个文件的 diff(按它的来源:单提交 / 两个版本之间)。
@@ -2680,8 +2752,9 @@ fn load_diff_with(
         s.result = None;
         s.flat = Flat::default();
         // 换文件 = 换一份 diff:跳转计数与滚动位置(连同两栏同步基准)都要归零,否则新文件
-        // 一进来就显示「3/12」,而两栏还停在上一份的偏移上
+        // 一进来就显示「3/12」,而两栏还停在上一份的偏移上;选区同理
         s.jump = None;
+        s.clear_selection();
         s.reset_scroll();
         s.request += 1;
         cx.notify();
@@ -2751,6 +2824,12 @@ impl CommitFileDiffPane {
             None,
             cx,
         )
+    }
+
+    /// 给宿主弹窗的焦点容器挂上正文的 Ctrl/Cmd+C、Ctrl/Cmd+A(键位按宿主的 key context
+    /// 绑在 `hotkeys.rs`)。
+    pub(crate) fn text_actions(&self, el: gpui::Div) -> gpui::Div {
+        selection::text_actions(el, &self.state)
     }
 
     /// 右上角:改动跳转 + 并排 / 行内切换 + ✕(关的是 `close_kind` 那个弹窗)。

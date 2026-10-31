@@ -626,6 +626,29 @@ pub fn bind_keys(cx: &mut App) {
         git_file_history::FileHistoryNext,
         Some(git_file_history::FILE_HISTORY_CONTEXT),
     ));
+    // 三个 diff 弹窗(单文件 / 提交 / 单文件历史)的正文选中复制:Ctrl/Cmd+C 复制选区、
+    // Ctrl/Cmd+A 全选当前栏。谓词是各弹窗焦点容器自己的 context;没有可复制 / 可选的
+    // 内容时处理器 `propagate`,按键照常往外走。F7 / Alt+←→ / ↑↓ / Esc 不受影响
+    for context in [
+        git_diff::FILE_DIFF_CONTEXT,
+        git_diff::COMMIT_DIFF_CONTEXT,
+        git_file_history::FILE_HISTORY_CONTEXT,
+    ] {
+        for keystroke in ["ctrl-c", "cmd-c"] {
+            bindings.push(KeyBinding::new(
+                keystroke,
+                git_diff::GitDiffCopy,
+                Some(context),
+            ));
+        }
+        for keystroke in ["ctrl-a", "cmd-a"] {
+            bindings.push(KeyBinding::new(
+                keystroke,
+                git_diff::GitDiffSelectAll,
+                Some(context),
+            ));
+        }
+    }
     // 贮藏列表弹窗:↑/↓ 换贮藏,Delete 删除(先确认);Enter 应用走 Dialog 自己的 Confirm
     bindings.push(KeyBinding::new(
         "up",

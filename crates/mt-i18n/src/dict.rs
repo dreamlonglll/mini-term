@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1444;
+pub const ZH_ENTRY_COUNT: usize = 1446;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1444;
+pub const EN_ENTRY_COUNT: usize = 1446;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -992,6 +992,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("committedToast", "已提交 {hash}：{title}"),
     ("conflictsGroup", "冲突"),
     ("copyError", "复制错误信息"),
+    ("copySelection", "复制"),
     ("deleteSelected", "删除所选 {count} 个未跟踪文件"),
     ("deleteUntracked", "删除此未跟踪文件"),
     ("discardAll", "全部丢弃（只丢未暂存的修改）"),
@@ -1024,6 +1025,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("prevFile", "上一个文件（{shortcut}）"),
     ("refresh", "刷新"),
     ("renameOnly", "仅重命名，内容无改动"),
+    ("selectAll", "全选"),
     ("sideStaged", "HEAD → 暂存区"),
     ("sideUnstaged", "暂存区 → 工作区"),
     ("sideWorking", "HEAD → 工作区"),
@@ -1072,6 +1074,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("committedToast", "Committed {hash}: {title}"),
     ("conflictsGroup", "Conflicts"),
     ("copyError", "Copy error message"),
+    ("copySelection", "Copy"),
     ("deleteSelected", "Delete {count} selected untracked files"),
     ("deleteUntracked", "Delete this untracked file"),
     ("discardAll", "Discard all (unstaged changes only)"),
@@ -1104,6 +1107,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("prevFile", "Previous file ({shortcut})"),
     ("refresh", "Refresh"),
     ("renameOnly", "Renamed only, no content changes"),
+    ("selectAll", "Select All"),
     ("sideStaged", "HEAD → Index"),
     ("sideUnstaged", "Index → Working tree"),
     ("sideWorking", "HEAD → Working tree"),

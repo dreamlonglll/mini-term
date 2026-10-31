@@ -126,9 +126,13 @@ pub fn open(
             let viewport = window.viewport_size();
             let (width, body_h) = git_diff::modal_size(viewport);
             let (prev, next) = (state.clone(), state.clone());
-            let focus = state.read(cx).focus.clone();
+            let (focus, diff) = {
+                let s = state.read(cx);
+                (s.focus.clone(), s.diff.clone())
+            };
             dialog.w(width).p_0().close_button(false).child(
-                div()
+                // 右栏 diff 正文的 Ctrl/Cmd+C / A 也挂在这个焦点容器上
+                diff.text_actions(div())
                     .w_full()
                     .h(body_h)
                     .flex()

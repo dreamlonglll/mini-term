@@ -27,6 +27,9 @@ export const gitCommit = {
     copyError: "复制错误信息",
     refresh: "刷新",
     dismiss: "关闭",
+    // ── diff 正文：选中复制（右键菜单） ──
+    copySelection: "复制",
+    selectAll: "全选",
 
     // ── 更改列表 ──
     conflictsGroup: "冲突",
@@ -112,6 +115,9 @@ export const gitCommit = {
     copyError: "Copy error message",
     refresh: "Refresh",
     dismiss: "Dismiss",
+    // ── diff text: select & copy (context menu) ──
+    copySelection: "Copy",
+    selectAll: "Select All",
 
     // ── Changes list ──
     conflictsGroup: "Conflicts",
