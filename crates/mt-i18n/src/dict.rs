@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1446;
+pub const ZH_ENTRY_COUNT: usize = 1454;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1446;
+pub const EN_ENTRY_COUNT: usize = 1454;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2850,8 +2850,16 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("paste", "粘贴"),
     ("pasteImageNoRemote", "远程连接不可用，剪贴板图片未粘贴"),
     ("pasteUploadFailed", "粘贴内容上传到远程失败：{detail}"),
+    ("sshAuthKey", "密钥"),
+    ("sshAuthPassword", "密码"),
     ("sshConnect", "SSH 连接"),
-    ("sshConnectEmpty", "SSH 连接（暂无）"),
+    ("sshEmpty", "还没有 SSH 连接"),
+    ("sshEmptyHint", "添加后即可在这里一键连接到当前终端"),
+    ("sshFooterHint", "↑↓ 选择 · ↵ 连接"),
+    ("sshManage", "管理连接"),
+    ("sshNewConnection", "新建连接"),
+    ("sshNoMatch", "没有匹配的连接"),
+    ("sshSearchPlaceholder", "搜索名称、主机或用户…"),
     ("ungrouped", "未分组"),
 ];
 #[rustfmt::skip]
@@ -2862,8 +2870,16 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("paste", "Paste"),
     ("pasteImageNoRemote", "Remote connection unavailable; the clipboard image was not pasted"),
     ("pasteUploadFailed", "Failed to upload pasted content to the remote host: {detail}"),
+    ("sshAuthKey", "Key"),
+    ("sshAuthPassword", "Password"),
     ("sshConnect", "SSH Connection"),
-    ("sshConnectEmpty", "SSH Connection (none)"),
+    ("sshEmpty", "No SSH connections yet"),
+    ("sshEmptyHint", "Add one to connect from this terminal in a click"),
+    ("sshFooterHint", "↑↓ Select · ↵ Connect"),
+    ("sshManage", "Manage"),
+    ("sshNewConnection", "New"),
+    ("sshNoMatch", "No matching connections"),
+    ("sshSearchPlaceholder", "Search name, host or user…"),
     ("ungrouped", "Ungrouped"),
 ];
 

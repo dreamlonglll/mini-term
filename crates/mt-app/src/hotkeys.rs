@@ -453,6 +453,19 @@ pub fn bind_keys(cx: &mut App) {
         Some("CommandLibrary > Input"),
     ));
 
+    // 终端右键「SSH 连接」快速连接面板的方向键。与项目切换器同一套理由:
+    // 面板内部键位不进表,谓词要与 `Input` 同深度才压得过它自带的 up/down。
+    bindings.push(KeyBinding::new(
+        "up",
+        crate::ssh_quick_connect::SshQuickPrev,
+        Some("SshQuickConnect > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        crate::ssh_quick_connect::SshQuickNext,
+        Some("SshQuickConnect > Input"),
+    ));
+
     // Git 分支弹窗:↑↓ 移动高亮、→ 弹出高亮分支的操作菜单。与项目切换器同一套理由
     // (谓词与 `Input` 同深度才压得过它自带的 up/down/right);→ 只在光标位于搜索词
     // 末尾时才接管,否则处理器 `propagate()` 让给输入框的 MoveRight(见 git_branches)。
