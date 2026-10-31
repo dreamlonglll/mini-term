@@ -825,7 +825,8 @@ impl SettingsView {
                         "{}'JetBrainsMono Nerd Font', monospace{}",
                         t("settings", "font.fontFamilyFooterPrefix"),
                         t("settings", "font.fontFamilyFooterSuffix"),
-                    ))),
+                    )))
+                    .child(ui::hint(t("settings", "font.nerdIconsBuiltin"))),
             )
             .child(
                 section("font.ligatures")

@@ -2,3 +2,6 @@
 # (mt-theme-packs 的测试会对账)。Windows 上 core.autocrlf=true 检出会把
 # 文件夹里的 JSON 换成 CRLF,zip 里仍是 LF,两边就对不上了。
 theme/**/*.json text eol=lf
+
+# 内置字体经 include_bytes! 编进 exe,一个字节都不能被换行转换动到
+*.ttf binary

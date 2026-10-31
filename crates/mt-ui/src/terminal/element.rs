@@ -17,6 +17,9 @@
 //! - **不可合并**:宽字符(CJK / emoji)、主字体缺字要回退、带组合符号的格子。
 //!   这些**单独 shape、单独画在 `col × cell_width` 上** —— 位置由我们指定,
 //!   字形宽度对不上也只是它自己糊出边界,绝不会把后面的列顶歪。
+//!   主字体缺的私用区图标(Nerd Font)也在这一类,只是换内置图标字体、按格子
+//!   缩了字号画;其中 powerline 分隔符不走字体,按格子几何直接画路径。
+//!   见 [`super::symbols`]。
 //!
 //! 这条分界是整个渲染器的地基:中英混排的对齐不依赖「CJK 恰好是两倍宽」这种
 //! 字体侧的巧合,而是由「每个非等宽格子都自己定位」保证的。
@@ -92,6 +95,7 @@ use super::mouse::{
 use super::scrollbar::{self, ScrollbarDrag, ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
 use super::search::{HighlightSpan, SearchHighlights, TerminalSearch};
 use super::selection_dwell::{DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
+use super::symbols;
 use super::theme::{SearchColors, TerminalStyle, TerminalTheme};
 use crate::background::BackgroundArtElement;
 use crate::theme_bridge::BackgroundArt;
@@ -375,7 +379,7 @@ struct TerminalElementState {
     /// (200 列 × 72B ≈ 14KB),而刷屏时整屏都是未命中。容量按「一帧未命中行数 ×
     /// 列数」的高水位收敛,一屏满打满算几百 KB —— 与行缓存自己那份产物同一量级。
     cells: Rc<RefCell<Vec<CellSignature>>>,
-    /// 「字符步进是否恰好一列宽」的缓存,见 [`AdvanceCache`]。
+    /// 「这个字符归哪类画法」(并段 / 单画 / 换内置图标字体)的缓存,见 [`AdvanceCache`]。
     advance: Rc<RefCell<AdvanceCache>>,
     /// 滚动条的拖动/悬停状态。
     scrollbar: Rc<StdCell<ScrollbarDrag>>,
@@ -424,6 +428,19 @@ struct TextPiece {
     line: ShapedLine,
 }
 
+/// 一个按几何直接画的 powerline 分隔符(见 [`symbols::powerline_separator`])。
+///
+/// 存的是 [`symbols::Separator`] 而不是建好的 Path:Path 是窗口绝对坐标,
+/// 行缓存要跨行复用就只能每帧现建 —— 一屏也就提示符上那几个,不值得再缓存。
+#[derive(Clone)]
+struct SeparatorPiece {
+    /// 行内相对坐标(格子左上角)。
+    origin: Point<Pixels>,
+    separator: symbols::Separator,
+    color: Hsla,
+    stroke: Pixels,
+}
+
 #[derive(Clone)]
 struct CursorLayout {
     /// 行内相对坐标。
@@ -439,6 +456,7 @@ struct RowRender {
     /// 查找命中段。`bool` = 是不是当前命中(要额外描一圈边)。
     searches: Vec<(Bounds<Pixels>, bool)>,
     texts: Vec<TextPiece>,
+    separators: Vec<SeparatorPiece>,
     cursor: Option<CursorLayout>,
 }
 
@@ -472,7 +490,8 @@ pub struct PreparedFrame {
     flash: Option<(Bounds<Pixels>, Hsla)>,
 }
 
-/// 「这个字符在主字体里有字形、且步进正好是一列宽吗」的缓存。
+/// 「这个字符在主字体里有字形、且步进正好是一列宽吗」的缓存 —— 答案是三档的
+/// [`Coverage`],多出来的那档给私用区图标(见下文末节)。
 ///
 /// 每帧对每个格子问一次,不缓存就是每帧几千次 DirectWrite 往返。挂在
 /// [`TerminalElementState`] 上(跨帧存活),prepaint 开头借一次、整帧共用 ——
@@ -481,7 +500,7 @@ pub struct PreparedFrame {
 /// 分两层:
 ///
 /// - **ASCII 直接下标**。一屏一万个格子里九成九是 ASCII,查一次表不该有哈希成本。
-///   小表按「字形变体 × 码位」分层,`[Option<bool>; 128] × 4` 一共 512 字节;
+///   小表按「字形变体 × 码位」分层,`[Option<Coverage>; 128] × 4` 一共 512 字节;
 ///   四档 FontId / 字号 / 列宽任一变化就整体清掉(那时 [`FrameKey`] 也变,
 ///   行缓存本来就要全量重建)。
 /// - **非 ASCII 走 HashMap**,键里带 font_id 与字号 —— 粗体 / 斜体是不同的
@@ -500,12 +519,33 @@ pub struct PreparedFrame {
 /// 所以这里按真实路径 shape 这一个字符,看落下的 run **是不是主字体族**、总宽
 /// **是不是一列**;两条都成立才算可合并。回退到别的字族一律不合并 —— 单独定位,
 /// 字形宽窄只糊它自己那一格。
+///
+/// # 私用区图标的第三档
+///
+/// Nerd Font 图标在私用区,主字体不是补丁版时它的结局是两种之一:落到主字体的
+/// `.notdef`(还是「主字体族、恰好一列」,照上面的判据会被并进段里画成方块),
+/// 或者被回退表接到某个碰巧也占了这个码位的字体上(私用区各家自定义,CJK 字体
+/// 可能带着 GB18030 的私用字,画出来与图标毫不相干)。两种都判成
+/// [`Coverage::Symbol`],交给内置图标字体单独画(见 [`super::symbols`])。
+/// 判据多看一样:落下的字形里有没有 glyph 0。
 struct AdvanceCache {
     /// ASCII 快表的有效性判据:四档变体的 FontId + 字号 + 列宽。
     key: Option<([FontId; 4], u32, u32)>,
     /// 下标 = [`VariantFonts::slot`] 的四档(正 / 粗 / 斜 / 粗斜)。
-    ascii: [[Option<bool>; 128]; 4],
-    wide: HashMap<(FontId, u32, char), bool>,
+    ascii: [[Option<Coverage>; 128]; 4],
+    wide: HashMap<(FontId, u32, char), Coverage>,
+}
+
+/// 一个字符在主字体(含回退表)下的着落,决定它怎么画。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coverage {
+    /// 主字体有字形、步进恰好一列:可以并进合并段。
+    Merge,
+    /// 单独 shape、单独定位,照常走主字体 + 回退表。
+    Alone,
+    /// 主字体没有真字形的私用区字符:单独定位,换内置图标字体画
+    /// (没接管时退回 [`Coverage::Alone`] 的画法)。
+    Symbol,
 }
 
 impl Default for AdvanceCache {
@@ -530,7 +570,7 @@ impl AdvanceCache {
 
     /// `base` 是主字体(含回退表),`slot` 选粗 / 斜变体;`font_id` 只当缓存键用。
     #[allow(clippy::too_many_arguments)]
-    fn fits(
+    fn classify(
         &mut self,
         window: &Window,
         base: &gpui::Font,
@@ -539,15 +579,15 @@ impl AdvanceCache {
         font_size: Pixels,
         ch: char,
         cell_width: Pixels,
-    ) -> bool {
+    ) -> Coverage {
         let code = ch as usize;
         if code < 128 {
             if let Some(hit) = self.ascii[slot][code] {
                 return hit;
             }
-            let fits = self.measure(window, base, slot, font_id, font_size, ch, cell_width);
-            self.ascii[slot][code] = Some(fits);
-            return fits;
+            let coverage = self.measure(window, base, slot, font_id, font_size, ch, cell_width);
+            self.ascii[slot][code] = Some(coverage);
+            return coverage;
         }
         self.measure(window, base, slot, font_id, font_size, ch, cell_width)
     }
@@ -562,28 +602,34 @@ impl AdvanceCache {
         font_size: Pixels,
         ch: char,
         cell_width: Pixels,
-    ) -> bool {
+    ) -> Coverage {
         let key = (font_id, f(font_size).to_bits(), ch);
         if let Some(hit) = self.wide.get(&key).copied() {
             return hit;
         }
-        let fits = shaped_by_primary_at_one_column(window, base, slot, font_size, ch, cell_width);
-        self.wide.insert(key, fits);
-        fits
+        let coverage = classify_glyph(window, base, slot, font_size, ch, cell_width);
+        self.wide.insert(key, coverage);
+        coverage
     }
 }
 
 /// 按真实路径 shape 单个字符:落下的每个 run 都是主字体族、且总宽恰好一列,才算
 /// 「可合并」。回退字族按**族名**比,不比 `FontId` —— 同一张字面在 gpui 里会因
 /// features / fallbacks 不同注册成多个 id,而 `font_id_by_identifier` 只记最后一个。
-fn shaped_by_primary_at_one_column(
+/// (回退表现接的字面根本不进 `get_font_for_id` 的表,查出来是 `None`,同样算「不是
+/// 主字体族」。)
+///
+/// 私用区字符另判:没落在主字体族上、或者落下的是 glyph 0(`.notdef`),就是
+/// [`Coverage::Symbol`]。只对私用区这么判 —— 别的码位缺字时 `.notdef` 照旧并段,
+/// 画面与以前一致。
+fn classify_glyph(
     window: &Window,
     base: &gpui::Font,
     slot: usize,
     font_size: Pixels,
     ch: char,
     cell_width: Pixels,
-) -> bool {
+) -> Coverage {
     let text = SharedString::from(ch.to_string());
     let run = TextRun {
         len: text.len(),
@@ -600,7 +646,20 @@ fn shaped_by_primary_at_one_column(
             .get_font_for_id(r.font_id)
             .is_some_and(|font| font.family == base.family)
     });
-    primary_only && (f(shaped.width) - f(cell_width)).abs() < 0.01
+    if symbols::is_private_use(ch) {
+        let notdef = shaped
+            .runs
+            .iter()
+            .any(|r| r.glyphs.iter().any(|g| g.id.0 == 0));
+        if notdef || !primary_only {
+            return Coverage::Symbol;
+        }
+    }
+    if primary_only && (f(shaped.width) - f(cell_width)).abs() < 0.01 {
+        Coverage::Merge
+    } else {
+        Coverage::Alone
+    }
 }
 
 /// 参与「能否与相邻格子合并成一个 ShapedLine」判定的款式。
@@ -1521,6 +1580,8 @@ impl Element for TerminalElement {
         let line_height = self.style.line_height_px();
         let cell_size = size(cell_width, line_height);
         report_metrics_once(window, font_id, font_size, cell_width, line_height, &self.style);
+        // 主字体缺的私用区图标换哪份字体画;`None` = 这一帧不接管(见 [`symbols`])。
+        let symbol_font = symbols::symbol_font(&self.style, window);
 
         // ── grid 尺寸随可用像素走
         let columns = ((f(bounds.size.width) / f(cell_width).max(1.0)).floor() as usize)
@@ -1582,6 +1643,9 @@ impl Element for TerminalElement {
         for fallback in &self.style.font_fallbacks {
             key = key.push(fallback.as_ref());
         }
+        // 接不接管图标同样只改 shaping 不改格子:启动时字体晚一步注册上,
+        // 已缓存的那几行也得跟着重建,别一直画着方块
+        key = key.push(symbol_font.is_some());
         let frame_key = key
             .push_hsla(self.theme.selection)
             .push_hsla(self.theme.cursor)
@@ -1777,6 +1841,7 @@ impl Element for TerminalElement {
                     font_size,
                     &variant_fonts,
                     &mut advance,
+                    symbol_font.as_ref(),
                     cell_width,
                     line_height,
                     &self.theme,
@@ -1995,6 +2060,15 @@ impl Element for TerminalElement {
             }
             for (y, render) in prepared.rows.iter() {
                 let delta = point(origin.x, origin.y + *y);
+                for piece in render.separators.iter() {
+                    symbols::paint_separator(
+                        window,
+                        piece.separator,
+                        Bounds::new(piece.origin + delta, prepared.cell_size),
+                        piece.color,
+                        piece.stroke,
+                    );
+                }
                 for piece in render.texts.iter() {
                     _ = piece.line.paint(
                         piece.origin + delta,
@@ -2100,6 +2174,42 @@ struct PendingPiece {
     cols: Option<usize>,
     text: String,
     style: RunStyle,
+    /// `Some(n)` = 换内置图标字体画,图标至多占 `n` 列(见 [`symbol_columns`])。
+    /// 只出现在单格片段上。
+    symbol: Option<usize>,
+}
+
+/// 内置图标字体画的这一格,图标至多能占几列。
+///
+/// 后面紧跟一个空格时放宽到两列:「图标 + 空格 + 文字」是提示符 / 状态栏的通行
+/// 写法,1em 见方的图标硬缩进一列(0.6em 上下)小得像个点;借右边那个空格的位置
+/// 就能按正文字号画(WezTerm 的 `allow_square_glyphs_to_overflow_width` 同一口径)。
+/// 后面不是空格就老老实实一列,绝不压到别的字上。
+///
+/// 借格还要两格「底下长得一样」:底色(含反显换出来的底)、选区、查找高亮都相同,
+/// 且两格都不是光标格。否则放大的图标有半截落在另一种底上 —— E2E 实拍:反显图标
+/// 后跟普通空格,右半截白字画在白底上只剩一个「┤」;块光标压在图标上,图标按反白色
+/// 画出两列宽,光标块被挖空成一个「[」。
+///
+/// powerline 分隔符这类色块字形(见 [`colors::is_fill_glyph`])永远一列 ——
+/// 它们要跟隔壁段严丝合缝,多糊出去就盖住下一段的底色。
+fn symbol_columns(cell: &CellSignature, next: Option<&CellSignature>) -> usize {
+    let followed_by_blank = next.is_some_and(|next| {
+        next.col == cell.col + 1
+            && next.ch == ' '
+            && next.zerowidth[0] == '\0'
+            && next.bg_default == cell.bg_default
+            && (cell.bg_default || next.bg == cell.bg)
+            && next.selected == cell.selected
+            && next.search == cell.search
+            && next.cursor == 0
+            && cell.cursor == 0
+    });
+    if followed_by_blank && !colors::is_fill_glyph(cell.ch) {
+        2
+    } else {
+        1
+    }
 }
 
 /// 合并段总宽与「列数 × 列宽」的容差(px)。
@@ -2167,6 +2277,8 @@ fn cursor_move_bytes(
 }
 
 /// 把一行解析好的格子变成可绘制产物。**几何全部相对行首**。
+///
+/// `symbol_font`:主字体缺的私用区图标换这份字体画;`None` = 不接管,照旧走回退表。
 #[allow(clippy::too_many_arguments)]
 fn build_row(
     window: &Window,
@@ -2175,6 +2287,7 @@ fn build_row(
     font_size: Pixels,
     variant_fonts: &VariantFonts,
     advance: &mut AdvanceCache,
+    symbol_font: Option<&gpui::Font>,
     cell_width: Pixels,
     line_height: Pixels,
     theme: &TerminalTheme,
@@ -2185,6 +2298,7 @@ fn build_row(
     let mut selections: Vec<Bounds<Pixels>> = Vec::new();
     let mut searches: Vec<(Bounds<Pixels>, bool)> = Vec::new();
     let mut pieces: Vec<PendingPiece> = Vec::new();
+    let mut separators: Vec<SeparatorPiece> = Vec::new();
     let mut cursor: Option<CursorLayout> = None;
 
     let mut bg_run: Option<(usize, usize, Hsla)> = None;
@@ -2192,7 +2306,7 @@ fn build_row(
     let mut search_run: Option<(usize, usize, u8)> = None;
     let mut text_run: Option<PendingRun> = None;
 
-    for cell in cells {
+    for (index, cell) in cells.iter().enumerate() {
         let col = cell.col;
 
         // ── 背景:默认背景不发 quad(背景图从这里透出来)
@@ -2279,12 +2393,13 @@ fn build_row(
         let has_zerowidth = cell.zerowidth[0] != '\0';
         let slot = VariantFonts::slot(style_key.bold, style_key.italic);
         let run_font_id = variant_fonts.id_at(slot);
-        // 可合并的条件:窄字符、无组合符号、不是光标格(光标格颜色单独)、
-        // 且主字体里有这个字形、步进恰好一列宽。
-        let mergeable = !cell.flags.contains(Flags::WIDE_CHAR)
-            && !has_zerowidth
-            && cell.cursor == 0
-            && advance.fits(
+        // 字形归属只问窄字符(宽字符一律单独画)。光标格 / 带组合符号的格子本来就
+        // 进不了合并段,不必 shape 着去问 —— 私用区除外:光标停在图标上,
+        // 那一格照样得换图标字体画。
+        let coverage = if !cell.flags.contains(Flags::WIDE_CHAR)
+            && ((!has_zerowidth && cell.cursor == 0) || symbols::is_private_use(cell.ch))
+        {
+            advance.classify(
                 window,
                 font,
                 slot,
@@ -2292,9 +2407,30 @@ fn build_row(
                 font_size,
                 cell.ch,
                 cell_width,
-            );
+            )
+        } else {
+            Coverage::Alone
+        };
+        // 可合并的条件:窄字符、无组合符号、不是光标格(光标格颜色单独)、
+        // 且主字体里有这个字形、步进恰好一列宽。
+        let mergeable = coverage == Coverage::Merge && !has_zerowidth && cell.cursor == 0;
+        let takeover = coverage == Coverage::Symbol && symbol_font.is_some();
+        // 接管的 powerline 分隔符不进字体,按格子几何直接画(理由见 [`symbols`] 模块注释)
+        let separator = takeover
+            .then(|| symbols::powerline_separator(cell.ch))
+            .flatten();
+        let symbol =
+            (takeover && separator.is_none()).then(|| symbol_columns(cell, cells.get(index + 1)));
 
-        if mergeable {
+        if let Some(separator) = separator {
+            flush_text(&mut text_run, &mut pieces);
+            separators.push(SeparatorPiece {
+                origin: point(cell_width * col as f32, px(0.0)),
+                separator,
+                color: style_key.fg,
+                stroke: symbols::separator_stroke(font_size),
+            });
+        } else if mergeable {
             match text_run.as_mut() {
                 Some(run) if run.style.same(&style_key) && run.start + run.len == col => {
                     run.text.push(cell.ch);
@@ -2324,6 +2460,7 @@ fn build_row(
                 cols: None,
                 text,
                 style: style_key,
+                symbol,
             });
         }
     }
@@ -2340,13 +2477,24 @@ fn build_row(
         {
             continue; // 纯空白且无下划线/删除线:没有任何像素,不必 shape
         }
-        let mut run_font = font.clone();
-        if piece.style.bold {
-            run_font.weight = gpui::FontWeight::BOLD;
-        }
-        if piece.style.italic {
-            run_font.style = gpui::FontStyle::Italic;
-        }
+        // 图标片段换内置字体、按格子缩字号;粗 / 斜不套(那份字体只有 Regular)。
+        // 竖直位置不用另算:paint 按这个 run 自己的 ascent + descent 在行内居中。
+        let (run_font, piece_size) = match (piece.symbol, symbol_font) {
+            (Some(cols), Some(symbol_font)) => (
+                symbol_font.clone(),
+                symbols::symbol_font_size(font_size, cell_width, line_height, cols),
+            ),
+            _ => {
+                let mut run_font = font.clone();
+                if piece.style.bold {
+                    run_font.weight = gpui::FontWeight::BOLD;
+                }
+                if piece.style.italic {
+                    run_font.style = gpui::FontStyle::Italic;
+                }
+                (run_font, font_size)
+            }
+        };
         let run = TextRun {
             len: piece.text.len(),
             font: run_font,
@@ -2356,10 +2504,12 @@ fn build_row(
             strikethrough: piece.style.strikethrough,
         };
         let text = SharedString::from(piece.text);
-        let mut shaped =
-            window
-                .text_system()
-                .shape_line(text.clone(), font_size, std::slice::from_ref(&run), None);
+        let mut shaped = window.text_system().shape_line(
+            text.clone(),
+            piece_size,
+            std::slice::from_ref(&run),
+            None,
+        );
 
         // ── 连字兜底:合并段的总宽必须仍等于「列数 × 列宽」。
         //
@@ -2399,6 +2549,7 @@ fn build_row(
         selections,
         searches,
         texts,
+        separators,
         cursor,
     }
 }
@@ -2414,6 +2565,7 @@ fn flush_text(run: &mut Option<PendingRun>, out: &mut Vec<PendingPiece>) {
             cols: Some(r.len),
             text: r.text,
             style: r.style,
+            symbol: None,
         });
     }
 }
@@ -2630,6 +2782,83 @@ mod tests {
         // 上限本身要放行
         let at_limit = cursor_move_bytes(0, 0, 0, MAX_CURSOR_MOVE_STEPS as i32, TermMode::empty());
         assert_eq!(at_limit.len(), MAX_CURSOR_MOVE_STEPS * 3);
+    }
+
+    /// 图标格借不借右边那格:紧跟一个干净的空格才借,powerline 分隔符永远不借。
+    #[test]
+    fn 图标后面紧跟空格才放宽到两列() {
+        let (fg, bg) = (gpui::white(), gpui::black());
+        let folder = CellSignature::plain(3, '\u{f07b}', fg, bg);
+        let blank = CellSignature::plain(4, ' ', fg, bg);
+        assert_eq!(symbol_columns(&folder, Some(&blank)), 2, "图标 + 空格");
+        assert_eq!(
+            symbol_columns(&folder, Some(&CellSignature::plain(4, 'x', fg, bg))),
+            1,
+            "后面是字:不许压上去"
+        );
+        assert_eq!(symbol_columns(&folder, None), 1, "行尾");
+        assert_eq!(
+            symbol_columns(&folder, Some(&CellSignature::plain(5, ' ', fg, bg))),
+            1,
+            "下一格不是紧挨着的那列"
+        );
+        let mut combining = blank;
+        combining.zerowidth[0] = '\u{0301}';
+        assert_eq!(
+            symbol_columns(&folder, Some(&combining)),
+            1,
+            "空格上带组合符号:有笔画"
+        );
+        // powerline 半圆端帽:要跟隔壁段严丝合缝,后面是空格也只占一列
+        let cap = CellSignature::plain(3, '\u{e0b4}', fg, bg);
+        assert_eq!(symbol_columns(&cap, Some(&blank)), 1);
+    }
+
+    /// 借格要两格「底下长得一样」—— 两条都是 E2E 实拍出来的:反显图标后跟普通
+    /// 空格,右半截白字落在白底上;块光标压在图标上,光标块被放大的图标挖空。
+    #[test]
+    fn 图标借格要两格底色光标选区一致() {
+        let (fg, bg) = (gpui::white(), gpui::black());
+        let folder = CellSignature::plain(3, '\u{f07b}', fg, bg);
+        let blank = CellSignature::plain(4, ' ', fg, bg);
+
+        // 反显(或带色底)的图标 + 默认底空格
+        let mut inverse = folder;
+        inverse.bg_default = false;
+        inverse.bg = gpui::white();
+        assert_eq!(symbol_columns(&inverse, Some(&blank)), 1, "反显图标");
+        // 同一种色底连成一段(powerline 段里的「图标 + 空格」)照样借
+        let mut segment_blank = blank;
+        segment_blank.bg_default = false;
+        segment_blank.bg = gpui::white();
+        assert_eq!(
+            symbol_columns(&inverse, Some(&segment_blank)),
+            2,
+            "同色底段"
+        );
+        let mut other_color = segment_blank;
+        other_color.bg = gpui::red();
+        assert_eq!(symbol_columns(&inverse, Some(&other_color)), 1, "底色不同");
+
+        // 光标在图标上 / 在右边那个空格上
+        let mut on_icon = folder;
+        on_icon.cursor = 1;
+        assert_eq!(symbol_columns(&on_icon, Some(&blank)), 1, "光标在图标上");
+        let mut cursor_next = blank;
+        cursor_next.cursor = 1;
+        assert_eq!(
+            symbol_columns(&folder, Some(&cursor_next)),
+            1,
+            "光标在空格上"
+        );
+
+        // 选区 / 查找高亮只盖了一格
+        let mut selected = blank;
+        selected.selected = true;
+        assert_eq!(symbol_columns(&folder, Some(&selected)), 1, "选区边界");
+        let mut hit = blank;
+        hit.search = 1;
+        assert_eq!(symbol_columns(&folder, Some(&hit)), 1, "查找命中边界");
     }
 
     /// 闪烁行的 grid 绝对行号 → 屏幕行:`row = line + display_offset`。

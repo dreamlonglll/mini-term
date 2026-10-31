@@ -2479,6 +2479,12 @@ fn main() {
         // 前提是组件库已经把系统值写过一遍(见 `motion::gate_values` 的注释)。
         motion::install(cx);
 
+        // 终端内置的 Nerd Font 图标字体(issue #86):终端字体缺私用区图标时拿它补,
+        // 不再画成方块。要早于任何终端出第一帧;失败只在日志里喊一声,图标退回旧样子。
+        // 为什么不是往回退表里加个名字,见 `mt_ui::terminal::symbols` 的模块注释。
+        mt_ui::terminal::install_symbol_font(cx);
+        startup_trace::mark("symbol font registered");
+
         // 键位表的唯一事实来源在 [`hotkeys`](crate::hotkeys) —— 它同时喂给
         // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`
         // 的结构(此前这里是一串裸 `KeyBinding::new`,与设置页各写各的会漂移)。
