@@ -256,11 +256,12 @@ pub enum AgentFilter {
 }
 
 /// 账本里存的 agent 字符串 → `ParsedSession` 要的 `&'static str`。
-/// 只认已接入用量统计的几家(agent 表的 `history` 位);未知值一律按 claude
-/// （账本只会写入这三种，兜底只为不 panic）。
+/// 只认已接入用量统计的三家(与 [`AgentFilter`] 同集);未知值一律按 claude
+/// （账本只会写入这三种，兜底只为不 panic）。不借 agent 表的 `history` 位:
+/// pi 接了历史面板却没接用量统计,两件事不再同进同出。
 pub(crate) fn agent_from_db(agent: &str) -> &'static str {
     AgentKind::parse(agent)
-        .filter(|k| k.spec().history)
+        .filter(|k| matches!(k, AgentKind::Claude | AgentKind::Codex | AgentKind::Grok))
         .unwrap_or(AgentKind::Claude)
         .key()
 }

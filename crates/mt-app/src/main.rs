@@ -2443,7 +2443,7 @@ fn main() {
         cx.background_executor()
             .spawn(async { mt_core::cleanup_ssh_temp_keys() })
             .detach();
-        // 已注册用户的启动期自愈,三家各一条。装机版 `lib.rs::setup` 里原本也是
+        // 已注册用户的启动期自愈,每家一条。装机版 `lib.rs::setup` 里原本也是
         // 一个后台线程按序跑这几条,GPUI 迁移时 hook_registry 逐字搬进了 mt-ai、
         // 这行调用漏搬,claude/grok 两条自 2026-08-20(b52a654 删 src-tauri)起
         // 一直没执行过 —— 补回来:
@@ -2453,8 +2453,8 @@ fn main() {
         // - codex:  把 config.toml 的 feature 键迁到现行名字(codex_hooks -> hooks),
         //           面板判「已注册」只看 hooks.json,界面上没有线索提示用户重点
         //           一次注册;键已是新名字就不落盘
-        // - omp:扩展文件与当前模板不同就整份重写(模板随版本演进)
-        // 四条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
+        // - omp / pi:扩展文件与当前模板不同就整份重写(模板随版本演进)
+        // 每条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
         // 都要读写用户主目录下的文件,故丢后台不挡启动。
         cx.background_executor()
             .spawn(async {
@@ -2462,6 +2462,7 @@ fn main() {
                 mt_ai::hook_registry::sync_grok_hooks_if_registered();
                 mt_ai::hook_registry::sync_codex_hooks_feature_if_registered();
                 mt_ai::hook_registry::sync_omp_hooks_if_registered();
+                mt_ai::hook_registry::sync_pi_hooks_if_registered();
             })
             .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):

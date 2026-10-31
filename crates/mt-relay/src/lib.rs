@@ -22,8 +22,8 @@
 //! - 现网中转 `wss://relay.dreaminglong.com` 跑的就是 v2 + 桌面端密钥,
 //!   桌面端换 UI 框架对它是透明的。
 //! - **镜像绑定红线**:hook 上报过会话身份就只认那一个会话文件;没有身份时,
-//!   只有"确实会写我们认识的会话记录"的 agent(claude / codex / grok)才退启发式。
-//!   opencode / pi 这类必须给空镜像 —— 退启发式会把同项目里别家的对话贴到这个
+//!   只有"确实会写我们认识的会话记录"的 agent(claude / codex / grok / omp / pi)才退
+//!   启发式。opencode 这类必须给空镜像 —— 退启发式会把同项目里别家的对话贴到这个
 //!   pane 上(串台),见 [`mirror::agent_has_session_log`]。
 //!
 //! # 与原实现的接口差异

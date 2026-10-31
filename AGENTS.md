@@ -39,8 +39,11 @@ cd mobile && npm run build
 # 改文案后重新生成 i18n 字典
 node crates/mt-i18n/tools/gen_from_ts.mjs
 
-# 改 oh-my-pi 扩展模板后离线验证（Bun 运行时，omp 本身不必安装）
+# 改 oh-my-pi / pi 扩展模板后离线验证（Bun 运行时，omp / pi 本身不必安装）
 bun run tools/omp-ext-check.ts
+bun run tools/pi-ext-check.ts
+# pi 模板再在本机装的真 pi 运行时里跑一遍（SDK + faux 假模型，不联网不花 token）
+node tools/pi-ext-realrun.mjs
 
 # 重做 README 顶部宣传片（Linux + Xvfb + lavapipe 实拍真实应用 → 逐帧合成，产物写到 docs/promo/；
 # 依赖与参数见 tools/promo/README.md）
@@ -183,7 +186,8 @@ hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 Sessio
 
 - Grok 的 hook 接入与另外两家有两处结构性差异，改动前先看 `mt-ai::hook_registry::register_grok_hooks` 的注释：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件会来两趟，sidecar 靠 `GROK_SESSION_ID` + 是否带 argv 丢弃兼容层那趟（只注册了 Claude 的用户必须放行——那是唯一来源，判据落在原生 hook 文件是否在场）；② 注册进 `~/.grok/hooks/` 的命令必须是**不含空格的裸文件名**（hook 二进制随注册复制进该目录），带空格会被 grok 丢给 shell，而 Windows 上具体是 git-bash/pwsh/powershell/cmd 由环境决定、四家引号语义互斥；事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递
 - oh-my-pi（omp）的 hook **不走 sidecar**：它的扩展点是 Bun 进程内加载的 TS 模块，`mt-ai::hook_registry` 把自带的 `crates/mt-ai/assets/miniterm-omp.ts` 整份写进 `~/.omp/agent/extensions/miniterm.ts`，扩展在 omp 进程内 `fetch` 本地 hook 服务器、事件名翻译成与 Claude 同名的 PascalCase。两条硬约束：① **只有 `ctx.mode === "tui"` 的主会话上报**——omp 的子代理是同进程内的独立会话，会重新绑定所有扩展工厂，照常上报会把父会话误报成完成；② 打断后的 `agent_end` 以 `Stop` + `reason: aborted` 上报，hook server 落成 cause=`Interrupt`。模板里 `pi.on(...)` 的事件集与 `OMP_HOOK_EVENTS`、上报的事件名与 `OMP_REPORTED_EVENTS` 都有单测逐条对账，改模板先改常量
-- Claude/Codex/Grok/OMP 有移动镜像可解析的本机会话记录（`mt-ai::sessions::agent_has_session_log`）。OMP 18.x 的记录位于 `{omp_agent_dir}/sessions/{编码 cwd}/{timestamp}_{session-id}.jsonl`，镜像按 hook session id 精确定位，解析 `message` 的 user/assistant/toolResult 与 assistant `toolCall(name=ask)`；OMP 的 AI 历史面板、用量统计与谱系扫描仍未接入。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像——镜像必须跳过启发式绑定，否则会把同项目其它 agent 的最新会话贴到该 pane 上
+- pi（earendil-works/pi，omp 的上游）同样走进程内 TS 扩展（`TsExtension`，写进 `~/.pi/agent/extensions/miniterm.ts`），但模板是另一份 `crates/mt-ai/assets/miniterm-pi.ts`，**两份不能互换**（对照实测：omp 模板装进 pi 会在 API 重试中途误报 StopFailure、漏掉权限对话框）：① 回合结束只认 `agent_settled`（pi ≥ 0.80.4）——`agent_end` 在自动重试 / 压缩重试 / 排队消息时一回合会来多次；② 没有 `session_switch`，换会话与 `/reload` 都是 `session_shutdown`(reason) 拆旧运行时 + 新运行时 `session_start`，只有 `quit` 是退出、`new/resume/fork` 打 `clear` 墓碑、`reload` 不报；③ 没有审批事件，扩展对话框走 `ui_prompt_start/end`（pi ≥ 0.84.4），只在回合进行中映射成 Elicitation 黄灯。对账常量是 `PI_HOOK_EVENTS` / `PI_REPORTED_EVENTS`。omp 也认 `PI_CODING_AGENT_DIR`，设了它两家共用同一个 `miniterm.ts`，归属按模板里的 `const AGENT = "…"` 认（`TsExtension::owns`）——别改掉模板里这一行，否则启动自愈会互相改写对方的注册。验证除了 `tools/pi-ext-check.ts`（伪事件总线），还有 `tools/pi-ext-realrun.mjs`（本机装的 pi 的 SDK + pi-ai 的 `fauxProvider`，`session.bindExtensions({ mode: "tui" })` 在真运行时里离线跑）
+- Claude/Codex/pi/Grok/OMP 有移动镜像可解析的本机会话记录（`mt-ai::sessions::agent_has_session_log`）。OMP 18.x 的记录位于 `{omp_agent_dir}/sessions/{编码 cwd}/{timestamp}_{session-id}.jsonl`，镜像按 hook session id 精确定位，解析 `message` 的 user/assistant/toolResult 与 assistant `toolCall(name=ask)`；OMP 的 AI 历史面板、用量统计与谱系扫描仍未接入。pi 的记录行格式与 OMP 相同、目录名只有 `--{绝对路径}--` 一种编码，定位与行解析共用 `sessions/omp.rs`（`PiFlavor`）；pi 额外接了 AI 历史面板（`sessions/pi.rs`，正文沿 `parentId` 只读当前分支），镜像不出提问卡片，用量统计与谱系未接。opencode 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像——镜像必须跳过启发式绑定，否则会把同项目其它 agent 的最新会话贴到该 pane 上
 - Grok 的会话记录形态与另外两家不同：一个会话是**一整个目录**（`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文 `updates.jsonl` 是 ACP 更新流，一条消息拆成多个 chunk 行、攒到边界才成一条；元信息在 `summary.json`）。定位项目走**解码目录名**而非编码项目路径，详见 `mt-ai::sessions` 的 Grok 段注释
 - GPUI 迁移期的逐批决策与「记档不修」清单在 `docs/gpui-migration-progress.md`——改到相关模块（拖拽/托盘/标题栏/关窗/toast 等）前先查该文档对应批次的记档，很多「看起来是 bug」的行为是评审定稿的取舍
 - 领域术语表在 `CONTEXT.md`（会话/会话来源/项目等 ubiquitous language）

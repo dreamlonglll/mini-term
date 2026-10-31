@@ -187,7 +187,7 @@ impl RelayHost for HostImpl {
 
     /// **如实**返回输入检测到的 agent 名(坑 3)。
     ///
-    /// 镜像绑定据此判断「这个 agent 有没有会话记录」:opencode / pi 这类只靠输入
+    /// 镜像绑定据此判断「这个 agent 有没有会话记录」:opencode 这类只靠输入
     /// 检测识别的 agent 必须拿到空镜像 —— 退启发式会绑到同项目里别家的最新会话
     /// 文件,把别人的对话贴到这个 pane 上(比空镜像更糟)。判定已在
     /// `mt_relay::mirror::agent_has_session_log` 里,**这里要做的就是别绕开它**:

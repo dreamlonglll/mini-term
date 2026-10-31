@@ -26,7 +26,7 @@ pub enum AgentKind {
     Codex,
     /// opencode:只靠输入检测识别,没有 hook、没有可解析的会话记录
     OpenCode,
-    /// pi(pi.dev):同 opencode
+    /// pi(pi.dev,earendil-works/pi):hook 走进程内 TS 扩展,会话记录与 omp 同形
     Pi,
     /// grok(xai-org/grok-build)
     Grok,
@@ -44,10 +44,10 @@ pub enum CwdBucket {
     /// [`crate::sessions::lookup_ai_session_cwd`])。起于子目录的会话在项目根
     /// `--resume` 会报 `No conversation found`,必须先反查。
     PerCwdLookup,
-    /// 按目录分桶,但没有反查手段:omp 的记录只接了镜像、没接谱系;grok 的历史列表
-    /// 只列「解码目录名全等于项目根」的会话,新终端默认目录即正确目录。
+    /// 按目录分桶,但没有反查手段:omp 的记录只接了镜像、没接谱系;grok / pi 的历史
+    /// 列表只列「项目根这个桶」里的会话,新终端默认目录即正确目录。
     PerCwd,
-    /// 没有可解析的会话记录,无从谈起(opencode / pi)。
+    /// 没有可解析的会话记录,无从谈起(opencode)。
     Unknown,
 }
 
@@ -78,7 +78,8 @@ pub struct AgentSpec {
     /// 为 `false` 的 agent 镜像必须跳过启发式绑定,否则会把同项目别家的最新会话
     /// 贴到该 pane 上(串台)。
     pub session_log: bool,
-    /// 会话记录已接入 AI 历史面板(列表 / 正文读取)与用量统计。
+    /// 会话记录已接入 AI 历史面板(列表 / 正文读取)。用量统计另有自己的解析器,
+    /// 只接了 claude / codex / grok(`mt_usage::AgentFilter`),不跟这一位走。
     pub history: bool,
     /// agent 自己会从系统剪贴板取图(`Alt+V`)—— 粘图时不落盘,直接发 `ESC v`。
     /// 官方文档把 `Alt+V` 列为 Windows / WSL 下的「Paste image from clipboard」。
@@ -141,11 +142,14 @@ const PI: AgentSpec = AgentSpec {
     aliases: &[],
     loose_match: false,
     label: "pi",
-    resume: None,
+    // 会话 id 来自 hook 上报或历史面板;`--session` 先在当前目录桶里按 id 找,
+    // 找到别的项目的同 id 会话会先问要不要 fork 过来,不会静默开错
+    resume: Some("pi --session {id}"),
+    // pi 有 `--fork <id>`,但分支树要靠谱系扫描画节点,pi 的谱系同 omp 未接
     fork: None,
-    cwd_bucket: CwdBucket::Unknown,
-    session_log: false,
-    history: false,
+    cwd_bucket: CwdBucket::PerCwd,
+    session_log: true,
+    history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
 };
@@ -284,7 +288,7 @@ pub const AGENT_COMMANDS: [&str; AgentKind::ALL.len()] = {
 
 /// 会话身份 → 续接命令。**续接命令的唯一生成处**:AI 历史面板(恢复 / 复制命令 /
 /// 分支树跳转)与启动自动续接都走它。agent 缺省按 Claude;认不出、不支持续接
-/// (opencode / pi)、id 可疑都返回 `None`。
+/// (opencode)、id 可疑都返回 `None`。
 pub fn resume_command(agent: Option<&str>, session_id: &str) -> Option<String> {
     AgentKind::from_session_agent(agent)?.resume_command(session_id)
 }
@@ -444,6 +448,11 @@ mod tests {
             Some("omp --resume 1f9d2a6b9c0d1234".to_string())
         );
         assert_eq!(
+            resume_command(Some("pi"), ID),
+            Some(format!("pi --session {ID}"))
+        );
+        assert_eq!(fork_command(Some("pi"), ID), None, "pi 谱系未接,不开 fork");
+        assert_eq!(
             fork_command(Some("claude-code"), ID),
             Some(format!("claude --resume {ID} --fork-session"))
         );
@@ -462,7 +471,7 @@ mod tests {
     /// 不支持续接的 / 认不出的:一律不产出命令,**不再落到 claude**。
     #[test]
     fn 不支持续接的不产出命令() {
-        for agent in ["opencode", "pi", "gemini", "什么鬼"] {
+        for agent in ["opencode", "gemini", "什么鬼"] {
             assert_eq!(resume_command(Some(agent), ID), None, "{agent}");
             assert_eq!(fork_command(Some(agent), ID), None, "{agent}");
         }
@@ -517,7 +526,8 @@ mod tests {
         }
     }
 
-    /// 能力位与 AGENTS.md「有会话记录的是 Claude/Codex/Grok/OMP」「历史面板只接了前三家」对账。
+    /// 能力位与 AGENTS.md「有会话记录的是 Claude/Codex/Pi/Grok/OMP」「历史面板接了
+    /// Claude/Codex/Pi/Grok」对账。
     #[test]
     fn 能力位对账() {
         let with_log: Vec<_> = AgentKind::ALL
@@ -529,6 +539,7 @@ mod tests {
             [
                 AgentKind::Claude,
                 AgentKind::Codex,
+                AgentKind::Pi,
                 AgentKind::Grok,
                 AgentKind::Omp
             ]
@@ -539,7 +550,12 @@ mod tests {
             .collect();
         assert_eq!(
             with_history,
-            [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok]
+            [
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::Grok
+            ]
         );
         // 能续接的必有会话记录(否则拿不到 id)
         for kind in AgentKind::ALL {

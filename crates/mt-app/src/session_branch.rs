@@ -3,7 +3,7 @@
 //! 平铺会话列表 + 分支边 → 森林 → 带连线前缀的行,外加 pane 右键菜单的**分支段**判据。
 //! 不碰 gpui、不碰磁盘,全部可单测 —— 与 TS 侧 `node --test` 直测同一个取舍。
 //!
-//! 各 agent 的分支能力位(fork / resume 模板、会话 id 白名单、opencode / pi 整表缺席)
+//! 各 agent 的分支能力位(fork / resume 模板、会话 id 白名单、opencode 整表缺席)
 //! 原先是这里的一张 `AgentBranchCaps` 表,与历史面板、启动续接各写一份、口径已分叉;
 //! 现在统一住在 [`mt_ai::agent`],这里只按表出菜单。
 //!

@@ -1,15 +1,16 @@
 //! Hook 注册/卸载模块
 //!
-//! 一键把 Claude Code / Codex / Grok / oh-my-pi 各家的 hook 配置写进各自的配置文件，
+//! 一键把 Claude Code / Codex / Grok / oh-my-pi / pi 各家的 hook 配置写进各自的配置文件，
 //! 并提供配置片段供用户手动粘贴。原本是一组 Tauri command，迁移后是普通函数。
 //!
-//! # oh-my-pi（omp）不走 sidecar
+//! # oh-my-pi（omp）与 pi 不走 sidecar
 //!
-//! omp 没有「shell 命令 hook」这种东西：它的扩展点是**进程内加载的 TS 模块**
-//! （`{omp_agent_dir}/extensions/*.ts`，Bun 运行时）。所以这一家不注册二进制命令，
-//! 而是把一份自带的 TS 扩展（[`OMP_EXTENSION_SOURCE`]）整份写进该目录；扩展在 omp
-//! 进程内直接 `fetch` 本地 hook 服务器，事件名翻译成与 Claude 同名的 PascalCase 后
-//! POST，hook server 不用为它改一行。详见 [`register_omp_hooks`]。
+//! 这两家没有「shell 命令 hook」这种东西：扩展点是**进程内加载的 TS 模块**
+//! （`{agent_dir}/extensions/*.ts`，omp 跑在 Bun 上、pi 跑在 Node 上经 jiti 加载）。
+//! 所以不注册二进制命令，而是把一份自带的 TS 扩展（[`OMP_EXTENSION_SOURCE`] /
+//! [`PI_EXTENSION_SOURCE`]）整份写进该目录；扩展在 CLI 进程内直接 `fetch` 本地 hook
+//! 服务器，事件名翻译成与 Claude 同名的 PascalCase 后 POST，hook server 不用为它们
+//! 改一行。详见 [`TsExtension`]。
 //!
 //! # Grok 的两处结构性差异（改动前先读 [`register_grok_hooks`] 与
 //! [`GROK_HOOK_FILE`] 的注释）
@@ -802,15 +803,22 @@ pub fn sync_grok_hooks_if_registered() {
     }
 }
 
-// ─── oh-my-pi（omp）扩展注册/卸载 ───
+// ─── 进程内 TS 扩展（oh-my-pi / pi）注册/卸载 ───
 //
+// 两家同一套做法（[`TsExtension`]）：整份模板写进 `{agent_dir}/extensions/miniterm.ts`。
 // 「注册现状」的判据是扩展文件在场且带 `miniterm-hook` 标识；事件计数按文件里
 // `pi.on("<event>"` 的出现与否对账，老版本模板缺的事件就显示成「旧版本 N/M」。
-// 启动期自愈（`sync_omp_hooks_if_registered`）在文件内容与当前模板不同时整份重写
+// 启动期自愈（`sync_*_hooks_if_registered`）在文件内容与当前模板不同时整份重写
 // ——模板修了 bug / 加了事件，老用户下次启动即拿到，不必再点一次「注册」。
+//
+// 两家的扩展 API 已经分叉（pi 有 `agent_settled`、换会话走 shutdown + start；omp
+// 有 `session_switch` / 工具审批事件），模板各写一份、不能互换。文件名相同是有意的：
+// 有人把 omp 的模板手抄进 pi 的扩展目录（issue #85 就是这么试的），它带着标识，
+// pi 的自愈会认出「旧版本」并换成 pi 的模板。设了 `PI_CODING_AGENT_DIR` 时两家落在
+// 同一个文件上，归属改按模板自报的 `const AGENT` 认（见 [`TsExtension::owns`]）。
 
-/// 写进 omp 扩展目录的文件名
-const OMP_EXTENSION_FILE: &str = "miniterm.ts";
+/// 写进扩展目录的文件名（omp 与 pi 相同，各在各的 agent 目录下）
+const EXTENSION_FILE: &str = "miniterm.ts";
 
 /// omp 扩展源码（随主程序编译进来，注册时整份落盘）。文件本身不含任何机器相关
 /// 信息：端口走 `MINITERM_HOOK_PORT` / hook-server.json，pane 走 `MINITERM_PTY_ID`，
@@ -894,121 +902,297 @@ pub fn omp_agent_dir() -> Option<PathBuf> {
     ))
 }
 
-/// mini-term 写入的 omp 扩展文件路径：`{omp_agent_dir}/extensions/miniterm.ts`
-fn omp_extension_path() -> Option<PathBuf> {
-    omp_agent_dir().map(|d| d.join("extensions").join(OMP_EXTENSION_FILE))
-}
+/// pi 扩展源码（同 [`OMP_EXTENSION_SOURCE`]，不含任何机器相关信息）
+const PI_EXTENSION_SOURCE: &str = include_str!("../assets/miniterm-pi.ts");
 
-/// 某段扩展源码里订阅了哪些 omp 事件（`pi.on("<event>"`）。不带 miniterm-hook
-/// 标识的文件不是我们写的，一律按「没注册」——绝不把用户自己的同名扩展算成我们的。
-fn omp_events_in_source(source: &str) -> std::collections::HashSet<String> {
-    if !source.contains(HOOK_MARKER) {
-        return std::collections::HashSet::new();
-    }
-    OMP_HOOK_EVENTS
-        .iter()
-        .filter(|e| source.contains(&format!("pi.on(\"{}\"", e)))
-        .map(|e| e.to_string())
-        .collect()
-}
+/// pi 扩展订阅的 pi 事件，与 `PI_EXTENSION_SOURCE` 里的 `pi.on(...)` 逐条对应
+/// （单测钉住两边一致）。`agent_settled` 需 pi ≥ 0.80.4、`ui_prompt_*` 需 ≥ 0.84.4；
+/// 更早的 pi 收不到这几个事件，回合结束靠停摆兜底收敛（不播报完成）。
+const PI_HOOK_EVENTS: &[&str] = &[
+    "session_start",
+    "session_shutdown",
+    "agent_start",
+    "agent_end",
+    "agent_settled",
+    "tool_call",
+    "tool_result",
+    "ui_prompt_start",
+    "ui_prompt_end",
+];
 
-fn registered_omp_events() -> std::collections::HashSet<String> {
-    let Some(path) = omp_extension_path() else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return std::collections::HashSet::new();
-    };
-    omp_events_in_source(&content)
-}
+/// pi 扩展会上报给 hook 服务器的事件名，口径同 [`OMP_REPORTED_EVENTS`]。
+pub const PI_REPORTED_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "Stop",
+    "StopFailure",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Elicitation",
+    "ElicitationResult",
+];
 
-/// 把扩展写到位。返回是否真的落盘：内容已是当前模板时一个字节不写（启动期自愈
-/// 每次启动都会走这里，不能每次都重写用户目录里的文件）。
+/// pi 的 agent 目录（纯函数，环境取值由 [`pi_agent_dir`] 负责）：`PI_CODING_AGENT_DIR`
+/// 优先（与 pi 的 `normalizePath` 一样认 `~` / `~/` 前缀，Windows 上另认 `~\`），
+/// 否则 `~/.pi/agent`——与 pi 自身 `getAgentDir()` 的口径一致。
 ///
-/// 同名文件在场却**不带**我们的标识 → 拒绝覆盖：那是用户自己的扩展，撞名也不能吃掉。
-fn write_omp_extension() -> Result<bool, String> {
-    let path = omp_extension_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
-    let current = std::fs::read_to_string(&path).ok();
-    if current.as_deref() == Some(OMP_EXTENSION_SOURCE) {
-        return Ok(false);
+/// ⚠️ omp 也认 `PI_CODING_AGENT_DIR`（见 [`omp_agent_dir_from`]）。设了它，两家落在
+/// 同一个目录、只放得下一个 `miniterm.ts`：归属按模板里的 `const AGENT = "…"` 认
+/// （[`TsExtension::owns`]），自愈不再把对方的文件当成自己的旧版改写。
+fn pi_agent_dir_from(home: &std::path::Path, coding_agent_dir: Option<&str>) -> PathBuf {
+    let Some(dir) = coding_agent_dir.filter(|d| !d.trim().is_empty()) else {
+        return home.join(".pi").join("agent");
+    };
+    if dir == "~" {
+        return home.to_path_buf();
     }
-    if current.is_some_and(|c| !c.contains(HOOK_MARKER)) {
-        return Err(format!(
-            "{} 已存在且不是 mini-term 写入的文件，未覆盖",
-            path.display()
-        ));
+    let rest = dir
+        .strip_prefix("~/")
+        .or_else(|| cfg!(windows).then(|| dir.strip_prefix("~\\")).flatten());
+    match rest {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(dir),
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 extensions 目录失败: {}", e))?;
-    }
-    crate::util::atomic_write(&path, OMP_EXTENSION_SOURCE.as_bytes())
-        .map_err(|e| format!("写入 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
-    Ok(true)
 }
 
-/// 注册 omp 扩展到 {omp_agent_dir}/extensions/miniterm.ts。
-///
-/// omp 只在启动时扫描扩展目录，正在跑的实例要重启或执行 `/reload-plugins` 才会装上
-/// ——结果文案里必须把这句带给用户，否则他会以为注册没生效。
-fn register_omp_hooks() -> Result<String, String> {
-    let written = write_omp_extension()?;
-    Ok(if written {
-        format!(
-            "oh-my-pi: 扩展已写入 (共 {} 个事件)；正在运行的 omp 需重启或执行 /reload-plugins 才生效",
-            OMP_HOOK_EVENTS.len()
-        )
-    } else {
-        format!(
-            "oh-my-pi: 扩展已是最新 (共 {} 个事件)",
-            OMP_HOOK_EVENTS.len()
-        )
-    })
+/// pi 的用户级 agent 目录（缺省 `~/.pi/agent`）
+pub fn pi_agent_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(pi_agent_dir_from(
+        &home,
+        std::env::var("PI_CODING_AGENT_DIR").ok().as_deref(),
+    ))
 }
 
-/// 删掉我们写的 omp 扩展文件,返回删掉的文件数(0 / 1)。文件不在、或同名文件不带
-/// 标识(那是用户自己的扩展)时不动。
-fn remove_omp_extension_at(path: &std::path::Path) -> Result<usize, String> {
+/// 一家「hook 是进程内 TS 扩展」的 CLI：整份模板写进 `{agent_dir}/extensions/miniterm.ts`。
+struct TsExtension {
+    /// 结果文案里的展示名（与 agent 表的 label 一致）
+    label: &'static str,
+    /// 日志里的短名
+    tag: &'static str,
+    source: &'static str,
+    /// 模板订阅的事件（面板「N/M」的分母）
+    events: &'static [&'static str],
+    agent_dir: fn() -> Option<PathBuf>,
+    /// 正在运行的实例怎么装上新扩展：它们都只在启动时扫描扩展目录，结果文案里
+    /// 必须把这句带给用户，否则他会以为注册没生效。
+    reload_hint: &'static str,
+}
+
+const OMP_EXTENSION: TsExtension = TsExtension {
+    label: "oh-my-pi",
+    tag: "omp",
+    source: OMP_EXTENSION_SOURCE,
+    events: OMP_HOOK_EVENTS,
+    agent_dir: omp_agent_dir,
+    reload_hint: "正在运行的 omp 需重启或执行 /reload-plugins 才生效",
+};
+
+const PI_EXTENSION: TsExtension = TsExtension {
+    label: "pi",
+    tag: "pi",
+    source: PI_EXTENSION_SOURCE,
+    events: PI_HOOK_EVENTS,
+    agent_dir: pi_agent_dir,
+    reload_hint: "正在运行的 pi 需重启或执行 /reload 才生效",
+};
+
+/// 模板自报的身份(`const AGENT = "omp";` 里的那个串);没有这一行返回 `None`。
+fn template_agent(source: &str) -> Option<&str> {
+    let rest = &source[source.find("const AGENT = \"")? + "const AGENT = \"".len()..];
+    rest.find('"').map(|end| &rest[..end])
+}
+
+impl TsExtension {
+    /// mini-term 写入的扩展文件路径：`{agent_dir}/extensions/miniterm.ts`
+    fn path(&self) -> Option<PathBuf> {
+        (self.agent_dir)().map(|d| d.join("extensions").join(EXTENSION_FILE))
+    }
+
+    /// 同一类的另一家(omp ↔ pi)
+    fn other(&self) -> &'static TsExtension {
+        if self.tag == OMP_EXTENSION.tag {
+            &PI_EXTENSION
+        } else {
+            &OMP_EXTENSION
+        }
+    }
+
+    /// 两家是否落在同一个文件上(设了 `PI_CODING_AGENT_DIR`,见 [`pi_agent_dir_from`])
+    fn shares_file_with_other(&self) -> bool {
+        self.path().is_some_and(|p| Some(p) == self.other().path())
+    }
+
+    /// 这份文件算不算本家的(含旧版)。不带 miniterm-hook 标识的不是我们写的,一律不算
+    /// ——绝不把用户自己的同名扩展算成我们的。带标识的按模板自报的身份认:
+    ///
+    /// - 是本家 → 算;
+    /// - 是另一家:两家共用一个文件时,那就是另一家的正经注册,**不能**算(否则启动
+    ///   自愈会把它改写成本家模板——只用 omp 的用户每次启动都被换成 pi 模板,完成
+    ///   判定随之失效);各在各的目录时,只可能是手抄错了地方(issue #85 就是把 omp
+    ///   的模板抄进了 pi 的目录),算成本家旧版,自愈好把它换掉;
+    /// - 没有身份行(不是任何一版模板写出来的)→ 按所在目录认。
+    fn owns(&self, source: &str, shared_file: bool) -> bool {
+        source.contains(HOOK_MARKER)
+            && match template_agent(source) {
+                Some(agent) => agent == self.tag || !shared_file,
+                None => true,
+            }
+    }
+
+    /// 某段扩展源码里订阅了本家的哪些事件（`pi.on("<event>"`）;不是本家的文件
+    /// ([`Self::owns`])一律按「没注册」。
+    fn events_in_source(
+        &self,
+        source: &str,
+        shared_file: bool,
+    ) -> std::collections::HashSet<String> {
+        if !self.owns(source, shared_file) {
+            return std::collections::HashSet::new();
+        }
+        self.events
+            .iter()
+            .filter(|e| source.contains(&format!("pi.on(\"{}\"", e)))
+            .map(|e| e.to_string())
+            .collect()
+    }
+
+    fn registered_events(&self) -> std::collections::HashSet<String> {
+        let Some(path) = self.path() else {
+            return std::collections::HashSet::new();
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return std::collections::HashSet::new();
+        };
+        self.events_in_source(&content, self.shares_file_with_other())
+    }
+
+    /// 把扩展写到位。返回是否真的落盘：内容已是当前模板时一个字节不写（启动期自愈
+    /// 每次启动都会走这里，不能每次都重写用户目录里的文件）。
+    ///
+    /// 同名文件在场却**不带**我们的标识 → 拒绝覆盖：那是用户自己的扩展，撞名也不能吃掉。
+    fn write(&self) -> Result<bool, String> {
+        let path = self
+            .path()
+            .ok_or_else(|| "无法获取 home 目录".to_string())?;
+        let current = std::fs::read_to_string(&path).ok();
+        if current.as_deref() == Some(self.source) {
+            return Ok(false);
+        }
+        if current.is_some_and(|c| !c.contains(HOOK_MARKER)) {
+            return Err(format!(
+                "{} 已存在且不是 mini-term 写入的文件，未覆盖",
+                path.display()
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 extensions 目录失败: {}", e))?;
+        }
+        crate::util::atomic_write(&path, self.source.as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {}", EXTENSION_FILE, e))?;
+        Ok(true)
+    }
+
+    fn register(&self) -> Result<String, String> {
+        // 两家共用一个文件时,注册本家只能顶掉另一家:结果行里说清楚,别让人以为两家都装着
+        let replaces_other = self.shares_file_with_other()
+            && self
+                .path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .is_some_and(|c| self.other().owns(&c, true));
+        let written = self.write()?;
+        Ok(if written {
+            let replaced = if replaces_other {
+                format!(
+                    "；{} 与它共用 PI_CODING_AGENT_DIR 指向的目录，原来的 {} 扩展已被替换",
+                    self.other().label,
+                    self.other().label
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "{}: 扩展已写入 (共 {} 个事件)；{}{}",
+                self.label,
+                self.events.len(),
+                self.reload_hint,
+                replaced
+            )
+        } else {
+            format!(
+                "{}: 扩展已是最新 (共 {} 个事件)",
+                self.label,
+                self.events.len()
+            )
+        })
+    }
+
+    /// 卸载：整个文件都是我们的，直接删；不带标识的同名文件、以及两家共用一个文件时
+    /// 另一家的注册([`Self::owns`])都不动。
+    fn unregister(&self) -> Result<String, String> {
+        let removed = self.remove_entries()?;
+        Ok(if removed == 0 {
+            format!(
+                "{}: 未发现 mini-term 写入的 {}，无需卸载",
+                self.label, EXTENSION_FILE
+            )
+        } else {
+            format!("{}: 已移除扩展文件", self.label)
+        })
+    }
+
+    fn remove_entries(&self) -> Result<usize, String> {
+        let shared = self.shares_file_with_other();
+        self.path().map_or(Ok(0), |path| {
+            remove_extension_at(&path, |source| self.owns(source, shared))
+        })
+    }
+
+    /// 已注册用户的启动期自愈：扩展文件与当前模板不同就整份重写。
+    ///
+    /// 与 grok 刷新二进制副本同一个理由——mini-term 升级后模板变了，用户目录里那份
+    /// 还是旧的；只要注册过就无条件对齐，从未注册的用户不碰。
+    fn sync_if_registered(&self) {
+        if self.registered_events().is_empty() {
+            return;
+        }
+        match self.write() {
+            Ok(true) => eprintln!("[hook-registry] {} 扩展已刷新至当前模板", self.tag),
+            Ok(false) => {}
+            Err(e) => eprintln!("[hook-registry] {} 扩展刷新失败: {}", self.tag, e),
+        }
+    }
+}
+
+/// 删掉我们写的扩展文件,返回删掉的文件数(0 / 1)。文件不在、或 `owns` 不认它
+/// (用户自己的扩展 / 共用目录里另一家的注册)时不动。
+fn remove_extension_at(
+    path: &std::path::Path,
+    owns: impl Fn(&str) -> bool,
+) -> Result<usize, String> {
     if !path.exists() {
         return Ok(0);
     }
     let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
-    if !content.contains(HOOK_MARKER) {
+        .map_err(|e| format!("读取 {} 失败: {}", EXTENSION_FILE, e))?;
+    if !owns(&content) {
         return Ok(0);
     }
-    std::fs::remove_file(path).map_err(|e| format!("删除 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
+    std::fs::remove_file(path).map_err(|e| format!("删除 {} 失败: {}", EXTENSION_FILE, e))?;
     Ok(1)
 }
 
-/// 从 omp 扩展目录卸载：整个文件都是我们的，直接删；不带标识的同名文件不动。
-fn unregister_omp_hooks() -> Result<String, String> {
-    let removed = match omp_extension_path() {
-        Some(path) => remove_omp_extension_at(&path)?,
-        None => 0,
-    };
-    Ok(if removed == 0 {
-        format!(
-            "oh-my-pi: 未发现 mini-term 写入的 {}，无需卸载",
-            OMP_EXTENSION_FILE
-        )
-    } else {
-        "oh-my-pi: 已移除扩展文件".to_string()
-    })
+/// omp 的启动期自愈，见 [`TsExtension::sync_if_registered`]
+pub fn sync_omp_hooks_if_registered() {
+    OMP_EXTENSION.sync_if_registered();
 }
 
-/// 已注册用户的启动期自愈：扩展文件与当前模板不同就整份重写。
-///
-/// 与 grok 刷新二进制副本同一个理由——mini-term 升级后模板变了，用户目录里那份
-/// 还是旧的；只要注册过就无条件对齐，从未注册的用户不碰。
-pub fn sync_omp_hooks_if_registered() {
-    if registered_omp_events().is_empty() {
-        return;
-    }
-    match write_omp_extension() {
-        Ok(true) => eprintln!("[hook-registry] omp 扩展已刷新至当前模板"),
-        Ok(false) => {}
-        Err(e) => eprintln!("[hook-registry] omp 扩展刷新失败: {}", e),
-    }
+/// pi 的启动期自愈，见 [`TsExtension::sync_if_registered`]
+pub fn sync_pi_hooks_if_registered() {
+    PI_EXTENSION.sync_if_registered();
 }
 
 // ─── 注册目标 ───
@@ -1027,6 +1211,8 @@ pub enum HookAgent {
     Grok,
     /// oh-my-pi（omp）：写的是 TS 扩展而不是 hook 命令，见模块注释
     Omp,
+    /// pi（earendil-works/pi，omp 的上游）：同 omp 写 TS 扩展，模板另一份
+    Pi,
 }
 
 impl HookAgent {
@@ -1035,6 +1221,7 @@ impl HookAgent {
         HookAgent::Codex,
         HookAgent::Grok,
         HookAgent::Omp,
+        HookAgent::Pi,
     ];
 
     /// 注册目标对应的 agent。标识与展示名都查 [`crate::agent`] 那张表,
@@ -1045,6 +1232,7 @@ impl HookAgent {
             HookAgent::Codex => AgentKind::Codex,
             HookAgent::Grok => AgentKind::Grok,
             HookAgent::Omp => AgentKind::Omp,
+            HookAgent::Pi => AgentKind::Pi,
         }
     }
 
@@ -1068,7 +1256,8 @@ impl HookAgent {
             HookAgent::Claude => CLAUDE_HOOK_EVENTS,
             HookAgent::Codex => CODEX_HOOK_EVENTS,
             HookAgent::Grok => GROK_HOOK_EVENTS,
-            HookAgent::Omp => OMP_HOOK_EVENTS,
+            HookAgent::Omp => OMP_EXTENSION.events,
+            HookAgent::Pi => PI_EXTENSION.events,
         }
     }
 
@@ -1077,7 +1266,8 @@ impl HookAgent {
             HookAgent::Claude => registered_claude_events(),
             HookAgent::Codex => registered_codex_events(),
             HookAgent::Grok => registered_grok_events(),
-            HookAgent::Omp => registered_omp_events(),
+            HookAgent::Omp => OMP_EXTENSION.registered_events(),
+            HookAgent::Pi => PI_EXTENSION.registered_events(),
         }
     }
 
@@ -1087,7 +1277,8 @@ impl HookAgent {
             HookAgent::Claude => claude_settings::settings_path(),
             HookAgent::Codex => codex_hooks_path(),
             HookAgent::Grok => grok_hooks_path(),
-            HookAgent::Omp => omp_extension_path(),
+            HookAgent::Omp => OMP_EXTENSION.path(),
+            HookAgent::Pi => PI_EXTENSION.path(),
         };
         let Some(raw) = raw else {
             return String::new();
@@ -1109,8 +1300,9 @@ impl HookAgent {
             HookAgent::Claude => register_claude_hooks(hook_path),
             HookAgent::Codex => register_codex_hooks(hook_path),
             HookAgent::Grok => register_grok_hooks(hook_path),
-            // omp 走的是进程内 TS 扩展，用不着 hook 二进制的路径
-            HookAgent::Omp => register_omp_hooks(),
+            // omp / pi 走的是进程内 TS 扩展，用不着 hook 二进制的路径
+            HookAgent::Omp => OMP_EXTENSION.register(),
+            HookAgent::Pi => PI_EXTENSION.register(),
         }
     }
 
@@ -1119,11 +1311,12 @@ impl HookAgent {
             HookAgent::Claude => unregister_claude_hooks(),
             HookAgent::Codex => unregister_codex_hooks(),
             HookAgent::Grok => unregister_grok_hooks(),
-            HookAgent::Omp => unregister_omp_hooks(),
+            HookAgent::Omp => OMP_EXTENSION.unregister(),
+            HookAgent::Pi => PI_EXTENSION.unregister(),
         }
     }
 
-    /// 与 [`Self::unregister`] 同一套摘除逻辑,结果是摘掉的条目数(omp 是文件数)。
+    /// 与 [`Self::unregister`] 同一套摘除逻辑,结果是摘掉的条目数(omp / pi 是文件数)。
     /// 拿不到 home / 配置目录时按「没有可摘的」返回 0。
     fn remove_entries(self) -> Result<usize, String> {
         match self {
@@ -1135,9 +1328,8 @@ impl HookAgent {
             HookAgent::Grok => grok_hooks_path().map_or(Ok(0), |path| {
                 remove_grok_entries_at(&path, grok_hook_binary_path().as_deref())
             }),
-            HookAgent::Omp => {
-                omp_extension_path().map_or(Ok(0), |path| remove_omp_extension_at(&path))
-            }
+            HookAgent::Omp => OMP_EXTENSION.remove_entries(),
+            HookAgent::Pi => PI_EXTENSION.remove_entries(),
         }
     }
 }
@@ -1204,7 +1396,7 @@ pub fn unregister_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, Str
 }
 
 /// 卸载 mini-term 本体时用(`mini-term.exe --unregister-hooks`,由 NSIS 卸载器调起):
-/// 四家配置里 mini-term 写入的条目全部摘掉,按家返回摘掉的条数。
+/// 五家配置里 mini-term 写入的条目全部摘掉,按家返回摘掉的条数。
 ///
 /// 与设置页「卸载」同一套摘除逻辑([`HookAgent::remove_entries`]),只认带
 /// `miniterm-hook` 标识的条目 / 文件;没有我们条目的配置文件一个字节不写;单家失败
@@ -1234,6 +1426,17 @@ pub fn get_ai_hook_registrations() -> Vec<HookRegistrationInfo> {
             }
         })
         .collect()
+}
+
+/// TS 扩展片段的落盘位置:与面板那一行同一个路径(跟着 `PI_CODING_AGENT_DIR` 走),
+/// 拿不到 home 时退回缺省目录的写法。
+fn ts_snippet_file(agent: HookAgent, default_agent_dir: &str) -> String {
+    let shown = agent.display_path();
+    if shown.is_empty() {
+        format!("{default_agent_dir}/extensions/{EXTENSION_FILE}")
+    } else {
+        shown
+    }
 }
 
 /// 获取 hook 配置片段供用户手动粘贴（结构化返回）
@@ -1309,9 +1512,19 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
                 {
                     // 扩展文件不含机器相关信息，整份照抄即可；omp 只在启动时扫描
                     // 扩展目录，保存后要重启或 /reload-plugins
-                    "file": format!("~/.omp/agent/extensions/{}", OMP_EXTENSION_FILE),
+                    "file": ts_snippet_file(HookAgent::Omp, "~/.omp/agent"),
                     "note": "整份保存；omp 需重启或执行 /reload-plugins",
                     "content": OMP_EXTENSION_SOURCE
+                }
+            ]
+        },
+        "pi": {
+            "files": [
+                {
+                    // 与 omp 同理;pi 的模板另一份,两家不能互抄
+                    "file": ts_snippet_file(HookAgent::Pi, "~/.pi/agent"),
+                    "note": "整份保存；pi 需重启或执行 /reload",
+                    "content": PI_EXTENSION_SOURCE
                 }
             ]
         }
@@ -1476,6 +1689,7 @@ mod tests {
     fn unknown_agent_is_rejected_at_deserialization() {
         assert!(serde_json::from_str::<HookAgent>("\"grok\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"omp\"").is_ok());
+        assert!(serde_json::from_str::<HookAgent>("\"pi\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"gemini\"").is_err());
         assert!(serde_json::from_str::<HookAgent>("\"Claude\"").is_err());
     }
@@ -1490,7 +1704,7 @@ mod tests {
             assert!(!agent.label().is_empty());
             assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
         }
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 5);
     }
 
     /// key / 展示名改由 agent 表供给后,与改造前逐字相同,且与 serde 名对齐
@@ -1502,6 +1716,7 @@ mod tests {
             (HookAgent::Codex, "codex", "Codex"),
             (HookAgent::Grok, "grok", "Grok"),
             (HookAgent::Omp, "omp", "oh-my-pi"),
+            (HookAgent::Pi, "pi", "pi"),
         ];
         assert_eq!(expected.len(), HookAgent::ALL.len());
         for (agent, key, label) in expected {
@@ -1519,7 +1734,7 @@ mod tests {
         assert_eq!(HookAgent::from_key("opencode"), None);
     }
 
-    // ---- oh-my-pi（omp）扩展 ----
+    // ---- 进程内 TS 扩展（omp / pi） ----
 
     /// 从扩展源码里抠出所有 `pi.on("<event>"` 的事件名。
     fn subscribed_events(source: &str) -> std::collections::BTreeSet<String> {
@@ -1532,42 +1747,113 @@ mod tests {
             .collect()
     }
 
-    /// 模板订阅的事件与 `OMP_HOOK_EVENTS` 必须逐条相等：面板的「N/M」与启动期
+    /// 模板订阅的事件与声明的事件集必须逐条相等：面板的「N/M」与启动期
     /// 对账都按后者算，两边一漂移，要么永远显示「旧版本」，要么漏掉新事件。
     #[test]
-    fn omp_template_subscribes_exactly_the_declared_events() {
-        let declared: std::collections::BTreeSet<String> =
-            OMP_HOOK_EVENTS.iter().map(|e| e.to_string()).collect();
-        assert_eq!(subscribed_events(OMP_EXTENSION_SOURCE), declared);
-        assert_eq!(
-            omp_events_in_source(OMP_EXTENSION_SOURCE).len(),
-            OMP_HOOK_EVENTS.len(),
-            "当前模板必须被判成「已注册全部事件」"
-        );
-        let mut seen = std::collections::HashSet::new();
-        for event in OMP_HOOK_EVENTS {
-            assert!(seen.insert(*event), "重复订阅事件: {event}");
+    fn ts_templates_subscribe_exactly_the_declared_events() {
+        for ext in [&OMP_EXTENSION, &PI_EXTENSION] {
+            let declared: std::collections::BTreeSet<String> =
+                ext.events.iter().map(|e| e.to_string()).collect();
+            assert_eq!(subscribed_events(ext.source), declared, "{}", ext.tag);
+            for shared in [false, true] {
+                assert_eq!(
+                    ext.events_in_source(ext.source, shared).len(),
+                    ext.events.len(),
+                    "{} 的当前模板必须被判成「已注册全部事件」",
+                    ext.tag
+                );
+            }
+            assert_eq!(template_agent(ext.source), Some(ext.tag));
+            let mut seen = std::collections::HashSet::new();
+            for event in ext.events {
+                assert!(seen.insert(*event), "{} 重复订阅事件: {event}", ext.tag);
+            }
         }
     }
 
-    /// 模板上报的事件名都得在 `OMP_REPORTED_EVENTS` 里（hook_server 按那张表验映射），
+    /// 模板上报的事件名都得在 `*_REPORTED_EVENTS` 里（hook_server 按那张表验映射），
     /// 且表里每一个都真的出现在模板中——表比模板宽会让 hook_server 的测试守着
     /// 不存在的事件。
     #[test]
-    fn omp_template_reports_only_declared_event_names() {
-        for event in OMP_REPORTED_EVENTS {
+    fn ts_templates_report_only_declared_event_names() {
+        for (source, reported) in [
+            (OMP_EXTENSION_SOURCE, OMP_REPORTED_EVENTS),
+            (PI_EXTENSION_SOURCE, PI_REPORTED_EVENTS),
+        ] {
+            for event in reported {
+                assert!(
+                    source.contains(&format!("\"{}\"", event)),
+                    "模板里没有上报 {event}"
+                );
+            }
+            // Claude 专有、两家模板都不该冒出来的事件名
+            for absent in ["SubagentStart", "SubagentStop", "PostToolBatch"] {
+                assert!(
+                    !source.contains(&format!("\"{}\"", absent)),
+                    "{absent} 出现在模板里却不在上报表里"
+                );
+            }
+        }
+        // pi 没有工具审批与重试事件,模板里不该有对应的上报
+        for absent in ["PermissionRequest", "PermissionDenied", "Notification"] {
             assert!(
-                OMP_EXTENSION_SOURCE.contains(&format!("\"{}\"", event)),
-                "模板里没有上报 {event}"
+                !PI_EXTENSION_SOURCE.contains(&format!("\"{}\"", absent)),
+                "{absent} 出现在 pi 模板里却不在 PI_REPORTED_EVENTS"
             );
         }
-        // Claude 专有、omp 模板不该冒出来的事件名
-        for absent in ["SubagentStart", "SubagentStop", "PostToolBatch"] {
+    }
+
+    /// pi 模板不能是 omp 模板的翻版:omp 的换会话 / 审批 / 重试事件 pi 一个都不发,
+    /// 照抄就等于那几段状态空着;pi 的回合结束只认 agent_settled,omp 没有它。
+    #[test]
+    fn pi_template_follows_pi_lifecycle_not_omps() {
+        let pi_events = subscribed_events(PI_EXTENSION_SOURCE);
+        for omp_only in [
+            "session_switch",
+            "session_branch",
+            "tool_approval_requested",
+            "tool_approval_resolved",
+            "auto_retry_start",
+            "auto_compaction_start",
+            "auto_compaction_end",
+        ] {
             assert!(
-                !OMP_EXTENSION_SOURCE.contains(&format!("\"{}\"", absent)),
-                "{absent} 出现在模板里却不在 OMP_REPORTED_EVENTS"
+                !pi_events.contains(omp_only),
+                "pi 模板订阅了 omp 专有事件 {omp_only}"
             );
         }
+        assert!(pi_events.contains("agent_settled"));
+        assert!(!subscribed_events(OMP_EXTENSION_SOURCE).contains("agent_settled"));
+        // 手抄进 pi 目录的 omp 模板(issue #85)要被认成「旧版本」,自愈才会换掉它
+        let copied = PI_EXTENSION.events_in_source(OMP_EXTENSION_SOURCE, false);
+        assert!(!copied.is_empty() && copied.len() < PI_HOOK_EVENTS.len());
+    }
+
+    /// 设了 `PI_CODING_AGENT_DIR`、两家共用一个 `miniterm.ts` 时按模板自报的身份认归属:
+    /// 互不把对方的文件当成自己的旧版(E2E 实测过的回归——只用 omp 的用户每次启动
+    /// omp 扩展都被 pi 的自愈换成 pi 模板),面板也不会把没注册的那家显示成「旧版本」。
+    #[test]
+    fn shared_file_is_owned_by_the_template_identity() {
+        for (ext, other) in [
+            (&OMP_EXTENSION, &PI_EXTENSION),
+            (&PI_EXTENSION, &OMP_EXTENSION),
+        ] {
+            assert!(ext.owns(ext.source, true), "{}", ext.tag);
+            assert!(
+                !ext.owns(other.source, true),
+                "{} 不该认 {} 的文件",
+                ext.tag,
+                other.tag
+            );
+            assert!(ext.events_in_source(other.source, true).is_empty());
+            // 各在各的目录时,另一家的模板只可能是抄错了地方 → 认成本家旧版
+            assert!(ext.owns(other.source, false), "{}", ext.tag);
+            // 没有身份行的(不是哪一版模板写的,但带标识)按目录认
+            let anonymous = format!("// {HOOK_MARKER}\npi.on(\"session_start\", f);");
+            assert!(ext.owns(&anonymous, true) && ext.owns(&anonymous, false));
+            assert_eq!(ext.other().tag, other.tag);
+        }
+        assert_eq!(template_agent("export default () => {}"), None);
     }
 
     /// 模板的几条硬约束：带标识（注册现状与卸载都按它认）、按 pane/端口环境变量
@@ -1593,17 +1879,77 @@ mod tests {
         assert!(!OMP_EXTENSION_SOURCE.contains("https://"));
     }
 
+    /// pi 模板的硬约束：同 omp 的标识 / 环境变量 / 主会话过滤 / 回环地址;换会话
+    /// 打 clear 墓碑、/reload 不报、打断按 aborted 上报、对话框只在回合内点黄灯。
+    #[test]
+    fn pi_template_keeps_its_contract_strings() {
+        for needle in [
+            HOOK_MARKER,
+            "MINITERM_PTY_ID",
+            "MINITERM_HOOK_PORT",
+            "hook-server.json",
+            "/hook",
+            "ctx.mode === \"tui\"",
+            "const AGENT = \"pi\"",
+            "\"clear\"",
+            "reason === \"reload\"",
+            "reason: \"aborted\"",
+            "event?.aborted === true",
+            "!busy",
+            "127.0.0.1",
+        ] {
+            assert!(PI_EXTENSION_SOURCE.contains(needle), "模板缺少 {needle:?}");
+        }
+        assert!(!PI_EXTENSION_SOURCE.contains("https://"));
+    }
+
     /// 不带标识的同名文件是用户自己的扩展：既不算「已注册」，也绝不能被覆盖。
     #[test]
-    fn omp_source_without_marker_is_not_ours() {
+    fn ts_source_without_marker_is_not_ours() {
         let foreign = "export default function (pi) { pi.on(\"session_start\", () => {}); }";
-        assert!(omp_events_in_source(foreign).is_empty());
-        // 老版本模板（带标识但事件不全）识别成「旧版本 N/M」
-        let stale =
-            format!("// {HOOK_MARKER}\npi.on(\"session_start\", f); pi.on(\"agent_end\", g);");
-        let got = omp_events_in_source(&stale);
-        assert_eq!(got.len(), 2);
-        assert!(got.contains("session_start") && got.contains("agent_end"));
+        for ext in [&OMP_EXTENSION, &PI_EXTENSION] {
+            for shared in [false, true] {
+                assert!(
+                    ext.events_in_source(foreign, shared).is_empty(),
+                    "{}",
+                    ext.tag
+                );
+            }
+            // 老版本模板（带标识但事件不全）识别成「旧版本 N/M」
+            let stale = format!(
+                "// {HOOK_MARKER}\nconst AGENT = \"{}\";\npi.on(\"session_start\", f); pi.on(\"agent_end\", g);",
+                ext.tag
+            );
+            let got = ext.events_in_source(&stale, true);
+            assert_eq!(got.len(), 2, "{}", ext.tag);
+            assert!(got.contains("session_start") && got.contains("agent_end"));
+        }
+    }
+
+    /// agent 目录的解析口径与 pi 自身一致：`PI_CODING_AGENT_DIR` 压倒一切且认 `~`,
+    /// 否则 `~/.pi/agent`。
+    #[test]
+    fn pi_agent_dir_follows_pi_env_precedence() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            pi_agent_dir_from(home, None),
+            PathBuf::from("/home/u/.pi/agent")
+        );
+        assert_eq!(
+            pi_agent_dir_from(home, Some("  ")),
+            PathBuf::from("/home/u/.pi/agent")
+        );
+        assert_eq!(
+            pi_agent_dir_from(home, Some("/custom/agent")),
+            PathBuf::from("/custom/agent")
+        );
+        assert_eq!(pi_agent_dir_from(home, Some("~")), PathBuf::from("/home/u"));
+        assert_eq!(
+            pi_agent_dir_from(home, Some("~/dots/pi")),
+            PathBuf::from("/home/u/dots/pi")
+        );
+        // `~user` 不是 home 前缀,原样当路径
+        assert_eq!(pi_agent_dir_from(home, Some("~x")), PathBuf::from("~x"));
     }
 
     /// agent 目录的解析口径与 omp 自身一致：`PI_CODING_AGENT_DIR` 压倒一切，
@@ -1846,20 +2192,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// omp:只删带标识的扩展文件,用户自己的同名文件不动。
+    /// omp / pi:只删本家的扩展文件,用户自己的同名文件、共用目录里另一家的注册都不动。
     #[test]
-    fn omp_removal_only_deletes_marked_extension() {
-        let dir = unique_test_dir("omp");
-        let ext = dir.join(OMP_EXTENSION_FILE);
-        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 0);
+    fn ts_extension_removal_only_deletes_owned_file() {
+        let dir = unique_test_dir("ts-ext");
+        let ext = dir.join(EXTENSION_FILE);
+        let pi_owns = |shared: bool| move |s: &str| PI_EXTENSION.owns(s, shared);
+        assert_eq!(remove_extension_at(&ext, pi_owns(false)).unwrap(), 0);
 
         std::fs::write(&ext, "export default function (pi) {}").unwrap();
-        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 0);
+        assert_eq!(remove_extension_at(&ext, pi_owns(false)).unwrap(), 0);
         assert!(ext.exists());
 
+        for source in [OMP_EXTENSION_SOURCE, PI_EXTENSION_SOURCE] {
+            std::fs::write(&ext, source).unwrap();
+            assert_eq!(remove_extension_at(&ext, pi_owns(false)).unwrap(), 1);
+            assert!(!ext.exists());
+        }
+
+        // 共用目录:卸载 pi 不能把 omp 的注册删掉
         std::fs::write(&ext, OMP_EXTENSION_SOURCE).unwrap();
-        assert_eq!(remove_omp_extension_at(&ext).unwrap(), 1);
-        assert!(!ext.exists());
+        assert_eq!(remove_extension_at(&ext, pi_owns(true)).unwrap(), 0);
+        assert!(ext.exists());
+        assert_eq!(
+            remove_extension_at(&ext, |s| OMP_EXTENSION.owns(s, true)).unwrap(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -57,7 +57,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 
 | 功能                 | 描述                                                         |
 |:--|---|
-| **AI事件通知** | 直接接入 **Claude Code / Codex / Grok Build / oh-my-pi 官方 Hook API**（oh-my-pi 走它的进程内扩展机制），使用轮询作为兜底。<br />注意：windows端的 GrokBuild 需要将本程序安装到`非空格`目录，才能保证hook功能正常<br />Windows 下卸载 Mini-Term 时会自动摘掉它写进各家 AI 工具配置里的 hook 条目（升级安装不动） |
+| **AI事件通知** | 直接接入 **Claude Code / Codex / Grok Build / oh-my-pi / pi 官方 Hook API**（oh-my-pi 与 pi 走各自的进程内扩展机制），使用轮询作为兜底。<br />注意：windows端的 GrokBuild 需要将本程序安装到`非空格`目录，才能保证hook功能正常<br />Windows 下卸载 Mini-Term 时会自动摘掉它写进各家 AI 工具配置里的 hook 条目（升级安装不动） |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。外链一律走同一道闸（禁 `@import`，指向包外的引用全拒）。点「更多皮肤」直达仓库 [`theme/`](theme/) 皮肤库（现有深色 Blue Hour 蓝调时分、浅色 Morning Mist 晨雾两款），挑一份下载后导入即用；想自己做一份，字段说明在 [`docs/theme-pack-example/`](docs/theme-pack-example/) |
 | **手机端支持** | 手机上实时看桌面 AI 会话的对话镜像：GFM 表格与代码块一键复制，连续的工具调用折叠成「工具调用 N 次」（读写了哪些文件、跑了什么命令），底部显示「AI 工作中 / 等你处理」，系统注入噪声自动滤掉；可直接给 AI 发指令、点选作答它的提问。<br />**前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
 | **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |

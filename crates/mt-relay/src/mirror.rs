@@ -1,6 +1,6 @@
 //! 对话镜像:会话记录(JSONL)的增量解析 → 镜像消息序列。
 //!
-//! 数据源是 Claude/Codex/Grok/OMP 会话记录文件,不是终端原始输出(docs/adr/0001)。
+//! 数据源是 Claude/Codex/Grok/OMP/pi 会话记录文件,不是终端原始输出(docs/adr/0001)。
 //! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
 //! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
 //! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
@@ -24,14 +24,14 @@ use mt_ai::sessions as ai_sessions;
 use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
-/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP 四家)。
+/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP / pi 五家)。
 ///
 /// 判定与其测试随 `ai_sessions.rs` 一起迁进了 mt-ai(那边是会话记录格式的归属方),
 /// 这里 re-export 保留原调用点名字。**红线**:输入检测能认出的 agent 比这宽
-/// (pi / opencode 也在 `AI_COMMANDS` 里),它们**没有**可解析的记录文件,调用方
+/// (opencode 也在 `AI_COMMANDS` 里),它**没有**可解析的记录文件,调用方
 /// 必须据此跳过启发式绑定 —— `resolve_session_file` 只按项目找"最新的
-/// claude/codex/grok/omp 记录",对一个 pi pane 调它会把同项目里别家的对话贴到这个
-/// pane 上(串台)。宁可空镜像。
+/// claude/codex/grok/omp/pi 记录",对一个 opencode pane 调它会把同项目里别家的对话
+/// 贴到这个 pane 上(串台)。宁可空镜像。
 pub use mt_ai::sessions::agent_has_session_log;
 
 /// 打开对话默认取最近 50 条,上拉分页每页同量。**工具活动消息(kind = "tool")
@@ -53,6 +53,8 @@ pub enum MirrorAgent {
     Codex,
     Grok,
     Omp,
+    /// pi:行形态与 OMP 相同,但没有内建提问工具 → 不出提问卡片
+    Pi,
 }
 
 /// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
@@ -146,6 +148,7 @@ impl MirrorParser {
             MirrorAgent::Codex => self.parse_codex_line(line, out),
             MirrorAgent::Grok => self.parse_grok_line(line, out),
             MirrorAgent::Omp => self.parse_omp_line(line, out),
+            MirrorAgent::Pi => self.parse_pi_line(line, out),
         }
     }
 
@@ -310,6 +313,17 @@ impl MirrorParser {
         }
     }
 
+    /// pi 行:与 OMP 同形的 user/assistant 文本 + 工具活动。pi 没有内建提问工具,
+    /// 第三方扩展的提问对话框在 TUI 里怎么作答各不相同,注不进按键 —— 不出提问卡片,
+    /// 扩展的 `ask` 之类工具照常算一行工具活动。
+    fn parse_pi_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(raw) = ai_sessions::omp_message_from_line(line) {
+            out.push(self.next_text_message(raw));
+        }
+        let calls = ai_sessions::pi_tool_calls_from_line(line, &self.tool_paths);
+        self.push_tool_calls(calls, out);
+    }
+
     /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
     /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
     /// AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
@@ -377,7 +391,8 @@ impl MirrorParser {
             MirrorAgent::Claude => "Other",
             MirrorAgent::Codex => "None of the above",
             MirrorAgent::Grok => "Type your answer here",
-            MirrorAgent::Omp => "Other (type your own)",
+            // pi 不出提问卡片(见 `parse_pi_line`),走不到这里;按 OMP 写只为穷尽
+            MirrorAgent::Omp | MirrorAgent::Pi => "Other (type your own)",
         };
         for item in &mut question.items {
             // OMP 在追加 Other 前按真实选项范围钳位 recommended。
@@ -663,7 +678,7 @@ fn newest_grok_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     newest
 }
 
-/// 解析 pane 所属项目当前应镜像的会话记录:三家里最新修改的那个。
+/// 解析 pane 所属项目当前应镜像的会话记录:各家里最新修改的那个。
 /// `min_mtime` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
 /// 宁可先给空镜像等新会话落盘(代价:`--resume` 恢复的旧记录在下一条消息前不显示)。
 pub fn resolve_session_file(
@@ -689,6 +704,10 @@ pub fn resolve_session_file(
                 min_mtime,
             ),
             MirrorAgent::Omp,
+        ),
+        (
+            fresh_since(ai_sessions::newest_pi_session_file(project_path), min_mtime),
+            MirrorAgent::Pi,
         ),
     ];
     let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
@@ -754,7 +773,7 @@ pub fn resolve_session_file_by_id(
     if !valid_session_id(session_id) {
         return None;
     }
-    // 识别口径统一在 mt-ai 的 agent 表(缺省 / 空串按 Claude;opencode / pi 没有
+    // 识别口径统一在 mt-ai 的 agent 表(缺省 / 空串按 Claude;opencode 没有
     // 记录格式 → None)
     match AgentKind::from_session_agent(agent)? {
         AgentKind::Codex => {
@@ -767,11 +786,13 @@ pub fn resolve_session_file_by_id(
         }
         AgentKind::Omp => ai_sessions::find_omp_session_file(project_path, session_id)
             .map(|p| (p, MirrorAgent::Omp)),
+        AgentKind::Pi => ai_sessions::find_pi_session_file(project_path, session_id)
+            .map(|p| (p, MirrorAgent::Pi)),
         AgentKind::Claude => {
             let dirs = ai_sessions::find_claude_project_dirs(project_path);
             claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
         }
-        AgentKind::OpenCode | AgentKind::Pi => None,
+        AgentKind::OpenCode => None,
     }
 }
 
@@ -1404,6 +1425,35 @@ mod tests {
         assert_eq!(marks[0].kind.as_deref(), Some("questionAnswered"));
         assert_eq!(marks[0].ref_seq, Some(2));
         assert_eq!(marks[0].labels, ["B"]);
+    }
+
+    /// pi:行形态取自本机 pi 1.4.0 记录。system 提示词、重试前的空回复、toolResult、
+    /// context_edit 都不是对话;同形的 `ask` 工具调用只出工具行、不出提问卡片。
+    #[test]
+    fn parser_pi_text_and_tools_without_question_cards() {
+        let mut parser = MirrorParser::new(MirrorAgent::Pi, PROJECT);
+        let data = [
+            r#"{"type":"session","version":3,"id":"01a17c02-730e-74db-ab0c-337bb007000f","timestamp":"2026-10-27T06:18:17.742Z","cwd":"D:\\Projects"}"#,
+            r#"{"type":"message","id":"688d2d94","parentId":"387dc167","timestamp":"t0","message":{"role":"system","content":"","sections":{"preamble":"You are an expert coding assistant"}}}"#,
+            r#"{"type":"message","id":"9823dbe4","parentId":"688d2d94","timestamp":"t1","message":{"role":"user","content":[{"type":"text","text":"分析协议"}],"timestamp":1793081964596}}"#,
+            r#"{"type":"message","id":"46518644","parentId":"9823dbe4","timestamp":"t2","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Connection error."}}"#,
+            r#"{"type":"context_edit","id":"9accd2fb","parentId":"46518644","timestamp":"t3","targetId":"46518644","replacement":null}"#,
+            r#"{"type":"message","id":"5627c0dc","parentId":"9accd2fb","timestamp":"t4","message":{"role":"assistant","content":[{"type":"text","text":"先看目录"},{"type":"toolCall","id":"call_00","name":"bash","arguments":{"command":"ls"}},{"type":"toolCall","id":"c2","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}],"stopReason":"toolUse"}}"#,
+            r#"{"type":"message","id":"cc9d6e1e","parentId":"5627c0dc","timestamp":"t5","message":{"role":"toolResult","toolCallId":"call_00","toolName":"bash","content":[{"type":"text","text":"a.txt"}],"isError":false}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let msgs = parser.feed(data.as_bytes());
+        let summary: Vec<(&str, Option<&str>, &str)> = msgs
+            .iter()
+            .map(|m| (m.source.as_str(), m.kind.as_deref(), m.content.as_str()))
+            .collect();
+        assert_eq!(summary.len(), 4, "{summary:?}");
+        assert_eq!(summary[0], ("desktop", None, "分析协议"));
+        assert_eq!(summary[1], ("assistant", None, "先看目录"));
+        assert_eq!(summary[2].1, Some("tool"));
+        assert_eq!(summary[3].1, Some("tool"));
+        assert!(msgs.iter().all(|m| m.kind.as_deref() != Some("question")));
     }
 
     #[test]

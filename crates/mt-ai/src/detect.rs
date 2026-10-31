@@ -16,7 +16,9 @@ pub(crate) use mt_core::strip_ansi_codes;
 /// `pi`（pi.dev，earendil-works/pi）只有两个字母，但匹配走 `ai_command_name` 的
 /// basename **全等**，`pip install` / `ping` / `pi.py` 都不会命中；它的
 /// `-p/--print`、`-h/--help`、`-v/--version` 与下面的非交互标志逐一对齐，
-/// 退出用的 `/quit` 也已在 `AI_EXIT_COMMANDS` 里，无需为它开特例。
+/// 退出用的 `/quit` 也已在 `AI_EXIT_COMMANDS` 里，无需为它开特例。`--session <id>`
+/// （续接命令）/ `--continue` / `--resume` 都进交互式 TUI。它的 hook 接入见
+/// `hook_registry` 的 TS 扩展段（与 omp 同一套做法、模板另一份）。
 ///
 /// `grok`（xai-org/grok-build）的官方安装把二进制铺成 `grok`（artifact 名是
 /// `xai-grok-pager`），非交互用 `-p`、`--version`/`--help` 也与下面对齐；
@@ -177,6 +179,21 @@ mod tests {
         }
         // 行快照里带 prompt 也认得出
         assert_eq!(line_ai_command_name("PS D:\\repo> omp"), Some("omp"));
+    }
+
+    /// pi 的续接命令(agent 表里的 `pi --session {id}`)与 Windows 的 `pi.cmd` 启动器
+    /// 都要认成进入 AI 会话——启动自动续接就是往 PTY 里敲这条命令。
+    #[test]
+    fn pi_resume_command_is_interactive() {
+        for cmd in [
+            "pi --session 01a17c02-730e-74db-ab0c-337bb007000f",
+            "pi.cmd",
+            "pi -c",
+            "pi -r",
+        ] {
+            assert_eq!(interactive_ai_command_name(cmd), Some("pi"), "{cmd}");
+        }
+        assert_eq!(interactive_ai_command_name("pi -p hi"), None);
     }
 
     /// 打断键识别:只认单独一个字节的裸 Esc / Ctrl+C。方向键等 CSI 序列由

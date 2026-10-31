@@ -1,3 +1,9 @@
+//! pi 系(pi 与它的分支 oh-my-pi)的 JSONL 会话记录:定位 + 行解析。
+//!
+//! 两家的行格式相同(首行 `type=session` 头,正文 `type=message` 行,角色与正文在
+//! `message.*`),差在 agent 目录与「cwd → 目录名」的编码,用 [`PiFlavor`] 区分。
+//! 行解析函数沿用 `omp_*` 的名字,pi 直接复用;pi 独有的历史列表 / 正文读取在 `pi.rs`。
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -43,7 +49,33 @@ pub fn omp_session_meta_from_line(line: &str) -> Option<OmpSessionMeta> {
     })
 }
 
-fn session_meta(path: &Path) -> Option<OmpSessionMeta> {
+/// pi 系会话记录属于哪一家。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PiFlavor {
+    Pi,
+    Omp,
+}
+
+impl PiFlavor {
+    fn agent_dir(self) -> Option<PathBuf> {
+        match self {
+            PiFlavor::Pi => crate::hook_registry::pi_agent_dir(),
+            PiFlavor::Omp => crate::hook_registry::omp_agent_dir(),
+        }
+    }
+
+    /// 项目对应的会话目录名候选(按优先级)。
+    fn dir_names(self, home: &str, temp_root: &str, project_path: &str) -> Vec<String> {
+        match self {
+            // pi 只有绝对路径这一种编码(`session-manager.ts::getDefaultSessionDirPath`),
+            // 正是 omp 改成 home 相对之前的那套
+            PiFlavor::Pi => vec![encoded_absolute_dir(project_path)],
+            PiFlavor::Omp => session_dir_names(home, temp_root, project_path),
+        }
+    }
+}
+
+pub(super) fn session_meta(path: &Path) -> Option<OmpSessionMeta> {
     let file = fs::File::open(path).ok()?;
     for line in BufReader::new(file).lines().take(5).flatten() {
         if let Some(meta) = omp_session_meta_from_line(&line) {
@@ -112,6 +144,7 @@ fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<Str
 }
 
 fn project_session_dirs_in(
+    flavor: PiFlavor,
     sessions_root: &Path,
     home: &Path,
     temp_root: &Path,
@@ -132,7 +165,7 @@ fn project_session_dirs_in(
     let temp_root = temp_root.to_string_lossy();
     let mut names = Vec::new();
     for project_path in project_paths {
-        for name in session_dir_names(&home, &temp_root, &project_path) {
+        for name in flavor.dir_names(&home, &temp_root, &project_path) {
             if !names.iter().any(|current| current == &name) {
                 names.push(name);
             }
@@ -146,14 +179,15 @@ fn project_session_dirs_in(
         .collect()
 }
 
-fn project_session_dirs(project_path: &str) -> Vec<PathBuf> {
-    let Some(agent_dir) = crate::hook_registry::omp_agent_dir() else {
+pub(super) fn project_session_dirs(flavor: PiFlavor, project_path: &str) -> Vec<PathBuf> {
+    let Some(agent_dir) = flavor.agent_dir() else {
         return Vec::new();
     };
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
     project_session_dirs_in(
+        flavor,
         &agent_dir.join("sessions"),
         &home,
         &std::env::temp_dir(),
@@ -161,13 +195,14 @@ fn project_session_dirs(project_path: &str) -> Vec<PathBuf> {
     )
 }
 
-fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
+pub(super) fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
     // 两边都可能是 canonicalize 的 verbatim 形态:先剥 `\\?\` 再取 Windows 比较键
     let key = |path: &str| windows_eq_key(&strip_verbatim_prefix(path));
     key(&meta.cwd) == key(project_path)
 }
 
-fn find_omp_session_file_in(
+fn find_session_file_in(
+    flavor: PiFlavor,
     sessions_root: &Path,
     home: &Path,
     temp_root: &Path,
@@ -175,7 +210,7 @@ fn find_omp_session_file_in(
     session_id: &str,
 ) -> Option<PathBuf> {
     let suffix = format!("_{session_id}.jsonl");
-    for dir in project_session_dirs_in(sessions_root, home, temp_root, project_path) {
+    for dir in project_session_dirs_in(flavor, sessions_root, home, temp_root, project_path) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -199,11 +234,11 @@ fn find_omp_session_file_in(
     None
 }
 
-/// 按 Hook 上报的 session id 精确定位 OMP JSONL。
-pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {
-    let agent_dir = crate::hook_registry::omp_agent_dir()?;
+fn find_session_file(flavor: PiFlavor, project_path: &str, session_id: &str) -> Option<PathBuf> {
+    let agent_dir = flavor.agent_dir()?;
     let home = dirs::home_dir()?;
-    find_omp_session_file_in(
+    find_session_file_in(
+        flavor,
         &agent_dir.join("sessions"),
         &home,
         &std::env::temp_dir(),
@@ -212,11 +247,31 @@ pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<Pat
     )
 }
 
-/// 无 Hook 时的启发式绑定:先按 mtime 限量,再读取 header 校验 cwd。
+/// 按 Hook 上报的 session id 精确定位 OMP JSONL。
+pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {
+    find_session_file(PiFlavor::Omp, project_path, session_id)
+}
+
+/// 按会话 id(hook 上报 / 历史面板)精确定位 pi JSONL。
+pub fn find_pi_session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {
+    find_session_file(PiFlavor::Pi, project_path, session_id)
+}
+
+/// 无 Hook 时的启发式绑定(OMP)。
 pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
+    newest_session_file(PiFlavor::Omp, project_path)
+}
+
+/// 无 Hook 时的启发式绑定(pi)。
+pub fn newest_pi_session_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
+    newest_session_file(PiFlavor::Pi, project_path)
+}
+
+/// 无 Hook 时的启发式绑定:先按 mtime 限量,再读取 header 校验 cwd。
+fn newest_session_file(flavor: PiFlavor, project_path: &str) -> Option<(PathBuf, SystemTime)> {
     const MAX_SCAN: usize = 30;
     let mut newest: Option<(PathBuf, SystemTime)> = None;
-    for dir in project_session_dirs(project_path) {
+    for dir in project_session_dirs(flavor, project_path) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -250,8 +305,14 @@ pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTim
 }
 
 /// OMP 18.x 的普通消息:外层 `type=message`,角色与正文位于 `message.*`。
+/// pi 同形(`system` / `toolResult` / `custom` 角色与非 message 条目一律不算对话)。
 pub fn omp_message_from_line(line: &str) -> Option<AiSessionMessage> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    omp_message_from_value(&obj)
+}
+
+/// [`omp_message_from_line`] 的已解析版本(调用方要顺带读 `id` / `parentId` 时免得解析两遍)。
+pub(super) fn omp_message_from_value(obj: &serde_json::Value) -> Option<AiSessionMessage> {
     if obj.get("type").and_then(|v| v.as_str()) != Some("message") {
         return None;
     }
@@ -555,24 +616,47 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = find_omp_session_file_in(
-            &agent.join("sessions"),
-            &root,
-            &root.join("Temp"),
-            project.to_str().unwrap(),
-            "session-1",
-        );
-        assert_eq!(found, Some(wanted));
-        assert!(
-            find_omp_session_file_in(
+        // 项目在 root(当 home)之下:omp 的默认名是 home 相对,这里落的是 legacy 绝对名,
+        // 照样找得到;pi 只认绝对名,同一份目录也找得到
+        for flavor in [PiFlavor::Omp, PiFlavor::Pi] {
+            let found = find_session_file_in(
+                flavor,
                 &agent.join("sessions"),
                 &root,
                 &root.join("Temp"),
                 project.to_str().unwrap(),
-                "missing",
-            )
-            .is_none()
-        );
+                "session-1",
+            );
+            assert_eq!(found.as_ref(), Some(&wanted), "{flavor:?}");
+            assert!(
+                find_session_file_in(
+                    flavor,
+                    &agent.join("sessions"),
+                    &root,
+                    &root.join("Temp"),
+                    project.to_str().unwrap(),
+                    "missing",
+                )
+                .is_none()
+            );
+        }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// pi 的目录名只有绝对路径一种(pi `getDefaultSessionDirPath`):剥一个前导分隔符,
+    /// `/ \ :` 换 `-`,两头包 `--`。home 之下也不改成相对名(那是 omp 的改动)。
+    #[test]
+    fn pi_dir_names_are_absolute_only() {
+        let names =
+            |project: &str| PiFlavor::Pi.dir_names(r"C:\Users\u", r"C:\Users\u\Temp", project);
+        // 与本机真实目录名 `--C--Users-12197-.pi-agent--` 同形
+        assert_eq!(
+            names(r"C:\Users\12197\.pi\agent"),
+            ["--C--Users-12197-.pi-agent--"]
+        );
+        assert_eq!(names(r"C:\Users\u\Git\proj"), ["--C--Users-u-Git-proj--"]);
+        assert_eq!(names(r"D:\Projects\本地处理"), ["--D--Projects-本地处理--"]);
+        assert_eq!(names("/home/u/proj"), ["--home-u-proj--"]);
+        assert_eq!(names(r"\\?\D:\Git\proj\"), ["--D--Git-proj--"]);
     }
 }
