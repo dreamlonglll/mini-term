@@ -138,6 +138,36 @@ pub(super) fn open_commit_menu(
     .detach();
 }
 
+/// 右键点在多选之内:精简菜单 —— 复制完整 / 短哈希(按列表顺序换行分隔)、查看这些
+/// 提交的合并变更。单提交专属的改写类操作(检出 / 拣选 / 重置…)不出现。
+pub(super) fn open_multi_menu(
+    this: &GitHistoryContent,
+    position: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut Context<GitHistoryContent>,
+) {
+    let picked = this.selection.ordered(&this.commits);
+    let full: Vec<&str> = picked.iter().map(|c| c.hash.as_str()).collect();
+    let short: Vec<&str> = picked.iter().map(|c| c.short_hash.as_str()).collect();
+    let (full, short) = (full.join("\n"), short.join("\n"));
+    let entity = cx.entity();
+    let entries: Vec<MenuEntry> = vec![
+        menu::item(t("gitLog", "menu.copyFullHash"), move |_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+        }),
+        menu::item(t("gitLog", "menu.copyShortHash"), move |_window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(short.clone()));
+        }),
+        menu::separator(),
+        MenuItem::new(t("gitHistoryContent", "viewChanges"))
+            .on_click(move |window, cx| {
+                entity.update(cx, |this, cx| this.view_selected_combined(None, window, cx));
+            })
+            .into(),
+    ];
+    menu::show(position, entries, window, cx);
+}
+
 /// 可用就挂动作,不可用就置灰并把原因写在 detail 行。
 fn action_item(
     label: impl Into<SharedString>,
@@ -511,9 +541,9 @@ impl GitHistoryContent {
     }
 
     /// 改写后新的 HEAD 选中并拉详情(列表重载完会按 hash 认出来)。
-    fn select_after(&mut self, hash: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_after(&mut self, hash: String, _window: &mut Window, cx: &mut Context<Self>) {
         if !hash.is_empty() {
-            self.select_hash(hash, window, cx);
+            self.select_hash(hash, cx);
         }
     }
 

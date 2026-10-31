@@ -1,6 +1,7 @@
 export const commitDiff = {
   zh: {
     fileCount: "{count} 个文件变更",
+    combinedTitle: "{count} 个提交的合并变更",
     sideBySide: "并排",
     inline: "内联",
     prevChange: "上一处改动",
@@ -12,6 +13,7 @@ export const commitDiff = {
   },
   en: {
     fileCount: "{count} files changed",
+    combinedTitle: "Combined changes of {count} commits",
     sideBySide: "Side by side",
     inline: "Inline",
     prevChange: "Previous change",

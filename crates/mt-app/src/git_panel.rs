@@ -2378,36 +2378,23 @@ impl GitPanel {
     /// 工具栏撤掉后上移到这。
     fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let tree_mode = self.store.read(cx).git_changes_view_mode() == "tree";
-        // 显示的是「点了会切到」的那种视图
-        git_ui::icon_button(
-            "git-changes-view-mode",
-            if tree_mode {
-                git_ui::ICON_LIST
-            } else {
-                git_ui::ICON_LIST_TREE
-            },
-            if tree_mode {
-                t("gitChanges", "switchToList")
-            } else {
-                t("gitChanges", "switchToTree")
-            },
-            true,
-        )
-        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-            // 按钮在 header 里:冒泡由共用图标按钮拦住,不会连带把整块折叠
-            this.store.update(cx, |store, cx| {
-                let next = if store.git_changes_view_mode() == "tree" {
-                    "list"
-                } else {
-                    "tree"
-                };
-                store.set_git_changes_view_mode(next, cx);
-            });
-            // GitChanges 不 observe store,列表要重排得显式踢它一脚
-            this.changes.update(cx, |_, cx| cx.notify());
-            cx.notify();
-        }))
-        .into_any_element()
+        // 显示的是「点了会切到」的那种视图(提交详情 / 提交 diff 左栏用同一颗)
+        git_ui::view_mode_toggle("git-changes-view-mode", tree_mode)
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                // 按钮在 header 里:冒泡由共用图标按钮拦住,不会连带把整块折叠
+                this.store.update(cx, |store, cx| {
+                    let next = if store.git_changes_view_mode() == "tree" {
+                        "list"
+                    } else {
+                        "tree"
+                    };
+                    store.set_git_changes_view_mode(next, cx);
+                });
+                // GitChanges 不 observe store,列表要重排得显式踢它一脚
+                this.changes.update(cx, |_, cx| cx.notify());
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// 仓库下拉。

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1431;
+pub const ZH_ENTRY_COUNT: usize = 1446;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1431;
+pub const EN_ENTRY_COUNT: usize = 1446;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -199,6 +199,7 @@ static COMMAND_LIBRARY_EN: &[(&str, &str)] = &[
 #[rustfmt::skip]
 static COMMIT_DIFF_ZH: &[(&str, &str)] = &[
     ("binaryFile", "二进制文件，不支持 diff 预览"),
+    ("combinedTitle", "{count} 个提交的合并变更"),
     ("fileCount", "{count} 个文件变更"),
     ("inline", "内联"),
     ("loading", "加载中..."),
@@ -211,6 +212,7 @@ static COMMIT_DIFF_ZH: &[(&str, &str)] = &[
 #[rustfmt::skip]
 static COMMIT_DIFF_EN: &[(&str, &str)] = &[
     ("binaryFile", "Binary file, diff preview not supported"),
+    ("combinedTitle", "Combined changes of {count} commits"),
     ("fileCount", "{count} files changed"),
     ("inline", "Inline"),
     ("loading", "Loading..."),
@@ -929,6 +931,8 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
     ("committing", "提交中..."),
     ("contextDiscard", "丢弃修改"),
     ("contextViewDiff", "查看 Diff"),
+    ("dirFiles", "{count} 个文件"),
+    ("dirFilesOne", "1 个文件"),
     ("discardCancel", "取消"),
     ("discardConfirm", "确定要丢弃 {count} 个文件的修改吗？\n此操作不可撤销。"),
     ("discardOk", "丢弃"),
@@ -949,6 +953,8 @@ static GIT_CHANGES_EN: &[(&str, &str)] = &[
     ("committing", "Committing..."),
     ("contextDiscard", "Discard Changes"),
     ("contextViewDiff", "View Diff"),
+    ("dirFiles", "{count} files"),
+    ("dirFilesOne", "1 file"),
     ("discardCancel", "Cancel"),
     ("discardConfirm", "Discard changes to {count} file(s)?\nThis action cannot be undone."),
     ("discardOk", "Discard"),
@@ -986,6 +992,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("committedToast", "已提交 {hash}：{title}"),
     ("conflictsGroup", "冲突"),
     ("copyError", "复制错误信息"),
+    ("copySelection", "复制"),
     ("deleteSelected", "删除所选 {count} 个未跟踪文件"),
     ("deleteUntracked", "删除此未跟踪文件"),
     ("discardAll", "全部丢弃（只丢未暂存的修改）"),
@@ -1018,6 +1025,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("prevFile", "上一个文件（{shortcut}）"),
     ("refresh", "刷新"),
     ("renameOnly", "仅重命名，内容无改动"),
+    ("selectAll", "全选"),
     ("sideStaged", "HEAD → 暂存区"),
     ("sideUnstaged", "暂存区 → 工作区"),
     ("sideWorking", "HEAD → 工作区"),
@@ -1066,6 +1074,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("committedToast", "Committed {hash}: {title}"),
     ("conflictsGroup", "Conflicts"),
     ("copyError", "Copy error message"),
+    ("copySelection", "Copy"),
     ("deleteSelected", "Delete {count} selected untracked files"),
     ("deleteUntracked", "Delete this untracked file"),
     ("discardAll", "Discard all (unstaged changes only)"),
@@ -1098,6 +1107,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("prevFile", "Previous file ({shortcut})"),
     ("refresh", "Refresh"),
     ("renameOnly", "Renamed only, no content changes"),
+    ("selectAll", "Select All"),
     ("sideStaged", "HEAD → Index"),
     ("sideUnstaged", "Index → Working tree"),
     ("sideWorking", "HEAD → Working tree"),
@@ -1311,6 +1321,16 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("menu.reword", "修改提交消息…"),
     ("menu.tag", "标签 {name}"),
     ("menu.undo", "撤销提交"),
+    ("multi.failed", "合并改动文件失败：{detail}"),
+    ("multi.limit", "最多合并查看 {limit} 个提交：只合并列表里最新的 {limit} 个"),
+    ("multi.loading", "合并改动文件中…"),
+    ("multi.more", "还有 {count} 个提交"),
+    ("multi.moreFiles", "还有 {count} 个文件，在合并 diff 中查看"),
+    ("multi.noFiles", "这些提交合起来没有改动文件"),
+    ("multi.openFile", "在合并 diff 中查看"),
+    ("multi.rangeTip", "每个文件取所选提交里最早一次改动之前到最后一次改动之后；夹在中间、没有选中的提交对同一文件的改动也算在内"),
+    ("multi.title", "已选 {count} 个提交"),
+    ("multi.viewFailed", "读取合并改动失败"),
     ("reason.alreadyCheckedOut", "已检出该提交"),
     ("reason.busy", "上一个操作还在进行中"),
     ("reason.inHistory", "已在当前分支的历史中"),
@@ -1460,6 +1480,16 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("menu.reword", "Edit Commit Message…"),
     ("menu.tag", "Tag {name}"),
     ("menu.undo", "Undo Commit"),
+    ("multi.failed", "Failed to combine changes: {detail}"),
+    ("multi.limit", "At most {limit} commits can be combined: only the newest {limit} in the list are included"),
+    ("multi.loading", "Combining changed files…"),
+    ("multi.more", "{count} more commits"),
+    ("multi.moreFiles", "{count} more files, view them in the combined diff"),
+    ("multi.noFiles", "No file changes in these commits combined"),
+    ("multi.openFile", "Open in combined diff"),
+    ("multi.rangeTip", "Each file is compared from before its earliest change to after its latest change in the selection; changes to it from unselected commits in between are included"),
+    ("multi.title", "{count} commits selected"),
+    ("multi.viewFailed", "Failed to read the combined changes"),
     ("reason.alreadyCheckedOut", "Already checked out"),
     ("reason.busy", "Another operation is still running"),
     ("reason.inHistory", "Already in the current branch"),

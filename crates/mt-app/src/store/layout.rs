@@ -222,6 +222,23 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::View));
     }
 
+    // === 提交详情 / 提交 diff 左栏的改动文件视图 ===
+
+    /// `config.gitCommitFilesViewMode`:是不是树形(缺省是)。与 [`Self::git_changes_view_mode`]
+    /// 同样存成 String,认不出的值回落缺省的树形。
+    pub fn git_commit_files_tree(&self) -> bool {
+        self.config.git_commit_files_view_mode != "list"
+    }
+
+    pub fn set_git_commit_files_tree(&mut self, tree: bool, cx: &mut Context<Self>) {
+        if self.git_commit_files_tree() == tree {
+            return;
+        }
+        self.config.git_commit_files_view_mode = if tree { "tree" } else { "list" }.to_string();
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::View));
+    }
+
     pub fn set_right_drawer_width(&mut self, width: f64, cx: &mut Context<Self>) {
         let width = width.clamp(240.0, 720.0);
         if self.config.right_drawer_width == Some(width) {

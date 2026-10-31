@@ -13,6 +13,7 @@
 //! | 语义胶囊 | 18px 高、全圆角、语义色 15% 底;HEAD = accent、本地 = success、远程 = info、标签 = warning、↑ = success、↓ = info |
 //! | 区块 / 分组标题 | 折叠箭头 + 标题 + 数量胶囊 + 右侧操作,整行可点折叠 |
 //! | 列表行 | 28px、左右 8、圆角 4;悬停薄纱底;选中 = `accent_subtle` 底 + 左侧 2px accent 竖条 |
+//! | 改动文件树 | 每层缩进 16;单链目录压缩成 `a/b/c`、目录行后缀弱化文件数、目录在前(`change_tree` 子模块) |
 //! | 字号 | 11(胶囊 / 角注)· 12(次要信息)· 13(正文 / 行)· 14(弹窗标题区) |
 //! | 弹窗 | 正文与标题、页脚同一条左缘;页脚「取消 / 确认」,确认键主色或危险色 |
 //!
@@ -40,9 +41,11 @@
 //! 与失败怎么展示仍由各区定:面板上的操作失败走可选中复制的详情框([`show_git_error`]),
 //! 弹窗里的就地红字(toast 在遮罩下看不见),成功走 toast([`toast`])。
 
+mod change_tree;
 pub mod gate;
 mod icons;
 
+pub use change_tree::*;
 pub use icons::*;
 
 use std::path::{Path, PathBuf};
@@ -960,19 +963,8 @@ pub fn file_label(path: &str, color: Hsla, deleted: bool, show_dir: bool) -> Div
         )
 }
 
-/// 提交里的一行改动文件(提交详情、提交 diff 左栏):[`list_row`] + [`file_label`] +
-/// 右端状态字母。`status` 是 `CommitFileInfo.status`(`added` / `modified` / …)。
-pub fn commit_file_row(
-    id: impl Into<ElementId>,
-    path: &str,
-    status: &str,
-    selected: bool,
-) -> Stateful<Div> {
-    let (letter, color) = commit_file_status(status);
-    list_row(id, selected)
-        .child(file_label(path, color, status == "deleted", true))
-        .child(status_letter(letter, color))
-}
+// 提交里的一行改动文件(提交详情、提交 diff 左栏)见 [`commit_file_row_at`]:平铺与
+// 树形两种画法,与目录树放在一起(`change_tree` 子模块)。
 
 // ─── 状态 → 字母 / 颜色 ───────────────────────────────────────
 
