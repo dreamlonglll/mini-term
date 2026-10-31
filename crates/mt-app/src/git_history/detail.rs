@@ -545,6 +545,7 @@ fn render_content(
         .map(|f| FileEntry {
             path: &f.path,
             status: &f.status,
+            old_path: f.old_path.as_deref(),
         })
         .collect();
     let caption = if files.is_empty() {
@@ -648,6 +649,7 @@ fn render_multi(
                 .map(|f| FileEntry {
                     path: &f.path,
                     status: &f.status,
+                    old_path: f.old_path.as_deref(),
                 })
                 .collect();
             let caption = if entries.is_empty() {
@@ -679,6 +681,8 @@ fn render_multi(
 struct FileEntry<'a> {
     path: &'a str,
     status: &'a str,
+    /// 重命名的起点路径(悬停写成 `旧 → 新`,与提交 diff 左栏同一口径)。
+    old_path: Option<&'a str>,
 }
 
 /// 点文件 / 「还有 N 个文件」:`Some(路径)` = 打开并选中它,`None` = 打开、选第一个。
@@ -770,6 +774,10 @@ fn render_files(
                 let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| {
                     open(this, Some(path.clone()), window, cx);
                 });
+                let tip = match file.old_path {
+                    Some(old) => format!("{old} → {}\n{}", file.path, texts.open_tip),
+                    None => texts.open_tip.to_string(),
+                };
                 list = list.child(
                     git_ui::commit_file_row_at(
                         SharedString::from(format!("git-log-detail-file-{index}")),
@@ -778,7 +786,7 @@ fn render_files(
                         false,
                         tree.then_some(depth),
                     )
-                    .tip(texts.open_tip)
+                    .tip(tip)
                     .on_click(on_click),
                 );
             }
