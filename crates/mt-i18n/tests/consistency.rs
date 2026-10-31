@@ -162,8 +162,12 @@ use mt_i18n::{
 /// 免得末字单独成行）、分支弹窗「新建分支…」的常规提示（`gitBranch.newBranchTip`，置灰时换成
 /// 「另一项 Git 操作正在进行」）、强推因期望值过期被拒时的指引（`gitBranch.rejectedStaleHint`，
 /// 不再劝「确认风险后强制推送」）。
+/// 1431 → 1444（issue #84）：历史区多选提交合并查看 —— 详情区多选态的标题 / 列表余数 /
+/// 合并上限 / 加载 / 失败 / 打开入口 / 合并口径说明（`gitLog.multi.*` 10 条）、合并 diff
+/// 弹窗标题（`commitDiff.combinedTitle`）、改动文件目录树的目录行文件数
+/// （`gitChanges.{dirFiles,dirFilesOne}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1431;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1444;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

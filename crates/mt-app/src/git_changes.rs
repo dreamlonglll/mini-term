@@ -75,11 +75,10 @@ use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
     GitStatus, RepoOpKind,
 };
-use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_ui::{
-    self, ButtonKind, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_COPY,
+    self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
     ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
     icon_button, mono, status_color, status_label_for,
 };
@@ -228,101 +227,23 @@ pub fn message_hints(message: &str) -> MessageHints {
 
 // ─── 树形视图 ─────────────────────────────────────────────────
 
-/// `buildFileTree` 建出来的节点(`GitChanges.tsx:36-56`)。
-///
-/// `file` 是**下标**而不是拷贝 —— 建树只是换个排列方式,内容仍在原数组里。
-#[derive(Debug, PartialEq)]
-pub struct FileTreeNode {
-    pub name: String,
-    pub full_path: String,
-    pub file: Option<usize>,
-    pub children: Vec<FileTreeNode>,
+// 建树 / 拍平是共用的(`git_ui::build_change_tree`:单链目录压缩、目录文件数、目录在前
+// 按名称排),提交详情与提交 diff 左栏同一套。这里只管折叠 key 带区名。
+
+/// 目录的折叠 key:带区名 —— 同一路径在四个区各自独立折叠(`GitChanges.tsx:285`、`:292`)。
+fn dir_key(area: Area, full_path: &str) -> String {
+    format!("{}:{}", area.key(), full_path)
 }
 
-/// 按 `/` 切 path 建目录树。**不做单链目录压缩**(与 FileTree 的
-/// `compactDirChains` 不同,这里没有)。
-pub fn build_file_tree(paths: &[(usize, &str)]) -> Vec<FileTreeNode> {
-    let mut root: Vec<FileTreeNode> = Vec::new();
-    for (index, path) in paths {
-        let parts: Vec<&str> = path.split('/').collect();
-        let mut current = &mut root;
-        let mut path_so_far = String::new();
-        for (i, part) in parts.iter().enumerate() {
-            if i > 0 {
-                path_so_far.push('/');
-            }
-            path_so_far.push_str(part);
-            if i == parts.len() - 1 {
-                current.push(FileTreeNode {
-                    name: (*part).to_string(),
-                    full_path: path_so_far.clone(),
-                    file: Some(*index),
-                    children: Vec::new(),
-                });
-            } else {
-                let pos = current
-                    .iter()
-                    .position(|n| n.name == *part && n.file.is_none());
-                let pos = match pos {
-                    Some(pos) => pos,
-                    None => {
-                        current.push(FileTreeNode {
-                            name: (*part).to_string(),
-                            full_path: path_so_far.clone(),
-                            file: None,
-                            children: Vec::new(),
-                        });
-                        current.len() - 1
-                    }
-                };
-                current = &mut current[pos].children;
-            }
-        }
-    }
-    root
-}
-
-/// 拍平后的一行。
-enum TreeRow {
-    Dir {
-        name: String,
-        full_path: String,
-        depth: usize,
-        collapsed: bool,
-    },
-    File {
-        index: usize,
-        depth: usize,
-    },
-}
-
-fn flatten_tree(
-    nodes: &[FileTreeNode],
+/// 某个分组的树形行(界面行序;收起的目录不往下展开)。
+fn area_tree_rows(
+    paths: &[(usize, &str)],
     area: Area,
     collapsed: &HashSet<String>,
-    depth: usize,
-    out: &mut Vec<TreeRow>,
-) {
-    for node in nodes {
-        match node.file {
-            Some(index) => out.push(TreeRow::File { index, depth }),
-            None => {
-                // 折叠集合 key 带区名 —— 同一路径在四个区各自独立折叠
-                // (`GitChanges.tsx:285`、`:292`)
-                let key = format!("{}:{}", area.key(), node.full_path);
-                let is_collapsed = collapsed.contains(&key);
-                out.push(TreeRow::Dir {
-                    name: node.name.clone(),
-                    full_path: node.full_path.clone(),
-                    depth,
-                    collapsed: is_collapsed,
-                });
-                if !is_collapsed {
-                    flatten_tree(&node.children, area, collapsed, depth + 1, out);
-                }
-            }
-        }
-    }
+) -> Vec<ChangeTreeRow> {
+    git_ui::flatten_change_tree(&git_ui::build_change_tree(paths), &|full_path| {
+        collapsed.contains(&dir_key(area, full_path))
+    })
 }
 
 /// 列表摊开要多高(见 [`GitChanges::list_content_height`]):上下内边距 + 每个非空分组
@@ -353,9 +274,7 @@ fn list_height(
             continue;
         }
         let rows = if tree_mode {
-            let mut rows = Vec::new();
-            flatten_tree(&build_file_tree(&paths), area, collapsed_dirs, 0, &mut rows);
-            rows.len()
+            area_tree_rows(&paths, area, collapsed_dirs).len()
         } else {
             paths.len()
         };
@@ -689,20 +608,7 @@ impl GitChanges {
             .iter()
             .map(|&i| (i, self.changes[i].path.as_str()))
             .collect();
-        let mut rows = Vec::new();
-        flatten_tree(
-            &build_file_tree(&paths),
-            area,
-            &self.collapsed_dirs,
-            0,
-            &mut rows,
-        );
-        rows.into_iter()
-            .filter_map(|row| match row {
-                TreeRow::File { index, .. } => Some(index),
-                TreeRow::Dir { .. } => None,
-            })
-            .collect()
+        git_ui::row_file_order(&area_tree_rows(&paths, area, &self.collapsed_dirs))
     }
 
     /// 键盘导航走的全部可见文件行(分组顺序 + 组内显示顺序,折起来的分组跳过)。
@@ -1774,30 +1680,21 @@ impl GitChanges {
                         .iter()
                         .map(|&i| (i, self.changes[i].path.as_str()))
                         .collect();
-                    let mut tree_rows = Vec::new();
-                    flatten_tree(
-                        &build_file_tree(&paths),
-                        area,
-                        &self.collapsed_dirs,
-                        0,
-                        &mut tree_rows,
-                    );
-                    for row in tree_rows {
+                    for row in area_tree_rows(&paths, area, &self.collapsed_dirs) {
                         match row {
-                            TreeRow::Dir {
+                            ChangeTreeRow::Dir {
                                 name,
                                 full_path,
                                 depth,
                                 collapsed,
+                                file_count,
                             } => {
-                                rows.push(
-                                    self.render_dir_row(
-                                        area, name, full_path, depth, collapsed, cx,
-                                    ),
-                                );
+                                rows.push(self.render_dir_row(
+                                    area, name, full_path, file_count, depth, collapsed, cx,
+                                ));
                                 keys.push(RowKey::Other);
                             }
-                            TreeRow::File { index, depth } => {
+                            ChangeTreeRow::File { index, depth } => {
                                 rows.push(self.render_file_row(index, area, depth, true, cx));
                                 keys.push(RowKey::File(area, index));
                             }
@@ -1937,48 +1834,27 @@ impl GitChanges {
             .into_any_element()
     }
 
+    /// 目录行(共用的 [`git_ui::tree_dir_row`]:单链压缩后的名称 + 弱化文件数)。
+    #[allow(clippy::too_many_arguments)]
     fn render_dir_row(
         &self,
         area: Area,
         name: String,
         full_path: String,
+        file_count: usize,
         depth: usize,
         collapsed: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let key = format!("{}:{}", area.key(), full_path);
-        div()
-            .id(SharedString::from(format!("git-dir-{key}")))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(ROW_HEIGHT))
-            .pr(px(8.0))
-            .pl(px(depth as f32 * 16.0 + 8.0))
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .text_size(ui::font_px(13.0))
-            .text_color(ui::text_secondary())
-            .hover(|el| el.bg(git_ui::hover_bg()))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(git_ui::ICON_SIZE))
-                    .flex()
-                    .justify_center()
-                    .child(git_ui::icon(
-                        if collapsed {
-                            ICON_CHEVRON_RIGHT
-                        } else {
-                            ICON_CHEVRON_DOWN
-                        },
-                        git_ui::ICON_SIZE_SM,
-                        ui::text_muted(),
-                    )),
-            )
-            .child(FileIcon::folder(!collapsed).size(px(git_ui::ICON_SIZE)))
-            .child(div().min_w_0().truncate().child(name))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+        let key = dir_key(area, &full_path);
+        git_ui::tree_dir_row(
+            SharedString::from(format!("git-dir-{key}")),
+            name,
+            file_count,
+            depth,
+            collapsed,
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if !this.collapsed_dirs.remove(&key) {
                     this.collapsed_dirs.insert(key.clone());
                 }
@@ -2088,7 +1964,7 @@ impl GitChanges {
 
         git_ui::list_row(row_id, selected)
             .group(ROW_GROUP)
-            .pl(px(depth as f32 * 16.0 + 8.0))
+            .pl(px(git_ui::tree_row_pad(depth)))
             .child(git_ui::file_label(&path, color, deleted, !tree_mode))
             .child(
                 div()
@@ -2747,53 +2623,40 @@ mod tests {
         assert_eq!(preview_paths(&paths[..2]).len(), 2);
     }
 
-    /// 建树:嵌套路径共用目录节点,**不做单链压缩**。
-    #[test]
-    fn 建树共用目录节点() {
-        let paths = [(0, "src/a.rs"), (1, "src/b.rs"), (2, "README.md")];
-        let tree = build_file_tree(&paths);
-        assert_eq!(tree.len(), 2, "src 目录 + README.md");
-        assert_eq!(tree[0].name, "src");
-        assert_eq!(tree[0].full_path, "src");
-        assert!(tree[0].file.is_none());
-        assert_eq!(tree[0].children.len(), 2);
-        assert_eq!(tree[0].children[0].full_path, "src/a.rs");
-        assert_eq!(tree[0].children[0].file, Some(0));
-        assert_eq!(tree[1].name, "README.md");
-        assert_eq!(tree[1].file, Some(2));
-
-        // 深嵌套不压缩:a/b/c/d.rs 是三层目录 + 一个文件
-        let deep = build_file_tree(&[(0, "a/b/c/d.rs")]);
-        assert_eq!(deep[0].name, "a");
-        assert_eq!(deep[0].children[0].name, "b");
-        assert_eq!(deep[0].children[0].children[0].name, "c");
-        assert_eq!(deep[0].children[0].children[0].children[0].name, "d.rs");
-    }
-
-    /// 同名的目录与文件互不合并(`find` 带 `&& !n.file` 那道判定)。
-    #[test]
-    fn 同名目录与文件不合并() {
-        let tree = build_file_tree(&[(0, "build"), (1, "build/out.js")]);
-        assert_eq!(tree.len(), 2);
-        assert_eq!(tree[0].file, Some(0), "先来的是文件");
-        assert!(tree[1].file.is_none(), "后来的目录另起一个节点");
-        assert_eq!(tree[1].children[0].full_path, "build/out.js");
-    }
-
     /// 折叠 key 带区名:同一路径在各个区各自独立折叠。
     #[test]
     fn 折叠_key_按区隔离() {
-        let tree = build_file_tree(&[(0, "src/a.rs")]);
+        let paths = [(0, "src/a.rs"), (1, "src/b.rs")];
         let mut collapsed = HashSet::new();
         collapsed.insert("staged:src".to_string());
 
-        let mut rows = Vec::new();
-        flatten_tree(&tree, Area::Staged, &collapsed, 0, &mut rows);
+        let rows = area_tree_rows(&paths, Area::Staged, &collapsed);
         assert_eq!(rows.len(), 1, "staged 区的 src 折起来了,只剩目录行");
 
-        let mut rows = Vec::new();
-        flatten_tree(&tree, Area::Unstaged, &collapsed, 0, &mut rows);
-        assert_eq!(rows.len(), 2, "unstaged 区不受影响");
-        assert!(matches!(rows[1], TreeRow::File { depth: 1, .. }));
+        let rows = area_tree_rows(&paths, Area::Unstaged, &collapsed);
+        assert_eq!(rows.len(), 3, "unstaged 区不受影响");
+        assert!(matches!(rows[1], ChangeTreeRow::File { depth: 1, .. }));
+    }
+
+    /// 树形视图的行序(渲染、键盘、Shift 连选、diff 弹窗前后换文件都按它):目录在前、
+    /// 单链目录压缩成一行;键盘走的文件顺序与画出来的行序一致。
+    #[test]
+    fn 树形行序与键盘顺序一致() {
+        let paths = [
+            (0, "z.md"),
+            (1, "src/ui/panel/a.rs"),
+            (2, "src/ui/panel/b.rs"),
+            (3, "docs/x.md"),
+        ];
+        let rows = area_tree_rows(&paths, Area::Unstaged, &HashSet::new());
+        let dirs: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ChangeTreeRow::Dir { name, .. } => Some(name.as_str()),
+                ChangeTreeRow::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(dirs, ["docs", "src/ui/panel"], "src/ui/panel 压缩成一行");
+        assert_eq!(git_ui::row_file_order(&rows), [3, 1, 2, 0]);
     }
 }

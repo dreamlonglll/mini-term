@@ -570,6 +570,17 @@ pub fn bind_keys(cx: &mut App) {
         git_history::GitLogSelectNext,
         history,
     ));
+    // Shift+↑/↓ 从锚点扩展 / 收缩多选(过滤框里的 Shift+↑/↓ 归更深的 `Input`,照旧选文字)
+    bindings.push(KeyBinding::new(
+        "shift-up",
+        git_history::GitLogExtendPrev,
+        history,
+    ));
+    bindings.push(KeyBinding::new(
+        "shift-down",
+        git_history::GitLogExtendNext,
+        history,
+    ));
     bindings.push(KeyBinding::new(
         "enter",
         git_history::GitLogOpenSelected,

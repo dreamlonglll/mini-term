@@ -151,6 +151,10 @@ pub struct AppConfig {
     pub vscode_path: Option<String>,
     #[serde(default = "default_git_changes_view_mode")]
     pub git_changes_view_mode: String,
+    /// 提交详情与提交 diff 左栏的改动文件:`"tree"`(缺省,按目录分组)或 `"list"`。
+    /// 两处共用这一个开关;与「更改」区的 `gitChangesViewMode` 各管各的。
+    #[serde(default = "default_git_commit_files_view_mode")]
+    pub git_commit_files_view_mode: String,
     #[serde(default = "default_true")]
     pub long_paste_to_file: bool,
     #[serde(default = "default_long_paste_line_threshold")]
@@ -626,6 +630,9 @@ fn default_ai_completion_taskbar_flash() -> bool {
 fn default_git_changes_view_mode() -> String {
     "list".into()
 }
+fn default_git_commit_files_view_mode() -> String {
+    "tree".into()
+}
 fn default_long_paste_line_threshold() -> u32 {
     10
 }
@@ -744,6 +751,7 @@ impl Default for AppConfig {
             default_editor: None,
             vscode_path: None,
             git_changes_view_mode: default_git_changes_view_mode(),
+            git_commit_files_view_mode: default_git_commit_files_view_mode(),
             long_paste_to_file: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),

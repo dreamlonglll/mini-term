@@ -1,6 +1,19 @@
 //! Git 面板的「提交历史」区。对应 `src/components/GitHistoryContent.tsx`(399 行),
 //! 之后按 JetBrains IDEA 的 Log 工具窗补了一圈:选中 + 提交详情、键盘导航、过滤栏、
-//! 标签胶囊、右键改写操作(见 [`actions`])。
+//! 标签胶囊、右键改写操作(见 [`actions`])、多选提交合并查看改动(见下)。
+//!
+//! # 多选(issue #84)
+//!
+//! 选择模型见 [`selection`]:单击单选、Ctrl/Cmd 单击切换、Shift 单击连选、Ctrl/Cmd+Shift
+//! 单击并入一段,Shift+↑/↓ 从锚点扩展 / 收缩;键盘移动、滚动跟随、触底预取都按「当前行」。
+//! 选中两个及以上时:详情区换成「已选 N 个提交」+ 这些提交**合并后**的改动文件;Enter /
+//! 右键「查看变更」打开合并 diff(`git_diff::open_combined_diff_loading`);Ctrl/Cmd+C 与右键
+//! 复制全部选中提交的哈希(列表顺序、换行分隔)。右键点在多选之内保持选择、弹精简菜单
+//! (单提交专属的改写类操作不出现);点在选择之外先单选它,菜单照旧。
+//!
+//! 每轮重新加载(保留旧列表的 [`GitHistoryContent::reload`],与换分支 / 换过滤条件的
+//! [`GitHistoryContent::restart`])首页落定时,选中集合只留仍在新列表里的提交,详情按留下
+//! 的选择跟上(全没了就清掉);只有换仓库才当场清空。
 //!
 //! # 分页与请求作废(`GitHistoryContent.tsx:234-290`)
 //!
@@ -43,6 +56,7 @@
 
 mod actions;
 mod detail;
+mod selection;
 
 pub use actions::GitLogRewordConfirm;
 pub(crate) use actions::REWORD_CONTEXT;
@@ -76,6 +90,8 @@ use crate::i18n::{t, tr};
 use crate::store::AppStore;
 use crate::ui;
 use crate::{git_diff, git_watch};
+use detail::DetailTarget;
+use selection::{ClickMods, CommitSelection};
 
 gpui::actions!(
     mini_term,
@@ -84,9 +100,13 @@ gpui::actions!(
         GitLogSelectPrev,
         /// 历史列表选中下一条(↓)
         GitLogSelectNext,
-        /// 打开选中提交的 diff(Enter;焦点在过滤框时 = 立即应用过滤)
+        /// 历史列表从锚点往上扩展 / 收缩选择(Shift+↑)
+        GitLogExtendPrev,
+        /// 历史列表从锚点往下扩展 / 收缩选择(Shift+↓)
+        GitLogExtendNext,
+        /// 打开选中提交的 diff,多选时打开合并 diff(Enter;焦点在过滤框时 = 立即应用过滤)
         GitLogOpenSelected,
-        /// 复制选中提交的完整哈希(Ctrl/Cmd+C)
+        /// 复制选中提交的完整哈希,多选时按列表顺序换行分隔(Ctrl/Cmd+C)
         GitLogCopyHash,
         /// 聚焦过滤框(Ctrl/Cmd+F,历史区上下文内)
         GitLogFocusFilter,
@@ -112,8 +132,12 @@ const NARROW_WIDTH: f32 = 380.0;
 const TITLE_FLOOR_EM: f32 = 8.0;
 /// 引用胶囊的收缩权重(标题是 1):悬殊到行放不下时几乎只缩胶囊。
 const PILL_SHRINK: f32 = 1000.0;
+/// 多选时最多合并查看多少个提交(取列表里最新的那些):再多后台合并一趟要好久,
+/// 合出来的文件也多到没法看。
+const MULTI_LIMIT: usize = 200;
 
-/// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Enter / Ctrl+C / Ctrl+F / Esc)。
+/// 历史区的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓ / Shift+↑ / Shift+↓ / Enter / Ctrl+C /
+/// Ctrl+F / Esc)。
 pub(crate) const HISTORY_CONTEXT: &str = "GitHistory";
 
 /// 往上冒的事件。
@@ -264,8 +288,8 @@ pub struct GitHistoryContent {
     /// pty-output 嗅探的 500ms 去抖终点(与「更改」区各算各的)。
     debounce_until: Option<Instant>,
     filter: FilterState,
-    /// 选中的提交(按 hash 记:分页 / 刷新后照样认得出)。
-    selected: Option<String>,
+    /// 选中的提交(按 hash 记:分页 / 刷新后照样认得出;多选口径见 [`selection`])。
+    selection: CommitSelection,
     /// 这一轮重载回来之后要核对选中还在不在列表里(见 [`Self::verify_selection`])。
     verify_selection: bool,
     detail: detail::DetailState,
@@ -376,7 +400,7 @@ impl GitHistoryContent {
                 debounce: None,
                 input_w: Rc::new(Cell::new(0.0)),
             },
-            selected: None,
+            selection: CommitSelection::default(),
             verify_selection: false,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
@@ -424,7 +448,7 @@ impl GitHistoryContent {
         }
         if repo_changed {
             // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
-            self.selected = None;
+            self.selection.clear();
             self.detail.clear();
             self.tags.clear();
             self.tags_by_commit.clear();
@@ -446,7 +470,9 @@ impl GitHistoryContent {
         self.begin_load(cx);
     }
 
-    /// 整体重来并**当场清空**(换仓库 / 换分支 / 换过滤条件:内容本来就不同)。
+    /// 整体重来并**当场清空列表**(换仓库 / 换分支 / 换过滤条件:内容本来就不同)。
+    /// 选择不在这里清:首页落定时由 [`Self::verify_selection`] 按「还在不在新列表里」逐个留
+    /// (切分支 / 过滤后选中的提交仍在就照旧选着);换仓库在 [`Self::sync`] 里当场清空。
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.commits.clear();
         self.graph = git_graph::compute(&[]);
@@ -499,7 +525,7 @@ impl GitHistoryContent {
         let unsure = self.repo_path.is_empty()
             || self.loading
             || self.has_more
-            || self.selected.is_some()
+            || !self.selection.is_empty()
             || self.commits.is_empty();
         (!unsure).then_some(44.0 + 8.0 + 2.0 + self.commits.len() as f32 * GRAPH_ROW_HEIGHT)
     }
@@ -592,7 +618,7 @@ impl GitHistoryContent {
                         this.settle_refs(refs);
                     }
                     match result {
-                        Ok((page, tags)) => this.merge_page(first, page, tags),
+                        Ok((page, tags)) => this.merge_page(first, page, tags, cx),
                         Err(err) => this.load_failed(err),
                     }
                     cx.notify();
@@ -623,7 +649,13 @@ impl GitHistoryContent {
     }
 
     /// 合并一页。去重 + 拓扑修正 + `has_more` 判定,见模块注释。
-    fn merge_page(&mut self, first: bool, page: Vec<GitCommitInfo>, tags: Option<Vec<TagInfo>>) {
+    fn merge_page(
+        &mut self,
+        first: bool,
+        page: Vec<GitCommitInfo>,
+        tags: Option<Vec<TagInfo>>,
+        cx: &mut Context<Self>,
+    ) {
         if first {
             // 刷新保留的旧列表到这里才换掉
             self.commits.clear();
@@ -635,22 +667,22 @@ impl GitHistoryContent {
         self.has_more = merge_into(&mut self.commits, page);
         self.graph = git_graph::compute(&self.commits);
         self.refresh_head_hash();
-        self.verify_selection();
+        self.verify_selection(cx);
     }
 
-    /// 重载回来(首页落定)之后核对选中:新列表里找不到它(切了分支 / 重置 / 改写掉了),
-    /// 选中与详情一起清掉 —— 否则「提交详情」还挂着别的分支上的提交。找得到就留着。
+    /// 重载回来(首页落定)之后核对选中:新列表里找不到的(切了分支 / 换了过滤条件 /
+    /// 重置 / 改写掉了)从选择里去掉,详情按留下的选择跟上 —— 全没了就清掉(否则「提交
+    /// 详情」还挂着别的分支上的提交),剩一个换回单提交详情,剩一组按这一组重新合并;
+    /// 都还在就什么都不动(与上一次要的相同,`sync_detail` 不重拉)。
     ///
     /// 只在每轮重载落定时核一次(`verify_selection` 由 [`Self::begin_load`] 置上),
     /// 之后触底续页不再核:那时选中的多半就是刚滚到的行。
-    fn verify_selection(&mut self) {
+    fn verify_selection(&mut self, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.verify_selection) {
             return;
         }
-        if !selection_survives(self.selected.as_deref(), &self.commits) {
-            self.selected = None;
-            self.detail.clear();
-        }
+        self.selection.retain(&self.commits);
+        self.sync_detail(cx);
     }
 
     /// 合并一页过滤结果;没凑够 [`FilterState::want`] 且还有下文就接着扫。
@@ -677,7 +709,7 @@ impl GitHistoryContent {
             self.load_page(false, cx);
         } else {
             // 过滤要连扫好几页才凑够首屏,凑够了才算这一轮落定
-            self.verify_selection();
+            self.verify_selection(cx);
         }
     }
 
@@ -822,60 +854,113 @@ impl GitHistoryContent {
 
     // ── 选中 / 键盘 ───────────────────────────────────────
 
-    fn selected_index(&self) -> Option<usize> {
-        let hash = self.selected.as_deref()?;
-        self.commits.iter().position(|c| c.hash == hash)
+    /// 详情区该展示什么(见 [`detail_target_of`])。
+    fn detail_target(&self) -> Option<DetailTarget> {
+        detail_target_of(&self.selection, &self.commits)
     }
 
-    /// 选中某个提交并拉它的详情。
-    fn select_hash(&mut self, hash: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.as_deref() != Some(hash.as_str()) {
-            self.selected = Some(hash.clone());
-            self.load_detail(hash, window, cx);
+    /// 选择变了之后让详情跟上:与上一次要的相同就不重拉。
+    fn sync_detail(&mut self, cx: &mut Context<Self>) {
+        let target = self.detail_target();
+        if !self.detail.retarget(target.clone()) {
+            return;
         }
+        match target {
+            None => self.detail.clear(),
+            Some(DetailTarget::Single(hash)) => self.load_detail(hash, cx),
+            Some(DetailTarget::Multi(hashes)) => self.load_multi_detail(hashes, cx),
+        }
+    }
+
+    /// 选择变了:详情跟上,重画。
+    fn selection_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_detail(cx);
         cx.notify();
     }
 
-    /// 选中第 `index` 行,滚到看得见,接近末尾时预取下一页。
-    fn select_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// 单选某个提交并拉它的详情。
+    fn select_hash(&mut self, hash: String, cx: &mut Context<Self>) {
+        self.selection.select_only(&hash);
+        self.selection_changed(cx);
+    }
+
+    /// 单选第 `index` 行,滚到看得见,接近末尾时预取下一页。
+    fn select_index(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(hash) = self.commits.get(index).map(|c| c.hash.clone()) else {
             return;
         };
-        self.select_hash(hash, window, cx);
+        self.select_hash(hash, cx);
+        self.follow_lead(index, cx);
+    }
+
+    /// 当前行滚到看得见;离已加载末尾不远时预取下一页。
+    fn follow_lead(&mut self, index: usize, cx: &mut Context<Self>) {
         self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         if index + PREFETCH_ROWS >= self.commits.len() {
             self.load_more(cx);
         }
     }
 
-    fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.commits.is_empty() {
-            return;
+    /// 单击第 `index` 行:修饰键决定单选 / 切换 / 连选(口径见 [`selection`])。
+    fn click_commit(&mut self, index: usize, mods: ClickMods, cx: &mut Context<Self>) {
+        self.selection.click(&self.commits, index, mods);
+        self.selection_changed(cx);
+    }
+
+    /// ↑/↓(`extend = false`,单选移动)与 Shift+↑/↓(`true`,从锚点扩展 / 收缩)。
+    fn move_selection(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if let Some(lead) = self.selection.move_lead(&self.commits, delta, extend) {
+            self.selection_changed(cx);
+            self.follow_lead(lead, cx);
         }
-        let last = self.commits.len() as isize - 1;
-        let next = match self.selected_index() {
-            None => 0,
-            Some(cur) => (cur as isize + delta).clamp(0, last),
-        };
-        self.select_index(next as usize, window, cx);
+    }
+
+    /// 选中的提交 hash,按列表顺序(见 [`selected_hashes_of`])。
+    fn selected_hashes(&self) -> Vec<String> {
+        selected_hashes_of(&self.selection, &self.commits)
+    }
+
+    /// 合并查看用的提交:选中的按列表顺序,最多 [`MULTI_LIMIT`] 个(取最新的)。
+    fn combined_hashes(&self) -> Vec<String> {
+        let mut hashes = self.selected_hashes();
+        hashes.truncate(MULTI_LIMIT);
+        hashes
     }
 
     fn on_select_prev(
         &mut self,
         _: &GitLogSelectPrev,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.move_selection(-1, window, cx);
+        self.move_selection(-1, false, cx);
     }
 
     fn on_select_next(
         &mut self,
         _: &GitLogSelectNext,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.move_selection(1, window, cx);
+        self.move_selection(1, false, cx);
+    }
+
+    fn on_extend_prev(
+        &mut self,
+        _: &GitLogExtendPrev,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(-1, true, cx);
+    }
+
+    fn on_extend_next(
+        &mut self,
+        _: &GitLogExtendNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(1, true, cx);
     }
 
     fn filter_focused(&self, window: &Window, cx: &App) -> bool {
@@ -901,7 +986,15 @@ impl GitHistoryContent {
             cx.propagate();
             return;
         }
-        if let Some(index) = self.selected_index() {
+        if self.selection.len() >= 2 {
+            self.view_selected_combined(None, window, cx);
+            return;
+        }
+        let index = self
+            .selection
+            .single()
+            .and_then(|hash| self.commits.iter().position(|c| c.hash == hash));
+        if let Some(index) = index {
             self.view_commit(index, window, cx);
         }
     }
@@ -911,8 +1004,9 @@ impl GitHistoryContent {
             cx.propagate();
             return;
         }
-        if let Some(hash) = self.selected.clone() {
-            cx.write_to_clipboard(ClipboardItem::new_string(hash));
+        let hashes = self.selected_hashes();
+        if !hashes.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(hashes.join("\n")));
         }
     }
 
@@ -954,6 +1048,37 @@ impl GitHistoryContent {
             window,
             cx,
         );
+    }
+
+    /// 多选时的「查看变更」(Enter / 右键 / 详情区点文件):打开这些提交的合并 diff,
+    /// `initial` = 先选中哪个文件。详情区已经合并好同一组提交的文件就直接用,否则后台
+    /// 再合并一次。只剩一个提交时退回单提交 diff。
+    fn view_selected_combined(
+        &self,
+        initial: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hashes = self.combined_hashes();
+        if hashes.len() < 2 {
+            let index = hashes
+                .first()
+                .and_then(|hash| self.commits.iter().position(|c| &c.hash == hash));
+            if let Some(index) = index {
+                self.view_commit(index, window, cx);
+            }
+            return;
+        }
+        let (store, repo) = (self.store.clone(), self.repo_path.clone());
+        match self.detail.combined_files(&hashes) {
+            Some(files) => {
+                git_diff::open_combined_diff(store, repo, hashes, files, initial, window, cx);
+            }
+            None => {
+                git_diff::open_combined_diff_loading(store, repo, hashes, initial, window, cx)
+                    .detach();
+            }
+        }
     }
 
     /// 取文件列表 → 打开提交 diff(`initial` = 先选中哪个文件)。失败口径见
@@ -1078,6 +1203,33 @@ fn merge_into(commits: &mut Vec<GitCommitInfo>, page: Vec<GitCommitInfo>) -> boo
     full_page && added > 0
 }
 
+/// 选中的提交 hash,按列表顺序。刚改写出来、列表还没重载到的新 HEAD 也算上(单选时)。
+fn selected_hashes_of(selection: &CommitSelection, commits: &[GitCommitInfo]) -> Vec<String> {
+    let ordered: Vec<String> = selection
+        .ordered(commits)
+        .iter()
+        .map(|c| c.hash.clone())
+        .collect();
+    if ordered.is_empty() {
+        return selection.single().map(str::to_string).into_iter().collect();
+    }
+    ordered
+}
+
+/// 详情区该展示什么:没选 / 单选那一个 / 多选的那一组(列表顺序,最多 [`MULTI_LIMIT`]
+/// 个)。[`GitHistoryContent::detail_target`] 的纯函数体,抽出来好测。
+fn detail_target_of(
+    selection: &CommitSelection,
+    commits: &[GitCommitInfo],
+) -> Option<DetailTarget> {
+    if let Some(hash) = selection.single() {
+        return Some(DetailTarget::Single(hash.to_string()));
+    }
+    let mut hashes = selected_hashes_of(selection, commits);
+    hashes.truncate(MULTI_LIMIT);
+    (hashes.len() >= 2).then_some(DetailTarget::Multi(hashes))
+}
+
 /// [`GitHistoryContent::shown_branches`] 的纯函数体,抽出来好测。
 fn pick_shown_branches<'a>(
     branches: &'a [BranchInfo],
@@ -1119,11 +1271,6 @@ fn only_mine_tip(filter: &FilterState) -> SharedString {
     } else {
         t("gitLog", "filter.onlyMine").into()
     }
-}
-
-/// 重载之后选中还算不算数:没选中,或选中的提交还在新列表里。
-fn selection_survives(selected: Option<&str>, commits: &[GitCommitInfo]) -> bool {
-    selected.is_none_or(|hash| commits.iter().any(|c| c.hash == hash))
 }
 
 /// 相对时间(`src/utils/timeFormat.ts:3-18`)。
@@ -1198,6 +1345,8 @@ impl Render for GitHistoryContent {
             .bg(ui::bg_surface())
             .on_action(cx.listener(Self::on_select_prev))
             .on_action(cx.listener(Self::on_select_next))
+            .on_action(cx.listener(Self::on_extend_prev))
+            .on_action(cx.listener(Self::on_extend_next))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_copy_hash))
             .on_action(cx.listener(Self::on_focus_filter))
@@ -1225,8 +1374,10 @@ impl Render for GitHistoryContent {
 
         root = root.child(self.render_filter_bar(cx));
 
+        // 详情区后台取回来的正文这时写进只读框(写框要窗口)
+        self.detail.flush_body(window, cx);
         let list = self.render_list(window, cx);
-        let has_detail = self.selected.is_some();
+        let has_detail = !self.selection.is_empty();
         let detail_open = has_detail && self.detail.open;
         root = root.child(grow(
             div()
@@ -1517,7 +1668,7 @@ impl GitHistoryContent {
         } else {
             None
         };
-        let selected = self.selected.as_deref() == Some(commit.hash.as_str());
+        let selected = self.selection.contains(&commit.hash);
         let is_head = self.head_hash.as_deref() == Some(commit.hash.as_str());
         let is_merge = commit.parent_hashes.len() >= 2;
         let now = chrono::Utc::now().timestamp();
@@ -1627,14 +1778,19 @@ impl GitHistoryContent {
             )
             .tip(row_tooltip(commit));
 
-        let hash_for_click = hash_full.clone();
         row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             window.focus(&this.focus, cx);
-            // ⚠️ 双击打开 diff(`GitHistoryContent.tsx:105`);单击 = 选中
-            if event.click_count() >= 2 {
+            let modifiers = event.modifiers();
+            let mods = ClickMods {
+                toggle: modifiers.secondary(),
+                range: modifiers.shift,
+            };
+            // ⚠️ 双击打开 diff(`GitHistoryContent.tsx:105`);单击 = 选中(带修饰键的单击
+            // 是切换 / 连选,双击也只按选择处理)
+            if mods == ClickMods::default() && event.click_count() >= 2 {
                 this.view_commit(index, window, cx);
             } else {
-                this.select_hash(hash_for_click.clone(), window, cx);
+                this.click_commit(index, mods, cx);
             }
         }))
         .on_mouse_down(
@@ -1642,7 +1798,12 @@ impl GitHistoryContent {
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
                 window.focus(&this.focus, cx);
-                this.select_hash(hash_full.clone(), window, cx);
+                // 点在多选之内:保持选择,弹多选菜单;否则先单选它,菜单照旧
+                if this.selection.len() >= 2 && this.selection.contains(&hash_full) {
+                    actions::open_multi_menu(this, event.position, window, cx);
+                    return;
+                }
+                this.select_hash(hash_full.clone(), cx);
                 actions::open_commit_menu(this, index, event.position, window, cx);
             }),
         )
@@ -2109,14 +2270,79 @@ mod tests {
         );
     }
 
-    /// 切分支 / 重置后重载:选中的提交不在新列表里就作废,还在就留着;没选中不算作废。
+    /// 切分支 / 改过滤词 / 切「仅我的」之后首页落定:选中的提交仍在新列表里就照旧选着,
+    /// 不在的去掉;详情要展示的目标随留下的选择走(剩一组 = 这一组按新列表顺序合并,
+    /// 剩一个 = 换回单提交详情,全没了 = 不展示),与选择始终一致。
     #[test]
-    fn 重载后选中不在列表里就作废() {
-        let commits = vec![test_commit("aaa", &["bbb"]), test_commit("bbb", &[])];
-        assert!(selection_survives(None, &commits));
-        assert!(selection_survives(Some("bbb"), &commits));
-        assert!(!selection_survives(Some("ccc"), &commits));
-        assert!(!selection_survives(Some("aaa"), &[]));
+    fn 换分支或过滤后首页落定_选择按仍在不在保留() {
+        let old: Vec<GitCommitInfo> = (0..6).map(|i| test_commit(&format!("c{i}"), &[])).collect();
+        let shift = ClickMods {
+            toggle: false,
+            range: true,
+        };
+        let mut sel = CommitSelection::default();
+        sel.click(&old, 1, ClickMods::default());
+        sel.click(&old, 4, shift);
+        assert_eq!(
+            detail_target_of(&sel, &old),
+            Some(DetailTarget::Multi(
+                ["c1", "c2", "c3", "c4"].map(String::from).to_vec()
+            ))
+        );
+
+        // 过滤后的新列表:c2、c4 不命中(c5 照旧在)
+        let filtered: Vec<GitCommitInfo> = ["c0", "c1", "c3", "c5"]
+            .iter()
+            .map(|h| test_commit(h, &[]))
+            .collect();
+        assert!(sel.retain(&filtered));
+        assert_eq!(
+            detail_target_of(&sel, &filtered),
+            Some(DetailTarget::Multi(["c1", "c3"].map(String::from).to_vec())),
+            "剩一组:按留下的这一组重新合并"
+        );
+
+        // 再换分支:只剩 c3 → 单提交详情
+        let branch: Vec<GitCommitInfo> = ["c3", "c9"].iter().map(|h| test_commit(h, &[])).collect();
+        assert!(sel.retain(&branch));
+        assert_eq!(
+            detail_target_of(&sel, &branch),
+            Some(DetailTarget::Single("c3".into()))
+        );
+
+        // 单选的提交都还在:什么都不变(详情不重拉)
+        assert!(!sel.retain(&branch));
+
+        // 全没了:清空,不展示详情
+        let other: Vec<GitCommitInfo> = vec![test_commit("x", &[])];
+        assert!(sel.retain(&other));
+        assert!(sel.is_empty());
+        assert_eq!(detail_target_of(&sel, &other), None);
+    }
+
+    /// 选中超过上限时只合并列表里最新的 [`MULTI_LIMIT`] 个。
+    #[test]
+    fn 多选合并目标有上限() {
+        let list: Vec<GitCommitInfo> = (0..MULTI_LIMIT + 5)
+            .map(|i| test_commit(&format!("h{i:04}"), &[]))
+            .collect();
+        let mut sel = CommitSelection::default();
+        sel.click(&list, 0, ClickMods::default());
+        sel.click(
+            &list,
+            list.len() - 1,
+            ClickMods {
+                toggle: false,
+                range: true,
+            },
+        );
+        assert_eq!(sel.len(), MULTI_LIMIT + 5);
+        let Some(DetailTarget::Multi(hashes)) = detail_target_of(&sel, &list) else {
+            panic!("应是多选目标");
+        };
+        assert_eq!(hashes.len(), MULTI_LIMIT);
+        assert_eq!(hashes[0], "h0000");
+        assert_eq!(hashes[MULTI_LIMIT - 1], format!("h{:04}", MULTI_LIMIT - 1));
     }
 
     /// 过滤条件:「仅我的」查不到邮箱时不算生效;路径是仓库根不算;几项都给时一起带下去。

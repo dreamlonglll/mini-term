@@ -1033,6 +1033,16 @@ pub fn get_commit_files(repo_path: &Path, commit_hash: &str) -> Result<Vec<Commi
     let repo = Repository::open(repo_path)?;
     let oid = git2::Oid::from_str(commit_hash)?;
     let commit = repo.find_commit(oid)?;
+    commit_files_in(&repo, &commit)
+}
+
+/// [`get_commit_files`] 的本体:拿已打开的仓库与提交算(合并查看多个提交时逐个调,
+/// 不必每个提交都重开一次仓库)。相对**第一个父**比(合并提交也只比第一父),根提交
+/// 对空树比。
+pub(crate) fn commit_files_in(
+    repo: &Repository,
+    commit: &Commit<'_>,
+) -> Result<Vec<CommitFileInfo>> {
     let tree = commit.tree()?;
 
     let parent_tree = if commit.parent_count() > 0 {
@@ -1096,42 +1106,72 @@ pub fn get_commit_file_diff(
         None
     };
 
-    let new_content = match tree.get_path(Path::new(file_path)) {
-        Ok(entry) => {
-            let obj = entry.to_object(&repo)?;
-            let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
-            if blob.is_binary() {
-                return Ok(binary_diff_result());
-            }
-            if blob.content().len() > MAX_DIFF_BYTES {
-                return Ok(too_large_diff_result());
-            }
-            std::str::from_utf8(blob.content())
-                .map_err(|_| anyhow!("binary"))?
-                .to_string()
-        }
-        Err(_) => String::new(),
-    };
-
     let old_lookup_path = old_file_path.unwrap_or(file_path);
-    let old_content = if let Some(ref pt) = parent_tree {
-        match pt.get_path(Path::new(old_lookup_path)) {
-            Ok(entry) => {
-                let obj = entry.to_object(&repo)?;
-                let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
-                if blob.is_binary() {
-                    return Ok(binary_diff_result());
-                }
-                std::str::from_utf8(blob.content())
-                    .map_err(|_| anyhow!("binary"))?
-                    .to_string()
-            }
-            Err(_) => String::new(),
-        }
-    } else {
-        String::new()
-    };
+    diff_tree_texts(
+        &repo,
+        parent_tree.as_ref().map(|t| (t, old_lookup_path)),
+        Some((&tree, file_path)),
+    )
+}
 
+/// 树里一个文件的文本内容(diff 的一侧)。
+enum TreeText {
+    Text(String),
+    Binary,
+    TooLarge,
+}
+
+/// 读 `tree` 里 `path` 这个文件的文本。树里没有这个路径(新增 / 删除的那一侧)当空文本;
+/// 不是 blob、不是 UTF-8 报错(与提交 diff 一直以来的口径一致)。`limit_size` 只给新的
+/// 那一侧开:超过 [`MAX_DIFF_BYTES`] 的整份不做 diff。
+fn read_tree_text(
+    repo: &Repository,
+    tree: &git2::Tree<'_>,
+    path: &str,
+    limit_size: bool,
+) -> Result<TreeText> {
+    let entry = match tree.get_path(Path::new(path)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(TreeText::Text(String::new())),
+    };
+    let obj = entry.to_object(repo)?;
+    let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
+    if blob.is_binary() {
+        return Ok(TreeText::Binary);
+    }
+    if limit_size && blob.content().len() > MAX_DIFF_BYTES {
+        return Ok(TreeText::TooLarge);
+    }
+    let text = std::str::from_utf8(blob.content()).map_err(|_| anyhow!("binary"))?;
+    Ok(TreeText::Text(text.to_string()))
+}
+
+/// 两棵树里各一个文件 → diff。`None` 的一侧当空文本(文件新增 / 删除)。
+///
+/// 判定顺序照旧:先读新的一侧(二进制 / 过大当场返回),再读旧的一侧(二进制返回)。
+/// 单提交 diff([`get_commit_file_diff`])与合并查看的两版本 diff
+/// ([`get_revision_file_diff`])共用这一份,口径不分叉。
+pub(crate) fn diff_tree_texts(
+    repo: &Repository,
+    old: Option<(&git2::Tree<'_>, &str)>,
+    new: Option<(&git2::Tree<'_>, &str)>,
+) -> Result<GitDiffResult> {
+    let new_content = match new {
+        Some((tree, path)) => match read_tree_text(repo, tree, path, true)? {
+            TreeText::Text(text) => text,
+            TreeText::Binary => return Ok(binary_diff_result()),
+            TreeText::TooLarge => return Ok(too_large_diff_result()),
+        },
+        None => String::new(),
+    };
+    let old_content = match old {
+        Some((tree, path)) => match read_tree_text(repo, tree, path, false)? {
+            TreeText::Text(text) => text,
+            TreeText::Binary => return Ok(binary_diff_result()),
+            TreeText::TooLarge => return Ok(too_large_diff_result()),
+        },
+        None => String::new(),
+    };
     Ok(diff_two_texts(old_content, new_content))
 }
 
@@ -2594,6 +2634,7 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
 // 编辑器 gutter 变更标记 / 注解(blame)的后端见 blame / line_diff 的模块注释
 mod blame;
 mod branch;
+mod combined;
 mod commit;
 mod conflict;
 mod hunk;
@@ -2607,6 +2648,7 @@ mod sync;
 mod tags;
 pub use blame::*;
 pub use branch::*;
+pub use combined::*;
 pub use commit::*;
 pub use conflict::*;
 pub use hunk::*;
