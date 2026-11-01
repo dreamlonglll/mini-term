@@ -107,6 +107,7 @@ mod prompt;
 mod pty_slot;
 mod redraw;
 mod remote_directory_picker;
+mod remote_notify;
 mod remote_project;
 mod search_modal;
 mod secrets;
@@ -747,7 +748,7 @@ impl Workspace {
         true
     }
 
-    /// 兑现一次提醒:提示音 / 任务栏闪烁 / toast。
+    /// 兑现一次提醒:提示音 / 任务栏闪烁 / 远程通知 / toast。
     ///
     /// toast 走自建的 [`toast`] 层。当初记的是 gpui-component `Notification` 的
     /// 四条**结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且
@@ -767,6 +768,12 @@ impl Workspace {
         }
         if alert.plan.flash {
             notify::flash_taskbar(window);
+        }
+        // 远程通知:几次 HTTPS 往返(每个渠道限时 10s),一律丢后台;失败只记日志
+        if let Some(remote) = alert.remote {
+            cx.background_executor()
+                .spawn(async move { remote_notify::deliver(remote) })
+                .detach();
         }
         let Some(kind) = alert.plan.toast else { return };
         toast::push_alert(kind, alert.project_id, alert.project_name, cx);

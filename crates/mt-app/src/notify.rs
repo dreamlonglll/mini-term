@@ -77,6 +77,9 @@ pub struct NotifyPrefs {
     pub sound: bool,
     pub flash: bool,
     pub popup: bool,
+    /// 远程通知(issue #87)真会往外推:总开关开着且至少勾了一个渠道
+    /// (`RemoteNotifyConfig::is_active`)。
+    pub remote: bool,
 }
 
 /// toast 的口径。前五种与旧版 `AiCompletionNotification['kind']` 同集
@@ -147,6 +150,12 @@ pub struct AlertPlan {
     pub toast: Option<ToastKind>,
     /// 项目行上的绿色「完成」标(只有完成才置,待确认不置 —— 语义对不上)。
     pub mark_needs_attention: bool,
+    /// 推一条远程通知(只会是 [`ToastKind::Completion`] / [`ToastKind::Attention`])。
+    ///
+    /// 判据与本地三个通道**同源**(完成的下降沿 / 待确认的上升沿),但不看本地开关、
+    /// 也不看是不是激活项目 —— 人不在电脑前时「就在眼前的项目」这条理由不成立。
+    /// 推不推只看远程通知自己的开关(不做「人离开了没有」的判断)。
+    pub remote: Option<ToastKind>,
 }
 
 impl AlertPlan {
@@ -235,6 +244,9 @@ impl DoneTracker {
                     plan.toast = Some(ToastKind::Completion);
                 }
             }
+            if prefs.remote {
+                plan.remote = Some(ToastKind::Completion);
+            }
         } else if is_attention_rise(t.old_attention, t.cause) {
             // 待确认固定随完成通知的三个通道提醒,没有单独的开关
             plan.sound = prefs.sound;
@@ -242,6 +254,9 @@ impl DoneTracker {
             // 不设 needsAttention:那是项目行上绿色的「完成」标,语义对不上
             if !t.project_active && prefs.popup {
                 plan.toast = Some(ToastKind::Attention);
+            }
+            if prefs.remote {
+                plan.remote = Some(ToastKind::Attention);
             }
         }
         plan
@@ -696,6 +711,17 @@ mod tests {
             sound: true,
             flash: true,
             popup: true,
+            remote: false,
+        }
+    }
+
+    /// 只开远程通知、本地三个通道全关。
+    fn remote_only() -> NotifyPrefs {
+        NotifyPrefs {
+            sound: false,
+            flash: false,
+            popup: false,
+            remote: true,
         }
     }
 
@@ -975,14 +1001,70 @@ mod tests {
             sound: false,
             flash: false,
             popup: false,
+            remote: false,
         };
         let plan = tracker.apply(
             &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),
             &prefs,
         );
         assert!(!plan.sound && !plan.flash && plan.toast.is_none());
+        assert!(plan.remote.is_none());
         assert!(plan.mark_needs_attention, "项目行的完成标不受通知开关管辖");
         assert_eq!(tracker.unread_count(), 1, "记账与提醒是两件事");
+    }
+
+    /// 远程通知与本地通道各管各的:本地全关也照推;激活项目、窗口聚焦、正盯着这个
+    /// pane 都不拦(人在不在电脑前不判断)。
+    #[test]
+    fn 远程通知不看本地开关与焦点() {
+        let mut tracker = DoneTracker::default();
+        let mut t = transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop"));
+        t.project_active = true;
+        t.window_focused = true;
+        t.pane_focused = true;
+        let plan = tracker.apply(&t, &remote_only());
+        assert_eq!(plan.remote, Some(ToastKind::Completion));
+        assert!(!plan.sound && !plan.flash && plan.toast.is_none());
+        assert!(!plan.is_empty(), "只有远程一项也得交给调用方兑现");
+
+        let plan = tracker.apply(
+            &transition(
+                PaneStatus::AiIdle,
+                PaneStatus::AiIdle,
+                Some("PermissionRequest"),
+            ),
+            &remote_only(),
+        );
+        assert_eq!(plan.remote, Some(ToastKind::Attention));
+    }
+
+    /// 远程通知沿用同一套去重:重复 Stop、黄灯已亮时的同类事件、非完成的 ai-idle
+    /// 事件一律不推 —— 手机上的误报比本地响一声代价大得多。
+    #[test]
+    fn 远程通知沿用本地的去重口径() {
+        let mut tracker = DoneTracker::default();
+        let done = transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop"));
+        assert!(tracker.apply(&done, &remote_only()).remote.is_some());
+        let again = transition(PaneStatus::AiIdle, PaneStatus::AiIdle, Some("Stop"));
+        assert!(tracker.apply(&again, &remote_only()).remote.is_none());
+        for cause in ["Notification", "Interrupt", "Stall", "Quiet"] {
+            let t = transition(PaneStatus::AiIdle, PaneStatus::AiIdle, Some(cause));
+            assert!(
+                tracker.apply(&t, &remote_only()).remote.is_none(),
+                "{cause}"
+            );
+        }
+
+        let mut t = transition(
+            PaneStatus::AiWorking,
+            PaneStatus::AiIdle,
+            Some("PermissionRequest"),
+        );
+        t.old_attention = true;
+        assert!(
+            tracker.apply(&t, &remote_only()).remote.is_none(),
+            "黄灯已亮 → 不再推"
+        );
     }
 
     /// 窗口聚焦时「未读」清空,但完成排队**不动** —— 两份口径本来就不同,

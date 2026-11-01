@@ -134,6 +134,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙。常驻的 sidecar daemon 懒加载的钥匙解不开（`Undecryptable`）时会重读一次密钥文件，文件确实换过（主程序重建了 `credential.key`）才换上新钥匙再解一次；`install` 登记的钥匙从不重载
 - **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
 - **中转桌面密钥同一套**：`mobileRelay.desktopKey` 与 SSH 密码同一把钥匙、同一迁移时机（`ConfigStore::load`）与兜底封存；封存点 `AppStore::set_mobile_relay_endpoint`，解封点 `mobile_relay::install`（建连）与 `mobile_panel::open`（回填），交给 mt-relay 的是明文。空串 = 未填不封存；解不开按未填写处理（中转回「密钥不正确」后停住）并在面板就地标红
+- **远程通知凭据同一套**（issue #87）：`remoteNotify` 的 Bark 设备 key / Telegram bot token / Webhook URL 与中转密钥同口径（同一迁移时机与兜底封存，空串不封存）；封存点 `AppStore::set_remote_notify_secret`，解封点 `remote_notify::build_request`（发送那一刻）与设置页回填（`settings::pages_remote_notify`）。发送走 mt-app 的 `remote_notify.rs`（判据复用 `notify::DoneTracker`，`AlertPlan.remote`），reqwest 错误一律 `without_url()`——token 就在 URL 里
 - **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
 - `mt-secret` 的依赖表只许有 mt-core / ring / base64 / serde / serde_json / zeroize，Windows 另加 DPAPI 用的 windows-sys（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
 

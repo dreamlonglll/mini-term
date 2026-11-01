@@ -285,6 +285,89 @@ pub struct AppConfig {
     /// 哪台机器上都是同一句。空库序列化跳过,旧配置缺字段按空库读。
     #[serde(default, skip_serializing_if = "CommandLibrary::is_empty")]
     pub command_library: CommandLibrary,
+    /// 远程通知(issue #87):AI 任务完成 / 停下来等你处理时,经 Bark / Telegram /
+    /// 通用 Webhook 推到手机。与本地三个通道(弹框 / 闪烁 / 提示音)各管各的;
+    /// 全缺省(总开关关、三个渠道都没配)时序列化跳过。
+    #[serde(default, skip_serializing_if = "RemoteNotifyConfig::is_default")]
+    pub remote_notify: RemoteNotifyConfig,
+}
+
+/// 远程通知配置(`remoteNotify`)。
+///
+/// **每个渠道各带启用位**:总开关打开后按渠道多选,未勾选的渠道配置照样留着,
+/// 下次勾上不必重填。三处凭据(Bark 设备 key / Telegram bot token / Webhook URL)
+/// 在库里**一律是 [`mt_secret`] 信封**,与 SSH 密码、中转桌面密钥同一套(见
+/// [`ConfigStore`] 的「密码封存」段):泄露出去的 bot token 能冒充机器人,
+/// Webhook URL 里常带着 token(Server酱的 sendkey、企业微信机器人的 key)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteNotifyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub bark: BarkChannel,
+    #[serde(default)]
+    pub telegram: TelegramChannel,
+    #[serde(default)]
+    pub webhook: WebhookChannel,
+}
+
+impl RemoteNotifyConfig {
+    /// 与缺省值逐字段相等(`skip_serializing_if` 用)。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 真会往外推:总开关开着且至少勾了一个渠道。
+    pub fn is_active(&self) -> bool {
+        self.enabled && (self.bark.enabled || self.telegram.enabled || self.webhook.enabled)
+    }
+}
+
+/// Bark(iOS 推送 App)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BarkChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 服务器地址;空串 = 官方 `https://api.day.app`(自建 bark-server 时填)。
+    #[serde(default)]
+    pub server: String,
+    /// 设备 key(信封)。
+    #[serde(default)]
+    pub device_key: String,
+}
+
+/// Telegram 机器人。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// bot token(信封)。
+    #[serde(default)]
+    pub bot_token: String,
+    /// 收消息的 chat id(私聊是数字,频道可以是 `@name`)。不是凭据,不封存。
+    #[serde(default)]
+    pub chat_id: String,
+    /// Bot API 地址;空串 = 官方 `https://api.telegram.org`(走反代时填)。
+    #[serde(default)]
+    pub api_base: String,
+}
+
+/// 通用 Webhook:POST 一段 JSON 到任意地址(ntfy / Server酱 / 企业微信 / 飞书 /
+/// 钉钉机器人 / Gotify / Discord 等都能接)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookChannel {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 目标地址(信封 —— 常带 token)。
+    #[serde(default)]
+    pub url: String,
+    /// 请求体模板(JSON,`{{title}}` 这类占位符);空串 = 发默认 JSON。不封存。
+    #[serde(default)]
+    pub body: String,
 }
 
 /// 命令库里的一条(`commandLibrary.commands[]`)。
@@ -785,6 +868,7 @@ impl Default for AppConfig {
             usage_custom_from: None,
             usage_custom_to: None,
             command_library: CommandLibrary::default(),
+            remote_notify: RemoteNotifyConfig::default(),
         }
     }
 }
@@ -1167,6 +1251,10 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// 不封存。解封在 mt-app 边界(`secrets::reveal_relay_key`),交给 mt-relay 的
 /// 仍是明文。
 ///
+/// 远程通知的三处凭据(`remoteNotify` 的 Bark 设备 key / Telegram bot token /
+/// Webhook URL)同样搭这一套,口径与中转密钥一致(只在库与备份里,空串不封存)。
+/// 字段晚于配置入库,存档里不可能有,存档那一步不管它们。
+///
 /// 令牌是一个乐观并发计数:[`load`](Self::load) 每成功一次就轮换,
 /// [`save`](Self::save) 必须携带当前令牌才允许写盘。不变量:**写盘的每一份配置,
 /// 必然派生自当次成功的 load** ——
@@ -1392,14 +1480,17 @@ impl ConfigStore {
             }
         };
         let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault)
-            + usize::from(seal_plaintext_relay_key(config, &vault));
+            + usize::from(seal_plaintext_relay_key(config, &vault))
+            + seal_plaintext_push_secrets(&mut config.remote_notify, &vault);
         if sealed > 0 {
             match db
                 .save(config)
                 .and_then(|()| db.scrub_after_secret_rewrite())
             {
                 Ok(()) => {
-                    eprintln!("[config] 已把 {sealed} 条凭据(SSH 密码 / 中转密钥)封存进 config.db")
+                    eprintln!(
+                        "[config] 已把 {sealed} 条凭据(SSH 密码 / 中转密钥 / 推送凭据)封存进 config.db"
+                    )
                 }
                 Err(err) => {
                     eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
@@ -1454,7 +1545,10 @@ impl ConfigStore {
     /// 落盘前的兜底:还有明文密码(或中转密钥)就克隆一份封存后再写,没有就原样借用。
     /// 凭据库开不起来只记日志、原样写(与加载时同一条降级)。
     fn sealed_for_disk<'a>(&self, config: &'a AppConfig) -> Cow<'a, AppConfig> {
-        if !has_plaintext_password(&config.ssh_connections) && !has_plaintext_relay_key(config) {
+        if !has_plaintext_password(&config.ssh_connections)
+            && !has_plaintext_relay_key(config)
+            && !has_plaintext_push_secret(&config.remote_notify)
+        {
             return Cow::Borrowed(config);
         }
         let vault = match self.vault() {
@@ -1466,8 +1560,9 @@ impl ConfigStore {
         };
         let mut owned = config.clone();
         let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault)
-            + usize::from(seal_plaintext_relay_key(&mut owned, &vault));
-        eprintln!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥)");
+            + usize::from(seal_plaintext_relay_key(&mut owned, &vault))
+            + seal_plaintext_push_secrets(&mut owned.remote_notify, &vault);
+        eprintln!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥 / 推送凭据)");
         Cow::Owned(owned)
     }
 
@@ -1535,6 +1630,45 @@ fn seal_plaintext_relay_key(config: &mut AppConfig, vault: &Vault) -> bool {
             false
         }
     }
+}
+
+/// 远程通知的三处凭据,按固定顺序给出可改引用(判据与封存共用这一张表)。
+fn push_secrets_mut(notify: &mut RemoteNotifyConfig) -> [(&'static str, &mut String); 3] {
+    [
+        ("Bark 设备 key", &mut notify.bark.device_key),
+        ("Telegram bot token", &mut notify.telegram.bot_token),
+        ("Webhook URL", &mut notify.webhook.url),
+    ]
+}
+
+/// 远程通知的凭据里还有明文吗。
+fn has_plaintext_push_secret(notify: &RemoteNotifyConfig) -> bool {
+    [
+        &notify.bark.device_key,
+        &notify.telegram.bot_token,
+        &notify.webhook.url,
+    ]
+    .into_iter()
+    .any(|value| is_plaintext_secret(value))
+}
+
+/// 把远程通知凭据里的明文换成信封。返回改了几条;单条封存失败只记日志、原样保留
+/// (下次再试)。日志不含凭据。
+fn seal_plaintext_push_secrets(notify: &mut RemoteNotifyConfig, vault: &Vault) -> usize {
+    let mut sealed = 0;
+    for (label, value) in push_secrets_mut(notify) {
+        if !is_plaintext_secret(value) {
+            continue;
+        }
+        match vault.seal(value) {
+            Ok(envelope) => {
+                *value = envelope;
+                sealed += 1;
+            }
+            Err(err) => eprintln!("[config] 远程通知 {label} 封存失败,保持原样: {err}"),
+        }
+    }
+    sealed
 }
 
 /// 把 `sshConnections[].password` 里的明文换成信封。返回改了几条;单条封存失败
@@ -3347,6 +3481,111 @@ mod tests {
             "空串是「未填」,不该变成一个信封"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    fn notify_with_secrets(bark: &str, token: &str, url: &str) -> RemoteNotifyConfig {
+        RemoteNotifyConfig {
+            enabled: true,
+            bark: BarkChannel {
+                enabled: true,
+                server: String::new(),
+                device_key: bark.into(),
+            },
+            telegram: TelegramChannel {
+                enabled: true,
+                bot_token: token.into(),
+                chat_id: "123456".into(),
+                api_base: String::new(),
+            },
+            webhook: WebhookChannel {
+                enabled: false,
+                url: url.into(),
+                body: String::new(),
+            },
+        }
+    }
+
+    /// 远程通知的三处凭据与中转密钥同一口径:加载时把旧版本落下的明文封存、库里
+    /// 连字节都不留;`save` 兜底再封一次;空串 = 未填,不封存;非凭据字段原样。
+    #[test]
+    fn 远程通知凭据加载与写盘都封存且空串不封() {
+        let root = unique_test_root("seal-push-secrets");
+        let path = root.join("config.json");
+        const BARK: &str = "BarkK3yPlain";
+        const TOKEN: &str = "123:TgT0kenPlain";
+        const URL: &str = "https://hook.example.com/send?key=W3bhookPlain";
+        {
+            let db = crate::db::ConfigDb::open_at(&root).unwrap();
+            let config = AppConfig {
+                remote_notify: notify_with_secrets(BARK, TOKEN, URL),
+                ..AppConfig::default()
+            };
+            db.save(&config).unwrap();
+        }
+
+        let store = ConfigStore::at(&path);
+        let loaded = store.load().unwrap();
+        let notify = loaded.config.remote_notify.clone();
+        let vault = store.vault().unwrap();
+        for (stored, plain) in [
+            (&notify.bark.device_key, BARK),
+            (&notify.telegram.bot_token, TOKEN),
+            (&notify.webhook.url, URL),
+        ] {
+            assert!(mt_secret::is_sealed(stored), "内存里已是信封: {stored}");
+            assert_eq!(vault.reveal(stored).unwrap(), plain);
+        }
+        assert_eq!(notify.telegram.chat_id, "123456", "chat id 不是凭据,原样");
+        assert!(notify.is_active());
+        for file in ["config.db", "config.db.bak", "config.json"] {
+            let bytes = fs::read(root.join(file)).unwrap();
+            for plain in [BARK, TOKEN, URL] {
+                assert!(
+                    !contains_bytes(&bytes, plain.as_bytes()),
+                    "{file} 里不该再有明文 {plain}"
+                );
+            }
+        }
+
+        // 写盘兜底:交来明文照样封;清空的凭据存空串
+        let token = loaded.token;
+        let config = AppConfig {
+            remote_notify: notify_with_secrets(BARK, "", ""),
+            ..AppConfig::default()
+        };
+        store.save(token, &config).unwrap();
+        let back = store.read().remote_notify;
+        assert!(mt_secret::is_sealed(&back.bark.device_key));
+        assert_eq!(back.telegram.bot_token, "", "空串是「未填」,不该变成信封");
+        assert_eq!(back.webhook.url, "");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 全缺省时整块不落盘;旧配置缺这一块按缺省读。
+    #[test]
+    fn 远程通知缺省不序列化且缺字段按缺省读() {
+        let json = serde_json::to_value(AppConfig::default()).unwrap();
+        assert!(json.get("remoteNotify").is_none());
+        // 旧配置:整份缺省配置本来就不带这个键,读回来就是「缺字段」的情形
+        let config: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(config.remote_notify.is_default());
+        assert!(!config.remote_notify.is_active());
+
+        let mut notify = RemoteNotifyConfig {
+            enabled: true,
+            ..RemoteNotifyConfig::default()
+        };
+        assert!(!notify.is_active(), "开了总开关但一个渠道都没勾 → 不推");
+        notify.webhook.enabled = true;
+        assert!(notify.is_active());
+        let config = AppConfig {
+            remote_notify: notify.clone(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["remoteNotify"]["webhook"]["enabled"], true);
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.remote_notify, notify);
     }
 
     fn project_stub() -> ProjectConfig {
