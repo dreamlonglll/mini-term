@@ -179,8 +179,12 @@ use mt_i18n::{
 /// 不再能收起，`gitLog.detail.{collapse,expand}` 随之下线。
 /// 1456 → 1457（issue #86）：终端内置 Nerd Font 图标回退，设置页字体区多一行说明
 /// （`settings.font.nerdIconsBuiltin`）。
+/// 1457 → 1509（issue #87）：远程通知 —— 设置页新分页（`settings.menu.remoteNotify`）与页内
+/// 开关 / 渠道多选 / 测试发送 / 手机端链接说明（`settings.remoteNotify.*` 15 条）、三个渠道的
+/// 表单文案（`.bark.*` 6 / `.telegram.*` 8 / `.webhook.*` 6）、推送正文（`.msg.*` 9）与
+/// 错误提示（`.err.*` 7）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1457;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1509;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -4,6 +4,8 @@
  * - 扫码首连:URL hash 携带一次性配对码(#pair=CODE),兑换长期凭证存 localStorage
  * - 重开/断线:凭凭证自动重连(指数退避,封顶 30s;页面回前台立即重试)
  * - 被吊销(新设备顶替/桌面端重置):清除凭证,提示重新扫码,不再重连
+ * - 通知深链:桌面端远程通知附的 `#pane=ID`,连上后在快照里找到该 pane 就直接进它的
+ *   对话镜像;找不到(会话已结束)停在列表页
  */
 import { create } from 'zustand';
 import {
@@ -134,16 +136,53 @@ function clearCredential() {
   }
 }
 
-/** 从 URL hash 取一次性配对码(#pair=CODE),读后立即清除避免刷新重放。 */
-function consumePairingCode(): string | null {
-  const m = /[#&]pair=([A-Za-z0-9-]+)/.exec(window.location.hash);
-  if (!m) return null;
+/** 清掉 URL hash(配对码 / 深链读过即清,避免刷新重放)。 */
+function clearHash() {
   try {
     history.replaceState(null, '', window.location.pathname + window.location.search);
   } catch {
     /* ignore */
   }
+}
+
+/** 从 URL hash 取一次性配对码(#pair=CODE),读后立即清除避免刷新重放。 */
+function consumePairingCode(): string | null {
+  const m = /[#&]pair=([A-Za-z0-9-]+)/.exec(window.location.hash);
+  if (!m) return null;
+  clearHash();
   return m[1];
+}
+
+/**
+ * 通知深链(#pane=ID):桌面端远程通知里附的那条,点开直接进该会话的对话镜像。
+ * 只读不清 —— 清 hash 由调用方统一做(与配对码同在一条 URL 里时不能先被抹掉)。
+ */
+function readPaneLink(): string | null {
+  const m = /[#&]pane=([A-Za-z0-9_-]+)/.exec(window.location.hash);
+  return m ? m[1] : null;
+}
+
+/**
+ * 等着打开的深链 pane。只试一次:收到快照时找得到就进镜像,找不到说明会话已经结束,
+ * 留在列表页(再等下去只会在用户已经在看别的东西时突然跳走)。
+ */
+let pendingPaneId: string | null = null;
+
+/**
+ * 这条连接收到过 sessionsSnapshot 没有(每次建连复位)。握手成功到首份快照之间
+ * (桌面端离线时这段可以很长)项目列表是空的或上一条连接的陈旧数据,深链在这期间
+ * 只能挂起等快照,不能当场按列表判「找不到」丢掉。
+ */
+let snapshotReady = false;
+
+/** 打开深链指向的 pane;已在看它就不动,在看别的就先退订再进。 */
+function openPaneLink(paneId: string) {
+  const { projects, mirror } = useRelayStore.getState();
+  const pane = findPane(projects, paneId);
+  if (!pane) return;
+  if (mirror?.paneId === pane.paneId && !mirror.closed) return;
+  if (mirror) closeMirror();
+  openMirror(pane.paneId, pane.title);
 }
 
 function wsUrl(): string {
@@ -165,6 +204,7 @@ function backoffMs(attempt: number): number {
 
 function connect(auth: { pairingCode?: string; credential?: string }) {
   stopped = false;
+  snapshotReady = false;
   if (auth.pairingCode) {
     setPhase('pairing');
   } else {
@@ -227,7 +267,13 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
           projects: msg.projects,
           launchers: msg.launchers ?? [],
         });
+        snapshotReady = true;
         onProjectsChanged();
+        if (pendingPaneId) {
+          const paneId = pendingPaneId;
+          pendingPaneId = null;
+          openPaneLink(paneId);
+        }
         break;
       case 'sessionsDelta': {
         const { projects } = useRelayStore.getState();
@@ -586,7 +632,10 @@ export function refreshSessions(): boolean {
 
 /** 应用启动入口:优先兑换 URL 里的配对码,否则凭本地凭证重连。 */
 export function startRelay() {
+  // 深链先读(配对码那一步会把整个 hash 清掉);连上后的首个快照里兑现
+  pendingPaneId = readPaneLink();
   const code = consumePairingCode();
+  if (pendingPaneId && !code) clearHash();
   if (code) {
     // 扫了新码就走新配对(顶替旧凭证),即使本地已有凭证
     connect({ pairingCode: code });
@@ -599,6 +648,20 @@ export function startRelay() {
     setPhase('idle');
   }
 }
+
+// 页面已经开着时再点一条通知:同一文档只换了 hash,不会重新走 startRelay。
+// 这条连接已收到过快照就当场打开;还在连、或连上了但快照没到(桌面端离线),
+// 就记下,等快照到了再兑现 —— 与冷启动走 startRelay 的那条路同一口径。
+window.addEventListener('hashchange', () => {
+  const paneId = readPaneLink();
+  if (!paneId) return;
+  clearHash();
+  if (useRelayStore.getState().phase === 'connected' && snapshotReady) {
+    openPaneLink(paneId);
+  } else {
+    pendingPaneId = paneId;
+  }
+});
 
 // 手机浏览器切后台常导致连接被杀:回前台且处于重连等待时立即重试
 document.addEventListener('visibilitychange', () => {

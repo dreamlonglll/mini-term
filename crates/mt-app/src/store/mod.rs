@@ -332,6 +332,8 @@ pub struct PendingAlert {
     pub project_name: String,
     /// 自定义提示音路径(`config.aiCompletionSoundPath`)。
     pub sound_path: Option<String>,
+    /// 要推的远程通知(`plan.remote` 有值时由 store 拼好:配置快照 + 文案 + 手机端链接)。
+    pub remote: Option<crate::remote_notify::RemoteAlert>,
 }
 
 /// 启动时持久化层的降级:本次运行哪些改动存不下来,以及原因。

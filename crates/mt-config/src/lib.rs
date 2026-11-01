@@ -42,11 +42,12 @@ mod config;
 mod db;
 
 pub use config::{
-    AiLauncher, AppConfig, CommandLibrary, ConfigStore, EditorConfig, LoadedConfig,
+    AiLauncher, AppConfig, BarkChannel, CommandLibrary, ConfigStore, EditorConfig, LoadedConfig,
     MobileRelayConfig, OldProjectGroup, ProjectConfig, ProjectEnvVar, ProjectGroup,
-    ProjectTreeItem, SaveError, SavedAiSession, SavedCommand, SavedLineageEdge, SavedPane,
-    SavedProjectLayout, SavedSplitNode, SavedTab, ShellConfig, SshConnection,
-    default_remote_paste_dir, migrate_config, normalize_saved_layout, read_config_from,
+    ProjectTreeItem, RemoteNotifyConfig, SaveError, SavedAiSession, SavedCommand, SavedLineageEdge,
+    SavedPane, SavedProjectLayout, SavedSplitNode, SavedTab, ShellConfig, SshConnection,
+    TelegramChannel, WebhookChannel, default_remote_paste_dir, migrate_config,
+    normalize_saved_layout, read_config_from,
 };
 pub use mt_theme_packs::{ThemePackData, ThemePackEntry, ThemePacks};
 pub use paths::{

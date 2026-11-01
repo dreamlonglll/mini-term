@@ -434,6 +434,12 @@ pub fn pair_url(relay_url: &str, code: &str) -> String {
     format!("{}/#pair={code}", relay_http_base(relay_url))
 }
 
+/// 直达某个会话的深链(远程通知里附的那条):PWA 连上后在快照里找到这个 pane
+/// 就直接进它的对话镜像,找不到(会话已结束)停在列表页。
+pub fn pane_url(relay_url: &str, pane_id: &str) -> String {
+    format!("{}/#pane={pane_id}", relay_http_base(relay_url))
+}
+
 /// 二维码画布边长(原版 `QRCode.toDataURL(.., { width: 260 })`)。
 pub const QR_CANVAS_PX: f32 = 260.0;
 /// 静区宽度,单位是**模块**不是像素。
@@ -1037,6 +1043,10 @@ mod tests {
     fn 中转地址去掉尾部斜杠且忽略首尾空白() {
         assert_eq!(relay_http_base("  wss://r.example.com///  "), "https://r.example.com");
         assert_eq!(pair_url("wss://r.example.com/", "AB12"), "https://r.example.com/#pair=AB12");
+        assert_eq!(
+            pane_url("ws://192.168.1.5:8080/", "pane-7"),
+            "http://192.168.1.5:8080/#pane=pane-7"
+        );
     }
 
     // ── 二维码几何 ─────────────────────────────────────────

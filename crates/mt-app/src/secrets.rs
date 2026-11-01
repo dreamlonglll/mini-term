@@ -16,6 +16,11 @@
 //! [`crate::store::AppStore::set_mobile_relay_endpoint`]([`stored_relay_key`]),
 //! 解封点两处 —— 启动建连(`mobile_relay::install`)与面板回填(`mobile_panel::open`),
 //! 都走 [`reveal_relay_key`]。解开后的明文交给 mt-relay,mt-relay 本身不认识信封。
+//!
+//! 远程通知的三处凭据(Bark 设备 key / Telegram bot token / Webhook URL)同一口径:
+//! 封存点 [`crate::store::AppStore::set_remote_notify_secret`]([`stored_secret`]),
+//! 解封点两处 —— 发送那一刻(`remote_notify::build_request`)与设置页回填
+//! (`settings::pages_remote_notify`),都走 [`reveal_secret`]。
 
 use gpui::App;
 
@@ -48,10 +53,21 @@ pub fn reveal_password(stored: &str) -> Result<String, String> {
 /// 解不开时反倒要提示用户「重新填写」一个本来就没填过的东西。其余与
 /// [`stored_password`] 同一口径(没改就沿用旧信封,不白白换 nonce 改写库)。
 pub fn stored_relay_key(plain: &str, existing: &str) -> Result<String, String> {
+    stored_secret(plain, existing)
+}
+
+/// 「空串 = 未填」类凭据的通用封存口径(中转桌面密钥、远程通知的三处凭据):
+/// 空串原样存空,其余与 [`stored_password`] 相同(没改就沿用旧信封)。
+pub fn stored_secret(plain: &str, existing: &str) -> Result<String, String> {
     if plain.is_empty() {
         return Ok(String::new());
     }
     stored_password(plain, Some(existing))
+}
+
+/// [`stored_secret`] 的反方向:遗留明文与空串原样放行,解不开给可展示的原因。
+pub fn reveal_secret(stored: &str) -> Result<String, String> {
+    reveal_password(stored)
 }
 
 /// 已存的中转桌面密钥 → 交给 mt-relay 的明文。遗留明文与空串原样放行。

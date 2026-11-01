@@ -326,6 +326,8 @@ impl AppStore {
                 let mut pane_id = String::new();
                 let mut old_status = PaneStatus::Idle;
                 let mut old_attention = false;
+                // 远程通知的「哪家 AI」:hook 上报的优先,退到 pane 上已认出的
+                let mut agent: Option<String> = None;
                 'projects: for (pid, state) in self.project_states.iter_mut() {
                     let mut hit = false;
                     // 跨全部面板找:后台面板里的 AI 状态一样要亮灯
@@ -342,6 +344,10 @@ impl AppStore {
                         old_status = pane.status;
                         old_attention = pane.attention;
                         pane_id = pane.id.clone();
+                        agent = change
+                            .agent
+                            .clone()
+                            .or_else(|| pane.ai_agent().map(str::to_string));
                         layout.update_status_by_pty(
                             change.pty_id,
                             status,
@@ -392,14 +398,35 @@ impl AppStore {
                 if plan.is_empty() {
                     return None;
                 }
+                let project_name = self
+                    .project(&owner)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| owner.clone());
+                let remote = plan.remote.map(|kind| {
+                    let pane_label = self
+                        .project_states
+                        .get(&owner)
+                        .and_then(|state| state.all_panes().into_iter().find(|p| p.id == pane_id))
+                        .map(|pane| self.pane_display_label(&owner, pane))
+                        .unwrap_or_default();
+                    crate::remote_notify::RemoteAlert {
+                        config: self.config.remote_notify.clone(),
+                        message: crate::remote_notify::compose(
+                            kind,
+                            change.cause.as_deref(),
+                            &project_name,
+                            agent.as_deref(),
+                            &pane_label,
+                            self.mobile_pwa_link(Some(&pane_id)),
+                        ),
+                    }
+                });
                 Some(PendingAlert {
                     plan,
-                    project_name: self
-                        .project(&owner)
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| owner.clone()),
+                    project_name,
                     project_id: owner,
                     sound_path: self.config.ai_completion_sound_path.clone(),
+                    remote,
                 })
             }
             AiEvent::Session(identity) => {
@@ -439,6 +466,7 @@ impl AppStore {
             sound: self.config.ai_completion_sound,
             flash: self.config.ai_completion_taskbar_flash,
             popup: self.config.ai_completion_popup,
+            remote: self.config.remote_notify.is_active(),
         }
     }
 

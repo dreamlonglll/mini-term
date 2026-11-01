@@ -1,11 +1,11 @@
 //! 偏好与配置写入相关的 `AppStore` 方法:AI 历史面板视图、用量面板偏好、主题、
 //! shell 列表、全局终端环境变量、通用配置补丁、终端渲染参数、终端重绘帧率、
-//! 界面字号/字族、AI 感知取数口、界面语言、pane 重命名、移动端中转。
+//! 界面字号/字族、AI 感知取数口、界面语言、pane 重命名、移动端中转、远程通知。
 //!
 //! 从 `store.rs` 原样搬来的一串段落,段注释随代码走,逻辑一行未改。
 
 use gpui::{App, Context, Entity, Window};
-use mt_config::{AiLauncher, AppConfig, MobileRelayConfig, ProjectEnvVar};
+use mt_config::{AiLauncher, AppConfig, MobileRelayConfig, ProjectEnvVar, RemoteNotifyConfig};
 use mt_relay::MobileRelayStatusPayload;
 use mt_ui::theme_bridge::BackgroundArt;
 
@@ -552,5 +552,63 @@ impl AppStore {
         self.config.mobile_relay = Some(relay);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::MobileRelay));
+    }
+
+    /// 手机端(PWA)链接:配了中转地址才有。`pane_id` 给了就带 `#pane=` 深链,
+    /// 点开直接进那个会话的对话镜像(PWA 侧认法见 `mobile/src/relay.ts`)。
+    ///
+    /// 只看地址不看配对状态:手机还没配对时点开是「去桌面端扫码」那一屏,
+    /// 本身就是正确的指引。
+    pub fn mobile_pwa_link(&self, pane_id: Option<&str>) -> Option<String> {
+        let relay = self.config.mobile_relay.as_ref()?;
+        if relay.relay_url.trim().is_empty() {
+            return None;
+        }
+        Some(match pane_id {
+            Some(pane_id) => crate::mobile_relay::pane_url(&relay.relay_url, pane_id),
+            None => crate::mobile_relay::relay_http_base(&relay.relay_url),
+        })
+    }
+
+    // === 远程通知(issue #87)===
+
+    /// 远程通知的非凭据字段(开关 / 渠道勾选 / 服务器地址 / chat id / 模板)。
+    ///
+    /// 立即落盘而不是 500ms 防抖:与中转配置同一条理由 —— 用户填完点「测试发送」
+    /// 就关掉应用,配置不该丢。
+    pub fn patch_remote_notify(
+        &mut self,
+        edit: impl FnOnce(&mut RemoteNotifyConfig),
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.config.remote_notify.clone();
+        edit(&mut self.config.remote_notify);
+        if self.config.remote_notify == before {
+            return;
+        }
+        self.save_config_now();
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
+    /// 写一处远程通知凭据(`plain` 是设置页交来的明文)。
+    ///
+    /// **在这里封存**,与 [`Self::set_mobile_relay_endpoint`] 同一口径:封存失败就
+    /// **不存**(清成空串)并把原因交给调用方就地提示 —— 宁可让用户再填一次,也不把
+    /// 明文写进库。没改(与旧信封解出来一致)就沿用旧信封,不白白改写库。
+    pub fn set_remote_notify_secret(
+        &mut self,
+        secret: crate::remote_notify::PushSecret,
+        plain: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let existing = secret.stored(&self.config.remote_notify).to_string();
+        let sealed = crate::secrets::stored_secret(plain, &existing);
+        let next = sealed.clone().unwrap_or_default();
+        if next != existing {
+            *secret.slot(&mut self.config.remote_notify) = next;
+            self.save_config_now();
+            cx.changed(StoreEvent::Config(ConfigSection::Settings));
+        }
+        sealed.map(|_| ())
     }
 }

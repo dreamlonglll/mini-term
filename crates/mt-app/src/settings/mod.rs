@@ -1,5 +1,5 @@
-//! 设置面板:两级侧栏 + 11 个分页。逐页对照 `src/components/SettingsModal.tsx`
-//! (「环境变量」页是 GPUI 版新增的,原版没有)。
+//! 设置面板:两级侧栏 + 12 个分页。逐页对照 `src/components/SettingsModal.tsx`
+//! (「环境变量」「远程通知」两页是 GPUI 版新增的,原版没有)。
 //!
 //! ```text
 //! ┌──────────────┬────────────────────────────────────────┐
@@ -46,8 +46,8 @@
 //! # 目录划分
 //!
 //! 本模块只留**面板本体**:分页枚举与侧栏分组、[`SettingsView`] 的状态字段、
-//! 草稿行的归一与提交、`open_settings` 与分页路由。十一个分页各自的渲染按主题
-//! 分在五个 `pages_*` 里,共用小件在 `widgets`:
+//! 草稿行的归一与提交、`open_settings` 与分页路由。十二个分页各自的渲染按主题
+//! 分在六个 `pages_*` 里,共用小件在 `widgets`:
 //!
 //! | 文件 | 内容 |
 //! |------|------|
@@ -55,6 +55,7 @@
 //! | `pages_env_vars` | env-vars(全局终端环境变量,表格与项目弹窗共用 `crate::env_vars`) |
 //! | `pages_appearance` | appearance(语言 / 主题 / 外置皮肤)/ font |
 //! | `pages_ai` | ai-notification / ai-hook |
+//! | `pages_remote_notify` | remote-notify(Bark / Telegram / Webhook 远程通知,发送在 `crate::remote_notify`) |
 //! | `pages_system` | system / editor / shortcuts / about |
 //! | `widgets` | 页/节骨架、设置行原语与零碎视图件 |
 //!
@@ -81,11 +82,13 @@ use crate::update_check::ReleaseInfo;
 mod pages_ai;
 mod pages_appearance;
 mod pages_env_vars;
+mod pages_remote_notify;
 mod pages_system;
 mod pages_terminal;
 mod widgets;
 
 use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
+use pages_remote_notify::RemoteNotifyForm;
 
 // ─── 分页 ─────────────────────────────────────────────────────
 
@@ -103,6 +106,8 @@ pub enum SettingsPage {
     Appearance,
     Font,
     AiNotification,
+    /// 远程通知(issue #87)。GPUI 版新增,原版没有这一页。
+    RemoteNotify,
     AiHook,
     System,
     Editor,
@@ -120,6 +125,7 @@ impl SettingsPage {
             Self::Appearance => "appearance",
             Self::Font => "font",
             Self::AiNotification => "ai-notification",
+            Self::RemoteNotify => "remote-notify",
             Self::AiHook => "ai-hook",
             Self::System => "system",
             Self::Editor => "editor",
@@ -137,6 +143,7 @@ impl SettingsPage {
             Self::Appearance => "menu.appearance",
             Self::Font => "menu.font",
             Self::AiNotification => "menu.aiNotification",
+            Self::RemoteNotify => "menu.remoteNotify",
             Self::AiHook => "menu.aiHook",
             Self::System => "menu.general",
             Self::Editor => "menu.editor",
@@ -169,7 +176,11 @@ const MENU_GROUPS: &[(&str, &[SettingsPage])] = &[
     ),
     (
         "menu.groupAi",
-        &[SettingsPage::AiNotification, SettingsPage::AiHook],
+        &[
+            SettingsPage::AiNotification,
+            SettingsPage::RemoteNotify,
+            SettingsPage::AiHook,
+        ],
     ),
     (
         "menu.groupSystem",
@@ -187,6 +198,7 @@ pub const ALL_PAGES: &[SettingsPage] = &[
     SettingsPage::Appearance,
     SettingsPage::Font,
     SettingsPage::AiNotification,
+    SettingsPage::RemoteNotify,
     SettingsPage::AiHook,
     SettingsPage::System,
     SettingsPage::Editor,
@@ -406,6 +418,9 @@ pub struct SettingsView {
     /// 选到非 `.wav` 时的提示(`notify.rs` 只认 wav,其余静默回落系统提示音)。
     sound_warning: bool,
 
+    // ── remote-notify 页 ──
+    remote: RemoteNotifyForm,
+
     // ── system 页:本地下载目录 ──
     download_dir_busy: bool,
     download_dir_error: Option<String>,
@@ -615,6 +630,7 @@ impl SettingsView {
                 .placeholder(DEFAULT_TERMINAL_FONT_PLACEHOLDER)
                 .default_value(config.terminal_font_family.clone().unwrap_or_default())
         });
+        let remote = RemoteNotifyForm::new(&config.remote_notify, window, cx);
 
         let mut this = Self {
             store,
@@ -659,6 +675,7 @@ impl SettingsView {
             show_snippet: false,
             snippet_tab: mt_ai::hook_registry::HookAgent::Claude.key(),
             sound_warning: false,
+            remote,
             download_dir_busy: false,
             download_dir_error: None,
             download_dir_validation_key: None,
@@ -711,6 +728,7 @@ impl SettingsView {
         }
 
         this.init_env_rows(&config.terminal_env_vars, window, cx);
+        this.subscribe_remote_inputs(window, cx);
 
         // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
         // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口。
@@ -973,6 +991,7 @@ impl SettingsView {
             SettingsPage::Appearance => self.render_appearance_page(window, cx),
             SettingsPage::Font => self.render_font_page(cx),
             SettingsPage::AiNotification => self.render_notification_page(cx),
+            SettingsPage::RemoteNotify => self.render_remote_notify_page(cx),
             SettingsPage::AiHook => self.render_hook_page(cx),
             SettingsPage::System => self.render_system_page(cx),
             SettingsPage::Editor => self.render_editor_page(cx),
@@ -1000,6 +1019,7 @@ mod tests {
                 "appearance",
                 "font",
                 "ai-notification",
+                "remote-notify",
                 "ai-hook",
                 "system",
                 "editor",
