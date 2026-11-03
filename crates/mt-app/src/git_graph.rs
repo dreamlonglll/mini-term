@@ -15,6 +15,13 @@
 //!
 //! 原版是两行布局的 48px;提交行改成 IDEA Log 那样的单行布局(标题 | 引用 | 作者 |
 //! 时间)之后收到 32px —— 几何全部按 [`GRAPH_ROW_HEIGHT`] 推,常量一改连线照样接得上。
+//!
+//! # 增量
+//!
+//! TS 版每次都从头扫整份列表;历史区一页页往下翻时,那是每页 O(已加载条数) 的重活。
+//! 这里把扫到末行时的 lane 现场留在 [`GraphLayout`] 里,续页只算新追加的行
+//! ([`GraphLayout::extend`]),与整份重算逐行一致。另外钳在最后一列、会被后画的同款
+//! 线段整条盖住的段在布局时就去掉(见 [`drop_covered`])。
 
 use mt_project::git::GitCommitInfo;
 
@@ -86,24 +93,66 @@ pub struct GraphLayout {
     pub rows: Vec<GraphRow>,
     /// 图形区宽度(px)。
     pub width: f32,
+    /// 扫到末行之后的 lane 现场:续页时接着它往下算(见 [`Self::extend`])。
+    state: LaneState,
+}
+
+/// 一条 lane 正在等的提交与它的颜色。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Lane {
+    hash: String,
+    color: u8,
+}
+
+/// 自上而下扫描的现场。扫完第 k 行时的现场只取决于前 k 行,所以把它留下来,续页追加的
+/// 行就能接着算,结果与从头整份重算逐行相同(单测对拍)。
+#[derive(Debug, Clone, PartialEq, Default)]
+struct LaneState {
+    lanes: Vec<Option<Lane>>,
+    color_seq: usize,
+    max_lane: i32,
+}
+
+impl GraphLayout {
+    /// 没有行的布局(宽度是 1 条 lane 的最小值)。
+    pub fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            width: width_of(0),
+            state: LaneState::default(),
+        }
+    }
+
+    /// 列表末尾追加了 `commits`(前面的行序没动):只算新行。历史区续页走这条,不再每页
+    /// 从头重算整份;跨页拓扑修正让行序变了时调用方改走 [`compute`]。
+    pub fn extend(&mut self, commits: &[GitCommitInfo]) {
+        self.rows.reserve(commits.len());
+        for commit in commits {
+            let row = self.state.push(commit);
+            self.rows.push(row);
+        }
+        self.width = width_of(self.state.max_lane);
+    }
+}
+
+fn width_of(max_lane: i32) -> f32 {
+    let lane_count = ((max_lane + 1) as usize).min(GRAPH_MAX_LANES);
+    lane_count as f32 * GRAPH_LANE_WIDTH + 4.0
 }
 
 /// 拓扑布局。输入按拓扑序(父提交永远排在子提交之后)。
 ///
 /// 自上而下扫描,维护一组 lane,每条 lane 记录它当前正在等待的 commit hash。
 pub fn compute(commits: &[GitCommitInfo]) -> GraphLayout {
-    #[derive(Clone)]
-    struct Lane {
-        hash: String,
-        color: u8,
-    }
+    let mut layout = GraphLayout::empty();
+    layout.extend(commits);
+    layout
+}
 
-    let mut lanes: Vec<Option<Lane>> = Vec::new();
-    let mut rows: Vec<GraphRow> = Vec::new();
-    let mut color_seq: usize = 0;
-    let mut max_lane: i32 = 0;
-
-    for commit in commits {
+impl LaneState {
+    /// 扫一行。
+    fn push(&mut self, commit: &GitCommitInfo) -> GraphRow {
+        let lanes = &mut self.lanes;
         let mut segments: Vec<GraphSegment> = Vec::new();
 
         // 1. 找出所有正等待本 commit 的 lane
@@ -119,8 +168,8 @@ pub fn compute(commits: &[GitCommitInfo]) -> GraphLayout {
             let color = lanes[first].as_ref().expect("incoming lane 必然非空").color;
             (first, color)
         } else {
-            let idx = alloc_lane(&mut lanes);
-            let color = next_color(&mut color_seq);
+            let idx = alloc_lane(lanes);
+            let color = next_color(&mut self.color_seq);
             lanes[idx] = Some(Lane {
                 hash: commit.hash.clone(),
                 color,
@@ -179,8 +228,8 @@ pub fn compute(commits: &[GitCommitInfo]) -> GraphLayout {
             let (target, c) = if pi == 0 {
                 (lane, color)
             } else {
-                let idx = alloc_lane(&mut lanes);
-                (idx, next_color(&mut color_seq))
+                let idx = alloc_lane(lanes);
+                (idx, next_color(&mut self.color_seq))
             };
             lanes[target] = Some(Lane {
                 hash: parent.clone(),
@@ -199,21 +248,40 @@ pub fn compute(commits: &[GitCommitInfo]) -> GraphLayout {
         for s in &segments {
             row_max = row_max.max(s.from).max(s.to);
         }
-        max_lane = max_lane.max(row_max);
+        self.max_lane = self.max_lane.max(row_max);
 
-        rows.push(GraphRow {
+        GraphRow {
             lane,
             color,
             is_merge: parents.len() >= 2,
-            segments,
-        });
+            segments: drop_covered(segments),
+        }
     }
+}
 
-    let lane_count = ((max_lane + 1) as usize).min(GRAPH_MAX_LANES);
-    GraphLayout {
-        rows,
-        width: lane_count as f32 * GRAPH_LANE_WIDTH + 4.0,
+/// 去掉会被后画的同款线段**整条盖住**的那些。
+///
+/// lane 数本身不封顶,但 [`lane_x`] 把第 [`GRAPH_MAX_LANES`] 条以后全钳在最后一列:同时活着
+/// 几十条线时,每行有几十段一模一样的竖线叠在同一位置,每段都要细分成 path 图元再画一遍。
+/// 两段钳完之后起止列相同、颜色与末端颜色也相同,画出来就是同一笔;后画的在上面,
+/// 所以只留**最后**一段 —— 先画的被它整条盖住,去掉之后最上面那层还是它,叠画时谁在上面
+/// 的口径不变(异色的各自保留,原有先后)。差别只在抗锯齿的边:同一笔叠画 N 遍时边缘会
+/// 越叠越实,去重后与其它列的线一样只画一遍。
+fn drop_covered(segments: Vec<GraphSegment>) -> Vec<GraphSegment> {
+    // 只有用到了钳位列才可能重复(没钳的列一条 lane 一段),绝大多数行直接放行
+    let last = GRAPH_MAX_LANES as i32 - 1;
+    if !segments.iter().any(|s| s.from > last || s.to > last) {
+        return segments;
     }
+    let clamp = |lane: i32| if lane < 0 { lane } else { lane.min(last) };
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<GraphSegment> = segments
+        .into_iter()
+        .rev()
+        .filter(|s| seen.insert((clamp(s.from), clamp(s.to), s.color, s.end_color)))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 fn next_color(seq: &mut usize) -> u8 {
@@ -581,5 +649,115 @@ mod tests {
         let layout = compute(&[]);
         assert!(layout.rows.is_empty());
         assert_eq!(layout.width, GRAPH_LANE_WIDTH + 4.0);
+        assert_eq!(layout, GraphLayout::empty());
+    }
+
+    /// 固定种子的随机 DAG,按拓扑序(子在前、父在后)排好。分支开得勤、合并也勤,
+    /// 好让同时活着的 lane 越过 8 条(钳位列与去重都走得到)。
+    fn random_dag(seed: u64, n: usize) -> Vec<GitCommitInfo> {
+        let mut state = seed;
+        let mut rand = move |m: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m.max(1)
+        };
+        let mut out = Vec::new();
+        for i in 0..n {
+            let mut parents: Vec<String> = Vec::new();
+            if i > 0 && rand(12) != 0 {
+                parents.push(format!("h{}", i - 1 - rand((i as u64).min(30)) as usize));
+                if rand(3) == 0 {
+                    let other = format!("h{}", rand(i as u64));
+                    if !parents.contains(&other) {
+                        parents.push(other);
+                    }
+                }
+            }
+            let refs: Vec<&str> = parents.iter().map(String::as_str).collect();
+            out.push(test_commit(&format!("h{i}"), &refs));
+        }
+        out.reverse();
+        out
+    }
+
+    /// 增量与整份重算逐行一致:任意切成几段一段段 `extend`,行、宽度、末行现场都与
+    /// `compute(整份)` 相同。
+    #[test]
+    fn 增量追加与整份重算逐行一致() {
+        for seed in [1u64, 7, 42, 2026] {
+            let commits = random_dag(seed, 300);
+            let full = compute(&commits);
+            assert!(
+                full.state.max_lane >= GRAPH_MAX_LANES as i32,
+                "seed {seed}:样本没越过钳位列"
+            );
+            for step in [1usize, 2, 7, 30, 299] {
+                let mut layout = GraphLayout::empty();
+                for chunk in commits.chunks(step) {
+                    layout.extend(chunk);
+                }
+                assert_eq!(layout, full, "seed {seed} 每段 {step} 行");
+            }
+        }
+    }
+
+    /// 钳到最后一列的同款线段只留最后画的那段;异色的、没钳的照旧,先后不变。
+    #[test]
+    fn 钳位列的同款线段只画最后一段() {
+        let segs = vec![
+            seg(3, 3, 1, None),
+            seg(7, 7, 2, None),
+            seg(8, 8, 5, None),
+            seg(9, 9, 2, None),
+            seg(10, 10, 5, None),
+            seg(11, -1, 4, Some(0)),
+            seg(12, -1, 4, Some(0)),
+            seg(-1, 9, 0, Some(2)),
+        ];
+        assert_eq!(
+            drop_covered(segs),
+            vec![
+                seg(3, 3, 1, None),
+                seg(9, 9, 2, None),
+                seg(10, 10, 5, None),
+                seg(12, -1, 4, Some(0)),
+                seg(-1, 9, 0, Some(2)),
+            ]
+        );
+        // 没用到钳位列:原样放行(哪怕有重复也不动)
+        let plain = vec![
+            seg(0, 0, 1, None),
+            seg(2, -1, 3, Some(1)),
+            seg(-1, 0, 1, None),
+        ];
+        assert_eq!(drop_covered(plain.clone()), plain);
+    }
+
+    /// 去重之后,每行画出来的每一笔(钳完的几何 + 颜色)与去重前最上面那层一致:
+    /// 去掉的段都被后画的同款段盖着。
+    #[test]
+    fn 去重不改变最上面那层() {
+        let commits = random_dag(99, 400);
+        let layout = compute(&commits);
+        let mut deduped_rows = 0;
+        for row in &layout.rows {
+            let mut keys = std::collections::HashSet::new();
+            for s in &row.segments {
+                let path = segment_path(s, row.lane);
+                assert!(
+                    keys.insert((format!("{path:?}"), s.color, s.end_color)),
+                    "行里还有重复的笔:{row:?}"
+                );
+            }
+            if row
+                .segments
+                .iter()
+                .any(|s| s.from >= GRAPH_MAX_LANES as i32)
+            {
+                deduped_rows += 1;
+            }
+        }
+        assert!(deduped_rows > 0, "样本没走到钳位列");
     }
 }

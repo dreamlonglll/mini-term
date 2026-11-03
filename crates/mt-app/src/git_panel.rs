@@ -226,13 +226,13 @@ fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMet
 }
 
 /// 分支弹窗要的一份快照(弹窗每帧从面板现取,数据始终与仓库栏一致)。
+///
+/// 大头的分支数据放在共享的 [`BranchData`] 里:面板按 [`GitPanel::branch_gen`] 缓存一份,
+/// 数据没换时每帧取快照只是加引用计数,不再把上千条分支整份深拷贝。
 #[derive(Clone)]
 pub(crate) struct BranchSnapshot {
     pub repo: String,
-    pub branches: Vec<BranchInfo>,
-    pub tracking: Vec<BranchTracking>,
-    pub recent: Vec<String>,
-    pub remotes: Vec<String>,
+    pub data: Rc<BranchData>,
     /// HEAD 所在的本地分支;detached / 空仓库为 `None`。
     pub head: Option<String>,
     /// detached 时的显示名(`"(1a2b3c4)"`)。
@@ -249,6 +249,17 @@ impl BranchSnapshot {
     pub fn writable(&self) -> bool {
         self.busy.is_none() && !self.gated
     }
+}
+
+/// 分支快照里随分支列表一起换的那几样(见 [`BranchSnapshot`])。
+pub(crate) struct BranchData {
+    /// 面板分支数据的代号([`GitPanel::branch_gen`]):同一代号必是同一份数据,分支弹窗
+    /// 拿它当排好的行的缓存键。
+    pub generation: u64,
+    pub branches: Vec<BranchInfo>,
+    pub tracking: Vec<BranchTracking>,
+    pub recent: Vec<String>,
+    pub remotes: Vec<String>,
 }
 
 /// 中缝拖拽的一次会话。
@@ -273,6 +284,11 @@ pub struct GitPanel {
     /// 正在查看(**未 checkout**)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
     meta: RepoMeta,
+    /// 分支数据的单调代号:`branches` / `meta` 每换一份(落地、清空)+1。分支快照按它
+    /// 缓存共享的那份 [`BranchData`],分支弹窗按它缓存排好的行。
+    branch_gen: u64,
+    /// [`Self::branch_snapshot`] 共享出去的分支数据,代号对不上就重建。
+    branch_data: RefCell<Option<Rc<BranchData>>>,
     /// 正在跑的写操作(见模块注释「写操作」)。
     busy: Option<GitBusy>,
     /// 抽屉里显示的是不是本面板。收着时不扫盘。
@@ -390,6 +406,8 @@ impl GitPanel {
             branches_loading: false,
             view_branch: None,
             meta: RepoMeta::default(),
+            branch_gen: 0,
+            branch_data: RefCell::new(None),
             busy: None,
             visible: false,
             stale: true,
@@ -494,6 +512,7 @@ impl GitPanel {
         self.view_branch = None;
         self.branches.clear();
         self.meta = RepoMeta::default();
+        self.branch_gen += 1;
         let path = self.project_path.clone().unwrap_or_default();
         let cached = REPO_CACHE.with(|c| c.borrow().get(&path).cloned());
         match cached {
@@ -579,6 +598,7 @@ impl GitPanel {
         if repo.is_empty() {
             self.branches.clear();
             self.meta = RepoMeta::default();
+            self.branch_gen += 1;
             return;
         }
         self.branches_loading = true;
@@ -617,6 +637,7 @@ impl GitPanel {
                         }
                         this.branches = list;
                         this.meta = meta;
+                        this.branch_gen += 1;
                     }
                     Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
                 }
@@ -674,6 +695,7 @@ impl GitPanel {
         self.branches.clear();
         self.view_branch = None;
         self.meta = RepoMeta::default();
+        self.branch_gen += 1;
         if let Some(project) = self.project_path.clone() {
             REPO_CACHE.with(|c| {
                 c.borrow_mut()
@@ -706,14 +728,12 @@ impl GitPanel {
 
     // ── 给分支弹窗 / 推送对话框的接口 ──────────────────────
 
-    /// 分支弹窗的数据快照。
+    /// 分支弹窗的数据快照。分支数据共享面板缓存的那一份(见 [`BranchData`]):分支弹窗
+    /// 开着时每帧都要取,数据没换就不深拷贝。
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
         BranchSnapshot {
             repo: self.selected_repo.clone(),
-            branches: self.branches.clone(),
-            tracking: self.meta.tracking.clone(),
-            recent: self.meta.recent.clone(),
-            remotes: self.meta.remotes.clone(),
+            data: self.branch_data(),
             head: self.head_branch().map(str::to_string),
             detached: self
                 .current_branch()
@@ -723,6 +743,24 @@ impl GitPanel {
             busy: self.busy,
             gated: self.gated(),
         }
+    }
+
+    /// 共享的分支数据:缓存着、且代号对得上就直接给,否则按眼下的 `branches` / `meta`
+    /// 建一份(只在分支数据换了之后的第一次取快照时深拷贝)。
+    fn branch_data(&self) -> Rc<BranchData> {
+        let mut cache = self.branch_data.borrow_mut();
+        if let Some(data) = cache.as_ref().filter(|d| d.generation == self.branch_gen) {
+            return data.clone();
+        }
+        let data = Rc::new(BranchData {
+            generation: self.branch_gen,
+            branches: self.branches.clone(),
+            tracking: self.meta.tracking.clone(),
+            recent: self.meta.recent.clone(),
+            remotes: self.meta.remotes.clone(),
+        });
+        *cache = Some(data.clone());
+        data
     }
 
     /// 面板自己没在跑写操作,但仓库的写操作闸被别的区占着(见模块注释「写操作」)。

@@ -183,8 +183,10 @@ use mt_i18n::{
 /// 开关 / 渠道多选 / 测试发送 / 手机端链接说明（`settings.remoteNotify.*` 15 条）、三个渠道的
 /// 表单文案（`.bark.*` 6 / `.telegram.*` 8 / `.webhook.*` 6）、推送正文（`.msg.*` 9）与
 /// 错误提示（`.err.*` 7）。
+/// 1509 → 1511：提交历史自动续页加软上限，到上限之后列表末尾换成「已加载 N 个提交」+
+/// 「加载更多」按钮（`gitLog.{autoLoadPaused,loadMore}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1509;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1511;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

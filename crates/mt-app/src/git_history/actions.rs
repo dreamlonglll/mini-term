@@ -355,10 +355,10 @@ fn commit_menu(
     entries.push(reword.into());
 
     // ── 指向它的标签:每个一组子菜单(删除 / 推送到各远程)
-    let tags = this
+    let tags: Vec<String> = this
         .tags_by_commit
         .get(&commit.hash)
-        .cloned()
+        .map(|tags| tags.iter().map(ToString::to_string).collect())
         .unwrap_or_default();
     if !tags.is_empty() {
         entries.push(menu::separator());

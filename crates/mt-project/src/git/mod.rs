@@ -658,8 +658,9 @@ pub fn discover_git_repos(project_path: &Path) -> Result<Vec<GitRepoInfo>> {
 /// 续页游标:由已加载的提交还原出来的遍历现场。
 ///
 /// 不在服务端缓存 revwalk(那要管仓库变更后的失效、多个面板各自的游标),而是
-/// 每次从已加载列表重算 —— O(已加载条数) 的哈希,远小于一次全历史遍历。
-#[derive(Debug, Clone, Default)]
+/// 由已加载列表还原 —— 历史区常驻一份 [`LoadedLog`],随每页增量推进(与整份重算逐字段
+/// 相同),不必每页 O(已加载条数) 地重算。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitLogCursor {
     /// 已加载(已产出)的提交。续页再遇到一律跳过。
     loaded: HashSet<Oid>,
@@ -882,6 +883,9 @@ fn commit_info(commit: &Commit<'_>) -> GitCommitInfo {
 /// 2. **跨页拓扑修正**:新提交里若有「父已经排在它前面」的(时钟偏移下迟到的子
 ///    提交,见 `get_git_log` 上方的说明),对整个列表做一次稳定的拓扑重排,保证
 ///    父永远在子之后 —— 拓扑图的连线依赖这一点。没有这种情况时一行不挪。
+///
+/// 每次都按整份列表现建位置表,O(已加载条数)。一页页往下翻的调用方用常驻索引的
+/// [`LoadedLog::merge`](语义相同,只做与新页成正比的活)。
 pub fn merge_log_page(loaded: &mut Vec<GitCommitInfo>, page: Vec<GitCommitInfo>) -> usize {
     let before = loaded.len();
     let mut known: HashSet<String> = loaded.iter().map(|c| c.hash.clone()).collect();
@@ -2648,6 +2652,7 @@ mod commit_extras;
 mod conflict;
 mod hunk;
 mod line_diff;
+mod log_index;
 mod log_ops;
 mod log_query;
 mod repo_state;
@@ -2663,6 +2668,7 @@ pub use commit_extras::*;
 pub use conflict::*;
 pub use hunk::*;
 pub use line_diff::*;
+pub use log_index::*;
 pub use log_ops::*;
 pub use log_query::*;
 pub use repo_state::*;

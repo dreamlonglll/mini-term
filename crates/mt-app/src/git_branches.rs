@@ -22,6 +22,13 @@
 //! 自己的 MoveRight,光标照常右移。Enter 订阅输入框的 `PressEnter`(它无条件发),
 //! Esc 是 Dialog 自带的取消。
 //!
+//! # 列表
+//!
+//! 排好的行按 (分支数据代号, HEAD, 搜索词) 缓存成 [`RowsModel`],走变高虚拟列表(分组标题
+//! 26、行 28)只给视口里的项建元素。弹窗开着时每帧重画、Dialog 的 builder 每帧还要估一次
+//! 高度 —— 远程分支上千条时,不能每帧把它们过滤、排序、建元素一遍。分支快照本身也是共享的
+//! (见 `git_panel::BranchData`),每帧取快照不再深拷贝整份分支列表。
+//!
 //! # 动作
 //!
 //! 行上单击 / 右键 / → 弹出该分支的动作菜单;选了动作先收弹窗、再交给 Git 面板的
@@ -31,19 +38,23 @@
 //! 这一行的分支,先看清待推送的提交再推。面板在跑写操作、或别的区占着仓库的写操作闸时,
 //! 写类动作一律禁用。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
     HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, StyledText, Subscription, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    ParentElement, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
+    StatefulInteractiveElement, Styled, StyledText, Subscription, Window, actions, div, point,
+    prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::git::{
-    BranchInfo, BranchNameIssue, DeleteOutcome, MergeOutcome, RebaseOutcome, RemoteCheckout,
-    split_remote_branch, validate_branch_name,
+    BranchInfo, BranchNameIssue, BranchTracking, DeleteOutcome, MergeOutcome, RebaseOutcome,
+    RemoteCheckout, split_remote_branch, validate_branch_name,
 };
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::TooltipExt as _;
@@ -73,9 +84,12 @@ pub(crate) const BRANCH_POPUP_CONTEXT: &str = "GitBranchPopup";
 
 /// 弹窗宽度。
 const POPUP_WIDTH: f32 = 348.0;
-/// 行高 / 分组标题高(与 `git_ui::list_row` / `git_ui::list_caption` 一一对应,估高度用)。
+/// 行高 / 分组标题高(与 `git_ui::list_row` / `git_ui::list_caption` 一一对应:估高度、
+/// 虚拟列表的项高都按它)。
 const ROW_H: f32 = git_ui::ROW_H;
 const GROUP_H: f32 = 26.0;
+/// 列表的内边距(四周)。
+const LIST_PAD: f32 = 4.0;
 /// 搜索框 + 动作行 + 底部提示条的固定高度。
 const CHROME_H: f32 = 52.0 + 40.0 + 36.0;
 
@@ -107,37 +121,69 @@ pub(crate) struct Row {
     pub upstream: Option<String>,
 }
 
+/// 大小写不敏感的子串匹配(一次性的搜索词;建行走 [`find_folded`],搜索词只折一次)。
+#[cfg(test)]
+pub(crate) fn find_ci(text: &str, query: &str) -> Option<Option<(usize, usize)>> {
+    let needle: Vec<char> = query.chars().map(fold_char).collect();
+    find_folded(text, &needle)
+}
+
+/// 折一个字符(见 [`find_folded`]):ASCII 直接折,其余取 `to_lowercase` 的第一个码点。
+fn fold_char(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_lowercase()
+    } else {
+        c.to_lowercase().next().unwrap_or(c)
+    }
+}
+
 /// 大小写不敏感的子串匹配。`None` = 不中;`Some(None)` = 中但无可高亮(空查询);
-/// `Some(Some(区间))` = 命中区间(char 下标)。
+/// `Some(Some(区间))` = 命中区间(char 下标)。`needle` 是用 [`fold_char`] 折好的搜索词。
 ///
 /// 逐字符折小写(取 `to_lowercase` 的第一个码点)保证折叠前后一一对应,
 /// 高亮区间才落得回原文。
-pub(crate) fn find_ci(text: &str, query: &str) -> Option<Option<(usize, usize)>> {
-    if query.is_empty() {
+///
+/// 建行时一个搜索词只折一次,逐个分支边走边折,不再每个分支分配两份 `Vec<char>`(远程
+/// 分支上千条时那是每次建行几千次分配)。命中的是第一个折叠后完全相同的位置,与整串
+/// 折好再逐位比对同一结果(单测对拍)。
+fn find_folded(text: &str, needle: &[char]) -> Option<Option<(usize, usize)>> {
+    if needle.is_empty() {
         return Some(None);
     }
-    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
-    let hay: Vec<char> = text.chars().map(fold).collect();
-    let needle: Vec<char> = query.chars().map(fold).collect();
-    if needle.len() > hay.len() {
-        return None;
+    let mut start = text.chars();
+    let mut at = 0;
+    loop {
+        let mut hay = start.clone();
+        if needle.iter().all(|&n| hay.next().map(fold_char) == Some(n)) {
+            return Some(Some((at, at + needle.len())));
+        }
+        start.next()?;
+        at += 1;
     }
-    (0..=hay.len() - needle.len())
-        .find(|&i| hay[i..i + needle.len()] == needle[..])
-        .map(|i| Some((i, i + needle.len())))
 }
 
 /// 按快照与搜索词排出全部行:当前分支 → 最近 → 本地 → 远程(按远程名分组,
 /// `origin` 打头),组内按名字(忽略大小写)排序;最近组保持 reflog 的新旧顺序。
+///
+/// 每个排序键只算一次(`sort_by_cached_key`,稳定排序,与逐次比较时现转小写同一结果),
+/// 领先落后按分支名建表查(重名取第一条,与逐个 `find` 同一口径)。
 pub(crate) fn build_rows(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
     let query = query.trim();
-    let mut locals: Vec<&BranchInfo> = snap.branches.iter().filter(|b| !b.is_remote).collect();
-    locals.sort_by_key(|b| b.name.to_lowercase());
+    let needle: Vec<char> = query.chars().map(fold_char).collect();
+    let data = &snap.data;
+    let mut locals: Vec<&BranchInfo> = data.branches.iter().filter(|b| !b.is_remote).collect();
+    locals.sort_by_cached_key(|b| b.name.to_lowercase());
     let head = snap.head.as_deref();
+    let mut tracking_of: HashMap<&str, &BranchTracking> = HashMap::new();
+    for tracking in &data.tracking {
+        tracking_of
+            .entry(tracking.branch.as_str())
+            .or_insert(tracking);
+    }
 
     let local_row = |group: Group, branch: &BranchInfo| -> Option<Row> {
-        let hit = find_ci(&branch.name, query)?;
-        let tracking = snap.tracking.iter().find(|t| t.branch == branch.name);
+        let hit = find_folded(&branch.name, &needle)?;
+        let tracking = tracking_of.get(branch.name.as_str()).copied();
         Some(Row {
             group,
             name: branch.name.clone(),
@@ -157,7 +203,7 @@ pub(crate) fn build_rows(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
     if let Some(current) = locals.iter().find(|b| Some(b.name.as_str()) == head) {
         rows.extend(local_row(Group::Current, current));
     }
-    for name in &snap.recent {
+    for name in &data.recent {
         if Some(name.as_str()) == head {
             continue;
         }
@@ -172,8 +218,8 @@ pub(crate) fn build_rows(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
     }
 
     let mut remote_rows: Vec<Row> = Vec::new();
-    for branch in snap.branches.iter().filter(|b| b.is_remote) {
-        let (remote, short) = split_remote_branch(&snap.remotes, &branch.name)
+    for branch in data.branches.iter().filter(|b| b.is_remote) {
+        let (remote, short) = split_remote_branch(&data.remotes, &branch.name)
             .or_else(|| {
                 branch
                     .name
@@ -182,9 +228,9 @@ pub(crate) fn build_rows(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
             })
             .unwrap_or_else(|| (String::new(), branch.name.clone()));
         // 先在显示名上找(能高亮);找不到再看完整名(`origin/fe` 这种带远程名的查询)
-        let hit = match find_ci(&short, query) {
+        let hit = match find_folded(&short, &needle) {
             Some(hit) => hit,
-            None if find_ci(&branch.name, query).is_some() => None,
+            None if find_folded(&branch.name, &needle).is_some() => None,
             None => continue,
         };
         remote_rows.push(Row {
@@ -199,21 +245,102 @@ pub(crate) fn build_rows(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
             upstream: None,
         });
     }
-    remote_rows.sort_by(|a, b| {
-        let key = |row: &Row| match &row.group {
+    remote_rows.sort_by_cached_key(|row| {
+        let (not_origin, remote) = match &row.group {
             Group::Remote(remote) => (remote != "origin", remote.to_lowercase()),
             _ => (true, String::new()),
         };
-        key(a)
-            .cmp(&key(b))
-            .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        (not_origin, remote, row.label.to_lowercase())
     });
     rows.extend(remote_rows);
     rows
 }
 
-/// 第 `cursor` 行在列表容器里是第几个子元素(分组标题也占一个)。
-/// 键盘移动后滚到可见、→ 弹菜单时定位都靠它。
+/// 虚拟列表的一项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    /// 分组标题(值是该组第一行的下标)。
+    Caption(usize),
+    Row(usize),
+}
+
+/// 分支列表的派生模型:排好的行 + 虚拟列表的项(分组标题 / 行)与尺寸 + 摊开的自然高度。
+///
+/// 按 (分支数据代号, HEAD, 搜索词) 缓存([`BranchPopup::model`]):弹窗开着时每帧重画、
+/// Dialog 的 builder 每帧还要估一次自然高度,不能每帧把上千条远程分支重新过滤、排序
+/// 两遍。数据只在分支快照落地(代号 +1)、搜索词变了时重算。
+pub(crate) struct RowsModel {
+    generation: u64,
+    head: Option<String>,
+    query: String,
+    pub rows: Vec<Row>,
+    items: Vec<Item>,
+    /// `rows[i]` 是 `items` 里的第几项(= [`child_index_of`] 的口径)。
+    item_of_row: Vec<usize>,
+    sizes: Rc<Vec<Size<Pixels>>>,
+    /// 摊开的自然高度(Dialog 按它定高,再夹到 70vh)。
+    height: f32,
+}
+
+impl RowsModel {
+    fn build(snap: &BranchSnapshot, query: &str) -> Self {
+        let rows = build_rows(snap, query);
+        let mut items = Vec::with_capacity(rows.len() + 8);
+        let mut item_of_row = Vec::with_capacity(rows.len());
+        let mut last: Option<&Group> = None;
+        for (i, row) in rows.iter().enumerate() {
+            if last != Some(&row.group) {
+                items.push(Item::Caption(i));
+                last = Some(&row.group);
+            }
+            item_of_row.push(items.len());
+            items.push(Item::Row(i));
+        }
+        let sizes = items
+            .iter()
+            .map(|item| match item {
+                Item::Caption(_) => size(px(0.0), px(GROUP_H)),
+                Item::Row(_) => size(px(0.0), px(ROW_H)),
+            })
+            .collect();
+        let groups = items.len() - rows.len();
+        let height = if rows.is_empty() {
+            CHROME_H + 150.0
+        } else {
+            CHROME_H + 8.0 + groups as f32 * GROUP_H + rows.len() as f32 * ROW_H
+        };
+        Self {
+            generation: snap.data.generation,
+            head: snap.head.clone(),
+            query: query.to_string(),
+            rows,
+            items,
+            item_of_row,
+            sizes: Rc::new(sizes),
+            height,
+        }
+    }
+
+    /// 是不是按这份快照、这个搜索词算的。
+    fn matches(&self, snap: &BranchSnapshot, query: &str) -> bool {
+        self.generation == snap.data.generation && self.head == snap.head && self.query == query
+    }
+
+    /// 第 `index` 项在列表内容里的上下沿(相对内容顶,不含列表内边距)。
+    fn item_span(&self, index: usize) -> Option<(f32, f32)> {
+        let size = self.sizes.get(index)?;
+        let top: f32 = self.sizes[..index]
+            .iter()
+            .map(|s| f32::from(s.height))
+            .sum();
+        Some((top, top + f32::from(size.height)))
+    }
+}
+
+/// 第 `cursor` 行在列表里是第几项(分组标题也占一项)。逐行数的写法,
+/// [`RowsModel::item_of_row`] 一次建好同一张表(键盘移动后滚到可见、→ 弹菜单定位用),
+/// 这里留着对拍。
+#[cfg(test)]
 pub(crate) fn child_index_of(rows: &[Row], cursor: usize) -> Option<usize> {
     let mut index = 0;
     let mut last: Option<&Group> = None;
@@ -268,7 +395,9 @@ pub struct BranchPopup {
     query: Entity<InputState>,
     /// 高亮到第几行(跨分组连续计数)。
     cursor: usize,
-    scroll: ScrollHandle,
+    scroll: VirtualListScrollHandle,
+    /// 排好的行(见 [`RowsModel`]),键不对就重算。
+    model: RefCell<Option<Rc<RowsModel>>>,
     _subs: Vec<Subscription>,
 }
 
@@ -310,7 +439,7 @@ impl BranchPopup {
                 // 搜索词一变,高亮回到第一条匹配
                 InputEvent::Change => {
                     this.cursor = 0;
-                    this.scroll.scroll_to_item(0);
+                    this.scroll.scroll_to_item(0, ScrollStrategy::Top);
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.checkout_cursor(window, cx),
@@ -323,45 +452,52 @@ impl BranchPopup {
             panel,
             query,
             cursor: 0,
-            scroll: ScrollHandle::new(),
+            scroll: VirtualListScrollHandle::new(),
+            model: RefCell::new(None),
             _subs: subs,
         }
     }
 
-    fn rows(&self, cx: &App) -> Vec<Row> {
+    /// 眼下这份快照、这个搜索词排出来的行(缓存着,见 [`RowsModel`])。
+    fn model(&self, cx: &App) -> Rc<RowsModel> {
         let snap = self.panel.read(cx).branch_snapshot();
-        let query = self.query.read(cx).value().to_string();
-        build_rows(&snap, &query)
+        self.model_for(&snap, cx)
+    }
+
+    fn model_for(&self, snap: &BranchSnapshot, cx: &App) -> Rc<RowsModel> {
+        let value = self.query.read(cx).value();
+        let query = value.trim();
+        if let Some(model) = self
+            .model
+            .borrow()
+            .as_ref()
+            .filter(|model| model.matches(snap, query))
+        {
+            return model.clone();
+        }
+        let model = Rc::new(RowsModel::build(snap, query));
+        *self.model.borrow_mut() = Some(model.clone());
+        model
     }
 
     fn natural_height(&self, cx: &App) -> f32 {
-        let rows = self.rows(cx);
-        if rows.is_empty() {
-            return CHROME_H + 150.0;
-        }
-        let mut groups = 0;
-        let mut last: Option<&Group> = None;
-        for row in &rows {
-            if last != Some(&row.group) {
-                groups += 1;
-                last = Some(&row.group);
-            }
-        }
-        CHROME_H + 8.0 + groups as f32 * GROUP_H + rows.len() as f32 * ROW_H
+        self.model(cx).height
     }
 
     fn move_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
-        self.cursor = next_cursor(self.cursor.min(rows.len()), rows.len(), delta);
-        if let Some(child) = child_index_of(&rows, self.cursor) {
-            self.scroll.scroll_to_item(child);
+        let model = self.model(cx);
+        let len = model.rows.len();
+        self.cursor = next_cursor(self.cursor.min(len), len, delta);
+        if let Some(&item) = model.item_of_row.get(self.cursor) {
+            self.scroll.scroll_to_item(item, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
 
     /// Enter:检出高亮的分支(当前分支则什么都不做)。
     fn checkout_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let rows = self.rows(cx);
+        let model = self.model(cx);
+        let rows = &model.rows;
         let Some(row) = rows
             .get(self.cursor.min(rows.len().saturating_sub(1)))
             .cloned()
@@ -387,15 +523,22 @@ impl BranchPopup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rows = self.rows(cx);
-        let Some(row) = rows.get(index).cloned() else {
+        let model = self.model(cx);
+        let Some(row) = model.rows.get(index).cloned() else {
             return;
         };
+        // 键盘触发:按这一行在列表里的位置算(虚拟列表不登记子元素的 bounds,按项高
+        // 与滚动偏移推:行左缘 + 36、行底 − 2,与此前取子元素 bounds 同一个点)
         let position = at
             .or_else(|| {
-                child_index_of(&rows, index)
-                    .and_then(|child| self.scroll.bounds_for_item(child))
-                    .map(|b| point(b.left() + px(36.0), b.bottom() - px(2.0)))
+                let item = *model.item_of_row.get(index)?;
+                let (_, bottom) = model.item_span(item)?;
+                let list = self.scroll.bounds();
+                let offset = self.scroll.offset();
+                Some(point(
+                    list.left() + px(LIST_PAD + 36.0),
+                    list.top() + offset.y + px(LIST_PAD + bottom - 2.0),
+                ))
             })
             .unwrap_or_else(|| window.mouse_position());
         let snap = self.panel.read(cx).branch_snapshot();
@@ -505,7 +648,7 @@ impl BranchPopup {
     }
 }
 
-/// 命中区间(char 下标,`find_ci` 的口径)→ 字节区间(`StyledText` 的高亮口径)。
+/// 命中区间(char 下标,`find_folded` 的口径)→ 字节区间(`StyledText` 的高亮口径)。
 /// 越界 / 逆序返回 `None`(一条坏区间不该把整行名字吞掉)。
 fn char_range_to_bytes(text: &str, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
     if start >= end {
@@ -533,7 +676,8 @@ impl Render for BranchPopup {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.panel.read(cx).branch_snapshot();
         let query = self.query.read(cx).value().trim().to_string();
-        let rows = build_rows(&snap, &query);
+        let model = self.model_for(&snap, cx);
+        let rows = &model.rows;
         // 候选变少之后游标可能越界
         let cursor = self.cursor.min(rows.len().saturating_sub(1));
         let busy = snap.busy;
@@ -627,19 +771,15 @@ impl Render for BranchPopup {
                 }),
             );
 
-        let mut list = div()
-            .id("git-branches-list")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
-            .px(px(4.0))
-            .py(px(4.0));
+        // 有行时走变高虚拟列表(分组标题 26、行 28),只给视口里的那几项建元素;空态 /
+        // 加载中这类整块占位仍是普通容器
+        let mut list = div().id("git-branches-list").flex_1().min_h(px(0.0));
 
         if rows.is_empty() {
             let this = cx.entity();
             let query_input = self.query.clone();
-            list = list.child(if snap.loading && snap.branches.is_empty() {
+            list = list.overflow_y_scroll().px(px(LIST_PAD)).py(px(LIST_PAD));
+            list = list.child(if snap.loading && snap.data.branches.is_empty() {
                 git_ui::loading_state(t("gitBranch", "loading"))
             } else if !query.is_empty() {
                 git_ui::empty_state(
@@ -665,15 +805,35 @@ impl Render for BranchPopup {
             } else {
                 git_ui::empty_state(git_ui::ICON_BRANCH, t("gitBranch", "noBranches"), None)
             });
-        }
-
-        let mut last: Option<&Group> = None;
-        for (index, row) in rows.iter().enumerate() {
-            if last != Some(&row.group) {
-                list = list.child(git_ui::list_caption(group_label(&row.group)));
-                last = Some(&row.group);
-            }
-            list = list.child(self.render_row(index, row, index == cursor, cx));
+        } else {
+            let items = model.clone();
+            list = list.child(
+                v_virtual_list(
+                    cx.entity(),
+                    "git-branches-rows",
+                    model.sizes.clone(),
+                    move |this, range, _window, cx| {
+                        range
+                            .filter_map(|ix| items.items.get(ix).copied())
+                            .map(|item| match item {
+                                Item::Caption(first) => {
+                                    git_ui::list_caption(group_label(&items.rows[first].group))
+                                        .into_any_element()
+                                }
+                                Item::Row(index) => {
+                                    this.render_row(index, &items.rows[index], index == cursor, cx)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(&self.scroll)
+                // 组件库给 base 挂的是双轴 `overflow_scroll`,关掉横轴,与换掉的
+                // `overflow_y_scroll()` 一致(同「更改」列表的处理)
+                .overflow_x_hidden()
+                .px(px(LIST_PAD))
+                .py(px(LIST_PAD)),
+            );
         }
 
         // detached HEAD 时置顶一句说明(它不是分支,列表里没有它)。显示名本身带括号
@@ -899,10 +1059,11 @@ fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut A
     // 要预检的本地分支:本地行就是它自己;远程行在本地已有同名分支时,检出的其实是那个
     let local = if remote {
         let snap = panel.read(cx).branch_snapshot();
-        split_remote_branch(&snap.remotes, &name)
+        split_remote_branch(&snap.data.remotes, &name)
             .map(|(_, local)| local)
             .filter(|local| {
-                snap.branches
+                snap.data
+                    .branches
                     .iter()
                     .any(|b| !b.is_remote && &b.name == local)
             })
@@ -1088,7 +1249,7 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
     let (panel, name) = (panel.clone(), row.name.clone());
     if row.is_remote {
         let snap = panel.read(cx).branch_snapshot();
-        let (remote, branch) = split_remote_branch(&snap.remotes, &name)
+        let (remote, branch) = split_remote_branch(&snap.data.remotes, &name)
             .unwrap_or_else(|| (String::new(), name.clone()));
         Confirm::new(
             t("gitBranch", "deleteRemoteTitle"),
@@ -1235,6 +1396,7 @@ pub(crate) fn open_name_dialog(
         return;
     }
     let existing: Vec<String> = snap
+        .data
         .branches
         .iter()
         .filter(|b| !b.is_remote)
@@ -1519,7 +1681,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_project::git::BranchTracking;
+    use crate::git_panel::BranchData;
 
     fn branch(name: &str, remote: bool) -> BranchInfo {
         BranchInfo {
@@ -1531,10 +1693,33 @@ mod tests {
         }
     }
 
-    fn snapshot() -> BranchSnapshot {
+    fn snapshot_of(
+        branches: Vec<BranchInfo>,
+        tracking: Vec<BranchTracking>,
+        recent: Vec<String>,
+        remotes: Vec<String>,
+        head: Option<&str>,
+    ) -> BranchSnapshot {
         BranchSnapshot {
             repo: "/r".into(),
-            branches: vec![
+            data: Rc::new(BranchData {
+                generation: 0,
+                branches,
+                tracking,
+                recent,
+                remotes,
+            }),
+            head: head.map(str::to_string),
+            detached: None,
+            loading: false,
+            busy: None,
+            gated: false,
+        }
+    }
+
+    fn snapshot() -> BranchSnapshot {
+        snapshot_of(
+            vec![
                 branch("main", false),
                 branch("feature/Login", false),
                 branch("dev", false),
@@ -1544,20 +1729,262 @@ mod tests {
                 branch("upstream/main", true),
                 branch("team/fork/x", true),
             ],
-            tracking: vec![BranchTracking {
+            vec![BranchTracking {
                 branch: "main".into(),
                 upstream: "origin/main".into(),
                 ahead: 2,
                 behind: 1,
             }],
-            recent: vec!["dev".into(), "main".into(), "gone".into()],
-            remotes: vec!["origin".into(), "upstream".into(), "team/fork".into()],
-            head: Some("main".into()),
-            detached: None,
-            loading: false,
-            busy: None,
-            gated: false,
+            vec!["dev".into(), "main".into(), "gone".into()],
+            vec!["origin".into(), "upstream".into(), "team/fork".into()],
+            Some("main"),
+        )
+    }
+
+    /// 改造前的 `find_ci`(整串折好、逐位比对),对拍用。
+    fn find_ci_reference(text: &str, query: &str) -> Option<Option<(usize, usize)>> {
+        if query.is_empty() {
+            return Some(None);
         }
+        let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+        let hay: Vec<char> = text.chars().map(fold).collect();
+        let needle: Vec<char> = query.chars().map(fold).collect();
+        if needle.len() > hay.len() {
+            return None;
+        }
+        (0..=hay.len() - needle.len())
+            .find(|&i| hay[i..i + needle.len()] == needle[..])
+            .map(|i| Some((i, i + needle.len())))
+    }
+
+    /// 改造前的 `build_rows`(逐分支现转小写比较、线性找领先落后、每次匹配现折两份
+    /// `Vec<char>`),对拍用。
+    fn build_rows_reference(snap: &BranchSnapshot, query: &str) -> Vec<Row> {
+        let query = query.trim();
+        let data = &snap.data;
+        let mut locals: Vec<&BranchInfo> = data.branches.iter().filter(|b| !b.is_remote).collect();
+        locals.sort_by_key(|b| b.name.to_lowercase());
+        let head = snap.head.as_deref();
+        let local_row = |group: Group, branch: &BranchInfo| -> Option<Row> {
+            let hit = find_ci_reference(&branch.name, query)?;
+            let tracking = data.tracking.iter().find(|t| t.branch == branch.name);
+            Some(Row {
+                group,
+                name: branch.name.clone(),
+                label: branch.name.clone(),
+                is_remote: false,
+                is_head: head == Some(branch.name.as_str()),
+                hit,
+                ahead: tracking.map_or(0, |t| t.ahead),
+                behind: tracking.map_or(0, |t| t.behind),
+                upstream: tracking
+                    .map(|t| t.upstream.clone())
+                    .or_else(|| branch.upstream.clone()),
+            })
+        };
+        let mut rows = Vec::new();
+        if let Some(current) = locals.iter().find(|b| Some(b.name.as_str()) == head) {
+            rows.extend(local_row(Group::Current, current));
+        }
+        for name in &data.recent {
+            if Some(name.as_str()) == head {
+                continue;
+            }
+            if let Some(branch) = locals.iter().find(|b| &b.name == name) {
+                rows.extend(local_row(Group::Recent, branch));
+            }
+        }
+        for branch in &locals {
+            if Some(branch.name.as_str()) != head {
+                rows.extend(local_row(Group::Local, branch));
+            }
+        }
+        let mut remote_rows: Vec<Row> = Vec::new();
+        for branch in data.branches.iter().filter(|b| b.is_remote) {
+            let (remote, short) = split_remote_branch(&data.remotes, &branch.name)
+                .or_else(|| {
+                    branch
+                        .name
+                        .split_once('/')
+                        .map(|(r, s)| (r.to_string(), s.to_string()))
+                })
+                .unwrap_or_else(|| (String::new(), branch.name.clone()));
+            let hit = match find_ci_reference(&short, query) {
+                Some(hit) => hit,
+                None if find_ci_reference(&branch.name, query).is_some() => None,
+                None => continue,
+            };
+            remote_rows.push(Row {
+                group: Group::Remote(remote),
+                name: branch.name.clone(),
+                label: short,
+                is_remote: true,
+                is_head: false,
+                hit,
+                ahead: 0,
+                behind: 0,
+                upstream: None,
+            });
+        }
+        remote_rows.sort_by(|a, b| {
+            let key = |row: &Row| match &row.group {
+                Group::Remote(remote) => (remote != "origin", remote.to_lowercase()),
+                _ => (true, String::new()),
+            };
+            key(a)
+                .cmp(&key(b))
+                .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
+        });
+        rows.extend(remote_rows);
+        rows
+    }
+
+    /// 一大份混了大小写、中文、带斜杠远程名、重名领先落后、同名不同大小写的分支:
+    /// 新旧两版建出来的行一条不差(各种搜索词,含非 ASCII、大小写、空白、命中远程前缀)。
+    #[test]
+    fn 建行与旧写法逐条一致() {
+        let mut branches = Vec::new();
+        let names = [
+            "main",
+            "Main2",
+            "dev",
+            "DEV-x",
+            "feature/Login",
+            "feature/login",
+            "修复/登录页",
+            "修复/LOGIN",
+            "release/1.0",
+            "Ärger",
+            "ärger-2",
+            "zeta",
+            "Alpha",
+            "alpha",
+        ];
+        for name in names {
+            branches.push(branch(name, false));
+        }
+        for remote in ["origin", "upstream", "team/fork", "Origin"] {
+            for name in names.iter().step_by(2) {
+                branches.push(branch(&format!("{remote}/{name}"), true));
+            }
+        }
+        branches.push(branch("stray", true));
+        let tracking = vec![
+            BranchTracking {
+                branch: "dev".into(),
+                upstream: "origin/dev".into(),
+                ahead: 3,
+                behind: 0,
+            },
+            BranchTracking {
+                branch: "dev".into(),
+                upstream: "upstream/dev".into(),
+                ahead: 9,
+                behind: 9,
+            },
+            BranchTracking {
+                branch: "修复/登录页".into(),
+                upstream: "origin/修复/登录页".into(),
+                ahead: 0,
+                behind: 4,
+            },
+        ];
+        let snap = snapshot_of(
+            branches,
+            tracking,
+            vec!["zeta".into(), "dev".into(), "main".into(), "nope".into()],
+            vec!["origin".into(), "upstream".into(), "team/fork".into()],
+            Some("dev"),
+        );
+        for query in [
+            "", "  ", "LOGIN", "login", "修复", "登录", "ärg", "ÄRG", "origin/", "fork/m", "a",
+            "zz", " Dev ", "/",
+        ] {
+            assert_eq!(
+                build_rows(&snap, query),
+                build_rows_reference(&snap, query),
+                "搜索词 {query:?}"
+            );
+        }
+    }
+
+    /// 新的子串匹配与旧写法逐个一致(大小写、非 ASCII、子串在末尾、搜索词比原文长)。
+    #[test]
+    fn 子串匹配与旧写法一致() {
+        let texts = [
+            "Feature/X",
+            "修复/登录页",
+            "ÄrgerÄrger",
+            "aaab",
+            "",
+            "ab",
+            "İstanbul",
+        ];
+        let queries = [
+            "", "x", "X", "登录", "äR", "aab", "ab", "abc", "b", "i̇", "STAN",
+        ];
+        for text in texts {
+            for query in queries {
+                assert_eq!(
+                    find_ci(text, query),
+                    find_ci_reference(text, query),
+                    "{text:?} / {query:?}"
+                );
+            }
+        }
+    }
+
+    /// 派生模型:项序 = 每组一个标题再跟组里的行,行到项的下标与逐行数的一致,尺寸按
+    /// 标题 26 / 行 28,自然高度与旧估法一致;同一份快照、同一个搜索词才算命中缓存。
+    #[test]
+    fn 派生模型与逐行数一致() {
+        let snap = snapshot();
+        for query in ["", "main", "zzz"] {
+            let model = RowsModel::build(&snap, query);
+            assert_eq!(model.rows, build_rows(&snap, query));
+            for i in 0..model.rows.len() {
+                assert_eq!(Some(model.item_of_row[i]), child_index_of(&model.rows, i));
+                assert_eq!(model.items[model.item_of_row[i]], Item::Row(i));
+            }
+            let groups = model
+                .items
+                .iter()
+                .filter(|item| matches!(item, Item::Caption(_)))
+                .count();
+            for (item, size) in model.items.iter().zip(model.sizes.iter()) {
+                let want = match item {
+                    Item::Caption(_) => GROUP_H,
+                    Item::Row(_) => ROW_H,
+                };
+                assert_eq!(f32::from(size.height), want);
+            }
+            let want_height = if model.rows.is_empty() {
+                CHROME_H + 150.0
+            } else {
+                CHROME_H + 8.0 + groups as f32 * GROUP_H + model.rows.len() as f32 * ROW_H
+            };
+            assert_eq!(model.height, want_height, "搜索词 {query:?}");
+            assert!(model.matches(&snap, query));
+            assert!(!model.matches(&snap, "other"));
+        }
+        let model = RowsModel::build(&snap, "");
+        // 第 2 项([标题 当前][main][标题 最近][dev]…)的上下沿
+        assert_eq!(
+            model.item_span(2),
+            Some((GROUP_H + ROW_H, 2.0 * GROUP_H + ROW_H))
+        );
+        let mut moved = snap.clone();
+        moved.head = Some("dev".into());
+        assert!(!model.matches(&moved, ""), "HEAD 换了要重排");
+        let mut newer = snap.clone();
+        newer.data = Rc::new(BranchData {
+            generation: 1,
+            branches: snap.data.branches.clone(),
+            tracking: snap.data.tracking.clone(),
+            recent: snap.data.recent.clone(),
+            remotes: snap.data.remotes.clone(),
+        });
+        assert!(!model.matches(&newer, ""), "分支数据换了一代要重排");
     }
 
     fn names(rows: &[Row]) -> Vec<(&Group, &str)> {
