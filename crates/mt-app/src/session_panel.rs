@@ -110,6 +110,8 @@ pub(crate) fn jump_to_session(
             store.activate_pane(&project_id, &pane_id, window, cx);
         });
         crate::workbench_area::activate_terminal_page(window, cx);
+        // 会话可能活在别的项目里,跳过去之后「项目」块要看得见它
+        crate::project_list::reveal(&project_id, cx);
         return Task::ready(());
     }
 

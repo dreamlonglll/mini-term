@@ -35,6 +35,20 @@
 //! 外部资源管理器拖文件夹进来那一路(`gpui::ExternalPaths`)挂在整个面板的容器上,
 //! 三态提示框与原版同构;目录判定(`filter_directories`)是阻塞 stat,一次性丢后台
 //! 算完存进 `external`,`on_drag_move` 只读缓存 —— 逐帧 `is_dir()` 在网络盘上会卡死主线程。
+//!
+//! # 揭示(从「项目」块之外切过来的项目)
+//!
+//! 标题栏胶囊、Ctrl+Shift+P 切换器、toast、托盘、会话跳转、添加项目……这些入口切完
+//! 活动项目,列表里的高亮跟着走,但那一行可能在可视区外、或藏在折叠的分组里。
+//! 它们切完都调一次 [`reveal`]:展开挡路的折叠分组(走分组折叠同一条落盘口径,
+//! 见 [`AppStore::expand_groups_to_project`])+ 登记一次滚动,下一帧渲染时由
+//! [`ScrollHandle::scroll_to_item`] 把那一行滚进可视区 —— gpui 这个策略就是「最小
+//! 滚动让它完整可见」:已在视口内不动,在上方贴上沿、在下方贴下沿。行高不用自己
+//! 算,滚动在 prepaint 里拿这一帧的真实布局(再校准一帧,理由见 `render` 里兑现那段)。
+//!
+//! **列表里自己点 / 按 Enter 切的不揭示**:那一行本来就在眼前,贴边那一行还会被
+//! 「补齐可见」顶一下,看着就是跳动。中栏收起时列表不在元素树里,登记的滚动留到
+//! 下次展开中栏时兑现(届时还是活动项目才滚)。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -47,6 +61,7 @@ use gpui::{
     Subscription, Task, Window, anchored, canvas, deferred, div,
     prelude::FluentBuilder, px,
 };
+use gpui::{Global, ScrollHandle};
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_project::project_kind::{ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, ProjectKind};
@@ -1043,6 +1058,43 @@ fn new_group_menu(store: &Entity<AppStore>) -> Vec<MenuEntry> {
     })]
 }
 
+// ─── 揭示(见模块注释) ────────────────────────────────────────
+
+struct GlobalProjectList(Entity<ProjectList>);
+impl Global for GlobalProjectList {}
+
+/// 登记全局的列表实体,[`reveal`] 经它找到列表。`Workspace` 建完列表调一次。
+pub fn install(list: Entity<ProjectList>, cx: &mut App) {
+    cx.set_global(GlobalProjectList(list));
+}
+
+/// 在「项目」块里揭示项目:展开挡路的折叠分组,下一帧把那一行滚进可视区。
+/// 给**列表之外**的切项目入口用,调用方先把它切成活动项目再调这里。
+///
+/// 整段排到本轮 effect 之后(`cx.defer`):调用方常常正拿着 store 的租约
+/// (`open_added_project`)或列表自己的租约(外部拖放),当场 `update` 就是嵌套
+/// 租约,gpui 直接 panic。列表还没装上(单测里的 store)时什么都不做。
+pub fn reveal(project_id: &str, cx: &mut App) {
+    let project_id = project_id.to_string();
+    cx.defer(move |cx| {
+        let Some(list) = cx.try_global::<GlobalProjectList>().map(|g| g.0.clone()) else {
+            return;
+        };
+        list.update(cx, |list, cx| list.reveal(project_id, cx));
+    });
+}
+
+/// 揭示目标是列表滚动容器的第几个子元素(给 [`ScrollHandle::scroll_to_item`])。
+///
+/// `render_rows` 把展平表**逐条一一**铺成子元素(分组行、项目行各占一个;展平表只收
+/// `config.projects` 里真有的项目,行渲染那道 `continue` 不会跳号),所以下标就是它
+/// 在表里的位置。只认项目行 —— 不在表里(所在分组还折叠着 / 已被删)→ `None`。
+fn reveal_row_index(ordered: &[OrderedItem], project_id: &str) -> Option<usize> {
+    ordered
+        .iter()
+        .position(|item| matches!(item, OrderedItem::Project { id, .. } if id == project_id))
+}
+
 // ─── 视图 ─────────────────────────────────────────────────────
 
 /// 行内重命名的编辑态(项目行与分组行共用一份 —— 同时只可能编辑一行)。
@@ -1106,6 +1158,17 @@ pub struct ProjectList {
     /// 处理,从头播一遍。表在 `render` 的前置段维护(`render_project` 拿的是
     /// `&self`,建不了)。
     done_tags: HashMap<String, mt_ui::motion::Transition>,
+    /// 行列表那个滚动容器的句柄(滚动偏移也住在这里)。揭示靠它把目标行滚进可视区。
+    rows_scroll: ScrollHandle,
+    /// 等着滚进可视区的项目,由 [`Self::reveal`] 登记、接下来的 `render` 兑现。
+    pending_reveal: Option<PendingReveal>,
+}
+
+/// 一次揭示的兑现进度(见 `render` 里兑现那一段)。
+struct PendingReveal {
+    project_id: String,
+    /// 兑现之后还要不要再校准一帧。
+    recheck: bool,
 }
 
 impl ProjectList {
@@ -1151,6 +1214,8 @@ impl ProjectList {
             hover_rect: None,
             pending_select_all: None,
             done_tags: HashMap::new(),
+            rows_scroll: ScrollHandle::new(),
+            pending_reveal: None,
             };
         // 挂载时先探一次(原版两个 effect 都在挂载时跑一遍)
         this.probe_worktrees(true, cx);
@@ -1208,6 +1273,24 @@ impl ProjectList {
         }
         self.store
             .update(cx, |store, cx| store.ensure_dir_kinds(paths, cx));
+    }
+
+    /// 揭示的视图半边(入口是自由函数 [`reveal`]):先把挡路的折叠分组展开,
+    /// 再登记滚动。滚动不能当场算 —— 刚展开的行还没铺出来,要等下一次 `render`
+    /// 拿新的展平表定行号(见 `render` 里兑现那一段)。
+    fn reveal(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| {
+            store.expand_groups_to_project(&project_id, cx)
+        });
+        // 列表要滚了,悬停缩略图的锚点随之失效(与滚轮那条同一个理由)
+        self.close_preview(cx);
+        self.pending_reveal = Some(PendingReveal {
+            project_id,
+            recheck: true,
+        });
+        // 本视图套着 view 级缓存:不 notify 的话这一帧整块沿用旧画面,
+        // prepaint 不跑,滚动请求也就没人兑现
+        cx.notify();
     }
 
     // ─── 行内重命名(`ProjectList.tsx:415-444`) ───────────────
@@ -1766,7 +1849,7 @@ impl ProjectList {
     }
 
     /// 外部文件落地。逐个加;**新增过就打开第一个新增的**(切过去 + 开首个终端,
-    /// 与「添加项目」弹窗同口径),一个没新增但撞上已有项目 → 只切过去。
+    /// 与「添加项目」弹窗同口径),一个没新增但撞上已有项目 → 只切过去(并揭示)。
     ///
     /// 原版 `ProjectList.tsx:295-319` 是「新增过任何一个就只落盘不切换」,
     /// 「添加完还得自己找过去」这一步被用户点名要掉,这里跟着弹窗一起改。
@@ -1800,8 +1883,14 @@ impl ProjectList {
                         first_added.get_or_insert(id);
                     }
                     match (first_added, existing_id) {
+                        // 新增的那个由 `open_added_project` 自己揭示
                         (Some(id), _) => store.open_added_project(&id, window, cx),
-                        (None, Some(id)) => store.set_active_project(&id, cx),
+                        // 撞上的既有项目可能藏在折叠组里 / 可视区外 —— 拖进来的是
+                        // 文件夹,不是点了那一行,同样要揭示
+                        (None, Some(id)) => {
+                            store.set_active_project(&id, cx);
+                            reveal(&id, cx);
+                        }
                         (None, None) => {}
                     }
                 });
@@ -1862,6 +1951,28 @@ impl Render for ProjectList {
             let store = self.store.read(cx);
             project_tree::get_ordered_tree(store.config())
         };
+        // 揭示在这里兑现:此刻的展平表已含 `reveal` 刚展开的分组,行号与这一帧铺出来
+        // 的子元素一一对应。目标已不是活动项目(中栏收着时登记、展开前又被别处切走)
+        // 就作罢 —— 揭示的语义是「让你看见当前项目」。
+        //
+        // 兑现两帧:gpui 拿**上一帧**画出来的视口矩形与滚动轴来算这次滚动,中栏刚展开
+        // 时那份是旧的(收着期间窗口改过高),开机就收着的话句柄连一次都没画过、全是
+        // 缺省值,这一次会被当成「不可滚」直接丢掉。下一帧按刚画出来的矩形再算一遍;
+        // 第一次已经算对时第二次是空操作(完整可见就不动)
+        if let Some(reveal) = self.pending_reveal.take() {
+            let still_active = self.store.read(cx).active_project_id.as_deref()
+                == Some(reveal.project_id.as_str());
+            if still_active && let Some(ix) = reveal_row_index(&ordered, &reveal.project_id) {
+                self.rows_scroll.scroll_to_item(ix);
+                if reveal.recheck {
+                    self.pending_reveal = Some(PendingReveal {
+                        recheck: false,
+                        ..reveal
+                    });
+                    window.request_animation_frame();
+                }
+            }
+        }
         self.sync_row_focus(&ordered, cx);
         self.sync_done_tags(&ordered, window, cx);
         let preview = self.render_preview(window, cx);
@@ -2150,6 +2261,8 @@ impl ProjectList {
             .flex_col()
             .flex_1()
             .overflow_y_scroll()
+            // 滚动偏移交给句柄持有,揭示才滚得动它(见模块注释「揭示」)
+            .track_scroll(&self.rows_scroll)
             // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
             .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
                 this.close_preview(cx);
@@ -3084,5 +3197,99 @@ mod tests {
         assert!(collect_worktree_probe_paths(&projects).is_empty());
         let alive: HashSet<String> = HashSet::new();
         assert!(find_stale_worktree_projects(&projects, &alive).is_empty());
+    }
+
+    // ─── 揭示 ───────────────────────────────────────────────
+
+    fn tree_group(id: &str, collapsed: bool, children: Vec<ProjectTreeItem>) -> ProjectTreeItem {
+        ProjectTreeItem::Group(mt_config::ProjectGroup {
+            id: id.to_string(),
+            name: id.to_string(),
+            collapsed,
+            children,
+        })
+    }
+
+    fn tree_proj(id: &str) -> ProjectTreeItem {
+        ProjectTreeItem::ProjectId(id.to_string())
+    }
+
+    /// 行号就是展平表里的位置:分组行也占一格(它在滚动容器里同样是一个子元素),
+    /// 分组 id 本身不当揭示目标。
+    #[test]
+    fn 揭示行号计入分组行() {
+        let ordered = vec![
+            OrderedItem::Group {
+                id: "g1".into(),
+                name: "g1".into(),
+                collapsed: false,
+                count: 2,
+                depth: 0,
+                parent_group_id: None,
+            },
+            OrderedItem::Project {
+                id: "p1".into(),
+                depth: 1,
+                parent_group_id: Some("g1".into()),
+                is_child: false,
+            },
+            OrderedItem::Project {
+                id: "p2".into(),
+                depth: 1,
+                parent_group_id: Some("g1".into()),
+                is_child: false,
+            },
+        ];
+        assert_eq!(reveal_row_index(&ordered, "p1"), Some(1));
+        assert_eq!(reveal_row_index(&ordered, "p2"), Some(2));
+        assert_eq!(reveal_row_index(&ordered, "g1"), None, "分组不是揭示目标");
+        assert_eq!(reveal_row_index(&ordered, "查无此项"), None);
+    }
+
+    /// 端到端走一遍揭示的两步:折叠着时目标不在表里(`None`,不滚);按
+    /// `collapsed_ancestors` 展开之后行号对得上 —— worktree 子项目紧跟父项目,
+    /// 中间那层本来就展开的组也占一行。
+    #[test]
+    fn 揭示先展开折叠组再定行号() {
+        let mut config = mt_config::AppConfig {
+            projects: vec![
+                project("外", r"D:\out", None),
+                project("父", r"D:\repo", None),
+                project("wt", r"D:\wt", Some("父")),
+            ],
+            project_tree: Some(vec![
+                tree_proj("外"),
+                tree_group(
+                    "g1",
+                    true,
+                    vec![tree_group(
+                        "g2",
+                        false,
+                        vec![tree_group("g3", true, vec![tree_proj("父")])],
+                    )],
+                ),
+            ]),
+            ..mt_config::AppConfig::default()
+        };
+        let before = project_tree::get_ordered_tree(&config);
+        assert_eq!(
+            reveal_row_index(&before, "wt"),
+            None,
+            "藏在折叠组里,这一帧不滚"
+        );
+
+        let groups = project_tree::collapsed_ancestors(&config, "wt");
+        assert_eq!(groups, vec!["g1", "g3"]);
+        let tree = config.project_tree.as_mut().expect("有树");
+        for id in &groups {
+            project_tree::find_group_in_tree_mut(tree, id)
+                .expect("交出来的是树里的组")
+                .collapsed = false;
+        }
+        // 外 / g1 / g2 / g3 / 父 / wt
+        let after = project_tree::get_ordered_tree(&config);
+        assert_eq!(reveal_row_index(&after, "父"), Some(4));
+        assert_eq!(reveal_row_index(&after, "wt"), Some(5));
+        assert_eq!(reveal_row_index(&after, "外"), Some(0));
     }
 }

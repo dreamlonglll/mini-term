@@ -402,6 +402,7 @@ impl ToastLayer {
                     store.activate_pane(&pid, &pane_id, window, cx);
                 }
             });
+            crate::project_list::reveal(&project_id, cx);
             if jumps_to_pane {
                 crate::workbench_area::activate_terminal_page(window, cx);
             }

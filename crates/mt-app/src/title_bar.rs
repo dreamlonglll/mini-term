@@ -740,6 +740,9 @@ impl TitleBar {
                         if !focus_attention_target(&store, Some(&target), window, cx) {
                             store.update(cx, |store, cx| store.set_active_project(&target, cx));
                         }
+                        // 两条路都落在 target 上:「项目」块里把它揭示出来
+                        // (折叠组里的展开、可视区外的滚进来),只换高亮等于没看见
+                        crate::project_list::reveal(&target, cx);
                     }))
                     // 左:6px 状态点(**不压暗** —— 这一行必然有 AI 会话)
                     .child(
