@@ -1989,23 +1989,20 @@ impl Render for GitPanel {
             0.0
         };
         // 两块都展开时按内容让位(见模块注释「两块的高度」)。两块「想要的高度」都是
-        // 上一帧量的;canvas 发现变了会再要一帧
+        // 上一帧量的;canvas 发现变了会再要一帧。「更改」区的列表高度读它的派生模型
+        // (缓存的,不再每帧建树),一帧只问一次、下限跟着同一个值算
         let (changes_grow, history_grow) = if both_open {
-            self.natural_seen = (
-                self.changes.read(cx).natural_height(cx),
-                self.history.read(cx).natural_height(),
-            );
+            let changes = self.changes.read(cx);
+            let changes_natural = changes.natural_height(cx);
+            let changes_floor = changes.min_height(changes_natural);
+            self.natural_seen = (changes_natural, self.history.read(cx).natural_height());
             let split = section_split(
                 self.sections_height,
                 section.ratio,
                 self.natural_seen.0,
                 self.natural_seen.1,
             );
-            let split = keep_changes_floor(
-                split,
-                self.sections_height,
-                self.changes.read(cx).min_height(cx),
-            );
+            let split = keep_changes_floor(split, self.sections_height, changes_floor);
             self.effective_ratio = split;
             (split, 1.0 - split)
         } else {
@@ -2119,16 +2116,24 @@ impl Render for GitPanel {
 
         // 拖拽期间鼠标可能划出手柄,移动/松手挂在面板根上
         root.when(self.drag.is_some(), |el| {
-            el.on_mouse_move(cx.listener(|this: &mut Self, event: &MouseMoveEvent, _window, cx| {
-                let Some(drag) = this.drag else { return };
-                if drag.total <= 0.0 {
-                    return;
-                }
-                let dy = f32::from(event.position.y - drag.start_y);
-                let next = clamp_ratio(drag.start_ratio + dy / drag.total);
-                SECTION_UI.with(|s| s.borrow_mut().ratio = next);
-                cx.notify();
-            }))
+            el.on_mouse_move(
+                cx.listener(|this: &mut Self, event: &MouseMoveEvent, _window, cx| {
+                    let Some(drag) = this.drag else { return };
+                    if drag.total <= 0.0 {
+                        return;
+                    }
+                    let dy = f32::from(event.position.y - drag.start_y);
+                    let next = clamp_ratio(drag.start_ratio + dy / drag.total);
+                    // 比例真变了才重画:钳到上下限之后鼠标接着动,每一下都是一次白画的整窗帧
+                    let moved = SECTION_UI.with(|s| {
+                        let mut s = s.borrow_mut();
+                        std::mem::replace(&mut s.ratio, next) != next
+                    });
+                    if moved {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this: &mut Self, _: &MouseUpEvent, _window, cx| {

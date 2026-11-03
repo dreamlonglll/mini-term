@@ -43,7 +43,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Element, FillOptions, FillRule, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px,
+    IntoElement, LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px, size,
 };
 
 use super::svg_path::SubPath;
@@ -255,6 +255,17 @@ pub fn round_rect_points(x: f32, y: f32, w: f32, h: f32, round: f32) -> Vec<(f32
     pts
 }
 
+/// 一枚边长 `side`、左上角在 `origin` 的图标最远会画到哪儿(窗口坐标):以绘制方框
+/// 中心为心、边长 `2 × side` 的正方形。绕中心旋转后的外接正方形是 `√2 × side`,描边的
+/// 半个线宽、官方 path 越出 viewBox 的那 1%(见单测「形状表的点全在单位方框内」)都
+/// 落在这一圈富余里 —— 宁可多画几枚贴边的,不能裁掉一枚该画的。
+fn paint_extent(origin: Point<Pixels>, side: f32) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(origin.x - px(side / 2.0), origin.y - px(side / 2.0)),
+        size: size(px(side * 2.0), px(side * 2.0)),
+    }
+}
+
 /// 一枚画好的图标元素。
 ///
 /// 尺寸是**正方形**,由 `size` 决定;`ink` 是 `Ink::Current` 的取色;
@@ -416,6 +427,13 @@ impl Element for VectorIcon {
         if side <= 0.0 {
             return;
         }
+        // 整枚落在裁剪区外就不画:下面每一笔都要 lyon 曲面细分,是这里最贵的一步,而
+        // 画出来的路径会在 `scene.insert_primitive` 里按裁剪区整个丢掉 —— 没虚拟化的
+        // 长列表、滚出视口的行、收起的面板里的图标照样走到 paint,CPU 那头白干一遍。
+        // 两边都是窗口坐标(paint 拿到的 bounds 已含滚动偏移,裁剪区是祖先层层求交的结果)
+        if !paint_extent(bounds.origin, side).intersects(&window.content_mask().bounds) {
+            return;
+        }
         let theta = self.rotation * TAU;
         let (sin, cos) = (theta.sin(), theta.cos());
         let map = |(x, y): (f32, f32)| -> Point<Pixels> {
@@ -510,6 +528,32 @@ mod tests {
             assert!((-0.001..=1.001).contains(x), "x 越界 {x}");
             assert!((-0.001..=0.401).contains(y), "y 越界 {y}");
         }
+    }
+
+    /// 裁剪判定:整枚落在裁剪区外才跳过;露出半截、方框在外但旋转 / 描边可能探进来的
+    /// 那一圈都照画。
+    #[test]
+    fn 裁剪区外的图标不画() {
+        let mask = Bounds {
+            origin: point(px(0.0), px(100.0)),
+            size: size(px(200.0), px(300.0)),
+        };
+        let drawn = |x: f32, y: f32| paint_extent(point(px(x), px(y)), 16.0).intersects(&mask);
+        assert!(drawn(10.0, 150.0), "在里面");
+        assert!(!drawn(10.0, 40.0), "整枚在上面");
+        assert!(!drawn(10.0, 420.0), "整枚在下面");
+        assert!(!drawn(-60.0, 150.0), "整枚在左边");
+        assert!(!drawn(260.0, 150.0), "整枚在右边");
+        assert!(drawn(10.0, 90.0), "露出下半截");
+        assert!(
+            drawn(10.0, 80.0),
+            "方框贴在上沿外 4px:外接正方形探进来了,照画"
+        );
+        // 外扩一整个边长:旋转 45° 的外接正方形(√2 倍)也包得住
+        let extent = paint_extent(point(px(0.0), px(0.0)), 10.0);
+        let corner = 5.0 + 5.0 * std::f32::consts::SQRT_2;
+        assert!(f32::from(extent.bottom()) >= corner && f32::from(extent.right()) >= corner);
+        assert!(f32::from(extent.top()) <= 10.0 - corner);
     }
 
     #[test]
