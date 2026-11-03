@@ -33,8 +33,8 @@ use git2::{BranchType, Oid, Repository, RepositoryState, Status, StatusOptions};
 use super::branch::head_branch_name;
 use super::{
     CommitFileInfo, GitDiffResult, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, checkout_branch,
-    failure_text, get_commit_file_diff, get_commit_files, invalidate_repo_cache, is_commit_hash,
-    list_conflicts, run_checked, run_git_output, validate_branch_name,
+    failure_text, get_commit_file_diff, get_commit_files, is_commit_hash, list_conflicts,
+    run_checked, run_git_output, validate_branch_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -372,8 +372,8 @@ pub fn stash_branch(
         WORKTREE_OP_TIMEOUT,
         "",
     )?;
-    // 分支可能已经建好并检出(随后的应用才失败),仓库栏的分支名要重新发现
-    invalidate_repo_cache();
+    // 分支可能已经建好并检出(随后的应用才失败):仓库栏的分支名不靠仓库发现缓存
+    // (那里只存路径,当前分支每次现读),面板随后的刷新自然读到新分支
     if out.success {
         return Ok(StashApplyOutcome::Applied);
     }

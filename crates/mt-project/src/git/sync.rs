@@ -134,9 +134,14 @@ pub struct PullConfig {
 /// 取值 `true / merges / interactive`(及其缩写、布尔同义词)都算变基;不变基时
 /// `pull.ff=only` → 仅快进,其余合并。读不到配置按合并算。
 pub fn pull_config(repo_path: &Path) -> PullConfig {
-    let Ok(repo) = Repository::open(repo_path) else {
-        return PullConfig::default();
-    };
+    match Repository::open(repo_path) {
+        Ok(repo) => pull_config_in(&repo),
+        Err(_) => PullConfig::default(),
+    }
+}
+
+/// [`pull_config`] 的本体(拿已打开的仓库算,分支快照用)。
+pub(super) fn pull_config_in(repo: &Repository) -> PullConfig {
     let Ok(config) = repo.config() else {
         return PullConfig::default();
     };
@@ -146,7 +151,7 @@ pub fn pull_config(repo_path: &Path) -> PullConfig {
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
     };
-    let branch_rebase = head_branch_name(&repo).and_then(|b| get(&format!("branch.{b}.rebase")));
+    let branch_rebase = head_branch_name(repo).and_then(|b| get(&format!("branch.{b}.rebase")));
     let pull_rebase = get("pull.rebase");
     let ff = get("pull.ff");
     let explicit = branch_rebase.is_some() || pull_rebase.is_some() || ff.is_some();
@@ -344,19 +349,23 @@ fn tracking_ref_name(repo: &Repository, remote: &str, branch: &str) -> String {
 /// 上游按配置读(`branch.<b>.remote` + `branch.<b>.merge`),不要求远程跟踪引用在场 ——
 /// 「远端分支被删了又 prune 过」时上游配置还在,推送会把它重新建出来。
 pub fn push_plan(repo_path: &Path, branch: Option<&str>) -> Result<PushPlan> {
-    let repo = Repository::open(repo_path)?;
+    push_plan_in(&Repository::open(repo_path)?, branch)
+}
+
+/// [`push_plan`] 的本体(拿已打开的仓库算,分支快照用)。
+pub(super) fn push_plan_in(repo: &Repository, branch: Option<&str>) -> Result<PushPlan> {
     let branch = match branch {
         Some(b) => {
             repo.find_branch(b, BranchType::Local)
                 .map_err(|_| anyhow!("未找到本地分支:{b}"))?;
             b.to_string()
         }
-        None => match head_branch_name(&repo) {
+        None => match head_branch_name(repo) {
             Some(b) => b,
             None => return Ok(PushPlan::Detached),
         },
     };
-    plan_for(&repo, branch)
+    plan_for(repo, branch)
 }
 
 fn plan_for(repo: &Repository, branch: String) -> Result<PushPlan> {

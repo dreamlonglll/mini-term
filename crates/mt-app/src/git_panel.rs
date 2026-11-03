@@ -207,22 +207,24 @@ struct RepoMeta {
 }
 
 /// 后台读一份分支快照。只读;除分支列表外,单项查询失败不拖垮整份。
+///
+/// 一次开库取齐([`mt_project::git::repo_panel_snapshot`]),签名在其余各项之前算 ——
+/// 读快照期间仓库又变了的话,签名停在旧状态,`.git` 监听下一次比对就认得出「变了」。
 fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMeta)> {
-    use mt_project::git as g;
-    let branches = g::get_repo_branches(repo)?;
+    let snap = mt_project::git::repo_panel_snapshot(repo, RECENT_LIMIT)?;
     let meta = RepoMeta {
-        head_label: g::current_head_label(repo).ok().flatten(),
-        head_tracking: g::ahead_behind(repo).ok().flatten(),
-        tracking: g::local_branch_tracking(repo).unwrap_or_default(),
-        recent: g::recent_branches(repo, RECENT_LIMIT).unwrap_or_default(),
-        remotes: g::list_remotes(repo).unwrap_or_default(),
-        op: g::repo_operation_state(repo).unwrap_or_default(),
-        signature: g::repo_signature(repo).ok(),
-        pull_config: g::pull_config(repo),
-        push_plan: g::push_plan(repo, None).ok(),
-        stash_count: g::stash_count(repo).unwrap_or_default(),
+        head_label: snap.head_label,
+        head_tracking: snap.head_tracking,
+        tracking: snap.tracking,
+        recent: snap.recent,
+        remotes: snap.remotes,
+        op: snap.op,
+        signature: snap.signature,
+        pull_config: snap.pull_config,
+        push_plan: snap.push_plan,
+        stash_count: snap.stash_count,
     };
-    Ok((branches, meta))
+    Ok((snap.branches, meta))
 }
 
 /// 分支弹窗要的一份快照(弹窗每帧从面板现取,数据始终与仓库栏一致)。

@@ -302,7 +302,11 @@ pub struct RepoSignature {
 
 /// 算 [`RepoSignature`]。纯 git2 只读。
 pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
-    let repo = Repository::open(repo_path)?;
+    repo_signature_in(&Repository::open(repo_path)?)
+}
+
+/// [`repo_signature`] 的本体(拿已打开的仓库算,分支快照用)。
+pub(super) fn repo_signature_in(repo: &Repository) -> Result<RepoSignature> {
     let mut hasher = DefaultHasher::new();
     match repo.head() {
         Ok(head) => {
@@ -324,7 +328,7 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
     refs.sort();
     refs.hash(&mut hasher);
     // 删 `stash@{n>0}` 时 `refs/stash` 不动、只少一条 reflog:贮藏条数单独算进来
-    stash_entries(&repo).hash(&mut hasher);
+    stash_entries(repo).hash(&mut hasher);
     let refs = hasher.finish();
 
     let mut hasher = DefaultHasher::new();
@@ -414,9 +418,15 @@ pub fn worktree_watch_dirs(repo_path: &Path) -> Result<WorktreeWatchDirs> {
 ///
 /// `paths` 是监听报上来的绝对路径(以 `repo_path` 为根拼的,见 [`worktree_watch_dirs`]);
 /// `.git` 下的一律不算;求不出相对路径的按「没被忽略」算 —— 宁可多刷一次。
+///
+/// 「被忽略」与 git 的口径一致:**已跟踪的文件不算被忽略**。libgit2 的 `is_path_ignored`
+/// 只看规则、不管跟没跟踪 —— 提交过、后来又写进 `.gitignore` 的文件被改了,`git status`
+/// 照样显示 M,只看规则的话这条变化被丢掉,「更改」区不刷。所以规则命中的再查一次暂存区
+/// (一批里只读一次暂存区,而且只在真有命中时才读)。
 pub fn any_unignored_change(repo_path: &Path, paths: &[PathBuf]) -> Result<bool> {
     let repo = Repository::open(repo_path)?;
     let root = trim_dir(repo_path);
+    let mut index: Option<Option<git2::Index>> = None;
     for path in paths {
         let Ok(rel) = path.strip_prefix(&root) else {
             return Ok(true);
@@ -430,8 +440,17 @@ pub fn any_unignored_change(repo_path: &Path, paths: &[PathBuf]) -> Result<bool>
             Some(first) if first == ".git" => continue,
             Some(_) => {}
         }
-        if !repo.is_path_ignored(parts.join("/")).unwrap_or(false) {
+        let rel = parts.join("/");
+        if !repo.is_path_ignored(&rel).unwrap_or(false) {
             return Ok(true);
+        }
+        // 规则命中:已跟踪(暂存区里有它,冲突中的也算)就不是被忽略的
+        let index = index.get_or_insert_with(|| repo.index().ok());
+        if let Some(index) = index {
+            let rel = Path::new(&rel);
+            if (0..=3).any(|stage| index.get_path(rel, stage).is_some()) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)

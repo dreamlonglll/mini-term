@@ -1,7 +1,8 @@
 //! 提交历史右键菜单背后的操作:检出 / 新建分支 / 拣选 / 还原 / 重置 / 撤销提交 /
 //! 修改提交消息,以及菜单判定要用的「这个提交与 HEAD、远程的关系」。
 //!
-//! 改仓库状态的一律走 git CLI(继承用户的 hooks / 签名 / 配置),只读判定走 git2。
+//! 改仓库状态的一律走 git CLI(继承用户的 hooks / 签名 / 配置),只读判定走 git2 ——
+//! 「是否已推送」例外:要对全部远程分支判祖先,交给 git 一趟遍历([`remotes_contain`])。
 //! **结果判定不看 git 的提示文本**(用户的 git 可能是中文界面):只看退出码、
 //! `repo.state()`、索引里有没有冲突条目这些结构化信号。
 //!
@@ -10,7 +11,6 @@
 //!
 //! 全部是**阻塞**调用(最长 120s),调用方自己放到后台执行器上跑。
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,10 +18,10 @@ use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Oid, Repository, RepositoryState};
 
 // 超时口径:拣选 / 还原 / 改消息会跑 hook,走 LOCAL_OP_TIMEOUT(同 `git_commit`);
-// 检出 / 重置改写工作区,走 WORKTREE_OP_TIMEOUT
+// 检出 / 重置改写工作区,走 WORKTREE_OP_TIMEOUT;「已推送」判定只读,走 QUICK_OP_TIMEOUT
 use super::{
-    LOCAL_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, failure_text, run_checked, run_git_command_labeled,
-    run_git_output,
+    LOCAL_OP_TIMEOUT, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, failure_text, run_checked,
+    run_git_command_labeled, run_git_output,
 };
 
 /// `git reset` 的四种模式。
@@ -128,7 +128,7 @@ fn in_progress(repo: &Repository) -> bool {
 /// 菜单判定:这个提交与 HEAD / 远程的关系。
 ///
 /// 「已推送」= 当前分支的上游包含它;没有上游时退到任一远程跟踪分支包含它
-/// (detached HEAD、刚从别处拉来的分支都走这条)。
+/// (detached HEAD、刚从别处拉来的分支都走这条)。判定方法见 [`pushed_in`]。
 pub fn commit_relation(repo_path: &Path, hash: &str) -> Result<CommitRelation> {
     let repo = Repository::open(repo_path)?;
     let oid = resolve_commit(&repo, hash)?;
@@ -138,7 +138,7 @@ pub fn commit_relation(repo_path: &Path, hash: &str) -> Result<CommitRelation> {
     Ok(CommitRelation {
         is_head: head == Some(oid),
         in_head_history: head.is_some_and(|h| contains(&repo, h, oid)),
-        pushed: pushed_in(&repo, oid, head_branch.as_deref()),
+        pushed: pushed_in(&repo, repo_path, oid, head_branch.as_deref()),
         parent_count: commit.parent_count(),
         head_branch,
         busy_state: in_progress(&repo),
@@ -150,7 +150,7 @@ pub fn is_commit_pushed(repo_path: &Path, hash: &str) -> Result<bool> {
     let repo = Repository::open(repo_path)?;
     let oid = resolve_commit(&repo, hash)?;
     let head_branch = head_branch_of(&repo);
-    Ok(pushed_in(&repo, oid, head_branch.as_deref()))
+    Ok(pushed_in(&repo, repo_path, oid, head_branch.as_deref()))
 }
 
 /// 该提交是否在 HEAD 的历史上(HEAD 自己也算)。空仓库恒 `false`。
@@ -163,12 +163,16 @@ pub fn is_ancestor_of_head(repo_path: &Path, hash: &str) -> Result<bool> {
 /// 把当前分支重置到 `target` 会不会丢掉**已推送**的提交(重置对话框据此警告「之后需要
 /// 强制推送」)。
 ///
-/// 重置丢掉的是「HEAD 能走到、`target` 走不到」的那些提交。对「已推送」口径里的每个
-/// 远程端点([`pushed_tips`]:当前分支的上游 + 全部远程跟踪分支)取它与 HEAD 的合并基 ——
-/// 那是 HEAD 这一侧已推送那段的顶端;它不在 `target` 的历史上,就有已推送的提交被移出
-/// 当前分支。HEAD 自己已推送时合并基就是 HEAD,判据退化成「`target` 不是 HEAD 也不是
-/// 它的后代」;HEAD 只领先几个本地提交、却重置到上游之前时同样认得出。
-/// 空仓库 / 一个远程分支都没有时恒 `false`。
+/// 重置丢掉的是「HEAD 能走到、`target` 走不到」的那些提交(记作 S);其中有任何一个被
+/// 「已推送」口径里的远程端点(当前分支的上游 + 全部远程跟踪分支)包含,就要强推。HEAD
+/// 自己已推送时 S 里的 HEAD 就是;HEAD 只领先几个本地提交、却重置到上游之前时,S 里
+/// 那段上游的提交同样认得出。
+///
+/// 判法:上游包含 HEAD(git2 一次判定,常见情况到此为止)直接是;否则让 git 数两遍 ——
+/// S 的大小,与 S 去掉远程端点能走到的之后还剩几个,少了就是有已推送的。旧实现对每个
+/// 远程端点各取一次与 HEAD 的合并基(1301 个远程分支 / 10 万提交的仓库要几分钟)。
+/// 空仓库 / 一个远程分支都没有时恒 `false`;git 跑失败也按 `false`(与旧实现判定失败时
+/// 一致)。
 pub fn reset_drops_pushed(repo_path: &Path, target: &str) -> Result<bool> {
     let repo = Repository::open(repo_path)?;
     let target = resolve_commit(&repo, target)?;
@@ -179,13 +183,36 @@ pub fn reset_drops_pushed(repo_path: &Path, target: &str) -> Result<bool> {
     if contains(&repo, target, head) {
         return Ok(false);
     }
-    let head_branch = head_branch_of(&repo);
-    let mut seen = HashSet::new();
-    Ok(pushed_tips(&repo, head_branch.as_deref())
-        .into_iter()
-        .filter(|tip| seen.insert(*tip))
-        .filter_map(|tip| repo.merge_base(head, tip).ok())
-        .any(|base| !contains(&repo, target, base)))
+    let upstream = upstream_tip(&repo, head_branch_of(&repo).as_deref());
+    // HEAD 在 S 里(上面刚排除了 target 包含 HEAD),它已推送就不用再数
+    if upstream.is_some_and(|tip| contains(&repo, tip, head)) {
+        return Ok(true);
+    }
+    drop(repo);
+    let (head, target) = (head.to_string(), target.to_string());
+    let upstream = upstream.map(|tip| tip.to_string());
+    let mut args = vec![
+        "rev-list",
+        "--count",
+        head.as_str(),
+        "--not",
+        target.as_str(),
+    ];
+    let dropped = rev_list_count(repo_path, &args);
+    // 上游可能是本地分支(`branch.<b>.remote=.`),不在 `--remotes` 里,单独排除
+    args.push("--remotes");
+    args.extend(upstream.as_deref());
+    let unpushed = rev_list_count(repo_path, &args);
+    Ok(matches!((dropped, unpushed), (Some(all), Some(left)) if left < all))
+}
+
+/// `git rev-list --count …` 的结果;跑失败为 `None`。
+fn rev_list_count(repo_path: &Path, args: &[&str]) -> Option<usize> {
+    let out = run_git_output(repo_path, args, "rev-list", QUICK_OP_TIMEOUT, "").ok()?;
+    if !out.success {
+        return None;
+    }
+    out.stdout.trim().parse().ok()
 }
 
 /// HEAD 所在的本地分支名;detached / 空仓库为 `None`。
@@ -196,27 +223,43 @@ fn head_branch_of(repo: &Repository) -> Option<String> {
         .and_then(|h| h.shorthand().map(str::to_string))
 }
 
-/// 「已推送」口径里的远程端点:当前分支的上游排在最前(绝大多数情况一次就有结论),
-/// 其后是全部远程跟踪分支。`origin/HEAD` 是符号引用,target() 为 None,天然跳过。
-fn pushed_tips(repo: &Repository, head_branch: Option<&str>) -> Vec<Oid> {
-    let mut tips = Vec::new();
-    if let Some(name) = head_branch
-        && let Ok(branch) = repo.find_branch(name, BranchType::Local)
-        && let Ok(upstream) = branch.upstream()
-        && let Some(tip) = upstream.get().target()
-    {
-        tips.push(tip);
-    }
-    if let Ok(remotes) = repo.branches(Some(BranchType::Remote)) {
-        tips.extend(remotes.flatten().filter_map(|(b, _)| b.get().target()));
-    }
-    tips
+/// 本地分支 `head_branch` 的上游指着的提交;没有上游 / 上游引用不在为 `None`。
+fn upstream_tip(repo: &Repository, head_branch: Option<&str>) -> Option<Oid> {
+    let branch = repo.find_branch(head_branch?, BranchType::Local).ok()?;
+    let upstream = branch.upstream().ok()?;
+    upstream.get().target()
 }
 
-fn pushed_in(repo: &Repository, oid: Oid, head_branch: Option<&str>) -> bool {
-    pushed_tips(repo, head_branch)
-        .into_iter()
-        .any(|tip| contains(repo, tip, oid))
+/// 「已推送」:先看当前分支的上游(git2 一次祖先判定,绝大多数情况到此就有结论),
+/// 不包含再看全部远程跟踪分支([`remotes_contain`],一趟 git 遍历)。
+fn pushed_in(repo: &Repository, repo_path: &Path, oid: Oid, head_branch: Option<&str>) -> bool {
+    upstream_tip(repo, head_branch).is_some_and(|tip| contains(repo, tip, oid))
+        || remotes_contain(repo_path, oid)
+}
+
+/// `oid` 是否已被某个远程跟踪分支(`refs/remotes/*`)包含,一趟判完。
+///
+/// `git rev-list -n 1 <oid> --not --remotes` 列的是「从 oid 走得到、从任何远程跟踪分支都
+/// 走不到」的提交:oid 被某个远程分支包含时它的祖先也全被包含,输出为空;否则 oid 自己
+/// 就在里面。旧实现对每个远程分支各做一次 `graph_descendant_of`(每次一趟 merge-base),
+/// 未推送的提交没法提前收手 —— 最常见的「右键一个本地提交」恰恰是最坏情况:1301 个远程
+/// 分支 / 10 万提交的仓库要一两分钟。git 一趟遍历(有 commit-graph 时还用代次号剪枝)
+/// 同一仓库 50~70ms,没有 commit-graph 也只要 0.1~0.3s。实测比过的另外两种:
+/// `for-each-ref --contains --count=1` 有 commit-graph 时一样快、没有时逐个引用判要 2.6s;
+/// libgit2 单个 revwalk `push(oid)` + `hide(全部远程)` 走 limited 模式要 0.6s。
+///
+/// 起不来 / 超时 / 非零退出(浅克隆缺对象之类)按「没推送」算,与旧实现判定失败时一致。
+/// `origin/HEAD` 这类符号引用指向的提交本来就在别的远程分支上,算进来不改变结论。
+pub(super) fn remotes_contain(repo_path: &Path, oid: Oid) -> bool {
+    let hex = oid.to_string();
+    run_git_output(
+        repo_path,
+        &["rev-list", "-n", "1", &hex, "--not", "--remotes"],
+        "rev-list",
+        QUICK_OP_TIMEOUT,
+        "",
+    )
+    .is_ok_and(|out| out.success && out.stdout.trim().is_empty())
 }
 
 /// 跑一条会改仓库状态的 git 命令,失败时把 git 的原文交回(工作区脏、hook 拒绝…,
@@ -792,6 +835,138 @@ mod tests {
         assert!(is_ancestor_of_head(&root, &first).unwrap());
         // 短哈希也认
         assert!(is_ancestor_of_head(&root, &first[..8]).unwrap());
+        cleanup(root);
+    }
+
+    /// 旧实现的「已推送」:当前分支的上游 + 全部远程跟踪分支逐个做祖先判定。
+    fn old_pushed(repo: &Repository, oid: Oid) -> bool {
+        old_tips(repo)
+            .into_iter()
+            .any(|tip| contains(repo, tip, oid))
+    }
+
+    fn old_tips(repo: &Repository) -> Vec<Oid> {
+        let mut tips: Vec<Oid> = upstream_tip(repo, head_branch_of(repo).as_deref())
+            .into_iter()
+            .collect();
+        tips.extend(
+            repo.branches(Some(BranchType::Remote))
+                .unwrap()
+                .flatten()
+                .filter_map(|(b, _)| b.get().target()),
+        );
+        tips
+    }
+
+    /// 旧实现的重置警告:每个远程端点取一次与 HEAD 的合并基,有不在 target 历史上的就报。
+    fn old_reset_drops(repo: &Repository, target: Oid) -> bool {
+        let Some(head) = head_oid(repo) else {
+            return false;
+        };
+        if contains(repo, target, head) {
+            return false;
+        }
+        old_tips(repo)
+            .into_iter()
+            .filter_map(|tip| repo.merge_base(head, tip).ok())
+            .any(|base| !contains(repo, target, base))
+    }
+
+    /// 改成「上游一次 + git 一趟」之后,在各种分支 / 远程布局下与逐个判定的旧实现结论
+    /// 逐条一致:HEAD 在跟踪远程的分支上、在以本地分支为上游的分支上、游离;每个提交都问
+    /// 一遍「已推送」与「重置到它会不会丢已推送的」。
+    #[test]
+    fn 已推送判定与逐个判定的旧实现一致() {
+        use super::super::test_support::git;
+        let root = init_repo_with_file("log-pushed-equiv", "a.txt", "1\n");
+        let c1 = head(&root);
+        let c2 = commit_file(&root, "a.txt", "2\n", "c2");
+        let c3 = commit_file(&root, "a.txt", "3\n", "c3");
+        let c4 = commit_file(&root, "a.txt", "4\n", "c4");
+        let c5 = commit_file(&root, "a.txt", "5\n", "c5");
+        let main = Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand()
+            .unwrap()
+            .to_string();
+        branch(&root, "side", &c2);
+        switch(&root, "side");
+        let s1 = commit_file(&root, "b.txt", "s1\n", "s1");
+        let s2 = commit_file(&root, "b.txt", "s2\n", "s2");
+        branch(&root, "topic", &c4);
+        switch(&root, "topic");
+        let t1 = commit_file(&root, "c.txt", "t1\n", "t1");
+        switch(&root, &main);
+        // 远程:origin/main 停在 c3、origin/feature 在旁支 s1、另一个远程 up/old 停在 c1
+        git(
+            &root,
+            &["remote", "add", "origin", "https://example.invalid/o.git"],
+        );
+        git(
+            &root,
+            &["remote", "add", "up", "https://example.invalid/u.git"],
+        );
+        for (name, at) in [
+            ("refs/remotes/origin/main", &c3),
+            ("refs/remotes/origin/feature", &s1),
+            ("refs/remotes/up/old", &c1),
+        ] {
+            git(&root, &["update-ref", name, at]);
+        }
+        git(
+            &root,
+            &["branch", "--set-upstream-to", "origin/main", &main],
+        );
+        // topic 以本地 main 为上游(`branch.topic.remote=.`)
+        git(&root, &["config", "branch.topic.remote", "."]);
+        git(
+            &root,
+            &[
+                "config",
+                "branch.topic.merge",
+                &format!("refs/heads/{main}"),
+            ],
+        );
+
+        let all = [&c1, &c2, &c3, &c4, &c5, &s1, &s2, &t1];
+        let check = |label: &str| {
+            let repo = Repository::open(&root).unwrap();
+            for hash in all {
+                let oid = Oid::from_str(hash).unwrap();
+                assert_eq!(
+                    is_commit_pushed(&root, hash).unwrap(),
+                    old_pushed(&repo, oid),
+                    "{label}: 已推送 {hash}"
+                );
+                assert_eq!(
+                    reset_drops_pushed(&root, hash).unwrap(),
+                    old_reset_drops(&repo, oid),
+                    "{label}: 重置到 {hash}"
+                );
+            }
+        };
+        check("HEAD 在 main(上游 origin/main)");
+        switch(&root, "topic");
+        check("HEAD 在 topic(上游是本地 main)");
+        switch(&root, "side");
+        check("HEAD 在没有上游的 side");
+        Repository::open(&root)
+            .unwrap()
+            .set_head_detached(Oid::from_str(&c4).unwrap())
+            .unwrap();
+        check("游离 HEAD");
+        // 一个远程分支都没有
+        for name in [
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+            "refs/remotes/up/old",
+        ] {
+            git(&root, &["update-ref", "-d", name]);
+        }
+        switch(&root, &main);
+        check("没有远程分支");
         cleanup(root);
     }
 
