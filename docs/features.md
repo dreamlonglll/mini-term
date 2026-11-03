@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.25-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.26-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -200,7 +200,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Custom title bar** — The frameless window gets a self-drawn top bar: app name, version and project switcher on the left, window controls on the right, colored from the theme instead of the system's grey strip. Adapted to each platform's conventions:
   - **Windows / Linux** — Minimize / maximize / close on the right, with the close button turning red on hover. Win11 **Snap Layouts** still work: hovering the maximize button pops the snap menu.
   - **macOS** — The native traffic lights are kept, with space reserved in the top-left corner; no hand-drawn dots, so full-screen, gestures, and system integration all survive. Closing the last window quits the process instead of leaving an unresponsive zombie icon in the Dock.
-  - **Project switcher** — A pill button next to the version number, set off by a divider, always showing the current project's name with its own AI status dot (dimmed when it has no AI session). Its dropdown lists every project with an AI session and its status (the same aggregation the tray menu uses, ordered awaiting > working > done > idle); clicking a project switches to it and lands on its most urgent pane, or just switches when everything is quiet.
+  - **Project switcher** — A pill button next to the version number, set off by a divider, always showing the current project's name with its own AI status dot (dimmed when it has no AI session). Its dropdown lists every project with an AI session and its status (the same aggregation the tray menu uses, ordered awaiting > working > done > idle); clicking a project switches to it and lands on its most urgent pane, or just switches when everything is quiet. Switching from here (or from Ctrl+Shift+P, notifications, the tray, AI history and other entry points outside the project list) also expands the collapsed groups containing the project in the left **Projects** pane and scrolls it into view.
   - Dragging and window controls go through GPUI's native WindowControlArea; double-clicking the bar toggles maximize / restore.
   - A **global status light** used to sit right beside the project switcher, aggregating the most urgent state across every project. It was removed in v1.2.6 — the pill already carries a dot for the current project's state, and two colored dots side by side just made you work out which was which. "Jump to the session that needs you next" is not lost: a left click on the tray icon does exactly that, and each row of the pill's dropdown jumps within its own project.
 - **External theme packs (Dream Skin-compatible)** — Settings → Appearance → Theme & language can import third-party skins from a folder or a zip into `{app_data_dir}/themes/<themeId>/` (`theme.json` required; `theme.css` / background image optional). "Create example" in the same section writes a ready-to-edit sample skin into `themes/example/` (`theme.json` + `theme.css` + a `README.md` documenting every field; save an edit and it hot-reloads). The sample is literally the **same file** as [`docs/theme-pack-example/`](theme-pack-example/) in the repo (embedded at compile time via `include_str!`, so docs and product can't drift apart), and it errors instead of overwriting when the folder already exists — a copy you've edited is never silently wiped. When the pack ships a `manifest.json`, every file is checked against its bytes + sha256 to catch corruption; imports land in a staging directory first and are swapped in atomically only after validation, so a bad pack can't take out an existing skin of the same name. A pack's light/dark nature is fixed by its author via `appearance` in `theme.json`, and the built-in theme buttons show as unselected while it's active. Editing a file in the pack hot-reloads it. A pack may declare a background image, in which case terminal surfaces turn translucent over that ambient layer, and the settings-page card shows a live thumbnail. An imported `theme.css` and the `tokens` overrides in `theme.json` pass through the same external-reference gate: no `@import`, and any reference pointing outside the pack rejected — the check runs on a sample with comments stripped and CSS escapes resolved, inspecting both `url()` and bare string literals like `image-set("…")`, so escaped forms such as `url(\68 ttps://…)` are caught too.
@@ -233,7 +233,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,772 Rust tests** (35 test targets) + relay-server protocol boundary tests |
+| Tests | **2,875 Rust tests** (35 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -374,7 +374,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (35 test targets, 2,772 cases)
+# Workspace-wide Rust tests (35 test targets, 2,875 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

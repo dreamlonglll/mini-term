@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.25-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.26-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -200,7 +200,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **自定义标题栏** — 无边框窗口改由应用自绘顶栏，左侧应用名、版本号与项目切换器，右侧窗口控制，配色跟随主题而不再是系统那条灰白。按平台适配窗口习惯：
   - **Windows / Linux** — 最小化 / 最大化 / 关闭三键靠右，关闭键悬停变红。Win11 的**贴靠布局**照常可用：悬停最大化按钮即弹分屏菜单
   - **macOS** — 保留系统原生交通灯，左上角留出让位，不自绘三色圆点，全屏 / 手势 / 系统集成一并保住；关闭最后一个窗口即退出进程，不会在 Dock 里留下一个点不开的僵尸图标
-  - **项目切换器** — 版本号右侧以竖线隔开的胶囊按钮，常显当前项目名与它自己的 AI 状态色点（没有 AI 会话时压暗）；下拉列出所有进入 AI 会话的项目及状态（与托盘右键菜单同一份聚合，按 待确认 > 处理中 > 已完成 > 空闲 排序），点击项目即切换并定位到该项目内最该处理的 pane，全都安静时只切换项目
+  - **项目切换器** — 版本号右侧以竖线隔开的胶囊按钮，常显当前项目名与它自己的 AI 状态色点（没有 AI 会话时压暗）；下拉列出所有进入 AI 会话的项目及状态（与托盘右键菜单同一份聚合，按 待确认 > 处理中 > 已完成 > 空闲 排序），点击项目即切换并定位到该项目内最该处理的 pane，全都安静时只切换项目。从这里（以及 Ctrl+Shift+P、通知、托盘、AI 历史等项目列表之外的入口）切过去时，左侧「项目」块会展开它所在的折叠分组并把它滚到可见处
   - 拖拽与窗口控制走 GPUI 原生 WindowControlArea；双击顶栏最大化 / 还原
   - 项目切换器右侧原本另有一颗**全局状态灯**（汇总所有项目的最紧急一档），v1.2.6 起撤掉——胶囊自己那颗点已经表达了当前项目的档位，并排两颗色点反而要人分辨谁是谁。「跳到下一个该我处理的会话」没丢：托盘图标左键做的是同一件事，胶囊下拉里逐项也各自跳自己那个项目
 - **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，设置页卡片直接铺实况缩略图。导入的 `theme.css` 与 `theme.json` 的 `tokens` 覆盖过同一道外链闸：禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与 `image-set("…")` 这类裸字符串双查，`url(\68 ttps://…)` 之类的转义写法同样挡得住
@@ -233,7 +233,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2772 个 Rust 测试**（35 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **2875 个 Rust 测试**（35 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -374,7 +374,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（35 个测试目标、2772 例）
+# 全工作区 Rust 测试（35 个测试目标、2875 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
