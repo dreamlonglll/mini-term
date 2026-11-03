@@ -28,7 +28,8 @@
 //! # 可见性闸
 //!
 //! [`GitPanel::set_visible`] 收起时**不跑 `discover_git_repos`**(它要扫盘,
-//! 大 monorepo 上是秒级);同时开关 [`git_watch`] 的输出旁路总闸与 `.git` 目录监听。
+//! 大 monorepo 上是秒级);同时开关 [`git_watch`] 的输出旁路总闸与 `.git` 目录监听
+//! (工作区监听收着时转去替文件树服务,见「自动刷新 / 抽屉与窗口」)。
 //! 范式照 `SessionPanel::set_visible`。
 //!
 //! # 写操作(分支 / 同步)
@@ -63,7 +64,10 @@
 //!   正在换目标)才回落原版的两个 500ms 去抖;
 //! - 工作区监听去抖之后按忽略规则过一遍,**只**重取「更改」列表,并把这批路径交给文件树
 //!   ([`git_watch::request_paths`],它只认自己没在监听的 —— 折起来的目录的汇总字母);
-//!   这批变化之后已经有一趟取数开跑的就不再要;git 正写着索引(`index.lock` 在)时退回重排。
+//!   这批变化之后已经有一趟取数开跑的就不再要。git 正写着索引(`index.lock` 在)时「更改」的
+//!   重取先压着、隔一阵复查,锁老过 [`crate::git_dir_watch::INDEX_LOCK_PATIENCE`](开着编辑器
+//!   的 `git commit`、崩溃残锁)就不等了照常取(判据见 [`IndexLockGate`]);交给文件树的那份
+//!   不等锁。目录太多时的递归监听与 Linux 上的低频兜底见 `git_dir_watch` 模块注释「递归子树」。
 //!
 //! ## 签名的先后
 //!
@@ -80,9 +84,18 @@
 //!
 //! ## 抽屉与窗口
 //!
-//! 抽屉收着时三路全停;同项目再打开时走便宜路:重取一次「更改」+ 比一次签名决定要不要
-//! 连分支 / 历史一起刷,不重新发现仓库。窗口最小化(不可见)时节拍暂停,监听照记,恢复
-//! 可见时补比一次签名;只是失焦照旧跑。
+//! 抽屉收着时 pty 旁路、`.git` 监听与节拍都停;同项目再打开时走便宜路:重取一次「更改」+
+//! 比一次签名决定要不要连分支 / 历史一起刷,不重新发现仓库。
+//!
+//! 工作区监听收着时**不停**,改为替文件树服务:文件树只盯根与展开着的目录,折起来的目录里
+//! 的纯内容改动(汇总字母)全靠这一路交路径。收着时不跑节拍,由监听的唤醒口叫醒
+//! ([`GitPanel::sync_feeder`]),一批只交路径、不重取「更改」。盯哪个仓库:面板对当前项目
+//! 选过的那个,没选过就在后台找项目根所属的仓库(只往上找,不扫盘 —— 「收着不跑
+//! `discover_git_repos`」那道闸照旧);父目录型项目在抽屉打开过之前找不到,不替它挂。
+//! 抽屉开合时同一个仓库的监听原样留着,不撤了重挂。
+//!
+//! 窗口最小化(不可见)时节拍暂停、替文件树取批次的任务也停,监听照记,恢复可见时补比一次
+//! 签名、把攒下的那批交掉;只是失焦照旧跑。
 //!
 //! 仓库栏的刷新按钮只在手动 ↻(或还一条分支都没有)时转圈,自动刷新不转 —— 结果没变时
 //! 整轮都不重画。
@@ -99,6 +112,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -107,12 +122,14 @@ use gpui::{
 };
 use mt_project::git::{
     BranchInfo, BranchTracking, GitRepoInfo, PullConfig, PullMode, PullOutcome, PushPlan,
-    RepoOpKind, RepoOpState, RepoSignature,
+    RepoOpKind, RepoOpState, RepoSignature, WorktreeWatchDirs,
 };
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
-use crate::git_dir_watch::{GitDirWatch, RepoObservation, WorktreeBatch, WorktreeWatch};
+use crate::git_dir_watch::{
+    GitDirWatch, IndexLockGate, LockProbe, RepoObservation, WorktreeBatch, WorktreeWatch,
+};
 use crate::git_history::{CommitDetailPane, GitHistoryContent, GitHistoryEvent};
 use crate::git_ui::{self, Tone, estimate_text_width};
 use crate::git_watch;
@@ -160,6 +177,10 @@ pub fn clamp_ratio(r: f32) -> f32 {
 const BAR_HEIGHT: f32 = 36.0;
 /// 「最近」分组最多几条。
 const RECENT_LIMIT: usize = 5;
+/// 工作区监听深处没挂上(Linux 上目录太多)时,抽屉开着每隔这么久兜底重取一次「更改」
+/// (见 `git_dir_watch` 模块注释「递归子树」)。大仓库上一次 status 是几百毫秒,10s 一次
+/// 约占半个百分点的单核。
+const PARTIAL_POLL: Duration = Duration::from_secs(10);
 
 /// 正在跑的写操作。同一时刻只跑一个 —— git 自己也靠 `index.lock` 互斥,并发点两下
 /// 只会让第二个报「另一个 git 进程正在运行」。
@@ -375,8 +396,18 @@ pub struct GitPanel {
     window_visible: bool,
     /// 工作区监听(AI / 外部编辑器改了文件 → 只重取「更改」列表,见 `git_dir_watch`)。
     work_watch: WorktreeWatch,
-    /// 一批工作区变化正在后台过忽略规则。
+    /// 一批工作区变化正在后台过忽略规则(或在复查 `index.lock` / 重列监听清单)。
     work_checking: bool,
+    /// 「更改」的重取撞上 `index.lock` 时压着等它写完,最多等一阵(见 [`IndexLockGate`])。
+    index_lock: IndexLockGate,
+    /// 工作区监听深处没挂上时,上一次兜底重取的时刻(见 [`PARTIAL_POLL`])。
+    partial_polled: Option<Instant>,
+    /// 抽屉收着时替文件树挂工作区监听的那个仓库(见模块注释「抽屉与窗口」)。
+    hidden_repo: Option<String>,
+    /// 求 `hidden_repo` 的请求令牌(后台找仓库期间又换了项目 / 打开了抽屉,旧结果丢弃)。
+    hidden_request: u64,
+    /// 抽屉收着、窗口可见时等工作区监听唤醒口的任务(见 [`Self::sync_feeder`])。
+    _feeder: Option<Task<()>>,
     /// 两块内容区加起来的高度,中缝拖拽换算比例要用。
     sections_height: f32,
     /// 上一帧按内容让位时用到的两块「想要的高度」(见 [`SectionHeights`])。量出来的
@@ -460,8 +491,10 @@ impl GitPanel {
                     if this.visible {
                         this.on_project_changed(cx);
                     } else {
-                        // 收着的时候不扫盘 —— 原版收起时组件根本没挂载
+                        // 收着的时候不扫盘 —— 原版收起时组件根本没挂载。替文件树挂的工作区
+                        // 监听跟着换项目(见模块注释「抽屉与窗口」)
                         this.stale = true;
+                        this.refresh_hidden_repo(cx);
                     }
                     cx.notify();
                 }
@@ -474,6 +507,12 @@ impl GitPanel {
                 this.set_window_visible(visibility.is_visible(), cx)
             },
         ));
+        // 抽屉一开始是收着的:替文件树挂上工作区监听(见模块注释「抽屉与窗口」)。等实体
+        // 建好再做 —— 这里还没有 `self`
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this: &mut Self, cx| this.refresh_hidden_repo(cx));
+        })
+        .detach();
 
         Self {
             store,
@@ -507,6 +546,11 @@ impl GitPanel {
             window_visible: window.is_visible(),
             work_watch: WorktreeWatch::new(),
             work_checking: false,
+            index_lock: IndexLockGate::default(),
+            partial_polled: None,
+            hidden_repo: None,
+            hidden_request: 0,
+            _feeder: None,
             sections_height: 0.0,
             natural_seen: (None, None),
             effective_ratio: 0.5,
@@ -531,9 +575,9 @@ impl GitPanel {
             if self.stale {
                 self.on_project_changed(cx);
             } else if !self.selected_repo.is_empty() && !self.is_remote_project(cx) {
-                // 同项目再打开(见模块注释「抽屉与窗口」):收着时三路全停,工作区改动只能
-                // 重取一次「更改」补上;引用 / 索引变没变等监听挂上后比一次签名再定,
-                // 不重新发现仓库
+                // 同项目再打开(见模块注释「抽屉与窗口」):收着时 `.git` 监听与节拍都停、
+                // 工作区那一路只把路径交给了文件树,「更改」只能重取一次补上;引用 / 索引
+                // 变没变等 `.git` 监听挂上后比一次签名再定,不重新发现仓库
                 self.changes.update(cx, |c, cx| c.load(cx));
                 self.catch_up = true;
             }
@@ -544,9 +588,16 @@ impl GitPanel {
             self._tick = None;
             self.catch_up = false;
             self.pty_hit_at = None;
+            // 收着不重取「更改」,重新打开时整份重取
+            self.index_lock.reset();
         }
-        // 可见 → 按当时选中的仓库挂监听;收起 → 撤掉
-        self.retarget_watch(cx);
+        if visible {
+            // 按当时选中的仓库挂两路监听
+            self.retarget_watch(cx);
+        } else {
+            // `.git` 那一路撤掉,工作区那一路替文件树接着听
+            self.refresh_hidden_repo(cx);
+        }
         cx.notify();
     }
 
@@ -558,6 +609,8 @@ impl GitPanel {
         }
         self.window_visible = visible;
         if !self.visible {
+            // 抽屉收着:替文件树等唤醒口的任务跟着停 / 起(恢复时先取一遍攒下的那批)
+            self.sync_feeder(cx);
             return;
         }
         if visible {
@@ -621,10 +674,36 @@ impl GitPanel {
             self.check_git_dir_change(cx);
         }
         // 上一批还在后台查:这一拍不取 —— 取出来也只能原样退回,每拍空转一次
-        if !self.work_checking
-            && let Some(batch) = self.work_watch.take_due()
+        if !self.work_checking {
+            if let Some(batch) = self.work_watch.take_due() {
+                self.check_worktree_change(Some(batch), cx);
+            } else if self.index_lock.retry_due(Instant::now()) {
+                // 「更改」的重取压着等 index.lock:到点复查一次锁(不是每拍都查)
+                self.check_worktree_change(None, cx);
+            }
+        }
+        self.poll_partial_worktree(cx);
+    }
+
+    /// 工作区监听深处没挂上(Linux 上目录太多,见 `git_dir_watch` 模块注释「递归子树」):
+    /// 每 [`PARTIAL_POLL`] 兜底重取一次「更改」;这段时间里已经有一趟开跑的就不再要。
+    fn poll_partial_worktree(&mut self, cx: &mut Context<Self>) {
+        if !self.work_watch.is_partial()
+            || self.work_watch.repo() != Some(self.selected_repo.as_str())
         {
-            self.check_worktree_change(batch, cx);
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .partial_polled
+            .is_some_and(|at| now.duration_since(at) < PARTIAL_POLL)
+        {
+            return;
+        }
+        self.partial_polled = Some(now);
+        let since = now.checked_sub(PARTIAL_POLL).unwrap_or(now);
+        if !self.changes.read(cx).load_covers(since) {
+            self.changes.update(cx, |c, cx| c.load(cx));
         }
     }
 
@@ -1235,56 +1314,80 @@ impl GitPanel {
 
     // ── `.git` 目录监听 ───────────────────────────────────
 
-    /// 让监听目标跟上「可见 + 本地项目 + 选中的仓库」:`.git` 目录与工作区两路一起换。
-    /// 目录在后台列(要读盘)。
+    /// 让监听目标跟上眼下的样子:抽屉开着 = 选中的仓库上挂 `.git` 与工作区两路;收着 = 只留
+    /// 工作区那一路替文件树听 [`Self::hidden_repo`](见模块注释「抽屉与窗口」)。两路各自比,
+    /// 没变的那一路不动(抽屉开合时工作区监听不必撤了重挂)。目录在后台列(要读盘)。
     fn retarget_watch(&mut self, cx: &mut Context<Self>) {
-        let want = (self.visible && !self.selected_repo.is_empty() && !self.is_remote_project(cx))
+        let local = !self.is_remote_project(cx);
+        let want_dir = (self.visible && !self.selected_repo.is_empty() && local)
             .then(|| self.selected_repo.clone());
-        if want.as_deref() == self.dir_watch.repo() && want.as_deref() == self.work_watch.repo() {
+        let want_work = if self.visible {
+            want_dir.clone()
+        } else {
+            self.hidden_repo.clone().filter(|_| local)
+        };
+        let dir_ok = want_dir.as_deref() == self.dir_watch.repo();
+        let work_ok = want_work.as_deref() == self.work_watch.repo();
+        if !(dir_ok && work_ok) {
+            // 在途的那趟列目录作废:它可能正替刚撤掉的目标列
+            self.watch_request += 1;
+        }
+        if !dir_ok {
+            self.dir_watch.clear();
+        }
+        if !work_ok {
+            self.work_watch.clear();
+            self.index_lock.reset();
+            self.partial_polled = None;
+        }
+        self.sync_feeder(cx);
+        let dir_repo = want_dir.filter(|_| !dir_ok);
+        let work_repo = want_work.filter(|_| !work_ok);
+        if dir_repo.is_none() && work_repo.is_none() {
+            // 同项目重新打开、两路都还挂着:当场比一次签名(见 `set_visible`)
+            if std::mem::take(&mut self.catch_up) {
+                self.check_git_dir_change(cx);
+            }
             return;
         }
-        self.watch_request += 1;
-        self.dir_watch.clear();
-        self.work_watch.clear();
-        let Some(repo) = want else {
-            return;
-        };
         let req = self.watch_request;
-        let path = PathBuf::from(&repo);
+        let (dir_task, work_task) = (dir_repo.clone(), work_repo.clone());
         cx.spawn(async move |this, cx| {
             let (git_dirs, work_dirs) = cx
                 .background_executor()
                 .spawn(async move {
-                    let git_dirs = mt_project::git::git_dir_layout(&path).map(|layout| {
-                        let dirs = mt_project::git::git_watch_dirs(&layout);
-                        (layout, dirs)
+                    let git_dirs = dir_task.map(|repo| {
+                        mt_project::git::git_dir_layout(Path::new(&repo)).map(|layout| {
+                            let dirs = mt_project::git::git_watch_dirs(&layout);
+                            (layout, dirs)
+                        })
                     });
-                    (git_dirs, mt_project::git::worktree_watch_dirs(&path))
+                    let work_dirs = work_task
+                        .map(|repo| mt_project::git::worktree_watch_dirs(Path::new(&repo)));
+                    (git_dirs, work_dirs)
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.watch_request != req {
                     return;
                 }
-                match git_dirs {
-                    Ok((layout, dirs)) => {
-                        this.dir_watch.set_target(repo.clone(), layout, dirs);
+                match (dir_repo, git_dirs) {
+                    (Some(repo), Some(Ok((layout, dirs)))) => {
+                        this.dir_watch.set_target(repo, layout, dirs);
                     }
                     // 监听挂不上不影响使用:手动 ↻ 与 pty 嗅探(回落去抖那条)照旧
-                    Err(err) => eprintln!("[git] 监听 .git 失败: {err:#}"),
+                    (_, Some(Err(err))) => eprintln!("[git] 监听 .git 失败: {err:#}"),
+                    _ => {}
                 }
-                match work_dirs {
-                    Ok(work) => {
-                        if work.truncated {
-                            eprintln!(
-                                "[git] 工作区目录多于 {} 个,只监听浅层的那些",
-                                mt_project::git::WORKTREE_WATCH_DIR_LIMIT
-                            );
-                        }
-                        this.work_watch.set_target(repo, work.dirs);
+                match (work_repo, work_dirs) {
+                    (Some(repo), Some(Ok(plan))) => {
+                        log_worktree_plan(&plan);
+                        this.work_watch.set_target(repo, plan);
                     }
-                    Err(err) => eprintln!("[git] 监听工作区失败: {err:#}"),
+                    (_, Some(Err(err))) => eprintln!("[git] 监听工作区失败: {err:#}"),
+                    _ => {}
                 }
+                this.sync_feeder(cx);
                 // 同项目重新打开:收着期间引用 / 索引变没变,当场比一次签名(见 `set_visible`)
                 if std::mem::take(&mut this.catch_up) {
                     this.check_git_dir_change(cx);
@@ -1294,17 +1397,171 @@ impl GitPanel {
         .detach();
     }
 
-    /// 工作区安静下来的一批变化:后台按忽略规则过一遍(全是被忽略的路径就不刷),有目录
-    /// 出现 / 消失就顺带重列监听清单;要刷的话**只**重取「更改」列表 —— 历史与分支只随
-    /// `.git` 变化走,大仓库里改个文件不至于把整个面板拖着重来。这批之后已经有一趟取数
-    /// 开跑的不再要;git 正写着索引时整批退回重排(见模块注释「自动刷新」)。
-    fn check_worktree_change(&mut self, batch: WorktreeBatch, cx: &mut Context<Self>) {
+    /// 抽屉收着时替文件树挂工作区监听的仓库(见模块注释「抽屉与窗口」):面板对当前项目选过
+    /// 的那个(没换过项目就是选中的,换过就查 [`REPO_CACHE`]);都没有就在后台找项目根所属
+    /// 的仓库 —— 只往上找,不像 `discover_git_repos` 那样扫盘。父目录型项目在抽屉打开过之前
+    /// 找不到,不替它挂。抽屉开着时什么都不做。
+    fn refresh_hidden_repo(&mut self, cx: &mut Context<Self>) {
+        self.hidden_request += 1;
+        if self.visible {
+            return;
+        }
+        let project = self
+            .store
+            .read(cx)
+            .active_project()
+            .filter(|p| p.ssh_connection_id.is_none())
+            .map(|p| p.path.clone());
+        let Some(project) = project else {
+            self.hidden_repo = None;
+            self.retarget_watch(cx);
+            return;
+        };
+        let known = if !self.stale
+            && self.project_path.as_deref() == Some(project.as_str())
+            && !self.selected_repo.is_empty()
+        {
+            Some(self.selected_repo.clone())
+        } else {
+            REPO_CACHE
+                .with(|c| {
+                    c.borrow()
+                        .get(&project)
+                        .map(|(_, selected)| selected.clone())
+                })
+                .filter(|selected| !selected.is_empty())
+        };
+        self.hidden_repo = known.clone();
+        self.retarget_watch(cx);
+        if known.is_some() {
+            return;
+        }
+        let req = self.hidden_request;
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { mt_project::git::enclosing_repo(Path::new(&project)) })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.hidden_request != req || this.visible {
+                    return;
+                }
+                this.hidden_repo = found.map(|path| path.to_string_lossy().to_string());
+                this.retarget_watch(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 抽屉收着、窗口可见、工作区监听挂着时,起一个等唤醒口的任务替文件树取批次(见
+    /// [`Self::feed_file_tree`]);别的情形撤掉。窗口最小化时它停着,监听照记,恢复时先把攒下
+    /// 的那批取掉 —— 那批开头的一声叫在了已经撤掉的口上。
+    fn sync_feeder(&mut self, cx: &mut Context<Self>) {
+        let want = !self.visible && self.window_visible && self.work_watch.repo().is_some();
+        if !want {
+            if self._feeder.take().is_some() {
+                self.work_watch.set_waker(None);
+            }
+            return;
+        }
+        if self._feeder.is_some() {
+            return;
+        }
+        let (tx, mut rx) = mpsc::unbounded();
+        self.work_watch.set_waker(Some(tx));
+        self._feeder = Some(cx.spawn(async move |this, cx| {
+            loop {
+                // 取到没有攒着的为止(没到点就睡到点);然后等下一批开头的那一声
+                loop {
+                    let Ok(wait) = this.update(cx, |this: &mut Self, cx| this.feed_file_tree(cx))
+                    else {
+                        return;
+                    };
+                    let Some(wait) = wait else {
+                        break;
+                    };
+                    cx.background_executor().timer(wait).await;
+                }
+                if rx.next().await.is_none() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// 抽屉收着时工作区监听攒下的一批:只把路径交给文件树(它自己按忽略规则过、只认没在
+    /// 监听的那些 —— 折起来的目录的汇总字母靠它跟上),目录出现 / 消失顺带重列清单。不重取
+    /// 「更改」,也就不看 `index.lock`。返回还要等多久再来取(`None` = 没有攒着的)。
+    fn feed_file_tree(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
+        if self.visible {
+            // 抽屉开了:节拍接管
+            return None;
+        }
+        let Some(batch) = self.work_watch.take_due() else {
+            return self
+                .work_watch
+                .due_in()
+                .map(|wait| wait.max(Duration::from_millis(10)));
+        };
+        git_watch::request_paths(
+            git_watch::Subscriber::FileTree,
+            &batch.paths,
+            batch.overflow,
+        );
+        if batch.dirs_changed {
+            self.replan_worktree(batch.last, cx);
+        }
+        None
+    }
+
+    /// 后台重列工作区监听清单(抽屉收着时,有目录出现 / 消失)。上一趟还没回来就把「要重列」
+    /// 退回去,下一批再来。
+    fn replan_worktree(&mut self, last: Instant, cx: &mut Context<Self>) {
+        let Some(repo) = self.work_watch.repo().map(str::to_string) else {
+            return;
+        };
+        if self.work_checking {
+            self.work_watch.requeue(WorktreeBatch {
+                paths: Vec::new(),
+                overflow: false,
+                dirs_changed: true,
+                last,
+            });
+            return;
+        }
+        self.work_checking = true;
+        let path = PathBuf::from(&repo);
+        cx.spawn(async move |this, cx| {
+            let plan = cx
+                .background_executor()
+                .spawn(async move { mt_project::git::worktree_watch_dirs(&path) })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, _cx| {
+                this.work_checking = false;
+                if this.work_watch.repo() == Some(repo.as_str())
+                    && let Ok(plan) = plan
+                {
+                    this.work_watch.update_dirs(plan);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 工作区安静下来的一批变化(`batch`),或压着等 `index.lock` 的那次重取到点复查(`None`):
+    /// 后台按忽略规则过一遍(全是被忽略的路径就不刷)、看一眼锁,有目录出现 / 消失就顺带重列
+    /// 监听清单;要刷的话**只**重取「更改」列表 —— 历史与分支只随 `.git` 变化走,大仓库里改个
+    /// 文件不至于把整个面板拖着重来。这批之后已经有一趟取数开跑的不再要;git 正写着索引时
+    /// 「更改」的重取先压着、最多等一阵,交给文件树的路径不等(见模块注释「自动刷新」)。
+    fn check_worktree_change(&mut self, batch: Option<WorktreeBatch>, cx: &mut Context<Self>) {
         let Some(repo) = self.work_watch.repo().map(str::to_string) else {
             return;
         };
         if self.work_checking {
             // 上一批还没查完(节拍那边已经不在这时取,这里只是兜底):退回去下一拍再交
-            self.work_watch.requeue(batch);
+            if let Some(batch) = batch {
+                self.work_watch.requeue(batch);
+            }
             return;
         }
         self.work_checking = true;
@@ -1315,27 +1572,24 @@ impl GitPanel {
             .filter(|_| self.dir_watch.repo() == Some(repo.as_str()))
             .map(|layout| layout.git_dir);
         cx.spawn(async move |this, cx| {
-            let verdict = cx
+            let (at, probe, checked) = cx
                 .background_executor()
                 .spawn(async move {
-                    // git 正写着索引(长一点的变基 / 检出 / 贮藏):工作区是中间态,这批先退回去,
-                    // 等它写完(锁没了)再看 —— 结束时 `.git` 那一路也会叫一次
-                    let locked = git_dir.is_some_and(|dir| dir.join("index.lock").exists());
-                    if locked {
-                        return WorkVerdict::Busy(batch);
-                    }
-                    let relevant = batch.overflow
-                        || mt_project::git::any_unignored_change(&path, &batch.paths)
-                            .unwrap_or(true);
-                    let dirs = batch
-                        .dirs_changed
-                        .then(|| mt_project::git::worktree_watch_dirs(&path).ok())
-                        .flatten();
-                    WorkVerdict::Checked {
-                        relevant,
-                        dirs,
-                        batch,
-                    }
+                    let at = Instant::now();
+                    // git 正写着索引(长一点的变基 / 检出 / 贮藏)时工作区是中间态;锁在不在、
+                    // 有多老,交给 `IndexLockGate` 定等不等
+                    let probe = git_dir.as_deref().map(LockProbe::read).unwrap_or_default();
+                    let checked = batch.map(|batch| {
+                        let relevant = batch.overflow
+                            || mt_project::git::any_unignored_change(&path, &batch.paths)
+                                .unwrap_or(true);
+                        let dirs = batch
+                            .dirs_changed
+                            .then(|| mt_project::git::worktree_watch_dirs(&path).ok())
+                            .flatten();
+                        (batch, relevant, dirs)
+                    });
+                    (at, probe, checked)
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -1343,33 +1597,29 @@ impl GitPanel {
                 if this.work_watch.repo() != Some(repo.as_str()) || this.selected_repo != repo {
                     return;
                 }
-                let (relevant, dirs, batch) = match verdict {
-                    WorkVerdict::Busy(batch) => {
-                        this.work_watch.requeue(batch);
-                        return;
+                let mut last = None;
+                if let Some((batch, relevant, dirs)) = checked {
+                    if let Some(plan) = dirs {
+                        this.work_watch.update_dirs(plan);
                     }
-                    WorkVerdict::Checked {
-                        relevant,
-                        dirs,
-                        batch,
-                    } => (relevant, dirs, batch),
-                };
-                if let Some(dirs) = dirs {
-                    this.work_watch.update_dirs(dirs.dirs);
+                    if relevant {
+                        // 文件树只认它自己没在监听的那些路径(折起来的目录,汇总字母要跟上)。
+                        // 不等锁:它取状态与索引锁无关,等了反倒让文件树也跟着卡住
+                        git_watch::request_paths(
+                            git_watch::Subscriber::FileTree,
+                            &batch.paths,
+                            batch.overflow,
+                        );
+                        last = Some(batch.last);
+                    }
                 }
-                if !relevant {
-                    return;
-                }
-                // 这批之后已经有一趟开跑(`.git` 那一路刚整轮刷过之类)就不再要
-                if !this.changes.read(cx).load_covers(batch.last) {
+                // 锁新就压着等它写完(到点由节拍复查),锁没了 / 太老了就取;这批之后已经有
+                // 一趟开跑(`.git` 那一路刚整轮刷过之类)就不再要
+                if let Some(last) = this.index_lock.offer(last, probe, at)
+                    && !this.changes.read(cx).load_covers(last)
+                {
                     this.changes.update(cx, |c, cx| c.load(cx));
                 }
-                // 文件树只认它自己没在监听的那些路径(折起来的目录,汇总字母要跟上)
-                git_watch::request_paths(
-                    git_watch::Subscriber::FileTree,
-                    &batch.paths,
-                    batch.overflow,
-                );
             });
         })
         .detach();
@@ -1490,15 +1740,20 @@ impl GitPanel {
     }
 }
 
-/// 工作区一批变化在后台过完的结论。
-enum WorkVerdict {
-    /// git 正写着索引:整批退回重排
-    Busy(WorktreeBatch),
-    Checked {
-        relevant: bool,
-        dirs: Option<mt_project::git::WorktreeWatchDirs>,
-        batch: WorktreeBatch,
-    },
+/// 工作区监听清单不是逐个非递归挂全的时候记一行(见 `git_dir_watch` 模块注释「递归子树」)。
+fn log_worktree_plan(plan: &WorktreeWatchDirs) {
+    let limit = mt_project::git::WORKTREE_WATCH_DIR_LIMIT;
+    if !plan.trees.is_empty() {
+        eprintln!(
+            "[git] 工作区目录多于 {limit} 个,改为递归监听 {} 棵子树",
+            plan.trees.len()
+        );
+    } else if plan.truncated {
+        eprintln!(
+            "[git] 工作区目录多于 {limit} 个,只监听浅层的那些,抽屉开着时深处每 {}s 兜底重取一次",
+            PARTIAL_POLL.as_secs()
+        );
+    }
 }
 
 /// 一轮整面板重取的来由(见 [`GitPanel::reload_views`])。
