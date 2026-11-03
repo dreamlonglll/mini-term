@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use git2::Repository;
 
-use super::{QUICK_OP_TIMEOUT, run_git_command};
+use super::{QUICK_OP_TIMEOUT, run_git_command, run_literal_paths};
 
 /// 冲突里取哪一侧。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,12 +148,14 @@ pub fn discard_unstaged(repo_path: &Path, files: &[String]) -> Result<()> {
     drop(index);
     drop(repo);
 
-    // 一次带太多路径会撞上 Windows 命令行 32K 的上限,分批跑
-    for chunk in tracked.chunks(64) {
-        let mut args = vec!["checkout", "--"];
-        args.extend_from_slice(chunk);
-        git(repo_path, &args)?;
-    }
+    // 路径多时从 stdin 一次喂完,git 太老才按批起进程(见 `run_literal_paths`)
+    run_literal_paths(
+        repo_path,
+        &["checkout"],
+        &tracked,
+        "checkout",
+        QUICK_OP_TIMEOUT,
+    )?;
     for file in untracked {
         let abs = workdir.join(file);
         match std::fs::symlink_metadata(&abs) {

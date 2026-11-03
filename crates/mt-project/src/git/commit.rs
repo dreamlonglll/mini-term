@@ -7,8 +7,10 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use git2::{BranchType, Oid, Repository, Sort};
+use git2::{BranchType, Oid, Repository};
 
+use super::branch::head_branch_name;
+use super::log_ops::remotes_contain;
 use super::{LOCAL_OP_TIMEOUT, run_git_command_labeled};
 
 /// 一次成功提交的结果(给「已提交 abc1234:标题」那条 toast 用)。
@@ -72,25 +74,32 @@ pub fn amend_info(repo_path: &Path) -> Result<Option<AmendInfo>> {
     let commit = head.peel_to_commit()?;
     Ok(Some(AmendInfo {
         message: commit.message().unwrap_or_default().to_string(),
-        pushed: is_pushed(&repo, commit.id()),
+        pushed: is_pushed(&repo, repo_path, commit.id()),
     }))
 }
 
 /// `oid` 是否已被任何远程跟踪分支(`refs/remotes/*`)包含。
 ///
-/// 远程跟踪分支是本地最后一次 fetch / push 时的快照,不联网;多一个分支就多一次
-/// 祖先判定,数量封顶避免远程分支成千上万的仓库卡住后台线程(超出部分不看,
-/// 宁可漏报「已推送」也不让勾选框转半天)。
-fn is_pushed(repo: &Repository, oid: Oid) -> bool {
-    const MAX_REMOTE_BRANCHES: usize = 500;
-    let Ok(branches) = repo.branches(Some(BranchType::Remote)) else {
-        return false;
-    };
-    branches
-        .flatten()
-        .take(MAX_REMOTE_BRANCHES)
-        .filter_map(|(branch, _)| branch.get().target())
-        .any(|tip| tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false))
+/// 远程跟踪分支是本地最后一次 fetch / push 时的快照,不联网。常见情况是 HEAD 的上游
+/// (一个远程跟踪分支)就包含它,git2 一次祖先判定;不包含再交给 git 对全部远程分支一趟
+/// 判完([`remotes_contain`])。旧实现逐个远程分支做祖先判定、数量封顶 500 个(超出的
+/// 不看,会漏报),未推送的 HEAD 在 1301 个远程分支的仓库里仍要 20~40s。
+fn is_pushed(repo: &Repository, repo_path: &Path, oid: Oid) -> bool {
+    let upstream = head_branch_name(repo)
+        .and_then(|name| repo.find_branch(&name, BranchType::Local).ok())
+        .and_then(|branch| branch.upstream().ok());
+    // 只认远程跟踪分支当上游(`branch.<b>.remote=.` 的本地上游不算「推送过」)
+    if let Some(upstream) = upstream
+        && upstream
+            .get()
+            .name()
+            .is_some_and(|name| name.starts_with("refs/remotes/"))
+        && let Some(tip) = upstream.get().target()
+        && (tip == oid || repo.graph_descendant_of(tip, oid).unwrap_or(false))
+    {
+        return true;
+    }
+    remotes_contain(repo_path, oid)
 }
 
 /// 仓库里有没有任何提交(没有就谈不上 amend)。打不开仓库按「没有」算。
@@ -136,6 +145,11 @@ pub struct CommitMessageEntry {
 ///
 /// 「当前用户」按 `user.email` 认(大小写不敏感);读不到就不过滤。最多翻
 /// `SCAN_LIMIT` 个提交 —— 别人提交占多数的大仓库里,凑不满也不再往下翻。
+///
+/// 遍历**不设排序**:libgit2 一设排序(哪怕只是 `Sort::TIME`)就先走完全部可达提交再排
+/// (见 `get_git_log` 上方的说明),`take(SCAN_LIMIT)` 形同虚设 —— 10 万提交的仓库每次
+/// 460~485ms。不设排序时 libgit2 按「弹出最新的、父按提交时间插回待走链表」增量地走,
+/// 本来就是按时间往回;只有时钟偏移时会有个别提交早出,结果末尾再按时间排一次兜住。
 pub fn recent_commit_messages(repo_path: &Path, limit: usize) -> Result<Vec<CommitMessageEntry>> {
     const SCAN_LIMIT: usize = 5000;
     let repo = Repository::open(repo_path)?;
@@ -151,7 +165,6 @@ pub fn recent_commit_messages(repo_path: &Path, limit: usize) -> Result<Vec<Comm
 
     let mut walk = repo.revwalk()?;
     walk.push_head()?;
-    walk.set_sorting(Sort::TIME)?;
 
     let mut out: Vec<CommitMessageEntry> = Vec::new();
     for oid in walk.take(SCAN_LIMIT) {
@@ -180,6 +193,8 @@ pub fn recent_commit_messages(repo_path: &Path, limit: usize) -> Result<Vec<Comm
             timestamp: commit.time().seconds(),
         });
     }
+    // 稳定排序:同一秒的保持遍历先后
+    out.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
     Ok(out)
 }
 
@@ -336,6 +351,38 @@ mod tests {
         assert_eq!(summaries, vec!["docs: 三", "fix: 二", "feat: 一", "init"]);
         assert_eq!(list[2].message, "feat: 一\n\n正文");
         assert_eq!(recent_commit_messages(&root, 2).unwrap().len(), 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 遍历不设排序之后,时钟偏移(子提交比父提交早)也照样按时间倒序给出。
+    #[test]
+    fn 消息历史在时钟偏移下仍按时间倒序() {
+        let root = init_repo_with_file("commit-history-skew", "a.txt", "a\n");
+        let repo = Repository::open(&root).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+        let mut parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let at = |secs: i64| {
+            git2::Signature::new("mini-term", "test@example.com", &git2::Time::new(secs, 0))
+                .unwrap()
+        };
+        // 第二个提交的时间比第一个早(时钟偏移),第三个最新
+        for (secs, msg) in [
+            (1_900_000_100, "first"),
+            (1_900_000_050, "second"),
+            (1_900_000_200, "third"),
+        ] {
+            let sig = at(secs);
+            let oid = repo
+                .commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&parent])
+                .unwrap();
+            parent = repo.find_commit(oid).unwrap();
+        }
+        let list = recent_commit_messages(&root, 20).unwrap();
+        let times: Vec<i64> = list.iter().map(|e| e.timestamp).collect();
+        let mut sorted = times.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(times, sorted, "{list:?}");
+        assert_eq!(list[0].summary, "third");
         std::fs::remove_dir_all(&root).ok();
     }
 }

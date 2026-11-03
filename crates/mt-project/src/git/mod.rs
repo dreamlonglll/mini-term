@@ -176,82 +176,444 @@ fn map_unstaged_status(status: Status, is_empty_repo: bool) -> Option<GitStatus>
     None
 }
 
-/// 取状态的选项:含未跟踪(逐个文件)、不含忽略,**暂存区一侧开重命名检测**。
+/// 取状态的选项:含未跟踪(逐个文件)、不含忽略,**不让 libgit2 做重命名检测**。
 ///
-/// 只开 HEAD → 暂存区这一侧(`git mv` / 暂存了「删旧 + 加新」之后显示一行 R,与
-/// `git status` 一致)。工作区一侧不开:libgit2 的 `RENAMES_INDEX_TO_WORKDIR` 会把
-/// 「工作区删掉的已跟踪文件」与**未跟踪文件**配成一对,`git status` 从不这么做 ——
-/// 未跟踪文件只是躺在那里,不该被认成谁的新名字。
+/// 「更改」区要的是暂存区一侧的重命名(`git mv` / 暂存了「删旧 + 加新」之后显示一行 R,
+/// 与 `git status` 一致),但 libgit2 status 自带的 `RENAMES_HEAD_TO_INDEX` 没有护栏:
+/// 相似度配对是「目标数 × min(源数, 1000)」次比较,还被 `diff.renameLimit`(默认 1000)
+/// 拦腰截断 —— 暂存 2000 个改名 1.24s、只配上 999 对。所以 status 本身不开,配对交给
+/// [`pair_staged_renames`](有护栏,见 [`find_renames_guarded`])。
+///
+/// 工作区一侧一直不配:libgit2 的 `RENAMES_INDEX_TO_WORKDIR` 会把「工作区删掉的已跟踪
+/// 文件」与**未跟踪文件**配成一对,`git status` 从不这么做 —— 未跟踪文件只是躺在那里,
+/// 不该被认成谁的新名字。
 fn status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .include_ignored(false)
-        .renames_head_to_index(true);
+        .include_ignored(false);
     opts
 }
 
-/// 一条状态的路径:`(当前路径, 重命名前的路径)`。
-///
-/// ⚠️ 不能直接用 `StatusEntry::path()`:git2 取的是 `head_to_index` 的**旧**路径 ——
-/// 开了重命名检测之后,已暂存的重命名会被报成旧名字。重命名要从 diff 的新旧两端各取。
-fn entry_paths(entry: &git2::StatusEntry<'_>) -> (String, Option<String>) {
-    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
-    if entry.status().contains(Status::INDEX_RENAMED)
-        && let Some(delta) = entry.head_to_index()
-        && let Some(new) = delta.new_file().path()
-    {
-        return (slash(new), delta.old_file().path().map(slash));
-    }
-    (entry.path().unwrap_or("").to_string(), None)
+/// 一次 status 的一条原始结果(重命名已配好)。「更改」区与文件树两种视图都从它派生。
+#[derive(Debug, Clone)]
+struct RawEntry {
+    /// 仓库内相对路径(`/` 分隔);已暂存的重命名是**新**路径。
+    path: String,
+    /// 已暂存重命名的旧路径。
+    renamed_from: Option<String>,
+    status: Status,
 }
 
-fn collect_repo_status(
-    repo: &Repository,
-    path_prefix: Option<&Path>,
-) -> Result<Vec<GitFileStatus>> {
-    let is_empty_repo = repo.head().is_err();
+/// 一个仓库一次全量 status 的结果,见 [`shared_status`]。
+#[derive(Debug)]
+struct RawStatus {
+    workdir: PathBuf,
+    is_empty_repo: bool,
+    entries: Vec<RawEntry>,
+}
 
-    let statuses = repo.statuses(Some(&mut status_options()))?;
-    let repo_workdir = repo.workdir().unwrap_or_else(|| repo.path());
-    // 项目经软链进入时 workdir 是解析过的真实路径,前缀也得换成真实路径才比得上
-    let path_prefix = path_prefix.map(|prefix| status_prefix(repo_workdir, prefix));
+fn slash_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
 
-    let mut result = Vec::new();
+/// 跑一次 status(`show` 决定比哪两侧),再配暂存区一侧的重命名。
+fn raw_entries(repo: &Repository, show: git2::StatusShow) -> Result<Vec<RawEntry>> {
+    let mut opts = status_options();
+    opts.show(show);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let mut entries = Vec::with_capacity(statuses.len());
+    let (mut deleted, mut added) = (false, false);
     for entry in statuses.iter() {
-        // 重命名只报新路径(旧路径已不在工作区,文件树上没有它那一行)
-        let (raw_path, renamed_from) = entry_paths(&entry);
-        let s = entry.status();
+        let status = entry.status();
+        deleted |= status.contains(Status::INDEX_DELETED);
+        added |= status.contains(Status::INDEX_NEW);
+        entries.push(RawEntry {
+            path: entry.path().unwrap_or("").to_string(),
+            renamed_from: None,
+            status,
+        });
+    }
+    drop(statuses);
+    // 只有「已暂存删除」与「已暂存新增」都在时才可能有重命名(绝大多数刷新到这里就完了)
+    if deleted && added {
+        pair_staged_renames(repo, &mut entries)?;
+    }
+    Ok(entries)
+}
 
-        let git_status = match map_status(s, is_empty_repo) {
-            Some(gs) => gs,
-            None => continue,
+/// 把 status 里一对「已暂存删除(旧路径)+ 已暂存新增(新路径)」并成一条已暂存重命名,
+/// 结果与 libgit2 status 开 `RENAMES_HEAD_TO_INDEX` 时的形态一致:
+///
+/// - 新路径那条:`INDEX_NEW` 换成 `INDEX_RENAMED`(内容也变了再加 `INDEX_MODIFIED`),
+///   工作区一侧的位原样保留,记下旧路径;
+/// - 旧路径那条:去掉 `INDEX_DELETED`;剩下的位(旧路径又冒出一个未跟踪文件)单独成行,
+///   什么都不剩就整条去掉。
+///
+/// 配对来自一份 HEAD → 暂存区的树 diff([`find_renames_guarded`],选项与 libgit2 status
+/// 自己做配对时相同)。这份 diff 与 status 不是同一刻读的:对不上(期间暂存区又变了)的
+/// 配对直接跳过,只合并两头都还在 status 里的。
+fn pair_staged_renames(repo: &Repository, entries: &mut Vec<RawEntry>) -> Result<()> {
+    let head_tree = match repo.head() {
+        Ok(head) => Some(head.peel_to_tree()?),
+        Err(_) => None,
+    };
+    let mut diff_opts = git2::DiffOptions::new();
+    diff_opts.include_typechange(true);
+    let mut diff = repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut diff_opts))?;
+    // 与 libgit2 status 同一份配对选项:只带 FOR_UNTRACKED(其余旗标不设 = 按 `diff.renames`
+    // 配置决定认不认重命名),阈值、`diff.renameLimit` 都取默认
+    let mut find = git2::DiffFindOptions::new();
+    find.for_untracked(true);
+    find_renames_guarded(&mut diff, find)?;
+
+    let pos: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.path.clone(), i))
+        .collect();
+    let mut emptied = false;
+    for delta in diff.deltas() {
+        if delta.status() != git2::Delta::Renamed {
+            continue;
+        }
+        let (Some(old), Some(new)) = (delta.old_file().path(), delta.new_file().path()) else {
+            continue;
         };
+        let (old, new) = (slash_path(old), slash_path(new));
+        let (Some(&src), Some(&dst)) = (pos.get(&old), pos.get(&new)) else {
+            continue;
+        };
+        if !entries[src].status.contains(Status::INDEX_DELETED)
+            || !entries[dst].status.contains(Status::INDEX_NEW)
+        {
+            continue;
+        }
+        let mut status = (entries[dst].status - Status::INDEX_NEW) | Status::INDEX_RENAMED;
+        if delta.old_file().id() != delta.new_file().id() {
+            status |= Status::INDEX_MODIFIED;
+        }
+        entries[dst].status = status;
+        entries[dst].renamed_from = Some(old);
+        entries[src].status -= Status::INDEX_DELETED;
+        emptied |= entries[src].status.is_empty();
+    }
+    if emptied {
+        entries.retain(|e| !e.status.is_empty());
+    }
+    Ok(())
+}
 
-        let label = status_label(&git_status).to_string();
+/// libgit2 相似度配对的上限(删除数 × 新增数)。实测(每个文件约 60 行 / 2.5 KB,
+/// HEAD → 暂存区):100×100 31ms、200×200 68ms、300×300 123ms、500×500 271ms,
+/// 2000×2000(还被 `diff.renameLimit` 截成 2000×1000)1.33s。status 每次刷新都要算,
+/// 取 200×200 那一档。
+const MAX_INEXACT_RENAME_PAIRS: u64 = 40_000;
 
-        // 相对 path_prefix 的展示路径;没给 prefix 就用仓库内相对路径
-        let display_path = if let Some(prefix) = &path_prefix {
-            let abs = repo_workdir.join(&raw_path);
-            diff_paths(&abs, prefix)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| raw_path.clone())
+/// 只做精确配对(blob 相同)的上限。精确配对也是逐对比较(只比 oid,2000×2000 约 12ms),
+/// 二次方增长,5000×5000 约 75ms;再多就整个不配了(删除 / 新增照原样分两行列出)。
+const MAX_EXACT_RENAME_PAIRS: u64 = 25_000_000;
+
+/// 重命名配对的档位,由删除数 × 新增数决定(见两个上限常量)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameTier {
+    /// 没有可配的(一侧为零)。
+    Nothing,
+    /// libgit2 的相似度配对,与以往一样(改名又改了内容也认得出)。
+    Similar,
+    /// 只认内容完全相同的(纯改名);改名又改了内容的照「删除 + 新增」列。
+    ExactOnly,
+    /// 不配对。
+    Skip,
+}
+
+fn rename_tier(sources: u64, targets: u64) -> RenameTier {
+    match sources.saturating_mul(targets) {
+        0 => RenameTier::Nothing,
+        n if n <= MAX_INEXACT_RENAME_PAIRS => RenameTier::Similar,
+        n if n <= MAX_EXACT_RENAME_PAIRS => RenameTier::ExactOnly,
+        _ => RenameTier::Skip,
+    }
+}
+
+/// 带护栏的 `find_similar`:先数一遍候选(删除 / 新增,类型变更两边都算),按
+/// [`rename_tier`] 决定怎么配。
+///
+/// libgit2 的配对没有 git CLI 那种「先精确配、候选太多就跳过模糊」的捷径,而是
+/// 「目标 × min(源, `diff.renameLimit`)」次相似度比较一把算完 —— 候选一多就是秒级,
+/// 还会被 renameLimit 截断(超出的源根本不看,纯改名也只配上一半)。精确档把
+/// renameLimit 放到候选数,保证纯改名全部配上。提交 diff([`first_parent_diff`])与
+/// 「更改」区([`pair_staged_renames`])共用。
+fn find_renames_guarded(diff: &mut git2::Diff<'_>, mut find: git2::DiffFindOptions) -> Result<()> {
+    let (mut sources, mut targets) = (0u64, 0u64);
+    for delta in diff.deltas() {
+        match delta.status() {
+            git2::Delta::Deleted => sources += 1,
+            git2::Delta::Added => targets += 1,
+            git2::Delta::Typechange => {
+                sources += 1;
+                targets += 1;
+            }
+            _ => {}
+        }
+    }
+    match rename_tier(sources, targets) {
+        RenameTier::Nothing | RenameTier::Skip => return Ok(()),
+        RenameTier::Similar => {}
+        RenameTier::ExactOnly => {
+            let limit = usize::try_from(sources.max(targets)).unwrap_or(usize::MAX);
+            find.exact_match_only(true).rename_limit(limit);
+        }
+    }
+    diff.find_similar(Some(&mut find))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// status 的单飞:同一仓库的并发请求合并成一趟
+// ---------------------------------------------------------------------------
+//
+// 「更改」区([`get_changes_status`])与文件树([`get_git_status`])对同一次变化各要一份
+// status,4 万文件 + 2 万未跟踪的仓库一份就是 120~190ms。两边共用一趟:
+//
+// - **只拿「请求之后才开始」的那一趟**。在途的那一趟若早于本次请求开始,它可能没看到
+//   请求之前刚发生的改动 —— 本次请求排到下一趟,下一趟由这期间到达的全部请求共享。
+// - **不按时间复用**(没有 TTL):一趟算完就不再交给后来的请求。
+// - **开算前留一个很短的集合窗口**([`STATUS_GATHER`]):同一刻发出的几路请求(一次变化
+//   同时叫醒「更改」区与文件树)前后差几毫秒才落到后台线程上,先到的那一路若立刻开算,
+//   后到的只能等它算完再自己算一趟(反倒比各算各的更慢)。窗口里到达的请求仍然早于
+//   计算开始,搭同一趟不违反上一条。
+//
+// 于是并发的 N 个请求最多触发两趟(在途的一趟 + 合并后的一趟),顺序的请求一趟不省。
+
+/// status 开算前的集合窗口(见上面的说明)。比一次 status 的耗时(大仓库上百毫秒)小两个
+/// 数量级,单独一路请求只多等这么一下。
+const STATUS_GATHER: Duration = Duration::from_millis(5);
+
+/// 单飞的现场。代次:`started` = 最近一趟开始(领跑)时的代次号,`finished` = 最近一趟
+/// 算完的代次号。请求进来时要的是此刻之后才开始计算的那一趟:领跑者还在集合窗口里
+/// (`gathering`)就是它这一趟,否则是下一趟。
+struct FlightState<T> {
+    running: bool,
+    gathering: bool,
+    started: u64,
+    finished: u64,
+    /// 正在等的请求数。算完时没人等就不留结果(不把整份 status 攥在内存里)。
+    waiters: usize,
+    /// 第 `finished` 趟的结果(有人等时才留)。
+    last: Option<T>,
+}
+
+struct SingleFlight<T> {
+    state: Mutex<FlightState<T>>,
+    done: parking_lot::Condvar,
+    /// 领跑者开算前等多久,让同一刻发出的请求搭上同一趟;零 = 不等。
+    gather: Duration,
+}
+
+impl<T> SingleFlight<T> {
+    fn with_gather(gather: Duration) -> Self {
+        Self {
+            state: Mutex::new(FlightState {
+                running: false,
+                gathering: false,
+                started: 0,
+                finished: 0,
+                waiters: 0,
+                last: None,
+            }),
+            done: parking_lot::Condvar::new(),
+            gather,
+        }
+    }
+}
+
+impl<T> Default for SingleFlight<T> {
+    fn default() -> Self {
+        Self::with_gather(Duration::ZERO)
+    }
+}
+
+/// 领跑者收尾:记下结果、放行等着的请求。放在 `Drop` 里 —— 计算中途 panic 也得把
+/// `running` 放掉,否则后来的请求永远等下去(那时不记结果,等着的请求里会有一个接着领跑)。
+struct FlightLeader<'a, T> {
+    flight: &'a SingleFlight<T>,
+    generation: u64,
+    value: Option<T>,
+}
+
+impl<T> Drop for FlightLeader<'_, T> {
+    fn drop(&mut self) {
+        let mut st = self.flight.state.lock();
+        st.running = false;
+        st.gathering = false;
+        if let Some(value) = self.value.take() {
+            st.finished = self.generation;
+            st.last = (st.waiters > 0).then_some(value);
+        }
+        self.flight.done.notify_all();
+    }
+}
+
+impl<T: Clone> SingleFlight<T> {
+    /// 拿一份「本次调用之后才开始计算」的结果:没有在途的就自己领跑(先等一个集合窗口);
+    /// 领跑者还在集合就搭它这一趟;已经开算了就等它算完,再由等着的请求之一领跑下一趟、
+    /// 其余共享。
+    fn run(&self, compute: impl FnOnce() -> T) -> T {
+        let mut st = self.state.lock();
+        let need = if st.running && st.gathering {
+            st.started
         } else {
-            raw_path.clone()
+            st.started + 1
         };
+        loop {
+            if st.finished >= need
+                && let Some(value) = &st.last
+            {
+                return value.clone();
+            }
+            if !st.running {
+                break;
+            }
+            st.waiters += 1;
+            self.done.wait(&mut st);
+            st.waiters -= 1;
+        }
+        st.running = true;
+        st.started += 1;
+        let mut leader = FlightLeader {
+            flight: self,
+            generation: st.started,
+            value: None,
+        };
+        if !self.gather.is_zero() {
+            st.gathering = true;
+            drop(st);
+            std::thread::sleep(self.gather);
+            // 窗口关上之后才开算:之后到的请求一律排下一趟
+            self.state.lock().gathering = false;
+        } else {
+            drop(st);
+        }
+        let value = compute();
+        leader.value = Some(value.clone());
+        drop(leader);
+        value
+    }
 
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.state.lock().waiters
+    }
+
+    #[cfg(test)]
+    fn is_gathering(&self) -> bool {
+        self.state.lock().gathering
+    }
+}
+
+type SharedStatus = std::result::Result<std::sync::Arc<RawStatus>, String>;
+
+static STATUS_FLIGHTS: std::sync::LazyLock<
+    Mutex<HashMap<String, std::sync::Arc<SingleFlight<SharedStatus>>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 一个仓库的全量 status(按仓库单飞,见上面的说明)。`repo_path` 是仓库根;同一仓库的
+/// 不同写法(libgit2 给的 `D:/x/proj/` 与配置里的反斜杠写法、Windows 上的大小写)按同一个
+/// 键认。只做字符串归一、不碰文件系统(WSL 项目的 UNC 路径规范化一次就要走一趟网络);
+/// 经软链换了写法的认不到一起,只是少共享一趟,结果不受影响。
+fn shared_status(repo_path: &Path) -> Result<std::sync::Arc<RawStatus>> {
+    let raw = repo_path.to_string_lossy();
+    let raw = mt_core::path_key::strip_verbatim_prefix(&raw);
+    let key = if cfg!(windows) {
+        mt_core::path_key::windows_eq_key(&raw)
+    } else {
+        mt_core::path_key::trim_trailing_separators(&raw).to_string()
+    };
+    let flight = STATUS_FLIGHTS
+        .lock()
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(SingleFlight::with_gather(STATUS_GATHER)))
+        .clone();
+    flight
+        .run(|| {
+            compute_raw_status(repo_path)
+                .map(std::sync::Arc::new)
+                .map_err(|e| format!("{e:#}"))
+        })
+        .map_err(anyhow::Error::msg)
+}
+
+fn compute_raw_status(repo_path: &Path) -> Result<RawStatus> {
+    let repo = Repository::open(repo_path)?;
+    Ok(RawStatus {
+        workdir: repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf(),
+        is_empty_repo: repo.head().is_err(),
+        entries: raw_entries(&repo, git2::StatusShow::IndexAndWorkdir)?,
+    })
+}
+
+/// 文件树的视图:路径相对项目根(`project_path` 可以是仓库里的子目录 —— 全量结果在
+/// 「更改」区与文件树之间共享,这里只挑项目根以下的;重命名只报新路径,旧路径已不在
+/// 工作区,文件树上没有它那一行)。
+fn file_tree_view(raw: &RawStatus, project_path: &Path) -> Vec<GitFileStatus> {
+    // 项目经软链进入时 workdir 是解析过的真实路径,前缀也得换成真实路径才比得上
+    let prefix = status_prefix(&raw.workdir, project_path);
+    let mut result = Vec::new();
+    for entry in &raw.entries {
+        let Some(git_status) = map_status(entry.status, raw.is_empty_repo) else {
+            continue;
+        };
+        let display_path = match diff_paths(raw.workdir.join(&entry.path), &prefix) {
+            Some(rel) => {
+                let rel = slash_path(&rel);
+                // 在项目根之外(项目是 monorepo 的子目录):文件树上没有这一行
+                if rel == ".." || rel.starts_with("../") {
+                    continue;
+                }
+                rel
+            }
+            None => entry.path.clone(),
+        };
         // 重命名才有 old_path
-        let old_path = renamed_from.filter(|_| matches!(git_status, GitStatus::Renamed));
-
+        let old_path = entry
+            .renamed_from
+            .clone()
+            .filter(|_| matches!(git_status, GitStatus::Renamed));
         result.push(GitFileStatus {
             path: display_path,
             old_path,
+            status_label: status_label(&git_status).to_string(),
             status: git_status,
+        });
+    }
+    result
+}
+
+/// 「更改」区的视图:每个文件的暂存 / 未暂存两侧状态。
+fn changes_view(raw: &RawStatus) -> Vec<ChangeFileStatus> {
+    let mut result = Vec::new();
+    for entry in &raw.entries {
+        let staged = map_staged_status(entry.status);
+        let unstaged = map_unstaged_status(entry.status, raw.is_empty_repo);
+        if staged.is_none() && unstaged.is_none() {
+            continue;
+        }
+        let label = staged
+            .as_ref()
+            .or(unstaged.as_ref())
+            .map(status_label)
+            .unwrap_or("")
+            .to_string();
+        result.push(ChangeFileStatus {
+            path: entry.path.clone(),
+            old_path: entry.renamed_from.clone(),
+            staged_status: staged,
+            unstaged_status: unstaged,
             status_label: label,
         });
     }
-
-    Ok(result)
+    result
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -414,6 +776,10 @@ const REPO_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// worktree 增删/清理之后调用:仓库集合已变,让所有项目的发现缓存立即失效,
 /// 否则 History/Changes 面板要等 TTL 过期才能看到新条目。
+///
+/// 缓存里只有路径(名字 / 路径 / 是不是 worktree),当前分支在 [`discover_git_repos`]
+/// 里每次现读 —— 检出 / 新建 / 改名 / 删除分支不改变缓存的内容,不必调它(调了只会让
+/// 下一次发现白白重扫一遍目录)。
 pub fn invalidate_repo_cache() {
     REPO_PATH_CACHE.lock().clear();
 }
@@ -457,6 +823,9 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
     }
 
     const MAX_DEPTH: u32 = 5;
+    // 依赖 / 构建产物 / 工具缓存目录:动辄成千上万个子目录,里面不会有用户自己的仓库。
+    // 只收「明确是依赖或缓存」的名字(Python 虚拟环境 / tox、Gradle、Nuxt 的产物目录、
+    // mypy / pytest 的缓存、bower 依赖);`build` / `vendor` 这类可能放着真仓库的不收。
     const SKIP_DIRS: &[&str] = &[
         ".git",
         "node_modules",
@@ -465,6 +834,14 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
         "dist",
         "__pycache__",
         ".superpowers",
+        ".venv",
+        "venv",
+        ".tox",
+        ".gradle",
+        ".nuxt",
+        ".mypy_cache",
+        ".pytest_cache",
+        "bower_components",
     ];
     fn scan(dir: &Path, depth: u32, entries: &mut Vec<RepoPathEntry>) {
         if depth > MAX_DEPTH {
@@ -476,7 +853,14 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
         };
         for entry in dir_entries.flatten() {
             let sub = entry.path();
-            if !sub.is_dir() {
+            // 枚举目录时顺带拿到的类型,不再每项多 stat 一次;符号链接 / 联接点才去
+            // 看它指向的是不是目录(与旧实现一样跟进去)
+            let is_dir = match entry.file_type() {
+                Ok(t) if t.is_symlink() => sub.is_dir(),
+                Ok(t) => t.is_dir(),
+                Err(_) => sub.is_dir(),
+            };
+            if !is_dir {
                 continue;
             }
             let dir_name = entry.file_name();
@@ -484,23 +868,27 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
             if SKIP_DIRS.contains(&dir_name_str.as_ref()) {
                 continue;
             }
-            if let Ok(repo) = Repository::open(&sub) {
-                if let Some(workdir) = repo.workdir() {
-                    if workdir.canonicalize().ok() == sub.canonicalize().ok() {
-                        let name = sub
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        // 物理上在项目目录内的 worktree 才会走到这里(作为子目录仓库),
-                        // 项目目录外的关联 worktree 不再注入
-                        entries.push(RepoPathEntry {
-                            name,
-                            path: sub,
-                            is_worktree: repo.is_worktree(),
-                        });
-                        continue;
-                    }
-                }
+            // 先看有没有 `.git`(目录或 worktree 的 gitfile)再开库:libgit2 开一个不是仓库的
+            // 目录要试一圈布局才失败(约 430µs),5000 个普通目录就是 2s;stat 一次只要几十 µs。
+            // 没有 `.git` 的目录 `Repository::open` 本来也只会失败或开出裸仓库(没有工作区,
+            // 下面照样不收),跳过开库不改变结果
+            if sub.join(".git").exists()
+                && let Ok(repo) = Repository::open(&sub)
+                && let Some(workdir) = repo.workdir()
+                && workdir.canonicalize().ok() == sub.canonicalize().ok()
+            {
+                let name = sub
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // 物理上在项目目录内的 worktree 才会走到这里(作为子目录仓库),
+                // 项目目录外的关联 worktree 不再注入
+                entries.push(RepoPathEntry {
+                    name,
+                    path: sub,
+                    is_worktree: repo.is_worktree(),
+                });
+                continue;
             }
             scan(&sub, depth + 1, entries);
         }
@@ -528,17 +916,16 @@ fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository, bool)> {
     repos
 }
 
+/// 文件树的 git 状态:项目根下每个仓库的状态,路径相对项目根。
+///
+/// 每个仓库的 status 与「更改」区([`get_changes_status`])按仓库单飞、共享一趟
+/// ([`shared_status`]);项目是 monorepo 的子目录时也是整仓一趟,再按项目根筛。
+/// 单个仓库读失败的跳过,不拖垮整份。
 pub fn get_git_status(project_path: &Path) -> Result<Vec<GitFileStatus>> {
-    let repos = find_repos(project_path);
-
-    if repos.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let mut all = Vec::new();
-    for (_, _, repo, _) in &repos {
-        if let Ok(mut files) = collect_repo_status(repo, Some(project_path)) {
-            all.append(&mut files);
+    for entry in find_repos_cached_paths(project_path) {
+        if let Ok(raw) = shared_status(&entry.path) {
+            all.extend(file_tree_view(&raw, project_path));
         }
     }
     Ok(all)
@@ -546,41 +933,10 @@ pub fn get_git_status(project_path: &Path) -> Result<Vec<GitFileStatus>> {
 
 /// 「更改」列表的数据:每个文件的暂存 / 未暂存两侧状态。已暂存的重命名是一行
 /// (`path` = 新路径、`old_path` = 旧路径、`staged_status = Renamed`),口径见 [`status_options`]。
+/// 与文件树共享同一趟 status([`shared_status`])。
 pub fn get_changes_status(repo_path: &Path) -> Result<Vec<ChangeFileStatus>> {
-    let repo = Repository::open(repo_path)?;
-    let is_empty_repo = repo.head().is_err();
-
-    let statuses = repo.statuses(Some(&mut status_options()))?;
-    let mut result = Vec::new();
-
-    for entry in statuses.iter() {
-        let (raw_path, old_path) = entry_paths(&entry);
-        let s = entry.status();
-
-        let staged = map_staged_status(s);
-        let unstaged = map_unstaged_status(s, is_empty_repo);
-
-        if staged.is_none() && unstaged.is_none() {
-            continue;
-        }
-
-        let label = staged
-            .as_ref()
-            .or(unstaged.as_ref())
-            .map(status_label)
-            .unwrap_or("")
-            .to_string();
-
-        result.push(ChangeFileStatus {
-            path: raw_path,
-            old_path,
-            staged_status: staged,
-            unstaged_status: unstaged,
-            status_label: label,
-        });
-    }
-
-    Ok(result)
+    let raw = shared_status(repo_path)?;
+    Ok(changes_view(&raw))
 }
 
 pub fn discover_git_repos(project_path: &Path) -> Result<Vec<GitRepoInfo>> {
@@ -981,7 +1337,14 @@ fn stable_topo_reorder(loaded: &mut Vec<GitCommitInfo>) {
 
 pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
     let repo = Repository::open(repo_path)?;
+    repo_branches_in(&repo, &mut branch::UpstreamResolver::new(&repo))
+}
 
+/// [`get_repo_branches`] 的本体(拿已打开的仓库算,分支快照 [`repo_panel_snapshot`] 用)。
+fn repo_branches_in(
+    repo: &Repository,
+    upstreams: &mut branch::UpstreamResolver<'_>,
+) -> Result<Vec<BranchInfo>> {
     let mut branches = Vec::new();
 
     // 本地分支
@@ -990,11 +1353,8 @@ pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
         let name = branch.name()?.unwrap_or("").to_string();
         if let Some(target) = branch.get().target() {
             // 上游:`branch.<name>.remote/merge` 经 fetch refspec 换算成远程跟踪引用;
-            // 没配或引用不在都是 Err,一律当没有上游
-            let upstream = branch
-                .upstream()
-                .ok()
-                .and_then(|u| u.name().ok().flatten().map(str::to_string));
+            // 没配或引用不在都当没有上游(整批共用一份配置快照,见 `UpstreamResolver`)
+            let upstream = upstreams.upstream(&name).map(|(short, _)| short);
             branches.push(BranchInfo {
                 name,
                 // 按「HEAD 这个符号引用指着谁」判,不按提交比:新建的分支与 main 同一提交时
@@ -1090,10 +1450,12 @@ pub(crate) fn first_parent_diff<'r>(
     };
     let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
     // 树对树的 diff 默认不做相似度配对:纯重命名会拆成一删一增,下游「仅重命名」的
-    // 分支永远走不到。按 `git show` 的默认口径配对(只认重命名、不认复制,相似度 50%)
+    // 分支永远走不到。按 `git show` 的默认口径配对(只认重命名、不认复制,相似度 50%);
+    // 删除 × 新增太多时退到只认纯改名 / 不配(护栏见 [`find_renames_guarded`]),
+    // 大批量搬目录的提交不再一点开就卡几秒
     let mut find = git2::DiffFindOptions::new();
     find.renames(true);
-    diff.find_similar(Some(&mut find))?;
+    find_renames_guarded(&mut diff, find)?;
     Ok(diff)
 }
 
@@ -1130,25 +1492,20 @@ enum TreeText {
 }
 
 /// 读 `tree` 里 `path` 这个文件的文本。树里没有这个路径(新增 / 删除的那一侧)当空文本;
-/// 不是 blob、不是 UTF-8 报错(与提交 diff 一直以来的口径一致)。`limit_size` 只给新的
-/// 那一侧开:超过 [`MAX_DIFF_BYTES`] 的整份不做 diff。
-fn read_tree_text(
-    repo: &Repository,
-    tree: &git2::Tree<'_>,
-    path: &str,
-    limit_size: bool,
-) -> Result<TreeText> {
+/// 不是 blob、不是 UTF-8 报错(与提交 diff 一直以来的口径一致)。超过 [`MAX_DIFF_BYTES`]
+/// 的整份不做 diff —— 先从对象头取大小再决定读不读,不把几百 MB 的 blob 整份读进内存。
+fn read_tree_text(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> Result<TreeText> {
     let entry = match tree.get_path(Path::new(path)) {
         Ok(entry) => entry,
         Err(_) => return Ok(TreeText::Text(String::new())),
     };
+    if blob_too_large(repo, entry.id())? {
+        return Ok(TreeText::TooLarge);
+    }
     let obj = entry.to_object(repo)?;
     let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
     if blob.is_binary() {
         return Ok(TreeText::Binary);
-    }
-    if limit_size && blob.content().len() > MAX_DIFF_BYTES {
-        return Ok(TreeText::TooLarge);
     }
     let text = std::str::from_utf8(blob.content()).map_err(|_| anyhow!("binary"))?;
     Ok(TreeText::Text(text.to_string()))
@@ -1156,7 +1513,10 @@ fn read_tree_text(
 
 /// 两棵树里各一个文件 → diff。`None` 的一侧当空文本(文件新增 / 删除)。
 ///
-/// 判定顺序照旧:先读新的一侧(二进制 / 过大当场返回),再读旧的一侧(二进制返回)。
+/// 判定顺序:先读新的一侧(二进制 / 过大当场返回),再读旧的一侧(同样)。两侧套同一条
+/// [`MAX_DIFF_BYTES`]:旧实现旧侧不限,删掉一个 200 MB 的文本文件再点开它,峰值内存是文件
+/// 的三四倍、还要算上好几秒。大小在读内容之前判,所以超限的文件一律报「过大」(是不是
+/// 二进制要读了内容才知道)。
 /// 单提交 diff([`get_commit_file_diff`])与合并查看的两版本 diff
 /// ([`get_revision_file_diff`])共用这一份,口径不分叉。
 pub(crate) fn diff_tree_texts(
@@ -1165,7 +1525,7 @@ pub(crate) fn diff_tree_texts(
     new: Option<(&git2::Tree<'_>, &str)>,
 ) -> Result<GitDiffResult> {
     let new_content = match new {
-        Some((tree, path)) => match read_tree_text(repo, tree, path, true)? {
+        Some((tree, path)) => match read_tree_text(repo, tree, path)? {
             TreeText::Text(text) => text,
             TreeText::Binary => return Ok(binary_diff_result()),
             TreeText::TooLarge => return Ok(too_large_diff_result()),
@@ -1173,7 +1533,7 @@ pub(crate) fn diff_tree_texts(
         None => String::new(),
     };
     let old_content = match old {
-        Some((tree, path)) => match read_tree_text(repo, tree, path, false)? {
+        Some((tree, path)) => match read_tree_text(repo, tree, path)? {
             TreeText::Text(text) => text,
             TreeText::Binary => return Ok(binary_diff_result()),
             TreeText::TooLarge => return Ok(too_large_diff_result()),
@@ -1190,7 +1550,15 @@ pub(crate) fn diff_tree_texts(
 /// 内置 diff 视图的上限,与 fs 侧的文件查看上限同为 1MB。
 const MAX_DIFF_BYTES: usize = 1_048_576;
 
-/// LCS 的 O(m·n) DP 表在超大文件上会吃爆内存,越过这条线就退化成「整块替换」。
+/// `oid` 是个超过 [`MAX_DIFF_BYTES`] 的 blob。只读对象头(打包对象不解压正文),
+/// 不把内容读进内存;不是 blob 的(目录、子模块的提交)交给调用方按原口径处理。
+fn blob_too_large(repo: &Repository, oid: Oid) -> Result<bool> {
+    let (size, kind) = repo.odb()?.read_header(oid)?;
+    Ok(kind == git2::ObjectType::Blob && size > MAX_DIFF_BYTES)
+}
+
+/// LCS 的 O(m·n) DP 表在超大文件上会吃爆内存,越过这条线就不跑 LCS(先跑的 Myers 也
+/// 放弃了的话,退化成「整块替换」)。
 ///
 /// ⚠️ 这条线量的是**剥掉公共前后缀之后**的中段(见 [`lcs_workload`])。按整文件
 /// 量的话,一个 4000 行的文件只改一行也会越线 —— 退化出来的「整块替换」把全文
@@ -1217,16 +1585,11 @@ fn too_large_diff_result() -> GitDiffResult {
     }
 }
 
-/// 两段文本 → 完整 diff 结果(超大文件自动退化为整块替换)。
+/// 两段文本 → 完整 diff 结果(改动面太大时退化为整块替换,见 [`build_hunks`])。
 fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
-
-    let hunks = if lcs_workload(&old_lines, &new_lines) > MAX_LCS_CELLS {
-        full_replace_diff(&old_content, &new_content)
-    } else {
-        build_hunks(&old_lines, &new_lines)
-    };
+    let hunks = build_hunks(&old_lines, &new_lines);
 
     GitDiffResult {
         old_content,
@@ -1237,7 +1600,9 @@ fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
     }
 }
 
-fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
+/// HEAD 里这个文件的内容。`None` = 空仓库;HEAD 里没有这个文件是空文本。
+/// 超过 [`MAX_DIFF_BYTES`] 的不读内容(先看对象头),报 [`SideText::TooLarge`]。
+fn head_text(repo: &Repository, rel_path: &str) -> Result<Option<SideText>> {
     let head = match repo.head() {
         Ok(h) => h,
         Err(_) => return Ok(None), // 空仓库
@@ -1245,18 +1610,42 @@ fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>>
     let tree = head.peel_to_tree()?;
     let entry = match tree.get_path(Path::new(rel_path)) {
         Ok(e) => e,
-        Err(_) => return Ok(Some(String::new())), // 文件还没进 HEAD
+        Err(_) => return Ok(Some(SideText::Text(String::new()))), // 文件还没进 HEAD
     };
+    if blob_too_large(repo, entry.id())? {
+        return Ok(Some(SideText::TooLarge));
+    }
     let obj = entry.to_object(repo)?;
     let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
-
     if blob.is_binary() {
-        bail!("binary");
+        return Ok(Some(SideText::Binary));
     }
-    let content = std::str::from_utf8(blob.content())
-        .map_err(|_| anyhow!("binary"))?
-        .to_string();
-    Ok(Some(content))
+    Ok(Some(match std::str::from_utf8(blob.content()) {
+        Ok(s) => SideText::Text(s.to_string()),
+        Err(_) => SideText::Binary,
+    }))
+}
+
+/// HEAD 版本的文本(按块操作用:要拿它拼回暂存区)。二进制 / 过大都是错误 ——
+/// 这两种文件的 diff 本来就没有块可操作。
+fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
+    match head_text(repo, rel_path)? {
+        None => Ok(None),
+        Some(SideText::Text(s)) => Ok(Some(s)),
+        Some(SideText::Binary) => bail!("binary"),
+        Some(SideText::TooLarge) => bail!("too large"),
+    }
+}
+
+/// diff 旧侧取 HEAD 版本:`Ok(None)` = 超过上限(整份不做 diff);空仓库 / HEAD 里没有
+/// 这个文件是空文本;二进制照旧报错(与此前的口径一致)。
+fn head_side_text(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
+    match head_text(repo, rel_path)? {
+        None => Ok(Some(String::new())),
+        Some(SideText::Text(s)) => Ok(Some(s)),
+        Some(SideText::Binary) => bail!("binary"),
+        Some(SideText::TooLarge) => Ok(None),
+    }
 }
 
 /// 两段行序列的公共前缀 / 后缀行数(前缀优先,后缀在剩下的范围里数)。
@@ -1293,17 +1682,59 @@ fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usiz
 
     let a = &old_lines[head..old_lines.len() - tail];
     let b = &new_lines[head..new_lines.len() - tail];
-    let (m, n) = (a.len(), b.len());
+    // DP 表里的值不超过 min(m, n)。格子数被 MAX_LCS_CELLS 封顶时 min(m, n) ≤ √1000 万 ≈ 3162,
+    // u16 装得下 —— 1000 万格的表从原先的 usize(80 MB,外加每行一次分配)降到 20 MB
+    if a.len().min(b.len()) < usize::from(u16::MAX) {
+        lcs_backtrack::<u16>(a, b, head, &mut flat);
+    } else {
+        lcs_backtrack::<u32>(a, b, head, &mut flat);
+    }
 
-    // LCS DP table
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for k in 0..tail {
+        flat.push(('=', old_lines.len() - tail + k, new_lines.len() - tail + k));
+    }
+    flat
+}
+
+/// LCS 表的格子类型(按 min(m, n) 选够用的最窄的那种)。
+trait LcsCell: Copy + Ord {
+    const ZERO: Self;
+    fn succ(self) -> Self;
+}
+
+impl LcsCell for u16 {
+    const ZERO: Self = 0;
+    fn succ(self) -> Self {
+        self + 1
+    }
+}
+
+impl LcsCell for u32 {
+    const ZERO: Self = 0;
+    fn succ(self) -> Self {
+        self + 1
+    }
+}
+
+/// 中段 `a` / `b` 的 LCS:填表(一整块 `(m+1)·(n+1)` 的平铺数组)再回溯,编辑追加进 `flat`
+/// (下标加回 `head`)。
+fn lcs_backtrack<T: LcsCell>(
+    a: &[&str],
+    b: &[&str],
+    head: usize,
+    flat: &mut Vec<(char, usize, usize)>,
+) {
+    let (m, n) = (a.len(), b.len());
+    let width = n + 1;
+    let mut dp = vec![T::ZERO; (m + 1) * width];
+    let at = |i: usize, j: usize| i * width + j;
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            if a[i] == b[j] {
-                dp[i][j] = dp[i + 1][j + 1] + 1;
+            dp[at(i, j)] = if a[i] == b[j] {
+                dp[at(i + 1, j + 1)].succ()
             } else {
-                dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
-            }
+                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
+            };
         }
     }
 
@@ -1320,7 +1751,7 @@ fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usiz
             flat.push(('=', head + i, head + j));
             i += 1;
             j += 1;
-        } else if j < n && (i >= m || dp[i][j + 1] > dp[i + 1][j]) {
+        } else if j < n && (i >= m || dp[at(i, j + 1)] > dp[at(i + 1, j)]) {
             flat.push(('+', head + i, head + j));
             j += 1;
         } else {
@@ -1328,17 +1759,16 @@ fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usiz
             i += 1;
         }
     }
-
-    for k in 0..tail {
-        flat.push(('=', old_lines.len() - tail + k, new_lines.len() - tail + k));
-    }
-    flat
 }
 
-/// 基于 LCS 的行 diff,上下文 3 行。改动块先按 git 的口径滑到位(见 `slide` 模块注释),
-/// 行号才与 `git diff` 对得上。
+/// 行 diff,上下文 3 行。编辑序列走 [`line_diff::diff_ops`](中段小走 LCS,大了先 Myers
+/// 再 LCS),改动块已按 git 的口径滑到位(见 `slide` 模块注释),行号才与 `git diff`
+/// 对得上。两条路都放弃(编辑距离超过 Myers 上限、中段又越过 [`MAX_LCS_CELLS`])时
+/// 退化成整块替换。
 fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
-    let flat = slide::compact_ops(&edit_script(old_lines, new_lines), old_lines, new_lines);
+    let Some(flat) = line_diff::diff_ops(old_lines, new_lines) else {
+        return full_replace_hunks(old_lines, new_lines);
+    };
 
     // 按上下文 3 行分组成 hunk
     const CONTEXT: usize = 3;
@@ -1445,9 +1875,14 @@ fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
     hunks
 }
 
+#[cfg(test)]
 fn full_replace_diff(old_content: &str, new_content: &str) -> Vec<DiffHunk> {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
+    full_replace_hunks(&old_lines, &new_lines)
+}
+
+fn full_replace_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
     let mut lines_out: Vec<DiffLine> = Vec::new();
 
     for (i, l) in old_lines.iter().enumerate() {
@@ -1538,11 +1973,16 @@ pub fn get_git_diff_from(
             Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
             None => String::new(),
         },
-        DiffSide::Unstaged | DiffSide::Working => {
-            if !abs_file.exists() {
-                String::new()
-            } else {
+        DiffSide::Unstaged | DiffSide::Working => match std::fs::metadata(&abs_file) {
+            // 不存在(工作区里已删除)= 空
+            Err(_) => String::new(),
+            // 先看大小再读:超限的文件不整份读进内存
+            Ok(meta) if meta.len() > MAX_DIFF_BYTES as u64 => {
+                return Ok(too_large_diff_result());
+            }
+            Ok(_) => {
                 let new_bytes = std::fs::read(&abs_file)?;
+                // 量完大小到读完之间文件又长大了:照样按上限算
                 if new_bytes.len() > MAX_DIFF_BYTES {
                     return Ok(too_large_diff_result());
                 }
@@ -1551,25 +1991,27 @@ pub fn get_git_diff_from(
                     Err(_) => return Ok(binary_diff_result()),
                 }
             }
-        }
+        },
     };
 
-    // 旧侧:未暂存比暂存区,其余比 HEAD
+    // 旧侧:未暂存比暂存区,其余比 HEAD。两侧同一条大小上限(旧侧超限同样报「过大」)
     let old_content = match side {
         DiffSide::Unstaged => match index_text(&repo, &rel_str)? {
             Some(SideText::Text(s)) => s,
             Some(SideText::Binary) => return Ok(binary_diff_result()),
             Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
             // 冲突中的文件没有 stage 0 条目 —— 退回 HEAD(ours),不能当成新增
-            None if is_conflicted(&repo, &rel_str)? => {
-                get_head_content(&repo, &rel_str)?.unwrap_or_default()
-            }
+            None if is_conflicted(&repo, &rel_str)? => match head_side_text(&repo, &rel_str)? {
+                Some(text) => text,
+                None => return Ok(too_large_diff_result()),
+            },
             // 不在暂存区 = 未跟踪 / 已暂存删除,全部算新增
             None => String::new(),
         },
-        DiffSide::Staged | DiffSide::Working => {
-            get_head_content(&repo, &head_rel)?.unwrap_or_default()
-        }
+        DiffSide::Staged | DiffSide::Working => match head_side_text(&repo, &head_rel)? {
+            Some(text) => text,
+            None => return Ok(too_large_diff_result()),
+        },
     };
 
     Ok(diff_two_texts(old_content, new_content))
@@ -1588,12 +2030,13 @@ fn index_text(repo: &Repository, rel_path: &str) -> Result<Option<SideText>> {
     let Some(entry) = index.get_path(Path::new(rel_path), 0) else {
         return Ok(None);
     };
+    // 大小先从对象头取:超限的不读内容
+    if blob_too_large(repo, entry.id)? {
+        return Ok(Some(SideText::TooLarge));
+    }
     let blob = repo.find_blob(entry.id)?;
     if blob.is_binary() {
         return Ok(Some(SideText::Binary));
-    }
-    if blob.content().len() > MAX_DIFF_BYTES {
-        return Ok(Some(SideText::TooLarge));
     }
     Ok(Some(match std::str::from_utf8(blob.content()) {
         Ok(s) => SideText::Text(s.to_string()),
@@ -1988,6 +2431,61 @@ fn remove_fresh_index_lock(repo_path: &Path, started: SystemTime) -> Option<Path
     None
 }
 
+/// 等子进程退出,最多等到 `deadline`:退出了是 `Ok(Some(状态))`,到点还没退是 `Ok(None)`
+/// (由调用方去杀)。
+///
+/// 旧实现每 15ms `try_wait` 一次,几十毫秒就跑完的 git(绝大多数调用)平白多等 0~15ms。
+/// Windows 上直接等进程句柄变为有信号(`WaitForSingleObject` 带超时),退出即醒、不轮询;
+/// 其余平台没有 libc 依赖就没有带超时的 `waitpid`,退而求其次:从 1ms 起翻倍、封顶 15ms
+/// 的退避轮询,快的命令几乎不多等,慢的命令也不至于空转。
+fn wait_child_until(
+    child: &mut std::process::Child,
+    deadline: Instant,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            // 不传 INFINITE(u32::MAX):超长的超时也分段等,到点由上面的判断收口
+            let millis = u32::try_from(left.as_millis())
+                .unwrap_or(u32::MAX - 1)
+                .max(1);
+            // SAFETY:child 存活期间它的进程句柄一直有效;只等、不关句柄
+            let woke = unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, millis) };
+            if woke == WAIT_FAILED {
+                // 等不了(极少见):退回旧的固定间隔轮询
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut nap = Duration::from_millis(1);
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(nap.min(deadline - now));
+            nap = (nap * 2).min(Duration::from_millis(15));
+        }
+    }
+}
+
 /// 起 git 子进程并限时等待;只有「起不来 / 超时」是 `Err`。stdin 是 null。
 fn spawn_git(
     repo_path: &Path,
@@ -2048,20 +2546,17 @@ fn spawn_git_with_input(
     let stderr = PipeDrain::start(child.stderr.take().map(|p| Box::new(p) as _));
 
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                tree.kill(&mut child);
-                let lock = remove_fresh_index_lock(repo_path, started);
-                bail!(
-                    "{}",
-                    timeout_message(op_label, timeout.as_secs(), timeout_hint, lock.as_deref())
-                );
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
-            Err(e) => bail!("git {} 等待失败:{}", op_label, e),
+    let status = match wait_child_until(&mut child, deadline) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            tree.kill(&mut child);
+            let lock = remove_fresh_index_lock(repo_path, started);
+            bail!(
+                "{}",
+                timeout_message(op_label, timeout.as_secs(), timeout_hint, lock.as_deref())
+            );
         }
+        Err(e) => bail!("git {} 等待失败:{}", op_label, e),
     };
 
     // 两根管道共用一个宽限期:git 已退出,只剩后代可能还攥着管道
@@ -2107,7 +2602,7 @@ pub fn git_push(repo_path: &Path) -> Result<String> {
 /// 与改写工作区的操作同档。
 const INDEX_OP_TIMEOUT: Duration = WORKTREE_OP_TIMEOUT;
 
-/// 一次带太多路径会撞上 Windows 命令行 32K 的上限,分批跑(与 `conflict.rs` 同口径)。
+/// 一次带太多路径会撞上 Windows 命令行 32K 的上限,分批跑(见 [`run_literal_paths`])。
 const PATHS_PER_CALL: usize = 64;
 
 /// `git --literal-pathspecs <head_args> -- <files>`,按批跑。
@@ -2117,14 +2612,65 @@ fn run_with_literal_paths(
     files: &[String],
     op_label: &str,
 ) -> Result<()> {
+    let files: Vec<&str> = files.iter().map(String::as_str).collect();
+    run_literal_paths(repo_path, head_args, &files, op_label, INDEX_OP_TIMEOUT)
+}
+
+/// `git --literal-pathspecs <head_args> -- <files>`。暂存 / 取消暂存 / 丢弃共用。
+///
+/// 一批装得下([`PATHS_PER_CALL`] 以内)就照常带在命令行上。再多的话,旧做法是每 64 个
+/// 路径起一个进程(1000 个文件 16 个进程、约 0.7s),现在改从 stdin 喂一次跑完
+/// (`--pathspec-from-file=- --pathspec-file-nul`,git ≥ 2.25;NUL 分隔、逐字读入,
+/// `--literal-pathspecs` 照样管着它们);git 太老不认这个选项(用法错误,退出码 129,
+/// 那时什么都还没做)才退回按批起进程。
+fn run_literal_paths(
+    repo_path: &Path,
+    head_args: &[&str],
+    files: &[&str],
+    op_label: &str,
+    timeout: Duration,
+) -> Result<()> {
+    if files.len() > PATHS_PER_CALL
+        && run_paths_via_stdin(repo_path, head_args, files, op_label, timeout)?
+    {
+        return Ok(());
+    }
     for chunk in files.chunks(PATHS_PER_CALL) {
         let mut args = vec!["--literal-pathspecs"];
         args.extend_from_slice(head_args);
         args.push("--");
-        args.extend(chunk.iter().map(String::as_str));
-        run_git_command_labeled(repo_path, &args, op_label, INDEX_OP_TIMEOUT, "")?;
+        args.extend_from_slice(chunk);
+        run_git_command_labeled(repo_path, &args, op_label, timeout, "")?;
     }
     Ok(())
+}
+
+/// 路径从 stdin 喂给 git 跑一次。`Ok(false)` = 这个 git 不认 `--pathspec-from-file`
+/// (调用方退回按批);其余失败是 `Err`(git 原文)。
+fn run_paths_via_stdin(
+    repo_path: &Path,
+    head_args: &[&str],
+    files: &[&str],
+    op_label: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut args = vec!["--literal-pathspecs"];
+    args.extend_from_slice(head_args);
+    args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+    let mut input = Vec::with_capacity(files.iter().map(|f| f.len() + 1).sum());
+    for file in files {
+        input.extend_from_slice(file.as_bytes());
+        input.push(0);
+    }
+    ensure_repo_dir(repo_path)?;
+    let out = spawn_git_with_input(repo_path, &args, &[], op_label, timeout, "", Some(input))?;
+    if out.success {
+        return Ok(true);
+    }
+    if out.code == Some(GIT_USAGE_ERROR) {
+        return Ok(false);
+    }
+    bail!("{}", failure_text(&out));
 }
 
 /// 还没有任何提交(HEAD 指向未出生的分支)。这时没有 HEAD 可以 reset 回去,
@@ -2166,18 +2712,16 @@ pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<()> {
 /// `files` 里已暂存重命名的新路径,补上各自的旧路径(列表里已有的不重复)。
 ///
 /// 只 reset 新路径的话,旧路径那条「已暂存删除」还挂在暂存区,一行 R 就裂成
-/// 「已暂存 D + 未跟踪」。只比 HEAD 与暂存区(`StatusShow::Index`),不扫工作区。
+/// 「已暂存 D + 未跟踪」。只比 HEAD 与暂存区(`StatusShow::Index`),不扫工作区;重命名
+/// 配对与「更改」区同一套(有护栏,见 [`pair_staged_renames`])。
 fn with_rename_sources(repo_path: &Path, files: &[String]) -> Result<Vec<String>> {
     let repo = Repository::open(repo_path)?;
-    let mut opts = StatusOptions::new();
-    opts.show(git2::StatusShow::Index)
-        .renames_head_to_index(true);
-    let statuses = repo.statuses(Some(&mut opts))?;
+    let entries = raw_entries(&repo, git2::StatusShow::Index)?;
     let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
     let mut out = files.to_vec();
-    for entry in statuses.iter() {
-        if let (new, Some(old)) = entry_paths(&entry)
-            && wanted.contains(new.as_str())
+    for entry in entries {
+        if let Some(old) = entry.renamed_from
+            && wanted.contains(entry.path.as_str())
             && !out.contains(&old)
         {
             out.push(old);
@@ -2680,6 +3224,10 @@ mod index_exec_tests;
 #[cfg(test)]
 #[path = "changes_tests.rs"]
 mod changes_tests;
+
+#[cfg(test)]
+#[path = "perf_guard_tests.rs"]
+mod perf_guard_tests;
 
 #[cfg(test)]
 mod tests {

@@ -34,12 +34,13 @@ use git2::{ObjectType, Repository};
 
 use super::slide::compact_ops;
 use super::{
-    MAX_DIFF_BYTES, MAX_LCS_CELLS, common_affix, discover_repo_for, edit_script, lcs_workload,
+    MAX_LCS_CELLS, blob_too_large, common_affix, discover_repo_for, edit_script, lcs_workload,
     repo_relative_path,
 };
 
 /// Myers 允许的最大编辑距离。超过它说明改动面已经大到「整段重写」的量级,
 /// 交给 LCS / 退化兜底。回溯要留每一步的 V 数组(≈ D² 个 `i32`),1000 步约 4 MB。
+/// diff 弹窗([`diff_ops`])与 gutter 同用这一个上限。
 pub const MYERS_MAX_D: usize = 1000;
 
 /// gutter 上一块变更的类型。颜色口径与 Git 状态色一致:新增绿 / 修改橙 / 删除红。
@@ -105,27 +106,63 @@ fn line_ops(old: &[&str], new: &[&str], max_d: usize) -> Vec<(char, usize, usize
     let (head, tail) = common_affix(old, new);
     let a = &old[head..old.len() - tail];
     let b = &new[head..new.len() - tail];
-
-    let middle = myers_ops(a, b, max_d).or_else(|| {
-        // LCS 自己也会剥前后缀;只把中段交给它,下标再整体平移回来
-        (lcs_workload(a, b) <= MAX_LCS_CELLS).then(|| edit_script(a, b))
-    });
-
-    let mut ops: Vec<(char, usize, usize)> = (0..head).map(|i| ('=', i, i)).collect();
-    match middle {
-        Some(middle) => {
-            ops.extend(
-                middle
-                    .into_iter()
-                    .map(|(kind, oi, ni)| (kind, oi + head, ni + head)),
-            );
-        }
+    let middle = middle_ops(a, b, max_d).unwrap_or_else(|| {
         // 两条路都放弃了:中段整块算「删掉旧的、换上新的」
-        None => {
-            ops.extend((0..a.len()).map(|i| ('-', head + i, head)));
-            ops.extend((0..b.len()).map(|j| ('+', head + a.len(), head + j)));
-        }
-    }
+        let mut block: Vec<(char, usize, usize)> = (0..a.len()).map(|i| ('-', i, 0)).collect();
+        block.extend((0..b.len()).map(|j| ('+', a.len(), j)));
+        block
+    });
+    with_affix(old, new, head, tail, middle)
+}
+
+/// diff 弹窗先跑 LCS 的上限(剥掉公共前后缀之后的格子数):表不超过 2 MB(u16 格子)、
+/// 几毫秒算完。超过它才换 Myers。
+const LCS_FIRST_CELLS: u64 = 1_000_000;
+
+/// diff 弹窗([`super::diff_two_texts`])的编辑序列,按 git 的口径滑过。两条路都放弃时
+/// 为 `None` —— 弹窗那边按它自己的口径整份退化。
+///
+/// 中段不大([`LCS_FIRST_CELLS`] 以内)照旧走 LCS;再大才先 Myers(O((N+M)·D),不开
+/// O(m·n) 的表)、Myers 超限再回 LCS(格子数仍受 [`MAX_LCS_CELLS`] 限制)。不一律先 Myers:
+/// 两条路求出的都是最短编辑,但相同长度的编辑有好几种摆法、滑动也只能统一一部分 ——
+/// 拿随机改动(1500 例,文件 ≤ 40 行、≤ 8 处改动)与 `git diff --no-index -U0` 逐块对账,
+/// LCS 路 1483 例一致、Myers 路 1469 例,LCS 更贴近 git。小改动保持原来的结果,大中段
+/// 才为内存换 Myers(以前那里是开几十 MB 的表,或者干脆整块退化)。
+pub(super) fn diff_ops(old: &[&str], new: &[&str]) -> Option<Vec<(char, usize, usize)>> {
+    let (head, tail) = common_affix(old, new);
+    let a = &old[head..old.len() - tail];
+    let b = &new[head..new.len() - tail];
+    let middle = if lcs_workload(a, b) <= LCS_FIRST_CELLS {
+        edit_script(a, b)
+    } else {
+        middle_ops(a, b, MYERS_MAX_D)?
+    };
+    Some(with_affix(old, new, head, tail, middle))
+}
+
+/// 剥掉公共前后缀之后的中段:先 Myers(编辑距离不超过 `max_d`),再 LCS(格子数不越
+/// [`MAX_LCS_CELLS`]);都放弃为 `None`。下标相对中段。
+fn middle_ops(a: &[&str], b: &[&str], max_d: usize) -> Option<Vec<(char, usize, usize)>> {
+    myers_ops(a, b, max_d).or_else(|| {
+        // LCS 自己也会剥前后缀;只把中段交给它,下标再由调用方整体平移回来
+        (lcs_workload(a, b) <= MAX_LCS_CELLS).then(|| edit_script(a, b))
+    })
+}
+
+/// 中段的编辑序列接回公共前后缀(下标平移 `head`),再滑到位。
+fn with_affix(
+    old: &[&str],
+    new: &[&str],
+    head: usize,
+    tail: usize,
+    middle: Vec<(char, usize, usize)>,
+) -> Vec<(char, usize, usize)> {
+    let mut ops: Vec<(char, usize, usize)> = (0..head).map(|i| ('=', i, i)).collect();
+    ops.extend(
+        middle
+            .into_iter()
+            .map(|(kind, oi, ni)| (kind, oi + head, ni + head)),
+    );
     ops.extend((0..tail).map(|k| ('=', old.len() - tail + k, new.len() - tail + k)));
     // 改动块按 git 的口径滑到位(`slide` 模块注释):gutter 的竖条与 diff 弹窗、`git diff`
     // 标在同几行,剥前后缀把末尾那个没改的 `}` 算进新增块的毛病也一并没了
@@ -147,11 +184,17 @@ fn myers_ops<'s>(a: &[&'s str], b: &[&'s str], max_d: usize) -> Option<Vec<(char
 
     let n = a_ids.len() as i64;
     let m = b_ids.len() as i64;
+    // 回溯轨迹按 i32 存(下面),行数超出 i32 的输入不走 Myers(实际到不了:diff 的
+    // 两侧都有 1 MB 的上限)
+    if n + m > i64::from(i32::MAX) {
+        return None;
+    }
     let max_d = (max_d as i64).min(n + m);
     // V 按 k + offset 下标;k 的取值范围是 [-(max_d+1), max_d+1]
     let offset = max_d + 1;
     let mut v = vec![0i64; (2 * offset + 1) as usize];
-    let mut trace: Vec<Vec<i64>> = Vec::new();
+    // 每步一份快照,存成 i32:轨迹是 Σ(2d+3) ≈ D² 个数,D = 1000 时约 4 MB(i64 要 8 MB)
+    let mut trace: Vec<Vec<i32>> = Vec::new();
     let mut found = None;
 
     'outer: for d in 0..=max_d {
@@ -159,7 +202,8 @@ fn myers_ops<'s>(a: &[&'s str], b: &[&'s str], max_d: usize) -> Option<Vec<(char
         // (d ≤ max_d,所以 offset - d - 1 ≥ 0、offset + d + 1 ≤ 2·offset,不会越界)
         let lo = (offset - d - 1) as usize;
         let hi = (offset + d + 1) as usize;
-        trace.push(v[lo..=hi].to_vec());
+        // V 里的值是 x ∈ [0, n],上面已确认 n 装得进 i32
+        trace.push(v[lo..=hi].iter().map(|&x| x as i32).collect());
         let mut k = -d;
         while k <= d {
             let idx = (k + offset) as usize;
@@ -189,7 +233,7 @@ fn myers_ops<'s>(a: &[&'s str], b: &[&'s str], max_d: usize) -> Option<Vec<(char
     for d in (0..=d_end).rev() {
         // 快照里第 0 格是 k = -(d+1)
         let snap = &trace[d as usize];
-        let at = |k: i64| snap[(k + d + 1) as usize];
+        let at = |k: i64| i64::from(snap[(k + d + 1) as usize]);
         let k = x - y;
         let prev_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) {
             k + 1
@@ -332,12 +376,14 @@ pub fn head_file(project_path: &Path, abs_file: &Path) -> Result<HeadFile> {
     let Some(blob_id) = blob_id else {
         return Ok(HeadFile::NotInHead(repo_file));
     };
-    let blob = repo.find_blob(git2::Oid::from_str(&blob_id)?)?;
+    let oid = git2::Oid::from_str(&blob_id)?;
+    // 先从对象头取大小:超限的不整份读进内存(是不是二进制要读了内容才知道,超限一律算过大)
+    if blob_too_large(&repo, oid)? {
+        return Ok(HeadFile::TooLarge(repo_file));
+    }
+    let blob = repo.find_blob(oid)?;
     if blob.is_binary() {
         return Ok(HeadFile::Binary(repo_file));
-    }
-    if blob.content().len() > MAX_DIFF_BYTES {
-        return Ok(HeadFile::TooLarge(repo_file));
     }
     Ok(match std::str::from_utf8(blob.content()) {
         Ok(text) => HeadFile::Text {
