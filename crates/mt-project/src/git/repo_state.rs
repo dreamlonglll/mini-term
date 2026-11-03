@@ -302,7 +302,11 @@ pub struct RepoSignature {
 
 /// 算 [`RepoSignature`]。纯 git2 只读。
 pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
-    let repo = Repository::open(repo_path)?;
+    repo_signature_in(&Repository::open(repo_path)?)
+}
+
+/// [`repo_signature`] 的本体(拿已打开的仓库算,分支快照用)。
+pub(super) fn repo_signature_in(repo: &Repository) -> Result<RepoSignature> {
     let mut hasher = DefaultHasher::new();
     match repo.head() {
         Ok(head) => {
@@ -324,7 +328,7 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
     refs.sort();
     refs.hash(&mut hasher);
     // 删 `stash@{n>0}` 时 `refs/stash` 不动、只少一条 reflog:贮藏条数单独算进来
-    stash_entries(&repo).hash(&mut hasher);
+    stash_entries(repo).hash(&mut hasher);
     let refs = hasher.finish();
 
     let mut hasher = DefaultHasher::new();
@@ -346,20 +350,41 @@ pub fn repo_signature(repo_path: &Path) -> Result<RepoSignature> {
 // 工作区监听(「更改」列表跟上外部改动)
 // ---------------------------------------------------------------------------
 
-/// 工作区监听一次最多挂多少个目录。监听器非递归(一个目录一条),Windows 上每条常驻
-/// 一块 16 KB 的变更缓冲 —— 256 条约 4 MB。按广度优先挂,超出时丢的是最深的那些目录,
-/// 它们里面的变化由 `.git` 监听 / 终端输出嗅探 / 手动刷新兜底。
-pub const WORKTREE_WATCH_DIR_LIMIT: usize = 256;
+/// 后端原生支持子树监听的平台(Windows 的 ReadDirectoryChangesW、macOS 的 FSEvents):目录
+/// 多于 [`WORKTREE_WATCH_DIR_LIMIT`] 时改成递归监听(见 [`worktree_watch_dirs`])。Linux 的
+/// inotify 没有子树监听 —— notify 的「递归」是逐个目录挂、连 `node_modules` 一起,不用。
+pub const NATIVE_TREE_WATCH: bool = cfg!(any(windows, target_os = "macos"));
+
+/// 工作区监听一次最多挂多少条非递归监听(一个目录一条),按广度优先挂。Windows 上每条常驻
+/// 一块 16 KB 的变更缓冲,256 条约 4 MB;Linux 上一条 inotify watch 只占约 1 KB 内核内存、
+/// 没有用户态缓冲,放宽到 1024 条(老内核每用户默认总额 8192,给 IDE 等别的程序留足)。
+/// 目录再多:原生支持子树监听的平台改成递归,Linux 只挂浅层的那些(`truncated`),深处由
+/// 面板的低频兜底补查。
+pub const WORKTREE_WATCH_DIR_LIMIT: usize = if NATIVE_TREE_WATCH { 256 } else { 1024 };
+
+/// 递归模式下为列出「子树里不报的目录」([`WorktreeWatchDirs::pruned`])最多看多少个目录。
+/// 更深处的被忽略目录不在清单里,它们里面的事件照样交到面板,由忽略规则在后台滤掉
+/// (只是多一点开销)。
+pub const WORKTREE_SCAN_DIR_LIMIT: usize = 4096;
+
+/// 递归模式下顶层目录多于这么多就不再逐个递归,整个工作区根递归一条。
+const WORKTREE_TREE_LIMIT: usize = 64;
 
 /// 不论写没写进 `.gitignore` 都不挂的目录:git 自己的目录与依赖 / 构建产物(文件数常以万计)。
-const WORKTREE_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
+/// 递归监听的子树里新冒出来的这类目录还没进 [`WorktreeWatchDirs::pruned`],监听方按名字认。
+pub const WORKTREE_SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
 
 /// [`worktree_watch_dirs`] 的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorktreeWatchDirs {
-    /// 工作区根在第一个,其余广度优先(浅的在前)
+    /// 非递归监听的目录:工作区根在第一个,其余广度优先(浅的在前)
     pub dirs: Vec<PathBuf>,
-    /// 目录比 [`WORKTREE_WATCH_DIR_LIMIT`] 多,没挂全
+    /// 递归监听的子树根(目录太多改递归时才有)
+    pub trees: Vec<PathBuf>,
+    /// 递归子树里被跳过的目录(被忽略的 / 嵌套仓库 / [`WORKTREE_SKIP_DIRS`]):事件落在它们
+    /// **里面**的,监听方直接丢
+    pub pruned: Vec<PathBuf>,
+    /// 目录比上限多、又没法递归(Linux):深处没挂上
     pub truncated: bool,
 }
 
@@ -370,43 +395,97 @@ pub struct WorktreeWatchDirs {
 /// [`WORKTREE_SKIP_DIRS`] 与符号链接(不顺着它跳出工作区)。路径以 `repo_path` 为根拼出来,
 /// 事件回来时按同一个根求相对路径([`any_unignored_change`])。
 ///
-/// **阻塞**(逐层读目录,最多读 [`WORKTREE_WATCH_DIR_LIMIT`] 个),调用方放后台执行器。
+/// 目录不多于 [`WORKTREE_WATCH_DIR_LIMIT`] 时逐个非递归挂(`dirs`)。再多的话:
+///
+/// - 原生支持子树监听的平台([`NATIVE_TREE_WATCH`]):工作区根照旧非递归(盯根下的文件与
+///   顶层目录的增删),每个顶层子目录递归一条(`trees`)。顶层的 `target/` / `node_modules/`
+///   这类于是不在任何一条递归里,构建、装依赖的成千上万条事件进不来;顶层目录多于 64 个就
+///   整个根递归一条。子树里被跳过的目录列进 `pruned`(最多看 [`WORKTREE_SCAN_DIR_LIMIT`]
+///   个目录),监听方按它丢事件;
+/// - 别处只挂浅层的那些,`truncated` 置位。
+///
+/// **阻塞**(逐层读目录),调用方放后台执行器。
 pub fn worktree_watch_dirs(repo_path: &Path) -> Result<WorktreeWatchDirs> {
+    let tree_limit = NATIVE_TREE_WATCH.then_some(WORKTREE_TREE_LIMIT);
+    worktree_watch_plan(repo_path, WORKTREE_WATCH_DIR_LIMIT, tree_limit)
+}
+
+/// [`worktree_watch_dirs`] 的本体。上限做成参数,单测不必真造几百个目录;`tree_limit` 为
+/// `None` = 平台不支持递归。
+fn worktree_watch_plan(
+    repo_path: &Path,
+    limit: usize,
+    tree_limit: Option<usize>,
+) -> Result<WorktreeWatchDirs> {
     let repo = Repository::open(repo_path)?;
     let root = trim_dir(repo_path);
-    let mut out = WorktreeWatchDirs {
-        dirs: vec![root.clone()],
-        truncated: false,
+    // 没被跳过的目录(广度优先);超过 `limit` 之后只在递归模式下接着看,为的是列全 `pruned`
+    let mut walked = vec![root.clone()];
+    let mut top: Vec<PathBuf> = Vec::new();
+    let mut pruned: Vec<PathBuf> = Vec::new();
+    let mut over = false;
+    let budget = match tree_limit {
+        Some(_) => WORKTREE_SCAN_DIR_LIMIT.max(limit),
+        None => limit,
     };
-    let mut queue = std::collections::VecDeque::from([(root, String::new())]);
+    let mut queue = std::collections::VecDeque::from([(root.clone(), String::new())]);
     'walk: while let Some((dir, rel)) = queue.pop_front() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         // `DirEntry::file_type` 不跟随符号链接:链接出去的目录不算
-        let mut children: Vec<(PathBuf, String)> = entries
+        let mut children: Vec<(PathBuf, String, bool)> = entries
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            .filter_map(|e| {
+            .map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                (!WORKTREE_SKIP_DIRS.contains(&name.as_str()))
-                    .then(|| (e.path(), format!("{rel}{name}/")))
+                let skip = WORKTREE_SKIP_DIRS.contains(&name.as_str());
+                (e.path(), format!("{rel}{name}/"), skip)
             })
             .collect();
         children.sort();
-        for (abs, child_rel) in children {
-            if abs.join(".git").exists() || repo.is_path_ignored(&child_rel).unwrap_or(false) {
+        for (abs, child_rel, skip) in children {
+            if skip
+                || abs.join(".git").exists()
+                || repo.is_path_ignored(&child_rel).unwrap_or(false)
+            {
+                pruned.push(abs);
                 continue;
             }
-            if out.dirs.len() >= WORKTREE_WATCH_DIR_LIMIT {
-                out.truncated = true;
-                break 'walk;
+            if rel.is_empty() {
+                top.push(abs.clone());
             }
-            out.dirs.push(abs.clone());
+            if walked.len() >= limit {
+                over = true;
+                if walked.len() >= budget {
+                    break 'walk;
+                }
+            }
+            walked.push(abs.clone());
             queue.push_back((abs, child_rel));
         }
     }
-    Ok(out)
+    let Some(tree_limit) = tree_limit.filter(|_| over) else {
+        walked.truncate(limit);
+        return Ok(WorktreeWatchDirs {
+            dirs: walked,
+            trees: Vec::new(),
+            pruned: Vec::new(),
+            truncated: over,
+        });
+    };
+    let whole_root = top.len() > tree_limit;
+    let trees = if whole_root { vec![root.clone()] } else { top };
+    // 顶层被跳过的那些不在任何一条递归里(整根递归时除外),不必列
+    if !whole_root {
+        pruned.retain(|dir| dir.parent() != Some(root.as_path()));
+    }
+    Ok(WorktreeWatchDirs {
+        dirs: vec![root],
+        trees,
+        pruned,
+        truncated: false,
+    })
 }
 
 /// 一批工作区变化里有没有**没被忽略**的路径。全是被忽略的(构建日志、编辑器的临时
@@ -414,9 +493,15 @@ pub fn worktree_watch_dirs(repo_path: &Path) -> Result<WorktreeWatchDirs> {
 ///
 /// `paths` 是监听报上来的绝对路径(以 `repo_path` 为根拼的,见 [`worktree_watch_dirs`]);
 /// `.git` 下的一律不算;求不出相对路径的按「没被忽略」算 —— 宁可多刷一次。
+///
+/// 「被忽略」与 git 的口径一致:**已跟踪的文件不算被忽略**。libgit2 的 `is_path_ignored`
+/// 只看规则、不管跟没跟踪 —— 提交过、后来又写进 `.gitignore` 的文件被改了,`git status`
+/// 照样显示 M,只看规则的话这条变化被丢掉,「更改」区不刷。所以规则命中的再查一次暂存区
+/// (一批里只读一次暂存区,而且只在真有命中时才读)。
 pub fn any_unignored_change(repo_path: &Path, paths: &[PathBuf]) -> Result<bool> {
     let repo = Repository::open(repo_path)?;
     let root = trim_dir(repo_path);
+    let mut index: Option<Option<git2::Index>> = None;
     for path in paths {
         let Ok(rel) = path.strip_prefix(&root) else {
             return Ok(true);
@@ -430,8 +515,17 @@ pub fn any_unignored_change(repo_path: &Path, paths: &[PathBuf]) -> Result<bool>
             Some(first) if first == ".git" => continue,
             Some(_) => {}
         }
-        if !repo.is_path_ignored(parts.join("/")).unwrap_or(false) {
+        let rel = parts.join("/");
+        if !repo.is_path_ignored(&rel).unwrap_or(false) {
             return Ok(true);
+        }
+        // 规则命中:已跟踪(暂存区里有它,冲突中的也算)就不是被忽略的
+        let index = index.get_or_insert_with(|| repo.index().ok());
+        if let Some(index) = index {
+            let rel = Path::new(&rel);
+            if (0..=3).any(|stage| index.get_path(rel, stage).is_some()) {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -780,6 +874,88 @@ mod tests {
             any_unignored_change(&root, &[root.join("x.log"), root.join("src").join("a.txt")])
                 .unwrap()
         );
+        cleanup(&[&root]);
+    }
+
+    /// 相对工作区根的 `/` 分隔路径(断言用)。
+    fn rels(root: &Path, dirs: &[PathBuf]) -> Vec<String> {
+        dirs.iter()
+            .map(|d| {
+                d.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
+    }
+
+    /// 目录多于上限:支持递归的平台改成「根非递归 + 每个顶层目录递归一条」,子树里被跳过
+    /// 的目录(被忽略的、嵌套仓库、node_modules)列进 pruned,顶层被跳过的不列(它们不在任何
+    /// 一条递归里);顶层目录太多就整根递归一条(顶层被跳过的也得列上)。不支持递归的平台
+    /// 只挂浅层的那些并标 truncated;没超上限时与原来一样逐个非递归挂。
+    #[test]
+    fn 工作区目录太多时改递归监听() {
+        let root = init_repo_with_file("state-trees", "src/a.txt", "a\n");
+        for dir in [
+            "src/core/deep",
+            "src/gen/out",
+            "src/pkg/node_modules/x",
+            "docs/guide",
+            "lib/nested/.git",
+            "build/out",
+            "target/debug",
+            "node_modules/y",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "build/\nsrc/gen/\n").unwrap();
+
+        // 上限 4:root + docs + lib + src 刚好挂满,再往下就超了
+        let plan = worktree_watch_plan(&root, 4, Some(64)).unwrap();
+        assert_eq!(rels(&root, &plan.dirs), vec![""]);
+        assert_eq!(rels(&root, &plan.trees), vec!["docs", "lib", "src"]);
+        let mut pruned = rels(&root, &plan.pruned);
+        pruned.sort();
+        assert_eq!(
+            pruned,
+            vec!["lib/nested", "src/gen", "src/pkg/node_modules"],
+            "顶层的 build / target / node_modules 不在任何一条递归里,不必列"
+        );
+        assert!(!plan.truncated);
+
+        // 顶层目录多于 tree_limit:整根递归一条,顶层被跳过的也要列
+        let plan = worktree_watch_plan(&root, 4, Some(2)).unwrap();
+        assert_eq!(rels(&root, &plan.dirs), vec![""]);
+        assert_eq!(rels(&root, &plan.trees), vec![""]);
+        let pruned = rels(&root, &plan.pruned);
+        for dir in ["build", "target", "node_modules", "src/gen", "lib/nested"] {
+            assert!(pruned.iter().any(|p| p == dir), "{dir} 不在 {pruned:?}");
+        }
+
+        // 不支持递归:只挂浅层的那些
+        let plan = worktree_watch_plan(&root, 4, None).unwrap();
+        assert_eq!(rels(&root, &plan.dirs), vec!["", "docs", "lib", "src"]);
+        assert!(plan.trees.is_empty() && plan.pruned.is_empty());
+        assert!(plan.truncated);
+
+        // 没超上限:逐个非递归挂,与平台无关
+        for tree_limit in [Some(64), None] {
+            let plan = worktree_watch_plan(&root, 256, tree_limit).unwrap();
+            assert_eq!(
+                rels(&root, &plan.dirs),
+                vec![
+                    "",
+                    "docs",
+                    "lib",
+                    "src",
+                    "docs/guide",
+                    "src/core",
+                    "src/pkg",
+                    "src/core/deep"
+                ]
+            );
+            assert!(plan.trees.is_empty() && plan.pruned.is_empty() && !plan.truncated);
+        }
         cleanup(&[&root]);
     }
 

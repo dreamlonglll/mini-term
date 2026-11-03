@@ -57,8 +57,37 @@
 //!
 //! 全部 git 调用(git2 的同步 IO 与带超时的 git CLI)一律丢 `cx.background_executor()`
 //! (范式照 `file_tree.rs:138-156`);异步回包用请求令牌防迟到。
+//!
+//! # 取数调度
+//!
+//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 弹窗
+//! 按块操作),大仓库一次 status 又要两三秒。[`GitChanges::load`] 因此是**单飞**的
+//! ([`git_ui::flight`]):同一时刻只跑一份,期间再要只记脏位,跑完当场补一趟;在途那份照样
+//! 落地,但「操作后落回的位置」与在等的 diff 弹窗留给补跑那份(在途那份可能还不含那次操作)。
+//!
+//! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
+//! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
+//! 分支都没动就不重取。
+//!
+//! 暂存 / 丢弃 / 冲突处理写完,在同一趟后台里**先**读一份签名([`RepoObservation`])再重取
+//! 列表,经 [`GitChangesEvent::IndexWritten`] 交给面板记作「已知」:紧接着那次 `.git` 检查
+//! 比出来没变,不再把列表、文件树重取一遍。
+//!
+//! # 列表只建看得见的行
+//!
+//! 根视图每帧都 render,没套 view 缓存的子视图跟着整个重跑 render + layout + paint ——
+//! 任一终端输出的一拍、spinner 的一拍、一次悬停都算。此前整张列表每帧连同目录树一起
+//! 重建,几千个改动时每一帧都是 0.1s 级。现在:
+//!
+//! - 列表走 `v_virtual_list`(变高:分组标题连外边距 32、文件 / 目录行 28),只给视口里
+//!   那几行建元素;加载中 / 失败 / 空态这类整块占位仍是普通滚动容器;
+//! - 分组 + 树形拍平后的行([`ListRow`])、每行高度、摊开总高、四组的显示顺序收在派生
+//!   模型 [`ListModel`] 里,**只在数据落地、折叠切换、切视图模式之后**算一次;render、
+//!   面板分高度、键盘导航、Shift 连选、diff 弹窗的文件序列都读这一份;
+//! - 取数落地([`GitChanges::apply_snapshot`])先比一次,与眼下的数据一模一样就既不
+//!   重算也不重画 —— 监听与 pty 嗅探触发的重取,绝大多数回包都没变。
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -67,16 +96,19 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, canvas, div, point, prelude::FluentBuilder as _, px,
+    ParentElement, Pixels, Point, Render, SharedString, Size, StatefulInteractiveElement, Styled,
+    Subscription, Window, canvas, div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
+use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
     GitStatus, RepoOpKind,
 };
-use mt_ui::tooltip::TooltipExt as _;
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
+use crate::git_dir_watch::RepoObservation;
+use crate::git_ui::flight::{Flight, Landing};
 use crate::git_ui::{
     self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
     ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
@@ -129,6 +161,10 @@ pub enum GitChangesEvent {
     Committed { open_push: bool },
     /// ▾ 菜单「贮藏当前改动…」贮藏成功 —— 工作区与贮藏数都变了,容器整面板刷新。
     Stashed,
+    /// 暂存 / 取消暂存 / 丢弃 / 冲突处理写完了(成败都算):写完当场、重取列表**之前**读的
+    /// 那份签名与冲突数。容器拿它当「已知」,紧接着那次 `.git` 检查就不再重刷一遍
+    /// (见模块注释「取数调度」)。
+    IndexWritten(RepoObservation),
 }
 
 /// 四个分组。`area` 既决定取哪一个 status,也进 `ElementId` 前缀。
@@ -155,6 +191,16 @@ impl Area {
             Area::Staged => "staged",
             Area::Unstaged => "unstaged",
             Area::Untracked => "untracked",
+        }
+    }
+
+    /// 在 [`Self::ORDER`] 里的位置(派生模型按它摆四组的数组)。
+    fn slot(self) -> usize {
+        match self {
+            Area::Conflicts => 0,
+            Area::Staged => 1,
+            Area::Unstaged => 2,
+            Area::Untracked => 3,
         }
     }
 }
@@ -201,6 +247,26 @@ fn status_text(status: Option<&GitStatus>) -> &'static str {
     }
 }
 
+/// 文件行的 tooltip:完整路径(重命名写「旧路径 → 新路径」)+ 状态说明(`partial` =
+/// 部分暂存,另注一句)。
+fn file_row_tip(
+    path: &str,
+    renamed_from: Option<&str>,
+    status: Option<&GitStatus>,
+    partial: bool,
+) -> String {
+    let shown_path = match renamed_from {
+        Some(old) => format!("{old} → {path}"),
+        None => path.to_string(),
+    };
+    let mut describe = status_text(status).to_string();
+    if partial {
+        describe.push_str(" · ");
+        describe.push_str(t("gitCommit", "partiallyStaged"));
+    }
+    format!("{shown_path}\n{describe}")
+}
+
 /// 提交消息的轻提示(不拦截)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MessageHints {
@@ -241,46 +307,208 @@ fn area_tree_rows(
     area: Area,
     collapsed: &HashSet<String>,
 ) -> Vec<ChangeTreeRow> {
-    git_ui::flatten_change_tree(&git_ui::build_change_tree(paths), &|full_path| {
-        collapsed.contains(&dir_key(area, full_path))
+    let tree = git_ui::build_change_tree(paths);
+    if collapsed.is_empty() {
+        return git_ui::flatten_change_tree(&tree, &|_| false);
+    }
+    // 折叠 key 拼在一块复用的缓冲里([`dir_key`] 的同一口径):每个目录行 `format!` 一次
+    // 是白分配,目录多的时候一次拍平就是几千次
+    let key = RefCell::new(format!("{}:", area.key()));
+    let prefix = key.borrow().len();
+    git_ui::flatten_change_tree(&tree, &|full_path| {
+        let mut key = key.borrow_mut();
+        key.truncate(prefix);
+        key.push_str(full_path);
+        collapsed.contains(key.as_str())
     })
 }
 
-/// 列表摊开要多高(见 [`GitChanges::list_content_height`]):上下内边距 + 每个非空分组
-/// 的标题(连上外边距)+ 展开分组里的文件 / 目录行。没有变更(加载中 / 失败 / 空态整块
-/// 占位,高度不定)为 `None`。
-fn list_height(
-    changes: &[ChangeFileStatus],
-    collapsed_groups: &HashSet<Area>,
-    collapsed_dirs: &HashSet<String>,
+// ─── 行模型 ───────────────────────────────────────────────────
+
+/// 「更改」列表里的一行,也就是虚拟列表的一项。
+#[derive(Debug, Clone, PartialEq)]
+enum ListRow {
+    /// 分组标题。`collapsed` = 这一组折起来了(只剩标题)
+    Header {
+        area: Area,
+        count: usize,
+        collapsed: bool,
+    },
+    /// 树形视图的目录行(单链压缩后的名称、递归文件数)
+    Dir {
+        area: Area,
+        name: String,
+        full_path: String,
+        depth: usize,
+        collapsed: bool,
+        file_count: usize,
+    },
+    /// 文件行。`index` 是 `changes` 里的下标,`depth` 是树形视图的层数(列表视图恒 0)
+    File {
+        area: Area,
+        index: usize,
+        depth: usize,
+    },
+}
+
+impl ListRow {
+    /// 这一行占多高:分组标题连上外边距,文件 / 目录行一个行高。虚拟列表按它定位,
+    /// 每种行画出来的高度必须与它一致(见各 `render_*`)。
+    fn height(&self) -> f32 {
+        match self {
+            ListRow::Header { .. } => GROUP_HEADER_GAP + GROUP_HEADER_H,
+            ListRow::Dir { .. } | ListRow::File { .. } => ROW_HEIGHT,
+        }
+    }
+}
+
+/// 「更改」列表的派生模型(见模块注释「列表只建看得见的行」):按 `changes` + 两种折叠态
+/// + 视图模式算一份,存在 [`GitChanges::model`] 的缓存里。
+#[derive(Debug)]
+struct ListModel {
+    /// 按哪种视图算的(与 store 里的视图模式对不上就作废重算)
     tree_mode: bool,
-) -> Option<f32> {
-    if changes.is_empty() {
-        return None;
-    }
-    let mut height = LIST_PAD_Y;
-    for area in Area::ORDER {
-        let paths: Vec<(usize, &str)> = changes
+    /// 四个分组各自的文件下标(`changes` 里的原顺序),按 [`Area::slot`] 摆
+    members: [Vec<usize>; 4],
+    /// 四个分组的文件**显示顺序**:列表视图同 `members`;树形视图按树走,收起的目录里
+    /// 的文件不算。**不看分组折叠** —— 折起来的分组照样能 Shift 连选、diff 弹窗照样能
+    /// 前后换文件(与此前现算的 `area_order` 同一口径)
+    order: [Vec<usize>; 4],
+    /// 界面上的行序:每个非空分组一个标题,展开的分组接着它的文件 / 目录行
+    rows: Vec<ListRow>,
+    /// 每行的尺寸(虚拟列表的 `item_sizes`,只用高)。随模型缓存,同一份数据跨帧是同一个
+    /// `Rc`,虚拟列表比一下就知道不用重算前缀和
+    sizes: Rc<Vec<Size<Pixels>>>,
+    /// 列表摊开要多高:上下内边距 + 全部行。没有变更(加载中 / 失败 / 空态整块占位,
+    /// 高度不定)为 `None`
+    height: Option<f32>,
+}
+
+impl ListModel {
+    fn build(
+        changes: &[ChangeFileStatus],
+        collapsed_groups: &HashSet<Area>,
+        collapsed_dirs: &HashSet<String>,
+        tree_mode: bool,
+    ) -> Self {
+        let mut members: [Vec<usize>; 4] = Default::default();
+        for (index, file) in changes.iter().enumerate() {
+            // 部分暂存的文件两组都进(见模块注释「四个分组的口径」)
+            for area in Area::ORDER {
+                if in_area(file, area) {
+                    members[area.slot()].push(index);
+                }
+            }
+        }
+        let mut order: [Vec<usize>; 4] = Default::default();
+        let mut rows = Vec::new();
+        for area in Area::ORDER {
+            let indices = &members[area.slot()];
+            if indices.is_empty() {
+                continue;
+            }
+            let group_rows = if tree_mode {
+                let paths: Vec<(usize, &str)> = indices
+                    .iter()
+                    .map(|&i| (i, changes[i].path.as_str()))
+                    .collect();
+                area_tree_rows(&paths, area, collapsed_dirs)
+            } else {
+                indices
+                    .iter()
+                    .map(|&index| ChangeTreeRow::File { index, depth: 0 })
+                    .collect()
+            };
+            order[area.slot()] = git_ui::row_file_order(&group_rows);
+            let collapsed = collapsed_groups.contains(&area);
+            rows.push(ListRow::Header {
+                area,
+                count: indices.len(),
+                collapsed,
+            });
+            if collapsed {
+                continue;
+            }
+            rows.extend(group_rows.into_iter().map(|row| match row {
+                ChangeTreeRow::Dir {
+                    name,
+                    full_path,
+                    depth,
+                    collapsed,
+                    file_count,
+                } => ListRow::Dir {
+                    area,
+                    name,
+                    full_path,
+                    depth,
+                    collapsed,
+                    file_count,
+                },
+                ChangeTreeRow::File { index, depth } => ListRow::File { area, index, depth },
+            }));
+        }
+        let sizes = rows
             .iter()
-            .enumerate()
-            .filter(|(_, c)| in_area(c, area))
-            .map(|(i, c)| (i, c.path.as_str()))
+            .map(|row| size(px(0.0), px(row.height())))
             .collect();
-        if paths.is_empty() {
-            continue;
+        let height = (!changes.is_empty())
+            .then(|| LIST_PAD_Y + rows.iter().map(ListRow::height).sum::<f32>());
+        Self {
+            tree_mode,
+            members,
+            order,
+            rows,
+            sizes: Rc::new(sizes),
+            height,
         }
-        height += GROUP_HEADER_GAP + GROUP_HEADER_H;
-        if collapsed_groups.contains(&area) {
-            continue;
-        }
-        let rows = if tree_mode {
-            area_tree_rows(&paths, area, collapsed_dirs).len()
-        } else {
-            paths.len()
-        };
-        height += rows as f32 * ROW_HEIGHT;
     }
-    Some(height)
+
+    /// 某个分组的全部文件(`changes` 里的原顺序)。
+    fn members(&self, area: Area) -> &[usize] {
+        &self.members[area.slot()]
+    }
+
+    /// 某个分组里文件的显示顺序(见字段注释)。
+    fn order(&self, area: Area) -> &[usize] {
+        &self.order[area.slot()]
+    }
+
+    /// 键盘导航走的全部可见文件行(行序里的文件行:折起来的分组、收起的目录跳过)。
+    fn nav(&self) -> impl Iterator<Item = (Area, usize)> + '_ {
+        self.rows.iter().filter_map(|row| match *row {
+            ListRow::File { area, index, .. } => Some((area, index)),
+            _ => None,
+        })
+    }
+
+    /// 某个文件行在行序里是第几行。
+    fn file_row(&self, area: Area, index: usize) -> Option<usize> {
+        self.rows.iter().position(|row| {
+            matches!(*row, ListRow::File { area: a, index: i, .. } if a == area && i == index)
+        })
+    }
+
+    /// 第 `row` 行在列表内容里的上下沿(从列表顶边量,含上内边距)。
+    fn row_span(&self, row: usize) -> Option<(f32, f32)> {
+        let height = self.rows.get(row)?.height();
+        let top = LIST_PAD_TOP + self.rows[..row].iter().map(ListRow::height).sum::<f32>();
+        Some((top, top + height))
+    }
+}
+
+/// 把上下沿是 `[top, bottom)` 的一行滚进高 `viewport` 的列表视口,返回新的纵向偏移
+/// (`offset_y` ≤ 0,与 gpui 的滚动偏移同号)。口径照 gpui `ScrollHandle::scroll_to_item`
+/// 的默认策略(`div.rs` 的 `scroll_to_active_item`):比视口高的行顶对齐;否则只滚最少的
+/// 量,已经整行可见就不动。上下沿按**整个列表框**比、不扣内边距 —— 换成虚拟列表之前就是
+/// 这么滚的,键盘走到最后一行时底下那 8px 内边距照旧不露出来。
+fn reveal_offset(offset_y: f32, top: f32, bottom: f32, viewport: f32) -> f32 {
+    if bottom - top > viewport || top + offset_y < 0.0 {
+        -top
+    } else if bottom + offset_y > viewport {
+        viewport - bottom
+    } else {
+        offset_y
+    }
 }
 
 // ─── 组件 ─────────────────────────────────────────────────────
@@ -293,15 +521,55 @@ struct Snapshot {
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
     has_head: bool,
-    /// 勾着 amend 时顺带刷新「已推送」判定;没勾为 `None`
-    amend: Option<Option<AmendInfo>>,
 }
 
-/// 列表里渲染出来的一行是什么(键盘导航要把选中行滚进视野,得知道它是第几个子元素)。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowKey {
-    Other,
-    File(Area, usize),
+/// 取数落地会改到的那几样,落地前拿来比「这份快照收下之后界面变不变」
+/// (见 [`GitChanges::apply_snapshot`])。只借不拷。
+struct Landed<'a> {
+    changes: &'a [ChangeFileStatus],
+    conflicts: &'a [ConflictInfo],
+    op_kind: Option<RepoOpKind>,
+    target: Option<&'a CommitTarget>,
+    has_head: bool,
+    amend: bool,
+    load_error: Option<&'a str>,
+}
+
+impl Landed<'_> {
+    /// 收下 `snap` 之后有没有东西变(落地的赋值口径见 `apply_snapshot`):冲突细节与
+    /// 进行中的操作只进菜单,也照样算 —— 宁可多画一帧,不能让菜单拿着旧数据。
+    /// 「已推送」判定不在快照里(另走一趟,见 [`GitChanges::refresh_amend`],变了自己重画)。
+    fn differs(&self, snap: &Snapshot) -> bool {
+        // 没有 HEAD 了 amend 收起
+        let amend = self.amend && snap.has_head;
+        !same_changes(self.changes, &snap.changes)
+            || self.conflicts != snap.conflicts.as_slice()
+            || self.op_kind != snap.op_kind
+            || self.target != snap.target.as_ref()
+            || self.has_head != snap.has_head
+            || self.amend != amend
+            || self.load_error.is_some()
+    }
+
+    /// 取数失败(列表清空、原因顶替空态)之后有没有东西变:同一条错误反复落地不算。
+    fn differs_on_error(&self, error: &str) -> bool {
+        !self.changes.is_empty()
+            || !self.conflicts.is_empty()
+            || self.op_kind.is_some()
+            || self.load_error != Some(error)
+    }
+}
+
+/// 两份变更列表一模一样(逐项逐字段比 —— `ChangeFileStatus` 没有派生 `PartialEq`)。
+fn same_changes(a: &[ChangeFileStatus], b: &[ChangeFileStatus]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.path == y.path
+                && x.old_path == y.old_path
+                && x.staged_status == y.staged_status
+                && x.unstaged_status == y.unstaged_status
+                && x.status_label == y.status_label
+        })
 }
 
 pub struct GitChanges {
@@ -321,8 +589,11 @@ pub struct GitChanges {
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
     collapsed_groups: HashSet<Area>,
-    /// 迟到响应丢弃。
-    request: u64,
+    /// 列表取数的单飞调度(见模块注释「取数调度」);换仓库时作废在途的那份。
+    flight: Flight,
+    /// 派生模型的缓存(见 [`Self::model`])。改了 `changes` / 两种折叠态的地方都要
+    /// [`Self::invalidate_model`];视图模式不归这里管,`model` 自己比
+    list_model: RefCell<Option<Rc<ListModel>>>,
     /// diff 弹窗按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
     /// 序列交回去(见 `git_diff::ReloadFiles`)。换仓库时以 `None` 交回。
     diff_waiters: Vec<(Area, git_diff::FilesDone)>,
@@ -342,9 +613,12 @@ pub struct GitChanges {
     /// 操作完重取列表后要落回的位置:同一分组的第 n 行(Space 暂存后停在下一行)
     reselect: Option<(Area, usize)>,
     list_focus: FocusHandle,
-    list_scroll: ScrollHandle,
-    /// 上一帧列表的子元素都是什么(与子元素一一对应)
-    row_keys: Vec<RowKey>,
+    /// 列表的滚动位置。虚拟列表与加载中 / 空态那几种普通滚动容器共用(后者走它底下那个
+    /// `ScrollHandle`);必须存在视图上,每帧新建等于每帧把滚动清零
+    list_scroll: VirtualListScrollHandle,
+    /// 下一帧把键盘游标所在的行滚进视野(键盘走动、操作后落回、diff 弹窗里换了文件)。
+    /// 到 render 时才按当帧的行序找行,prepaint 时按当帧的视口算偏移
+    reveal_cursor: bool,
 
     // ── 提交区 ──
     commit_input: Entity<TextareaState>,
@@ -358,6 +632,10 @@ pub struct GitChanges {
     /// amend 勾上时预填进去的那段消息(取消勾选时消息没动过就清掉)
     amend_prefill: Option<String>,
     amend_request: u64,
+    /// 勾着 amend 时随列表重取「已推送」判定的那一趟(单飞,见 [`Self::refresh_amend`])
+    amend_flight: Flight,
+    /// 眼下 `amend_info` 是在哪份引用签名下取的:没变就不重取
+    amend_key: Option<u64>,
     committing: bool,
     history_loading: bool,
     /// 上一次提交失败的说明(已格式化好的整句),挂在提交按钮下方。
@@ -394,7 +672,8 @@ impl GitChanges {
             load_error: None,
             collapsed_dirs: HashSet::new(),
             collapsed_groups: HashSet::new(),
-            request: 0,
+            flight: Flight::default(),
+            list_model: RefCell::new(None),
             diff_waiters: Vec::new(),
             debounce_until: None,
             busy_ops: 0,
@@ -404,8 +683,8 @@ impl GitChanges {
             cursor: None,
             reselect: None,
             list_focus: cx.focus_handle(),
-            list_scroll: ScrollHandle::new(),
-            row_keys: Vec::new(),
+            list_scroll: VirtualListScrollHandle::new(),
+            reveal_cursor: false,
             commit_input,
             target: None,
             placeholder: None,
@@ -414,6 +693,8 @@ impl GitChanges {
             amend_info: None,
             amend_prefill: None,
             amend_request: 0,
+            amend_flight: Flight::default(),
+            amend_key: None,
             committing: false,
             history_loading: false,
             commit_error: None,
@@ -425,14 +706,18 @@ impl GitChanges {
 
     /// 「更改」区整块摊开(列表不滚动)要多高:列表内容 + 上下留白 + 提交区。面板分配
     /// 「更改 / 提交历史」两块高度时用(`git_panel::section_split`)。提交区是上一帧量的;
-    /// 列表有分组时按眼下的数据算([`Self::list_content_height`]),否则也取上一帧量的。
+    /// 列表有分组时读派生模型的摊开总高([`ListModel::height`]),否则也取上一帧量的。
     /// 还没画过时为 `None`。
+    ///
+    /// 列表高度按**眼下的数据**、不按上一帧量:外部改动多出一组(未暂存)的那一帧,
+    /// 「更改」区还是按旧内容分的高度,排在最后的分组(未跟踪)被挤出可见区、下一帧才
+    /// 回来(E2E r4 A12 的过渡帧)。模型是缓存的,面板一帧问几次都只是读一个数。
     pub fn natural_height(&self, cx: &App) -> Option<f32> {
         let commit = self.commit_area_h.get();
         if commit <= 0.0 {
             return None;
         }
-        let list = match self.list_content_height(self.tree_mode(cx)) {
+        let list = match self.model(cx).height {
             Some(list) => list,
             None => {
                 let last = self.list_scroll.children_count().checked_sub(1)?;
@@ -445,33 +730,17 @@ impl GitChanges {
         Some(list + commit)
     }
 
-    /// 列表摊开要多高,按**眼下的数据**算([`list_height`]),与 [`Self::render_list`] 的
-    /// 排法一一对应。
-    ///
-    /// 不按上一帧量:外部改动多出一组(未暂存)的那一帧,「更改」区还是按旧内容分的高度,
-    /// 排在最后的分组(未跟踪)被挤出可见区、下一帧才回来(E2E r4 A12 的过渡帧)。
-    fn list_content_height(&self, tree_mode: bool) -> Option<f32> {
-        list_height(
-            &self.changes,
-            &self.collapsed_groups,
-            &self.collapsed_dirs,
-            tree_mode,
-        )
-    }
-
     /// 「更改」区最矮要多高:提交区整块 + 列表至少露出一行(列表本身更矮时按列表)。
-    /// 中缝拖到下限时面板按它兜底,提交按钮整颗露着、点得到(E2E r4 B11)。还没画过时
+    /// 中缝拖到下限时面板按它兜底,提交按钮整颗露着、点得到(E2E r4 B11)。`natural` 是
+    /// 同一帧的 [`Self::natural_height`](面板已经问过一次,不再算第二遍)。还没画过时
     /// 为 `None`。
-    pub fn min_height(&self, cx: &App) -> Option<f32> {
+    pub fn min_height(&self, natural: Option<f32>) -> Option<f32> {
         let commit = self.commit_area_h.get();
         if commit <= 0.0 {
             return None;
         }
         let floor = commit + LIST_PAD_Y + GROUP_HEADER_GAP + ROW_HEIGHT;
-        Some(
-            self.natural_height(cx)
-                .map_or(floor, |natural| natural.min(floor)),
-        )
+        Some(natural.map_or(floor, |natural| natural.min(floor)))
     }
 
     /// 换仓库(容器调)。空串 = 无仓库。
@@ -484,6 +753,7 @@ impl GitChanges {
         self.conflicts.clear();
         self.op_kind = None;
         self.collapsed_dirs.clear();
+        self.invalidate_model();
         self.clear_selection();
         self.target = None;
         self.has_head = false;
@@ -491,11 +761,15 @@ impl GitChanges {
         self.amend = false;
         self.amend_info = None;
         self.amend_prefill = None;
+        self.amend_key = None;
+        self.amend_flight.reset();
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
         // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
         self.flush_diff_waiters(false, cx);
+        // 上一个仓库在途的那趟作废:回来一律丢,新仓库这趟不必等它
+        self.flight.reset();
         self.load(cx);
         cx.notify();
     }
@@ -516,59 +790,167 @@ impl GitChanges {
         }
     }
 
+    /// 重取列表(单飞,见模块注释「取数调度」)。勾着 amend 时顺带另起一趟刷新「已推送」判定。
     pub fn load(&mut self, cx: &mut Context<Self>) {
         if self.repo_path.is_empty() {
             self.flush_diff_waiters(false, cx);
             return;
         }
+        self.refresh_amend(cx);
+        self.start_load(cx);
+    }
+
+    /// 在 `at` 那一刻之前的工作区 / 索引变化,列表这边是不是已经有一趟取数会反映出来
+    /// (在那之后才开跑的,或者排着补跑)。面板拿它判断监听交来的一批要不要再要一次。
+    pub fn load_covers(&self, at: Instant) -> bool {
+        self.flight.covers(at)
+    }
+
+    fn start_load(&mut self, cx: &mut Context<Self>) {
+        // 在途:只记脏位,那趟落地后当场补跑
+        let Some(token) = self.flight.begin(Instant::now()) else {
+            return;
+        };
         self.loading = true;
-        self.request += 1;
-        let req = self.request;
         let repo = PathBuf::from(&self.repo_path);
-        let want_amend = self.amend;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { load_snapshot(&repo, want_amend) })
+                .spawn(async move { load_snapshot(&repo) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                if this.request != req {
-                    return;
+                let rerun = match this.flight.finish(token) {
+                    Landing::Stale => return,
+                    Landing::Done { rerun } => rerun,
+                };
+                this.apply_snapshot(result, rerun, cx);
+                if rerun {
+                    this.start_load(cx);
                 }
-                this.loading = false;
-                let loaded = result.is_ok();
-                match result {
-                    Ok(snap) => {
-                        this.changes = snap.changes;
-                        this.conflicts = snap.conflicts;
-                        this.op_kind = snap.op_kind;
-                        this.target = snap.target;
-                        this.has_head = snap.has_head;
-                        if !this.has_head {
-                            this.amend = false;
-                        }
-                        if let Some(info) = snap.amend.filter(|_| this.amend) {
-                            this.amend_info = info;
-                        }
-                        this.load_error = None;
-                    }
-                    Err(err) => {
-                        // 原版 `.catch(() => setChanges([]))` —— 失败即清空;
-                        // 这里另把原因留给列表区显示,别让人当成「没有变更」
-                        eprintln!("[git] 取变更失败: {err:#}");
-                        this.changes.clear();
-                        this.conflicts.clear();
-                        this.op_kind = None;
-                        this.load_error = Some(format!("{err:#}"));
-                    }
-                }
-                this.after_reload(cx);
-                this.flush_diff_waiters(loaded, cx);
-                cx.notify();
             });
         })
         .detach();
-        cx.notify();
+        // `loading` 只在列表为空时画得出来(「加载中」占位);有内容时发起这一趟不必重画
+        if self.changes.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// 勾着「修改上次提交」时重取「已推送」判定(见模块注释「取数调度」):单独一趟、不挡
+    /// 列表;引用签名没变就只算一次签名、不重取。没勾 / 无仓库时什么都不做。
+    fn refresh_amend(&mut self, cx: &mut Context<Self>) {
+        if !self.amend || self.repo_path.is_empty() {
+            return;
+        }
+        let Some(token) = self.amend_flight.begin(Instant::now()) else {
+            return;
+        };
+        let req = self.amend_request;
+        let repo = PathBuf::from(&self.repo_path);
+        let known = self.amend_key;
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_executor()
+                .spawn(async move { fetch_amend(&repo, known) })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                let rerun = match this.amend_flight.finish(token) {
+                    Landing::Stale => return,
+                    Landing::Done { rerun } => rerun,
+                };
+                // 期间取消过勾选(令牌前移)就作废;换仓库时 amend_flight 已作废,走不到这里
+                if this.amend
+                    && this.amend_request == req
+                    && let Some((key, info)) = fetched
+                {
+                    this.amend_key = key;
+                    if this.amend_info != info {
+                        this.amend_info = info;
+                        cx.notify();
+                    }
+                }
+                if rerun {
+                    this.refresh_amend(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 一次取数落地(迟到的回包单飞调度已经丢掉了)。收下之后界面有东西变(数据、选择、
+    /// 加载态)才重算派生模型、才重画;与眼下一模一样的回包什么都不碰 —— 此前每次落地
+    /// 都无条件 notify,监听 / pty 嗅探触发的每一趟都是一次整窗帧。
+    ///
+    /// `rerun` = 在途期间又有人要过、落地后当场补跑:这份照样落(比画着的新),但它可能
+    /// 还不含触发补跑的那次操作 ——「操作后落回的位置」与在等的 diff 弹窗留给补跑那份。
+    /// 不补跑时 diff 弹窗的回执照交(它要的是「这一次重取落地了」,不管变没变)。
+    fn apply_snapshot(
+        &mut self,
+        result: anyhow::Result<Snapshot>,
+        rerun: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let loading_shown = self.shows_loading();
+        self.loading = false;
+        let reselect = if rerun { self.reselect.take() } else { None };
+        let loaded = result.is_ok();
+        let changed = match result {
+            Ok(snap) => {
+                let changed = self.landed().differs(&snap);
+                self.changes = snap.changes;
+                self.conflicts = snap.conflicts;
+                self.op_kind = snap.op_kind;
+                self.target = snap.target;
+                self.has_head = snap.has_head;
+                if !self.has_head {
+                    self.amend = false;
+                }
+                self.load_error = None;
+                changed
+            }
+            Err(err) => {
+                // 原版 `.catch(() => setChanges([]))` —— 失败即清空;
+                // 这里另把原因留给列表区显示,别让人当成「没有变更」
+                eprintln!("[git] 取变更失败: {err:#}");
+                let error = format!("{err:#}");
+                let changed = self.landed().differs_on_error(&error);
+                self.changes.clear();
+                self.conflicts.clear();
+                self.op_kind = None;
+                self.load_error = Some(error);
+                changed
+            }
+        };
+        if changed {
+            self.invalidate_model();
+        }
+        let reselected = self.after_reload(cx);
+        if rerun {
+            self.reselect = reselect;
+        } else {
+            self.flush_diff_waiters(loaded, cx);
+        }
+        if changed || reselected || loading_shown != self.shows_loading() {
+            cx.notify();
+        }
+    }
+
+    /// 落地前的比对视图(见 [`Landed`])。
+    fn landed(&self) -> Landed<'_> {
+        Landed {
+            changes: &self.changes,
+            conflicts: &self.conflicts,
+            op_kind: self.op_kind,
+            target: self.target.as_ref(),
+            has_head: self.has_head,
+            amend: self.amend,
+            load_error: self.load_error.as_deref(),
+        }
+    }
+
+    /// 列表区此刻画的是不是「加载中」(只有没数据、也没报错时才画它)。
+    fn shows_loading(&self) -> bool {
+        self.loading && self.changes.is_empty() && self.load_error.is_none()
     }
 
     /// 把在等序列的 diff 弹窗回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
@@ -578,9 +960,9 @@ impl GitChanges {
         if self.diff_waiters.is_empty() {
             return;
         }
-        let tree_mode = self.tree_mode(cx);
+        let model = self.model(cx);
         for (area, done) in std::mem::take(&mut self.diff_waiters) {
-            let files = loaded.then(|| self.diff_files(area, tree_mode));
+            let files = loaded.then(|| self.diff_files(model.order(area), area));
             cx.defer(move |cx| done(files, cx));
         }
     }
@@ -589,39 +971,32 @@ impl GitChanges {
         self.store.read(cx).git_changes_view_mode() == "tree"
     }
 
-    fn group_indices(&self, area: Area) -> Vec<usize> {
-        self.changes
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| in_area(c, area))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// 某个分组里文件的**显示顺序**(树形视图按树走,折起来的目录里的文件不算)。
-    fn area_order(&self, area: Area, tree_mode: bool) -> Vec<usize> {
-        let indices = self.group_indices(area);
-        if !tree_mode {
-            return indices;
+    /// 派生模型(见 [`ListModel`])。缓存着、且是按眼下的视图模式算的就直接给,否则按
+    /// 眼下的数据算一份存起来 —— 视图模式住在 store 里(面板标题栏的切换钮、设置同步都
+    /// 能改它),这里每次比一下,不靠谁记得来作废。
+    fn model(&self, cx: &App) -> Rc<ListModel> {
+        let tree_mode = self.tree_mode(cx);
+        if let Some(model) = self
+            .list_model
+            .borrow()
+            .as_ref()
+            .filter(|model| model.tree_mode == tree_mode)
+        {
+            return model.clone();
         }
-        let paths: Vec<(usize, &str)> = indices
-            .iter()
-            .map(|&i| (i, self.changes[i].path.as_str()))
-            .collect();
-        git_ui::row_file_order(&area_tree_rows(&paths, area, &self.collapsed_dirs))
+        let model = Rc::new(ListModel::build(
+            &self.changes,
+            &self.collapsed_groups,
+            &self.collapsed_dirs,
+            tree_mode,
+        ));
+        *self.list_model.borrow_mut() = Some(model.clone());
+        model
     }
 
-    /// 键盘导航走的全部可见文件行(分组顺序 + 组内显示顺序,折起来的分组跳过)。
-    fn nav_rows(&self, tree_mode: bool) -> Vec<(Area, usize)> {
-        Area::ORDER
-            .into_iter()
-            .filter(|area| !self.collapsed_groups.contains(area))
-            .flat_map(|area| {
-                self.area_order(area, tree_mode)
-                    .into_iter()
-                    .map(move |i| (area, i))
-            })
-            .collect()
+    /// 派生模型作废(`changes` / 分组折叠 / 目录折叠变了),下次用到时重算。
+    fn invalidate_model(&self) {
+        self.list_model.borrow_mut().take();
     }
 
     // ── 选择 ──
@@ -664,7 +1039,8 @@ impl GitChanges {
         let modifiers = event.modifiers();
         let same_area = self.sel_area == Some(area);
         if modifiers.shift && same_area && self.anchor.is_some() {
-            let order = self.area_order(area, self.tree_mode(cx));
+            let model = self.model(cx);
+            let order = model.order(area);
             let anchor = self.anchor.clone().unwrap_or_default();
             let pos = |p: &str| order.iter().position(|&i| self.changes[i].path == p);
             if let (Some(a), Some(b)) = (pos(&anchor), pos(&path)) {
@@ -708,9 +1084,10 @@ impl GitChanges {
         if !self.is_selected(area, path) || self.selected.len() <= 1 {
             return vec![path.to_string()];
         }
-        self.area_order(area, self.tree_mode(cx))
-            .into_iter()
-            .map(|i| self.changes[i].path.clone())
+        self.model(cx)
+            .order(area)
+            .iter()
+            .map(|&i| self.changes[i].path.clone())
             .filter(|p| self.selected.contains(p))
             .collect()
     }
@@ -719,9 +1096,10 @@ impl GitChanges {
     fn selection_targets(&self, cx: &App) -> Option<(Area, Vec<String>)> {
         let area = self.sel_area?;
         let paths: Vec<String> = self
-            .area_order(area, self.tree_mode(cx))
-            .into_iter()
-            .map(|i| self.changes[i].path.clone())
+            .model(cx)
+            .order(area)
+            .iter()
+            .map(|&i| self.changes[i].path.clone())
             .filter(|p| self.selected.contains(p))
             .collect();
         (!paths.is_empty()).then_some((area, paths))
@@ -729,51 +1107,53 @@ impl GitChanges {
 
     /// 选中集里第一项在本组显示顺序里的位置(操作完落回这里 = 停在「下一行」)。
     fn selection_anchor_pos(&self, area: Area, cx: &App) -> Option<usize> {
-        self.area_order(area, self.tree_mode(cx))
+        self.model(cx)
+            .order(area)
             .iter()
             .position(|&i| self.selected.contains(&self.changes[i].path))
     }
 
-    /// 重取列表之后:清掉已不在原分组里的选中项;有待落回的位置就落回去。
-    fn after_reload(&mut self, cx: &mut Context<Self>) {
-        let tree_mode = self.tree_mode(cx);
+    /// 重取列表之后:清掉已不在原分组里的选中项;有待落回的位置就落回去。选择因此
+    /// 变了就返回 `true`(数据没变时落地也得为它重画)。
+    fn after_reload(&mut self, cx: &mut Context<Self>) -> bool {
+        let model = self.model(cx);
         if let Some((area, pos)) = self.reselect.take() {
-            let order = self.area_order(area, tree_mode);
+            let order = model.order(area);
             if let Some(&index) = order.get(pos).or(order.last()) {
                 self.select_single(area, index);
-                self.scroll_to_row(RowKey::File(area, index));
-                return;
+                self.reveal_cursor = true;
+                return true;
             }
             self.clear_selection();
-            return;
+            return true;
         }
-        if let Some(area) = self.sel_area {
-            let present: HashSet<&str> = self
-                .group_indices(area)
-                .into_iter()
-                .map(|i| self.changes[i].path.as_str())
-                .collect();
-            self.selected.retain(|p| present.contains(p.as_str()));
-            if self.selected.is_empty() {
-                self.clear_selection();
-            } else if self
-                .cursor
-                .as_ref()
-                .is_some_and(|(_, p)| !present.contains(p.as_str()))
-            {
-                self.cursor = None;
-            }
-        }
-    }
-
-    fn scroll_to_row(&self, key: RowKey) {
-        if let Some(child) = self.row_keys.iter().position(|k| *k == key) {
-            self.list_scroll.scroll_to_item(child);
+        let Some(area) = self.sel_area else {
+            return false;
+        };
+        let present: HashSet<&str> = model
+            .members(area)
+            .iter()
+            .map(|&i| self.changes[i].path.as_str())
+            .collect();
+        let before = self.selected.len();
+        self.selected.retain(|p| present.contains(p.as_str()));
+        if self.selected.is_empty() {
+            self.clear_selection();
+            true
+        } else if self
+            .cursor
+            .as_ref()
+            .is_some_and(|(_, p)| !present.contains(p.as_str()))
+        {
+            self.cursor = None;
+            true
+        } else {
+            self.selected.len() != before
         }
     }
 
     fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let rows = self.nav_rows(self.tree_mode(cx));
+        let rows: Vec<(Area, usize)> = self.model(cx).nav().collect();
         if rows.is_empty() {
             return;
         }
@@ -788,7 +1168,7 @@ impl GitChanges {
         };
         let (area, index) = rows[next];
         self.select_single(area, index);
-        self.scroll_to_row(RowKey::File(area, index));
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -859,9 +1239,15 @@ impl GitChanges {
         git_ui::gate::is_busy(&self.repo_path)
     }
 
-    /// 整文件操作能不能点:自己没在跑、闸也没被别人占。
+    /// 整文件操作能不能点:自己没在跑、闸也没被别人占。render 里只问一次、传给每一行
+    /// (问闸要拼一次比较键,不该每行一次)。
     fn ops_enabled(&self) -> bool {
-        self.busy_ops == 0 && !self.gated()
+        self.ops_enabled_with(self.gated())
+    }
+
+    /// [`Self::ops_enabled`],闸的状态由调用方给(同一帧已经问过了)。
+    fn ops_enabled_with(&self, gated: bool) -> bool {
+        self.busy_ops == 0 && !gated
     }
 
     /// 跑一件阻塞的 git 动作(暂存 / 取消暂存 / 丢弃 / 冲突处理),占闸、后台执行,完成后
@@ -880,8 +1266,18 @@ impl GitChanges {
         let this = cx.entity().downgrade();
         let started = git_ui::spawn_gated(
             &self.repo_path,
-            op,
-            move |result, window, cx| {
+            move |repo| {
+                let result = op(repo);
+                // 写完当场读一份签名与冲突数(成败都读:失败也可能改了一半),**先于**下面那次
+                // 重取列表 —— 面板拿它当「已知」,不能比列表更新(见 `IndexWritten`)
+                Ok((result, RepoObservation::read(repo)))
+            },
+            move |outcome, window, cx| {
+                // 外层只是包装,实际恒为 `Ok`
+                let (result, observed) = match outcome {
+                    Ok((result, observed)) => (result, Some(observed)),
+                    Err(err) => (Err(err), None),
+                };
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     this.busy_ops = this.busy_ops.saturating_sub(1);
                     match result {
@@ -899,6 +1295,9 @@ impl GitChanges {
                     this.load(cx);
                     // 丢弃改了工作区、解决冲突改了状态:文件树的 git 标记跟着重算
                     git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                    if let Some(observed) = observed {
+                        cx.emit(GitChangesEvent::IndexWritten(observed));
+                    }
                 });
             },
             window,
@@ -964,17 +1363,18 @@ impl GitChanges {
     }
 
     /// 某个分组的全部路径。
-    fn area_paths(&self, area: Area) -> Vec<String> {
-        self.group_indices(area)
-            .into_iter()
-            .map(|i| self.changes[i].path.clone())
+    fn area_paths(&self, area: Area, cx: &App) -> Vec<String> {
+        self.model(cx)
+            .members(area)
+            .iter()
+            .map(|&i| self.changes[i].path.clone())
             .collect()
     }
 
     /// 分组标题上的「全部暂存」:**只暂存这一组**。原先未跟踪组的按钮也调
     /// `git_stage_all`(`add_all("*")`),会把已跟踪的改动一起暂存。
     fn stage_group(&mut self, area: Area, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = self.area_paths(area);
+        let paths = self.area_paths(area, cx);
         self.stage(paths, None, window, cx);
     }
 
@@ -1108,12 +1508,9 @@ impl GitChanges {
         .detach();
     }
 
-    /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序。
-    fn diff_files(&self, area: Area, tree_mode: bool) -> Vec<git_diff::DiffFile> {
-        self.area_order(area, tree_mode)
-            .into_iter()
-            .map(|i| self.diff_file(i, area))
-            .collect()
+    /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
+    fn diff_files(&self, order: &[usize], area: Area) -> Vec<git_diff::DiffFile> {
+        order.iter().map(|&i| self.diff_file(i, area)).collect()
     }
 
     fn diff_file(&self, index: usize, area: Area) -> git_diff::DiffFile {
@@ -1146,9 +1543,9 @@ impl GitChanges {
     /// 打开某一行的 diff,文件序列 = 它所在分组的显示顺序(弹窗里 Alt+←/→ 前后换)。
     /// 按块操作之后序列跟着重载过的列表走(取消暂存最后一块,文件就离开了「已暂存」)。
     fn view_diff(&self, index: usize, area: Area, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.area_order(area, self.tree_mode(cx));
-        let files: Vec<git_diff::DiffFile> =
-            order.iter().map(|&i| self.diff_file(i, area)).collect();
+        let model = self.model(cx);
+        let order = model.order(area);
+        let files = self.diff_files(order, area);
         let current = order.iter().position(|&i| i == index).unwrap_or(0);
         let weak = cx.entity().downgrade();
         let reload_files: git_diff::ReloadFiles = Rc::new(
@@ -1191,35 +1588,36 @@ impl GitChanges {
             return;
         };
         self.select_single(area, index);
-        self.scroll_to_row(RowKey::File(area, index));
+        self.reveal_cursor = true;
         cx.notify();
     }
 
     // ── 提交 ──
 
-    fn staged_count(&self) -> usize {
-        self.changes
-            .iter()
-            .filter(|c| in_area(c, Area::Staged))
-            .count()
-    }
-
-    fn conflict_count(&self) -> usize {
-        self.changes.iter().filter(|c| is_conflicted(c)).count()
-    }
-
     /// 提交按钮为什么点不了(`None` = 能点)。`stage_first` = 「全部暂存并提交」。
     fn commit_blocker(&self, stage_first: bool, cx: &App) -> Option<String> {
+        self.commit_blocker_with(stage_first, self.gated(), &self.model(cx), cx)
+    }
+
+    /// [`Self::commit_blocker`],闸的状态与派生模型由调用方给(render 里同一帧已经
+    /// 取过;已暂存 / 冲突 / 未暂存的数目都从模型读,不再每帧扫一遍 `changes`)。
+    fn commit_blocker_with(
+        &self,
+        stage_first: bool,
+        gated: bool,
+        model: &ListModel,
+        cx: &App,
+    ) -> Option<String> {
         if self.repo_path.is_empty() {
             return Some(t("gitCommit", "blockNoRepo").to_string());
         }
         if self.committing {
             return Some(t("gitCommit", "blockBusy").to_string());
         }
-        if self.gated() {
+        if gated {
             return Some(git_ui::gate_busy_text().to_string());
         }
-        let conflicts = self.conflict_count();
+        let conflicts = model.members(Area::Conflicts).len();
         if conflicts > 0 {
             return Some(tr!(
                 "gitCommit",
@@ -1234,13 +1632,13 @@ impl GitChanges {
             return (!self.has_head).then(|| t("gitCommit", "amendNoHead").to_string());
         }
         if stage_first {
-            return self
-                .group_indices(Area::Unstaged)
+            return model
+                .members(Area::Unstaged)
                 .is_empty()
                 .then(|| t("gitCommit", "blockNothingToStage").to_string());
         }
-        if self.staged_count() == 0 {
-            return Some(if self.group_indices(Area::Unstaged).is_empty() {
+        if model.members(Area::Staged).is_empty() {
+            return Some(if model.members(Area::Unstaged).is_empty() {
                 t("gitCommit", "blockNothingStaged").to_string()
             } else {
                 t("gitCommit", "blockNothingStagedHint").to_string()
@@ -1264,7 +1662,7 @@ impl GitChanges {
         let message = self.commit_input.read(cx).value().trim().to_string();
         let amend = self.amend;
         let stage_paths = if stage_first {
-            self.area_paths(Area::Unstaged)
+            self.area_paths(Area::Unstaged, cx)
         } else {
             Vec::new()
         };
@@ -1289,6 +1687,7 @@ impl GitChanges {
                             this.amend = false;
                             this.amend_info = None;
                             this.amend_prefill = None;
+                            this.amend_key = None;
                             this.notify_info(
                                 tr!(
                                     "gitCommit",
@@ -1376,6 +1775,7 @@ impl GitChanges {
                     .update(cx, |state, cx| state.set_value("", window, cx));
             }
             self.amend_info = None;
+            self.amend_key = None;
             cx.notify();
             return;
         }
@@ -1383,9 +1783,12 @@ impl GitChanges {
         let repo = PathBuf::from(&self.repo_path);
         let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
+            let (key, result) = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::amend_info(&repo) })
+                .spawn(async move {
+                    // 顺带记下这份是在哪份引用签名下取的:之后随列表重取时没变就不再取
+                    (amend_key_of(&repo), mt_project::git::amend_info(&repo))
+                })
                 .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
                 if this.amend_request != req || !this.amend {
@@ -1401,6 +1804,7 @@ impl GitChanges {
                             this.amend_prefill = Some(message);
                         }
                         this.amend_info = Some(info);
+                        this.amend_key = key;
                     }
                     // 空仓库:没有上次提交可改
                     Ok(None) => {
@@ -1494,8 +1898,29 @@ impl GitChanges {
     }
 }
 
+/// 「已推送」判定的缓存键:引用那一半签名(HEAD + 全部引用)。只看 HEAD 不够 —— 推送 /
+/// fetch 挪了远程跟踪分支,同一个 HEAD 的判定也会变。读不到为 `None`(当作变了)。
+fn amend_key_of(repo: &Path) -> Option<u64> {
+    mt_project::git::repo_signature(repo)
+        .ok()
+        .map(|sig| sig.refs)
+}
+
+/// 手上那份 amend 信息还作不作数:键读不到、或与取它时的键不同,都要重取。
+fn amend_stale(known: Option<u64>, now: Option<u64>) -> bool {
+    now.is_none() || now != known
+}
+
+/// [`GitChanges::refresh_amend`] 的后台那一趟:键没变返回 `None`(不重取),否则
+/// `Some((新键, 信息))` —— 信息读失败 / 空仓库为 `None`,与原先随列表取时同一口径。
+fn fetch_amend(repo: &Path, known: Option<u64>) -> Option<(Option<u64>, Option<AmendInfo>)> {
+    let key = amend_key_of(repo);
+    amend_stale(known, key).then(|| (key, mt_project::git::amend_info(repo).ok().flatten()))
+}
+
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
-fn load_snapshot(repo: &Path, want_amend: bool) -> anyhow::Result<Snapshot> {
+/// amend 的「已推送」判定不在这里(见 [`GitChanges::refresh_amend`])。
+fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     let changes = mt_project::git::get_changes_status(repo)?;
     let conflicts = if changes.iter().any(is_conflicted) {
         mt_project::git::list_conflicts(repo).unwrap_or_default()
@@ -1511,7 +1936,6 @@ fn load_snapshot(repo: &Path, want_amend: bool) -> anyhow::Result<Snapshot> {
         op_kind,
         target: mt_project::git::commit_target(repo).ok(),
         has_head: mt_project::git::head_exists(repo),
-        amend: want_amend.then(|| mt_project::git::amend_info(repo).ok().flatten()),
     })
 }
 
@@ -1627,9 +2051,11 @@ const ROW_GROUP: &str = "git-file-row";
 impl Render for GitChanges {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_placeholder(window, cx);
-        let tree_mode = self.tree_mode(cx);
-        let list = self.render_list(tree_mode, cx);
-        let commit_area = self.render_commit_area(cx);
+        // 写操作闸每帧只问一次:行内 / 组操作按钮与提交按钮都按它画
+        let gated = self.gated();
+        let model = self.model(cx);
+        let list = self.render_list(&model, self.ops_enabled_with(gated), cx);
+        let commit_area = self.render_commit_area(&model, gated, cx);
 
         div()
             .size_full()
@@ -1646,71 +2072,31 @@ impl Render for GitChanges {
 }
 
 impl GitChanges {
-    fn render_list(&mut self, tree_mode: bool, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        let mut keys: Vec<RowKey> = Vec::new();
+    /// 列表区。有变更时是虚拟列表(只建视口里的行,见模块注释「列表只建看得见的行」);
+    /// 加载中 / 取数失败 / 工作区干净三种整块占位仍是普通滚动容器。焦点、键位与滚动
+    /// 位置两种形态共用。`enabled` = 整文件操作能不能点(同一帧只问一次闸)。
+    fn render_list(
+        &mut self,
+        model: &Rc<ListModel>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let empty = self.changes.is_empty();
-
-        if self.loading && empty && self.load_error.is_none() {
-            rows.push(git_ui::loading_state(t("gitChanges", "loading")).into_any_element());
-            keys.push(RowKey::Other);
+        let placeholder = if self.loading && empty && self.load_error.is_none() {
+            Some(git_ui::loading_state(t("gitChanges", "loading")).into_any_element())
         } else if let Some(err) = self.load_error.as_deref().filter(|_| empty) {
             // 取变更失败顶替空态:否则读失败会被误认成「工作区是干净的」
-            rows.push(
+            Some(
                 git_ui::error_state(tr!("gitChanges", "loadFailed", detail = err))
                     .into_any_element(),
-            );
-            keys.push(RowKey::Other);
+            )
         } else if empty {
-            rows.push(self.render_clean_state(cx));
-            keys.push(RowKey::Other);
+            Some(self.render_clean_state(cx))
         } else {
-            for area in Area::ORDER {
-                let indices = self.group_indices(area);
-                if indices.is_empty() {
-                    continue;
-                }
-                rows.push(self.render_group_header(area, indices.len(), cx));
-                keys.push(RowKey::Other);
-                if self.collapsed_groups.contains(&area) {
-                    continue;
-                }
-                if tree_mode {
-                    let paths: Vec<(usize, &str)> = indices
-                        .iter()
-                        .map(|&i| (i, self.changes[i].path.as_str()))
-                        .collect();
-                    for row in area_tree_rows(&paths, area, &self.collapsed_dirs) {
-                        match row {
-                            ChangeTreeRow::Dir {
-                                name,
-                                full_path,
-                                depth,
-                                collapsed,
-                                file_count,
-                            } => {
-                                rows.push(self.render_dir_row(
-                                    area, name, full_path, file_count, depth, collapsed, cx,
-                                ));
-                                keys.push(RowKey::Other);
-                            }
-                            ChangeTreeRow::File { index, depth } => {
-                                rows.push(self.render_file_row(index, area, depth, true, cx));
-                                keys.push(RowKey::File(area, index));
-                            }
-                        }
-                    }
-                } else {
-                    for index in indices {
-                        rows.push(self.render_file_row(index, area, 0, false, cx));
-                        keys.push(RowKey::File(area, index));
-                    }
-                }
-            }
-        }
-        self.row_keys = keys;
+            None
+        };
 
-        div()
+        let list = div()
             .id("git-changes-list")
             .track_focus(&self.list_focus)
             .key_context(LIST_CONTEXT)
@@ -1720,14 +2106,115 @@ impl GitChanges {
             .on_action(cx.listener(Self::on_open_diff))
             .on_action(cx.listener(Self::on_discard_key))
             .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .track_scroll(&self.list_scroll)
-            .px(px(4.0))
-            .pt(px(LIST_PAD_TOP))
-            .pb(px(LIST_PAD_BOTTOM))
-            .children(rows)
+            .min_h(px(0.0));
+        if let Some(placeholder) = placeholder {
+            self.reveal_cursor = false;
+            return list
+                .overflow_y_scroll()
+                .track_scroll(&self.list_scroll)
+                .px(px(4.0))
+                .pt(px(LIST_PAD_TOP))
+                .pb(px(LIST_PAD_BOTTOM))
+                .child(placeholder)
+                .into_any_element();
+        }
+
+        // 游标行要滚进视野:行序按这一帧的模型找,偏移等 prepaint 量到这一帧的视口再算
+        // (下面那块 canvas 排在虚拟列表**之前**,先于它 prepaint,改的偏移当帧就生效)
+        let reveal = std::mem::take(&mut self.reveal_cursor)
+            .then(|| self.cursor_row(model))
+            .flatten()
+            .and_then(|row| model.row_span(row));
+        let scroll = self.list_scroll.clone();
+        let rows = model.clone();
+        let tree_mode = model.tree_mode;
+        list.relative()
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, _cx| {
+                        let Some((top, bottom)) = reveal else {
+                            return;
+                        };
+                        let mut offset = scroll.offset();
+                        let viewport = f32::from(bounds.size.height);
+                        offset.y = px(reveal_offset(f32::from(offset.y), top, bottom, viewport));
+                        scroll.set_offset(offset);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                v_virtual_list(
+                    cx.entity(),
+                    "git-changes-rows",
+                    model.sizes.clone(),
+                    move |this, range, _window, cx| {
+                        range
+                            .filter_map(|ix| rows.rows.get(ix))
+                            .map(|row| this.render_row(row, enabled, tree_mode, cx))
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(&self.list_scroll)
+                // 组件库给 base 挂的是双轴 `overflow_scroll`,关掉横轴,与换掉的
+                // `overflow_y_scroll()` 一致(横向内容宽是拿首行量的,首帧量的是 min-content,
+                // 会凭空多出一段横向可滚范围 —— 搜索弹窗同一处理)
+                .overflow_x_hidden()
+                .px(px(4.0))
+                .pt(px(LIST_PAD_TOP))
+                .pb(px(LIST_PAD_BOTTOM)),
+            )
             .into_any_element()
+    }
+
+    /// 键盘游标所在的文件行在行序里是第几行(游标所在分组折起来了 / 目录收起了就没有)。
+    fn cursor_row(&self, model: &ListModel) -> Option<usize> {
+        let (area, path) = self.cursor.as_ref()?;
+        let index = model
+            .members(*area)
+            .iter()
+            .copied()
+            .find(|&i| self.changes[i].path == *path)?;
+        model.file_row(*area, index)
+    }
+
+    /// 虚拟列表的一项。每种行画出来的高度与 [`ListRow::height`] 一致,宽度撑满(虚拟列表
+    /// 按根布局排每一项,不像普通块容器那样自动撑满)。
+    fn render_row(
+        &self,
+        row: &ListRow,
+        enabled: bool,
+        tree_mode: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match row {
+            ListRow::Header {
+                area,
+                count,
+                collapsed,
+            } => self.render_group_header(*area, *count, *collapsed, enabled, cx),
+            ListRow::Dir {
+                area,
+                name,
+                full_path,
+                depth,
+                collapsed,
+                file_count,
+            } => self.render_dir_row(
+                *area,
+                name.clone(),
+                full_path.clone(),
+                *file_count,
+                *depth,
+                *collapsed,
+                cx,
+            ),
+            ListRow::File { area, index, depth } => {
+                self.render_file_row(*index, *area, *depth, tree_mode, enabled, cx)
+            }
+        }
     }
 
     /// 工作区干净:32px 勾形图标 + 一句说明 + 「刷新」。
@@ -1754,15 +2241,23 @@ impl GitChanges {
     }
 
     /// 分组标题:折叠箭头 + 标题 + 数量胶囊 + 右对齐的组操作(常显,保证可发现)。
-    fn render_group_header(&self, area: Area, count: usize, cx: &mut Context<Self>) -> AnyElement {
-        let collapsed = self.collapsed_groups.contains(&area);
+    ///
+    /// 上外边距 4 改成外面包一层的上内边距:虚拟列表把每一项当布局根排,根节点的外边距
+    /// 靠不住;包一层不可交互的壳,点那 4px 照旧什么都不触发,看上去一模一样。
+    fn render_group_header(
+        &self,
+        area: Area,
+        count: usize,
+        collapsed: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (title, tone) = match area {
             Area::Conflicts => (t("gitCommit", "conflictsGroup"), ui::color_attention()),
             Area::Staged => (t("panels", "stagedChanges"), ui::text_muted()),
             Area::Unstaged => (t("panels", "unstagedChanges"), ui::text_muted()),
             Area::Untracked => (t("panels", "untrackedFiles"), ui::text_muted()),
         };
-        let enabled = self.ops_enabled();
         let key = area.key();
         let mut header = SectionHeader::new(SharedString::from(format!("git-group-{key}")), title)
             .group()
@@ -1800,7 +2295,7 @@ impl GitChanges {
                         )
                         .when(enabled, |el| {
                             el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                let paths = this.area_paths(area);
+                                let paths = this.area_paths(area, cx);
                                 this.discard(area, paths, window, cx);
                             }))
                         }),
@@ -1822,15 +2317,17 @@ impl GitChanges {
             }
         }
 
-        header
-            .build()
-            .mt(px(GROUP_HEADER_GAP))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                if !this.collapsed_groups.remove(&area) {
-                    this.collapsed_groups.insert(area);
-                }
-                cx.notify();
-            }))
+        let toggle = cx.listener(move |this, _: &ClickEvent, _window, cx| {
+            if !this.collapsed_groups.remove(&area) {
+                this.collapsed_groups.insert(area);
+            }
+            this.invalidate_model();
+            cx.notify();
+        });
+        div()
+            .w_full()
+            .pt(px(GROUP_HEADER_GAP))
+            .child(header.build().on_click(toggle))
             .into_any_element()
     }
 
@@ -1854,13 +2351,15 @@ impl GitChanges {
             depth,
             collapsed,
         )
+        .w_full()
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                if !this.collapsed_dirs.remove(&key) {
-                    this.collapsed_dirs.insert(key.clone());
-                }
-                cx.notify();
-            }))
-            .into_any_element()
+            if !this.collapsed_dirs.remove(&key) {
+                this.collapsed_dirs.insert(key.clone());
+            }
+            this.invalidate_model();
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     /// 文件行:文件图标 + 文件名(状态色,删除加删除线)+ 弱化目录 … 右端状态字母;
@@ -1872,6 +2371,7 @@ impl GitChanges {
         area: Area,
         depth: usize,
         tree_mode: bool,
+        enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(file) = self.changes.get(index) else {
@@ -1883,19 +2383,17 @@ impl GitChanges {
         let path = file.path.clone();
         let deleted = matches!(status, Some(GitStatus::Deleted));
         let selected = self.is_selected(area, &path);
-        let enabled = self.ops_enabled();
 
-        // tooltip:完整路径(重命名带旧路径)+ 状态说明(部分暂存另注一句)
-        let shown_path = match &file.old_path {
-            Some(old) if matches!(status, Some(GitStatus::Renamed)) => format!("{old} → {path}"),
-            _ => path.clone(),
-        };
-        let mut describe = status_text(status).to_string();
-        if file.staged_status.is_some() && file.unstaged_status.is_some() && !is_conflicted(file) {
-            describe.push_str(" · ");
-            describe.push_str(t("gitCommit", "partiallyStaged"));
-        }
-        let tip = format!("{shown_path}\n{describe}");
+        // tooltip:完整路径(重命名带旧路径)+ 状态说明(部分暂存另注一句)。文字等气泡
+        // 真要弹出时才拼(上游等满停留时长才调构造闭包),这里只带拼它要的几样
+        let tip_old = file
+            .old_path
+            .clone()
+            .filter(|_| matches!(status, Some(GitStatus::Renamed)));
+        let tip_path = path.clone();
+        let tip_status = status.cloned();
+        let tip_partial =
+            file.staged_status.is_some() && file.unstaged_status.is_some() && !is_conflicted(file);
 
         let row_id = SharedString::from(format!("git-file-{}-{}", area.key(), path));
         let id_of =
@@ -1984,7 +2482,15 @@ impl GitChanges {
                     )
                     .child(actions),
             )
-            .tip(tip)
+            .tip_with(move |window, cx| {
+                let tip = file_row_tip(
+                    &tip_path,
+                    tip_old.as_deref(),
+                    tip_status.as_ref(),
+                    tip_partial,
+                );
+                Tooltip::new(tip).build(window, cx)
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_row(area, index, event, window, cx);
             }))
@@ -2147,13 +2653,18 @@ impl GitChanges {
 
     /// 提交区:输入框 + 工具条(Amend / 消息历史 / 标题字数)+ 软提示 + 拆分式提交按钮
     /// + 就地错误。
-    fn render_commit_area(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_commit_area(
+        &self,
+        model: &ListModel,
+        gated: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let message = self.commit_input.read(cx).value().to_string();
         let hints = message_hints(&message);
-        let blocker = self.commit_blocker(false, cx);
+        let blocker = self.commit_blocker_with(false, gated, model, cx);
         let can_commit = blocker.is_none();
-        let stage_first_ok = self.commit_blocker(true, cx).is_none();
-        let staged_count = self.staged_count();
+        let stage_first_ok = self.commit_blocker_with(true, gated, model, cx).is_none();
+        let staged_count = model.members(Area::Staged).len();
 
         let commit_label = if self.committing {
             t("gitChanges", "committing").to_string()
@@ -2492,6 +3003,64 @@ mod tests {
         assert!(theirs.contains("你的改动"), "{theirs}");
     }
 
+    /// amend 的「已推送」判定按引用签名缓存:键没变才沿用,读不到当作变了。
+    #[test]
+    fn amend_信息按引用签名缓存() {
+        assert!(!amend_stale(Some(7), Some(7)), "HEAD 与远程跟踪分支都没动");
+        assert!(amend_stale(Some(7), Some(8)), "提交 / 推送 / fetch 之后");
+        assert!(amend_stale(None, Some(7)), "还没取过");
+        assert!(amend_stale(Some(7), None), "签名读不到时宁可重取");
+        assert!(amend_stale(None, None));
+    }
+
+    /// 真仓库上走一遍:第一次取到信息,键不变时不重取,提交之后重取。
+    #[test]
+    fn amend_信息键不变不重取() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-amend-key-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@e"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git 起不来");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let (key, info) = fetch_amend(&root, None).expect("还没取过:要取");
+        assert!(key.is_some());
+        assert_eq!(
+            info.map(|i| i.message.trim().to_string()).as_deref(),
+            Some("first")
+        );
+        assert!(fetch_amend(&root, key).is_none(), "键没变:不重取");
+
+        std::fs::write(root.join("a.txt"), "b\n").unwrap();
+        git(&["commit", "-q", "-am", "second"]);
+        let (new_key, info) = fetch_amend(&root, key).expect("HEAD 动了:重取");
+        assert_ne!(new_key, key);
+        assert_eq!(
+            info.map(|i| i.message.trim().to_string()).as_deref(),
+            Some("second")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn change(
         path: &str,
         staged: Option<GitStatus>,
@@ -2544,30 +3113,33 @@ mod tests {
     fn 列表高度按数据算() {
         let none_dirs = HashSet::new();
         let none_groups = HashSet::new();
+        let height = |changes: &[ChangeFileStatus], groups: &HashSet<Area>, tree: bool| {
+            ListModel::build(changes, groups, &none_dirs, tree).height
+        };
         let untracked = vec![change("src/new.ts", None, Some(GitStatus::Untracked))];
         assert_eq!(
-            list_height(&untracked, &none_groups, &none_dirs, false),
+            height(&untracked, &none_groups, false),
             Some(12.0 + 32.0 + 28.0)
         );
         // 多出一组未暂存:两组标题 + 两行
         let mut both = untracked.clone();
         both.insert(0, change("src/api.ts", None, Some(GitStatus::Modified)));
         assert_eq!(
-            list_height(&both, &none_groups, &none_dirs, false),
+            height(&both, &none_groups, false),
             Some(12.0 + 2.0 * 32.0 + 2.0 * 28.0)
         );
         // 折起来的分组只算标题
         let folded: HashSet<Area> = [Area::Untracked].into_iter().collect();
         assert_eq!(
-            list_height(&both, &folded, &none_dirs, false),
+            height(&both, &folded, false),
             Some(12.0 + 2.0 * 32.0 + 28.0)
         );
         // 树形:每组多一行目录 src/
         assert_eq!(
-            list_height(&both, &none_groups, &none_dirs, true),
+            height(&both, &none_groups, true),
             Some(12.0 + 2.0 * 32.0 + 4.0 * 28.0)
         );
-        assert_eq!(list_height(&[], &none_groups, &none_dirs, false), None);
+        assert_eq!(height(&[], &none_groups, false), None);
     }
 
     /// 取哪一个 status 由所在区决定 —— 部分暂存的文件在两组里显示的字母不同。
@@ -2658,5 +3230,448 @@ mod tests {
             .collect();
         assert_eq!(dirs, ["docs", "src/ui/panel"], "src/ui/panel 压缩成一行");
         assert_eq!(git_ui::row_file_order(&rows), [3, 1, 2, 0]);
+    }
+
+    // ── 派生模型与换掉的逐帧现算逐行对账 ──
+    //
+    // 下面几个 `old_*` 是换成派生模型之前 render / `list_height` / `area_order` /
+    // `nav_rows` 的原样实现,留在测试里当对照:模型的行序、高度、显示顺序、键盘顺序
+    // 必须与它们逐项一致(界面零变化的判据)。
+
+    fn old_tree_rows(
+        paths: &[(usize, &str)],
+        area: Area,
+        collapsed: &HashSet<String>,
+    ) -> Vec<ChangeTreeRow> {
+        git_ui::flatten_change_tree(&git_ui::build_change_tree(paths), &|full_path| {
+            collapsed.contains(&dir_key(area, full_path))
+        })
+    }
+
+    fn old_group_indices(changes: &[ChangeFileStatus], area: Area) -> Vec<usize> {
+        changes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| in_area(c, area))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn old_group_paths(changes: &[ChangeFileStatus], area: Area) -> Vec<(usize, &str)> {
+        old_group_indices(changes, area)
+            .into_iter()
+            .map(|i| (i, changes[i].path.as_str()))
+            .collect()
+    }
+
+    fn old_list_height(
+        changes: &[ChangeFileStatus],
+        collapsed_groups: &HashSet<Area>,
+        collapsed_dirs: &HashSet<String>,
+        tree_mode: bool,
+    ) -> Option<f32> {
+        if changes.is_empty() {
+            return None;
+        }
+        let mut height = LIST_PAD_Y;
+        for area in Area::ORDER {
+            let paths = old_group_paths(changes, area);
+            if paths.is_empty() {
+                continue;
+            }
+            height += GROUP_HEADER_GAP + GROUP_HEADER_H;
+            if collapsed_groups.contains(&area) {
+                continue;
+            }
+            let rows = if tree_mode {
+                old_tree_rows(&paths, area, collapsed_dirs).len()
+            } else {
+                paths.len()
+            };
+            height += rows as f32 * ROW_HEIGHT;
+        }
+        Some(height)
+    }
+
+    fn old_area_order(
+        changes: &[ChangeFileStatus],
+        area: Area,
+        collapsed_dirs: &HashSet<String>,
+        tree_mode: bool,
+    ) -> Vec<usize> {
+        if !tree_mode {
+            return old_group_indices(changes, area);
+        }
+        let paths = old_group_paths(changes, area);
+        git_ui::row_file_order(&old_tree_rows(&paths, area, collapsed_dirs))
+    }
+
+    fn old_nav_rows(
+        changes: &[ChangeFileStatus],
+        collapsed_groups: &HashSet<Area>,
+        collapsed_dirs: &HashSet<String>,
+        tree_mode: bool,
+    ) -> Vec<(Area, usize)> {
+        Area::ORDER
+            .into_iter()
+            .filter(|area| !collapsed_groups.contains(area))
+            .flat_map(|area| {
+                old_area_order(changes, area, collapsed_dirs, tree_mode)
+                    .into_iter()
+                    .map(move |i| (area, i))
+            })
+            .collect()
+    }
+
+    /// 旧 `render_list` 往滚动容器里 push 的子元素序列(换成本模块的行类型)。
+    fn old_render_rows(
+        changes: &[ChangeFileStatus],
+        collapsed_groups: &HashSet<Area>,
+        collapsed_dirs: &HashSet<String>,
+        tree_mode: bool,
+    ) -> Vec<ListRow> {
+        let mut rows = Vec::new();
+        for area in Area::ORDER {
+            let indices = old_group_indices(changes, area);
+            if indices.is_empty() {
+                continue;
+            }
+            let collapsed = collapsed_groups.contains(&area);
+            rows.push(ListRow::Header {
+                area,
+                count: indices.len(),
+                collapsed,
+            });
+            if collapsed {
+                continue;
+            }
+            if tree_mode {
+                let paths = old_group_paths(changes, area);
+                for row in old_tree_rows(&paths, area, collapsed_dirs) {
+                    rows.push(match row {
+                        ChangeTreeRow::Dir {
+                            name,
+                            full_path,
+                            depth,
+                            collapsed,
+                            file_count,
+                        } => ListRow::Dir {
+                            area,
+                            name,
+                            full_path,
+                            depth,
+                            collapsed,
+                            file_count,
+                        },
+                        ChangeTreeRow::File { index, depth } => {
+                            ListRow::File { area, index, depth }
+                        }
+                    });
+                }
+            } else {
+                rows.extend(indices.into_iter().map(|index| ListRow::File {
+                    area,
+                    index,
+                    depth: 0,
+                }));
+            }
+        }
+        rows
+    }
+
+    /// 测试用的确定性伪随机数(不引依赖)。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn pick(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// 一份随机的变更列表:路径不重复(git 给的就不重复),目录名混大小写、文件与目录
+    /// 同名,状态覆盖部分暂存 / 冲突 / 未跟踪 / 重命名。
+    fn random_changes(rng: &mut Lcg, count: usize) -> Vec<ChangeFileStatus> {
+        const DIRS: [&str; 7] = ["src", "Src", "ui", "UI", "a", "docs", "x"];
+        const FILES: [&str; 7] = ["a.rs", "A.rs", "b.md", "x", "ui", "src", "Z.txt"];
+        const STATUS: [(Option<GitStatus>, Option<GitStatus>); 8] = [
+            (Some(GitStatus::Added), None),
+            (Some(GitStatus::Modified), Some(GitStatus::Modified)),
+            (None, Some(GitStatus::Modified)),
+            (None, Some(GitStatus::Untracked)),
+            (Some(GitStatus::Conflicted), Some(GitStatus::Conflicted)),
+            (Some(GitStatus::Deleted), None),
+            (Some(GitStatus::Renamed), Some(GitStatus::Deleted)),
+            (None, Some(GitStatus::Deleted)),
+        ];
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        while out.len() < count {
+            let depth = rng.pick(4);
+            let mut path: Vec<&str> = (0..depth).map(|_| DIRS[rng.pick(DIRS.len())]).collect();
+            path.push(FILES[rng.pick(FILES.len())]);
+            let path = path.join("/");
+            if !seen.insert(path.clone()) {
+                // 组合空间不大,撞了就换一个(数量给得小,不会死循环)
+                continue;
+            }
+            let (staged, unstaged) = STATUS[rng.pick(STATUS.len())].clone();
+            out.push(change(&path, staged, unstaged));
+        }
+        out
+    }
+
+    /// 某份变更列表里出现过的目录(全部前缀),随机挑一部分按区名拼成折叠 key。
+    fn random_collapsed_dirs(rng: &mut Lcg, changes: &[ChangeFileStatus]) -> HashSet<String> {
+        let mut dirs: Vec<String> = Vec::new();
+        for file in changes {
+            let parts: Vec<&str> = file.path.split('/').collect();
+            for end in 1..parts.len() {
+                dirs.push(parts[..end].join("/"));
+            }
+        }
+        let mut out = HashSet::new();
+        if dirs.is_empty() {
+            return out;
+        }
+        for _ in 0..rng.pick(4) {
+            let area = Area::ORDER[rng.pick(4)];
+            out.insert(dir_key(area, &dirs[rng.pick(dirs.len())]));
+        }
+        out
+    }
+
+    /// 派生模型与旧的逐帧现算逐项一致:行序(连标题 / 目录行的每个字段)、摊开总高、
+    /// 四组成员与显示顺序、键盘顺序;尺寸表与行一一对应。随机数据覆盖两种视图、分组
+    /// 折叠、目录折叠(压缩节点折叠 key 是最深那一级的完整路径)。
+    #[test]
+    fn 派生模型与逐帧现算逐行一致() {
+        let mut rng = Lcg(0x5eed);
+        for round in 0..300 {
+            let count = rng.pick(40);
+            let changes = random_changes(&mut rng, count);
+            let groups: HashSet<Area> = Area::ORDER
+                .into_iter()
+                .filter(|_| rng.pick(4) == 0)
+                .collect();
+            let dirs = random_collapsed_dirs(&mut rng, &changes);
+            for tree in [false, true] {
+                let model = ListModel::build(&changes, &groups, &dirs, tree);
+                let ctx = format!("round {round} tree {tree} groups {groups:?} dirs {dirs:?}");
+                assert_eq!(
+                    model.rows,
+                    old_render_rows(&changes, &groups, &dirs, tree),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    model.height,
+                    old_list_height(&changes, &groups, &dirs, tree),
+                    "{ctx}"
+                );
+                for area in Area::ORDER {
+                    assert_eq!(
+                        model.members(area),
+                        old_group_indices(&changes, area),
+                        "{ctx}"
+                    );
+                    assert_eq!(
+                        model.order(area),
+                        old_area_order(&changes, area, &dirs, tree),
+                        "{ctx} {area:?}"
+                    );
+                }
+                assert_eq!(
+                    model.nav().collect::<Vec<_>>(),
+                    old_nav_rows(&changes, &groups, &dirs, tree),
+                    "{ctx}"
+                );
+                assert_eq!(model.sizes.len(), model.rows.len());
+                for (size, row) in model.sizes.iter().zip(&model.rows) {
+                    assert_eq!(f32::from(size.height), row.height());
+                }
+            }
+        }
+    }
+
+    /// 键盘导航的下标映射:文件行 → 行号,行号 → 上下沿(从列表顶边量,含上内边距);
+    /// 折起来的分组里的文件没有行。
+    #[test]
+    fn 文件行的行号与上下沿() {
+        let changes = vec![
+            change("src/a.rs", Some(GitStatus::Added), None),
+            change("src/b.rs", None, Some(GitStatus::Modified)),
+            change("new.ts", None, Some(GitStatus::Untracked)),
+        ];
+        let (no_groups, no_dirs) = (HashSet::new(), HashSet::new());
+        let model = ListModel::build(&changes, &no_groups, &no_dirs, false);
+        // 已暂存标题 / a / 未暂存标题 / b / 未跟踪标题 / new
+        assert_eq!(model.file_row(Area::Staged, 0), Some(1));
+        assert_eq!(model.file_row(Area::Unstaged, 1), Some(3));
+        assert_eq!(model.file_row(Area::Untracked, 2), Some(5));
+        assert_eq!(model.file_row(Area::Staged, 1), None, "b 不在已暂存组");
+        assert_eq!(model.row_span(0), Some((4.0, 36.0)), "标题连上外边距 32");
+        assert_eq!(model.row_span(1), Some((36.0, 64.0)));
+        let last_top = 4.0 + 3.0 * 32.0 + 2.0 * 28.0;
+        assert_eq!(model.row_span(5), Some((last_top, 184.0)));
+        assert_eq!(model.row_span(6), None);
+        // 摊开总高 = 上内边距 + 全部行 + 下内边距,最后一行的下沿再加 8
+        assert_eq!(model.height, Some(184.0 + 8.0));
+
+        let folded: HashSet<Area> = [Area::Unstaged].into_iter().collect();
+        let model = ListModel::build(&changes, &folded, &no_dirs, false);
+        assert_eq!(
+            model.file_row(Area::Unstaged, 1),
+            None,
+            "折起来的分组没有文件行"
+        );
+        assert_eq!(model.file_row(Area::Untracked, 2), Some(4));
+        assert_eq!(model.order(Area::Unstaged), [1], "显示顺序不看分组折叠");
+        assert_eq!(
+            model.nav().collect::<Vec<_>>(),
+            [(Area::Staged, 0), (Area::Untracked, 2)],
+            "键盘跳过折起来的分组"
+        );
+    }
+
+    /// 滚进视野的偏移与 gpui `scroll_to_item` 的默认策略一致:整行可见不动、上面露不全
+    /// 顶对齐、下面露不全底对齐、比视口高的行顶对齐;上下沿按整个列表框比。
+    #[test]
+    fn 滚进视野只滚最少的量() {
+        // 视口 100,行在内容里 [40, 68)
+        let reveal = |offset: f32, top: f32, viewport: f32| {
+            reveal_offset(offset, top, top + ROW_HEIGHT, viewport)
+        };
+        assert_eq!(reveal(0.0, 40.0, 100.0), 0.0, "整行可见");
+        assert_eq!(reveal(-50.0, 40.0, 100.0), -40.0, "在上面:顶对齐");
+        assert_eq!(reveal(0.0, 120.0, 100.0), -48.0, "在下面:底对齐");
+        assert_eq!(reveal(-10.0, 4.0, 100.0), -4.0, "露了半截也算");
+        assert_eq!(reveal(-30.0, 40.0, 20.0), -40.0, "比视口高:顶对齐");
+    }
+
+    fn snapshot(changes: Vec<ChangeFileStatus>) -> Snapshot {
+        Snapshot {
+            changes,
+            conflicts: Vec::new(),
+            op_kind: None,
+            target: Some(CommitTarget::Branch("main".into())),
+            has_head: true,
+        }
+    }
+
+    fn landed_from(snap: &Snapshot) -> Landed<'_> {
+        Landed {
+            changes: &snap.changes,
+            conflicts: &snap.conflicts,
+            op_kind: snap.op_kind,
+            target: snap.target.as_ref(),
+            has_head: snap.has_head,
+            amend: false,
+            load_error: None,
+        }
+    }
+
+    /// 落地去重:一模一样的回包不算变;任何一个会进界面(或菜单)的字段变了都算。
+    #[test]
+    fn 取数落地没变就不重画() {
+        let files = vec![
+            change("a.rs", Some(GitStatus::Modified), None),
+            change("b.rs", None, Some(GitStatus::Untracked)),
+        ];
+        let base = snapshot(files.clone());
+        let landed = landed_from(&base);
+        assert!(!landed.differs(&snapshot(files.clone())), "同一份数据");
+
+        let mut moved = files.clone();
+        moved[0].unstaged_status = Some(GitStatus::Modified);
+        assert!(landed.differs(&snapshot(moved)), "状态变了");
+        let mut renamed = files.clone();
+        renamed[1].old_path = Some("old.rs".into());
+        assert!(landed.differs(&snapshot(renamed)), "旧路径变了");
+        assert!(landed.differs(&snapshot(files[..1].to_vec())), "少了一个");
+
+        let mut next = snapshot(files.clone());
+        next.conflicts = vec![ConflictInfo {
+            path: "a.rs".into(),
+            ours: true,
+            theirs: false,
+        }];
+        assert!(landed.differs(&next), "冲突细节变了(菜单文案跟着它)");
+        let mut next = snapshot(files.clone());
+        next.op_kind = Some(RepoOpKind::Rebase);
+        assert!(landed.differs(&next), "进行中的操作变了");
+        let mut next = snapshot(files.clone());
+        next.target = Some(CommitTarget::Branch("dev".into()));
+        assert!(landed.differs(&next), "提交目标(占位符)变了");
+        let mut next = snapshot(files.clone());
+        next.has_head = false;
+        assert!(landed.differs(&next), "HEAD 没了");
+
+        let errored = Landed {
+            load_error: Some("boom"),
+            ..landed_from(&base)
+        };
+        assert!(errored.differs(&snapshot(files)), "上次失败、这次成功");
+    }
+
+    /// 勾着 amend 时回包没变就不算变(「已推送」判定另走一趟);HEAD 没了 amend 收起算变。
+    #[test]
+    fn 取数落地的_amend_口径() {
+        let base = snapshot(Vec::new());
+        let amending = Landed {
+            amend: true,
+            ..landed_from(&base)
+        };
+        let mut next = snapshot(Vec::new());
+        assert!(!amending.differs(&next), "数据没变");
+        next.has_head = false;
+        assert!(amending.differs(&next), "HEAD 没了:amend 收起");
+        assert!(
+            !landed_from(&base).differs(&snapshot(Vec::new())),
+            "没勾 amend"
+        );
+    }
+
+    /// 取数失败:同一条错误反复落地不算变;换了原因、或此前还有数据都算。
+    #[test]
+    fn 取数失败的落地去重() {
+        let empty = snapshot(Vec::new());
+        let failing = Landed {
+            load_error: Some("boom"),
+            target: None,
+            ..landed_from(&empty)
+        };
+        assert!(!failing.differs_on_error("boom"));
+        assert!(failing.differs_on_error("bang"));
+        let full = snapshot(vec![change("a.rs", None, Some(GitStatus::Modified))]);
+        assert!(landed_from(&full).differs_on_error("boom"), "列表要清空");
+    }
+
+    /// 行 tooltip 现拼的文字与此前每帧预拼的一致:重命名带旧路径,部分暂存另注一句。
+    #[test]
+    fn 文件行提示文字() {
+        let text = |status: Option<&GitStatus>| status_text(status).to_string();
+        assert_eq!(
+            file_row_tip("src/a.rs", None, Some(&GitStatus::Modified), false),
+            format!("src/a.rs\n{}", text(Some(&GitStatus::Modified)))
+        );
+        assert_eq!(
+            file_row_tip("b.rs", Some("a.rs"), Some(&GitStatus::Renamed), false),
+            format!("a.rs → b.rs\n{}", text(Some(&GitStatus::Renamed)))
+        );
+        assert_eq!(
+            file_row_tip("c.rs", None, Some(&GitStatus::Modified), true),
+            format!(
+                "c.rs\n{} · {}",
+                text(Some(&GitStatus::Modified)),
+                t("gitCommit", "partiallyStaged")
+            )
+        );
     }
 }

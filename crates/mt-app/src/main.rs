@@ -1930,12 +1930,17 @@ impl Render for Workspace {
         let drawer_layer = self.right_drawer.or(exiting).map(|panel| {
             let leaving = self.right_drawer.is_none();
             let width = drawer_width as f32;
-            // ⚠️ 抽屉里这两块**不套** [`cached_panel`],两条理由缺一不可:
+            // ⚠️ 抽屉里这两块**不套** [`cached_panel`](Git 面板里的「更改」「提交历史」
+            // 两个子视图也没单独套):
             // ① 它们身上压着两层 `with_animation`(整层滑入滑出 + 换面板的
             //    `panelSwapIn` 改 opacity),而 opacity 是 paint 期烙进图元的、
-            //    `reuse_paint` 原样重放 —— 命中缓存就会把某一帧的透明度定死;
-            // ② 抽屉默认收着且开合不持久化,收起时这两个实体压根不进元素树,
-            //    稳态下本来就没有每帧开销可省。
+            //    `reuse_paint` 原样重放 —— 命中缓存就会把某一帧的透明度定死。连带的
+            //    `ml(10·(1−δ))` 在末几帧被布局按设备像素取整成 0,缓存键与终态相同,
+            //    挡不住复用;动画的起止对面板又不可见,「动画期间不走缓存」没有干净的判据;
+            // ② 收起时这两个实体压根不进元素树。开着时每帧确实整个重跑,但最重的
+            //    「更改」列表已虚拟化(只建视口里那几行,见 `git_changes` 模块注释),
+            //    剩下的开销与改动数无关;提交历史区每行按墙钟现算「x 分钟前」、没有
+            //    定时 notify,套缓存会把它冻住。
             let content: gpui::AnyElement = match panel {
                 DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
                 DrawerPanel::Git => self.git_panel.clone().into_any_element(),
@@ -2236,13 +2241,20 @@ impl Render for Workspace {
             // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
             // —— 等价于原版往 document 上挂 mousemove/mouseup
             .when(self.drawer_drag.is_some(), |el| {
-                el.on_mouse_move(cx.listener(|this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
-                    if let Some(drag) = this.drawer_drag.as_mut() {
-                        let delta = f32::from(drag.start_x - event.position.x) as f64;
-                        drag.width = (drag.start_width + delta).clamp(240.0, 720.0);
-                        cx.notify();
-                    }
-                }))
+                el.on_mouse_move(cx.listener(
+                    |this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
+                        if let Some(drag) = this.drawer_drag.as_mut() {
+                            let delta = f32::from(drag.start_x - event.position.x) as f64;
+                            let width = (drag.start_width + delta).clamp(240.0, 720.0);
+                            // 宽度真变了才重画:钳到上下限之后鼠标接着动,每一下都是一次
+                            // 白画的整窗帧
+                            if width != drag.width {
+                                drag.width = width;
+                                cx.notify();
+                            }
+                        }
+                    },
+                ))
                 .on_mouse_up(
                     gpui::MouseButton::Left,
                     cx.listener(|this: &mut Self, _event: &gpui::MouseUpEvent, _window, cx| {
@@ -2261,9 +2273,13 @@ impl Render for Workspace {
                     |this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
                         if let Some(drag) = this.detail_drag.as_mut() {
                             let delta = f32::from(drag.start_x - event.position.x) as f64;
-                            drag.width = (drag.start_width + delta)
+                            let width = (drag.start_width + delta)
                                 .clamp(store::GIT_DETAIL_MIN_WIDTH, store::GIT_DETAIL_MAX_WIDTH);
-                            cx.notify();
+                            // 同上:钳住之后不再每次移动都整窗重画
+                            if width != drag.width {
+                                drag.width = width;
+                                cx.notify();
+                            }
                         }
                     },
                 ))

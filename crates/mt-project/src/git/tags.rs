@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use git2::Repository;
+use git2::{ObjectType, Repository};
 use serde::{Deserialize, Serialize};
 
 use super::log_ops::is_commit_hash;
@@ -51,13 +51,14 @@ fn is_valid_remote_name(name: &str) -> bool {
 }
 
 /// 列出全部指向提交的标签,按名字排序。指向树 / blob 的标签(极少见)跳过。
+///
+/// 只遍历 `refs/tags/*`(不必把成百上千的分支 / 远程分支也走一遍);每个标签只按目标
+/// 查一次对象:是标签对象就是附注标签,再从它剥到提交(旧实现剥一次、再单独
+/// `find_tag` 一次,同一个对象查两遍)。历史首页每次重载都要列一遍。
 pub fn list_tags(repo_path: &Path) -> Result<Vec<TagInfo>> {
     let repo = Repository::open(repo_path)?;
     let mut tags = Vec::new();
-    for reference in repo.references()? {
-        let Ok(reference) = reference else {
-            continue;
-        };
+    for reference in repo.references_glob("refs/tags/*")?.flatten() {
         let Some(name) = reference
             .name()
             .and_then(|n| n.strip_prefix("refs/tags/"))
@@ -65,12 +66,20 @@ pub fn list_tags(repo_path: &Path) -> Result<Vec<TagInfo>> {
         else {
             continue;
         };
-        let Ok(commit) = reference.peel_to_commit() else {
+        // 符号引用形式的标签(极少见)先解到直接引用
+        let Some(target) = reference
+            .target()
+            .or_else(|| reference.resolve().ok()?.target())
+        else {
             continue;
         };
-        let annotated = reference
-            .target()
-            .is_some_and(|oid| repo.find_tag(oid).is_ok());
+        let Ok(object) = repo.find_object(target, None) else {
+            continue;
+        };
+        let annotated = object.kind() == Some(ObjectType::Tag);
+        let Ok(commit) = object.peel_to_commit() else {
+            continue;
+        };
         tags.push(TagInfo {
             name,
             target_hash: commit.id().to_string(),
@@ -216,6 +225,40 @@ mod tests {
             .collect();
         assert_eq!(names, ["rel/v3", "v2"]);
         assert!(delete_tag(&root, "nope").is_err(), "不存在的标签要报错");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// 只按 `refs/tags/*` 列之后:分支不混进来;指向树的标签照旧跳过;引用打包进
+    /// `packed-refs` 之后结果不变。
+    #[test]
+    fn 标签列表只看标签引用() {
+        let root = init_repo_with_file("tags-glob", "a.txt", "1\n");
+        no_sign(&root);
+        let hash = head(&root);
+        create_tag(&root, "v1", &hash, None).unwrap();
+        create_tag(&root, "notes/v2", &hash, Some("annotated")).unwrap();
+        {
+            let repo = Repository::open(&root).unwrap();
+            let tree = repo.head().unwrap().peel_to_tree().unwrap();
+            repo.tag_lightweight("tree-tag", tree.as_object(), false)
+                .unwrap();
+            let commit = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("tags-lookalike", &commit, false).unwrap();
+        }
+        let shape = |root: &Path| -> Vec<(String, bool)> {
+            list_tags(root)
+                .unwrap()
+                .into_iter()
+                .map(|t| {
+                    assert_eq!(t.target_hash, hash);
+                    (t.name, t.annotated)
+                })
+                .collect()
+        };
+        let expect = vec![("notes/v2".to_string(), true), ("v1".to_string(), false)];
+        assert_eq!(shape(&root), expect);
+        super::super::test_support::git(&root, &["pack-refs", "--all"]);
+        assert_eq!(shape(&root), expect, "打包之后一样");
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -14,8 +14,11 @@
 //!
 //! 拍平([`flatten_change_tree`])的结果就是界面上的行序:渲染、键盘导航、Shift 连选、
 //! diff 弹窗里前后换文件都走它,视觉顺序与键盘顺序不会对不上。
+//!
+//! 建树按层给子目录挂「名字 → 下标」索引,排序键每个节点只算一次:同一目录下几千个
+//! 文件时,此前「逐个线性扫兄弟找同名目录」+「每次比较现转两次小写」都是 O(N²) 级。
 
-use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use gpui::{
     AnyElement, Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful, Styled,
@@ -58,45 +61,80 @@ impl ChangeTreeNode {
 ///
 /// 同名的文件与目录(`build` 文件与 `build/out.js`)各是各的节点,不合并。
 pub fn build_change_tree(paths: &[(usize, &str)]) -> Vec<ChangeTreeNode> {
-    let mut root: Vec<ChangeTreeNode> = Vec::new();
-    for (index, path) in paths {
-        let parts: Vec<&str> = path.split('/').collect();
-        let mut current = &mut root;
-        let mut path_so_far = String::new();
-        for (i, part) in parts.iter().enumerate() {
+    // 先建一棵只借路径切片的草稿树(下标 0 是虚根),再整棵转成带所有权的节点:
+    // 节点的完整路径就是原路径的一段前缀,建的时候一个字节都不用拷
+    let mut drafts = vec![Draft::new("", "", None)];
+    for &(index, path) in paths {
+        let mut current = 0;
+        let mut end = 0;
+        let mut parts = path.split('/').enumerate().peekable();
+        while let Some((i, part)) = parts.next() {
+            // `full_path` = 原路径到这一段为止的前缀(段间的 `/` 也算上)
             if i > 0 {
-                path_so_far.push('/');
+                end += 1;
             }
-            path_so_far.push_str(part);
-            if i == parts.len() - 1 {
-                current.push(ChangeTreeNode {
-                    name: (*part).to_string(),
-                    full_path: path_so_far.clone(),
-                    file: Some(*index),
-                    file_count: 1,
-                    children: Vec::new(),
-                });
+            end += part.len();
+            let full_path = &path[..end];
+            if parts.peek().is_none() {
+                let id = drafts.len();
+                drafts.push(Draft::new(part, full_path, Some(index)));
+                drafts[current].children.push(id);
             } else {
-                let pos = current.iter().position(|n| n.name == *part && n.is_dir());
-                let pos = match pos {
-                    Some(pos) => pos,
+                current = match drafts[current].dirs.get(part) {
+                    Some(&id) => id,
                     None => {
-                        current.push(ChangeTreeNode {
-                            name: (*part).to_string(),
-                            full_path: path_so_far.clone(),
-                            file: None,
-                            file_count: 0,
-                            children: Vec::new(),
-                        });
-                        current.len() - 1
+                        let id = drafts.len();
+                        drafts.push(Draft::new(part, full_path, None));
+                        drafts[current].children.push(id);
+                        drafts[current].dirs.insert(part, id);
+                        id
                     }
                 };
-                current = &mut current[pos].children;
             }
         }
     }
+    let mut root = own_nodes(&drafts, &drafts[0].children);
     finish(&mut root);
     root
+}
+
+/// 建树时的草稿节点:名字与完整路径都是借来的切片,子节点是草稿表里的下标(按出现
+/// 顺序 —— 与此前直接往 `Vec` 里 push 的次序一致,排序前的相对顺序因此不变)。
+struct Draft<'a> {
+    name: &'a str,
+    full_path: &'a str,
+    file: Option<usize>,
+    children: Vec<usize>,
+    /// 子**目录**名 → 草稿下标(同名文件不进来,文件与目录各是各的节点)
+    dirs: HashMap<&'a str, usize>,
+}
+
+impl<'a> Draft<'a> {
+    fn new(name: &'a str, full_path: &'a str, file: Option<usize>) -> Self {
+        Self {
+            name,
+            full_path,
+            file,
+            children: Vec::new(),
+            dirs: HashMap::new(),
+        }
+    }
+}
+
+/// 草稿 → 节点(文件数先给 0 / 1,[`finish`] 重算)。
+fn own_nodes(drafts: &[Draft<'_>], ids: &[usize]) -> Vec<ChangeTreeNode> {
+    ids.iter()
+        .map(|&id| {
+            let draft = &drafts[id];
+            ChangeTreeNode {
+                name: draft.name.to_string(),
+                full_path: draft.full_path.to_string(),
+                file: draft.file,
+                file_count: usize::from(draft.file.is_some()),
+                children: own_nodes(drafts, &draft.children),
+            }
+        })
+        .collect()
 }
 
 /// 自底向上:压缩单链、算文件数、排序。
@@ -117,15 +155,13 @@ fn finish(nodes: &mut [ChangeTreeNode]) {
         }
         node.file_count = node.children.iter().map(|c| c.file_count).sum();
     }
-    nodes.sort_by(compare_nodes);
+    nodes.sort_by_cached_key(sort_key);
 }
 
-/// 目录在前、文件在后;同类按名称不分大小写排,只差大小写的再按原样排(顺序稳定)。
-fn compare_nodes(a: &ChangeTreeNode, b: &ChangeTreeNode) -> Ordering {
-    b.is_dir()
-        .cmp(&a.is_dir())
-        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        .then_with(|| a.name.cmp(&b.name))
+/// 排序键:目录在前、文件在后;同类按名称不分大小写排,只差大小写的再按原样排。
+/// 每个节点只算一次(`sort_by_cached_key`),不在每次比较时现转小写。
+fn sort_key(node: &ChangeTreeNode) -> (bool, String, String) {
+    (!node.is_dir(), node.name.to_lowercase(), node.name.clone())
 }
 
 /// 拍平后的一行。
@@ -494,5 +530,171 @@ mod tests {
         assert_eq!(row_file_order(&rows), [4, 1]);
         let rows = change_rows(&paths, true, &|_| false);
         assert_eq!(row_file_order(&rows), [1, 4], "树形:目录在前");
+    }
+
+    // ── 换实现前后逐节点对账 ──
+
+    /// 换成「按层索引 + 缓存排序键」之前的建树原样实现,当对照用:新实现的整棵树
+    /// (名字、完整路径、下标、文件数、子节点顺序)必须与它一模一样 —— 提交详情、
+    /// 提交 diff 左栏、「更改」区三处的行序都靠它。
+    fn old_build(paths: &[(usize, &str)]) -> Vec<ChangeTreeNode> {
+        use std::cmp::Ordering;
+
+        fn compare_nodes(a: &ChangeTreeNode, b: &ChangeTreeNode) -> Ordering {
+            b.is_dir()
+                .cmp(&a.is_dir())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.name.cmp(&b.name))
+        }
+
+        fn old_finish(nodes: &mut [ChangeTreeNode]) {
+            for node in nodes.iter_mut() {
+                if !node.is_dir() {
+                    node.file_count = 1;
+                    continue;
+                }
+                old_finish(&mut node.children);
+                while node.children.len() == 1 && node.children[0].is_dir() {
+                    let Some(child) = node.children.pop() else {
+                        break;
+                    };
+                    node.name = format!("{}/{}", node.name, child.name);
+                    node.full_path = child.full_path;
+                    node.children = child.children;
+                }
+                node.file_count = node.children.iter().map(|c| c.file_count).sum();
+            }
+            nodes.sort_by(compare_nodes);
+        }
+
+        let mut root: Vec<ChangeTreeNode> = Vec::new();
+        for (index, path) in paths {
+            let parts: Vec<&str> = path.split('/').collect();
+            let mut current = &mut root;
+            let mut path_so_far = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    path_so_far.push('/');
+                }
+                path_so_far.push_str(part);
+                if i == parts.len() - 1 {
+                    current.push(ChangeTreeNode {
+                        name: (*part).to_string(),
+                        full_path: path_so_far.clone(),
+                        file: Some(*index),
+                        file_count: 1,
+                        children: Vec::new(),
+                    });
+                } else {
+                    let pos = current.iter().position(|n| n.name == *part && n.is_dir());
+                    let pos = match pos {
+                        Some(pos) => pos,
+                        None => {
+                            current.push(ChangeTreeNode {
+                                name: (*part).to_string(),
+                                full_path: path_so_far.clone(),
+                                file: None,
+                                file_count: 0,
+                                children: Vec::new(),
+                            });
+                            current.len() - 1
+                        }
+                    };
+                    current = &mut current[pos].children;
+                }
+            }
+        }
+        old_finish(&mut root);
+        root
+    }
+
+    /// 测试用的确定性伪随机数(不引依赖)。
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn pick(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((self.0 >> 33) % n as u64) as usize
+        }
+    }
+
+    /// 固定的边角:大小写只差一位、文件与目录同名、空段(`a//b`、开头 / 结尾的 `/`)、
+    /// 空路径、深单链、重复路径。
+    #[test]
+    fn 新旧建树逐节点一致_边角() {
+        let cases: [&[&str]; 6] = [
+            &[
+                "b.txt",
+                "Zeta/x.rs",
+                "A.txt",
+                "a.txt",
+                "alpha/one/x.rs",
+                "Alpha/y.rs",
+            ],
+            &["build", "build/out.js", "Build/a", "build/Out.js"],
+            &["a//b", "/x", "y/", "", "a/b"],
+            &["d/e/f/g/h/i.rs", "d/e/f/g/h/j.rs", "d/e/k.rs"],
+            &["same.rs", "same.rs", "dir/same.rs", "dir/same.rs"],
+            &["中文/文件.md", "中文/B.md", "Ä/ä.rs", "ä/Ä.rs"],
+        ];
+        for case in cases {
+            let paths: Vec<(usize, &str)> = case.iter().copied().enumerate().collect();
+            assert_eq!(build_change_tree(&paths), old_build(&paths), "{case:?}");
+        }
+    }
+
+    /// 随机路径(目录名混大小写、文件与目录同名、深浅不一、下标乱序)逐节点对账,
+    /// 拍平(带折叠)后的行序也一致。
+    #[test]
+    fn 新旧建树逐节点一致_随机() {
+        const SEGMENTS: [&str; 9] = ["src", "Src", "ui", "UI", "a", "A", "x.rs", "X.rs", "b"];
+        let mut rng = Lcg(42);
+        for round in 0..300 {
+            let count = rng.pick(60);
+            let owned: Vec<String> = (0..count)
+                .map(|_| {
+                    let depth = rng.pick(5) + 1;
+                    (0..depth)
+                        .map(|_| SEGMENTS[rng.pick(SEGMENTS.len())])
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect();
+            let paths: Vec<(usize, &str)> = owned
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (count * 7 - i, p.as_str()))
+                .collect();
+            let tree = build_change_tree(&paths);
+            assert_eq!(tree, old_build(&paths), "round {round}: {owned:?}");
+            let collapsed = |p: &str| p.len().is_multiple_of(3);
+            assert_eq!(
+                flatten_change_tree(&tree, &collapsed),
+                flatten_change_tree(&old_build(&paths), &collapsed)
+            );
+        }
+    }
+
+    /// 同一目录下几千个文件(此前逐个线性扫兄弟、排序比较时现转小写的最坏情形):
+    /// 结构照旧 —— 一个目录节点、文件按名称排。
+    #[test]
+    fn 同目录大量文件() {
+        let owned: Vec<String> = (0..3000)
+            .map(|i| format!("big/f{:04}.rs", 2999 - i))
+            .collect();
+        let paths: Vec<(usize, &str)> = owned
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.as_str()))
+            .collect();
+        let tree = build_change_tree(&paths);
+        assert_eq!(names(&tree), ["big"]);
+        assert_eq!(tree[0].file_count, 3000);
+        assert_eq!(tree[0].children[0].name, "f0000.rs");
+        assert_eq!(tree[0].children[0].file, Some(2999));
+        assert_eq!(tree, old_build(&paths));
     }
 }

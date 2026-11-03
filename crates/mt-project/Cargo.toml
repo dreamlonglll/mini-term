@@ -32,8 +32,10 @@ windows-registry = "0.6"
 # git CLI 超时要连孙进程一起杀(`git.exe` 只是启动器,hook / ssh 都是它的后代):
 # spawn 后挂进 Job Object,超时 `TerminateJobObject`。版本与 mt-secret 那份对齐
 # (根 Cargo.toml 的 workspace.dependencies 里没有它,mt-secret 也是直接写版本)。
+# `Win32_System_Threading`:等 git 退出用 `WaitForSingleObject`(退出即醒,不轮询)。
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }

@@ -189,6 +189,8 @@ export const gitLog = {
     working: "执行中…",
     refreshing: "刷新中…",
     loadingMore: "加载更多…",
+    loadMore: "加载更多",
+    autoLoadPaused: "已加载 {count} 个提交",
     loadFailed: "读取提交历史失败：{detail}",
   },
   en: {
@@ -381,6 +383,8 @@ export const gitLog = {
     working: "Working…",
     refreshing: "Refreshing…",
     loadingMore: "Loading more…",
+    loadMore: "Load more",
+    autoLoadPaused: "{count} commits loaded",
     loadFailed: "Failed to load history: {detail}",
   },
 } as const;

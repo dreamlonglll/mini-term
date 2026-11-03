@@ -15,16 +15,22 @@
 //! 所以凡是用户输入的新名字一律先过 [`validate_branch_name`];已有分支的名字则先在
 //! git2 里查到实体再交给 CLI —— git 本身不许建 `-` 开头的分支,查得到就安全。
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use anyhow::{Result, anyhow, bail};
 use git2::{BranchType, Oid, Repository};
+use parking_lot::Mutex;
 
-use super::repo_state::conflicted_file_count;
+use super::repo_state::{
+    RepoOpState, RepoSignature, conflicted_file_count, op_kind_of, repo_signature_in,
+};
+use super::stash::stash_entries;
+use super::sync::{PullConfig, PushPlan, pull_config_in, push_plan_in};
 use super::{
-    NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT, failure_text,
-    invalidate_repo_cache, run_checked, run_git_output, run_git_output_env,
+    BranchInfo, NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, QUICK_OP_TIMEOUT, WORKTREE_OP_TIMEOUT,
+    failure_text, repo_branches_in, run_checked, run_git_output, run_git_output_env,
 };
 
 // ---------------------------------------------------------------------------
@@ -112,17 +118,18 @@ pub(super) fn head_branch_name(repo: &Repository) -> Option<String> {
 ///
 /// Git 面板每次重载分支时拿它刷新仓库栏 —— 仓库列表那份要等下一次重新发现仓库。
 pub fn current_head_label(repo_path: &Path) -> Result<Option<String>> {
-    let repo = Repository::open(repo_path)?;
-    let Ok(head) = repo.head() else {
-        return Ok(None);
-    };
+    Ok(current_head_label_in(&Repository::open(repo_path)?))
+}
+
+fn current_head_label_in(repo: &Repository) -> Option<String> {
+    let head = repo.head().ok()?;
     if head.is_branch() {
-        return Ok(head.shorthand().map(str::to_string));
+        return head.shorthand().map(str::to_string);
     }
-    Ok(head.target().map(|oid| {
+    head.target().map(|oid| {
         let s = oid.to_string();
         format!("({})", &s[..7.min(s.len())])
-    }))
+    })
 }
 
 fn head_oid(repo: &Repository) -> Option<Oid> {
@@ -185,7 +192,6 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
         WORKTREE_OP_TIMEOUT,
         "",
     )?;
-    invalidate_repo_cache();
     Ok(())
 }
 
@@ -219,7 +225,6 @@ pub fn checkout_remote_branch(repo_path: &Path, remote_branch: &str) -> Result<R
         WORKTREE_OP_TIMEOUT,
         "",
     )?;
-    invalidate_repo_cache();
     Ok(RemoteCheckout::Created { local })
 }
 
@@ -254,7 +259,6 @@ pub fn create_branch(
         QUICK_OP_TIMEOUT
     };
     run_checked(repo_path, &args, "branch", timeout, "")?;
-    invalidate_repo_cache();
     Ok(())
 }
 
@@ -274,7 +278,6 @@ pub fn rename_branch(repo_path: &Path, old: &str, new: &str) -> Result<()> {
         QUICK_OP_TIMEOUT,
         "",
     )?;
-    invalidate_repo_cache();
     Ok(())
 }
 
@@ -305,7 +308,6 @@ pub fn delete_branch(repo_path: &Path, name: &str, force: bool) -> Result<Delete
         "",
     )?;
     if out.success {
-        invalidate_repo_cache();
         return Ok(DeleteOutcome::Deleted);
     }
     // 拒绝的原因不看文案,看事实:分支还在、而且确实没被合进 HEAD / 上游
@@ -468,10 +470,13 @@ pub fn parse_checkout_reflog(message: &str) -> Option<(&str, &str)> {
 /// 那个分支正是最常要切回去的)。**排除当前分支**(它在列表里另有标记)、已被删除
 /// 的分支与 detached 检出的提交号。
 pub fn recent_branches(repo_path: &Path, limit: usize) -> Result<Vec<String>> {
-    let repo = Repository::open(repo_path)?;
-    let current = head_branch_name(&repo);
+    Ok(recent_branches_in(&Repository::open(repo_path)?, limit))
+}
+
+fn recent_branches_in(repo: &Repository, limit: usize) -> Vec<String> {
+    let current = head_branch_name(repo);
     let Ok(reflog) = repo.reflog("HEAD") else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -487,12 +492,12 @@ pub fn recent_branches(repo_path: &Path, limit: usize) -> Result<Vec<String>> {
             if repo.find_branch(name, BranchType::Local).is_ok() {
                 out.push(name.to_string());
                 if out.len() >= limit {
-                    return Ok(out);
+                    return out;
                 }
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// 本地分支相对上游的领先 / 落后。
@@ -507,17 +512,125 @@ pub struct BranchTracking {
     pub behind: usize,
 }
 
-/// 逐个本地分支算领先 / 落后的上限。分支成百上千的仓库只算前这么多个,
-/// 分支弹窗里其余的不显示计数 —— 每个都要走一次提交图。
+/// 逐个本地分支算领先 / 落后的上限。分支成百上千的仓库只算按引用名排在前面的这么多个,
+/// 分支弹窗里其余的不显示计数 —— 每个都要走一次提交图(结果有缓存,见 [`AheadBehindCache`])。
+/// HEAD 所在分支不受这个上限:排第几都算(见 [`local_branch_tracking_in`])。
 const TRACKING_LIMIT: usize = 300;
 
-fn tracking_of(repo: &Repository, branch: &git2::Branch<'_>) -> Option<BranchTracking> {
+/// 领先 / 落后的进程级缓存,键是 `(仓库的 git 目录, 本地提交, 上游提交)`。
+///
+/// 每次面板刷新(哪怕只动了索引)都要把几百个分支的计数重算一遍:每个都是一趟提交图
+/// 遍历,300 个分支实测 1~1.5s。提交对象不可变,同一对提交的计数永远不变,所以
+/// **不需要失效** —— 分支移动了键就跟着变;只设容量上限,满了整表清空。浅克隆
+/// (`fetch --deepen` 会改变提交图的形状)不进缓存。
+struct AheadBehindCache {
+    map: HashMap<(PathBuf, Oid, Oid), (usize, usize)>,
+    cap: usize,
+}
+
+impl AheadBehindCache {
+    fn get(&self, key: &(PathBuf, Oid, Oid)) -> Option<(usize, usize)> {
+        self.map.get(key).copied()
+    }
+
+    fn insert(&mut self, key: (PathBuf, Oid, Oid), counts: (usize, usize)) {
+        if self.map.len() >= self.cap {
+            self.map.clear();
+        }
+        self.map.insert(key, counts);
+    }
+}
+
+/// 缓存条目上限:每条几十字节,够几十个仓库各几百个分支用。
+const AHEAD_BEHIND_CACHE_CAP: usize = 4096;
+
+static AHEAD_BEHIND: LazyLock<Mutex<AheadBehindCache>> = LazyLock::new(|| {
+    Mutex::new(AheadBehindCache {
+        map: HashMap::new(),
+        cap: AHEAD_BEHIND_CACHE_CAP,
+    })
+});
+
+/// `graph_ahead_behind(local, upstream)`,先查缓存。
+fn cached_ahead_behind(repo: &Repository, local: Oid, upstream: Oid) -> Option<(usize, usize)> {
+    if repo.is_shallow() {
+        return repo.graph_ahead_behind(local, upstream).ok();
+    }
+    let key = (repo.path().to_path_buf(), local, upstream);
+    if let Some(hit) = AHEAD_BEHIND.lock().get(&key) {
+        return Some(hit);
+    }
+    // 算的时候不攥着锁:别的仓库 / 别的分支照样能查
+    let counts = repo.graph_ahead_behind(local, upstream).ok()?;
+    AHEAD_BEHIND.lock().insert(key, counts);
+    Some(counts)
+}
+
+/// 一批本地分支共用的上游解析,口径照 libgit2 的 `git_branch_upstream`:
+/// `branch.<b>.remote` + `branch.<b>.merge`,经该远程第一条匹配的 fetch refspec 换算成
+/// 远程跟踪引用(`remote = .` 时就是本地分支 `merge` 本身),引用不在算没有上游。
+///
+/// 逐分支调 `Branch::upstream()` 时 libgit2 每次都给整份配置做两回快照(读上游配置一回、
+/// 按名字查远程又一回):配置里有几百个分支段的仓库,300 个分支光这一步就 0.6s(提交图
+/// 都还没走)。这里整批共用一份配置快照、每个远程只查一次。
+pub(super) struct UpstreamResolver<'r> {
+    repo: &'r Repository,
+    config: Option<git2::Config>,
+    remotes: HashMap<String, Option<git2::Remote<'r>>>,
+}
+
+impl<'r> UpstreamResolver<'r> {
+    pub(super) fn new(repo: &'r Repository) -> Self {
+        Self {
+            repo,
+            config: repo.config().and_then(|mut c| c.snapshot()).ok(),
+            remotes: HashMap::new(),
+        }
+    }
+
+    /// 本地分支 `branch`(短名)的上游:`(上游短名,上游引用指向的提交)`。短名与
+    /// `Branch::upstream()?.name()` 相同(`origin/main`;本地上游是分支名);上游是符号引用时
+    /// 提交为 `None`。没配上游、远程跟踪引用不在、上游不是分支都是 `None`。
+    pub(super) fn upstream(&mut self, branch: &str) -> Option<(String, Option<Oid>)> {
+        let refname = self.upstream_refname(branch)?;
+        let reference = self.repo.find_reference(&refname).ok()?;
+        let short = refname
+            .strip_prefix("refs/remotes/")
+            .or_else(|| refname.strip_prefix("refs/heads/"))?
+            .to_string();
+        Some((short, reference.target()))
+    }
+
+    fn upstream_refname(&mut self, branch: &str) -> Option<String> {
+        let config = self.config.as_ref()?;
+        let get = |key: String| config.get_string(&key).ok().filter(|v| !v.is_empty());
+        let remote = get(format!("branch.{branch}.remote"))?;
+        let merge = get(format!("branch.{branch}.merge"))?;
+        if remote == "." {
+            return Some(merge);
+        }
+        let repo = self.repo;
+        let found = self
+            .remotes
+            .entry(remote)
+            .or_insert_with_key(|name| repo.find_remote(name).ok())
+            .as_ref()?;
+        let spec = found
+            .refspecs()
+            .find(|spec| spec.direction() == git2::Direction::Fetch && spec.src_matches(&merge))?;
+        spec.transform(&merge).ok()?.as_str().map(str::to_string)
+    }
+}
+
+fn tracking_of(
+    repo: &Repository,
+    upstreams: &mut UpstreamResolver<'_>,
+    branch: &git2::Branch<'_>,
+) -> Option<BranchTracking> {
     let name = branch.name().ok().flatten()?.to_string();
     let local = branch.get().target()?;
-    let upstream = branch.upstream().ok()?;
-    let upstream_name = upstream.name().ok().flatten()?.to_string();
-    let remote = upstream.get().target()?;
-    let (ahead, behind) = repo.graph_ahead_behind(local, remote).ok()?;
+    let (upstream_name, remote) = upstreams.upstream(&name)?;
+    let (ahead, behind) = cached_ahead_behind(repo, local, remote?)?;
     Some(BranchTracking {
         branch: name,
         upstream: upstream_name,
@@ -529,25 +642,115 @@ fn tracking_of(repo: &Repository, branch: &git2::Branch<'_>) -> Option<BranchTra
 /// 全部配了上游(且远程跟踪引用在场)的本地分支的领先 / 落后。分支弹窗逐行用。
 pub fn local_branch_tracking(repo_path: &Path) -> Result<Vec<BranchTracking>> {
     let repo = Repository::open(repo_path)?;
+    local_branch_tracking_in(&repo, &mut UpstreamResolver::new(&repo), TRACKING_LIMIT)
+}
+
+/// 按引用名顺序算前 `limit` 个本地分支;HEAD 所在分支排在这之外时单独补在末尾 ——
+/// 分支弹窗的「当前分支」行只查这张表,本地分支几百个、当前分支名又靠后时(`main`
+/// 排在一堆 `feature/*` 后面)它会没有 ↑↓,而仓库栏照样有。
+fn local_branch_tracking_in(
+    repo: &Repository,
+    upstreams: &mut UpstreamResolver<'_>,
+    limit: usize,
+) -> Result<Vec<BranchTracking>> {
+    let head = head_branch_name(repo);
+    let mut head_seen = false;
     let mut out = Vec::new();
-    for item in repo.branches(Some(BranchType::Local))?.take(TRACKING_LIMIT) {
+    for item in repo.branches(Some(BranchType::Local))?.take(limit) {
         let (branch, _) = item?;
-        if let Some(tracking) = tracking_of(&repo, &branch) {
+        head_seen |= branch.name().ok().flatten() == head.as_deref();
+        if let Some(tracking) = tracking_of(repo, upstreams, &branch) {
             out.push(tracking);
         }
+    }
+    if !head_seen
+        && let Some(branch) = head.and_then(|name| repo.find_branch(&name, BranchType::Local).ok())
+        && let Some(tracking) = tracking_of(repo, upstreams, &branch)
+    {
+        out.push(tracking);
     }
     Ok(out)
 }
 
-/// HEAD 所在分支相对上游的领先 / 落后(`git2::graph_ahead_behind`)。
+/// HEAD 所在分支相对上游的领先 / 落后(`git2::graph_ahead_behind`,有缓存)。
 /// detached HEAD、没配上游、上游引用不在时是 `None`。
 pub fn ahead_behind(repo_path: &Path) -> Result<Option<BranchTracking>> {
     let repo = Repository::open(repo_path)?;
-    let Some(name) = head_branch_name(&repo) else {
+    ahead_behind_in(&repo, &mut UpstreamResolver::new(&repo))
+}
+
+fn ahead_behind_in(
+    repo: &Repository,
+    upstreams: &mut UpstreamResolver<'_>,
+) -> Result<Option<BranchTracking>> {
+    let Some(name) = head_branch_name(repo) else {
         return Ok(None);
     };
     let branch = repo.find_branch(&name, BranchType::Local)?;
-    Ok(tracking_of(&repo, &branch))
+    Ok(tracking_of(repo, upstreams, &branch))
+}
+
+// ---------------------------------------------------------------------------
+// Git 面板的分支快照
+// ---------------------------------------------------------------------------
+
+/// Git 面板一次分支快照要的全部只读数据(仓库栏、分支弹窗、横幅、推拉按钮),
+/// 由 [`repo_panel_snapshot`] 一次开库取齐。
+#[derive(Debug, Clone)]
+pub struct RepoPanelSnapshot {
+    /// 读这份快照**之前**的仓库签名(见 [`repo_panel_snapshot`] 为什么要最先算)。
+    pub signature: Option<RepoSignature>,
+    pub branches: Vec<BranchInfo>,
+    /// HEAD 的显示名(同 [`current_head_label`])。
+    pub head_label: Option<String>,
+    /// HEAD 分支相对上游的领先 / 落后(同 [`ahead_behind`])。
+    pub head_tracking: Option<BranchTracking>,
+    /// 全部本地分支的领先 / 落后(同 [`local_branch_tracking`]):分支多时只算前一段,
+    /// HEAD 分支总在列。
+    pub tracking: Vec<BranchTracking>,
+    /// 最近检出过的分支(同 [`recent_branches`])。
+    pub recent: Vec<String>,
+    pub remotes: Vec<String>,
+    pub op: RepoOpState,
+    pub pull_config: PullConfig,
+    /// HEAD 分支的推送计划(同 `push_plan(repo, None)`)。
+    pub push_plan: Option<PushPlan>,
+    pub stash_count: usize,
+}
+
+/// 一次开库读齐 Git 面板的分支快照。只读;除分支列表外,单项失败按空值 / 默认值算,
+/// 不拖垮整份(与逐项调用各自的公开函数时一致)。
+///
+/// 以前面板是逐项调十一个公开函数,各开一次库(开库 1~2ms,读索引的那几项还各读一遍
+/// 索引)。更要紧的是**签名必须最先算**:以前签名排在最后,读快照期间仓库又变了的话
+/// (AI 先 `git add` 再 `git commit`),签名已是新状态、其余各项还是旧的;之后 `.git`
+/// 监听拿新算的签名一比「没变」就不刷,面板停在旧数据上。签名先算,它最多比数据旧 ——
+/// 旧了下一次比对就认得出,只会多刷一次。
+pub fn repo_panel_snapshot(repo_path: &Path, recent_limit: usize) -> Result<RepoPanelSnapshot> {
+    let repo = Repository::open(repo_path)?;
+    let signature = repo_signature_in(&repo).ok();
+    let mut upstreams = UpstreamResolver::new(&repo);
+    let branches = repo_branches_in(&repo, &mut upstreams)?;
+    let tracking =
+        local_branch_tracking_in(&repo, &mut upstreams, TRACKING_LIMIT).unwrap_or_default();
+    // HEAD 那条刚在上面算过(排第几都算),这里命中缓存
+    let head_tracking = ahead_behind_in(&repo, &mut upstreams).ok().flatten();
+    Ok(RepoPanelSnapshot {
+        signature,
+        branches,
+        head_label: current_head_label_in(&repo),
+        head_tracking,
+        tracking,
+        recent: recent_branches_in(&repo, recent_limit),
+        remotes: remote_names(&repo),
+        op: RepoOpState {
+            kind: op_kind_of(repo.state()),
+            conflicted: conflicted_file_count(&repo),
+        },
+        pull_config: pull_config_in(&repo),
+        push_plan: push_plan_in(&repo, None).ok(),
+        stash_count: stash_entries(&repo),
+    })
 }
 
 #[cfg(test)]
@@ -866,6 +1069,185 @@ mod tests {
             "detached 的显示名是带括号的短 hash"
         );
         cleanup(&[&work, &bare, &other]);
+    }
+
+    /// 本地分支多过上限时,HEAD 所在分支排在上限之外也照算(分支弹窗「当前分支」行的
+    /// ↑↓ 与仓库栏同一个数);其余分支的上限口径不变,HEAD 在范围里时也不重复补。
+    #[test]
+    fn 领先落后超上限时当前分支照算() {
+        let (work, bare, main) = repo_with_origin("br-ab-limit");
+        // HEAD 换到一条配好上游、再领先一个提交的分支上
+        git(&work, &["checkout", "-q", "-b", "zz-head"]);
+        git(&work, &["push", "-q", "-u", "origin", "zz-head"]);
+        commit_file(&work, "w.txt", "w\n", "w");
+
+        let repo = Repository::open(&work).unwrap();
+        let tracked = |limit: usize| -> Vec<BranchTracking> {
+            let mut all =
+                local_branch_tracking_in(&repo, &mut UpstreamResolver::new(&repo), limit).unwrap();
+            all.sort_by(|a, b| a.branch.cmp(&b.branch));
+            all
+        };
+        // 上限 0:一条分支都轮不到 —— 配了上游的 main 照旧不算,HEAD 的 zz-head 照算
+        let capped = tracked(0);
+        let names: Vec<&str> = capped.iter().map(|t| t.branch.as_str()).collect();
+        assert_eq!(names, ["zz-head"]);
+        assert_eq!((capped[0].ahead, capped[0].behind), (1, 0));
+        assert_eq!(capped[0].upstream, "origin/zz-head");
+        // 上限够用:HEAD 已在范围里,不重复补
+        let all = tracked(TRACKING_LIMIT);
+        let names: Vec<&str> = all.iter().map(|t| t.branch.as_str()).collect();
+        assert_eq!(names, [main.as_str(), "zz-head"]);
+        drop(repo);
+
+        // 快照里的当前分支计数与仓库栏(head_tracking)同一个数
+        let snap = repo_panel_snapshot(&work, 5).unwrap();
+        let head = snap.head_tracking.clone().expect("有上游");
+        assert!(snap.tracking.contains(&head), "{:?}", snap.tracking);
+        cleanup(&[&work, &bare]);
+    }
+
+    /// 整批共用一份配置快照的上游解析,结论与逐分支 `Branch::upstream()` 逐条相同:
+    /// 跟踪远程分支、以本地分支为上游、自定义 refspec 的远程、上游引用已不在、没配上游。
+    #[test]
+    fn 上游解析与_libgit2_逐个解析一致() {
+        let (work, bare, main) = repo_with_origin("br-upstream-equiv");
+        git(&work, &["branch", "local-up"]);
+        git(&work, &["branch", "--set-upstream-to", &main, "local-up"]);
+        git(&work, &["branch", "gone-up"]);
+        git(&work, &["config", "branch.gone-up.remote", "origin"]);
+        git(
+            &work,
+            &["config", "branch.gone-up.merge", "refs/heads/never-pushed"],
+        );
+        git(&work, &["branch", "plain"]);
+        // 自定义 refspec:远程叫 fork,跟踪引用放在 refs/remotes/mirror/ 下
+        git(
+            &work,
+            &["remote", "add", "fork", "https://example.invalid/f.git"],
+        );
+        git(
+            &work,
+            &[
+                "config",
+                "remote.fork.fetch",
+                "+refs/heads/*:refs/remotes/mirror/*",
+            ],
+        );
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["update-ref", "refs/remotes/mirror/dev", &head]);
+        git(&work, &["branch", "dev"]);
+        git(&work, &["config", "branch.dev.remote", "fork"]);
+        git(&work, &["config", "branch.dev.merge", "refs/heads/dev"]);
+
+        let repo = Repository::open(&work).unwrap();
+        let mut upstreams = UpstreamResolver::new(&repo);
+        let mut checked = 0;
+        for item in repo.branches(Some(BranchType::Local)).unwrap() {
+            let (branch, _) = item.unwrap();
+            let name = branch.name().unwrap().unwrap().to_string();
+            let expect = branch
+                .upstream()
+                .ok()
+                .map(|u| (u.name().unwrap().unwrap().to_string(), u.get().target()));
+            assert_eq!(upstreams.upstream(&name), expect, "{name}");
+            checked += 1;
+        }
+        assert_eq!(checked, 5);
+        assert_eq!(
+            upstreams.upstream("dev").map(|(n, _)| n).as_deref(),
+            Some("mirror/dev")
+        );
+        assert_eq!(upstreams.upstream("gone-up"), None);
+        cleanup(&[&work, &bare]);
+    }
+
+    /// 领先 / 落后的缓存:同一对提交第二次直接命中;分支一动(提交变了)就是新的键,
+    /// 计数跟着变,不会拿到旧数。
+    #[test]
+    fn 领先落后缓存不给旧数() {
+        let (work, bare, branch) = repo_with_origin("br-ab-cache");
+        commit_file(&work, "w.txt", "w\n", "w");
+        let first = ahead_behind(&work).unwrap().unwrap();
+        assert_eq!((first.ahead, first.behind), (1, 0));
+        let repo = Repository::open(&work).unwrap();
+        let local = repo.head().unwrap().target().unwrap();
+        let upstream = repo
+            .find_branch(&branch, BranchType::Local)
+            .unwrap()
+            .upstream()
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        let key = (repo.path().to_path_buf(), local, upstream);
+        assert_eq!(AHEAD_BEHIND.lock().get(&key), Some((1, 0)), "算过就进缓存");
+        drop(repo);
+
+        commit_file(&work, "w2.txt", "w2\n", "w2");
+        let second = ahead_behind(&work).unwrap().unwrap();
+        assert_eq!((second.ahead, second.behind), (2, 0));
+        git(&work, &["push", "-q", "origin", &branch]);
+        let pushed = ahead_behind(&work).unwrap().unwrap();
+        assert_eq!((pushed.ahead, pushed.behind), (0, 0));
+        cleanup(&[&work, &bare]);
+    }
+
+    /// 缓存满了整表清空,再接着记。
+    #[test]
+    fn 领先落后缓存满了清空() {
+        let mut cache = AheadBehindCache {
+            map: HashMap::new(),
+            cap: 2,
+        };
+        let key = |n: u8| {
+            (
+                PathBuf::from("r"),
+                Oid::from_bytes(&[n; 20]).unwrap(),
+                Oid::zero(),
+            )
+        };
+        cache.insert(key(1), (1, 1));
+        cache.insert(key(2), (2, 2));
+        assert_eq!(cache.get(&key(1)), Some((1, 1)));
+        cache.insert(key(3), (3, 3));
+        assert_eq!(cache.map.len(), 1, "满了先清空");
+        assert_eq!(cache.get(&key(1)), None);
+        assert_eq!(cache.get(&key(3)), Some((3, 3)));
+    }
+
+    /// 一次开库的分支快照与逐项调用各自的公开函数结果一致。
+    #[test]
+    fn 分支快照与逐项读取一致() {
+        let (work, bare, _) = repo_with_origin("br-snapshot");
+        commit_file(&work, "w.txt", "w\n", "w");
+        git(&work, &["branch", "other"]);
+        git(&work, &["checkout", "-q", "other"]);
+        git(&work, &["checkout", "-q", "-"]);
+        std::fs::write(work.join("a.txt"), "stash me\n").unwrap();
+        git(&work, &["stash", "push", "-q"]);
+
+        let snap = repo_panel_snapshot(&work, 5).unwrap();
+        assert_eq!(
+            snap.signature,
+            Some(super::super::repo_signature(&work).unwrap())
+        );
+        assert_eq!(
+            snap.branches,
+            super::super::get_repo_branches(&work).unwrap()
+        );
+        assert_eq!(snap.head_label, current_head_label(&work).unwrap());
+        assert_eq!(snap.head_tracking, ahead_behind(&work).unwrap());
+        assert_eq!(snap.tracking, local_branch_tracking(&work).unwrap());
+        assert_eq!(snap.recent, recent_branches(&work, 5).unwrap());
+        assert_eq!(snap.recent, vec!["other".to_string()]);
+        assert_eq!(snap.remotes, list_remotes(&work).unwrap());
+        assert_eq!(snap.op, super::super::repo_operation_state(&work).unwrap());
+        assert_eq!(snap.pull_config, super::super::pull_config(&work));
+        assert_eq!(snap.push_plan, super::super::push_plan(&work, None).ok());
+        assert_eq!(snap.stash_count, 1);
+        assert!(snap.head_tracking.is_some() && !snap.tracking.is_empty());
+        cleanup(&[&work, &bare]);
     }
 
     /// 远程分支检出:本地没有就建跟踪分支,有就检出本地那个。

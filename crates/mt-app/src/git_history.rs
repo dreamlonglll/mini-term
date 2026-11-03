@@ -22,9 +22,15 @@
 //!   续页的游标由已加载列表还原([`GitLogCursor::from_loaded`]:已加载集合 +
 //!   它们尚未加载的父),不需要 branch。原版只拿「上一页末尾 commit 的 parent」
 //!   续走,合并历史里页边界上另一侧分支的提交会丢、已加载的会被带回来;
-//! - 合并新页走 [`mt_project::git::merge_log_page`]:按 hash 去重(防线,游标续页
-//!   本身不回已加载的),并在时钟偏移让子提交迟到时做一次稳定的拓扑修正 ——
-//!   拓扑图要求父永远在子之后。`has_more = 本页 >= 30 && 真的新增了`;
+//! - 合并新页走常驻索引 [`LoadedLog::merge`](语义同 `merge_log_page`):按 hash 去重
+//!   (防线,游标续页本身不回已加载的),并在时钟偏移让子提交迟到时做一次稳定的拓扑
+//!   修正 —— 拓扑图要求父永远在子之后。`has_more = 本页 >= 30 && 真的新增了`;
+//! - **每页只做与新页成正比的活**:去重用的位置表、续页游标、拓扑图都随追加的行增量
+//!   维护(上万条之后若每页整份重算,每续一页都要在主线程白做几十毫秒),只有触发了
+//!   拓扑修正(行序变了)才整份重建;
+//! - **自动续页有软上限**:滚到底 / 键盘走到末尾附近自动要下一页,累计
+//!   [`AUTO_LOAD_LIMIT`] 条之后停下,列表末尾换成「加载更多」按钮,点一下续一页 ——
+//!   视口停在底部时不会一页接一页地一路续到头;
 //! - **请求令牌**:换仓库 / 换分支时令牌 +1,迟到响应直接丢弃。
 //!
 //! # 过滤
@@ -46,11 +52,25 @@
 //! 首页回来时整体替换,期间只在过滤栏右侧标一个「刷新中…」。换仓库 / 换分支 / 换过滤
 //! 条件([`GitHistoryContent::restart`])内容本就不同,才当场清空。
 //!
+//! 监听触发的重载([`GitHistoryContent::reload_quiet`],`.git` 引用变了)同样保留旧列表,
+//! 但发起时不重画;首页回来与眼下一模一样(提交序列、引用、标签、选择都没变 —— 贮藏、
+//! fetch 了别的分支之类)就连落地那一下也不画。期间要是别处让窗口画过一帧(那一帧画出了
+//! 「刷新中…」),落地照常重画把它收掉。
+//!
+//! 刷新的首页按已加载的深度重取(至多 [`RELOAD_KEEP_LIMIT`] 条,见 [`reload_depth`]):
+//! 往下翻过的人,终端里提交一次触发的自动刷新不会把列表截回 30 条、把滚动位置钳回顶上
+//! 那一截 —— 列表照旧整体替换,条数差不多,滚动偏移留在原处。
+//!
+//! 留在原处只对**同一份列表**的刷新成立。首页落定时按列表的身份([`ListIdentity`]:仓库、
+//! 查看的分支 / 跟随 HEAD 时 HEAD 的显示名、生效的过滤条件)判:身份变了就回到顶部 ——
+//! 跟随 HEAD 时检出另一个分支走的也是保留旧列表的刷新,不判的话新分支的列表停在旧分支
+//! 翻到的第两百行,HEAD 那一行不在视口里。
+//!
 //! # 拓扑图为什么自绘
 //!
 //! gpui 的 `svg()` 是单色 alpha 掩膜(丢色),Image 的 SVG 分支有 BGRA 交换 bug ——
 //! 两条都不能用(K 批记档)。这里走 [`gpui::PathBuilder`] 自绘:贝塞尔用
-//! `cubic_bezier_to`,渐变用**分段近似**(见 [`GraphCell`] 的注释)。
+//! `cubic_bezier_to`,渐变用 path 的线性渐变底色(见 [`GraphCell`] 的注释)。
 //!
 //! ⚠️ 行高必须恒为 [`GRAPH_ROW_HEIGHT`](crate::git_graph::GRAPH_ROW_HEIGHT),
 //! 否则连线跨行接不上(过滤时图列隐藏,行高照旧,uniform_list 才量得准)。
@@ -70,16 +90,18 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element, Entity,
-    EventEmitter, FocusHandle, Focusable as _, GlobalElementId, Hsla, InspectorElementId,
+    AnyElement, AnyView, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Element,
+    Entity, EventEmitter, FocusHandle, Focusable as _, GlobalElementId, Hsla, InspectorElementId,
     InteractiveElement, IntoElement, LayoutId, MouseButton, MouseDownEvent, ParentElement,
     PathBuilder, Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement,
-    Style, Styled, Subscription, Task, UniformListScrollHandle, Window, canvas, div, point,
-    prelude::FluentBuilder as _, px, uniform_list,
+    Style, Styled, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas, div,
+    linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use mt_project::git::{BranchInfo, GitCommitInfo, GitLogCursor, LogFilter, LogPage, TagInfo};
-use mt_ui::tooltip::TooltipExt as _;
+use mt_project::git::{
+    BranchInfo, GitCommitInfo, GitLogCursor, LoadedLog, LogFilter, LogPage, TagInfo,
+};
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
@@ -127,6 +149,11 @@ const FILTER_DEBOUNCE_MS: u64 = 300;
 const FILTER_INPUT_MIN_W: f32 = 140.0;
 /// 键盘往下走时,离已加载末尾还剩几行就预取下一页。
 const PREFETCH_ROWS: usize = 5;
+/// 自动续页(滚到底 / 键盘预取)的软上限:累计这么多条之后不再自动要,列表末尾换成
+/// 「加载更多」按钮(见模块注释「分页」)。
+const AUTO_LOAD_LIMIT: usize = 5000;
+/// 保留旧列表的刷新,首页最多重取多少条(见 [`reload_depth`])。
+const RELOAD_KEEP_LIMIT: usize = 300;
 /// 行里直接显示几个引用胶囊,其余收进「+N」。
 const MAX_PILLS: usize = 2;
 /// 历史区窄于这个宽度时,行里只留作者头像、不写作者名。
@@ -279,16 +306,32 @@ pub struct GitHistoryContent {
     view_branch: Option<String>,
     tags: Vec<TagInfo>,
     /// 提交 → 指向它的标签名(行渲染逐行查表,不在每帧里扫全部标签)。
-    tags_by_commit: HashMap<String, Vec<String>>,
+    tags_by_commit: HashMap<String, Vec<SharedString>>,
+    /// 提交 → 行上要挂的分支胶囊(展示口径见 [`shows_branch`]),换引用 / 换查看
+    /// 分支时按 [`branch_pills_by_commit`] 建一次:行渲染逐行查表,不再每行把全部分支扫两遍。
+    branch_pills: HashMap<String, Vec<(SharedString, RefKind)>>,
     commits: Vec<GitCommitInfo>,
+    /// `commits` 的常驻索引(hash → 行号 + 续页游标),随每页增量维护(见模块注释「分页」)。
+    /// ⚠️ 与 `commits` 同进同退:清空 / 合并一律成对改。
+    log: LoadedLog,
     graph: GraphLayout,
     loading: bool,
     has_more: bool,
+    /// 这一轮首页要几条:换仓库 / 换分支 / 换过滤条件是一页,保留旧列表的刷新按
+    /// [`reload_depth`] 回与眼下差不多深的一段。只在令牌 +1 的时候改。
+    first_limit: usize,
     /// 保留旧列表的重载在途(过滤栏右侧标「刷新中…」)。
     refreshing: bool,
     load_error: Option<String>,
     /// 请求令牌:换仓库 / 换分支后的迟到响应丢弃。
     request: u64,
+    /// 屏上这份列表是按什么取的(见 [`ListIdentity`]);`None` = 当场清空过 / 还没落定过。
+    shown: Option<ListIdentity>,
+    /// 这一轮是 [`Self::reload_quiet`] 发起的:发起前屏上那份列表区的样子(发起时会复位
+    /// `has_more` 等字段,所以在那之前记)。首页回来与它一样就不重画。
+    quiet_baseline: Option<ListView>,
+    /// 上一帧画出了在途态(`loading` / `refreshing`):静默重载落地时必须重画把它收掉。
+    drawn_loading: bool,
     /// pty-output 嗅探的 500ms 去抖终点(与「更改」区各算各的)。
     debounce_until: Option<Instant>,
     filter: FilterState,
@@ -313,6 +356,67 @@ impl EventEmitter<GitHistoryEvent> for GitHistoryContent {}
 struct HistoryRefs {
     branches: Vec<BranchInfo>,
     head: Option<String>,
+}
+
+/// 见 [`GitHistoryContent::list_view`]。提交按 hash 比:同一个 hash 的内容不会变。
+#[derive(Debug, PartialEq)]
+struct ListView {
+    hashes: Vec<String>,
+    has_more: bool,
+    error: Option<String>,
+    tags: Vec<TagInfo>,
+    branches: Vec<BranchInfo>,
+    head_branch: Option<String>,
+    head_hash: Option<String>,
+    selection: CommitSelection,
+    detail: Option<DetailTarget>,
+}
+
+/// 提交列表的「身份」:首页是按什么取的。首页落定时与屏上那份比(见 [`scrolls_to_top`]):
+/// 变了就是整份重来,列表回到顶部、HEAD 那一行看得见;没变就是同一份列表的刷新(外部新提交、
+/// 按已加载深度重取首页),滚动位置与选中照旧(见模块注释「刷新不闪」)。
+///
+/// 跟随 HEAD 时 HEAD 换没换指向要等首页回来才知道:检出另一个分支走的是保留旧列表的
+/// [`GitHistoryContent::reload`],发起时 HEAD 名还是旧的,首页带着同一时刻读的引用回来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListIdentity {
+    repo: String,
+    branch: ShownBranch,
+    /// 生效的过滤条件;没有生效的为 `None`。
+    filter: Option<LogFilter>,
+}
+
+/// 列表展示的是哪条线的历史。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShownBranch {
+    /// 查看指定分支(未检出):HEAD 怎么动都与列表无关。
+    Viewing(String),
+    /// 跟随 HEAD:HEAD 的显示名(分支名;detached 是 `"(1a2b3c4)"`)。
+    Head(Option<String>),
+}
+
+impl ListIdentity {
+    fn new(
+        repo: &str,
+        view_branch: Option<&str>,
+        head: Option<&str>,
+        filter: Option<LogFilter>,
+    ) -> Self {
+        Self {
+            repo: repo.to_string(),
+            branch: match view_branch {
+                Some(branch) => ShownBranch::Viewing(branch.to_string()),
+                None => ShownBranch::Head(head.map(str::to_string)),
+            },
+            filter,
+        }
+    }
+}
+
+/// 首页落定时列表要不要回到顶部:屏上那份(`None` = 当场清空过 / 还没落定过)与这一份
+/// 身份不同就回。
+fn scrolls_to_top(shown: Option<&ListIdentity>, landed: &ListIdentity) -> bool {
+    shown != Some(landed)
 }
 
 /// 过滤框变窄之后把光标拉回可见区。
@@ -347,8 +451,25 @@ fn keep_caret_in_view(input: &Entity<InputState>, cx: &mut App) {
 /// 沿用容器透下来的那份。纯 git2 只读。
 fn read_history_refs(repo: &std::path::Path) -> Option<HistoryRefs> {
     let branches = mt_project::git::get_repo_branches(repo).ok()?;
-    let head = mt_project::git::current_head_label(repo).ok().flatten();
-    Some(HistoryRefs { branches, head })
+    Some(HistoryRefs {
+        head: head_label_of(&branches, || {
+            mt_project::git::current_head_label(repo).ok().flatten()
+        }),
+        branches,
+    })
+}
+
+/// HEAD 的显示名。HEAD 在某条本地分支上时就是它的名字 —— 分支列表里 `is_head` 按
+/// 「HEAD 这个符号引用指着谁」判,与 `current_head_label` 的分支名同一口径,不必为它再开
+/// 一次库;没有这样的分支(游离 HEAD 要短哈希、空仓库是 `None`)才走 `fallback` 去查。
+fn head_label_of(
+    branches: &[BranchInfo],
+    fallback: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    match branches.iter().find(|b| b.is_head && !b.is_remote) {
+        Some(branch) => Some(branch.name.clone()),
+        None => fallback(),
+    }
 }
 
 impl GitHistoryContent {
@@ -377,13 +498,19 @@ impl GitHistoryContent {
             view_branch: None,
             tags: Vec::new(),
             tags_by_commit: HashMap::new(),
+            branch_pills: HashMap::new(),
             commits: Vec::new(),
-            graph: git_graph::compute(&[]),
+            log: LoadedLog::default(),
+            graph: GraphLayout::empty(),
             loading: false,
             has_more: false,
+            first_limit: PAGE_SIZE,
             refreshing: false,
             load_error: None,
             request: 0,
+            shown: None,
+            quiet_baseline: None,
+            drawn_loading: false,
             debounce_until: None,
             filter: FilterState {
                 input,
@@ -432,6 +559,10 @@ impl GitHistoryContent {
         let reload = repo_changed || self.view_branch.as_deref() != view_branch;
         self.repo_path = repo_path.to_string();
         self.view_branch = view_branch.map(str::to_string);
+        if reload {
+            // 胶囊挂哪几条分支随查看分支变(它自己与它的上游)
+            self.rebuild_branch_pills();
+        }
         if tags_changed {
             let refs = HistoryRefs {
                 branches: branches.to_vec(),
@@ -465,25 +596,56 @@ impl GitHistoryContent {
     /// 右侧标「刷新中…」,内容不闪。
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.refreshing = !self.commits.is_empty();
+        self.quiet_baseline = None;
+        // 首页要回与眼下差不多深的一段(见 [`reload_depth`]):往下翻过的不会被截回 30 条
+        self.first_limit = reload_depth(self.commits.len());
+        self.begin_load(cx);
+        cx.notify();
+    }
+
+    /// 监听触发的重载(见模块注释「刷新不闪」):与 [`Self::reload`] 一样保留旧列表,但
+    /// 发起时不重画,首页回来与发起前屏上的相同就不重画。没有旧列表时(首屏还没出来)
+    /// 按普通重载。
+    pub fn reload_quiet(&mut self, cx: &mut Context<Self>) {
+        if self.commits.is_empty() {
+            self.reload(cx);
+            return;
+        }
+        // 已经有一轮静默的在途:屏上还是那一轮发起前的样子,沿用它的基线
+        if self.quiet_baseline.is_none() {
+            self.quiet_baseline = Some(self.list_view());
+        }
+        self.refreshing = true;
+        self.first_limit = reload_depth(self.commits.len());
         self.begin_load(cx);
     }
 
     /// 整体重来并**当场清空列表**(换仓库 / 换分支 / 换过滤条件:内容本来就不同)。
     /// 选择不在这里清:首页落定时由 [`Self::verify_selection`] 按「还在不在新列表里」逐个留
     /// (切分支 / 过滤后选中的提交仍在就照旧选着);换仓库在 [`Self::sync`] 里当场清空。
+    ///
+    /// 滚动也不在这里复位,只把屏上那份的身份作废:首页落定时由 [`Self::settle_identity`]
+    /// 回顶。检出另一个分支走的是保留旧列表的刷新、不经过这里,回顶只能在落定那一刻判,
+    /// 两条路收在一处。
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.commits.clear();
-        self.graph = git_graph::compute(&[]);
+        self.log.clear();
+        self.graph = GraphLayout::empty();
         self.refreshing = false;
+        self.shown = None;
+        self.quiet_baseline = None;
+        self.first_limit = PAGE_SIZE;
         self.begin_load(cx);
+        cx.notify();
     }
 
+    /// 发起首页。**不重画**:要不要当场画由调用方定([`Self::reload_quiet`] 不画)。
     fn begin_load(&mut self, cx: &mut Context<Self>) {
         self.has_more = false;
         self.load_error = None;
         self.filter.cursor = None;
         self.filter.scanned = 0;
-        self.filter.want = PAGE_SIZE;
+        self.filter.want = self.first_limit;
         self.request += 1;
         self.verify_selection = true;
         // ⚠️ loading 必须复位:令牌已 +1,在途响应注定被丢弃,而丢弃分支
@@ -497,8 +659,8 @@ impl GitHistoryContent {
             && let Some(refs) = self.deferred_refs.take()
         {
             self.apply_refs(refs, cx);
+            cx.notify();
         }
-        cx.notify();
     }
 
     /// 容器的 pty-output 嗅探命中了。
@@ -573,6 +735,10 @@ impl GitHistoryContent {
                     if this.request != req {
                         return;
                     }
+                    // 过滤时一页页接着扫(「搜索中…已扫描 N 个」要跟着走),静默不了,照常重画
+                    if first {
+                        this.quiet_baseline = None;
+                    }
                     this.loading = false;
                     if first {
                         this.settle_refs(refs, cx);
@@ -588,15 +754,17 @@ impl GitHistoryContent {
         } else {
             self.loading = true;
             self.refs_in_flight |= first;
-            let after = (!first).then(|| GitLogCursor::from_loaded(&self.commits));
+            // 续页游标随每页增量维护(`self.log`),这里只共享一份,不从整份列表重算
+            let after = (!first).then(|| self.log.cursor());
+            let limit = self.page_limit(first);
             cx.spawn(async move |this, cx| {
                 let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
                         let page = mt_project::git::get_git_log(
                             &repo,
-                            after.as_ref(),
-                            Some(PAGE_SIZE),
+                            after.as_deref(),
+                            Some(limit),
                             branch.as_deref(),
                         );
                         let tags =
@@ -609,6 +777,14 @@ impl GitHistoryContent {
                     if this.request != req {
                         return;
                     }
+                    // 静默重载(见 `reload_quiet`):期间没画出过在途态时,首页合并完与发起前
+                    // 屏上的一样就不重画
+                    let drawn = this.drawn_loading;
+                    let before = if first {
+                        this.quiet_baseline.take().filter(|_| !drawn)
+                    } else {
+                        None
+                    };
                     this.loading = false;
                     if first {
                         this.settle_refs(refs, cx);
@@ -617,12 +793,33 @@ impl GitHistoryContent {
                         Ok((page, tags)) => this.merge_page(first, page, tags, cx),
                         Err(err) => this.load_failed(err),
                     }
-                    cx.notify();
+                    if before.is_none_or(|before| before != this.list_view()) {
+                        cx.notify();
+                    }
                 });
             })
             .detach();
         }
-        cx.notify();
+        // 静默重载的首页:发起时不画(见 `reload_quiet`)
+        if !(first && self.quiet_baseline.is_some()) {
+            cx.notify();
+        }
+    }
+
+    /// 列表区与详情画出来取决于的那份数据(不含 `loading` / `refreshing` 这类在途标记),
+    /// 静默重载落地前后各取一份比对。
+    fn list_view(&self) -> ListView {
+        ListView {
+            hashes: self.commits.iter().map(|c| c.hash.clone()).collect(),
+            has_more: self.has_more,
+            error: self.load_error.clone(),
+            tags: self.tags.clone(),
+            branches: self.branches.clone(),
+            head_branch: self.head_branch.clone(),
+            head_hash: self.head_hash.clone(),
+            selection: self.selection.clone(),
+            detail: self.detail_target(),
+        }
     }
 
     fn load_failed(&mut self, err: anyhow::Error) {
@@ -639,9 +836,38 @@ impl GitHistoryContent {
             self.tags_by_commit
                 .entry(tag.target_hash.clone())
                 .or_default()
-                .push(tag.name.clone());
+                .push(tag.name.clone().into());
         }
         self.tags = tags;
+    }
+
+    /// 首页回来了:刷新保留的旧列表到这里才换掉(列表、索引、拓扑图一起)。
+    fn clear_loaded(&mut self) {
+        self.commits.clear();
+        self.log.clear();
+        self.graph = GraphLayout::empty();
+        self.refreshing = false;
+    }
+
+    /// 眼下这份列表的身份(见 [`ListIdentity`])。首页的引用落定([`Self::settle_refs`])
+    /// 之后取,HEAD 名才是与首页同一时刻的。
+    fn list_identity(&self) -> ListIdentity {
+        ListIdentity::new(
+            &self.repo_path,
+            self.view_branch.as_deref(),
+            self.head_branch.as_deref(),
+            self.filter.active().then(|| self.filter.as_filter()),
+        )
+    }
+
+    /// 首页落定:列表身份变了(整份重来)就回到顶部,同一份列表的刷新不动滚动位置
+    /// (见 [`scrolls_to_top`])。选中照旧由 [`Self::verify_selection`] 按新列表核对。
+    fn settle_identity(&mut self) {
+        let landed = self.list_identity();
+        if scrolls_to_top(self.shown.as_ref(), &landed) {
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.shown = Some(landed);
     }
 
     /// 合并一页。去重 + 拓扑修正 + `has_more` 判定,见模块注释。
@@ -653,17 +879,29 @@ impl GitHistoryContent {
         cx: &mut Context<Self>,
     ) {
         if first {
-            // 刷新保留的旧列表到这里才换掉
-            self.commits.clear();
-            self.refreshing = false;
+            self.clear_loaded();
+            self.settle_identity();
         }
         if let Some(tags) = tags {
             self.set_tags(tags);
         }
-        self.has_more = merge_into(&mut self.commits, page);
-        self.graph = git_graph::compute(&self.commits);
+        // 请求时的页大小:首页按 `first_limit`,续页一页 30。两者都只在令牌 +1 的时候改,
+        // 能落到这里的响应必是按眼下这个值请求的
+        let limit = self.page_limit(first);
+        self.has_more = merge_into(
+            &mut self.commits,
+            &mut self.log,
+            &mut self.graph,
+            page,
+            limit,
+        );
         self.refresh_head_hash();
         self.verify_selection(cx);
+    }
+
+    /// 这一页(无过滤时)要几条:首页按 [`Self::first_limit`],续页一页 [`PAGE_SIZE`]。
+    fn page_limit(&self, first: bool) -> usize {
+        if first { self.first_limit } else { PAGE_SIZE }
     }
 
     /// 重载回来(首页落定)之后核对选中:新列表里找不到的(切了分支 / 换了过滤条件 /
@@ -690,14 +928,15 @@ impl GitHistoryContent {
         cx: &mut Context<Self>,
     ) {
         if first {
-            self.commits.clear();
-            self.refreshing = false;
+            self.clear_loaded();
+            self.settle_identity();
         }
         if let Some(tags) = tags {
             self.set_tags(tags);
         }
         self.filter.scanned += page.scanned;
-        mt_project::git::merge_log_page(&mut self.commits, page.commits);
+        // 过滤后图列隐藏,拓扑图不必跟着算(换回无过滤时整体重来)
+        self.log.merge(&mut self.commits, page.commits);
         self.filter.cursor = page.next;
         self.has_more = self.filter.cursor.is_some();
         self.refresh_head_hash();
@@ -709,7 +948,7 @@ impl GitHistoryContent {
         }
     }
 
-    /// 触底:再要一页。
+    /// 再要一页(「加载更多」按钮直接走这里,不受 [`AUTO_LOAD_LIMIT`] 限制)。
     fn load_more(&mut self, cx: &mut Context<Self>) {
         if self.has_more && !self.loading {
             if self.filter.active() {
@@ -719,16 +958,38 @@ impl GitHistoryContent {
         }
     }
 
+    /// 自动续页(滚到底 / 键盘走到末尾附近):累计到 [`AUTO_LOAD_LIMIT`] 条就停,之后
+    /// 由列表末尾的「加载更多」按钮一页页要。
+    fn auto_load_more(&mut self, cx: &mut Context<Self>) {
+        if self.auto_load_allowed() {
+            self.load_more(cx);
+        }
+    }
+
+    fn auto_load_allowed(&self) -> bool {
+        self.commits.len() < AUTO_LOAD_LIMIT
+    }
+
     /// 换上一份引用(分支胶囊、HEAD 圆环跟着变)。分支有变(提交 / 推送 / 拉取之后分支头
     /// 前移)时,详情栏的「所在分支」跟着重查。
     fn apply_refs(&mut self, refs: HistoryRefs, cx: &mut Context<Self>) {
         let branches_changed = self.branches != refs.branches;
         self.branches = refs.branches;
         self.head_branch = refs.head;
+        self.rebuild_branch_pills();
         self.refresh_head_hash();
         if branches_changed {
             self.refresh_containing(cx);
         }
+    }
+
+    /// 按眼下的分支列表 / HEAD / 查看分支重建行上的分支胶囊表(见 [`Self::branch_pills`])。
+    fn rebuild_branch_pills(&mut self) {
+        self.branch_pills = branch_pills_by_commit(
+            &self.branches,
+            self.head_branch.as_deref(),
+            self.view_branch.as_deref(),
+        );
     }
 
     /// 首页落定(成败都算):引用与提交列表一起换。首页没读到引用时退回在途期间容器透下来
@@ -898,7 +1159,7 @@ impl GitHistoryContent {
     fn follow_lead(&mut self, index: usize, cx: &mut Context<Self>) {
         self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
         if index + PREFETCH_ROWS >= self.commits.len() {
-            self.load_more(cx);
+            self.auto_load_more(cx);
         }
     }
 
@@ -1122,42 +1383,19 @@ impl GitHistoryContent {
 
     // ── 引用 ──────────────────────────────────────────────
 
-    /// 该行要标注的分支胶囊。
-    ///
-    /// ⚠️ **只标注本工作区的分支**(`GitHistoryContent.tsx:166-169` 原注释):
-    /// worktree 与主仓库共享 refs,标出全部分支会把其他工作区/远程的分支全挂到
-    /// commit 上,看起来像本工作区持有它们。
-    ///
-    /// 唯一的例外是**正在展示的本地分支的上游**(`origin/main`):它与本地分支
-    /// 胶囊同行就是「已推送」,落在下面几行就是「本地领先、还没推」,远端领先则
-    /// 压根不在这条线的历史里。用户一眼就能看出最新代码有没有到远程。
-    fn shown_branches(&self, hash: &str) -> Vec<&BranchInfo> {
-        pick_shown_branches(
-            &self.branches,
-            self.head_branch.as_deref(),
-            self.view_branch.as_deref(),
-            hash,
-        )
-    }
-
     fn branch_kind(&self, branch: &BranchInfo) -> RefKind {
-        if branch.is_remote {
-            RefKind::Remote
-        } else if Some(branch.name.as_str()) == self.head_branch.as_deref() {
-            RefKind::Head
-        } else {
-            RefKind::Local
-        }
+        branch_ref_kind(branch, self.head_branch.as_deref())
     }
 
-    /// 行上的引用胶囊:detached 的 HEAD → 分支(展示口径见 [`Self::shown_branches`])→ 标签。
-    fn row_refs(&self, hash: &str) -> Vec<(String, RefKind)> {
+    /// 行上的引用胶囊:detached 的 HEAD → 分支(展示口径见 [`shows_branch`],查预先建好的
+    /// [`Self::branch_pills`])→ 标签。
+    fn row_refs(&self, hash: &str) -> Vec<(SharedString, RefKind)> {
         let mut refs = Vec::new();
         if self.head_detached() && self.head_hash.as_deref() == Some(hash) {
-            refs.push((t("gitLog", "ref.head").to_string(), RefKind::Head));
+            refs.push((t("gitLog", "ref.head").into(), RefKind::Head));
         }
-        for branch in self.shown_branches(hash) {
-            refs.push((branch.name.clone(), self.branch_kind(branch)));
+        if let Some(pills) = self.branch_pills.get(hash) {
+            refs.extend(pills.iter().cloned());
         }
         if let Some(tags) = self.tags_by_commit.get(hash) {
             refs.extend(tags.iter().map(|t| (t.clone(), RefKind::Tag)));
@@ -1166,13 +1404,13 @@ impl GitHistoryContent {
     }
 
     /// 详情区的引用:指向它的**全部**分支(本地在前)+ 标签 —— 详情是查证用的,不做展示裁剪。
-    fn all_refs(&self, hash: &str) -> Vec<(String, RefKind)> {
+    fn all_refs(&self, hash: &str) -> Vec<(SharedString, RefKind)> {
         let mut refs = Vec::new();
         if self.head_detached() && self.head_hash.as_deref() == Some(hash) {
-            refs.push((t("gitLog", "ref.head").to_string(), RefKind::Head));
+            refs.push((t("gitLog", "ref.head").into(), RefKind::Head));
         }
         for branch in self.branches.iter().filter(|b| b.commit_hash == hash) {
-            refs.push((branch.name.clone(), self.branch_kind(branch)));
+            refs.push((branch.name.clone().into(), self.branch_kind(branch)));
         }
         refs.sort_by_key(|(_, kind)| match kind {
             RefKind::Head => 0,
@@ -1212,12 +1450,35 @@ impl GitHistoryContent {
     }
 }
 
+/// 保留旧列表的刷新,首页要几条:与已加载的差不多深(往下翻过的人刷新之后不会被截回
+/// 首页 30 条、滚动位置跟着被钳回顶上那一截),至少一页、至多 [`RELOAD_KEEP_LIMIT`] 条
+/// —— 再深的照旧从那里起由续页补(终端里每提交一次都要刷新一遍,不能每次重取几千条)。
+fn reload_depth(loaded: usize) -> usize {
+    loaded.clamp(PAGE_SIZE, RELOAD_KEEP_LIMIT)
+}
+
 /// [`GitHistoryContent::merge_page`] 的纯函数体,抽出来好测。返回 `has_more`:
-/// 本页满页**且**真的新增了提交 —— 整页重复时停下,免得拿同一个游标死循环请求。
-fn merge_into(commits: &mut Vec<GitCommitInfo>, page: Vec<GitCommitInfo>) -> bool {
-    let full_page = page.len() >= PAGE_SIZE;
-    let added = mt_project::git::merge_log_page(commits, page);
-    full_page && added > 0
+/// 本页满页(按请求的 `limit` 算)**且**真的新增了提交 —— 整页重复时停下,免得拿同一个
+/// 游标死循环请求。
+///
+/// 索引与拓扑图都只按新追加的行增量续上;这一页触发了跨页拓扑修正(行序变了)时
+/// 拓扑图整份重算(索引由 [`LoadedLog::merge`] 自己重建)。
+fn merge_into(
+    commits: &mut Vec<GitCommitInfo>,
+    log: &mut LoadedLog,
+    graph: &mut GraphLayout,
+    page: Vec<GitCommitInfo>,
+    limit: usize,
+) -> bool {
+    let full_page = page.len() >= limit;
+    let before = commits.len();
+    let merged = log.merge(commits, page);
+    if merged.reordered {
+        *graph = git_graph::compute(commits);
+    } else {
+        graph.extend(&commits[before..]);
+    }
+    full_page && merged.added > 0
 }
 
 /// 选中的提交 hash,按列表顺序。刚改写出来、列表还没重载到的新 HEAD 也算上(单选时)。
@@ -1247,7 +1508,55 @@ fn detail_target_of(
     (hashes.len() >= 2).then_some(DetailTarget::Multi(hashes))
 }
 
-/// [`GitHistoryContent::shown_branches`] 的纯函数体,抽出来好测。
+/// 行上挂哪些分支的胶囊。
+///
+/// ⚠️ **只标注本工作区的分支**(`GitHistoryContent.tsx:166-169` 原注释):
+/// worktree 与主仓库共享 refs,标出全部分支会把其他工作区/远程的分支全挂到
+/// commit 上,看起来像本工作区持有它们。
+///
+/// 唯一的例外是**正在展示的本地分支的上游**(`origin/main`):它与本地分支
+/// 胶囊同行就是「已推送」,落在下面几行就是「本地领先、还没推」,远端领先则
+/// 压根不在这条线的历史里。用户一眼就能看出最新代码有没有到远程。
+fn shows_branch(branch: &BranchInfo, view_branch: Option<&str>, upstream: Option<&str>) -> bool {
+    branch.is_head
+        || Some(branch.name.as_str()) == view_branch
+        || Some(branch.name.as_str()) == upstream
+}
+
+/// 分支胶囊的颜色档:远程 / HEAD 所在的本地分支 / 其它本地分支。
+fn branch_ref_kind(branch: &BranchInfo, head_branch: Option<&str>) -> RefKind {
+    if branch.is_remote {
+        RefKind::Remote
+    } else if Some(branch.name.as_str()) == head_branch {
+        RefKind::Head
+    } else {
+        RefKind::Local
+    }
+}
+
+/// 提交 → 行上的分支胶囊(口径见 [`shows_branch`]),组内保持分支列表的先后。一次扫完
+/// 全部分支建表,行渲染逐行查,不再每个可见行把全部分支扫两遍。
+fn branch_pills_by_commit(
+    branches: &[BranchInfo],
+    head_branch: Option<&str>,
+    view_branch: Option<&str>,
+) -> HashMap<String, Vec<(SharedString, RefKind)>> {
+    let upstream = tracked_upstream(branches, head_branch, view_branch);
+    let mut pills: HashMap<String, Vec<(SharedString, RefKind)>> = HashMap::new();
+    for branch in branches
+        .iter()
+        .filter(|b| shows_branch(b, view_branch, upstream))
+    {
+        pills.entry(branch.commit_hash.clone()).or_default().push((
+            branch.name.clone().into(),
+            branch_ref_kind(branch, head_branch),
+        ));
+    }
+    pills
+}
+
+/// 逐行一问的写法(建表之前每个可见行都这么扫一遍),留着给 [`branch_pills_by_commit`] 对拍。
+#[cfg(test)]
 fn pick_shown_branches<'a>(
     branches: &'a [BranchInfo],
     head_branch: Option<&str>,
@@ -1257,9 +1566,7 @@ fn pick_shown_branches<'a>(
     let upstream = tracked_upstream(branches, head_branch, view_branch);
     branches
         .iter()
-        .filter(|b| {
-            b.is_head || Some(b.name.as_str()) == view_branch || Some(b.name.as_str()) == upstream
-        })
+        .filter(|b| shows_branch(b, view_branch, upstream))
         .filter(|b| b.commit_hash == hash)
         .collect()
 }
@@ -1348,8 +1655,41 @@ fn row_tooltip(commit: &GitCommitInfo) -> String {
     )
 }
 
+/// 提交行的 tooltip 气泡:文字在**弹出那一刻**按 hash 回查这个提交现拼([`row_tooltip`])。
+/// 每帧给几十个可见行都先拼好太亏 —— 绝对时间要按本地时区换算,而真弹出来的最多一个。
+fn commit_tip(
+    view: WeakEntity<GitHistoryContent>,
+    hash: String,
+) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |window, cx| {
+        let text = view
+            .upgrade()
+            .and_then(|view| {
+                let history = view.read(cx);
+                let index = history.log.position(&hash)?;
+                history.commits.get(index).map(row_tooltip)
+            })
+            .unwrap_or_default();
+        Tooltip::new(text).build(window, cx)
+    }
+}
+
+/// 一串名字的 tooltip 气泡(「+N」胶囊悬停列出全部),弹出时才换行拼起来。
+fn names_tip(names: Vec<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |window, cx| {
+        let text = names
+            .iter()
+            .map(SharedString::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+        Tooltip::new(text).build(window, cx)
+    }
+}
+
 impl Render for GitHistoryContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 静默重载落地时据此判断:屏上是不是还挂着在途态(见 `reload_quiet`)
+        self.drawn_loading = self.loading || self.refreshing;
         let this = cx.entity();
         let mut root = div()
             .id("git-history")
@@ -1584,9 +1924,10 @@ impl GitHistoryContent {
         if self.commits.is_empty() {
             return self.render_empty(cx);
         }
-        // 刷新(保留旧列表)期间不挂这一行:那一趟取的是首页,状态已标在过滤栏右侧
-        let footer: Option<String> = (self.loading && !self.refreshing).then(|| {
-            if self.filter.active() {
+        // 刷新(保留旧列表)期间不挂这一行:那一趟取的是首页,状态已标在过滤栏右侧。
+        // 自动续页停在软上限时,末尾换成「加载更多」按钮
+        let footer: Option<Footer> = if self.loading && !self.refreshing {
+            Some(Footer::Busy(if self.filter.active() {
                 tr!(
                     "gitLog",
                     "filter.searching",
@@ -1594,8 +1935,15 @@ impl GitHistoryContent {
                 )
             } else {
                 t("gitLog", "loadingMore").to_string()
-            }
-        });
+            }))
+        } else if self.has_more && !self.loading && !self.auto_load_allowed() {
+            Some(Footer::More(self.commits.len()))
+        } else {
+            None
+        };
+        // 稳态(到底了 / 在途 / 到了软上限)不去排续页任务:可视区停在底部时这个回调
+        // 每帧都跑,不判的话每帧白 spawn 一个空转的 `load_more`
+        let auto_more = self.has_more && !self.loading && self.auto_load_allowed();
         let commits = self.commits.len();
         let count = commits + usize::from(footer.is_some());
         let this = cx.entity();
@@ -1605,19 +1953,20 @@ impl GitHistoryContent {
             move |range, _window, cx: &mut App| {
                 // 触底再要一页。**延到下一拍**执行:这里还在窗口的 prepaint 里,
                 // 直接 update 自己会与正在进行的渲染打架。
-                if range.end >= commits {
+                if auto_more && range.end >= commits {
                     let this = this.clone();
                     cx.spawn(async move |cx| {
-                        this.update(cx, |this: &mut GitHistoryContent, cx| this.load_more(cx));
+                        this.update(cx, |this: &mut GitHistoryContent, cx| {
+                            this.auto_load_more(cx)
+                        });
                     })
                     .detach();
                 }
                 let this = this.clone();
-                let footer = footer.clone();
                 range
                     .map(|i| {
                         if i >= commits {
-                            return footer_row(footer.clone().unwrap_or_default());
+                            return footer_row(footer.as_ref(), &this);
                         }
                         this.update(cx, |this, cx| this.render_commit(i, cx))
                     })
@@ -1742,17 +2091,14 @@ impl GitHistoryContent {
             row = row.child(pill);
         }
         if refs.len() > max_pills {
-            let all = refs
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+            let hidden = refs.len() - max_pills;
+            let all = refs.into_iter().map(|(name, _)| name).collect();
             row = row.child(
                 more_pill(
                     SharedString::from(format!("git-ref-more-{short_hash}")),
-                    refs.len() - max_pills,
+                    hidden,
                 )
-                .tip(all),
+                .tip_with(names_tip(all)),
             );
         }
 
@@ -1786,7 +2132,7 @@ impl GitHistoryContent {
                     .text_color(ui::text_muted())
                     .child(relative),
             )
-            .tip(row_tooltip(commit));
+            .tip_with(commit_tip(cx.entity().downgrade(), hash_full.clone()));
 
         row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             window.focus(&this.focus, cx);
@@ -1821,29 +2167,64 @@ impl GitHistoryContent {
     }
 }
 
-/// 列表末尾那一行「加载更多… / 搜索中…」(共用的加载提示行)。高度与提交行一致
-/// (uniform_list 按行等高排)。
-fn footer_row(text: String) -> AnyElement {
-    div()
+/// 列表末尾那一行。
+enum Footer {
+    /// 「加载更多… / 搜索中…」(共用的加载提示行)。
+    Busy(String),
+    /// 自动续页停在软上限:「已加载 N 个提交」+「加载更多」按钮。
+    More(usize),
+}
+
+/// 列表末尾那一行(见 [`Footer`])。高度与提交行一致(uniform_list 按行等高排)。
+fn footer_row(footer: Option<&Footer>, this: &Entity<GitHistoryContent>) -> AnyElement {
+    let row = div()
         .w_full()
         .h(px(GRAPH_ROW_HEIGHT))
         .flex()
         .items_center()
-        .justify_center()
-        .child(git_ui::busy_line(text))
-        .into_any_element()
+        .justify_center();
+    match footer {
+        Some(Footer::Busy(text)) => row.child(git_ui::busy_line(text.clone())),
+        Some(Footer::More(loaded)) => {
+            let this = this.clone();
+            row.gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .child(tr!("gitLog", "autoLoadPaused", count = loaded.to_string())),
+                )
+                .child(
+                    git_ui::action_button(
+                        "git-log-load-more",
+                        t("gitLog", "loadMore"),
+                        ButtonKind::Ghost,
+                        true,
+                    )
+                    .on_click(move |_: &ClickEvent, _window, cx| {
+                        this.update(cx, |this, cx| this.load_more(cx));
+                    }),
+                )
+        }
+        None => row,
+    }
+    .into_any_element()
 }
 
 // ─── 拓扑图单元格(自绘) ─────────────────────────────────────
 
 /// 一行的拓扑图。宽度 = [`GraphLayout::width`],高度恒为 [`GRAPH_ROW_HEIGHT`]。
 ///
-/// # 渐变的取舍
+/// # 渐变
 ///
 /// 原版每条异色线段挂一个 `<linearGradient>`(三个 stop:0% color / 70% color /
-/// 100% endColor)。gpui 的 `paint_path` 只吃单色,这里改成**分段近似**:
-/// 把路径按参数 t 切成若干小段,`t < 0.7` 用起点色,之后线性插值到终点色。
-/// 渐变是纯装饰(分支线并入主线时的过渡),分段够密时肉眼无差。
+/// 100% endColor)。`paint_path` 的底色可以是线性渐变(三个渲染后端的 path 光栅化都按
+/// path 包围盒套 `gradient_color`),于是整条线段一个 path:自上而下(180°),70% 处起点色、
+/// 100% 处终点色,之前全是起点色 —— 与原版三个 stop 同一形态。线段一律自上而下走,
+/// 按包围盒的纵向比例算与原版按 SVG 包围盒算是同一口径。
+///
+/// 早先 gpui 的 path 只吃单色,这里是按参数 t 切 8 段、每段一个 path 的分段近似;换成
+/// 真渐变之后过渡更平滑,每条异色线段的 path 图元从 8 个降到 1 个。
 struct GraphCell {
     row: GraphRow,
     width: f32,
@@ -1853,8 +2234,10 @@ struct GraphCell {
     selected: bool,
 }
 
-/// 渐变分段数。段与段之间留一点重叠(见 `paint`),8 段在行高上已看不出台阶。
-const GRADIENT_STEPS: usize = 8;
+/// 渐变从线段的哪个位置开始(此前全是起点色),与原版 `<linearGradient>` 的 70% stop 一致。
+const GRADIENT_START: f32 = 0.7;
+/// 渐变方向:自上而下(gpui 的角度 0° 朝上、顺时针增)。
+const GRADIENT_ANGLE: f32 = 180.0;
 /// 连线线宽。
 const GRAPH_STROKE: f32 = 1.75;
 /// 节点半径。
@@ -1864,33 +2247,6 @@ impl IntoElement for GraphCell {
     type Element = Self;
     fn into_element(self) -> Self::Element {
         self
-    }
-}
-
-fn lerp_color(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    // 在 RGB 上插值:HSL 上插值会绕色相环(蓝→绿会经过青,原版 SVG 是 RGB 插值)
-    let (a, b) = (gpui::Rgba::from(a), gpui::Rgba::from(b));
-    gpui::Rgba {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-    .into()
-}
-
-/// 贝塞尔 / 直线上按参数 t 取点。
-fn sample(path: &SegPath, t: f32) -> (f32, f32) {
-    match path {
-        SegPath::Line { x, y0, y1 } => (*x, y0 + (y1 - y0) * t),
-        SegPath::Cubic { p0, c1, c2, p1 } => {
-            let u = 1.0 - t;
-            let (b0, b1, b2, b3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-            (
-                b0 * p0.0 + b1 * c1.0 + b2 * c2.0 + b3 * p1.0,
-                b0 * p0.1 + b1 * c1.1 + b2 * c2.1 + b3 * p1.1,
-            )
-        }
     }
 }
 
@@ -1949,45 +2305,35 @@ impl Element for GraphCell {
             let Some(path) = segment_path(seg, self.row.lane) else {
                 continue;
             };
-            let color = palette_color(seg.color);
-            if !git_graph::needs_gradient(seg) {
-                let mut builder = PathBuilder::stroke(px(GRAPH_STROKE));
-                match path {
-                    SegPath::Line { x, y0, y1 } => {
-                        builder.move_to(map((x, y0)));
-                        builder.line_to(map((x, y1)));
-                    }
-                    SegPath::Cubic { p0, c1, c2, p1 } => {
-                        builder.move_to(map(p0));
-                        builder.cubic_bezier_to(map(p1), map(c1), map(c2));
-                    }
+            let mut builder = PathBuilder::stroke(px(GRAPH_STROKE));
+            match path {
+                SegPath::Line { x, y0, y1 } => {
+                    builder.move_to(map((x, y0)));
+                    builder.line_to(map((x, y1)));
                 }
-                if let Ok(built) = builder.build() {
-                    window.paint_path(built, color);
+                SegPath::Cubic { p0, c1, c2, p1 } => {
+                    builder.move_to(map(p0));
+                    builder.cubic_bezier_to(map(p1), map(c1), map(c2));
                 }
-                continue;
             }
-
-            // 异色:按 t 分段,0..0.7 用起点色,之后插值到终点色
-            let end = palette_color(seg.end_color.unwrap_or(seg.color));
-            for step in 0..GRADIENT_STEPS {
-                let t0 = step as f32 / GRADIENT_STEPS as f32;
-                // 段尾多伸一点点,免得相邻段之间露出缝
-                let t1 = ((step + 1) as f32 / GRADIENT_STEPS as f32 + 0.02).min(1.0);
-                let mid = (t0 + t1) * 0.5;
-                let color = if mid <= 0.7 {
-                    color
-                } else {
-                    lerp_color(color, end, (mid - 0.7) / 0.3)
-                };
-                let mut builder = PathBuilder::stroke(px(GRAPH_STROKE));
-                builder.move_to(map(sample(&path, t0)));
-                // 分段本身用折线近似:一段只占整条曲线的 1/8,直线误差 < 0.5px
-                builder.line_to(map(sample(&path, mid)));
-                builder.line_to(map(sample(&path, t1)));
-                if let Ok(built) = builder.build() {
-                    window.paint_path(built, color);
-                }
+            let Ok(built) = builder.build() else {
+                continue;
+            };
+            let color = palette_color(seg.color);
+            if git_graph::needs_gradient(seg) {
+                // 异色:70% 之前是起点色,之后线性过渡到终点色(见类型注释「渐变」)。
+                // 默认 sRGB 插值,与原版 SVG 一样不绕色相环
+                let end = palette_color(seg.end_color.unwrap_or(seg.color));
+                window.paint_path(
+                    built,
+                    linear_gradient(
+                        GRADIENT_ANGLE,
+                        linear_color_stop(color, GRADIENT_START),
+                        linear_color_stop(end, 1.0),
+                    ),
+                );
+            } else {
+                window.paint_path(built, color);
             }
         }
 
@@ -2055,45 +2401,219 @@ mod tests {
     use super::*;
     use crate::git_graph::test_commit;
 
+    /// 一页页合并的现场:列表 + 常驻索引 + 拓扑图。
+    #[derive(Default)]
+    struct Merged {
+        commits: Vec<GitCommitInfo>,
+        log: LoadedLog,
+        graph: Option<GraphLayout>,
+    }
+
+    impl Merged {
+        fn merge(&mut self, page: Vec<GitCommitInfo>) -> bool {
+            let graph = self.graph.get_or_insert_with(GraphLayout::empty);
+            merge_into(&mut self.commits, &mut self.log, graph, page, PAGE_SIZE)
+        }
+
+        fn graph(&self) -> &GraphLayout {
+            self.graph.as_ref().expect("至少合并过一页")
+        }
+    }
+
     /// 去重(防线):重复 hash 必须丢掉,否则拓扑图连线会算错;整页重复时
     /// 停止分页,免得拿同一个游标死循环。
     #[test]
     fn 分页去重与_has_more() {
-        let mut commits = Vec::new();
+        let mut merged = Merged::default();
         // 满页 30 条 → 还有更多
         let page: Vec<_> = (0..PAGE_SIZE)
             .map(|i| test_commit(&format!("c{i}"), &[]))
             .collect();
-        assert!(merge_into(&mut commits, page.clone()));
-        assert_eq!(commits.len(), PAGE_SIZE);
+        assert!(merged.merge(page.clone()));
+        assert_eq!(merged.commits.len(), PAGE_SIZE);
 
         // 整页都是重复的 → 合并后长度没涨 → 停止分页
-        assert!(!merge_into(&mut commits, page.clone()));
-        assert_eq!(commits.len(), PAGE_SIZE, "重复 hash 必须丢掉");
+        assert!(!merged.merge(page.clone()));
+        assert_eq!(merged.commits.len(), PAGE_SIZE, "重复 hash 必须丢掉");
 
         // 不满页 → 到底了
-        assert!(!merge_into(&mut commits, vec![test_commit("tail", &[])]));
-        assert_eq!(commits.len(), PAGE_SIZE + 1);
+        assert!(!merged.merge(vec![test_commit("tail", &[])]));
+        assert_eq!(merged.commits.len(), PAGE_SIZE + 1);
+        assert_eq!(merged.graph(), &git_graph::compute(&merged.commits));
     }
 
     /// 迟到的子提交(时钟偏移):它的父已经在上一页展示了,合并时要把它提到父
     /// 前面 —— 拓扑图按「父永远在子之后」自上而下派 lane,倒挂的话父那条线
-    /// 永远等不到人。
+    /// 永远等不到人。行序变了,拓扑图要整份重算(不能接着旧现场往下续)。
     #[test]
     fn 迟到的子提交合并后排到父前面() {
-        let mut commits = vec![
+        let mut merged = Merged::default();
+        merged.merge(vec![
             test_commit("m", &["a", "late"]),
             test_commit("a", &["base"]),
             test_commit("base", &[]),
-        ];
-        merge_into(&mut commits, vec![test_commit("late", &["base"])]);
-        let order: Vec<_> = commits.iter().map(|c| c.hash.as_str()).collect();
+        ]);
+        merged.merge(vec![test_commit("late", &["base"])]);
+        let order: Vec<_> = merged.commits.iter().map(|c| c.hash.as_str()).collect();
         assert_eq!(order, ["m", "a", "late", "base"]);
+        assert_eq!(merged.graph(), &git_graph::compute(&merged.commits));
         // 末行(根提交 base)不再往下派线。倒挂时末行是 late,它派给 base 的那条线
         // 往下空等一个永远不会再出现的父,图上就是一根断在底边的线
-        let layout = git_graph::compute(&commits);
-        let last = layout.rows.last().unwrap();
+        let last = merged.graph().rows.last().unwrap();
         assert!(last.segments.iter().all(|s| s.from != -1), "{last:?}");
+    }
+
+    /// 一页页合并下来,拓扑图(增量续算)与按最终列表整份重算的逐行一致;列表本身与
+    /// 旧写法(`merge_log_page` 整份去重)一致。页里混进重复与迟到的子提交。
+    #[test]
+    fn 续页合并与整份重算一致() {
+        let mut state = 5u64;
+        let mut rand = move |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n.max(1)
+        };
+        // 新 → 旧排好的拓扑序:h{i} 的父编号更小
+        let mut history: Vec<GitCommitInfo> = (0..200)
+            .map(|i: usize| {
+                let mut parents: Vec<String> = Vec::new();
+                if i > 0 {
+                    parents.push(format!("h{}", i - 1 - rand((i as u64).min(4)) as usize));
+                    if rand(4) == 0 {
+                        parents.push(format!("h{}", rand(i as u64)));
+                    }
+                }
+                parents.dedup();
+                let refs: Vec<&str> = parents.iter().map(String::as_str).collect();
+                test_commit(&format!("h{i}"), &refs)
+            })
+            .collect();
+        history.reverse();
+
+        let mut merged = Merged::default();
+        let mut reference: Vec<GitCommitInfo> = Vec::new();
+        let mut rest = history;
+        let mut held: Option<GitCommitInfo> = None;
+        while !rest.is_empty() {
+            let take = (1 + rand(PAGE_SIZE as u64) as usize).min(rest.len());
+            let mut page: Vec<GitCommitInfo> = rest.drain(..take).collect();
+            // 上一页扣下的提交这一页才来(迟到),再从这一页里扣一个
+            page.extend(held.take());
+            if page.len() > 2 && rand(3) == 0 {
+                held = Some(page.remove(0));
+            }
+            if rand(4) == 0 {
+                page.push(page[page.len() - 1].clone());
+            }
+            mt_project::git::merge_log_page(&mut reference, page.clone());
+            merged.merge(page);
+            let ours: Vec<_> = merged.commits.iter().map(|c| c.hash.as_str()).collect();
+            let theirs: Vec<_> = reference.iter().map(|c| c.hash.as_str()).collect();
+            assert_eq!(ours, theirs);
+            assert_eq!(merged.graph(), &git_graph::compute(&merged.commits));
+        }
+        if let Some(late) = held {
+            merged.merge(vec![late]);
+            assert_eq!(merged.graph(), &git_graph::compute(&merged.commits));
+        }
+        assert_eq!(merged.commits.len(), 200);
+    }
+
+    /// 保留旧列表的刷新:首页重取与已加载差不多深的一段(至少一页、至多上限);满没满页按
+    /// 这一趟请求的条数算 —— 要 120 条回来 120 条是满页(还有下文),只回来 60 条(历史就
+    /// 这么多)是到底了;按一页 30 条算的话后者会被当成满页,白多要一页。
+    #[test]
+    fn 刷新重取深度与满页判定() {
+        assert_eq!(reload_depth(0), PAGE_SIZE);
+        assert_eq!(reload_depth(12), PAGE_SIZE);
+        assert_eq!(reload_depth(120), 120);
+        assert_eq!(reload_depth(10_000), RELOAD_KEEP_LIMIT);
+
+        let page = |n: usize| -> Vec<GitCommitInfo> {
+            (0..n).map(|i| test_commit(&format!("r{i}"), &[])).collect()
+        };
+        let mut merged = Merged::default();
+        let graph = merged.graph.get_or_insert_with(GraphLayout::empty);
+        assert!(merge_into(
+            &mut merged.commits,
+            &mut merged.log,
+            graph,
+            page(120),
+            120
+        ));
+        let mut short = Merged::default();
+        let graph = short.graph.get_or_insert_with(GraphLayout::empty);
+        assert!(
+            !merge_into(&mut short.commits, &mut short.log, graph, page(60), 120),
+            "要 120 条只回来 60 条:到底了"
+        );
+    }
+
+    /// 首页落定回不回顶:整份重来(跟随 HEAD 时 HEAD 换了指向、换查看的分支、换仓库、换过滤
+    /// 条件、列表当场清空过)回到顶部;同一分支上的刷新(外部新提交、按已加载深度重取首页 ——
+    /// 身份没变)滚动位置照旧。
+    #[test]
+    fn 首页落定只在列表身份变了时回顶() {
+        let filter = |text: &str| {
+            Some(LogFilter {
+                text: text.to_string(),
+                ..LogFilter::default()
+            })
+        };
+        let follow = |head: &str| ListIdentity::new("repo", None, Some(head), None);
+        let viewing =
+            |view: &str, head: &str| ListIdentity::new("repo", Some(view), Some(head), None);
+        let shown = follow("main");
+
+        // 同一分支上的刷新:身份没变,不回顶
+        assert!(!scrolls_to_top(Some(&shown), &follow("main")));
+        // 跟随 HEAD:检出了别的分支 / 游离到某个提交(检出走的是保留旧列表的刷新)
+        assert!(scrolls_to_top(Some(&shown), &follow("b103")));
+        assert!(scrolls_to_top(Some(&shown), &follow("(1a2b3c4)")));
+        // 查看指定分支(未检出)时 HEAD 怎么动都与列表无关
+        assert!(!scrolls_to_top(
+            Some(&viewing("dev", "main")),
+            &viewing("dev", "b103")
+        ));
+        // 换查看的分支;跟随 HEAD ↔ 查看同名分支也算换了(两条路各取各的首页)
+        assert!(scrolls_to_top(
+            Some(&viewing("dev", "main")),
+            &viewing("feat", "main")
+        ));
+        assert!(scrolls_to_top(Some(&shown), &viewing("main", "main")));
+        // 换仓库
+        let other = ListIdentity::new("other", None, Some("main"), None);
+        assert!(scrolls_to_top(Some(&shown), &other));
+        // 换过滤条件;同一组条件下的刷新照旧
+        let fix = ListIdentity::new("repo", None, Some("main"), filter("fix"));
+        assert!(scrolls_to_top(Some(&shown), &fix));
+        assert!(!scrolls_to_top(Some(&fix), &fix));
+        let feat = ListIdentity::new("repo", None, Some("main"), filter("feat"));
+        assert!(scrolls_to_top(Some(&fix), &feat));
+        // 列表当场清空过(`restart`)/ 头一回落定:一律回顶
+        assert!(scrolls_to_top(None, &shown));
+    }
+
+    /// 首页回来时 HEAD 的显示名:HEAD 在本地分支上就直接用分支列表里的名字,不再去查;
+    /// 游离 / 空仓库才查。
+    #[test]
+    fn head_显示名优先取分支列表() {
+        let branches = vec![
+            branch("main", "c1", false, None),
+            branch("dev", "c2", true, None),
+            branch("origin/dev", "c2", false, None),
+        ];
+        let asked = std::cell::Cell::new(false);
+        let probe = || {
+            asked.set(true);
+            Some("(c9)".to_string())
+        };
+        assert_eq!(head_label_of(&branches, probe).as_deref(), Some("dev"));
+        assert!(!asked.get(), "分支列表里有就不必再开一次库");
+        let detached = vec![branch("main", "c1", false, None)];
+        assert_eq!(head_label_of(&detached, probe).as_deref(), Some("(c9)"));
+        assert!(asked.get());
     }
 
     /// `origin/` 开头的当远程分支,与 `get_repo_branches` 的产出形态一致。
@@ -2409,29 +2929,38 @@ mod tests {
         assert_eq!(parse(""), pair("", ""));
     }
 
-    /// 贝塞尔采样:两端点必须落在路径端点上(渐变分段接得住)。
+    /// 预先建好的分支胶囊表与逐行一问(`pick_shown_branches` + 颜色档)逐个提交一致:
+    /// 跟随 HEAD / 查看本地分支 / 查看远程分支 / 游离 HEAD 都对,查不到的提交没有胶囊。
     #[test]
-    fn 贝塞尔采样端点对齐() {
-        let cubic = SegPath::Cubic {
-            p0: (7.0, 0.0),
-            c1: (7.0, 12.0),
-            c2: (21.0, 12.0),
-            p1: (21.0, 24.0),
-        };
-        assert_eq!(sample(&cubic, 0.0), (7.0, 0.0));
-        let end = sample(&cubic, 1.0);
-        assert!((end.0 - 21.0).abs() < 0.001 && (end.1 - 24.0).abs() < 0.001);
-        // 中点落在两端之间
-        let mid = sample(&cubic, 0.5);
-        assert!(mid.0 > 7.0 && mid.0 < 21.0);
-
-        let line = SegPath::Line {
-            x: 7.0,
-            y0: 24.0,
-            y1: 48.0,
-        };
-        assert_eq!(sample(&line, 0.0), (7.0, 24.0));
-        assert_eq!(sample(&line, 1.0), (7.0, 48.0));
-        assert_eq!(sample(&line, 0.5), (7.0, 36.0));
+    fn 分支胶囊表与逐行一问一致() {
+        let branches = vec![
+            branch("main", "c2", true, Some("origin/main")),
+            branch("dev", "c0", false, Some("origin/dev")),
+            branch("lonely", "c3", false, None),
+            branch("feature", "c2", false, None),
+            branch("origin/main", "c1", false, None),
+            branch("origin/dev", "c0", false, None),
+            branch("origin/feature", "c2", false, None),
+        ];
+        let views: [(Option<&str>, Option<&str>); 6] = [
+            (Some("main"), None),
+            (Some("main"), Some("dev")),
+            (Some("main"), Some("origin/dev")),
+            (Some("main"), Some("lonely")),
+            (Some("(c9)"), None),
+            (None, None),
+        ];
+        for (head, view) in views {
+            let table = branch_pills_by_commit(&branches, head, view);
+            for hash in ["c0", "c1", "c2", "c3", "c9"] {
+                let want: Vec<(SharedString, RefKind)> =
+                    pick_shown_branches(&branches, head, view, hash)
+                        .into_iter()
+                        .map(|b| (b.name.clone().into(), branch_ref_kind(b, head)))
+                        .collect();
+                let got = table.get(hash).cloned().unwrap_or_default();
+                assert_eq!(got, want, "head {head:?} 查看 {view:?} 提交 {hash}");
+            }
+        }
     }
 }

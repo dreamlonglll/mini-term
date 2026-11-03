@@ -567,6 +567,18 @@ pub fn bind_keys(cx: &mut App) {
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
     ));
+    // 提交 diff 弹窗:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换提交同一
+    // 手感)。谓词是弹窗焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
+    bindings.push(KeyBinding::new(
+        "down",
+        git_diff::GitCommitDiffNextFile,
+        Some(git_diff::COMMIT_DIFF_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "up",
+        git_diff::GitCommitDiffPrevFile,
+        Some(git_diff::COMMIT_DIFF_CONTEXT),
+    ));
 
     // Git 提交历史(焦点在历史区时)。**不进快捷键表** —— 面板内部键位,同上。
     // `GitHistory` 比 `Workspace` 深,Ctrl+F 在历史区里归过滤框、出了历史区照旧是

@@ -28,7 +28,8 @@
 //! `add_worktree`(120s)/ `remove_worktree`(60s)/ `prune_worktrees`(30s)
 //! 全是 CLI,一律丢 `cx.background_executor()`。
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -38,6 +39,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputState};
+use mt_config::ProjectConfig;
 use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
 
@@ -181,15 +183,16 @@ fn remove_failure_text(err: &anyhow::Error) -> String {
 ///
 /// 逐组算「本地分支 − 该组已被任一 worktree 占用的分支」,再取**全组交集**,
 /// 顺序按第一个组的列表。
-pub fn available_branches(groups: &[(Vec<BranchInfo>, Vec<Option<String>>)]) -> Vec<String> {
-    let per_group: Vec<Vec<String>> = groups
+pub fn available_branches(groups: &[(&[BranchInfo], Vec<Option<&str>>)]) -> Vec<String> {
+    let per_group: Vec<Vec<&str>> = groups
         .iter()
         .map(|(branches, occupied)| {
+            let occupied: HashSet<&str> = occupied.iter().flatten().copied().collect();
             branches
                 .iter()
                 .filter(|b| !b.is_remote)
-                .map(|b| b.name.clone())
-                .filter(|name| !occupied.iter().any(|o| o.as_deref() == Some(name)))
+                .map(|b| b.name.as_str())
+                .filter(|name| !occupied.contains(name))
                 .collect()
         })
         .collect();
@@ -197,23 +200,28 @@ pub fn available_branches(groups: &[(Vec<BranchInfo>, Vec<Option<String>>)]) -> 
 }
 
 /// 「新分支起点」的可选项(`:261-268`):逐组的**全部**分支名(含远程)取交集。
-pub fn base_branch_options(groups: &[Vec<BranchInfo>]) -> Vec<String> {
-    let per_group: Vec<Vec<String>> = groups
+pub fn base_branch_options(groups: &[&[BranchInfo]]) -> Vec<String> {
+    let per_group: Vec<Vec<&str>> = groups
         .iter()
-        .map(|branches| branches.iter().map(|b| b.name.clone()).collect())
+        .map(|branches| branches.iter().map(|b| b.name.as_str()).collect())
         .collect();
     intersect_ordered(&per_group)
 }
 
-/// 取交集,顺序按第一组。
-fn intersect_ordered(groups: &[Vec<String>]) -> Vec<String> {
+/// 取交集,顺序按第一组。其余各组先建成集合再查(几个仓库各两千条分支时,逐条
+/// `Vec::contains` 是千万次比较)。
+fn intersect_ordered(groups: &[Vec<&str>]) -> Vec<String> {
     let Some(first) = groups.first() else {
         return Vec::new();
     };
+    let rest: Vec<HashSet<&str>> = groups[1..]
+        .iter()
+        .map(|g| g.iter().copied().collect())
+        .collect();
     first
         .iter()
-        .filter(|name| groups[1..].iter().all(|g| g.contains(name)))
-        .cloned()
+        .filter(|name| rest.iter().all(|g| g.contains(*name)))
+        .map(|name| name.to_string())
         .collect()
 }
 
@@ -286,11 +294,15 @@ struct WorktreeModal {
     repo_path: String,
     discover_repos: bool,
     project_id: Option<String>,
-    /// `None` = 还在加载。
-    groups: Option<Vec<RepoGroup>>,
+    /// `None` = 还在加载。共享一份:Dialog 的 builder 每帧重跑,按钮闭包也要拿着它,
+    /// 不每帧深拷贝。
+    groups: Option<Rc<Vec<RepoGroup>>>,
     load_error: Option<String>,
     selected_keys: Vec<String>,
-    branches_by_repo: HashMap<String, Vec<BranchInfo>>,
+    /// 各组的分支(按组键),同样共享。
+    branches_by_repo: HashMap<String, Rc<Vec<BranchInfo>>>,
+    /// 两个下拉的选项(见 [`OptionsCache`])。
+    options_cache: RefCell<Option<OptionsCache>>,
     mode: Mode,
     sel_branch: String,
     base_branch: String,
@@ -305,6 +317,110 @@ struct WorktreeModal {
     create_results: Vec<(String, String)>,
     pruning_key: Option<String>,
     on_changed: Rc<dyn Fn(&mut App)>,
+}
+
+/// 「检出现有分支」/「新分支起点」下拉的选项缓存。
+///
+/// 选项是各勾选组分支列表的交集(几个仓库各两千条分支时是千万次比较的活),而弹窗开着
+/// 时 builder 每帧都要画 —— 只在模式、勾选、分组或分支列表换了时才重算。认法是比指针:
+/// 分组与各组分支都是共享的 `Rc`,数据一换就是新的一份;缓存自己也握着旧的那几份,
+/// 它们不会被释放后又在同一个地址冒出来,所以不会认错。
+struct OptionsCache {
+    mode: Mode,
+    groups: Rc<Vec<RepoGroup>>,
+    /// 勾选的组(分组里的先后)与当时各组的分支。
+    selected: Vec<(String, Option<Rc<Vec<BranchInfo>>>)>,
+    options: Rc<Vec<String>>,
+}
+
+impl OptionsCache {
+    fn matches(
+        &self,
+        mode: Mode,
+        groups: &Rc<Vec<RepoGroup>>,
+        selected: &[(String, Option<Rc<Vec<BranchInfo>>>)],
+    ) -> bool {
+        self.mode == mode
+            && Rc::ptr_eq(&self.groups, groups)
+            && self.selected.len() == selected.len()
+            && self
+                .selected
+                .iter()
+                .zip(selected)
+                .all(|((ka, a), (kb, b))| {
+                    ka == kb
+                        && match (a, b) {
+                            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                            (None, None) => true,
+                            _ => false,
+                        }
+                })
+    }
+}
+
+/// 下拉的选项:「检出现有分支」是 [`available_branches`],「新分支起点」是 HEAD +
+/// [`base_branch_options`]。`selected` 是勾选的组(分组里的先后)。
+fn dropdown_options(
+    mode: Mode,
+    selected: &[&RepoGroup],
+    branches_by_repo: &HashMap<String, Rc<Vec<BranchInfo>>>,
+) -> Vec<String> {
+    let branches_of = |g: &RepoGroup| -> &[BranchInfo] {
+        branches_by_repo
+            .get(&g.key)
+            .map(|b| b.as_slice())
+            .unwrap_or_default()
+    };
+    match mode {
+        Mode::Existing => {
+            let per_group: Vec<(&[BranchInfo], Vec<Option<&str>>)> = selected
+                .iter()
+                .map(|g| {
+                    (
+                        branches_of(g),
+                        g.worktrees.iter().map(|w| w.branch.as_deref()).collect(),
+                    )
+                })
+                .collect();
+            available_branches(&per_group)
+        }
+        Mode::New => {
+            let per_group: Vec<&[BranchInfo]> = selected.iter().map(|g| branches_of(g)).collect();
+            let mut options = vec![t("worktree", "baseHead").to_string()];
+            options.extend(base_branch_options(&per_group));
+            options
+        }
+    }
+}
+
+impl WorktreeModal {
+    /// 眼下的下拉选项(缓存着,见 [`OptionsCache`])。
+    fn options(&self, groups: &Rc<Vec<RepoGroup>>, selected: &[&RepoGroup]) -> Rc<Vec<String>> {
+        let key: Vec<(String, Option<Rc<Vec<BranchInfo>>>)> = selected
+            .iter()
+            .map(|g| (g.key.clone(), self.branches_by_repo.get(&g.key).cloned()))
+            .collect();
+        if let Some(cache) = self
+            .options_cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.matches(self.mode, groups, &key))
+        {
+            return cache.options.clone();
+        }
+        let options = Rc::new(dropdown_options(
+            self.mode,
+            selected,
+            &self.branches_by_repo,
+        ));
+        *self.options_cache.borrow_mut() = Some(OptionsCache {
+            mode: self.mode,
+            groups: groups.clone(),
+            selected: key,
+            options: options.clone(),
+        });
+        options
+    }
 }
 
 impl Render for WorktreeModal {
@@ -336,6 +452,7 @@ pub fn open(
         load_error: None,
         selected_keys: Vec::new(),
         branches_by_repo: HashMap::new(),
+        options_cache: RefCell::new(None),
         mode: Mode::Existing,
         sel_branch: String::new(),
         base_branch: String::new(),
@@ -410,10 +527,10 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
             })
             .await;
 
-        let _ = state.update(cx, |s: &mut WorktreeModal, cx| {
+        state.update(cx, |s: &mut WorktreeModal, cx| {
             match loaded {
                 Err(err) => {
-                    s.groups = Some(Vec::new());
+                    s.groups = Some(Rc::default());
                     s.load_error = Some(err);
                 }
                 Ok(items) => {
@@ -422,7 +539,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
                         && items.len() == 1
                         && let Some((_, Err(err))) = items.first()
                     {
-                        s.groups = Some(Vec::new());
+                        s.groups = Some(Rc::default());
                         s.load_error = Some(err.clone());
                         cx.notify();
                         return;
@@ -437,7 +554,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
                     {
                         s.selected_keys = vec![groups[0].key.clone()];
                     }
-                    s.groups = Some(groups);
+                    s.groups = Some(Rc::new(groups));
                 }
             }
             cx.notify();
@@ -464,7 +581,7 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
         let state = state.clone();
         // 先占位,避免同一帧内重复排队
         state.update(cx, |s, _| {
-            s.branches_by_repo.insert(key.clone(), Vec::new());
+            s.branches_by_repo.insert(key.clone(), Rc::default());
         });
         cx.spawn(async move |cx| {
             let result = cx
@@ -473,10 +590,10 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
                     mt_project::git::get_repo_branches(std::path::Path::new(&main_path))
                 })
                 .await;
-            let _ = state.update(cx, |s: &mut WorktreeModal, cx| {
+            state.update(cx, |s: &mut WorktreeModal, cx| {
                 match result {
                     Ok(list) => {
-                        s.branches_by_repo.insert(key, list);
+                        s.branches_by_repo.insert(key, Rc::new(list));
                     }
                     Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
                 }
@@ -503,6 +620,7 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
     let s = state.read(cx);
     let mut root = div().flex().flex_col().gap(px(8.0));
 
+    // 共享的那一份(加引用计数,不深拷贝:下面每一行都要拿 `&mut App` 渲染,不能一直借着 `s`)
     let Some(groups) = s.groups.clone() else {
         return root
             .child(git_ui::loading_state(t("worktree", "loading")))
@@ -563,8 +681,13 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
         );
     }
 
-    for group in &groups {
-        root = root.child(render_group(state, group, multi_repo, cx));
+    // 「已是项目」:每行都要按路径找项目,先一次建好表(同一路径取最先的那个项目,与逐行
+    // `find` 同一口径),不再每行把全部项目扫一遍、每次比较都现算两个归一键
+    let projects = local_project_ids(state.read(cx).store.read(cx).projects());
+    for index in 0..groups.len() {
+        root = root.child(render_group(
+            state, &groups, index, multi_repo, &projects, cx,
+        ));
     }
 
     // 默认路径建议(`GitWorktreeModal.tsx:289-303` 那个 effect 的对应物)。
@@ -637,12 +760,27 @@ fn reset_form_on_selection(s: &mut WorktreeModal) {
     s.create_results.clear();
 }
 
+/// 本地项目:归一路径键(`windows_eq_key`)→ 项目 id,同一路径取最先的那个。
+fn local_project_ids(projects: &[ProjectConfig]) -> HashMap<String, String> {
+    let mut ids = HashMap::new();
+    for project in projects.iter().filter(|p| p.ssh_connection_id.is_none()) {
+        ids.entry(windows_eq_key(&project.path))
+            .or_insert_with(|| project.id.clone());
+    }
+    ids
+}
+
+/// 第 `index` 组。`groups` 是共享的那一份:按钮闭包拿着它与下标,点的时候再取,
+/// 不每帧把整组(连同全部 worktree)深拷贝进闭包。
 fn render_group(
     state: &Entity<WorktreeModal>,
-    group: &RepoGroup,
+    groups: &Rc<Vec<RepoGroup>>,
+    index: usize,
     multi_repo: bool,
+    projects: &HashMap<String, String>,
     cx: &mut App,
 ) -> AnyElement {
+    let group = &groups[index];
     // 先把要用的字段拷出来:下面每一行都要拿 `&mut App` 去渲染,不能一直借着 `s`
     let (selected, pruning) = {
         let s = state.read(cx);
@@ -721,13 +859,13 @@ fn render_group(
     }
 
     let mut rows = div().flex().flex_col().gap(px(2.0)).p(px(4.0));
-    for (idx, wt) in group.worktrees.iter().enumerate() {
-        rows = rows.child(render_worktree_row(state, group, idx, wt, cx));
+    for idx in 0..group.worktrees.len() {
+        rows = rows.child(render_worktree_row(state, groups, index, idx, projects, cx));
     }
     block = block.child(rows);
 
     if group.worktrees.iter().any(|w| !w.is_valid) {
-        let (state_for_prune, group_for_prune) = (state.clone(), group.clone());
+        let (state_for_prune, groups_for_prune) = (state.clone(), groups.clone());
         block = block.child(
             div().flex().justify_end().px(px(8.0)).pb(px(8.0)).child(
                 git_ui::action_button(
@@ -742,7 +880,7 @@ fn render_group(
                 )
                 .when(!pruning, |el| {
                     el.on_click(move |_: &ClickEvent, _window, cx| {
-                        prune(&state_for_prune, &group_for_prune, cx);
+                        prune(&state_for_prune, &groups_for_prune[index], cx);
                     })
                 }),
             ),
@@ -752,24 +890,20 @@ fn render_group(
     block.into_any_element()
 }
 
+/// 第 `group_index` 组的第 `idx` 个 worktree。`projects` 见 [`local_project_ids`]。
 fn render_worktree_row(
     state: &Entity<WorktreeModal>,
-    group: &RepoGroup,
+    groups: &Rc<Vec<RepoGroup>>,
+    group_index: usize,
     idx: usize,
-    wt: &WorktreeInfo,
+    projects: &HashMap<String, String>,
     cx: &mut App,
 ) -> AnyElement {
     let s = state.read(cx);
-    // 「已是项目」:订阅 config.projects,增删项目即时反映
-    let existing_project = s
-        .store
-        .read(cx)
-        .projects()
-        .iter()
-        .find(|p| {
-            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
-        })
-        .map(|p| p.id.clone());
+    let group = &groups[group_index];
+    let wt = &group.worktrees[idx];
+    // 「已是项目」:订阅 config.projects,增删项目即时反映(表每帧按眼下的项目建)
+    let existing_project = projects.get(&windows_eq_key(&wt.path)).cloned();
     let is_project = existing_project.is_some();
 
     // 胶囊全走共用的语义胶囊:分支 = 本地分支色(带分支图标)、失效 = 错误、
@@ -888,8 +1022,7 @@ fn render_worktree_row(
 
         // 「删除」(非 main 才有)
         if !wt.is_main {
-            let (state_for_remove, group_for_remove, wt_for_remove) =
-                (state.clone(), group.clone(), wt.clone());
+            let (state_for_remove, groups_for_remove) = (state.clone(), groups.clone());
             actions = actions.child(
                 git_ui::action_button(
                     SharedString::from(format!("wt-remove-{}-{idx}", group.key)),
@@ -898,10 +1031,11 @@ fn render_worktree_row(
                     true,
                 )
                 .on_click(move |_: &ClickEvent, window, cx| {
+                    let group = &groups_for_remove[group_index];
                     open_remove_confirm(
                         &state_for_remove,
-                        &group_for_remove,
-                        &wt_for_remove,
+                        group,
+                        &group.worktrees[idx],
                         window,
                         cx,
                     );
@@ -971,7 +1105,7 @@ fn render_worktree_row(
 /// 新建 worktree 那一段。
 fn render_create_section(
     state: &Entity<WorktreeModal>,
-    groups: &[RepoGroup],
+    groups: &Rc<Vec<RepoGroup>>,
     multi_repo: bool,
     cx: &mut App,
 ) -> AnyElement {
@@ -1060,16 +1194,7 @@ fn render_create_section(
             if !branches_ready {
                 section = section.child(git_ui::loading_state(t("worktree", "loading")));
             } else {
-                let per_group: Vec<(Vec<BranchInfo>, Vec<Option<String>>)> = selected
-                    .iter()
-                    .map(|g| {
-                        (
-                            s.branches_by_repo.get(&g.key).cloned().unwrap_or_default(),
-                            g.worktrees.iter().map(|w| w.branch.clone()).collect(),
-                        )
-                    })
-                    .collect();
-                let options = available_branches(&per_group);
+                let options = s.options(groups, &selected);
                 if options.is_empty() {
                     section = section.child(hint_line(if multi_target {
                         t("worktree", "noCommonBranch")
@@ -1092,12 +1217,7 @@ fn render_create_section(
             }
         }
         Mode::New => {
-            let per_group: Vec<Vec<BranchInfo>> = selected
-                .iter()
-                .map(|g| s.branches_by_repo.get(&g.key).cloned().unwrap_or_default())
-                .collect();
-            let mut options = vec![t("worktree", "baseHead").to_string()];
-            options.extend(base_branch_options(&per_group));
+            let options = s.options(groups, &selected);
             section = section.child(
                 div()
                     .flex()
@@ -1198,7 +1318,7 @@ fn render_create_section(
 
     let creating = s.creating;
     let state_for_create = state.clone();
-    let groups_for_create = groups.to_vec();
+    let groups_for_create = groups.clone();
     section = section.child(
         div().flex().justify_end().child(
             git_ui::action_button(
@@ -1233,7 +1353,7 @@ fn dropdown(
     state: &Entity<WorktreeModal>,
     id: &'static str,
     current: String,
-    options: Vec<String>,
+    options: Rc<Vec<String>>,
     apply: fn(&mut WorktreeModal, String),
 ) -> AnyElement {
     let state = state.clone();
@@ -1961,26 +2081,27 @@ mod tests {
     /// 「检出现有分支」:本地分支减去已被占用的,再取全组交集。
     #[test]
     fn 可用分支取交集且排除已占用() {
-        let g1 = (
-            vec![
-                branch("main", false),
-                branch("feat", false),
-                branch("origin/main", true),
-            ],
-            // main 被主工作区占着
-            vec![Some("main".to_string())],
-        );
-        assert_eq!(available_branches(&[g1.clone()]), vec!["feat"]);
+        let b1 = vec![
+            branch("main", false),
+            branch("feat", false),
+            branch("origin/main", true),
+        ];
+        // main 被主工作区占着
+        let g1 = (b1.as_slice(), vec![Some("main"), None]);
+        assert_eq!(available_branches(std::slice::from_ref(&g1)), vec!["feat"]);
 
-        let g2 = (
-            vec![branch("main", false), branch("feat", false), branch("x", false)],
-            vec![Some("main".to_string())],
-        );
+        let b2 = vec![
+            branch("main", false),
+            branch("feat", false),
+            branch("x", false),
+        ];
+        let g2 = (b2.as_slice(), vec![Some("main")]);
         // 两组交集仍是 feat(x 只有第二组有)
         assert_eq!(available_branches(&[g1.clone(), g2]), vec!["feat"]);
 
         // 没有共同可用分支
-        let g3 = (vec![branch("main", false)], vec![Some("main".to_string())]);
+        let b3 = vec![branch("main", false)];
+        let g3 = (b3.as_slice(), vec![Some("main")]);
         assert!(available_branches(&[g1, g3]).is_empty());
     }
 
@@ -1994,11 +2115,119 @@ mod tests {
         ];
         let b = vec![branch("origin/main", true), branch("main", false)];
         assert_eq!(
-            base_branch_options(&[a.clone(), b]),
+            base_branch_options(&[&a, &b]),
             vec!["main", "origin/main"],
             "顺序按第一组"
         );
-        assert_eq!(base_branch_options(&[a]).len(), 3);
+        assert_eq!(base_branch_options(&[&a]).len(), 3);
         assert!(base_branch_options(&[]).is_empty());
+    }
+
+    /// 交集改成先建集合再查之后,结果(连同次序、第一组里的重名)与逐条 `Vec::contains`
+    /// 的旧写法一致。
+    #[test]
+    fn 交集与旧写法一致且保持次序() {
+        let reference = |groups: &[Vec<&str>]| -> Vec<String> {
+            let Some(first) = groups.first() else {
+                return Vec::new();
+            };
+            first
+                .iter()
+                .filter(|name| groups[1..].iter().all(|g| g.contains(name)))
+                .map(|name| name.to_string())
+                .collect()
+        };
+        let mut state = 11u64;
+        let mut rand = move |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n.max(1)
+        };
+        let names: Vec<String> = (0..60).map(|i| format!("b{i}")).collect();
+        for round in 0..30 {
+            let groups: Vec<Vec<&str>> = (0..1 + rand(4))
+                .map(|_| {
+                    (0..rand(80))
+                        .map(|_| names[rand(names.len() as u64) as usize].as_str())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                intersect_ordered(&groups),
+                reference(&groups),
+                "第 {round} 轮"
+            );
+        }
+        assert!(intersect_ordered(&[]).is_empty());
+    }
+
+    /// 下拉选项缓存:同一份分组 / 分支 / 模式命中;勾选、模式、某组分支换了一份都要重算。
+    #[test]
+    fn 下拉选项缓存按指针认新旧() {
+        let groups = Rc::new(merge_groups(vec![
+            ("/a".into(), Ok(vec![wt("a", "/a", true, Some("main"))])),
+            ("/b".into(), Ok(vec![wt("b", "/b", true, Some("dev"))])),
+        ]));
+        let branches = Rc::new(vec![branch("main", false), branch("dev", false)]);
+        let key = |list: &Rc<Vec<BranchInfo>>| -> Vec<(String, Option<Rc<Vec<BranchInfo>>>)> {
+            vec![(groups[0].key.clone(), Some(list.clone()))]
+        };
+        let cache = OptionsCache {
+            mode: Mode::Existing,
+            groups: groups.clone(),
+            selected: key(&branches),
+            options: Rc::new(Vec::new()),
+        };
+        assert!(cache.matches(Mode::Existing, &groups, &key(&branches)));
+        assert!(
+            !cache.matches(Mode::New, &groups, &key(&branches)),
+            "换了模式"
+        );
+        let same_content = Rc::new((*branches).clone());
+        assert!(
+            !cache.matches(Mode::Existing, &groups, &key(&same_content)),
+            "分支换了一份(哪怕内容一样)"
+        );
+        assert!(!cache.matches(Mode::Existing, &groups, &[]), "勾选变了");
+        let regrouped = Rc::new((*groups).clone());
+        assert!(
+            !cache.matches(Mode::Existing, &regrouped, &key(&branches)),
+            "分组重载了"
+        );
+
+        // 选项本身:已有分支去掉被占用的,起点选项以 HEAD 打头
+        let mut by_repo = HashMap::new();
+        by_repo.insert(groups[0].key.clone(), branches.clone());
+        let picked = [&groups[0]];
+        assert_eq!(
+            dropdown_options(Mode::Existing, &picked, &by_repo),
+            vec!["dev"]
+        );
+        let base = dropdown_options(Mode::New, &picked, &by_repo);
+        assert_eq!(base[0], t("worktree", "baseHead"));
+        assert_eq!(&base[1..], ["main", "dev"]);
+    }
+
+    /// 「已是项目」的表:远程项目不算,同一路径(换写法)取最先的那个。
+    #[test]
+    fn 已是项目按归一路径查() {
+        let project = |id: &str, path: &str, ssh: Option<&str>| ProjectConfig {
+            id: id.into(),
+            path: path.into(),
+            ssh_connection_id: ssh.map(str::to_string),
+            ..Default::default()
+        };
+        let ids = local_project_ids(&[
+            project("p1", "D:/Git/Repo", None),
+            project("p2", "d:\\git\\repo\\", None),
+            project("p3", "D:/Git/Other", Some("ssh1")),
+        ]);
+        assert_eq!(
+            ids.get(&windows_eq_key("D:\\Git\\Repo"))
+                .map(String::as_str),
+            Some("p1")
+        );
+        assert!(!ids.contains_key(&windows_eq_key("D:/Git/Other")));
     }
 }

@@ -10,7 +10,8 @@
 //! 就是约 40 个实例。Windows 后端每个实例一条线程、每 100ms 醒一次
 //! (`WaitForSingleObjectEx(…, 100, …)`,合计约 400 次/秒空唤醒);Linux 每个实例
 //! 占一个 inotify 实例(默认每用户上限 128)。现在全进程只有 [`Hub`] 手里那一个
-//! notify watcher,[`FsWatcher`] 退化成**订阅者句柄**:watch / unwatch 记在它名下,
+//! notify watcher(递归监听另有一个,只在有人用时存在,见「递归监听」),
+//! [`FsWatcher`] 退化成**订阅者句柄**:watch / unwatch 记在它名下,
 //! **句柄 drop 时名下全部监听一并撤销**,调用方漏了 unwatch 也不会泄漏。
 //!
 //! # 两层引用计数
@@ -86,6 +87,28 @@
 //!   (watch / unwatch / drop)也不会自锁;
 //! - 主线程的 watch / unwatch / drop 只拿它改内存表,既不等注册线程也不等后端线程。
 //!
+//! # 递归监听([`FsWatcher::watch_tree`])
+//!
+//! 默认都是非递归(只盯目录自己的直接子项)。工作区监听在大仓库上要盯成百上千个目录,
+//! 一目录一条装不下(Windows 上每条常驻 16 KB 缓冲),于是另给一种「连同整棵子树」的
+//! 监听,由后端原生支持的平台(Windows 的 ReadDirectoryChangesW 子树、macOS 的 FSEvents)
+//! 一条盖住一棵子树。Linux 的 inotify 没有子树监听,notify 的「递归」是逐个目录挂、连
+//! `node_modules` 一起,调用方不在 Linux 上用它(口径见 `git::worktree_watch_dirs`)。
+//!
+//! 两种方式**各走各的 notify watcher**(递归那个第一次有人要时才建,最后一条撤走就收掉),
+//! 路由表、注册表也各一份:
+//!
+//! - 同一目录可以同时被两种方式监听(文件树展开着 `src`、工作区监听递归盯着 `src`),
+//!   后端各挂各的,互不改对方的模式 —— 若共用一条,文件树那条就得跟着变成递归,子树
+//!   深处的洪水(构建产物、依赖安装)会挤爆它的缓冲,把文件树自己的事件一起冲掉;
+//! - 事件只按**报它的那个后端**的路由分:非递归后端的事件只交非递归订阅(规则同上一节),
+//!   递归后端的事件只交递归订阅,按「哪个被监听目录是它的祖先(含自身)」改写成
+//!   `字面 key.join(相对路径)`。两边互不串,同一条变化不会因为两种方式都挂着就交两遍;
+//! - 「被监听目录自己被删 / 改名 / 重建」看事件路径本身,不管是哪个后端报的:Windows 上
+//!   这类事件来自它父目录的监听,父目录通常是非递归挂的,递归那一条也要据此重挂。
+//!
+//! 目录自身的变化(被删、被改名)只有它的父目录也被监听时才有事件,两种方式一样。
+//!
 //! # 平台
 //!
 //! Linux inotify、macOS FSEvents 走同一个单例。macOS 有一笔代价:notify 7 的 FSEvents
@@ -102,7 +125,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use notify::event::ModifyKind;
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Condvar, Mutex};
 
@@ -241,13 +264,26 @@ impl FsWatcher {
     /// WSL UNC(`\\wsl.localhost\...`)项目走同一条路。校验不过、目录不存在或 notify
     /// 报错时落「失败」态并打日志,计数照记;对失败的路径再 watch 一次会重试。
     pub fn watch(&self, path: &Path, project_path: &str) -> WatchReady {
-        self.hub.watch(self.id, path, project_path)
+        self.hub.watch(self.id, Lane::Flat, path, project_path)
     }
 
     /// 引用计数 -1,归零时撤销(后端那一条在无人引用后由注册线程摘除)。
     /// 未被监听的路径是空操作。`path` 要与 watch 时的字面路径同形。
     pub fn unwatch(&self, path: &Path) {
-        self.hub.unwatch(self.id, path);
+        self.hub.unwatch(self.id, Lane::Flat, path);
+    }
+
+    /// 递归监听整棵子树(见模块注释「递归监听」):子树里任何一层的变化都报上来,路径是
+    /// `path` 的字面形态 + 相对路径。计数、校验、落定回执与 [`Self::watch`] 一样,且与
+    /// 它**分开记账**:同一路径两种方式都挂着时各撤各的。Linux 上代价是逐目录挂,别用在
+    /// 大目录上。
+    pub fn watch_tree(&self, path: &Path, project_path: &str) -> WatchReady {
+        self.hub.watch(self.id, Lane::Tree, path, project_path)
+    }
+
+    /// [`Self::watch_tree`] 的配对撤销。
+    pub fn unwatch_tree(&self, path: &Path) {
+        self.hub.unwatch(self.id, Lane::Tree, path);
     }
 
     /// 名下持有且未失败的路径数(排队中的也算;不是引用计数之和)。
@@ -255,9 +291,9 @@ impl FsWatcher {
         self.hub.watched_count(self.id)
     }
 
-    /// 这条路径的最近一次注册是否失败了(未监听的路径返回 `false`)。
+    /// 这条路径(非递归那一份)的最近一次注册是否失败了(未监听的路径返回 `false`)。
     pub fn is_failed(&self, path: &Path) -> bool {
-        self.hub.is_failed(self.id, path)
+        self.hub.is_failed(self.id, Lane::Flat, path)
     }
 }
 
@@ -270,6 +306,33 @@ impl Drop for FsWatcher {
 // ─── 单例 ─────────────────────────────────────────────────
 
 type SubId = u64;
+
+/// 监听方式(见模块注释「递归监听」)。两种方式各一个后端、各一份路由与注册表。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    /// 只盯目录自己的直接子项
+    Flat,
+    /// 连同整棵子树
+    Tree,
+}
+
+const LANES: [Lane; 2] = [Lane::Flat, Lane::Tree];
+
+impl Lane {
+    fn idx(self) -> usize {
+        match self {
+            Lane::Flat => 0,
+            Lane::Tree => 1,
+        }
+    }
+
+    fn mode(self) -> RecursiveMode {
+        match self {
+            Lane::Flat => RecursiveMode::NonRecursive,
+            Lane::Tree => RecursiveMode::Recursive,
+        }
+    }
+}
 
 /// 一个订阅对一个后端目录的路由:事件改写回 `key` 的形态、带上 `project_path`。
 struct Route {
@@ -303,10 +366,11 @@ struct WatchEntry {
 struct Subscriber {
     label: &'static str,
     sink: FsChangeSink,
-    /// 字面路径 → 订阅。
-    watches: HashMap<PathBuf, WatchEntry>,
+    /// 逐种方式([`Lane::idx`]):字面路径 → 订阅。
+    watches: [HashMap<PathBuf, WatchEntry>; 2],
 }
 
+/// 下面三张表都按 [`Lane::idx`] 分两份,两种方式各管各的后端。
 #[derive(Default)]
 struct State {
     subs: HashMap<SubId, Subscriber>,
@@ -314,11 +378,11 @@ struct State {
     next_generation: u64,
     /// canonical 目录 → 路由。**只有 Resolved / Active 的订阅有路由**,所以
     /// 键集合就是「后端应当注册着的目录」。
-    routes: HashMap<PathBuf, Vec<Route>>,
+    routes: [HashMap<PathBuf, Vec<Route>>; 2],
     /// 后端实际注册着的目录。只有注册线程改它(调完 notify 回来记账)。
-    registered: HashSet<PathBuf>,
+    registered: [HashSet<PathBuf>; 2],
     /// 被监听目录自己被删/改名/重建,要摘掉重挂的(事件回调记,注册线程消费)。
-    stale: HashSet<PathBuf>,
+    stale: [HashSet<PathBuf>; 2],
     /// 期望表变了、注册线程该醒。
     dirty: bool,
     /// 注册线程手上没活、在睡(测试等它收敛用)。
@@ -337,41 +401,46 @@ impl State {
     }
 
     /// 撤掉一条订阅:落定回执、摘路由。后端那一条等注册线程对账时摘。
-    fn release(&mut self, sub: SubId, key: &Path, entry: WatchEntry) {
+    fn release(&mut self, sub: SubId, lane: Lane, key: &Path, entry: WatchEntry) {
         match entry.phase {
             Phase::Pending(ready) => ready.settle(WatchOutcome::Cancelled),
             Phase::Resolved { canonical, ready } => {
-                self.drop_route(&canonical, sub, key);
+                self.drop_route(lane, &canonical, sub, key);
                 ready.settle(WatchOutcome::Cancelled);
             }
-            Phase::Active { canonical } => self.drop_route(&canonical, sub, key),
+            Phase::Active { canonical } => self.drop_route(lane, &canonical, sub, key),
             Phase::Failed => {}
         }
     }
 
-    fn drop_route(&mut self, canonical: &Path, sub: SubId, key: &Path) {
-        if let Some(routes) = self.routes.get_mut(canonical) {
+    fn drop_route(&mut self, lane: Lane, canonical: &Path, sub: SubId, key: &Path) {
+        let table = &mut self.routes[lane.idx()];
+        if let Some(routes) = table.get_mut(canonical) {
             routes.retain(|route| !(route.sub == sub && route.key == key));
             if routes.is_empty() {
-                self.routes.remove(canonical);
+                table.remove(canonical);
             }
         }
     }
 
-    /// 最早排队的待决订阅(按代次号,先来先办)。
+    /// 最早排队的待决订阅(按代次号,先来先办;两种方式混在一起排)。
     fn next_pending(&self) -> Option<Job> {
         self.subs
             .iter()
             .flat_map(|(&sub, subscriber)| {
-                subscriber
-                    .watches
-                    .iter()
-                    .filter(|(_, entry)| matches!(entry.phase, Phase::Pending(_)))
-                    .map(move |(key, entry)| (entry.generation, sub, key, &entry.project_path))
+                LANES.into_iter().flat_map(move |lane| {
+                    subscriber.watches[lane.idx()]
+                        .iter()
+                        .filter(|(_, entry)| matches!(entry.phase, Phase::Pending(_)))
+                        .map(move |(key, entry)| {
+                            (entry.generation, sub, lane, key, &entry.project_path)
+                        })
+                })
             })
             .min_by_key(|(generation, ..)| *generation)
-            .map(|(generation, sub, key, project_path)| Job {
+            .map(|(generation, sub, lane, key, project_path)| Job {
                 sub,
+                lane,
                 key: key.clone(),
                 project_path: project_path.clone(),
                 generation,
@@ -380,11 +449,12 @@ impl State {
 
     /// 注册线程解析完一个待决订阅,回来记账。返回要打的日志行。
     fn apply_resolution(&mut self, job: Job, result: Result<PathBuf>) -> Vec<String> {
+        let lane = job.lane;
         let Some(subscriber) = self.subs.get_mut(&job.sub) else {
             return Vec::new();
         };
         let label = subscriber.label;
-        let Some(entry) = subscriber.watches.get_mut(&job.key) else {
+        let Some(entry) = subscriber.watches[lane.idx()].get_mut(&job.key) else {
             return Vec::new();
         };
         // 解析期间被撤掉又重挂过:新的一轮还在 Pending,留给下一轮办
@@ -403,8 +473,8 @@ impl State {
                 vec![format!("[{label}] 监听 {} 失败: {msg}", job.key.display())]
             }
             Ok(canonical) => {
-                // 别的订阅已经把这个目录挂上了:直接就位,不必再碰后端
-                let active = self.registered.contains(&canonical);
+                // 别的订阅已经用同一种方式把这个目录挂上了:直接就位,不必再碰后端
+                let active = self.registered[lane.idx()].contains(&canonical);
                 entry.phase = if active {
                     Phase::Active {
                         canonical: canonical.clone(),
@@ -416,11 +486,14 @@ impl State {
                     }
                 };
                 let project_path = entry.project_path.clone();
-                self.routes.entry(canonical).or_default().push(Route {
-                    sub: job.sub,
-                    key: job.key,
-                    project_path,
-                });
+                self.routes[lane.idx()]
+                    .entry(canonical)
+                    .or_default()
+                    .push(Route {
+                        sub: job.sub,
+                        key: job.key,
+                        project_path,
+                    });
                 if active {
                     ready.settle(WatchOutcome::Active);
                 }
@@ -430,20 +503,20 @@ impl State {
     }
 
     /// 注册线程调完一次后端 watch,回来记账。返回要打的日志行。
-    fn apply_registration(&mut self, dir: &Path, result: Result<()>) -> Vec<String> {
-        let targets: Vec<(SubId, PathBuf)> = self
-            .routes
+    fn apply_registration(&mut self, lane: Lane, dir: &Path, result: Result<()>) -> Vec<String> {
+        let i = lane.idx();
+        let targets: Vec<(SubId, PathBuf)> = self.routes[i]
             .get(dir)
             .map(|routes| routes.iter().map(|r| (r.sub, r.key.clone())).collect())
             .unwrap_or_default();
         match result {
             Ok(()) => {
-                self.registered.insert(dir.to_path_buf());
+                self.registered[i].insert(dir.to_path_buf());
                 for (sub, key) in targets {
                     let Some(entry) = self
                         .subs
                         .get_mut(&sub)
-                        .and_then(|subscriber| subscriber.watches.get_mut(&key))
+                        .and_then(|subscriber| subscriber.watches[i].get_mut(&key))
                     else {
                         continue;
                     };
@@ -462,13 +535,13 @@ impl State {
             Err(err) => {
                 // 挂不上:引用这个目录的订阅全部落「失败」(重挂失败时也包括原先 Active 的)
                 let msg = format!("{err:#}");
-                self.routes.remove(dir);
+                self.routes[i].remove(dir);
                 let mut logs = Vec::new();
                 for (sub, key) in targets {
                     let Some(subscriber) = self.subs.get_mut(&sub) else {
                         continue;
                     };
-                    let Some(entry) = subscriber.watches.get_mut(&key) else {
+                    let Some(entry) = subscriber.watches[i].get_mut(&key) else {
                         continue;
                     };
                     if let Phase::Resolved { ready, .. } =
@@ -491,6 +564,7 @@ impl State {
 /// 注册线程的一件解析活。
 struct Job {
     sub: SubId,
+    lane: Lane,
     key: PathBuf,
     project_path: String,
     generation: u64,
@@ -505,12 +579,12 @@ struct Shared {
 }
 
 impl Shared {
-    /// notify 的事件回调(后端线程上)。查路由时持锁,调 sink 前放锁。
-    fn dispatch(&self, res: notify::Result<NotifyEvent>) {
+    /// notify 的事件回调(`lane` 那个后端的线程上)。查路由时持锁,调 sink 前放锁。
+    fn dispatch(&self, lane: Lane, res: notify::Result<NotifyEvent>) {
         let Ok(event) = res else {
             return;
         };
-        if event.paths.is_empty() {
+        if event.paths.is_empty() || is_access_only(&event.kind) {
             return;
         }
         let kind = format!("{:?}", event.kind);
@@ -521,40 +595,71 @@ impl Shared {
             let mut guard = self.state.lock();
             let st = &mut *guard;
             for p in &event.paths {
+                // 被监听目录自己没了 / 换了一个:哪种方式挂着它都要重挂,不管这条是哪个
+                // 后端报的(见模块注释「递归监听」)
+                if reshapes {
+                    for l in LANES {
+                        if st.registered[l.idx()].contains(p) {
+                            st.stale[l.idx()].insert(p.clone());
+                            wake = true;
+                        }
+                    }
+                }
                 // 去重只在同一个路径的命中之间做:同一订阅者经「父目录」与「自身」
                 // 两条路由命中同一路径时只交一次
                 let start = out.len();
-                if let Some(routes) = st.routes.get(p) {
-                    if reshapes && st.registered.contains(p) {
-                        st.stale.insert(p.clone());
-                        wake = true;
+                let routes = &st.routes[lane.idx()];
+                match lane {
+                    Lane::Flat => {
+                        if let Some(hits) = routes.get(p) {
+                            for route in hits {
+                                push_change(
+                                    &st.subs,
+                                    &mut out,
+                                    start,
+                                    route,
+                                    route.key.clone(),
+                                    &kind,
+                                    reshapes,
+                                );
+                            }
+                        }
+                        if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
+                            && let Some(hits) = routes.get(parent)
+                        {
+                            for route in hits {
+                                push_change(
+                                    &st.subs,
+                                    &mut out,
+                                    start,
+                                    route,
+                                    route.key.join(name),
+                                    &kind,
+                                    reshapes,
+                                );
+                            }
+                        }
                     }
-                    for route in routes {
-                        push_change(
-                            &st.subs,
-                            &mut out,
-                            start,
-                            route,
-                            route.key.clone(),
-                            &kind,
-                            reshapes,
-                        );
+                    // 递归:哪个被监听目录是它的祖先(含自身)就交给谁,改写成字面 key + 相对路径
+                    Lane::Tree if !routes.is_empty() => {
+                        for dir in p.ancestors() {
+                            let Some(hits) = routes.get(dir) else {
+                                continue;
+                            };
+                            let rel = p.strip_prefix(dir).unwrap_or(Path::new(""));
+                            for route in hits {
+                                let path = if rel.as_os_str().is_empty() {
+                                    route.key.clone()
+                                } else {
+                                    route.key.join(rel)
+                                };
+                                push_change(
+                                    &st.subs, &mut out, start, route, path, &kind, reshapes,
+                                );
+                            }
+                        }
                     }
-                }
-                if let (Some(parent), Some(name)) = (p.parent(), p.file_name())
-                    && let Some(routes) = st.routes.get(parent)
-                {
-                    for route in routes {
-                        push_change(
-                            &st.subs,
-                            &mut out,
-                            start,
-                            route,
-                            route.key.join(name),
-                            &kind,
-                            reshapes,
-                        );
-                    }
+                    Lane::Tree => {}
                 }
             }
             if wake {
@@ -611,6 +716,14 @@ fn reshapes_dir(kind: &EventKind) -> bool {
     )
 }
 
+/// 只是被打开 / 读过的访问事件,不交给任何订阅者。notify 的 inotify 后端(Linux)连
+/// `IN_OPEN` 一起报:递归注册自己遍历子目录、git status 逐个读目录、文件树列目录都会
+/// 打开被监听的目录,交下去就成了「取状态 → 打开目录 → 又一批变化」的空转。写完关上
+/// (`IN_CLOSE_WRITE`)是真的改动,照交。Windows / macOS 的后端不报访问事件。
+fn is_access_only(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Access(access) if *access != AccessKind::Close(AccessMode::Write))
+}
+
 /// 进程级单例的外壳。持有者全部放手后通知注册线程收摊(全局那一份永不放手)。
 struct Hub {
     shared: Arc<Shared>,
@@ -662,7 +775,7 @@ impl Hub {
             Subscriber {
                 label,
                 sink,
-                watches: HashMap::new(),
+                watches: [HashMap::new(), HashMap::new()],
             },
         );
         FsWatcher {
@@ -671,7 +784,7 @@ impl Hub {
         }
     }
 
-    fn watch(&self, sub: SubId, path: &Path, project_path: &str) -> WatchReady {
+    fn watch(&self, sub: SubId, lane: Lane, path: &Path, project_path: &str) -> WatchReady {
         let mut guard = self.shared.state.lock();
         let st = &mut *guard;
         st.next_generation += 1;
@@ -680,7 +793,7 @@ impl Hub {
             return WatchReady::settled(WatchOutcome::Cancelled);
         };
         let label = subscriber.label;
-        let entry = match subscriber.watches.entry(path.to_path_buf()) {
+        let entry = match subscriber.watches[lane.idx()].entry(path.to_path_buf()) {
             Entry::Occupied(occupied) => {
                 let entry = occupied.into_mut();
                 entry.count += 1;
@@ -716,13 +829,14 @@ impl Hub {
         WatchReady(ready)
     }
 
-    fn unwatch(&self, sub: SubId, path: &Path) {
+    fn unwatch(&self, sub: SubId, lane: Lane, path: &Path) {
         let mut guard = self.shared.state.lock();
         let st = &mut *guard;
         let Some(subscriber) = st.subs.get_mut(&sub) else {
             return;
         };
-        let Some(entry) = subscriber.watches.get_mut(path) else {
+        let watches = &mut subscriber.watches[lane.idx()];
+        let Some(entry) = watches.get_mut(path) else {
             return;
         };
         // 计数归零的条目当场删除,所以这里 count ≥ 1,不会减出负数
@@ -730,10 +844,10 @@ impl Hub {
         if entry.count > 0 {
             return;
         }
-        let Some(entry) = subscriber.watches.remove(path) else {
+        let Some(entry) = watches.remove(path) else {
             return;
         };
-        st.release(sub, path, entry);
+        st.release(sub, lane, path, entry);
         st.mark_dirty();
         drop(guard);
         self.shared.work_cv.notify_one();
@@ -745,8 +859,10 @@ impl Hub {
         let Some(mut subscriber) = st.subs.remove(&sub) else {
             return;
         };
-        for (key, entry) in subscriber.watches.drain() {
-            st.release(sub, &key, entry);
+        for lane in LANES {
+            for (key, entry) in subscriber.watches[lane.idx()].drain() {
+                st.release(sub, lane, &key, entry);
+            }
         }
         st.mark_dirty();
         drop(guard);
@@ -760,25 +876,29 @@ impl Hub {
         st.subs.get(&sub).map_or(0, |subscriber| {
             subscriber
                 .watches
-                .values()
+                .iter()
+                .flat_map(HashMap::values)
                 .filter(|entry| !matches!(entry.phase, Phase::Failed))
                 .count()
         })
     }
 
-    fn is_failed(&self, sub: SubId, path: &Path) -> bool {
+    fn is_failed(&self, sub: SubId, lane: Lane, path: &Path) -> bool {
         let st = self.shared.state.lock();
         st.subs
             .get(&sub)
-            .and_then(|subscriber| subscriber.watches.get(path))
+            .and_then(|subscriber| subscriber.watches[lane.idx()].get(path))
             .is_some_and(|entry| matches!(entry.phase, Phase::Failed))
     }
 }
 
 // ─── 注册线程 ─────────────────────────────────────────────
 
+/// 注册线程的一轮活:要摘的、要挂的(逐条带方式)、一个待决订阅。
+type Work = (Vec<(Lane, PathBuf)>, Vec<(Lane, PathBuf)>, Option<Job>);
+
 /// 注册线程取活:要摘的、要挂的、一个待决订阅。没活就睡到有人叫;收摊返回 `None`。
-fn next_work(shared: &Shared) -> Option<(Vec<PathBuf>, Vec<PathBuf>, Option<Job>)> {
+fn next_work(shared: &Shared) -> Option<Work> {
     let mut guard = shared.state.lock();
     loop {
         if guard.shutdown {
@@ -786,22 +906,27 @@ fn next_work(shared: &Shared) -> Option<(Vec<PathBuf>, Vec<PathBuf>, Option<Job>
         }
         let st = &mut *guard;
         st.dirty = false;
-        let stale: HashSet<PathBuf> = std::mem::take(&mut st.stale)
-            .into_iter()
-            .filter(|dir| st.registered.contains(dir))
-            .collect();
-        let removals: Vec<PathBuf> = st
-            .registered
-            .iter()
-            .filter(|dir| !st.routes.contains_key(*dir) || stale.contains(*dir))
-            .cloned()
-            .collect();
-        let additions: Vec<PathBuf> = st
-            .routes
-            .keys()
-            .filter(|dir| !st.registered.contains(*dir) || stale.contains(*dir))
-            .cloned()
-            .collect();
+        let mut removals = Vec::new();
+        let mut additions = Vec::new();
+        for lane in LANES {
+            let i = lane.idx();
+            let stale: HashSet<PathBuf> = std::mem::take(&mut st.stale[i])
+                .into_iter()
+                .filter(|dir| st.registered[i].contains(dir))
+                .collect();
+            removals.extend(
+                st.registered[i]
+                    .iter()
+                    .filter(|dir| !st.routes[i].contains_key(*dir) || stale.contains(*dir))
+                    .map(|dir| (lane, dir.clone())),
+            );
+            additions.extend(
+                st.routes[i]
+                    .keys()
+                    .filter(|dir| !st.registered[i].contains(*dir) || stale.contains(*dir))
+                    .map(|dir| (lane, dir.clone())),
+            );
+        }
         let job = st.next_pending();
         if removals.is_empty() && additions.is_empty() && job.is_none() {
             st.idle = true;
@@ -817,44 +942,53 @@ fn next_work(shared: &Shared) -> Option<(Vec<PathBuf>, Vec<PathBuf>, Option<Job>
 }
 
 fn worker_loop(shared: Arc<Shared>, mut factory: BackendFactory) {
-    let dispatcher = Dispatcher(Arc::downgrade(&shared));
-    // notify watcher 只归这条线程,调它时手上没有任何锁(见模块注释「死锁红线」)
-    let mut backend: Option<Box<dyn Backend>> = None;
+    // notify watcher 只归这条线程,调它时手上没有任何锁(见模块注释「死锁红线」)。
+    // 两种方式各一个,第一次要用时才建
+    let mut backends: [Option<Box<dyn Backend>>; 2] = [None, None];
     while let Some((removals, additions, job)) = next_work(&shared) {
         // ① 先摘:删目录前的脱挂要尽快把句柄放掉
-        if let Some(backend) = backend.as_mut() {
-            for dir in &removals {
+        for (lane, dir) in &removals {
+            if let Some(backend) = backends[lane.idx()].as_mut() {
                 // 目录已被删时 inotify / FSEvents 会报「没在监听」,不必理会
                 let _ = backend.unwatch(dir);
             }
         }
         if !removals.is_empty() {
             let mut st = shared.state.lock();
-            for dir in &removals {
-                st.registered.remove(dir);
+            for (lane, dir) in &removals {
+                st.registered[lane.idx()].remove(dir);
+            }
+            // 递归那一路没人用了:后端整个收掉(Windows 上它是一条每 100ms 醒一次的线程),
+            // 下次有人要再建。没有路由就不会有要挂的,本轮的 additions 里不会有它
+            let tree = Lane::Tree.idx();
+            let idle_tree = st.routes[tree].is_empty() && st.registered[tree].is_empty();
+            drop(st);
+            if idle_tree {
+                drop(backends[tree].take());
             }
         }
         // ② 再挂。目录已经不在了就不碰后端:多半是被监听目录自己被删之后的重挂(删掉
         // 某个前缀下最后一个分支时 git 连空目录 `refs/heads/bugfix` 一起删),或解析完才
         // 被删。订阅照样落「失败」,但这不是故障 —— 订阅方下一次重列清单时自会撤掉它,
         // 不打日志
-        for dir in additions {
+        for (lane, dir) in additions {
             if !dir.is_dir() {
                 let vanished = Err(anyhow::anyhow!("目录已不存在: {}", dir.display()));
-                let _ = shared.state.lock().apply_registration(&dir, vanished);
+                let _ = shared.state.lock().apply_registration(lane, &dir, vanished);
                 continue;
             }
-            let result = match backend.as_mut() {
+            let slot = &mut backends[lane.idx()];
+            let result = match slot.as_mut() {
                 Some(backend) => backend.watch(&dir),
-                None => match factory(dispatcher.clone()) {
+                None => match factory(Dispatcher(Arc::downgrade(&shared), lane), lane) {
                     Ok(created) => {
                         shared.state.lock().backends_created += 1;
-                        backend.insert(created).watch(&dir)
+                        slot.insert(created).watch(&dir)
                     }
                     Err(err) => Err(err),
                 },
             };
-            let logs = shared.state.lock().apply_registration(&dir, result);
+            let logs = shared.state.lock().apply_registration(lane, &dir, result);
             print_logs(logs);
         }
         // ③ 解析一个待决订阅(IO 在锁外)
@@ -865,7 +999,7 @@ fn worker_loop(shared: Arc<Shared>, mut factory: BackendFactory) {
         }
     }
     // 收摊:notify watcher 在锁外析构
-    drop(backend);
+    drop(backends);
 }
 
 fn print_logs(logs: Vec<String>) {
@@ -883,52 +1017,59 @@ fn resolve(key: &Path, project_path: &str) -> Result<PathBuf> {
     std::fs::canonicalize(key).with_context(|| format!("监听目录失败: {}", key.display()))
 }
 
-/// notify watcher 的最小接口。测试里换成假后端,数调用、卡时机。
+/// notify watcher 的最小接口。测试里换成假后端,数调用、卡时机。监听方式在建的时候定
+/// (见 [`BackendFactory`]),一个后端只用一种。
 trait Backend {
     fn watch(&mut self, dir: &Path) -> Result<()>;
     fn unwatch(&mut self, dir: &Path) -> Result<()>;
 }
 
-type BackendFactory = Box<dyn FnMut(Dispatcher) -> Result<Box<dyn Backend>> + Send>;
+/// 按方式建后端:事件经 `Dispatcher` 回到单例,它记着自己是哪种方式的。
+type BackendFactory = Box<dyn FnMut(Dispatcher, Lane) -> Result<Box<dyn Backend>> + Send>;
 
-/// 事件回调手里的单例引用。弱引用:单例收摊后迟到的事件直接丢弃。
+/// 事件回调手里的单例引用 + 报事件的是哪种方式的后端。弱引用:单例收摊后迟到的事件
+/// 直接丢弃。
 #[derive(Clone)]
-struct Dispatcher(Weak<Shared>);
+struct Dispatcher(Weak<Shared>, Lane);
 
 impl Dispatcher {
     fn dispatch(&self, res: notify::Result<NotifyEvent>) {
         if let Some(shared) = self.0.upgrade() {
-            shared.dispatch(res);
+            shared.dispatch(self.1, res);
         }
     }
 }
 
-struct NotifyBackend(RecommendedWatcher);
+struct NotifyBackend {
+    watcher: RecommendedWatcher,
+    mode: RecursiveMode,
+}
 
 impl Backend for NotifyBackend {
     fn watch(&mut self, dir: &Path) -> Result<()> {
-        self.0
-            .watch(dir, RecursiveMode::NonRecursive)
-            .with_context(|| {
-                format!(
-                    "监听目录失败: {}",
-                    crate::fs::strip_verbatim_prefix(dir.to_path_buf()).display()
-                )
-            })
+        self.watcher.watch(dir, self.mode).with_context(|| {
+            format!(
+                "监听目录失败: {}",
+                crate::fs::strip_verbatim_prefix(dir.to_path_buf()).display()
+            )
+        })
     }
 
     fn unwatch(&mut self, dir: &Path) -> Result<()> {
-        self.0.unwatch(dir)?;
+        self.watcher.unwatch(dir)?;
         Ok(())
     }
 }
 
-fn notify_backend(dispatcher: Dispatcher) -> Result<Box<dyn Backend>> {
+fn notify_backend(dispatcher: Dispatcher, lane: Lane) -> Result<Box<dyn Backend>> {
     let watcher = notify::recommended_watcher(move |res: notify::Result<NotifyEvent>| {
         dispatcher.dispatch(res)
     })
     .context("创建文件监听器失败")?;
-    Ok(Box::new(NotifyBackend(watcher)))
+    Ok(Box::new(NotifyBackend {
+        watcher,
+        mode: lane.mode(),
+    }))
 }
 
 #[cfg(test)]
@@ -942,11 +1083,16 @@ mod tests {
     const BUDGET: Duration = Duration::from_secs(10);
 
     fn temp_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("mini-term-watch-{tag}-{ts}"));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "mini-term-watch-{tag}-{}-{ts}-{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1020,7 +1166,11 @@ mod tests {
         }
 
         fn registered(&self) -> HashSet<PathBuf> {
-            self.shared.state.lock().registered.clone()
+            self.shared.state.lock().registered[Lane::Flat.idx()].clone()
+        }
+
+        fn registered_trees(&self) -> HashSet<PathBuf> {
+            self.shared.state.lock().registered[Lane::Tree.idx()].clone()
         }
 
         fn backends_created(&self) -> usize {
@@ -1030,12 +1180,19 @@ mod tests {
 
     // ── 假后端:数调用、可把某个目录的 watch 卡住、可手工发事件 ──
 
+    /// 非递归后端的记账在前几个字段(老用例照旧读),递归后端的在 `tree_*`。
     #[derive(Default)]
     struct FakeLog {
         live: HashSet<PathBuf>,
         watch_calls: Vec<PathBuf>,
         unwatch_calls: Vec<PathBuf>,
         dispatcher: Option<Dispatcher>,
+        tree_live: HashSet<PathBuf>,
+        tree_watch_calls: Vec<PathBuf>,
+        tree_dispatcher: Option<Dispatcher>,
+        /// 递归后端建过 / 收掉过几次
+        tree_created: usize,
+        tree_dropped: usize,
     }
 
     #[derive(Default)]
@@ -1093,6 +1250,7 @@ mod tests {
     struct FakeBackend {
         log: Arc<Mutex<FakeLog>>,
         gate: Arc<Gate>,
+        lane: Lane,
     }
 
     impl Backend for FakeBackend {
@@ -1102,16 +1260,41 @@ mod tests {
                 anyhow::bail!("目录不存在: {}", dir.display());
             }
             let mut log = self.log.lock();
-            log.watch_calls.push(dir.to_path_buf());
-            log.live.insert(dir.to_path_buf());
+            match self.lane {
+                Lane::Flat => {
+                    log.watch_calls.push(dir.to_path_buf());
+                    log.live.insert(dir.to_path_buf());
+                }
+                Lane::Tree => {
+                    log.tree_watch_calls.push(dir.to_path_buf());
+                    log.tree_live.insert(dir.to_path_buf());
+                }
+            }
             Ok(())
         }
 
         fn unwatch(&mut self, dir: &Path) -> Result<()> {
             let mut log = self.log.lock();
-            log.unwatch_calls.push(dir.to_path_buf());
-            log.live.remove(dir);
+            match self.lane {
+                Lane::Flat => {
+                    log.unwatch_calls.push(dir.to_path_buf());
+                    log.live.remove(dir);
+                }
+                Lane::Tree => {
+                    log.tree_live.remove(dir);
+                }
+            }
             Ok(())
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            if self.lane == Lane::Tree {
+                let mut log = self.log.lock();
+                log.tree_dropped += 1;
+                log.tree_live.clear();
+            }
         }
     }
 
@@ -1127,11 +1310,20 @@ mod tests {
             let gate = Arc::new(Gate::default());
             let (factory_log, factory_gate) = (log.clone(), gate.clone());
             let hub = Hub::spawn(Box::new(
-                move |dispatcher: Dispatcher| -> Result<Box<dyn Backend>> {
-                    factory_log.lock().dispatcher = Some(dispatcher);
+                move |dispatcher: Dispatcher, lane: Lane| -> Result<Box<dyn Backend>> {
+                    let mut log = factory_log.lock();
+                    match lane {
+                        Lane::Flat => log.dispatcher = Some(dispatcher),
+                        Lane::Tree => {
+                            log.tree_dispatcher = Some(dispatcher);
+                            log.tree_created += 1;
+                        }
+                    }
+                    drop(log);
                     Ok(Box::new(FakeBackend {
                         log: factory_log.clone(),
                         gate: factory_gate.clone(),
+                        lane,
                     }) as Box<dyn Backend>)
                 },
             ));
@@ -1141,6 +1333,20 @@ mod tests {
         /// 以后端形态(canonical 路径)发一条事件,与 notify 回调同一入口。
         fn emit(&self, kind: EventKind, paths: &[PathBuf]) {
             let dispatcher = self.log.lock().dispatcher.clone().expect("后端还没建");
+            let event = paths
+                .iter()
+                .fold(NotifyEvent::new(kind), |event, p| event.add_path(p.clone()));
+            dispatcher.dispatch(Ok(event));
+        }
+
+        /// 同上,由递归后端报。
+        fn emit_tree(&self, kind: EventKind, paths: &[PathBuf]) {
+            let dispatcher = self
+                .log
+                .lock()
+                .tree_dispatcher
+                .clone()
+                .expect("递归后端还没建");
             let event = paths
                 .iter()
                 .fold(NotifyEvent::new(kind), |event, p| event.add_path(p.clone()));
@@ -1506,6 +1712,135 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // ── 递归监听(见模块注释「递归监听」) ──
+
+    /// 子树深处的变化交给递归订阅(字面 key + 相对路径);同一目录两种方式各挂一条后端,
+    /// 事件按报它的后端分、互不串;最后一条递归撤走时递归后端整个收掉,再要时重建。
+    #[test]
+    fn tree_watch_routes_deep_paths_on_its_own_backend() {
+        let fake = Fake::new();
+        let root = temp_dir("tree");
+        let sub = root.join("sub");
+        let deep = sub.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let (s1, rx_tree) = channel_sink();
+        let (s2, rx_flat) = channel_sink();
+        let tree = fake.hub.subscribe("tree", s1);
+        let flat = fake.hub.subscribe("flat", s2);
+        for ready in [
+            tree.watch_tree(&root, &proj(&root)),
+            flat.watch(&root, &proj(&root)),
+            flat.watch(&sub, &proj(&root)),
+        ] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+        fake.idle();
+        assert_eq!(
+            fake.hub.registered(),
+            HashSet::from([canon(&root), canon(&sub)])
+        );
+        assert_eq!(fake.hub.registered_trees(), HashSet::from([canon(&root)]));
+        assert_eq!(fake.log.lock().tree_watch_calls, vec![canon(&root)]);
+
+        // 递归后端报的深处变化:只交递归订阅
+        fake.emit_tree(
+            EventKind::Create(CreateKind::File),
+            &[canon(&deep).join("x.txt")],
+        );
+        assert_eq!(
+            drain_paths(&rx_tree),
+            vec![root.join("sub").join("deep").join("x.txt")]
+        );
+        assert!(
+            drain_paths(&rx_flat).is_empty(),
+            "非递归订阅不收递归后端的事件"
+        );
+        // 被监听目录自身(深度 0)也交
+        fake.emit_tree(EventKind::Modify(ModifyKind::Any), &[canon(&root)]);
+        assert_eq!(drain_paths(&rx_tree), vec![root.clone()]);
+        // 非递归后端报的只交非递归订阅:递归那条也盖着这里,但不交第二遍
+        fake.emit(
+            EventKind::Modify(ModifyKind::Any),
+            &[canon(&sub).join("a.txt")],
+        );
+        assert!(drain_paths(&rx_tree).is_empty());
+        assert_eq!(drain_paths(&rx_flat), vec![sub.join("a.txt")]);
+        assert_eq!(tree.watched_count(), 1);
+        assert_eq!(flat.watched_count(), 2);
+
+        tree.unwatch_tree(&root);
+        fake.idle();
+        assert!(fake.hub.registered_trees().is_empty());
+        assert_eq!(fake.log.lock().tree_dropped, 1, "递归后端没人用就收掉");
+        assert_eq!(fake.hub.registered().len(), 2, "非递归那边不受影响");
+        assert_eq!(
+            tree.watch_tree(&root, &proj(&root)).wait(BUDGET),
+            Some(WatchOutcome::Active)
+        );
+        assert_eq!(fake.log.lock().tree_created, 2);
+        drop((tree, flat));
+        fake.idle();
+        assert!(fake.hub.registered().is_empty() && fake.hub.registered_trees().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 递归盯着的目录被删又建回来:这类事件由父目录的非递归监听报(Windows 的形态),
+    /// 递归那一条也要据此摘掉重挂 —— 不然它还盯着旧目录对象。非递归那边没挂它,不动。
+    #[test]
+    fn tree_dir_recreated_is_reregistered_from_parent_event() {
+        let fake = Fake::new();
+        let root = temp_dir("tree-stale");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let (sink, rx) = channel_sink();
+        let w = fake.hub.subscribe("w", sink);
+        for ready in [
+            w.watch(&root, &proj(&root)),
+            w.watch_tree(&src, &proj(&root)),
+        ] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+        fake.idle();
+        fake.emit(
+            EventKind::Create(CreateKind::Folder),
+            std::slice::from_ref(&canon(&src)),
+        );
+        assert_eq!(drain_paths(&rx), vec![src.clone()], "父目录那条照常交");
+        fake.idle();
+        assert_eq!(
+            fake.log.lock().tree_watch_calls,
+            vec![canon(&src), canon(&src)]
+        );
+        assert_eq!(fake.log.lock().watch_calls, vec![canon(&root)]);
+        drop(w);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 真后端:递归监听报得出子树深处的变化,路径改写回字面形态;撤掉后不残留。
+    #[test]
+    fn real_tree_watch_reports_deep_changes() {
+        let hub = Hub::real();
+        let root = temp_dir("tree-real");
+        let deep = root.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let (sink, rx) = channel_sink();
+        let w = hub.subscribe("tree", sink);
+        assert_eq!(
+            w.watch_tree(&root, &proj(&root)).wait(BUDGET),
+            Some(WatchOutcome::Active)
+        );
+        let file = deep.join("c.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert!(
+            recv_matching(&rx, |c| c.path == file).is_some(),
+            "子树深处的变化要报上来"
+        );
+        drop(w);
+        assert!(hub.wait_idle(BUDGET));
+        assert!(hub.registered_trees().is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn dir_removed_or_recreated_gets_reregistered() {
         let fake = Fake::new();
@@ -1592,6 +1927,39 @@ mod tests {
         // 只是内容 / 元数据变了:不标
         fake.emit(EventKind::Modify(ModifyKind::Any), &[canon(&dir)]);
         assert_eq!(flags(&rx), vec![(dir.clone(), false)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// inotify 的「被打开」(`IN_OPEN`)一类访问事件不交:取状态、列目录都会打开被监听的
+    /// 目录,交下去就是空转(CI 的 Linux 上递归注册遍历子目录时实撞)。写完关上照交。
+    #[test]
+    fn access_events_are_dropped_except_close_write() {
+        let fake = Fake::new();
+        let root = temp_dir("access");
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sink, rx) = channel_sink();
+        let w = fake.hub.subscribe("w", sink);
+        for ready in [w.watch(&root, &proj(&root)), w.watch(&dir, &proj(&root))] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Any),
+        ] {
+            fake.emit(kind, &[canon(&dir)]);
+            fake.emit(kind, &[canon(&dir).join("a.txt")]);
+            fake.idle();
+            assert_eq!(rx.try_iter().count(), 0, "{kind:?}");
+        }
+        fake.emit(
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            &[canon(&dir).join("a.txt")],
+        );
+        let got: Vec<PathBuf> = rx.try_iter().map(|c| c.path).collect();
+        assert_eq!(got, vec![dir.join("a.txt")]);
         std::fs::remove_dir_all(&root).ok();
     }
 

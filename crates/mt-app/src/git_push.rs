@@ -300,7 +300,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                     let message = pushed_summary(&target, count, truncated, force);
                     panel.update(cx, |p, cx| {
                         p.notify_result(message, Tone::Info, cx);
-                        p.refresh_all(cx);
+                        p.refresh_after_write(cx);
                     });
                     None
                 }
@@ -334,7 +334,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                 s.error = Some((text_state, hint));
                 cx.notify();
             });
-            panel.update(cx, |p, cx| p.refresh_all(cx));
+            panel.update(cx, |p, cx| p.refresh_after_write(cx));
         },
         window,
         cx,

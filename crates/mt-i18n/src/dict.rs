@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1509;
+pub const ZH_ENTRY_COUNT: usize = 1511;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1509;
+pub const EN_ENTRY_COUNT: usize = 1511;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1238,6 +1238,7 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("action.revert", "还原"),
     ("action.reword", "修改提交消息"),
     ("action.undo", "撤销提交"),
+    ("autoLoadPaused", "已加载 {count} 个提交"),
     ("branch.base", "基于 {hash}「{title}」"),
     ("branch.checkout", "创建后检出"),
     ("branch.errEmpty", "请输入名称"),
@@ -1313,6 +1314,7 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("filter.searching", "搜索中…已扫描 {count} 个提交"),
     ("filter.syntaxTip", "关键词匹配标题 / 正文 / 哈希前缀 / 作者\n加一段 path:<路径> 只看改动了该文件或目录的提交（仓库内相对路径）\n路径带空格时加引号：path:\"a b/c\""),
     ("loadFailed", "读取提交历史失败：{detail}"),
+    ("loadMore", "加载更多"),
     ("loadingMore", "加载更多…"),
     ("menu.checkout", "检出此提交"),
     ("menu.cherryPick", "拣选到当前分支（Cherry-pick）"),
@@ -1403,6 +1405,7 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("action.revert", "Revert"),
     ("action.reword", "Edit message"),
     ("action.undo", "Undo commit"),
+    ("autoLoadPaused", "{count} commits loaded"),
     ("branch.base", "Based on {hash} \"{title}\""),
     ("branch.checkout", "Checkout after creation"),
     ("branch.errEmpty", "Enter a name"),
@@ -1478,6 +1481,7 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("filter.searching", "Searching… {count} commits scanned"),
     ("filter.syntaxTip", "Keywords match the subject / body / hash prefix / author\nAdd path:<path> to keep only commits that changed that file or directory (relative to the repository root); quote paths with spaces: path:\"a b/c\""),
     ("loadFailed", "Failed to load history: {detail}"),
+    ("loadMore", "Load more"),
     ("loadingMore", "Loading more…"),
     ("menu.checkout", "Checkout Revision"),
     ("menu.cherryPick", "Cherry-pick"),
