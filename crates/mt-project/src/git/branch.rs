@@ -512,8 +512,9 @@ pub struct BranchTracking {
     pub behind: usize,
 }
 
-/// 逐个本地分支算领先 / 落后的上限。分支成百上千的仓库只算前这么多个,
+/// 逐个本地分支算领先 / 落后的上限。分支成百上千的仓库只算按引用名排在前面的这么多个,
 /// 分支弹窗里其余的不显示计数 —— 每个都要走一次提交图(结果有缓存,见 [`AheadBehindCache`])。
+/// HEAD 所在分支不受这个上限:排第几都算(见 [`local_branch_tracking_in`])。
 const TRACKING_LIMIT: usize = 300;
 
 /// 领先 / 落后的进程级缓存,键是 `(仓库的 git 目录, 本地提交, 上游提交)`。
@@ -641,19 +642,32 @@ fn tracking_of(
 /// 全部配了上游(且远程跟踪引用在场)的本地分支的领先 / 落后。分支弹窗逐行用。
 pub fn local_branch_tracking(repo_path: &Path) -> Result<Vec<BranchTracking>> {
     let repo = Repository::open(repo_path)?;
-    local_branch_tracking_in(&repo, &mut UpstreamResolver::new(&repo))
+    local_branch_tracking_in(&repo, &mut UpstreamResolver::new(&repo), TRACKING_LIMIT)
 }
 
+/// 按引用名顺序算前 `limit` 个本地分支;HEAD 所在分支排在这之外时单独补在末尾 ——
+/// 分支弹窗的「当前分支」行只查这张表,本地分支几百个、当前分支名又靠后时(`main`
+/// 排在一堆 `feature/*` 后面)它会没有 ↑↓,而仓库栏照样有。
 fn local_branch_tracking_in(
     repo: &Repository,
     upstreams: &mut UpstreamResolver<'_>,
+    limit: usize,
 ) -> Result<Vec<BranchTracking>> {
+    let head = head_branch_name(repo);
+    let mut head_seen = false;
     let mut out = Vec::new();
-    for item in repo.branches(Some(BranchType::Local))?.take(TRACKING_LIMIT) {
+    for item in repo.branches(Some(BranchType::Local))?.take(limit) {
         let (branch, _) = item?;
+        head_seen |= branch.name().ok().flatten() == head.as_deref();
         if let Some(tracking) = tracking_of(repo, upstreams, &branch) {
             out.push(tracking);
         }
+    }
+    if !head_seen
+        && let Some(branch) = head.and_then(|name| repo.find_branch(&name, BranchType::Local).ok())
+        && let Some(tracking) = tracking_of(repo, upstreams, &branch)
+    {
+        out.push(tracking);
     }
     Ok(out)
 }
@@ -691,7 +705,8 @@ pub struct RepoPanelSnapshot {
     pub head_label: Option<String>,
     /// HEAD 分支相对上游的领先 / 落后(同 [`ahead_behind`])。
     pub head_tracking: Option<BranchTracking>,
-    /// 全部本地分支的领先 / 落后(同 [`local_branch_tracking`])。
+    /// 全部本地分支的领先 / 落后(同 [`local_branch_tracking`]):分支多时只算前一段,
+    /// HEAD 分支总在列。
     pub tracking: Vec<BranchTracking>,
     /// 最近检出过的分支(同 [`recent_branches`])。
     pub recent: Vec<String>,
@@ -716,8 +731,9 @@ pub fn repo_panel_snapshot(repo_path: &Path, recent_limit: usize) -> Result<Repo
     let signature = repo_signature_in(&repo).ok();
     let mut upstreams = UpstreamResolver::new(&repo);
     let branches = repo_branches_in(&repo, &mut upstreams)?;
-    let tracking = local_branch_tracking_in(&repo, &mut upstreams).unwrap_or_default();
-    // HEAD 那条刚在上面算过,这里命中缓存
+    let tracking =
+        local_branch_tracking_in(&repo, &mut upstreams, TRACKING_LIMIT).unwrap_or_default();
+    // HEAD 那条刚在上面算过(排第几都算),这里命中缓存
     let head_tracking = ahead_behind_in(&repo, &mut upstreams).ok().flatten();
     Ok(RepoPanelSnapshot {
         signature,
@@ -1053,6 +1069,42 @@ mod tests {
             "detached 的显示名是带括号的短 hash"
         );
         cleanup(&[&work, &bare, &other]);
+    }
+
+    /// 本地分支多过上限时,HEAD 所在分支排在上限之外也照算(分支弹窗「当前分支」行的
+    /// ↑↓ 与仓库栏同一个数);其余分支的上限口径不变,HEAD 在范围里时也不重复补。
+    #[test]
+    fn 领先落后超上限时当前分支照算() {
+        let (work, bare, main) = repo_with_origin("br-ab-limit");
+        // HEAD 换到一条配好上游、再领先一个提交的分支上
+        git(&work, &["checkout", "-q", "-b", "zz-head"]);
+        git(&work, &["push", "-q", "-u", "origin", "zz-head"]);
+        commit_file(&work, "w.txt", "w\n", "w");
+
+        let repo = Repository::open(&work).unwrap();
+        let tracked = |limit: usize| -> Vec<BranchTracking> {
+            let mut all =
+                local_branch_tracking_in(&repo, &mut UpstreamResolver::new(&repo), limit).unwrap();
+            all.sort_by(|a, b| a.branch.cmp(&b.branch));
+            all
+        };
+        // 上限 0:一条分支都轮不到 —— 配了上游的 main 照旧不算,HEAD 的 zz-head 照算
+        let capped = tracked(0);
+        let names: Vec<&str> = capped.iter().map(|t| t.branch.as_str()).collect();
+        assert_eq!(names, ["zz-head"]);
+        assert_eq!((capped[0].ahead, capped[0].behind), (1, 0));
+        assert_eq!(capped[0].upstream, "origin/zz-head");
+        // 上限够用:HEAD 已在范围里,不重复补
+        let all = tracked(TRACKING_LIMIT);
+        let names: Vec<&str> = all.iter().map(|t| t.branch.as_str()).collect();
+        assert_eq!(names, [main.as_str(), "zz-head"]);
+        drop(repo);
+
+        // 快照里的当前分支计数与仓库栏(head_tracking)同一个数
+        let snap = repo_panel_snapshot(&work, 5).unwrap();
+        let head = snap.head_tracking.clone().expect("有上游");
+        assert!(snap.tracking.contains(&head), "{:?}", snap.tracking);
+        cleanup(&[&work, &bare]);
     }
 
     /// 整批共用一份配置快照的上游解析,结论与逐分支 `Branch::upstream()` 逐条相同:
