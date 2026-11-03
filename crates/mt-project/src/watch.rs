@@ -125,7 +125,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use notify::event::ModifyKind;
+use notify::event::{AccessKind, AccessMode, ModifyKind};
 use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::{Condvar, Mutex};
 
@@ -584,7 +584,7 @@ impl Shared {
         let Ok(event) = res else {
             return;
         };
-        if event.paths.is_empty() {
+        if event.paths.is_empty() || is_access_only(&event.kind) {
             return;
         }
         let kind = format!("{:?}", event.kind);
@@ -714,6 +714,14 @@ fn reshapes_dir(kind: &EventKind) -> bool {
         kind,
         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
     )
+}
+
+/// 只是被打开 / 读过的访问事件,不交给任何订阅者。notify 的 inotify 后端(Linux)连
+/// `IN_OPEN` 一起报:递归注册自己遍历子目录、git status 逐个读目录、文件树列目录都会
+/// 打开被监听的目录,交下去就成了「取状态 → 打开目录 → 又一批变化」的空转。写完关上
+/// (`IN_CLOSE_WRITE`)是真的改动,照交。Windows / macOS 的后端不报访问事件。
+fn is_access_only(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Access(access) if *access != AccessKind::Close(AccessMode::Write))
 }
 
 /// 进程级单例的外壳。持有者全部放手后通知注册线程收摊(全局那一份永不放手)。
@@ -1919,6 +1927,39 @@ mod tests {
         // 只是内容 / 元数据变了:不标
         fake.emit(EventKind::Modify(ModifyKind::Any), &[canon(&dir)]);
         assert_eq!(flags(&rx), vec![(dir.clone(), false)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// inotify 的「被打开」(`IN_OPEN`)一类访问事件不交:取状态、列目录都会打开被监听的
+    /// 目录,交下去就是空转(CI 的 Linux 上递归注册遍历子目录时实撞)。写完关上照交。
+    #[test]
+    fn access_events_are_dropped_except_close_write() {
+        let fake = Fake::new();
+        let root = temp_dir("access");
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sink, rx) = channel_sink();
+        let w = fake.hub.subscribe("w", sink);
+        for ready in [w.watch(&root, &proj(&root)), w.watch(&dir, &proj(&root))] {
+            assert_eq!(ready.wait(BUDGET), Some(WatchOutcome::Active));
+        }
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Any),
+        ] {
+            fake.emit(kind, &[canon(&dir)]);
+            fake.emit(kind, &[canon(&dir).join("a.txt")]);
+            fake.idle();
+            assert_eq!(rx.try_iter().count(), 0, "{kind:?}");
+        }
+        fake.emit(
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            &[canon(&dir).join("a.txt")],
+        );
+        let got: Vec<PathBuf> = rx.try_iter().map(|c| c.path).collect();
+        assert_eq!(got, vec![dir.join("a.txt")]);
         std::fs::remove_dir_all(&root).ok();
     }
 
