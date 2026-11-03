@@ -196,6 +196,8 @@ impl ProjectSwitcher {
         };
         self.store
             .update(cx, |store, cx| store.set_active_project(&id, cx));
+        // 侧栏里那一行可能藏在折叠组里 / 可视区外,一并揭示
+        crate::project_list::reveal(&id, cx);
         // 关闭排到本轮 effect 之后:这会儿本实体正被 Dialog 的 builder 持有着,
         // 当场 `close_dialog` 等于在自己脚下抽地毯
         window.defer(cx, |window, cx| {

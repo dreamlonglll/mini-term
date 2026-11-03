@@ -462,6 +462,8 @@ impl Workspace {
 
         let title_bar = cx.new(|cx| TitleBar::new(store.clone(), cx));
         let project_list = cx.new(|cx| ProjectList::new(store.clone(), cx));
+        // 列表之外的切项目入口(标题栏 / 托盘 / toast …)经它在列表里揭示新项目
+        project_list::install(project_list.clone(), cx);
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         file_tree::install(file_tree.clone(), cx);
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
@@ -722,6 +724,7 @@ impl Workspace {
                 if !self.focus_attention_target(Some(&project_id), window, cx) {
                     self.store
                         .update(cx, |store, cx| store.set_active_project(&project_id, cx));
+                    project_list::reveal(&project_id, cx);
                 }
             }
         }
@@ -745,6 +748,8 @@ impl Workspace {
         });
         self.workbench_area
             .update(cx, |area, cx| area.activate_terminal(window, cx));
+        // 跳过去的项目在「项目」块里也得看得见(折叠组里 / 可视区外)
+        project_list::reveal(&project_id, cx);
         true
     }
 

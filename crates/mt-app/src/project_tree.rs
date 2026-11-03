@@ -517,6 +517,75 @@ pub fn get_ordered_tree(config: &AppConfig) -> Vec<OrderedItem> {
     result
 }
 
+// ─── 揭示 ─────────────────────────────────────────────────────
+
+/// 要让某个项目的行出现在侧栏里,得先展开哪些**折叠着的**分组(外层在前)。
+///
+/// 位置口径与 [`get_ordered_tree`] 同一套:
+/// - 在树里 → 它的祖先分组链;
+/// - worktree 子项目不在树里、紧随父项目渲染 → 沿 `parentProjectId` 往上找到
+///   在树里的那一代,取那一代的祖先链(`seen` 兼做环路保护,与展平里 `pushed`
+///   同一个用途);
+/// - 根层 / 树外孤儿(收尾兜底顶在根层)/ 查无此项 → 空,什么都不用展开。
+///
+/// 只交出 `collapsed` 的那几层 —— 本来就展开着的组不碰,省得白写一次盘。
+pub fn collapsed_ancestors(config: &AppConfig, project_id: &str) -> Vec<String> {
+    /// 树里找项目节点,沿途经过的分组压进 `path`(找到时 `path` 就是祖先链)。
+    fn chain<'a>(
+        items: &'a [ProjectTreeItem],
+        target: &str,
+        path: &mut Vec<&'a ProjectGroup>,
+    ) -> bool {
+        for item in items {
+            match item {
+                ProjectTreeItem::ProjectId(id) => {
+                    if id == target {
+                        return true;
+                    }
+                }
+                ProjectTreeItem::Group(group) => {
+                    path.push(group);
+                    if chain(&group.children, target, path) {
+                        return true;
+                    }
+                    path.pop();
+                }
+            }
+        }
+        false
+    }
+
+    let empty: Vec<ProjectTreeItem> = Vec::new();
+    let tree = config.project_tree.as_ref().unwrap_or(&empty);
+    let mut current = project_id;
+    let mut seen: Vec<&str> = Vec::new();
+    loop {
+        let mut path: Vec<&ProjectGroup> = Vec::new();
+        if chain(tree, current, &mut path) {
+            return path
+                .into_iter()
+                .filter(|g| g.collapsed)
+                .map(|g| g.id.clone())
+                .collect();
+        }
+        // 不在树里:worktree 子项目跟着父项目走;父项目不存在 = 孤儿,顶在根层
+        seen.push(current);
+        let parent = config
+            .projects
+            .iter()
+            .find(|p| p.id == current)
+            .and_then(|p| p.parent_project_id.as_deref());
+        match parent {
+            Some(parent)
+                if !seen.contains(&parent) && config.projects.iter().any(|p| p.id == parent) =>
+            {
+                current = parent;
+            }
+            _ => return Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +954,114 @@ mod tests {
         let ordered = get_ordered_tree(&config);
         let ids: Vec<&str> = ordered.iter().map(|i| i.id()).collect();
         assert_eq!(ids, vec!["p1"]);
+    }
+
+    // ─── 揭示 ─────────────────────────────────────────────────
+
+    fn collapsed_group(id: &str, children: Vec<ProjectTreeItem>) -> ProjectTreeItem {
+        let ProjectTreeItem::Group(mut g) = group(id, children) else {
+            unreachable!()
+        };
+        g.collapsed = true;
+        ProjectTreeItem::Group(g)
+    }
+
+    /// 根层项目、本来就展开着的组里的项目:一层都不用动。
+    #[test]
+    fn 揭示_可见的项目不展开任何组() {
+        let config = config_with(
+            vec![project_cfg("p1", None), project_cfg("p2", None)],
+            Some(vec![proj("p1"), group("g1", vec![proj("p2")])]),
+        );
+        assert!(collapsed_ancestors(&config, "p1").is_empty());
+        assert!(collapsed_ancestors(&config, "p2").is_empty());
+    }
+
+    /// 多级嵌套:只交出折叠着的那几层,外层在前;夹在中间的展开组不碰。
+    #[test]
+    fn 揭示_多级嵌套只交出折叠层且外层在前() {
+        let config = config_with(
+            vec![project_cfg("p", None), project_cfg("旁", None)],
+            Some(vec![collapsed_group(
+                "g1",
+                vec![
+                    proj("旁"),
+                    group("g2", vec![collapsed_group("g3", vec![proj("p")])]),
+                ],
+            )]),
+        );
+        assert_eq!(collapsed_ancestors(&config, "p"), vec!["g1", "g3"]);
+        assert_eq!(collapsed_ancestors(&config, "旁"), vec!["g1"]);
+    }
+
+    /// worktree 子项目不在树里,按父项目的位置算;孙辈同理。
+    #[test]
+    fn 揭示_子项目跟着父项目所在的组() {
+        let config = config_with(
+            vec![
+                project_cfg("父", None),
+                project_cfg("子", Some("父")),
+                project_cfg("孙", Some("子")),
+            ],
+            Some(vec![collapsed_group("g1", vec![proj("父")])]),
+        );
+        assert_eq!(collapsed_ancestors(&config, "子"), vec!["g1"]);
+        assert_eq!(collapsed_ancestors(&config, "孙"), vec!["g1"]);
+    }
+
+    /// 孤儿(父项目没了,兜底顶在根层)、父子互指、查无此项:都没有组可展开,且跑得完。
+    #[test]
+    fn 揭示_孤儿与坏配置不展开() {
+        let config = config_with(
+            vec![
+                project_cfg("孤儿", Some("已删除的父项目")),
+                project_cfg("a", Some("b")),
+                project_cfg("b", Some("a")),
+            ],
+            Some(vec![collapsed_group("g1", vec![])]),
+        );
+        assert!(collapsed_ancestors(&config, "孤儿").is_empty());
+        assert!(collapsed_ancestors(&config, "a").is_empty());
+        assert!(collapsed_ancestors(&config, "查无此项").is_empty());
+        // 还没有过分组(`projectTree` 缺省)也一样
+        let config = config_with(vec![project_cfg("p", None)], None);
+        assert!(collapsed_ancestors(&config, "p").is_empty());
+    }
+
+    /// 与展平口径对账:把交出来的组展开之后,目标行确实出现在展平表里。
+    #[test]
+    fn 揭示_展开之后目标出现在展平表里() {
+        let mut config = config_with(
+            vec![
+                project_cfg("p", None),
+                project_cfg("wt", Some("p")),
+                project_cfg("外", None),
+            ],
+            Some(vec![
+                proj("外"),
+                collapsed_group(
+                    "g1",
+                    vec![group("g2", vec![collapsed_group("g3", vec![proj("p")])])],
+                ),
+            ]),
+        );
+        let visible = |config: &AppConfig, id: &str| {
+            get_ordered_tree(config).iter().any(|item| item.id() == id)
+        };
+        assert!(!visible(&config, "wt"), "前提:目标藏在折叠组里");
+        let groups = collapsed_ancestors(&config, "wt");
+        let tree = config.project_tree.as_mut().expect("有树");
+        for id in &groups {
+            find_group_in_tree_mut(tree, id)
+                .expect("交出来的是树里的组")
+                .collapsed = false;
+        }
+        assert!(visible(&config, "wt"));
+        assert!(visible(&config, "p"));
+        assert!(
+            collapsed_ancestors(&config, "wt").is_empty(),
+            "展开过就不再交出"
+        );
     }
 
     // ─── store 五个 action 的组合语义 ─────────────────────────

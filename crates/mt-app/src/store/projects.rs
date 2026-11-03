@@ -112,6 +112,10 @@ impl AppStore {
     /// 项目的终端再切回去,空态是他自己要的,不该被自动补一个。路径撞上既有项目
     /// 时(`add_project*` 返回旧 id)也走这里 —— 旧项目要是有终端就只切不开。
     ///
+    /// 末尾那句揭示:新项目追加在根层末尾(列表一长就在可视区下面),worktree 子项目
+    /// 跟着父项目可能落在折叠组里,不揭示的话「加完看不见,像是没生效」。它排到本轮
+    /// effect 之后才跑(见 [`crate::project_list::reveal`]),此刻拿着 store 的租约也不怕。
+    ///
     /// [`set_active_project`]: Self::set_active_project
     pub fn open_added_project(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.set_active_project(id, cx);
@@ -122,6 +126,7 @@ impl AppStore {
         if !has_terminal {
             self.new_terminal(id, None, None, window, cx);
         }
+        crate::project_list::reveal(id, cx);
     }
 
     /// 按路径找项目(`store.ts::findProjectByPath`)。
@@ -438,6 +443,31 @@ impl AppStore {
             return;
         };
         group.collapsed = !group.collapsed;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::ProjectTreeChanged);
+    }
+
+    /// 揭示项目:把挡着它那一行的**折叠分组**逐层展开(worktree 子项目按父项目的
+    /// 位置算,判据见 [`project_tree::collapsed_ancestors`])。与 [`Self::toggle_group_collapse`]
+    /// 同一条路:改 `projectTree` 里的 `collapsed`、防抖落盘、发 `ProjectTreeChanged`;
+    /// 一层都不用展开时什么都不发。
+    ///
+    /// 唯一的调用方是 [`crate::project_list::reveal`](从「项目」块之外切过来的项目)。
+    pub fn expand_groups_to_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let groups = project_tree::collapsed_ancestors(&self.config, project_id);
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return;
+        };
+        let mut expanded = false;
+        for group_id in &groups {
+            if let Some(group) = project_tree::find_group_in_tree_mut(tree, group_id) {
+                group.collapsed = false;
+                expanded = true;
+            }
+        }
+        if !expanded {
+            return;
+        }
         self.save_config_soon(cx);
         cx.changed(StoreEvent::ProjectTreeChanged);
     }
