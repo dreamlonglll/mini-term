@@ -691,15 +691,28 @@ impl LockProbe {
 /// 索引,工作区可能是中间态)就把这次重取压着,隔 [`INDEX_LOCK_RETRY`] 再看;锁老过
 /// [`INDEX_LOCK_PATIENCE`] 就不等了,照常取。
 ///
-/// 锁的年龄取「按修改时间算的」与「从第一次看到它算起的」两者中大的:前者让崩溃残锁、开了
-/// 很久的提交编辑器第一次撞上就放行;后者兜住修改时间读不到 / 在将来、或有谁一直碰它的锁
-/// —— 只看前者的话这两种又会无限期等下去。锁没了才清「第一次看到」。
+/// 锁的年龄按锁文件的修改时间算:崩溃残锁、开了很久的提交编辑器第一次撞上就放行;两次探测
+/// 之间锁被删掉又建了一把新的(连着跑几条 git 命令),新锁的修改时间是新的,照样从头等 ——
+/// 不能拿「第一次看到」去垫,那记的是旧锁(复验 E2E 实撞)。修改时间读不到 / 在将来时才按
+/// 第一次看到它起算,锁没了才清。另外一次重取最多压 [`INDEX_LOCK_PATIENCE`]:有谁一直碰锁、
+/// 修改时间一直很新时也不至于无限期等。
 #[derive(Debug, Default)]
 pub struct IndexLockGate {
-    /// 压着的那次重取:要反映的最后一条变化的时刻、下一次看锁的时刻
-    held: Option<(Instant, Instant)>,
-    /// 这把锁第一次被看到的时刻
+    /// 压着的那次重取
+    held: Option<HeldReload>,
+    /// 这把锁第一次被看到的时刻(只在读不到修改时间时用)
     first_seen: Option<Instant>,
+}
+
+/// [`IndexLockGate`] 压着的那次重取。
+#[derive(Debug, Clone, Copy)]
+struct HeldReload {
+    /// 要反映的最后一条变化的时刻
+    need: Instant,
+    /// 开始压着的时刻
+    since: Instant,
+    /// 下一次看锁的时刻
+    retry: Instant,
 }
 
 impl IndexLockGate {
@@ -712,7 +725,7 @@ impl IndexLockGate {
         probe: LockProbe,
         at: Instant,
     ) -> Option<Instant> {
-        let need = match (self.held.map(|(held, _)| held), last) {
+        let need = match (self.held.map(|held| held.need), last) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
@@ -722,21 +735,28 @@ impl IndexLockGate {
             return need;
         }
         let first = *self.first_seen.get_or_insert(at);
-        let seen = at.saturating_duration_since(first);
-        let age = probe.age.map_or(seen, |age| age.max(seen));
+        let age = probe
+            .age
+            .unwrap_or_else(|| at.saturating_duration_since(first));
         let need = need?;
-        if age >= INDEX_LOCK_PATIENCE {
+        let since = self.held.map_or(at, |held| held.since);
+        let waited = at.saturating_duration_since(since);
+        if age >= INDEX_LOCK_PATIENCE || waited >= INDEX_LOCK_PATIENCE {
             self.held = None;
             return Some(need);
         }
-        let retry = (INDEX_LOCK_PATIENCE - age).min(INDEX_LOCK_RETRY);
-        self.held = Some((need, at + retry));
+        let left = (INDEX_LOCK_PATIENCE - age).min(INDEX_LOCK_PATIENCE - waited);
+        self.held = Some(HeldReload {
+            need,
+            since,
+            retry: at + left.min(INDEX_LOCK_RETRY),
+        });
         None
     }
 
     /// 压着的那次到点该复查了。
     pub fn retry_due(&self, now: Instant) -> bool {
-        self.held.is_some_and(|(_, at)| now >= at)
+        self.held.is_some_and(|held| now >= held.retry)
     }
 
     /// 换目标 / 收起:压着的作废。
@@ -1091,8 +1111,9 @@ mod tests {
         );
     }
 
-    /// index.lock 的耐心(L1):短锁压着等它写完、隔一阵复查;锁没了当场取;老锁不等;锁一直
-    /// 在最多等 [`INDEX_LOCK_PATIENCE`];读不到修改时间按第一次看到起算;锁没了再出现重新起算。
+    /// index.lock 的耐心(L1):短锁压着等它写完、隔一阵复查;锁没了当场取;老锁不等;一次
+    /// 重取最多压 [`INDEX_LOCK_PATIENCE`];读不到修改时间按第一次看到起算;锁没了再出现重新
+    /// 起算;两次探测之间换了一把新锁也从头等。
     #[test]
     fn 索引锁短锁等写完_长锁放行() {
         let t0 = Instant::now();
@@ -1143,14 +1164,31 @@ mod tests {
         // 锁还在:之后的批次不再等
         let t2 = t0 + ms(5000);
         assert_eq!(gate.offer(Some(t2), held(None), t2), Some(t2));
-        // 修改时间一直很新、但已经看了它很久(有谁一直碰它):同样放行,不无限等
-        assert_eq!(gate.offer(Some(t2), held(Some(10)), t2), Some(t2));
         // 锁没了又出现:重新起算
         assert_eq!(gate.offer(None, gone, t2), None);
         let t3 = t2 + ms(100);
         assert_eq!(gate.offer(Some(t3), held(None), t3), None);
         gate.reset();
         assert!(!gate.retry_due(t3 + ms(60_000)), "reset 后压着的作废");
+
+        // 两次探测之间锁被删掉又建了一把新的(没看到「没锁」的那一刻):旧锁的「第一次看到」
+        // 不能垫给新锁,新锁按自己的修改时间从头等
+        let mut gate = IndexLockGate::default();
+        assert_eq!(gate.offer(Some(t0), held(Some(60_000)), t0), Some(t0));
+        let t4 = t0 + ms(3000);
+        assert_eq!(gate.offer(Some(t4), held(Some(300)), t4), None);
+        assert_eq!(gate.offer(None, held(Some(1300)), t4 + ms(1000)), None);
+        assert_eq!(gate.offer(None, held(Some(2000)), t4 + ms(1700)), Some(t4));
+
+        // 修改时间一直很新(有谁一直碰它):一次重取最多压满耐心,不无限等
+        let mut gate = IndexLockGate::default();
+        assert_eq!(gate.offer(Some(t0), held(Some(10)), t0), None);
+        assert_eq!(gate.offer(None, held(Some(10)), t0 + ms(1000)), None);
+        assert!(gate.retry_due(t0 + ms(1000) + INDEX_LOCK_RETRY));
+        assert_eq!(
+            gate.offer(None, held(Some(10)), t0 + INDEX_LOCK_PATIENCE),
+            Some(t0)
+        );
     }
 
     /// 真文件探测:没有锁 / 刚建的锁(年龄很小)。
