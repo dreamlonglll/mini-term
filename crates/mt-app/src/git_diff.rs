@@ -44,7 +44,8 @@
 //!    从更改列表打开的走 `reload_files`:列表重载落地后文件序列跟着换,当前文件离开了
 //!    分组(取消暂存 / 丢弃了最后一块)就换到原位置上的下一个(见 [`resync_index`])。
 //! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮),
-//!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。
+//!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。提交 diff 弹窗左栏 ↑ / ↓
+//!     换文件(按左栏看得见的行序走,见 [`step_file`])。
 //! 11. **正文能拖选复制**(对标 IDEA):拖选 / 双击选词 / 三击选行 / Shift+单击延伸,
 //!     拖出视口自动滚动;Ctrl/Cmd+C 复制、Ctrl/Cmd+A 全选、右键「复制 / 全选」。并排视图
 //!     只选起拖的那一栏,行内视图不带行号与 `+`/`-`,tab 按原文复制。原版的行是 DOM,
@@ -99,6 +100,10 @@ gpui::actions!(
         GitDiffNextFile,
         /// 单文件 diff:分组里的上一个文件(Alt+←)
         GitDiffPrevFile,
+        /// 提交 diff:左栏的下一个文件(↓)
+        GitCommitDiffNextFile,
+        /// 提交 diff:左栏的上一个文件(↑)
+        GitCommitDiffPrevFile,
         /// 三个 diff 弹窗:复制正文选区(Ctrl/Cmd+C)
         GitDiffCopy,
         /// 三个 diff 弹窗:全选当前栏(Ctrl/Cmd+A)
@@ -109,7 +114,7 @@ gpui::actions!(
 /// 单文件 diff 弹窗的 key context(键位绑在 `hotkeys.rs` 的表外段)。
 pub const FILE_DIFF_CONTEXT: &str = "GitFileDiff";
 
-/// 提交 diff 弹窗的 key context(正文的 Ctrl/Cmd+C / A 挂在它上面)。
+/// 提交 diff 弹窗的 key context(左栏换文件的 ↑ / ↓、正文的 Ctrl/Cmd+C / A 挂在它上面)。
 pub const COMMIT_DIFF_CONTEXT: &str = "GitCommitDiff";
 
 /// 视图模式。**组件态,不落盘**;默认 side-by-side(`DiffModal.tsx:158`)。
@@ -2426,6 +2431,68 @@ fn file_row_of(files: &[ModalFile], tree: bool, ix: usize) -> Option<usize> {
         .position(|r| matches!(r, ChangeTreeRow::File { index, .. } if *index == ix))
 }
 
+/// 左栏 ↑ / ↓ 换到哪个文件:眼下**看得见**的行里,选中那一行的上一个 / 下一个文件行(目录
+/// 行跳过,收起的目录里的不算;到头停住、不绕回)。选中的文件藏在收起的目录里时 ↓ 落到
+/// 第一个、↑ 落到最后一个(与「更改」列表的 ↑↓ 同一口径)。返回 `(文件下标, 行号)`;
+/// 没得换(到头了、一个文件行都没有)是 `None`。
+fn step_file(rows: &[ChangeTreeRow], selected: usize, delta: isize) -> Option<(usize, usize)> {
+    let files: Vec<(usize, usize)> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(row, r)| match r {
+            ChangeTreeRow::File { index, .. } => Some((*index, row)),
+            ChangeTreeRow::Dir { .. } => None,
+        })
+        .collect();
+    let last = files.len().checked_sub(1)?;
+    let current = files.iter().position(|&(index, _)| index == selected);
+    let next = match current {
+        None if delta > 0 => 0,
+        None => last,
+        Some(pos) => (pos as isize + delta).clamp(0, last as isize) as usize,
+    };
+    (Some(next) != current).then(|| files[next])
+}
+
+/// 左栏选中第 `index` 个文件,右栏换成它的 diff(单击行与 ↑ / ↓ 共用)。已经是它就什么都不做。
+fn choose_modal_file(
+    pick: &Entity<CommitPick>,
+    state: &Entity<DiffState>,
+    files: &[ModalFile],
+    repo_path: &str,
+    index: usize,
+    cx: &mut App,
+) {
+    if pick.read(cx).selected == index {
+        return;
+    }
+    pick.update(cx, |p, cx| {
+        p.selected = index;
+        cx.notify();
+    });
+    if let Some(file) = files.get(index) {
+        load_modal_file(state, repo_path, file, cx);
+    }
+}
+
+/// ↑ / ↓:左栏换到上一个 / 下一个文件(见 [`step_file`]),选中行滚到看得见。
+fn step_modal_file(
+    pick: &Entity<CommitPick>,
+    state: &Entity<DiffState>,
+    files: &[ModalFile],
+    repo_path: &str,
+    scroll: &UniformListScrollHandle,
+    delta: isize,
+    cx: &mut App,
+) {
+    let (rows, selected) = pick.update(cx, |p, _| (p.rows(files), p.selected));
+    let Some((index, row)) = step_file(&rows, selected, delta) else {
+        return;
+    };
+    scroll.scroll_to_item(row, ScrollStrategy::Nearest);
+    choose_modal_file(pick, state, files, repo_path, index, cx);
+}
+
 /// 左栏文件行的 tooltip:完整路径,重命名写 `旧 → 新`。
 fn modal_file_tip(file: &ModalFile) -> String {
     match &file.old_path {
@@ -2483,16 +2550,7 @@ fn modal_row(
             let (pick, state, files) = (pick.clone(), state.clone(), files.clone());
             let repo = repo_path.clone();
             let choose = move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                if pick.read(cx).selected == index {
-                    return;
-                }
-                pick.update(cx, |p, cx| {
-                    p.selected = index;
-                    cx.notify();
-                });
-                if let Some(file) = files.get(index) {
-                    load_modal_file(&state, &repo, file, cx);
-                }
+                choose_modal_file(&pick, &state, &files, &repo, index, cx);
             };
             Some(
                 git_ui::commit_file_row_at(
@@ -2748,11 +2806,29 @@ fn open_files_diff(
                 );
 
             let (width, body_h) = modal_size(viewport);
+            // 左栏换文件:↑ / ↓ 挂在整个弹窗的焦点容器上(焦点就这一个,正文的拖选 / 滚动
+            // 不占方向键),右栏跟着换、选中行滚到看得见
+            let step = {
+                let (pick, state, files, repo_path, scroll) = (
+                    pick.clone(),
+                    state.clone(),
+                    files.clone(),
+                    repo_path.clone(),
+                    file_scroll.clone(),
+                );
+                move |delta: isize, cx: &mut App| {
+                    step_modal_file(&pick, &state, &files, &repo_path, &scroll, delta, cx);
+                }
+            };
+            let step = Rc::new(step);
+            let (step_next, step_prev) = (step.clone(), step);
             dialog.w(width).p_0().close_button(false).child(
-                // 正文的 Ctrl/Cmd+C / A 挂在这里;Esc 冒泡到 Dialog 关窗
+                // 左栏的 ↑ / ↓ 与正文的 Ctrl/Cmd+C / A 挂在这里;Esc 冒泡到 Dialog 关窗
                 selection::text_actions(div(), &state)
                     .track_focus(&focus)
                     .key_context(COMMIT_DIFF_CONTEXT)
+                    .on_action(move |_: &GitCommitDiffNextFile, _window, cx| step_next(1, cx))
+                    .on_action(move |_: &GitCommitDiffPrevFile, _window, cx| step_prev(-1, cx))
                     .w_full()
                     .h(body_h)
                     .flex()
@@ -3072,6 +3148,56 @@ mod tests {
             modal_rows(&files, false, &pick.collapsed)
         );
         assert_eq!(pick.rows(&files).len(), files.len());
+    }
+
+    /// 左栏 ↑ / ↓ 换文件:按眼下看得见的行序走,目录行跳过、收起的目录里的不算,到头停住;
+    /// 选中的文件藏在收起的目录里时 ↓ 落到第一个、↑ 落到最后一个。返回(文件下标, 行号)。
+    #[test]
+    fn 左栏上下键按可见行序换文件() {
+        let commit = |path: &str| {
+            ModalFile::from_commit(
+                "abc",
+                CommitFileInfo {
+                    path: path.into(),
+                    status: "modified".into(),
+                    old_path: None,
+                },
+            )
+        };
+        let files = [
+            commit("z.md"),
+            commit("src/ui/a.rs"),
+            commit("src/ui/b.rs"),
+            commit("docs/c.md"),
+        ];
+        // 树形:docs(0)、c.md(1)、src/ui(2)、a.rs(3)、b.rs(4)、z.md(5)
+        let tree = modal_rows(&files, true, &HashSet::new());
+        assert_eq!(step_file(&tree, 3, 1), Some((1, 3)), "跳过 src/ui 目录行");
+        assert_eq!(step_file(&tree, 1, -1), Some((3, 1)), "往回也跳过目录行");
+        assert_eq!(step_file(&tree, 2, 1), Some((0, 5)));
+        assert_eq!(step_file(&tree, 0, 1), None, "最后一个:到头不绕回");
+        assert_eq!(step_file(&tree, 3, -1), None, "第一个:到头不绕回");
+
+        // 收起 src/ui:里面的 a.rs / b.rs 不算
+        let folded = modal_rows(&files, true, &HashSet::from(["src/ui".to_string()]));
+        assert_eq!(step_file(&folded, 3, 1), Some((0, 3)));
+        assert_eq!(step_file(&folded, 0, -1), Some((3, 1)));
+        // 选中的文件就在收起的目录里:↓ 落到第一个,↑ 落到最后一个
+        assert_eq!(step_file(&folded, 1, 1), Some((3, 1)));
+        assert_eq!(step_file(&folded, 1, -1), Some((0, 3)));
+
+        // 平铺:就是文件序
+        let flat = modal_rows(&files, false, &HashSet::new());
+        assert_eq!(step_file(&flat, 0, 1), Some((1, 1)));
+        assert_eq!(step_file(&flat, 3, -1), Some((2, 2)));
+        // 一个文件行都没有(全收起 / 空提交)
+        let all_folded = modal_rows(
+            &files,
+            true,
+            &HashSet::from(["src/ui".to_string(), "docs".to_string()]),
+        );
+        assert_eq!(step_file(&all_folded[..2], 1, 1), None);
+        assert_eq!(step_file(&[], 0, 1), None);
     }
 
     /// 没有改动块时的空态:纯重命名单说一句,其余照旧「没有更多改动」。

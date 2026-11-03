@@ -61,6 +61,11 @@
 //! 往下翻过的人,终端里提交一次触发的自动刷新不会把列表截回 30 条、把滚动位置钳回顶上
 //! 那一截 —— 列表照旧整体替换,条数差不多,滚动偏移留在原处。
 //!
+//! 留在原处只对**同一份列表**的刷新成立。首页落定时按列表的身份([`ListIdentity`]:仓库、
+//! 查看的分支 / 跟随 HEAD 时 HEAD 的显示名、生效的过滤条件)判:身份变了就回到顶部 ——
+//! 跟随 HEAD 时检出另一个分支走的也是保留旧列表的刷新,不判的话新分支的列表停在旧分支
+//! 翻到的第两百行,HEAD 那一行不在视口里。
+//!
 //! # 拓扑图为什么自绘
 //!
 //! gpui 的 `svg()` 是单色 alpha 掩膜(丢色),Image 的 SVG 分支有 BGRA 交换 bug ——
@@ -320,6 +325,8 @@ pub struct GitHistoryContent {
     load_error: Option<String>,
     /// 请求令牌:换仓库 / 换分支后的迟到响应丢弃。
     request: u64,
+    /// 屏上这份列表是按什么取的(见 [`ListIdentity`]);`None` = 当场清空过 / 还没落定过。
+    shown: Option<ListIdentity>,
     /// 这一轮是 [`Self::reload_quiet`] 发起的:发起前屏上那份列表区的样子(发起时会复位
     /// `has_more` 等字段,所以在那之前记)。首页回来与它一样就不重画。
     quiet_baseline: Option<ListView>,
@@ -363,6 +370,53 @@ struct ListView {
     head_hash: Option<String>,
     selection: CommitSelection,
     detail: Option<DetailTarget>,
+}
+
+/// 提交列表的「身份」:首页是按什么取的。首页落定时与屏上那份比(见 [`scrolls_to_top`]):
+/// 变了就是整份重来,列表回到顶部、HEAD 那一行看得见;没变就是同一份列表的刷新(外部新提交、
+/// 按已加载深度重取首页),滚动位置与选中照旧(见模块注释「刷新不闪」)。
+///
+/// 跟随 HEAD 时 HEAD 换没换指向要等首页回来才知道:检出另一个分支走的是保留旧列表的
+/// [`GitHistoryContent::reload`],发起时 HEAD 名还是旧的,首页带着同一时刻读的引用回来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListIdentity {
+    repo: String,
+    branch: ShownBranch,
+    /// 生效的过滤条件;没有生效的为 `None`。
+    filter: Option<LogFilter>,
+}
+
+/// 列表展示的是哪条线的历史。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShownBranch {
+    /// 查看指定分支(未检出):HEAD 怎么动都与列表无关。
+    Viewing(String),
+    /// 跟随 HEAD:HEAD 的显示名(分支名;detached 是 `"(1a2b3c4)"`)。
+    Head(Option<String>),
+}
+
+impl ListIdentity {
+    fn new(
+        repo: &str,
+        view_branch: Option<&str>,
+        head: Option<&str>,
+        filter: Option<LogFilter>,
+    ) -> Self {
+        Self {
+            repo: repo.to_string(),
+            branch: match view_branch {
+                Some(branch) => ShownBranch::Viewing(branch.to_string()),
+                None => ShownBranch::Head(head.map(str::to_string)),
+            },
+            filter,
+        }
+    }
+}
+
+/// 首页落定时列表要不要回到顶部:屏上那份(`None` = 当场清空过 / 还没落定过)与这一份
+/// 身份不同就回。
+fn scrolls_to_top(shown: Option<&ListIdentity>, landed: &ListIdentity) -> bool {
+    shown != Some(landed)
 }
 
 /// 过滤框变窄之后把光标拉回可见区。
@@ -454,6 +508,7 @@ impl GitHistoryContent {
             refreshing: false,
             load_error: None,
             request: 0,
+            shown: None,
             quiet_baseline: None,
             drawn_loading: false,
             debounce_until: None,
@@ -568,11 +623,16 @@ impl GitHistoryContent {
     /// 整体重来并**当场清空列表**(换仓库 / 换分支 / 换过滤条件:内容本来就不同)。
     /// 选择不在这里清:首页落定时由 [`Self::verify_selection`] 按「还在不在新列表里」逐个留
     /// (切分支 / 过滤后选中的提交仍在就照旧选着);换仓库在 [`Self::sync`] 里当场清空。
+    ///
+    /// 滚动也不在这里复位,只把屏上那份的身份作废:首页落定时由 [`Self::settle_identity`]
+    /// 回顶。检出另一个分支走的是保留旧列表的刷新、不经过这里,回顶只能在落定那一刻判,
+    /// 两条路收在一处。
     fn restart(&mut self, cx: &mut Context<Self>) {
         self.commits.clear();
         self.log.clear();
         self.graph = GraphLayout::empty();
         self.refreshing = false;
+        self.shown = None;
         self.quiet_baseline = None;
         self.first_limit = PAGE_SIZE;
         self.begin_load(cx);
@@ -789,6 +849,27 @@ impl GitHistoryContent {
         self.refreshing = false;
     }
 
+    /// 眼下这份列表的身份(见 [`ListIdentity`])。首页的引用落定([`Self::settle_refs`])
+    /// 之后取,HEAD 名才是与首页同一时刻的。
+    fn list_identity(&self) -> ListIdentity {
+        ListIdentity::new(
+            &self.repo_path,
+            self.view_branch.as_deref(),
+            self.head_branch.as_deref(),
+            self.filter.active().then(|| self.filter.as_filter()),
+        )
+    }
+
+    /// 首页落定:列表身份变了(整份重来)就回到顶部,同一份列表的刷新不动滚动位置
+    /// (见 [`scrolls_to_top`])。选中照旧由 [`Self::verify_selection`] 按新列表核对。
+    fn settle_identity(&mut self) {
+        let landed = self.list_identity();
+        if scrolls_to_top(self.shown.as_ref(), &landed) {
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
+        self.shown = Some(landed);
+    }
+
     /// 合并一页。去重 + 拓扑修正 + `has_more` 判定,见模块注释。
     fn merge_page(
         &mut self,
@@ -799,6 +880,7 @@ impl GitHistoryContent {
     ) {
         if first {
             self.clear_loaded();
+            self.settle_identity();
         }
         if let Some(tags) = tags {
             self.set_tags(tags);
@@ -847,6 +929,7 @@ impl GitHistoryContent {
     ) {
         if first {
             self.clear_loaded();
+            self.settle_identity();
         }
         if let Some(tags) = tags {
             self.set_tags(tags);
@@ -2465,6 +2548,51 @@ mod tests {
             !merge_into(&mut short.commits, &mut short.log, graph, page(60), 120),
             "要 120 条只回来 60 条:到底了"
         );
+    }
+
+    /// 首页落定回不回顶:整份重来(跟随 HEAD 时 HEAD 换了指向、换查看的分支、换仓库、换过滤
+    /// 条件、列表当场清空过)回到顶部;同一分支上的刷新(外部新提交、按已加载深度重取首页 ——
+    /// 身份没变)滚动位置照旧。
+    #[test]
+    fn 首页落定只在列表身份变了时回顶() {
+        let filter = |text: &str| {
+            Some(LogFilter {
+                text: text.to_string(),
+                ..LogFilter::default()
+            })
+        };
+        let follow = |head: &str| ListIdentity::new("repo", None, Some(head), None);
+        let viewing =
+            |view: &str, head: &str| ListIdentity::new("repo", Some(view), Some(head), None);
+        let shown = follow("main");
+
+        // 同一分支上的刷新:身份没变,不回顶
+        assert!(!scrolls_to_top(Some(&shown), &follow("main")));
+        // 跟随 HEAD:检出了别的分支 / 游离到某个提交(检出走的是保留旧列表的刷新)
+        assert!(scrolls_to_top(Some(&shown), &follow("b103")));
+        assert!(scrolls_to_top(Some(&shown), &follow("(1a2b3c4)")));
+        // 查看指定分支(未检出)时 HEAD 怎么动都与列表无关
+        assert!(!scrolls_to_top(
+            Some(&viewing("dev", "main")),
+            &viewing("dev", "b103")
+        ));
+        // 换查看的分支;跟随 HEAD ↔ 查看同名分支也算换了(两条路各取各的首页)
+        assert!(scrolls_to_top(
+            Some(&viewing("dev", "main")),
+            &viewing("feat", "main")
+        ));
+        assert!(scrolls_to_top(Some(&shown), &viewing("main", "main")));
+        // 换仓库
+        let other = ListIdentity::new("other", None, Some("main"), None);
+        assert!(scrolls_to_top(Some(&shown), &other));
+        // 换过滤条件;同一组条件下的刷新照旧
+        let fix = ListIdentity::new("repo", None, Some("main"), filter("fix"));
+        assert!(scrolls_to_top(Some(&shown), &fix));
+        assert!(!scrolls_to_top(Some(&fix), &fix));
+        let feat = ListIdentity::new("repo", None, Some("main"), filter("feat"));
+        assert!(scrolls_to_top(Some(&fix), &feat));
+        // 列表当场清空过(`restart`)/ 头一回落定:一律回顶
+        assert!(scrolls_to_top(None, &shown));
     }
 
     /// 首页回来时 HEAD 的显示名:HEAD 在本地分支上就直接用分支列表里的名字,不再去查;
