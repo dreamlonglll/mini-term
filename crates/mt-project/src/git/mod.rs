@@ -2599,7 +2599,9 @@ pub fn git_push(repo_path: &Path) -> Result<String> {
 //   `reset(HEAD, Mixed)` 也一样)会顺手清掉 MERGE_HEAD / rebase-merge / sequencer,
 //   解决完冲突点一下「全部取消暂存」,合并提交就静默成了单亲、变基现场被毁;
 // - 路径一律 `--literal-pathspecs` + `--`:文件名里的 `*` `?` `[ab]` 不许被当通配
-//   (libgit2 的 `reset_default` 就把它们当 glob),`-` 开头的不许被当选项。
+//   (libgit2 的 `reset_default` 就把它们当 glob),`-` 开头的不许被当选项;
+// - 一批超过 [`PATHS_PER_CALL`] 条先试逐路径直写暂存区的快路径(`bulk_index`):pathspec
+//   是「条目数 × 路径数」,2 万条要近 10s。快路径拿不准的整批照旧走 pathspec。
 // ---------------------------------------------------------------------------
 
 /// 暂存类操作的超时:本身毫秒级,但 clean 过滤器(git-lfs 给大文件算哈希)可能很慢,
@@ -2661,11 +2663,7 @@ fn run_paths_via_stdin(
     let mut args = vec!["--literal-pathspecs"];
     args.extend_from_slice(head_args);
     args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
-    let mut input = Vec::with_capacity(files.iter().map(|f| f.len() + 1).sum());
-    for file in files {
-        input.extend_from_slice(file.as_bytes());
-        input.push(0);
-    }
+    let input = nul_separated(files);
     ensure_repo_dir(repo_path)?;
     let out = spawn_git_with_input(repo_path, &args, &[], op_label, timeout, "", Some(input))?;
     if out.success {
@@ -2675,6 +2673,25 @@ fn run_paths_via_stdin(
         return Ok(false);
     }
     bail!("{}", failure_text(&out));
+}
+
+/// 路径逐条接上 NUL,喂给 `-z` / `--pathspec-file-nul` 一类从 stdin 读路径的 git 命令。
+fn nul_separated<S: AsRef<str>>(paths: &[S]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(paths.iter().map(|p| p.as_ref().len() + 1).sum());
+    for path in paths {
+        input.extend_from_slice(path.as_ref().as_bytes());
+        input.push(0);
+    }
+    input
+}
+
+/// 暂存 / 取消暂存实际走了哪条路(单测据此确认分派)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexRoute {
+    /// `--literal-pathspecs` 的 `add -A` / `reset`([`run_literal_paths`])
+    Pathspec,
+    /// 逐路径直写暂存区(`bulk_index`)
+    Bulk,
 }
 
 /// 还没有任何提交(HEAD 指向未出生的分支)。这时没有 HEAD 可以 reset 回去,
@@ -2689,7 +2706,17 @@ pub fn git_stage(repo_path: &Path, files: &[String]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
     }
-    run_with_literal_paths(repo_path, &["add", "-A"], files, "add")
+    stage_paths(repo_path, files).map(|_| ())
+}
+
+/// [`git_stage`] 的本体。一批装得下([`PATHS_PER_CALL`] 以内)照旧走 pathspec;更多的先试
+/// 快路径,它不收(或它的 git 失败、暂存区原样未动)再整批走 pathspec。
+fn stage_paths(repo_path: &Path, files: &[String]) -> Result<IndexRoute> {
+    if files.len() > PATHS_PER_CALL && bulk_index::stage(repo_path, files)? {
+        return Ok(IndexRoute::Bulk);
+    }
+    run_with_literal_paths(repo_path, &["add", "-A"], files, "add")?;
+    Ok(IndexRoute::Pathspec)
 }
 
 /// 取消暂存这些文件(`git reset -q -- <paths>`,只动暂存区、不碰仓库状态)。
@@ -2710,7 +2737,16 @@ pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<()> {
         return Ok(());
     }
     let files = with_rename_sources(repo_path, files)?;
-    run_with_literal_paths(repo_path, &["reset", "-q"], &files, "reset")
+    unstage_paths(repo_path, &files).map(|_| ())
+}
+
+/// [`git_unstage`] 在 HEAD 已出生时的本体,分派口径同 [`stage_paths`]。
+fn unstage_paths(repo_path: &Path, files: &[String]) -> Result<IndexRoute> {
+    if files.len() > PATHS_PER_CALL && bulk_index::unstage(repo_path, files)? {
+        return Ok(IndexRoute::Bulk);
+    }
+    run_with_literal_paths(repo_path, &["reset", "-q"], files, "reset")?;
+    Ok(IndexRoute::Pathspec)
 }
 
 /// `files` 里已暂存重命名的新路径,补上各自的旧路径(列表里已有的不重复)。
@@ -3190,6 +3226,7 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
 // 编辑器 gutter 变更标记 / 注解(blame)的后端见 blame / line_diff 的模块注释
 mod blame;
 mod branch;
+mod bulk_index;
 mod combined;
 mod commit;
 mod commit_extras;
