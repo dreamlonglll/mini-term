@@ -3632,7 +3632,10 @@ mod tests {
         assert!(!amending.differs(&next), "数据没变");
         next.has_head = false;
         assert!(amending.differs(&next), "HEAD 没了:amend 收起");
-        assert!(!landed_from(&base).differs(&snapshot(Vec::new())), "没勾 amend");
+        assert!(
+            !landed_from(&base).differs(&snapshot(Vec::new())),
+            "没勾 amend"
+        );
     }
 
     /// 取数失败:同一条错误反复落地不算变;换了原因、或此前还有数据都算。
