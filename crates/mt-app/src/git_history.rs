@@ -46,6 +46,11 @@
 //! 首页回来时整体替换,期间只在过滤栏右侧标一个「刷新中…」。换仓库 / 换分支 / 换过滤
 //! 条件([`GitHistoryContent::restart`])内容本就不同,才当场清空。
 //!
+//! 监听触发的重载([`GitHistoryContent::reload_quiet`],`.git` 引用变了)同样保留旧列表,
+//! 但发起时不重画;首页回来与眼下一模一样(提交序列、引用、标签、选择都没变 —— 贮藏、
+//! fetch 了别的分支之类)就连落地那一下也不画。期间要是别处让窗口画过一帧(那一帧画出了
+//! 「刷新中…」),落地照常重画把它收掉。
+//!
 //! # 拓扑图为什么自绘
 //!
 //! gpui 的 `svg()` 是单色 alpha 掩膜(丢色),Image 的 SVG 分支有 BGRA 交换 bug ——
@@ -289,6 +294,11 @@ pub struct GitHistoryContent {
     load_error: Option<String>,
     /// 请求令牌:换仓库 / 换分支后的迟到响应丢弃。
     request: u64,
+    /// 这一轮是 [`Self::reload_quiet`] 发起的:发起前屏上那份列表区的样子(发起时会复位
+    /// `has_more` 等字段,所以在那之前记)。首页回来与它一样就不重画。
+    quiet_baseline: Option<ListView>,
+    /// 上一帧画出了在途态(`loading` / `refreshing`):静默重载落地时必须重画把它收掉。
+    drawn_loading: bool,
     /// pty-output 嗅探的 500ms 去抖终点(与「更改」区各算各的)。
     debounce_until: Option<Instant>,
     filter: FilterState,
@@ -313,6 +323,20 @@ impl EventEmitter<GitHistoryEvent> for GitHistoryContent {}
 struct HistoryRefs {
     branches: Vec<BranchInfo>,
     head: Option<String>,
+}
+
+/// 见 [`GitHistoryContent::list_view`]。提交按 hash 比:同一个 hash 的内容不会变。
+#[derive(Debug, PartialEq)]
+struct ListView {
+    hashes: Vec<String>,
+    has_more: bool,
+    error: Option<String>,
+    tags: Vec<TagInfo>,
+    branches: Vec<BranchInfo>,
+    head_branch: Option<String>,
+    head_hash: Option<String>,
+    selection: CommitSelection,
+    detail: Option<DetailTarget>,
 }
 
 /// 过滤框变窄之后把光标拉回可见区。
@@ -384,6 +408,8 @@ impl GitHistoryContent {
             refreshing: false,
             load_error: None,
             request: 0,
+            quiet_baseline: None,
+            drawn_loading: false,
             debounce_until: None,
             filter: FilterState {
                 input,
@@ -465,6 +491,24 @@ impl GitHistoryContent {
     /// 右侧标「刷新中…」,内容不闪。
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.refreshing = !self.commits.is_empty();
+        self.quiet_baseline = None;
+        self.begin_load(cx);
+        cx.notify();
+    }
+
+    /// 监听触发的重载(见模块注释「刷新不闪」):与 [`Self::reload`] 一样保留旧列表,但
+    /// 发起时不重画,首页回来与发起前屏上的相同就不重画。没有旧列表时(首屏还没出来)
+    /// 按普通重载。
+    pub fn reload_quiet(&mut self, cx: &mut Context<Self>) {
+        if self.commits.is_empty() {
+            self.reload(cx);
+            return;
+        }
+        // 已经有一轮静默的在途:屏上还是那一轮发起前的样子,沿用它的基线
+        if self.quiet_baseline.is_none() {
+            self.quiet_baseline = Some(self.list_view());
+        }
+        self.refreshing = true;
         self.begin_load(cx);
     }
 
@@ -475,9 +519,12 @@ impl GitHistoryContent {
         self.commits.clear();
         self.graph = git_graph::compute(&[]);
         self.refreshing = false;
+        self.quiet_baseline = None;
         self.begin_load(cx);
+        cx.notify();
     }
 
+    /// 发起首页。**不重画**:要不要当场画由调用方定([`Self::reload_quiet`] 不画)。
     fn begin_load(&mut self, cx: &mut Context<Self>) {
         self.has_more = false;
         self.load_error = None;
@@ -497,8 +544,8 @@ impl GitHistoryContent {
             && let Some(refs) = self.deferred_refs.take()
         {
             self.apply_refs(refs, cx);
+            cx.notify();
         }
-        cx.notify();
     }
 
     /// 容器的 pty-output 嗅探命中了。
@@ -573,6 +620,10 @@ impl GitHistoryContent {
                     if this.request != req {
                         return;
                     }
+                    // 过滤时一页页接着扫(「搜索中…已扫描 N 个」要跟着走),静默不了,照常重画
+                    if first {
+                        this.quiet_baseline = None;
+                    }
                     this.loading = false;
                     if first {
                         this.settle_refs(refs, cx);
@@ -609,6 +660,14 @@ impl GitHistoryContent {
                     if this.request != req {
                         return;
                     }
+                    // 静默重载(见 `reload_quiet`):期间没画出过在途态时,首页合并完与发起前
+                    // 屏上的一样就不重画
+                    let drawn = this.drawn_loading;
+                    let before = if first {
+                        this.quiet_baseline.take().filter(|_| !drawn)
+                    } else {
+                        None
+                    };
                     this.loading = false;
                     if first {
                         this.settle_refs(refs, cx);
@@ -617,12 +676,33 @@ impl GitHistoryContent {
                         Ok((page, tags)) => this.merge_page(first, page, tags, cx),
                         Err(err) => this.load_failed(err),
                     }
-                    cx.notify();
+                    if before.is_none_or(|before| before != this.list_view()) {
+                        cx.notify();
+                    }
                 });
             })
             .detach();
         }
-        cx.notify();
+        // 静默重载的首页:发起时不画(见 `reload_quiet`)
+        if !(first && self.quiet_baseline.is_some()) {
+            cx.notify();
+        }
+    }
+
+    /// 列表区与详情画出来取决于的那份数据(不含 `loading` / `refreshing` 这类在途标记),
+    /// 静默重载落地前后各取一份比对。
+    fn list_view(&self) -> ListView {
+        ListView {
+            hashes: self.commits.iter().map(|c| c.hash.clone()).collect(),
+            has_more: self.has_more,
+            error: self.load_error.clone(),
+            tags: self.tags.clone(),
+            branches: self.branches.clone(),
+            head_branch: self.head_branch.clone(),
+            head_hash: self.head_hash.clone(),
+            selection: self.selection.clone(),
+            detail: self.detail_target(),
+        }
     }
 
     fn load_failed(&mut self, err: anyhow::Error) {
@@ -1350,6 +1430,8 @@ fn row_tooltip(commit: &GitCommitInfo) -> String {
 
 impl Render for GitHistoryContent {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 静默重载落地时据此判断:屏上是不是还挂着在途态(见 `reload_quiet`)
+        self.drawn_loading = self.loading || self.refreshing;
         let this = cx.entity();
         let mut root = div()
             .id("git-history")

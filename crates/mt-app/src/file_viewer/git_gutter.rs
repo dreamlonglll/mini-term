@@ -40,6 +40,9 @@
 //! 时顺带算 blame 的行映射)→ 用请求令牌丢掉迟到结果。HEAD 版本按页签缓存:载入 /
 //! 外部改动重载时重取,页签激活、保存成功、每 [`HEAD_POLL`] 轮询一次 HEAD 指纹
 //! (git2 读 ref + tree,几毫秒),变了才重取。
+//!
+//! 轮询只给**当前文档**跑:页签醒来发现自己不是当前文档就停表(此前每个打开的页签各挂
+//! 一个 3s 定时器,三十个页签约每秒十次空唤醒),再被激活时当场查一次指纹并重新起表。
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -665,21 +668,31 @@ impl FileViewer {
         self.gutter.poll_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(HEAD_POLL).await;
-                if this
-                    .update(cx, |view: &mut FileViewer, cx| {
-                        view.git_check_head(false, cx)
-                    })
-                    .is_err()
-                {
+                let keep = this.update(cx, |view: &mut FileViewer, cx| view.git_poll_tick(cx));
+                if !matches!(keep, Ok(true)) {
                     return;
                 }
             }
         }));
     }
 
-    /// 页签激活:立刻查一次 HEAD 指纹。
+    /// 轮询醒了一次。本页签不是当前文档就停表(见模块注释「数据流」),返回 `false`;
+    /// 再被激活时 [`Self::git_on_activated`] 补查一次并重新起表。
+    fn git_poll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if !crate::workbench_area::is_document_active(&self.source, cx) {
+            self.gutter.poll_task = None;
+            return false;
+        }
+        self.git_check_head(false, cx);
+        true
+    }
+
+    /// 页签激活:立刻查一次 HEAD 指纹,并(重新)起轮询 —— 不是当前文档时它已经停了。
     pub(super) fn git_on_activated(&mut self, cx: &mut Context<Self>) {
         self.git_check_head(true, cx);
+        if self.gutter.repo.is_some() {
+            self.git_start_head_poll(cx);
+        }
     }
 
     /// 保存成功:查一次 HEAD 指纹;注解开着且 blame 之后改过内容的,按落盘内容重跑一次

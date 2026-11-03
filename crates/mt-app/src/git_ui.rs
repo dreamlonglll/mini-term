@@ -40,8 +40,11 @@
 //! 放闸 → 回 UI 线程交给调用方。各区自己的「进行中」标记(按钮转圈、确认键换「执行中…」)
 //! 与失败怎么展示仍由各区定:面板上的操作失败走可选中复制的详情框([`show_git_error`]),
 //! 弹窗里的就地红字(toast 在遮罩下看不见),成功走 toast([`toast`])。
+//!
+//! 只读取数的调度(同一时刻一份 + 脏位补跑)在 [`flight`]。
 
 mod change_tree;
+pub mod flight;
 pub mod gate;
 mod icons;
 

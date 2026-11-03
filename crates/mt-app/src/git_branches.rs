@@ -1479,7 +1479,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
                         p.set_view_branch(None, cx);
                     }
                     p.notify_result(message, Tone::Info, cx);
-                    p.refresh_all(cx);
+                    p.refresh_after_write(cx);
                 });
             }
             Err(err) => {
