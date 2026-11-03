@@ -37,26 +37,78 @@
 //!   深处的变化由另两路与手动刷新兜底;Windows 上每条约 16 KB 缓冲,封顶约 4 MB)。
 //!   同一目录文件树也在听时共用后端那一条,不重复注册;
 //! - sink 只记路径与时刻(`.git` 下的直接丢),并在「目录出现 / 消失」时标记要重列清单;
+//! - sink 只做常数开销的事:「是不是目录」这一次 stat 在**锁外**做(`\\wsl.localhost` 上
+//!   一次 stat 是毫秒级的 9P 往返,主线程每 100ms 的 `take_due` 要拿同一把锁),且只对
+//!   建 / 删 / 改名这几种事件做;
 //! - 主线程借面板节拍问 [`WorktreeWatch::take_due`]:安静满 [`DEBOUNCE`](或一直有变化、
 //!   攒满 [`WORKTREE_MAX_WAIT`])才交出一批,面板在后台按忽略规则过一遍
 //!   ([`mt_project::git::any_unignored_change`]),有一条没被忽略才**只重取「更改」列表**
-//!   (历史 / 分支不动,大仓库不跟着抖)。
+//!   (历史 / 分支不动,大仓库不跟着抖)。上一批还在后台查时面板不来取(取出来也只能
+//!   原样退回);git 正写着索引(`index.lock` 在)时这批退回重排,等它写完再看。
 //!
 //! 防自激:刷新链路全是只读(git2 的 status 不回写索引,读文件不产生写事件),面板自己
 //! 不会把自己叫醒;面板里的丢弃 / 按块丢弃会改工作区,顺带再取一次列表,无害。
+//!
+//! # 签名检查读什么([`RepoObservation`])
+//!
+//! `.git` 那一路安静下来之后,面板在后台读一份 [`RepoObservation`]:签名 + 进行中操作 /
+//! 冲突数,连同**开始读的时刻**。时刻是用来排先后的:面板手上的签名可能来自一份还没落地
+//! 的分支快照、面板自己刚写完索引时读的那份、或者更早的一次检查,谁新听谁的(规则在
+//! `git_panel.rs`)。
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mt_project::git::{GitDirLayout, is_relevant_git_change};
+use mt_project::git::{GitDirLayout, RepoOpState, RepoSignature, is_relevant_git_change};
 use mt_project::watch::{FsWatcher, WatchReady};
 use parking_lot::Mutex;
 
 /// 去抖窗口:最后一次相关变化之后安静这么久才刷。一次 `git commit` 会在几十毫秒里
 /// 连写 index / 对象 / 引用 / reflog,一次 rebase 更多 —— 等它写完再看。
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// 某一刻读到的仓库「面板可见状态」(见模块注释「签名检查读什么」)。
+#[derive(Debug, Clone, Copy)]
+pub struct RepoObservation {
+    /// 开始读的时刻:读到的状态不早于它。
+    pub at: Instant,
+    /// 读不到(仓库被删 / 正被别的进程改写)为 `None`。
+    pub signature: Option<RepoSignature>,
+    /// 进行中的合并 / 变基… 与冲突数(横幅);读不到为 `None`。
+    pub op: Option<RepoOpState>,
+}
+
+impl RepoObservation {
+    /// **阻塞**(两次 git2 只读,不写 `.git`),调用方放后台执行器。
+    pub fn read(repo: &Path) -> Self {
+        let at = Instant::now();
+        Self {
+            at,
+            signature: mt_project::git::repo_signature(repo).ok(),
+            op: mt_project::git::repo_operation_state(repo).ok(),
+        }
+    }
+}
+
+/// `old` → `new` 的差额:要撤掉的、要新挂的(各自保持 `new` / `old` 里的先后)。
+/// 两边都封顶 256 条,但主线程上不必 N² 地逐个 `contains`。
+fn dir_diff(old: &[PathBuf], new: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let old_set: HashSet<&PathBuf> = old.iter().collect();
+    let new_set: HashSet<&PathBuf> = new.iter().collect();
+    let removed = old
+        .iter()
+        .filter(|d| !new_set.contains(d))
+        .cloned()
+        .collect();
+    let added = new
+        .iter()
+        .filter(|d| !old_set.contains(d))
+        .cloned()
+        .collect();
+    (removed, added)
+}
 
 /// sink 与主线程共享的那一小块。
 #[derive(Default)]
@@ -142,14 +194,10 @@ impl GitDirWatch {
         if target.dirs == dirs {
             return;
         }
-        for old in target.dirs.iter().filter(|d| !dirs.contains(d)) {
+        let (removed, added) = dir_diff(&target.dirs, &dirs);
+        for old in &removed {
             self.watcher.unwatch(old);
         }
-        let added: Vec<PathBuf> = dirs
-            .iter()
-            .filter(|d| !target.dirs.contains(d))
-            .cloned()
-            .collect();
         let layout = target.layout.clone();
         target.dirs = dirs;
         for dir in &added {
@@ -231,13 +279,16 @@ impl WorkShared {
 }
 
 /// 一批安静下来的工作区变化。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorktreeBatch {
     pub paths: Vec<PathBuf>,
     /// 路径太多没记全:当相关处理
     pub overflow: bool,
     /// 有目录出现 / 消失:监听目录清单要重列
     pub dirs_changed: bool,
+    /// 这一批最后一条变化记下的时刻(sink 收到事件时;文件真正被写不晚于它)。在它之后才
+    /// 开跑的取数一定反映得出这一批。
+    pub last: Instant,
 }
 
 /// 一条变化是不是 git 自己的目录里的(`<root>/.git/…`,linked worktree 的 `.git` 文件同理)。
@@ -248,13 +299,16 @@ fn is_git_internal(root: &Path, path: &Path) -> bool {
         .is_some_and(|first| first.as_os_str() == ".git")
 }
 
-/// 这条变化会不会改变「该挂哪些目录」:目录被建 / 删 / 改名(notify 的 kind 是
-/// `EventKind` 的调试串,`Create(..)` / `Remove(..)` / `Modify(Name(..))`)。
-fn reshapes_dirs(kind: &str, path: &Path, watched: &HashSet<PathBuf>) -> bool {
-    let structural =
-        kind.starts_with("Create") || kind.starts_with("Remove") || kind.contains("Name");
-    // 被删 / 改走的目录已经 stat 不到了,只能靠「它在不在清单里」认
-    structural && (watched.contains(path) || path.is_dir())
+/// 这条事件是不是「某一项出现 / 消失 / 改名」(notify 的 kind 是 `EventKind` 的调试串,
+/// `Create(..)` / `Remove(..)` / `Modify(Name(..))`)。只看字符串,不碰盘。
+fn is_structural(kind: &str) -> bool {
+    kind.starts_with("Create") || kind.starts_with("Remove") || kind.contains("Name")
+}
+
+/// 这条变化会不会改变「该挂哪些目录」:目录被建 / 删 / 改名。`is_dir_now` 是调用方在
+/// **锁外** stat 的结果;被删 / 改走的目录已经 stat 不到了,只能靠「它在不在清单里」认。
+fn reshapes_dirs(structural: bool, is_dir_now: bool, watched: bool) -> bool {
+    structural && (watched || is_dir_now)
 }
 
 /// 工作区监听(见模块注释「工作区监听」)。
@@ -270,15 +324,18 @@ impl WorktreeWatch {
         let shared = Arc::new(Mutex::new(WorkShared::default()));
         let sink = shared.clone();
         let watcher = FsWatcher::with_label("git-worktree", move |change| {
-            // notify 线程:只过滤 + 记账,不碰 GPUI
+            // notify 线程:只过滤 + 记账,不碰 GPUI。「是不是目录」要 stat,放在拿锁之前 ——
+            // 主线程每拍的 `take_due` 等的是同一把锁,网络盘上一次 stat 就是一次往返
+            let structural = is_structural(&change.kind);
+            let is_dir_now = structural && change.path.is_dir();
             let mut shared = sink.lock();
-            let Some(root) = shared.root.clone() else {
+            let Some(root) = shared.root.as_deref() else {
                 return;
             };
-            if is_git_internal(&root, &change.path) {
+            if is_git_internal(root, &change.path) {
                 return;
             }
-            if reshapes_dirs(&change.kind, &change.path, &shared.dirs) {
+            if reshapes_dirs(structural, is_dir_now, shared.dirs.contains(&change.path)) {
                 shared.dirs_dirty = true;
             }
             if shared.pending.len() < PENDING_CAP {
@@ -334,10 +391,11 @@ impl WorktreeWatch {
             return;
         };
         let project = root.to_string_lossy().to_string();
-        for old in current.iter().filter(|d| !dirs.contains(d)) {
+        let (removed, added) = dir_diff(current, &dirs);
+        for old in &removed {
             self.watcher.unwatch(old);
         }
-        for dir in dirs.iter().filter(|d| !current.contains(d)) {
+        for dir in &added {
             self.watcher.watch(dir, &project);
         }
         self.shared.lock().dirs = dirs.iter().cloned().collect();
@@ -369,12 +427,14 @@ impl WorktreeWatch {
             paths: shared.pending.drain().collect(),
             overflow: shared.overflow,
             dirs_changed: shared.dirs_dirty,
+            last,
         };
         shared.reset_batch();
         Some(batch)
     }
 
-    /// 上一批还在后台检查时又到点了:把这一批退回去,等下一拍再交(变化时刻按现在算)。
+    /// 把一批退回去,安静满去抖之后再交(变化时刻按现在算):后台检查发现 git 正写着索引
+    /// (`index.lock` 在),或者上一批还没查完。
     pub fn requeue(&mut self, batch: WorktreeBatch) {
         if self.target.is_none() {
             return;
@@ -533,6 +593,33 @@ mod tests {
         assert!(watch.take_due().is_none());
         assert_eq!(watch.repo(), None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 差额:撤掉的按旧清单的先后、新挂的按新清单的先后;没变的两边都不出现。
+    #[test]
+    fn 监听目录只增删差额() {
+        let p = |s: &str| PathBuf::from(s);
+        let old = [p("/r"), p("/r/a"), p("/r/b"), p("/r/c")];
+        let new = [p("/r"), p("/r/c"), p("/r/d"), p("/r/a/x")];
+        let (removed, added) = dir_diff(&old, &new);
+        assert_eq!(removed, vec![p("/r/a"), p("/r/b")]);
+        assert_eq!(added, vec![p("/r/d"), p("/r/a/x")]);
+        let (removed, added) = dir_diff(&old, &old);
+        assert!(removed.is_empty() && added.is_empty());
+    }
+
+    /// 只有建 / 删 / 改名才可能改变监听清单;被删的目录 stat 不到,靠清单认。
+    #[test]
+    fn 结构变化才重列清单() {
+        assert!(is_structural("Create(Folder)"));
+        assert!(is_structural("Remove(Any)"));
+        assert!(is_structural("Modify(Name(Both))"));
+        assert!(!is_structural("Modify(Data(Content))"));
+        assert!(!is_structural("Modify(Any)"));
+        assert!(reshapes_dirs(true, true, false), "新建的目录");
+        assert!(reshapes_dirs(true, false, true), "被删的监听目录");
+        assert!(!reshapes_dirs(true, false, false), "建 / 删的是文件");
+        assert!(!reshapes_dirs(false, true, true), "只是内容变了");
     }
 
     #[test]

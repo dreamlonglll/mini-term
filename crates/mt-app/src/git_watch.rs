@@ -43,9 +43,20 @@
 //! 主线程被叫醒的次数由消费方自己节流(文件树两次扫描之间至少隔 [`POLL_MS`])。
 //! 置位与复位都在同一把锁里,「扫完之后又来的字节」一定能再叫醒一次,不会漏。
 //!
-//! 另有一条不经字节的路:[`request_refresh`] 点名让某个订阅者刷一次(Git 面板发现仓库
-//! 变了 —— `.git` 监听命中、面板里的写操作做完 —— 叫文件树重算 git 标记),下一次扫描
-//! 直接算命中。
+//! 另有几条不经字节的路,都是 Git 面板叫文件树(它自己的监听只盯展开着的目录,且收不到
+//! AI pane 里的提交):
+//!
+//! - [`request_refresh`] —— 点名**无条件**刷一次(面板里的暂存 / 丢弃 / 提交、写操作做完、
+//!   手动 ↻),下一次扫描直接算命中;
+//! - [`request_check`] —— 「仓库签名可能变了」(`.git` 监听判出变化):文件树后台比一次
+//!   签名,与它上次取状态时的那份一样就不重取 —— 它自己的 `.git` 事件多半已经先取过了;
+//! - [`request_paths`] —— 工作区监听判定命中的那批路径:文件树只认**自己没在监听**的那些
+//!   (折起来的目录里的改动,汇总字母要跟上),自己听得到的不重复取。
+//!
+//! 后两种由 [`take_requests`] 领走,不算进 [`drain_hit_for`] 的命中。
+//!
+//! Git 面板自己在 `.git` 监听挂着时,命中也不再直接整面板重取,而是叫监听比一次签名
+//! (见 `git_panel.rs` 模块注释「自动刷新」)。
 //!
 //! # 多订阅者(Y 批扩)
 //!
@@ -77,6 +88,7 @@
 //!    `mode ` 能凑出一次误命中。后果只是多刷一次列表,不值得为它按 pane 分桶。
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -148,6 +160,30 @@ const IDLE_SUB: Sub = Sub {
     forced: false,
 };
 
+/// 一次 [`request_paths`] 最多记多少条路径;再多只记「溢出」(按无条件刷算)。
+const REQUEST_PATH_CAP: usize = 256;
+
+/// 不经字节的点名请求([`request_check`] / [`request_paths`]),由 [`take_requests`] 一次领走。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Requests {
+    /// 仓库签名可能变了:比一次签名,变了才重取
+    pub check: bool,
+    /// 工作区里变了的文件(绝对路径,去重前的原样)
+    pub paths: Vec<PathBuf>,
+    /// 路径太多没记全:当无条件刷处理
+    pub overflow: bool,
+}
+
+impl Requests {
+    const fn new() -> Self {
+        Self {
+            check: false,
+            paths: Vec::new(),
+            overflow: false,
+        }
+    }
+}
+
 struct Tap {
     /// `aiPtyIds`(`src/utils/terminalCache.ts:106`)的对应物。
     ai_panes: HashSet<u32>,
@@ -157,11 +193,26 @@ struct Tap {
     subs: [Sub; SUB_COUNT],
     /// 逐订阅者的唤醒口(见 [`wake_channel_for`])。`None` = 该订阅者自己轮询。
     wakers: [Option<mpsc::UnboundedSender<()>>; SUB_COUNT],
+    /// 逐订阅者攒着的点名请求。
+    requests: [Requests; SUB_COUNT],
 }
 
 impl Tap {
     fn total_seq(&self) -> u64 {
         self.head_seq + self.ring.len() as u64
+    }
+
+    /// 给开着、登记了唤醒口、这一轮还没叫过的订阅者丢一声(点名请求用;字节那条路在
+    /// [`observe_output`] 里逐个叫)。
+    fn wake(&mut self, idx: usize) {
+        let slot = &mut self.subs[idx];
+        if slot.enabled
+            && !slot.wake_sent
+            && let Some(waker) = &self.wakers[idx]
+        {
+            slot.wake_sent = true;
+            let _ = waker.unbounded_send(());
+        }
     }
 }
 
@@ -174,6 +225,7 @@ static TAP: LazyLock<Mutex<Tap>> = LazyLock::new(|| {
         head_seq: 0,
         subs: [IDLE_SUB; SUB_COUNT],
         wakers: [const { None }; SUB_COUNT],
+        requests: [const { Requests::new() }; SUB_COUNT],
     })
 });
 
@@ -205,6 +257,7 @@ pub fn set_enabled_for(sub: Subscriber, on: bool) {
     slot.skip_overlap = true;
     slot.wake_sent = false;
     slot.forced = false;
+    tap.requests[sub.idx()] = Requests::new();
     let any = tap.subs.iter().any(|s| s.enabled);
     if !any {
         tap.head_seq = total;
@@ -227,18 +280,51 @@ pub fn set_enabled(on: bool) {
 /// (远程项目 / 没项目本来就不拉 git 状态)。刷新仍走订阅者自己的去抖。
 pub fn request_refresh(sub: Subscriber) {
     let mut tap = TAP.lock();
-    let tap = &mut *tap;
     let slot = &mut tap.subs[sub.idx()];
     if !slot.enabled {
         return;
     }
     slot.forced = true;
-    if !slot.wake_sent
-        && let Some(waker) = &tap.wakers[sub.idx()]
-    {
-        slot.wake_sent = true;
-        let _ = waker.unbounded_send(());
+    tap.wake(sub.idx());
+}
+
+/// 点名「仓库签名可能变了」(见模块注释):订阅者比一次签名,变了才重取。关着时什么都不做。
+pub fn request_check(sub: Subscriber) {
+    let mut tap = TAP.lock();
+    if !tap.subs[sub.idx()].enabled {
+        return;
     }
+    tap.requests[sub.idx()].check = true;
+    tap.wake(sub.idx());
+}
+
+/// 交给订阅者一批工作区里变了的文件(见模块注释)。`overflow` = 调用方自己就没记全。
+/// 关着时什么都不做;攒满 [`REQUEST_PATH_CAP`] 之后只记溢出。
+pub fn request_paths(sub: Subscriber, paths: &[PathBuf], overflow: bool) {
+    if paths.is_empty() && !overflow {
+        return;
+    }
+    let mut tap = TAP.lock();
+    if !tap.subs[sub.idx()].enabled {
+        return;
+    }
+    let pending = &mut tap.requests[sub.idx()];
+    pending.overflow |= overflow;
+    for path in paths {
+        if pending.paths.len() < REQUEST_PATH_CAP {
+            pending.paths.push(path.clone());
+        } else {
+            pending.overflow = true;
+            break;
+        }
+    }
+    tap.wake(sub.idx());
+}
+
+/// 领走某个订阅者攒着的点名请求([`request_check`] / [`request_paths`]),领走即清。
+/// 与 [`drain_hit_for`] 在同一次唤醒里调。
+pub fn take_requests(sub: Subscriber) -> Requests {
+    std::mem::take(&mut TAP.lock().requests[sub.idx()])
 }
 
 /// 标记某个 PTY 是不是 AI pane。对应 `App.tsx:284` 的
@@ -394,6 +480,7 @@ mod tests {
         tap.head_seq = 0;
         tap.subs = [IDLE_SUB; SUB_COUNT];
         tap.wakers = [const { None }; SUB_COUNT];
+        tap.requests = [const { Requests::new() }; SUB_COUNT];
     }
 
     /// 旧实现(逐字节 `pop_front`)原样留作对照。
@@ -645,6 +732,43 @@ mod tests {
         request_refresh(Subscriber::FileTree);
         set_enabled_for(Subscriber::FileTree, true);
         assert!(!drain_hit_for(Subscriber::FileTree));
+
+        // ─── 核签名 / 交路径(不算命中,另由 take_requests 领走) ───
+        // ⑳ 叫醒一次、不算进命中、领走即清;路径照原样累积,超过上限只记溢出
+        let _ = pending(&mut fresh);
+        request_check(Subscriber::FileTree);
+        request_paths(
+            Subscriber::FileTree,
+            &[PathBuf::from("/w/a.rs"), PathBuf::from("/w/b.rs")],
+            false,
+        );
+        assert_eq!(pending(&mut fresh), 1, "两条点名在同一轮里只叫一次");
+        assert!(!drain_hit_for(Subscriber::FileTree), "核签名不是无条件刷");
+        let got = take_requests(Subscriber::FileTree);
+        assert!(got.check);
+        assert_eq!(got.paths.len(), 2);
+        assert!(!got.overflow);
+        assert_eq!(take_requests(Subscriber::FileTree), Requests::default());
+        let many: Vec<PathBuf> = (0..REQUEST_PATH_CAP + 5)
+            .map(|i| PathBuf::from(format!("/w/{i}")))
+            .collect();
+        request_paths(Subscriber::FileTree, &many, false);
+        let got = take_requests(Subscriber::FileTree);
+        assert_eq!(got.paths.len(), REQUEST_PATH_CAP);
+        assert!(got.overflow, "超出上限要记溢出");
+        // 空请求不叫醒
+        let _ = drain_hit_for(Subscriber::FileTree);
+        let _ = pending(&mut fresh);
+        request_paths(Subscriber::FileTree, &[], false);
+        assert_eq!(pending(&mut fresh), 0);
+
+        // ㉑ 关着时一律不收,重开也不带出旧请求
+        request_check(Subscriber::FileTree);
+        set_enabled_for(Subscriber::FileTree, false);
+        request_check(Subscriber::FileTree);
+        request_paths(Subscriber::FileTree, &[PathBuf::from("/w/c")], true);
+        set_enabled_for(Subscriber::FileTree, true);
+        assert_eq!(take_requests(Subscriber::FileTree), Requests::default());
 
         reset();
     }

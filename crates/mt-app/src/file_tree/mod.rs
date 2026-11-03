@@ -45,6 +45,13 @@
 //! 真排了一次刷新时才存在。没项目 / 远程项目 / 终端没输出时主线程一次都不被叫。
 //! 目录行的汇总字母在状态加载完成时一次性预算成表(见 [`GitLabels`]),render 只查表。
 //!
+//! 去抖期间攒的是一份**刷新计划**([`git_refresh`]):`.git` 内部的变化只记「比签名」、
+//! 工作区文件的变化记下路径,到点在后台先比签名 / 过忽略规则,真有必要才跑全量 status
+//! (理由与口径见那个模块)。Git 面板开着时还会点名:`.git` 判出变化叫它比签名、工作区
+//! 监听命中把路径交过来(只认这边没在监听的 —— 折起来的目录的汇总字母靠它跟上)。
+//! 拉状态是**单飞**的([`crate::git_ui::flight`]):同一时刻一份,期间攒的计划跑完补一趟,
+//! 迟到的旧结果不会盖掉新的;结果与眼下一样不重画(整树是拍平重建的)。
+//!
 //! # store 变化 → 重画的闸
 //!
 //! [`AppStore`] 任何改动都会 notify(AI 跑着时 OSC 标题约 4Hz/pane),而本面板
@@ -78,17 +85,21 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::dnd::DragFilePath;
 use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
 use crate::fs_ops;
+use crate::git_ui::flight::{Flight, Landing};
 use crate::git_watch;
 use crate::i18n::{t, tr};
 use crate::menu::MenuEntry;
 use crate::store::AppStore;
 use crate::ui;
 
+mod git_refresh;
 mod menu;
 mod move_to;
 mod ops;
 #[cfg(test)]
 mod tests;
+
+use git_refresh::{GitRefreshPlan, RepoSigs};
 
 use menu::{background_menu, file_menu, mod_label};
 use move_to::MoveSource;
@@ -226,6 +237,12 @@ pub struct FileTree {
     git_refresh_at: Option<Instant>,
     /// 去抖计时任务在不在睡。只在排了刷新时才起一个,见 [`Self::schedule_git_refresh`]。
     git_refresh_armed: bool,
+    /// 去抖期间攒下的刷新理由(见模块注释「git 状态着色」)。
+    git_plan: GitRefreshPlan,
+    /// 拉 git 状态的单飞调度;换项目时作废在途的那趟。
+    git_flight: Flight,
+    /// 上次拉状态之前读的签名表:`.git` 变了时与它比。
+    git_sigs: Option<RepoSigs>,
     /// 上一次 render 看到的 [`store_render_signature`]。store notify 时与它比,
     /// 相同就不重画。
     rendered_store_signature: u64,
@@ -375,17 +392,7 @@ impl FileTree {
                 };
                 if this
                     .update(cx, |tree: &mut FileTree, cx| {
-                        if tree.path_is_suppressed(&path) {
-                            return;
-                        }
-                        if structural {
-                            tree.forget_reshaped_dir(&path, cx);
-                        }
-                        tree.invalidate(&dir, cx);
-                        // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
-                        // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
-                        tree.schedule_git_refresh(cx);
-                        tree.invalidate_dir_kind(&path, &dir, cx);
+                        tree.on_fs_change(path, structural, &dir, cx)
                     })
                     .is_err()
                 {
@@ -437,6 +444,9 @@ impl FileTree {
             git: GitLabels::default(),
             git_refresh_at: None,
             git_refresh_armed: false,
+            git_plan: GitRefreshPlan::default(),
+            git_flight: Flight::default(),
+            git_sigs: None,
             rendered_store_signature: 0,
             chain_owner: HashMap::new(),
             root_loading: false,
@@ -475,7 +485,7 @@ impl FileTree {
         .detach();
     }
 
-    /// 去抖计时任务醒了:到点就真去拉并收摊;被顺延过就回报还要再睡多久;
+    /// 去抖计时任务醒了:到点就真去跑攒下的计划并收摊;被顺延过就回报还要再睡多久;
     /// 排的那次已被撤掉(换项目)就直接收摊。
     fn fire_git_refresh(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
         let now = Instant::now();
@@ -484,7 +494,7 @@ impl FileTree {
             Some(_) => {
                 self.git_refresh_at = None;
                 self.git_refresh_armed = false;
-                self.load_git_status(cx);
+                self.run_git_plan(cx);
                 None
             }
             None => {
@@ -494,45 +504,142 @@ impl FileTree {
         }
     }
 
-    /// 旁路叫醒了:扫一遍新字节,命中就排一次去抖。
+    /// 旁路叫醒了:扫一遍新字节(命中 / 被点名无条件刷 = 无条件拉),顺带领走 Git 面板的
+    /// 点名(比签名 / 一批工作区路径),攒进计划排一次去抖。
     fn on_git_output(&mut self, cx: &mut Context<Self>) {
-        if git_watch::drain_hit_for(git_watch::Subscriber::FileTree) {
+        let hit = git_watch::drain_hit_for(git_watch::Subscriber::FileTree);
+        let requests = git_watch::take_requests(git_watch::Subscriber::FileTree);
+        let mut queued = false;
+        if hit || requests.overflow {
+            self.git_plan.force = true;
+            queued = true;
+        }
+        if requests.check {
+            self.git_plan.check = true;
+            queued = true;
+        }
+        if !requests.paths.is_empty()
+            && let Some(root) = self.project_root(cx)
+        {
+            // 只认这边**没在监听**的(折起来的目录):听得到的那些自己的 fs 事件已经排过了
+            for path in requests.paths {
+                let watched = path.parent().is_some_and(|dir| self.watched.contains(dir));
+                if !watched && path.starts_with(&root) {
+                    self.git_plan.add_path(path);
+                    queued = true;
+                }
+            }
+        }
+        if queued {
             self.schedule_git_refresh(cx);
         }
     }
 
-    /// 拉一次 git 状态。`get_git_status` 要跑 libgit2 的全量 status,**必须丢后台**。
+    /// 目录监听报上来一条变化(notify 线程丢过来,主线程上处理)。
+    fn on_fs_change(
+        &mut self,
+        path: PathBuf,
+        structural: bool,
+        dir: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if self.path_is_suppressed(&path) {
+            return;
+        }
+        let git_internal = self
+            .project_root(cx)
+            .is_some_and(|root| git_refresh::is_git_internal(&root, &path));
+        if git_internal && !structural {
+            // `.git` 里的东西被改写(Windows 的非递归监听会报一条「.git 被修改」):`.git`
+            // 永远隐藏,目录列表不会变,不重列;git 标记只按签名核一遍(见 `git_refresh`)
+            self.git_plan.check = true;
+            self.schedule_git_refresh(cx);
+            return;
+        }
+        if structural {
+            self.forget_reshaped_dir(&path, cx);
+        }
+        self.invalidate(dir, cx);
+        // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
+        // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
+        if git_internal {
+            // `.git` 出现 / 消失(git init / clone / 删仓库):仓库集合变了,发现缓存作废、
+            // 无条件重拉
+            mt_project::git::invalidate_repo_cache();
+            self.git_plan.force = true;
+        } else {
+            self.git_plan.add_path(path.clone());
+        }
+        self.schedule_git_refresh(cx);
+        self.invalidate_dir_kind(&path, dir, cx);
+    }
+
+    /// 无条件拉一次 git 状态(切项目 / 手动刷新),不等去抖。
+    fn load_git_status(&mut self, cx: &mut Context<Self>) {
+        self.git_plan.force = true;
+        self.run_git_plan(cx);
+    }
+
+    /// 跑攒下的刷新计划。`get_git_status` 要跑 libgit2 的全量 status,**必须丢后台**;
+    /// 计划(比签名 / 过忽略规则)也在后台判,没必要就不拉。单飞:在途时计划留着继续攒,
+    /// 那趟落地后当场补跑。
     ///
     /// 失败一律清空(原版 `.catch(() => setGitStatusMap(new Map()))`):
     /// 不是 git 仓库 / 仓库坏了的时候,留着上一个项目的状态字母比没有更糟。
-    fn load_git_status(&mut self, cx: &mut Context<Self>) {
+    fn run_git_plan(&mut self, cx: &mut Context<Self>) {
+        if self.git_plan.is_empty() {
+            return;
+        }
         let Some(context) = self.operation_context(cx) else {
+            self.git_plan = GitRefreshPlan::default();
             self.git.clear();
             return;
         };
         if !matches!(&context.backend, FileBackendIdentity::Local) {
+            self.git_plan = GitRefreshPlan::default();
             self.git.clear();
             return;
         }
+        let Some(token) = self.git_flight.begin(Instant::now()) else {
+            return;
+        };
+        let plan = std::mem::take(&mut self.git_plan);
+        let known = self.git_sigs.clone();
         let root = context.root.clone();
         cx.spawn(async move |this, cx| {
-            let probe = root.clone();
             // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
-            let result = cx
+            let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    mt_project::git::get_git_status(&probe)
-                        .map(|files| GitLabels::new(git_status_table(files)))
+                    git_refresh::run_plan(&root, &plan, known.as_ref()).map(|(sigs, files)| {
+                        let labels = files
+                            .map(|files| GitLabels::new(git_status_table(files)))
+                            .unwrap_or_default();
+                        (sigs, labels)
+                    })
                 })
                 .await;
             let _ = this.update(cx, |tree: &mut FileTree, cx| {
-                // 回来时项目、连接或 source generation 都可能已经变化；完整上下文
-                // 不相等就丢弃，避免同路径项目之间串入迟到的 git 状态。
+                // 换项目时令牌已作废;另外回来时项目、连接或 source generation 都可能已经
+                // 变化:完整上下文不相等就丢弃,避免同路径项目之间串入迟到的 git 状态。
+                let rerun = match tree.git_flight.finish(token) {
+                    Landing::Stale => return,
+                    Landing::Done { rerun } => rerun,
+                };
                 if tree.operation_context(cx).as_ref() != Some(&context) {
                     return;
                 }
-                tree.git = result.unwrap_or_default();
-                cx.notify();
+                if let Some((sigs, labels)) = outcome {
+                    tree.git_sigs = Some(sigs);
+                    // 整树是拍平重建的:状态与眼下一样就不重画
+                    if tree.git != labels {
+                        tree.git = labels;
+                        cx.notify();
+                    }
+                }
+                if rerun {
+                    tree.run_git_plan(cx);
+                }
             });
         })
         .detach();
@@ -580,8 +687,12 @@ impl FileTree {
         self.pending_reload.clear();
         self.chain_owner.clear();
         self.git.clear();
-        // 排着的去抖刷新作废;在睡的计时任务醒来看到 `None` 自己收摊
+        // 排着的去抖刷新作废;在睡的计时任务醒来看到 `None` 自己收摊。攒的计划、在途的
+        // 那趟、记下的签名都属于上一个项目
         self.git_refresh_at = None;
+        self.git_plan = GitRefreshPlan::default();
+        self.git_flight.reset();
+        self.git_sigs = None;
         self.root_error = None;
         self.current_project = project_id;
         self.source_signature = signature;
@@ -1337,7 +1448,7 @@ fn git_status_table(files: Vec<mt_project::git::GitFileStatus>) -> HashMap<Strin
 
 /// git 状态表 + 目录汇总表。汇总表是状态表的派生物,**只能一起换**
 /// (构造只有 [`GitLabels::new`] 一条路),render 时逐行只查表。
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct GitLabels {
     /// 相对项目根的 `/` 分隔路径 → 状态字母(M/A/D/R/?/C)。
     files: HashMap<String, String>,

@@ -49,11 +49,43 @@
 //! (都在 [`crate::git_dir_watch`]):AI agent 在终端里提交、外部工具切分支、AI / 外部
 //! 编辑器改了文件,面板都自己跟上。
 //!
-//! - `.git` 监听去抖之后先在后台算 [`RepoSignature`],**没变就不刷**(防别的程序只刷新
-//!   索引 stat 缓存时白刷一遍);只变了索引就只重取「更改」区与冲突数,引用变了才连
-//!   分支、计数、提交历史一起刷。两种都顺带叫文件树重算 git 标记
-//!   ([`git_watch::request_refresh`]);
-//! - 工作区监听去抖之后按忽略规则过一遍,**只**重取「更改」列表。
+//! - `.git` 监听去抖之后先在后台读一份 [`RepoObservation`](签名 + 冲突数),**没变就不刷**
+//!   (防别的程序只刷新索引 stat 缓存时白刷一遍);只变了索引(终端里 `git add`、解决了一个
+//!   冲突)就只重取「更改」区,冲突数直接用读到的那份 —— 分支快照里其余各项(分支、领先
+//!   落后、最近分支、贮藏数、推送计划…)只随引用 / 仓库配置变,配置不在监听里(改了它连
+//!   事件都没有),所以不必重取;引用变了才连分支、计数、提交历史一起刷(**不**重新发现仓库,
+//!   见下)。两种都叫文件树按签名核一遍 git 标记([`git_watch::request_check`]);
+//! - pty 嗅探命中时,`.git` 监听挂在选中仓库上就**只**叫它比一次签名([`PtyRoute`]):终端
+//!   里的 git 命令改仓库必然经过 `.git`(提交 / 检出 / 合并 / 拉取 / 贮藏都动引用或索引),
+//!   与那一路各刷一遍是白刷;`git log --stat` / `git show` 这类误命中签名不变,不刷。唯一
+//!   两路都看不到的是子模块里的提交(父仓库的「更改」会多出一行,`.git` 与工作区监听都
+//!   跳过了子模块),所以签名没变时补一次**只**重取「更改」列表。监听没挂上(列目录失败、
+//!   正在换目标)才回落原版的两个 500ms 去抖;
+//! - 工作区监听去抖之后按忽略规则过一遍,**只**重取「更改」列表,并把这批路径交给文件树
+//!   ([`git_watch::request_paths`],它只认自己没在监听的 —— 折起来的目录的汇总字母);
+//!   这批变化之后已经有一趟取数开跑的就不再要;git 正写着索引(`index.lock` 在)时退回重排。
+//!
+//! ## 签名的先后
+//!
+//! 面板手上的签名([`RepoMeta::signature`])有三个来源:分支快照、`.git` 检查、面板自己写完
+//! 索引时读的那份([`GitChangesEvent::IndexWritten`])。每份都带「开始读的时刻」,**谁新听
+//! 谁的**:比手上那份旧的检查结果直接丢;分支快照在途时到的检查先压着,等快照落地拿它的
+//! 签名再比(否则「刚发出的那一轮还没回来」会被误判成变了、再整轮刷一遍);快照落地时手上
+//! 那份若是它发出之后才读的,签名与冲突数沿用手上的(判据见 [`check_fate`] 等几个纯函数)。
+//!
+//! ## 什么时候重新发现仓库
+//!
+//! `discover_git_repos` 要扫盘(父目录型项目上是秒级),只在换项目、手动 ↻、Worktree 管理
+//! 弹窗改过之后跑;监听 / 写操作触发的刷新不跑 —— 仓库栏上的分支名由分支快照回填。
+//!
+//! ## 抽屉与窗口
+//!
+//! 抽屉收着时三路全停;同项目再打开时走便宜路:重取一次「更改」+ 比一次签名决定要不要
+//! 连分支 / 历史一起刷,不重新发现仓库。窗口最小化(不可见)时节拍暂停,监听照记,恢复
+//! 可见时补比一次签名;只是失焦照旧跑。
+//!
+//! 仓库栏的刷新按钮只在手动 ↻(或还一条分支都没有)时转圈,自动刷新不转 —— 结果没变时
+//! 整轮都不重画。
 //!
 //! # 两块的高度
 //!
@@ -65,7 +97,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
@@ -80,7 +112,7 @@ use mt_project::git::{
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
-use crate::git_dir_watch::{GitDirWatch, WorktreeBatch, WorktreeWatch};
+use crate::git_dir_watch::{GitDirWatch, RepoObservation, WorktreeBatch, WorktreeWatch};
 use crate::git_history::{CommitDetailPane, GitHistoryContent, GitHistoryEvent};
 use crate::git_ui::{self, Tone, estimate_text_width};
 use crate::git_watch;
@@ -206,6 +238,20 @@ struct RepoMeta {
     stash_count: usize,
 }
 
+/// 两份元数据画出来是不是一样:除签名(不上屏)外逐项比。快照落地时据此决定要不要重画。
+/// ⚠️ [`RepoMeta`] 加了上屏的字段,这里要跟着加。
+fn meta_view_eq(a: &RepoMeta, b: &RepoMeta) -> bool {
+    a.head_label == b.head_label
+        && a.head_tracking == b.head_tracking
+        && a.tracking == b.tracking
+        && a.recent == b.recent
+        && a.remotes == b.remotes
+        && a.op == b.op
+        && a.pull_config == b.pull_config
+        && a.push_plan == b.push_plan
+        && a.stash_count == b.stash_count
+}
+
 /// 后台读一份分支快照。只读;除分支列表外,单项查询失败不拖垮整份。
 fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMeta)> {
     use mt_project::git as g;
@@ -269,7 +315,11 @@ pub struct GitPanel {
     repos: Vec<GitRepoInfo>,
     selected_repo: String,
     branches: Vec<BranchInfo>,
+    /// 仓库栏刷新按钮转不转圈 / 分支弹窗的「加载中」占位:手动 ↻ 或还一条分支都没有时的
+    /// 那趟快照才算(自动刷新不转圈,见模块注释)。在途与否看 `snapshot_in_flight`。
     branches_loading: bool,
+    /// 有一趟分支快照在途(不管转不转圈)。
+    snapshot_in_flight: bool,
     /// 正在查看(**未 checkout**)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
     meta: RepoMeta,
@@ -292,6 +342,19 @@ pub struct GitPanel {
     sig_checking: bool,
     /// 检查在跑期间又来了一批变化:等它回来再查一轮,别把这批漏掉。
     sig_recheck: bool,
+    /// `meta.signature` / `meta.op` 是哪一刻读的(见模块注释「签名的先后」)。
+    sig_observed_at: Option<Instant>,
+    /// 最近一轮「分支 + 更改 + 历史」整轮重取发出的时刻:比它早开始的检查结果不必再看。
+    round_issued: Option<Instant>,
+    /// 分支快照在途时到的检查结果:等快照落地拿新签名再比。
+    deferred_check: Option<RepoObservation>,
+    /// 走签名那条路的 pty 命中时刻:比签名的检查回来后,还没有哪趟「更改」取数在它之后
+    /// 开跑的话补一次(子模块,见模块注释「自动刷新」)。
+    pty_hit_at: Option<Instant>,
+    /// 同项目重新打开抽屉:监听挂上之后当场比一次签名(见模块注释「抽屉与窗口」)。
+    catch_up: bool,
+    /// 窗口在不在呈现(最小化 / 整个被挡住时为 `false`,节拍暂停)。
+    window_visible: bool,
     /// 工作区监听(AI / 外部编辑器改了文件 → 只重取「更改」列表,见 `git_dir_watch`)。
     work_watch: WorktreeWatch,
     /// 一批工作区变化正在后台过忽略规则。
@@ -326,9 +389,11 @@ impl GitPanel {
             &changes,
             window,
             |this: &mut Self, _entity, event, window, cx| match event {
-                // 提交成功:历史整体重来 + 重载分支(分支头已前移)。「提交并推送」接着开
+                // 提交成功:历史整体重来 + 重载分支(分支头已前移);「更改」区自己已重取,
+                // 这三样凑成一整轮(紧接着那次 `.git` 检查据此短路)。「提交并推送」接着开
                 // 推送对话框(预选当前分支),在那里看清待推送的提交再确认
                 GitChangesEvent::Committed { open_push } => {
+                    this.round_issued = Some(Instant::now());
                     this.history.update(cx, |h, cx| h.reload(cx));
                     this.load_branches(cx);
                     if *open_push {
@@ -336,19 +401,25 @@ impl GitPanel {
                     }
                 }
                 // 更改区里贮藏了改动:工作区与贮藏数都变了,整面板刷新
-                GitChangesEvent::Stashed => this.refresh_all(cx),
+                GitChangesEvent::Stashed => this.refresh_after_write(cx),
+                // 暂存 / 丢弃 / 冲突处理写完:记作「已知」(见模块注释「签名的先后」)
+                GitChangesEvent::IndexWritten(observed) => this.absorb_own_write(*observed, cx),
             },
         ));
         subs.push(cx.subscribe_in(
             &history,
             window,
             |this: &mut Self, _entity, event, window, cx| match event {
-                GitHistoryEvent::RefreshRepos => this.refresh_repo_meta(cx),
+                // pty 嗅探回落那条路(`.git` 监听没挂上):只重载分支 —— 仓库栏的分支名由
+                // 快照回填,不必为它重新发现仓库
+                GitHistoryEvent::RefreshRepos => this.load_branches(cx),
                 // 历史区的改写操作(检出 / 重置 / 拣选…)动了 HEAD、分支或工作区:
-                // 分支徽章与「更改」列表都要重取(历史区自己已重载)
+                // 分支徽章与「更改」列表都要重取(历史区自己已重载),凑成一整轮
                 GitHistoryEvent::RepoChanged => {
-                    this.refresh_repo_meta(cx);
+                    this.round_issued = Some(Instant::now());
+                    this.load_branches(cx);
                     this.changes.update(cx, |c, cx| c.load(cx));
+                    git_watch::request_check(git_watch::Subscriber::FileTree);
                 }
                 GitHistoryEvent::CommitUndone { message } => {
                     this.changes
@@ -378,6 +449,13 @@ impl GitPanel {
                 }
             }),
         );
+        // 最小化 / 整个被挡住:节拍暂停(监听照记),恢复呈现时补比一次签名
+        subs.push(cx.observe_window_visibility(
+            window,
+            |this: &mut Self, visibility, _window, cx| {
+                this.set_window_visible(visibility.is_visible(), cx)
+            },
+        ));
 
         Self {
             store,
@@ -388,6 +466,7 @@ impl GitPanel {
             selected_repo: String::new(),
             branches: Vec::new(),
             branches_loading: false,
+            snapshot_in_flight: false,
             view_branch: None,
             meta: RepoMeta::default(),
             busy: None,
@@ -400,6 +479,12 @@ impl GitPanel {
             watch_request: 0,
             sig_checking: false,
             sig_recheck: false,
+            sig_observed_at: None,
+            round_issued: None,
+            deferred_check: None,
+            pty_hit_at: None,
+            catch_up: false,
+            window_visible: window.is_visible(),
             work_watch: WorktreeWatch::new(),
             work_checking: false,
             sections_height: 0.0,
@@ -425,14 +510,42 @@ impl GitPanel {
             self.project_path = self.store.read(cx).active_project().map(|p| p.path.clone());
             if self.stale {
                 self.on_project_changed(cx);
+            } else if !self.selected_repo.is_empty() && !self.is_remote_project(cx) {
+                // 同项目再打开(见模块注释「抽屉与窗口」):收着时三路全停,工作区改动只能
+                // 重取一次「更改」补上;引用 / 索引变没变等监听挂上后比一次签名再定,
+                // 不重新发现仓库
+                self.changes.update(cx, |c, cx| c.load(cx));
+                self.catch_up = true;
             }
-            self.start_tick(cx);
+            if self.window_visible {
+                self.start_tick(cx);
+            }
         } else {
             self._tick = None;
+            self.catch_up = false;
+            self.pty_hit_at = None;
         }
         // 可见 → 按当时选中的仓库挂监听;收起 → 撤掉
         self.retarget_watch(cx);
         cx.notify();
+    }
+
+    /// 窗口呈现与否变了(见模块注释「抽屉与窗口」)。不可见时停节拍 —— 监听的 sink 照记,
+    /// 节拍一恢复就交;恢复时另补比一次签名兜底。
+    fn set_window_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.window_visible == visible {
+            return;
+        }
+        self.window_visible = visible;
+        if !self.visible {
+            return;
+        }
+        if visible {
+            self.start_tick(cx);
+            self.check_git_dir_change(cx);
+        } else {
+            self._tick = None;
+        }
     }
 
     /// 抽屉左侧要挂的「提交详情」栏(见 `git_history::detail` 模块注释)。没选中提交、
@@ -449,9 +562,9 @@ impl GitPanel {
         shown.then(|| self.detail_pane.clone())
     }
 
-    /// pty-output 嗅探的节拍。100ms 一拍:抽干旁路 → 命中就通知两个子面板
-    /// (**各自** 500ms 去抖,原版是两个独立定时器)→ 到点的那个自己重取。
-    /// 同一拍顺带问一声 `.git` 监听有没有攒够一批安静下来的变化。
+    /// pty-output 嗅探的节拍。100ms 一拍:抽干旁路 → 命中按 [`PtyRoute`] 分流(监听挂着就
+    /// 只叫它比签名;否则通知两个子面板,**各自** 500ms 去抖,原版是两个独立定时器)。
+    /// 同一拍顺带问一声 `.git` / 工作区监听有没有攒够一批安静下来的变化。
     fn start_tick(&mut self, cx: &mut Context<Self>) {
         self._tick = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -459,26 +572,40 @@ impl GitPanel {
                     .timer(Duration::from_millis(git_watch::POLL_MS))
                     .await;
                 let alive = this
-                    .update(cx, |this: &mut Self, cx| {
-                        if git_watch::drain_hit() {
-                            this.changes.update(cx, |c, _| c.note_pty_hit());
-                            this.history.update(cx, |h, _| h.note_pty_hit());
-                        }
-                        this.changes.update(cx, |c, cx| c.tick(cx));
-                        this.history.update(cx, |h, cx| h.tick(cx));
-                        if this.dir_watch.take_due() {
-                            this.check_git_dir_change(cx);
-                        }
-                        if let Some(batch) = this.work_watch.take_due() {
-                            this.check_worktree_change(batch, cx);
-                        }
-                    })
+                    .update(cx, |this: &mut Self, cx| this.on_tick(cx))
                     .is_ok();
                 if !alive {
                     return;
                 }
             }
         }));
+    }
+
+    fn on_tick(&mut self, cx: &mut Context<Self>) {
+        if git_watch::drain_hit() {
+            let watching = self.dir_watch.repo() == Some(self.selected_repo.as_str());
+            match pty_route(watching) {
+                PtyRoute::Signature => {
+                    self.pty_hit_at = Some(Instant::now());
+                    self.dir_watch.poke();
+                }
+                PtyRoute::Debounce => {
+                    self.changes.update(cx, |c, _| c.note_pty_hit());
+                    self.history.update(cx, |h, _| h.note_pty_hit());
+                }
+            }
+        }
+        self.changes.update(cx, |c, cx| c.tick(cx));
+        self.history.update(cx, |h, cx| h.tick(cx));
+        if self.dir_watch.take_due() {
+            self.check_git_dir_change(cx);
+        }
+        // 上一批还在后台查:这一拍不取 —— 取出来也只能原样退回,每拍空转一次
+        if !self.work_checking
+            && let Some(batch) = self.work_watch.take_due()
+        {
+            self.check_worktree_change(batch, cx);
+        }
     }
 
     fn is_remote_project(&self, cx: &App) -> bool {
@@ -488,12 +615,25 @@ impl GitPanel {
             .is_some_and(|p| p.ssh_connection_id.is_some())
     }
 
-    /// 项目变了:先吃缓存(没有就清空)→ 重新发现仓库。
-    fn on_project_changed(&mut self, cx: &mut Context<Self>) {
-        self.stale = false;
+    /// 换仓库 / 换项目:分支、元数据、签名的先后记录全部作废;在途的分支快照也作废 ——
+    /// 它属于上一个仓库,且不作废的话「在途」标记会一直挂着(签名检查就一直被压着)。
+    fn reset_repo_state(&mut self) {
         self.view_branch = None;
         self.branches.clear();
         self.meta = RepoMeta::default();
+        self.branch_request += 1;
+        self.branches_loading = false;
+        self.snapshot_in_flight = false;
+        self.sig_observed_at = None;
+        self.round_issued = None;
+        self.deferred_check = None;
+        self.pty_hit_at = None;
+    }
+
+    /// 项目变了:先吃缓存(没有就清空)→ 重新发现仓库。
+    fn on_project_changed(&mut self, cx: &mut Context<Self>) {
+        self.stale = false;
+        self.reset_repo_state();
         let path = self.project_path.clone().unwrap_or_default();
         let cached = REPO_CACHE.with(|c| c.borrow().get(&path).cloned());
         match cached {
@@ -511,7 +651,8 @@ impl GitPanel {
         self.retarget_watch(cx);
     }
 
-    /// 发现仓库(**重**:首次扫盘深度 5)。远程项目直接 return。
+    /// 发现仓库(**重**:首次扫盘深度 5)。远程项目直接 return。只在换项目、手动 ↻、
+    /// Worktree 管理弹窗改过之后跑(见模块注释「什么时候重新发现仓库」)。
     fn load_repos(&mut self, cx: &mut Context<Self>) {
         if self.is_remote_project(cx) {
             return;
@@ -532,6 +673,7 @@ impl GitPanel {
                     return;
                 }
                 let before = this.selected_repo.clone();
+                let repos_before = repo_list_key(&this.repos);
                 match result {
                     Ok(repos) => {
                         // 选中仓库保持原值(若仍在列表里),否则取第一个
@@ -562,26 +704,43 @@ impl GitPanel {
                     &before,
                     &this.selected_repo,
                     this.branches.is_empty(),
-                    this.branches_loading,
+                    this.snapshot_in_flight,
                 ) {
                     this.load_branches(cx);
                 }
                 this.retarget_watch(cx);
-                cx.notify();
+                // 扫出来的与眼下一样(手动 ↻ 的常态)就不重画:分支快照那边自己会画
+                if before != this.selected_repo || repos_before != repo_list_key(&this.repos) {
+                    cx.notify();
+                }
             });
         })
         .detach();
     }
 
-    /// 重载分支列表与随它一起的元数据(领先落后、最近分支、进行中操作、签名)。
+    /// 重载分支列表与随它一起的元数据(领先落后、最近分支、进行中操作、签名)。不转圈,
+    /// 见 [`Self::load_branches_with`]。
     fn load_branches(&mut self, cx: &mut Context<Self>) {
+        self.load_branches_with(false, cx);
+    }
+
+    /// `spin` = 仓库栏的刷新按钮转圈(手动 ↻);还一条分支都没有时也转(弹窗里是「加载中」
+    /// 占位)。自动刷新不转圈,结果与眼下相同时整趟不重画(见模块注释)。
+    fn load_branches_with(&mut self, spin: bool, cx: &mut Context<Self>) {
         let repo = self.selected_repo.clone();
         if repo.is_empty() {
             self.branches.clear();
             self.meta = RepoMeta::default();
+            self.branches_loading = false;
+            self.snapshot_in_flight = false;
             return;
         }
-        self.branches_loading = true;
+        let spin = spin || self.branches.is_empty();
+        let spinner_changed = spin && !self.branches_loading;
+        self.branches_loading |= spin;
+        self.snapshot_in_flight = true;
+        // 这趟的签名读得不早于此刻(快照先读签名)
+        let issued = Instant::now();
         self.branch_request += 1;
         let req = self.branch_request;
         let task_repo = std::path::PathBuf::from(&repo);
@@ -591,13 +750,20 @@ impl GitPanel {
                 .spawn(async move { load_branch_snapshot(&task_repo) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                // 迟到响应丢弃:换仓库后的旧响应不许覆盖
-                if this.branch_request != req || this.selected_repo != repo {
+                // 迟到响应丢弃:换仓库后的旧响应不许覆盖(换仓库时令牌已前移)
+                if this.branch_request != req {
                     return;
                 }
-                this.branches_loading = false;
+                this.snapshot_in_flight = false;
+                if this.selected_repo != repo {
+                    // 令牌没换、仓库却换了(不该出现):在途标记照样收掉,别把检查一直压着
+                    this.branches_loading = false;
+                    return;
+                }
+                // 转着圈的那趟落地一定要画一下把圈收掉
+                let mut changed = std::mem::take(&mut this.branches_loading);
                 match result {
-                    Ok((list, meta)) => {
+                    Ok((list, mut meta)) => {
                         // 正在查看的分支没了(被删 / 改名):回到跟随 HEAD,
                         // 否则历史区拿着一个不存在的分支名去查
                         if this
@@ -606,45 +772,78 @@ impl GitPanel {
                             .is_some_and(|v| !list.iter().any(|b| &b.name == v))
                         {
                             this.view_branch = None;
+                            changed = true;
                         }
                         let selected = this.selected_repo.clone();
                         if let Some(info) = this
                             .repos
                             .iter_mut()
                             .find(|r| r.path.to_string_lossy() == selected)
+                            && info.current_branch != meta.head_label
                         {
                             info.current_branch = meta.head_label.clone();
+                            changed = true;
                         }
+                        // 签名与冲突数:手上那份若是这趟发出之后才读的(检查 / 面板自己写完索引),
+                        // 它更新,沿用(见模块注释「签名的先后」)
+                        if keep_newer_observation(this.sig_observed_at, issued) {
+                            meta.signature = this.meta.signature;
+                            meta.op = this.meta.op;
+                        } else {
+                            this.sig_observed_at = Some(issued);
+                        }
+                        changed |= this.branches != list || !meta_view_eq(&this.meta, &meta);
                         this.branches = list;
                         this.meta = meta;
                     }
                     Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
                 }
                 this.push_repo_down(cx);
-                cx.notify();
+                if changed {
+                    cx.notify();
+                }
+                // 在途期间压着的那次检查:拿刚落地的签名再比
+                if let Some(observed) = this.deferred_check.take() {
+                    this.apply_observation(observed, cx);
+                }
             });
         })
         .detach();
-        cx.notify();
+        if spinner_changed {
+            cx.notify();
+        }
     }
 
-    /// 仓库栏的手动刷新与 pty 嗅探回调都走这里(原版 `refreshRepoMeta`)。
-    fn refresh_repo_meta(&mut self, cx: &mut Context<Self>) {
-        self.load_repos(cx);
-        self.load_branches(cx);
-    }
-
-    /// 整面板刷新:仓库元数据 + 分支 + 「更改」+ 提交历史。手动 ↻、写操作完成、
-    /// `.git` 引用变化都走这里。
-    pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
-        self.refresh_repo_meta(cx);
-        // 「更改」列表也要跟着重取 —— push_repo_down 的 set_repo
-        // 对同仓库路径会短路,不显式 load 它就纹丝不动
+    /// 仓库内容变了之后的一整轮重取:分支快照 + 「更改」+ 提交历史,文件树按签名核一遍。
+    /// **不**重新发现仓库(见模块注释)。`round` 决定转不转圈、历史区静不静默。
+    fn reload_views(&mut self, round: Round, cx: &mut Context<Self>) {
+        self.round_issued = Some(Instant::now());
+        self.load_branches_with(round == Round::Manual, cx);
+        // 「更改」列表要显式重取 —— push_repo_down 的 set_repo 对同仓库路径会短路
         self.changes.update(cx, |c, cx| c.load(cx));
-        self.history.update(cx, |h, cx| h.reload(cx));
-        // 文件树的 git 标记也重算:合并 / 变基「继续」做完、终端里提交之后它不一定
-        // 听得到(那条路只嗅终端输出,AI pane 还排除在外)
-        git_watch::request_refresh(git_watch::Subscriber::FileTree);
+        self.history.update(cx, |h, cx| match round {
+            Round::Watch => h.reload_quiet(cx),
+            Round::Manual | Round::Write => h.reload(cx),
+        });
+        // 文件树的 git 标记也跟上:合并 / 变基「继续」做完、终端 / AI pane 里提交之后它
+        // 不一定听得到。手动 ↻ 无条件重取;其余让它比签名(它自己的 `.git` 事件多半已经取过)
+        if round == Round::Manual {
+            git_watch::request_refresh(git_watch::Subscriber::FileTree);
+        } else {
+            git_watch::request_check(git_watch::Subscriber::FileTree);
+        }
+    }
+
+    /// 手动 ↻:重新发现仓库 + 一整轮重取 + 文件树无条件重取。
+    pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.load_repos(cx);
+        self.reload_views(Round::Manual, cx);
+    }
+
+    /// 写操作(Fetch / 拉取 / 推送 / 检出 / 分支增删改 / 贮藏 / 横幅「继续」「中止」…)做完:
+    /// 一整轮重取,不重新发现仓库 —— 仓库集合没变,分支名由快照回填。
+    pub(crate) fn refresh_after_write(&mut self, cx: &mut Context<Self>) {
+        self.reload_views(Round::Write, cx);
     }
 
     /// 把仓库 / 分支透给两个子面板。
@@ -671,9 +870,7 @@ impl GitPanel {
         }
         self.selected_repo = path;
         // 换仓库:分支清空、viewBranch 复位、元数据清掉
-        self.branches.clear();
-        self.view_branch = None;
-        self.meta = RepoMeta::default();
+        self.reset_repo_state();
         if let Some(project) = self.project_path.clone() {
             REPO_CACHE.with(|c| {
                 c.borrow_mut()
@@ -754,8 +951,8 @@ impl GitPanel {
     ///
     /// `op` 占着仓库的写操作闸在后台执行器上跑(阻塞 CLI,见 [`git_ui::spawn_gated`]);
     /// `done` 拿到成功结果后在主线程上推摘要 / 接着开下一个确认框。失败统一弹详情框,
-    /// 标题是「{动作}失败」。无论成败都整面板刷新 —— 失败也可能已经改了一半(合并停在
-    /// 冲突上之类)。闸被别的区占着时不执行,推一条 toast 说明。
+    /// 标题是「{动作}失败」。无论成败都整面板刷新([`Self::refresh_after_write`])—— 失败也
+    /// 可能已经改了一半(合并停在冲突上之类)。闸被别的区占着时不执行,推一条 toast 说明。
     pub(crate) fn run_write_op<T: Send + 'static>(
         &mut self,
         busy: GitBusy,
@@ -786,7 +983,7 @@ impl GitPanel {
                             );
                         }
                     }
-                    this.refresh_all(cx);
+                    this.refresh_after_write(cx);
                     cx.notify();
                 });
             },
@@ -925,7 +1122,7 @@ impl GitPanel {
                 if follow_head {
                     p.set_view_branch(None, cx);
                 }
-                p.refresh_all(cx);
+                p.refresh_after_write(cx);
             });
         })
     }
@@ -1025,7 +1222,7 @@ impl GitPanel {
                     (git_dirs, mt_project::git::worktree_watch_dirs(&path))
                 })
                 .await;
-            let _ = this.update(cx, |this: &mut Self, _cx| {
+            let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.watch_request != req {
                     return;
                 }
@@ -1033,7 +1230,7 @@ impl GitPanel {
                     Ok((layout, dirs)) => {
                         this.dir_watch.set_target(repo.clone(), layout, dirs);
                     }
-                    // 监听挂不上不影响使用:手动 ↻ 与 pty 嗅探照旧
+                    // 监听挂不上不影响使用:手动 ↻ 与 pty 嗅探(回落去抖那条)照旧
                     Err(err) => eprintln!("[git] 监听 .git 失败: {err:#}"),
                 }
                 match work_dirs {
@@ -1048,6 +1245,10 @@ impl GitPanel {
                     }
                     Err(err) => eprintln!("[git] 监听工作区失败: {err:#}"),
                 }
+                // 同项目重新打开:收着期间引用 / 索引变没变,当场比一次签名(见 `set_visible`)
+                if std::mem::take(&mut this.catch_up) {
+                    this.check_git_dir_change(cx);
+                }
             });
         })
         .detach();
@@ -1055,22 +1256,34 @@ impl GitPanel {
 
     /// 工作区安静下来的一批变化:后台按忽略规则过一遍(全是被忽略的路径就不刷),有目录
     /// 出现 / 消失就顺带重列监听清单;要刷的话**只**重取「更改」列表 —— 历史与分支只随
-    /// `.git` 变化走,大仓库里改个文件不至于把整个面板拖着重来。
+    /// `.git` 变化走,大仓库里改个文件不至于把整个面板拖着重来。这批之后已经有一趟取数
+    /// 开跑的不再要;git 正写着索引时整批退回重排(见模块注释「自动刷新」)。
     fn check_worktree_change(&mut self, batch: WorktreeBatch, cx: &mut Context<Self>) {
         let Some(repo) = self.work_watch.repo().map(str::to_string) else {
             return;
         };
         if self.work_checking {
-            // 上一批还没查完:退回去下一拍再交
+            // 上一批还没查完(节拍那边已经不在这时取,这里只是兜底):退回去下一拍再交
             self.work_watch.requeue(batch);
             return;
         }
         self.work_checking = true;
         let path = PathBuf::from(&repo);
+        let git_dir = self
+            .dir_watch
+            .layout()
+            .filter(|_| self.dir_watch.repo() == Some(repo.as_str()))
+            .map(|layout| layout.git_dir);
         cx.spawn(async move |this, cx| {
-            let (relevant, dirs) = cx
+            let verdict = cx
                 .background_executor()
                 .spawn(async move {
+                    // git 正写着索引(长一点的变基 / 检出 / 贮藏):工作区是中间态,这批先退回去,
+                    // 等它写完(锁没了)再看 —— 结束时 `.git` 那一路也会叫一次
+                    let locked = git_dir.is_some_and(|dir| dir.join("index.lock").exists());
+                    if locked {
+                        return WorkVerdict::Busy(batch);
+                    }
                     let relevant = batch.overflow
                         || mt_project::git::any_unignored_change(&path, &batch.paths)
                             .unwrap_or(true);
@@ -1078,7 +1291,11 @@ impl GitPanel {
                         .dirs_changed
                         .then(|| mt_project::git::worktree_watch_dirs(&path).ok())
                         .flatten();
-                    (relevant, dirs)
+                    WorkVerdict::Checked {
+                        relevant,
+                        dirs,
+                        batch,
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -1086,19 +1303,41 @@ impl GitPanel {
                 if this.work_watch.repo() != Some(repo.as_str()) || this.selected_repo != repo {
                     return;
                 }
+                let (relevant, dirs, batch) = match verdict {
+                    WorkVerdict::Busy(batch) => {
+                        this.work_watch.requeue(batch);
+                        return;
+                    }
+                    WorkVerdict::Checked {
+                        relevant,
+                        dirs,
+                        batch,
+                    } => (relevant, dirs, batch),
+                };
                 if let Some(dirs) = dirs {
                     this.work_watch.update_dirs(dirs.dirs);
                 }
-                if relevant {
+                if !relevant {
+                    return;
+                }
+                // 这批之后已经有一趟开跑(`.git` 那一路刚整轮刷过之类)就不再要
+                if !this.changes.read(cx).load_covers(batch.last) {
                     this.changes.update(cx, |c, cx| c.load(cx));
                 }
+                // 文件树只认它自己没在监听的那些路径(折起来的目录,汇总字母要跟上)
+                git_watch::request_paths(
+                    git_watch::Subscriber::FileTree,
+                    &batch.paths,
+                    batch.overflow,
+                );
             });
         })
         .detach();
     }
 
-    /// `.git` 下攒够一批安静下来的变化:后台算签名,对比上一份快照决定刷什么
-    /// (见模块注释「自动刷新」)。顺带重列监听目录(新出现的分支前缀目录要补挂)。
+    /// `.git` 下攒够一批安静下来的变化(或 pty 命中 / 重新打开 / 窗口恢复呈现叫的一次):
+    /// 后台读一份 [`RepoObservation`],按「签名的先后」决定刷什么(见模块注释)。顺带重列
+    /// 监听目录(新出现的分支前缀目录要补挂)。监听没挂上时什么都不做。
     fn check_git_dir_change(&mut self, cx: &mut Context<Self>) {
         let (Some(repo), Some(layout)) = (
             self.dir_watch.repo().map(str::to_string),
@@ -1113,11 +1352,11 @@ impl GitPanel {
         self.sig_checking = true;
         let path = PathBuf::from(&repo);
         cx.spawn(async move |this, cx| {
-            let (signature, dirs) = cx
+            let (observed, dirs) = cx
                 .background_executor()
                 .spawn(async move {
                     (
-                        mt_project::git::repo_signature(&path).ok(),
+                        RepoObservation::read(&path),
                         mt_project::git::git_watch_dirs(&layout),
                     )
                 })
@@ -1133,26 +1372,196 @@ impl GitPanel {
                     this.dir_watch.poke();
                 }
                 this.dir_watch.update_dirs(dirs);
-                match (this.meta.signature, signature) {
-                    // 没变:别的程序只是刷新了索引的 stat 缓存之类
-                    (Some(old), Some(new)) if old == new => {}
-                    // 只动了索引(终端里 `git add`、解决了一个冲突):「更改」区与冲突数,
-                    // 文件树的标记也跟着重算(解决冲突后的 C 要消掉)
-                    (Some(old), Some(new)) if old.refs == new.refs => {
-                        this.meta.signature = Some(new);
-                        this.changes.update(cx, |c, cx| c.load(cx));
-                        this.load_branches(cx);
-                        git_watch::request_refresh(git_watch::Subscriber::FileTree);
-                    }
-                    _ => {
-                        this.meta.signature = signature;
-                        this.refresh_all(cx);
-                    }
+                let known = this.round_issued.max(this.sig_observed_at);
+                match check_fate(observed.at, known, this.snapshot_in_flight) {
+                    // 这份读得比手上的旧(或之后已整轮重取过):没什么可补的
+                    CheckFate::Covered => this.settle_pty_hit(observed.at, cx),
+                    // 分支快照还在路上:等它落地拿新签名再比
+                    CheckFate::Defer => this.deferred_check = Some(observed),
+                    CheckFate::Compare => this.apply_observation(observed, cx),
                 }
             });
         })
         .detach();
     }
+
+    /// 拿一份读到的状态与手上的签名比,决定刷什么(见模块注释「自动刷新」)。比手上的旧就丢。
+    fn apply_observation(&mut self, observed: RepoObservation, cx: &mut Context<Self>) {
+        if self.sig_observed_at.is_some_and(|at| observed.at < at) {
+            self.settle_pty_hit(observed.at, cx);
+            return;
+        }
+        match sig_verdict(self.meta.signature, observed.signature) {
+            // 没变:别的程序只是刷新了索引的 stat 缓存之类
+            SigVerdict::Unchanged => {}
+            // 只动了索引(终端里 `git add`、解决了一个冲突):重取「更改」区,冲突数(横幅)
+            // 直接用读到的;文件树按签名核一遍(解决冲突后的 C 要消掉)。分支快照不必重取,
+            // 理由见模块注释
+            SigVerdict::IndexOnly => {
+                self.meta.signature = observed.signature;
+                self.sig_observed_at = Some(observed.at);
+                if let Some(op) = observed.op
+                    && op != self.meta.op
+                {
+                    self.meta.op = op;
+                    cx.notify();
+                }
+                self.changes.update(cx, |c, cx| c.load(cx));
+                git_watch::request_check(git_watch::Subscriber::FileTree);
+            }
+            SigVerdict::Refs => {
+                self.meta.signature = observed.signature;
+                self.sig_observed_at = Some(observed.at);
+                self.reload_views(Round::Watch, cx);
+            }
+        }
+        self.settle_pty_hit(observed.at, cx);
+    }
+
+    /// 走签名那条路的 pty 命中,在 `checked_at` 开始的那次检查之后收尾:签名没变、也没有
+    /// 哪趟「更改」取数在命中之后开跑,就补一次只重取「更改」(子模块里的提交,见模块注释)。
+    /// 命中晚于这次检查的留给下一次(poke 过,一定还有一次)。
+    fn settle_pty_hit(&mut self, checked_at: Instant, cx: &mut Context<Self>) {
+        let Some(hit) = self.pty_hit_at.filter(|hit| *hit <= checked_at) else {
+            return;
+        };
+        self.pty_hit_at = None;
+        if !self.changes.read(cx).load_covers(hit) {
+            self.changes.update(cx, |c, cx| c.load(cx));
+        }
+    }
+
+    /// 「更改」区自己的暂存 / 丢弃 / 冲突处理写完了:写完当场读的那份签名与冲突数记作
+    /// 「已知」,紧接着那次 `.git` 检查比出来没变就不再刷一遍(见模块注释「签名的先后」)。
+    /// 引用那半与手上的对不上(期间别处动了引用)就不收,留给检查去判。
+    fn absorb_own_write(&mut self, observed: RepoObservation, cx: &mut Context<Self>) {
+        if !absorbs_own_write(self.meta.signature, self.sig_observed_at, &observed) {
+            return;
+        }
+        self.meta.signature = observed.signature;
+        self.sig_observed_at = Some(observed.at);
+        if let Some(op) = observed.op
+            && op != self.meta.op
+        {
+            // 解决了一个冲突:横幅上的冲突数跟着变
+            self.meta.op = op;
+            cx.notify();
+        }
+    }
+}
+
+/// 工作区一批变化在后台过完的结论。
+enum WorkVerdict {
+    /// git 正写着索引:整批退回重排
+    Busy(WorktreeBatch),
+    Checked {
+        relevant: bool,
+        dirs: Option<mt_project::git::WorktreeWatchDirs>,
+        batch: WorktreeBatch,
+    },
+}
+
+/// 一轮整面板重取的来由(见 [`GitPanel::reload_views`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round {
+    /// 手动 ↻:按钮转圈、历史标「刷新中…」、文件树无条件重取
+    Manual,
+    /// 面板 / 弹窗里的写操作做完
+    Write,
+    /// `.git` 监听判出引用变了:历史静默重载(没变不重画)
+    Watch,
+}
+
+/// pty 嗅探命中之后走哪条路(见模块注释「自动刷新」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyRoute {
+    /// `.git` 监听挂在选中的仓库上:只叫它比一次签名,没变不刷
+    Signature,
+    /// 监听没挂上(列目录失败 / 正在换目标):回落原版的两个 500ms 去抖
+    Debounce,
+}
+
+fn pty_route(watching_selected: bool) -> PtyRoute {
+    if watching_selected {
+        PtyRoute::Signature
+    } else {
+        PtyRoute::Debounce
+    }
+}
+
+/// 两份签名的差别该刷什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigVerdict {
+    /// 没变
+    Unchanged,
+    /// 只有索引那半变了:只重取「更改」与冲突数
+    IndexOnly,
+    /// 引用变了(或有一边读不到):整轮重取
+    Refs,
+}
+
+fn sig_verdict(known: Option<RepoSignature>, new: Option<RepoSignature>) -> SigVerdict {
+    match (known, new) {
+        (Some(old), Some(new)) if old == new => SigVerdict::Unchanged,
+        (Some(old), Some(new)) if old.refs == new.refs => SigVerdict::IndexOnly,
+        _ => SigVerdict::Refs,
+    }
+}
+
+/// 一次检查读到的状态怎么处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckFate {
+    /// 读得不比手上的新(手上那份是之后读的,或之后已经发过整轮重取):丢
+    Covered,
+    /// 分支快照在途:它落地时签名会换,先压着,落地后再比
+    Defer,
+    /// 当场比
+    Compare,
+}
+
+/// `observed` = 这次检查开始读的时刻;`known` = 手上签名的读取时刻与最近一轮整轮重取的发出
+/// 时刻里晚的那个。
+fn check_fate(observed: Instant, known: Option<Instant>, snapshot_in_flight: bool) -> CheckFate {
+    if known.is_some_and(|known| observed <= known) {
+        CheckFate::Covered
+    } else if snapshot_in_flight {
+        CheckFate::Defer
+    } else {
+        CheckFate::Compare
+    }
+}
+
+/// 分支快照落地时,签名与冲突数要不要沿用手上那份:手上那份是这趟快照发出**之后**才读的。
+fn keep_newer_observation(observed_at: Option<Instant>, snapshot_issued: Instant) -> bool {
+    observed_at.is_some_and(|at| at > snapshot_issued)
+}
+
+/// 面板自己写完索引后读的那份能不能直接记作「已知」:两边都读得到、引用那半一致(只是
+/// 索引变了),且不比手上的旧。
+fn absorbs_own_write(
+    known: Option<RepoSignature>,
+    known_at: Option<Instant>,
+    observed: &RepoObservation,
+) -> bool {
+    let (Some(known), Some(new)) = (known, observed.signature) else {
+        return false;
+    };
+    known.refs == new.refs && known_at.is_none_or(|at| at <= observed.at)
+}
+
+/// 仓库列表画出来取决于的那几项(`GitRepoInfo` 没有 `PartialEq`)。
+fn repo_list_key(repos: &[GitRepoInfo]) -> Vec<(String, PathBuf, Option<String>, bool)> {
+    repos
+        .iter()
+        .map(|r| {
+            (
+                r.name.clone(),
+                r.path.clone(),
+                r.current_branch.clone(),
+                r.is_worktree,
+            )
+        })
+        .collect()
 }
 
 /// 发现仓库回来之后要不要再取一次分支快照:选中的仓库换了,或者还一份都没取过(切项目
@@ -1161,6 +1570,9 @@ impl GitPanel {
 /// 选中仓库没变时不重取:「刷新」本来就同时发了一趟分支快照,这里再发会把它作废(令牌
 /// 前移),横幅 / 计数要等扫盘(深 5 层)做完再从头取一遍 —— 外部 `git merge --abort`
 /// 后冲突横幅拖到约 3.3s 才消失(E2E r4 A11)。
+///
+/// `loading` 是「有快照在途」(`snapshot_in_flight`),不是刷新按钮转不转圈 —— 自动刷新
+/// 不转圈,但同样在途。
 fn branches_stale_after_discovery(before: &str, after: &str, empty: bool, loading: bool) -> bool {
     before != after || (empty && !loading)
 }
@@ -2747,6 +3159,146 @@ mod tests {
         // 选中仓库换了(原先的不见了 / 第一次发现)
         assert!(branches_stale_after_discovery("", "D:/r", true, false));
         assert!(branches_stale_after_discovery("D:/a", "D:/b", false, true));
+    }
+
+    fn sig(refs: u64, index: u64) -> RepoSignature {
+        RepoSignature { refs, index }
+    }
+
+    fn after(base: Instant, ms: u64) -> Instant {
+        base + Duration::from_millis(ms)
+    }
+
+    /// pty 命中:`.git` 监听挂在选中仓库上才走签名,否则回落两个去抖。
+    #[test]
+    fn pty_命中挂着监听时改走签名() {
+        assert_eq!(pty_route(true), PtyRoute::Signature);
+        assert_eq!(pty_route(false), PtyRoute::Debounce);
+    }
+
+    /// 签名的差别:全同不刷;只有索引变了走轻量那条(不重取分支快照);引用变了或读不到
+    /// 一边整轮刷。
+    #[test]
+    fn 只动了索引走轻量路径() {
+        let s = sig(1, 10);
+        assert_eq!(sig_verdict(Some(s), Some(s)), SigVerdict::Unchanged);
+        assert_eq!(
+            sig_verdict(Some(s), Some(sig(1, 11))),
+            SigVerdict::IndexOnly
+        );
+        assert_eq!(sig_verdict(Some(s), Some(sig(2, 10))), SigVerdict::Refs);
+        assert_eq!(sig_verdict(Some(s), Some(sig(2, 11))), SigVerdict::Refs);
+        assert_eq!(sig_verdict(None, Some(s)), SigVerdict::Refs, "还没有快照");
+        assert_eq!(sig_verdict(Some(s), None), SigVerdict::Refs, "读不到当变了");
+    }
+
+    /// 检查结果的处置:不比手上的新就丢;快照在途就压着等它落地;否则当场比。
+    #[test]
+    fn 检查结果按先后处置() {
+        let t0 = Instant::now();
+        // 从没有过已知:在途就压着,不在途就比
+        assert_eq!(check_fate(t0, None, false), CheckFate::Compare);
+        assert_eq!(check_fate(t0, None, true), CheckFate::Defer);
+        // 手上那份(或最近一轮整轮重取)晚于这次检查开读:丢,即便快照在途
+        assert_eq!(
+            check_fate(after(t0, 10), Some(after(t0, 20)), true),
+            CheckFate::Covered
+        );
+        assert_eq!(
+            check_fate(after(t0, 20), Some(after(t0, 20)), false),
+            CheckFate::Covered,
+            "同一刻:整轮重取读到的不早于它"
+        );
+        // 检查更新:写完操作后刷新已发出、快照还没回来 —— 压着,别当场判「变了」整轮再刷
+        assert_eq!(check_fate(after(t0, 500), Some(t0), true), CheckFate::Defer);
+        assert_eq!(
+            check_fate(after(t0, 500), Some(t0), false),
+            CheckFate::Compare
+        );
+    }
+
+    /// 快照落地:手上那份签名是它发出之后读的才沿用(面板刚写完索引 / 检查刚比过)。
+    #[test]
+    fn 快照落地不拿旧签名盖新的() {
+        let t0 = Instant::now();
+        assert!(!keep_newer_observation(None, t0));
+        assert!(
+            !keep_newer_observation(Some(t0), after(t0, 1)),
+            "手上的更旧"
+        );
+        assert!(!keep_newer_observation(Some(t0), t0), "同一刻按快照的");
+        assert!(keep_newer_observation(Some(after(t0, 5)), t0));
+    }
+
+    /// 面板自己写完索引:引用那半一致、且不比手上的旧才收;读不到不收。
+    #[test]
+    fn 自己写完索引记作已知() {
+        let t0 = Instant::now();
+        let observed = |at: Instant, s: Option<RepoSignature>| RepoObservation {
+            at,
+            signature: s,
+            op: None,
+        };
+        let known = Some(sig(1, 10));
+        // 常态:暂存了一个文件,只有索引变了
+        assert!(absorbs_own_write(
+            known,
+            Some(t0),
+            &observed(after(t0, 5), Some(sig(1, 11)))
+        ));
+        assert!(absorbs_own_write(
+            known,
+            None,
+            &observed(t0, Some(sig(1, 11)))
+        ));
+        // 期间别处动了引用:留给检查去判(要整轮刷)
+        assert!(!absorbs_own_write(
+            known,
+            Some(t0),
+            &observed(after(t0, 5), Some(sig(2, 11)))
+        ));
+        // 手上那份是之后读的:不拿旧的盖
+        assert!(!absorbs_own_write(
+            known,
+            Some(after(t0, 10)),
+            &observed(after(t0, 5), Some(sig(1, 11)))
+        ));
+        // 任一边读不到
+        assert!(!absorbs_own_write(
+            None,
+            None,
+            &observed(t0, Some(sig(1, 11)))
+        ));
+        assert!(!absorbs_own_write(
+            known,
+            Some(t0),
+            &observed(after(t0, 5), None)
+        ));
+    }
+
+    /// 端到端推一遍「面板里暂存一次」:写完读的签名被收下之后,紧接着那次 `.git` 检查
+    /// 读到的同一份签名判成没变 —— 「更改」不再重取第二遍、分支快照一次都不取。
+    #[test]
+    fn 面板暂存后紧接着的检查短路() {
+        let t0 = Instant::now();
+        let before = sig(1, 10);
+        let written = sig(1, 11);
+        // 已知:上一份快照(t0 发出)
+        let mut known = Some(before);
+        let mut known_at = Some(t0);
+        // 写完那一刻(t0+100)读的
+        let own = RepoObservation {
+            at: after(t0, 100),
+            signature: Some(written),
+            op: None,
+        };
+        assert!(absorbs_own_write(known, known_at, &own));
+        known = own.signature;
+        known_at = Some(own.at);
+        // 500ms 去抖后的检查(t0+600):读到的还是这份
+        let check_at = after(t0, 600);
+        assert_eq!(check_fate(check_at, known_at, false), CheckFate::Compare);
+        assert_eq!(sig_verdict(known, Some(written)), SigVerdict::Unchanged);
     }
 
     /// 仓库栏写按钮的提示:面板自己在推送时(没占别人的闸,`gated = false`),其余按钮

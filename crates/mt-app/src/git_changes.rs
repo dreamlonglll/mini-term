@@ -57,6 +57,21 @@
 //!
 //! 全部 git 调用(git2 的同步 IO 与带超时的 git CLI)一律丢 `cx.background_executor()`
 //! (范式照 `file_tree.rs:138-156`);异步回包用请求令牌防迟到。
+//!
+//! # 取数调度
+//!
+//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 弹窗
+//! 按块操作),大仓库一次 status 又要两三秒。[`GitChanges::load`] 因此是**单飞**的
+//! ([`git_ui::flight`]):同一时刻只跑一份,期间再要只记脏位,跑完当场补一趟;在途那份照样
+//! 落地,但「操作后落回的位置」与在等的 diff 弹窗留给补跑那份(在途那份可能还不含那次操作)。
+//!
+//! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
+//! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
+//! 分支都没动就不重取。
+//!
+//! 暂存 / 丢弃 / 冲突处理写完,在同一趟后台里**先**读一份签名([`RepoObservation`])再重取
+//! 列表,经 [`GitChangesEvent::IndexWritten`] 交给面板记作「已知」:紧接着那次 `.git` 检查
+//! 比出来没变,不再把列表、文件树重取一遍。
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -77,6 +92,8 @@ use mt_project::git::{
 };
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::git_dir_watch::RepoObservation;
+use crate::git_ui::flight::{Flight, Landing};
 use crate::git_ui::{
     self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
     ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
@@ -129,6 +146,10 @@ pub enum GitChangesEvent {
     Committed { open_push: bool },
     /// ▾ 菜单「贮藏当前改动…」贮藏成功 —— 工作区与贮藏数都变了,容器整面板刷新。
     Stashed,
+    /// 暂存 / 取消暂存 / 丢弃 / 冲突处理写完了(成败都算):写完当场、重取列表**之前**读的
+    /// 那份签名与冲突数。容器拿它当「已知」,紧接着那次 `.git` 检查就不再重刷一遍
+    /// (见模块注释「取数调度」)。
+    IndexWritten(RepoObservation),
 }
 
 /// 四个分组。`area` 既决定取哪一个 status,也进 `ElementId` 前缀。
@@ -293,8 +314,6 @@ struct Snapshot {
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
     has_head: bool,
-    /// 勾着 amend 时顺带刷新「已推送」判定;没勾为 `None`
-    amend: Option<Option<AmendInfo>>,
 }
 
 /// 列表里渲染出来的一行是什么(键盘导航要把选中行滚进视野,得知道它是第几个子元素)。
@@ -321,8 +340,8 @@ pub struct GitChanges {
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
     collapsed_groups: HashSet<Area>,
-    /// 迟到响应丢弃。
-    request: u64,
+    /// 列表取数的单飞调度(见模块注释「取数调度」);换仓库时作废在途的那份。
+    flight: Flight,
     /// diff 弹窗按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
     /// 序列交回去(见 `git_diff::ReloadFiles`)。换仓库时以 `None` 交回。
     diff_waiters: Vec<(Area, git_diff::FilesDone)>,
@@ -358,6 +377,10 @@ pub struct GitChanges {
     /// amend 勾上时预填进去的那段消息(取消勾选时消息没动过就清掉)
     amend_prefill: Option<String>,
     amend_request: u64,
+    /// 勾着 amend 时随列表重取「已推送」判定的那一趟(单飞,见 [`Self::refresh_amend`])
+    amend_flight: Flight,
+    /// 眼下 `amend_info` 是在哪份引用签名下取的:没变就不重取
+    amend_key: Option<u64>,
     committing: bool,
     history_loading: bool,
     /// 上一次提交失败的说明(已格式化好的整句),挂在提交按钮下方。
@@ -394,7 +417,7 @@ impl GitChanges {
             load_error: None,
             collapsed_dirs: HashSet::new(),
             collapsed_groups: HashSet::new(),
-            request: 0,
+            flight: Flight::default(),
             diff_waiters: Vec::new(),
             debounce_until: None,
             busy_ops: 0,
@@ -414,6 +437,8 @@ impl GitChanges {
             amend_info: None,
             amend_prefill: None,
             amend_request: 0,
+            amend_flight: Flight::default(),
+            amend_key: None,
             committing: false,
             history_loading: false,
             commit_error: None,
@@ -491,11 +516,15 @@ impl GitChanges {
         self.amend = false;
         self.amend_info = None;
         self.amend_prefill = None;
+        self.amend_key = None;
+        self.amend_flight.reset();
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
         // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
         self.flush_diff_waiters(false, cx);
+        // 上一个仓库在途的那趟作废:回来一律丢,新仓库这趟不必等它
+        self.flight.reset();
         self.load(cx);
         cx.notify();
     }
@@ -516,26 +545,43 @@ impl GitChanges {
         }
     }
 
+    /// 重取列表(单飞,见模块注释「取数调度」)。勾着 amend 时顺带另起一趟刷新「已推送」判定。
     pub fn load(&mut self, cx: &mut Context<Self>) {
         if self.repo_path.is_empty() {
             self.flush_diff_waiters(false, cx);
             return;
         }
+        self.refresh_amend(cx);
+        self.start_load(cx);
+    }
+
+    /// 在 `at` 那一刻之前的工作区 / 索引变化,列表这边是不是已经有一趟取数会反映出来
+    /// (在那之后才开跑的,或者排着补跑)。面板拿它判断监听交来的一批要不要再要一次。
+    pub fn load_covers(&self, at: Instant) -> bool {
+        self.flight.covers(at)
+    }
+
+    fn start_load(&mut self, cx: &mut Context<Self>) {
+        // 在途:只记脏位,那趟落地后当场补跑
+        let Some(token) = self.flight.begin(Instant::now()) else {
+            return;
+        };
         self.loading = true;
-        self.request += 1;
-        let req = self.request;
         let repo = PathBuf::from(&self.repo_path);
-        let want_amend = self.amend;
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { load_snapshot(&repo, want_amend) })
+                .spawn(async move { load_snapshot(&repo) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                if this.request != req {
-                    return;
-                }
+                let rerun = match this.flight.finish(token) {
+                    Landing::Stale => return,
+                    Landing::Done { rerun } => rerun,
+                };
                 this.loading = false;
+                // 期间又有人要过:这份照样落(比画着的新),但它可能还不含触发补跑的那次操作 ——
+                // 「操作后落回的位置」与在等的 diff 弹窗留给补跑那份
+                let reselect = if rerun { this.reselect.take() } else { None };
                 let loaded = result.is_ok();
                 match result {
                     Ok(snap) => {
@@ -546,9 +592,6 @@ impl GitChanges {
                         this.has_head = snap.has_head;
                         if !this.has_head {
                             this.amend = false;
-                        }
-                        if let Some(info) = snap.amend.filter(|_| this.amend) {
-                            this.amend_info = info;
                         }
                         this.load_error = None;
                     }
@@ -563,12 +606,63 @@ impl GitChanges {
                     }
                 }
                 this.after_reload(cx);
-                this.flush_diff_waiters(loaded, cx);
+                if rerun {
+                    this.reselect = reselect;
+                } else {
+                    this.flush_diff_waiters(loaded, cx);
+                }
                 cx.notify();
+                if rerun {
+                    this.start_load(cx);
+                }
             });
         })
         .detach();
-        cx.notify();
+        // `loading` 只在列表为空时画得出来(「加载中」占位);有内容时发起这一趟不必重画
+        if self.changes.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// 勾着「修改上次提交」时重取「已推送」判定(见模块注释「取数调度」):单独一趟、不挡
+    /// 列表;引用签名没变就只算一次签名、不重取。没勾 / 无仓库时什么都不做。
+    fn refresh_amend(&mut self, cx: &mut Context<Self>) {
+        if !self.amend || self.repo_path.is_empty() {
+            return;
+        }
+        let Some(token) = self.amend_flight.begin(Instant::now()) else {
+            return;
+        };
+        let req = self.amend_request;
+        let repo = PathBuf::from(&self.repo_path);
+        let known = self.amend_key;
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_executor()
+                .spawn(async move { fetch_amend(&repo, known) })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                let rerun = match this.amend_flight.finish(token) {
+                    Landing::Stale => return,
+                    Landing::Done { rerun } => rerun,
+                };
+                // 期间取消过勾选(令牌前移)就作废;换仓库时 amend_flight 已作废,走不到这里
+                if this.amend
+                    && this.amend_request == req
+                    && let Some((key, info)) = fetched
+                {
+                    this.amend_key = key;
+                    if this.amend_info != info {
+                        this.amend_info = info;
+                        cx.notify();
+                    }
+                }
+                if rerun {
+                    this.refresh_amend(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// 把在等序列的 diff 弹窗回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
@@ -880,8 +974,18 @@ impl GitChanges {
         let this = cx.entity().downgrade();
         let started = git_ui::spawn_gated(
             &self.repo_path,
-            op,
-            move |result, window, cx| {
+            move |repo| {
+                let result = op(repo);
+                // 写完当场读一份签名与冲突数(成败都读:失败也可能改了一半),**先于**下面那次
+                // 重取列表 —— 面板拿它当「已知」,不能比列表更新(见 `IndexWritten`)
+                Ok((result, RepoObservation::read(repo)))
+            },
+            move |outcome, window, cx| {
+                // 外层只是包装,实际恒为 `Ok`
+                let (result, observed) = match outcome {
+                    Ok((result, observed)) => (result, Some(observed)),
+                    Err(err) => (Err(err), None),
+                };
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     this.busy_ops = this.busy_ops.saturating_sub(1);
                     match result {
@@ -899,6 +1003,9 @@ impl GitChanges {
                     this.load(cx);
                     // 丢弃改了工作区、解决冲突改了状态:文件树的 git 标记跟着重算
                     git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                    if let Some(observed) = observed {
+                        cx.emit(GitChangesEvent::IndexWritten(observed));
+                    }
                 });
             },
             window,
@@ -1289,6 +1396,7 @@ impl GitChanges {
                             this.amend = false;
                             this.amend_info = None;
                             this.amend_prefill = None;
+                            this.amend_key = None;
                             this.notify_info(
                                 tr!(
                                     "gitCommit",
@@ -1376,6 +1484,7 @@ impl GitChanges {
                     .update(cx, |state, cx| state.set_value("", window, cx));
             }
             self.amend_info = None;
+            self.amend_key = None;
             cx.notify();
             return;
         }
@@ -1383,9 +1492,12 @@ impl GitChanges {
         let repo = PathBuf::from(&self.repo_path);
         let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
+            let (key, result) = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::amend_info(&repo) })
+                .spawn(async move {
+                    // 顺带记下这份是在哪份引用签名下取的:之后随列表重取时没变就不再取
+                    (amend_key_of(&repo), mt_project::git::amend_info(&repo))
+                })
                 .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
                 if this.amend_request != req || !this.amend {
@@ -1401,6 +1513,7 @@ impl GitChanges {
                             this.amend_prefill = Some(message);
                         }
                         this.amend_info = Some(info);
+                        this.amend_key = key;
                     }
                     // 空仓库:没有上次提交可改
                     Ok(None) => {
@@ -1494,8 +1607,29 @@ impl GitChanges {
     }
 }
 
+/// 「已推送」判定的缓存键:引用那一半签名(HEAD + 全部引用)。只看 HEAD 不够 —— 推送 /
+/// fetch 挪了远程跟踪分支,同一个 HEAD 的判定也会变。读不到为 `None`(当作变了)。
+fn amend_key_of(repo: &Path) -> Option<u64> {
+    mt_project::git::repo_signature(repo)
+        .ok()
+        .map(|sig| sig.refs)
+}
+
+/// 手上那份 amend 信息还作不作数:键读不到、或与取它时的键不同,都要重取。
+fn amend_stale(known: Option<u64>, now: Option<u64>) -> bool {
+    now.is_none() || now != known
+}
+
+/// [`GitChanges::refresh_amend`] 的后台那一趟:键没变返回 `None`(不重取),否则
+/// `Some((新键, 信息))` —— 信息读失败 / 空仓库为 `None`,与原先随列表取时同一口径。
+fn fetch_amend(repo: &Path, known: Option<u64>) -> Option<(Option<u64>, Option<AmendInfo>)> {
+    let key = amend_key_of(repo);
+    amend_stale(known, key).then(|| (key, mt_project::git::amend_info(repo).ok().flatten()))
+}
+
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
-fn load_snapshot(repo: &Path, want_amend: bool) -> anyhow::Result<Snapshot> {
+/// amend 的「已推送」判定不在这里(见 [`GitChanges::refresh_amend`])。
+fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     let changes = mt_project::git::get_changes_status(repo)?;
     let conflicts = if changes.iter().any(is_conflicted) {
         mt_project::git::list_conflicts(repo).unwrap_or_default()
@@ -1511,7 +1645,6 @@ fn load_snapshot(repo: &Path, want_amend: bool) -> anyhow::Result<Snapshot> {
         op_kind,
         target: mt_project::git::commit_target(repo).ok(),
         has_head: mt_project::git::head_exists(repo),
-        amend: want_amend.then(|| mt_project::git::amend_info(repo).ok().flatten()),
     })
 }
 
@@ -2490,6 +2623,64 @@ mod tests {
         // 文案里真写着方向:theirs 那条点明是「你的改动」
         let theirs = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitCommit", "takeTheirsRebase");
         assert!(theirs.contains("你的改动"), "{theirs}");
+    }
+
+    /// amend 的「已推送」判定按引用签名缓存:键没变才沿用,读不到当作变了。
+    #[test]
+    fn amend_信息按引用签名缓存() {
+        assert!(!amend_stale(Some(7), Some(7)), "HEAD 与远程跟踪分支都没动");
+        assert!(amend_stale(Some(7), Some(8)), "提交 / 推送 / fetch 之后");
+        assert!(amend_stale(None, Some(7)), "还没取过");
+        assert!(amend_stale(Some(7), None), "签名读不到时宁可重取");
+        assert!(amend_stale(None, None));
+    }
+
+    /// 真仓库上走一遍:第一次取到信息,键不变时不重取,提交之后重取。
+    #[test]
+    fn amend_信息键不变不重取() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-amend-key-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@e"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git 起不来");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let (key, info) = fetch_amend(&root, None).expect("还没取过:要取");
+        assert!(key.is_some());
+        assert_eq!(
+            info.map(|i| i.message.trim().to_string()).as_deref(),
+            Some("first")
+        );
+        assert!(fetch_amend(&root, key).is_none(), "键没变:不重取");
+
+        std::fs::write(root.join("a.txt"), "b\n").unwrap();
+        git(&["commit", "-q", "-am", "second"]);
+        let (new_key, info) = fetch_amend(&root, key).expect("HEAD 动了:重取");
+        assert_ne!(new_key, key);
+        assert_eq!(
+            info.map(|i| i.message.trim().to_string()).as_deref(),
+            Some("second")
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn change(
