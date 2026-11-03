@@ -17,11 +17,17 @@ use git2::Repository;
 /// 仓库级配置写好 `user.name` / `user.email`:CI 机器没有全局身份,
 /// 走 git CLI 的提交 / merge / cherry-pick 用例否则会报 `Please tell me who you are`。
 pub(crate) fn init_repo_with_file(tag: &str, rel: &str, content: &str) -> PathBuf {
+    // 目录名带 pid + 纳秒 + 进程内序号:并行跑的用例、同时跑的两份测试进程都撞不上
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("mini-term-git-{tag}-{ts}"));
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "mini-term-git-{tag}-{}-{ts}-{seq}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&root).unwrap();
     let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
     let repo = Repository::init(&root).unwrap();

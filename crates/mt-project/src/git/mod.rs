@@ -742,6 +742,15 @@ fn discover_repo_limited(project_path: &Path) -> Option<Repository> {
     open_repo_within(project_path, project_path)
 }
 
+/// 项目根所属仓库的工作区根(形态与 [`discover_git_repos`] 给的 `path` 一致);项目不在任何
+/// 仓库里(父目录型项目)为 `None`。只往上找、不扫子目录,开销是几次 stat —— 收着的 Git
+/// 面板替文件树挂工作区监听时用,不为它去扫盘。
+pub fn enclosing_repo(project_path: &Path) -> Option<PathBuf> {
+    discover_repo_limited(project_path)?
+        .workdir()
+        .map(Path::to_path_buf)
+}
+
 /// 从 `start` 向上找仓库,最多找到 `anchor` 往上 [`MAX_DISCOVER_PARENTS`] 级为止
 /// (libgit2 的 ceiling 排他,故取第 N+1 级)。
 fn open_repo_within(start: &Path, anchor: &Path) -> Option<Repository> {
