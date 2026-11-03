@@ -53,7 +53,7 @@ use gpui::{
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels,
     Point, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity,
     Window, actions, anchored, canvas, deferred, div, fill, point, prelude::FluentBuilder as _, px,
-    size,
+    size, uniform_list,
 };
 use gpui_component::input::{Editor, EditorState, Position, RopeExt as _};
 use mt_project::git::{DiffSide, HeadFile, LineChangeKind, LineHunk, RepoFile};
@@ -118,6 +118,8 @@ const POPUP_MIN_WIDTH: f32 = 360.0;
 const POPUP_MAX_WIDTH: f32 = 760.0;
 /// 浮层里旧内容最多显示多少行高(再多滚动)。
 const POPUP_MAX_LINES: f32 = 14.0;
+/// 旧内容多于这么多行时换 uniform_list(只建可视的行);不多时照旧全建,高度随内容收。
+const POPUP_PLAIN_LINES: usize = 200;
 /// 浮层旧内容的行号列:每位数字的宽度(13px 等宽字一位约 7.8px,留点余量 ——
 /// 编辑器字族是用户可配的,宽一点的等宽字也装得下)与左右留白。
 const POPUP_DIGIT_W: f32 = 8.5;
@@ -409,8 +411,9 @@ pub(super) struct HeadBase {
     /// 编辑器投影(归一行尾 + 展开 Tab):diff 与回滚都比这一份。`SharedString` 是
     /// 引用计数的,丢后台不必整份拷贝
     pub text: SharedString,
-    /// 编辑器投影按行
-    pub lines: Vec<String>,
+    /// 编辑器投影按行。变更小窗每帧都把这一块的旧行画出来,存成 `SharedString`,
+    /// 画的时候只加引用计数
+    pub lines: Vec<SharedString>,
     /// 原文按行(只归一行尾,Tab 原样):「复制原内容」给的是 HEAD 里的真实内容
     pub raw_lines: Vec<String>,
 }
@@ -449,7 +452,7 @@ pub(super) fn prepare_head(file: HeadFile) -> HeadOutcome {
         repo,
         base: Some(HeadBase {
             repo: repo_file,
-            lines: expanded.lines().map(str::to_string).collect(),
+            lines: expanded.lines().map(SharedString::from).collect(),
             raw_lines: lf.lines().map(str::to_string).collect(),
             text: expanded.into(),
         }),
@@ -498,7 +501,7 @@ impl GitGutter {
 impl HeadBase {
     /// 一块变更在 HEAD 里的原文(编辑器投影)。块与 HEAD 不同代(HEAD 刚换、块还没
     /// 重算)时越界,返回 `None` 而不是 panic。
-    pub(super) fn old_lines(&self, hunk: &LineHunk) -> Option<&[String]> {
+    pub(super) fn old_lines(&self, hunk: &LineHunk) -> Option<&[SharedString]> {
         self.lines.get(hunk.old_range())
     }
 }
@@ -842,7 +845,7 @@ impl FileViewer {
         let Some(old) = head.old_lines(&hunk) else {
             return;
         };
-        let old: Vec<&str> = old.iter().map(String::as_str).collect();
+        let old: Vec<&str> = old.iter().map(SharedString::as_str).collect();
         let text = editor.read(cx).value();
         let (range, replacement) = rollback_edit(&text, &hunk, &old);
         self.gutter.popup = None;
@@ -947,7 +950,9 @@ impl FileViewer {
         let popup = self.gutter.popup.as_ref()?;
         let anchor = popup.anchor?;
         let hunk = self.gutter.hunks.get(popup.hunk)?.clone();
-        let old_lines: Vec<String> = self.gutter.head_base()?.old_lines(&hunk)?.to_vec();
+        // 借着 HEAD 那份,不整块克隆;行是 `SharedString`,建元素时只加引用计数
+        let head = self.gutter.head_base()?.clone();
+        let old_lines = head.old_lines(&hunk)?;
         let total = self.gutter.hunks.len();
         let index = popup.hunk;
 
@@ -1076,40 +1081,47 @@ impl FileViewer {
         // 旧内容:等宽、删除底色,左边是 HEAD 里的行号
         let number_width = popup_number_width(hunk.old_start + hunk.old_len);
         let body = has_old.then(|| {
-            let rows = old_lines.into_iter().enumerate().map(|(i, line)| {
-                div()
-                    .flex()
-                    .h(line_height)
-                    .items_center()
-                    .bg(ui::diff_del_bg())
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(number_width)
-                            .pl(px(POPUP_NUMBER_PAD_L))
-                            .pr(px(POPUP_NUMBER_PAD_R))
-                            .text_right()
-                            .text_color(ui::text_muted())
-                            .child((hunk.old_start + i + 1).to_string()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_color(ui::text_primary())
-                            .child(SharedString::from(line)),
-                    )
-            });
-            div()
-                .id("git-change-popup-lines")
-                .max_h(line_height * POPUP_MAX_LINES)
-                .overflow_y_scroll()
-                .py(px(4.0))
+            let lines = div()
                 .font_family(super::editor_font_family())
-                .text_size(px(13.0))
-                .children(rows)
+                .text_size(px(13.0));
+            if old_lines.len() <= POPUP_PLAIN_LINES {
+                return lines
+                    .id("git-change-popup-lines")
+                    .max_h(line_height * POPUP_MAX_LINES)
+                    .overflow_y_scroll()
+                    .py(px(4.0))
+                    .children(old_lines.iter().enumerate().map(|(i, line)| {
+                        popup_old_line(hunk.old_start + i, line, number_width, line_height)
+                    }))
+                    .into_any_element();
+            }
+            // 一大块删除(几百上千行):行高恒定,换 uniform_list 只建可视的那十几行。块这么
+            // 大时必然顶到 [`POPUP_MAX_LINES`] 的高度上限,外框高度与普通滚动容器一样
+            let (start, count) = (hunk.old_start, old_lines.len());
+            let rows_head = head.clone();
+            let rows_hunk = hunk.clone();
+            lines
+                .h(line_height * POPUP_MAX_LINES)
+                .child(
+                    uniform_list(
+                        "git-change-popup-lines",
+                        count,
+                        move |range, _window, _cx: &mut App| {
+                            let old = rows_head.old_lines(&rows_hunk).unwrap_or_default();
+                            range
+                                .map(|i| match old.get(i) {
+                                    Some(line) => {
+                                        popup_old_line(start + i, line, number_width, line_height)
+                                    }
+                                    None => div().h(line_height),
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .size_full()
+                    .py(px(4.0)),
+                )
+                .into_any_element()
         });
 
         let card = div()
@@ -1141,6 +1153,41 @@ impl FileViewer {
             .into_any_element(),
         )
     }
+}
+
+/// 变更小窗里的一行旧内容:HEAD 里的行号(`index` 是 0 起的行号)+ 原文,删除底色。
+/// `w_full`:放进 uniform_list 时行按根布局排,不补的话底色只有字那么宽。
+fn popup_old_line(
+    index: usize,
+    line: &SharedString,
+    number_width: Pixels,
+    line_height: Pixels,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .h(line_height)
+        .items_center()
+        .bg(ui::diff_del_bg())
+        .child(
+            div()
+                .flex_none()
+                .w(number_width)
+                .pl(px(POPUP_NUMBER_PAD_L))
+                .pr(px(POPUP_NUMBER_PAD_R))
+                .text_right()
+                .text_color(ui::text_muted())
+                .child((index + 1).to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(ui::text_primary())
+                .child(line.clone()),
+        )
 }
 
 // ─── 后台重算 ─────────────────────────────────────────────────

@@ -44,7 +44,15 @@
 //! 走共用的目录树(`git_ui::build_change_tree`:单链目录压缩、目录行带文件数),与提交
 //! diff 左栏共用一个「列表 / 树形」开关(配置 `gitCommitFilesViewMode`,缺省树形)。
 //! 最多直接画 [`MAX_FILE_ROWS`] 行(按拍平后的行数算),其余进提交 diff 里看。
+//!
+//! # 派生数据缓存
+//!
+//! 这一栏不套视图缓存,抽屉开着时随终端输出、转圈每帧重画。拍平后的文件行、藏起来的
+//! 文件数、逐文件行数统计的对应表、「所在分支」的排序与「+N」的悬停文字都缓存在
+//! [`DetailState`] 里([`FileRows`] / [`ContainingOrder`]):取数落地、换提交、折叠目录时
+//! 作废,切列表 / 树形、单选 / 多选形态对不上时重算 —— 不再每帧把几千个文件重新建一遍树。
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -58,13 +66,12 @@ use gpui::{
 use gpui_component::Size;
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::{
-    CombinedFileChange, CommitDetail, CommitLineStats, ContainingBranch, FileLineStat,
+    CombinedFileChange, CommitDetail, CommitLineStats, ContainingBranch, FileLineStat, LoadedLog,
 };
 use mt_ui::tooltip::TooltipExt as _;
 
-use super::{
-    GitHistoryContent, MULTI_LIMIT, format_detail_time, format_relative_time, row_tooltip,
-};
+use super::selection::CommitSelection;
+use super::{GitHistoryContent, MULTI_LIMIT, commit_tip, format_detail_time, format_relative_time};
 use crate::git_ui::{
     self, ChangeTreeRow, ICON_CLOSE, ICON_COMMIT, ICON_COPY, ICON_DIFF, RefKind, avatar,
     error_text, icon, icon_button, mono, more_pill, ref_pill,
@@ -129,6 +136,33 @@ pub(super) struct DetailState {
     /// 详情区的滚动位置。换了一个提交就回到顶上(标题与元信息在最上面),
     /// 不然上一个提交往下翻过,新提交一进来先看到的是文件列表的半截。
     scroll: ScrollHandle,
+    /// 文件区派生出来的行(见模块注释「派生数据缓存」)。文件列表 / 行数统计 / 收起的
+    /// 目录一变就作废([`Self::files_changed`])。
+    file_rows: RefCell<Option<Rc<FileRows>>>,
+    /// 「所在分支」排好的次序,所在分支一回来就作废。
+    containing_order: RefCell<Option<Rc<ContainingOrder>>>,
+}
+
+/// 文件区拍平后的行,只留前 [`MAX_FILE_ROWS`] 行(不虚拟化,见模块注释「改动文件」)。
+struct FileRows {
+    /// 按哪种视图、哪种形态(单选 / 多选)算的:这两样渲染时才知道,对不上就重算。
+    tree: bool,
+    multi: bool,
+    rows: Vec<ChangeTreeRow>,
+    /// 前 [`MAX_FILE_ROWS`] 行之后藏起来了几个文件。
+    hidden: usize,
+    /// 单提交:第 i 个文件的增删行数在 `CommitLineStats::files` 里的下标(行数还没回来时空)。
+    stat_of: Vec<Option<usize>>,
+}
+
+/// 「所在分支」的展示次序(当前分支排第一,其余保持原序)与「+N」的悬停文字。
+struct ContainingOrder {
+    /// 按哪个提交、哪个 HEAD 排的。
+    hash: String,
+    head: Option<String>,
+    order: Vec<usize>,
+    /// 收进「+N」的那些分支,换行分隔。
+    rest_tip: SharedString,
 }
 
 impl DetailState {
@@ -149,6 +183,8 @@ impl DetailState {
             pending_body: None,
             collapsed: HashSet::new(),
             scroll: ScrollHandle::new(),
+            file_rows: RefCell::new(None),
+            containing_order: RefCell::new(None),
         }
     }
 
@@ -166,6 +202,100 @@ impl DetailState {
         self.shown = None;
         self.pending_body = None;
         self.collapsed.clear();
+        self.files_changed();
+        self.containing_changed();
+    }
+
+    /// 文件列表 / 行数统计 / 收起的目录变了:文件区的派生行作废,下一帧重算。
+    fn files_changed(&mut self) {
+        *self.file_rows.get_mut() = None;
+    }
+
+    /// 所在分支回来了(或作废了):排好的次序作废。
+    fn containing_changed(&mut self) {
+        *self.containing_order.get_mut() = None;
+    }
+
+    /// 文件区的派生行(见 [`FileRows`]):缓存着、且是按这种视图 / 形态算的就直接给。
+    fn file_rows(&self, multi: bool, tree: bool) -> Rc<FileRows> {
+        if let Some(rows) = self
+            .file_rows
+            .borrow()
+            .as_ref()
+            .filter(|rows| rows.tree == tree && rows.multi == multi)
+        {
+            return rows.clone();
+        }
+        let rows = Rc::new(self.build_file_rows(multi, tree));
+        *self.file_rows.borrow_mut() = Some(rows.clone());
+        rows
+    }
+
+    fn build_file_rows(&self, multi: bool, tree: bool) -> FileRows {
+        let paths: Vec<(usize, &str)> = if multi {
+            match self.multi.as_ref().map(|m| &m.result) {
+                Some(Ok(files)) => files
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| (i, f.path.as_str()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            self.data
+                .iter()
+                .flat_map(|d| d.files.iter().enumerate())
+                .map(|(i, f)| (i, f.path.as_str()))
+                .collect()
+        };
+        let (rows, hidden) = flatten_files(&paths, tree, &self.collapsed);
+        let stat_of = self
+            .data
+            .as_ref()
+            .filter(|_| !multi)
+            .and_then(|d| self.stats_of(&d.hash))
+            .map(|stats| stat_index(&paths, stats))
+            .unwrap_or_default();
+        FileRows {
+            tree,
+            multi,
+            rows,
+            hidden,
+            stat_of,
+        }
+    }
+
+    /// 「所在分支」的展示次序:缓存着、且是按这个提交与这个 HEAD 排的就直接给。
+    fn containing_order(
+        &self,
+        hash: &str,
+        list: &[ContainingBranch],
+        head: Option<&str>,
+    ) -> Rc<ContainingOrder> {
+        if let Some(order) = self
+            .containing_order
+            .borrow()
+            .as_ref()
+            .filter(|o| o.hash == hash && o.head.as_deref() == head)
+        {
+            return order.clone();
+        }
+        let order = sort_containing(list, head);
+        let rest_tip = order
+            .iter()
+            .skip(BRANCH_PILLS)
+            .map(|&i| list[i].name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+        let order = Rc::new(ContainingOrder {
+            hash: hash.to_string(),
+            head: head.map(str::to_string),
+            order,
+            rest_tip,
+        });
+        *self.containing_order.borrow_mut() = Some(order.clone());
+        order
     }
 
     /// 取回来的正文写进只读框(渲染时调:写框要窗口)。
@@ -186,10 +316,14 @@ impl DetailState {
         let was_multi = matches!(self.target, Some(DetailTarget::Multi(_)));
         let was_single = matches!(self.target, Some(DetailTarget::Single(_)));
         match &target {
-            Some(DetailTarget::Multi(_)) if !was_multi => self.multi = None,
+            Some(DetailTarget::Multi(_)) if !was_multi => {
+                self.multi = None;
+                self.files_changed();
+            }
             Some(DetailTarget::Single(_)) if !was_single => {
                 self.data = None;
                 self.error = None;
+                self.files_changed();
             }
             _ => {}
         }
@@ -203,6 +337,7 @@ impl DetailState {
         if self.shown.as_ref() != Some(&target) {
             self.scroll.set_offset(point(px(0.0), px(0.0)));
             self.collapsed.clear();
+            self.files_changed();
         }
         self.shown = Some(target);
     }
@@ -228,6 +363,34 @@ impl DetailState {
             .filter(|(of, _)| of == hash)
             .map(|(_, result)| result)
     }
+}
+
+/// 文件区的行:拍平(树形 / 平铺,收起的目录不展开)后只留前 [`MAX_FILE_ROWS`] 行,
+/// 连同之后藏起来的文件数。
+fn flatten_files(
+    paths: &[(usize, &str)],
+    tree: bool,
+    collapsed: &HashSet<String>,
+) -> (Vec<ChangeTreeRow>, usize) {
+    let mut rows = git_ui::change_rows(paths, tree, &|p| collapsed.contains(p));
+    let hidden = git_ui::hidden_file_count(&rows, MAX_FILE_ROWS);
+    rows.truncate(MAX_FILE_ROWS);
+    (rows, hidden)
+}
+
+/// 第 i 个文件的增删行数在 `stats.files` 里的下标(同一路径出现两次时取后一条,与按路径
+/// 建表查的口径一致)。
+fn stat_index(paths: &[(usize, &str)], stats: &CommitLineStats) -> Vec<Option<usize>> {
+    let by_path: HashMap<&str, usize> = stats
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.path.as_str(), i))
+        .collect();
+    paths
+        .iter()
+        .map(|(_, path)| by_path.get(path).copied())
+        .collect()
 }
 
 /// 完整消息 → (标题, 正文)。正文去掉与标题之间的空行。
@@ -295,6 +458,7 @@ impl GitHistoryContent {
                         this.detail.data = None;
                     }
                 }
+                this.detail.files_changed();
                 cx.notify();
             });
 
@@ -304,7 +468,10 @@ impl GitHistoryContent {
                     return;
                 }
                 match stats {
-                    Ok(Some(stats)) => this.detail.stats = Some((hash, stats)),
+                    Ok(Some(stats)) => {
+                        this.detail.stats = Some((hash, stats));
+                        this.detail.files_changed();
+                    }
                     // 文件太多,不算(见 `LINE_STATS_MAX_FILES`)
                     Ok(None) => {}
                     Err(err) => eprintln!("[git] 统计提交 {hash} 的增删行数失败: {err:#}"),
@@ -337,6 +504,7 @@ impl GitHistoryContent {
                     eprintln!("[git] 查包含提交 {hash} 的分支失败: {err:#}");
                 }
                 this.detail.containing = Some((hash, result.map_err(|err| error_text(&err))));
+                this.detail.containing_changed();
                 cx.notify();
             });
         })
@@ -380,6 +548,7 @@ impl GitHistoryContent {
                     hashes,
                     result: result.map_err(|err| error_text(&err)),
                 });
+                this.detail.files_changed();
                 cx.notify();
             });
         })
@@ -388,7 +557,7 @@ impl GitHistoryContent {
 
     /// 点父提交:已加载就选中并滚过去。
     fn jump_to(&mut self, hash: &str, cx: &mut Context<Self>) {
-        if let Some(index) = self.commits.iter().position(|c| c.hash == hash) {
+        if let Some(index) = self.log.position(hash) {
             self.select_index(index, cx);
         }
     }
@@ -754,31 +923,35 @@ fn render_content(
     // ③ 改动文件(行数回来了就带上)
     body = body.child(div().h(px(1.0)).bg(ui::border_subtle()));
     let stats = this.detail.stats_of(&d.hash);
-    let stat_by_path: HashMap<&str, &FileLineStat> = stats
-        .map(|s| s.files.iter().map(|f| (f.path.as_str(), f)).collect())
-        .unwrap_or_default();
-    let files: Vec<FileEntry<'_>> = d
-        .files
-        .iter()
-        .map(|f| FileEntry {
+    let tree = this.store.read(cx).git_commit_files_tree();
+    let model = this.detail.file_rows(false, tree);
+    let entry = |index: usize| -> Option<FileEntry<'_>> {
+        let f = d.files.get(index)?;
+        let stat = match (stats, model.stat_of.get(index)) {
+            (Some(stats), Some(&Some(at))) => stats.files.get(at),
+            _ => None,
+        };
+        Some(FileEntry {
             path: &f.path,
             status: &f.status,
             old_path: f.old_path.as_deref(),
-            stat: stat_by_path.get(f.path.as_str()).copied(),
+            stat,
         })
-        .collect();
-    let caption = if files.is_empty() {
+    };
+    let count = d.files.len();
+    let caption = if count == 0 {
         t("gitLog", "detail.noFiles").to_string()
     } else {
-        tr!("gitLog", "detail.files", count = files.len().to_string())
+        tr!("gitLog", "detail.files", count = count.to_string())
     };
     let hash = d.hash.clone();
     let open: OpenFile = Rc::new(move |this, initial, window, cx| {
         this.open_commit_diff(hash.clone(), title.clone(), initial, window, cx);
     });
     body.child(render_files(
-        this,
-        &files,
+        &model,
+        count,
+        &entry,
         FileTexts {
             caption,
             caption_tip: None,
@@ -825,7 +998,11 @@ fn render_parents(
         );
     }
     for (i, parent) in d.parent_hashes.iter().enumerate() {
-        let loaded = this.commits.iter().find(|c| &c.hash == parent);
+        // 按常驻索引查(不在每帧里扫整份已加载列表)
+        let loaded = this
+            .log
+            .position(parent)
+            .and_then(|index| this.commits.get(index));
         let short: String = parent.chars().take(7).collect();
         let target = parent.clone();
         // 「已加载 / 未加载」会随触底续页变:提示现读,不抓移入那一刻的
@@ -838,7 +1015,7 @@ fn render_parents(
         .tip_live(move |cx| {
             let loaded = view
                 .upgrade()
-                .is_some_and(|v| v.read(cx).commits.iter().any(|c| c.hash == probe));
+                .is_some_and(|v| v.read(cx).log.contains(&probe));
             if loaded {
                 t("gitLog", "detail.jumpParent").into()
             } else {
@@ -894,13 +1071,14 @@ fn render_containing(this: &GitHistoryContent, hash: &str) -> AnyElement {
         Some(Ok(list)) => list,
     };
     let head = this.head_branch.as_deref();
-    let is_head = |b: &ContainingBranch| !b.is_remote && Some(b.name.as_str()) == head;
-    let mut ordered: Vec<&ContainingBranch> = list.iter().collect();
-    ordered.sort_by_key(|b| !is_head(b));
+    // 排序与「+N」的悬停文字按 (提交, HEAD) 缓存(见 [`ContainingOrder`]):包含主线提交的
+    // 分支动辄上千条,每帧排一遍、拼一遍太亏
+    let sorted = this.detail.containing_order(hash, list, head);
 
     let mut pills = div().flex().flex_wrap().gap(px(6.0));
-    for (i, branch) in ordered.iter().take(BRANCH_PILLS).enumerate() {
-        let kind = if is_head(branch) {
+    for (i, &at) in sorted.order.iter().take(BRANCH_PILLS).enumerate() {
+        let branch = &list[at];
+        let kind = if is_head_branch(branch, head) {
             RefKind::Head
         } else if branch.is_remote {
             RefKind::Remote
@@ -917,16 +1095,28 @@ fn render_containing(this: &GitHistoryContent, hash: &str) -> AnyElement {
             .tip(branch.name.clone()),
         );
     }
-    if ordered.len() > BRANCH_PILLS {
-        let rest = ordered[BRANCH_PILLS..]
-            .iter()
-            .map(|b| b.name.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        pills = pills
-            .child(more_pill("git-log-detail-branch-more", ordered.len() - BRANCH_PILLS).tip(rest));
+    if sorted.order.len() > BRANCH_PILLS {
+        pills = pills.child(
+            more_pill(
+                "git-log-detail-branch-more",
+                sorted.order.len() - BRANCH_PILLS,
+            )
+            .tip(sorted.rest_tip.clone()),
+        );
     }
     pills.into_any_element()
+}
+
+/// 这条是不是 HEAD 所在的本地分支。
+fn is_head_branch(branch: &ContainingBranch, head: Option<&str>) -> bool {
+    !branch.is_remote && Some(branch.name.as_str()) == head
+}
+
+/// 「所在分支」的展示次序(下标):当前分支排第一,其余保持原序(稳定排序)。
+fn sort_containing(list: &[ContainingBranch], head: Option<&str>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..list.len()).collect();
+    order.sort_by_key(|&i| !is_head_branch(&list[i], head));
+    order
 }
 
 /// 多选态的正文:「已选 N 个提交」+ 选中提交的小列表 +(超上限的说明)+ 合并后的改动文件。
@@ -946,9 +1136,14 @@ fn render_multi(
     );
 
     // 选中提交的小列表:短哈希 + 标题 + 作者 + 相对时间,完整信息挂 tooltip
-    let picked = this.selection.ordered(&this.commits);
+    let picked = picked_rows(&this.selection, &this.log);
     let mut list = div().flex().flex_col().gap(px(2.0));
-    for commit in picked.iter().take(MULTI_LIST_ROWS) {
+    let view = cx.entity().downgrade();
+    for commit in picked
+        .iter()
+        .take(MULTI_LIST_ROWS)
+        .filter_map(|&index| this.commits.get(index))
+    {
         list = list.child(
             div()
                 .id(SharedString::from(format!("git-log-multi-{}", commit.hash)))
@@ -988,7 +1183,7 @@ fn render_multi(
                         .text_color(ui::text_muted())
                         .child(format_relative_time(commit.timestamp, now)),
                 )
-                .tip(row_tooltip(commit)),
+                .tip_with(commit_tip(view.clone(), commit.hash.clone())),
         );
     }
     if picked.len() > MULTI_LIST_ROWS {
@@ -1019,27 +1214,30 @@ fn render_multi(
             ui::color_error(),
         )),
         Some(Ok(files)) => {
-            let entries: Vec<FileEntry<'_>> = files
-                .iter()
-                .map(|f| FileEntry {
+            let tree = this.store.read(cx).git_commit_files_tree();
+            let model = this.detail.file_rows(true, tree);
+            let entry = |index: usize| -> Option<FileEntry<'_>> {
+                let f = files.get(index)?;
+                Some(FileEntry {
                     path: &f.path,
                     status: &f.status,
                     old_path: f.old_path.as_deref(),
                     stat: None,
                 })
-                .collect();
-            let caption = if entries.is_empty() {
+            };
+            let caption = if files.is_empty() {
                 t("gitLog", "multi.noFiles").to_string()
             } else {
-                tr!("gitLog", "detail.files", count = entries.len().to_string())
+                tr!("gitLog", "detail.files", count = files.len().to_string())
             };
             // 点文件 = 打开合并 diff(用的是这一份已经合并好的文件)
             let open: OpenFile = Rc::new(|this, initial, window, cx| {
                 this.view_selected_combined(initial, window, cx);
             });
             body.child(render_files(
-                this,
-                &entries,
+                &model,
+                files.len(),
+                &entry,
                 FileTexts {
                     caption,
                     caption_tip: Some(t("gitLog", "multi.rangeTip")),
@@ -1052,6 +1250,17 @@ fn render_multi(
             ))
         }
     }
+}
+
+/// 选中的提交在列表里的行号,按列表顺序(与 `CommitSelection::ordered` 同一结果)。按常驻
+/// 索引查位置,只做与选中数成正比的活 —— 多选态这一栏每帧都画,不能每帧扫整份已加载列表。
+fn picked_rows(selection: &CommitSelection, log: &LoadedLog) -> Vec<usize> {
+    let mut rows: Vec<usize> = selection
+        .hashes()
+        .filter_map(|hash| log.position(hash))
+        .collect();
+    rows.sort_unstable();
+    rows
 }
 
 /// 文件区里的一个文件(单提交 / 多选合并共用一套画法)。
@@ -1084,15 +1293,17 @@ struct FileTexts {
 }
 
 /// 文件区:标题行(文件数 + 合计行数 + 列表 / 树形切换)+ 文件行(最多 [`MAX_FILE_ROWS`]
-/// 行)+「还有 N 个文件」。
-fn render_files(
-    this: &GitHistoryContent,
-    files: &[FileEntry<'_>],
+/// 行)+「还有 N 个文件」。行序取缓存的 [`FileRows`],`file(下标)` 给出那个文件,
+/// `count` 是文件总数。
+fn render_files<'a>(
+    model: &FileRows,
+    count: usize,
+    file: &dyn Fn(usize) -> Option<FileEntry<'a>>,
     texts: FileTexts,
     open: OpenFile,
     cx: &mut Context<GitHistoryContent>,
 ) -> gpui::Div {
-    let tree = this.store.read(cx).git_commit_files_tree();
+    let tree = model.tree;
     let caption = mono(div())
         .id("git-log-detail-files-caption")
         .min_w_0()
@@ -1123,7 +1334,7 @@ fn render_files(
         .child(caption)
         .children(totals)
         .child(div().flex_1())
-        .when(!files.is_empty(), |el| {
+        .when(count > 0, |el| {
             el.child(
                 git_ui::view_mode_toggle("git-log-detail-view-mode", tree).on_click(cx.listener(
                     |this, _: &ClickEvent, _window, cx| {
@@ -1137,12 +1348,9 @@ fn render_files(
             )
         });
 
-    let paths: Vec<(usize, &str)> = files.iter().enumerate().map(|(i, f)| (i, f.path)).collect();
-    let collapsed = &this.detail.collapsed;
-    let rows = git_ui::change_rows(&paths, tree, &|p| collapsed.contains(p));
-    let hidden = git_ui::hidden_file_count(&rows, MAX_FILE_ROWS);
+    let hidden = model.hidden;
     let mut list = div().flex().flex_col();
-    for row in rows.into_iter().take(MAX_FILE_ROWS) {
+    for row in &model.rows {
         match row {
             ChangeTreeRow::Dir {
                 name,
@@ -1152,32 +1360,34 @@ fn render_files(
                 file_count,
             } => {
                 let id = SharedString::from(format!("git-log-detail-dir-{full_path}"));
+                let full_path = full_path.clone();
                 list = list.child(
-                    git_ui::tree_dir_row(id, name, file_count, depth, collapsed).on_click(
-                        cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                             if !this.detail.collapsed.remove(&full_path) {
                                 this.detail.collapsed.insert(full_path.clone());
                             }
+                            this.detail.files_changed();
                             cx.notify();
-                        }),
-                    ),
+                        })),
                 );
             }
-            ChangeTreeRow::File { index, depth } => {
-                let Some(file) = files.get(index) else {
+            &ChangeTreeRow::File { index, depth } => {
+                let Some(file) = file(index) else {
                     continue;
                 };
                 let (open, path) = (open.clone(), file.path.to_string());
                 let on_click = cx.listener(move |this, _: &ClickEvent, window, cx| {
                     open(this, Some(path.clone()), window, cx);
                 });
-                let tip = match file.old_path {
-                    Some(old) => format!("{old} → {}\n{}", file.path, texts.open_tip),
-                    None => texts.open_tip.to_string(),
+                // 绝大多数行的提示就是一句固定文案,不必每帧拼一份
+                let tip: SharedString = match file.old_path {
+                    Some(old) => format!("{old} → {}\n{}", file.path, texts.open_tip).into(),
+                    None => texts.open_tip.into(),
                 };
                 list = list.child(
                     git_ui::commit_file_row_with(
-                        SharedString::from(format!("git-log-detail-file-{index}")),
+                        ("git-log-detail-file", index),
                         file.path,
                         file.status,
                         false,
@@ -1216,7 +1426,105 @@ fn render_files(
 
 #[cfg(test)]
 mod tests {
+    use super::super::selection::ClickMods;
     use super::*;
+    use crate::git_graph::test_commit;
+
+    /// 缓存的文件行与旧写法(每帧 `change_rows` 再 `take(300)`、藏起来的数按全量行算)一致;
+    /// 行数统计的对应表与按路径建表查一致(重复路径取后一条)。
+    #[test]
+    fn 文件区派生行与逐帧现算一致() {
+        let owned: Vec<String> = (0..700)
+            .map(|i| format!("src/m{}/sub{}/f{i}.rs", i % 7, i % 3))
+            .collect();
+        let paths: Vec<(usize, &str)> = owned
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.as_str()))
+            .collect();
+        let collapsed: HashSet<String> = ["src/m3".to_string(), "src/m5/sub1".to_string()]
+            .into_iter()
+            .collect();
+        for tree in [false, true] {
+            let all = git_ui::change_rows(&paths, tree, &|p| collapsed.contains(p));
+            let want_hidden = git_ui::hidden_file_count(&all, MAX_FILE_ROWS);
+            let want: Vec<ChangeTreeRow> = all.into_iter().take(MAX_FILE_ROWS).collect();
+            let (rows, hidden) = flatten_files(&paths, tree, &collapsed);
+            assert_eq!(rows, want, "tree = {tree}");
+            assert_eq!(hidden, want_hidden, "tree = {tree}");
+        }
+
+        let stat = |path: &str, additions| FileLineStat {
+            path: path.into(),
+            additions,
+            deletions: 0,
+            binary: false,
+        };
+        let stats = CommitLineStats {
+            files: vec![stat("a", 1), stat("b", 2), stat("a", 3)],
+            additions: 6,
+            deletions: 0,
+        };
+        let paths = [(0, "a"), (1, "c"), (2, "b")];
+        let old: HashMap<&str, &FileLineStat> =
+            stats.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        let index = stat_index(&paths, &stats);
+        for (i, path) in paths {
+            let got = index[i].map(|at| &stats.files[at]);
+            assert_eq!(got, old.get(path).copied(), "{path}");
+        }
+    }
+
+    /// 「所在分支」:当前分支排第一,其余保持原序;远程的同名分支不算当前分支。
+    #[test]
+    fn 所在分支当前分支排第一() {
+        let branch = |name: &str, is_remote| ContainingBranch {
+            name: name.into(),
+            is_remote,
+        };
+        let list = vec![
+            branch("dev", false),
+            branch("main", false),
+            branch("zz", false),
+            branch("main", true),
+            branch("origin/main", true),
+        ];
+        assert_eq!(sort_containing(&list, Some("main")), vec![1, 0, 2, 3, 4]);
+        assert_eq!(sort_containing(&list, None), vec![0, 1, 2, 3, 4]);
+        assert_eq!(sort_containing(&list, Some("gone")), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// 多选小列表的行号与 `CommitSelection::ordered` 同一结果(列表顺序)。
+    #[test]
+    fn 多选行号与按列表扫一致() {
+        let commits: Vec<_> = (0..40)
+            .map(|i| test_commit(&format!("p{i}"), &[]))
+            .collect();
+        let log = {
+            let mut log = LoadedLog::default();
+            let mut loaded = Vec::new();
+            log.merge(&mut loaded, commits.clone());
+            log
+        };
+        let mut sel = CommitSelection::default();
+        let toggle = ClickMods {
+            toggle: true,
+            range: false,
+        };
+        for i in [31, 4, 17, 0, 39, 22] {
+            sel.click(&commits, i, toggle);
+        }
+        let want: Vec<&str> = sel
+            .ordered(&commits)
+            .iter()
+            .map(|c| c.hash.as_str())
+            .collect();
+        let got: Vec<&str> = picked_rows(&sel, &log)
+            .into_iter()
+            .map(|i| commits[i].hash.as_str())
+            .collect();
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn 消息拆成标题与正文() {

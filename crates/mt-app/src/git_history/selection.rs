@@ -80,6 +80,11 @@ impl CommitSelection {
         self.lead = Some(hash.to_string());
     }
 
+    /// 选中的 hash(无序)。
+    pub(super) fn hashes(&self) -> impl Iterator<Item = &str> {
+        self.selected.iter().map(String::as_str)
+    }
+
     /// 选中的提交,按列表顺序。
     pub(super) fn ordered<'a>(&self, commits: &'a [GitCommitInfo]) -> Vec<&'a GitCommitInfo> {
         commits

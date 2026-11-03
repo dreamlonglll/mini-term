@@ -75,7 +75,7 @@ use mt_project::git::{
     CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, StaleDiff,
 };
 use mt_ui::icons::FileIcon;
-use mt_ui::tooltip::TooltipExt as _;
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::git_ui::{
     self, ChangeTreeRow, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
@@ -372,12 +372,22 @@ fn head_start(start: u32, lines: u32) -> u32 {
     }
 }
 
+/// 拍平后的一行(两个视图共用)。
+struct FlatLine {
+    kind: String,
+    /// **tab 展开后**的显示文本。存成 `SharedString`:行回调每帧给每个可见行建文字元素,
+    /// clone 只加引用计数 —— 压缩过的单行 JS / JSON 一行就几百 KB,每帧整行复制一份太亏。
+    content: SharedString,
+    old_lineno: Option<u32>,
+    new_lineno: Option<u32>,
+}
+
 /// 一次 diff 结果算好的**全部派生数据**。结果一到就算一次,不在每帧的
 /// uniform_list 回调里重算。
 #[derive(Default)]
 struct Flat {
     /// 拍平的行(两个视图共用一份)。`content` 是 **tab 展开后**的显示文本
-    lines: Vec<DiffLine>,
+    lines: Vec<FlatLine>,
     /// 与 [`Flat::lines`] 等长:含 tab 的行展开前的原文(复制要给它),没有 tab 的是 `None`
     raw: Vec<Option<String>>,
     /// 与 [`Flat::lines`] 等长:每行的行内改动片段。空 = 整行一个底色
@@ -426,14 +436,21 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
         let base = f.lines.len();
         let (lines, pairs) = pair_rows(std::slice::from_ref(hunk));
         // `\t` 在 gpui 文本里是零宽(见 `tab_expansion` 模块注释),显示前按制表位展开。
-        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上;原文另存一份给复制用
-        let lines: Vec<(DiffLine, Option<String>)> = lines
+        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上;原文另存一份给复制用。
+        // 显示文本在这里一次转成 `SharedString`(见 [`FlatLine::content`])
+        let lines: Vec<(FlatLine, Option<String>)> = lines
             .into_iter()
-            .map(|mut line| {
-                let mut raw = None;
-                if let Cow::Owned(expanded) = expand_line(&line.content, TAB_WIDTH) {
-                    raw = Some(std::mem::replace(&mut line.content, expanded));
-                }
+            .map(|line| {
+                let (content, raw) = match expand_line(&line.content, TAB_WIDTH) {
+                    Cow::Owned(expanded) => (expanded, Some(line.content)),
+                    Cow::Borrowed(_) => (line.content, None),
+                };
+                let line = FlatLine {
+                    kind: line.kind,
+                    content: content.into(),
+                    old_lineno: line.old_lineno,
+                    new_lineno: line.new_lineno,
+                };
                 (line, raw)
             })
             .collect();
@@ -560,7 +577,7 @@ fn pinned(scroll_x: Pixels) -> gpui::Div {
 /// 行号列照旧是箭头。行高同时设成文字行高 —— 高亮底色按文字行高画,两者不一致时
 /// 跨行选区的底色会一条压一条、叠出深浅相间的横纹。
 fn diff_line_row(
-    line: &DiffLine,
+    line: &FlatLine,
     gutters: &[(String, f32)],
     line_height: f32,
     marks: &[Range<usize>],
@@ -568,7 +585,8 @@ fn diff_line_row(
     row: RowText,
 ) -> AnyElement {
     let kind = line.kind.as_str();
-    let content = SharedString::from(line.content.clone());
+    // 只加引用计数,不复制整行(见 [`FlatLine::content`])
+    let content = line.content.clone();
     let gutter_w: f32 = gutters.iter().map(|(_, width)| *width).sum();
     // `whitespace-pre`:diff 行不换行 —— 少了它 gpui 会把长行回绕,而行高是恒定的
     // (uniform_list 的前提),回绕出来的第二行直接被裁掉,看着像「缺了半行」。
@@ -2221,6 +2239,32 @@ struct CommitPick {
     tree: bool,
     /// 树形里收起的目录(完整路径)。
     collapsed: HashSet<String>,
+    /// 左栏拍平后的行(见 [`Self::rows`])。切视图、收起 / 展开目录时作废。
+    rows: Option<Rc<Vec<ChangeTreeRow>>>,
+}
+
+impl CommitPick {
+    /// 左栏的行。文件列表在弹窗的一生里不变,行只随视图与收起的目录变,所以缓存着:
+    /// 弹窗开着时 builder 每帧重跑(右栏滚动、拖选),大提交几千个文件、合并查看两百个提交
+    /// 时不能每帧重新建一遍树。选中项不在行里(画的时候才比),换选中不必重算。
+    fn rows(&mut self, files: &[ModalFile]) -> Rc<Vec<ChangeTreeRow>> {
+        self.rows
+            .get_or_insert_with(|| Rc::new(modal_rows(files, self.tree, &self.collapsed)))
+            .clone()
+    }
+
+    fn set_tree(&mut self, tree: bool) {
+        self.tree = tree;
+        self.rows = None;
+    }
+
+    /// 收起 / 展开一个目录。
+    fn toggle_dir(&mut self, full_path: &str) {
+        if !self.collapsed.remove(full_path) {
+            self.collapsed.insert(full_path.to_string());
+        }
+        self.rows = None;
+    }
 }
 
 impl Render for CommitPick {
@@ -2382,13 +2426,22 @@ fn file_row_of(files: &[ModalFile], tree: bool, ix: usize) -> Option<usize> {
         .position(|r| matches!(r, ChangeTreeRow::File { index, .. } if *index == ix))
 }
 
-/// 左栏的一行:目录行点击收起 / 展开,文件行点击换右栏的 diff。
+/// 左栏文件行的 tooltip:完整路径,重命名写 `旧 → 新`。
+fn modal_file_tip(file: &ModalFile) -> String {
+    match &file.old_path {
+        Some(old) => format!("{old} → {}", file.path),
+        None => file.path.clone(),
+    }
+}
+
+/// 左栏的一行:目录行点击收起 / 展开,文件行点击换右栏的 diff。只给可视区里的行建
+/// (左栏是 uniform_list,行等高 [`git_ui::ROW_H`])。
 fn modal_row(
-    row: ChangeTreeRow,
+    row: &ChangeTreeRow,
     files: &Rc<Vec<ModalFile>>,
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
-    repo_path: &str,
+    repo_path: &SharedString,
     selected: usize,
     tree: bool,
 ) -> Option<AnyElement> {
@@ -2402,28 +2455,33 @@ fn modal_row(
         } => {
             let pick = pick.clone();
             let id = SharedString::from(format!("git-commit-dir-{full_path}"));
+            let full_path = full_path.clone();
             let toggle = move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 pick.update(cx, |p, cx| {
-                    if !p.collapsed.remove(&full_path) {
-                        p.collapsed.insert(full_path.clone());
-                    }
+                    p.toggle_dir(&full_path);
                     cx.notify();
                 });
             };
             Some(
-                git_ui::tree_dir_row(id, name, file_count, depth, collapsed)
+                git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed)
+                    // 列表项按根布局排,不像块容器那样自动撑满:不补 w_full 悬停底只有字那么宽
+                    .w_full()
                     .on_click(toggle)
                     .into_any_element(),
             )
         }
-        ChangeTreeRow::File { index, depth } => {
+        &ChangeTreeRow::File { index, depth } => {
             let file = files.get(index)?;
-            let tip = match &file.old_path {
-                Some(old) => format!("{old} → {}", file.path),
-                None => file.path.clone(),
+            // 提示文字在气泡弹出时才拼:每帧给可视区每一行都先拼好没必要
+            let tip = {
+                let files = files.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    let text = files.get(index).map(modal_file_tip).unwrap_or_default();
+                    Tooltip::new(text).build(window, cx)
+                }
             };
             let (pick, state, files) = (pick.clone(), state.clone(), files.clone());
-            let repo = repo_path.to_string();
+            let repo = repo_path.clone();
             let choose = move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 if pick.read(cx).selected == index {
                     return;
@@ -2444,7 +2502,7 @@ fn modal_row(
                     index == selected,
                     tree.then_some(depth),
                 )
-                .tip(tip)
+                .tip_with(tip)
                 .on_click(choose)
                 .into_any_element(),
             )
@@ -2472,14 +2530,15 @@ fn open_files_diff(
     let first = initial_ix.unwrap_or(0);
     // 选中的文件可能排在很后面:左栏滚到它那一行(下一次布局时生效)。树形里行序与文件
     // 序不同,按拍平后的行找
-    let file_scroll = gpui::ScrollHandle::new();
+    let file_scroll = UniformListScrollHandle::new();
     if let Some(row) = initial_ix.and_then(|ix| file_row_of(&files, tree, ix)) {
-        file_scroll.scroll_to_item(row);
+        file_scroll.scroll_to_item(row, ScrollStrategy::Nearest);
     }
     let pick = cx.new(|_| CommitPick {
         selected: first,
         tree,
         collapsed: HashSet::new(),
+        rows: None,
     });
 
     match files.get(first) {
@@ -2490,6 +2549,7 @@ fn open_files_diff(
     }
 
     let files = Rc::new(files);
+    let repo_path = SharedString::from(repo_path);
     // 正文的 Ctrl/Cmd+C / A 挂在弹窗的焦点容器上(见下面 builder 末尾)。已经开着一个时
     // 守卫会拦下这次打开,那就不能再聚焦 —— 焦点会落进一个永远画不出来的元素
     let focus = cx.focus_handle();
@@ -2506,20 +2566,45 @@ fn open_files_diff(
                 let p = pick.read(cx);
                 (p.selected, p.tree)
             };
-            let rows = modal_rows(&files, tree, &pick.read(cx).collapsed);
+            let rows = pick.update(cx, |p, _| p.rows(&files));
 
             // 左栏文件列表:与提交详情同一种文件行(FileIcon + 状态色文件名 + 弱化目录
-            // + 状态字母;树形按目录分组、单链目录压缩),选中 = accent 淡底 + 左侧竖条
-            let file_list = div()
-                .id("git-commit-files")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .track_scroll(&file_scroll)
-                .p(px(4.0))
-                .children(rows.into_iter().filter_map(|row| {
-                    modal_row(row, &files, &pick, &state, &repo_path, selected, tree)
-                }));
+            // + 状态字母;树形按目录分组、单链目录压缩),选中 = accent 淡底 + 左侧竖条。
+            // 行等高,走 uniform_list:只给可视区里的那几行建元素
+            let file_list = {
+                let (files, pick, state, repo_path) = (
+                    files.clone(),
+                    pick.clone(),
+                    state.clone(),
+                    repo_path.clone(),
+                );
+                div().flex_1().min_h(px(0.0)).child(
+                    uniform_list(
+                        "git-commit-files",
+                        rows.len(),
+                        move |range, _window, _cx: &mut App| {
+                            range
+                                .map(|ix| {
+                                    rows.get(ix)
+                                        .and_then(|row| {
+                                            modal_row(
+                                                row, &files, &pick, &state, &repo_path, selected,
+                                                tree,
+                                            )
+                                        })
+                                        // 数不上的行(不会出现)占住一行高,别把后面的行挤乱
+                                        .unwrap_or_else(|| {
+                                            div().h(px(git_ui::ROW_H)).into_any_element()
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    )
+                    .size_full()
+                    .track_scroll(&file_scroll)
+                    .p(px(4.0)),
+                )
+            };
 
             // 左栏头部:标题(与单文件历史左栏头部同一档:14px 半粗)+ 等宽副标题,
             // 副标题那一行右侧是「列表 / 树形」切换
@@ -2529,7 +2614,7 @@ fn open_files_diff(
                     move |_: &ClickEvent, _window, cx| {
                         let next = !pick.read(cx).tree;
                         pick.update(cx, |p, cx| {
-                            p.tree = next;
+                            p.set_tree(next);
                             cx.notify();
                         });
                         store.update(cx, |s, cx| s.set_git_commit_files_tree(next, cx));
@@ -2937,11 +3022,56 @@ mod tests {
             head: None,
         });
         assert_eq!(renamed.old_path.as_deref(), Some("old/x.rs"));
-        let rows = modal_rows(&[renamed], true, &HashSet::new());
+        let rows = modal_rows(std::slice::from_ref(&renamed), true, &HashSet::new());
         assert!(
             matches!(&rows[0], ChangeTreeRow::Dir { name, .. } if name == "new/dir"),
             "{rows:?}"
         );
+        assert_eq!(modal_file_tip(&renamed), "old/x.rs → new/dir/x.rs");
+        assert_eq!(modal_file_tip(&files[1]), "src/ui/a.rs");
+    }
+
+    /// 左栏的行缓存着:与每帧现算的一致;换选中不动它,收起目录 / 切视图之后作废重算。
+    #[test]
+    fn 左栏行缓存随折叠与视图作废() {
+        let commit = |path: &str| {
+            ModalFile::from_commit(
+                "abc",
+                CommitFileInfo {
+                    path: path.into(),
+                    status: "modified".into(),
+                    old_path: None,
+                },
+            )
+        };
+        let files: Vec<ModalFile> = (0..50)
+            .map(|i| commit(&format!("src/m{}/f{i}.rs", i % 4)))
+            .collect();
+        let mut pick = CommitPick {
+            selected: 0,
+            tree: true,
+            collapsed: HashSet::new(),
+            rows: None,
+        };
+        let first = pick.rows(&files);
+        assert_eq!(*first, modal_rows(&files, true, &HashSet::new()));
+        pick.selected = 7;
+        assert!(Rc::ptr_eq(&first, &pick.rows(&files)), "换选中不重算");
+
+        pick.toggle_dir("src/m2");
+        let folded = pick.rows(&files);
+        assert!(!Rc::ptr_eq(&first, &folded));
+        assert_eq!(*folded, modal_rows(&files, true, &pick.collapsed));
+        assert!(folded.len() < first.len());
+        pick.toggle_dir("src/m2");
+        assert_eq!(*pick.rows(&files), *first, "再点一下展开回来");
+
+        pick.set_tree(false);
+        assert_eq!(
+            *pick.rows(&files),
+            modal_rows(&files, false, &pick.collapsed)
+        );
+        assert_eq!(pick.rows(&files).len(), files.len());
     }
 
     /// 没有改动块时的空态:纯重命名单说一句,其余照旧「没有更多改动」。

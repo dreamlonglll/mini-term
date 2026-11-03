@@ -53,7 +53,7 @@ use mt_project::git::{
     StashInfo, StashSaveOptions, StashSaveOutcome,
 };
 use mt_ui::icons::Shape;
-use mt_ui::tooltip::TooltipExt as _;
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::git_diff::{self, CommitFileDiffPane};
 use crate::git_history::{format_absolute_time, format_relative_time};
@@ -1085,6 +1085,16 @@ fn short_hash(hash: &str) -> &str {
     &hash[..7.min(hash.len())]
 }
 
+/// 行 tooltip:完整消息 + 绝对时间 · 短哈希。
+fn stash_tip(stash: &StashInfo) -> String {
+    format!(
+        "{}\n{} · {}",
+        stash.message,
+        format_absolute_time(stash.timestamp),
+        short_hash(&stash.hash)
+    )
+}
+
 /// 「未跟踪」的颜色:与更改区的未跟踪分组同色。
 fn untracked_color() -> Hsla {
     git_ui::status_color(Some(&GitStatus::Untracked))
@@ -1100,12 +1110,17 @@ fn render_row(state: &Entity<StashDialog>, index: usize, now: i64, cx: &mut App)
     let mut meta = vec![stash.reference.clone()];
     meta.extend(stash.branch.clone());
     meta.push(format_relative_time(stash.timestamp, now));
-    let tip = format!(
-        "{}\n{} · {}",
-        stash.message,
-        format_absolute_time(stash.timestamp),
-        short_hash(&stash.hash)
-    );
+    // 提示文字在气泡弹出时才拼:绝对时间要按本地时区换算,不必每帧给每一行都先拼好
+    let tip = {
+        let state = state.downgrade();
+        move |window: &mut Window, cx: &mut App| {
+            let text = state
+                .upgrade()
+                .and_then(|s| s.read(cx).stashes.get(index).map(stash_tip))
+                .unwrap_or_default();
+            Tooltip::new(text).build(window, cx)
+        }
+    };
     let (click_state, menu_state) = (state.clone(), state.clone());
 
     // 共用列表行(选中 = accent 淡底 + 左侧竖条、悬停薄纱底),两行布局与单文件历史的
@@ -1150,7 +1165,7 @@ fn render_row(state: &Entity<StashDialog>, index: usize, now: i64, cx: &mut App)
             .text_color(ui::text_muted())
             .child(meta.join(" · ")),
     )
-    .tip(tip)
+    .tip_with(tip)
     .on_click(move |_: &ClickEvent, window, cx| {
         let focus = click_state.read(cx).focus.clone();
         window.focus(&focus, cx);
