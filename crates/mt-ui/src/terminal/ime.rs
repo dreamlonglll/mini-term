@@ -23,7 +23,7 @@ use std::ops::Range;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preedit {
     pub text: String,
-    /// 光标在串内的位置（UTF-16 偏移）。IME 用它决定候选框贴在哪。
+    /// 光标在串内的位置（UTF-16 偏移）。画插入符用；候选框贴的是串的起点，不看它。
     pub cursor_utf16: usize,
 }
 

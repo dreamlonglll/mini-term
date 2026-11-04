@@ -36,6 +36,7 @@ use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 pub mod links;
 pub mod width;
@@ -115,6 +116,84 @@ pub struct TerminalEmulator {
     cursor_floor: Mutex<Option<CursorFloor>>,
     /// 内容代数,见 [`Self::generation`]。
     generation: AtomicU64,
+    /// 光标的停稳追踪,见 [`Self::settled_cursor`]。
+    cursor_settle: Mutex<CursorSettle>,
+}
+
+/// 光标要在一格上停多久才算「停稳」。
+///
+/// 下限是「同步块写完 → 光标归位」那段空档:真 ConPTY 上实测 p50 约 50µs、
+/// 最大约 400µs,这里留足负载下的余量。上限是 TUI 的重绘间隔:pi-tui 最快 16ms
+/// 一帧,光标每帧都要离开输入位置再回来,超过它的话输入位置永远轮不到停稳。
+const CURSOR_SETTLE: Duration = Duration::from_millis(8);
+
+/// IME 该贴着的光标位置。行列口径与 `grid().cursor.point` 相同。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettledCursor {
+    pub line: i32,
+    pub column: usize,
+    /// 光标最新的落点与这里不同,过一会儿读到的可能就变了 —— 要跟的人得再读一次。
+    pub pending: bool,
+}
+
+/// 把 TUI 重绘途中的光标滤掉。
+///
+/// 自绘输入框的 TUI 每帧都让光标先走到改动内容的末尾,再回到输入位置。pi-tui 的
+/// regular 模式还把这两步拆成两次 write,于是 reader 线程收到两批字节,其间光标
+/// 就停在撑满整行的边框行尾。这段空档只有几十微秒,但 IME 恰好这时来取坐标,
+/// 候选窗就飞到屏幕右边去了(issue #88)。
+///
+/// 判据是「停了多久」而不是认某个 TUI 的字节形态:途中的位置停不到
+/// [`CURSOR_SETTLE`] 就不算数,真挪了位置的最多晚这么久生效。
+#[derive(Debug)]
+struct CursorSettle {
+    /// 停稳过的最近一个位置。
+    settled: (i32, usize),
+    /// 最新的位置,以及它从什么时候开始待在这儿。
+    latest: (i32, usize),
+    latest_since: Instant,
+}
+
+impl CursorSettle {
+    fn new(cell: (i32, usize), now: Instant) -> Self {
+        Self {
+            settled: cell,
+            latest: cell,
+            latest_since: now,
+        }
+    }
+
+    /// 记一次光标位置。**挪走之前**先结算旧位置 —— 它可能已经停够了,而读的人
+    /// 这期间一次都没来。
+    fn observe(&mut self, cell: (i32, usize), now: Instant) {
+        if cell == self.latest {
+            return;
+        }
+        self.promote(now);
+        self.latest = cell;
+        self.latest_since = now;
+    }
+
+    fn read(&mut self, now: Instant) -> SettledCursor {
+        self.promote(now);
+        SettledCursor {
+            line: self.settled.0,
+            column: self.settled.1,
+            pending: self.settled != self.latest,
+        }
+    }
+
+    fn promote(&mut self, now: Instant) {
+        if now.saturating_duration_since(self.latest_since) >= CURSOR_SETTLE {
+            self.settled = self.latest;
+        }
+    }
+}
+
+/// 光标此刻在 grid 的哪一格。
+fn cursor_cell(term: &Term<EventQueue>) -> (i32, usize) {
+    let point = term.grid().cursor.point;
+    (point.line.0, point.column.0)
 }
 
 /// VT 解析器与它的随身暂存。
@@ -173,6 +252,7 @@ impl TerminalEmulator {
             ..Config::default()
         };
         let term = Term::new(config, &size, events.clone());
+        let cursor_settle = CursorSettle::new(cursor_cell(&term), Instant::now());
         Self {
             term: Arc::new(Mutex::new(term)),
             parser: Mutex::new(Parser {
@@ -183,6 +263,7 @@ impl TerminalEmulator {
             scrollback: AtomicUsize::new(scrollback),
             cursor_floor: Mutex::new(None),
             generation: AtomicU64::new(0),
+            cursor_settle: Mutex::new(cursor_settle),
         }
     }
 
@@ -231,21 +312,35 @@ impl TerminalEmulator {
         let mut term = self.term.lock();
         // 持着 term 锁记账:读的人持锁看到的代数与内容必然同步
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.feed(&mut term, bytes);
+        self.cursor_settle
+            .lock()
+            .observe(cursor_cell(&term), Instant::now());
+    }
+
+    fn feed(&self, term: &mut Term<EventQueue>, bytes: &[u8]) {
         let mut parser = self.parser.lock();
         let mut floor = self.cursor_floor.lock();
         let Some(floor) = floor.as_mut().filter(|f| f.budget > 0) else {
-            parser.advance(&mut term, bytes);
+            parser.advance(term, bytes);
             return;
         };
         let (sampled, rest) = bytes.split_at(bytes.len().min(floor.budget));
         for byte in sampled {
-            parser.advance(&mut term, std::slice::from_ref(byte));
-            floor.min = floor.min.min(cursor_row(&term));
+            parser.advance(term, std::slice::from_ref(byte));
+            floor.min = floor.min.min(cursor_row(term));
         }
         floor.budget -= sampled.len();
         if !rest.is_empty() {
-            parser.advance(&mut term, rest);
+            parser.advance(term, rest);
         }
+    }
+
+    /// IME 该贴着的光标位置:滤掉了 TUI 重绘途中的落点,见 [`CursorSettle`]。
+    ///
+    /// **现读,不走帧**:IME 取坐标的时机由系统决定,不会等下一帧。
+    pub fn settled_cursor(&self) -> SettledCursor {
+        self.cursor_settle.lock().read(Instant::now())
     }
 
     /// 开始追踪光标绝对行的**最低水位**,起点是此刻的光标位置。
@@ -281,6 +376,9 @@ impl TerminalEmulator {
         let mut term = self.term.lock();
         term.resize(size);
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.cursor_settle
+            .lock()
+            .observe(cursor_cell(&term), Instant::now());
     }
 
     /// 供渲染侧读取 grid。持锁期间 reader 线程会被挡住 —— 这正是我们要的背压。
@@ -421,6 +519,108 @@ mod tests {
         for i in 0..n {
             e.advance(format!("line{i}\r\n").as_bytes());
         }
+    }
+
+    const INPUT: (i32, usize) = (5, 2);
+    const BORDER_END: (i32, usize) = (4, 149);
+
+    fn settled_at(settle: &mut CursorSettle, now: Instant) -> ((i32, usize), bool) {
+        let cursor = settle.read(now);
+        ((cursor.line, cursor.column), cursor.pending)
+    }
+
+    /// **issue #88 的回归**:pi-tui 写完边框后光标在行尾停几十微秒才归位。
+    /// IME 恰好在这段空档里取坐标,也必须拿到输入位置。
+    #[test]
+    fn 重绘途中读到的还是停稳的位置() {
+        let t0 = Instant::now();
+        let mut settle = CursorSettle::new(INPUT, t0);
+        let render = t0 + Duration::from_millis(16);
+        settle.observe(BORDER_END, render);
+        let in_gap = render + Duration::from_micros(20);
+        assert_eq!(settled_at(&mut settle, in_gap), (INPUT, true));
+        settle.observe(INPUT, render + Duration::from_micros(50));
+        assert_eq!(
+            settled_at(&mut settle, in_gap + Duration::from_micros(40)),
+            (INPUT, false)
+        );
+    }
+
+    /// TUI 按最快节奏持续重绘:光标每帧都跑一趟,读到的永远是输入位置。
+    #[test]
+    fn 持续重绘时输入位置不被途中落点顶掉() {
+        let t0 = Instant::now();
+        let mut settle = CursorSettle::new(INPUT, t0);
+        for frame in 1..=120u32 {
+            let render = t0 + Duration::from_millis(16) * frame;
+            settle.observe(BORDER_END, render);
+            assert_eq!(settled_at(&mut settle, render).0, INPUT);
+            settle.observe(INPUT, render + Duration::from_micros(50));
+            let after = render + Duration::from_millis(10);
+            assert_eq!(settled_at(&mut settle, after), (INPUT, false));
+        }
+    }
+
+    /// 真挪了位置(输入框被流式正文往下推)最多晚一个停稳窗口生效。
+    #[test]
+    fn 真挪了位置停够之后生效() {
+        let t0 = Instant::now();
+        let mut settle = CursorSettle::new(INPUT, t0);
+        let moved = (6, 2);
+        settle.observe(moved, t0);
+        assert_eq!(
+            settled_at(&mut settle, t0 + Duration::from_millis(1)),
+            (INPUT, true)
+        );
+        assert_eq!(settled_at(&mut settle, t0 + CURSOR_SETTLE), (moved, false));
+    }
+
+    /// 没人来读的时候光标停够又挪走了:旧位置也要结算,不能退回更早的那个。
+    #[test]
+    fn 挪走之前先结算旧位置() {
+        let t0 = Instant::now();
+        let mut settle = CursorSettle::new(INPUT, t0);
+        let moved = (6, 2);
+        settle.observe(moved, t0);
+        let render = t0 + Duration::from_millis(16);
+        settle.observe(BORDER_END, render);
+        assert_eq!(settled_at(&mut settle, render), (moved, true));
+    }
+
+    /// 光标一直在动就一直不算停稳,结论留在上一个停稳的位置,并如实报 pending。
+    #[test]
+    fn 光标一直在动时不产生新结论() {
+        let t0 = Instant::now();
+        let mut settle = CursorSettle::new(INPUT, t0);
+        for step in 0..100u32 {
+            let now = t0 + Duration::from_millis(1) * step;
+            settle.observe((0, step as usize + 10), now);
+            assert_eq!(settled_at(&mut settle, now), (INPUT, true));
+        }
+    }
+
+    /// 接线:`advance` 与 `resize` 都要报告光标。只断言「等够之后」这一头 ——
+    /// 另一头受机器负载影响,交给上面注入时钟的用例。
+    #[test]
+    fn 字节与_resize_挪动的光标都能读到() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        let wait = || std::thread::sleep(CURSOR_SETTLE * 3);
+
+        e.advance(b"abc");
+        wait();
+        let cursor = e.settled_cursor();
+        assert_eq!((cursor.line, cursor.column, cursor.pending), (0, 3, false));
+
+        e.advance(b"\x1b[10;1H");
+        wait();
+        assert_eq!(e.settled_cursor().line, 9);
+
+        // 行数变少,光标被挤回视口内
+        e.resize(TermSize::new(40, 5));
+        wait();
+        let cursor = e.settled_cursor();
+        assert_eq!(cursor.line, e.with_term(|t| t.grid().cursor.point.line.0));
+        assert!(cursor.line < 5);
     }
 
     /// 回滚行数**建终端时就要生效**:默认值(10000)与配置默认值撞上纯属巧合,
