@@ -48,11 +48,21 @@
 //! 分开是因为两者的「晚一拍」代价完全不同:应答晚了对面的 TUI 干等,画面晚一拍
 //! 没人看得出来。此前两件事绑在同一个 16ms 定时器上,于是每个 pane 各自按 62fps
 //! 请求整窗重绘 —— N 个 pane 相位错开,等于每个 vsync 都撞上一次 dirty。
+//!
+//! # 同步输出的超时释放
+//!
+//! 程序用 `ESC[?2026h` 开一个同步块之后,字节只进解析器的缓冲、不上屏。vte 只记一个
+//! 到期时刻,到期不会自己解开:TUI 崩了、ssh 断了,结束标记永远不来,shell 其实还活着,
+//! 提示符与回显却全进了缓冲,画面看着就是死了,resize 也救不回来。
+//!
+//! 所以唤醒循环看到有同步块在攒就排一个**一次性**定时器(见
+//! [`TerminalPane::arm_sync_release`]):不用常驻轮询,也不依赖下一次输出、不依赖有没有
+//! 在画帧 —— 前台任务不看窗口脸色,后台与最小化时照样到点释放,重绘请求由节拍器攒着。
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
@@ -66,7 +76,7 @@ use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
-use mt_terminal::{TermSize, TerminalEmulator};
+use mt_terminal::{SyncRelease, TermSize, TerminalEmulator};
 use mt_ui::terminal::{MouseMods, prefers_local_handling};
 use mt_ui::{
     CopiedTip, DwellConfig, FlashLine, PasteAction, TerminalSearch, TerminalSearchBar,
@@ -190,6 +200,10 @@ pub struct TerminalPane {
     pending_pty_size: Option<(u16, u16)>,
     /// PTY resize 的去抖计时器。新尺寸一到就换一个,旧的随之丢弃。
     _pty_resize_timer: Option<Task<()>>,
+    /// 同步块释放定时器在途。见 [`Self::arm_sync_release`]。
+    sync_release_armed: bool,
+    /// 同步块的释放定时器。掉了任务就没了,必须存着。
+    _sync_release_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -412,6 +426,7 @@ impl TerminalPane {
                 if this
                     .update(cx, |pane, cx| {
                         pane.drain_term_events(cx);
+                        pane.arm_sync_release(cx);
                         // 子进程快到回填之前就退了:先挂着,回填完成后再报
                         // (`PtySlot::note_exit`)—— 退出永远排在回填之后
                         if let Some(code) = exit.and_then(|code| pane.pty.note_exit(code)) {
@@ -486,11 +501,13 @@ impl TerminalPane {
                 .smart_copy_paste(|cx: &gpui::App| {
                     AppStore::global(cx).read(cx).config().smart_copy_paste
                 })
-                // Ctrl(⌘)+悬停 / 单击输出里的文件路径 → 文件页新开页签。视图只认
-                // 形状,「指向哪个文件、文件页开不开得了」全在 `terminal_links`
+                // Ctrl(⌘)+悬停 / 单击输出里的文件路径 → 文件页新开页签;网址 → 默认
+                // 浏览器。视图只认形状,「指向哪个文件、文件页开不开得了」全在
+                // `terminal_links`
                 .file_links(
                     move |cand, cx| crate::terminal_links::resolve(pty_id, cand, cx),
                     crate::terminal_links::open,
+                    crate::terminal_links::open_url,
                 )
                 .selection_dwell(dwell)
                 .on_selection_copied(move |_text, origin, _window, cx| {
@@ -537,8 +554,58 @@ impl TerminalPane {
             _osc_title_timer: None,
             pending_pty_size: None,
             _pty_resize_timer: None,
+            sync_release_armed: false,
+            _sync_release_timer: None,
             _wake: wake,
         }
+    }
+
+    /// 有同步块在攒就排一个到期时刻的定时器(缘由见模块注释「同步输出的超时释放」)。
+    ///
+    /// **已经排着就不动**:定时器醒来会重新读当前的到期时刻 —— 被新的 BSU 续过期就接着睡,
+    /// 结束标记到过了就收摊,所以旧定时器不可能把续过期的那一帧提前放出来,连着来的同步
+    /// 块也不必一帧换一个任务。
+    ///
+    /// 没有漏排的窗口:reader 线程是先把字节推进状态机、再发唤醒信号的,而这里与定时器
+    /// 收摊都在主线程上 —— 定时器看到没有同步块才落下 `sync_release_armed`,这之后开的同步块
+    /// 的信号还在队列里,等它收完摊才轮到这里。
+    fn arm_sync_release(&mut self, cx: &mut Context<Self>) {
+        if self.sync_release_armed {
+            return;
+        }
+        let Some(mut deadline) = self.emulator.sync_deadline() else {
+            return;
+        };
+        self.sync_release_armed = true;
+        // 不在任务里清自己的句柄(从运行中的任务里丢掉自己的 `Task` 是在给自己拆脚手架),
+        // 下次排定时器时句柄自然被顶掉
+        self._sync_release_timer = Some(cx.spawn(async move |pane, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(deadline.saturating_duration_since(Instant::now()))
+                    .await;
+                let outcome = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                    let outcome = pane.emulator.release_expired_sync();
+                    if !matches!(outcome, SyncRelease::Pending(_)) {
+                        pane.sync_release_armed = false;
+                    }
+                    if outcome == SyncRelease::Released {
+                        // 攒在块里的查询这时才跑,应答不能等下一次输出
+                        pane.drain_term_events(cx);
+                    }
+                    outcome
+                });
+                match outcome {
+                    Ok(SyncRelease::Pending(next)) => deadline = next,
+                    Ok(SyncRelease::Released) => {
+                        // 走节拍器,不在 `pane.update` 里调:它当场 flush 时要 update 这个 pane
+                        cx.update(|cx| redraw::request(pane.clone(), cx));
+                        return;
+                    }
+                    Ok(SyncRelease::Idle) | Err(_) => return,
+                }
+            }
+        }));
     }
 
     /// grid 尺寸变了:停稳后再下发给 PTY,时机见 [`PTY_RESIZE_SETTLE`]。

@@ -209,6 +209,28 @@ impl Parser {
         self.vte
             .advance(&mut WidthOverride::new(term, &mut self.cluster), bytes);
     }
+
+    /// 同步块的到期时刻。`None` = 没有同步块在攒。
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.vte.sync_timeout().sync_timeout()
+    }
+
+    /// 结束同步块:把攒下的字节同样经 [`WidthOverride`] 推进 `term`。
+    fn stop_sync(&mut self, term: &mut Term<EventQueue>) {
+        self.vte
+            .stop_sync(&mut WidthOverride::new(term, &mut self.cluster));
+    }
+}
+
+/// [`TerminalEmulator::release_expired_sync`] 的结论。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRelease {
+    /// 没有同步块在攒:结束标记已经到了,或者早就释放过了。
+    Idle,
+    /// 还没到期(可能刚被新的 BSU 续过期),到这个时刻再来问。
+    Pending(Instant),
+    /// 到期了,攒下的字节已经落进 grid。
+    Released,
 }
 
 /// 追踪中的光标水位。
@@ -334,6 +356,51 @@ impl TerminalEmulator {
         if !rest.is_empty() {
             parser.advance(term, rest);
         }
+    }
+
+    /// 同步块(`ESC[?2026h`)的到期时刻。`None` = 没有同步块在攒。
+    ///
+    /// 只拿解析器这一把锁:持着它不会再去等 term,与 term→parser 的锁序不冲突。
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.lock().sync_deadline()
+    }
+
+    /// 同步块到期了就把攒下的字节放出来。宿主的定时器到点时调。
+    ///
+    /// vte 进了同步块之后字节只进它自己的缓冲,等结束标记、缓冲满 2 MiB 或宿主调
+    /// `stop_sync`。deadline(150ms)只是个记录:**到期不会自解**,新来的字节也解不开。
+    /// alacritty 自己的事件循环是按 deadline 等 poll 超时,这里的 reader 线程阻塞在 read
+    /// 上等不了,所以交给宿主排定时器(mt-app 的 `TerminalPane::arm_sync_release`)。
+    ///
+    /// deadline **在这里重新读**:同步块进行中再来一个 BSU 会续期,旧定时器到点时拿到
+    /// [`SyncRelease::Pending`] 接着排,不能提前放行。
+    ///
+    /// 两把锁与 [`Self::advance`] 同序(term→parser),释放与后续输出不会交错。
+    pub fn release_expired_sync(&self) -> SyncRelease {
+        self.release_expired_sync_at(Instant::now())
+    }
+
+    /// [`Self::release_expired_sync`] 的可注入时钟版本,单测用。
+    fn release_expired_sync_at(&self, now: Instant) -> SyncRelease {
+        let mut term = self.term.lock();
+        let mut parser = self.parser.lock();
+        let Some(deadline) = parser.sync_deadline() else {
+            return SyncRelease::Idle;
+        };
+        if now < deadline {
+            return SyncRelease::Pending(deadline);
+        }
+        // 持着 term 锁记账,口径同 `advance`
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        parser.stop_sync(&mut term);
+        // 块里的中间态已经看不到了(结束标记那条路也一样),水位只能记下放完之后的光标
+        if let Some(floor) = self.cursor_floor.lock().as_mut().filter(|f| f.budget > 0) {
+            floor.min = floor.min.min(cursor_row(&term));
+        }
+        self.cursor_settle
+            .lock()
+            .observe(cursor_cell(&term), Instant::now());
+        SyncRelease::Released
     }
 
     /// IME 该贴着的光标位置:滤掉了 TUI 重绘途中的落点,见 [`CursorSettle`]。
@@ -899,5 +966,268 @@ mod tests {
         assert_eq!(e.generation(), g2, "同值不重设,代数不动");
         e.set_scrollback(3);
         assert!(e.generation() > g2, "调小回滚会裁历史,必须 +1");
+    }
+
+    // ── 同步输出(DEC 2026)的超时释放 ──────────────────────────────────────
+
+    const BSU: &[u8] = b"\x1b[?2026h";
+    const ESU: &[u8] = b"\x1b[?2026l";
+
+    /// 远远越过任何 deadline 的时刻:注入时钟,测试不必真睡 150ms。
+    fn far_future() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    /// 定时器在所有 deadline 之后醒来。
+    fn force_release(e: &TerminalEmulator) -> SyncRelease {
+        e.release_expired_sync_at(far_future())
+    }
+
+    /// 钉住宿主为什么要接这一套:deadline 只是个记录,到期后 vte 照旧往缓冲里攒,
+    /// 新来的字节解不开它。哪天上游自己处理了,这条会红,到时候再看宿主这边要不要留。
+    #[test]
+    fn vte_到期也不会自己释放() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"frozen");
+        let deadline = e.sync_deadline().expect("BSU 之后必须有 deadline");
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()) * 2);
+        e.advance(b" more");
+        e.resize(TermSize::new(50, 6));
+        assert_eq!(e.visible_lines()[0], "", "到期 + 新输出 + resize 都解不开");
+    }
+
+    /// 核心用例:TUI 崩了、ssh 断了,结束标记永远不来。到期释放后攒的内容上屏,
+    /// 之后的输出也不再进缓冲。
+    #[test]
+    fn 漏发结束标记时到期释放() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"frozen");
+        assert_eq!(e.visible_lines()[0], "", "同步块里的字节不上屏");
+        assert!(e.sync_deadline().is_some());
+
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        assert_eq!(e.visible_lines()[0], "frozen");
+        assert_eq!(e.sync_deadline(), None);
+
+        e.advance(b" after");
+        assert_eq!(e.visible_lines()[0], "frozen after", "释放后直接上屏");
+        assert_eq!(e.sync_deadline(), None);
+    }
+
+    /// 不注入时钟走一遍:真等到 deadline,用的是宿主调的那个入口。
+    #[test]
+    fn 真实时钟到点释放() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"late");
+        let deadline = e.sync_deadline().expect("BSU 之后必须有 deadline");
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+        assert_eq!(e.release_expired_sync(), SyncRelease::Released);
+        assert_eq!(e.visible_lines()[0], "late");
+    }
+
+    /// 释放必须走 [`WidthOverride`]。绕开的话 👍🏽 按字符算 4 列,后面的 x 落到第 4 列;
+    /// 单码点仍是 1 列(`mt_terminal::width` 的铁律)。
+    #[test]
+    fn 释放走列宽封装() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance("👍🏽x\r\n●y".as_bytes());
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        let rows = e.visible_columns();
+        assert_eq!(rows[0][..2], [(0, '👍'), (2, 'x')]);
+        assert_eq!(rows[1][..2], [(0, '●'), (1, 'y')]);
+    }
+
+    /// 正常的 BSU→ESU 不受影响:定时器在两批之间醒来也不能拆帧。
+    #[test]
+    fn 正常结束不被拆帧() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"frame-");
+        let deadline = e.sync_deadline().expect("BSU 之后必须有 deadline");
+        assert_eq!(
+            e.release_expired_sync_at(deadline - Duration::from_millis(1)),
+            SyncRelease::Pending(deadline)
+        );
+        assert_eq!(e.visible_lines()[0], "", "没到期不许动");
+
+        e.advance(b"done");
+        e.advance(ESU);
+        assert_eq!(e.visible_lines()[0], "frame-done", "整帧一起上屏");
+        assert_eq!(e.sync_deadline(), None);
+        assert_eq!(
+            force_release(&e),
+            SyncRelease::Idle,
+            "结束标记到过了,定时器醒来什么都不做"
+        );
+    }
+
+    /// 没有同步块时问一次不留痕迹:`stop_sync` 会无条件走一遍 `unset_private_mode`,
+    /// 不能让它在正常输出之间空跑。
+    #[test]
+    fn 没有同步块时不做事也不动代数() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(b"plain");
+        let generation = e.generation();
+        assert_eq!(force_release(&e), SyncRelease::Idle);
+        assert_eq!(e.generation(), generation);
+        assert_eq!(e.visible_lines()[0], "plain");
+    }
+
+    /// 同步块进行中又来一个 BSU = 续期。旧定时器到点只能拿到新 deadline 去续排,
+    /// 不能按旧 deadline 把这一帧提前放出来。
+    #[test]
+    fn 续期后旧定时器不提前释放() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"a");
+        let old = e.sync_deadline().expect("BSU 之后必须有 deadline");
+        // 留出时钟分辨率,新 deadline 才严格晚于旧的
+        std::thread::sleep(Duration::from_millis(5));
+        e.advance(BSU);
+        e.advance(b"b");
+        let new = e.sync_deadline().expect("续期后还在同步块里");
+        assert!(new > old, "BSU 必须续期");
+
+        assert_eq!(e.release_expired_sync_at(old), SyncRelease::Pending(new));
+        assert_eq!(e.visible_lines()[0], "", "旧 deadline 到点不许放行");
+
+        assert_eq!(e.release_expired_sync_at(new), SyncRelease::Released);
+        assert_eq!(e.visible_lines()[0], "ab");
+    }
+
+    /// 一批里上一帧结束、下一帧开头:上一帧当场上屏,下一帧照样受超时保护。
+    #[test]
+    fn 结束标记后紧跟新同步块时后者照常到期() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        let mut batch = BSU.to_vec();
+        batch.extend_from_slice(b"one ");
+        batch.extend_from_slice(ESU);
+        batch.extend_from_slice(BSU);
+        batch.extend_from_slice(b"two");
+        e.advance(&batch);
+        assert_eq!(e.visible_lines()[0], "one", "上一帧已经结束");
+        assert!(e.sync_deadline().is_some(), "下一帧还在攒");
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        assert_eq!(e.visible_lines()[0], "one two");
+    }
+
+    /// 释放时切在多字节字符 / 转义序列半中间:解析器状态要接得上,不丢不错位。
+    #[test]
+    fn 释放切在字符与序列半中间也接得上() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        let wide = "中".as_bytes();
+        e.advance(BSU);
+        e.advance(&wide[..1]);
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        e.advance(&wide[1..]);
+        assert_eq!(e.visible_lines()[0], "中", "UTF-8 切半");
+
+        e.advance(BSU);
+        e.advance(b"\x1b[3;");
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        e.advance(b"5Hx");
+        assert!(e.visible_columns()[2].contains(&(4, 'x')), "CUP 切半");
+    }
+
+    /// 释放是内容变化,代数要推进(查找引擎靠它判「有没有新输出」);攒在块里的
+    /// 查询这时才跑,应答要进事件队列。
+    #[test]
+    fn 释放推进代数并吐出块内应答() {
+        let is_reply = |event: &Event| matches!(event, Event::PtyWrite(_));
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"\x1b[6n");
+        assert!(!e.events().drain().iter().any(is_reply), "块里的查询还没跑");
+
+        let generation = e.generation();
+        let deadline = e.sync_deadline().expect("BSU 之后必须有 deadline");
+        e.release_expired_sync_at(deadline - Duration::from_millis(1));
+        assert_eq!(e.generation(), generation, "没释放不动代数");
+
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        assert!(e.generation() > generation, "释放了必须 +1");
+        assert!(e.events().drain().iter().any(is_reply), "应答要交给宿主");
+    }
+
+    /// 光标是块里的字节挪的:IME 的停稳追踪与 ⚑ 的水位都要记上释放这一下。
+    #[test]
+    fn 释放挪动的光标记得上() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(BSU);
+        e.advance(b"abc");
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        std::thread::sleep(CURSOR_SETTLE * 3);
+        let cursor = e.settled_cursor();
+        assert_eq!((cursor.line, cursor.column, cursor.pending), (0, 3, false));
+
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(b"a\r\nb\r\nc");
+        e.arm_cursor_floor();
+        e.advance(BSU);
+        e.advance(b"\x1b[H");
+        assert_eq!(force_release(&e), SyncRelease::Released);
+        assert_eq!(e.take_cursor_floor(), Some(0), "释放后光标顶回首行");
+    }
+
+    /// reader 线程一边喂、定时器一边释放:逐字节喂(切开 BSU、多字节字符、换行),
+    /// 每行都要不多不少地落进 grid。靠的是两边同走 term→parser 两把锁。
+    #[test]
+    fn 释放与后续输出并发不丢不重() {
+        use std::sync::atomic::AtomicBool;
+
+        const LINES: usize = 1500;
+        let e = Arc::new(TerminalEmulator::with_scrollback(
+            TermSize::new(40, 5),
+            LINES * 2,
+        ));
+        let done = Arc::new(AtomicBool::new(false));
+        let releaser = {
+            let (e, done) = (e.clone(), done.clone());
+            std::thread::spawn(move || {
+                let future = far_future();
+                let mut released = 0usize;
+                while !done.load(Ordering::Relaxed) {
+                    if e.release_expired_sync_at(future) == SyncRelease::Released {
+                        released += 1;
+                    }
+                }
+                released
+            })
+        };
+        // 等释放线程真跑起来:第一个同步块被它放行之后才开始喂
+        e.advance(BSU);
+        let give_up = Instant::now() + Duration::from_secs(30);
+        while e.sync_deadline().is_some() {
+            assert!(Instant::now() < give_up, "同步块一直没被放行");
+            std::thread::yield_now();
+        }
+        for i in 0..LINES {
+            let mut batch = BSU.to_vec();
+            batch.extend_from_slice(format!("第{i}行\r\n").as_bytes());
+            for byte in &batch {
+                e.advance(std::slice::from_ref(byte));
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        let released = releaser.join().expect("释放线程不该 panic");
+        // 最后一批可能还攒着
+        force_release(&e);
+        assert!(released > 0, "这条用例要真撞上释放才有意义");
+
+        assert_eq!(e.history_lines(), LINES + 1 - 5);
+        for i in 0..LINES {
+            assert_eq!(
+                e.line_text(i as i32).as_deref(),
+                Some(format!("第{i}行").as_str()),
+                "第 {i} 行丢了或重了"
+            );
+        }
+        assert_eq!(e.line_text(LINES as i32).as_deref(), Some(""));
     }
 }

@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mt_pty::{PtySession, PtySpawn};
-use mt_terminal::{TermSize, TerminalEmulator};
+use mt_terminal::alacritty_terminal::event::Event;
+use mt_terminal::{SyncRelease, TermSize, TerminalEmulator};
 
 /// 起一个 shell,把输出喂进 emulator。
 fn spawn_shell(size: TermSize) -> (PtySession, Arc<TerminalEmulator>) {
@@ -94,6 +95,197 @@ fn pty_回显能从_grid_读回来() {
         "20s 内没有从 grid 读回 echo 的输出,grid 现状:\n{}",
         emulator.visible_lines().join("\n")
     );
+
+    let _ = pty.kill();
+}
+
+/// 替宿主回终端应答。便携 ConPTY 一起来就发 DA1,收不到应答后面的输出全卡着
+/// (见 `mt_pty::conpty` 的模块注释);mini-term 里这是 pane 的 `drain_term_events`。
+fn answer_queries(emulator: &TerminalEmulator, pty: &PtySession) {
+    for event in emulator.events().drain() {
+        if let Event::PtyWrite(text) = event {
+            pty.write_reply(text.as_bytes()).expect("写 PTY 失败");
+        }
+    }
+}
+
+/// 轮询 `pred` 直到成立或超时,期间替宿主回终端应答。
+fn pump_until(
+    emulator: &TerminalEmulator,
+    pty: &PtySession,
+    timeout: Duration,
+    mut pred: impl FnMut(&TerminalEmulator) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        answer_queries(emulator, pty);
+        if pred(emulator) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 可视区里 `needle` 出现在几行上。
+fn lines_with(emulator: &TerminalEmulator, needle: &str) -> usize {
+    let lines = emulator.visible_lines();
+    lines.iter().filter(|l| l.contains(needle)).count()
+}
+
+/// 替宿主跑「到点释放」:mini-term 里这是 pane 的 `arm_sync_release`。
+/// 真等到 deadline,走的是宿主调的那个入口。返回是否真的释放过。
+fn release_when_due(emulator: &TerminalEmulator, pty: &PtySession, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        answer_queries(emulator, pty);
+        match emulator.release_expired_sync() {
+            SyncRelease::Released => return true,
+            SyncRelease::Pending(due) => {
+                std::thread::sleep(due.saturating_duration_since(Instant::now()))
+            }
+            SyncRelease::Idle => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    false
+}
+
+/// 这条用例对着哪个 ConPTY 跑,打在日志里。
+///
+/// 默认走系统 ConPTY。发行版默认用的是便携 ConPTY,想对着它跑:
+/// `MT_SMOKE_CONPTY_DIR=<含 portable-conpty 的目录> cargo test -p mt-terminal --test
+/// terminal_smoke <用例名> -- --nocapture`。预载要早于进程里任何一次 `openpty`,
+/// 所以一次只跑一条。
+fn announce_conpty_backend() {
+    let backend = match std::env::var_os("MT_SMOKE_CONPTY_DIR") {
+        Some(dir) => format!("{:?}", mt_pty::conpty::initialize(dir.as_ref())),
+        None => "默认(系统 ConPTY)".to_string(),
+    };
+    eprintln!("[smoke] ConPTY 后端: {backend}");
+}
+
+/// OSC 8 穿过真 PTY 落到 cell 上:ConPTY 夹在中间,不是所有版本都原样放行。
+#[test]
+fn osc8_穿过真_pty_认得出网址() {
+    announce_conpty_backend();
+    let (mut pty, emulator) = spawn_shell(TermSize::new(100, 30));
+    let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        e.visible_lines().iter().any(|l| !l.trim().is_empty())
+    });
+    assert!(ready, "shell 20s 内没有任何输出");
+
+    // 标记串是算出来的,理由同下面那条
+    const MARK: &str = "MT_LINK_1234";
+    #[cfg(windows)]
+    let command = "[Console]::Out.Write(\"$([char]27)]8;;https://example.com/smoke$([char]27)\\MT_LINK_\" + (1000 + 234) + \"$([char]27)]8;;$([char]27)\\`r`n\")\r";
+    #[cfg(not(windows))]
+    let command = "printf '\\033]8;;https://example.com/smoke\\033\\\\MT_LINK_%d\\033]8;;\\033\\\\\\n' $((1000 + 234))\r";
+    pty.write(command.as_bytes()).expect("写 PTY 失败");
+    let shown = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        lines_with(e, MARK) > 0
+    });
+    assert!(
+        shown,
+        "20s 内没有输出,grid 现状:\n{}",
+        emulator.visible_lines().join("\n")
+    );
+
+    let lines = emulator.visible_lines();
+    let row = lines.iter().position(|l| l.contains(MARK)).unwrap();
+    let column = emulator.visible_columns()[row]
+        .windows(MARK.len())
+        .find(|cells| cells.iter().map(|&(_, c)| c).eq(MARK.chars()))
+        .map(|cells| cells[0].0)
+        .expect("标记串的列位置");
+    match emulator.url_at(row as i32, column) {
+        Some(link) => {
+            assert_eq!(link.url, "https://example.com/smoke");
+            assert!(link.from_osc8);
+            assert_eq!(link.cells.len(), MARK.len());
+        }
+        // 旧版系统 conhost 重新渲染时把链接丢了:文字还在,只是点不了
+        None if cfg!(windows) => eprintln!("[smoke] 这个 ConPTY 把 OSC 8 吞了"),
+        None => panic!("PTY 不该吞转义序列"),
+    }
+    let _ = pty.kill();
+}
+
+/// 漏发同步结束标记的端到端:子进程开了同步块就不管了(TUI 崩溃的样子),shell 还活着。
+/// 没人释放时提示符与回显全进缓冲、到期也出不来;释放之后画面回来,再敲命令也不用再释放。
+#[test]
+fn 漏发同步结束标记时到期释放() {
+    announce_conpty_backend();
+    let (mut pty, emulator) = spawn_shell(TermSize::new(100, 30));
+    let dump = |e: &TerminalEmulator| e.visible_lines().join("\n");
+    let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        e.visible_lines().iter().any(|l| !l.trim().is_empty())
+    });
+    assert!(ready, "shell 20s 内没有任何输出");
+
+    // 标记串是算出来的:回显里只有算式,grid 里出现整串只能是命令的输出
+    const MARK: &str = "MT_SYNC_1234";
+    #[cfg(windows)]
+    let command = "[Console]::Out.Write(\"$([char]27)[?2026hMT_SYNC_\" + (1000 + 234))\r";
+    #[cfg(not(windows))]
+    let command = "printf '\\033[?2026hMT_SYNC_%d' $((1000 + 234))\r";
+    pty.write(command.as_bytes()).expect("写 PTY 失败");
+
+    let settled = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        e.sync_deadline().is_some() || lines_with(e, MARK) > 0
+    });
+    assert!(
+        settled,
+        "20s 内命令没有结果,grid 现状:\n{}",
+        dump(&emulator)
+    );
+    let Some(deadline) = emulator.sync_deadline() else {
+        // 旧版系统 conhost 自己解析 VT 再重新渲染,认不得的 ?2026 到不了这一层:这种后端
+        // 上不会假死,没东西可测(CI 的 Windows runner 可能就是它)
+        if !cfg!(windows) {
+            panic!("PTY 不该吞转义序列");
+        }
+        eprintln!("[smoke] 这个 ConPTY 把同步块吞了,跳过");
+        let _ = pty.kill();
+        return;
+    };
+    assert_eq!(lines_with(&emulator, MARK), 0, "同步块里的字节不该上屏");
+
+    // 假死的样子:过了 deadline 没人释放,输出照旧出不来,敲的命令连回显都没有
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()) * 2);
+    assert_eq!(lines_with(&emulator, MARK), 0, "到期不会自己释放");
+    const DURING: &str = "MT_SYNC_DURING_55";
+    pty.write(format!("echo {DURING}\r").as_bytes())
+        .expect("写 PTY 失败");
+    let leaked = pump_until(&emulator, &pty, Duration::from_millis(300), |e| {
+        lines_with(e, DURING) > 0
+    });
+    assert!(!leaked, "还没释放,回显不该上屏:\n{}", dump(&emulator));
+
+    // 释放:攒下的内容一起出来(DURING 回显与输出各一行)
+    assert!(
+        release_when_due(&emulator, &pty, Duration::from_secs(5)),
+        "同步块一直没到期"
+    );
+    let shown = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        lines_with(e, MARK) > 0 && lines_with(e, DURING) >= 2
+    });
+    assert!(shown, "释放之后内容没上屏,grid 现状:\n{}", dump(&emulator));
+
+    // 释放之后 shell 是活的,回显与输出直接上屏,不用再释放
+    const AFTER: &str = "MT_SYNC_AFTER_77";
+    pty.write(format!("echo {AFTER}\r").as_bytes())
+        .expect("写 PTY 失败");
+    let alive = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        lines_with(e, AFTER) >= 2
+    });
+    assert!(
+        alive,
+        "释放之后敲命令没有回显,grid 现状:\n{}",
+        dump(&emulator)
+    );
+    assert_eq!(emulator.sync_deadline(), None);
 
     let _ = pty.kill();
 }

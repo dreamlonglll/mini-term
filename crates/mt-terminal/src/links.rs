@@ -1,16 +1,33 @@
-//! 终端输出里的文件路径识别 —— 按住 Ctrl(macOS 上 ⌘)悬停 / 单击打开文件用。
+//! 终端输出里的链接识别 —— 按住 Ctrl(macOS 上 ⌘)悬停 / 单击打开文件或网址用。
 //!
-//! 两件纯逻辑,都不碰 gpui:
+//! 全是纯逻辑,都不碰 gpui:
 //!
 //! - [`TerminalEmulator::logical_line_at`] 顺着软换行(`WRAPLINE`)把被终端折开的
 //!   几段物理行拼回一整行,每个字符记住自己落在哪一格 —— 长路径被折成两行时照样
 //!   认得出,下划线也能跨行画。
 //! - [`path_candidates`] 在一行里找「鼠标所在那个字符」所属的路径片段,把
 //!   `:行:列` / `(行,列)` / `#L行` / Python 的 `", line N` 这些行号写法一并拆出来。
+//! - [`TerminalEmulator::url_at`] 回答鼠标底下有没有网址,见下面「网址」一节。
 //!
-//! 这里**只看形状**。存不存在、在不在项目里、相对路径对着哪个目录解析,全是宿主的事
+//! 路径这边**只看形状**。存不存在、在不在项目里、相对路径对着哪个目录解析,全是宿主的事
 //! (mt-app 的 `terminal_links`)—— 所以给出的是一串候选(最像的排在前面),宿主
 //! 挨个去盘上验,第一个成立的才算链接。入口是 [`TerminalEmulator::path_candidates_at`]。
+//!
+//! # 网址
+//!
+//! 两个来源,**OSC 8 优先**:
+//!
+//! - **OSC 8**(`ESC]8;;URI ESC\ 文字 ESC]8;; ESC\`):目标是程序明说的,落在 cell 上
+//!   ([`Cell::hyperlink`])。只开 http / https。别的 scheme(`file:`、`javascript:`……)
+//!   不亮不开,也不再把它的显示文字当网址认 —— 文字与目标对不上正是伪装的样子;文字
+//!   要是像项目里的文件路径,照旧走上面那条验盘的路(`ls --hyperlink` 这类程序给路径
+//!   包的 `file:` 链接,不能因此把原有的文件链接弄没了)。
+//! - **普通文本**([`url_candidate`]):认 `http://` / `https://` 开头、不含非 ASCII 字符的
+//!   一段,边界口径见那边。与路径互不抢:路径识别遇到带 scheme 的片段一律不给候选
+//!   (`file://` 除外,而网址这边不认 `file://`)。
+//!
+//! OSC 8 的显示文字可以写成任何样子,所以 [`UrlLink::from_osc8`] 为真时宿主必须把真实
+//! 目标亮给人看。
 //!
 //! # 硬换行:TUI 自己折开的路径
 //!
@@ -28,12 +45,16 @@
 //! 没接的照样垫底 —— 散文在词边界被折开(`…the file` / `src/a.ts`)时接出来的
 //! `filesrc/a.ts` 盘上不存在,宿主自然落到没接的那个。一行一个路径的短列表不贴右边缘,
 //! 不会被接。
+//!
+//! 网址复用同一套走法,但**没有盘可验**,接错就是开错页面,所以判据收得更紧(见
+//! [`URL_WRAP`]):行尾要真贴着右边缘,下一行开头还得像网址的后半截。
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use alacritty_terminal::grid::{Dimensions as _, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 
 use crate::TerminalEmulator;
 
@@ -41,12 +62,47 @@ use crate::TerminalEmulator;
 const MAX_WRAPPED_ROWS: i32 = 16;
 /// 往上 / 往下各最多接几段 TUI 自己折开的行(硬换行)。
 const MAX_HARD_WRAP_ROWS: usize = 2;
+/// 网址的版本:登录链接这类长网址在 80 列里能折成好几行,而每一行都要过 [`URL_WRAP`]
+/// 那道判据,多看几行不会多接错。
+const MAX_URL_HARD_WRAP_ROWS: usize = 8;
 /// 行尾离右边缘不超过这么多列,才算「写满了、被 TUI 折到下一行」。
 ///
 /// 留的是 TUI 的右边距(Claude Code 一两列)与「宽字符放不下、行尾空一格」。
 const HARD_WRAP_EDGE_SLACK: usize = 6;
+/// 网址的版本:只留 TUI 右边距那一两列。接错没有盘上校验兜底,宁可少接。
+const URL_HARD_WRAP_EDGE_SLACK: usize = 2;
 /// 认作路径的片段最多多少个字符。超了直接不认,免得在一整屏 base64 上逐字扫。
 const MAX_PATH_CHARS: usize = 1024;
+/// 认作网址的片段最多多少个字符(OSC 8 给的目标同样受这个限)。
+const MAX_URL_CHARS: usize = 2048;
+/// alacritty 给没写 `id=` 的 OSC 8 链接自动生成的 id 的后缀(`cell.rs` 的 `HyperlinkInner`)。
+const AUTO_LINK_ID_SUFFIX: &str = "_alacritty";
+
+/// 硬换行怎么接:路径与网址同一套走法,只有判据不同。
+struct HardWrapRule {
+    /// 接缝两侧该是哪类字符。
+    is_char: fn(char) -> bool,
+    /// 行尾离右边缘不超过这么多列才算写满了。
+    edge_slack: usize,
+    /// 这一行开头(去掉缩进)像不像上一行被折下来的后半截。
+    continues: fn(&LogicalLine) -> bool,
+    /// 往上 / 往下各最多接几段。
+    max_rows: usize,
+}
+
+const PATH_WRAP: HardWrapRule = HardWrapRule {
+    is_char: is_path_char,
+    edge_slack: HARD_WRAP_EDGE_SLACK,
+    continues: LogicalLine::starts_with_path_char,
+    max_rows: MAX_HARD_WRAP_ROWS,
+};
+
+const URL_WRAP: HardWrapRule = HardWrapRule {
+    is_char: is_url_char,
+    edge_slack: URL_HARD_WRAP_EDGE_SLACK,
+    continues: LogicalLine::looks_like_url_tail,
+    max_rows: MAX_URL_HARD_WRAP_ROWS,
+};
 
 /// 逻辑行里一个字符落在哪一格。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,22 +138,53 @@ impl LogicalLine {
         Some((first, last))
     }
 
-    /// 内容写到了最后一个物理行的右边缘附近、收尾是路径字符 —— 像是被 TUI 折下去了。
-    fn runs_to_edge(&self, columns: usize) -> bool {
+    /// 内容写到了最后一个物理行的右边缘附近、收尾是接得上的字符 —— 像是被 TUI 折下去了。
+    fn runs_to_edge(&self, columns: usize, rule: &HardWrapRule) -> bool {
         let Some((_, last)) = self.content_bounds() else {
             return false;
         };
         let cell = self.cells[last];
         let end = cell.column + if cell.wide { 2 } else { 1 };
         self.cells.last().is_some_and(|tail| tail.line == cell.line)
-            && end + HARD_WRAP_EDGE_SLACK >= columns
-            && is_path_char(self.chars[last])
+            && end + rule.edge_slack >= columns
+            && (rule.is_char)(self.chars[last])
     }
 
     /// 去掉缩进之后以路径字符开头 —— 可能是上一行被 TUI 折下来的后半截。
     fn starts_with_path_char(&self) -> bool {
         self.content_bounds()
             .is_some_and(|(first, _)| is_path_char(self.chars[first]))
+    }
+
+    /// 去掉缩进之后开头那个词像网址的后半截。
+    ///
+    /// 散文在词边界被折行时下一行开头是普通单词(`and`),网址没有盘可验,接上去就是
+    /// 开错页面,所以光「是网址字符」不够:要带数字或网址的结构字符;或者它独占这一行
+    /// (长网址最后一截经常是几个字母)。自带 scheme 的是下一条网址,不是后半截。
+    fn looks_like_url_tail(&self) -> bool {
+        let Some((first, _)) = self.content_bounds() else {
+            return false;
+        };
+        let end = (first..self.chars.len())
+            .find(|&i| !is_url_char(self.chars[i]))
+            .unwrap_or(self.chars.len());
+        let word = &self.chars[first..end];
+        if scheme_len_at(word, 0).is_some() {
+            return false;
+        }
+        let trimmed = word.len() - trailing_url_punct(word);
+        if trimmed == 0 {
+            return false;
+        }
+        let alone = trimmed == word.len() && self.chars[end..].iter().all(|c| c.is_whitespace());
+        alone
+            || word[..trimmed].iter().any(|c| {
+                c.is_ascii_digit()
+                    || matches!(
+                        c,
+                        '/' | '?' | '=' | '&' | '%' | '#' | '-' | '_' | '.' | '~' | '+' | ':' | '@'
+                    )
+            })
     }
 
     fn top_line(&self) -> Option<i32> {
@@ -132,7 +219,6 @@ impl TerminalEmulator {
     ) -> Option<(LogicalLine, Vec<PathCandidate>)> {
         let term = self.term.lock();
         let grid = term.grid();
-        let columns = grid.columns();
         let current = logical_line(grid, line)?;
         let index = current.index_at(line, column)?;
         // 鼠标不在路径字符上就不必往上下找了。反过来不成立:`:20` 这种只剩行号的
@@ -142,87 +228,164 @@ impl TerminalEmulator {
         }
         let plain = path_candidates(&current.chars, index);
 
-        // 往上:当前行以路径字符开头,上一行写满且以路径字符收尾
-        let mut before: Vec<LogicalLine> = Vec::new();
-        let mut head = current.top_line()?;
-        let mut head_continues = current.starts_with_path_char();
-        while head_continues && before.len() < MAX_HARD_WRAP_ROWS {
-            let Some(prev) = logical_line(grid, head - 1) else {
-                break;
-            };
-            if !prev.runs_to_edge(columns) {
-                break;
-            }
-            head = prev.top_line()?;
-            head_continues = prev.starts_with_path_char();
-            before.push(prev);
-        }
-        // 往下:当前行写满且以路径字符收尾,下一行以路径字符开头
-        let mut after: Vec<LogicalLine> = Vec::new();
-        let mut tail = current.bottom_line()?;
-        let mut tail_continues = current.runs_to_edge(columns);
-        while tail_continues && after.len() < MAX_HARD_WRAP_ROWS {
-            let Some(next) = logical_line(grid, tail + 1) else {
-                break;
-            };
-            if !next.starts_with_path_char() {
-                break;
-            }
-            tail = next.bottom_line()?;
-            tail_continues = next.runs_to_edge(columns);
-            after.push(next);
-        }
+        let (before, after) = hard_wrap_neighbors(grid, &current, &PATH_WRAP)?;
         drop(term);
-        if before.is_empty() && after.is_empty() {
+        let Some(joined) = join_hard_wrapped(&current, &before, &after, index) else {
             return Some((current, plain));
-        }
-
-        // 拼:接缝两侧的空白都去掉 —— 上一行的行尾空白、下一行 TUI 补的对齐缩进
-        let mut joined = LogicalLine::default();
-        for prev in before.iter().rev() {
-            let (first, last) = prev.content_bounds()?;
-            joined.push_slice(prev, first..last + 1);
-        }
-        let (cur_first, cur_last) = current.content_bounds()?;
-        let cur_from = if before.is_empty() { 0 } else { cur_first };
-        let cur_to = if after.is_empty() {
-            current.chars.len()
-        } else {
-            cur_last + 1
         };
-        if !(cur_from..cur_to).contains(&index) {
-            return Some((current, plain));
-        }
-        let offset = joined.chars.len();
-        joined.push_slice(&current, cur_from..cur_to);
-        let cur_end = joined.chars.len();
-        for (i, next) in after.iter().enumerate() {
-            let (first, last) = next.content_bounds()?;
-            let to = if i + 1 == after.len() {
-                next.chars.len()
-            } else {
-                last + 1
-            };
-            joined.push_slice(next, first..to);
-        }
 
-        let shift = |i: usize| offset + i - cur_from;
         // 接上的只留真跨过接缝的;没跨的与「没接」那份重复
-        let mut out: Vec<PathCandidate> = path_candidates(&joined.chars, shift(index))
+        let mut out: Vec<PathCandidate> = path_candidates(&joined.line.chars, joined.shift(index))
             .into_iter()
-            .filter(|cand| cand.range.start < offset || cand.range.end > cur_end)
+            .filter(|cand| {
+                cand.range.start < joined.current.start || cand.range.end > joined.current.end
+            })
             .collect();
         for cand in plain {
             let shifted = PathCandidate {
-                range: shift(cand.range.start)..shift(cand.range.end),
+                range: joined.shift(cand.range.start)..joined.shift(cand.range.end),
                 ..cand
             };
             if !out.contains(&shifted) {
                 out.push(shifted);
             }
         }
-        Some((joined, out))
+        Some((joined.line, out))
     }
+
+    /// 鼠标对着 grid 的 `(line, column)` 时底下的网址(口径见模块注释「网址」)。
+    ///
+    /// `None` 不等于这里没有链接:OSC 8 的非 http(s) 目标、以及普通的文件路径都归
+    /// [`Self::path_candidates_at`] 那条路接着认。
+    pub fn url_at(&self, line: i32, column: usize) -> Option<UrlLink> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        if let Some(link) = hyperlink_at(grid, line, column) {
+            if !is_web_url(link.uri()) {
+                return None;
+            }
+            return Some(UrlLink {
+                url: link.uri().to_string(),
+                cells: hyperlink_cells(grid, line, column, &link),
+                from_osc8: true,
+            });
+        }
+        let current = logical_line(grid, line)?;
+        let index = current.index_at(line, column)?;
+        if !current.chars.get(index).is_some_and(|&c| is_url_char(c)) {
+            return None;
+        }
+        let (before, after) = hard_wrap_neighbors(grid, &current, &URL_WRAP)?;
+        drop(term);
+        // 接得上就先按接好的认:网址贴着接缝时这才是完整的。接缝附近没有网址
+        // (上一行末尾只是个碰巧贴边的词)时落回当前行自己
+        join_hard_wrapped(&current, &before, &after, index)
+            .and_then(|joined| plain_url_link(&joined.line, joined.shift(index)))
+            .or_else(|| plain_url_link(&current, index))
+    }
+}
+
+/// 顺着 TUI 硬换行找 `current` 上下接得上的行,上面的由近及远。
+fn hard_wrap_neighbors(
+    grid: &Grid<Cell>,
+    current: &LogicalLine,
+    rule: &HardWrapRule,
+) -> Option<(Vec<LogicalLine>, Vec<LogicalLine>)> {
+    let columns = grid.columns();
+    // 往上:当前行开头接得上,上一行写满且以接得上的字符收尾
+    let mut before: Vec<LogicalLine> = Vec::new();
+    let mut head = current.top_line()?;
+    let mut head_continues = (rule.continues)(current);
+    while head_continues && before.len() < rule.max_rows {
+        let Some(prev) = logical_line(grid, head - 1) else {
+            break;
+        };
+        if !prev.runs_to_edge(columns, rule) {
+            break;
+        }
+        head = prev.top_line()?;
+        head_continues = (rule.continues)(&prev);
+        before.push(prev);
+    }
+    // 往下:当前行写满且以接得上的字符收尾,下一行开头接得上
+    let mut after: Vec<LogicalLine> = Vec::new();
+    let mut tail = current.bottom_line()?;
+    let mut tail_continues = current.runs_to_edge(columns, rule);
+    while tail_continues && after.len() < rule.max_rows {
+        let Some(next) = logical_line(grid, tail + 1) else {
+            break;
+        };
+        if !(rule.continues)(&next) {
+            break;
+        }
+        tail = next.bottom_line()?;
+        tail_continues = next.runs_to_edge(columns, rule);
+        after.push(next);
+    }
+    Some((before, after))
+}
+
+/// 接好的一整条,以及当前行落在里面的哪一截。
+struct HardWrapJoin {
+    line: LogicalLine,
+    /// 当前行在 `line` 里占的下标区间。
+    current: Range<usize>,
+    /// 当前行从第几个字符开始接进来的(前面的缩进被剥掉了)。
+    from: usize,
+}
+
+impl HardWrapJoin {
+    /// 当前行的字符下标 → `line` 里的下标。
+    fn shift(&self, index: usize) -> usize {
+        self.current.start + index - self.from
+    }
+}
+
+/// 把 [`hard_wrap_neighbors`] 找到的行拼成一条。没东西可接、或鼠标正落在拼接时要剥掉
+/// 的空白上,返回 `None`。
+///
+/// 接缝两侧的空白都去掉 —— 上一行的行尾空白、下一行 TUI 补的对齐缩进。
+fn join_hard_wrapped(
+    current: &LogicalLine,
+    before: &[LogicalLine],
+    after: &[LogicalLine],
+    index: usize,
+) -> Option<HardWrapJoin> {
+    if before.is_empty() && after.is_empty() {
+        return None;
+    }
+    let mut joined = LogicalLine::default();
+    for prev in before.iter().rev() {
+        let (first, last) = prev.content_bounds()?;
+        joined.push_slice(prev, first..last + 1);
+    }
+    let (cur_first, cur_last) = current.content_bounds()?;
+    let cur_from = if before.is_empty() { 0 } else { cur_first };
+    let cur_to = if after.is_empty() {
+        current.chars.len()
+    } else {
+        cur_last + 1
+    };
+    if !(cur_from..cur_to).contains(&index) {
+        return None;
+    }
+    let offset = joined.chars.len();
+    joined.push_slice(current, cur_from..cur_to);
+    let cur_end = joined.chars.len();
+    for (i, next) in after.iter().enumerate() {
+        let (first, last) = next.content_bounds()?;
+        let to = if i + 1 == after.len() {
+            next.chars.len()
+        } else {
+            last + 1
+        };
+        joined.push_slice(next, first..to);
+    }
+    Some(HardWrapJoin {
+        line: joined,
+        current: offset..cur_end,
+        from: cur_from,
+    })
 }
 
 /// `line` 所在的整条逻辑行(顺着 `WRAPLINE` 往上下拼)。行号越界返回 `None`。
@@ -453,6 +616,311 @@ fn find_seq(haystack: &[char], needle: &[char]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+// ── 网址 ───────────────────────────────────────────────────────────────────────
+
+/// 鼠标底下的网址。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrlLink {
+    /// 要交给浏览器的目标。普通文本就是那段文字本身,OSC 8 是程序给的 URI,原样不动。
+    pub url: String,
+    /// 下划线该盖住的格子,按阅读顺序。
+    pub cells: Vec<LineCell>,
+    /// 来自 OSC 8:显示的文字可以与目标毫不相干,宿主必须把 [`Self::url`] 亮给人看。
+    pub from_osc8: bool,
+}
+
+/// 能出现在普通文本网址里的字符:可见 ASCII,去掉 RFC 3986 不允许裸写、终端里又常
+/// 贴着网址的几个(引号、尖括号、反引号、反斜杠、竖线、`^`)。
+///
+/// 只认 ASCII 是刻意的:中文标点、汉字、Claude Code 的 `│` 边框紧贴在网址后面是常态,
+/// 而真要带非 ASCII 字符的网址在终端里本来就该是编码过的。
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '"' | '<' | '>' | '\\' | '^' | '`' | '|')
+}
+
+/// `chars[at..]` 以 `http://` / `https://` 开头(不分大小写)时返回这段的长度。
+fn scheme_len_at(chars: &[char], at: usize) -> Option<usize> {
+    const HTTP: [char; 4] = ['h', 't', 't', 'p'];
+    const SEPARATOR: [char; 3] = [':', '/', '/'];
+    let rest = chars.get(at..)?;
+    if rest.len() < HTTP.len()
+        || !rest
+            .iter()
+            .zip(HTTP)
+            .all(|(c, want)| c.eq_ignore_ascii_case(&want))
+    {
+        return None;
+    }
+    let tls = rest
+        .get(HTTP.len())
+        .is_some_and(|c| c.eq_ignore_ascii_case(&'s'));
+    let prefix = HTTP.len() + usize::from(tls);
+    rest.get(prefix..prefix + SEPARATOR.len())
+        .is_some_and(|sep| sep == SEPARATOR)
+        .then_some(prefix + SEPARATOR.len())
+}
+
+/// `at` 处真是一个 scheme 的开头:前一个字符不是 scheme 的合法字符。
+/// `xhttp://`、`git+https://` 是别的 scheme,不算。
+fn at_scheme_start(chars: &[char], at: usize) -> bool {
+    at == 0 || !(chars[at - 1].is_ascii_alphanumeric() || matches!(chars[at - 1], '+' | '-' | '.'))
+}
+
+/// 从 `start`(scheme 之后)往后走到网址的原始结尾,不超过 `limit`。
+///
+/// 遇到没有配对的右括号就停:`(见 https://a.com)`、`[t](https://a.com)` 里的 `)` 不属于
+/// 网址,而 `wiki/Foo_(bar)` 的成对括号属于。分隔符后紧跟新的 scheme 也停 —— 两条网址
+/// 连写;`?to=https://…` 这种查询参数里的网址前面是 `=`,不在此列。
+fn url_end(chars: &[char], start: usize, limit: usize) -> usize {
+    let mut depth = [0usize; 3];
+    let mut i = start;
+    while i < limit {
+        let c = chars[i];
+        if matches!(c, ',' | ';') && scheme_len_at(&chars[..limit], i + 1).is_some() {
+            break;
+        }
+        match c {
+            '(' => depth[0] += 1,
+            '[' => depth[1] += 1,
+            '{' => depth[2] += 1,
+            ')' | ']' | '}' => {
+                let open = match c {
+                    ')' => 0,
+                    ']' => 1,
+                    _ => 2,
+                };
+                if depth[open] == 0 {
+                    break;
+                }
+                depth[open] -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// 网址尾巴上有多少个字符不算网址:句末标点、Markdown 的粗体星号、没配对的单引号、
+/// 半边左括号。没配对的右括号在 [`url_end`] 就停了,`"` `>` 根本不是网址字符。
+fn trailing_url_punct(text: &[char]) -> usize {
+    let mut end = text.len();
+    while end > 0 {
+        let strip = match text[end - 1] {
+            '.' | ',' | ';' | ':' | '!' | '?' | '*' | '(' | '[' | '{' => true,
+            '\'' => text[..end].iter().filter(|&&c| c == '\'').count() % 2 == 1,
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
+        end -= 1;
+    }
+    text.len() - end
+}
+
+/// 鼠标对着 `chars[index]` 时,它所在的网址占哪几个字符。不在网址上是 `None`。
+///
+/// 边界:scheme 只认 http / https;非 ASCII 字符一律终止(中文标点紧贴在网址后面时只取到
+/// 标点之前);尾部的 `.,;:!?` 与没配对的 `)]}>'"` 不算;成对括号保留(`wiki/Foo_(bar)`)。
+/// 整段连续的网址字符超过 [`MAX_URL_CHARS`] 直接不认,免得在一整屏 base64 上逐字扫。
+pub fn url_candidate(chars: &[char], index: usize) -> Option<Range<usize>> {
+    if !chars.get(index).is_some_and(|&c| is_url_char(c)) {
+        return None;
+    }
+    let mut run_start = index;
+    while run_start > 0 && is_url_char(chars[run_start - 1]) {
+        run_start -= 1;
+        if index - run_start > MAX_URL_CHARS {
+            return None;
+        }
+    }
+    let mut run_end = index + 1;
+    while run_end < chars.len() && is_url_char(chars[run_end]) {
+        run_end += 1;
+        if run_end - run_start > MAX_URL_CHARS {
+            return None;
+        }
+    }
+    // 从左往右切:查询参数里还带着网址时,鼠标在后半截也得是外面那条
+    let mut pos = run_start;
+    while pos < run_end {
+        let start = (pos..run_end).find(|&i| {
+            scheme_len_at(&chars[..run_end], i).is_some() && at_scheme_start(chars, i)
+        })?;
+        if start > index {
+            return None;
+        }
+        let authority = start + scheme_len_at(&chars[..run_end], start)?;
+        let end = url_end(chars, authority, run_end);
+        if index < end {
+            let end = end - trailing_url_punct(&chars[authority..end]);
+            let has_host = end > authority
+                && (chars[authority].is_ascii_alphanumeric() || chars[authority] == '[');
+            return (has_host && index < end).then_some(start..end);
+        }
+        pos = end;
+    }
+    None
+}
+
+/// `line` 里鼠标对着第 `index` 个字符时的普通文本网址。
+fn plain_url_link(line: &LogicalLine, index: usize) -> Option<UrlLink> {
+    let range = url_candidate(&line.chars, index)?;
+    Some(UrlLink {
+        url: line.chars[range.clone()].iter().collect(),
+        cells: line.cells[range].to_vec(),
+        from_osc8: false,
+    })
+}
+
+/// OSC 8 的目标能不能交给浏览器:只认 http / https,不超长,带了主机;不含空白、控制
+/// 字符、不可见的格式字符(方向覆盖、零宽字符 —— 它们能让气泡里显示的与实际打开的
+/// 不是一回事),ASCII 部分还要过 [`is_url_char`]。
+pub fn is_web_url(url: &str) -> bool {
+    let chars: Vec<char> = url.chars().collect();
+    let Some(authority) = scheme_len_at(&chars, 0) else {
+        return false;
+    };
+    chars.len() <= MAX_URL_CHARS
+        && chars
+            .get(authority)
+            .is_some_and(|&c| c.is_alphanumeric() || c == '[')
+        && chars.iter().all(|&c| {
+            if c.is_ascii() {
+                is_url_char(c)
+            } else {
+                !c.is_whitespace() && !c.is_control() && !is_invisible_format(c)
+            }
+        })
+}
+
+/// 不可见的 Unicode 格式字符。
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// `(line, column)` 那一格的 OSC 8 链接。越界或没有都是 `None`。
+fn hyperlink_at(grid: &Grid<Cell>, line: i32, column: usize) -> Option<Hyperlink> {
+    let top = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    if line < top || line > bottom || column >= grid.columns() {
+        return None;
+    }
+    grid[Line(line)][Column(column)].hyperlink()
+}
+
+/// 一条 OSC 8 链接占的所有格子,按阅读顺序。上下各最多看 [`MAX_WRAPPED_ROWS`] 行。
+///
+/// - **写了 `id=`**:同 id 同 URI 的格子不管隔多远都是一条(OSC 8 规范的本意,程序分段
+///   输出、中间隔着别的内容时就靠它);
+/// - **没写**:alacritty 给每次 OSC 8 各发一个 id,TUI 自己换行时一条链接的每段 id
+///   都不同,只能看位置 —— 同一 URI 的格子连续、跨行时只隔着行尾与行首的空白才算一条。
+fn hyperlink_cells(grid: &Grid<Cell>, line: i32, column: usize, link: &Hyperlink) -> Vec<LineCell> {
+    let columns = grid.columns();
+    let top = (line - MAX_WRAPPED_ROWS).max(-(grid.history_size() as i32));
+    let bottom = (line + MAX_WRAPPED_ROWS).min(grid.screen_lines() as i32 - 1);
+    let auto_id = link.id().ends_with(AUTO_LINK_ID_SUFFIX);
+    let same = |cell: &Cell| {
+        cell.hyperlink().is_some_and(|other| {
+            if auto_id {
+                other.uri() == link.uri()
+            } else {
+                other == *link
+            }
+        })
+    };
+    let rows: VecDeque<(i32, Range<usize>)> = if auto_id {
+        adjacent_runs(grid, (line, column), top..=bottom, &same)
+    } else {
+        (top..=bottom).map(|l| (l, 0..columns)).collect()
+    };
+    let mut out = Vec::new();
+    for (l, range) in rows {
+        let row = &grid[Line(l)];
+        for col in range {
+            let cell = &row[Column(col)];
+            let spacer = cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            if !spacer && same(cell) {
+                out.push(LineCell {
+                    line: l,
+                    column: col,
+                    wide: cell.flags.contains(Flags::WIDE_CHAR),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 从 `(line, column)` 那一段往上下走,跨行时只容忍行尾与行首的空白。
+fn adjacent_runs(
+    grid: &Grid<Cell>,
+    (line, column): (i32, usize),
+    rows: std::ops::RangeInclusive<i32>,
+    same: &dyn Fn(&Cell) -> bool,
+) -> VecDeque<(i32, Range<usize>)> {
+    let columns = grid.columns();
+    // 空格且不属于任何链接。宽字符的 spacer 也是空格,但它是内容
+    let blank = |cell: &Cell| {
+        cell.c == ' ' && cell.hyperlink().is_none() && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+    };
+    let run_at = |l: i32, col: usize| {
+        let row = &grid[Line(l)];
+        let mut start = col;
+        while start > 0 && same(&row[Column(start - 1)]) {
+            start -= 1;
+        }
+        let mut end = col + 1;
+        while end < columns && same(&row[Column(end)]) {
+            end += 1;
+        }
+        start..end
+    };
+    let first = run_at(line, column);
+    let (mut up, mut up_start) = (line, first.start);
+    let (mut down, mut down_end) = (line, first.end);
+    let mut out = VecDeque::from([(line, first)]);
+    while up > *rows.start() && (0..up_start).all(|c| blank(&grid[Line(up)][Column(c)])) {
+        let prev = &grid[Line(up - 1)];
+        let Some(last) = (0..columns).rev().find(|&c| !blank(&prev[Column(c)])) else {
+            break;
+        };
+        if !same(&prev[Column(last)]) {
+            break;
+        }
+        let run = run_at(up - 1, last);
+        up -= 1;
+        up_start = run.start;
+        out.push_front((up, run));
+    }
+    while down < *rows.end() && (down_end..columns).all(|c| blank(&grid[Line(down)][Column(c)])) {
+        let next = &grid[Line(down + 1)];
+        let Some(first) = (0..columns).find(|&c| !blank(&next[Column(c)])) else {
+            break;
+        };
+        if !same(&next[Column(first)]) {
+            break;
+        }
+        let run = run_at(down + 1, first);
+        down += 1;
+        down_end = run.end;
+        out.push_back((down, run));
+    }
+    out
 }
 
 /// 连续数字 → 数值。`0` 当没写(行号从 1 起)。
@@ -926,5 +1394,494 @@ mod tests {
         // 宽字符之后的列号照实记(空格在第 2 列,a 在第 3 列)
         assert_eq!(line.index_at(0, 3), Some(2));
         assert_eq!(line.chars[2], 'a');
+    }
+
+    // ── 普通文本里的网址 ───────────────────────────────────────────────────────
+
+    /// 鼠标对着 `needle` 第一个字符时认出的网址。
+    fn url_in(text: &str, needle: &str) -> Option<String> {
+        let chars = chars(text);
+        let byte = text.find(needle).expect("needle 不在文本里");
+        let index = text[..byte].chars().count();
+        url_candidate(&chars, index).map(|range| chars[range].iter().collect())
+    }
+
+    #[test]
+    fn 网址的基本形状() {
+        for url in [
+            "https://example.com",
+            "http://example.com/a/b.html?x=1&y=2#frag",
+            "https://example.com:8443/a_b-c~d%20e",
+            "http://localhost:3000/x",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080/a",
+            "HTTPS://EXAMPLE.COM/A",
+            "https://user:pw@example.com/",
+        ] {
+            let text = format!("see {url} now");
+            assert_eq!(url_in(&text, url).as_deref(), Some(url));
+            // 鼠标在网址尾部同样认得出整条
+            let last = url.chars().last().unwrap().to_string();
+            let tail = text.rfind(&format!("{last} now")).unwrap();
+            let chars = chars(&text);
+            let index = text[..tail].chars().count();
+            let range = url_candidate(&chars, index).expect("网址尾部");
+            assert_eq!(chars[range].iter().collect::<String>(), url);
+        }
+    }
+
+    #[test]
+    fn 只认_http_与_https() {
+        for text in [
+            "ftp://example.com/a",
+            "file:///D:/proj/a.ts",
+            "javascript:alert(1)",
+            "ssh://git@github.com/a/b",
+            "git+https://github.com/a/b",
+            "xhttps://example.com",
+            "http-https://example.com",
+            "www.example.com",
+        ] {
+            let chars = chars(text);
+            assert_eq!(url_candidate(&chars, 0), None, "{text}");
+            assert_eq!(url_candidate(&chars, chars.len() - 1), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn 没有主机的不算网址() {
+        assert_eq!(url_in("https://", "h"), None);
+        assert_eq!(url_in("https://.", "h"), None);
+        assert_eq!(url_in("https:///etc/passwd", "h"), None);
+        assert_eq!(url_in("https://?x=1", "h"), None);
+        assert_eq!(url_in("https:/a.com", "h"), None);
+    }
+
+    #[test]
+    fn 尾部标点不算网址() {
+        for tail in [
+            ".", ",", ";", ":", "!", "?", "...", "?!", ",.", "**", "):", ");",
+        ] {
+            let text = format!("(see https://example.com/a{tail}");
+            assert_eq!(
+                url_in(&text, "https").as_deref(),
+                Some("https://example.com/a"),
+                "{tail}"
+            );
+        }
+        // 鼠标停在尾部标点上不亮
+        assert_eq!(
+            url_in("https://example.com.", "."),
+            Some("https://example.com".into())
+        );
+        let text = chars("https://example.com.");
+        assert_eq!(url_candidate(&text, text.len() - 1), None);
+        // 中段的标点属于网址
+        assert_eq!(
+            url_in("https://example.com/a.b,c;d:e!f?g", "h").as_deref(),
+            Some("https://example.com/a.b,c;d:e!f?g")
+        );
+    }
+
+    #[test]
+    fn 没配对的括号与引号不算网址() {
+        for (text, expected) in [
+            ("(https://a.com)", "https://a.com"),
+            ("[https://a.com]", "https://a.com"),
+            ("{https://a.com}", "https://a.com"),
+            ("<https://a.com>", "https://a.com"),
+            ("'https://a.com'", "https://a.com"),
+            ("\"https://a.com\"", "https://a.com"),
+            ("`https://a.com`", "https://a.com"),
+            ("**https://a.com**", "https://a.com"),
+            ("[文档](https://a.com/x)", "https://a.com/x"),
+            ("(见 https://a.com/x).", "https://a.com/x"),
+            ("'https://a.com/x',", "https://a.com/x"),
+            ("https://a.com/x)y", "https://a.com/x"),
+            ("https://a.com/x(", "https://a.com/x"),
+            ("│ https://a.com │", "https://a.com"),
+        ] {
+            assert_eq!(url_in(text, "https").as_deref(), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn 成对的括号保留() {
+        for url in [
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "https://a.com/x[1]/y",
+            "https://a.com/{id}",
+            "https://a.com/'x'",
+        ] {
+            assert_eq!(url_in(url, "https").as_deref(), Some(url));
+        }
+        // 外面还包着一层时只剥外层
+        assert_eq!(
+            url_in("(https://en.wikipedia.org/wiki/Foo_(bar))", "https").as_deref(),
+            Some("https://en.wikipedia.org/wiki/Foo_(bar)")
+        );
+        assert_eq!(
+            url_in("[w](https://en.wikipedia.org/wiki/Foo_(bar)).", "https").as_deref(),
+            Some("https://en.wikipedia.org/wiki/Foo_(bar)")
+        );
+    }
+
+    #[test]
+    fn 非_ascii_字符终止网址() {
+        // U+FF0C 全角逗号。写成转义免得被编辑器换成半角,那样这条就测不到了
+        const TEXT: &str = "访问https://a.com\u{FF0C}然后";
+        assert_eq!(url_in(TEXT, "https").as_deref(), Some("https://a.com"));
+        assert_eq!(url_in(TEXT, ".com").as_deref(), Some("https://a.com"));
+        assert_eq!(url_in(TEXT, "访问"), None);
+        assert_eq!(url_in(TEXT, "然后"), None);
+        assert_eq!(
+            url_in("https://a.com/路径/x", "https").as_deref(),
+            Some("https://a.com/")
+        );
+        assert_eq!(url_in("https://a.com/路径/x", "x"), None);
+        assert_eq!(
+            url_in("见「https://a.com」。", "https").as_deref(),
+            Some("https://a.com")
+        );
+    }
+
+    #[test]
+    fn 两条网址连写与查询参数里的网址() {
+        let text = "https://a.com,https://b.com;https://c.com";
+        assert_eq!(url_in(text, "a.com").as_deref(), Some("https://a.com"));
+        assert_eq!(url_in(text, "b.com").as_deref(), Some("https://b.com"));
+        assert_eq!(url_in(text, "c.com").as_deref(), Some("https://c.com"));
+        // 查询参数里的网址是外面那条的一部分,鼠标停在哪半截都一样
+        let text = "https://a.com/go?to=https://b.com/x";
+        assert_eq!(url_in(text, "a.com").as_deref(), Some(text));
+        assert_eq!(url_in(text, "b.com").as_deref(), Some(text));
+        // 右括号收尾之后紧跟的是另一条
+        let text = "[a](https://a.com),[b](https://b.com)";
+        assert_eq!(url_in(text, "a.com").as_deref(), Some("https://a.com"));
+        assert_eq!(url_in(text, "b.com").as_deref(), Some("https://b.com"));
+    }
+
+    #[test]
+    fn 网址长度有上限() {
+        let long = |n: usize| format!("https://a.com/{}", "x".repeat(n));
+        let head = "https://a.com/".len();
+        let fits = long(MAX_URL_CHARS - head);
+        assert_eq!(url_in(&fits, "https").as_deref(), Some(fits.as_str()));
+        let over = long(MAX_URL_CHARS - head + 1);
+        assert_eq!(url_in(&over, "https"), None);
+        assert_eq!(url_in(&over, "xxx"), None);
+    }
+
+    /// `(line, column)` 底下的网址文本。
+    fn url_at(e: &TerminalEmulator, line: i32, column: usize) -> Option<String> {
+        e.url_at(line, column).map(|link| link.url)
+    }
+
+    #[test]
+    fn 软换行折开的网址拼回来() {
+        let e = TerminalEmulator::new(TermSize::new(10, 4));
+        e.advance("见 https://a.com/bc/de 后".as_bytes());
+        // 第一行:见(0-1) 空格(2) https://(3..) 写到第 9 列折行
+        for (line, column) in [(0, 3), (0, 9), (1, 0), (1, 7)] {
+            let link = e.url_at(line, column).expect("鼠标在网址上");
+            assert_eq!(link.url, "https://a.com/bc/de", "({line},{column})");
+            assert!(!link.from_osc8);
+            assert_eq!(link.cells.first().map(|c| (c.line, c.column)), Some((0, 3)));
+            assert_eq!(
+                link.cells.last().map(|c| (c.line, c.column)),
+                Some((2, 1)),
+                "下划线要盖到最后一段"
+            );
+        }
+        assert_eq!(url_at(&e, 0, 0), None, "宽字符不是网址");
+        assert_eq!(url_at(&e, 2, 3), None, "宽字符不是网址");
+    }
+
+    /// 路径与网址的候选互不抢:网址里没有路径候选,路径上没有网址,贴在一起也各认各的。
+    #[test]
+    fn 路径与网址互不抢() {
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(b"src/a.ts:12,https://a.com/x.ts:9 file:///D:/b.ts:3");
+        assert_eq!(paths_at(&e, 0, 2), ["src/a.ts"]);
+        assert_eq!(url_at(&e, 0, 2), None);
+        assert_eq!(url_at(&e, 0, 14).as_deref(), Some("https://a.com/x.ts:9"));
+        assert!(paths_at(&e, 0, 14).is_empty(), "网址不归路径认");
+        assert_eq!(url_at(&e, 0, 44), None, "file:// 不是网址");
+        assert_eq!(paths_at(&e, 0, 44), ["D:/b.ts"]);
+    }
+
+    /// Claude Code 的排版:长网址写到右边缘被硬断,下一行缩进两格接着写。
+    #[test]
+    fn tui_硬换行折开的网址接回来() {
+        let e = TerminalEmulator::new(TermSize::new(24, 6));
+        e.advance(b"  https://a.com/docs/xy\r\n  z/overview?a=1 ok\r\n");
+        let want = "https://a.com/docs/xyz/overview?a=1";
+        for (line, column) in [(0, 4), (0, 22), (1, 2), (1, 10)] {
+            let link = e.url_at(line, column).expect("鼠标在网址上");
+            assert_eq!(link.url, want, "({line},{column})");
+            assert_eq!(link.cells[0].line, 0);
+            assert_eq!(link.cells.last().map(|c| c.line), Some(1), "下划线跨两行");
+        }
+        assert_eq!(url_at(&e, 1, 17), None, "后面的散文不是网址");
+    }
+
+    /// 登录链接这类长网址折成好几行:路径那边只接上下各两段,网址要走完整条。
+    #[test]
+    fn 硬换行折成好几行的长网址整条接回来() {
+        let e = TerminalEmulator::new(TermSize::new(20, 8));
+        let rows = [
+            "  https://a.com/auth",
+            "  ?client=abcdefghi",
+            "  jklmnopqrstuvwxyz",
+            "  0123456789abcdefg",
+            "  &state=xyz end",
+        ];
+        e.advance(rows.join("\r\n").as_bytes());
+        let want =
+            "https://a.com/auth?client=abcdefghijklmnopqrstuvwxyz0123456789abcdefg&state=xyz";
+        for (line, column) in [(0, 5), (1, 5), (2, 5), (3, 5), (4, 5)] {
+            let link = e.url_at(line, column).expect("鼠标在网址上");
+            assert_eq!(link.url, want, "({line},{column})");
+        }
+        assert_eq!(url_at(&e, 4, 14), None, "后面的散文不是网址");
+    }
+
+    /// 长网址最后一截只有几个字母时靠「独占一行」认。
+    #[test]
+    fn 硬换行的最后一截独占一行时接回来() {
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"https://a.com/abcdef\r\n  ghij\r\n");
+        assert_eq!(
+            url_at(&e, 1, 3).as_deref(),
+            Some("https://a.com/abcdefghij")
+        );
+    }
+
+    /// 散文在词边界折行:没有盘可验,接错就是开错页面。这些一律不接。
+    #[test]
+    fn 散文折行不接到网址上() {
+        // 下一行开头是普通单词
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"https://a.com/abcdef\r\nand then more\r\n");
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/abcdef"));
+        assert_eq!(url_at(&e, 1, 0), None);
+
+        // 句子的最后一个词独占一行,带着句号
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"https://a.com/abcdef\r\ninformation.\r\n");
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/abcdef"));
+
+        // 行尾离右边缘超过两列
+        let e = TerminalEmulator::new(TermSize::new(24, 4));
+        e.advance(b"https://a.com/abcde\r\nfoo/bar\r\n");
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/abcde"));
+        assert_eq!(url_at(&e, 1, 0), None);
+
+        // 一行一条网址的列表
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"https://a.com/abcdef\r\nhttps://b.com/x\r\n");
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/abcdef"));
+        assert_eq!(url_at(&e, 1, 3).as_deref(), Some("https://b.com/x"));
+
+        // 上一行只是碰巧贴边的词,不影响当前行自己的网址
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"aaaa bbbb cccc dddd\r\nhttps://b.com/x\r\n");
+        assert_eq!(url_at(&e, 1, 3).as_deref(), Some("https://b.com/x"));
+    }
+
+    // ── OSC 8 ─────────────────────────────────────────────────────────────────
+
+    /// `ESC]8;params;uri ST 文字 ESC]8;; ST`
+    fn osc8(params: &str, uri: &str, text: &str) -> Vec<u8> {
+        format!("\x1b]8;{params};{uri}\x1b\\{text}\x1b]8;;\x1b\\").into_bytes()
+    }
+
+    #[test]
+    fn osc8_经解析落到_cell_上() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(b"a ");
+        e.advance(&osc8("id=x", "https://real.example/p", "text"));
+        e.advance(b" b");
+        e.with_term(|term| {
+            let row = &term.grid()[Line(0)];
+            assert!(row[Column(0)].hyperlink().is_none(), "链接外");
+            let link = row[Column(2)].hyperlink().expect("链接落到了 cell 上");
+            assert_eq!(link.uri(), "https://real.example/p");
+            assert_eq!(link.id(), "x");
+            assert_eq!(row[Column(5)].hyperlink().as_ref(), Some(&link));
+            assert!(row[Column(6)].hyperlink().is_none(), "结束序列之后没有链接");
+        });
+        // BEL 结尾、URI 里带 `;` 也认
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(b"\x1b]8;;https://a.com/x;y=1\x07t\x1b]8;;\x07");
+        assert_eq!(url_at(&e, 0, 0).as_deref(), Some("https://a.com/x;y=1"));
+    }
+
+    /// 经过同步块也一样:释放走的是同一条解析路径。
+    #[test]
+    fn osc8_在同步块里也落到_cell_上() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(b"\x1b[?2026h");
+        e.advance(&osc8("", "https://a.com", "text"));
+        assert_eq!(url_at(&e, 0, 0), None, "还没上屏");
+        e.advance(b"\x1b[?2026l");
+        assert_eq!(url_at(&e, 0, 0).as_deref(), Some("https://a.com"));
+    }
+
+    #[test]
+    fn osc8_显示文字可以与目标毫不相干() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(&osc8("", "https://evil.example", "https://bank.example"));
+        let link = e.url_at(0, 3).expect("链接上");
+        assert_eq!(link.url, "https://evil.example", "以 URI 为准,不是显示文字");
+        assert!(link.from_osc8, "宿主要把真实目标亮出来");
+        assert_eq!(link.cells.len(), "https://bank.example".len());
+    }
+
+    #[test]
+    fn osc8_只开_http_与_https() {
+        for uri in [
+            "file:///D:/proj/a.ts",
+            "javascript:alert(1)",
+            "vscode://file/a.ts",
+            "mailto:a@b.c",
+            "https://",
+            "https://a.com/a b",
+            "https://a.com/\u{202E}moc.live",
+            "https://a.com/\u{200B}x",
+            "https://a.com/\\x",
+        ] {
+            let e = TerminalEmulator::new(TermSize::new(40, 4));
+            e.advance(&osc8("", uri, "https://shown.example"));
+            assert_eq!(url_at(&e, 0, 3), None, "{uri:?}");
+        }
+        assert!(
+            is_web_url("HTTP://A.COM/路径"),
+            "非 ASCII 字符交给浏览器编码"
+        );
+        assert!(!is_web_url("https://a.com/\tx"), "解析器会吞掉,判据也得挡");
+        let long = format!("https://a.com/{}", "x".repeat(MAX_URL_CHARS));
+        assert!(!is_web_url(&long));
+    }
+
+    /// `file:` 链接包着的路径文字不能因此认不出:`ls --hyperlink` 这类程序给路径包的
+    /// 就是它。走的是验盘的那条路,不是打开它的 URI。
+    #[test]
+    fn osc8_的_file_链接不挡路径识别() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(&osc8("", "file:///D:/elsewhere", "src/a.ts:7"));
+        assert_eq!(url_at(&e, 0, 2), None);
+        let (_, cands) = e.path_candidates_at(0, 2).unwrap();
+        assert_eq!(cands[0].path, "src/a.ts");
+    }
+
+    #[test]
+    fn osc8_整段一起高亮() {
+        // 软换行折开,中间还夹着宽字符
+        let e = TerminalEmulator::new(TermSize::new(10, 4));
+        e.advance(b"ab");
+        e.advance(&osc8("", "https://a.com", "12345678中9"));
+        e.advance(b"z");
+        for (line, column) in [(0, 2), (0, 9), (1, 0), (1, 1), (1, 2)] {
+            let link = e.url_at(line, column).expect("链接上");
+            let cells: Vec<(i32, usize)> = link.cells.iter().map(|c| (c.line, c.column)).collect();
+            assert_eq!(
+                cells,
+                [
+                    (0, 2),
+                    (0, 3),
+                    (0, 4),
+                    (0, 5),
+                    (0, 6),
+                    (0, 7),
+                    (0, 8),
+                    (0, 9),
+                    (1, 0),
+                    (1, 2)
+                ],
+                "鼠标在 ({line},{column})"
+            );
+            assert!(link.cells[8].wide);
+        }
+        assert_eq!(url_at(&e, 0, 1), None);
+        assert_eq!(url_at(&e, 1, 3), None);
+
+        // 宽字符放不下时行尾留一格占位:占位格不进下划线,鼠标停在上面照样是这条链接
+        let e = TerminalEmulator::new(TermSize::new(10, 4));
+        e.advance(b"abc");
+        e.advance(&osc8("", "https://a.com", "123456中"));
+        let link = e.url_at(0, 9).expect("占位格也属于这条链接");
+        let cells: Vec<(i32, usize)> = link.cells.iter().map(|c| (c.line, c.column)).collect();
+        assert_eq!(
+            cells,
+            [(0, 3), (0, 4), (0, 5), (0, 6), (0, 7), (0, 8), (1, 0)]
+        );
+    }
+
+    /// TUI 自己换行:每行各发一次 OSC 8、没写 id,alacritty 给的 id 各不相同。
+    /// 同一 URI、只隔着行尾行首的空白,还是一条。
+    #[test]
+    fn osc8_tui_分行输出时跨行高亮() {
+        let e = TerminalEmulator::new(TermSize::new(20, 6));
+        e.advance(b"see ");
+        e.advance(&osc8("", "https://a.com/long", "https://a.c"));
+        e.advance(b"\r\n  ");
+        e.advance(&osc8("", "https://a.com/long", "om/long"));
+        e.advance(b"\r\n");
+        for (line, column) in [(0, 5), (1, 3)] {
+            let link = e.url_at(line, column).expect("链接上");
+            assert_eq!(
+                link.cells.len(),
+                "https://a.com/long".len(),
+                "({line},{column})"
+            );
+            assert_eq!(link.cells[0].line, 0);
+            assert_eq!(link.cells.last().map(|c| c.line), Some(1));
+        }
+    }
+
+    /// 同一 URI 但隔着别的内容、又没写 id:是两条,只亮鼠标底下那条。
+    #[test]
+    fn osc8_隔着内容的两段不连起来() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(&osc8("", "https://a.com", "one"));
+        e.advance(b" mid ");
+        e.advance(&osc8("", "https://a.com", "two"));
+        let link = e.url_at(0, 1).unwrap();
+        assert_eq!(link.cells.len(), 3);
+        assert_eq!(link.cells[0].column, 0);
+        let link = e.url_at(0, 9).unwrap();
+        assert_eq!(link.cells.len(), 3);
+        assert_eq!(link.cells[0].column, 8);
+    }
+
+    /// 写了同一个 id:OSC 8 规范说它们就是一条,隔着内容也一起亮。
+    /// id 相同但 URI 不同不算(规范以 id + URI 为准)。
+    #[test]
+    fn osc8_同_id_同_uri_隔着内容也是一条() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(&osc8("id=x", "https://a.com", "one"));
+        e.advance(b" mid ");
+        e.advance(&osc8("id=x", "https://a.com", "two"));
+        e.advance(b" ");
+        e.advance(&osc8("id=x", "https://b.com", "other"));
+        let link = e.url_at(0, 1).unwrap();
+        let columns: Vec<usize> = link.cells.iter().map(|c| c.column).collect();
+        assert_eq!(columns, [0, 1, 2, 8, 9, 10]);
+        assert_eq!(e.url_at(0, 13).unwrap().url, "https://b.com");
+        assert_eq!(e.url_at(0, 13).unwrap().cells.len(), 5);
+    }
+
+    /// 回看缓冲里的链接照样能认,行号越界 / 列号越界都不 panic。
+    #[test]
+    fn osc8_在回看缓冲里也认得出() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 3), 100);
+        e.advance(&osc8("", "https://a.com", "old"));
+        e.advance(b"\r\n1\r\n2\r\n3\r\n4\r\n");
+        let top = -(e.history_lines() as i32);
+        assert_eq!(url_at(&e, top, 1).as_deref(), Some("https://a.com"));
+        assert_eq!(url_at(&e, top - 1, 1), None);
+        assert_eq!(url_at(&e, 3, 1), None);
+        assert_eq!(url_at(&e, 0, 40), None);
     }
 }

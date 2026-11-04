@@ -87,14 +87,16 @@ use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
 use super::input::{Arrow, arrow_bytes};
-use super::links::{self, FileLinks, HoveredLink, LinkCache};
+use super::links::{self, FileLinks, HoveredLink, LinkCache, LinkTarget};
 use super::mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, alt_screen_scroll_bytes,
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
 };
 use super::scrollbar::{self, ScrollbarDrag, ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
 use super::search::{HighlightSpan, SearchHighlights, TerminalSearch};
-use super::selection_dwell::{DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
+use super::selection_dwell::{
+    DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction, tip_colors,
+};
 use super::symbols;
 use super::theme::{SearchColors, TerminalStyle, TerminalTheme};
 use crate::background::BackgroundArtElement;
@@ -778,7 +780,7 @@ impl TerminalElement {
         AlacPoint::new(Line(row as i32 - display_offset as i32), Column(col))
     }
 
-    /// 这一帧鼠标底下的文件链接。**只能在 paint 里调**:`hitbox.is_hovered` 认的是
+    /// 这一帧鼠标底下的链接(文件或网址)。**只能在 paint 里调**:`hitbox.is_hovered` 认的是
     /// 本帧的命中测试,prepaint 时它还是上一帧的。
     ///
     /// 不在链接态(没按 Ctrl / 鼠标不在终端上 / 正在拖选或拖滚动条 / 按键正被上报给
@@ -852,6 +854,92 @@ impl TerminalElement {
                 ),
                 self.theme.foreground,
             ));
+        }
+    }
+
+    /// OSC 8 链接的真实目标:显示的文字可以写成任何样子,悬停时必须看得到实际要打开的
+    /// 是什么(见 [`super::links`] 模块注释)。样式照「已复制」气泡;字体用终端字体,
+    /// 折行才能按列算。
+    fn paint_link_target(
+        &self,
+        prepared: &PreparedFrame,
+        link: &HoveredLink,
+        target: &str,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        const PAD_X: Pixels = px(8.0);
+        const PAD_Y: Pixels = px(4.0);
+        const MAX_ROWS: usize = 6;
+
+        let cell = prepared.cell_size;
+        let screen_row = |line: i32| {
+            let row = line + prepared.display_offset as i32;
+            (row >= 0 && (row as usize) < prepared.screen_lines).then_some(row as f32)
+        };
+        let Some((first, first_row)) = link
+            .spans
+            .iter()
+            .find_map(|span| Some((span, screen_row(span.line)?)))
+        else {
+            return;
+        };
+        let last_row = link
+            .spans
+            .iter()
+            .rev()
+            .find_map(|span| screen_row(span.line))
+            .unwrap_or(first_row);
+
+        let columns = (f(bounds.size.width - PAD_X * 2.0) / f(cell.width).max(1.0)) as usize;
+        // 矮窗口里也得整个看得见:高过元素的部分会被裁掉,裁掉的偏偏是留着的尾巴
+        let max_rows = MAX_ROWS.min(prepared.screen_lines.saturating_sub(1));
+        let (background, foreground) = tip_colors();
+        let font = self.style.font();
+        let lines: Vec<ShapedLine> = links::wrap_link_target(target, columns, max_rows)
+            .into_iter()
+            .map(|row| {
+                let run = TextRun {
+                    len: row.len(),
+                    font: font.clone(),
+                    color: foreground,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                window
+                    .text_system()
+                    .shape_line(row.into(), self.style.font_size, &[run], None)
+            })
+            .collect();
+        let width = lines.iter().map(|line| line.width).max().unwrap_or(px(0.0));
+        let tip = size(
+            width + PAD_X * 2.0,
+            cell.height * lines.len() as f32 + PAD_Y * 2.0,
+        );
+        let origin = links::link_target_origin(
+            prepared.origin.x + cell.width * first.start as f32,
+            prepared.origin.y + cell.height * first_row,
+            prepared.origin.y + cell.height * (last_row + 1.0),
+            tip,
+            bounds,
+        );
+        window.paint_quad(
+            fill(Bounds::new(origin, tip), background).corner_radii(Corners::all(px(4.0))),
+        );
+        for (row, line) in lines.iter().enumerate() {
+            _ = line.paint(
+                point(
+                    origin.x + PAD_X,
+                    origin.y + PAD_Y + cell.height * row as f32,
+                ),
+                cell.height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
         }
     }
 
@@ -1095,7 +1183,7 @@ impl TerminalElement {
                     }
                 }
 
-                // ── 文件链接:Ctrl(⌘)+左键点在链接上 = 打开。排在鼠标上报之前 ——
+                // ── 链接:Ctrl(⌘)+左键点在链接上 = 打开。排在鼠标上报之前 ——
                 //    开了上报的 TUI 里照样能点;点中了既不起选区、也不报给程序。
                 //
                 //    按**这一下**的位置与修饰键现识别,不读上一帧画出来的悬停态:
@@ -1116,8 +1204,11 @@ impl TerminalElement {
                         cx,
                     );
                     if let Some(hit) = hit {
-                        (links.open)(&hit.link, window, cx);
-                        // 视图那层的「左键聚焦终端」不必再跑:焦点马上要交给文件页
+                        match &hit.target {
+                            LinkTarget::File(link) => (links.open)(link, window, cx),
+                            LinkTarget::Url { url, .. } => (links.open_url)(url, cx),
+                        }
+                        // 视图那层的「左键聚焦终端」不必再跑:焦点马上要交给文件页 / 浏览器
                         cx.stop_propagation();
                         return;
                     }
@@ -1241,7 +1332,7 @@ impl TerminalElement {
                     return;
                 }
 
-                // ── 文件链接:按住 Ctrl 跨格、松开、移出元素时要一帧(悬停态在 paint 里
+                // ── 链接:按住 Ctrl 跨格、松开、移出元素时要一帧(悬停态在 paint 里
                 //    现算)。不按 Ctrl 的移动这里只比一次 `None == None`,不要帧。
                 if has_links {
                     let cell = (event.modifiers.secondary()
@@ -2042,7 +2133,7 @@ impl Element for TerminalElement {
         }
 
         let origin = bounds.origin;
-        // 文件链接的悬停态:这一帧现算(理由见 `super::links` 模块注释)。
+        // 链接的悬停态:这一帧现算(理由见 `super::links` 模块注释)。
         // 不进行签名、不碰 RowCache —— 下划线是叠在格子上的一层浮标,与整行闪烁同一口径
         let hovered_link = self.hovered_link(prepared, window, cx);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
@@ -2140,9 +2231,12 @@ impl Element for TerminalElement {
                 }
             }
 
-            // ── 文件链接下划线压在文字之上、预编辑浮层之下(组合串要盖住它底下的一切)
+            // ── 链接下划线压在文字之上、预编辑浮层之下(组合串要盖住它底下的一切)
             if let Some(link) = hovered_link.as_ref() {
                 self.paint_link_underline(prepared, link, window);
+                if let Some(target) = link.revealed_target() {
+                    self.paint_link_target(prepared, link, target, bounds, window, cx);
+                }
             }
 
             // ── IME 预编辑浮层:盖住底下的 grid 内容再画,否则组合串会与残留字符叠糊

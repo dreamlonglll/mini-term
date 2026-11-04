@@ -1,5 +1,6 @@
-//! 终端里的文件链接:按住 Ctrl(macOS 上 ⌘)悬停 AI 输出里的文件路径出下划线,
-//! 单击在文件页新开页签(带行号就定位到那一行)。
+//! 终端里的链接:按住 Ctrl(macOS 上 ⌘)悬停 AI 输出里的文件路径出下划线,
+//! 单击在文件页新开页签(带行号就定位到那一行);网址(http / https 文本、OSC 8 超链接)
+//! 同一套交互,单击交给系统默认浏览器([`open_url`])。
 //!
 //! mt-ui 只认形状(哪段字符像路径、带不带行号,见 `mt_terminal::links`),这里回答
 //! 「它指向哪个文件、文件页能不能打开」:
@@ -98,6 +99,16 @@ pub fn open(link: &FileLink, window: &mut Window, cx: &mut App) {
         window,
         cx,
     );
+}
+
+/// Ctrl+单击网址:交给系统默认浏览器。
+///
+/// 识别那层只放 http / https,这里是字符串真正交出去的地方,再挡一道 —— OSC 8 的目标是
+/// 终端里跑的程序写什么就是什么,`javascript:`、`file:` 这些绝不能漏到 shell 手里。
+pub fn open_url(url: &str, cx: &mut App) {
+    if mt_terminal::links::is_web_url(url) {
+        cx.open_url(url);
+    }
 }
 
 /// 本地 / WSL 项目下,`raw` 依次可能是哪些文件(还没验盘)。

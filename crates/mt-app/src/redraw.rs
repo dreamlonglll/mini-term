@@ -361,7 +361,7 @@ pub fn set_window_visible(visible: bool, cx: &mut App) {
 /// `set_window_active` 那条是宿主挂的,因为它顺带还要改 store 的「窗口聚焦」态;
 /// 可见性**只有这条泵关心**,挂进来就不必让 `Workspace` 多背一个字段。
 /// 时机上也安全:第一次 PTY 有输出时窗口必然已经建好,而本函数的唯一调用点
-/// [`request`] 是从 pane 的唤醒循环(异步任务)进来的,窗口不在更新中 ——
+/// [`request`] 是从 pane 的异步任务(唤醒循环、同步块释放)进来的,窗口不在更新中 ——
 /// 万一撞上,`AnyWindowHandle::update` 返回 `Err` 而不是 panic
 /// (`app.rs:1919-1924` 里那句 `windows.get_mut(id)?.take()?`),下一次输出再试。
 ///
