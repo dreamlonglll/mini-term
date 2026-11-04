@@ -422,6 +422,9 @@ struct Workspace {
     /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
     /// **也没有「忽略此版本」** —— 原版查完就一直亮着那颗按钮,直到升级为止。
     update_release: Option<crate::update_check::ReleaseInfo>,
+    /// 上一次收到关闭快捷键的时刻,判按住不放的连发用
+    /// (见 [`pane_actions::swallows_close_hotkey`])。
+    last_close_hotkey: Option<std::time::Instant>,
     /// 系统托盘(状态灯 + 项目菜单)。**drop 即摘图标**,所以必须由 Workspace
     /// 持有而不是丢进全局:窗口没了托盘也就该没了。
     tray: Tray,
@@ -598,6 +601,7 @@ impl Workspace {
             frost: None,
             frost_task: None,
             update_release: None,
+            last_close_hotkey: None,
             tray,
             _update_check: update_check,
             _ai_pump: ai_pump,
@@ -816,6 +820,11 @@ impl Workspace {
     /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let last = self.last_close_hotkey.replace(now);
+        if pane_actions::swallows_close_hotkey(self.store.read(cx).config(), last, now) {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {

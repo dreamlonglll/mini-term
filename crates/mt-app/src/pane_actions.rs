@@ -20,9 +20,25 @@
 //! 单个 tab 的文案里带 pane 名(`closeTabAiMessage`),整组的文案里带**个数**
 //! (`closeGroupAiMessage`)—— 与原版一字不差;个数之外**再列一串名字**放在
 //! 灰色补充行里(原版没有这一段,但「哪几个终端会被杀」是关整组时最想知道的)。
+//!
+//! # 确认偏好(issue #90)
+//!
+//! 用户可以选择关终端不再确认(确认框的「不再询问」/ 设置页开关,都写
+//! `AppConfig::confirm_terminal_close`)。偏好只决定**弹不弹框**:判据与关闭动作都
+//! 收在 [`close_after_prompt`] 一处,弹框与不弹框跑的是同一个关闭闭包,
+//! 回收 PTY / 撤出 AI 轮询 / 布局落盘全在 `AppStore::close_*` 里,一步不少。
+//! 上面的盘点口径([`is_ai_alive`])不受偏好影响,它还有别的消费方。
+//!
+//! 关整组 / 关面板在入口处问一次、之后一次关完,不存在「问了一半」:
+//! `AppStore::close_*` 这一层本来就不弹框。
+//!
+//! 关窗([`crate::title_bar::allow_close`])、移除项目、删 worktree 各有各的确认框,
+//! **不归这个偏好管**:它们一次毁掉的东西更多,语义也不同。
 
-use gpui::{App, Entity, Window};
-use mt_config::{AiLauncher, ShellConfig};
+use std::time::{Duration, Instant};
+
+use gpui::{App, Context, Entity, Window};
+use mt_config::{AiLauncher, AppConfig, ShellConfig};
 
 use crate::i18n::{t, tr};
 use crate::menu;
@@ -202,25 +218,63 @@ fn leaf_panes(store: &AppStore, project_id: &str, leaf_id: &str) -> Vec<PaneStat
         .unwrap_or_default()
 }
 
-/// 关闭一个终端 tab。**总是**先确认(与原版一致:没有 AI 也要问一句)。
-pub fn close_pane(
-    store: Entity<AppStore>,
-    project_id: String,
-    pane_id: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let Some(pane) = store
-        .read(cx)
-        .project_state(&project_id)
-        .and_then(|s| s.pane(&pane_id))
-        .cloned()
-    else {
-        return;
-    };
+/// 关闭前要不要弹确认框。只看偏好,**不看 pane 状态**:用户选了不再询问,
+/// AI 对话也不问(issue #90 要的正是这一档);反过来如果只放过没跑 AI 的终端,
+/// 那就成了关 shell 还要点确定、关 AI 却不用,比现状更说不通。
+pub fn should_confirm_close(config: &AppConfig) -> bool {
+    config.confirm_terminal_close
+}
+
+/// 两次关闭快捷键的间隔短于它,后一次当成按住不放的连发。取值要盖过系统的首次连发
+/// 延迟(Windows 最长一档 1s),否则第一次连发能漏过去多关一组。
+const CLOSE_HOTKEY_REPEAT_WINDOW: Duration = Duration::from_millis(1100);
+
+/// 这次关闭快捷键该不该吞掉。
+///
+/// 确认框开着时全局快捷键一律让路,按住不放的连发天然被挡住;不弹框之后这道闸没了,
+/// 而键盘焦点不在被关的终端上时(文件树、另一个页签……)绑定每次连发都还能命中,
+/// 按久一点就把项目里的终端一组一组全关掉。action 拿不到 `is_held`,只能按间隔判;
+/// `last` 每次连发都刷新,所以按多久都只算一次。
+pub fn swallows_close_hotkey(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
+    swallows_repeat(config, last, now, CLOSE_HOTKEY_REPEAT_WINDOW)
+}
+
+/// 两次点 × 的间隔短于它,后一次当成连点。要盖住手快的双击(150~300ms),
+/// 又不能长到挨个关 tab 时觉得点不动。
+const CLOSE_CLICK_REPEAT_WINDOW: Duration = Duration::from_millis(400);
+
+/// 这次点 × 该不该吞掉。
+///
+/// 关掉一个 tab 后右边的页签立刻补位,下一个 × 正好滑到鼠标底下;关掉一组后旁边的组
+/// 铺过来,它的 × 也可能落到同一处。连点的第二下就会把相邻终端连同里面的进程关掉。
+/// 确认框开着时第二下落在遮罩上,没有这个问题;不弹框之后才要这道闸。
+/// `last` 每次点击都刷新(吞掉的也算),所以连点多少下都只关一个。
+pub fn swallows_close_click(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
+    swallows_repeat(config, last, now, CLOSE_CLICK_REPEAT_WINDOW)
+}
+
+fn swallows_repeat(
+    config: &AppConfig,
+    last: Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    !should_confirm_close(config) && last.is_some_and(|last| now.duration_since(last) < window)
+}
+
+/// 确认框的文案。不弹框时用不上,但算一份没有代价,不值得为此把入口写成两段。
+#[derive(Debug, PartialEq, Eq)]
+struct ClosePrompt {
+    title: &'static str,
+    message: String,
+    /// 正文下面的灰色补充行(关整组时列出会被杀的 AI 终端)。
+    detail: Vec<String>,
+}
+
+/// 关一个 tab 的文案:带 pane 名,有活着的 AI 时换成「关闭 AI 对话」那一档。
+fn pane_close_prompt(pane: &PaneState) -> ClosePrompt {
     let label = pane.label().to_string();
-    let has_ai = is_ai_alive(pane.status);
-    let (title, message) = if has_ai {
+    let (title, message) = if is_ai_alive(pane.status) {
         (
             t("paneGroup", "closeAiTitle"),
             tr!("paneGroup", "closeTabAiMessage", label = label),
@@ -231,14 +285,103 @@ pub fn close_pane(
             tr!("paneGroup", "closeTabMessage", label = label),
         )
     };
+    ClosePrompt {
+        title,
+        message,
+        detail: Vec::new(),
+    }
+}
 
-    Confirm::new(title, message).open(
-        move |_window, cx| {
+/// 关整组的文案;组是空的返回 `None`(什么都不用做)。
+///
+/// 名字列在灰色补充行里 —— 正文的口径(个数)与原版一字不差,
+/// 「哪几个会被杀」是关整组时最想知道的,不改文案也能给出来。
+fn group_close_prompt(panes: &[PaneState]) -> Option<ClosePrompt> {
+    if panes.is_empty() {
+        return None;
+    }
+    let detail = ai_session_labels(panes);
+    let (title, message) = if detail.is_empty() {
+        (
+            t("paneGroup", "closeTerminalTitle"),
+            t("paneGroup", "closeGroupMessage").to_string(),
+        )
+    } else {
+        (
+            t("paneGroup", "closeAiTitle"),
+            tr!("paneGroup", "closeGroupAiMessage", count = detail.len()),
+        )
+    };
+    Some(ClosePrompt {
+        title,
+        message,
+        detail,
+    })
+}
+
+/// 关终端的**唯一闸**:按偏好弹确认框或直接关,两条路跑同一个 `do_close`。
+///
+/// 不弹框时也要 `window.defer`:调用方多半是 `cx.listener` 里(tab 的 ×、控制条、
+/// Ctrl+Shift+W),`TerminalArea` / `Workspace` 正被 update 着。确认框那条路的
+/// `do_close` 是在弹窗的 action 里跑的,没有这层租约;这里排到本轮 effect 之后,
+/// 两条路才是真的同一种调用环境,不必去推敲 `AppStore::close_*` 会不会读回它们。
+fn close_after_prompt(
+    store: Entity<AppStore>,
+    prompt: ClosePrompt,
+    do_close: impl Fn(&mut AppStore, &mut Context<AppStore>) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !should_confirm_close(store.read(cx).config()) {
+        window.defer(cx, move |_window, cx| {
+            store.update(cx, |store, cx| do_close(store, cx));
+        });
+        return;
+    }
+    let store_for_opt_out = store.clone();
+    Confirm::new(prompt.title, prompt.message)
+        .detail(prompt.detail)
+        .dont_ask_again(
+            t("paneGroup", "closeDontAskAgain"),
+            t("paneGroup", "closeDontAskHint"),
+            move |cx| {
+                store_for_opt_out.update(cx, |store, cx| {
+                    store.patch_config(|c| c.confirm_terminal_close = false, cx);
+                });
+            },
+        )
+        .open(
+            move |_window, cx| {
+                store.update(cx, |store, cx| do_close(store, cx));
+            },
+            window,
+            cx,
+        );
+}
+
+/// 关闭一个终端 tab。偏好开着时**总是**先确认(与原版一致:没有 AI 也要问一句)。
+pub fn close_pane(
+    store: Entity<AppStore>,
+    project_id: String,
+    pane_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(prompt) = store
+        .read(cx)
+        .project_state(&project_id)
+        .and_then(|s| s.pane(&pane_id))
+        .map(pane_close_prompt)
+    else {
+        return;
+    };
+    close_after_prompt(
+        store,
+        prompt,
+        move |store, cx| {
             // 按 id 从**最新**布局关(不是拿确认前那份快照)—— 确认框开着的这段
             // 时间里 pane 可能刚拿到 pty_id,用旧快照会漏掉回收(原版同一条注释)
-            store.update(cx, |store, cx| {
-                store.close_pane(&project_id, &pane_id, cx);
-            });
+            store.close_pane(&project_id, &pane_id, cx);
         },
         window,
         cx,
@@ -261,15 +404,17 @@ pub fn close_leaf_of_pane(
     else {
         return;
     };
-    let panes = leaf_panes(store.read(cx), &project_id, &leaf_id);
-    confirm_close_group(
-        panes,
-        move |_window, cx| {
+    let Some(prompt) = group_close_prompt(&leaf_panes(store.read(cx), &project_id, &leaf_id))
+    else {
+        return;
+    };
+    close_after_prompt(
+        store,
+        prompt,
+        move |store, cx| {
             // 确认之后**按 pane id 重新定位叶子**:这段时间里可能又分了一次屏,
             // 叶子 id 会变(insert_split 把原叶子换成 split 的一个子节点)
-            store.update(cx, |store, cx| {
-                store.close_leaf_of_pane(&project_id, &pane_id, cx);
-            });
+            store.close_leaf_of_pane(&project_id, &pane_id, cx);
         },
         window,
         cx,
@@ -284,14 +429,14 @@ pub fn close_leaf(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let panes = leaf_panes(store.read(cx), &project_id, &leaf_id);
-    confirm_close_group(
-        panes,
-        move |_window, cx| {
-            store.update(cx, |store, cx| {
-                store.close_leaf(&project_id, &leaf_id, cx);
-            });
-        },
+    let Some(prompt) = group_close_prompt(&leaf_panes(store.read(cx), &project_id, &leaf_id))
+    else {
+        return;
+    };
+    close_after_prompt(
+        store,
+        prompt,
+        move |store, cx| store.close_leaf(&project_id, &leaf_id, cx),
         window,
         cx,
     );
@@ -312,13 +457,13 @@ pub fn close_panel(
         .and_then(|s| s.panels.iter().find(|p| p.id == panel_id))
         .map(|p| p.layout.panes().into_iter().cloned().collect())
         .unwrap_or_default();
-    confirm_close_group(
-        panes,
-        move |_window, cx| {
-            store.update(cx, |store, cx| {
-                store.close_panel(&project_id, &panel_id, cx);
-            });
-        },
+    let Some(prompt) = group_close_prompt(&panes) else {
+        return;
+    };
+    close_after_prompt(
+        store,
+        prompt,
+        move |store, cx| store.close_panel(&project_id, &panel_id, cx),
         window,
         cx,
     );
@@ -401,35 +546,6 @@ pub fn fork_pane_session(
         .detach();
 }
 
-/// 「关整组」的确认框(两条入口共用)。组是空的就什么都不做。
-fn confirm_close_group(
-    panes: Vec<PaneState>,
-    on_ok: impl Fn(&mut Window, &mut App) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if panes.is_empty() {
-        return;
-    }
-    let ai_labels = ai_session_labels(&panes);
-    let (title, message) = if ai_labels.is_empty() {
-        (
-            t("paneGroup", "closeTerminalTitle"),
-            t("paneGroup", "closeGroupMessage").to_string(),
-        )
-    } else {
-        (
-            t("paneGroup", "closeAiTitle"),
-            tr!("paneGroup", "closeGroupAiMessage", count = ai_labels.len()),
-        )
-    };
-    // 名字列在灰色补充行里 —— 正文的口径(个数)与原版一字不差,
-    // 「哪几个会被杀」是关整组时最想知道的,不改文案也能给出来
-    Confirm::new(title, message)
-        .detail(ai_labels)
-        .open(on_ok, window, cx);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +581,108 @@ mod tests {
         let mut p = PaneState::new(label);
         p.status = status;
         p
+    }
+
+    fn opted_out_config() -> AppConfig {
+        AppConfig {
+            confirm_terminal_close: false,
+            ..Default::default()
+        }
+    }
+
+    /// 没选过的人照旧确认;选了不再询问就不问。判据不看 pane 状态,
+    /// AI 与非 AI 的终端不会出现「一半确认一半不确认」。
+    #[test]
+    fn 确认与否只看偏好() {
+        assert!(should_confirm_close(&AppConfig::default()));
+        assert!(!should_confirm_close(&opted_out_config()));
+    }
+
+    /// 单个 tab 的文案分档跟着 AI 判据走,偏好没有掺和进去。
+    #[test]
+    fn 单个_tab_的文案按_ai_分档() {
+        let ai = pane_close_prompt(&pane("pwsh", PaneStatus::AiWorking));
+        assert_eq!(ai.title, t("paneGroup", "closeAiTitle"));
+        assert!(ai.message.contains("pwsh"));
+        assert!(ai.detail.is_empty());
+
+        let plain = pane_close_prompt(&pane("pwsh", PaneStatus::Idle));
+        assert_eq!(plain.title, t("paneGroup", "closeTerminalTitle"));
+        assert!(plain.message.contains("pwsh"));
+
+        // 输入检测认出的 AI 同样是 ai-idle,不要求 hook 身份
+        let idle_ai = pane_close_prompt(&pane("bash", PaneStatus::AiIdle));
+        assert_eq!(idle_ai.title, t("paneGroup", "closeAiTitle"));
+    }
+
+    /// 整组汇总成一个确认框:AI 终端的个数进正文、名字进补充行;空组什么都不做。
+    #[test]
+    fn 整组汇总成一个确认框() {
+        assert_eq!(group_close_prompt(&[]), None);
+
+        let plain = group_close_prompt(&[pane("bash", PaneStatus::Idle)]).unwrap();
+        assert_eq!(plain.title, t("paneGroup", "closeTerminalTitle"));
+        assert!(plain.detail.is_empty());
+
+        let mixed = group_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            pane("pi", PaneStatus::AiWorking),
+            pane("codex", PaneStatus::AiIdle),
+        ])
+        .unwrap();
+        assert_eq!(mixed.title, t("paneGroup", "closeAiTitle"));
+        assert!(mixed.message.contains('2'));
+        assert_eq!(mixed.detail, vec!["pi".to_string(), "codex".to_string()]);
+    }
+
+    /// 按住 Ctrl+Shift+W 不放:首次连发隔 500ms~1s 才来、之后几十毫秒一次,一律吞掉;
+    /// 松手隔够了能再关。确认框开着的人走不到这条(弹框本身就挡住了连发)。
+    #[test]
+    fn 按住关闭快捷键只算一次() {
+        let config = opted_out_config();
+        let start = Instant::now();
+        assert!(
+            !swallows_close_hotkey(&config, None, start),
+            "第一次按下不吞"
+        );
+        for ms in [33, 500, 1000] {
+            let now = start + Duration::from_millis(ms);
+            assert!(swallows_close_hotkey(&config, Some(start), now), "{ms}ms");
+        }
+        let later = start + CLOSE_HOTKEY_REPEAT_WINDOW;
+        assert!(!swallows_close_hotkey(&config, Some(start), later));
+
+        let confirming = AppConfig::default();
+        let soon = start + Duration::from_millis(33);
+        assert!(
+            !swallows_close_hotkey(&confirming, Some(start), soon),
+            "确认开着时不归这道闸管"
+        );
+    }
+
+    /// 连点 × 的第二下落在补位过来的相邻 tab 上,要吞掉;隔够了是在挨个关,照常放行。
+    /// 确认开着时第二下落在遮罩上,不归这道闸管。
+    #[test]
+    fn 连点关闭按钮只算一次() {
+        let config = opted_out_config();
+        let start = Instant::now();
+        assert!(
+            !swallows_close_click(&config, None, start),
+            "第一次点击不吞"
+        );
+        for ms in [150, 200, 399] {
+            let now = start + Duration::from_millis(ms);
+            assert!(swallows_close_click(&config, Some(start), now), "{ms}ms");
+        }
+        let later = start + CLOSE_CLICK_REPEAT_WINDOW;
+        assert!(!swallows_close_click(&config, Some(start), later));
+
+        let confirming = AppConfig::default();
+        let soon = start + Duration::from_millis(150);
+        assert!(
+            !swallows_close_click(&confirming, Some(start), soon),
+            "确认开着时不归这道闸管"
+        );
     }
 
     /// 「活着的 AI」只认两个状态 —— idle 与 error 都不算。

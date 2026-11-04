@@ -188,8 +188,11 @@ use mt_i18n::{
 /// 1511 → 1513：终端中文字体（issue #91，`settings.font.{terminalCjkFont,terminalCjkFontHint}`）。
 /// 1513 → 1536（issue #89）：AI 历史面板右键「删除会话」的菜单项、确认框与错误提示
 /// （`sessionList.deleteSession.*`）。
+/// 1536 → 1540（issue #90）：关闭终端的确认框加「不再询问」与改回去的指路
+/// （`paneGroup.{closeDontAskAgain,closeDontAskHint}`），设置页加对应开关
+/// （`settings.terminal.{confirmCloseTitle,confirmCloseDesc}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1536;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1540;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

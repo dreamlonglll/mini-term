@@ -213,6 +213,11 @@ pub struct AppConfig {
     /// 关掉只是不显示副段，标题本身照常收着，重新打开立刻就有。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_title_follows_shell: Option<bool>,
+    /// 关闭终端 / 整个区域 / 面板前要不要弹确认框(AI 对话那一档也归它,issue #90)。
+    /// **默认开**:`Default` 与「库里没这个键」两条路都是 true,老用户升级后行为不变。
+    /// 关窗与移除项目的确认语义不同(一次毁掉的东西更多),不归这个开关管。
+    #[serde(default = "default_true")]
+    pub confirm_terminal_close: bool,
     /// 启动恢复布局后是否自动续接上次的 AI 会话（往 pane 写 resume 命令）。
     /// `None` = UI 层默认开启（保持旧行为）。关掉只是不写命令，会话身份仍随布局
     /// 持久化，重新打开开关后下次启动照样能续上。
@@ -855,6 +860,7 @@ impl Default for AppConfig {
             tray_click_focus: None,
             terminal_animations: None,
             tab_title_follows_shell: None,
+            confirm_terminal_close: true,
             ai_auto_resume: None,
             terminal_fps_foreground: None,
             terminal_fps_background: None,
@@ -1823,6 +1829,33 @@ mod tests {
         assert!(json.contains(r#""tabTitleFollowsShell":false"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tab_title_follows_shell, Some(false));
+    }
+
+    /// 关闭终端前确认默认开:`Default` 与「库里没这个键」两条路都得是 true(老用户升级后
+    /// 行为不变),用户关掉后存的显式 `false` 要能往返,键名是 camelCase 的 `confirmTerminalClose`。
+    #[test]
+    fn confirm_terminal_close_缺键时默认开且显式关能往返() {
+        assert!(AppConfig::default().confirm_terminal_close);
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(
+            missing.confirm_terminal_close,
+            "没这个键 = 从没选过,照旧确认"
+        );
+
+        let config = AppConfig {
+            confirm_terminal_close: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""confirmTerminalClose":false"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            !parsed.confirm_terminal_close,
+            "显式 false 不许被默认值盖掉"
+        );
     }
 
     /// Markdown 目录栏开合:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。
