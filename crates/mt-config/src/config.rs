@@ -83,6 +83,10 @@ pub struct AppConfig {
     pub ui_font_family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_family: Option<String>,
+    /// 终端中文字体(issue #91):排进回退表最前,主字体缺字时优先用它。
+    /// 英文与列宽仍由 `terminal_font_family` 决定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_cjk_font_family: Option<String>,
     #[serde(default)]
     pub terminal_ligatures: bool,
     /// 每个终端保留的回滚行数(scrollback)。
@@ -817,6 +821,7 @@ impl Default for AppConfig {
             terminal_font_size: default_terminal_font_size(),
             ui_font_family: None,
             terminal_font_family: None,
+            terminal_cjk_font_family: None,
             terminal_ligatures: false,
             terminal_scrollback: default_terminal_scrollback(),
             terminal_env_vars: vec![],
@@ -1960,13 +1965,18 @@ mod tests {
             "uiFontSize": 13,
             "terminalFontSize": 14,
             "uiFontFamily": "Arial, sans-serif",
-            "terminalFontFamily": "'JetBrainsMono Nerd Font', monospace"
+            "terminalFontFamily": "'JetBrainsMono Nerd Font', monospace",
+            "terminalCjkFontFamily": "Sarasa Fixed SC"
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.ui_font_family.as_deref(), Some("Arial, sans-serif"));
         assert_eq!(
             config.terminal_font_family.as_deref(),
             Some("'JetBrainsMono Nerd Font', monospace")
+        );
+        assert_eq!(
+            config.terminal_cjk_font_family.as_deref(),
+            Some("Sarasa Fixed SC")
         );
     }
 
@@ -1982,6 +1992,7 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert!(config.ui_font_family.is_none());
         assert!(config.terminal_font_family.is_none());
+        assert!(config.terminal_cjk_font_family.is_none());
     }
 
     /// `locale` 是纯增量字段:旧 config.json 没有它照样读得进来,没设过时不写盘

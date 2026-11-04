@@ -835,6 +835,7 @@ mod tests {
             ui_font_size: 15.0,
             theme: "dark".into(),
             terminal_font_family: Some("Cascadia Mono".into()),
+            terminal_cjk_font_family: Some("Sarasa Fixed SC".into()),
             download_dir: Some("/tmp/mini-term-downloads".into()),
             hook_enabled: true,
             projects: vec![project("p1", "甲"), project("p2", "乙")],
@@ -854,6 +855,10 @@ mod tests {
         assert_eq!(back.ui_font_size, 15.0);
         assert_eq!(back.theme, "dark");
         assert_eq!(back.terminal_font_family.as_deref(), Some("Cascadia Mono"));
+        assert_eq!(
+            back.terminal_cjk_font_family.as_deref(),
+            Some("Sarasa Fixed SC")
+        );
         assert_eq!(
             back.download_dir.as_deref(),
             Some("/tmp/mini-term-downloads")

@@ -1022,6 +1022,7 @@ impl AppStore {
         terminal_style_from(
             self.config.terminal_font_size,
             self.config.terminal_font_family.as_deref(),
+            self.config.terminal_cjk_font_family.as_deref(),
             self.config.terminal_ligatures,
         )
     }

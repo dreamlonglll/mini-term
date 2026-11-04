@@ -329,35 +329,56 @@ const CJK_FALLBACK_FONTS: [&str; 3] = ["Microsoft YaHei", "PingFang SC", "Noto S
 /// `Segoe UI Emoji` 一个,macOS / Linux 上必然落空,终端里的 emoji 无字体可用。
 const EMOJI_FALLBACK_FONTS: [&str; 3] = ["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"];
 
-/// `config.terminalFontSize` + `terminalFontFamily` → [`TerminalStyle`]。
+/// 字族串 → 字族名列表,去掉 gpui 认不出的通用族名。
+fn named_families(list: Option<&str>) -> Vec<String> {
+    let mut families = list.map(crate::ui::font_family_list).unwrap_or_default();
+    families.retain(|f| !GENERIC_FAMILIES.contains(&f.to_ascii_lowercase().as_str()));
+    families
+}
+
+/// `config.terminalFontSize` + `terminalFontFamily` + `terminalCjkFontFamily` →
+/// [`TerminalStyle`]。
 ///
 /// 字族那一串是 CSS `font-family` 语法(原版直接喂 xterm),而
 /// [`TerminalStyle`] 是「主字体 + 回退列表」两段式:取首项当主字体,其余进回退,
 /// 再自动补 CJK 与 emoji —— 与原版 `resolveTerminalFontFamily` 同语义
 /// (它是往用户串后面拼 `CJK_FALLBACK_FONTS`)。
 ///
-/// 字族为空 / 只写了通用族名时整段回落 [`TerminalStyle::default`]。
-pub fn terminal_style_from(size: f64, family: Option<&str>, ligatures: bool) -> TerminalStyle {
+/// 字族为空 / 只写了通用族名时回落 [`TerminalStyle::default`] 的字族栈。
+///
+/// 中文字体(issue #91)排进回退表最前,其余一概不动,留空时结果不变。回退只在主字体
+/// 缺字时才轮到:主字体自带汉字的话,中文仍用主字体。汉字单独按列定位,所以中文字体的
+/// 步进影响不到网格对齐,列宽只来自主字体。
+pub fn terminal_style_from(
+    size: f64,
+    family: Option<&str>,
+    cjk_family: Option<&str>,
+    ligatures: bool,
+) -> TerminalStyle {
     let mut style = TerminalStyle {
         font_size: gpui::px(size as f32),
         ligatures,
         ..TerminalStyle::default()
     };
-    let Some(list) = family.map(str::trim).filter(|s| !s.is_empty()) else {
-        return style;
-    };
-    let mut families = crate::ui::font_family_list(list);
-    families.retain(|f| !GENERIC_FAMILIES.contains(&f.to_ascii_lowercase().as_str()));
-    if families.is_empty() {
-        return style;
+    let mut families = named_families(family);
+    if !families.is_empty() {
+        style.font_family = families.remove(0).into();
+        for extra in CJK_FALLBACK_FONTS.iter().chain(EMOJI_FALLBACK_FONTS.iter()) {
+            if !families.iter().any(|f| f == extra) {
+                families.push((*extra).to_string());
+            }
+        }
+        style.font_fallbacks = families.into_iter().map(Into::into).collect();
     }
-    style.font_family = families.remove(0).into();
-    for extra in CJK_FALLBACK_FONTS.iter().chain(EMOJI_FALLBACK_FONTS.iter()) {
-        if !families.iter().any(|f| f == extra) {
-            families.push((*extra).to_string());
+    let cjk = named_families(cjk_family);
+    style
+        .font_fallbacks
+        .retain(|f| !cjk.iter().any(|c| c.eq_ignore_ascii_case(f)));
+    for font in cjk.into_iter().rev() {
+        if !font.eq_ignore_ascii_case(&style.font_family) {
+            style.font_fallbacks.insert(0, font.into());
         }
     }
-    style.font_fallbacks = families.into_iter().map(Into::into).collect();
     style
 }
 
@@ -1413,6 +1434,7 @@ mod tests {
         let style = terminal_style_from(
             15.0,
             Some("'JetBrainsMono Nerd Font', 'Cascadia Code', monospace"),
+            None,
             false,
         );
         assert_eq!(style.font_size, gpui::px(15.0));
@@ -1442,7 +1464,7 @@ mod tests {
     fn 终端字族为空时回落默认() {
         let default = TerminalStyle::default();
         for family in [None, Some(""), Some("   "), Some("monospace, serif")] {
-            let style = terminal_style_from(14.0, family, false);
+            let style = terminal_style_from(14.0, family, None, false);
             assert_eq!(style.font_family, default.font_family, "{family:?}");
             assert_eq!(style.font_fallbacks, default.font_fallbacks, "{family:?}");
         }
@@ -1451,7 +1473,7 @@ mod tests {
     /// 重复声明 CJK 字体时不该在回退串里出现两次。
     #[test]
     fn 终端字族回退不重复() {
-        let style = terminal_style_from(14.0, Some("Consolas, 'Microsoft YaHei'"), false);
+        let style = terminal_style_from(14.0, Some("Consolas, 'Microsoft YaHei'"), None, false);
         let yahei = style
             .font_fallbacks
             .iter()
@@ -1460,16 +1482,77 @@ mod tests {
         assert_eq!(yahei, 1);
     }
 
+    /// 中文字体排进回退表最前:主字体(英文与列宽的来源)不动,其余回退照旧跟在后面。
+    #[test]
+    fn 终端中文字体排在回退最前() {
+        let style = terminal_style_from(
+            14.0,
+            Some("'JetBrains Mono', 'Cascadia Code'"),
+            Some("'Sarasa Fixed SC', 'LXGW WenKai Mono'"),
+            false,
+        );
+        assert_eq!(style.font_family.as_ref(), "JetBrains Mono");
+        let fallbacks: Vec<&str> = style.font_fallbacks.iter().map(|f| f.as_ref()).collect();
+        assert_eq!(
+            fallbacks[..3],
+            ["Sarasa Fixed SC", "LXGW WenKai Mono", "Cascadia Code"]
+        );
+        for extra in CJK_FALLBACK_FONTS.iter().chain(EMOJI_FALLBACK_FONTS.iter()) {
+            assert!(fallbacks.contains(extra), "缺默认回退 {extra}");
+        }
+    }
+
+    /// 只填中文字体、终端字体留空:默认字族栈整份保留,中文字体照样排最前。
+    #[test]
+    fn 终端字体留空时中文字体照样生效() {
+        let default = TerminalStyle::default();
+        let style = terminal_style_from(14.0, None, Some("Sarasa Fixed SC"), false);
+        assert_eq!(style.font_family, default.font_family);
+        assert_eq!(style.font_fallbacks[0].as_ref(), "Sarasa Fixed SC");
+        assert_eq!(style.font_fallbacks[1..], default.font_fallbacks[..]);
+    }
+
+    /// 留空 / 只写通用族名等于没配:结果与不传一字不差,存量用户的画面不变。
+    #[test]
+    fn 终端中文字体留空时样式不变() {
+        for family in [None, Some("Fira Code")] {
+            let base = terminal_style_from(14.0, family, None, false);
+            for cjk in [Some(""), Some("   "), Some("monospace")] {
+                let style = terminal_style_from(14.0, family, cjk, false);
+                assert_eq!(style, base, "{family:?} + {cjk:?}");
+            }
+        }
+    }
+
+    /// 回退表里已有的字体挪到最前、不留重复(字族名不分大小写);与主字体同名的不进回退。
+    #[test]
+    fn 终端中文字体不重复() {
+        let style = terminal_style_from(14.0, Some("Consolas"), Some("microsoft yahei"), false);
+        assert_eq!(style.font_fallbacks[0].as_ref(), "microsoft yahei");
+        let yahei = style
+            .font_fallbacks
+            .iter()
+            .filter(|f| f.eq_ignore_ascii_case("Microsoft YaHei"))
+            .count();
+        assert_eq!(yahei, 1);
+
+        let main = Some("Sarasa Fixed SC");
+        assert_eq!(
+            terminal_style_from(14.0, main, main, false),
+            terminal_style_from(14.0, main, None, false)
+        );
+    }
+
     /// 连字开关一路穿到 [`TerminalStyle`],**不被字族解析那一段吃掉** ——
     /// 早退分支(字族为空 / 只剩通用族名)也得带着它走。
     #[test]
     fn 连字开关穿到样式并存活于早退分支() {
-        let on = terminal_style_from(14.0, Some("Fira Code"), true);
+        let on = terminal_style_from(14.0, Some("Fira Code"), None, true);
         assert!(on.ligatures);
-        assert!(!terminal_style_from(14.0, Some("Fira Code"), false).ligatures);
+        assert!(!terminal_style_from(14.0, Some("Fira Code"), None, false).ligatures);
         // 这两条走的是 `terminal_style_from` 里的两个 `return style` 早退
-        assert!(terminal_style_from(14.0, None, true).ligatures);
-        assert!(terminal_style_from(14.0, Some("monospace"), true).ligatures);
+        assert!(terminal_style_from(14.0, None, None, true).ligatures);
+        assert!(terminal_style_from(14.0, Some("monospace"), None, true).ligatures);
     }
 
     // ---- 会话分支自记账 ----

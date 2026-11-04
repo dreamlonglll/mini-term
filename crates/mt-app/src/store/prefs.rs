@@ -231,6 +231,21 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
+    /// 终端中文字体。空串 = 沿用默认回退(写 `None`,不落空串)。只动回退表,
+    /// 主字体与列宽不变 —— 见 [`terminal_style_from`]。
+    pub fn set_terminal_cjk_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let next = family
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
+        if self.config.terminal_cjk_font_family == next {
+            return;
+        }
+        self.config.terminal_cjk_font_family = next;
+        self.apply_terminal_style(cx);
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
+    }
+
     /// 连体字开关。**字族本身得带 `calt` 表**才看得见效果 —— 默认的
     /// Cascadia **Mono** 是去连字版,开了也没东西可连(设置页那行提示说的就是这个)。
     ///

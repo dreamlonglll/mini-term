@@ -1214,6 +1214,8 @@ const USED_KEYS: &[&str] = &[
     "settings.font.ligaturesDescSuffix",
     "settings.font.ligaturesTitle",
     "settings.font.ligaturesUnavailable",
+    "settings.font.terminalCjkFont",
+    "settings.font.terminalCjkFontHint",
     "settings.font.terminalFont",
     "settings.font.terminalFontSize",
     "settings.font.uiFont",

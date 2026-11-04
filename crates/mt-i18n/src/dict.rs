@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1511;
+pub const ZH_ENTRY_COUNT: usize = 1513;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1511;
+pub const EN_ENTRY_COUNT: usize = 1513;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2388,6 +2388,8 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("font.ligaturesTitle", "启用终端连体字 (ligatures)"),
     ("font.ligaturesUnavailable", "默认的 Cascadia Mono 是去连字版本，开了也看不到效果 —— 需先把上面的终端字体换成 Cascadia Code、Fira Code 这类带连字的字族"),
     ("font.nerdIconsBuiltin", "终端已内置 Nerd Font 图标：终端字体缺图标时自动补上，不必另装 Nerd Font 补丁版字体"),
+    ("font.terminalCjkFont", "终端中文字体"),
+    ("font.terminalCjkFontHint", "终端字体决定英文、数字和列宽，这里选中文用什么字体，留空用默认 · 终端字体自带汉字时，中文仍用终端字体"),
     ("font.terminalFont", "终端字体"),
     ("font.terminalFontSize", "终端字体大小"),
     ("font.uiFont", "界面字体"),
@@ -2647,6 +2649,8 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("font.ligaturesTitle", "Enable terminal ligatures"),
     ("font.ligaturesUnavailable", "The default Cascadia Mono is the ligature-free variant, so enabling this changes nothing — switch the terminal font above to a ligature-carrying family such as Cascadia Code or Fira Code first"),
     ("font.nerdIconsBuiltin", "Nerd Font icons are built in: icons missing from the terminal font are filled in automatically, no patched Nerd Font required"),
+    ("font.terminalCjkFont", "Terminal CJK font"),
+    ("font.terminalCjkFontHint", "The terminal font sets Latin letters, digits and column width; this one picks the font for Chinese. Leave empty for the default · A terminal font with its own Chinese glyphs keeps using them"),
     ("font.terminalFont", "Terminal font"),
     ("font.terminalFontSize", "Terminal font size"),
     ("font.uiFont", "UI font"),

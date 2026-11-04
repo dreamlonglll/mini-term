@@ -185,8 +185,9 @@ use mt_i18n::{
 /// 错误提示（`.err.*` 7）。
 /// 1509 → 1511：提交历史自动续页加软上限，到上限之后列表末尾换成「已加载 N 个提交」+
 /// 「加载更多」按钮（`gitLog.{autoLoadPaused,loadMore}`）。
+/// 1511 → 1513：终端中文字体（issue #91，`settings.font.{terminalCjkFont,terminalCjkFontHint}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1511;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1513;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -821,11 +821,16 @@ impl SettingsView {
                         t("settings", "font.terminalFont"),
                         &self.txt_terminal_font,
                     ))
+                    .child(font_family_input(
+                        t("settings", "font.terminalCjkFont"),
+                        &self.txt_terminal_cjk_font,
+                    ))
                     .child(ui::hint(format!(
                         "{}'JetBrainsMono Nerd Font', monospace{}",
                         t("settings", "font.fontFamilyFooterPrefix"),
                         t("settings", "font.fontFamilyFooterSuffix"),
                     )))
+                    .child(ui::hint(t("settings", "font.terminalCjkFontHint")))
                     .child(ui::hint(t("settings", "font.nerdIconsBuiltin"))),
             )
             .child(

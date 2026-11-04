@@ -431,6 +431,8 @@ impl Element for MiniTerminalElement {
         f(bounds.size.height).to_bits().hash(&mut hasher);
         f(geometry.font_size).to_bits().hash(&mut hasher);
         self.style.font_family.hash(&mut hasher);
+        // 只改中文字体时主字族不变,回退表不进键的话缩略图要等下一次定时刷新
+        self.style.font_fallbacks.hash(&mut hasher);
         // 与 `TerminalElement` 的帧指纹同理:连字改的是 shaping 结果而不是内容,
         // 不进键的话切开关后缩略图会一直停在旧画面
         self.style.ligatures.hash(&mut hasher);

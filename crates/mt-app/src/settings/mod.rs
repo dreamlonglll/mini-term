@@ -294,6 +294,7 @@ enum TextField {
     RemotePasteDir,
     UiFontFamily,
     TerminalFontFamily,
+    TerminalCjkFontFamily,
 }
 
 /// 远程粘贴目录的归一(`SettingsModal.tsx:657-663`)。
@@ -391,6 +392,7 @@ pub struct SettingsView {
     txt_remote_paste_dir: Entity<InputState>,
     txt_ui_font: Entity<InputState>,
     txt_terminal_font: Entity<InputState>,
+    txt_terminal_cjk_font: Entity<InputState>,
 
     // ── appearance 页:外置皮肤 ──
     theme_cards: Vec<ThemeCard>,
@@ -630,6 +632,11 @@ impl SettingsView {
                 .placeholder(DEFAULT_TERMINAL_FONT_PLACEHOLDER)
                 .default_value(config.terminal_font_family.clone().unwrap_or_default())
         });
+        let txt_terminal_cjk_font = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(TERMINAL_CJK_FONT_PLACEHOLDER)
+                .default_value(config.terminal_cjk_font_family.clone().unwrap_or_default())
+        });
         let remote = RemoteNotifyForm::new(&config.remote_notify, window, cx);
 
         let mut this = Self {
@@ -661,6 +668,7 @@ impl SettingsView {
             txt_remote_paste_dir,
             txt_ui_font,
             txt_terminal_font,
+            txt_terminal_cjk_font,
             theme_cards: Vec::new(),
             theme_thumbs: HashSet::new(),
             theme_error: None,
@@ -713,7 +721,14 @@ impl SettingsView {
         let texts = [
             (this.txt_remote_paste_dir.clone(), TextField::RemotePasteDir),
             (this.txt_ui_font.clone(), TextField::UiFontFamily),
-            (this.txt_terminal_font.clone(), TextField::TerminalFontFamily),
+            (
+                this.txt_terminal_font.clone(),
+                TextField::TerminalFontFamily,
+            ),
+            (
+                this.txt_terminal_cjk_font.clone(),
+                TextField::TerminalCjkFontFamily,
+            ),
         ];
         for (entity, field) in texts {
             this._subs.push(cx.subscribe_in(
@@ -826,6 +841,11 @@ impl SettingsView {
                 self.store
                     .update(cx, |store, cx| store.set_terminal_font_family(next, cx));
             }
+            TextField::TerminalCjkFontFamily => {
+                let next = Some(draft).filter(|s| !s.trim().is_empty());
+                self.store
+                    .update(cx, |store, cx| store.set_terminal_cjk_font_family(next, cx));
+            }
         }
     }
 
@@ -848,6 +868,8 @@ fn commits(event: &InputEvent) -> bool {
 /// `DEFAULT_TERMINAL_FONT_FAMILY`)。
 const DEFAULT_TERMINAL_FONT_PLACEHOLDER: &str =
     "'JetBrainsMono Nerd Font', 'CaskaydiaCove Nerd Font', 'JetBrains Mono', Consolas";
+
+const TERMINAL_CJK_FONT_PLACEHOLDER: &str = "'Sarasa Fixed SC', 'Microsoft YaHei'";
 
 // ─── 渲染 ─────────────────────────────────────────────────────
 
