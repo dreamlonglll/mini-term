@@ -212,7 +212,7 @@ use super::element::{
     FlashLine, FrameGeometry, OnGridResize, OnInput, PreeditText, TerminalElement,
 };
 use super::ime::{ImeState, commit_to_bytes};
-use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes, win32_input_bytes};
 use super::links::{FileLink, FileLinks};
 use super::scrollbar::ScrollbarStyle;
 use super::search::TerminalSearch;
@@ -738,7 +738,16 @@ impl TerminalView {
             return;
         }
 
-        let Some(bytes) = keystroke_to_bytes(keystroke, self.emulator.mode()) else {
+        let mode = self.emulator.mode();
+        let bytes = if self.emulator.win32_input_mode() {
+            // ConPTY 已请求 win32-input-mode：发带真实 VK 的记录，传统编码里
+            // `Ctrl+J` / Enter 的字节冲突就不再存在。映射不到的键回落传统编码，
+            // 避免丢键。
+            win32_input_bytes(keystroke).or_else(|| keystroke_to_bytes(keystroke, mode))
+        } else {
+            keystroke_to_bytes(keystroke, mode)
+        };
+        let Some(bytes) = bytes else {
             return;
         };
         self.scroll_to_bottom();

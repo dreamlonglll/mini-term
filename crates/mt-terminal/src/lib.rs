@@ -36,7 +36,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod kitty;
@@ -122,6 +122,12 @@ pub struct TerminalEmulator {
     cursor_settle: Mutex<CursorSettle>,
     /// Kitty 图形。`None` = 开关关着(缺省),字节不经过它。见 [`kitty`]。
     kitty: Option<kitty::Kitty>,
+    /// ConPTY 的 win32-input-mode(`CSI ? 9001h/l`)是否已由应用开启。
+    /// 键盘编码要据它决定发 WSI 记录还是传统字节,见 [`Self::win32_input_mode`]。
+    win32_input: AtomicBool,
+    /// 本次运行是否允许跟踪 WSI。`MT_DISABLE_WIN32_INPUT_MODE=1` 时整条路径
+    /// 关闭,行为与加入该协议前逐字节一致。
+    win32_input_allowed: bool,
 }
 
 /// 光标要在一格上停多久才算「停稳」。
@@ -209,9 +215,16 @@ struct Parser {
 
 impl Parser {
     /// 把一批字节经 [`WidthOverride`] 推进 `term`。
-    fn advance(&mut self, term: &mut Term<EventQueue>, bytes: &[u8]) {
-        self.vte
-            .advance(&mut WidthOverride::new(term, &mut self.cluster), bytes);
+    fn advance(
+        &mut self,
+        term: &mut Term<EventQueue>,
+        bytes: &[u8],
+        win32_input: Option<&AtomicBool>,
+    ) {
+        self.vte.advance(
+            &mut WidthOverride::new(term, &mut self.cluster, win32_input),
+            bytes,
+        );
     }
 
     /// 同步块的到期时刻。`None` = 没有同步块在攒。
@@ -220,9 +233,12 @@ impl Parser {
     }
 
     /// 结束同步块:把攒下的字节同样经 [`WidthOverride`] 推进 `term`。
-    fn stop_sync(&mut self, term: &mut Term<EventQueue>) {
-        self.vte
-            .stop_sync(&mut WidthOverride::new(term, &mut self.cluster));
+    fn stop_sync(&mut self, term: &mut Term<EventQueue>, win32_input: Option<&AtomicBool>) {
+        self.vte.stop_sync(&mut WidthOverride::new(
+            term,
+            &mut self.cluster,
+            win32_input,
+        ));
     }
 }
 
@@ -291,6 +307,12 @@ impl TerminalEmulator {
             generation: AtomicU64::new(0),
             cursor_settle: Mutex::new(cursor_settle),
             kitty: None,
+            win32_input: AtomicBool::new(false),
+            win32_input_allowed: cfg!(windows)
+                && !matches!(
+                    std::env::var("MT_DISABLE_WIN32_INPUT_MODE").as_deref(),
+                    Ok("1")
+                ),
         }
     }
 
@@ -372,20 +394,21 @@ impl TerminalEmulator {
     }
 
     fn feed(&self, term: &mut Term<EventQueue>, bytes: &[u8]) {
+        let win32_input = self.win32_input_allowed.then_some(&self.win32_input);
         let mut parser = self.parser.lock();
         let mut floor = self.cursor_floor.lock();
         let Some(floor) = floor.as_mut().filter(|f| f.budget > 0) else {
-            parser.advance(term, bytes);
+            parser.advance(term, bytes, win32_input);
             return;
         };
         let (sampled, rest) = bytes.split_at(bytes.len().min(floor.budget));
         for byte in sampled {
-            parser.advance(term, std::slice::from_ref(byte));
+            parser.advance(term, std::slice::from_ref(byte), win32_input);
             floor.min = floor.min.min(cursor_row(term));
         }
         floor.budget -= sampled.len();
         if !rest.is_empty() {
-            parser.advance(term, rest);
+            parser.advance(term, rest, win32_input);
         }
     }
 
@@ -413,6 +436,7 @@ impl TerminalEmulator {
 
     /// [`Self::release_expired_sync`] 的可注入时钟版本,单测用。
     fn release_expired_sync_at(&self, now: Instant) -> SyncRelease {
+        let win32_input = self.win32_input_allowed.then_some(&self.win32_input);
         let mut term = self.term.lock();
         let mut parser = self.parser.lock();
         let Some(deadline) = parser.sync_deadline() else {
@@ -423,7 +447,7 @@ impl TerminalEmulator {
         }
         // 持着 term 锁记账,口径同 `advance`
         self.generation.fetch_add(1, Ordering::Relaxed);
-        parser.stop_sync(&mut term);
+        parser.stop_sync(&mut term, win32_input);
         // 块里的中间态已经看不到了(结束标记那条路也一样),水位只能记下放完之后的光标
         if let Some(floor) = self.cursor_floor.lock().as_mut().filter(|f| f.budget > 0) {
             floor.min = floor.min.min(cursor_row(&term));
@@ -499,6 +523,16 @@ impl TerminalEmulator {
     /// 键盘编码与粘贴编码都要看它。
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
+    }
+
+    /// Windows 本地 ConPTY 的 win32-input-mode 是否开启:应用发过
+    /// `CSI ? 9001h`,之后没有 `CSI ? 9001l`,且本次运行没被
+    /// `MT_DISABLE_WIN32_INPUT_MODE=1` 关掉。非 Windows 恒为 false。
+    ///
+    /// 键盘编码据它决定是否把 `Shift+Enter` / `Ctrl+J` 发成 WSI 记录;其余按键
+    /// 始终走 legacy 字节。
+    pub fn win32_input_mode(&self) -> bool {
+        self.win32_input_allowed && self.win32_input.load(Ordering::Relaxed)
     }
 
     /// 借出 grid 只读地做一件事。比裸拿 `term()` 少一次「忘了尽早放锁」的机会。
@@ -1260,5 +1294,62 @@ mod tests {
             );
         }
         assert_eq!(e.line_text(LINES as i32).as_deref(), Some(""));
+    }
+
+    fn emulator_with_wsi() -> TerminalEmulator {
+        let mut e = TerminalEmulator::new(TermSize::new(20, 4));
+        // 绕过 cfg(windows)/环境变量门控，单独验证模式跟踪本身。
+        e.win32_input_allowed = true;
+        e
+    }
+
+    /// WSI 开关完全跟随应用的 `CSI ? 9001h/l`。
+    #[test]
+    fn win32_input_mode_follows_private_mode() {
+        let e = emulator_with_wsi();
+        assert!(!e.win32_input_mode());
+        e.advance(b"\x1b[?9001h");
+        assert!(e.win32_input_mode());
+        e.advance(b"\x1b[?9001l");
+        assert!(!e.win32_input_mode());
+    }
+
+    /// 序列被 PTY 读取切成两批时也必须识别（解析器状态机跨 chunk）。
+    #[test]
+    fn win32_input_mode_survives_chunk_split() {
+        let e = emulator_with_wsi();
+        e.advance(b"\x1b[?90");
+        assert!(!e.win32_input_mode());
+        e.advance(b"01h");
+        assert!(e.win32_input_mode());
+        e.advance(b"\x1b[?900");
+        e.advance(b"1l");
+        assert!(!e.win32_input_mode());
+    }
+
+    /// 普通私有模式（光标、鼠标、括号粘贴）不能被误当成 WSI。
+    #[test]
+    fn other_private_modes_do_not_toggle_win32_input() {
+        let e = emulator_with_wsi();
+        e.advance(b"\x1b[?1h\x1b[?25l\x1b[?1000h\x1b[?2004h");
+        assert!(!e.win32_input_mode());
+    }
+
+    /// RIS（`ESC c`）必须把 WSI 状态一并清掉。
+    #[test]
+    fn reset_clears_win32_input_mode() {
+        let e = emulator_with_wsi();
+        e.advance(b"\x1b[?9001h");
+        assert!(e.win32_input_mode());
+        e.advance(b"\x1bc");
+        assert!(!e.win32_input_mode());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn win32_input_mode_disabled_off_windows() {
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"\x1b[?9001h");
+        assert!(!e.win32_input_mode());
     }
 }

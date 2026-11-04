@@ -65,6 +65,8 @@ use alacritty_terminal::vte::ansi::{
     KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
     ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use unicode_segmentation::GraphemeCursor;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -139,14 +141,22 @@ pub(crate) struct WidthOverride<'a, T> {
     /// 簇文本的暂存,跨字符复用免得每个字符分配一次。
     cluster: &'a mut String,
     kitty: Option<&'a KittyShared>,
+    /// ConPTY 的 win32-input-mode(`CSI ? 9001h/l`)开关。`None` = 本次运行禁用
+    /// (`MT_DISABLE_WIN32_INPUT_MODE=1`),序列照常喂给 `Term`,只是不置位。
+    win32_input: Option<&'a AtomicBool>,
 }
 
 impl<'a, T: EventListener> WidthOverride<'a, T> {
-    pub(crate) fn new(term: &'a mut Term<T>, scratch: &'a mut Scratch) -> Self {
+    pub(crate) fn new(
+        term: &'a mut Term<T>,
+        scratch: &'a mut Scratch,
+        win32_input: Option<&'a AtomicBool>,
+    ) -> Self {
         Self {
             term,
             cluster: &mut scratch.text,
             kitty: scratch.kitty.as_deref(),
+            win32_input,
         }
     }
 
@@ -316,10 +326,34 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
     }
 
     fn reset_state(&mut self) {
+        if let Some(flag) = self.win32_input {
+            flag.store(false, Ordering::Relaxed);
+        }
         if let Some(kitty) = self.kitty {
             kitty.on_reset();
         }
         self.term.reset_state();
+    }
+
+    /// `CSI ? 9001h/l` —— ConPTY 的 win32-input-mode 开关。未知私有模式 `vte`
+    /// 会原样派发给 `Handler`,所以不需要在字节流上另写扫描器(跨 chunk 也由
+    /// 解析器状态机负责)。
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        if matches!(mode, PrivateMode::Unknown(9001))
+            && let Some(flag) = self.win32_input
+        {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.term.set_private_mode(mode);
+    }
+
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        if matches!(mode, PrivateMode::Unknown(9001))
+            && let Some(flag) = self.win32_input
+        {
+            flag.store(false, Ordering::Relaxed);
+        }
+        self.term.unset_private_mode(mode);
     }
 
     forward_to_term! {
@@ -364,8 +398,6 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         set_mode(mode: Mode);
         unset_mode(mode: Mode);
         report_mode(mode: Mode);
-        set_private_mode(mode: PrivateMode);
-        unset_private_mode(mode: PrivateMode);
         report_private_mode(mode: PrivateMode);
         set_scrolling_region(top: usize, bottom: Option<usize>);
         set_keypad_application_mode();

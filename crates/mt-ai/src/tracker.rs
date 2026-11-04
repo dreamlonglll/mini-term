@@ -136,7 +136,23 @@ impl InputState {
         line
     }
 
+    /// win32-input-mode 的换行记录。mini-term 只对 `Shift+Enter` / `Ctrl+J`
+    /// 发送；这两条必须当作“插入换行”，不能落进通用 CSI 的 `clear_line`。
+    /// `74;36;0;...` 是旧版/兼容写法，一并认。
+    fn apply_wsi_newline(&mut self, sequence: &str) -> bool {
+        match sequence {
+            "13;28;13;1;16;1_" | "74;36;10;1;8;1_" | "74;36;0;1;8;1_" => {
+                self.insert_char('\n');
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn apply_csi(&mut self, sequence: &str) {
+        if self.apply_wsi_newline(sequence) {
+            return;
+        }
         match sequence {
             "200~" => self.bracketed_paste = true,
             "201~" => self.bracketed_paste = false,
@@ -1045,6 +1061,22 @@ mod tests {
         assert_eq!(submits.len(), 1);
         assert_eq!(submits[0].line, "fix the bug");
         assert!(submits[0].ts > 0);
+    }
+
+    /// WSI 的 Shift+Enter / Ctrl+J 是插入换行，不能清空已输入内容。
+    #[test]
+    fn wsi_newline_records_keep_multiline_submit() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "first line");
+        mgr.track_input(1, "\x1b[13;28;13;1;16;1_"); // Shift+Enter
+        mgr.track_input(1, "second line");
+        mgr.track_input(1, "\x1b[74;36;10;1;8;1_"); // Ctrl+J
+        mgr.track_input(1, "third line\r");
+
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "first line\nsecond line\nthird line");
     }
 
     #[test]

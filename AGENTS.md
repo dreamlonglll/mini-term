@@ -94,6 +94,14 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 原 Tauri 版的 16ms 批缓冲 / 有界 channel / 4MB-1MB 双水位背压 / 30s 超时兜底整套
 是为 WebView IPC 边界造的，已随架构作废；孤儿 PTY 回收同理（单进程无失引用链路）。
 
+Windows 本地 pane 多一层输入协议：ConPTY 启动时发 `CSI ? 9001h` 请求
+win32-input-mode，`mt-terminal` 跟踪该模式（`TerminalEmulator::win32_input_mode`）。
+只有传统编码表达不了的 `Shift+Enter` / `Ctrl+J` 两个键由
+`mt-ui::terminal::input::win32_input_bytes` 编码成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`，
+其余按键仍走 legacy 字节；`Ctrl+J` 的 `Uc=10`（Node raw / `_getwch` 依赖非零
+Uc，OMP 需上游放宽解码）。`mt-ai` 的输入旁路把这两条记录当换行处理，不落
+`clear_line`。非 Windows 不跟踪；`MT_DISABLE_WIN32_INPUT_MODE=1` 可关闭。
+
 ### 持久化布局：数据目录里有什么
 
 `{active_data_dir}`（`%APPDATA%\com.mini-term.app`，dev 实例由 `MT_APP_DATA_DIR` 覆盖）：
