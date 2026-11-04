@@ -59,7 +59,7 @@ const STROKE: f32 = 1.2 / 16.0;
 /// 无 AI 会话的面板图标:终端窗口(圆角框 + 提示符 `>`)。
 /// 与 [`activity_bar::SSH`] 相近但**不带光标下划线** —— 两个字形分别指
 /// 「SSH 连接管理」与「一个终端面板」,并排出现时得有差异。
-const PANEL_ICON: &[Shape] = &[
+pub(crate) const PANEL_ICON: &[Shape] = &[
     Shape::line(
         Ink::Current,
         STROKE,
@@ -349,7 +349,7 @@ fn open_rename_panel(
 }
 
 /// 面板显示名:自定义名 > 「面板 N」(N 是 1-based 列表位)。
-fn panel_title(state: &crate::store::ProjectState, panel_id: &str) -> String {
+pub(crate) fn panel_title(state: &crate::store::ProjectState, panel_id: &str) -> String {
     let Some(idx) = state.panels.iter().position(|p| p.id == panel_id) else {
         return String::new();
     };

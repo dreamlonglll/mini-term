@@ -191,8 +191,10 @@ use mt_i18n::{
 /// 1536 → 1540（issue #90）：关闭终端的确认框加「不再询问」与改回去的指路
 /// （`paneGroup.{closeDontAskAgain,closeDontAskHint}`），设置页加对应开关
 /// （`settings.terminal.{confirmCloseTitle,confirmCloseDesc}`）。
+/// 1540 → 1545：文件树目录右键「在此目录搜索内容」（`fileTree.menu.searchInDirectory`）
+/// 与搜索弹窗的范围徽标（`search.{scopeLabel,scopeClear,scopeMissing,scopeOutside}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1540;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1545;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

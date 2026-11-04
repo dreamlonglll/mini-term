@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1540;
+pub const ZH_ENTRY_COUNT: usize = 1545;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1540;
+pub const EN_ENTRY_COUNT: usize = 1545;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -370,6 +370,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("menu.paste", "粘贴"),
     ("menu.rename", "重命名"),
     ("menu.revealInFolder", "在文件夹中打开"),
+    ("menu.searchInDirectory", "在此目录搜索内容"),
     ("menu.uploadFiles", "上传文件…"),
     ("menu.uploadFolder", "上传文件夹…"),
     ("menu.viewDiff", "查看变更"),
@@ -456,6 +457,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("menu.paste", "Paste"),
     ("menu.rename", "Rename"),
     ("menu.revealInFolder", "Reveal in Folder"),
+    ("menu.searchInDirectory", "Search in This Folder"),
     ("menu.uploadFiles", "Upload Files…"),
     ("menu.uploadFolder", "Upload Folder…"),
     ("menu.viewDiff", "View Changes"),
@@ -2082,8 +2084,8 @@ static PROJECT_SWITCHER_ZH: &[(&str, &str)] = &[
     ("hintClose", "关闭"),
     ("hintMove", "移动"),
     ("hintOpen", "打开"),
-    ("noMatch", "没有匹配的项目"),
-    ("placeholder", "输入项目名或分组…"),
+    ("noMatch", "没有匹配的项目或终端"),
+    ("placeholder", "输入项目名、分组或已开的终端…"),
     ("title", "切换项目"),
 ];
 #[rustfmt::skip]
@@ -2093,8 +2095,8 @@ static PROJECT_SWITCHER_EN: &[(&str, &str)] = &[
     ("hintClose", "close"),
     ("hintMove", "move"),
     ("hintOpen", "open"),
-    ("noMatch", "No matching project"),
-    ("placeholder", "Type a project or group name…"),
+    ("noMatch", "No matching project or terminal"),
+    ("placeholder", "Type a project, group or open terminal…"),
     ("title", "Switch project"),
 ];
 
@@ -2184,6 +2186,10 @@ static SEARCH_ZH: &[(&str, &str)] = &[
     ("placeholderFilename", "搜索文件名（含 / 则按路径匹配）..."),
     ("regexTitle", "正则表达式"),
     ("remoteUnsupported", "远程项目暂不支持全局搜索。"),
+    ("scopeClear", "清除范围，搜索整个项目"),
+    ("scopeLabel", "搜索范围"),
+    ("scopeMissing", "这个目录不存在或已被删除，没有执行搜索。"),
+    ("scopeOutside", "这个目录不在项目内（可能是指向项目外的链接），没有执行搜索。"),
     ("searchButton", "搜索"),
     ("searching", "搜索中..."),
     ("searchingFound", "搜索中... 已找到 {count} 条"),
@@ -2203,6 +2209,10 @@ static SEARCH_EN: &[(&str, &str)] = &[
     ("placeholderFilename", "Search filenames (include / to match paths)..."),
     ("regexTitle", "Regular Expression"),
     ("remoteUnsupported", "Global search is not available for remote projects yet."),
+    ("scopeClear", "Clear and search the whole project"),
+    ("scopeLabel", "Search in"),
+    ("scopeMissing", "This folder no longer exists, so nothing was searched."),
+    ("scopeOutside", "This folder is outside the project (possibly a link pointing elsewhere), so nothing was searched."),
     ("searchButton", "Search"),
     ("searching", "Searching..."),
     ("searchingFound", "Searching... {count} found"),

@@ -650,7 +650,11 @@ impl BranchPopup {
 
 /// 命中区间(char 下标,`find_folded` 的口径)→ 字节区间(`StyledText` 的高亮口径)。
 /// 越界 / 逆序返回 `None`(一条坏区间不该把整行名字吞掉)。
-fn char_range_to_bytes(text: &str, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+pub(crate) fn char_range_to_bytes(
+    text: &str,
+    start: usize,
+    end: usize,
+) -> Option<std::ops::Range<usize>> {
     if start >= end {
         return None;
     }
