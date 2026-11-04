@@ -20,6 +20,12 @@
 //! 内容搜索另有三道闸,挡的是「项目里躺着大日志 / 数据集 / 压缩过的 JS」这一类:
 //! 跳过大于 [`MAX_CONTENT_FILE_BYTES`] 的文件、先读文件头判二进制再决定读不读全文
 //! ([`read_text_file`])、超长命中行只留命中点附近一段([`clip_long_line`])。
+//!
+//! # 范围
+//!
+//! [`SearchRequest::scope`] 只缩小遍历起点,**项目根的语义一概不动**:结果路径、排序键、
+//! 按路径匹配都仍然相对项目根,上层靠它拼回绝对路径打开文件。祖先目录的 `.gitignore`
+//! 由 `ignore` 的 parents 机制沿起点往上加载,从子目录起步与从根起步判得一样。
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
@@ -86,11 +92,22 @@ pub struct SearchResultItem {
     pub match_in_path: bool,
 }
 
+/// 搜索范围不成立的原因,见 [`resolve_scope`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeError {
+    /// 目录不存在、已被删除,或者不是目录。
+    Missing,
+    /// 规范化之后落在项目根之外(`..` 逃逸、指向项目外的链接)。
+    OutsideRoot,
+}
+
 /// 搜索过程中回调给上层的事件。
 #[derive(Debug, Clone)]
 pub enum SearchEvent {
     /// 一批命中(50 条或 100ms 攒一批)。整次搜索里按「文件路径 → 行号」有序。
     Results(Vec<SearchResultItem>),
+    /// 范围不成立,这次一个文件都没碰。后面紧跟一条零结果的 [`SearchEvent::Complete`]。
+    ScopeRejected(ScopeError),
     /// 搜索结束。`cancelled=true` 表示是被取消的,结果不完整;`truncated=true` 表示
     /// 收满 [`MAX_RESULTS`] 条后提前收工、后面可能还有命中——此时 `total_count` 就是
     /// 上限,不再是完整命中数。
@@ -105,6 +122,11 @@ pub enum SearchEvent {
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
     pub project_root: PathBuf,
+    /// 只搜这个目录(绝对路径,或相对项目根)。`None` = 整个项目。
+    ///
+    /// 只决定**从哪里开始遍历**:结果路径照旧相对 `project_root`。必须落在项目根内,
+    /// 否则这次搜索被拒绝([`SearchEvent::ScopeRejected`])。
+    pub scope: Option<PathBuf>,
     pub query: String,
     pub mode: SearchMode,
     pub use_regex: bool,
@@ -233,6 +255,60 @@ fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel 
     builder.build_parallel()
 }
 
+/// 把搜索范围解析成本次遍历的起点:规范化后校验它在项目根内,再按**项目根原来的写法**
+/// 拼回去。
+///
+/// 两边都先 `canonicalize`:Windows 上的大小写与分隔符由此归一(拿到的是磁盘上的真实
+/// 写法),`..` 逃逸与指向项目外的链接(符号链接 / junction)也在这里现形。不直接拿规范化
+/// 结果去遍历:它在 Windows 上是 `\\?\` 形态,而 [`collect_candidates`] 靠
+/// `strip_prefix(project_root)` 算相对路径。
+///
+/// 范围就是项目根本身时返回项目根,与不带范围完全一致。
+///
+/// 这里要碰盘(WSL 路径可能还要等 VM 冷启动),只在搜索线程上调。
+pub fn resolve_scope(project_root: &Path, scope: &Path) -> Result<PathBuf, ScopeError> {
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|_| ScopeError::Missing)?;
+    // `join` 遇到绝对路径直接取后者,相对路径则算在项目根下
+    let canonical_scope = project_root
+        .join(scope)
+        .canonicalize()
+        .map_err(|_| ScopeError::Missing)?;
+    let rel = relative_within(&canonical_root, &canonical_scope).ok_or(ScopeError::OutsideRoot)?;
+    if !canonical_scope.is_dir() {
+        return Err(ScopeError::Missing);
+    }
+    Ok(if rel.as_os_str().is_empty() {
+        project_root.to_path_buf()
+    } else {
+        project_root.join(rel)
+    })
+}
+
+/// `scope` 相对 `root` 的路径,不在根内返回 `None`。两者都得是**已规范化**的路径。
+///
+/// 按路径段比,不是按字符串前缀比(`/a/bc` 不在 `/a/b` 内)。段内大小写严格比较:
+/// 规范化之后两边都是磁盘上的真实写法,而 WSL 的文件系统本来就区分大小写。
+///
+/// WSL 另走一条:同一发行版有 `\\wsl$` 与 `\\wsl.localhost` 两种写法,规范化不会把它们
+/// 归成一种,路径前缀因此对不上。认成同一处后按 Linux 路径比。
+fn relative_within(root: &Path, scope: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = scope.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    let root = mt_core::parse_wsl_unc(&root.to_string_lossy())?;
+    let scope = mt_core::parse_wsl_unc(&scope.to_string_lossy())?;
+    if !root.distro.eq_ignore_ascii_case(&scope.distro) {
+        return None;
+    }
+    let rel = Path::new(&scope.unix_path)
+        .strip_prefix(&root.unix_path)
+        .ok()?;
+    // 重新收集一遍换成本平台的分隔符:这段要接到项目根后面当 Windows 路径用
+    Some(rel.components().collect())
+}
+
 /// 大小写不敏感子串搜索，直接返回【原始 text】的 char 区间（上层按 char 高亮）。
 ///
 /// 逐字符做小写折叠，同时记录每个小写字符来自哪个原始字符；匹配在小写字符序列
@@ -240,7 +316,7 @@ fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel 
 /// 长度（İ→i̇、ǅ→ǆ 等），结果也始终落在原始字符边界上——从根本上避免了旧实现里
 /// 「按字节 +1 步进切多字节字符 panic」以及「在 to_lowercase() 串上算偏移却拿原串
 /// 做 byte→char 映射导致越界 / 错位」两个问题。query_lower 由调用方预先小写化。
-fn find_substring_char_ranges(text: &str, query_lower: &str) -> Vec<(usize, usize)> {
+pub fn find_substring_char_ranges(text: &str, query_lower: &str) -> Vec<(usize, usize)> {
     if query_lower.is_empty() {
         return Vec::new();
     }
@@ -479,14 +555,16 @@ fn file_name_of(rel_path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// 第一段:并行遍历收齐候选文件(目录不算)并排好序。被取消时返回 `None`。
+/// 第一段:从 `walk_root` 并行遍历,收齐候选文件(目录不算)并排好序。被取消时返回
+/// `None`。相对路径算到项目根 `root`,不是遍历起点。
 fn collect_candidates(
     root: &Path,
+    walk_root: &Path,
     max_filesize: Option<u64>,
     cancel: &SearchHandle,
 ) -> Option<Vec<Candidate>> {
     let found: Mutex<Vec<Candidate>> = Mutex::new(Vec::new());
-    build_walker(root, max_filesize).run(|| {
+    build_walker(walk_root, max_filesize).run(|| {
         let found = &found;
         Box::new(move |entry| {
             if cancel.is_cancelled() {
@@ -678,6 +756,7 @@ fn normalize_path_query(query: &str) -> String {
 /// 返回是否因上限截断。
 fn search_filenames<F: Fn(SearchEvent)>(
     root: &Path,
+    walk_root: &Path,
     query: &str,
     use_regex: bool,
     cap: usize,
@@ -692,7 +771,7 @@ fn search_filenames<F: Fn(SearchEvent)>(
     } else {
         Matcher::Substring(query.to_lowercase())
     };
-    let Some(candidates) = collect_candidates(root, None, cancel) else {
+    let Some(candidates) = collect_candidates(root, walk_root, None, cancel) else {
         return Ok(false);
     };
     // 只比对名字,活太轻,多线程的调度开销反而更大:本线程按序扫
@@ -727,6 +806,7 @@ fn search_filenames<F: Fn(SearchEvent)>(
 /// 返回是否因上限截断。
 fn search_contents<F: Fn(SearchEvent)>(
     root: &Path,
+    walk_root: &Path,
     query: &str,
     use_regex: bool,
     cap: usize,
@@ -738,7 +818,9 @@ fn search_contents<F: Fn(SearchEvent)>(
     } else {
         Matcher::Substring(query.to_lowercase())
     };
-    let Some(candidates) = collect_candidates(root, Some(MAX_CONTENT_FILE_BYTES), cancel) else {
+    let Some(candidates) =
+        collect_candidates(root, walk_root, Some(MAX_CONTENT_FILE_BYTES), cancel)
+    else {
         return Ok(false);
     };
     let per_file = |candidate: &Candidate| {
@@ -794,7 +876,8 @@ fn compile_regex(query: &str) -> Result<Regex> {
 ///
 /// sink 会先收到若干 [`SearchEvent::Results`](按文件路径、行号有序,最多
 /// [`MAX_RESULTS`] 条),最后必定收到一条 [`SearchEvent::Complete`] —— 即便中途
-/// panic 也不例外。
+/// panic 也不例外。范围不成立时只有一条 [`SearchEvent::ScopeRejected`] 加那条
+/// 零结果的 `Complete`。
 pub fn run_search<F>(req: SearchRequest, cancel: SearchHandle, sink: F)
 where
     F: Fn(SearchEvent),
@@ -808,6 +891,18 @@ where
     F: Fn(SearchEvent),
 {
     let mut batcher = ResultBatcher::new(sink);
+    // 校验放在这里而不是 `start_search`:要碰盘,而 `start_search` 跑在调用方(UI)线程上
+    let walk_root = match &req.scope {
+        Some(scope) => match resolve_scope(&req.project_root, scope) {
+            Ok(walk_root) => walk_root,
+            Err(err) => {
+                (batcher.sink)(SearchEvent::ScopeRejected(err));
+                batcher.finish(cancel.is_cancelled(), false);
+                return;
+            }
+        },
+        None => req.project_root.clone(),
+    };
     // 用 catch_unwind 兜底:即便搜索体内将来再出现 panic,也不会跳过下面的 finish(),
     // 否则上层永远收不到 Complete、搜索框卡死在 loading。工作线程里的 panic 由
     // `thread::scope` 在汇合时转抛到这里。
@@ -815,6 +910,7 @@ where
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.mode {
         SearchMode::FileName => search_filenames(
             &req.project_root,
+            &walk_root,
             &req.query,
             req.use_regex,
             cap,
@@ -823,6 +919,7 @@ where
         ),
         SearchMode::FileContent => search_contents(
             &req.project_root,
+            &walk_root,
             &req.query,
             req.use_regex,
             cap,
@@ -1260,6 +1357,7 @@ mod tests {
         run_search_capped(
             SearchRequest {
                 project_root: root.to_path_buf(),
+                scope: None,
                 query: query.to_string(),
                 mode,
                 use_regex,
@@ -1277,6 +1375,7 @@ mod tests {
         for ev in rx {
             match ev {
                 SearchEvent::Results(mut batch) => items.append(&mut batch),
+                SearchEvent::ScopeRejected(err) => panic!("这里没带范围,却被拒了:{err:?}"),
                 SearchEvent::Complete {
                     total_count,
                     cancelled: c,
@@ -1602,6 +1701,7 @@ mod tests {
         run_search(
             SearchRequest {
                 project_root: root.clone(),
+                scope: None,
                 query: "match".to_string(),
                 mode: SearchMode::FileContent,
                 use_regex: false,
@@ -1616,7 +1716,7 @@ mod tests {
             .iter()
             .map(|ev| match ev {
                 SearchEvent::Results(items) => items.len(),
-                SearchEvent::Complete { .. } => 0,
+                SearchEvent::ScopeRejected(_) | SearchEvent::Complete { .. } => 0,
             })
             .sum();
         assert_eq!(shown, MAX_RESULTS);
@@ -1640,6 +1740,7 @@ mod tests {
         run_search(
             SearchRequest {
                 project_root: root.clone(),
+                scope: None,
                 query: "alpha".to_string(),
                 mode: SearchMode::FileName,
                 use_regex: false,
@@ -1666,6 +1767,7 @@ mod tests {
     fn start_search_rejects_empty_query_and_bad_regex() {
         let req = |q: &str, re: bool| SearchRequest {
             project_root: std::env::temp_dir(),
+            scope: None,
             query: q.to_string(),
             mode: SearchMode::FileName,
             use_regex: re,
@@ -1675,5 +1777,385 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("Invalid regex"), "实际错误: {err}");
+    }
+
+    // ── 范围 ──
+
+    /// 多服务单仓:同一个关键词躺在根目录、目标目录、兄弟目录与目标的子目录里。
+    fn make_monorepo(tag: &str) -> PathBuf {
+        let root = temp_project(tag);
+        for dir in ["services/api/deep", "services/web"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "root.txt",
+            "services/api/handler.rs",
+            "services/api/deep/inner.rs",
+            "services/web/page.rs",
+        ] {
+            std::fs::write(root.join(file), "first\nneedle here\n").unwrap();
+        }
+        root
+    }
+
+    /// 返回 `(命中, 被拒原因)`。
+    fn collect_scoped(
+        root: &Path,
+        scope: Option<&Path>,
+        query: &str,
+        mode: SearchMode,
+    ) -> (Vec<SearchResultItem>, Option<ScopeError>) {
+        let (tx, rx) = channel();
+        run_search(
+            SearchRequest {
+                project_root: root.to_path_buf(),
+                scope: scope.map(Path::to_path_buf),
+                query: query.to_string(),
+                mode,
+                use_regex: false,
+            },
+            SearchHandle::new(),
+            move |ev| {
+                let _ = tx.send(ev);
+            },
+        );
+        let mut items = Vec::new();
+        let mut rejected = None;
+        let mut completes = 0;
+        for ev in rx {
+            match ev {
+                SearchEvent::Results(mut batch) => items.append(&mut batch),
+                SearchEvent::ScopeRejected(err) => rejected = Some(err),
+                SearchEvent::Complete { .. } => completes += 1,
+            }
+        }
+        assert_eq!(completes, 1, "必定收尾一条 Complete");
+        (items, rejected)
+    }
+
+    /// 结果路径统一成 `/` 再比,测试在各平台写法一致。
+    fn rel_paths(items: &[SearchResultItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| i.file_path.to_string_lossy().replace('\\', "/"))
+            .collect()
+    }
+
+    #[test]
+    fn scope_limits_search_to_directory_and_keeps_paths_relative_to_root() {
+        let root = make_monorepo("scope-basic");
+        for scope in [
+            // 文件树给的是绝对路径;相对项目根的写法同样认
+            root.join("services").join("api"),
+            PathBuf::from("services/api"),
+        ] {
+            let (items, rejected) =
+                collect_scoped(&root, Some(&scope), "needle", SearchMode::FileContent);
+            assert_eq!(rejected, None);
+            assert_eq!(
+                rel_paths(&items),
+                ["services/api/deep/inner.rs", "services/api/handler.rs"],
+                "兄弟目录与根目录不参与,结果相对项目根"
+            );
+            // 上层就是这么拼回去打开文件的:拼出来的路径上,那一行真有这个词
+            for item in &items {
+                let text = std::fs::read_to_string(root.join(&item.file_path)).unwrap();
+                let line = item.line_number.unwrap() as usize;
+                assert_eq!(text.lines().nth(line - 1), item.line_content.as_deref());
+            }
+        }
+
+        // 文件名模式同一范围
+        let scope = root.join("services").join("web");
+        let (items, rejected) = collect_scoped(&root, Some(&scope), ".rs", SearchMode::FileName);
+        assert_eq!(rejected, None);
+        assert_eq!(rel_paths(&items), ["services/web/page.rs"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 按路径匹配的口径也不变:路径仍从项目根算起,不是从范围目录算起。
+    #[test]
+    fn scope_path_match_is_still_relative_to_root() {
+        let root = make_monorepo("scope-pathmatch");
+        let scope = root.join("services").join("api");
+        let (items, _) =
+            collect_scoped(&root, Some(&scope), "services/api/h", SearchMode::FileName);
+        assert_eq!(rel_paths(&items), ["services/api/handler.rs"]);
+        assert!(items[0].match_in_path);
+        assert_eq!(items[0].match_ranges, vec![(0, 14)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 范围是项目根本身:与不带范围的结果逐条相同。
+    #[test]
+    fn scope_equal_to_root_matches_whole_project() {
+        let root = make_monorepo("scope-root");
+        let (all, _) = collect_scoped(&root, None, "needle", SearchMode::FileContent);
+        let (scoped, rejected) =
+            collect_scoped(&root, Some(&root), "needle", SearchMode::FileContent);
+        assert_eq!(rejected, None);
+        assert_eq!(all.len(), 4);
+        assert_eq!(rel_paths(&scoped), rel_paths(&all));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 根与子目录的 `.gitignore` 从子目录起步都要生效,**含根里相对根写死的规则**:
+    /// 不加载祖先规则、或者规则按遍历起点去解释,第二类就漏了。
+    #[test]
+    fn scope_honors_root_and_nested_gitignore() {
+        let root = make_monorepo("scope-gitignore");
+        // `.gitignore` 只在 git 仓库里才认(`require_git` 默认开)
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "*.log\n/services/api/anchored.rs\nservices/api/generated/\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("services/api/.gitignore"), "local-only.rs\n").unwrap();
+        std::fs::write(root.join("services/api/deep/.gitignore"), "deep-only.rs\n").unwrap();
+        std::fs::create_dir_all(root.join("services/api/generated")).unwrap();
+        for ignored in [
+            "services/api/app.log",
+            "services/api/anchored.rs",
+            "services/api/generated/out.rs",
+            "services/api/local-only.rs",
+            "services/api/deep/deep-only.rs",
+        ] {
+            std::fs::write(root.join(ignored), "needle\n").unwrap();
+        }
+
+        let scope = root.join("services").join("api");
+        let (items, rejected) =
+            collect_scoped(&root, Some(&scope), "needle", SearchMode::FileContent);
+        assert_eq!(rejected, None);
+        assert_eq!(
+            rel_paths(&items),
+            ["services/api/deep/inner.rs", "services/api/handler.rs"]
+        );
+
+        // 再对一遍账:子目录起步的结果,恰是全项目结果里落在该目录下的那部分
+        let (all, _) = collect_scoped(&root, None, "needle", SearchMode::FileContent);
+        let expected: Vec<String> = rel_paths(&all)
+            .into_iter()
+            .filter(|p| p.starts_with("services/api/"))
+            .collect();
+        assert_eq!(rel_paths(&items), expected);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 用户明确点了一个被忽略的目录:目录规则挡不住它里面的文件(规则只匹配目录本身),
+    /// 按文件名写的规则照样生效。
+    #[test]
+    fn scope_inside_ignored_directory_searches_its_contents() {
+        let root = make_monorepo("scope-ignored-dir");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".gitignore"), "dist/\n*.map\n").unwrap();
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::write(root.join("dist/bundle.js"), "needle\n").unwrap();
+        std::fs::write(root.join("dist/bundle.map"), "needle\n").unwrap();
+
+        let (all, _) = collect_scoped(&root, None, "bundle", SearchMode::FileName);
+        assert!(all.is_empty(), "全项目搜索不进被忽略的目录");
+        let (items, rejected) = collect_scoped(
+            &root,
+            Some(&root.join("dist")),
+            "needle",
+            SearchMode::FileContent,
+        );
+        assert_eq!(rejected, None);
+        assert_eq!(rel_paths(&items), ["dist/bundle.js"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scope_outside_root_is_rejected_without_results() {
+        let base = temp_project("scope-outside");
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/in.txt"), "needle\n").unwrap();
+        // 名字以项目根开头的兄弟目录:按字符串前缀比就放进去了
+        let sibling = base.join("proj-other");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("out.txt"), "needle\n").unwrap();
+        std::fs::write(base.join("parent.txt"), "needle\n").unwrap();
+
+        for scope in [
+            sibling.clone(),
+            base.clone(),
+            root.join("..").join("proj-other"),
+            PathBuf::from("../proj-other"),
+            PathBuf::from("sub/../.."),
+        ] {
+            let (items, rejected) =
+                collect_scoped(&root, Some(&scope), "needle", SearchMode::FileContent);
+            assert_eq!(rejected, Some(ScopeError::OutsideRoot), "{scope:?}");
+            assert!(items.is_empty(), "{scope:?} 不能搜到项目外");
+        }
+        // 绕一圈还在根内的不算逃逸
+        let (items, rejected) = collect_scoped(
+            &root,
+            Some(&root.join("sub").join("..").join("sub")),
+            "needle",
+            SearchMode::FileContent,
+        );
+        assert_eq!(rejected, None);
+        assert_eq!(rel_paths(&items), ["sub/in.txt"]);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn scope_missing_or_not_a_directory_is_rejected() {
+        let root = make_monorepo("scope-missing");
+        for scope in [root.join("no-such-dir"), root.join("root.txt")] {
+            let (items, rejected) =
+                collect_scoped(&root, Some(&scope), "needle", SearchMode::FileContent);
+            assert_eq!(rejected, Some(ScopeError::Missing), "{scope:?}");
+            assert!(items.is_empty());
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 指向项目外的链接:名字在项目里,内容在外面。不规范化就看不出来。
+    #[cfg(unix)]
+    #[test]
+    fn scope_symlink_escaping_root_is_rejected() {
+        let base = temp_project("scope-symlink");
+        let root = base.join("proj");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "needle\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let (items, rejected) = collect_scoped(
+            &root,
+            Some(&root.join("link")),
+            "needle",
+            SearchMode::FileContent,
+        );
+        assert_eq!(rejected, Some(ScopeError::OutsideRoot));
+        assert!(items.is_empty());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// junction 不要管理员权限,Windows 上项目里常见的就是它。
+    #[cfg(windows)]
+    #[test]
+    fn scope_junction_escaping_root_is_rejected() {
+        let base = temp_project("scope-junction");
+        let root = base.join("proj");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "needle\n").unwrap();
+        let link = root.join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction 建不出来,这条测不到东西");
+
+        let (items, rejected) =
+            collect_scoped(&root, Some(&link), "needle", SearchMode::FileContent);
+        assert_eq!(rejected, Some(ScopeError::OutsideRoot));
+        assert!(items.is_empty());
+        std::fs::remove_dir(&link).ok();
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 大小写不同、分隔符不同的写法指的是同一个目录,结果路径取磁盘上的真实写法。
+    #[cfg(windows)]
+    #[test]
+    fn scope_case_and_separators_are_normalized_on_windows() {
+        let root = make_monorepo("scope-case");
+        let shouted = root
+            .join("SERVICES")
+            .join("API")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let (items, rejected) = collect_scoped(
+            &root,
+            Some(Path::new(&shouted)),
+            "needle",
+            SearchMode::FileContent,
+        );
+        assert_eq!(rejected, None);
+        assert_eq!(
+            rel_paths(&items),
+            ["services/api/deep/inner.rs", "services/api/handler.rs"]
+        );
+
+        // 项目根本身换个写法也一样:算相对路径用的是原样的那个根
+        let shouted_root = PathBuf::from(root.to_string_lossy().to_uppercase());
+        let (items, rejected) = collect_scoped(
+            &shouted_root,
+            Some(&root.join("services").join("web")),
+            "needle",
+            SearchMode::FileContent,
+        );
+        assert_eq!(rejected, None);
+        assert_eq!(rel_paths(&items), ["services/web/page.rs"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 判定本身是纯路径运算,不用真起 WSL。`canonicalize` 对 UNC 给的是 `\\?\UNC\` 形态。
+    #[test]
+    fn relative_within_understands_wsl_unc() {
+        let within = |root: &str, scope: &str| relative_within(Path::new(root), Path::new(scope));
+        let root = r"\\?\UNC\wsl$\Ubuntu\home\me\proj";
+
+        assert_eq!(
+            within(root, r"\\?\UNC\wsl$\Ubuntu\home\me\proj\src\api"),
+            Some(["src", "api"].iter().collect())
+        );
+        assert_eq!(within(root, root), Some(PathBuf::new()), "范围就是根本身");
+        // 同一发行版的两种写法是同一处
+        assert_eq!(
+            within(root, r"\\?\UNC\wsl.localhost\Ubuntu\home\me\proj\src"),
+            Some(PathBuf::from("src"))
+        );
+        assert_eq!(
+            within(
+                r"\\wsl.localhost\Ubuntu\home\me\proj",
+                r"\\wsl$\ubuntu\home\me\proj\src"
+            ),
+            Some(PathBuf::from("src")),
+            "host 与发行版名都不分大小写"
+        );
+
+        // 下面这些都不在根内
+        for outside in [
+            r"\\?\UNC\wsl$\Ubuntu\home\me\project",
+            r"\\?\UNC\wsl$\Ubuntu\home\me",
+            r"\\?\UNC\wsl$\Debian\home\me\proj\src",
+            // Linux 文件系统区分大小写:这是另一个目录
+            r"\\?\UNC\wsl$\Ubuntu\home\me\PROJ\src",
+            r"D:\repo\proj\src",
+        ] {
+            assert_eq!(within(root, outside), None, "{outside}");
+        }
+    }
+
+    /// 同一个根上换范围、清范围,各得各的结果。「在途的老请求不混进来」是上层的事:
+    /// 它换范围时丢掉整条接收端(见 `mt-app::search_modal`)。
+    #[test]
+    fn scope_can_be_switched_and_cleared_on_same_root() {
+        let root = make_monorepo("scope-switch");
+        let api = root.join("services").join("api");
+        let web = root.join("services").join("web");
+        let (items, _) = collect_scoped(&root, Some(&api), "needle", SearchMode::FileContent);
+        assert!(
+            rel_paths(&items)
+                .iter()
+                .all(|p| p.starts_with("services/api/"))
+        );
+        let (items, _) = collect_scoped(&root, Some(&web), "needle", SearchMode::FileContent);
+        assert_eq!(rel_paths(&items), ["services/web/page.rs"]);
+        let (items, _) = collect_scoped(&root, None, "needle", SearchMode::FileContent);
+        assert_eq!(items.len(), 4, "清掉范围回到全项目");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

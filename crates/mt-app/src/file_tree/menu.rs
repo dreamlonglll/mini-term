@@ -29,6 +29,8 @@ use super::{FileTree, Row};
 /// 两者都是「换路径」的操作,本地/远程、文件/目录一律有。
 /// 「Git 历史」(`GitHistory`,IDEA 的 Show History)也是 GPUI 版补的,与「查看变更」
 /// 同组:本地、非目录、文件落在 git 仓库里就给 —— **不要求有改动**。
+/// 「在此目录搜索内容」(`SearchInDirectory`)同样是 GPUI 版补的,只给本地目录:
+/// SSH 项目本来就不支持全局搜索(`search_modal::open` 那道拦截)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileMenuAction {
     OpenWithDefault,
@@ -41,6 +43,7 @@ pub(super) enum FileMenuAction {
     CopyAbsolutePath,
     RevealInFolder,
     OpenInTerminal,
+    SearchInDirectory,
     Rename,
     MoveTo,
     Delete,
@@ -75,13 +78,11 @@ pub(super) fn file_menu_actions(
     if !remote {
         actions.push(Some(RevealInFolder));
     }
-    actions.extend([
-        Some(OpenInTerminal),
-        None,
-        Some(Rename),
-        Some(MoveTo),
-        Some(Delete),
-    ]);
+    actions.push(Some(OpenInTerminal));
+    if !remote && is_dir {
+        actions.push(Some(SearchInDirectory));
+    }
+    actions.extend([None, Some(Rename), Some(MoveTo), Some(Delete)]);
     if is_dir {
         actions.extend([None, Some(NewFile), Some(NewFolder)]);
     }
@@ -233,6 +234,20 @@ pub(super) fn file_menu(
                         cx,
                     );
                 })
+            }
+            FileMenuAction::SearchInDirectory => {
+                let store = store.clone();
+                menu::item(
+                    t("fileTree", "menu.searchInDirectory"),
+                    move |window, cx| {
+                        crate::search_modal::open_in_directory(
+                            store.clone(),
+                            path.clone(),
+                            window,
+                            cx,
+                        );
+                    },
+                )
             }
             FileMenuAction::Rename => {
                 let is_dir = row.is_dir;

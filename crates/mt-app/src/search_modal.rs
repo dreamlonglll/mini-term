@@ -23,6 +23,16 @@
 //! 1. 分组头在原版是 `sticky top-0`,gpui 没有 sticky,画成普通行。
 //! 2. 原版**没有**输入去抖 —— 搜索只在 Enter / 点「搜索」时发起(内容搜索是
 //!    ripgrep 级别的重活,边打字边搜会把磁盘打满)。这里照此,不加去抖。
+//!
+//! # 搜索范围
+//!
+//! 文件树目录右键「在此目录搜索内容」([`open_in_directory`])把这次搜索限定在那个目录,
+//! 弹窗上挂一枚范围徽标,✕ 一键回到全项目。弹窗是**单例、跨打开留状态**,范围不收口的话
+//! 下次就静默只搜一个子目录了,所以三处必清:普通入口打开([`open`])、切项目、点 ✕。
+//!
+//! 换范围或清范围必定走 [`SearchModal::rerun`]:[`SearchModal::reset`] 丢掉结果泵,旧
+//! 请求连同它攒在 channel 里没消费的结果一起作废(模块开头那条「整个换掉前台任务」),
+//! 不靠比对请求号。结果路径仍相对项目根,打开文件那条路一行没动。
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -38,7 +48,8 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::search::{
-    SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
+    ScopeError, SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem,
+    start_search,
 };
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -86,6 +97,16 @@ enum Status {
     Done,
 }
 
+/// 这次搜索限定的目录(模块注释「搜索范围」)。
+struct SearchScope {
+    /// 它属于哪个项目。范围不跨项目:项目一换就作废。
+    project_id: String,
+    /// 目录的绝对路径,原样交给后端校验。
+    path: PathBuf,
+    /// 徽标上那段文字:相对项目根,分隔符统一成 `/`。
+    label: String,
+}
+
 pub struct SearchModal {
     store: Entity<AppStore>,
     /// Identity of the local project that produced the currently displayed
@@ -95,6 +116,10 @@ pub struct SearchModal {
     query: Entity<InputState>,
     mode: SearchMode,
     use_regex: bool,
+    /// `None` = 整个项目。
+    scope: Option<SearchScope>,
+    /// 后端拒绝了当前范围(目录没了 / 不在项目内)。跟结果同生死,[`Self::reset`] 清。
+    scope_error: Option<ScopeError>,
     status: Status,
     results: Vec<SearchResultItem>,
     /// 后端报的命中数。后端收满 [`MAX_RESULTS`] 条即提前收工,此时它就是上限、
@@ -138,7 +163,18 @@ pub fn toggle(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
 
 /// 打开搜索框。已经开着(且上面压着别的弹窗)时是空操作 —— 防叠开在
 /// [`open_guarded`] 里。
+///
+/// 这是**普通入口**:上次留下的目录范围在这里清掉,搜的是整个项目。
 pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
+    open_with(store, None, window, cx);
+}
+
+/// 文件树目录右键「在此目录搜索内容」:限定在 `dir` 并切到内容模式打开。
+pub fn open_in_directory(store: Entity<AppStore>, dir: PathBuf, window: &mut Window, cx: &mut App) {
+    open_with(store, Some(dir), window, cx);
+}
+
+fn open_with(store: Entity<AppStore>, dir: Option<PathBuf>, window: &mut Window, cx: &mut App) {
     // 守卫要在**建视图之前**判一次:`open_guarded` 里那道判定拦下来的时候,
     // 下面那个输入框已经建好、`window.defer` 也已经排上了聚焦 —— 而它永远不会被
     // 画出来,焦点等于被送进虚空(终端从此收不到键)。与 `show_prompt` 同一个坑。
@@ -175,7 +211,13 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
         cx.set_global(GlobalSearchModal(view.clone()));
         view
     };
-    view.update(cx, |view, _cx| view.cancel_pending_close());
+    view.update(cx, |view, cx| {
+        view.cancel_pending_close();
+        match dir {
+            Some(dir) => view.set_scope(dir, window, cx),
+            None => view.clear_scope(cx),
+        }
+    });
     let input = view.read(cx).query.clone();
 
     open_guarded(kind::GLOBAL_SEARCH, window, cx, {
@@ -219,11 +261,23 @@ impl SearchModal {
         // 活动项目换了 / 被删了 / 变成远程的,旧结果就作废。只在活动项目可能变了时
         // 比对(`StoreEvent::touches_active_project`)。与改造前一样只在作废时 notify
         // (render 里「搜索钮可不可点」那一处读取随根视图重画,不靠这里)
+        //
+        // 范围同理,而且**弹窗关着时也要清**(这个订阅不看开合):只清不重搜,弹窗多半
+        // 关着,没人等这次全项目扫描的结果
         let project_sub = cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
-            if event.touches_active_project()
-                && this.search_project.is_some()
-                && this.current_search_root(cx).is_none()
-            {
+            if !event.touches_active_project() {
+                return;
+            }
+            let active = this.project_snapshot(cx).map(|(id, _)| id);
+            let scope_stale = this
+                .scope
+                .as_ref()
+                .is_some_and(|scope| !scope_belongs_to(&scope.project_id, active.as_deref()));
+            if scope_stale {
+                this.scope = None;
+                this.reset(cx);
+                cx.notify();
+            } else if this.search_project.is_some() && this.current_search_root(cx).is_none() {
                 this.reset(cx);
                 cx.notify();
             }
@@ -234,6 +288,8 @@ impl SearchModal {
             query,
             mode: SearchMode::FileName,
             use_regex: false,
+            scope: None,
+            scope_error: None,
             status: Status::Idle,
             results: Vec::new(),
             total_count: 0,
@@ -278,6 +334,37 @@ impl SearchModal {
         cx.notify();
     }
 
+    /// 限定到 `dir` 并切到内容模式。输入框里留着的关键词立刻按新范围重搜:这是用户
+    /// 明确点出来的动作,再要求按一次回车没有意义。
+    fn set_scope(&mut self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, root)) = self.project_snapshot(cx) else {
+            return;
+        };
+        let label = scope_label(&dir.to_string_lossy(), &root.to_string_lossy());
+        self.scope = Some(SearchScope {
+            project_id,
+            path: dir,
+            label,
+        });
+        self.set_mode(SearchMode::FileContent, window, cx);
+        self.rerun(cx);
+    }
+
+    /// 回到全项目。没有范围时什么都不动:普通入口每次打开都走这里,不能把上次的
+    /// 结果冲掉,也不能平白起一次全项目扫描。
+    fn clear_scope(&mut self, cx: &mut Context<Self>) {
+        if self.scope.take().is_some() {
+            self.rerun(cx);
+        }
+    }
+
+    /// 范围变了:旧结果全部作废,输入框里有词就按新范围搜,没有就回到空闲。
+    fn rerun(&mut self, cx: &mut Context<Self>) {
+        self.reset(cx);
+        self.run(cx);
+        cx.notify();
+    }
+
     /// 停掉当前搜索并清空结果。
     fn reset(&mut self, _cx: &mut Context<Self>) {
         self.cancel_pending_close();
@@ -290,6 +377,7 @@ impl SearchModal {
         self.truncated = false;
         self.status = Status::Idle;
         self.search_project = None;
+        self.scope_error = None;
     }
 
     fn cancel_pending_close(&mut self) {
@@ -341,11 +429,20 @@ impl SearchModal {
             return;
         }
         self.reset(cx);
+        // 项目切换那边已经清过范围,这里兜一层:绝不拿 A 项目的目录去搜 B 项目
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|scope| !scope_belongs_to(&scope.project_id, Some(&project_id)))
+        {
+            self.scope = None;
+        }
         self.search_project = Some((project_id, root.clone()));
 
         let (tx, mut rx) = mpsc::unbounded::<SearchEvent>();
         let request = SearchRequest {
             project_root: root,
+            scope: self.scope.as_ref().map(|scope| scope.path.clone()),
             query,
             mode: self.mode,
             use_regex: self.use_regex,
@@ -386,6 +483,7 @@ impl SearchModal {
     fn apply(&mut self, event: SearchEvent) {
         match event {
             SearchEvent::Results(items) => append_capped(&mut self.results, items, MAX_RESULTS),
+            SearchEvent::ScopeRejected(err) => self.scope_error = Some(err),
             SearchEvent::Complete {
                 total_count,
                 truncated,
@@ -463,6 +561,25 @@ pub fn result_action(click_count: usize) -> ResultAction {
         ResultAction::ExternalEditor
     } else {
         ResultAction::Preview
+    }
+}
+
+/// 范围还算不算数:活动项目还是发起时那个。活动项目没了 / 变成远程的(`None`)也不算。
+fn scope_belongs_to(scope_project: &str, active_project: Option<&str>) -> bool {
+    active_project == Some(scope_project)
+}
+
+/// 徽标文字:目录相对项目根的路径,分隔符统一成 `/`。算不出相对路径时(理论上文件树
+/// 给的都在根内)退回目录本身的写法,不留空徽标。
+fn scope_label(dir: &str, root: &str) -> String {
+    crate::fs_ops::relative_path(dir, root).replace('\\', "/")
+}
+
+/// 范围被拒时那句提示。
+fn scope_error_text(err: ScopeError) -> &'static str {
+    match err {
+        ScopeError::Missing => t("search", "scopeMissing"),
+        ScopeError::OutsideRoot => t("search", "scopeOutside"),
     }
 }
 
@@ -815,6 +932,77 @@ impl SearchModal {
             )
     }
 
+    /// 范围徽标那一行。没有范围时不占位,普通入口的版面与从前一样。
+    fn render_scope_row(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let scope = self.scope.as_ref()?;
+        let rejected = self.scope_error.is_some();
+        let (fg, bg) = if rejected {
+            (
+                ui::color_warning(),
+                ui::with_alpha(ui::color_warning(), 0.15),
+            )
+        } else {
+            (ui::accent(), ui::accent_subtle())
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .flex_none()
+                .px(px(16.0))
+                .py(px(8.0))
+                .border_b_1()
+                .border_color(ui::border_subtle())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .child(t("search", "scopeLabel")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .min_w(px(0.0))
+                        .pl(px(8.0))
+                        .rounded(px(4.0))
+                        .bg(bg)
+                        .text_size(ui::font_px(12.0))
+                        .text_color(fg)
+                        // 省略掉的是开头:路径最要紧的是末段,要搜的就是那个目录
+                        .child(
+                            div()
+                                .id("search-scope-label")
+                                .min_w(px(0.0))
+                                .py(px(4.0))
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis_start()
+                                .tip(SharedString::from(scope.label.clone()))
+                                .child(SharedString::from(scope.label.clone())),
+                        )
+                        // 内边距代替徽标的间距与右内边距:点击区铺到徽标右端与上下边,版面不变。
+                        // 别改用负外边距:taffy 算自然宽度时会把文字那段压没
+                        .child(
+                            div()
+                                .id("search-scope-clear")
+                                .flex_none()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .cursor_pointer()
+                                .hover(|el| el.text_color(ui::text_primary()))
+                                .tip(t("search", "scopeClear"))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.clear_scope(cx);
+                                }))
+                                .child("✕"),
+                        ),
+                ),
+        )
+    }
+
     /// 右键菜单:只有「复制文件地址」一项(与原版一致)。
     fn result_menu(
         &self,
@@ -993,10 +1181,11 @@ impl SearchModal {
     /// 四种),行高由 [`RowMetrics`] 预先算出,定位走前缀和 + 二分。
     fn render_results(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.results.is_empty() {
-            let hint = match self.status {
-                Status::Searching => Some(t("search", "searching")),
-                Status::Idle => Some(t("search", "idleHint")),
-                Status::Done => None,
+            let hint = match (self.scope_error, self.status) {
+                (Some(err), _) => Some(scope_error_text(err)),
+                (None, Status::Searching) => Some(t("search", "searching")),
+                (None, Status::Idle) => Some(t("search", "idleHint")),
+                (None, Status::Done) => None,
             };
             let mut body = div().size_full();
             if let Some(hint) = hint {
@@ -1007,7 +1196,11 @@ impl SearchModal {
                         .justify_center()
                         .h_full()
                         .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
+                        .text_color(if self.scope_error.is_some() {
+                            ui::color_warning()
+                        } else {
+                            ui::text_muted()
+                        })
                         .child(hint),
                 );
             }
@@ -1071,6 +1264,7 @@ impl Render for SearchModal {
             .overflow_hidden()
             .child(self.render_header(cx))
             .child(self.render_query_row(cx))
+            .children(self.render_scope_row(cx))
             .child(list)
             .child(
                 div()
@@ -1150,6 +1344,31 @@ mod tests {
             Some(&expected),
             &expected,
         ));
+    }
+
+    /// 范围不跨项目:切走、项目没了、项目变成远程的(快照为 `None`)都作废。
+    #[test]
+    fn 范围只在发起项目仍是活动项目时算数() {
+        assert!(scope_belongs_to("a", Some("a")));
+        assert!(!scope_belongs_to("a", Some("b")));
+        assert!(!scope_belongs_to("a", None));
+    }
+
+    /// 徽标是相对项目根的路径,Windows 反斜杠也统一成 `/`;WSL 的 UNC 根同一口径。
+    #[test]
+    fn 范围徽标相对项目根() {
+        assert_eq!(
+            scope_label(r"D:\repo\services\api", r"D:\repo"),
+            "services/api"
+        );
+        assert_eq!(scope_label("/home/me/p/src", "/home/me/p"), "src");
+        assert_eq!(
+            scope_label(
+                r"\\wsl$\Ubuntu\home\me\p\src\lib",
+                r"\\wsl$\Ubuntu\home\me\p"
+            ),
+            "src/lib"
+        );
     }
 
     /// 满了就整批丢弃(不是丢最旧的),没满只取装得下的前几条。

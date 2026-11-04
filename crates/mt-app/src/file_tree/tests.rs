@@ -145,6 +145,7 @@ fn 目录菜单项序与原版一致() {
             Some(CopyAbsolutePath),
             Some(RevealInFolder),
             Some(OpenInTerminal),
+            Some(SearchInDirectory),
             None,
             Some(Rename),
             Some(MoveTo),
@@ -173,6 +174,9 @@ fn 目录与文件的差别只在两处() {
     assert!(!dir.contains(&OpenWithDefault));
     assert!(dir.contains(&NewFile) && dir.contains(&NewFolder));
     assert!(!file.contains(&NewFile) && !file.contains(&NewFolder));
+    // 「在此目录搜索内容」只给目录
+    assert!(dir.contains(&SearchInDirectory));
+    assert!(!file.contains(&SearchInDirectory));
     // 有状态的目录同样不给 ViewDiff
     let dirty_dir: Vec<_> = file_menu_actions(true, true, true, false)
         .into_iter()

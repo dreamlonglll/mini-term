@@ -16,6 +16,10 @@ export const search = {
     foundMatches: "找到 {count} 处匹配",
     shortcutHint: "{mod}+Shift+F 打开搜索",
     remoteUnsupported: "远程项目暂不支持全局搜索。",
+    scopeLabel: "搜索范围",
+    scopeClear: "清除范围，搜索整个项目",
+    scopeMissing: "这个目录不存在或已被删除，没有执行搜索。",
+    scopeOutside: "这个目录不在项目内（可能是指向项目外的链接），没有执行搜索。",
   },
   en: {
     copyFilePath: "Copy File Path",
@@ -34,5 +38,9 @@ export const search = {
     foundMatches: "{count} matches found",
     shortcutHint: "{mod}+Shift+F to open search",
     remoteUnsupported: "Global search is not available for remote projects yet.",
+    scopeLabel: "Search in",
+    scopeClear: "Clear and search the whole project",
+    scopeMissing: "This folder no longer exists, so nothing was searched.",
+    scopeOutside: "This folder is outside the project (possibly a link pointing elsewhere), so nothing was searched.",
   },
 } as const;

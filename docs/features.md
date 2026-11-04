@@ -82,6 +82,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### File Search
 
 - **Global search** — Triggered by `Ctrl+Shift+F` (macOS `⌘+Shift+F`) or the file-tree toolbar button, supporting both filename and file-content search modes.
+- **Search in a folder** — Right-click a folder in the file tree (local projects, WSL included) and choose "Search in This Folder" to open content search limited to it: sibling folders are never walked, ignore rules from the project root and subfolders still apply, and result paths stay relative to the project root. A badge in the search box shows the current scope and its ✕ goes back to the whole project; opening search through `Ctrl+Shift+F` or switching projects clears the scope too, so a leftover scope can never quietly narrow a later search.
 - **Path matching** — In filename mode, a query containing `/` (a Windows backslash works too) is matched against the project-relative path, e.g. `pages/task/my` hits `src/pages/task/my/my.vue`, with the highlight on the path; queries without a separator still match the bare filename only.
 - **Regex matching** — Toggle between substring / regex modes, with matched keywords highlighted in the results.
 - **Streaming results** — The backend walks the file tree with the `ignore` crate and pushes results in batches every 50 entries or 100ms, cancellable at any time.
