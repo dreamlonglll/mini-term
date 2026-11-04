@@ -7,6 +7,8 @@
 //! 它做的正是「清 AI 感知痕迹」,原文件里也紧挨着标记段。
 
 use gpui::Context;
+use mt_ai::AgentKind;
+use mt_config::{SavedProjectLayout, SavedSplitNode};
 
 use crate::ai::AiEvent;
 use crate::markers::{self, AiMarker, MarkerBatch};
@@ -650,6 +652,54 @@ impl AppStore {
         None
     }
 
+    /// 项目里有多少个正跑着 `agent`、却没拿到会话身份的 pane。
+    ///
+    /// hook 没开时这是常态([`Self::find_live_session_pane`] 对它们无能为力):删除会话
+    /// 前据此提醒一句 —— 判断不了它们是不是在用这个会话。没认出是哪家的也算,宁可多提醒。
+    pub fn unidentified_ai_panes(&self, project_id: &str, agent: &str) -> usize {
+        self.project_states
+            .get(project_id)
+            .map_or(0, |state| count_unidentified_ai_panes(state, agent))
+    }
+
+    /// 会话的原始记录被删了:摘掉还挂着它的 pane 身份与自记账边。
+    ///
+    /// 身份不摘的话,下次启动会对着一个已经不存在的会话去 `--resume`。还在跑的 pane
+    /// 不动 —— 删除前已经拦过一道,真走到这里只可能是确认之后才恢复起来的,它的身份是真的。
+    ///
+    /// 要重写哪些项目按**落盘快照**判定,不按内存里摘没摘到:pane 退出 AI 时身份只从
+    /// 内存清掉、不写布局(`SplitNode::update_status_by_pty`),内存里查不到不代表磁盘上没有。
+    pub fn forget_deleted_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let mut cleared = false;
+        for state in self.project_states.values_mut() {
+            cleared |= clear_deleted_session_identity(state, session_id);
+        }
+        let stale: Vec<String> = self
+            .config
+            .projects
+            .iter()
+            .filter(|project| {
+                project
+                    .saved_layout
+                    .as_ref()
+                    .is_some_and(|layout| saved_layout_mentions_session(layout, session_id))
+            })
+            .map(|project| project.id.clone())
+            .collect();
+        for project_id in &stale {
+            self.save_project_layout_soon(project_id, cx);
+        }
+        if cleared {
+            cx.changed(StoreEvent::PaneSessionChanged);
+        }
+        let lineage = &mut self.config.session_lineage;
+        let edges = lineage.len();
+        lineage.retain(|e| e.session_id != session_id && e.parent_session_id != session_id);
+        if lineage.len() != edges {
+            self.save_config_soon(cx);
+        }
+    }
+
     /// 把恢复出来的会话身份**当场**写回 pane(对应 `setPaneAiSessionByPty`)。
     ///
     /// 不能干等 hook:codex resume 不会重新上报 SessionStart,新 pane 会永远
@@ -729,6 +779,67 @@ impl AppStore {
     }
 }
 
+/// [`AppStore::unidentified_ai_panes`] 的纯函数版。
+fn count_unidentified_ai_panes(state: &ProjectState, agent: &str) -> usize {
+    let agent = AgentKind::parse(agent);
+    state
+        .all_panes()
+        .into_iter()
+        .filter(|pane| {
+            pane.ai_session.is_none()
+                && pane.pty_id.is_some()
+                && matches!(pane.status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+                && pane
+                    .detected_agent
+                    .as_deref()
+                    .and_then(AgentKind::parse)
+                    .is_none_or(|detected| Some(detected) == agent)
+        })
+        .count()
+}
+
+/// [`AppStore::forget_deleted_session`] 的 pane 那一半。返回这个项目有没有 pane 被摘。
+fn clear_deleted_session_identity(state: &mut ProjectState, session_id: &str) -> bool {
+    let pane_ids: Vec<String> = state
+        .all_panes()
+        .into_iter()
+        .filter(|pane| {
+            pane.ai_session
+                .as_ref()
+                .is_some_and(|s| s.session_id == session_id)
+                && !matches!(pane.status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+        })
+        .map(|pane| pane.id.clone())
+        .collect();
+    for pane_id in &pane_ids {
+        if let Some(pane) = state.pane_mut(pane_id) {
+            pane.ai_session = None;
+            pane.resume_pending = false;
+        }
+    }
+    !pane_ids.is_empty()
+}
+
+/// 布局快照里还有没有这个会话的身份(含旧格式的单 pane 叶子)。
+fn saved_layout_mentions_session(layout: &SavedProjectLayout, session_id: &str) -> bool {
+    fn node_mentions(node: &SavedSplitNode, session_id: &str) -> bool {
+        match node {
+            SavedSplitNode::Leaf { pane, panes } => pane.iter().chain(panes).any(|pane| {
+                pane.ai_session
+                    .as_ref()
+                    .is_some_and(|s| s.session_id == session_id)
+            }),
+            SavedSplitNode::Split { children, .. } => children
+                .iter()
+                .any(|child| node_mentions(child, session_id)),
+        }
+    }
+    layout
+        .tabs
+        .iter()
+        .any(|tab| node_mentions(&tab.split_layout, session_id))
+}
+
 /// [`AppStore::global_ai_light`] 的纯函数版:入参是全部项目。
 ///
 /// 每个 pane 的 `error` 先压成 `idle` 再取最高档(理由见那个方法的注释)。
@@ -745,6 +856,7 @@ mod tests {
     use super::*;
     use crate::store::ProjectState;
     use crate::tree::{PaneState, ProjectPanel, SplitDirection, SplitNode};
+    use mt_config::{SavedAiSession, SavedPane, SavedTab};
 
     /// 测试里的一个 pane:四态 + attention 位,即五档灯的全部输入。
     #[derive(Clone, Copy, Debug)]
@@ -885,5 +997,163 @@ mod tests {
         state.pane_mut(&pane_id).unwrap().status = PaneStatus::Error;
         assert_eq!(stale_cache, StatusLight::Idle);
         assert_eq!(state.highest_light(), StatusLight::Error);
+    }
+
+    fn session_ref(id: &str) -> AiSessionRef {
+        AiSessionRef {
+            agent: Some("claude".into()),
+            session_id: id.into(),
+            cwd: None,
+        }
+    }
+
+    /// 造一个 pane:状态 + 留着的会话身份(None = 没有)+ 输入检测认出的 agent。
+    fn ai_pane(status: PaneStatus, session: Option<&str>, agent: Option<&str>) -> PaneState {
+        let mut pane = PaneState::new("pwsh");
+        pane.status = status;
+        pane.pty_id = Some(1);
+        pane.ai_session = session.map(session_ref);
+        pane.resume_pending = session.is_some();
+        pane.detected_agent = agent.map(str::to_string);
+        pane
+    }
+
+    /// 一个面板,全部 pane 并排进根叶子的 tab 栏。
+    fn panel(panes: Vec<PaneState>) -> ProjectPanel {
+        let mut panes = panes.into_iter();
+        let first = panes.next().expect("面板至少一个 pane");
+        let root_id = first.id.clone();
+        let mut layout = SplitNode::leaf(first);
+        for pane in panes {
+            assert!(layout.append_pane(Some(&root_id), pane));
+        }
+        ProjectPanel::new(layout)
+    }
+
+    /// 会话被删:退出后留着备查的身份要摘掉,否则下次启动对着它去 `--resume`;
+    /// 跨面板都算;别的会话与还在跑的 pane 不动。
+    #[test]
+    fn 删除会话摘掉留着备查的身份() {
+        let exited = ai_pane(PaneStatus::Idle, Some("gone"), None);
+        let other = ai_pane(PaneStatus::Idle, Some("other"), None);
+        let running = ai_pane(PaneStatus::AiWorking, Some("gone"), None);
+        let background = ai_pane(PaneStatus::Idle, Some("gone"), None);
+        let ids = [
+            exited.id.clone(),
+            other.id.clone(),
+            running.id.clone(),
+            background.id.clone(),
+        ];
+        let mut state = ProjectState::new();
+        state.panels.push(panel(vec![exited, other, running]));
+        state.panels.push(panel(vec![background]));
+
+        assert!(clear_deleted_session_identity(&mut state, "gone"));
+
+        let pane = |ix: usize| state.pane(&ids[ix]).unwrap();
+        assert_eq!(pane(0).ai_session, None);
+        assert!(!pane(0).resume_pending);
+        assert_eq!(pane(1).ai_session, Some(session_ref("other")));
+        assert!(pane(1).resume_pending);
+        assert_eq!(
+            pane(2).ai_session,
+            Some(session_ref("gone")),
+            "还在跑的不摘"
+        );
+        assert_eq!(pane(3).ai_session, None, "后台面板也算");
+
+        assert!(!clear_deleted_session_identity(
+            &mut state,
+            "no-such-session"
+        ));
+    }
+
+    /// pane 退出 AI 时身份只从内存清掉,落盘快照还留着:内存里摘不到东西,快照照样
+    /// 认得出,重写之后身份才真的没了。否则下次启动对着已删的会话去 `--resume`。
+    #[test]
+    fn 退出后的身份只在落盘快照里也认得出() {
+        let mut state = ProjectState::new();
+        state
+            .panels
+            .push(panel(vec![ai_pane(PaneStatus::AiIdle, Some("gone"), None)]));
+        let saved = crate::persist::serialize_layout(&state.panels, 0);
+
+        assert!(
+            state
+                .layouts_mut()
+                .any(|layout| layout.update_status_by_pty(1, PaneStatus::Idle, false, None))
+        );
+        assert!(!clear_deleted_session_identity(&mut state, "gone"));
+
+        assert!(saved_layout_mentions_session(&saved, "gone"));
+        assert!(!saved_layout_mentions_session(&saved, "other"));
+        let rewritten = crate::persist::serialize_layout(&state.panels, 0);
+        assert!(!saved_layout_mentions_session(&rewritten, "gone"));
+    }
+
+    /// 快照按整棵树找:后面的页签、嵌套分屏、旧格式的单 pane 叶子都算。
+    #[test]
+    fn 落盘快照按整棵树找会话身份() {
+        let saved_pane = |session: Option<&str>| SavedPane {
+            shell_name: "pwsh".into(),
+            cwd: None,
+            ai_session: session.map(|id| SavedAiSession {
+                agent: None,
+                cwd: None,
+                session_id: id.into(),
+            }),
+        };
+        let tab = |split_layout| SavedTab {
+            custom_title: None,
+            split_layout,
+        };
+        let layout = SavedProjectLayout {
+            tabs: vec![
+                tab(SavedSplitNode::Leaf {
+                    pane: None,
+                    panes: vec![saved_pane(None)],
+                }),
+                tab(SavedSplitNode::Split {
+                    direction: "horizontal".into(),
+                    children: vec![
+                        SavedSplitNode::Leaf {
+                            pane: None,
+                            panes: vec![saved_pane(None), saved_pane(Some("nested"))],
+                        },
+                        SavedSplitNode::Leaf {
+                            pane: Some(saved_pane(Some("legacy"))),
+                            panes: Vec::new(),
+                        },
+                    ],
+                    sizes: vec![0.5, 0.5],
+                }),
+            ],
+            active_tab_index: 0,
+        };
+
+        assert!(saved_layout_mentions_session(&layout, "nested"));
+        assert!(saved_layout_mentions_session(&layout, "legacy"));
+        assert!(!saved_layout_mentions_session(&layout, "nest"));
+    }
+
+    /// 没拿到身份的 AI pane 才计数:有身份的查得到,没跑 AI / PTY 没了的不算;
+    /// 认出是别家的不算,没认出是哪家的算。
+    #[test]
+    fn 未上报身份的_ai_pane_计数() {
+        let mut no_pty = ai_pane(PaneStatus::AiWorking, None, Some("claude"));
+        no_pty.pty_id = None;
+        let mut state = ProjectState::new();
+        state.panels.push(panel(vec![
+            ai_pane(PaneStatus::AiWorking, None, Some("claude")),
+            ai_pane(PaneStatus::AiIdle, None, Some("codex")),
+            ai_pane(PaneStatus::AiIdle, None, None),
+            ai_pane(PaneStatus::AiIdle, Some("known"), Some("claude")),
+            ai_pane(PaneStatus::Idle, None, Some("claude")),
+            no_pty,
+        ]));
+
+        assert_eq!(count_unidentified_ai_panes(&state, "claude"), 2);
+        assert_eq!(count_unidentified_ai_panes(&state, "codex"), 2);
+        assert_eq!(count_unidentified_ai_panes(&state, "pi"), 1);
     }
 }

@@ -23,7 +23,7 @@ use super::{
 use mt_core::path_key::windows_eq_key;
 
 /// grok 会话根目录:`{$GROK_HOME | ~/.grok}/sessions`
-fn grok_sessions_dir() -> Option<PathBuf> {
+pub(super) fn grok_sessions_dir() -> Option<PathBuf> {
     crate::hook_registry::grok_home().map(|h| h.join("sessions"))
 }
 
@@ -71,8 +71,12 @@ pub fn find_grok_cwd_dirs(project_path: &str) -> Vec<PathBuf> {
     let Some(sessions_dir) = grok_sessions_dir() else {
         return Vec::new();
     };
+    find_grok_cwd_dirs_in(&sessions_dir, project_path)
+}
+
+pub(super) fn find_grok_cwd_dirs_in(sessions_dir: &Path, project_path: &str) -> Vec<PathBuf> {
     let normalized = windows_eq_key(project_path);
-    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
         return Vec::new();
     };
     entries
@@ -146,8 +150,15 @@ fn read_grok_summary(session_dir: &Path) -> Option<GrokSummary> {
 
 /// Windows 宿主视角的 grok 会话扫描
 pub(super) fn get_grok_sessions(project_path: &str) -> Vec<AiSession> {
+    let Some(sessions_dir) = grok_sessions_dir() else {
+        return Vec::new();
+    };
+    grok_sessions_in(&sessions_dir, project_path)
+}
+
+pub(super) fn grok_sessions_in(sessions_dir: &Path, project_path: &str) -> Vec<AiSession> {
     let mut sessions = Vec::new();
-    for group in find_grok_cwd_dirs(project_path) {
+    for group in find_grok_cwd_dirs_in(sessions_dir, project_path) {
         let Ok(entries) = fs::read_dir(&group) else {
             continue;
         };

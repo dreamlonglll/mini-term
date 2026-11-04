@@ -6,7 +6,7 @@
 //!              ├─ background: mt_ai::sessions::scan_session_lineage(分支边,树视图用)
 //!              └─ background: mt_ai::sessions::get_wsl_ai_sessions(9P + 可能的 VM 冷启动)
 //!                     ↓ 各自回主线程 setState,按时间戳降序混排
-//! 右键一行 ─→ 查看 / 在当前终端恢复 / 新标签恢复 / 复制命令
+//! 右键一行 ─→ 查看 / 在当前终端恢复 / 新标签恢复 / 复制命令 / 删除
 //! 树模式点一行 ─→ 已在跑就跳过去,没在跑就新终端 resume
 //! ```
 //!
@@ -44,6 +44,17 @@
 //! 子菜单挂载点上、取数口是 pane 自己的 `ai_session`、只画那一支家族。两边共用
 //! 的是纯逻辑([`crate::session_branch`])与节点点击行为([`jump_to_session`])
 //! —— 点同一种节点必须有同一种行为。
+//!
+//! # 删除会话
+//!
+//! ```text
+//! 右键「删除会话」→ 在跑就拒绝 → [后台] 找全文件(plan)→ 确认框列出路径
+//!   → 确定 → 再查一遍在跑 → [后台] 复核并删除(execute)→ 就地摘掉这一行
+//! ```
+//!
+//! 直接删原始文件,不进回收站(与文件树的删除同一口径)。删完**就地摘行,不走
+//! [`SessionPanel::refresh`]**:连删好几条短会话时,整表重拉会把滚动位置和
+//! 「加载更多」翻出来的页数全丢掉。缓存由 `execute` 作废,重开面板读到的是新的。
 
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
@@ -52,13 +63,15 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
-use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
+use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge, SessionDeleteError};
+use mt_config::SshConnection;
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;
+use crate::prompt::{Confirm, show_alert};
 use crate::session_branch::{build_session_tree, flatten_session_tree, merge_lineage_edges};
 use crate::store::{AppStore, StoreEvent};
 use crate::toast;
@@ -324,6 +337,150 @@ impl Preview {
     }
 }
 
+/// 确认框里的会话标题最多显示多少个字符。
+const DELETE_TITLE_MAX_CHARS: usize = 60;
+
+/// 确认框里的会话标题:第一个非空行,过长截断。标题取自用户消息,可能是一大段多行文字,
+/// 原样塞进去会把确认语挤没(确认框的正文按 `\n` 分行)。
+fn delete_title_preview(title: &str) -> String {
+    let line = title
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() <= DELETE_TITLE_MAX_CHARS {
+        return line.to_string();
+    }
+    let mut preview: String = line.chars().take(DELETE_TITLE_MAX_CHARS).collect();
+    preview.push('…');
+    preview
+}
+
+/// 确认框正文:删的是什么、范围多大,以及「可能还有 AI 在用」的提醒。
+fn delete_confirm_message(
+    session: &AiSession,
+    remote_name: Option<&str>,
+    recently_written: bool,
+    unidentified_panes: usize,
+) -> String {
+    let title = delete_title_preview(&session.title);
+    let mut message = match remote_name {
+        Some(name) => tr!(
+            "sessionList",
+            "deleteSession.messageRemote",
+            title = title,
+            name = name
+        ),
+        None => tr!("sessionList", "deleteSession.message", title = title),
+    };
+    if recently_written {
+        message.push('\n');
+        message.push_str(t("sessionList", "deleteSession.recentWrite"));
+    }
+    if unidentified_panes > 0 {
+        let agent = mt_ai::AgentKind::parse(&session.session_type)
+            .map_or(session.session_type.as_str(), |kind| kind.spec().label);
+        message.push('\n');
+        message.push_str(&tr!(
+            "sessionList",
+            "deleteSession.unidentifiedAi",
+            count = unidentified_panes,
+            agent = agent
+        ));
+    }
+    message
+}
+
+/// 确认框的补充行:要删的路径,以及哪些东西连带着没 / 不会没。
+fn delete_confirm_details(
+    session: &AiSession,
+    paths: &[(String, bool)],
+    forks: usize,
+) -> Vec<String> {
+    let mut lines = vec![t("sessionList", "deleteSession.pathsHeader").to_string()];
+    for (path, is_dir) in paths {
+        let suffix = if *is_dir {
+            t("sessionList", "deleteSession.dirSuffix")
+        } else {
+            ""
+        };
+        lines.push(format!("• {path}{suffix}"));
+    }
+    if mt_ai::AgentKind::parse(&session.session_type) == Some(mt_ai::AgentKind::Pi) {
+        lines.push(t("sessionList", "deleteSession.piBranches").to_string());
+    }
+    if forks > 0 {
+        lines.push(tr!("sessionList", "deleteSession.forksKept", count = forks));
+    }
+    lines.push(t("sessionList", "deleteSession.usageKept").to_string());
+    lines
+}
+
+fn delete_error_message(err: &SessionDeleteError) -> String {
+    match err {
+        SessionDeleteError::InvalidId => t("sessionList", "deleteSession.errInvalidId").to_string(),
+        SessionDeleteError::Unsupported => {
+            t("sessionList", "deleteSession.errUnsupported").to_string()
+        }
+        SessionDeleteError::NotFound => t("sessionList", "deleteSession.errNotFound").to_string(),
+        SessionDeleteError::Unsafe(path) => {
+            tr!("sessionList", "deleteSession.errUnsafe", path = path)
+        }
+        SessionDeleteError::Changed(path) => {
+            tr!("sessionList", "deleteSession.errChanged", path = path)
+        }
+        SessionDeleteError::Io { path, message } => format!("{path}\n{message}"),
+        SessionDeleteError::Remote(message) => message.clone(),
+    }
+}
+
+/// 一次删除的计划。本机 / WSL 走 `mt_ai`,SSH 远程走 `mt_remote`;确认框与执行共用。
+#[derive(Clone)]
+enum DeletePlan {
+    Local(mt_ai::sessions::SessionDeletePlan),
+    Remote(Box<SshConnection>, mt_remote::RemoteSessionDeletePlan),
+}
+
+impl DeletePlan {
+    /// 要删的路径 + 是否整个目录。
+    fn paths(&self) -> Vec<(String, bool)> {
+        match self {
+            Self::Local(plan) => plan
+                .targets
+                .iter()
+                .map(|t| (t.path.to_string_lossy().into_owned(), t.is_dir))
+                .collect(),
+            Self::Remote(_, plan) => plan
+                .targets
+                .iter()
+                .map(|t| (t.path.clone(), t.is_dir))
+                .collect(),
+        }
+    }
+
+    fn recently_written(&self) -> bool {
+        match self {
+            Self::Local(plan) => plan.recently_written,
+            Self::Remote(_, plan) => plan.recently_written,
+        }
+    }
+
+    fn remote_name(&self) -> Option<&str> {
+        match self {
+            Self::Local(_) => None,
+            Self::Remote(conn, _) => Some(&conn.name),
+        }
+    }
+
+    /// **阻塞**,丢后台。
+    fn execute(&self) -> Result<(), SessionDeleteError> {
+        match self {
+            Self::Local(plan) => mt_ai::sessions::execute_session_delete(plan),
+            Self::Remote(conn, plan) => mt_remote::execute_remote_session_delete(conn, plan),
+        }
+    }
+}
+
 /// 平铺 / 分支树两种视图。取值与 `AppConfig::session_list_view` 的字面量同。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ViewMode {
@@ -378,6 +535,10 @@ pub struct SessionPanel {
     remote_broken: bool,
     preview: Option<Preview>,
     _tasks: Vec<Task<()>>,
+    /// 删除流程在途(找文件 / 真删)。同一时间只走一单,头部转圈。
+    delete_busy: bool,
+    /// 不放 `_tasks`:那边刷新时整个清掉,用户点过确定的删除不能被一次刷新取消。
+    _delete_task: Option<Task<()>>,
 }
 
 impl SessionPanel {
@@ -425,6 +586,8 @@ impl SessionPanel {
             remote_broken: false,
             preview: None,
             _tasks: Vec::new(),
+            delete_busy: false,
+            _delete_task: None,
         }
     }
 
@@ -696,6 +859,8 @@ impl SessionPanel {
     /// 在新终端标签恢复
     /// ──────────                  ← 仅当 cmd 拼得出
     /// 复制恢复命令
+    /// ──────────                  ← 仅当这个来源能删(GPUI 版新增,原版没有)
+    /// 删除会话
     /// ```
     ///
     /// `canResumeHere = cmd.is_some() && wsl_distro.is_none() && ssh_connection_id.is_none()`
@@ -738,7 +903,250 @@ impl SessionPanel {
                 },
             ));
         }
+        if mt_ai::sessions::session_delete_supported(
+            &session.session_type,
+            session.wsl_distro.as_deref(),
+            session.ssh_connection_id.as_deref(),
+        ) {
+            let session = session.clone();
+            entries.push(menu::separator());
+            entries.push(
+                menu::MenuItem::new(t("sessionList", "deleteSession.menu"))
+                    .danger()
+                    .on_click(move |window, cx: &mut App| {
+                        let session = session.clone();
+                        entity.update(cx, |this, cx| this.request_delete(session, window, cx));
+                    })
+                    .into(),
+            );
+        }
         entries
+    }
+
+    /// 这个会话正跑在某个 pane 里的话,给出拒绝删除的说明。AI 还在往文件里写的时候删掉,
+    /// 下一次追加就会把它重新建出来,只剩半截。
+    fn running_message(&self, session_id: &str, cx: &App) -> Option<String> {
+        let store = self.store.read(cx);
+        let (project_id, _, _) = store.find_live_session_pane(session_id)?;
+        let project = store
+            .projects()
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        Some(tr!(
+            "sessionList",
+            "deleteSession.running",
+            project = project
+        ))
+    }
+
+    /// 这个会话有几条分支。fork 是独立副本,删它们的父不连带,确认框交代一句。
+    fn fork_children(&self, session_id: &str) -> usize {
+        merge_lineage_edges(self.lineage.clone(), self.bookkept.clone())
+            .iter()
+            .filter(|edge| edge.parent_session_id == session_id)
+            .count()
+    }
+
+    /// 右键「删除会话」:拦下在跑的 → 后台找全文件 → 开确认框。
+    fn request_delete(&mut self, session: AiSession, window: &mut Window, cx: &mut Context<Self>) {
+        if self.delete_busy {
+            show_alert(
+                t("sessionList", "deleteSession.blockedTitle"),
+                t("sessionList", "deleteSession.busy"),
+                window,
+                cx,
+            );
+            return;
+        }
+        if let Some(message) = self.running_message(&session.id, cx) {
+            show_alert(
+                t("sessionList", "deleteSession.blockedTitle"),
+                message,
+                window,
+                cx,
+            );
+            return;
+        }
+        let Some(project_path) = self.project_path.clone() else {
+            return;
+        };
+        let (conn, unidentified_panes) = {
+            let store = self.store.read(cx);
+            let project_id = store.active_project_id.as_deref().unwrap_or_default();
+            // 远程会话的文件在**这条连接**指向的机器上:连接从主线程取好再传进后台
+            // (`mt_remote` 的线程口径),对不上就别去碰
+            let conn = store
+                .remote_connection_of(project_id)
+                .filter(|conn| session.ssh_connection_id.as_deref() == Some(conn.id.as_str()));
+            (
+                conn,
+                store.unidentified_ai_panes(project_id, &session.session_type),
+            )
+        };
+        if session.ssh_connection_id.is_some() && conn.is_none() {
+            self.delete_failed(&SessionDeleteError::Unsupported, window, cx);
+            return;
+        }
+        let forks = self.fork_children(&session.id);
+        self.delete_busy = true;
+        cx.notify();
+
+        let session_type = session.session_type.clone();
+        let session_id = session.id.clone();
+        let distro = session.wsl_distro.clone();
+        // Codex 要扫全部 rollout 头部,WSL 走 9P,远程走 SFTP:雷打不动丢后台
+        let task = cx.background_executor().spawn(async move {
+            match conn {
+                Some(conn) => mt_remote::plan_remote_session_delete(
+                    &conn,
+                    &session_type,
+                    &session_id,
+                    &project_path,
+                )
+                .map(|plan| DeletePlan::Remote(Box::new(conn), plan)),
+                None => mt_ai::sessions::plan_session_delete(
+                    &session_type,
+                    &session_id,
+                    &project_path,
+                    distro.as_deref(),
+                )
+                .map(DeletePlan::Local),
+            }
+        });
+        self._delete_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
+                this.delete_busy = false;
+                cx.notify();
+                match result {
+                    Ok(plan) => {
+                        this.confirm_delete(session, plan, forks, unidentified_panes, window, cx)
+                    }
+                    Err(err) => this.delete_failed(&err, window, cx),
+                }
+            });
+        }));
+    }
+
+    fn confirm_delete(
+        &mut self,
+        session: AiSession,
+        plan: DeletePlan,
+        forks: usize,
+        unidentified_panes: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = delete_confirm_message(
+            &session,
+            plan.remote_name(),
+            plan.recently_written(),
+            unidentified_panes,
+        );
+        let details = delete_confirm_details(&session, &plan.paths(), forks);
+        let entity = cx.entity();
+        Confirm::new(t("sessionList", "deleteSession.title"), message)
+            .detail(details)
+            .danger()
+            .ok_text(t("sessionList", "deleteSession.ok"))
+            .cancel_text(t("sessionList", "deleteSession.cancel"))
+            .open(
+                move |window, cx| {
+                    let (session, plan) = (session.clone(), plan.clone());
+                    entity.update(cx, |this, cx| this.run_delete(session, plan, window, cx));
+                },
+                window,
+                cx,
+            );
+    }
+
+    /// 确认框点了确定。
+    fn run_delete(
+        &mut self,
+        session: AiSession,
+        plan: DeletePlan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 确认框开着的这段时间,可能有人(移动端发起、自动续接)把它恢复起来了
+        if let Some(message) = self.running_message(&session.id, cx) {
+            // 这里还在确认框的 on_ok 里,它返回后组件库才弹栈:现在开提示框,被弹掉的
+            // 就是提示框,所以挪到这一轮 effect 之后
+            window.defer(cx, move |window, cx| {
+                show_alert(
+                    t("sessionList", "deleteSession.blockedTitle"),
+                    message,
+                    window,
+                    cx,
+                );
+            });
+            return;
+        }
+        self.delete_busy = true;
+        cx.notify();
+        let task = cx
+            .background_executor()
+            .spawn(async move { plan.execute() });
+        self._delete_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
+                this.delete_busy = false;
+                cx.notify();
+                match result {
+                    Ok(()) => this.after_deleted(&session, cx),
+                    Err(err) => this.delete_failed(&err, window, cx),
+                }
+            });
+        }));
+    }
+
+    /// 走到这里确认框已经关了,toast 也看得见,但这是用户刚点确定的操作:失败要拦一下。
+    fn delete_failed(
+        &mut self,
+        err: &SessionDeleteError,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        show_alert(
+            t("sessionList", "deleteSession.failedTitle"),
+            delete_error_message(err),
+            window,
+            cx,
+        );
+        // 列表和磁盘对不上了才重拉。远程错误不重拉:连接抖一下时,重拉的结果是空表
+        // (`mt_remote::ai_sessions` 失败静默降级),整张列表都会不见
+        if matches!(
+            err,
+            SessionDeleteError::NotFound | SessionDeleteError::Io { .. }
+        ) {
+            self.refresh(true, cx);
+        }
+    }
+
+    /// 删完就地摘行(理由见模块注释)。
+    fn after_deleted(&mut self, session: &AiSession, cx: &mut Context<Self>) {
+        let keep = |s: &AiSession| {
+            s.id != session.id
+                || s.session_type != session.session_type
+                || s.wsl_distro != session.wsl_distro
+                || s.ssh_connection_id != session.ssh_connection_id
+        };
+        self.host.retain(keep);
+        self.wsl.retain(keep);
+        // 只摘它作为孩子的边。孩子还在的那些边留着,悬空父按根处理(见 `session_branch`)
+        self.lineage.retain(|edge| edge.session_id != session.id);
+        self.bookkept
+            .retain(|edge| edge.session_id != session.id && edge.parent_session_id != session.id);
+        self.store.update(cx, |store, cx| {
+            store.forget_deleted_session(&session.id, cx)
+        });
+        // 在途扫描读到的可能是删除前的文件,它们的结果回来会把这一行带回去:作废重拉
+        if self.loading || self.wsl_loading {
+            self.refresh(true, cx);
+        }
+        cx.notify();
     }
 
     fn open_preview(&mut self, session: &AiSession, cx: &mut Context<Self>) {
@@ -1050,6 +1458,7 @@ impl Render for SessionPanel {
         let tree = self.view == ViewMode::Tree;
         let remote = self.remote;
         let remote_broken = self.remote_broken;
+        let delete_busy = self.delete_busy;
         // 行尾的远程来源标识:连接名(连接被删时回退 'SSH')。
         // 逐行现查连接表,规模是连接条数
         let remote_name_of = |session: &AiSession| -> Option<String> {
@@ -1342,6 +1751,17 @@ impl Render for SessionPanel {
                                         .tip(t("sessionList", "remoteLoading"))
                                         .child(ui::spinner(px(12.0), ui::text_muted())),
                                 )
+                            })
+                            // 删除进行中(WSL / 远程要几秒,确认框关了之后得有个交代)
+                            .when(delete_busy, |el| {
+                                el.child(
+                                    div()
+                                        .id("session-delete-spinner")
+                                        .flex()
+                                        .items_center()
+                                        .tip(t("sessionList", "deleteSession.deleting"))
+                                        .child(ui::spinner(px(12.0), ui::text_muted())),
+                                )
                             }),
                     )
                     .child(
@@ -1554,5 +1974,92 @@ mod tests {
         };
         let text = preview.all_text();
         assert!(text.contains(&format!("第{}条", PREVIEW_PAGE_SIZE + 4)));
+    }
+
+    /// 标题取自用户消息:多行只留第一个非空行,过长截断。
+    #[test]
+    fn 确认框标题收成一行() {
+        assert_eq!(delete_title_preview("hi"), "hi");
+        assert_eq!(delete_title_preview("\n  第一行  \n第二行"), "第一行");
+        assert_eq!(delete_title_preview(""), "");
+        let long = "长".repeat(DELETE_TITLE_MAX_CHARS + 1);
+        let preview = delete_title_preview(&long);
+        assert_eq!(preview.chars().count(), DELETE_TITLE_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        // 恰好到上限的不截
+        let exact = "长".repeat(DELETE_TITLE_MAX_CHARS);
+        assert_eq!(delete_title_preview(&exact), exact);
+    }
+
+    /// 正文点明标题;提醒只在有理由时才多出一行(正文按 `\n` 分行)。
+    #[test]
+    fn 确认框正文按情况多出提醒() {
+        let mut session = ai_session("claude", "s1");
+        session.title = "只有 hi 的短会话".into();
+        let lines = |recent, panes| {
+            delete_confirm_message(&session, None, recent, panes)
+                .split('\n')
+                .count()
+        };
+        let plain = delete_confirm_message(&session, None, false, 0);
+        assert!(plain.contains("只有 hi 的短会话"), "{plain}");
+        assert_eq!(lines(false, 0), 2);
+        assert_eq!(lines(true, 0), 3);
+        assert_eq!(lines(false, 2), 3);
+        assert_eq!(lines(true, 2), 4);
+        // 远程那句要点名是哪台机器
+        let remote = delete_confirm_message(&session, Some("prod-1"), false, 0);
+        assert!(remote.contains("prod-1"), "{remote}");
+        assert!(!plain.contains("prod-1"));
+        // 未上报身份的提醒要说出是哪家(展示名,不是 session_type)
+        let warned = delete_confirm_message(&session, None, false, 2);
+        assert!(warned.contains("Claude Code"), "{warned}");
+    }
+
+    /// 补充行列出每条路径;pi 与有分支的会话多交代一句;用量那句恒在。
+    #[test]
+    fn 确认框补充行列出路径与连带范围() {
+        let paths = [
+            ("/a/s1.jsonl".to_string(), false),
+            ("/a/s1".to_string(), true),
+        ];
+        let claude = delete_confirm_details(&ai_session("claude", "s1"), &paths, 0);
+        // 标题行 + 2 条路径 + 用量
+        assert_eq!(claude.len(), 4, "{claude:?}");
+        assert_eq!(claude[1], "• /a/s1.jsonl");
+        // 目录那条多一段「整个目录」的后缀
+        assert!(claude[2].starts_with("• /a/s1") && claude[2] != "• /a/s1");
+
+        let forked = delete_confirm_details(&ai_session("claude", "s1"), &paths, 3);
+        assert_eq!(forked.len(), 5);
+        assert!(forked[3].contains('3'), "{forked:?}");
+
+        let pi = delete_confirm_details(&ai_session("pi", "s1"), &paths, 0);
+        assert_eq!(pi.len(), 5, "pi 多一行说明文件内的分支一并删除");
+    }
+
+    #[test]
+    fn 删除错误带上路径与原始信息() {
+        for err in [
+            SessionDeleteError::Unsafe("/a/link".into()),
+            SessionDeleteError::Changed("/a/link".into()),
+            SessionDeleteError::Io {
+                path: "/a/link".into(),
+                message: "denied".into(),
+            },
+        ] {
+            assert!(delete_error_message(&err).contains("/a/link"), "{err:?}");
+        }
+        assert_eq!(
+            delete_error_message(&SessionDeleteError::Remote("连接断了".into())),
+            "连接断了"
+        );
+        for err in [
+            SessionDeleteError::InvalidId,
+            SessionDeleteError::Unsupported,
+            SessionDeleteError::NotFound,
+        ] {
+            assert!(!delete_error_message(&err).is_empty(), "{err:?}");
+        }
     }
 }

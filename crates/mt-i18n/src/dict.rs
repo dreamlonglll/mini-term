@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1513;
+pub const ZH_ENTRY_COUNT: usize = 1536;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1513;
+pub const EN_ENTRY_COUNT: usize = 1536;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2213,6 +2213,29 @@ static SESSION_LIST_ZH: &[(&str, &str)] = &[
     ("branchTree.remoteResumeUnsupported", "WSL / 远程来源的会话无法在本机恢复"),
     ("branchTree.runningIn", "正在「{project}」运行，点击跳转"),
     ("copyResumeCommand", "复制恢复命令"),
+    ("deleteSession.blockedTitle", "无法删除会话"),
+    ("deleteSession.busy", "上一个删除操作还没结束，请稍候再试。"),
+    ("deleteSession.cancel", "取消"),
+    ("deleteSession.deleting", "正在删除会话…"),
+    ("deleteSession.dirSuffix", "（整个目录）"),
+    ("deleteSession.errChanged", "确认期间会话记录发生了变化，可能正有 AI 在写入，已取消删除：\n{path}"),
+    ("deleteSession.errInvalidId", "会话 id 不合法，已拒绝删除。"),
+    ("deleteSession.errNotFound", "磁盘上找不到这个会话的记录，可能已被删除，列表已刷新。"),
+    ("deleteSession.errUnsafe", "目标不是预期的会话记录（可能是符号链接，或在会话目录之外），已拒绝删除：\n{path}"),
+    ("deleteSession.errUnsupported", "暂不支持删除这种来源的会话。"),
+    ("deleteSession.failedTitle", "删除会话失败"),
+    ("deleteSession.forksKept", "它的 {count} 个分支会话是独立副本，不会被删除，之后显示为独立的会话。"),
+    ("deleteSession.menu", "删除会话"),
+    ("deleteSession.message", "确定要删除会话「{title}」吗？\n会直接删除磁盘上 AI 工具的原始会话记录（不只是从列表移除），不进回收站，无法恢复。"),
+    ("deleteSession.messageRemote", "确定要删除会话「{title}」吗？\n会通过 SSH 直接删除远程机器「{name}」上 AI 工具的原始会话记录（不只是从列表移除），无法恢复。"),
+    ("deleteSession.ok", "删除"),
+    ("deleteSession.pathsHeader", "将删除："),
+    ("deleteSession.piBranches", "这个文件里的全部分支（/tree）会一并删除。"),
+    ("deleteSession.recentWrite", "⚠ 这个会话刚刚还有写入，可能仍有 AI 在使用，请确认它已退出。"),
+    ("deleteSession.running", "这个会话正在项目「{project}」的终端里运行，请先退出 AI 再删除。"),
+    ("deleteSession.title", "删除会话"),
+    ("deleteSession.unidentifiedAi", "⚠ 当前项目有 {count} 个 {agent} 终端没有上报会话身份，无法判断是否在用这个会话；如在使用请先退出。"),
+    ("deleteSession.usageKept", "已入账的用量会保留，用量账本重建时除外。"),
     ("empty", "暂无会话记录"),
     ("loadMore", "加载更多（还有 {n} 条）"),
     ("loading", "加载中…"),
@@ -2239,6 +2262,29 @@ static SESSION_LIST_EN: &[(&str, &str)] = &[
     ("branchTree.remoteResumeUnsupported", "WSL / remote sessions can't be resumed on this machine"),
     ("branchTree.runningIn", "Running in \"{project}\", click to jump"),
     ("copyResumeCommand", "Copy resume command"),
+    ("deleteSession.blockedTitle", "Can't Delete Session"),
+    ("deleteSession.busy", "The previous delete hasn't finished yet. Try again in a moment."),
+    ("deleteSession.cancel", "Cancel"),
+    ("deleteSession.deleting", "Deleting session…"),
+    ("deleteSession.dirSuffix", " (entire directory)"),
+    ("deleteSession.errChanged", "The session record changed while the dialog was open, so an AI may be writing to it. The delete was cancelled:\n{path}"),
+    ("deleteSession.errInvalidId", "The session id is invalid, so the delete was refused."),
+    ("deleteSession.errNotFound", "No records for this session were found on disk. It may already be deleted, so the list was refreshed."),
+    ("deleteSession.errUnsafe", "The target isn't the expected session record (it may be a symlink or outside the session directory), so the delete was refused:\n{path}"),
+    ("deleteSession.errUnsupported", "Sessions from this source can't be deleted yet."),
+    ("deleteSession.failedTitle", "Failed to Delete Session"),
+    ("deleteSession.forksKept", "Its {count} forked session(s) are independent copies. They are kept and will show as separate sessions."),
+    ("deleteSession.menu", "Delete session"),
+    ("deleteSession.message", "Delete session \"{title}\"?\nThis deletes the AI tool's original session records from disk (not just from this list). They skip the Recycle Bin and can't be recovered."),
+    ("deleteSession.messageRemote", "Delete session \"{title}\"?\nThis deletes the AI tool's original session records on the remote machine \"{name}\" over SSH (not just from this list). They can't be recovered."),
+    ("deleteSession.ok", "Delete"),
+    ("deleteSession.pathsHeader", "Will delete:"),
+    ("deleteSession.piBranches", "All branches inside this file (/tree) are deleted with it."),
+    ("deleteSession.recentWrite", "⚠ This session was written to moments ago and may still be in use. Make sure the AI has exited."),
+    ("deleteSession.running", "This session is running in a terminal of project \"{project}\". Exit the AI before deleting it."),
+    ("deleteSession.title", "Delete Session"),
+    ("deleteSession.unidentifiedAi", "⚠ {count} {agent} terminal(s) in this project haven't reported a session identity, so it can't be told whether they're using this session. Exit them first if they are."),
+    ("deleteSession.usageKept", "Usage already recorded is kept, unless the usage ledger gets rebuilt."),
     ("empty", "No session history"),
     ("loadMore", "Load more ({n} left)"),
     ("loading", "Loading…"),

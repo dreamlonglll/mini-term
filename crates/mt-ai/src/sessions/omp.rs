@@ -143,7 +143,7 @@ fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<Str
     }
 }
 
-fn project_session_dirs_in(
+pub(super) fn project_session_dirs_in(
     flavor: PiFlavor,
     sessions_root: &Path,
     home: &Path,

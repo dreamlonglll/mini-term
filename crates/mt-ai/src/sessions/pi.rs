@@ -42,7 +42,7 @@ pub(super) fn get_pi_sessions(project_path: &str) -> Vec<AiSession> {
     )
 }
 
-fn pi_sessions_in(dirs: &[PathBuf], project_path: &str) -> Vec<AiSession> {
+pub(super) fn pi_sessions_in(dirs: &[PathBuf], project_path: &str) -> Vec<AiSession> {
     let mut paths = Vec::new();
     for dir in dirs {
         let Ok(entries) = fs::read_dir(dir) else {

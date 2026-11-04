@@ -6,7 +6,7 @@ use mt_ai::sessions::{
     AiSession, AiSessionMessage, CachedSessions, MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
     claude_message_from_line, claude_session_info_from_lines, codex_message_from_line,
     codex_meta_from_line, codex_user_title_from_line, encode_project_path, is_encoded_variant,
-    session_cache, session_id_path_safe,
+    session_cache, session_cache_epoch, session_id_path_safe,
 };
 use mt_config::SshConnection;
 use mt_core::path_key::posix_ci_eq_key;
@@ -132,6 +132,7 @@ pub fn ai_sessions(
         }
     }
 
+    let epoch = session_cache_epoch();
     let sessions = match scan_remote_sessions(conn, project_path) {
         Ok(s) => s,
         Err(e) => {
@@ -140,13 +141,18 @@ pub fn ai_sessions(
         }
     };
 
-    lock(session_cache()).insert(
-        cache_key,
-        CachedSessions {
-            loaded_at: Instant::now(),
-            sessions: sessions.clone(),
-        },
-    );
+    // 扫描期间有会话被删过,这份结果就可能还含着它,不写回
+    let mut cache = lock(session_cache());
+    if session_cache_epoch() == epoch {
+        cache.insert(
+            cache_key,
+            CachedSessions {
+                loaded_at: Instant::now(),
+                sessions: sessions.clone(),
+            },
+        );
+    }
+    drop(cache);
 
     Ok(sessions)
 }
@@ -209,15 +215,13 @@ async fn remote_claude_dir_matches(sftp: &SftpHandle, dir: &str, normalized_proj
     false
 }
 
-async fn scan_remote_claude(
-    st: &RemoteSshState,
+/// 项目对应的远程 Claude 桶目录(含尾部斜杠 / 大小写变体)。
+pub(super) async fn matched_remote_claude_dirs(
     sftp: &SftpHandle,
-    home: &str,
-    conn_id: &str,
+    projects_dir: &str,
     project_path: &str,
-) -> Vec<AiSession> {
-    let projects_dir = join_posix(&join_posix(home, ".claude"), "projects");
-    let Ok(dir_entries) = sftp.read_dir(&projects_dir).await else {
+) -> Vec<String> {
+    let Ok(dir_entries) = sftp.read_dir(projects_dir).await else {
         return vec![]; // 远程没装 claude / 目录不存在 → 静默空
     };
 
@@ -230,14 +234,26 @@ async fn scan_remote_claude(
             continue;
         }
         if entry.name == encoded {
-            matched_dirs.push(join_posix(&projects_dir, &entry.name));
+            matched_dirs.push(join_posix(projects_dir, &entry.name));
         } else if is_encoded_variant(&entry.name, &encoded) {
-            let dir_path = join_posix(&projects_dir, &entry.name);
+            let dir_path = join_posix(projects_dir, &entry.name);
             if remote_claude_dir_matches(sftp, &dir_path, &normalized_project).await {
                 matched_dirs.push(dir_path);
             }
         }
     }
+    matched_dirs
+}
+
+async fn scan_remote_claude(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    home: &str,
+    conn_id: &str,
+    project_path: &str,
+) -> Vec<AiSession> {
+    let projects_dir = join_posix(&join_posix(home, ".claude"), "projects");
+    let matched_dirs = matched_remote_claude_dirs(sftp, &projects_dir, project_path).await;
 
     // 收集 (path, id, mtime),同 id 去重,按 mtime 降序限量。
     let mut files: Vec<(String, String, u64)> = Vec::new();
@@ -295,7 +311,7 @@ async fn scan_remote_claude(
 
 /// 按 `sessions/<year>/<month>/<day>/` 目录名倒序(零填充,字典序即时间序)收集
 /// 最新的 rollout 文件,凑够 `limit` 即停 —— 避免全量递归的 SFTP 往返爆炸。
-async fn collect_remote_codex_files(
+pub(super) async fn collect_remote_codex_files(
     sftp: &SftpHandle,
     sessions_dir: &str,
     limit: usize,
