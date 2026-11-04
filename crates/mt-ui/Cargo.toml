@@ -23,3 +23,11 @@ mt-theme-packs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+# 只当 `gpui::RenderImage` 的字节容器(`image::Frame` / `RgbaImage`,终端里的图片用),
+# 不解码任何东西。与 gpui、mt-terminal 同一份 0.25。
+image = { version = "0.25", default-features = false }
+
+[dev-dependencies]
+# 单测现场编一张 PNG、走一遍真的传输。
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"

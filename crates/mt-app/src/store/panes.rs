@@ -837,6 +837,13 @@ impl AppStore {
             // hook 子进程靠它关联回具体 pane(与装机版同一个变量名,不能改)
             ("MINITERM_PTY_ID".to_string(), pty_id.to_string()),
         ];
+        // 告诉 pi 这里能发 Kitty 图形。默认关闭,口径见 `kitty_graphics` 模块注释
+        env.extend(crate::kitty_graphics::protocol_env(
+            crate::kitty_graphics::active(),
+            project.ssh_connection_id.is_some(),
+            crate::kitty_graphics::is_wsl_launch(&cwd, &shell.command),
+            std::env::var_os("PI_IMAGE_PROTOCOL").as_deref(),
+        ));
         let hook_port = self.ai.hook_port();
         if hook_port > 0 {
             env.push(("MINITERM_HOOK_PORT".to_string(), hook_port.to_string()));

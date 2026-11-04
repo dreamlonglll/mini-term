@@ -19,8 +19,9 @@
 //!    语义(Simple / Block / Semantic / Lines),需要接上鼠标事件与剪贴板。
 //! 3. **IME 组合输入**:GPUI 侧的 `InputHandler`,预编辑文本要浮在光标处。
 //! 4. **链接检测 / 搜索**:alacritty 有 `RegexSearch`,但 hint 的 UI 要自己做。
-//! 5. **图片协议(Sixel / Kitty)**:alacritty_terminal **不支持**,当前 xterm.js
-//!    侧若有依赖需要单独评估,不要默认它会跟着过来。
+//! 5. **图片协议**:alacritty_terminal **不支持**。Kitty 图形协议的静态 PNG 子集在
+//!    [`kitty`] 模块,默认关闭(宿主经 [`TerminalEmulator::with_kitty_graphics`] 打开);
+//!    Sixel 与 iTerm2 没有实现。
 //!
 //! # 背景图与半透明
 //!
@@ -38,10 +39,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+pub mod kitty;
 pub mod links;
 pub mod width;
 
-use width::WidthOverride;
+use width::{Scratch, WidthOverride};
 
 /// 把 alacritty 整个重新导出。渲染层(`mt-ui`)要用 `Cell` / `Flags` / `Color` /
 /// `TermMode` / `Selection` 这些类型,统一从这里取,避免各 crate 各自写一份
@@ -118,6 +120,8 @@ pub struct TerminalEmulator {
     generation: AtomicU64,
     /// 光标的停稳追踪,见 [`Self::settled_cursor`]。
     cursor_settle: Mutex<CursorSettle>,
+    /// Kitty 图形。`None` = 开关关着(缺省),字节不经过它。见 [`kitty`]。
+    kitty: Option<kitty::Kitty>,
 }
 
 /// 光标要在一格上停多久才算「停稳」。
@@ -199,8 +203,8 @@ fn cursor_cell(term: &Term<EventQueue>) -> (i32, usize) {
 /// VT 解析器与它的随身暂存。
 struct Parser {
     vte: Processor,
-    /// [`WidthOverride`] 拼簇文本用的暂存,跟解析器同锁、跨批次复用。
-    cluster: String,
+    /// [`WidthOverride`] 的随身状态(拼簇文本的暂存等),跟解析器同锁、跨批次复用。
+    cluster: Scratch,
 }
 
 impl Parser {
@@ -279,14 +283,30 @@ impl TerminalEmulator {
             term: Arc::new(Mutex::new(term)),
             parser: Mutex::new(Parser {
                 vte: Processor::new(),
-                cluster: String::new(),
+                cluster: Scratch::default(),
             }),
             events,
             scrollback: AtomicUsize::new(scrollback),
             cursor_floor: Mutex::new(None),
             generation: AtomicU64::new(0),
             cursor_settle: Mutex::new(cursor_settle),
+            kitty: None,
         }
+    }
+
+    /// 打开 Kitty 图形。开不开由宿主判(环境变量开关 + ConPTY 后端),`false` 原样返回。
+    pub fn with_kitty_graphics(mut self, enabled: bool) -> Self {
+        if enabled {
+            let kitty = kitty::Kitty::new(self.events.clone());
+            self.parser.get_mut().cluster.set_kitty(kitty.shared());
+            self.kitty = Some(kitty);
+        }
+        self
+    }
+
+    /// Kitty 图形状态。`None` = 没开。
+    pub fn kitty(&self) -> Option<&kitty::Kitty> {
+        self.kitty.as_ref()
     }
 
     /// 内容代数:每推进一批字节、每次 resize、每次真改了回滚行数都 +1。
@@ -330,7 +350,18 @@ impl TerminalEmulator {
     ///
     /// 字节不是直接喂 `Term`,中间隔着 [`WidthOverride`]:emoji 序列整簇落一格,
     /// 理由与手法见 [`width`] 模块注释。
+    ///
+    /// 开了 Kitty 图形时先在锁外过一遍预解析器(含 PNG 解码),见 [`kitty`]。
     pub fn advance(&self, bytes: &[u8]) {
+        let mut kitty = self.kitty.as_ref().map(kitty::Kitty::pre_parser);
+        let bytes = match kitty.as_mut() {
+            Some(pre) => pre.filter(bytes),
+            None => bytes,
+        };
+        // 这一批全是图片 payload:不用去抢 term 锁
+        if self.kitty.is_some() && bytes.is_empty() {
+            return;
+        }
         let mut term = self.term.lock();
         // 持着 term 锁记账:读的人持锁看到的代数与内容必然同步
         self.generation.fetch_add(1, Ordering::Relaxed);

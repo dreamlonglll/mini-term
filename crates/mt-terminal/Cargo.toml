@@ -10,6 +10,12 @@ alacritty_terminal.workspace = true
 parking_lot.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+# Kitty 图形协议(`kitty` 模块):PNG 解码与缩放、payload 的 base64、流式预解析里找 ESC。
+# 都是依赖树里已有的那一份:image 与 mt-app 同取 0.25(只开 png),base64 与 mt-secret
+# 同取 0.22,memchr 是 vte 自己也在用的。
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+memchr = "2"
 
 [dev-dependencies]
 # 只给 `tests/terminal_smoke.rs` 用:起真 PTY 把字节喂进状态机,验 PTY → VT → grid

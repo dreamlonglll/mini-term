@@ -5572,6 +5572,9 @@ name = "mt-terminal"
 version = "1.13.26"
 dependencies = [
  "alacritty_terminal",
+ "base64 0.22.1",
+ "image",
+ "memchr",
  "mt-pty",
  "parking_lot",
  "unicode-segmentation",
@@ -5595,8 +5598,10 @@ version = "1.13.26"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "base64 0.22.1",
  "gpui-component",
  "gpui-pre",
+ "image",
  "mt-terminal",
  "mt-theme-packs",
  "serde",

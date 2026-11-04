@@ -360,13 +360,14 @@ impl TerminalPane {
         //
         // 回滚行数(`config.terminalScrollback`)必须在这一刻喂进 alacritty 的
         // `term::Config`:它决定 grid 的历史容量,建完再改只能靠 `set_options`。
-        let emulator = Arc::new(TerminalEmulator::with_scrollback(
+        let emulator = TerminalEmulator::with_scrollback(
             TermSize::new(
                 mt_pty::INITIAL_PTY_COLS as usize,
                 mt_pty::INITIAL_PTY_ROWS as usize,
             ),
             scrollback,
-        ));
+        );
+        let emulator = Arc::new(emulator.with_kitty_graphics(crate::kitty_graphics::active()));
 
         let (tx, mut rx) = mpsc::unbounded::<PaneSignal>();
         let exit_tx = tx.clone();
@@ -1141,11 +1142,16 @@ impl TerminalPane {
                 }
                 TermEvent::TextAreaSizeRequest(format) => {
                     let size = self.emulator.term_size();
+                    // 开着 Kitty 图形才报真实像素:关着时维持原样,与现在字节级一致
+                    let (cell_width, cell_height) = self
+                        .emulator
+                        .kitty()
+                        .map_or((1, 1), |kitty| kitty.reported_cell_pixels());
                     let payload = format(mt_terminal::alacritty_terminal::event::WindowSize {
                         num_lines: size.screen_lines as u16,
                         num_cols: size.columns as u16,
-                        cell_width: 1,
-                        cell_height: 1,
+                        cell_width,
+                        cell_height,
                     });
                     self.write_raw(payload.as_bytes());
                 }

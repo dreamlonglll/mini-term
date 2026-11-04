@@ -10,6 +10,7 @@
 pub mod colors;
 pub mod damage;
 mod element;
+mod images;
 pub mod ime;
 mod input;
 pub mod links;

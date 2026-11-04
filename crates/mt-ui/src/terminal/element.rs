@@ -205,6 +205,8 @@ pub struct TerminalElement {
     search_colors: SearchColors,
     flash: Option<FlashLine>,
     file_links: Option<FileLinks>,
+    /// Kitty 图片的纹理缓存,由视图持有。见 [`super::images`]。
+    image_cache: Option<Rc<RefCell<super::images::TerminalImageCache>>>,
 }
 
 /// 一次性的「整行闪一下」。跳到某一行之后给的可见反馈,到期由**宿主**撤掉
@@ -292,7 +294,17 @@ impl TerminalElement {
             search_colors: SearchColors::default(),
             flash: None,
             file_links: None,
+            image_cache: None,
         }
+    }
+
+    /// Kitty 图片的纹理缓存。不接就不画图(宿主没开图形时就是这样)。
+    pub(super) fn image_cache(
+        mut self,
+        cache: Rc<RefCell<super::images::TerminalImageCache>>,
+    ) -> Self {
+        self.image_cache = Some(cache);
+        self
     }
 
     /// Ctrl(⌘)+悬停 / 单击文件路径。见 [`super::links`]。
@@ -520,6 +532,8 @@ pub struct PreparedFrame {
     scrollbar: Option<ScrollbarLayout>,
     /// 整行闪烁的矩形与颜色(已换算到窗口坐标)。`None` = 没设 / 不在视口里。
     flash: Option<(Bounds<Pixels>, Hsla)>,
+    /// 这一帧看得见的 Kitty 图片。没开图形或没有图时是空的。
+    images: Vec<mt_terminal::kitty::VisibleImage>,
 }
 
 /// 「这个字符在主字体里有字形、且步进正好是一列宽吗」的缓存 —— 答案是三档的
@@ -1701,6 +1715,11 @@ impl Element for TerminalElement {
         let line_height = self.style.line_height_px();
         let cell_size = size(cell_width, line_height);
         report_metrics_once(window, font_id, font_size, cell_width, line_height, &self.style);
+        // Kitty 图形要知道一格多少设备像素:查询应答、按显示尺寸缩图都靠它
+        if let Some(kitty) = self.emulator.kitty() {
+            let scale = window.scale_factor();
+            kitty.set_cell_pixels(f(cell_width) * scale, f(line_height) * scale);
+        }
         // 主字体缺的私用区图标换哪份字体画;`None` = 这一帧不接管(见 [`symbols`])。
         let symbol_font = symbols::symbol_font(&self.style, window);
 
@@ -1784,9 +1803,15 @@ impl Element for TerminalElement {
         // 滚动条要用:整条内容有多长、视口顶在哪
         let total_lines;
         let frame_display_offset;
+        let images;
 
         {
             let term_lock = self.emulator.term().lock();
+            // 与这一帧的格子同一把锁:图片跟着格子走,不能错开
+            images = self
+                .emulator
+                .kitty()
+                .map_or_else(Vec::new, |kitty| kitty.visible_images(&term_lock));
             total_lines = term_lock.grid().total_lines();
             let content = term_lock.renderable_content();
             let display_offset = content.display_offset;
@@ -2107,6 +2132,7 @@ impl Element for TerminalElement {
             preedit,
             scrollbar,
             flash,
+            images,
         }
     }
 
@@ -2202,6 +2228,17 @@ impl Element for TerminalElement {
                         cx,
                     );
                 }
+            }
+            // ── Kitty 图片压在文字之上(协议的缺省 z 序),细光标与浮层之下。
+            //    **不进行缓存**:每帧照当前摆放重发,摆放变了不用作废任何一行
+            if let (Some(kitty), Some(cache)) = (self.emulator.kitty(), self.image_cache.as_ref()) {
+                let layer = super::images::ImageLayer {
+                    origin,
+                    cell: prepared.cell_size,
+                    display_offset: prepared.display_offset,
+                    clip: bounds,
+                };
+                super::images::paint_images(kitty, &prepared.images, &layer, cache, window, cx);
             }
             if let Some(c) = prepared.cursor.as_ref() {
                 match (focused, c.shape) {
