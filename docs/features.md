@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.26-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.27-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -53,6 +53,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Dwell-to-copy selection** — After drag-selecting, holding the mouse still past a configurable dwell (default 1s, 0.2–60s, 0 = off) copies the selection and shows a "Copied" tip at the cursor; if the selection kept growing before mouse-up, it copies once more so the clipboard always matches the final selection.
 - **Alt / ⌥+click to place the cursor** — Hold Alt (⌥ on macOS) and click a cell in the terminal: left/right arrow keys are synthesized from the column delta to the current cursor (following DECCKM application-cursor mode; zero delta sends nothing, more than 512 steps gives up, and it is inactive while scrolled back). **Same line only** — cross-line clicks never move: in a line editor the vertical arrows usually recall history rather than move the cursor, and not moving beats destroying what you were typing. Cell-accurate at bash / zsh / pwsh prompts; Ink-style TUIs such as Claude CLI park the hardware cursor at the end of the input line, so the starting point doesn't line up and accuracy is best-effort.
 - **Terminal file links** — Hold Ctrl (⌘ on macOS) and hover a file path in the terminal: a recognised path is underlined and the cursor turns into a hand; click to open it in a new file tab (or switch to the existing one) at that line. Line / column suffixes such as `a.ts:20`, `a.ts:20:5` and `a.ts(30,5)` are understood. Relative paths resolve against the AI session's start directory, then the pane's working directory, then the project root, and the first one that exists on disk wins; WSL projects map `/home/…` back to the project root's UNC path, and in local projects `/mnt/d/…` (panes running wsl.exe) and Git Bash `/d/…` map back to `D:…`. Long paths broken by soft wraps are recognised as a whole, and so are paths a TUI hard-wrapped itself (one line runs to the right edge, the next continues it). Only files **inside the project root** are linked (the same rule the file tab uses to read from disk, so paths outside the project are never underlined); SSH remote projects are matched by shape under the project root rather than checked over SFTP on every hover. While Ctrl is held, a click takes priority over a TUI's mouse reporting. Web links use the same gesture and open in the default browser: plain `http://` / `https://` text (trailing punctuation and unmatched brackets are left out, a non-ASCII character ends the URL, and URLs broken by soft wraps or a TUI's hard wraps are joined) and OSC 8 hyperlinks. An OSC 8 link is underlined as a whole and a bubble shows its real target, since its display text can say anything; targets other than http / https are never opened (if the display text is itself a path inside the project, it still works as a file link).
+- **Kitty images in the terminal (experimental, off by default)** — Set the environment variable `MT_ENABLE_KITTY_GRAPHICS=1` to try it: the static PNG subset of the Kitty graphics protocol (transmit, place, crop, delete), with images following scrolling, scrollback and clears. It only turns on with the bundled ConPTY on Windows, and tells local shells `PI_IMAGE_PROTOCOL=kitty`, so pi can show images in the terminal. Other Kitty features, iTerm2 and Sixel are not implemented; WSL and SSH are not covered. With the variable unset nothing changes
 - **Long-text paste** — When clipboard text is ≥10 lines or ≥2000 chars, it is automatically saved to a temporary `.txt` and a quoted file path is pasted instead, avoiding the performance and paste-bracket issues of feeding huge content straight to AI tools.
 - **Image paste** — Detects screenshots in the clipboard. On Windows it reads the Win32 clipboard (`CF_DIB` / `CF_BITMAP`), saves a temporary PNG and pastes a quoted path — compatible with non-standard formats such as PinPix; other platforms write the system clipboard's raw PNG/JPEG bytes straight to disk. When an image is present but cannot be decoded (e.g. a `BI_BITFIELDS` bitmap), it sends `Alt+V` so the AI tool running in the terminal can read the clipboard itself. **While Claude Code is running in that terminal (local / WSL), nothing is written to disk — `Alt+V` is sent directly**: Claude inserts an `[Image #N]` chip and the model sees the picture rather than a path. Once Claude exits, or in SSH remote projects (the remote agent reads the remote clipboard), the save / upload route applies as before.
 - **Remote / WSL paste lands where the agent can read it** — Both "save to a file, paste the path" features above automatically remap their destination in remote terminals: SSH remote projects upload the file over SFTP and paste the **remote** path (default `<project root>/.mini-term/pasted`, inside the project so agents need no extra permission; configurable to `/tmp/mini-term`, `~/uploads`, etc., and a self-ignoring `.gitignore` is written so your `git status` stays clean), while WSL projects rewrite `C:\...` into `/mnt/c/...` (no upload needed). Upload failures raise an explicit toast instead of pasting a local path the remote host cannot read.
@@ -235,7 +236,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,875 Rust tests** (35 test targets) + relay-server protocol boundary tests |
+| Tests | **3,143 Rust tests** (36 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -376,7 +377,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (35 test targets, 2,875 cases)
+# Workspace-wide Rust tests (36 test targets, 3,143 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.26-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.27-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -53,6 +53,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **拖选停留自动复制** — 拖选文本后按住鼠标静止超过设定时长（默认 1s，可调 0.2–60s，0 = 关闭）自动复制选区并在光标旁弹「已复制」气泡；松手时选区已继续增长则补复制一次，剪贴板始终是最终看到的完整选区
 - **Alt / ⌥+单击定位光标** — 按住 Alt（macOS ⌥）单击终端里的某个格子，按与当前光标的列差合成左右方向键把光标挪过去（跟随 DECCKM 应用光标键模式，零位移不发、超过 512 步放弃、滚动回看时不生效）；**只在同一行内生效**，跨行一律不动——行编辑器里的上下方向键往往是召回历史而不是移动光标，宁可不动也不能毁掉正在输入的内容。bash / zsh / pwsh 提示符下逐格准确；Claude CLI 这类 Ink TUI 把硬件光标停在行末、起点对不上，不保证
 - **终端文件链接** — 按住 Ctrl（macOS ⌘）悬停终端里的文件路径，认得出的路径画出下划线、光标变手形，单击即在文件页新开页签（已开过就切过去）并定位到行；行列号认 `a.ts:20`、`a.ts:20:5`、`a.ts(30,5)` 等常见写法。相对路径依次对着 AI 会话的启动目录、pane 的工作目录、项目根解析，第一个在盘上的胜出；WSL 项目把 `/home/…` 换回项目根的 UNC 路径，本地项目里 `/mnt/d/…`（跑 wsl.exe 的 pane）与 Git Bash 的 `/d/…` 换回 `D:…`；软换行折开的长路径整段识别，TUI 自己硬换行折开的路径（上一行写到右边缘、下一行续上）也能接上。只认**项目根内**的文件（与文件页读盘同一把尺子，项目外的路径不画下划线）；SSH 远程项目不逐次走 SFTP 验盘，只按形状认项目根下的路径。按住 Ctrl 时单击优先于 TUI 的鼠标上报。网址用同一套手势、单击交给系统默认浏览器：普通 `http://` / `https://` 文本（尾部标点与没配对的括号不算，碰到非 ASCII 字符即止，软换行与 TUI 硬换行折开的长网址能接上）和 OSC 8 超链接；OSC 8 链接整段一起高亮，并用气泡显示真实目标（它的显示文字可以写成任何样子），http / https 以外的目标一律不打开（显示文字本身是项目内路径时，仍按文件链接处理）
+- **终端 Kitty 图片（实验性，默认关闭）** — 设环境变量 `MT_ENABLE_KITTY_GRAPHICS=1` 试用：支持 Kitty 图形协议的静态 PNG 子集（传输、摆放、裁切、删除），图片随滚动、回看、清屏移动。Windows 上只有随包的 ConPTY 生效时才开启，并给本机 shell 注入 `PI_IMAGE_PROTOCOL=kitty`，pi 因此能在终端里显示图片。其他 Kitty 能力、iTerm2 与 Sixel 未实现，WSL 与 SSH 未覆盖。不设这个变量时一切照旧
 - **长文本粘贴** — 剪贴板文本 ≥10 行或 ≥2000 字符时自动转存为临时 `.txt` 并粘贴带引号的文件路径，避免 AI 工具直接处理超长内容引发性能与 paste bracket 问题
 - **图片粘贴** — 剪贴板含截图时自动检测，Windows 经 Win32 剪贴板 API（`CF_DIB` / `CF_BITMAP`）保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式；其余平台读系统剪贴板里的 PNG/JPEG 等原始字节直接落盘；图片确实在场却解不出来（如 `BI_BITFIELDS` 压缩位图）时发送 `Alt+V`，交给终端里的 AI 工具自行读取剪贴板。**终端里正跑着 Claude Code（本地 / WSL）时不落盘，直接发 `Alt+V`**——它会插入 `[Image #N]` 芯片，模型直接看到图而不是一条路径；Claude 退出后、或在 SSH 远程项目里（远端读的是远端剪贴板）仍走落盘 / 上传路线
 - **远程 / WSL 粘贴自动落地** — 上面两种「转存成文件再粘路径」的能力在远程终端里会自动换算落点：SSH 远程项目经 SFTP 把文件上传到远端目录后粘贴**远端**路径（默认 `<项目根>/.mini-term/pasted`，落在项目内 agent 无需额外授权即可读，目录可在设置中改成 `/tmp/mini-term`、`~/uploads` 等，并自动写入自忽略的 `.gitignore` 以免弄脏 `git status`）；WSL 项目则把 `C:\...` 换算为 `/mnt/c/...`（无需上传）。上传失败会明确弹提示，而不是粘一个远端读不到的本机路径
@@ -235,7 +236,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2875 个 Rust 测试**（35 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **3143 个 Rust 测试**（36 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -376,7 +377,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（35 个测试目标、2875 例）
+# 全工作区 Rust 测试（36 个测试目标、3143 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
