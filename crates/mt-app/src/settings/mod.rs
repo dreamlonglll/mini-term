@@ -21,7 +21,8 @@
 //!    需要额外副作用的(主题 / 字号 / 字族 / 回滚行数 / 停留时长 / 帧率)各有专用 setter;
 //! 2. **数字行是草稿态**:输入期间只改草稿,失焦 / 回车才归一并提交 ——
 //!    边打字边 clamp 会让「1000」在敲到「1」时就被吃掉
-//!    (`SettingsModal.tsx:167-171` 的注释)。滑块相反,**拖动即时提交**;
+//!    (`SettingsModal.tsx:167-171` 的注释)。关面板时兜底再提交一次(点 ✕ / Esc 不保证
+//!    输入框先失焦)。滑块相反,**拖动即时提交**;
 //! 3. **分页 id 一字不改**:[`SettingsPage::id`] 返回的字符串与原版
 //!    `SettingsPage` 联合类型完全一致,深链(`initial_page`)不会因为重排失效。
 //!
@@ -698,16 +699,7 @@ impl SettingsView {
         // 草稿行:失焦 / 回车才归一并提交(见模块注释第 2 条)。
         // 走 `subscribe_in` 而不是 `subscribe` —— 归一后要把值写回输入框,
         // 而 `InputState::set_value` 要 `&mut Window`。
-        let numeric = [
-            (this.num_scrollback.clone(), NumField::Scrollback),
-            (this.num_dwell.clone(), NumField::Dwell),
-            (this.num_line_threshold.clone(), NumField::LineThreshold),
-            (this.num_char_threshold.clone(), NumField::CharThreshold),
-            (this.num_tray_max.clone(), NumField::TrayMax),
-            (this.num_fps_foreground.clone(), NumField::FpsForeground),
-            (this.num_fps_background.clone(), NumField::FpsBackground),
-        ];
-        for (entity, field) in numeric {
+        for (entity, field) in this.number_inputs() {
             this._subs.push(cx.subscribe_in(
                 &entity.clone(),
                 window,
@@ -718,19 +710,7 @@ impl SettingsView {
                 },
             ));
         }
-        let texts = [
-            (this.txt_remote_paste_dir.clone(), TextField::RemotePasteDir),
-            (this.txt_ui_font.clone(), TextField::UiFontFamily),
-            (
-                this.txt_terminal_font.clone(),
-                TextField::TerminalFontFamily,
-            ),
-            (
-                this.txt_terminal_cjk_font.clone(),
-                TextField::TerminalCjkFontFamily,
-            ),
-        ];
-        for (entity, field) in texts {
+        for (entity, field) in this.text_inputs() {
             this._subs.push(cx.subscribe_in(
                 &entity.clone(),
                 window,
@@ -747,11 +727,11 @@ impl SettingsView {
 
         // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
         // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口。
-        // 环境变量页在这里兜底提交一次:点 ✕ 关面板不保证输入框先失焦
+        // 草稿在这里兜底提交一次:点 ✕ / Esc 关面板不保证输入框先失焦
         cx.on_release(|this: &mut Self, cx: &mut App| {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
-            this.commit_env_vars(cx);
+            this.commit_drafts(cx);
         })
         .detach();
 
@@ -762,6 +742,48 @@ impl SettingsView {
 
     // ── 提交 ──
 
+    /// 数字草稿行。失焦 / 回车的订阅与关面板兜底共用这张表,新增一行两边都有。
+    fn number_inputs(&self) -> [(Entity<InputState>, NumField); 7] {
+        [
+            (self.num_scrollback.clone(), NumField::Scrollback),
+            (self.num_dwell.clone(), NumField::Dwell),
+            (self.num_line_threshold.clone(), NumField::LineThreshold),
+            (self.num_char_threshold.clone(), NumField::CharThreshold),
+            (self.num_tray_max.clone(), NumField::TrayMax),
+            (self.num_fps_foreground.clone(), NumField::FpsForeground),
+            (self.num_fps_background.clone(), NumField::FpsBackground),
+        ]
+    }
+
+    /// 文本草稿行,同 [`Self::number_inputs`]。
+    fn text_inputs(&self) -> [(Entity<InputState>, TextField); 4] {
+        [
+            (self.txt_remote_paste_dir.clone(), TextField::RemotePasteDir),
+            (self.txt_ui_font.clone(), TextField::UiFontFamily),
+            (
+                self.txt_terminal_font.clone(),
+                TextField::TerminalFontFamily,
+            ),
+            (
+                self.txt_terminal_cjk_font.clone(),
+                TextField::TerminalCjkFontFamily,
+            ),
+        ]
+    }
+
+    /// 把还没提交的草稿全部落盘。收 `&mut App`:关面板时的兜底在 `on_release` 里,
+    /// 那里只有 `App`,也写不回输入框 —— 面板都关了,不用写。没改的行到 setter 都是空转。
+    fn commit_drafts(&mut self, cx: &mut App) {
+        for (input, field) in self.number_inputs() {
+            self.save_number(field, &input, cx);
+        }
+        for (input, field) in self.text_inputs() {
+            self.save_text(field, &input, cx);
+        }
+        self.commit_remote_drafts(cx);
+        self.commit_env_vars(cx);
+    }
+
     fn commit_number(
         &mut self,
         field: NumField,
@@ -769,16 +791,21 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let draft = input.read(cx).value().to_string();
-        let saved = self.saved_number(field, cx);
-        let next = normalize_number(field, &draft).unwrap_or(saved);
         // 归一后的值写回输入框(原版 `setDraft(String(next))`)
-        let text = number_text(field, next);
+        let text = self.save_number(field, input, cx);
         if input.read(cx).value().as_ref() != text.as_str() {
             input.update(cx, |state, cx| state.set_value(text, window, cx));
         }
+    }
+
+    /// 归一并写进配置,返回归一后的显示串。不碰输入框,所以没有 `Window` 也能调。
+    fn save_number(&self, field: NumField, input: &Entity<InputState>, cx: &mut App) -> String {
+        let draft = input.read(cx).value().to_string();
+        let saved = self.saved_number(field, cx);
+        let next = normalize_number(field, &draft).unwrap_or(saved);
+        let text = number_text(field, next);
         if (next - saved).abs() < f64::EPSILON {
-            return;
+            return text;
         }
         self.store.update(cx, |store, cx| match field {
             NumField::Scrollback => store.set_terminal_scrollback(next as u32, cx),
@@ -793,6 +820,7 @@ impl SettingsView {
             NumField::FpsForeground => store.set_foreground_fps(next as u32, cx),
             NumField::FpsBackground => store.set_background_fps(next as u32, cx),
         });
+        text
     }
 
     fn saved_number(&self, field: NumField, cx: &App) -> f64 {
@@ -816,37 +844,44 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let text = self.save_text(field, input, cx);
+        if input.read(cx).value().as_ref() != text.as_str() {
+            input.update(cx, |state, cx| state.set_value(text, window, cx));
+        }
+    }
+
+    /// 归一并写进配置,返回归一后的文本。不碰输入框,同 [`Self::save_number`]。
+    fn save_text(&self, field: TextField, input: &Entity<InputState>, cx: &mut App) -> String {
         let draft = input.read(cx).value().to_string();
         match field {
             TextField::RemotePasteDir => {
                 let next = normalize_remote_paste_dir(&draft);
-                if next != draft {
-                    input.update(cx, |state, cx| state.set_value(next.clone(), window, cx));
+                if self.store.read(cx).config().remote_paste_dir != next {
+                    let value = next.clone();
+                    self.store.update(cx, |store, cx| {
+                        store.patch_config(|c| c.remote_paste_dir = value, cx)
+                    });
                 }
-                if self.store.read(cx).config().remote_paste_dir == next {
-                    return;
-                }
-                self.store.update(cx, |store, cx| {
-                    store.patch_config(|c| c.remote_paste_dir = next, cx)
-                });
+                return next;
             }
             // 空串提交 → 写 `None` 而不是空字符串(`SettingsModal.tsx:881, 920`)
             TextField::UiFontFamily => {
-                let next = Some(draft).filter(|s| !s.trim().is_empty());
+                let next = Some(draft.clone()).filter(|s| !s.trim().is_empty());
                 self.store
                     .update(cx, |store, cx| store.set_ui_font_family(next, cx));
             }
             TextField::TerminalFontFamily => {
-                let next = Some(draft).filter(|s| !s.trim().is_empty());
+                let next = Some(draft.clone()).filter(|s| !s.trim().is_empty());
                 self.store
                     .update(cx, |store, cx| store.set_terminal_font_family(next, cx));
             }
             TextField::TerminalCjkFontFamily => {
-                let next = Some(draft).filter(|s| !s.trim().is_empty());
+                let next = Some(draft.clone()).filter(|s| !s.trim().is_empty());
                 self.store
                     .update(cx, |store, cx| store.set_terminal_cjk_font_family(next, cx));
             }
         }
+        draft
     }
 
     // ── ↑↓ 导航 ──

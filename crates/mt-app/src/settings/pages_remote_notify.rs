@@ -6,12 +6,13 @@
 //!   ([`AppStore::set_remote_notify_secret`](crate::store::AppStore::set_remote_notify_secret)),
 //!   打开面板时解开回填;解不开就回填空并就地标红,与移动端面板的桌面密钥同一套;
 //! - 「测试发送」先把该渠道的草稿**全部提交**再发 —— 点按钮不一定让输入框先失焦;
+//!   关面板时同理兜底再提交一次([`SettingsView::commit_remote_drafts`]);
 //! - 结果与错误一律**就地显示**,不走 toast(toast 画在设置弹窗遮罩之下,看不见)。
 
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder,
     px,
 };
@@ -206,33 +207,45 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = self.remote.input(field).clone();
-        let draft = input.read(cx).value().to_string();
+        for (field, value) in self.save_remote_field(field, cx) {
+            let input = self.remote.input(field).clone();
+            if input.read(cx).value().as_ref() != value.as_str() {
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 归一并写进配置,返回要写回输入框的内容。不碰输入框,所以没有 `Window` 也能调。
+    fn save_remote_field(
+        &mut self,
+        field: RemoteField,
+        cx: &mut App,
+    ) -> Vec<(RemoteField, String)> {
+        let draft = self.remote.input(field).read(cx).value().to_string();
         let Some(secret) = field.secret() else {
             let value = match field {
                 RemoteField::BarkServer => normalize_base(&draft, BARK_DEFAULT_SERVER),
                 RemoteField::TgApi => normalize_base(&draft, TELEGRAM_DEFAULT_API),
                 _ => draft.trim().to_string(),
             };
-            if value != draft {
-                input.update(cx, |state, cx| state.set_value(value.clone(), window, cx));
-            }
+            let stored = value.clone();
             self.store.update(cx, |store, cx| {
                 store.patch_remote_notify(
                     |c| match field {
-                        RemoteField::BarkServer => c.bark.server = value,
-                        RemoteField::TgChat => c.telegram.chat_id = value,
-                        RemoteField::TgApi => c.telegram.api_base = value,
-                        RemoteField::HookBody => c.webhook.body = value,
+                        RemoteField::BarkServer => c.bark.server = stored,
+                        RemoteField::TgChat => c.telegram.chat_id = stored,
+                        RemoteField::TgApi => c.telegram.api_base = stored,
+                        RemoteField::HookBody => c.webhook.body = stored,
                         _ => {}
                     },
                     cx,
                 )
             });
-            cx.notify();
-            return;
+            return vec![(field, value)];
         };
 
+        let mut writes = Vec::new();
         let mut plain = draft.trim().to_string();
         // Bark App 里复制的是整条推送地址:拆成服务器 + key,服务器框一并改
         if field == RemoteField::BarkKey
@@ -240,20 +253,16 @@ impl SettingsView {
         {
             plain = key;
             let server = normalize_base(&server, BARK_DEFAULT_SERVER);
-            self.remote
-                .bark_server
-                .update(cx, |state, cx| state.set_value(server.clone(), window, cx));
+            writes.push((RemoteField::BarkServer, server.clone()));
             self.store.update(cx, |store, cx| {
                 store.patch_remote_notify(|c| c.bark.server = server, cx)
             });
         }
-        if plain != draft {
-            input.update(cx, |state, cx| state.set_value(plain.clone(), window, cx));
-        }
+        writes.push((field, plain.clone()));
         // 解不开的旧凭据:框是空的,用户只是点进来又点走 —— 别把它当「清空」提交,
         // 红字留着等用户真重填
         if plain.is_empty() && self.remote.unreadable.contains(&secret) {
-            return;
+            return writes;
         }
         let result = self.store.update(cx, |store, cx| {
             store.set_remote_notify_secret(secret, &plain, cx)
@@ -269,7 +278,28 @@ impl SettingsView {
                     Some(tr!("settings", "remoteNotify.err.sealFailed", detail = err));
             }
         }
-        cx.notify();
+        writes
+    }
+
+    /// 关面板兜底提交全部草稿。顺序沿用 [`RemoteField::ALL`]:这里写不回输入框,key 框里
+    /// 贴的整条推送地址要盖过服务器框,服务器框就得先提交。
+    pub(super) fn commit_remote_drafts(&mut self, cx: &mut App) {
+        for field in RemoteField::ALL {
+            if !self.remote_secret_unchanged(field, cx) {
+                self.save_remote_field(field, cx);
+            }
+        }
+    }
+
+    /// 凭据框的内容与已存的一致。没改就别过封存:封存失败会把已存的清空,
+    /// 不能让「只是关个面板」碰上这条路。
+    fn remote_secret_unchanged(&self, field: RemoteField, cx: &App) -> bool {
+        let Some(secret) = field.secret() else {
+            return false;
+        };
+        let stored = secret.stored(&self.store.read(cx).config().remote_notify);
+        let draft = self.remote.input(field).read(cx).value();
+        crate::secrets::reveal_secret(stored).is_ok_and(|plain| plain == draft.trim())
     }
 
     /// 把一个渠道的草稿全部提交(测试发送之前)。
@@ -672,6 +702,13 @@ mod tests {
             normalize_base("https://api.telegram.org", TELEGRAM_DEFAULT_API),
             ""
         );
+    }
+
+    /// 关面板兜底按 [`RemoteField::ALL`] 提交:key 框贴的整条推送地址要盖过服务器框。
+    #[test]
+    fn 服务器框排在_key_框之前提交() {
+        let at = |field| RemoteField::ALL.iter().position(|f| *f == field);
+        assert!(at(RemoteField::BarkServer) < at(RemoteField::BarkKey));
     }
 
     #[test]
