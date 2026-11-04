@@ -501,11 +501,13 @@ impl TerminalPane {
                 .smart_copy_paste(|cx: &gpui::App| {
                     AppStore::global(cx).read(cx).config().smart_copy_paste
                 })
-                // Ctrl(⌘)+悬停 / 单击输出里的文件路径 → 文件页新开页签。视图只认
-                // 形状,「指向哪个文件、文件页开不开得了」全在 `terminal_links`
+                // Ctrl(⌘)+悬停 / 单击输出里的文件路径 → 文件页新开页签;网址 → 默认
+                // 浏览器。视图只认形状,「指向哪个文件、文件页开不开得了」全在
+                // `terminal_links`
                 .file_links(
                     move |cand, cx| crate::terminal_links::resolve(pty_id, cand, cx),
                     crate::terminal_links::open,
+                    crate::terminal_links::open_url,
                 )
                 .selection_dwell(dwell)
                 .on_selection_copied(move |_text, origin, _window, cx| {

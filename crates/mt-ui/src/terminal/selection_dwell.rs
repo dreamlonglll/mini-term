@@ -219,13 +219,19 @@ pub struct CopiedTip {
     font_size: Pixels,
 }
 
+/// 终端上方小气泡的默认配色(底色,文字):--bg-overlay / --text-primary(与 mt_app::ui
+/// 那张表同源)。深底浅字,盖在什么主题的终端内容上都看得清。
+pub(super) fn tip_colors() -> (Hsla, Hsla) {
+    (rgb8(0x25, 0x23, 0x20), rgb8(0xf0, 0xec, 0xe6))
+}
+
 impl CopiedTip {
     pub fn new(label: impl Into<String>) -> Self {
+        let (background, foreground) = tip_colors();
         Self {
             label: label.into(),
-            // --bg-overlay / --text-primary(与 mt_app::ui 那张表同源)
-            background: rgb8(0x25, 0x23, 0x20),
-            foreground: rgb8(0xf0, 0xec, 0xe6),
+            background,
+            foreground,
             font_size: px(11.0),
         }
     }

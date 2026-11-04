@@ -369,12 +369,16 @@ impl TerminalView {
     ///
     /// `open` 在元素的鼠标监听里调用,**没有**借着这个视图 —— 宿主可以放心去
     /// update 别的实体(开文件页签)。
+    ///
+    /// 网址(http / https 文本、OSC 8 超链接)走同一套交互,不用问 `resolve`,单击交给
+    /// `open_url`。
     pub fn file_links(
         mut self,
         resolve: impl Fn(&PathCandidate, &App) -> Option<std::path::PathBuf> + 'static,
         open: impl Fn(&FileLink, &mut Window, &mut App) + 'static,
+        open_url: impl Fn(&str, &mut App) + 'static,
     ) -> Self {
-        self.file_links = Some(FileLinks::new(resolve, open));
+        self.file_links = Some(FileLinks::new(resolve, open, open_url));
         self
     }
 
