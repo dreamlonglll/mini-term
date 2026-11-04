@@ -84,6 +84,7 @@ mod git_worktree;
 mod hotkeys;
 mod i18n;
 mod image_lightbox;
+mod kitty_graphics;
 mod logfile;
 mod markers;
 mod menu;

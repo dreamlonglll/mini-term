@@ -250,6 +250,8 @@ pub struct TerminalView {
     file_links: Option<FileLinks>,
     /// 上一次 modifiers-changed 时链接修饰键按着没有 —— 只在它翻转时要一帧。
     link_modifier_held: bool,
+    /// Kitty 图片的纹理缓存。挂在视图上的理由见 [`super::images`] 模块注释。
+    images: Rc<RefCell<super::images::TerminalImageCache>>,
 }
 
 /// 宿主对一次粘贴的裁决。
@@ -333,8 +335,16 @@ impl TerminalView {
         focus: FocusHandle,
         style: TerminalStyle,
         theme: TerminalTheme,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Self {
+        let images = Rc::new(RefCell::new(super::images::TerminalImageCache::default()));
+        if emulator.kitty().is_some() {
+            let images = images.clone();
+            cx.on_release(move |_: &mut Self, cx: &mut App| {
+                super::images::release_all(&images, cx);
+            })
+            .detach();
+        }
         Self {
             id: id.into(),
             emulator,
@@ -357,6 +367,7 @@ impl TerminalView {
             smart_copy_paste: None,
             file_links: None,
             link_modifier_held: false,
+            images,
         }
     }
 
@@ -816,6 +827,9 @@ impl Render for TerminalView {
         if let Some(cb) = self.on_selection_copied.clone() {
             element = element
                 .on_selection_copied(move |text, origin, window, cx| cb(text, origin, window, cx));
+        }
+        if self.emulator.kitty().is_some() {
+            element = element.image_cache(self.images.clone());
         }
 
         div()

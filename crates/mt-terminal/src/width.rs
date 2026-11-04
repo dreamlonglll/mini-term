@@ -53,6 +53,8 @@
 //! - 肤色修饰符跟在非 emoji 基字后面(`中🏽`)照样并入——UAX #29 就这么断,ConPTY
 //!   同款;字形怎么画是字体的事。
 
+use std::sync::Arc;
+
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::index::Column;
 use alacritty_terminal::term::cell::{Cell, Flags};
@@ -65,6 +67,8 @@ use alacritty_terminal::vte::ansi::{
 };
 use unicode_segmentation::GraphemeCursor;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::kitty::{self, KittyShared};
 
 /// 借道用的占位字符:U+3000 全角空格,unicode-width 口径下稳定为 2 列。
 const PLACEHOLDER: char = '\u{3000}';
@@ -110,7 +114,23 @@ fn extends_cluster(cluster: &str, c: char) -> bool {
     !cursor.is_boundary(cluster, 0).unwrap_or(true)
 }
 
-/// 套在 `Term` 外面的 `Handler`:只拦 `input`,其余全部原样转发。
+/// [`WidthOverride`] 的随身状态:跟解析器同锁、跨批次存活。
+#[derive(Default)]
+pub(crate) struct Scratch {
+    /// 簇文本的暂存,跨字符复用免得每个字符分配一次。
+    text: String,
+    /// Kitty 图形。`None` = 开关关着,下面那几条序列原样转发。
+    kitty: Option<Arc<KittyShared>>,
+}
+
+impl Scratch {
+    pub(crate) fn set_kitty(&mut self, kitty: Arc<KittyShared>) {
+        self.kitty = Some(kitty);
+    }
+}
+
+/// 套在 `Term` 外面的 `Handler`:只拦 `input`(列宽)与 Kitty 图形关心的三条序列,
+/// 其余全部原样转发。
 ///
 /// ⚠️ 升级 `vte` 时对照 `Handler` 的方法清单——新增的方法有默认空实现,
 /// 漏转发不会编译报错,只会让那条序列静默失效。
@@ -118,11 +138,16 @@ pub(crate) struct WidthOverride<'a, T> {
     term: &'a mut Term<T>,
     /// 簇文本的暂存,跨字符复用免得每个字符分配一次。
     cluster: &'a mut String,
+    kitty: Option<&'a KittyShared>,
 }
 
 impl<'a, T: EventListener> WidthOverride<'a, T> {
-    pub(crate) fn new(term: &'a mut Term<T>, cluster: &'a mut String) -> Self {
-        Self { term, cluster }
+    pub(crate) fn new(term: &'a mut Term<T>, scratch: &'a mut Scratch) -> Self {
+        Self {
+            term,
+            cluster: &mut scratch.text,
+            kitty: scratch.kitty.as_deref(),
+        }
     }
 
     /// 光标前那一格——可能是当前字位簇的落点。`None` = 行首,没有前一格。
@@ -268,6 +293,35 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         self.term.input(c);
     }
 
+    /// Kitty 图形的带内标记走这条路到达(见 [`crate::kitty`] 模块注释)。标记不转发:
+    /// 它不是链接,也不能动光标模板上的链接状态。对不上号的同 scheme 序列同样到此为止
+    /// —— 程序不能借此往格子上挂假锚。
+    fn set_hyperlink(&mut self, hyperlink: Option<Hyperlink>) {
+        if let (Some(kitty), Some(link)) = (self.kitty, hyperlink.as_ref())
+            && link.uri.starts_with(kitty::SCHEME)
+        {
+            kitty.on_marker(&link.uri, self.term);
+            return;
+        }
+        self.term.set_hyperlink(hyperlink);
+    }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        if let Some(kitty) = self.kitty
+            && matches!(mode, ClearMode::All)
+        {
+            kitty.on_clear_screen(self.term);
+        }
+        self.term.clear_screen(mode);
+    }
+
+    fn reset_state(&mut self) {
+        if let Some(kitty) = self.kitty {
+            kitty.on_reset();
+        }
+        self.term.reset_state();
+    }
+
     forward_to_term! {
         set_title(title: Option<String>);
         set_cursor_style(style: Option<CursorStyle>);
@@ -303,10 +357,8 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         save_cursor_position();
         restore_cursor_position();
         clear_line(mode: LineClearMode);
-        clear_screen(mode: ClearMode);
         clear_tabs(mode: TabulationClearMode);
         set_tabs(interval: u16);
-        reset_state();
         reverse_index();
         terminal_attribute(attr: Attr);
         set_mode(mode: Mode);
@@ -330,7 +382,6 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         pop_title();
         text_area_size_pixels();
         text_area_size_chars();
-        set_hyperlink(hyperlink: Option<Hyperlink>);
         set_mouse_cursor_icon(icon: CursorIcon);
         report_keyboard_mode();
         push_keyboard_mode(mode: KeyboardModes);

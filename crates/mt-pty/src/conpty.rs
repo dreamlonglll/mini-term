@@ -238,15 +238,29 @@ mod windows_runtime {
             })
             .clone()
     }
+
+    /// 便携后端已经生效。没调过 [`initialize`](含 [`super::DISABLE_ENV`] 跳过预载)= 否。
+    pub fn portable_active() -> bool {
+        matches!(
+            BOOTSTRAP_DECISION.get(),
+            Some(ConptyBootstrapDecision::Portable { .. })
+        )
+    }
 }
 
 #[cfg(windows)]
-pub use windows_runtime::initialize;
+pub use windows_runtime::{initialize, portable_active};
 
 /// 非 Windows 平台没有 ConPTY,直接返回系统后端 —— 让调用方无需写 `cfg`。
 #[cfg(not(windows))]
 pub fn initialize(_resource_dir: &Path) -> ConptyBootstrapDecision {
     system_decision("非 Windows 平台不使用 ConPTY")
+}
+
+/// 非 Windows 平台没有 ConPTY,自然也没有便携后端。
+#[cfg(not(windows))]
+pub fn portable_active() -> bool {
+    false
 }
 
 /// [`initialize`] + [`default_resource_dir`] 的组合:应用启动处一行调用。
