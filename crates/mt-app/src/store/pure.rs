@@ -259,6 +259,22 @@ pub(super) fn next_maximized(current: Option<&str>, requested: Option<&str>) -> 
     }
 }
 
+/// 目标 pane 是不是被最大化折掉了:别的组正铺满,它所在的组缩在折叠条里。
+/// 判据落在**叶子**上,理由同 `toggle_maximized_leaf`:最大化之后在组内切过 tab,
+/// `maximized` 还指着切换前那个 pane。
+pub(super) fn folded_by_maximize(
+    layout: &SplitNode,
+    maximized: Option<&str>,
+    pane_id: &str,
+) -> bool {
+    let Some(max_leaf) = maximized.and_then(|id| layout.leaf_of_pane(id)) else {
+        return false;
+    };
+    layout
+        .leaf_of_pane(pane_id)
+        .is_some_and(|leaf| leaf.id() != max_leaf.id())
+}
+
 // 拆分前是模块私有;现在调用点(`store::prefs`)是兄弟模块,升到 `pub(super)`。
 pub(super) fn rename_pane_in_states(
     states: &mut HashMap<String, ProjectState>,
@@ -613,7 +629,7 @@ pub(super) fn remove_from_tree(tree: &mut Vec<mt_config::ProjectTreeItem>, proje
 
 /// OSC 标题的字符数上限。tab 栏是一行横排,副段过长会把同组其它 tab 挤出可视区;
 /// 比移动端改名那条(64)更紧 —— 那是用户手打的名字,这里是 shell 自动灌的
-/// 一整条目录路径,默认就很长。截断而不是丢弃。
+/// 一整条目录路径,默认就很长。截断而不是丢弃,被截过的以 `…` 收尾(算在上限内)。
 pub const MAX_OSC_TITLE_GRAPHEMES: usize = 48;
 
 /// 收敛 shell 报上来的窗口标题:砍控制字符 → 去首尾空白 → 按**字素**限长。
@@ -630,13 +646,13 @@ pub fn sanitize_osc_title(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let mut out = String::new();
-    for (i, g) in UnicodeSegmentation::graphemes(trimmed, true).enumerate() {
-        if i >= MAX_OSC_TITLE_GRAPHEMES {
-            break;
-        }
-        out.push_str(g);
+    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(trimmed, true).collect();
+    if graphemes.len() <= MAX_OSC_TITLE_GRAPHEMES {
+        return Some(trimmed.to_string());
     }
+    // 页签和切换器量宽时放得下这一段,不会再替它画省略号:截没截过要写在文字里
+    let mut out = graphemes[..MAX_OSC_TITLE_GRAPHEMES - 1].concat();
+    out.push('…');
     Some(out)
 }
 
@@ -1706,6 +1722,49 @@ mod tests {
         assert_eq!(next_maximized(None, None), None);
     }
 
+    /// 跳 pane 前判它是不是缩在折叠条里:同组(哪怕是后台 tab)不算,别的组才算。
+    #[test]
+    fn 被最大化折掉的判据落在叶子上() {
+        let left = PaneState::new("pwsh");
+        let mut tab = PaneState::new("pwsh");
+        let right = PaneState::new("pwsh");
+        let (left_id, right_id) = (left.id.clone(), right.id.clone());
+        tab.id = "tab".into();
+        let left_leaf = SplitNode::Leaf {
+            id: "left-leaf".into(),
+            active_pane_id: left_id.clone(),
+            panes: vec![left, tab],
+        };
+        let layout = SplitNode::Split {
+            id: "split".into(),
+            direction: crate::tree::SplitDirection::Horizontal,
+            children: vec![left_leaf, SplitNode::leaf(right)],
+            sizes: vec![50.0, 50.0],
+        };
+
+        assert!(!folded_by_maximize(&layout, None, &right_id), "没最大化");
+        assert!(
+            folded_by_maximize(&layout, Some(&left_id), &right_id),
+            "左组铺满,右组折着"
+        );
+        assert!(
+            !folded_by_maximize(&layout, Some(&left_id), &left_id),
+            "目标就在铺满的那组"
+        );
+        assert!(
+            !folded_by_maximize(&layout, Some(&left_id), "tab"),
+            "同组的后台 tab 切过去就行,不用换铺满"
+        );
+        assert!(
+            !folded_by_maximize(&layout, Some("已关掉的"), &right_id),
+            "陈旧的最大化 id 按没最大化算"
+        );
+        assert!(
+            !folded_by_maximize(&layout, Some(&left_id), "已关掉的"),
+            "目标不在这棵树上"
+        );
+    }
+
     // ─── 页签标题跟随 shell(OSC 0/2) ───────────────────────────
 
     /// 清洗:控制字符要在 trim 之前砍掉,收敛后为空归一成 `None`。
@@ -1735,12 +1794,11 @@ mod tests {
     #[test]
     fn osc_标题按字素截断() {
         let ascii = "x".repeat(100);
-        assert_eq!(
-            sanitize_osc_title(&ascii).unwrap().chars().count(),
-            MAX_OSC_TITLE_GRAPHEMES
-        );
+        let cut = sanitize_osc_title(&ascii).unwrap();
+        assert_eq!(cut.chars().count(), MAX_OSC_TITLE_GRAPHEMES);
+        assert!(cut.ends_with('…'), "被截过要看得出来");
 
-        // 多字节(每个汉字 3 字节):按字素算仍是 48 个
+        // 多字节(每个汉字 3 字节,`…` 也是 3 字节):按字素算仍是 48 个
         let cjk = "目".repeat(100);
         let cut = sanitize_osc_title(&cjk).unwrap();
         assert_eq!(cut.chars().count(), MAX_OSC_TITLE_GRAPHEMES);
@@ -1754,8 +1812,8 @@ mod tests {
             MAX_OSC_TITLE_GRAPHEMES
         );
         assert!(
-            cut.ends_with('\u{1f4bb}'),
-            "末尾必须是完整的一簇,不能停在 ZWJ 上:{cut:?}"
+            cut.trim_end_matches('…').ends_with('\u{1f4bb}'),
+            "省略号前必须是完整的一簇,不能停在 ZWJ 上:{cut:?}"
         );
 
         let combining = "e\u{301}".repeat(60); // é 的组合形式
@@ -1764,7 +1822,10 @@ mod tests {
             UnicodeSegmentation::graphemes(cut.as_str(), true).count(),
             MAX_OSC_TITLE_GRAPHEMES
         );
-        assert!(cut.ends_with('\u{301}'), "组合符不能与基字被切开:{cut:?}");
+        assert!(
+            cut.trim_end_matches('…').ends_with('\u{301}'),
+            "组合符不能与基字被切开:{cut:?}"
+        );
 
         // 刚好 48 个字素:一个都不动
         let exact = "y".repeat(MAX_OSC_TITLE_GRAPHEMES);

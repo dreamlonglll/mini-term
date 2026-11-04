@@ -16,9 +16,10 @@ use crate::tree::{
 
 use super::events::StoreChanged;
 use super::pure::{
-    apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, merge_terminal_env,
-    next_maximized, resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback,
-    sanitize_osc_title, subtitle_enabled, terminal_style_from, visible_subtitle_changes,
+    apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, folded_by_maximize,
+    merge_terminal_env, next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
+    resolve_scrollback, sanitize_osc_title, subtitle_enabled, terminal_style_from,
+    visible_subtitle_changes,
 };
 use super::{AppStore, StoreEvent};
 
@@ -463,6 +464,44 @@ impl AppStore {
         }
         self.focus_pane(project_id, pane_id, window, cx);
         self.save_project_layout_soon(project_id, cx);
+    }
+
+    /// 定位到一个已开的 pane:切项目 → 切面板 → 最大化时让它那一组接管铺满 → 激活。
+    /// pane 已经不在了(调用方手上的候选是上一帧算的)就什么都不做,不会留下指向
+    /// 空 pane 的焦点。
+    ///
+    /// 比 [`Self::activate_pane`] 多的那一步:别的组正铺满时,目标缩在折叠条里,只激活
+    /// 的话焦点落在屏幕上看不见的那格。顺序与折叠条点击(`take_over_maximized`)相同:
+    /// 先换铺满再激活。判据看的是活动面板的布局,所以面板要先切(换面板本身也会把
+    /// 最大化收掉)。
+    pub fn jump_to_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel_id) = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.panel_id_of_pane(pane_id))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        self.set_active_project(project_id, cx);
+        self.set_active_panel(project_id, &panel_id, cx);
+        let folded = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.active_layout())
+            .is_some_and(|layout| {
+                folded_by_maximize(layout, self.maximized_pane_id(project_id), pane_id)
+            });
+        if folded {
+            self.toggle_maximized_leaf(project_id, pane_id, cx);
+        }
+        self.activate_pane(project_id, pane_id, window, cx);
     }
 
     /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。只有一个 tab 时什么也不做。
