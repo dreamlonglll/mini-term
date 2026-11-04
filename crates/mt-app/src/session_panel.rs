@@ -317,6 +317,19 @@ struct Preview {
 }
 
 impl Preview {
+    /// 收下这一次加载的结果。成败互斥:成功要把错误清掉,失败留着已有的正文不动。
+    fn apply_loaded(&mut self, result: Result<(Vec<AiSessionMessage>, Vec<String>), String>) {
+        self.loading = false;
+        match result {
+            Ok((messages, rendered_messages)) => {
+                self.error = None;
+                self.messages = messages;
+                self.rendered_messages = rendered_messages;
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
     /// 「复制全文」的文本:整份对话按 `角色 · 时间` + 正文平铺。
     ///
     /// 逐条选中复制是 [`TextView`] 的能力,但它的选区**只在单个 TextView 内**
@@ -534,6 +547,11 @@ pub struct SessionPanel {
     /// 断链的远程项目:列表恒空,头部给一句断链提示。
     remote_broken: bool,
     preview: Option<Preview>,
+    /// 正文加载。不放 `_tasks`:那边只进不换,旧任务迟到时回写的是**当前**那份预览
+    /// (打开 A → 返回 → 打开 B,A 晚回来就是 B 的标题配 A 的正文)。这里每次打开
+    /// 覆盖、返回与刷新置空,丢掉句柄即取消回写。已经在跑的同步读取停不下来,
+    /// 读完结果也没有人收。
+    preview_task: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     /// 删除流程在途(找文件 / 真删)。同一时间只走一单,头部转圈。
     delete_busy: bool,
@@ -585,6 +603,7 @@ impl SessionPanel {
             remote: false,
             remote_broken: false,
             preview: None,
+            preview_task: None,
             _tasks: Vec::new(),
             delete_busy: false,
             _delete_task: None,
@@ -662,6 +681,7 @@ impl SessionPanel {
         self.lineage.clear();
         self.display_count = PAGE_SIZE;
         self.preview = None;
+        self.preview_task = None;
         self._tasks.clear();
 
         let Some((path, distro)) = project else {
@@ -1175,7 +1195,7 @@ impl SessionPanel {
                 .as_deref()
                 .and_then(|id| store.remote_connection_of(id))
         };
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        self.preview_task = Some(cx.spawn(async move |this, cx| {
             // 正文可能几 MB + WSL 9P / SFTP 往返,雷打不动丢后台
             let result = cx
                 .background_executor()
@@ -1211,14 +1231,7 @@ impl SessionPanel {
                 let Some(preview) = this.preview.as_mut() else {
                     return;
                 };
-                preview.loading = false;
-                match result {
-                    Ok((messages, rendered_messages)) => {
-                        preview.messages = messages;
-                        preview.rendered_messages = rendered_messages;
-                    }
-                    Err(err) => preview.error = Some(err),
-                }
+                preview.apply_loaded(result);
                 cx.notify();
             });
         }));
@@ -1387,10 +1400,13 @@ impl SessionPanel {
                             "session-preview-back",
                             format!("‹ {}", t("fileViewer", "back")),
                         )
-                        .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
-                            this.preview = None;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this: &mut Self, _, _window, cx| {
+                                this.preview = None;
+                                this.preview_task = None;
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         div()
@@ -1917,6 +1933,41 @@ mod tests {
         assert!(format_message_time("2026-08-24T00:30:05.123Z").is_some());
         assert!(format_message_time("").is_none());
         assert!(format_message_time("不是时间").is_none());
+    }
+
+    /// 回写:成功清掉错误,失败留着已有正文,两条都收掉「加载中」。
+    ///
+    /// 「旧请求不回写」本身靠丢 `Task` 取消,要 gpui 的 test-support 才测得到
+    /// (本 crate 不开,见 `main.rs` 那条测试的说明),这里只钉回写的状态转移。
+    #[test]
+    fn 预览回写成功清错误失败留正文() {
+        let msg = AiSessionMessage {
+            role: "user".to_string(),
+            content: "正文".to_string(),
+            timestamp: String::new(),
+        };
+        let mut preview = Preview {
+            session_id: "s1".into(),
+            title: "t".into(),
+            loading: true,
+            error: Some("旧错误".into()),
+            messages: Vec::new(),
+            rendered_messages: Vec::new(),
+            shown: PREVIEW_PAGE_SIZE,
+            command: None,
+        };
+
+        preview.apply_loaded(Ok((vec![msg], vec!["正文".into()])));
+        assert!(!preview.loading);
+        assert_eq!(preview.error, None, "成功不能和错误提示同屏");
+        assert_eq!(preview.messages.len(), 1);
+
+        preview.loading = true;
+        preview.apply_loaded(Err("读不到".into()));
+        assert!(!preview.loading);
+        assert_eq!(preview.error.as_deref(), Some("读不到"));
+        assert_eq!(preview.messages.len(), 1, "失败不清已有正文");
+        assert_eq!(preview.rendered_messages.len(), 1);
     }
 
     /// 「复制全文」拼的是 `角色 · 时间` + 正文,时间戳缺失时只留角色。
