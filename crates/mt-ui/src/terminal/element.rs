@@ -82,7 +82,7 @@ use gpui::{
     MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size,
     StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
-use mt_terminal::{TermSize, TerminalEmulator};
+use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
@@ -137,20 +137,50 @@ pub struct PreeditText {
 /// 最近一帧的几何信息,由元素在 prepaint 里回填给宿主。
 ///
 /// IME 的候选框定位(`bounds_for_range`)要的就是「光标那个格子在屏幕上的矩形」,
-/// 而那是渲染阶段才算得出来的 —— 视图侧只能从这里读。
+/// 而网格的像素原点与格子大小是渲染阶段才算得出来的 —— 视图侧只能从这里读。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameGeometry {
     pub origin: Point<Pixels>,
     pub cell_size: Size<Pixels>,
     pub columns: usize,
     pub screen_lines: usize,
-    /// 光标格的屏幕矩形。**与光标可见性无关** —— TUI 藏起光标(`ESC[?25l`)
-    /// 自己画插入符时,这里照样给出那一格,否则 IME 候选框会退到元素左上角。
-    /// `None` 只有一个含义:还没画过任何一帧。
+    pub display_offset: usize,
+    /// 这一帧 IME 贴着的那一格,也是预编辑串的起点。**与光标可见性无关** ——
+    /// TUI 藏起光标(`ESC[?25l`)自己画插入符时,这里照样给出那一格,否则 IME
+    /// 候选框会退到元素左上角。`None` 只有一个含义:还没画过任何一帧。
     pub cursor: Option<Bounds<Pixels>>,
-    /// 预编辑串内插入符的屏幕矩形。候选框要贴着它,不是贴着终端光标 ——
-    /// 组合到第三个字时候选框还停在第一个字下面会挡住正在输入的内容。
-    pub preedit_caret: Option<Bounds<Pixels>>,
+    /// 这一帧画着预编辑串吗。
+    pub composing: bool,
+}
+
+impl FrameGeometry {
+    /// 光标位置 → 屏幕矩形。IME 取坐标时现读光标,不必等下一帧才对得上。
+    pub fn cell_of(&self, cursor: SettledCursor) -> Bounds<Pixels> {
+        cursor_cell_bounds(
+            self.origin,
+            self.cell_size,
+            self.columns,
+            self.screen_lines,
+            cursor.line,
+            cursor.column,
+            self.display_offset,
+        )
+    }
+}
+
+/// 这一帧要不要把 IME 坐标重新报给平台。
+///
+/// gpui 的 Windows 后端**一轮组合只在 `WM_IME_STARTCOMPOSITION` 定位一次**,之后的
+/// 组合更新都不再设坐标,所以那一下的坐标不对,整轮候选窗就一直停在错的地方
+/// (issue #88)。这里补两个时机:
+///
+/// - **组合后的第一帧**:哪怕坐标没变也报一次。输入法可能先于上面那次定位取到
+///   上一轮留下的坐标,再报一次才有机会纠正;
+/// - **组合中锚点挪了**:输入框被流式正文往下推、回显把光标带走。
+///
+/// 打字本身不会触发:锚点是组合串的起点,不是串内的插入符,候选窗不随字母右移。
+fn ime_anchor_needs_sync(prev: &FrameGeometry, next: &FrameGeometry) -> bool {
+    next.composing && (!prev.composing || prev.cursor != next.cursor)
 }
 
 pub struct TerminalElement {
@@ -1663,9 +1693,6 @@ impl Element for TerminalElement {
         // 滚动条要用:整条内容有多长、视口顶在哪
         let total_lines;
         let frame_display_offset;
-        // IME 锚点要用:光标在哪一格。**不受 `CursorShape::Hidden` 影响**,
-        // 藏起来的光标照样占着一个格子 —— 见 [`cursor_cell_bounds`]。
-        let frame_cursor_point;
 
         {
             let term_lock = self.emulator.term().lock();
@@ -1678,7 +1705,6 @@ impl Element for TerminalElement {
             let selection_range = content.selection;
             let cursor_point = content.cursor.point;
             let cursor_shape = content.cursor.shape;
-            frame_cursor_point = cursor_point;
 
             let mut cache = state.rows.borrow_mut();
             // 逐行解析出来的格子写进这根跨帧复用的 arena(见 `TerminalElementState::cells`):
@@ -1877,15 +1903,17 @@ impl Element for TerminalElement {
             })
             .collect();
 
-        // ── 光标格。上面那个 `cursor`(CursorLayout)是「要画的光标」,可能没有;
-        //    这个是「光标占的那一格」,永远有 —— IME 拿它当锚点。
+        // ── 光标格。上面那个 `cursor`(CursorLayout)是「要画的光标」,可能没有,而且
+        //    这一帧可能正赶上 TUI 重绘途中;这个是「光标停稳的那一格」,永远有
+        //    —— **不受 `CursorShape::Hidden` 影响**,IME 拿它当锚点。
+        let ime_cursor = self.emulator.settled_cursor();
         let cursor_cell = cursor_cell_bounds(
             bounds.origin,
             cell_size,
             columns,
             screen_lines,
-            frame_cursor_point.line.0,
-            frame_cursor_point.column.0,
+            ime_cursor.line,
+            ime_cursor.column,
             frame_display_offset,
         );
 
@@ -1923,19 +1951,23 @@ impl Element for TerminalElement {
         });
 
         if let Some(sink) = self.geometry_sink.as_ref() {
-            sink.set(FrameGeometry {
+            let geometry = FrameGeometry {
                 origin: bounds.origin,
                 cell_size,
                 columns,
                 screen_lines,
+                display_offset: frame_display_offset,
                 cursor: Some(cursor_cell),
-                preedit_caret: preedit.as_ref().map(|p| {
-                    Bounds::new(
-                        point(p.origin.x + p.caret_x, p.origin.y),
-                        size(px(2.0), line_height),
-                    )
-                }),
-            });
+                composing: preedit.is_some(),
+            };
+            if ime_anchor_needs_sync(&sink.replace(geometry), &geometry) {
+                window.invalidate_character_coordinates();
+            }
+            // 光标刚挪、还没停稳。不再要一帧的话,输出一停这一帧就是最后一帧,
+            // 预编辑串和候选窗都会留在旧位置上
+            if geometry.composing && ime_cursor.pending {
+                window.request_animation_frame();
+            }
         }
 
         // ── 滚动条几何
@@ -2913,6 +2945,71 @@ mod tests {
         let b = cursor_cell_bounds(origin, cell, 80, 24, 12, 30, 0);
         assert_eq!(b.origin, point(px(300.0), px(240.0)));
         assert_ne!(b.origin, origin, "绝不能退回元素左上角");
+    }
+
+    fn ime_frame(composing: bool, cursor_x: f32) -> FrameGeometry {
+        FrameGeometry {
+            cursor: Some(Bounds::new(
+                point(px(cursor_x), px(0.0)),
+                size(px(10.0), px(20.0)),
+            )),
+            composing,
+            ..FrameGeometry::default()
+        }
+    }
+
+    /// **issue #88 的回归**:gpui 一轮组合只定位一次,这里是唯一的纠错机会。
+    /// 第一帧哪怕坐标没变也要报,否则输入法抢先取到的旧坐标就纠正不回来。
+    #[test]
+    fn 组合后第一帧无条件同步候选窗坐标() {
+        let idle = ime_frame(false, 100.0);
+        assert!(ime_anchor_needs_sync(&idle, &ime_frame(true, 100.0)));
+        // 从没画过一帧就进了组合
+        assert!(ime_anchor_needs_sync(
+            &FrameGeometry::default(),
+            &ime_frame(true, 100.0)
+        ));
+    }
+
+    /// 组合中只有锚点真挪了才同步:每帧都报等于每帧都让输入法重排候选窗。
+    #[test]
+    fn 组合中只在锚点挪动时同步() {
+        let composing = ime_frame(true, 100.0);
+        assert!(!ime_anchor_needs_sync(&composing, &ime_frame(true, 100.0)));
+        assert!(ime_anchor_needs_sync(&composing, &ime_frame(true, 110.0)));
+    }
+
+    /// 没在组合时候选窗不存在,光标怎么动都不碰平台。
+    #[test]
+    fn 没在组合时不同步() {
+        assert!(!ime_anchor_needs_sync(
+            &ime_frame(false, 100.0),
+            &ime_frame(false, 110.0)
+        ));
+        assert!(!ime_anchor_needs_sync(
+            &ime_frame(true, 100.0),
+            &ime_frame(false, 110.0)
+        ));
+    }
+
+    /// IME 现读光标时用上一帧的网格换算,回看位置也要算进去。
+    #[test]
+    fn 现读的光标按帧几何换算成屏幕矩形() {
+        let geometry = FrameGeometry {
+            origin: point(px(100.0), px(50.0)),
+            cell_size: size(px(8.0), px(16.0)),
+            columns: 80,
+            screen_lines: 24,
+            display_offset: 2,
+            ..FrameGeometry::default()
+        };
+        let bounds = geometry.cell_of(SettledCursor {
+            line: 3,
+            column: 5,
+            pending: false,
+        });
+        assert_eq!(bounds.origin, point(px(140.0), px(130.0)));
+        assert_eq!(bounds.size, geometry.cell_size);
     }
 
     /// 连字可以换字形,但**换完总共还得占 N 列**。守恒才放行,不守恒就退回禁连字

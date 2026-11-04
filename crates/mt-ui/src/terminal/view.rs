@@ -917,15 +917,16 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry.get();
-        // 组合中:贴着预编辑串里的插入符;否则贴着终端光标格 —— 后者与光标
-        // **可见性无关**,TUI 发 `ESC[?25l` 藏了光标也照样有(见 `FrameGeometry::cursor`)。
-        // 两个都没有只可能是还没画过一帧,退回元素左上角 —— 总比不弹候选框强。
-        Some(
-            geometry
-                .preedit_caret
-                .or(geometry.cursor)
-                .unwrap_or_else(|| Bounds::new(element_bounds.origin, geometry.cell_size)),
-        )
+        // 还没画过一帧,退回元素左上角 —— 总比不弹候选框强。
+        if geometry.cursor.is_none() {
+            return Some(Bounds::new(element_bounds.origin, geometry.cell_size));
+        }
+        // 候选窗贴着组合串的起点,也就是终端光标停稳的那一格,不随串内插入符右移
+        // —— 一条候选栏每打一个字母就跳一下没法看。这一格与光标**可见性无关**,
+        // TUI 发 `ESC[?25l` 藏了光标也照样有。
+        //
+        // 光标现读而不读上一帧:系统来取坐标时,上一帧可能已经旧了 33ms。
+        Some(geometry.cell_of(self.emulator.settled_cursor()))
     }
 
     fn character_index_for_point(
