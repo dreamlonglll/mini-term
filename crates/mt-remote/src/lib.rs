@@ -70,6 +70,7 @@ mod delete;
 mod dirs;
 mod files;
 mod paths;
+mod session_delete;
 mod sessions;
 mod transfer;
 
@@ -77,6 +78,7 @@ pub use delete::*;
 pub use dirs::*;
 pub use files::*;
 pub use paths::*;
+pub use session_delete::*;
 pub use sessions::*;
 pub use transfer::*;
 

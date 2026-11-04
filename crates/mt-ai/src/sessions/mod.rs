@@ -10,6 +10,7 @@
 //! mobile_mirror)迁移后各自成 crate,只能从这里 `pub` 出去。
 
 mod codex;
+mod delete;
 mod grok;
 mod lineage;
 mod omp;
@@ -21,6 +22,10 @@ pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
     codex_question_answer_from_line, codex_question_from_line, codex_user_title_from_line,
     collect_codex_session_paths, load_codex_thread_names,
+};
+pub use delete::{
+    SessionDeleteError, SessionDeletePlan, SessionDeleteTarget, execute_session_delete,
+    plan_session_delete, session_delete_supported, written_recently_at,
 };
 pub use grok::{
     GrokUpdateParser, decode_grok_cwd_dir, find_grok_cwd_dirs, find_grok_session_dir,
@@ -59,6 +64,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -85,6 +91,24 @@ static SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedSessions>>> = OnceLoc
 /// 锁契约:即取即放,**绝不跨慢 IO 持锁**(见 spec/backend/wsl-unc-session-scanning.md)。
 pub fn session_cache() -> &'static Mutex<HashMap<String, CachedSessions>> {
     SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static SESSION_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// 缓存代号。扫描开工前取一次,写回前比对:对不上说明扫描期间缓存被作废过
+/// ([`invalidate_session_cache`]),这份结果可能含已删的会话,不许写回。
+pub fn session_cache_epoch() -> u64 {
+    SESSION_CACHE_EPOCH.load(atomic::Ordering::SeqCst)
+}
+
+/// 作废全部来源的列表缓存(会话被删之后)。TTL 只有几秒,整张清掉没有代价,也省得
+/// 为一个会话去推算它落在哪几把 key 下。
+pub fn invalidate_session_cache() {
+    SESSION_CACHE_EPOCH.fetch_add(1, atomic::Ordering::SeqCst);
+    session_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1102,6 +1126,7 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
         // get_wsl_ai_sessions 与其它项目的查询一起卡住(与下方 WSL 侧同一口径)
     }
 
+    let epoch = session_cache_epoch();
     let mut sessions = Vec::new();
 
     sessions.extend(get_claude_sessions(&project_path));
@@ -1120,13 +1145,15 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     let mut cache = session_cache()
         .lock()
         .map_err(|_| "session cache lock poisoned".to_string())?;
-    cache.insert(
-        cache_key,
-        CachedSessions {
-            loaded_at: Instant::now(),
-            sessions: sessions.clone(),
-        },
-    );
+    if session_cache_epoch() == epoch {
+        cache.insert(
+            cache_key,
+            CachedSessions {
+                loaded_at: Instant::now(),
+                sessions: sessions.clone(),
+            },
+        );
+    }
 
     Ok(sessions)
 }
@@ -1165,6 +1192,7 @@ pub fn get_wsl_ai_sessions(
         // 扫描期间不持锁:9P IO 可能秒级,别把 Windows 侧 get_ai_sessions 一起卡住
     }
 
+    let epoch = session_cache_epoch();
     let mut sessions = Vec::new();
     for home in wsl_candidate_homes(&distro) {
         sessions.extend(get_claude_sessions_in(
@@ -1191,13 +1219,15 @@ pub fn get_wsl_ai_sessions(
     let mut cache = session_cache()
         .lock()
         .map_err(|_| "session cache lock poisoned".to_string())?;
-    cache.insert(
-        cache_key,
-        CachedSessions {
-            loaded_at: Instant::now(),
-            sessions: sessions.clone(),
-        },
-    );
+    if session_cache_epoch() == epoch {
+        cache.insert(
+            cache_key,
+            CachedSessions {
+                loaded_at: Instant::now(),
+                sessions: sessions.clone(),
+            },
+        );
+    }
 
     Ok(sessions)
 }
