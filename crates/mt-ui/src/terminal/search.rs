@@ -80,6 +80,10 @@
 //! 就算对齐点找错了(内容高度重复时可能),核对是逐行比内容的 —— 错的对齐只会让
 //! 核对早早失配、重扫范围变大,不会留下错的命中。
 //!
+//! 全扫的结果封顶时连快照都不抓:下一次反正只能再全扫,这份要逐格哈希整个回滚区的
+//! 快照抓了也用不上,而那段时间 grid 锁一直攥着。结果掉回上限以下的那一轮才抓,再下一轮
+//! 恢复增量。
+//!
 //! 命中条数上限 [`SearchLimits::max_matches`] 默认 1000,同样照抄 xterm 的
 //! `_highlightLimit` —— `grep -o` 式的关键词(比如一个空格)不会把内存与绘制打爆。
 //!
@@ -692,11 +696,16 @@ impl TerminalSearch {
                     }
                     other => (other.filter(|_| can_increment), None),
                 };
-                // 限定了扫描窗口就用不上快照,省掉逐行哈希
-                let snapshot = if windowed {
+                // 能增量才要先抓新快照:计划靠它逐行核对。限定了扫描窗口就用不上快照,
+                // 省掉逐行哈希
+                let mut snapshot = if windowed {
                     None
                 } else {
-                    reusable.or_else(|| Some(ScanSnapshot::capture(term, generation, fingerprint)))
+                    reusable.or_else(|| {
+                        prior
+                            .as_ref()
+                            .map(|_| ScanSnapshot::capture(term, generation, fingerprint))
+                    })
                 };
                 let plan = match (prior.as_ref(), snapshot.as_ref()) {
                     (Some(old), Some(new)) => {
@@ -711,6 +720,11 @@ impl TerminalSearch {
                     }
                     None => collect_matches(term, dfa, options, &limits),
                 };
+                // 不能增量的路径收完命中才定:封顶了下一次反正只能全扫,这份要逐格哈希整个
+                // 回滚区的快照抓了也用不上。还在同一次持锁里,内容与刚才收命中时是同一份
+                if snapshot.is_none() && !windowed && found.len() < limits.max_matches {
+                    snapshot = Some(ScanSnapshot::capture(term, generation, fingerprint));
+                }
                 let anchor = -(term.grid().display_offset() as i32);
                 (
                     found,
@@ -918,6 +932,12 @@ fn collect_range<T>(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 这个线程上 [`ScanSnapshot::capture`] 被调了多少次(单测确认封顶路径真的没抓)。
+    static SNAPSHOT_CAPTURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// 一次扫描时 grid 的样子:逐行内容哈希 + 几个决定「行结构还能不能对上」的维度。
 struct ScanSnapshot {
     /// 自 topmost 往下每一行的内容哈希(见 [`row_hash`])。下标 i ↔ `Line(i - history)`。
@@ -933,6 +953,8 @@ struct ScanSnapshot {
 
 impl ScanSnapshot {
     fn capture<T>(term: &Term<T>, generation: u64, fingerprint: u64) -> Self {
+        #[cfg(test)]
+        SNAPSHOT_CAPTURES.with(|n| n.set(n.get() + 1));
         let grid = term.grid();
         let rows = (term.topmost_line().0..=term.bottommost_line().0)
             .map(|line| row_hash(&grid[Line(line)][..]))
@@ -2227,6 +2249,136 @@ mod tests {
             "内容变了,按新内容重抓快照"
         );
         assert_eq!(s.count(), 2);
+    }
+
+    /// 这个线程上到现在一共抓过几次逐行快照。
+    fn captures() -> u64 {
+        SNAPSHOT_CAPTURES.with(std::cell::Cell::get)
+    }
+
+    /// 限了条数的引擎,对着一屏命中远超上限的内容。
+    fn capped_setup(max_matches: usize) -> (TerminalEmulator, TerminalSearch) {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 5), 200);
+        for _ in 0..50 {
+            e.advance(b"needle needle\r\n");
+        }
+        let s = TerminalSearch::with_limits(SearchLimits {
+            max_matches,
+            ..Default::default()
+        });
+        (e, s)
+    }
+
+    /// 同样的上限下全扫一遍,作对照。
+    fn fresh_capped(e: &TerminalEmulator, query: &str, max_matches: usize) -> Vec<SearchMatch> {
+        let mut s = TerminalSearch::with_limits(SearchLimits {
+            max_matches,
+            ..Default::default()
+        });
+        s.set_query(query);
+        s.refresh(e);
+        s.matches().to_vec()
+    }
+
+    /// 结果封顶时下一次反正只能全扫,逐行快照抓了也用不上:不管是首次全扫就封顶,
+    /// 还是输出不停、一轮轮地接着封顶,都不该逐格哈希整个回滚区。
+    #[test]
+    fn 封顶路径不抓快照() {
+        let (e, mut s) = capped_setup(10);
+        s.set_query("needle");
+
+        let before = captures();
+        s.refresh(&e);
+        assert_eq!(s.count(), 10);
+        assert_eq!(captures(), before, "首次全扫就封顶,不抓");
+        assert!(s.snapshot.is_none());
+
+        for step in 1..=5u64 {
+            e.advance(b"needle more\r\n");
+            sync_later(&mut s, &e, step);
+            assert_eq!(s.matches(), fresh_capped(&e, "needle", 10).as_slice());
+            assert_eq!(captures(), before, "第 {step} 轮仍封顶,不抓");
+            assert!(s.snapshot.is_none());
+        }
+        assert_eq!(s.incremental_scans, 0, "封顶期间一次增量都走不了");
+    }
+
+    /// 结果掉回上限以下:这一轮结果完整了才抓快照,下一轮恢复增量,且与全扫逐条相同。
+    #[test]
+    fn 结果降到上限以下后恢复增量() {
+        let (e, mut s) = capped_setup(10);
+        s.set_query("needle");
+        s.refresh(&e);
+        assert_eq!(s.count(), 10);
+
+        // 清屏 + 清历史,命中掉到上限以下
+        e.advance(b"\x1b[2J\x1b[3J\x1b[Hneedle once\r\n");
+        let before = captures();
+        sync_later(&mut s, &e, 1);
+        assert_eq!(s.count(), 1);
+        assert_eq!(captures(), before + 1, "结果完整了就抓一份");
+        assert_eq!(s.incremental_scans, 0, "手上没有旧快照,这一轮还是全扫");
+
+        e.advance(b"plain\r\nneedle twice\r\n");
+        sync_later(&mut s, &e, 2);
+        assert_eq!(s.incremental_scans, 1, "恢复增量");
+        assert_eq!(s.count(), 2);
+        assert_eq!(s.matches(), fresh_capped(&e, "needle", 10).as_slice());
+    }
+
+    /// 增量那一路:没封顶时抓新快照照旧(计划要拿它逐行核对);这一轮涨到上限之后,
+    /// 下一轮才回到不抓的路径。
+    #[test]
+    fn 涨到上限那一轮之后才不再抓() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 5), 200);
+        e.advance(b"needle needle\r\n");
+        let mut s = TerminalSearch::with_limits(SearchLimits {
+            max_matches: 4,
+            ..Default::default()
+        });
+        s.set_query("needle");
+        s.refresh(&e);
+        assert_eq!(s.count(), 2);
+        assert!(s.snapshot.is_some());
+
+        let before = captures();
+        e.advance(b"needle needle needle\r\n");
+        sync_later(&mut s, &e, 1);
+        assert_eq!(s.count(), 4);
+        assert_eq!(s.incremental_scans, 1, "上一轮结果完整,这一轮走增量");
+        assert_eq!(captures(), before + 1, "增量计划要拿新快照核对");
+        assert_eq!(s.matches(), fresh_capped(&e, "needle", 4).as_slice());
+
+        let before = captures();
+        e.advance(b"needle\r\n");
+        sync_later(&mut s, &e, 2);
+        assert_eq!(s.count(), 4);
+        assert_eq!(captures(), before, "已经封顶,不再抓");
+        assert!(s.snapshot.is_none());
+    }
+
+    /// 只改关键词时内容没动:旧快照留着,换成封顶的关键词也一样(不花钱);
+    /// 内容一动,它就对不上了。
+    #[test]
+    fn 内容没动时封顶也留着旧快照() {
+        let (e, mut s) = capped_setup(10);
+        s.set_query("zzz");
+        s.refresh(&e);
+        assert_eq!(s.count(), 0);
+        let rows = s.snapshot.as_ref().map(|snap| snap.rows.as_ptr());
+        assert!(rows.is_some());
+
+        let before = captures();
+        s.set_query("needle");
+        s.refresh(&e);
+        assert_eq!(s.count(), 10);
+        assert_eq!(captures(), before);
+        assert_eq!(s.snapshot.as_ref().map(|snap| snap.rows.as_ptr()), rows);
+
+        e.advance(b"more\r\n");
+        sync_later(&mut s, &e, 1);
+        assert_eq!(captures(), before);
+        assert!(s.snapshot.is_none(), "内容变了,旧快照作废且不重抓");
     }
 
     #[test]
