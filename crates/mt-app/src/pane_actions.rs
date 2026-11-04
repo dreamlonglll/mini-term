@@ -236,8 +236,30 @@ const CLOSE_HOTKEY_REPEAT_WINDOW: Duration = Duration::from_millis(1100);
 /// 按久一点就把项目里的终端一组一组全关掉。action 拿不到 `is_held`,只能按间隔判;
 /// `last` 每次连发都刷新,所以按多久都只算一次。
 pub fn swallows_close_hotkey(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
-    !should_confirm_close(config)
-        && last.is_some_and(|last| now.duration_since(last) < CLOSE_HOTKEY_REPEAT_WINDOW)
+    swallows_repeat(config, last, now, CLOSE_HOTKEY_REPEAT_WINDOW)
+}
+
+/// 两次点 × 的间隔短于它,后一次当成连点。要盖住手快的双击(150~300ms),
+/// 又不能长到挨个关 tab 时觉得点不动。
+const CLOSE_CLICK_REPEAT_WINDOW: Duration = Duration::from_millis(400);
+
+/// 这次点 × 该不该吞掉。
+///
+/// 关掉一个 tab 后右边的页签立刻补位,下一个 × 正好滑到鼠标底下;关掉一组后旁边的组
+/// 铺过来,它的 × 也可能落到同一处。连点的第二下就会把相邻终端连同里面的进程关掉。
+/// 确认框开着时第二下落在遮罩上,没有这个问题;不弹框之后才要这道闸。
+/// `last` 每次点击都刷新(吞掉的也算),所以连点多少下都只关一个。
+pub fn swallows_close_click(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
+    swallows_repeat(config, last, now, CLOSE_CLICK_REPEAT_WINDOW)
+}
+
+fn swallows_repeat(
+    config: &AppConfig,
+    last: Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    !should_confirm_close(config) && last.is_some_and(|last| now.duration_since(last) < window)
 }
 
 /// 确认框的文案。不弹框时用不上,但算一份没有代价,不值得为此把入口写成两段。
@@ -634,6 +656,31 @@ mod tests {
         let soon = start + Duration::from_millis(33);
         assert!(
             !swallows_close_hotkey(&confirming, Some(start), soon),
+            "确认开着时不归这道闸管"
+        );
+    }
+
+    /// 连点 × 的第二下落在补位过来的相邻 tab 上,要吞掉;隔够了是在挨个关,照常放行。
+    /// 确认开着时第二下落在遮罩上,不归这道闸管。
+    #[test]
+    fn 连点关闭按钮只算一次() {
+        let config = opted_out_config();
+        let start = Instant::now();
+        assert!(
+            !swallows_close_click(&config, None, start),
+            "第一次点击不吞"
+        );
+        for ms in [150, 200, 399] {
+            let now = start + Duration::from_millis(ms);
+            assert!(swallows_close_click(&config, Some(start), now), "{ms}ms");
+        }
+        let later = start + CLOSE_CLICK_REPEAT_WINDOW;
+        assert!(!swallows_close_click(&config, Some(start), later));
+
+        let confirming = AppConfig::default();
+        let soon = start + Duration::from_millis(150);
+        assert!(
+            !swallows_close_click(&confirming, Some(start), soon),
             "确认开着时不归这道闸管"
         );
     }

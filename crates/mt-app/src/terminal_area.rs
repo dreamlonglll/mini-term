@@ -264,6 +264,9 @@ pub struct TerminalArea {
     /// RevealBack 在飞期间,整树里这个 pane 的格子只画底色不挂实体 ——
     /// 实体在飞行层上,同帧双挂会撞元素 id。只在渲染进场内容时置位。
     suppress_entity_pane: Option<String>,
+    /// 上一次点 ×(tab 上的与控制条的)的时刻,判连点用
+    /// (见 [`pane_actions::swallows_close_click`])。
+    last_close_click: Option<std::time::Instant>,
 }
 
 /// 叶内切 tab 的一次 push 过渡。
@@ -842,7 +845,15 @@ impl TerminalArea {
             swap_seq: 0,
             area_origin: gpui::Point::default(),
             suppress_entity_pane: None,
+            last_close_click: None,
         }
+    }
+
+    /// 这次点 × 要不要当连点吞掉。吞掉的点击也要记时刻,连点才只算一次。
+    fn swallows_close_click(&mut self, cx: &App) -> bool {
+        let now = std::time::Instant::now();
+        let last = self.last_close_click.replace(now);
+        pane_actions::swallows_close_click(self.store.read(cx).config(), last, now)
     }
 
     // ─── 非激活 tab 的悬停缩略图(`PaneGroup.tsx:234-277`) ─────
@@ -2283,6 +2294,9 @@ impl TerminalArea {
                             // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
                             .on_click(cx.listener(move |this, _event, window, cx| {
                                 cx.stop_propagation();
+                                if this.swallows_close_click(cx) {
+                                    return;
+                                }
                                 pane_actions::close_pane(
                                     this.store.clone(),
                                     pid_close.clone(),
@@ -2618,6 +2632,9 @@ impl TerminalArea {
                     // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         cx.stop_propagation();
+                        if this.swallows_close_click(cx) {
+                            return;
+                        }
                         pane_actions::close_leaf(
                             this.store.clone(),
                             pid_close_leaf.clone(),
