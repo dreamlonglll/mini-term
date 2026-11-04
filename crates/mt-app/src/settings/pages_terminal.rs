@@ -25,11 +25,12 @@ impl SettingsView {
     pub(super) fn render_terminal_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let list = self.store.read(cx).shell_list();
         let editing = self.shell_editing;
-        let (animations, title_follows_shell) = {
+        let (animations, title_follows_shell, confirm_close) = {
             let config = self.store.read(cx).config();
             (
                 config.terminal_animations.unwrap_or(true),
                 config.tab_title_follows_shell.unwrap_or(true),
+                config.confirm_terminal_close,
             )
         };
 
@@ -176,6 +177,21 @@ impl SettingsView {
                         |this, next, _window, cx| {
                             this.store.update(cx, |store, cx| {
                                 store.patch_config(|c| c.tab_title_follows_shell = Some(next), cx)
+                            });
+                        },
+                        cx,
+                    ))
+                    // 确认框里勾「不再询问」写的也是这个字段,这里是改回去的唯一入口
+                    // (弹窗不再出现之后,用户只能从这儿找回确认)
+                    .child(toggle_row(
+                        "confirm-terminal-close",
+                        "terminal.confirmCloseTitle",
+                        "terminal.confirmCloseDesc",
+                        confirm_close,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.confirm_terminal_close = next, cx)
                             });
                         },
                         cx,

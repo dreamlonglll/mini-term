@@ -1095,6 +1095,35 @@ mod tests {
         }
     }
 
+    /// 「关闭终端前确认」走库的往返:勾了「不再询问」存下的 `false` 重启后还在;
+    /// 库里没这个键(升级上来的存量库)时回到默认的开启。
+    /// 键名不能撞 [`RETIRED_KEYS`] —— 撞了每次保存都会被当下线键删掉,偏好存不住。
+    #[test]
+    fn 关闭终端前确认的偏好入库往返() {
+        assert!(!RETIRED_KEYS.contains(&"confirmTerminalClose"));
+
+        let dir = temp_dir("confirm-terminal-close");
+        let db = ConfigDb::open_at(&dir).unwrap();
+        let config = AppConfig {
+            confirm_terminal_close: false,
+            ..Default::default()
+        };
+        db.save(&config).unwrap();
+        assert_eq!(
+            setting_raw(&db, "confirmTerminalClose").as_deref(),
+            Some("false")
+        );
+        assert!(!db.load().unwrap().unwrap().confirm_terminal_close);
+
+        put_raw(
+            &db,
+            "DELETE FROM settings WHERE key = ?1",
+            &["confirmTerminalClose"],
+        );
+        assert!(db.load().unwrap().unwrap().confirm_terminal_close);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// 新版本写的 settings 键:旧版本读得进来(忽略)、存得回去(原文一字不动)。
     /// 已知键被清回缺省时照样删 —— 那是用户的「重置」,留着下次会被读回来。
     #[test]

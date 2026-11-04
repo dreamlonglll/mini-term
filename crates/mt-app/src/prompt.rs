@@ -36,6 +36,7 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::dialog::{Cancel, Dialog, DialogFooter};
 use gpui_component::input::{Input, InputState, SelectAll};
 
+use crate::git_ui;
 use crate::i18n::{t, tr};
 use crate::overlay;
 use crate::ui;
@@ -364,6 +365,16 @@ pub struct Confirm {
     cancel_text: SharedString,
     /// 确认键用危险色(删除 / 丢弃 / 强推这类不可逆操作)。
     danger: bool,
+    /// 「不再询问」那一行;`None` = 不出(绝大多数确认框)。
+    dont_ask_again: Option<DontAskAgain>,
+}
+
+/// 确认框里的「不再询问」行,见 [`Confirm::dont_ask_again`]。
+struct DontAskAgain {
+    label: SharedString,
+    /// 复选框下面那行灰字:改回去的入口在哪儿。
+    hint: SharedString,
+    on_opt_out: Rc<dyn Fn(&mut App)>,
 }
 
 impl Confirm {
@@ -375,6 +386,7 @@ impl Confirm {
             ok_text: t("prompt", "confirm").into(),
             cancel_text: t("prompt", "cancel").into(),
             danger: false,
+            dont_ask_again: None,
         }
     }
 
@@ -399,6 +411,23 @@ impl Confirm {
         self
     }
 
+    /// 加一行「不再询问」复选框。每次打开都是没勾的;勾着点「确定」(或回车)时先调
+    /// `on_opt_out` 记下偏好、再走 `on_ok`。取消 / Esc / 点遮罩都不经过 `on_ok`,
+    /// 所以这几条路上勾了也不算数 —— 操作都没做,不能替用户把偏好改了。
+    pub fn dont_ask_again(
+        mut self,
+        label: impl Into<SharedString>,
+        hint: impl Into<SharedString>,
+        on_opt_out: impl Fn(&mut App) + 'static,
+    ) -> Self {
+        self.dont_ask_again = Some(DontAskAgain {
+            label: label.into(),
+            hint: hint.into(),
+            on_opt_out: Rc::new(on_opt_out),
+        });
+        self
+    }
+
     /// 弹出来。`on_ok` 只在点「确定」时调用。
     pub fn open(
         self,
@@ -407,8 +436,21 @@ impl Confirm {
         cx: &mut App,
     ) {
         let on_ok = Rc::new(on_ok);
-        open_guarded(kind::CONFIRM, window, cx, move |dialog, _window, _cx| {
+        // 勾选状态要活过重绘:builder 每帧都被 Root 重调一遍,写在里面就每帧复位。
+        // 放实体(与 `git_worktree` 的 `RemoveForm` 同一手法)还顺带解决了重绘 ——
+        // builder 在 Root 的 render 里读过它,`notify` 就会让 Root 重画
+        let opted_out = cx.new(|_| false);
+        open_guarded(kind::CONFIRM, window, cx, move |dialog, _window, cx| {
             let on_ok = on_ok.clone();
+            let dont_ask_row = self
+                .dont_ask_again
+                .as_ref()
+                .map(|row| dont_ask_again_row(row, &opted_out, cx));
+            let on_opt_out = self
+                .dont_ask_again
+                .as_ref()
+                .map(|row| row.on_opt_out.clone());
+            let opted_out = opted_out.clone();
             dialog
                 .title(self.title.clone())
                 // 三件套(prompt/confirm/alert)统一宽度,见 `DIALOG_W`
@@ -420,12 +462,43 @@ impl Confirm {
                     self.danger,
                 ))
                 .child(body(&self.message, &self.detail))
+                .children(dont_ask_row)
                 .on_ok(move |_: &ClickEvent, window, cx| {
+                    if *opted_out.read(cx)
+                        && let Some(on_opt_out) = &on_opt_out
+                    {
+                        on_opt_out(cx);
+                    }
                     on_ok(window, cx);
                     true
                 })
         });
     }
+}
+
+/// 复选框 + 下面一行灰字(与复选框的文字左缘对齐,窄窗口 / 大字号下能自己折行)。
+fn dont_ask_again_row(
+    row: &DontAskAgain,
+    opted_out: &Entity<bool>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let checked = *opted_out.read(cx);
+    let opted_out = opted_out.clone();
+    div()
+        .mt(px(12.0))
+        .flex()
+        .flex_col()
+        .child(
+            git_ui::check_row("confirm-dont-ask-again", checked, row.label.clone(), false)
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    opted_out.update(cx, |opted_out, cx| {
+                        *opted_out = !*opted_out;
+                        cx.notify();
+                    });
+                }),
+        )
+        // 22 = 复选框 14 + 与文字的间距 8(`git_ui::check_row`)
+        .child(ui::hint(row.hint.clone()).pl(px(22.0)))
 }
 
 // ─── alert ────────────────────────────────────────────────────

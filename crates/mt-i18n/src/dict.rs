@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1511;
+pub const ZH_ENTRY_COUNT: usize = 1515;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1511;
+pub const EN_ENTRY_COUNT: usize = 1515;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1835,6 +1835,8 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("branchPopover.current", "← 当前"),
     ("branchPopover.empty", "该会话没有分支记录"),
     ("closeAiTitle", "关闭 AI 对话"),
+    ("closeDontAskAgain", "不再询问"),
+    ("closeDontAskHint", "之后可在「设置 → Shell → 终端行为」中重新开启"),
     ("closeGroupAiMessage", "该区域内有 {count} 个终端正在运行 AI 对话，关闭后对话将被终止，确定继续吗？"),
     ("closeGroupMessage", "确定要关闭该区域内所有终端吗？"),
     ("closePane", "关闭整个区域"),
@@ -1871,6 +1873,8 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("branchPopover.current", "← current"),
     ("branchPopover.empty", "No branch records for this session"),
     ("closeAiTitle", "Close AI Session"),
+    ("closeDontAskAgain", "Don't ask again"),
+    ("closeDontAskHint", "You can turn this back on in Settings → Shell → Terminal behavior"),
     ("closeGroupAiMessage", "{count} terminal(s) in this area are running AI sessions. Closing will terminate them. Continue?"),
     ("closeGroupMessage", "Close all terminals in this area?"),
     ("closePane", "Close whole pane"),
@@ -2522,6 +2526,8 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("terminal.animationsTitle", "启用动画"),
     ("terminal.availableTerminals", "可用终端（●= 默认）"),
     ("terminal.behavior", "终端行为"),
+    ("terminal.confirmCloseDesc", "关闭终端、整个区域或面板前先弹窗确认。关掉后直接关闭，其中正在运行的 AI 对话会被一并终止。关闭窗口与移除项目的确认不受影响"),
+    ("terminal.confirmCloseTitle", "关闭终端前确认"),
     ("terminal.defaultHint", "点击圆点设为默认终端 · 新建终端标签页时可选择类型"),
     ("terminal.fontSizeNewOnly", "改动作用于新建的终端"),
     ("terminal.newArgsPlaceholder", "启动参数（空格分隔，可选）"),
@@ -2781,6 +2787,8 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("terminal.animationsTitle", "Enable animations"),
     ("terminal.availableTerminals", "Available terminals (● = default)"),
     ("terminal.behavior", "Terminal behavior"),
+    ("terminal.confirmCloseDesc", "Ask before closing a terminal, a whole pane or a panel. When off they close right away, terminating any AI session running in them. The confirmations for closing the window and removing a project are not affected"),
+    ("terminal.confirmCloseTitle", "Confirm before closing terminals"),
     ("terminal.defaultHint", "Click the dot to set the default terminal · Choose a type when opening a new tab"),
     ("terminal.fontSizeNewOnly", "Applies to newly opened terminals"),
     ("terminal.newArgsPlaceholder", "Launch args (space-separated, optional)"),
