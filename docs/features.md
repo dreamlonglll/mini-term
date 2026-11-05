@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.28-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.29-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -134,7 +134,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 
 **Prerequisite**: you need your own publicly reachable server to run the relay (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS — see the [deployment guide](deploy-relay.md)).
 
-- **Connect and pair in one place** — Fill in the relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code, all in a single panel. Scanning with your phone camera opens the PWA and pairs automatically; the code is single-use (valid for 10 minutes), pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly.
+- **Connect and pair in one place** — Fill in the relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code, all in a single panel. Scanning with your phone camera opens the PWA and pairs automatically; if the phone has no scanner, copy the pairing link shown below the QR code and open it in the phone's browser. The QR code and link are single-use (valid for 10 minutes), pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly.
 - **Active AI session list** — The phone shows running Claude / Codex / Grok sessions grouped by project, with status lights that add, remove, and change color in real time alongside the desktop; when the desktop goes offline a top banner appears and the list greys out, clearing automatically on reconnect.
 - **Start a new session from your phone** — Tap **+** → pick a project → pick an AI launcher, and the desktop opens a terminal tab in that project in the background and brings the agent up; once the session is really running the phone enters its mirror automatically, without disturbing whatever you are looking at on the desktop. Projects are listed with the desktop's group hierarchy and can be collapsed. Launchers are named entries configured on the desktop — the phone references them by id and only ever sees the name, so **the command text never passes through the phone or the relay**.
 - **Rename sessions** — Give a session a name you will recognise, from the ✎ on a list row or the title on the mirror page; it shows up on the desktop terminal tab as well. Leave it empty to restore the default name.
@@ -236,7 +236,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **3,150 Rust tests** (36 test targets) + relay-server protocol boundary tests |
+| Tests | **3,159 Rust tests** (36 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -377,7 +377,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (36 test targets, 3,150 cases)
+# Workspace-wide Rust tests (36 test targets, 3,159 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

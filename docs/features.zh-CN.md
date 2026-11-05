@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.28-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.29-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -134,7 +134,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 **前提**：需要一台你自己的、可公网访问的服务器来跑中转（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS，见[部署文档](deploy-relay.zh-CN.md)）。
 
-- **一站式连接与配对** — 顶栏「移动端」面板里填中转地址 → 保存并连接 → 生成配对二维码，全流程一个面板走完；手机相机扫码即打开 PWA 自动配对，配对码一次性有效（10 分钟），新设备配对自动顶替旧设备，「重置配对」立即吊销全部凭证
+- **一站式连接与配对** — 顶栏「移动端」面板里填中转地址 → 保存并连接 → 生成配对二维码，全流程一个面板走完；手机相机扫码即打开 PWA 自动配对，手机没有扫码功能时可复制二维码下方的配对链接，用手机浏览器打开；二维码与链接一次性有效（10 分钟），新设备配对自动顶替旧设备，「重置配对」立即吊销全部凭证
 - **活跃 AI 会话列表** — 手机端按项目分组展示正在跑的 Claude / Codex / Grok 会话，状态灯与桌面端实时同步增删变色；桌面端离线时顶部横幅提示并置灰，恢复后自动消除
 - **手机发起新会话** — 右下角 + → 选项目 → 选 AI 启动器，桌面端在该项目后台开一个终端标签并把 agent 拉起来，会话真起来后手机自动进入它的对话镜像（不打断你桌面上正在看的现场）；项目按桌面端的分组层级展示，可折叠。启动器是桌面端配置的具名条目，手机只按 id 引用、看得到名字，**命令文本从不经过手机或中转**
 - **会话重命名** — 手机上给会话改个看得懂的名字（列表行的 ✎ 或镜像页标题），同步显示在桌面端的终端标签上；留空恢复默认名
@@ -236,7 +236,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **3150 个 Rust 测试**（36 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **3159 个 Rust 测试**（36 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -377,7 +377,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（36 个测试目标、3150 例）
+# 全工作区 Rust 测试（36 个测试目标、3159 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
