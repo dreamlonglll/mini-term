@@ -512,9 +512,11 @@ fn 同步块超时释放时图形状态接得上() {
         let mut term = e.term.lock();
         let mut parser = e.parser.lock();
         let parser = &mut *parser;
-        parser
-            .vte
-            .stop_sync(&mut WidthOverride::new(&mut term, &mut parser.cluster));
+        parser.vte.stop_sync(&mut WidthOverride::new(
+            &mut term,
+            &mut parser.cluster,
+            None,
+        ));
     };
     force_release(&e);
     assert_eq!(e.visible_lines()[0], "frozen");

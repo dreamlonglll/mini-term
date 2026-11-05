@@ -5,6 +5,11 @@
 //! (`TermMode::DISAMBIGUATE_ESC_CODES` 那一族)本轮**不做**,alacritty 会
 //! 老老实实按 legacy 编码工作。
 //!
+//! Windows 还有一条:ConPTY 请求 `CSI ? 9001h`(win32-input-mode)之后,只有
+//! `Shift+Enter` 与 `Ctrl+J` 改由 [`win32_input_bytes`] 编码成
+//! `CSI Vk;Sc;Uc;Kd;Cs;Rc _`。其余按键继续走 legacy 字节,`Enter` / `Esc` /
+//! `Ctrl+C` / 方向键等行为不变。文本输入仍走平台通道。
+//!
 //! 放在 `mt-ui` 而不是 `mt-terminal`,是因为入参是 gpui 的 [`Keystroke`],
 //! 而 `mt-terminal` 明确不依赖 gpui。
 
@@ -208,6 +213,38 @@ fn control_code(key: &str) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(vec![byte])
+}
+
+/// win32-input-mode 的按键记录:`CSI Vk;Sc;Uc;Kd;Cs;Rc _`。
+///
+/// **只用于传统编码表达不了的两个键**:`Shift+Enter` 与 `Ctrl+J`。其余键继续
+/// 走原有字节,`Enter` / `Esc` / `Ctrl+C` / 方向键 / `ReadConsoleInput` 消费者
+/// 的行为都不变。
+///
+/// `Ctrl+J` 的 `Uc` 取 `0x0A`(LF):Node raw mode / `_getwch` / .NET 这类直接读
+/// 控制台记录的程序依赖非零 `Uc`。OMP 的 WSI 解码器需要上游放宽
+/// `(shift || uc === 0)` 才会把它还原成 `ctrl+j`。
+pub fn win32_input_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    if !cfg!(windows) {
+        return None;
+    }
+    win32_input_bytes_inner(keystroke)
+}
+
+/// 平台无关的编码主体；测试在非 Windows 上也能覆盖这两条记录的字节形态。
+fn win32_input_bytes_inner(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let m = &keystroke.modifiers;
+    if m.function || m.platform {
+        return None;
+    }
+    match (keystroke.key.as_str(), m.shift, m.control, m.alt) {
+        // Shift+Enter：VK_RETURN / Sc 0x1C / Uc CR / Shift。
+        ("enter", true, false, false) => Some(b"\x1b[13;28;13;1;16;1_".to_vec()),
+        // Ctrl+J：VK_J / Sc 0x24 / Uc LF / Ctrl。Uc 不能填 0，否则 Node raw 等
+        // 直接读控制台记录的程序会丢键。
+        ("j", false, true, false) => Some(b"\x1b[74;36;10;1;8;1_".to_vec()),
+        _ => None,
+    }
 }
 
 /// 一个方向键。见 [`arrow_bytes`]。
@@ -419,5 +456,56 @@ mod tests {
     fn 粘贴内容不能劫持结束标记() {
         let out = paste_to_bytes("a\x1b[201~b", TermMode::BRACKETED_PASTE);
         assert_eq!(out, b"\x1b[200~ab\x1b[201~".to_vec());
+    }
+
+    fn mods(control: bool, shift: bool, alt: bool, platform: bool) -> Modifiers {
+        Modifiers {
+            control,
+            shift,
+            alt,
+            platform,
+            ..Default::default()
+        }
+    }
+
+    /// 只编码两个传统编码表达不了的键。
+    #[test]
+    fn wsi_只编码_shift_enter_与_ctrl_j() {
+        assert_eq!(
+            win32_input_bytes_inner(&key("enter", mods(false, true, false, false))).unwrap(),
+            b"\x1b[13;28;13;1;16;1_".to_vec()
+        );
+        assert_eq!(
+            win32_input_bytes_inner(&key("j", Modifiers::control())).unwrap(),
+            b"\x1b[74;36;10;1;8;1_".to_vec()
+        );
+    }
+
+    /// 其余键必须保持传统字节，尤其 Enter / Ctrl+C / 方向键 / Tab / Alt。
+    #[test]
+    fn wsi_其余按键全部回落传统编码() {
+        for (name, m) in [
+            ("enter", mods(false, false, false, false)),
+            ("enter", mods(true, false, false, false)),
+            ("tab", Modifiers::default()),
+            ("c", Modifiers::control()),
+            ("up", Modifiers::default()),
+            ("b", Modifiers::alt()),
+            ("p", mods(true, true, false, false)),
+            ("c", mods(false, false, false, true)),
+            ("unmapped-key", Modifiers::default()),
+        ] {
+            assert!(
+                win32_input_bytes_inner(&key(name, m)).is_none(),
+                "{name} 不该走 WSI"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn wsi_非_windows_永不编码() {
+        assert!(win32_input_bytes(&key("j", Modifiers::control())).is_none());
+        assert!(win32_input_bytes(&key("enter", mods(false, true, false, false))).is_none());
     }
 }
