@@ -10,7 +10,9 @@
 //!    `qrcode` crate 只取位矩阵,再用 `gpui::canvas` + `paint_quad` 逐模块画。
 //!    底色**固定白**(不跟主题)—— 相机识别要高对比。静区 1 模块、纠错 M,
 //!    与原版 `{ width: 260, margin: 1 }` 一字不差(几何见
-//!    [`crate::mobile_relay::qr_module_px`])。配对码文本同屏可见,便于手输。
+//!    [`crate::mobile_relay::qr_module_px`])。配对链接同屏可见、可复制:没有扫码
+//!    功能的手机靠它打开(issue #94)。只显示配对码没用 —— PWA 只认链接里的
+//!    `#pair=`,没有手输配对码的入口。
 //! 2. **shell 选择走自建菜单**([`crate::menu`])而不是 `<select>` ——
 //!    与 N 批的下拉风格一致,勾选态用「✓ 」文本方案。
 //!
@@ -19,10 +21,12 @@
 //! 走 [`crate::prompt::open_guarded`] + [`crate::overlay::kind::MOBILE_RELAY`]
 //! (原版没有,是 audit 记的缺口)。重置配对的确认框是**另一种类**,照样叠得上去。
 
+use std::time::Duration;
+
 use gpui::{
-    App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
+    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, InteractiveElement,
+    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::AiLauncher;
@@ -49,6 +53,10 @@ const BODY_MAX_H: f32 = 540.0;
 /// 标题与正文之间 `gap` 16(`dialog.rs:373/430-432`)。正文高度按它扣,
 /// 面板整体才落在 76vh 内。
 const CHROME_H: f32 = 83.0;
+/// 「已复制」回显多久(与命令库同一档)。
+const COPIED_MS: u64 = 1200;
+/// 复制按钮的最小宽度,按较长的文案(「已复制」/ Copied)定。
+const COPY_BUTTON_MIN_W: f32 = 64.0;
 
 /// 编辑中的启动器草稿。`id` 为空串 = 新增(与原版 `DraftState` 一致)。
 struct Draft {
@@ -64,11 +72,15 @@ pub struct MobilePanel {
     bridge: Entity<RelayBridge>,
     url: Entity<InputState>,
     key: Entity<InputState>,
-    /// 位矩阵 + 配对码原文。**面板一关就随实体销毁** —— 留着的旧码可能已被
+    /// 位矩阵 + 配对链接原文。**面板一关就随实体销毁** —— 留着的旧码可能已被
     /// 后续操作作废(原版关闭面板会 `setQrDataUrl(null)`)。
     qr: Option<(QrMatrix, String)>,
     /// 已经点过「生成」但码还没回来(渲染 `modal.qrWaiting`)。
     qr_requested: bool,
+    /// 配对链接刚复制过:复制按钮短暂显示「已复制」。**不走 toast**,理由见
+    /// [`Self::key_unreadable`]。
+    link_copied: bool,
+    _copied_timer: Option<Task<()>>,
     draft: Option<Draft>,
     /// 已存的桌面密钥(信封)解不开:密钥框回填为空,框下**就地**标红说明;
     /// 用户一开始输入就隐去,保存成功后清掉。**不走 toast** —— toast 层画在弹窗
@@ -90,11 +102,32 @@ impl Render for MobilePanel {
 }
 
 impl MobilePanel {
-    /// 配对码到达([`RelayBridge`] 的泵调它)。
-    pub fn set_pairing_code(&mut self, code: String, url: String, cx: &mut Context<Self>) {
+    /// 配对码到达,`url` 是拼好的配对链接([`RelayBridge`] 的泵调它)。
+    pub fn set_pair_link(&mut self, url: String, cx: &mut Context<Self>) {
         // 编码失败(理论上到不了:配对链接只有几十字节)时保持 `qr_requested`,
         // 面板继续显示「正在请求…」—— 与原版 `.catch(() => setQrDataUrl(null))` 同
-        self.qr = mobile_relay::encode_qr(&url).map(|m| (m, code));
+        self.qr = mobile_relay::encode_qr(&url).map(|m| (m, url));
+        // 「已复制」说的是上一条链接:复制后马上重新生成时,回显不能落到新链接头上
+        self.link_copied = false;
+        self._copied_timer = None;
+        cx.notify();
+    }
+
+    fn copy_pair_link(&mut self, cx: &mut Context<Self>) {
+        let Some((_, link)) = self.qr.as_ref() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
+        self.link_copied = true;
+        self._copied_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(COPIED_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.link_copied = false;
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -194,6 +227,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
             key,
             qr: None,
             qr_requested: false,
+            link_copied: false,
+            _copied_timer: None,
             draft: None,
             key_unreadable,
             notice: None,
@@ -308,6 +343,7 @@ struct Frame {
     notice: Option<SharedString>,
     qr: Option<(QrMatrix, String)>,
     qr_requested: bool,
+    link_copied: bool,
     launchers: Vec<AiLauncher>,
     /// 草稿的轻量切面(输入框实体是 `Clone` 的句柄)。
     draft: Option<(String, Entity<InputState>, Entity<InputState>, Option<String>)>,
@@ -330,6 +366,7 @@ fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
         notice: panel.notice.clone(),
         qr: panel.qr.clone(),
         qr_requested: panel.qr_requested,
+        link_copied: panel.link_copied,
         launchers: relay.launchers,
         draft: panel.draft.as_ref().map(|d| {
             (
@@ -445,7 +482,7 @@ fn render_body(
     }
 
     let mut qr_section = div().flex().flex_col().gap(px(12.0));
-    if let Some((matrix, code)) = frame.qr.as_ref() {
+    if let Some((matrix, link)) = frame.qr.as_ref() {
         qr_section = qr_section.child(
             div()
                 .flex()
@@ -453,13 +490,7 @@ fn render_body(
                 .items_center()
                 .gap(px(12.0))
                 .child(render_qr(matrix))
-                // 配对码文本同屏可见:扫不出码时还能手输
-                .child(
-                    div()
-                        .text_size(ui::font_px(13.0))
-                        .text_color(ui::text_primary())
-                        .child(SharedString::from(code.clone())),
-                )
+                .child(render_pair_link(state, link, frame.link_copied))
                 .child(
                     div()
                         .text_size(ui::font_px(11.0))
@@ -1046,6 +1077,42 @@ fn render_qr(matrix: &QrMatrix) -> impl IntoElement {
                 )
                 .size_full(),
             ),
+        )
+}
+
+/// 配对链接全文 + 复制按钮。
+///
+/// 链接**折行显示,不截断**:手机扫不了码、复制也传不过去时,还能照着敲。
+fn render_pair_link(state: &Entity<MobilePanel>, link: &str, copied: bool) -> impl IntoElement {
+    row_card()
+        // 父级是 `items_center`,不撑满的话行宽跟着内容走,链接折不了行
+        .w_full()
+        .child(
+            crate::git_ui::mono(div())
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(ui::font_px(13.0))
+                .text_color(ui::text_primary())
+                .child(SharedString::from(link.to_string())),
+        )
+        .child(
+            ui::ghost_button(
+                "relay-copy-link",
+                if copied {
+                    t("mobileRelay", "modal.linkCopied")
+                } else {
+                    t("mobileRelay", "modal.copyLink")
+                },
+            )
+            .flex_none()
+            // 文案变长时按钮不变宽,链接才不会跟着重新折行
+            .min_w(ui::font_px(COPY_BUTTON_MIN_W))
+            .on_click({
+                let state = state.clone();
+                move |_: &ClickEvent, _window, cx| {
+                    state.update(cx, |panel, cx| panel.copy_pair_link(cx));
+                }
+            }),
         )
 }
 

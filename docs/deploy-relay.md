@@ -123,7 +123,7 @@ server {
 
 1. Desktop mini-term → "Mobile" in the title bar: set the relay server address to `wss://relay.example.com`, enter the same access key as the relay's `MT_RELAY_DESKTOP_KEY`, save and connect, and wait for the status to turn "Connected".
 2. In the same panel → generate the pairing QR code.
-3. Scan it with your phone camera → the PWA opens in the browser, pairs automatically, and shows the list of active AI sessions.
+3. Scan it with your phone camera → the PWA opens in the browser, pairs automatically, and shows the list of active AI sessions. If your phone has no scanner, click "Copy" below the QR code, send the link to your phone and open it in the browser — the result is the same.
 4. Use the browser menu's "Add to Home Screen" so it opens as a standalone window from then on (on iOS, adding to the home screen is required for the standalone window experience).
 5. Start Claude / Codex in any desktop terminal → it appears in the phone's list in real time → tap in to watch the conversation mirror → send a command from the input box at the bottom, and it is written verbatim into the desktop terminal.
 6. Tap **+** at the bottom right of the phone's home screen → pick a project → pick an AI launcher → the desktop opens a new tab in that project and brings the agent up; once the session is live the phone enters its conversation mirror automatically. Projects are listed with the desktop's group hierarchy and can be collapsed; launchers are managed in the desktop "Mobile" panel (Claude / Codex are preset), and commands and shells never leave the desktop.

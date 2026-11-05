@@ -645,7 +645,7 @@ impl RelayBridge {
         // 草稿还没 apply 的话中转根本不在那个地址上
         let relay_url = self.store.read(cx).mobile_relay().relay_url;
         let url = pair_url(&relay_url, &code);
-        panel.update(cx, |panel, cx| panel.set_pairing_code(code, url, cx));
+        panel.update(cx, |panel, cx| panel.set_pair_link(url, cx));
     }
 
     /// 移动端发起会话:**外层统一回执**,结构上杜绝漏回执(坑 5)。

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1545;
+pub const ZH_ENTRY_COUNT: usize = 1547;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1545;
+pub const EN_ENTRY_COUNT: usize = 1547;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1759,14 +1759,16 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("launchers.namePlaceholder", "名称（如 Claude）"),
     ("launchers.save", "保存"),
     ("launchers.title", "AI 启动器"),
+    ("modal.copyLink", "复制"),
     ("modal.generateQr", "生成配对二维码"),
+    ("modal.linkCopied", "已复制"),
     ("modal.needConnected", "与中转连接后才能生成配对二维码。"),
     ("modal.notConfigured", "填写并保存中转服务器地址后，即可在此生成配对二维码。"),
     ("modal.notPaired", "未配对"),
     ("modal.paired", "已配对"),
     ("modal.pairedLabel", "配对状态"),
     ("modal.pairedUnknown", "未知（等待中转同步）"),
-    ("modal.qrHint", "用手机相机或浏览器扫码打开移动端页面，配对自动完成。配对码一次性有效（10 分钟内），新设备配对会顶替旧设备。"),
+    ("modal.qrHint", "用手机相机或浏览器扫码打开移动端页面，配对自动完成；手机没有扫码功能时，复制上方链接发到手机，用浏览器打开。二维码与链接一次性有效（10 分钟内），新设备配对会顶替旧设备。"),
     ("modal.qrWaiting", "正在向中转请求配对码…"),
     ("modal.regenerateQr", "重新生成"),
     ("modal.resetConfirm", "重置后当前已配对的移动端立即失效，需要重新扫码。确定重置吗？"),
@@ -1806,14 +1808,16 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("launchers.namePlaceholder", "Name (e.g. Claude)"),
     ("launchers.save", "Save"),
     ("launchers.title", "AI launchers"),
+    ("modal.copyLink", "Copy"),
     ("modal.generateQr", "Generate pairing QR code"),
+    ("modal.linkCopied", "Copied"),
     ("modal.needConnected", "Connect to the relay first to generate a pairing QR code."),
     ("modal.notConfigured", "Save a relay server address above to generate a pairing QR code here."),
     ("modal.notPaired", "Not paired"),
     ("modal.paired", "Paired"),
     ("modal.pairedLabel", "Pairing status"),
     ("modal.pairedUnknown", "Unknown (waiting for relay)"),
-    ("modal.qrHint", "Scan with your phone camera or browser to open the mobile page — pairing completes automatically. The code is single-use (valid for 10 minutes); pairing a new device replaces the old one."),
+    ("modal.qrHint", "Scan with your phone camera or browser to open the mobile page — pairing completes automatically. No scanner on your phone? Copy the link above, send it to your phone and open it in the browser. The QR code and link are single-use (valid for 10 minutes); pairing a new device replaces the old one."),
     ("modal.qrWaiting", "Requesting pairing code from relay…"),
     ("modal.regenerateQr", "Regenerate"),
     ("modal.resetConfirm", "Resetting immediately invalidates the currently paired mobile device; it will need to re-scan. Reset now?"),
