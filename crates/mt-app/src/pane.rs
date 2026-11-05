@@ -862,7 +862,7 @@ impl TerminalPane {
     fn observe_user_write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
         // 只能在回车前抓一份当前可见行补判(见 observe_input_with_line_snapshot)。
-        let snapshot = if bytes.contains(&b'\r') {
+        let snapshot = if self.ai.perception().wants_line_snapshot(bytes) {
             self.current_line()
         } else {
             None

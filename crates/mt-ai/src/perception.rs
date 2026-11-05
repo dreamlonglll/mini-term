@@ -60,6 +60,11 @@ impl AiPerception {
         self.observe_input_with_line_snapshot(pane_id, bytes, None);
     }
 
+    /// 这次写入要不要先抓一份可见行快照,再传给 [`Self::observe_input_with_line_snapshot`]。
+    pub fn wants_line_snapshot(&self, bytes: &[u8]) -> bool {
+        crate::tracker::wants_line_snapshot(bytes)
+    }
+
     /// 带可见行快照的版本:上箭头历史召回 / Tab 补全会让 shell 整行改写,
     /// 本地输入缓冲重建不出来,只能靠调用方在回车前抓一份当前可见行补判。
     pub fn observe_input_with_line_snapshot(

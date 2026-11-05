@@ -46,6 +46,22 @@ pub const FOCUS_COOLDOWN: Duration = Duration::from_millis(800);
 pub(crate) const FOCUS_IN_SEQ: &str = "\x1b[I";
 pub(crate) const FOCUS_OUT_SEQ: &str = "\x1b[O";
 
+/// win32-input-mode 的 Shift+Enter / Ctrl+J 记录,与 mt-ui 的 `win32_input_bytes` 逐字一致。
+const WSI_SHIFT_ENTER: &str = "\x1b[13;28;13;1;16;1_";
+const WSI_CTRL_J: &str = "\x1b[74;36;10;1;8;1_";
+
+/// Shift+Enter 是换行的 agent:Codex(crossterm 直读按键记录)与 OMP(自己解码 WSI)
+/// 看得到 Shift。其余 agent 开着 VT 输入,conhost 把这条记录翻成 `\r`,实测
+/// Claude Code 2.1.302 与 pi 1.4.0 都是提交;Grok / opencode 没测,按提交算。
+const SHIFT_ENTER_NEWLINE_AGENTS: &[&str] = &["codex", "omp"];
+
+/// 这次写入要不要在交给 PTY 之前抓一份可见行快照。
+///
+/// Shift+Enter 的记录里没有 `\r`,但多数情况下按提交算,↑ 召回后提交同样要靠快照补判。
+pub(crate) fn wants_line_snapshot(bytes: &[u8]) -> bool {
+    bytes.contains(&b'\r') || bytes == WSI_SHIFT_ENTER.as_bytes()
+}
+
 /// AI 会话内用户提交的一行(供上层做用量统计/移动端回显)
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSubmit {
@@ -136,12 +152,11 @@ impl InputState {
         line
     }
 
-    /// win32-input-mode 的换行记录。mini-term 只对 `Shift+Enter` / `Ctrl+J`
-    /// 发送；这两条必须当作“插入换行”，不能落进通用 CSI 的 `clear_line`。
-    /// `74;36;0;...` 是旧版/兼容写法，一并认。
+    /// win32-input-mode 的换行记录:能走到这里的都已判定为真换行
+    /// (见 [`SessionTracker::resolve_wsi_record`]),不能落进通用 CSI 的 `clear_line`。
     fn apply_wsi_newline(&mut self, sequence: &str) -> bool {
         match sequence {
-            "13;28;13;1;16;1_" | "74;36;10;1;8;1_" | "74;36;0;1;8;1_" => {
+            "13;28;13;1;16;1_" | "74;36;10;1;8;1_" => {
                 self.insert_char('\n');
                 true
             }
@@ -417,6 +432,21 @@ impl SessionTracker {
         }
     }
 
+    /// WSI 记录在前台程序那里到底是提交还是换行。换行就原样放行给 `apply_csi`,
+    /// 提交就换算成传统字节,后面走回车那条路。
+    ///
+    /// 不在 AI 会话时两条都算回车:cmd / bash 实际会执行。PowerShell 这两个键是续行,
+    /// 这里分不出来,所以 `claude` 后接续行会被误认成启动;无 hook 时才有这个误判。
+    fn resolve_wsi_record<'a>(&self, pane_id: u32, data: &'a str) -> &'a str {
+        let sessions = self.ai_sessions.lock();
+        match (data, sessions.get(&pane_id).map(String::as_str)) {
+            (WSI_SHIFT_ENTER, Some(agent)) if SHIFT_ENTER_NEWLINE_AGENTS.contains(&agent) => data,
+            (WSI_SHIFT_ENTER, _) => "\r",
+            (WSI_CTRL_J, None) => "\n",
+            _ => data,
+        }
+    }
+
     #[cfg(test)]
     pub fn track_input(&self, pane_id: u32, data: &str) {
         self.track_input_with_line_snapshot(pane_id, data, None);
@@ -428,6 +458,7 @@ impl SessionTracker {
         data: &str,
         line_snapshot: Option<&str>,
     ) {
+        let data = self.resolve_wsi_record(pane_id, data);
         let in_ai = self.is_ai_session(pane_id);
         let mut enter_ai: Option<&'static str> = None;
         let mut exit_ai = false;
@@ -1063,20 +1094,102 @@ mod tests {
         assert!(submits[0].ts > 0);
     }
 
-    /// WSI 的 Shift+Enter / Ctrl+J 是插入换行，不能清空已输入内容。
+    /// Codex / OMP 的 Shift+Enter 与 AI 会话里的 Ctrl+J 都是插入换行,不能清空已输入内容。
     #[test]
     fn wsi_newline_records_keep_multiline_submit() {
-        let mgr = SessionTracker::new();
-        mgr.track_input(1, "claude\r");
-        mgr.track_input(1, "first line");
-        mgr.track_input(1, "\x1b[13;28;13;1;16;1_"); // Shift+Enter
-        mgr.track_input(1, "second line");
-        mgr.track_input(1, "\x1b[74;36;10;1;8;1_"); // Ctrl+J
-        mgr.track_input(1, "third line\r");
+        for agent in ["codex", "omp"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, &format!("{agent}\r"));
+            mgr.track_input(1, "first line");
+            mgr.track_input(1, WSI_SHIFT_ENTER);
+            mgr.track_input(1, "second line");
+            mgr.track_input(1, WSI_CTRL_J);
+            mgr.track_input(1, "third line\r");
 
-        let submits = mgr.drain_submits(1);
-        assert_eq!(submits.len(), 1);
-        assert_eq!(submits[0].line, "first line\nsecond line\nthird line");
+            let submits = mgr.drain_submits(1);
+            assert_eq!(submits.len(), 1, "{agent}");
+            assert_eq!(submits[0].line, "first line\nsecond line\nthird line", "{agent}");
+        }
+    }
+
+    /// Claude Code / pi 收到的 Shift+Enter 是 `\r`,实际已经提交。漏记的话回合闩上不了,
+    /// 这一行还会串进下一条提交。
+    #[test]
+    fn wsi_shift_enter_submits_for_other_agents() {
+        for agent in ["claude", "pi"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, &format!("{agent}\r"));
+            mgr.track_input(1, "first");
+            mgr.track_input(1, WSI_SHIFT_ENTER);
+            assert!(mgr.is_turn_armed(1), "{agent}");
+            mgr.track_input(1, "second\r");
+
+            let lines: Vec<String> = mgr.drain_submits(1).into_iter().map(|s| s.line).collect();
+            assert_eq!(lines, ["first", "second"], "{agent}");
+        }
+    }
+
+    /// Claude Code / pi 的 Ctrl+J 是换行,提交时正文要带上前面那一行。
+    #[test]
+    fn wsi_ctrl_j_is_newline_for_other_agents() {
+        for agent in ["claude", "pi"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, &format!("{agent}\r"));
+            mgr.track_input(1, "first");
+            mgr.track_input(1, WSI_CTRL_J);
+            assert!(!mgr.is_turn_armed(1), "{agent}");
+            mgr.track_input(1, "second\r");
+
+            let submits = mgr.drain_submits(1);
+            assert_eq!(submits.len(), 1, "{agent}");
+            assert_eq!(submits[0].line, "first\nsecond", "{agent}");
+        }
+    }
+
+    /// hook 扶正的会话没有键入过启动命令,同样按 agent 判。
+    #[test]
+    fn wsi_shift_enter_follows_hook_marked_agent() {
+        let mgr = SessionTracker::new();
+        mgr.mark_ai_session(1, "omp");
+        mgr.track_input(1, "first");
+        mgr.track_input(1, WSI_SHIFT_ENTER);
+        assert!(mgr.drain_submits(1).is_empty());
+
+        let mgr = SessionTracker::new();
+        mgr.mark_ai_session(1, "claude");
+        mgr.track_input(1, "first");
+        mgr.track_input(1, WSI_SHIFT_ENTER);
+        assert_eq!(mgr.drain_submits(1).len(), 1);
+    }
+
+    /// 不在 AI 会话时两条记录都按回车算:cmd / bash 实际会执行,与传统字节同一口径。
+    #[test]
+    fn wsi_records_outside_ai_session_behave_like_enter() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude");
+        mgr.track_input(1, WSI_SHIFT_ENTER);
+        assert!(mgr.is_ai_session(1));
+
+        // 上一条不串进下一条:`git status` 执行过后,紧接着的 `claude` 还要认得出来
+        for record in [WSI_SHIFT_ENTER, WSI_CTRL_J] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, "git status");
+            mgr.track_input(1, record);
+            assert!(!mgr.is_ai_session(1));
+            mgr.track_input(1, "claude\r");
+            assert!(mgr.is_ai_session(1));
+        }
+    }
+
+    /// Shift+Enter 按提交算时要有行快照可用(↑ 召回后提交),所以写入侧也得抓一份。
+    #[test]
+    fn wsi_shift_enter_wants_line_snapshot() {
+        assert!(wants_line_snapshot(b"\r"));
+        assert!(wants_line_snapshot(b"claude\r"));
+        assert!(wants_line_snapshot(WSI_SHIFT_ENTER.as_bytes()));
+        // Ctrl+J 的传统字节是 `\n`,本来就不抓
+        assert!(!wants_line_snapshot(WSI_CTRL_J.as_bytes()));
+        assert!(!wants_line_snapshot(b"a"));
     }
 
     #[test]
