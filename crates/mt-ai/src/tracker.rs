@@ -1108,7 +1108,10 @@ mod tests {
 
             let submits = mgr.drain_submits(1);
             assert_eq!(submits.len(), 1, "{agent}");
-            assert_eq!(submits[0].line, "first line\nsecond line\nthird line", "{agent}");
+            assert_eq!(
+                submits[0].line, "first line\nsecond line\nthird line",
+                "{agent}"
+            );
         }
     }
 
