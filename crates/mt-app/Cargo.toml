@@ -197,7 +197,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     # 托盘线程要注册自己的窗口类,RegisterClassW 的 hInstance 来自 GetModuleHandleW。
     "Win32_System_LibraryLoader",
-    # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
+    # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口;
+    # SetWindowSubclass 拦 WebView 转来的键盘菜单(见 native_view.rs)。
     "Win32_UI_Shell",
     # 搜索结果单/双击判定:GetDoubleClickTime 读取系统双击间隔。
     "Win32_UI_Input_KeyboardAndMouse",

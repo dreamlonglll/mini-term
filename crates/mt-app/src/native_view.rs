@@ -46,6 +46,19 @@
 //!
 //! 新加的浮层若会盖到文档区,要么进 overlay 栈,要么挂这两个元素之一,否则就是
 //! 「看得见、点不到」。
+//!
+//! # 键盘菜单:WebView 里单按 Alt 会卡死整个界面
+//!
+//! 焦点在 WebView 时松开 Alt / F10,Chromium 把按键交给 `DefWindowProc`,系统再把
+//! `WM_SYSCOMMAND(SC_KEYMENU)` **同步**发给顶层窗口。GPUI 窗口没有菜单栏,默认处理
+//! 照样进一个看不见的菜单模式:主线程占住鼠标捕获,界面还在画但点不动,最小化后也还原
+//! 不了;WebView2 的 UI 线程阻塞在这次发送上,而键盘焦点还在它的窗口上,两边又因为跨进程
+//! 父子窗口共享输入队列。手上有待释放的 COM 引用时主线程还会占满一个核:栈上是
+//! `ClassicSTAThreadCanMakeOutRemReleaseCall` 判否后把 RemRelease 一遍遍重投给自己
+//! (11-05 装机版现场抓栈)。
+//!
+//! 所以建 WebView 时就在顶层窗口上拦下这条消息(`win::guard_key_menu`)。主窗口自己
+//! 的 Alt+Space 系统菜单不受影响。
 
 // Linux 上没有子视图,登记洞的那半边只剩单测在用
 #![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -342,6 +355,8 @@ mod hosted {
         pub fn register(webview: wry::WebView, window: &mut Window, cx: &mut App) -> Rc<Self> {
             #[cfg(windows)]
             let container = win::container_of(&webview);
+            #[cfg(windows)]
+            win::guard_key_menu(container);
             let mut webview = gpui_wry::WebView::new(webview, window, cx);
             webview.hide();
             let hosted = Rc::new(Self {
@@ -467,13 +482,68 @@ mod hosted {
 
     #[cfg(windows)]
     mod win {
-        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
         use windows::Win32::Graphics::Gdi::{
             CombineRgn, CreateRectRgn, DeleteObject, RGN_DIFF, SetWindowRgn,
         };
         use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+        use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOT, GetAncestor, InSendMessage, SC_KEYMENU, WM_NCDESTROY, WM_SYSCOMMAND,
+        };
 
         use super::PxRect;
+
+        /// 顶层窗口上键盘菜单拦截的子类化 ID。重复挂只是覆盖,多个 WebView 共用一份。
+        const KEY_MENU_SUBCLASS_ID: usize = 0x4D54_4B4D;
+
+        /// 这条 `WM_SYSCOMMAND` 要不要拦(见模块注释「键盘菜单」)。`wparam` 低 4 位归系统
+        /// 内部使用,比较前要掩掉。
+        ///
+        /// `lparam == 0` 是单按 Alt / F10,没有菜单栏时只会进隐形的菜单模式。带字符的
+        /// (Alt+Space 等)来自别的线程就是 WebView 转发的,菜单开着期间 WebView2 同样被
+        /// 阻塞,一并拦下;主窗口自己按的走同线程路径,系统菜单照常。
+        fn swallows_key_menu(wparam: usize, lparam: isize, from_other_thread: bool) -> bool {
+            wparam & 0xFFF0 == SC_KEYMENU as usize && (lparam == 0 || from_other_thread)
+        }
+
+        unsafe extern "system" fn key_menu_subclass(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+            id: usize,
+            _data: usize,
+        ) -> LRESULT {
+            // SAFETY: 系统按子类化约定回调,句柄与参数原样转交;窗口销毁前摘掉自己
+            unsafe {
+                if msg == WM_SYSCOMMAND
+                    && swallows_key_menu(wparam.0, lparam.0, InSendMessage().as_bool())
+                {
+                    return LRESULT(0);
+                }
+                if msg == WM_NCDESTROY {
+                    let _ = RemoveWindowSubclass(hwnd, Some(key_menu_subclass), id);
+                }
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+        }
+
+        /// 在 `container` 所在的顶层窗口上拦下键盘菜单。要在 WebView 现身之前调用。
+        pub(super) fn guard_key_menu(container: isize) {
+            if container == 0 {
+                return;
+            }
+            // SAFETY: 句柄来自本进程的子窗口;调用方在 UI 线程,即顶层窗口的创建线程
+            unsafe {
+                let root = GetAncestor(HWND(container as *mut _), GA_ROOT);
+                if !SetWindowSubclass(root, Some(key_menu_subclass), KEY_MENU_SUBCLASS_ID, 0)
+                    .as_bool()
+                {
+                    eprintln!("[webview] 拦截键盘菜单失败,WebView 里单按 Alt 可能卡死界面");
+                }
+            }
+        }
 
         /// WebView2 控制器挂在哪个窗口下 —— 即 wry 建的 `WRY_WEBVIEW` 容器。
         pub(super) fn container_of(webview: &wry::WebView) -> isize {
@@ -517,6 +587,42 @@ mod hosted {
                 }
                 if SetWindowRgn(hwnd, Some(region), true) == 0 {
                     let _ = DeleteObject(region.into());
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::swallows_key_menu;
+
+            const KEY_MENU: usize = 0xF100;
+            const SPACE: isize = 0x20;
+
+            #[test]
+            fn 单按_alt_或_f10_一律拦下() {
+                assert!(swallows_key_menu(KEY_MENU, 0, true));
+                assert!(swallows_key_menu(KEY_MENU, 0, false));
+            }
+
+            #[test]
+            fn webview_转发的_alt_space_拦下_主窗口自己的保留() {
+                assert!(swallows_key_menu(KEY_MENU, SPACE, true));
+                assert!(!swallows_key_menu(KEY_MENU, SPACE, false));
+            }
+
+            #[test]
+            fn wparam_低四位不影响判定() {
+                assert!(swallows_key_menu(KEY_MENU | 0x3, 0, true));
+            }
+
+            #[test]
+            fn 其它系统命令不拦() {
+                const SC_CLOSE: usize = 0xF060;
+                const SC_MINIMIZE: usize = 0xF020;
+                const SC_RESTORE: usize = 0xF120;
+                for command in [SC_CLOSE, SC_MINIMIZE, SC_RESTORE] {
+                    assert!(!swallows_key_menu(command, 0, true));
+                    assert!(!swallows_key_menu(command, 0, false));
                 }
             }
         }
