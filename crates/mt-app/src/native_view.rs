@@ -47,18 +47,19 @@
 //! 新加的浮层若会盖到文档区,要么进 overlay 栈,要么挂这两个元素之一,否则就是
 //! 「看得见、点不到」。
 //!
-//! # 键盘菜单:WebView 里单按 Alt 会卡死整个界面
+//! # 键盘菜单:WebView 里单按 Alt 会进隐形的菜单模式
 //!
 //! 焦点在 WebView 时松开 Alt / F10,Chromium 把按键交给 `DefWindowProc`,系统再把
 //! `WM_SYSCOMMAND(SC_KEYMENU)` **同步**发给顶层窗口。GPUI 窗口没有菜单栏,默认处理
-//! 照样进一个看不见的菜单模式:主线程占住鼠标捕获,界面还在画但点不动,最小化后也还原
-//! 不了;WebView2 的 UI 线程阻塞在这次发送上,而键盘焦点还在它的窗口上,两边又因为跨进程
-//! 父子窗口共享输入队列。手上有待释放的 COM 引用时主线程还会占满一个核:栈上是
-//! `ClassicSTAThreadCanMakeOutRemReleaseCall` 判否后把 RemRelease 一遍遍重投给自己
-//! (11-05 装机版现场抓栈)。
+//! 照样进一个看不见的菜单模式:主线程占住鼠标捕获,WebView2 的 UI 线程阻塞在这次发送上,
+//! 而键盘焦点还在它的窗口上,两边又因为跨进程父子窗口共享输入队列。
 //!
-//! 所以建 WebView 时就在顶层窗口上拦下这条消息(`win::guard_key_menu`)。主窗口自己
-//! 的 Alt+Space 系统菜单不受影响。
+//! 这个模式平时下一次点击或再按 Alt 就退出(11-05 装机版实测)。但当天有一次没退出:窗口
+//! 最小化后点不回来,主线程占满一个核,栈上是 `ClassicSTAThreadCanMakeOutRemReleaseCall`
+//! 判否后把 RemRelease 一遍遍重投给自己。空转怎么来的没查明,隐藏桌面上没复现。
+//!
+//! 所以建 WebView 时就在顶层窗口上拦下这条消息(`win::guard_key_menu`),不让它进这个
+//! 模式。主窗口自己的 Alt+Space 系统菜单不受影响。
 
 // Linux 上没有子视图,登记洞的那半边只剩单测在用
 #![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
