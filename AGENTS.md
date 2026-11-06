@@ -96,14 +96,20 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 
 Windows 本地 pane 多一层输入协议：ConPTY 启动时发 `CSI ? 9001h` 请求
 win32-input-mode，`mt-terminal` 跟踪该模式（`TerminalEmulator::win32_input_mode`）。
-只有传统编码表达不了的 `Shift+Enter` / `Ctrl+J` 两个键由
-`mt-ui::terminal::input::win32_input_bytes` 编码成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`，
-其余按键仍走 legacy 字节；`Ctrl+J` 的 `Uc=10`（Node raw / `_getwch` 依赖非零
-Uc，OMP 需上游放宽解码）。前台程序对这两条记录的解释不一：`Shift+Enter` 在
-Codex（crossterm 直读记录）与 OMP（自己解码 WSI）里是换行，在 Claude Code / pi 里
-被 conhost 翻成 `\r`，是提交。`mt-ai` 的输入旁路据此判定（`tracker.rs::resolve_wsi_record`）：
-不在 AI 会话时两条都算回车；AI 会话里 `Ctrl+J` 算换行，`Shift+Enter` 只有
-codex / omp 算换行。非 Windows 不跟踪；`MT_DISABLE_WIN32_INPUT_MODE=1` 可关闭。
+两类按键由 `mt-ui::terminal::input::win32_input_bytes` 编码成
+`CSI Vk;Sc;Uc;Kd;Cs;Rc _`，其余按键仍走 legacy 字节：① 传统编码表达不了的
+`Shift+Enter` / `Ctrl+J`，其中 `Ctrl+J` 的 `Uc=10`（Node raw / `_getwch` 依赖非零
+Uc，OMP 需上游放宽解码）；② conhost 会挂起的传统前缀。⚠️ conhost 收到过一条记录后，
+就不再把写入末尾的不完整序列当按键冲掉：裸 `ESC` 与 `ESC` + `[ O DEL` 挂到下一键，
+`ESC` + `] P X ^ _` 吞掉之后所有按键直到下一条 Esc 记录，所以 `Esc`、`Alt+Backspace`、
+`Alt+]` 等按传统字节查表换成等价记录（`held_prefix_record`，名单是把 `ESC` + 每个
+ASCII 字节喂给便携与系统 conhost 扫出来的）。前台程序对 Shift+Enter / Ctrl+J
+的解释不一：`Shift+Enter` 在 Codex（crossterm 直读记录）与 OMP（自己解码 WSI）里
+是换行，在 Claude Code / pi 里被 conhost 翻成 `\r`，是提交。`mt-ai` 的输入旁路
+据此判定（`tracker.rs::resolve_wsi_record`）：不在 AI 会话时两条都算回车；
+AI 会话里 `Ctrl+J` 算换行，`Shift+Enter` 只有 codex / omp 算换行；Esc 记录换算成
+裸 Esc，清行、摘回合闩、打断都与传统 Esc 一致。非 Windows 不跟踪；
+`MT_DISABLE_WIN32_INPUT_MODE=1` 可关闭。
 
 ### 持久化布局：数据目录里有什么
 

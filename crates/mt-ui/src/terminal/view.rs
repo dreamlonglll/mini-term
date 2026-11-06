@@ -740,8 +740,9 @@ impl TerminalView {
 
         let mode = self.emulator.mode();
         let bytes = if self.emulator.win32_input_mode() {
-            // ConPTY 已请求 win32-input-mode:只有 `Shift+Enter` 与 `Ctrl+J` 发带真实
-            // VK 的记录,传统编码里它们和 Enter 撞字节。其余键照旧走传统编码。
+            // ConPTY 已请求 win32-input-mode:`Shift+Enter` / `Ctrl+J`(传统编码里和 Enter
+            // 撞字节)与 conhost 会挂起的传统前缀(`Esc`、`Alt+Backspace` 等)发带真实 VK 的
+            // 记录。其余键照旧走传统编码。
             win32_input_bytes(keystroke).or_else(|| keystroke_to_bytes(keystroke, mode))
         } else {
             keystroke_to_bytes(keystroke, mode)

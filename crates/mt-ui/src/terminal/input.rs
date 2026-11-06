@@ -5,10 +5,10 @@
 //! (`TermMode::DISAMBIGUATE_ESC_CODES` 那一族)本轮**不做**,alacritty 会
 //! 老老实实按 legacy 编码工作。
 //!
-//! Windows 还有一条:ConPTY 请求 `CSI ? 9001h`(win32-input-mode)之后,只有
-//! `Shift+Enter` 与 `Ctrl+J` 改由 [`win32_input_bytes`] 编码成
-//! `CSI Vk;Sc;Uc;Kd;Cs;Rc _`。其余按键继续走 legacy 字节,`Enter` / `Esc` /
-//! `Ctrl+C` / 方向键等行为不变。文本输入仍走平台通道。
+//! Windows 还有一条:ConPTY 请求 `CSI ? 9001h`(win32-input-mode)之后,
+//! `Shift+Enter` / `Ctrl+J` 和 conhost 会挂起的传统前缀(`Esc`、`Alt+Backspace`、
+//! `Alt+[` 等)改由 [`win32_input_bytes`] 编码成 `CSI Vk;Sc;Uc;Kd;Cs;Rc _`。其余按键
+//! 继续走 legacy 字节,`Enter` / `Ctrl+C` / 方向键等行为不变。文本输入仍走平台通道。
 //!
 //! 放在 `mt-ui` 而不是 `mt-terminal`,是因为入参是 gpui 的 [`Keystroke`],
 //! 而 `mt-terminal` 明确不依赖 gpui。
@@ -215,15 +215,15 @@ fn control_code(key: &str) -> Option<Vec<u8>> {
     Some(vec![byte])
 }
 
-/// win32-input-mode 的按键记录:`CSI Vk;Sc;Uc;Kd;Cs;Rc _`。
+/// win32-input-mode 的按键记录:`CSI Vk;Sc;Uc;Kd;Cs;Rc _`。`None` 表示这个键走传统字节。
 ///
-/// **只用于传统编码表达不了的两个键**:`Shift+Enter` 与 `Ctrl+J`。其余键继续
-/// 走原有字节,`Enter` / `Esc` / `Ctrl+C` / 方向键 / `ReadConsoleInput` 消费者
-/// 的行为都不变。
+/// 只有两类键发记录,其余键继续走原有字节,`Enter` / `Ctrl+C` / 方向键 /
+/// `ReadConsoleInput` 消费者的行为都不变:
 ///
-/// `Ctrl+J` 的 `Uc` 取 `0x0A`(LF):Node raw mode / `_getwch` / .NET 这类直接读
-/// 控制台记录的程序依赖非零 `Uc`。OMP 的 WSI 解码器需要上游放宽
-/// `(shift || uc === 0)` 才会把它还原成 `ctrl+j`。
+/// - 传统编码表达不了的 `Shift+Enter` / `Ctrl+J`。`Ctrl+J` 的 `Uc` 取 `0x0A`(LF):
+///   Node raw mode / `_getwch` / .NET 这类直接读控制台记录的程序依赖非零 `Uc`。
+///   OMP 的 WSI 解码器需要上游放宽 `(shift || uc === 0)` 才会把它还原成 `ctrl+j`。
+/// - 传统字节会被 conhost 挂起的键,见 `held_prefix_record`。
 pub fn win32_input_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
     if !cfg!(windows) {
         return None;
@@ -231,20 +231,56 @@ pub fn win32_input_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
     win32_input_bytes_inner(keystroke)
 }
 
-/// 平台无关的编码主体；测试在非 Windows 上也能覆盖这两条记录的字节形态。
+/// 平台无关的编码主体;测试在非 Windows 上也能覆盖这些记录的字节形态。
 fn win32_input_bytes_inner(keystroke: &Keystroke) -> Option<Vec<u8>> {
     let m = &keystroke.modifiers;
     if m.function || m.platform {
         return None;
     }
     match (keystroke.key.as_str(), m.shift, m.control, m.alt) {
-        // Shift+Enter：VK_RETURN / Sc 0x1C / Uc CR / Shift。
+        // Shift+Enter:VK_RETURN / Sc 0x1C / Uc CR / Shift。
         ("enter", true, false, false) => Some(b"\x1b[13;28;13;1;16;1_".to_vec()),
-        // Ctrl+J：VK_J / Sc 0x24 / Uc LF / Ctrl。Uc 不能填 0，否则 Node raw 等
+        // Ctrl+J:VK_J / Sc 0x24 / Uc LF / Ctrl。Uc 不能填 0,否则 Node raw 等
         // 直接读控制台记录的程序会丢键。
         ("j", false, true, false) => Some(b"\x1b[74;36;10;1;8;1_".to_vec()),
-        _ => None,
+        // mode 只决定方向键用 CSI 还是 SS3,那些序列本来就完整,这里用不上。
+        _ => keystroke_to_bytes(keystroke, TermMode::empty())
+            .and_then(|legacy| held_prefix_record(&legacy))
+            .map(<[u8]>::to_vec),
     }
+}
+
+/// 传统字节 → 等价的 WSI 记录,只收 conhost 处理不好的前缀形态。
+///
+/// conhost 收到过一条 WSI 记录后,就不再把写入末尾的不完整序列当按键冲掉。裸 `ESC`
+/// 与 `ESC` + `[ O DEL` 会挂到下一键,把它吞掉或变成 Alt+下一键;`ESC` + `] P X ^ _`
+/// 更会吞掉之后的所有按键,直到下一条 Esc 记录才恢复。`ESC \` 不挂起,但便携 conhost
+/// 会把它拆成两条没有 VK 的记录,一并换掉。
+///
+/// 这张表是把 `ESC` + 每个 ASCII 字节喂给便携与系统 conhost 扫出来的,没列的形态
+/// (`Alt+.`、`Alt+字母` 等)与没见过 WSI 记录时一致。
+///
+/// 按传统字节查表而不是按键名,`Esc` / `Ctrl+[` / `Shift+Esc` / `Ctrl+Alt+[` 这些
+/// 同字节的键才不会漏。VK / Sc 按美式布局写死,其他布局上读控制台记录的程序看到的
+/// VK 可能与实际键位不符。
+fn held_prefix_record(legacy: &[u8]) -> Option<&'static [u8]> {
+    let record: &'static [u8] = match legacy {
+        // VK_ESCAPE / Sc 0x01 / Uc ESC / 无修饰。
+        b"\x1b" => b"\x1b[27;1;27;1;0;1_",
+        // 以下都带 LEFT_ALT(Cs=2),要按 Shift 才打得出的再加 SHIFT(Cs=18)。
+        b"\x1b[" => b"\x1b[219;26;91;1;2;1_",
+        b"\x1b]" => b"\x1b[221;27;93;1;2;1_",
+        b"\x1b\\" => b"\x1b[220;43;92;1;2;1_",
+        b"\x1bO" => b"\x1b[79;24;79;1;18;1_",
+        b"\x1bP" => b"\x1b[80;25;80;1;18;1_",
+        b"\x1bX" => b"\x1b[88;45;88;1;18;1_",
+        b"\x1b^" => b"\x1b[54;7;94;1;18;1_",
+        b"\x1b_" => b"\x1b[189;12;95;1;18;1_",
+        // Alt+Backspace:Uc 与真实键盘一样是 BS,conhost 自己翻成 `ESC DEL`。
+        b"\x1b\x7f" => b"\x1b[8;14;8;1;2;1_",
+        _ => return None,
+    };
+    Some(record)
 }
 
 /// 一个方向键。见 [`arrow_bytes`]。
@@ -468,9 +504,9 @@ mod tests {
         }
     }
 
-    /// 只编码两个传统编码表达不了的键。
+    /// 传统编码表达不了的两个键。
     #[test]
-    fn wsi_只编码_shift_enter_与_ctrl_j() {
+    fn wsi_编码_shift_enter_与_ctrl_j() {
         assert_eq!(
             win32_input_bytes_inner(&key("enter", mods(false, true, false, false))).unwrap(),
             b"\x1b[13;28;13;1;16;1_".to_vec()
@@ -479,6 +515,76 @@ mod tests {
             win32_input_bytes_inner(&key("j", Modifiers::control())).unwrap(),
             b"\x1b[74;36;10;1;8;1_".to_vec()
         );
+    }
+
+    /// 传统字节同为裸 ESC 的键都发 Esc 记录,否则 conhost 会把它挂到下一键。
+    #[test]
+    fn wsi_裸_esc_一律发记录() {
+        for (label, name, m) in [
+            ("Esc", "escape", Modifiers::default()),
+            ("Shift+Esc", "escape", mods(false, true, false, false)),
+            ("Alt+Esc", "escape", Modifiers::alt()),
+            ("Ctrl+[", "[", Modifiers::control()),
+            ("Ctrl+Alt+[", "[", mods(true, false, true, false)),
+        ] {
+            assert_eq!(
+                win32_input_bytes_inner(&key(name, m)).unwrap(),
+                b"\x1b[27;1;27;1;0;1_".to_vec(),
+                "{label}"
+            );
+        }
+    }
+
+    /// conhost 处理不好的 Alt 前缀(名单见 `held_prefix_record`)。键名与 key_char 按
+    /// gpui 的给法写:字母键 key 是小写、key_char 才是大写;符号键的 Shift 已折进 key。
+    #[test]
+    fn wsi_alt_前缀发带真实_vk_的记录() {
+        let alt_shift_letter = |name: &str, ch: &str| Keystroke {
+            modifiers: mods(false, true, true, false),
+            key: name.into(),
+            key_char: Some(ch.into()),
+        };
+        for (label, keystroke, record) in [
+            ("Alt+[", key("[", Modifiers::alt()), "\x1b[219;26;91;1;2;1_"),
+            ("Alt+]", key("]", Modifiers::alt()), "\x1b[221;27;93;1;2;1_"),
+            (
+                "Alt+\\",
+                key("\\", Modifiers::alt()),
+                "\x1b[220;43;92;1;2;1_",
+            ),
+            (
+                "Alt+Shift+O",
+                alt_shift_letter("o", "O"),
+                "\x1b[79;24;79;1;18;1_",
+            ),
+            (
+                "Alt+Shift+P",
+                alt_shift_letter("p", "P"),
+                "\x1b[80;25;80;1;18;1_",
+            ),
+            (
+                "Alt+Shift+X",
+                alt_shift_letter("x", "X"),
+                "\x1b[88;45;88;1;18;1_",
+            ),
+            ("Alt+^", key("^", Modifiers::alt()), "\x1b[54;7;94;1;18;1_"),
+            (
+                "Alt+_",
+                key("_", Modifiers::alt()),
+                "\x1b[189;12;95;1;18;1_",
+            ),
+            (
+                "Alt+Backspace",
+                key("backspace", Modifiers::alt()),
+                "\x1b[8;14;8;1;2;1_",
+            ),
+        ] {
+            assert_eq!(
+                win32_input_bytes_inner(&keystroke).unwrap(),
+                record.as_bytes(),
+                "{label}"
+            );
+        }
     }
 
     /// 其余键必须保持传统字节，尤其 Enter / Ctrl+C / 方向键 / Tab / Alt。
@@ -490,7 +596,12 @@ mod tests {
             ("tab", Modifiers::default()),
             ("c", Modifiers::control()),
             ("up", Modifiers::default()),
+            ("backspace", Modifiers::default()),
             ("b", Modifiers::alt()),
+            // 小写 `ESC o` / `ESC p` 是完整序列,大写才是前缀。
+            ("o", Modifiers::alt()),
+            ("p", Modifiers::alt()),
+            (".", Modifiers::alt()),
             ("p", mods(true, true, false, false)),
             ("c", mods(false, false, false, true)),
             ("unmapped-key", Modifiers::default()),
@@ -507,5 +618,6 @@ mod tests {
     fn wsi_非_windows_永不编码() {
         assert!(win32_input_bytes(&key("j", Modifiers::control())).is_none());
         assert!(win32_input_bytes(&key("enter", mods(false, true, false, false))).is_none());
+        assert!(win32_input_bytes(&key("escape", Modifiers::default())).is_none());
     }
 }
