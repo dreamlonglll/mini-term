@@ -348,6 +348,7 @@ const USED_KEYS: &[&str] = &[
     "fileTree.upload.chooseFolderTitle",
     "fileViewer.back",
     "fileViewer.binaryNotSupported",
+    "fileViewer.closeAll",
     "fileViewer.closeOthers",
     "fileViewer.closeTab",
     "fileViewer.closeToLeft",

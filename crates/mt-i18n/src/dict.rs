@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1547;
+pub const ZH_ENTRY_COUNT: usize = 1548;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1547;
+pub const EN_ENTRY_COUNT: usize = 1548;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -495,6 +495,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
 static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("back", "返回"),
     ("binaryNotSupported", "二进制文件，不支持预览"),
+    ("closeAll", "关闭所有"),
     ("closeOthers", "关闭其他"),
     ("closeTab", "关闭"),
     ("closeToLeft", "关闭左边"),
@@ -543,6 +544,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
 static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("back", "Back"),
     ("binaryNotSupported", "Binary file, preview not supported"),
+    ("closeAll", "Close All"),
     ("closeOthers", "Close Others"),
     ("closeTab", "Close"),
     ("closeToLeft", "Close to the Left"),

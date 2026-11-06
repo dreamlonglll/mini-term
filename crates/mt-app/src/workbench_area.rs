@@ -621,6 +621,8 @@ impl WorkbenchArea {
     /// 一次关掉一批页签。`fallback` 是右键的那一页（批量关闭时必然留下），
     /// 活动页被这一批带走时直接落到它上面 —— 逐个 `close` 的左右邻居收敛
     /// 在批量语境下会把活动页停在一个马上又要被关掉的页签上。
+    ///
+    /// 「关闭所有」没有锚点、传 `None`：页签全部关完，`close` 的收敛终点就是终端页。
     fn close_documents(
         &mut self,
         project_id: &str,
@@ -685,7 +687,7 @@ impl WorkbenchArea {
         documents_in_scope(&keys, anchor_index, scope)
     }
 
-    /// 批量关闭入口。脏页签只弹**一次**确认（列出文件名），取消则一个都不关。
+    /// 文档页签右键的三档批量关闭。
     fn request_close_scope(
         &mut self,
         project_id: String,
@@ -695,6 +697,39 @@ impl WorkbenchArea {
         cx: &mut Context<Self>,
     ) {
         let targets = self.scope_targets(&project_id, &anchor, scope);
+        self.request_close_batch(project_id, targets, Some(anchor), window, cx);
+    }
+
+    /// 终端页右键的「关闭所有」：关掉该项目全部文档页签。
+    fn request_close_all(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets = self
+            .projects
+            .get(&project_id)
+            .map(|project| {
+                project
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.request_close_batch(project_id, targets, None, window, cx);
+    }
+
+    /// 批量关闭入口。脏页签只弹**一次**确认（列出文件名），取消则一个都不关。
+    fn request_close_batch(
+        &mut self,
+        project_id: String,
+        targets: Vec<DocumentKey>,
+        fallback: Option<DocumentKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if targets.is_empty() {
             return;
         }
@@ -711,7 +746,7 @@ impl WorkbenchArea {
             })
             .unwrap_or_default();
         if dirty.is_empty() {
-            self.close_documents(&project_id, &targets, Some(&anchor), window, cx);
+            self.close_documents(&project_id, &targets, fallback.as_ref(), window, cx);
             return;
         }
 
@@ -725,11 +760,11 @@ impl WorkbenchArea {
             move |window, cx| {
                 let this = this.clone();
                 let project_id = project_id.clone();
-                let anchor = anchor.clone();
+                let fallback = fallback.clone();
                 let targets = targets.clone();
                 window.defer(cx, move |window, cx| {
                     this.update(cx, |area, cx| {
-                        area.close_documents(&project_id, &targets, Some(&anchor), window, cx)
+                        area.close_documents(&project_id, &targets, fallback.as_ref(), window, cx)
                     });
                 });
             },
@@ -738,10 +773,26 @@ impl WorkbenchArea {
         );
     }
 
+    /// 常驻终端页的右键菜单。终端页自己关不掉，这里只管清空文档页签；
+    /// 页签条只在有文档时才画，所以这一项不会没得可关。
+    fn terminal_tab_menu(&self, project_id: &str, cx: &Context<Self>) -> Vec<MenuEntry> {
+        let area = cx.entity();
+        let project_id = project_id.to_string();
+        vec![menu::item(
+            t("fileViewer", "closeAll"),
+            move |window, cx| {
+                let project_id = project_id.clone();
+                area.update(cx, |area, cx| {
+                    area.request_close_all(project_id, window, cx)
+                });
+            },
+        )]
+    }
+
     /// 文档页签的右键菜单。
     ///
-    /// 终端页**没有**这份菜单，也不出现在任何一档的关闭范围里 —— 它是常驻页，
-    /// 关不掉（[`CloseScope`]）。
+    /// 终端页有自己那份（[`Self::terminal_tab_menu`]），也不出现在这里任何一档的
+    /// 关闭范围里 —— 它是常驻页，关不掉（[`CloseScope`]）。
     fn document_tab_menu(
         &self,
         project_id: &str,
@@ -866,6 +917,7 @@ impl Render for WorkbenchArea {
         }
 
         let terminal_active = active == WorkbenchPage::Terminal;
+        let terminal_menu_project = project_id.clone();
         // 常驻终端页**钉在最左**,不进滚动区 —— 它是回终端的唯一入口,被文件页签
         // 挤出视野后要先横向滚回去才点得到。
         let terminal_tab = div()
@@ -895,7 +947,16 @@ impl Render for WorkbenchArea {
                     })
             })
             .child(t("terminalArea", "terminal"))
-            .on_click(cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)));
+            .on_click(cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)))
+            // 右键菜单:关闭所有文档页签
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let entries = this.terminal_tab_menu(&terminal_menu_project, cx);
+                    menu::show(event.position, entries, window, cx);
+                }),
+            );
 
         // 文档页签横向滚动区(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
         //
@@ -1013,7 +1074,7 @@ impl Render for WorkbenchArea {
                         this.activate_document(&click_project, &tab_key, window, cx)
                     }))
                     // 页签右键菜单:关闭 / 关闭其他 / 关闭右边 / 关闭左边。
-                    // 常驻的终端页没有这份菜单 —— 它关不掉
+                    // 常驻的终端页有自己那份(terminal_tab_menu) —— 它关不掉
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
