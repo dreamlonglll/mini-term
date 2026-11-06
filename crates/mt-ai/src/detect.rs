@@ -140,8 +140,7 @@ pub(crate) fn snapshot_submit_text(line: &str) -> Option<String> {
 /// `SessionTracker::track_input_with_line_snapshot`），Esc 同理，两者都不产生
 /// hook 事件。
 pub(crate) fn is_interrupt_key(data: &str) -> bool {
-    const WSI_ESCAPE: &str = "\x1b[27;1;27;1;0;1_";
-    data == "\x1b" || data == "\x03" || data == WSI_ESCAPE
+    data == "\x1b" || data == "\x03" || data == crate::tracker::WSI_ESCAPE
 }
 
 #[cfg(test)]

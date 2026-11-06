@@ -46,11 +46,10 @@ pub const FOCUS_COOLDOWN: Duration = Duration::from_millis(800);
 pub(crate) const FOCUS_IN_SEQ: &str = "\x1b[I";
 pub(crate) const FOCUS_OUT_SEQ: &str = "\x1b[O";
 
-/// win32-input-mode 的 Shift+Enter / Ctrl+J 记录,与 mt-ui 的 `win32_input_bytes` 逐字一致。
+/// win32-input-mode 的 Shift+Enter / Ctrl+J / Esc 记录,与 mt-ui 的 `win32_input_bytes` 逐字一致。
 const WSI_SHIFT_ENTER: &str = "\x1b[13;28;13;1;16;1_";
 const WSI_CTRL_J: &str = "\x1b[74;36;10;1;8;1_";
-/// Esc 记录去掉 `ESC[` 与 `_` 之后的部分（`InputState::apply_csi` 收到的形态）。
-const WSI_ESCAPE_BODY: &str = "27;1;27;1;0;1_";
+pub(crate) const WSI_ESCAPE: &str = "\x1b[27;1;27;1;0;1_";
 
 /// Shift+Enter 是换行的 agent:Codex(crossterm 直读按键记录)与 OMP(自己解码 WSI)
 /// 看得到 Shift。其余 agent 开着 VT 输入,conhost 把这条记录翻成 `\r`,实测
@@ -154,17 +153,6 @@ impl InputState {
         line
     }
 
-    /// WSI 的 Esc 记录。legacy `0x1b` 与 WSI 混用时会被 conhost 挂起，mini-term
-    /// 改为发送完整记录；这里按 Esc 语义清空当前行。
-    fn apply_wsi_escape(&mut self, sequence: &str) -> bool {
-        if sequence == WSI_ESCAPE_BODY {
-            self.clear_line();
-            true
-        } else {
-            false
-        }
-    }
-
     /// win32-input-mode 的换行记录:能走到这里的都已判定为真换行
     /// (见 [`SessionTracker::resolve_wsi_record`]),不能落进通用 CSI 的 `clear_line`。
     fn apply_wsi_newline(&mut self, sequence: &str) -> bool {
@@ -178,9 +166,6 @@ impl InputState {
     }
 
     fn apply_csi(&mut self, sequence: &str) {
-        if self.apply_wsi_escape(sequence) {
-            return;
-        }
         if self.apply_wsi_newline(sequence) {
             return;
         }
@@ -448,14 +433,16 @@ impl SessionTracker {
         }
     }
 
-    /// WSI 记录在前台程序那里到底是提交还是换行。换行就原样放行给 `apply_csi`,
+    /// WSI 记录在前台程序那里实际是什么。Esc 记录就是 Esc,换算成裸字节走同一条路,
+    /// 清行与摘回合闩都不能少。另两条分提交还是换行:换行就原样放行给 `apply_csi`,
     /// 提交就换算成传统字节,后面走回车那条路。
     ///
-    /// 不在 AI 会话时两条都算回车:cmd / bash 实际会执行。PowerShell 这两个键是续行,
+    /// 不在 AI 会话时那两条都算回车:cmd / bash 实际会执行。PowerShell 这两个键是续行,
     /// 这里分不出来,所以 `claude` 后接续行会被误认成启动;无 hook 时才有这个误判。
     fn resolve_wsi_record<'a>(&self, pane_id: u32, data: &'a str) -> &'a str {
         let sessions = self.ai_sessions.lock();
         match (data, sessions.get(&pane_id).map(String::as_str)) {
+            (WSI_ESCAPE, _) => "\x1b",
             (WSI_SHIFT_ENTER, Some(agent)) if SHIFT_ENTER_NEWLINE_AGENTS.contains(&agent) => data,
             (WSI_SHIFT_ENTER, _) => "\r",
             (WSI_CTRL_J, None) => "\n",
@@ -1225,6 +1212,20 @@ mod tests {
         assert_eq!(submits[0].line, "keep");
     }
 
+    /// Alt+[ 换成记录后是完整序列:不能像传统的 `ESC [` 那样把状态机留在序列中间,
+    /// 吞掉下一个字符。
+    #[test]
+    fn wsi_prefix_record_does_not_swallow_next_key() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "\x1b[219;26;91;1;2;1_");
+        mgr.track_input(1, "keep\r");
+
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "keep");
+    }
+
     #[test]
     fn track_input_no_submit_outside_ai_session() {
         let mgr = SessionTracker::new();
@@ -1557,10 +1558,10 @@ mod tests {
         assert!(!mgr.take_turn(1));
     }
 
-    /// 打断(裸 Esc / 单次 Ctrl+C)与退出都摘闩 —— 被打断的回合不算做完。
+    /// 打断(Esc 的裸字节与 WSI 记录 / 单次 Ctrl+C)与退出都摘闩 —— 被打断的回合不算做完。
     #[test]
     fn 打断与退出摘掉回合闩() {
-        for interrupt in ["\x1b", "\x03", "\x04", "/exit\r"] {
+        for interrupt in ["\x1b", WSI_ESCAPE, "\x03", "\x04", "/exit\r"] {
             let mgr = SessionTracker::new();
             mgr.track_input(1, "claude\r");
             mgr.track_input(1, "fix the bug\r");
