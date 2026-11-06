@@ -29,6 +29,10 @@
 //! 回收 PTY / 撤出 AI 轮询 / 布局落盘全在 `AppStore::close_*` 里,一步不少。
 //! 上面的盘点口径([`is_ai_alive`])不受偏好影响,它还有别的消费方。
 //!
+//! 例外是 **AI 手上有事**([`is_ai_busy`]:正在工作或亮黄灯等你处理):这时关闭会打断
+//! 它手上的事,偏好关着也要问一次,判据见 [`close_needs_prompt`]。这个框不出「不再询问」
+//! —— 它本来就关不掉。
+//!
 //! 关整组 / 关面板在入口处问一次、之后一次关完,不存在「问了一半」:
 //! `AppStore::close_*` 这一层本来就不弹框。
 //!
@@ -45,11 +49,20 @@ use crate::menu;
 use crate::prompt::Confirm;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::{AppStore, resolve_fork_cwd};
-use crate::tree::{PaneState, PaneStatus, SplitDirection, SplitNode};
+use crate::tree::{PaneState, PaneStatus, SplitDirection, SplitNode, StatusLight};
 
 /// 这个状态算「AI 会话还活着」吗。
 pub fn is_ai_alive(status: PaneStatus) -> bool {
     matches!(status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+}
+
+/// 这个 pane 的 AI 手上有事吗:正在工作,或亮黄灯等你处理(授权 / 表单 / 回合因 API
+/// 错误结束)。跟状态灯走:Claude 等授权是 ai-idle + attention,只看 `PaneStatus` 会漏。
+fn is_ai_busy(pane: &PaneState) -> bool {
+    matches!(
+        pane.light(),
+        StatusLight::AiWorking | StatusLight::Attention
+    )
 }
 
 // === 新建终端菜单 ===
@@ -218,11 +231,16 @@ fn leaf_panes(store: &AppStore, project_id: &str, leaf_id: &str) -> Vec<PaneStat
         .unwrap_or_default()
 }
 
-/// 关闭前要不要弹确认框。只看偏好,**不看 pane 状态**:用户选了不再询问,
-/// AI 对话也不问(issue #90 要的正是这一档);反过来如果只放过没跑 AI 的终端,
-/// 那就成了关 shell 还要点确定、关 AI 却不用,比现状更说不通。
+/// 用户的确认偏好开没开。连点 / 连发闸只看它:偏好开着时第二下落在遮罩上或被快捷键
+/// 让路挡住,偏好关着才需要闸。要不要弹框看 [`close_needs_prompt`]。
 pub fn should_confirm_close(config: &AppConfig) -> bool {
     config.confirm_terminal_close
+}
+
+/// 这次关闭要不要弹确认框。偏好开着总是问;选了不再询问后(issue #90)普通终端与
+/// 闲着的 AI(ai-idle 且没亮黄灯)都直接关,只有 AI 手上有事([`is_ai_busy`])时还要问一次。
+fn close_needs_prompt(config: &AppConfig, ai_busy: bool) -> bool {
+    should_confirm_close(config) || ai_busy
 }
 
 /// 两次关闭快捷键的间隔短于它,后一次当成按住不放的连发。取值要盖过系统的首次连发
@@ -269,6 +287,8 @@ struct ClosePrompt {
     message: String,
     /// 正文下面的灰色补充行(关整组时列出会被杀的 AI 终端)。
     detail: Vec<String>,
+    /// 要关的终端里有 AI 手上有事,见 [`close_needs_prompt`]。
+    ai_busy: bool,
 }
 
 /// 关一个 tab 的文案:带 pane 名,有活着的 AI 时换成「关闭 AI 对话」那一档。
@@ -289,6 +309,7 @@ fn pane_close_prompt(pane: &PaneState) -> ClosePrompt {
         title,
         message,
         detail: Vec::new(),
+        ai_busy: is_ai_busy(pane),
     }
 }
 
@@ -316,10 +337,11 @@ fn group_close_prompt(panes: &[PaneState]) -> Option<ClosePrompt> {
         title,
         message,
         detail,
+        ai_busy: panes.iter().any(is_ai_busy),
     })
 }
 
-/// 关终端的**唯一闸**:按偏好弹确认框或直接关,两条路跑同一个 `do_close`。
+/// 关终端的**唯一闸**:按 [`close_needs_prompt`] 弹确认框或直接关,两条路跑同一个 `do_close`。
 ///
 /// 不弹框时也要 `window.defer`:调用方多半是 `cx.listener` 里(tab 的 ×、控制条、
 /// Ctrl+Shift+W),`TerminalArea` / `Workspace` 正被 update 着。确认框那条路的
@@ -332,16 +354,17 @@ fn close_after_prompt(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if !should_confirm_close(store.read(cx).config()) {
+    if !close_needs_prompt(store.read(cx).config(), prompt.ai_busy) {
         window.defer(cx, move |_window, cx| {
             store.update(cx, |store, cx| do_close(store, cx));
         });
         return;
     }
-    let store_for_opt_out = store.clone();
-    Confirm::new(prompt.title, prompt.message)
-        .detail(prompt.detail)
-        .dont_ask_again(
+    let mut confirm = Confirm::new(prompt.title, prompt.message).detail(prompt.detail);
+    // AI 手上有事时偏好关着也会弹这个框,勾「不再询问」并不能让它不再出现
+    if !prompt.ai_busy {
+        let store_for_opt_out = store.clone();
+        confirm = confirm.dont_ask_again(
             t("paneGroup", "closeDontAskAgain"),
             t("paneGroup", "closeDontAskHint"),
             move |cx| {
@@ -349,17 +372,19 @@ fn close_after_prompt(
                     store.patch_config(|c| c.confirm_terminal_close = false, cx);
                 });
             },
-        )
-        .open(
-            move |_window, cx| {
-                store.update(cx, |store, cx| do_close(store, cx));
-            },
-            window,
-            cx,
         );
+    }
+    confirm.open(
+        move |_window, cx| {
+            store.update(cx, |store, cx| do_close(store, cx));
+        },
+        window,
+        cx,
+    );
 }
 
-/// 关闭一个终端 tab。偏好开着时**总是**先确认(与原版一致:没有 AI 也要问一句)。
+/// 关闭一个终端 tab。偏好开着时**总是**先确认(与原版一致:没有 AI 也要问一句);
+/// 偏好关着时只有 AI 手上有事才问。
 pub fn close_pane(
     store: Entity<AppStore>,
     project_id: String,
@@ -590,12 +615,72 @@ mod tests {
         }
     }
 
-    /// 没选过的人照旧确认;选了不再询问就不问。判据不看 pane 状态,
-    /// AI 与非 AI 的终端不会出现「一半确认一半不确认」。
+    /// 没选过的人照旧确认;选了不再询问后只有 AI 手上有事还要问。
     #[test]
-    fn 确认与否只看偏好() {
-        assert!(should_confirm_close(&AppConfig::default()));
-        assert!(!should_confirm_close(&opted_out_config()));
+    fn 不再询问后只有_ai_手上有事还要确认() {
+        let confirming = AppConfig::default();
+        assert!(close_needs_prompt(&confirming, false));
+        assert!(close_needs_prompt(&confirming, true));
+
+        let opted_out = opted_out_config();
+        assert!(!close_needs_prompt(&opted_out, false));
+        assert!(close_needs_prompt(&opted_out, true));
+    }
+
+    fn attention_pane(label: &str, status: PaneStatus) -> PaneState {
+        let mut p = pane(label, status);
+        p.attention = true;
+        p
+    }
+
+    /// 正在工作或亮黄灯才算手上有事:Codex 等授权是 ai-working + attention,
+    /// Claude 等授权是 ai-idle + attention。闲着的 ai-idle 偏好关着时照样直接关;
+    /// 死掉的终端残留 attention 也不算,它不亮黄灯。
+    #[test]
+    fn 单个_tab_正在工作或亮黄灯才算手上有事() {
+        for (status, attention, expect) in [
+            (PaneStatus::AiWorking, false, true),
+            (PaneStatus::AiWorking, true, true),
+            (PaneStatus::AiIdle, true, true),
+            (PaneStatus::AiIdle, false, false),
+            (PaneStatus::Idle, false, false),
+            (PaneStatus::Idle, true, false),
+            (PaneStatus::Error, false, false),
+            (PaneStatus::Error, true, false),
+        ] {
+            let mut p = pane("pi", status);
+            p.attention = attention;
+            assert_eq!(
+                pane_close_prompt(&p).ai_busy,
+                expect,
+                "{status:?} attention={attention}"
+            );
+        }
+    }
+
+    /// 关整组 / 关面板:组里只要有一个 AI 手上有事就算,否则它会被一并杀掉而没人问。
+    #[test]
+    fn 整组里有一个_ai_手上有事就算() {
+        let working = group_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            pane("pi", PaneStatus::AiWorking),
+        ])
+        .unwrap();
+        assert!(working.ai_busy);
+
+        let waiting = group_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            attention_pane("claude", PaneStatus::AiIdle),
+        ])
+        .unwrap();
+        assert!(waiting.ai_busy);
+
+        let idle = group_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            pane("codex", PaneStatus::AiIdle),
+        ])
+        .unwrap();
+        assert!(!idle.ai_busy);
     }
 
     /// 单个 tab 的文案分档跟着 AI 判据走,偏好没有掺和进去。

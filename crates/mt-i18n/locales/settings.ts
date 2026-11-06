@@ -32,7 +32,7 @@ export const settings = {
       tabTitleFollowsShellTitle: "页签标题跟随 shell",
       tabTitleFollowsShellDesc: "在页签名后面追加 shell 自己设置的窗口标题（oh-my-posh 之类会把当前目录写进去），用来区分同一种 shell 的多个页签。已手动改过名的页签不受影响；shell 报的是自身默认标题时也不显示",
       confirmCloseTitle: "关闭终端前确认",
-      confirmCloseDesc: "关闭终端、整个区域或面板前先弹窗确认。关掉后直接关闭，其中正在运行的 AI 对话会被一并终止。关闭窗口与移除项目的确认不受影响",
+      confirmCloseDesc: "关闭终端、整个区域或面板前先弹窗确认。关掉后直接关闭，闲置的 AI 对话会被一并终止，但 AI 正在工作或等你处理时仍会确认。关闭窗口与移除项目的确认不受影响",
     },
     clipboard: {
       copyPaste: "复制粘贴",
@@ -342,7 +342,7 @@ export const settings = {
       tabTitleFollowsShellTitle: "Tab title follows the shell",
       tabTitleFollowsShellDesc: "Append the window title the shell sets for itself (oh-my-posh and friends put the current directory there) after the tab name, so several tabs of the same shell can be told apart. Tabs you renamed by hand are left alone, and a shell reporting only its own default title shows nothing",
       confirmCloseTitle: "Confirm before closing terminals",
-      confirmCloseDesc: "Ask before closing a terminal, a whole pane or a panel. When off they close right away, terminating any AI session running in them. The confirmations for closing the window and removing a project are not affected",
+      confirmCloseDesc: "Ask before closing a terminal, a whole pane or a panel. When off they close right away, terminating any idle AI session in them, but you are still asked while an AI is working or waiting for you. The confirmations for closing the window and removing a project are not affected",
     },
     clipboard: {
       copyPaste: "Copy & paste",
