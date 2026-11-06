@@ -132,15 +132,16 @@ pub(crate) fn snapshot_submit_text(line: &str) -> Option<String> {
 
 /// 这一次写入是否为「打断当前 AI 任务」的按键。
 ///
-/// 只认单独一个字节的裸 Esc / Ctrl+C：终端把方向键、功能键等 CSI 序列
-/// （`\x1b[A` …）一次性交给输入回调，粘贴同理，长度一律大于 1，因此等值比较
-/// 足以把它们排除掉，不需要解析转义状态机。
+/// 只认裸 Esc / Ctrl+C，以及 mini-term 的 WSI Esc 记录：终端把方向键、功能键等
+/// CSI 序列（`\x1b[A` …）一次性交给输入回调，粘贴同理，长度一律大于 1，因此
+/// 等值比较足以把它们排除掉，不需要解析转义状态机。
 ///
 /// 单次 Ctrl+C 在 AI 里是「取消当前任务」（连按两次才退出，见
 /// `SessionTracker::track_input_with_line_snapshot`），Esc 同理，两者都不产生
 /// hook 事件。
 pub(crate) fn is_interrupt_key(data: &str) -> bool {
-    data == "\x1b" || data == "\x03"
+    const WSI_ESCAPE: &str = "\x1b[27;1;27;1;0;1_";
+    data == "\x1b" || data == "\x03" || data == WSI_ESCAPE
 }
 
 #[cfg(test)]
@@ -196,13 +197,14 @@ mod tests {
         assert_eq!(interactive_ai_command_name("pi -p hi"), None);
     }
 
-    /// 打断键识别:只认单独一个字节的裸 Esc / Ctrl+C。方向键等 CSI 序列由
-    /// 终端一次性发来(`\x1b[A`),不能因为首字节是 Esc 就当成打断——否则
+    /// 打断键识别:裸 Esc / Ctrl+C,以及 mini-term 的 WSI Esc 记录。方向键等 CSI
+    /// 序列由终端一次性发来(`\x1b[A`),不能因为首字节是 Esc 就当成打断——否则
     /// 用户翻个历史记录就把「工作中」徽章打灭了。
     #[test]
-    fn interrupt_key_only_matches_bare_esc_and_ctrl_c() {
+    fn interrupt_key_matches_bare_esc_ctrl_c_and_wsi_esc() {
         assert!(is_interrupt_key("\x1b"));
         assert!(is_interrupt_key("\x03"));
+        assert!(is_interrupt_key("\x1b[27;1;27;1;0;1_"));
 
         for data in [
             "\x1b[A",    // ↑

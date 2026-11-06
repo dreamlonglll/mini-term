@@ -49,6 +49,8 @@ pub(crate) const FOCUS_OUT_SEQ: &str = "\x1b[O";
 /// win32-input-mode 的 Shift+Enter / Ctrl+J 记录,与 mt-ui 的 `win32_input_bytes` 逐字一致。
 const WSI_SHIFT_ENTER: &str = "\x1b[13;28;13;1;16;1_";
 const WSI_CTRL_J: &str = "\x1b[74;36;10;1;8;1_";
+/// Esc 记录去掉 `ESC[` 与 `_` 之后的部分（`InputState::apply_csi` 收到的形态）。
+const WSI_ESCAPE_BODY: &str = "27;1;27;1;0;1_";
 
 /// Shift+Enter 是换行的 agent:Codex(crossterm 直读按键记录)与 OMP(自己解码 WSI)
 /// 看得到 Shift。其余 agent 开着 VT 输入,conhost 把这条记录翻成 `\r`,实测
@@ -152,6 +154,17 @@ impl InputState {
         line
     }
 
+    /// WSI 的 Esc 记录。legacy `0x1b` 与 WSI 混用时会被 conhost 挂起，mini-term
+    /// 改为发送完整记录；这里按 Esc 语义清空当前行。
+    fn apply_wsi_escape(&mut self, sequence: &str) -> bool {
+        if sequence == WSI_ESCAPE_BODY {
+            self.clear_line();
+            true
+        } else {
+            false
+        }
+    }
+
     /// win32-input-mode 的换行记录:能走到这里的都已判定为真换行
     /// (见 [`SessionTracker::resolve_wsi_record`]),不能落进通用 CSI 的 `clear_line`。
     fn apply_wsi_newline(&mut self, sequence: &str) -> bool {
@@ -165,6 +178,9 @@ impl InputState {
     }
 
     fn apply_csi(&mut self, sequence: &str) {
+        if self.apply_wsi_escape(sequence) {
+            return;
+        }
         if self.apply_wsi_newline(sequence) {
             return;
         }
@@ -1193,6 +1209,20 @@ mod tests {
         // Ctrl+J 的传统字节是 `\n`,本来就不抓
         assert!(!wants_line_snapshot(WSI_CTRL_J.as_bytes()));
         assert!(!wants_line_snapshot(b"a"));
+    }
+
+    /// WSI Esc 要按 Esc 语义清空当前行，不能当成普通 CSI 忽略。
+    #[test]
+    fn wsi_escape_record_clears_line() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "discard me");
+        mgr.track_input(1, "\x1b[27;1;27;1;0;1_");
+        mgr.track_input(1, "keep\r");
+
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "keep");
     }
 
     #[test]

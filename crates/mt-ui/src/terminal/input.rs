@@ -6,9 +6,9 @@
 //! 老老实实按 legacy 编码工作。
 //!
 //! Windows 还有一条:ConPTY 请求 `CSI ? 9001h`(win32-input-mode)之后,只有
-//! `Shift+Enter` 与 `Ctrl+J` 改由 [`win32_input_bytes`] 编码成
-//! `CSI Vk;Sc;Uc;Kd;Cs;Rc _`。其余按键继续走 legacy 字节,`Enter` / `Esc` /
-//! `Ctrl+C` / 方向键等行为不变。文本输入仍走平台通道。
+//! `Esc`/`Ctrl+[`/`Shift+Enter`/`Ctrl+J` 改由 [`win32_input_bytes`] 编码成
+//! `CSI Vk;Sc;Uc;Kd;Cs;Rc _`。其余按键继续走 legacy 字节,`Enter` / `Ctrl+C` /
+//! 方向键等行为不变。文本输入仍走平台通道。
 //!
 //! 放在 `mt-ui` 而不是 `mt-terminal`,是因为入参是 gpui 的 [`Keystroke`],
 //! 而 `mt-terminal` 明确不依赖 gpui。
@@ -217,9 +217,12 @@ fn control_code(key: &str) -> Option<Vec<u8>> {
 
 /// win32-input-mode 的按键记录:`CSI Vk;Sc;Uc;Kd;Cs;Rc _`。
 ///
-/// **只用于传统编码表达不了的两个键**:`Shift+Enter` 与 `Ctrl+J`。其余键继续
-/// 走原有字节,`Enter` / `Esc` / `Ctrl+C` / 方向键 / `ReadConsoleInput` 消费者
-/// 的行为都不变。
+/// **只用于传统编码表达不了的键**:`Esc` / `Ctrl+[` / `Shift+Enter` / `Ctrl+J`。
+/// 其余键继续走原有字节,`Enter` / `Ctrl+C` / 方向键 / `ReadConsoleInput`
+/// 消费者的行为都不变。
+///
+/// `Esc` 单独列出:legacy `0x1b` 是未完成的 VT 前缀,与 WSI 记录混用时会被
+/// conhost 挂起等待后续字节,单独按 Esc 反而失效。
 ///
 /// `Ctrl+J` 的 `Uc` 取 `0x0A`(LF):Node raw mode / `_getwch` / .NET 这类直接读
 /// 控制台记录的程序依赖非零 `Uc`。OMP 的 WSI 解码器需要上游放宽
@@ -238,6 +241,11 @@ fn win32_input_bytes_inner(keystroke: &Keystroke) -> Option<Vec<u8>> {
         return None;
     }
     match (keystroke.key.as_str(), m.shift, m.control, m.alt) {
+        // Esc / Ctrl+[：legacy 0x1b 是未完成的 VT 前缀，和 WSI 记录混用时会被
+        // conhost/解码器挂起等待后续字节，单独按 Esc 反而失效；发完整 WSI 记录。
+        ("escape", false, false, false) | ("[", false, true, false) => {
+            Some(b"\x1b[27;1;27;1;0;1_".to_vec())
+        }
         // Shift+Enter：VK_RETURN / Sc 0x1C / Uc CR / Shift。
         ("enter", true, false, false) => Some(b"\x1b[13;28;13;1;16;1_".to_vec()),
         // Ctrl+J：VK_J / Sc 0x24 / Uc LF / Ctrl。Uc 不能填 0，否则 Node raw 等
@@ -468,9 +476,19 @@ mod tests {
         }
     }
 
-    /// 只编码两个传统编码表达不了的键。
+    /// 只编码需要区分的键：Esc / Ctrl+[ / Shift+Enter / Ctrl+J。
     #[test]
-    fn wsi_只编码_shift_enter_与_ctrl_j() {
+    fn wsi_只编码需要区分的键() {
+        for (name, m) in [
+            ("escape", Modifiers::default()),
+            ("[", Modifiers::control()),
+        ] {
+            assert_eq!(
+                win32_input_bytes_inner(&key(name, m)).unwrap(),
+                b"\x1b[27;1;27;1;0;1_".to_vec(),
+                "{name}"
+            );
+        }
         assert_eq!(
             win32_input_bytes_inner(&key("enter", mods(false, true, false, false))).unwrap(),
             b"\x1b[13;28;13;1;16;1_".to_vec()
