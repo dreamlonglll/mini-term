@@ -2,6 +2,7 @@
  * 移动端 → 中转的 WebSocket 连接管理。
  *
  * - 扫码首连:URL hash 携带一次性配对码(#pair=CODE),兑换长期凭证存 localStorage
+ * - 配对码兑换不了(过期 / 已兑换过 / 书签里存的是配对链接)而本地有凭证:退回凭证重连
  * - 重开/断线:凭凭证自动重连(指数退避,封顶 30s;页面回前台立即重试)
  * - 被吊销(新设备顶替/桌面端重置):清除凭证,提示重新扫码,不再重连
  * - 通知深链:桌面端远程通知附的 `#pane=ID`,连上后在快照里找到该 pane 就直接进它的
@@ -202,7 +203,11 @@ function backoffMs(attempt: number): number {
   return Math.min(1000 * 2 ** Math.max(0, attempt - 1), 30_000);
 }
 
-function connect(auth: { pairingCode?: string; credential?: string }) {
+/**
+ * `staleCode`:这次是配对码被拒后退回凭证的重连(见 `helloReject` 分支),
+ * 凭证也不认时按「配对码无效」提示——用户要的是新二维码,不是「凭证已失效」。
+ */
+function connect(auth: { pairingCode?: string; credential?: string; staleCode?: boolean }) {
   stopped = false;
   snapshotReady = false;
   if (auth.pairingCode) {
@@ -245,11 +250,25 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
         }
         break;
       }
-      case 'helloReject':
+      case 'helloReject': {
         stopped = true;
         if (msg.reason === 'invalidCredential') clearCredential();
-        setPhase('rejected', msg.reason);
+        // 配对码兑换不了(书签里存的是带 #pair= 的配对链接、码过期或已兑换过),本地还留着
+        // 上次配对的凭证:退回凭证重连,别把用户拦在「配对码无效」页上。一个中转只对一台
+        // 桌面端,这把凭证连的就是同一台。凭证重连只会回 invalidCredential,不会再进这里
+        if (msg.reason === 'invalidPairingCode') {
+          const cred = getCredential();
+          if (cred) {
+            connect({ credential: cred, staleCode: true });
+            break;
+          }
+        }
+        setPhase(
+          'rejected',
+          auth.staleCode && msg.reason === 'invalidCredential' ? 'invalidPairingCode' : msg.reason,
+        );
         break;
+      }
       case 'revoked':
         stopped = true;
         clearCredential();
