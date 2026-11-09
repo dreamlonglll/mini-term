@@ -44,9 +44,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ParentElement, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, Focusable as _,
+    FontWeight, HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ParentElement, Pixels, Point, Render, ScrollStrategy, SharedString, Size,
     StatefulInteractiveElement, Styled, StyledText, Subscription, Window, actions, div, point,
     prelude::FluentBuilder as _, px, size,
 };
@@ -985,6 +985,18 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
                     close_guarded(kind::GIT_BRANCHES, window, cx);
                     let name = name.clone();
                     panel.update(cx, |p, cx| p.set_view_branch(Some(name), cx));
+                })
+                .into(),
+        );
+    }
+    {
+        // 只读动作,写操作在跑时照样可用。复制完整名(远程行带 `origin/` 前缀,与菜单标题一致)
+        let name = row.name.clone();
+        entries.push(
+            MenuItem::new(t("gitBranch", "menuCopyName"))
+                .on_click(move |window, cx| {
+                    close_guarded(kind::GIT_BRANCHES, window, cx);
+                    cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
                 })
                 .into(),
         );

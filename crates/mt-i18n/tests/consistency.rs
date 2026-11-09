@@ -195,8 +195,9 @@ use mt_i18n::{
 /// 与搜索弹窗的范围徽标（`search.{scopeLabel,scopeClear,scopeMissing,scopeOutside}`）。
 /// 1545 → 1547（issue #94）：「移动端」面板复制配对链接（`mobileRelay.modal.{copyLink,linkCopied}`）。
 /// 1547 → 1548：工作区「终端」页签右键「关闭所有」（`fileViewer.closeAll`）。
+/// 1548 → 1549：分支弹窗行右键「复制分支名」（`gitBranch.menuCopyName`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1548;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1549;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

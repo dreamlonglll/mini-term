@@ -445,6 +445,7 @@ const USED_KEYS: &[&str] = &[
     "gitBranch.kindRevert",
     "gitBranch.loading",
     "gitBranch.menuCheckout",
+    "gitBranch.menuCopyName",
     "gitBranch.menuDelete",
     "gitBranch.menuDeleteRemote",
     "gitBranch.menuMerge",

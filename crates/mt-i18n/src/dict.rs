@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1548;
+pub const ZH_ENTRY_COUNT: usize = 1549;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1548;
+pub const EN_ENTRY_COUNT: usize = 1549;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -657,6 +657,7 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("kindRevert", "还原"),
     ("loading", "加载中…"),
     ("menuCheckout", "检出"),
+    ("menuCopyName", "复制分支名"),
     ("menuDelete", "删除"),
     ("menuDeleteRemote", "删除远程分支…"),
     ("menuMerge", "合并到当前分支（{current}）"),
@@ -826,6 +827,7 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("kindRevert", "revert"),
     ("loading", "Loading…"),
     ("menuCheckout", "Checkout"),
+    ("menuCopyName", "Copy branch name"),
     ("menuDelete", "Delete"),
     ("menuDeleteRemote", "Delete remote branch…"),
     ("menuMerge", "Merge into current branch ({current})"),
