@@ -85,7 +85,7 @@ impl FilePage {
         cx: &mut App,
     ) -> Self {
         let font_size = store.read(cx).config().terminal_font_size as f32;
-        let state = cx.new(|cx| DiffState::new(font_size, cx));
+        let state = cx.new(|_| DiffState::new(font_size));
         let ctl = cx.new(|_| FileDiff {
             repo_path,
             files,
@@ -280,7 +280,7 @@ impl FilesPage {
     ) -> Self {
         let font_size = store.read(cx).config().terminal_font_size as f32;
         let tree = store.read(cx).git_commit_files_tree();
-        let state = cx.new(|cx| DiffState::new(font_size, cx));
+        let state = cx.new(|_| DiffState::new(font_size));
         let initial_ix = initial
             .as_deref()
             .and_then(|p| files.iter().position(|f| f.path == p));
@@ -556,7 +556,7 @@ impl TextPage {
         cx: &mut App,
     ) -> Self {
         let font_size = store.read(cx).config().terminal_font_size as f32;
-        let state = cx.new(|cx| DiffState::new(font_size, cx));
+        let state = cx.new(|_| DiffState::new(font_size));
         state.update(cx, |s, _| {
             s.apply(Ok(mt_project::git::diff_two_texts(disk, mine)));
         });
