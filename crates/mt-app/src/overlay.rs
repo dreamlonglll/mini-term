@@ -147,6 +147,9 @@ pub mod kind {
     pub const GIT_STASH_DANGER: &str = "git-stash-danger";
     /// 检出被本地改动挡住时的「贮藏后检出」确认框。
     pub const GIT_STASH_CHECKOUT: &str = "git-stash-checkout";
+    /// 冲突文件「逐段解决」弹窗(更改列表冲突行的右键菜单 / 行内按钮)。种类唯一:
+    /// 同一时刻只解决一个文件,连点两次不叠开。
+    pub const GIT_CONFLICT_SEGMENTS: &str = "git-conflict-segments";
 }
 
 /// 栈里的一条。

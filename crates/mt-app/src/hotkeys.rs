@@ -32,8 +32,8 @@ use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane,
     SelectPane, SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary,
-    ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_diff,
-    git_file_history, git_history, git_stash, project_switcher, quick_open,
+    ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_conflict,
+    git_diff, git_file_history, git_history, git_stash, project_switcher, quick_open,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -592,6 +592,18 @@ pub fn bind_keys(cx: &mut App) {
         "alt-left",
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
+    // 冲突文件「逐段解决」弹窗:F7 / Shift+F7 跳下一段 / 上一段(与上面跳改动同一对键)。
+    // 谓词同样是弹窗自己的 context;两侧原文框是只读的 Textarea,不绑 F7,按键照常冒上来
+    bindings.push(KeyBinding::new(
+        "f7",
+        git_conflict::GitConflictNextSegment,
+        Some(git_conflict::SEGMENTS_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "shift-f7",
+        git_conflict::GitConflictPrevSegment,
+        Some(git_conflict::SEGMENTS_CONTEXT),
     ));
     // 提交 diff 弹窗:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换提交同一
     // 手感)。谓词是弹窗焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
