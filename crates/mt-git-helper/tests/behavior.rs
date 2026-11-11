@@ -325,8 +325,10 @@ fn discovery_preserves_multiple_repositories_and_ancestor_context() {
         panic!("expected repos")
     };
     assert_eq!(repos.len(), 2);
-    assert!(repos.iter().any(|repo| repo.path == first));
-    assert!(repos.iter().any(|repo| repo.path == second));
+    let first_canonical = first.canonicalize().unwrap();
+    let second_canonical = second.canonicalize().unwrap();
+    assert!(repos.iter().any(|repo| repo.path == first_canonical));
+    assert!(repos.iter().any(|repo| repo.path == second_canonical));
     let child = first.join("child/deep");
     std::fs::create_dir_all(&child).unwrap();
     let replies = operations(
@@ -340,7 +342,7 @@ fn discovery_preserves_multiple_repositories_and_ancestor_context() {
         panic!("expected repos")
     };
     assert_eq!(repos.len(), 1);
-    assert_eq!(repos[0].path, first);
+    assert_eq!(repos[0].path, first_canonical);
 }
 
 #[test]
