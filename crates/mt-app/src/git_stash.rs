@@ -1213,7 +1213,11 @@ fn render_row(state: &Entity<StashDialog>, index: usize, now: i64, cx: &mut App)
 
 fn render_detail_column(state: &Entity<StashDialog>, cx: &mut App) -> AnyElement {
     let diff = state.read(cx).diff.clone();
-    let toolbar = diff.toolbar("git-stash-diff", kind::GIT_STASH, cx);
+    let toolbar = diff.toolbar(
+        "git-stash-diff",
+        git_diff::ToolbarTail::Close(kind::GIT_STASH),
+        cx,
+    );
     let has_file = state.read(cx).selected_file.is_some();
     let diff_body = has_file.then(|| diff.body(cx));
     let s = state.read(cx);
