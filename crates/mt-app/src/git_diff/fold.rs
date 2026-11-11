@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(gap_runs(1, |_| false), vec![Run::Shown(0..1)]);
         assert_eq!(gap_runs(0, |_| false), vec![]);
         assert_eq!(
-            gap_runs(10, |i| i < 3 || i >= 8),
+            gap_runs(10, |i| !(3..8).contains(&i)),
             vec![Run::Shown(0..3), Run::Folded(3..8), Run::Shown(8..10)]
         );
         // 第 3 行单独折着:并进前后的展开段
