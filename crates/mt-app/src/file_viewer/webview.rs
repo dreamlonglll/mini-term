@@ -327,7 +327,7 @@ mod imp {
             let serve = Arc::new(Mutex::new(ServeState {
                 kind,
                 root: root.to_path_buf(),
-                root_canonical: std::fs::canonicalize(root).ok(),
+                root_canonical: mt_core::path::canonicalize(root).ok(),
                 doc_rel: doc_rel.clone(),
                 doc_path: doc.to_path_buf(),
                 doc_body: Arc::from(body),
@@ -486,7 +486,7 @@ mod imp {
         let Some(root) = root else {
             return response(403, None, Vec::new());
         };
-        let Ok(real) = std::fs::canonicalize(path) else {
+        let Ok(real) = mt_core::path::canonicalize(path) else {
             return response(404, None, Vec::new());
         };
         if !real.starts_with(root) {

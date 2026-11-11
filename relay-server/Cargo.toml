@@ -5,3 +5,9 @@ members = ["protocol", "server"]
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# dev 构建(含 `cargo test`)只留行号表,理由同仓库根 Cargo.toml 的 [profile.dev]:
+# backtrace 照样有 file:line,target 小一大截;要看局部变量时本地临时改回 `true`。
+# Docker 镜像走 `--release`,不受影响。
+[profile.dev]
+debug = "line-tables-only"

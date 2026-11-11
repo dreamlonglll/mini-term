@@ -15,7 +15,7 @@ RUN npm run build
 FROM rust:1-bookworm AS relay
 WORKDIR /build
 COPY relay-server/ ./
-RUN cargo build --release -p mt-relay-server
+RUN cargo build --locked --release -p mt-relay-server
 
 # ── 阶段 3:运行时(最小化,非 root) ──
 FROM debian:bookworm-slim

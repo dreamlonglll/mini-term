@@ -198,8 +198,8 @@ pub fn is_always_hidden(name: &str, is_dir: bool) -> bool {
 ///
 /// 剥法本身收在 [`mt_core::path_key::strip_verbatim_prefix`](会话记录定位、
 /// 剪贴板路径转换共用);canonicalize 在 WSL UNC 上会产出 `\\?\UNC\` 形式,
-/// 不剥前缀的话路径无法直接粘进 shell。
-#[cfg(any(windows, test))]
+/// 不剥前缀的话路径无法直接粘进 shell。这里只留给下面那组字符串用例。
+#[cfg(test)]
 fn try_strip_windows_verbatim(s: &str) -> Option<String> {
     let stripped = mt_core::path_key::strip_verbatim_prefix(s);
     // 没剥动 = 原串原样借回(长度不变);剥了一定变短(盘符形态少 4 字节、UNC 少 6)
@@ -209,18 +209,13 @@ fn try_strip_windows_verbatim(s: &str) -> Option<String> {
 /// Windows 上 `Path::canonicalize()` 会给路径加上 `\\?\` verbatim 前缀
 /// (绕过 MAX_PATH 限制),这种形式拖进 shell 不友好。
 /// 同时剥掉盘符 `\\?\C:\...` 与 UNC `\\?\UNC\<host>\...` 两种形式;
-/// Volume GUID 等其他特殊前缀保留不动。
-#[cfg(windows)]
+/// Volume GUID 等其他特殊前缀保留不动;非 Windows 原样返回。
+///
+/// 实现收在 [`mt_core::path::strip_verbatim`](与 [`mt_core::path::canonicalize`]
+/// 同一把尺子),这里保住 `mt_project::fs::strip_verbatim_prefix` 这条公开路径。
+/// 要 canonicalize 的地方直接用 `mt_core::path::canonicalize`,不用先调 std 再剥。
 pub fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
-    match try_strip_windows_verbatim(&p.to_string_lossy()) {
-        Some(stripped) => PathBuf::from(stripped),
-        None => p,
-    }
-}
-
-#[cfg(not(windows))]
-pub fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
-    p
+    mt_core::path::strip_verbatim(p)
 }
 
 /// 校验 target 必须在 project_root 内,防止调用方(UI 里的重命名输入框、
@@ -241,9 +236,7 @@ pub(crate) fn verify_under_project_root(
     target: &Path,
     must_exist: bool,
 ) -> Result<PathBuf> {
-    let root = project_root
-        .canonicalize()
-        .map(strip_verbatim_prefix)
+    let root = mt_core::path::canonicalize(project_root)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
 
     // project_root 自己可能是 symlink。调用方把根本身(包括 `root/.`)作为
@@ -254,8 +247,7 @@ pub(crate) fn verify_under_project_root(
         || fs::symlink_metadata(target)
             .ok()
             .filter(|meta| !meta.file_type().is_symlink())
-            .and_then(|_| target.canonicalize().ok())
-            .map(strip_verbatim_prefix)
+            .and_then(|_| mt_core::path::canonicalize(target).ok())
             .is_some_and(|candidate| candidate == root);
     let canon = if target_is_root {
         root.clone()
@@ -263,9 +255,7 @@ pub(crate) fn verify_under_project_root(
         let parent = target
             .parent()
             .ok_or_else(|| anyhow!("无法获取父目录: {}", target.display()))?;
-        let parent_canon = parent
-            .canonicalize()
-            .map(strip_verbatim_prefix)
+        let parent_canon = mt_core::path::canonicalize(parent)
             .map_err(|e| anyhow!("父目录不可访问: {}: {}", parent.display(), e))?;
         let name = target
             .file_name()
@@ -292,13 +282,9 @@ pub(crate) fn verify_under_project_root(
 /// 仍在项目根内。
 fn verify_followed_under_project_root(project_root: &Path, target: &Path) -> Result<PathBuf> {
     let leaf = verify_under_project_root(project_root, target, true)?;
-    let root = project_root
-        .canonicalize()
-        .map(strip_verbatim_prefix)
+    let root = mt_core::path::canonicalize(project_root)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
-    let followed = leaf
-        .canonicalize()
-        .map(strip_verbatim_prefix)
+    let followed = mt_core::path::canonicalize(&leaf)
         .map_err(|e| anyhow!("路径不可访问: {}: {}", target.display(), e))?;
     if !followed.starts_with(&root) {
         bail!(
@@ -461,9 +447,7 @@ pub fn rename_entry(project_root: &Path, old_path: &Path, new_name: &str) -> Res
 /// 源已经在目标目录里(`source.parent == target_dir`)按错误返回:UI 层应当在
 /// 那之前就把这种落点判成无效,这里兜底。
 pub fn move_entry(project_root: &Path, source: &Path, target_dir: &Path) -> Result<PathBuf> {
-    let root = project_root
-        .canonicalize()
-        .map(strip_verbatim_prefix)
+    let root = mt_core::path::canonicalize(project_root)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
     let source_canon = verify_under_project_root(project_root, source, true)?;
     if source_canon == root {
@@ -543,9 +527,7 @@ pub fn copy_entry(
     destination: &Path,
     policy: CopyConflictPolicy,
 ) -> Result<PathBuf> {
-    let root = project_root
-        .canonicalize()
-        .map(strip_verbatim_prefix)
+    let root = mt_core::path::canonicalize(project_root)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
     let source = verify_under_project_root(project_root, source, true)?;
     let source_meta = fs::symlink_metadata(&source)
@@ -1023,9 +1005,9 @@ fn remove_path_no_follow(path: &Path) -> Result<()> {
 pub fn delete_entry(project_root: &Path, path: &Path) -> Result<()> {
     let target = verify_under_project_root(project_root, path, true)?;
     // 多一道保险:绝不允许删除项目根目录本身
-    // 必须同样剥掉 `\\?\`,否则与 verify_under_project_root 返回的
-    // target 形式不一致
-    let root = project_root.canonicalize().map(strip_verbatim_prefix)?;
+    // 必须与 verify_under_project_root 同样走 mt_core::path::canonicalize(剥掉 `\\?\`),
+    // 否则与它返回的 target 形式不一致
+    let root = mt_core::path::canonicalize(project_root)?;
     if target == root {
         bail!("不能删除项目根目录");
     }
@@ -1160,7 +1142,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         // 规范成长路径:被测函数返回 canonicalize 过的路径,而 GitHub Windows runner 的
         // 临时目录是 8.3 短路径(`C:\Users\RUNNER~1\...`),直接拿 `root.join(..)` 比会对不上
-        let root = strip_verbatim_prefix(root.canonicalize().unwrap());
+        let root = mt_core::path::canonicalize(&root).unwrap();
         let inner_file = root.join("inside.txt");
         fs::write(&inner_file, "hi").unwrap();
         (root, inner_file)
@@ -1170,7 +1152,7 @@ mod tests {
     fn verify_accepts_path_inside_project() {
         let (root, file) = make_test_project();
         let canon = verify_under_project_root(&root, &file, true).unwrap();
-        assert!(canon.starts_with(strip_verbatim_prefix(root.canonicalize().unwrap())));
+        assert!(canon.starts_with(mt_core::path::canonicalize(&root).unwrap()));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1283,7 +1265,9 @@ mod tests {
         let moved = move_entry(&root, &file, &target).expect("move 失败");
         assert_eq!(
             moved,
-            strip_verbatim_prefix(target.canonicalize().unwrap()).join("inside.txt")
+            mt_core::path::canonicalize(&target)
+                .unwrap()
+                .join("inside.txt")
         );
         assert!(moved.exists());
         assert!(!file.exists(), "源文件应被移走");
@@ -1759,7 +1743,7 @@ mod tests {
         let (root, _) = make_test_project();
         let new_file = root.join("brand-new.txt");
         let canon = verify_under_project_root(&root, &new_file, false).unwrap();
-        assert!(canon.starts_with(strip_verbatim_prefix(root.canonicalize().unwrap())));
+        assert!(canon.starts_with(mt_core::path::canonicalize(&root).unwrap()));
         assert!(!canon.exists()); // 文件还没创建
         fs::remove_dir_all(&root).ok();
     }
@@ -1910,6 +1894,8 @@ mod tests {
     /// starts_with 比较的对称性。
     #[cfg(windows)]
     #[test]
+    // 本用例要的就是 std 原样给的 verbatim 形态(验证这种输入也能用),不能走剥前缀的封装
+    #[allow(clippy::disallowed_methods)]
     fn verify_equivalence_between_verbatim_and_plain_input() {
         let (root, file) = make_test_project();
         let plain = verify_under_project_root(&root, &file, true).unwrap();

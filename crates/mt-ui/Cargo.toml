@@ -20,6 +20,9 @@ alacritty_terminal.workspace = true
 # mt-project 带 git2 等重库。查找条文案由宿主注入(`TerminalSearchBar::new` 的
 # labels 参数),技术栈徽标按落盘字符串查表(`TechIcon::new(kind.as_str())`)。
 mt-theme-packs.workspace = true
+# 粘贴的 bracketed paste 编码(`mt_core::paste`,与 mt-relay 的移动端指令共用一份)。
+# 叶子 crate(只依赖 serde / serde_json / dirs),不带重库,也很少改。
+mt-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

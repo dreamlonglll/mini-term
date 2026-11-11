@@ -16,3 +16,8 @@ serde = ["dep:serde"]
 # 唯一（且可选）的依赖。字典本身是纯静态数据，不需要任何运行时库；
 # **绝不引 gpui** —— 后端 crate 也要能拿文案，不该为此拖进 GPU 栈。
 serde = { workspace = true, optional = true }
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

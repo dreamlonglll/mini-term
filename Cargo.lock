@@ -5602,6 +5602,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "image",
+ "mt-core",
  "mt-terminal",
  "mt-theme-packs",
  "serde",

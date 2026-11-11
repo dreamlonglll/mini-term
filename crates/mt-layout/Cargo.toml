@@ -14,3 +14,8 @@ anyhow.workspace = true
 mt-config.workspace = true
 # 版本与 features 收在工作区(三家 db 必须同版本,理由见根 Cargo.toml)。
 rusqlite.workspace = true
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

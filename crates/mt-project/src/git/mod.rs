@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use git2::{Commit, Oid, Repository, RepositoryOpenFlags, Status, StatusOptions};
+use mt_core::path::canonicalize;
 use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
@@ -700,8 +701,8 @@ fn discover_repo_for(project_path: &Path, abs_file: &Path) -> Option<Repository>
 /// 为整文件新增、按块暂存找不到条目。只规范化**项目根**(它一定存在),文件那一段原样
 /// 拼回去:文件本身可能已被删除,也不该顺着文件自己的软链跳走。
 ///
-/// Windows 上 `canonicalize` 给的是 `\\?\` 形式,经 [`crate::fs::strip_verbatim_prefix`]
-/// 剥回 `C:\…` / `\\server\share\…`(`\\?\UNC\wsl$\…` → `\\wsl$\…`)。第一步就算对时
+/// Windows 上 std 的 `canonicalize` 给的是 `\\?\` 形式,[`mt_core::path::canonicalize`]
+/// 已剥回 `C:\…` / `\\server\share\…`(`\\?\UNC\wsl$\…` → `\\wsl$\…`)。第一步就算对时
 /// (绝大多数情况,libgit2 在 Windows 上不解析联接点)根本走不到这里。
 fn repo_relative_path(workdir: &Path, project_path: &Path, abs_file: &Path) -> Option<String> {
     let inside = |rel: PathBuf| -> Option<String> {
@@ -718,7 +719,7 @@ fn repo_relative_path(workdir: &Path, project_path: &Path, abs_file: &Path) -> O
         return Some(rel);
     }
     let in_project = abs_file.strip_prefix(project_path).ok()?;
-    let real_project = crate::fs::strip_verbatim_prefix(project_path.canonicalize().ok()?);
+    let real_project = canonicalize(project_path).ok()?;
     diff_paths(real_project.join(in_project), workdir).and_then(inside)
 }
 
@@ -729,9 +730,7 @@ fn status_prefix(workdir: &Path, project_path: &Path) -> PathBuf {
     if related(project_path) {
         return project_path.to_path_buf();
     }
-    project_path
-        .canonicalize()
-        .map(crate::fs::strip_verbatim_prefix)
+    canonicalize(project_path)
         .ok()
         .filter(|real| related(real))
         .unwrap_or_else(|| project_path.to_path_buf())
@@ -884,7 +883,7 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
             if sub.join(".git").exists()
                 && let Ok(repo) = Repository::open(&sub)
                 && let Some(workdir) = repo.workdir()
-                && workdir.canonicalize().ok() == sub.canonicalize().ok()
+                && canonicalize(workdir).ok() == canonicalize(&sub).ok()
             {
                 let name = sub
                     .file_name()

@@ -786,7 +786,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let dir = mt_project::fs::strip_verbatim_prefix(std::fs::canonicalize(&dir).unwrap());
+        let dir = mt_core::path::canonicalize(&dir).unwrap();
         let out = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(&dir)
