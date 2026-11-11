@@ -24,7 +24,9 @@ impl Fixture {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Self(root.canonicalize().unwrap())
+        Self(mt_project::fs::strip_verbatim_prefix(
+            root.canonicalize().unwrap(),
+        ))
     }
 
     fn repo(&self, name: &str) -> PathBuf {
@@ -890,7 +892,7 @@ fn binary_and_oversized_diff_markers_survive_worktree_index_and_head() {
     let fixture = Fixture::new("diff-markers");
     let repo = fixture.repo("repo");
     let cases: [(&str, Vec<u8>, bool, bool); 4] = [
-        ("nul.bin", b"\0binary\x01".to_vec(), true, false),
+        ("binary-nul.bin", b"\0binary\x01".to_vec(), true, false),
         ("invalid.bin", vec![0xff, 0xfe, 0x80], true, false),
         ("large.txt", vec![b'x'; 1_048_577], false, true),
         ("large.bin", vec![0; 1_048_577], false, true),
