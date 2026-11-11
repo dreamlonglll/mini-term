@@ -24,6 +24,14 @@ export const gitCommit = {
     discardLinesConfirm: "确定丢弃勾选的 {count} 行未暂存修改吗？\n只影响勾选的行，没勾选的改动与已暂存的内容不受影响。\n此操作不可恢复。",
     clearPicks: "清除勾选",
     clearPicksTip: "清除全部勾选（Esc）",
+    // ── 单文件 diff：并排视图中间栏每处改动上的按钮 ──
+    stageChangeTip: "暂存这一处改动（{count} 行）",
+    unstageChangeTip: "取消暂存这一处改动（{count} 行）",
+    discardChangeTip: "丢弃这一处改动（{count} 行）…",
+    discardChangeTitle: "丢弃这一处改动",
+    discardChangeConfirm: "确定丢弃这一处未暂存的修改（{count} 行）吗？\n只影响这一处，其余改动与已暂存的内容不受影响。\n此操作不可恢复。",
+    toggleChangeTip: "勾选 / 取消勾选这一处的 {count} 行改动",
+    emptySide: "空文件",
     // ── diff 正文：折叠的上下文 ──
     foldedLines: "{count} 行未改动",
     expandDown: "向下展开 {count} 行",
@@ -183,6 +191,13 @@ export const gitCommit = {
     discardLinesConfirm: "Discard {count} checked unstaged line(s)?\nOnly the checked lines are affected; unchecked changes and staged content are kept. This cannot be undone.",
     clearPicks: "Clear selection",
     clearPicksTip: "Uncheck all lines (Esc)",
+    stageChangeTip: "Stage this change ({count} line(s))",
+    unstageChangeTip: "Unstage this change ({count} line(s))",
+    discardChangeTip: "Discard this change ({count} line(s))…",
+    discardChangeTitle: "Discard Change",
+    discardChangeConfirm: "Discard this unstaged change ({count} line(s))?\nOnly this change is affected; other changes and staged content are kept. This cannot be undone.",
+    toggleChangeTip: "Check / uncheck the {count} changed line(s) here",
+    emptySide: "Empty file",
     // ── diff text: folded context ──
     foldedLines: "{count} unchanged line(s)",
     expandDown: "Expand {count} down",

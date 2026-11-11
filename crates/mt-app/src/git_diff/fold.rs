@@ -144,9 +144,11 @@ pub(super) struct Fold {
     pub above: bool,
     /// 下面挨着内容:能「向上展开」
     pub below: bool,
-    /// 这条分隔行在行内视图 / 并排视图里是第几行(展开后据此平移选区)
+    /// 这条分隔行在行内视图 / 并排视图左栏 / 右栏里各是第几行(展开后据此平移选区;并排两栏
+    /// 各自连续排行,改动两侧行数不同时同一条分隔行在两栏里的行号不同)
     pub inline_row: usize,
-    pub pair_row: usize,
+    pub old_row: usize,
+    pub new_row: usize,
 }
 
 /// 分隔行上的三种展开。
@@ -316,7 +318,8 @@ mod tests {
             above,
             below,
             inline_row: 0,
-            pair_row: 0,
+            old_row: 0,
+            new_row: 0,
         }
     }
 

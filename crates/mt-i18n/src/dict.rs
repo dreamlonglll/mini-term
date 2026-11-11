@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1652;
+pub const ZH_ENTRY_COUNT: usize = 1659;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1652;
+pub const EN_ENTRY_COUNT: usize = 1659;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1044,6 +1044,9 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("deleteSelected", "删除所选 {count} 个未跟踪文件"),
     ("deleteUntracked", "删除此未跟踪文件"),
     ("discardAll", "全部丢弃（只丢未暂存的修改）"),
+    ("discardChangeConfirm", "确定丢弃这一处未暂存的修改（{count} 行）吗？\n只影响这一处，其余改动与已暂存的内容不受影响。\n此操作不可恢复。"),
+    ("discardChangeTip", "丢弃这一处改动（{count} 行）…"),
+    ("discardChangeTitle", "丢弃这一处改动"),
     ("discardHunk", "丢弃此块"),
     ("discardHunkConfirm", "确定丢弃这一块未暂存的修改吗？\n只影响这一块，已暂存的内容不受影响。\n此操作不可恢复。"),
     ("discardHunkTitle", "丢弃此块"),
@@ -1054,6 +1057,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("discardUnstagedConfirm", "确定丢弃 {count} 个文件的未暂存修改吗？\n已暂存的部分会保留。此操作不可恢复。"),
     ("discardUntrackedConfirm", "确定删除 {count} 个未跟踪文件吗？\n此操作不可恢复。"),
     ("dismiss", "关闭"),
+    ("emptySide", "空文件"),
     ("expandAll", "全部展开"),
     ("expandDown", "向下展开 {count} 行"),
     ("expandUp", "向上展开 {count} 行"),
@@ -1142,6 +1146,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("stageAllAndCommitDetail", "暂存全部已跟踪的改动（不含未跟踪文件）后提交"),
     ("stageAllPartialConfirm", "{count} 个文件目前只暂存了一部分。\n「全部暂存并提交」会把它们剩下的改动也一起暂存并提交。确定继续吗？"),
     ("stageAllPartialOk", "全部暂存并提交"),
+    ("stageChangeTip", "暂存这一处改动（{count} 行）"),
     ("stageHunk", "暂存此块"),
     ("stageLines", "暂存所选 {count} 行"),
     ("stageSelected", "暂存所选 {count} 个文件"),
@@ -1159,7 +1164,9 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("takeTheirsDeleted", "采用对方版本（theirs：删除此文件）"),
     ("takeTheirsRebase", "采用正在重放的提交（theirs，你的改动）"),
     ("takeTheirsRebaseDeleted", "采用正在重放的提交（theirs，你的改动：删除此文件）"),
+    ("toggleChangeTip", "勾选 / 取消勾选这一处的 {count} 行改动"),
     ("unstageAll", "全部取消暂存"),
+    ("unstageChangeTip", "取消暂存这一处改动（{count} 行）"),
     ("unstageHunk", "取消暂存此块"),
     ("unstageLines", "取消暂存所选 {count} 行"),
     ("unstageSelected", "取消暂存所选 {count} 个文件"),
@@ -1192,6 +1199,9 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("deleteSelected", "Delete {count} selected untracked files"),
     ("deleteUntracked", "Delete this untracked file"),
     ("discardAll", "Discard all (unstaged changes only)"),
+    ("discardChangeConfirm", "Discard this unstaged change ({count} line(s))?\nOnly this change is affected; other changes and staged content are kept. This cannot be undone."),
+    ("discardChangeTip", "Discard this change ({count} line(s))…"),
+    ("discardChangeTitle", "Discard Change"),
     ("discardHunk", "Discard hunk"),
     ("discardHunkConfirm", "Discard this unstaged hunk?\nOnly this hunk is affected; staged content is kept. This cannot be undone."),
     ("discardHunkTitle", "Discard Hunk"),
@@ -1202,6 +1212,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("discardUnstagedConfirm", "Discard unstaged changes in {count} file(s)?\nStaged parts are kept. This cannot be undone."),
     ("discardUntrackedConfirm", "Delete {count} untracked file(s)?\nThis cannot be undone."),
     ("dismiss", "Dismiss"),
+    ("emptySide", "Empty file"),
     ("expandAll", "Expand all"),
     ("expandDown", "Expand {count} down"),
     ("expandUp", "Expand {count} up"),
@@ -1290,6 +1301,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("stageAllAndCommitDetail", "Stages all tracked changes (untracked files excluded), then commits"),
     ("stageAllPartialConfirm", "{count} file(s) are only partially staged.\n\"Stage All and Commit\" will stage and commit their remaining changes too. Continue?"),
     ("stageAllPartialOk", "Stage all and commit"),
+    ("stageChangeTip", "Stage this change ({count} line(s))"),
     ("stageHunk", "Stage hunk"),
     ("stageLines", "Stage {count} selected line(s)"),
     ("stageSelected", "Stage {count} selected files"),
@@ -1307,7 +1319,9 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("takeTheirsDeleted", "Accept theirs (delete this file)"),
     ("takeTheirsRebase", "Accept the commit being replayed (theirs: your change)"),
     ("takeTheirsRebaseDeleted", "Accept the commit being replayed (theirs: your change, delete this file)"),
+    ("toggleChangeTip", "Check / uncheck the {count} changed line(s) here"),
     ("unstageAll", "Unstage all"),
+    ("unstageChangeTip", "Unstage this change ({count} line(s))"),
     ("unstageHunk", "Unstage hunk"),
     ("unstageLines", "Unstage {count} selected line(s)"),
     ("unstageSelected", "Unstage {count} selected files"),
