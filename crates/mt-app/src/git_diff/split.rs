@@ -12,25 +12,31 @@
 //!
 //! # 滚动映射
 //!
-//! 移植自 Winc(Apache-2.0)`crates/winc-editor/src/diff_view.rs` 的 `layout` 里的分段点与
-//! `row_at` / `side_scroll`:
+//! 共用坐标与两栏行号的对应移植自 Winc(Apache-2.0)`crates/winc-editor/src/diff_view.rs` 的
+//! `layout` 里的分段点与 `row_at`;对齐与钳位是这里自己的([`Split::side_tops`]):
 //!
-//! - 滚动位置是两栏共用的坐标(单位:行):改动以外两栏逐行对应,每处改动占两侧里较多的
-//!   行数,较短的一侧按比例移动(0 行的一侧不动)。只按右栏滚的话,左栏一大段删除在右栏
-//!   只占一个点,滚动时会被直接越过;
-//! - 两栏在同一个**对齐点**上对齐([`anchor`]):滚过半屏之后对齐点在视口正中,开头不足半屏
-//!   时对齐点跟着往上挪、到顶时在顶边。同一处改动因此在两栏里一起进入、一起离开视口;
-//! - 与 Winc 的差别:Winc 的编辑区能滚过末行,这里不能(与原先的 uniform_list 同口径),
-//!   于是末尾半屏对称地把对齐点往下挪、到底时在底边 —— 否则最后一处改动里较短的那一侧
-//!   滚不到自己的末行。
+//! - **共用坐标**(单位:行):改动以外两栏逐行对应,每处改动占两侧里较多的行数,较短的一侧
+//!   按比例移动(0 行的一侧不动)。只按右栏算的话,左栏一大段删除在右栏只占一个点,滚动时会被
+//!   直接越过;
+//! - **对齐**:对齐点固定在视口正中,两栏都把共用坐标上的同一处摆在那里,再各按自己的范围
+//!   `[0, 行数 − 视口]` 钳住 —— 两栏都滚不过自己的首行与末行(与原先的 uniform_list 同口径)。
+//!   被钳住的那一栏,对齐的那一行仍在视口里(开头在上半屏、末尾在下半屏),同一处改动两栏
+//!   照样都看得见,带子不会伸出视口;
+//! - **滚动位置**是两栏顶边走过的路程:每滚一行,走得快的那一栏恰好挪一行。两栏都被钳住的
+//!   那几段不占滚动位置,滚轮不会空转;谁也不会一步跳好几行。两栏顶边都随滚动位置单调不减,
+//!   起点都在第一行,终点都停在自己的末行。
+//!
+//! 与 Winc 的差别:Winc 的对齐点在开头半屏里从顶边挪到正中(编辑区能滚过末行,末尾不用挪)。
+//! 对齐点一挪,对侧是纯新增 / 纯删除时这一栏的顶边会往回走 —— 顶边 = 对齐行 − 对齐点,对齐行
+//! 不动而对齐点在下移。这里对齐点不动,开头末尾改由钳位兜住。
 //!
 //! # 两栏怎么跟着滚动位置走
 //!
 //! 两栏仍是各自的 `uniform_list`(虚拟化:只给视野里的行建元素),但它们自己的滚轮处理被
 //! 截下([`scroll_layer`]):滚轮在捕获阶段改共用的滚动位置并停止冒泡,每帧
-//! ([`DiffState::sync_split`])再按滚动位置算出两栏各自的顶边、写回两个列表的偏移。横向两栏
-//! 照旧同步、各按自己的范围钳住(原先 `sync_columns` 的口径);纵向滚动条只有一条,画在
-//! 右缘、表示共用的滚动位置([`SplitScroll`])。
+//! ([`DiffState::sync_split`])再按滚动位置算出两栏各自的顶边、写回两个列表的偏移。横向同样是
+//! 一个共用的位置、两栏各按自己的范围钳住(见 [`shared_x`]);纵向滚动条只有一条,画在右缘、
+//! 表示共用的滚动位置([`SplitScroll`])。
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -108,14 +114,35 @@ pub(super) struct Split {
     pub(super) changes: Vec<Change>,
     /// 各条分隔行在两栏里的行号,与 `Flat::folds` 同序
     pub(super) fold_rows: Vec<[usize; 2]>,
-    /// 每个 hunk 第一行的滚动位置(F7 跳转的落点)
+    /// 每个 hunk 第一行的共用坐标(F7 跳转的落点)
     hunk_pos: Vec<f64>,
-    /// 滚动位置的分段点:每处改动的开头、结尾各一个,`(滚动位置, [左栏行, 右栏行])`
+    /// 共用坐标的分段点:每处改动的开头、结尾各一个,`(共用坐标, [左栏行, 右栏行])`
     knots: Vec<(f64, [f64; 2])>,
-    /// 滚动位置的总长(行)
+    /// 共用坐标的总长(行)
     total: f64,
     /// 给 uniform_list 量宽用的「最宽的那一行」,两栏各一个
     pub(super) widest: [usize; 2],
+    /// 上一次算的滚动路径(按视口高认;只有改了窗口大小才重算,见 [`Split::path`])
+    path: RefCell<Option<Rc<Path>>>,
+}
+
+/// 某个视口高度下两栏顶边的路径(见模块注释「滚动映射」):按共用坐标排的一串折点,相邻
+/// 两点之间两栏顶边、滚动位置都随共用坐标线性变化。
+#[derive(Debug)]
+struct Path {
+    visible: f64,
+    stops: Vec<Stop>,
+}
+
+/// 路径上的一个折点。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Stop {
+    /// 对齐点(视口正中)所在的共用坐标
+    at: f64,
+    /// 滚动位置
+    pos: f64,
+    /// 两栏顶边(行)
+    tops: [f64; 2],
 }
 
 impl Split {
@@ -221,76 +248,155 @@ impl Split {
 
     // ── 滚动映射 ──
 
-    /// 滚动位置的总长(行)。
-    pub(super) fn total(&self) -> f64 {
-        self.total
-    }
-
-    /// 第 `hunk` 块第一行的滚动位置。
-    pub(super) fn hunk_pos(&self, hunk: usize) -> f64 {
-        self.hunk_pos.get(hunk).copied().unwrap_or(0.0)
-    }
-
-    /// 第 `i` 个分段点的前一个 `(滚动位置, 第 side 栏的行)`;`i` 为 0 时是起点。
+    /// 第 `i` 个分段点的前一个 `(共用坐标, 第 side 栏的行)`;`i` 为 0 时是起点。
+    #[cfg(test)]
     fn knot(&self, side: usize, i: usize) -> (f64, f64) {
         i.checked_sub(1)
             .and_then(|i| self.knots.get(i))
             .map_or((0.0, 0.0), |&(at, rows)| (at, rows[side]))
     }
 
-    /// 滚动位置 `pos` 对应第 `side` 栏的第几行(可以是小数):二分找第一个不小于 `pos` 的
-    /// 分段点,在它与前一个之间插值。改动以外两栏逐行对应,改动里按比例。
-    pub(super) fn row_at(&self, side: usize, pos: f64) -> f64 {
-        let i = self.knots.partition_point(|k| k.0 < pos);
+    /// 共用坐标 `at` 对应第 `side` 栏的第几行(可以是小数):二分找第一个不小于 `at` 的
+    /// 分段点,在它与前一个之间插值。改动以外两栏逐行对应,改动里按比例。只有单测用 ——
+    /// 排滚动路径时([`Split::build_path`])直接在折点之间插值,同一条折线。
+    #[cfg(test)]
+    pub(super) fn row_at(&self, side: usize, at: f64) -> f64 {
+        let i = self.knots.partition_point(|k| k.0 < at);
         let from = self.knot(side, i);
-        let Some(&(at, rows)) = self.knots.get(i) else {
-            return from.1 + (pos - from.0);
+        let Some(&(to_at, rows)) = self.knots.get(i) else {
+            return from.1 + (at - from.0);
         };
-        let to = (at, rows[side]);
+        let to = (to_at, rows[side]);
         let t = if to.0 > from.0 {
-            (pos - from.0) / (to.0 - from.0)
+            (at - from.0) / (to.0 - from.0)
         } else {
             1.0
         };
         from.1 + (to.1 - from.1) * t
     }
 
-    /// 视口 `visible` 行时滚动位置的上限。
+    /// 视口 `visible` 行时的滚动路径。只按视口高缓存一份:行模型一换整个 `Split` 跟着重建,
+    /// 视口高只在改窗口大小时变。
+    fn path(&self, visible: f64) -> Rc<Path> {
+        if let Some(path) = self.path.borrow().as_ref()
+            && path.visible == visible
+        {
+            return path.clone();
+        }
+        let path = Rc::new(Path {
+            visible,
+            stops: self.build_path(visible),
+        });
+        *self.path.borrow_mut() = Some(path.clone());
+        path
+    }
+
+    /// 排出滚动路径(见模块注释「滚动映射」):对齐点在视口正中,共用坐标 `at` 处两栏顶边 =
+    /// 该栏的对齐行 − 半屏,钳进 `[0, 行数 − 视口]`;滚动位置是顶边走过的路程(两栏里挪得多
+    /// 的那一栏的行数)。
+    ///
+    /// 两栏行号对共用坐标是折线(顶点:起点、各分段点、终点),钳位又在每栏「对齐行 = 半屏」
+    /// 「对齐行 = 半屏 + 最大顶边」两处各折一下,所以把这些点都排成折点,两点之间就全是线性的。
+    fn build_path(&self, visible: f64) -> Vec<Stop> {
+        let half = visible / 2.0;
+        let len = [LEFT, RIGHT].map(|side| self.rows[side].len() as f64);
+        let max_top = len.map(|n| (n - visible).max(0.0));
+        let tops_of = |rows: [f64; 2]| {
+            [LEFT, RIGHT].map(|side| (rows[side] - half).clamp(0.0, max_top[side]))
+        };
+        let mut corners: Vec<(f64, [f64; 2])> = Vec::with_capacity(self.knots.len() + 2);
+        corners.push((0.0, [0.0, 0.0]));
+        corners.extend(self.knots.iter().copied());
+        corners.push((self.total, len));
+
+        let mut stops = vec![Stop {
+            at: 0.0,
+            pos: 0.0,
+            tops: [0.0, 0.0],
+        }];
+        let mut cuts: Vec<f64> = Vec::with_capacity(5);
+        for pair in corners.windows(2) {
+            let [(a0, r0), (a1, r1)] = [pair[0], pair[1]];
+            if a1 <= a0 {
+                continue;
+            }
+            // 这一段里两栏各自碰到钳位边界的地方
+            cuts.clear();
+            for side in [LEFT, RIGHT] {
+                let (from, to) = (r0[side], r1[side]);
+                for edge in [half, half + max_top[side]] {
+                    if from < edge && edge < to {
+                        cuts.push(a0 + (edge - from) / (to - from) * (a1 - a0));
+                    }
+                }
+            }
+            cuts.sort_by(f64::total_cmp);
+            cuts.push(a1);
+            for &at in &cuts {
+                let t = (at - a0) / (a1 - a0);
+                let tops = tops_of([LEFT, RIGHT].map(|side| r0[side] + (r1[side] - r0[side]) * t));
+                let last = stops[stops.len() - 1];
+                let step = (tops[LEFT] - last.tops[LEFT]).max(tops[RIGHT] - last.tops[RIGHT]);
+                stops.push(Stop {
+                    at,
+                    pos: last.pos + step,
+                    tops,
+                });
+            }
+        }
+        stops
+    }
+
+    /// 视口 `visible` 行时滚动位置的上限(行)。
     pub(super) fn max_pos(&self, visible: f64) -> f64 {
-        (self.total - visible).max(0.0)
+        self.path(visible).stops.last().map_or(0.0, |stop| stop.pos)
     }
 
-    /// 滚动位置为 `pos`、视口 `visible` 行时两栏顶边各是第几行(可以是小数):两栏在同一个
-    /// 对齐点([`anchor`])上对齐,再各按自己的行数钳住(uniform_list 滚不过自己的末行)。
+    /// 滚动位置为 `pos`、视口 `visible` 行时两栏顶边各是第几行(可以是小数)。两栏都随 `pos`
+    /// 单调不减,`pos` 为 0 时都是 0,到上限时都停在自己的末行(见模块注释「滚动映射」)。
     pub(super) fn side_tops(&self, pos: f64, visible: f64) -> [f64; 2] {
-        let max_pos = self.max_pos(visible);
-        let pos = pos.clamp(0.0, max_pos);
-        let a = anchor(pos, max_pos, visible);
-        [LEFT, RIGHT].map(|side| {
-            let top = self.row_at(side, pos + a) - a;
-            let max_top = (self.rows[side].len() as f64 - visible).max(0.0);
-            top.clamp(0.0, max_top)
-        })
+        let path = self.path(visible);
+        let stops = &path.stops;
+        let i = stops.partition_point(|stop| stop.pos < pos);
+        match (i.checked_sub(1).map(|j| stops[j]), stops.get(i)) {
+            // 前一个点严格小于 `pos`、这一个不小于:两点的滚动位置必然不同
+            (Some(a), Some(b)) => {
+                let t = (pos - a.pos) / (b.pos - a.pos);
+                [LEFT, RIGHT].map(|side| a.tops[side] + (b.tops[side] - a.tops[side]) * t)
+            }
+            (None, Some(b)) => b.tops,
+            (Some(a), None) => a.tops,
+            (None, None) => [0.0, 0.0],
+        }
     }
-}
 
-/// 对齐点离视口顶边几行:开头的半屏里从顶边(0)匀速挪到正中,中段停在正中,末尾的半屏
-/// 里再挪到底边。滚到顶时两栏都从第一行起,滚到底时两栏都停在自己的末行。内容不满两屏
-/// 时没有「中段」,对齐点从顶边匀速挪到底边。
-pub(super) fn anchor(pos: f64, max_pos: f64, visible: f64) -> f64 {
-    if max_pos <= 0.0 {
-        return 0.0;
+    /// 对齐点(视口正中)落在共用坐标 `at` 上时的滚动位置。
+    fn pos_at(&self, at: f64, visible: f64) -> f64 {
+        let path = self.path(visible);
+        let stops = &path.stops;
+        let i = stops.partition_point(|stop| stop.at < at);
+        match (i.checked_sub(1).map(|j| stops[j]), stops.get(i)) {
+            (Some(a), Some(b)) if b.at > a.at => {
+                a.pos + (b.pos - a.pos) * (at - a.at) / (b.at - a.at)
+            }
+            (_, Some(b)) => b.pos,
+            (Some(a), None) => a.pos,
+            (None, None) => 0.0,
+        }
     }
-    if max_pos < visible {
-        return pos / max_pos * visible;
+
+    /// 第 `hunk` 块第一行的共用坐标。
+    #[cfg(test)]
+    pub(super) fn hunk_pos(&self, hunk: usize) -> f64 {
+        self.hunk_pos.get(hunk).copied().unwrap_or(0.0)
     }
-    let half = visible / 2.0;
-    if pos < half {
-        pos
-    } else if pos > max_pos - half {
-        visible - (max_pos - pos)
-    } else {
-        half
+
+    /// F7 跳到第 `hunk` 块时的滚动位置:对齐点落在它第一行之下半屏处,于是它的第一行停在
+    /// 顶边(之后半屏里有行数不等的改动时,较长的一侧恰在顶边、较短的一侧稍靠下;开头、末尾
+    /// 那一屏按钳位走)。
+    pub(super) fn jump_pos(&self, hunk: usize, visible: f64) -> f64 {
+        let at = self.hunk_pos.get(hunk).copied().unwrap_or(0.0);
+        self.pos_at(at + visible / 2.0, visible)
     }
 }
 
@@ -305,7 +411,7 @@ pub(super) struct SplitScroll(Rc<RefCell<ScrollState>>);
 #[derive(Default)]
 struct ScrollState {
     pos: f32,
-    /// 滚动位置的总长(像素)
+    /// 滚动条的内容高(像素):可滚的距离 + 一屏
     total: f32,
     /// 正文视口(上一帧量到的)
     viewport: Bounds<Pixels>,
@@ -414,14 +520,22 @@ impl DiffState {
         self.place_split(x)
     }
 
+    /// 正文视口能放几行(上一帧量到的;还没量到是 0)。
+    fn split_visible(&self) -> f64 {
+        let view_h = f32::from(self.split_scroll.viewport().size.height);
+        f64::from(view_h / self.line_height())
+    }
+
     /// 按共用的滚动位置算出两栏的顶边,连同横向偏移 `x` 写回两个列表。
     fn place_split(&mut self, x: [Pixels; 2]) -> SplitFrame {
         let lh = self.line_height();
         let view_h = f32::from(self.split_scroll.viewport().size.height);
+        let visible = self.split_visible();
         let split = &self.flat.split;
-        let visible = f64::from(view_h / lh);
-        self.split_scroll.set_total(split.total() as f32 * lh);
-        let max = (split.max_pos(visible) * f64::from(lh)) as f32;
+        let max_pos = split.max_pos(visible);
+        // 滚动条的内容高 = 可滚的距离 + 一屏
+        self.split_scroll.set_total((max_pos + visible) as f32 * lh);
+        let max = (max_pos * f64::from(lh)) as f32;
         let pos = self.split_scroll.pos().min(max);
         self.split_scroll.set_pos(pos);
         let tops = split.side_tops(f64::from(pos / lh), visible);
@@ -436,31 +550,25 @@ impl DiffState {
         SplitFrame { tops, lh, view_h }
     }
 
-    /// 滚轮(像素,`delta` 与 gpui 的滚动偏移同号):纵向改共用的滚动位置,横向改指针下那一栏、
-    /// 另一栏按自己的范围跟上。两个方向都有时只取幅度大的那个。动了返回 `true`。
-    pub(super) fn wheel_split(&mut self, delta: Point<Pixels>, at: Point<Pixels>) -> bool {
+    /// 滚轮(像素,`delta` 与 gpui 的滚动偏移同号):纵向改共用的滚动位置,横向改共用的横向
+    /// 位置(见 [`shared_x`])。两个方向都有时只取幅度大的那个。动了返回 `true`。
+    pub(super) fn wheel_split(&mut self, delta: Point<Pixels>) -> bool {
         let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
-        let side = if at.x < self.side_handle(LEFT).bounds().right() {
-            LEFT
-        } else {
-            RIGHT
-        };
         if dx.abs() > dy.abs() {
-            self.scroll_split(side, -dx, 0.0)
+            self.scroll_split(-dx, 0.0)
         } else {
-            self.scroll_split(side, 0.0, -dy)
+            self.scroll_split(0.0, -dy)
         }
     }
 
-    /// 往后滚 `dy`(纵向,两栏共用)、`dx`(横向,第 `side` 栏,另一栏跟上),当场写回两个
+    /// 往后滚 `dy`(纵向)、往右滚 `dx`(横向),两个方向都是两栏共用的位置;当场写回两个
     /// 列表(拖选的自动滚动紧接着就要按新偏移算落点)。动了返回 `true`。
-    pub(super) fn scroll_split(&mut self, side: usize, dx: f32, dy: f32) -> bool {
+    pub(super) fn scroll_split(&mut self, dx: f32, dy: f32) -> bool {
         let before = (self.split_scroll.pos(), self.synced_x);
         let mut x = self.synced_x();
         if dx != 0.0 {
-            let handles = [self.side_handle(LEFT), self.side_handle(RIGHT)];
-            x[side] = clamp_x(x[side] - px(dx), &handles[side]);
-            x[1 - side] = clamp_x(x[side], &handles[1 - side]);
+            let reach = [LEFT, RIGHT].map(|side| max_x(&self.side_handle(side)));
+            x = shared_x(x.map(f32::from), reach, dx).map(px);
         }
         if dy != 0.0 {
             self.split_scroll.set_pos(self.split_scroll.pos() + dy);
@@ -469,11 +577,10 @@ impl DiffState {
         (self.split_scroll.pos(), self.synced_x) != before
     }
 
-    /// 跳到第 `hunk` 块:它的第一行停在顶边(较长的一侧恰在顶边,较短的一侧稍靠下,两栏
-    /// 都在视野里,见模块注释「滚动映射」)。
+    /// 跳到第 `hunk` 块:它的第一行停在顶边(见 [`Split::jump_pos`])。
     pub(super) fn split_jump(&mut self, hunk: usize) {
-        let pos = self.flat.split.hunk_pos(hunk) as f32 * self.line_height();
-        self.split_scroll.set_pos(pos);
+        let pos = self.flat.split.jump_pos(hunk, self.split_visible());
+        self.split_scroll.set_pos(pos as f32 * self.line_height());
     }
 
     /// 两栏回到顶部、左缘(换文件时)。
@@ -486,10 +593,27 @@ impl DiffState {
     }
 }
 
+/// 这一栏横向最多能滚多远(像素,≥ 0)。
+fn max_x(handle: &ScrollHandle) -> f32 {
+    f32::from(handle.max_offset().x).max(0.0)
+}
+
 /// 横向偏移按该栏自己的范围钳住(≤ 0)。
 fn clamp_x(x: Pixels, handle: &ScrollHandle) -> Pixels {
-    let max = f32::from(handle.max_offset().x).max(0.0);
-    px(f32::from(x).clamp(-max, 0.0))
+    px(f32::from(x).clamp(-max_x(handle), 0.0))
+}
+
+/// 滚轮 / 拖选往右滚 `dx`(像素)之后两栏的横向偏移(≤ 0)。`x` 是两栏眼下的偏移,`reach` 是
+/// 各自最多能滚多远(≥ 0)。
+///
+/// 横向是两栏共用的一个位置:两栏里滚得远的那个就是它(另一栏只是被自己的范围钳住了),在两栏
+/// 范围的并集里挪,再各按自己的范围钳住。于是窄的一栏到头之后宽的那栏还能接着滚,窄栏那边
+/// 再往前滚也不会把宽栏拽回来;往回滚时宽栏先动,共用位置回到窄栏的范围里窄栏才跟上 ——
+/// 两栏只要都滚得到,看的就是同一列。
+pub(super) fn shared_x(x: [f32; 2], reach: [f32; 2], dx: f32) -> [f32; 2] {
+    let lead = x[LEFT].min(x[RIGHT]);
+    let next = (lead - dx).clamp(-reach[LEFT].max(reach[RIGHT]), 0.0);
+    reach.map(|reach| next.max(-reach))
 }
 
 // ─── 渲染 ─────────────────────────────────────────────────────
@@ -743,9 +867,8 @@ fn scroll_layer(
                     return;
                 }
                 let delta = event.delta.pixel_delta(px(lh));
-                let position = event.position;
                 state.update(cx, |s, cx| {
-                    if s.wheel_split(delta, position) {
+                    if s.wheel_split(delta) {
                         cx.notify();
                     }
                 });
@@ -761,7 +884,7 @@ fn scroll_layer(
 mod tests {
     use mt_project::git::{DiffHunk, DiffLine, diff_two_texts};
 
-    use super::super::{flatten, flatten_diff, fold};
+    use super::super::{Flat, flatten, flatten_diff, fold};
     use super::*;
 
     fn line(kind: &str, content: &str) -> DiffLine {
@@ -844,22 +967,22 @@ mod tests {
         assert_eq!(f.split.change_at(RIGHT, 9), None);
     }
 
-    /// 滚动位置 ↔ 行:改动以外两栏逐行对应;改动里较短的一侧按比例走;0 行的一侧不动;
+    /// 共用坐标 ↔ 行:改动以外两栏逐行对应;改动里较短的一侧按比例走;0 行的一侧不动;
     /// 末尾之后两栏一起往后。
     #[test]
-    fn 滚动位置换行_块外逐行块内按比例() {
-        // 上下文 2 行,1 行改成 3 行,上下文 2 行:滚动总长 2 + 3 + 2
+    fn 共用坐标换行_块外逐行块内按比例() {
+        // 上下文 2 行,1 行改成 3 行,上下文 2 行:共用坐标总长 2 + 3 + 2
         let mut lines = vec![line("context", "a"), line("context", "b")];
         lines.push(line("delete", "x"));
         lines.extend((0..3).map(|i| line("add", &format!("X{i}"))));
         lines.extend([line("context", "c"), line("context", "d")]);
         let f = flatten(&[hunk(lines)]);
         let s = &f.split;
-        assert_eq!(s.total(), 7.0);
+        assert_eq!(s.total, 7.0);
         assert_eq!(s.hunk_pos(0), 0.0);
-        for pos in [0.0, 1.0, 1.5, 2.0] {
-            assert_eq!(s.row_at(LEFT, pos), pos);
-            assert_eq!(s.row_at(RIGHT, pos), pos);
+        for at in [0.0, 1.0, 1.5, 2.0] {
+            assert_eq!(s.row_at(LEFT, at), at);
+            assert_eq!(s.row_at(RIGHT, at), at);
         }
         // 改动里:右栏 1:1,左栏 1 行摊在 3 个位置上
         assert_eq!(s.row_at(RIGHT, 3.5), 3.5);
@@ -883,63 +1006,215 @@ mod tests {
         assert_eq!(f.split.row_at(LEFT, 3.5), 1.5);
     }
 
-    /// 对齐点:到顶时在顶边、中段在正中、到底时在底边;内容不满两屏时从顶边匀速挪到底边;
-    /// 不用滚时恒为 0。
-    #[test]
-    fn 对齐点_首尾挪到边上() {
-        assert_eq!(anchor(0.0, 100.0, 40.0), 0.0);
-        assert_eq!(anchor(10.0, 100.0, 40.0), 10.0);
-        assert_eq!(anchor(20.0, 100.0, 40.0), 20.0);
-        assert_eq!(anchor(50.0, 100.0, 40.0), 20.0);
-        assert_eq!(anchor(90.0, 100.0, 40.0), 30.0);
-        assert_eq!(anchor(100.0, 100.0, 40.0), 40.0);
-        assert_eq!(anchor(5.0, 10.0, 40.0), 20.0, "不满两屏:按比例");
-        assert_eq!(anchor(0.0, 0.0, 40.0), 0.0);
+    /// 按 `(种类, 行数)` 一段段拼出一块(不折叠)。
+    fn shape(parts: &[(&str, usize)]) -> Flat {
+        let mut lines = Vec::new();
+        for &(kind, n) in parts {
+            let at = lines.len();
+            lines.extend((0..n).map(|i| line(kind, &format!("{kind}{}", at + i))));
+        }
+        flatten(&[hunk(lines)])
     }
 
-    /// 两栏顶边:同一处改动在对齐点上对齐;到顶时两栏都从第一行起,到底时两栏都停在自己的
-    /// 末行(较短的一侧也滚得到底);一侧只有几行时钉在顶上。
+    /// 在整个滚动范围上密采样:两栏顶边单调不减、不越出自己的范围,每一步既不跳行(挪得多的
+    /// 那一栏不超过这一步)也不空转(两栏加起来至少挪这一步);起点两栏都是 0,终点两栏都停在
+    /// 自己的末行。路径上每个折点处,对齐的那一行在两栏里都看得见。
+    fn check_scroll(s: &Split, visible: f64, case: &str) {
+        const EPS: f64 = 1e-6;
+        let len = [LEFT, RIGHT].map(|side| s.rows[side].len() as f64);
+        let max_top = len.map(|n| (n - visible).max(0.0));
+        let max = s.max_pos(visible);
+        assert_eq!(s.side_tops(0.0, visible), [0.0, 0.0], "{case}:起点");
+        let end = s.side_tops(max, visible);
+        for side in [LEFT, RIGHT] {
+            assert!(
+                (end[side] - max_top[side]).abs() < EPS,
+                "{case}:终点 {end:?}"
+            );
+        }
+        assert_eq!(s.side_tops(max + 7.0, visible), end, "{case}:越界钳回上限");
+        if max_top == [0.0, 0.0] {
+            assert_eq!(max, 0.0, "{case}:两栏都放得下就不用滚");
+        }
+        let n = 3000;
+        let step = max / f64::from(n);
+        let mut last = [0.0, 0.0];
+        for k in 1..=n {
+            let pos = max * f64::from(k) / f64::from(n);
+            let now = s.side_tops(pos, visible);
+            let d = [now[LEFT] - last[LEFT], now[RIGHT] - last[RIGHT]];
+            assert!(
+                d[LEFT] >= -EPS && d[RIGHT] >= -EPS,
+                "{case}:往回走 pos={pos}:{last:?} → {now:?}"
+            );
+            assert!(d[LEFT].max(d[RIGHT]) <= step + EPS, "{case}:跳行 pos={pos}");
+            assert!(d[LEFT] + d[RIGHT] >= step - EPS, "{case}:空转 pos={pos}");
+            for side in [LEFT, RIGHT] {
+                assert!(now[side] <= max_top[side] + EPS, "{case}:越界 {now:?}");
+            }
+            last = now;
+        }
+        for stop in &s.path(visible).stops {
+            for side in [LEFT, RIGHT] {
+                let y = s.row_at(side, stop.at.min(s.total)) - stop.tops[side];
+                assert!(
+                    (-EPS..=visible + EPS).contains(&y),
+                    "{case}:对齐行出了视口 {stop:?}"
+                );
+            }
+        }
+    }
+
+    /// 两栏顶边随滚动位置单调不减、首尾都到得了,各种形状、几种视口高都一样。旧口径(对齐点
+    /// 在开头末尾半屏里挪动)下,左 50 行、右 70 行(第 25 行后右栏纯新增 20 行)、视口 40 行,
+    /// 往下滚左栏顶边是 0→10→0→10。
     #[test]
-    fn 两栏顶边_首尾都到得了() {
+    fn 两栏顶边单调且首尾都到得了() {
+        let shapes: [(&str, &[(&str, usize)]); 15] = [
+            (
+                "左 50 右 70(中段纯新增)",
+                &[("context", 25), ("add", 20), ("context", 25)],
+            ),
+            (
+                "中段纯删除",
+                &[("context", 25), ("delete", 20), ("context", 25)],
+            ),
+            (
+                "修改",
+                &[("context", 30), ("delete", 5), ("add", 12), ("context", 30)],
+            ),
+            ("首行改动", &[("delete", 1), ("add", 10), ("context", 60)]),
+            ("末行改动", &[("context", 60), ("delete", 3), ("add", 15)]),
+            ("首行纯新增", &[("add", 30), ("context", 50)]),
+            ("末尾纯删除", &[("context", 50), ("delete", 30)]),
+            ("新文件", &[("add", 100)]),
+            ("删掉的文件", &[("delete", 100)]),
+            ("比视口短", &[("context", 10), ("add", 5)]),
+            ("恰好一屏", &[("context", 20), ("add", 20)]),
+            ("一屏多", &[("context", 30), ("add", 15), ("context", 10)]),
+            (
+                "恰好两屏",
+                &[
+                    ("context", 40),
+                    ("delete", 10),
+                    ("add", 30),
+                    ("context", 10),
+                ],
+            ),
+            (
+                "纯增纯删交替",
+                &[
+                    ("context", 2),
+                    ("delete", 10),
+                    ("context", 2),
+                    ("add", 10),
+                    ("context", 2),
+                    ("delete", 10),
+                    ("context", 2),
+                    ("add", 10),
+                    ("context", 2),
+                ],
+            ),
+            (
+                "一行改成一屏",
+                &[("context", 3), ("delete", 1), ("add", 45), ("context", 3)],
+            ),
+        ];
+        for (name, parts) in shapes {
+            let f = shape(parts);
+            for visible in [40.0, 10.0, 23.5, 0.0] {
+                check_scroll(&f.split, visible, &format!("{name} / 视口 {visible}"));
+            }
+        }
+        // 很多小改动
+        let mut many = Vec::new();
+        for _ in 0..30 {
+            many.extend([("context", 1), ("delete", 1), ("add", 3)]);
+        }
+        check_scroll(&shape(&many).split, 40.0, "很多小改动");
+
+        // 评审的例子:左栏顶边 0 → 5 → 停 → 10,右栏 0 → 30
+        let f = shape(&[("context", 25), ("add", 20), ("context", 25)]);
+        let s = &f.split;
+        assert_eq!((s.rows[LEFT].len(), s.rows[RIGHT].len()), (50, 70));
+        assert_eq!(s.max_pos(40.0), 30.0);
+        assert_eq!(s.side_tops(5.0, 40.0), [5.0, 5.0]);
+        assert_eq!(
+            s.side_tops(25.0, 40.0),
+            [5.0, 25.0],
+            "新增那 20 行滚过对齐点时左栏停着"
+        );
+        assert_eq!(s.side_tops(30.0, 40.0), [10.0, 30.0]);
+    }
+
+    /// 中段两栏在视口正中对齐:对齐点落在一行改成 30 行的正中时,右栏正中是第 15 行新增,
+    /// 左栏正中是那一行删除的正中;两栏行数不同照样都滚到自己的末行。新文件左栏恒在顶上。
+    #[test]
+    fn 两栏在视口正中对齐() {
         // 100 行上下文 + 1 行改成 30 行 + 100 行上下文(不折叠)
-        let mut lines: Vec<DiffLine> = (0..100)
-            .map(|i| line("context", &format!("a{i}")))
-            .collect();
-        lines.push(line("delete", "x"));
-        lines.extend((0..30).map(|i| line("add", &format!("N{i}"))));
-        lines.extend((0..100).map(|i| line("context", &format!("b{i}"))));
-        let f = flatten(&[hunk(lines)]);
+        let f = shape(&[
+            ("context", 100),
+            ("delete", 1),
+            ("add", 30),
+            ("context", 100),
+        ]);
         let s = &f.split;
         assert_eq!((s.rows[LEFT].len(), s.rows[RIGHT].len()), (201, 230));
         let visible = 40.0;
-        let max = s.max_pos(visible);
-        assert_eq!(s.side_tops(0.0, visible), [0.0, 0.0]);
-        let end = s.side_tops(max, visible);
+        let end = s.side_tops(s.max_pos(visible), visible);
         assert_eq!(end, [201.0 - visible, 230.0 - visible]);
-        assert_eq!(s.side_tops(max + 50.0, visible), end, "越界钳回上限");
-        // 对齐点(正中)落在改动的一半处:右栏是第 15 行新增,左栏是那一行删除的正中
         let c = &s.changes[0];
-        let at = s.knots[0].0 + 15.0;
-        let tops = s.side_tops(at - visible / 2.0, visible);
+        let tops = s.side_tops(s.pos_at(s.knots[0].0 + 15.0, visible), visible);
         let center = |side: usize| tops[side] + visible / 2.0;
         assert!((center(RIGHT) - (c.rows[RIGHT].start as f64 + 15.0)).abs() < 1e-6);
         assert!((center(LEFT) - (c.rows[LEFT].start as f64 + 0.5)).abs() < 1e-6);
-        // 滚动是单调的:往下滚两栏都不往回走(中段)
-        let mut last = s.side_tops(visible, visible);
-        for step in 1..100 {
-            let now = s.side_tops(visible + f64::from(step), visible);
-            assert!(now[LEFT] >= last[LEFT] - 1e-9 && now[RIGHT] >= last[RIGHT] - 1e-9);
-            last = now;
-        }
 
-        // 新文件:左栏没有行,恒在顶上;右栏照常滚
-        let f = flatten(&[hunk(
-            (0..100).map(|i| line("add", &format!("n{i}"))).collect(),
-        )]);
+        let f = shape(&[("add", 100)]);
         assert_eq!(f.split.empty_sides(), [true, false]);
         let tops = f.split.side_tops(30.0, 20.0);
-        assert_eq!(tops[LEFT], 0.0);
-        assert!(tops[RIGHT] > 0.0);
+        assert_eq!(tops, [0.0, 30.0]);
+    }
+
+    /// F7 的落点:块的第一行停在顶边(这块里右栏多一行:右栏恰在顶边,左栏稍靠下一行);
+    /// 第一块从顶上起;末尾那一屏钳到上限。
+    #[test]
+    fn 跳到某块时它的第一行在顶边() {
+        let mut first = vec![line("context", "top")];
+        first.extend((0..60).map(|i| line("context", &format!("a{i}"))));
+        first.extend([line("delete", "x"), line("add", "X")]);
+        first.extend((0..3).map(|i| line("context", &format!("b{i}"))));
+        let mut second: Vec<DiffLine> = (0..3).map(|i| line("context", &format!("c{i}"))).collect();
+        second.extend([line("delete", "y"), line("add", "Y"), line("add", "Y2")]);
+        second.extend((0..80).map(|i| line("context", &format!("d{i}"))));
+        let mut third: Vec<DiffLine> = (0..3).map(|i| line("context", &format!("e{i}"))).collect();
+        third.extend([line("delete", "z"), line("add", "Z")]);
+        let f = flatten(&[hunk(first), hunk(second), hunk(third)]);
+        let s = &f.split;
+        let visible = 40.0;
+        assert_eq!(s.jump_pos(0, visible), 0.0);
+        let at = s.hunk_pos(1);
+        assert_eq!(s.side_tops(s.jump_pos(1, visible), visible), [at - 1.0, at]);
+        let max = s.max_pos(visible);
+        assert_eq!(s.jump_pos(2, visible), max, "末尾那一屏钳到上限");
+    }
+
+    /// 横向共用一个位置:窄栏到头后再往右滚,已经滚得更远的宽栏不会被拽回来;两栏都停在窄栏
+    /// 尽头时宽栏接着滚;往回滚宽栏先动,回到窄栏的范围里两栏重新对齐;两头都钳住。
+    #[test]
+    fn 横向共用位置_窄栏到头不拽回宽栏() {
+        let reach = [800.0, 300.0];
+        assert_eq!(shared_x([-800.0, -300.0], reach, 50.0), [-800.0, -300.0]);
+        assert_eq!(shared_x([-300.0, -300.0], reach, 50.0), [-350.0, -300.0]);
+        assert_eq!(shared_x([-800.0, -300.0], reach, -100.0), [-700.0, -300.0]);
+        assert_eq!(shared_x([-700.0, -300.0], reach, -600.0), [-100.0, -100.0]);
+        assert_eq!(shared_x([-100.0, -100.0], reach, -500.0), [0.0, 0.0]);
+        // 左右对调一样
+        assert_eq!(
+            shared_x([-300.0, -800.0], [300.0, 800.0], 50.0),
+            [-300.0, -800.0]
+        );
+        // 两栏都没有长行:不动
+        assert_eq!(shared_x([0.0, 0.0], [0.0, 0.0], 50.0), [0.0, 0.0]);
     }
 
     /// 折叠行两栏成对:同一条分隔行在两栏里的行号记在 `fold_rows` 与 `Fold` 上;改动在两侧

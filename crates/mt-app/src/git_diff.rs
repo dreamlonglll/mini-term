@@ -55,7 +55,8 @@
 //!    每处改动上,见 [`HunkUi`] / [`ribbon`]):
 //!    后端 `mt_project::git::{stage_hunk, unstage_hunk, discard_hunk}` 拿 diff 两侧全文
 //!    与该块的精确行号做文本拼接,执行前重读两侧防陈旧。操作后页签**原地**重取 diff、
-//!    视图模式不变、滚到原位置上的下一块;同时回调 `on_changed` 让更改列表重载。
+//!    视图模式不变、滚到原位置上的下一块(并排视图按一处改动操作、这块还留着别的改动时不跳,
+//!    停在原地);同时回调 `on_changed` 让更改列表重载。
 //!    从更改列表打开的走 `reload_files`:列表重载落地后文件序列跟着换,当前文件离开了
 //!    分组(取消暂存 / 丢弃了最后一块)就换到原位置上的下一个(见 [`resync_index`])。
 //! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮,在当前页签里换,
@@ -115,8 +116,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use mt_project::encoding::TextEncoding;
 pub use mt_project::git::DiffSide;
 use mt_project::git::{
-    CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, HunkPick,
-    StaleDiff,
+    CombinedFileChange, CommitFileInfo, DiffHunk, FileRevision, GitDiffResult, HunkPick, StaleDiff,
 };
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
@@ -418,6 +418,20 @@ struct Flat {
     /// 标题栏「+12 −3」的两个数
     adds: usize,
     deletes: usize,
+}
+
+/// 并排视图一处改动的身份:所在的块、两侧第一行的行号(删除行在旧侧、新增行在新侧;该侧
+/// 没有行时 `None`)、两侧行数。
+///
+/// 按钮回调里记的改动序号是渲染时的:静默重取刚落地、还没重画的那一两帧里点下去,同一个
+/// 序号可能已经指着别处。回调连同身份一起记下,点下去时与眼下的行模型核对(见
+/// [`DiffState::change_is`]),对不上就作罢。行内视图的块头按钮同理,身份是块头
+/// (见 [`Flat::hunk_key`])。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangeKey {
+    hunk: usize,
+    first: [Option<u32>; 2],
+    len: [usize; 2],
 }
 
 /// 行宽的近似列数:CJK/全角按 2,其余按 1。
@@ -732,6 +746,33 @@ impl Flat {
             .changes
             .get(change)
             .map_or_else(Vec::new, |c| self.pickable_of(c.lines.clone()))
+    }
+
+    /// 并排视图第 `change` 处改动的身份(见 [`ChangeKey`])。
+    fn change_key(&self, change: usize) -> Option<ChangeKey> {
+        let c = self.split.changes.get(change)?;
+        let first = |side: usize| {
+            let row = c.rows[side].clone().next()?;
+            let SideRow::Line(ix) = self.split.rows[side].get(row)? else {
+                return None;
+            };
+            let line = self.lines.get(*ix)?;
+            if side == LEFT {
+                line.old_lineno
+            } else {
+                line.new_lineno
+            }
+        };
+        Some(ChangeKey {
+            hunk: c.hunk,
+            first: [first(LEFT), first(RIGHT)],
+            len: [c.rows[LEFT].len(), c.rows[RIGHT].len()],
+        })
+    }
+
+    /// 第 `hunk` 块的身份:块头 `@@ -a,b +c,d @@`(两侧起点与行数)。
+    fn hunk_key(&self, hunk: usize) -> Option<SharedString> {
+        self.heads.get(hunk).map(|head| head.inline.clone())
     }
 
     /// `lines`(拍平行区间)里的增删行。
@@ -1206,12 +1247,16 @@ fn hunk_check(state: &Entity<DiffState>, s: &DiffState, hunk: usize) -> AnyEleme
     }
     let picked = lines.iter().filter(|ix| s.picks.contains(ix)).count();
     let state = state.clone();
+    let head = s.flat.hunk_key(hunk);
     check_cell(
         SharedString::from(format!("git-diff-pick-hunk-{hunk}")),
         Tick::of(picked, lines.len()),
         move |cx| {
             state.update(cx, |s, cx| {
-                s.toggle_lines(s.flat.pickable_in(hunk));
+                // 块号还指着渲染时那一块才翻(见 [`ChangeKey`])
+                if head.as_ref().is_some_and(|head| s.hunk_is(hunk, head)) {
+                    s.toggle_lines(s.flat.pickable_in(hunk));
+                }
                 cx.notify();
             })
         },
@@ -1519,6 +1564,16 @@ impl DiffState {
             .map_or(0, |c| self.picks.range(c.lines.clone()).count())
     }
 
+    /// 按钮回调里记的第 `change` 处改动(身份 `key`)是不是还在原处(见 [`ChangeKey`])。
+    fn change_is(&self, change: usize, key: Option<ChangeKey>) -> bool {
+        key.is_some() && self.flat.change_key(change) == key
+    }
+
+    /// 同上,行内视图的第 `hunk` 块(身份是块头)。
+    fn hunk_is(&self, hunk: usize, key: &SharedString) -> bool {
+        self.flat.hunk_key(hunk).as_ref() == Some(key)
+    }
+
     /// 点块操作按钮那一刻要交给后端的东西:屏幕上的这份 diff + 要动的块与行(见 [`OpTarget`])。
     /// 没有 diff、块号越界、跨块操作却一行都没勾 → `None`。
     fn op_target(&self, scope: OpScope) -> Option<OpTarget> {
@@ -1540,13 +1595,15 @@ impl DiffState {
                     diff,
                     picks,
                     busy: Busy::Hunk(hunk),
-                    land: hunk,
+                    land: Some(hunk),
                     lines,
                     change: false,
                 })
             }
-            // 一处改动 = 所在 hunk 里的这几行增删行(按行操作;全选上与整块逐字节一致,见
-            // `mt_project::git::hunk`)。这一处里勾了行就只动勾上的
+            // 一处改动 = 所在 hunk 里的这几行增删行,按行交给后端。这一处里勾了行就只动勾上的。
+            // 这几行就是这块剩下的全部增删行时与整块逐字节一致;这一处是块里最后一处改动、块又
+            // 碰到文件末尾时,末尾换行跟随来源侧(否则那处看不见的差异会被留下,见
+            // `mt_project::git::hunk` 模块注释「按行操作」)
             OpScope::Change(change) => {
                 let hunk = self.flat.split.changes.get(change)?.hunk;
                 if hunk >= diff.hunks.len() {
@@ -1560,11 +1617,14 @@ impl DiffState {
                 if picks.is_empty() {
                     return None;
                 }
+                // 这块整个落下去了(动的是它剩下的全部增删行)才按块的口径落到下一块;块还在
+                // 就停在原地 —— 跳回块头的话,长 hunk 里点了第 25 处会被拽回上百行之外
+                let gone = lines.iter().copied().eq(self.flat.pickable_in(hunk));
                 Some(OpTarget {
                     diff,
                     picks,
                     busy: Busy::Change(change),
-                    land: hunk,
+                    land: gone.then_some(hunk),
                     lines: Some(lines.len()),
                     change: whole,
                 })
@@ -1581,7 +1641,7 @@ impl DiffState {
                     diff,
                     picks,
                     busy: Busy::Lines,
-                    land,
+                    land: Some(land),
                     lines: Some(lines),
                     change: false,
                 })
@@ -1798,9 +1858,10 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                         line_height,
                         gutter,
                         can_pick.then(|| hunk_check(&rows_state, s, h)),
-                        hunks
-                            .as_ref()
-                            .map(|ui| hunk_actions(ui, h, s.picks_in_hunk(h))),
+                        hunks.as_ref().map(|ui| {
+                            let head = s.flat.heads[h].inline.clone();
+                            hunk_actions(ui, h, head, s.picks_in_hunk(h))
+                        }),
                         scroll.x,
                     ),
                     InlineRow::Fold(f) => fold_row(
@@ -2115,8 +2176,8 @@ struct OpTarget {
     /// 要动的块(块号递增)与各块生效的行(`None` = 整块)
     picks: Vec<HunkPick>,
     busy: Busy,
-    /// 操作后原地重取时停在第几块(原位置上的那一块 / 下一块)
-    land: usize,
+    /// 操作后原地重取时停在第几块(原位置上的那一块 / 下一块);`None` = 不跳,停在原地
+    land: Option<usize>,
     /// 按行操作时一共几行(确认框文案用);整块是 `None`
     lines: Option<usize>,
     /// 并排视图里整处改动(没勾行)的操作:确认框说「这一处改动」而不是「勾选的行」
@@ -2218,8 +2279,9 @@ fn op_key(op: HunkOp) -> &'static str {
 
 /// hunk 头上的块操作按钮:未暂存侧「暂存此块 / 丢弃此块」,已暂存侧「取消暂存此块」;
 /// 块里勾了 `picked` 行时换成「暂存所选 N 行」这类、只对勾上的行生效。
-/// 正在处理的那一块换成「处理中…」,其余块的按钮一并禁用。
-fn hunk_actions(hunk_ui: &HunkUi, hunk: usize, picked: usize) -> AnyElement {
+/// 正在处理的那一块换成「处理中…」,其余块的按钮一并禁用。`head` 是这一块的块头(点下去时
+/// 核对块号还指不指着它,见 [`ChangeKey`])。
+fn hunk_actions(hunk_ui: &HunkUi, hunk: usize, head: SharedString, picked: usize) -> AnyElement {
     if hunk_ui.busy == Some(Busy::Hunk(hunk)) {
         return working_label().into_any_element();
     }
@@ -2227,6 +2289,7 @@ fn hunk_actions(hunk_ui: &HunkUi, hunk: usize, picked: usize) -> AnyElement {
     let blocked = hunk_ui.blocked.clone();
     let button = |op: HunkOp| {
         let (state, ctl) = (hunk_ui.state.clone(), hunk_ui.ctl.clone());
+        let head = head.clone();
         text_button(
             SharedString::from(format!("git-hunk-{}-{hunk}", op_key(op))),
             op_label(op, picked),
@@ -2237,7 +2300,9 @@ fn hunk_actions(hunk_ui: &HunkUi, hunk: usize, picked: usize) -> AnyElement {
         .when(enabled, move |el| {
             el.on_click(move |_: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                request_hunk_op(&state, &ctl, op, OpScope::Hunk(hunk), window, cx);
+                if still_there(&state, cx, |s| s.hunk_is(hunk, &head)) {
+                    request_hunk_op(&state, &ctl, op, OpScope::Hunk(hunk), window, cx);
+                }
             })
         })
     };
@@ -2325,6 +2390,20 @@ fn non_utf8_hunk_reason(encoding: TextEncoding) -> SharedString {
         label => label,
     };
     tr!("gitCommit", "hunkNonUtf8", encoding = label).into()
+}
+
+/// 按钮点下去时,它记的作用对象还在不在原处(`check` 拿眼下的行模型核对,见 [`ChangeKey`])。
+/// 不在就重画一帧换上新按钮、返回 `false`,这次点击作罢。
+fn still_there(
+    state: &Entity<DiffState>,
+    cx: &mut App,
+    check: impl FnOnce(&DiffState) -> bool,
+) -> bool {
+    if check(state.read(cx)) {
+        return true;
+    }
+    state.update(cx, |_, cx| cx.notify());
+    false
 }
 
 /// 点了块操作按钮(行内视图块头上的、并排视图中间栏里的,或工具栏上跨块的「所选行」)。
@@ -2498,8 +2577,9 @@ enum Fetch {
     /// 换文件 / 首次打开:清空(勾选与展开一并清掉)、回「加载中」、回到顶部
     Fresh,
     /// 按块操作后原地重取(错误条上的「刷新」也走这条):不清空旧内容、不回「加载中」(否则
-    /// 整页闪一下),落到第 k 块(原位置上的下一块),并清掉块操作的 `busy`
-    AfterOp(usize),
+    /// 整页闪一下),`Some(k)` 落到第 k 块(原位置上的下一块)、`None` 不动滚动位置,并清掉
+    /// 块操作的 `busy`
+    AfterOp(Option<usize>),
     /// 页签切回来 / 工具栏「刷新」/ 仓库变了:静默原地重取。拿回来的与屏幕上的一样就什么都
     /// 不动(见 [`DiffState::refresh_unchanged`]);变了照旧按内容认回勾选、按行号认回展开,
     /// 滚动位置不动、不跳块。已经有一趟在途(加载中 / 另一趟静默重取)就不叠
@@ -2542,7 +2622,7 @@ fn load_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, fetch: Fetch, cx
             if !s.land_fetch(req, fetch, result) {
                 return;
             }
-            if let Fetch::AfterOp(next) = fetch {
+            if let Fetch::AfterOp(Some(next)) = fetch {
                 s.jump_to(next);
             }
             cx.notify();
@@ -2575,14 +2655,14 @@ fn resync_index(old: &[DiffFile], current: usize, new: &[DiffFile]) -> Option<us
 }
 
 /// 块操作后打开方重载出了新序列(见 [`ReloadFiles`]):换上它,按 [`resync_index`]
-/// 决定停在哪。当前文件还在 → 原地重取(落到原位置上的下一块);换了文件 → 告诉打开方、
-/// 从头取那个文件;组空了 → 留下当前文件原地重取,正文是「没有更多改动」的空态、换文件
-/// 的按钮随之收起。`None`(没取到)沿用旧序列原地重取。
+/// 决定停在哪。当前文件还在 → 原地重取(`hunk` 为 `Some` 时落到原位置上的下一块,`None`
+/// 停在原地);换了文件 → 告诉打开方、从头取那个文件;组空了 → 留下当前文件原地重取,正文是
+/// 「没有更多改动」的空态、换文件的按钮随之收起。`None`(没取到)沿用旧序列原地重取。
 fn resync_files(
     state: &Entity<DiffState>,
     ctl: &Entity<FileDiff>,
     files: Option<Vec<DiffFile>>,
-    hunk: usize,
+    hunk: Option<usize>,
     cx: &mut App,
 ) {
     let Some(files) = files else {
@@ -2862,7 +2942,7 @@ fn error_bar(
                         cx.notify();
                     });
                     let at = refresh_state.read(cx).jump.unwrap_or(0);
-                    load_file(&refresh_state, &refresh_ctl, Fetch::AfterOp(at), cx);
+                    load_file(&refresh_state, &refresh_ctl, Fetch::AfterOp(Some(at)), cx);
                 }),
             )
         })
@@ -3348,6 +3428,8 @@ impl CommitFileDiffPane {
 
 #[cfg(test)]
 mod tests {
+    use mt_project::git::DiffLine;
+
     use super::*;
 
     fn hunk(lines: Vec<DiffLine>) -> DiffHunk {
@@ -4059,7 +4141,8 @@ mod tests {
         let second = s.op_target(OpScope::Change(1)).expect("有这一处");
         assert_eq!(
             (second.land, second.lines, second.change),
-            (0, Some(3), true)
+            (None, Some(3), true),
+            "块里还有另一处:操作后停在原地"
         );
         assert_eq!(second.busy, Busy::Change(1));
         let lines = second.picks[0].lines.as_ref().expect("按行交给后端");
@@ -4083,6 +4166,101 @@ mod tests {
         s.toggle_change_picks(0);
         assert_eq!(s.picks_in_change(0), 0);
         assert_eq!(s.picks_in_change(1), 1, "另一处的勾选不受影响");
+    }
+
+    /// 按钮回调记的改动 / 块的身份:同一份 diff 里认得出;重取之后同一个序号指着别处时对不上
+    /// (这次点击作罢),原来那一处换了序号也认得出是它。
+    #[test]
+    fn 按钮记的改动序号过期就不认() {
+        let mut s = DiffState::new(13.0);
+        s.pickable = true;
+        s.apply(Ok(diff_two_texts(
+            "a\nb\nc\nd\ne\n".into(),
+            "a\nB\nc\nd\nE\nF\n".into(),
+        )));
+        let (first, second) = (s.flat.change_key(0), s.flat.change_key(1));
+        assert!(first.is_some() && first != second);
+        assert!(s.change_is(1, second) && !s.change_is(0, second));
+        let head = s.flat.hunk_key(0).unwrap();
+        assert!(s.hunk_is(0, &head));
+        // 第 0 处暂存掉之后重取:原来的第 1 处成了第 0 处,块头也变了
+        s.apply(Ok(diff_two_texts(
+            "a\nB\nc\nd\ne\n".into(),
+            "a\nB\nc\nd\nE\nF\n".into(),
+        )));
+        assert!(!s.change_is(1, second), "序号 1 已经没有了");
+        assert!(!s.change_is(0, first), "序号 0 指着原来的第 1 处");
+        assert!(s.change_is(0, second));
+        assert!(!s.hunk_is(0, &head));
+        assert!(!s.change_is(0, None));
+    }
+
+    /// 按一处改动操作后落在哪:块里还剩别的改动时停在原地(不跳回块头);动的是块里剩下的
+    /// 全部增删行(没勾行,或这一处全勾上了)时块整个落下去,按块的口径落到原位置上的下一块。
+    /// 行内视图的块头按钮照旧落到下一块。
+    #[test]
+    fn 按改动操作后停在原地或落到下一块() {
+        let mut s = DiffState::new(13.0);
+        s.pickable = true;
+        s.apply(Ok(diff_two_texts(
+            "a\nb\nc\nd\ne\n".into(),
+            "a\nB\nc\nd\nE\nF\n".into(),
+        )));
+        assert_eq!(s.op_target(OpScope::Change(0)).unwrap().land, None);
+        assert_eq!(s.op_target(OpScope::Hunk(0)).unwrap().land, Some(0));
+
+        let mut new = numbered(40);
+        new[4] = "FIVE".into();
+        new[30] = "THIRTY".into();
+        s.apply(Ok(diff_two_texts(text(&numbered(40)), text(&new))));
+        assert_eq!((s.flat.heads.len(), s.flat.split.changes.len()), (2, 2));
+        assert_eq!(s.op_target(OpScope::Change(1)).unwrap().land, Some(1));
+        s.toggle_change_picks(1);
+        assert_eq!(s.op_target(OpScope::Change(1)).unwrap().land, Some(1));
+        // 只勾了一部分:块还在
+        s.toggle_pick(s.flat.change_lines(1)[0]);
+        assert_eq!(s.op_target(OpScope::Change(1)).unwrap().land, None);
+    }
+
+    /// 按中间栏的箭头把 `cur` 的第 `change` 处改动往 `goal` 那边搬一步(暂存 = `Apply`,丢弃 =
+    /// `Revert`),返回写下去的那一侧。
+    fn step_change(
+        s: &mut DiffState,
+        (old, new): (&str, &str),
+        change: usize,
+        dir: HunkDirection,
+    ) -> String {
+        s.apply(Ok(diff_two_texts(old.into(), new.into())));
+        let target = s.op_target(OpScope::Change(change)).expect("有这一处");
+        let picks: Vec<_> = target
+            .picks
+            .iter()
+            .map(|pick| (&target.diff.hunks[pick.hunk], pick.lines.as_ref()))
+            .collect();
+        splice_hunks(old, new, &picks, dir, "\n").unwrap()
+    }
+
+    /// 同一 hunk 里两处改动、后一处碰到文件末尾且末尾换行不同(这处差异 diff 里看不见):不管先
+    /// 点哪一处,两处都暂存 / 丢弃之后两侧逐字节相同 —— 末尾换行不会被孤零零留下、文件也就不会
+    /// 「没有改动却一直挂在未暂存里」。
+    #[test]
+    fn 按改动操作不漏掉末尾换行() {
+        use HunkDirection::{Apply, Revert};
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+        let new = "l1\nl2\nL3\nl4\nl5\nl6\nl7\nl8\nl9\nL10";
+        assert_eq!(diff_two_texts(old.into(), new.into()).hunks.len(), 1);
+        let mut s = DiffState::new(13.0);
+        s.pickable = true;
+        for first in [1, 0] {
+            // 暂存:先动 `first` 那一处,剩下的那处这时是第 0 处
+            let staged = step_change(&mut s, (old, new), first, Apply);
+            let staged = step_change(&mut s, (&staged, new), 0, Apply);
+            assert_eq!(staged, new, "先暂存第 {first} 处");
+            // 丢弃
+            let kept = step_change(&mut s, (old, new), first, Revert);
+            let kept = step_change(&mut s, (old, &kept), 0, Revert);
+            assert_eq!(kept, old, "先丢弃第 {first} 处");
+        }
     }
 
     /// 块头按钮上的字:没勾 = 整块,勾了 = 「所选 N 行」;按侧给哪几种操作。

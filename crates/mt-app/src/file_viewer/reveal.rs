@@ -1,5 +1,7 @@
 //! 打开文件时的「定位到行」(终端文件链接、全局搜索点进来的两条路):目标行滚到视口
-//! **顶上**,范围写法(`a.ts:20-35`)连同选中那几行。[`FileViewer`] 的又一半 `impl`。
+//! **顶上**,范围写法(`a.ts:20-35`)连同选中那几行。快速打开的 `文件:行` 跳行例外:目标行
+//! 滚到视口**正中**(对标 IDEA 的 Ctrl+G,上下都留着上下文,见 [`LineTarget::centered`])。
+//! [`FileViewer`] 的又一半 `impl`。
 //!
 //! # 为什么不直接用 `set_cursor_position`
 //!
@@ -21,7 +23,7 @@
 //! - 视口外的行:不折行的文件行高均一,`行号 × 行高` 就是准数;软换行的(md / txt)
 //!   显示行表没公开,先让组件按它自己的表把那一行滚进视口,下一帧再量。
 //!
-//! 内容总高同样没公开,滚动量的上限用下界代替(见 [`top_scroll`])。
+//! 内容总高同样没公开,滚动量的上限用下界代替(见 [`top_scroll`] / [`center_scroll`])。
 //!
 //! # 时机
 //!
@@ -41,23 +43,37 @@ use super::file_kind::should_wrap;
 pub struct LineTarget {
     pub line: u32,
     pub end: Option<u32>,
+    /// 目标行滚到视口正中(快速打开的跳行);`false` = 顶到视口顶上(终端文件链接、全局搜索)
+    pub center: bool,
 }
 
 impl LineTarget {
-    /// 只定位一行,不选中。
+    /// 只定位一行,不选中;目标行顶到视口顶上。
     pub fn line(line: u32) -> Self {
-        Self { line, end: None }
+        Self {
+            line,
+            end: None,
+            center: false,
+        }
+    }
+
+    /// 目标行改为滚到视口正中(对标 IDEA 的 Ctrl+G:上下都留着上下文)。
+    pub fn centered(self) -> Self {
+        Self {
+            center: true,
+            ..self
+        }
     }
 
     /// 夹进一份 `total` 行的文件:起点越界不定位(`None`),终点越界夹到末行、
     /// 比起点小当没写。
     pub(super) fn clamp(self, total: u32) -> Option<Self> {
         (self.line >= 1 && self.line <= total).then(|| Self {
-            line: self.line,
             end: self
                 .end
                 .filter(|&end| end >= self.line)
                 .map(|end| end.min(total)),
+            ..self
         })
     }
 }
@@ -99,8 +115,23 @@ pub(super) fn top_scroll(
     top.min((content - viewport).max(px(0.)))
 }
 
+/// 同 [`top_scroll`],但让这一行落在视口正中:文件头那一屏顶不下去(不滚过首行)、文件尾
+/// 那一屏同样夹到最大滚动量;比视口还高的行(软换行的长段)退回顶到视口顶上,保住它的开头。
+pub(super) fn center_scroll(
+    top: Pixels,
+    height: Pixels,
+    rows_below: usize,
+    line_height: Pixels,
+    viewport: Pixels,
+) -> Pixels {
+    let centered = top - ((viewport - height) / 2.).max(px(0.));
+    top_scroll(top, height, rows_below, line_height, viewport)
+        .min(centered)
+        .max(px(0.))
+}
+
 /// 摆光标 / 选区:单行把光标放到行首,范围选中起点行首到终点行尾。组件顺带把光标
-/// 滚进视口(排过版时才滚得动,滚多少由 [`scroll_to_top`] 接着改)。
+/// 滚进视口(排过版时才滚得动,滚多少由 [`scroll_to_target`] 接着改)。
 fn place_cursor(
     state: &mut EditorState,
     target: LineTarget,
@@ -135,8 +166,8 @@ fn row_extent(state: &EditorState, row: usize) -> Option<(Pixels, Pixels)> {
     Some((bounds.origin.y - origin, bounds.size.height))
 }
 
-/// 把目标行滚到视口顶上(办法见模块注释)。
-fn scroll_to_top(
+/// 把目标行滚到视口顶上(`center` 时滚到正中;办法见模块注释)。
+fn scroll_to_target(
     state: &mut EditorState,
     pending: &PendingReveal,
     soft_wrap: bool,
@@ -159,13 +190,18 @@ fn scroll_to_top(
     };
     let rows_below = state.text().lines_len().saturating_sub(row + 1);
     let viewport = state.input_bounds().size.height;
-    let y = top_scroll(top, height, rows_below, line_height, viewport);
+    let y = if pending.target.center {
+        center_scroll(top, height, rows_below, line_height, viewport)
+    } else {
+        top_scroll(top, height, rows_below, line_height, viewport)
+    };
     state.set_scroll_offset(point(px(0.), -y), cx);
     Step::Done
 }
 
 impl FileViewer {
-    /// 摆光标 / 选区,再把目标行滚到视口顶上。编辑器还没画过(新开的页签)就等它画出来。
+    /// 摆光标 / 选区,再把目标行滚到视口顶上(或正中,见 [`LineTarget::center`])。编辑器还没
+    /// 画过(新开的页签)就等它画出来。
     pub(super) fn reveal(
         &mut self,
         target: LineTarget,
@@ -214,7 +250,7 @@ impl FileViewer {
         };
         let soft_wrap = should_wrap(&self.file_name());
         let step = editor.update(cx, |state, cx| {
-            scroll_to_top(state, &pending, soft_wrap, window, cx)
+            scroll_to_target(state, &pending, soft_wrap, window, cx)
         });
         match step {
             // 编辑器没画出来(页签切走了):等下一次渲染

@@ -56,6 +56,12 @@
 //! 差异 diff 里又看不见、没法再暂存回去。被写那一侧是空文件时没有「原来的样子」,末行
 //! 跟随搬进来那一行在来源侧的写法。块里的增删行全选上 = 整块,与不传选择逐字节一致。
 //!
+//! 例外:块里**最后一处改动**(末尾那一段连续的增删行)整段选上了(并排视图中间栏的箭头
+//! 动的就是整处改动),末尾换行按整块的口径跟随来源侧。这时结果从那里到块尾与来源侧逐行
+//! 相同,块里剩下的差异全在前面、离末尾可能超过上下文的行数,重算出来的块碰不到末尾 —— 不
+//! 跟着走的话,那处看不见的末尾换行差异就再也落不进任何一块(界面上没有改动,文件却一直
+//! 挂在未暂存里),而且结果取决于几处改动的点击先后。
+//!
 //! 一次可以动好几块([`splice_hunks`]):块按位置先后排、互不重叠,一趟拼完再落盘 ——
 //! 逐块落盘的话,第一块写下去,后面几块对应的那份 diff 就过期了。
 
@@ -196,8 +202,11 @@ struct Plan {
     /// 块在来源侧占的行区间
     source: Range<usize>,
     pieces: Vec<Piece>,
-    /// 只有一部分增删行生效(按行操作;末尾换行的口径不同,见模块注释)
+    /// 只有一部分增删行生效(按行操作)
     partial: bool,
+    /// 末尾换行保持被写那一侧原来的样子:按行操作、且块里最后一处改动没有整段选上(见模块
+    /// 注释「按行操作」)。否则按整块的口径跟随来源侧
+    keep_eof: bool,
 }
 
 /// 对账一块并排出它的拼法。`lines` 是按行操作时生效的行(`None` = 整块)。
@@ -234,6 +243,16 @@ fn plan_hunk(
     let picked = |i: usize| lines.is_none_or(|set| set.contains(&i));
     // 增删行全选上了就是整块:与不传选择逐字节一致
     let partial = (0..hunk.lines.len()).any(|i| changed(i) && !picked(i));
+    // 块里最后一处改动(末尾那一段连续的增删行)整段选上了:结果从那里到块尾与来源侧逐行相同,
+    // 末尾换行要跟随来源侧,否则那处看不见的差异会孤零零留下
+    let tail_change_picked = hunk
+        .lines
+        .iter()
+        .enumerate()
+        .rev()
+        .skip_while(|(_, line)| line.kind == "context")
+        .take_while(|(_, line)| line.kind != "context")
+        .all(|(i, _)| picked(i));
 
     let mut pieces: Vec<Piece> = Vec::with_capacity(hunk.lines.len());
     let (mut target_first, mut target_next) = (None, None);
@@ -290,6 +309,7 @@ fn plan_hunk(
         source: source_begin..source_end,
         pieces,
         partial,
+        keep_eof: partial && !tail_change_picked,
     })
 }
 
@@ -368,12 +388,12 @@ pub fn splice_hunks(
     }
     // 末尾换行(见模块注释)。只有最后一块可能碰到末尾,也只在结果的末行正是块里的行时
     // 才动(块外一个字节都不碰):
-    // - 整块碰到了两侧的文件末尾:跟随来源侧;
-    // - 按行操作碰到了被写那一侧的末尾:保持被写那一侧原来有没有末尾换行(空文件没有
+    // - 整块(或按行操作时块里最后一处改动整段选上了)碰到了两侧的文件末尾:跟随来源侧;
+    // - 其余按行操作碰到了被写那一侧的末尾:保持被写那一侧原来有没有末尾换行(空文件没有
     //   「原来」,末行留着搬进来时的写法)。落到末尾的是空行时它的换行不能拿掉 —— 拿掉
     //   这一行就没了,内容比末尾换行要紧
     let at_eof = tail_plan.target.end == target.len() && tail_plan.source.end == source.len();
-    let final_eol = if tail_plan.partial {
+    let final_eol = if tail_plan.keep_eof {
         target
             .last()
             .filter(|_| tail_plan.target.end == target.len())
@@ -384,7 +404,7 @@ pub fn splice_hunks(
         None
     };
     if let (Some(keep), Some(tail)) = (final_eol, out.last_mut()) {
-        if !keep && !(tail_plan.partial && tail.0.is_empty()) {
+        if !keep && !(tail_plan.keep_eof && tail.0.is_empty()) {
             tail.1 = "";
         } else if tail.1.is_empty() {
             tail.1 = eol;
