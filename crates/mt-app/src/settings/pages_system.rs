@@ -144,26 +144,6 @@ impl SettingsView {
                 },
                 cx,
             )))
-            .child(section("system.remoteGitGroup").child(toggle_row(
-                "remote-git-helper-enabled",
-                "system.remoteGitTitle",
-                "system.remoteGitDesc",
-                self.store.read(cx).config().remote_git_helper_enabled,
-                false,
-                |this, next, window, cx| {
-                    if next {
-                        crate::git_backend::request_enable(this.store.clone(), window, cx);
-                    } else {
-                        this.store.update(cx, |store, cx| {
-                            store.patch_config(
-                                |config| config.remote_git_helper_enabled = false,
-                                cx,
-                            );
-                        });
-                    }
-                },
-                cx,
-            )))
             .child(
                 section("system.downloadDirectoryGroup")
                     .child(ui::setting_row(

@@ -16,6 +16,7 @@ use super::{acquire_session, state};
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_CAP: usize = 16 * 1024;
 
 #[derive(Clone, Copy)]
@@ -302,6 +303,28 @@ impl RemoteGitClient {
     /// Whether the framed stream is still synchronized and can accept another request.
     pub(crate) fn is_connected(&self) -> bool {
         self.transport.is_some()
+    }
+
+    /// A strictly read-only liveness probe. Failure is known-before-write, so the
+    /// workspace may replace this channel before sending the actual mutation once.
+    pub(crate) fn probe_idle(&mut self, repo: &str) -> Result<(), mt_git_helper::GitFailure> {
+        let previous = self
+            .transport
+            .as_ref()
+            .map(|transport| transport.timeouts.request);
+        if let Some(transport) = self.transport.as_mut() {
+            transport.timeouts.request = transport.timeouts.request.min(IDLE_PROBE_TIMEOUT);
+        }
+        let result = self
+            .request_data::<mt_project::git::RepoSignature>(Operation::Query {
+                repo: repo.to_owned(),
+                query: mt_git_helper::GitQuery::RepoSignature,
+            })
+            .map(|_| ());
+        if let (Some(transport), Some(previous)) = (self.transport.as_mut(), previous) {
+            transport.timeouts.request = previous;
+        }
+        result
     }
 
     /// Send EOF, wait at most two seconds for helper exit, then close the channel (500ms).

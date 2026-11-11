@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use gpui::{Context, Window};
-use mt_config::ProjectConfig;
+use mt_config::{AppConfig, ProjectConfig};
 use mt_project::project_kind::ProjectKind;
 
 use crate::project_tree;
@@ -17,7 +17,142 @@ use super::events::StoreChanged;
 use super::pure::remove_from_tree;
 use super::{AppStore, ProjectState, StoreEvent};
 
+/// Removing a parent also affects the recovery entry of its nested projects.
+fn removal_source_pending<'a>(
+    config: &'a AppConfig,
+    id: &str,
+    mut pending: impl FnMut(&ProjectConfig) -> bool,
+) -> Option<&'a ProjectConfig> {
+    config.projects.iter().find(|project| {
+        let mut current = *project;
+        for _ in 0..config.projects.len() {
+            if current.id == id {
+                return pending(project);
+            }
+            let Some(parent) = current
+                .parent_project_id
+                .as_deref()
+                .and_then(|parent| config.projects.iter().find(|project| project.id == parent))
+            else {
+                break;
+            };
+            current = parent;
+        }
+        false
+    })
+}
+
+/// Credentials and display metadata can change without redirecting a recovery entry.
+fn remote_git_source_changed(original: &AppConfig, next: &AppConfig, project_id: &str) -> bool {
+    let Some(before) = original
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+    else {
+        return false;
+    };
+    let Some(after) = next
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+    else {
+        return true;
+    };
+    if before.path != after.path || before.ssh_connection_id != after.ssh_connection_id {
+        return true;
+    }
+    let mut ancestor = before;
+    for _ in 0..original.projects.len() {
+        let Some(parent) = ancestor
+            .parent_project_id
+            .as_deref()
+            .and_then(|id| original.projects.iter().find(|project| project.id == id))
+        else {
+            break;
+        };
+        if !next.projects.iter().any(|project| project.id == parent.id) {
+            return true;
+        }
+        ancestor = parent;
+    }
+    let before_connection = original
+        .ssh_connections
+        .iter()
+        .find(|connection| before.ssh_connection_id.as_deref() == Some(connection.id.as_str()));
+    let after_connection = next
+        .ssh_connections
+        .iter()
+        .find(|connection| after.ssh_connection_id.as_deref() == Some(connection.id.as_str()));
+    match (before_connection, after_connection) {
+        (Some(before), Some(after)) => remote_git_endpoint_changed(before, after),
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+pub(super) fn remote_git_endpoint_changed(
+    before: &mt_config::SshConnection,
+    after: &mt_config::SshConnection,
+) -> bool {
+    before.host != after.host || before.port != after.port || before.user != after.user
+}
+
+/// Stage only while a recovery source is busy; rejected patches never touch live config.
+pub(super) fn patch_preserving_remote_git_sources(
+    config: &mut AppConfig,
+    pending_sources: &[String],
+    edit: impl FnOnce(&mut AppConfig),
+) -> Option<String> {
+    if pending_sources.is_empty() {
+        edit(config);
+        return None;
+    }
+    let mut next = config.clone();
+    edit(&mut next);
+    if let Some(id) = pending_sources
+        .iter()
+        .find(|id| remote_git_source_changed(config, &next, id))
+    {
+        return Some(id.clone());
+    }
+    *config = next;
+    None
+}
+
 impl AppStore {
+    /// Bypass consent gating here: revoking consent must not hide an in-flight/unknown write.
+    pub(super) fn remote_git_source_pending(&self, project: &ProjectConfig) -> bool {
+        let Some(connection) = self.config.ssh_connections.iter().find(|connection| {
+            project.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+        }) else {
+            return false;
+        };
+        let context = mt_remote::GitContext::remote(
+            project.id.clone(),
+            connection.clone(),
+            project.path.clone(),
+        );
+        context.write_running() || context.unknown_write().is_some()
+    }
+
+    pub(super) fn notify_remote_git_source_blocked(
+        &self,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .project(project_id)
+            .map(|project| project.name.as_str())
+            .unwrap_or(project_id);
+        crate::toast::push_message_deduped(
+            crate::notify::ToastKind::PasteError,
+            project_id.to_string(),
+            name.to_string(),
+            crate::i18n::t("gitHistory", "recoverySourceBlocked").to_string(),
+            cx,
+        );
+    }
+
     /// 新项目 id:对 `projects` **与** `projectTree` 双双去重。树里也要查 ——
     /// 树上可能残留指向已删项目的 id,撞上会让新项目凭空出现在残留的位置。
     /// 背景见 [`gen_unique_id`] / `tree::gen_id` 的注释(曾把库里既有项目顶掉)。
@@ -300,6 +435,36 @@ impl AppStore {
         cx.changed(StoreEvent::ProjectsChanged);
     }
 
+    /// Persist explicit helper consent and synchronously update the deny-by-default registry.
+    /// The caller obtains consent through git_backend::request_enable before enabling.
+    pub fn set_project_remote_git_enabled(
+        &mut self,
+        project_id: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self
+            .config
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+        else {
+            return;
+        };
+        let connection = self.config.ssh_connections.iter().find(|connection| {
+            project.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+        });
+        project.set_remote_git_enabled(connection, enabled);
+        mt_remote::set_project_git_permission(
+            project_id,
+            connection,
+            &project.path,
+            connection.is_some_and(|connection| project.remote_git_enabled(connection)),
+        );
+        self.save_config_now();
+        cx.changed(StoreEvent::ProjectsChanged);
+    }
+
     /// 项目级环境变量(`ProjectEnvVarsModal` 的落盘那一半)。
     ///
     /// **立即落盘**而不是 500ms 防抖:整屏手填的键值对不该在防抖窗口里被一次
@@ -343,8 +508,15 @@ impl AppStore {
         cx.changed(StoreEvent::ProjectsChanged);
     }
 
-    /// 移除项目:先回收它所有 pane 的 PTY,再从配置里摘掉。
+    /// 移除项目:先原子撤销 Git 来源/授权,再回收 pane 的 PTY 和布局状态。
     pub fn remove_project(&mut self, id: &str, cx: &mut Context<Self>) {
+        let source_change = mt_remote::remote_git_source_change_guard();
+        if let Some(source) = removal_source_pending(&self.config, id, |project| {
+            self.remote_git_source_pending(project)
+        }) {
+            self.notify_remote_git_source_blocked(&source.id, cx);
+            return;
+        }
         if crate::workbench_area::project_has_dirty_documents(id, cx) {
             let project_name = self
                 .project(id)
@@ -359,6 +531,11 @@ impl AppStore {
             );
             return;
         }
+        // Commit the source/grant cutover before releasing dispatch; terminal shutdown
+        // remains outside the lock because a remote PTY may need transport cleanup.
+        mt_remote::set_project_git_permission(id, None, "", false);
+        self.config.projects.retain(|p| p.id != id);
+        drop(source_change);
         let pty_ids: Vec<u32> = self
             .project_states
             .get(id)
@@ -374,7 +551,6 @@ impl AppStore {
         // 它的 toast 一并撤掉(`store.ts:859`)—— 留着的话点下去会跳向一个
         // 已经不存在的项目
         crate::toast::remove_project(id, cx);
-        self.config.projects.retain(|p| p.id != id);
         if let Some(tree) = self.config.project_tree.as_mut() {
             remove_from_tree(tree, id);
         }
@@ -560,5 +736,155 @@ impl AppStore {
         cx.emit(StoreEvent::ProjectsChanged);
         cx.changed(StoreEvent::ProjectTreeChanged);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext as _;
+    use mt_config::{ProjectGroup, ProjectTreeItem, SshConnection};
+
+    fn recovery_config() -> AppConfig {
+        let connection: SshConnection = serde_json::from_value(serde_json::json!({
+            "id": "source-ssh", "name": "Source server", "host": "source.invalid",
+            "port": 22, "user": "developer"
+        }))
+        .unwrap();
+        let mut source = ProjectConfig::new("source", "Source", "/srv/repository");
+        source.ssh_connection_id = Some(connection.id.clone());
+        source.parent_project_id = Some("parent".into());
+        source.set_remote_git_enabled(Some(&connection), true);
+        let mut config = AppConfig::default();
+        config.ssh_connections.push(connection);
+        config.projects = vec![
+            ProjectConfig::new("parent", "Parent", "/srv"),
+            source,
+            ProjectConfig::new("ordinary", "Ordinary", "/ordinary"),
+        ];
+        config.project_tree = Some(vec![
+            ProjectTreeItem::Group(ProjectGroup {
+                id: "group".into(),
+                name: "Group".into(),
+                collapsed: false,
+                children: vec![ProjectTreeItem::ProjectId("parent".into())],
+            }),
+            ProjectTreeItem::ProjectId("ordinary".into()),
+        ]);
+        config
+    }
+
+    #[test]
+    fn pending_source_blocks_own_and_ancestor_removal_but_not_other_projects() {
+        let config = recovery_config();
+        for id in ["source", "parent"] {
+            let source = removal_source_pending(&config, id, |project| project.id == "source");
+            assert_eq!(source.map(|project| project.id.as_str()), Some("source"));
+        }
+        assert!(
+            removal_source_pending(&config, "ordinary", |project| project.id == "source").is_none()
+        );
+        assert!(removal_source_pending(&config, "source", |_| false).is_none());
+        assert!(removal_source_pending(&config, "parent", |_| false).is_none());
+    }
+
+    #[test]
+    fn busy_source_target_patches_are_rejected_without_mutating_configuration() {
+        let edits: [fn(&mut AppConfig); 9] = [
+            |config| config.projects[1].path = "/different".into(),
+            |config| config.projects[1].ssh_connection_id = Some("different-ssh".into()),
+            |config| config.ssh_connections[0].host = "different.invalid".into(),
+            |config| config.ssh_connections[0].port = 2222,
+            |config| config.ssh_connections[0].user = "different-user".into(),
+            |config| config.ssh_connections.clear(),
+            |config| config.projects.retain(|project| project.id != "source"),
+            |config| config.projects.retain(|project| project.id != "parent"),
+            |config| config.projects[1].ssh_connection_id = None,
+        ];
+        for edit in edits {
+            let mut config = recovery_config();
+            let before = serde_json::to_value(&config).unwrap();
+            assert_eq!(
+                patch_preserving_remote_git_sources(&mut config, &["source".into()], edit,)
+                    .as_deref(),
+                Some("source")
+            );
+            assert_eq!(serde_json::to_value(&config).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn busy_source_allows_credentials_metadata_grant_revocation_and_group_promotion() {
+        let mut config = recovery_config();
+        assert!(
+            patch_preserving_remote_git_sources(&mut config, &["source".into()], |config| {
+                config.ssh_connections[0].password = Some("replacement-credential".into());
+                config.ssh_connections[0].identity_file = Some("/replacement-key".into());
+                config.ssh_connections[0].name = "Renamed connection".into();
+                config.projects[1].name = "Renamed source".into();
+                config.projects[1].remote_git_permission = None;
+                project_tree::remove_group_and_promote_children(
+                    config.project_tree.as_mut().unwrap(),
+                    "group",
+                );
+            })
+            .is_none()
+        );
+        assert!(config.projects[1].remote_git_permission.is_none());
+        assert_eq!(
+            config.ssh_connections[0].password.as_deref(),
+            Some("replacement-credential")
+        );
+        assert_eq!(
+            config.ssh_connections[0].identity_file.as_deref(),
+            Some("/replacement-key")
+        );
+        assert_eq!(config.projects[1].name, "Renamed source");
+        assert!(project_tree::contains_id(
+            config.project_tree.as_ref().unwrap(),
+            "parent"
+        ));
+        assert!(
+            project_tree::find_group_in_tree(config.project_tree.as_ref().unwrap(), "group")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolved_source_accepts_previously_blocked_changes() {
+        let mut config = recovery_config();
+        assert!(
+            patch_preserving_remote_git_sources(&mut config, &[], |config| {
+                config.projects.retain(|project| project.id != "source");
+                config.ssh_connections[0].host = "different.invalid".into();
+            })
+            .is_none()
+        );
+        assert!(!config.projects.iter().any(|project| project.id == "source"));
+        assert_eq!(config.ssh_connections[0].host, "different.invalid");
+    }
+
+    #[gpui::test]
+    fn ordinary_project_removal_and_group_promotion_keep_their_existing_behavior(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::toast::init);
+        let store = cx.new(|cx| AppStore::git_test_store(recovery_config(), cx));
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.remove_project("ordinary", cx);
+                assert!(store.project("ordinary").is_none());
+                assert!(store.project("source").is_some());
+                store.remove_group("group", cx);
+                assert!(store.project("source").is_some());
+                assert!(store.project("parent").is_some());
+                assert!(project_tree::contains_id(
+                    store.config.project_tree.as_ref().unwrap(),
+                    "parent"
+                ));
+                store.remove_project("source", cx);
+                assert!(store.project("source").is_none());
+            })
+        });
     }
 }

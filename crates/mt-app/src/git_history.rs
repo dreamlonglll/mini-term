@@ -182,7 +182,10 @@ pub enum GitHistoryEvent {
     RepoChanged,
     /// 撤销了最近一次提交:它的完整消息交给提交框回填(IDEA 的 Undo Commit 口径),
     /// 改完直接再提交即可。
-    CommitUndone { message: String },
+    CommitUndone {
+        context: GitContext,
+        message: String,
+    },
 }
 
 /// 过滤栏的状态。
@@ -734,7 +737,7 @@ impl GitHistoryContent {
             self.loading = true;
             self.refs_in_flight |= first;
             cx.spawn(async move |this, cx| {
-                let (result, refs) = mt_remote::run_git(move || {
+                let (result, refs) = mt_remote::run_git_on(&repo.clone(), move || {
                     let page =
                         repo.get_git_log_filtered(after, PAGE_SIZE, branch.as_deref(), &filter);
                     let tags = first.then(|| repo.list_tags().unwrap_or_default());
@@ -769,7 +772,7 @@ impl GitHistoryContent {
             let after = (!first).then(|| self.log.cursor());
             let limit = self.page_limit(first);
             cx.spawn(async move |this, cx| {
-                let (result, refs) = mt_remote::run_git(move || {
+                let (result, refs) = mt_remote::run_git_on(&repo.clone(), move || {
                     let page = repo.get_git_log(after.as_deref(), Some(limit), branch.as_deref());
                     let tags = first.then(|| repo.list_tags().unwrap_or_default());
                     let refs = first.then(|| read_history_refs(&repo)).flatten();
@@ -1112,7 +1115,8 @@ impl GitHistoryContent {
         };
         let repo_key = repo.key();
         cx.spawn(async move |this, cx| {
-            let email = mt_remote::run_git(move || repo.config_user_email()).await;
+            let email =
+                mt_remote::run_git_on(&repo.clone(), move || repo.config_user_email()).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str())
                     || !email_response_current(

@@ -1328,9 +1328,11 @@ pub fn error_text(err: &anyhow::Error) -> String {
                     "remote_git_disabled" => "remoteDisabled",
                     "remote_git_queue_full" => "serviceBusy",
                     "remote_git_connection_changed" => "connectionChanged",
-                    "remote_git_permission_changed" | "remote_git_request_cancelled" => {
-                        "permissionChanged"
-                    }
+                    "remote_git_permission_changed" => "permissionChanged",
+                    "remote_git_request_cancelled" => "requestCancelled",
+                    "remote_git_recovery_stale" => "recoveryStale",
+                    "remote_git_recovery_changed" => "recoveryChanged",
+                    "remote_git_no_unknown_write" => "noUnknownWrite",
                     "remote_git_invalid_root" => "invalidRoot",
                     "remote_git_deployment_failed" => "deploymentFailed",
                     "remote_git_connection_failed" => "connectionFailed",
@@ -1372,7 +1374,7 @@ pub fn spawn_gated<T: Send + 'static>(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let Some(guard) = gate::try_acquire_key(&repo.key()) else {
+    let Some(guard) = gate::try_acquire_key(&repo.repository_key()) else {
         return false;
     };
     cx.refresh_windows();
@@ -1381,10 +1383,10 @@ pub fn spawn_gated<T: Send + 'static>(
     window
         .spawn(cx, async move |cx| {
             // ⚠️ 全是阻塞调用(git CLI 最多 120s),必须后台执行器
-            let result = mt_remote::run_git(move || {
+            let result = mt_remote::run_git_on(&context.clone(), move || {
                 let result = op(&context);
                 match &result {
-                    Ok(_) => eprintln!("[git] {identity}: operation completed"),
+                    Ok(_) => {}
                     Err(err) => eprintln!("[git] {identity}: operation failed: {err:#}"),
                 }
                 result
@@ -1536,7 +1538,7 @@ pub fn toast(store: &Entity<AppStore>, message: String, tone: Tone, cx: &mut App
 /// Captured backend identity, never the project selected when an operation finishes.
 pub fn repo_label(repo: &GitContext) -> String {
     match repo.connection() {
-        Some(connection) => format!("{} · {}", connection.id, repo.path()),
+        Some(connection) => format!("{} · {}", connection.name, repo.path()),
         None => repo.path().to_string(),
     }
 }
@@ -1546,7 +1548,7 @@ pub fn repo_text(repo: &GitContext, message: impl AsRef<str>) -> String {
 }
 
 pub fn toast_for_repo(
-    _store: &Entity<AppStore>,
+    store: &Entity<AppStore>,
     repo: &GitContext,
     message: String,
     tone: Tone,
@@ -1556,12 +1558,76 @@ pub fn toast_for_repo(
         Tone::Info => ToastKind::Info,
         Tone::Attention => ToastKind::Error,
     };
-    crate::toast::push_message(kind, String::new(), repo_label(repo), message, cx);
+    let (project_id, title) = repo_attribution(store, repo, cx);
+    crate::toast::push_message(
+        kind,
+        project_id,
+        title,
+        format!("{}\n{message}", repo.path()),
+        cx,
+    );
+}
+
+fn repo_attribution(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> (String, String) {
+    let store = store.read(cx);
+    let project = match repo.project_id() {
+        Some(id) => store.projects().iter().find(|project| project.id == id),
+        None => store.projects().iter().find(|project| {
+            project.ssh_connection_id.is_none()
+                && (project.path == repo.path()
+                    || std::path::Path::new(repo.path()).starts_with(&project.path))
+        }),
+    };
+    let project_id = project
+        .map(|project| project.id.clone())
+        .or_else(|| repo.project_id().map(str::to_string))
+        .unwrap_or_default();
+    let project_name = project
+        .map(|project| project.name.as_str())
+        .unwrap_or(repo.path());
+    let title = match repo.connection() {
+        Some(connection) => format!("{project_name} · {}", connection.name),
+        None => project_name.to_string(),
+    };
+    (project_id, title)
+}
+
+pub fn repo_title(store: &Entity<AppStore>, repo: &GitContext, action: &str, cx: &App) -> String {
+    let (_, title) = repo_attribution(store, repo, cx);
+    format!("{action} — {title} · {}", repo.path())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn attribution_uses_source_project_and_connection_names(cx: &mut gpui::TestAppContext) {
+        let connection: mt_config::SshConnection = serde_json::from_value(serde_json::json!({
+            "id": "internal-connection-id", "name": "Production SSH", "host": "invalid.test",
+            "port": 22, "user": "developer"
+        }))
+        .unwrap();
+        let mut config = mt_config::AppConfig::default();
+        let mut source =
+            mt_config::ProjectConfig::new("source-project", "Source project", "/srv/project");
+        source.ssh_connection_id = Some(connection.id.clone());
+        config.projects.push(source);
+        config.last_active_project_id = Some("different-project".into());
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let repo = GitContext::remote("source-project".into(), connection, "/srv/project".into())
+            .with_path("/srv/project/nested-repo");
+        cx.update(|cx| {
+            let (id, title) = repo_attribution(&store, &repo, cx);
+            assert_eq!(id, "source-project");
+            assert_eq!(title, "Source project · Production SSH");
+            let title = repo_title(&store, &repo, "Push commits", cx);
+            assert!(title.contains("Source project"));
+            assert!(title.contains("Production SSH"));
+            assert!(title.contains("/srv/project/nested-repo"));
+            assert!(!title.contains("internal-connection-id"));
+        });
+    }
 
     /// 表单两态:执行中不许再开始;失败复位并记原因;再开始时清掉上次的原因。
     #[test]

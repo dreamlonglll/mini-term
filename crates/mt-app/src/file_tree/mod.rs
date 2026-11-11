@@ -33,7 +33,7 @@
 //!
 //! # git 状态着色(Y 批)
 //!
-//! Git IO 通过 `mt_remote::run_git` 在服务独立线程执行，键为以 `/` 分隔的相对路径。
+//! Git IO 通过 `mt_remote::run_git_on` 在本地/远程独立配额线程执行，键为以 `/` 分隔的相对路径。
 //! 远程授权关闭时，切项目、刷新、计划和菜单全部停在入口，不安排任何 Git IO。
 //! 刷新时机照抄原版四条:切项目 / `fs-change`(500ms 去抖)/ 终端里跑过 git 命令
 //! (同一个去抖)/ 头部刷新按钮。第三条走 [`crate::git_watch`] 的**输出旁路**,
@@ -646,8 +646,9 @@ impl FileTree {
         let root = context.root.clone();
         let backend = crate::git_backend::project_context(self.store.read(cx), &context.project_id);
         cx.spawn(async move |this, cx| {
+            let execution = backend.clone();
             // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
-            let outcome = mt_remote::run_git(move || {
+            let outcome = mt_remote::run_git_on(&execution, move || {
                 if backend.local_path().is_none() {
                     let repos = backend
                         .discover_git_repos()
@@ -826,7 +827,7 @@ impl FileTree {
         let remote = store.is_remote_project(&project.id);
         git_io_allowed(
             remote,
-            crate::git_backend::remote_git_enabled(store),
+            crate::git_backend::remote_git_enabled(store, &project.id),
             remote && store.remote_connection_of(&project.id).is_none(),
         )
     }

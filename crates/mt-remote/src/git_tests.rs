@@ -40,6 +40,8 @@ enum Answer {
     BadDataOnce,
     Silent,
     Large,
+    LostWriteOnce,
+    SilentProbeOnce,
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +61,11 @@ struct Counts {
     eof: AtomicUsize,
     finished: AtomicUsize,
     closed: AtomicUsize,
+    lost_writes: AtomicUsize,
+    probes: AtomicUsize,
+    signature: AtomicUsize,
+    invalid_probe: AtomicUsize,
+    repositories: std::sync::Mutex<Vec<String>>,
 }
 
 struct Handler {
@@ -160,6 +167,37 @@ impl server::Handler for Handler {
         let request: Request = serde_json::from_slice(&self.input[4..size + 4]).unwrap();
         self.input.drain(..size + 4);
         let number = self.counts.requests.fetch_add(1, Ordering::SeqCst);
+        if let Operation::Query { repo, .. }
+        | Operation::Status { repo }
+        | Operation::Commit { repo, .. } = &request.operation
+        {
+            self.counts.repositories.lock().unwrap().push(repo.clone());
+        }
+        if matches!(self.behavior.answer, Answer::LostWriteOnce)
+            && request.operation.is_write()
+            && self.counts.lost_writes.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            session.close(channel)?;
+            return Ok(());
+        }
+        if matches!(
+            &request.operation,
+            Operation::Query {
+                query: mt_git_helper::GitQuery::RepoSignature,
+                ..
+            }
+        ) {
+            self.counts.probes.fetch_add(1, Ordering::SeqCst);
+            if self.counts.invalid_probe.swap(0, Ordering::SeqCst) != 0 {
+                session.close(channel)?;
+                return Ok(());
+            }
+            if matches!(self.behavior.answer, Answer::SilentProbeOnce)
+                && self.counts.probes.load(Ordering::SeqCst) == 1
+            {
+                return Ok(());
+            }
+        }
         let reply = match &request.operation {
             Operation::Barrier { completed_id } => Reply::Completed {
                 completed_id: *completed_id,
@@ -169,6 +207,32 @@ impl server::Handler for Handler {
             },
             Operation::Discover => Reply::Repositories { repos: Vec::new() },
             Operation::Status { .. } => Reply::Status { files: Vec::new() },
+            Operation::Query {
+                query: mt_git_helper::GitQuery::RepoSignature,
+                ..
+            } => Reply::Data {
+                value: serde_json::value::to_raw_value(&mt_project::git::RepoSignature {
+                    refs: self.counts.signature.load(Ordering::SeqCst) as u64,
+                    index: 2,
+                })
+                .unwrap(),
+            },
+            Operation::Query {
+                query: mt_git_helper::GitQuery::RepoOperationState,
+                ..
+            } => Reply::Data {
+                value: serde_json::value::to_raw_value(&mt_project::git::RepoOpState::default())
+                    .unwrap(),
+            },
+            Operation::Query {
+                query: mt_git_helper::GitQuery::GetGitLog { .. },
+                ..
+            } => Reply::Data {
+                value: serde_json::value::to_raw_value(
+                    &Vec::<mt_project::git::GitCommitInfo>::new(),
+                )
+                .unwrap(),
+            },
             Operation::Commit { .. } => Reply::Committed {
                 output: if matches!(self.behavior.answer, Answer::Large) {
                     "x".repeat(3 * 1024 * 1024)
@@ -383,6 +447,32 @@ impl Fixture {
             .await
             .expect("server lifecycle event");
         });
+    }
+
+    fn workspace(&self) -> crate::RemoteGitWorkspace {
+        let connection = self.connection.clone();
+        let runtime = self.runtime.clone();
+        let pool = self.pool.clone();
+        crate::git_service::testing_workspace(
+            format!("ssh-recovery-{}", self.connection.port),
+            self.connection.clone(),
+            "/test".into(),
+            Arc::new(move || {
+                RemoteGitClient::connect_with(
+                    &connection,
+                    "/test/helper",
+                    "/test",
+                    runtime.clone(),
+                    pool.clone(),
+                    GitTimeouts {
+                        start: Duration::from_secs(3),
+                        request: Duration::from_millis(150),
+                        close: Duration::from_millis(150),
+                    },
+                )
+                .map_err(Into::into)
+            }),
+        )
     }
 }
 
@@ -717,4 +807,211 @@ fn lost_original_channel_cannot_supply_completion_receipt() {
     assert!(client.prove_pending_write_completed().is_err());
     assert!(client.pending_write.is_some());
     assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn service_hard_lost_recovery_reuses_reader_and_rejects_changed_or_old_generations() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::LostWriteOnce,
+        ..Default::default()
+    });
+    let workspace = fixture.workspace();
+    assert!(matches!(
+        fixture.runtime.block_on(workspace.request_async(commit())),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    let first_generation = workspace.unknown_write().unwrap().generation;
+    let first = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot())
+        .unwrap();
+    assert_eq!(first.repo, "/test/repository");
+    assert!(!first.completion_proven);
+    assert!(workspace.write_outcome_unknown());
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    let next = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot())
+        .unwrap();
+    assert_eq!(next.generation, first.generation);
+    let first = next;
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    fixture.counts.signature.fetch_add(1, Ordering::SeqCst);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.acknowledge_recovery(first.clone()))
+            .unwrap_err()
+            .to_string()
+            .contains("remote_git_recovery_changed")
+    );
+    assert!(workspace.write_outcome_unknown());
+    let current = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot())
+        .unwrap();
+    fixture
+        .runtime
+        .block_on(workspace.acknowledge_recovery(current))
+        .unwrap();
+    assert!(!workspace.write_outcome_unknown());
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    fixture.counts.lost_writes.store(0, Ordering::SeqCst);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(commit()))
+            .is_err()
+    );
+    assert_ne!(
+        workspace.unknown_write().unwrap().generation,
+        first_generation
+    );
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.acknowledge_recovery(first))
+            .unwrap_err()
+            .to_string()
+            .contains("remote_git_recovery_stale")
+    );
+    let current = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot())
+        .unwrap();
+    fixture
+        .runtime
+        .block_on(workspace.acknowledge_recovery(current))
+        .unwrap();
+    assert!(
+        fixture
+            .counts
+            .repositories
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|repo| repo == "/test/repository")
+    );
+}
+
+#[test]
+fn service_failed_recovery_probe_reconnects_reads_without_replaying_write() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::LostWriteOnce,
+        ..Default::default()
+    });
+    let workspace = fixture.workspace();
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(commit()))
+            .is_err()
+    );
+    fixture.counts.invalid_probe.store(1, Ordering::SeqCst);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.recovery_snapshot())
+            .is_err()
+    );
+    assert!(workspace.write_outcome_unknown());
+    let snapshot = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot())
+        .unwrap();
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    fixture
+        .runtime
+        .block_on(workspace.acknowledge_recovery(snapshot))
+        .unwrap();
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    assert_eq!(fixture.counts.lost_writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn service_idle_probe_timeout_reconnects_before_single_write_dispatch() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::SilentProbeOnce,
+        ..Default::default()
+    });
+    let workspace = fixture.workspace();
+    fixture
+        .runtime
+        .block_on(workspace.request_async(status()))
+        .unwrap();
+    fixture
+        .runtime
+        .block_on(workspace.request_async(commit()))
+        .unwrap();
+    assert!(!workspace.write_outcome_unknown());
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn service_password_rotation_preserves_unknown_generation_and_never_replays_write() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::LostWriteOnce,
+        ..Default::default()
+    });
+    let origin = fixture.workspace();
+    assert!(
+        fixture
+            .runtime
+            .block_on(origin.request_async(commit()))
+            .is_err()
+    );
+    let unknown = origin.unknown_write().unwrap();
+    let project_id = format!("ssh-recovery-{}", fixture.connection.port);
+    let mut connection = fixture.connection.clone();
+    connection.password = Some("rotated-password".into());
+    let runtime = fixture.runtime.clone();
+    let pool = fixture.pool.clone();
+    let read_connection = connection.clone();
+    let successor = crate::git_service::testing_workspace(
+        project_id,
+        connection,
+        "/test".into(),
+        Arc::new(move || {
+            RemoteGitClient::connect_with(
+                &read_connection,
+                "/test/helper",
+                "/test",
+                runtime.clone(),
+                pool.clone(),
+                GitTimeouts {
+                    start: Duration::from_secs(3),
+                    request: Duration::from_millis(150),
+                    close: Duration::from_millis(150),
+                },
+            )
+            .map_err(Into::into)
+        }),
+    );
+    assert_eq!(successor.unknown_write(), Some(unknown.clone()));
+    assert!(matches!(
+        fixture.runtime.block_on(successor.request_async(commit())),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    let snapshot = fixture
+        .runtime
+        .block_on(successor.recovery_snapshot())
+        .unwrap();
+    assert_eq!(snapshot.generation, unknown.generation);
+    assert_eq!(snapshot.operation, unknown.operation);
+    assert_eq!(snapshot.occurred, unknown.occurred);
+    assert!(!snapshot.completion_proven);
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    fixture
+        .runtime
+        .block_on(successor.acknowledge_recovery(snapshot))
+        .unwrap();
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    assert!(!origin.write_outcome_unknown());
+    assert!(!successor.write_outcome_unknown());
+    assert_eq!(fixture.counts.lost_writes.load(Ordering::SeqCst), 1);
 }

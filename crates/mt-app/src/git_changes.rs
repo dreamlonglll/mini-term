@@ -580,6 +580,12 @@ fn same_changes(a: &[ChangeFileStatus], b: &[ChangeFileStatus]) -> bool {
         })
 }
 
+struct CommitDraft {
+    input: Entity<TextareaState>,
+    revision: Rc<Cell<u64>>,
+    _subscription: Subscription,
+}
+
 pub struct GitChanges {
     store: Entity<AppStore>,
     /// 捕获的仓库后端;`None` 时停在空态,不发起任何 IO。
@@ -631,7 +637,11 @@ pub struct GitChanges {
 
     // ── 提交区 ──
     commit_input: Entity<TextareaState>,
-    drafts: HashMap<String, (Entity<TextareaState>, Rc<Cell<u64>>)>,
+    drafts: HashMap<String, CommitDraft>,
+    blank_draft: Option<CommitDraft>,
+    input_subscription: Option<Subscription>,
+    amend_drafts: HashMap<String, (bool, Option<String>)>,
+    pending_messages: HashMap<String, Vec<String>>,
     input_key: Option<String>,
     input_revision: Rc<Cell<u64>>,
     /// 占位符里写的分支(随列表一起取)
@@ -646,6 +656,7 @@ pub struct GitChanges {
     amend_request: u64,
     /// 勾着 amend 时随列表重取「已推送」判定的那一趟(单飞,见 [`Self::refresh_amend`])
     amend_flight: Flight,
+    amend_verifying: bool,
     /// 眼下 `amend_info` 是在哪份引用签名下取的:没变就不重取
     amend_key: Option<u64>,
     committing: bool,
@@ -656,7 +667,6 @@ pub struct GitChanges {
     commit_area_h: Rc<Cell<f32>>,
     /// 提交按钮那一行(主按钮 + ▾)的窗口坐标:▾ 菜单贴着它的下沿 / 上沿弹,不压按钮。
     commit_buttons: Rc<Cell<Option<Bounds<Pixels>>>>,
-    _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<GitChangesEvent> for GitChanges {}
@@ -670,14 +680,12 @@ impl GitChanges {
         });
         let input_revision = Rc::new(Cell::new(0u64));
         let revision = input_revision.clone();
-        let subs = vec![
-            cx.subscribe(&commit_input, move |_, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    revision.set(revision.get().wrapping_add(1));
-                    cx.notify();
-                }
-            }),
-        ];
+        let subscription = cx.subscribe(&commit_input, move |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                revision.set(revision.get().wrapping_add(1));
+                cx.notify();
+            }
+        });
         Self {
             store,
             context: None,
@@ -705,6 +713,10 @@ impl GitChanges {
             reveal_cursor: false,
             commit_input,
             drafts: HashMap::new(),
+            blank_draft: None,
+            input_subscription: Some(subscription),
+            amend_drafts: HashMap::new(),
+            pending_messages: HashMap::new(),
             input_key: None,
             input_revision,
             target: None,
@@ -715,13 +727,13 @@ impl GitChanges {
             amend_prefill: None,
             amend_request: 0,
             amend_flight: Flight::default(),
+            amend_verifying: false,
             amend_key: None,
             committing: false,
             history_loading: false,
             commit_error: None,
             commit_area_h: Rc::new(Cell::new(0.0)),
             commit_buttons: Rc::new(Cell::new(None)),
-            _subs: subs,
         }
     }
 
@@ -769,6 +781,12 @@ impl GitChanges {
         if self.context == repo {
             return;
         }
+        if let Some(key) = self.input_key.as_ref()
+            && self.context.as_ref().map(GitContext::key).as_ref() == Some(key)
+        {
+            self.amend_drafts
+                .insert(key.clone(), (self.amend, self.amend_prefill.clone()));
+        }
         self.context = repo;
         // Inputs are retained by backend key. Until render attaches the selected
         // draft, no keyboard action may submit the previous repository's input.
@@ -795,6 +813,13 @@ impl GitChanges {
         self.amend_prefill = None;
         self.amend_key = None;
         self.amend_flight.reset();
+        self.amend_verifying = false;
+        if let Some(key) = self.context.as_ref().map(GitContext::key)
+            && let Some((amend, prefill)) = self.amend_drafts.get(&key)
+        {
+            self.amend = *amend;
+            self.amend_prefill = prefill.clone();
+        }
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
@@ -849,7 +874,7 @@ impl GitChanges {
         };
         self.loading = !self.loaded_once;
         cx.spawn(async move |this, cx| {
-            let result = mt_remote::run_git(move || load_snapshot(&repo)).await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || load_snapshot(&repo)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 let rerun = match this.flight.finish(token) {
                     Landing::Stale => return,
@@ -877,18 +902,22 @@ impl GitChanges {
         let Some(token) = self.amend_flight.begin(Instant::now()) else {
             return;
         };
+        self.amend_verifying = true;
         let req = self.amend_request;
         let Some(repo) = self.context.clone() else {
             return;
         };
         let known = self.amend_key;
         cx.spawn(async move |this, cx| {
-            let fetched = mt_remote::run_git(move || fetch_amend(&repo, known)).await;
+            let fetched =
+                mt_remote::run_git_on(&repo.clone(), move || fetch_amend(&repo, known)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 let rerun = match this.amend_flight.finish(token) {
                     Landing::Stale => return,
                     Landing::Done { rerun } => rerun,
                 };
+                this.amend_verifying = false;
+                cx.notify();
                 // 期间取消过勾选(令牌前移)就作废;换仓库时 amend_flight 已作废,走不到这里
                 if this.amend
                     && this.amend_request == req
@@ -939,9 +968,7 @@ impl GitChanges {
                 self.op_kind = snap.op_kind;
                 self.target = snap.target;
                 self.has_head = snap.has_head;
-                if !self.has_head {
-                    self.amend = false;
-                }
+                // Keep amend intent if HEAD disappears; never silently submit normally.
                 self.load_error = None;
                 self.metadata_warning = snap.metadata_warning;
                 changed
@@ -1278,7 +1305,7 @@ impl GitChanges {
     fn gated(&self) -> bool {
         self.context
             .as_ref()
-            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.repository_key()))
     }
 
     /// 整文件操作能不能点:自己没在跑、闸也没被别人占。render 里只问一次、传给每一行
@@ -1324,6 +1351,12 @@ impl GitChanges {
             repo,
             move |repo| {
                 let result = op(repo);
+                if let Err(err) = &result {
+                    eprintln!(
+                        "[git] {}: working tree operation failed: {err:#}",
+                        git_ui::repo_label(repo)
+                    );
+                }
                 // 写完当场读一份签名与冲突数(成败都读:失败也可能改了一半),**先于**下面那次
                 // 重取列表 —— 面板拿它当「已知」,不能比列表更新(见 `IndexWritten`)
                 let observed = RepoObservation {
@@ -1340,13 +1373,20 @@ impl GitChanges {
                     Err(err) => (Err(err), None),
                 };
                 match &result {
-                    Ok(()) => git_ui::toast_for_repo(
-                        &store,
-                        &context,
-                        t("gitChanges", "operationSucceeded").to_string(),
-                        Tone::Info,
-                        cx,
-                    ),
+                    Ok(()) => {
+                        let current = this
+                            .upgrade()
+                            .is_some_and(|this| this.read(cx).context.as_ref() == Some(&context));
+                        if !current {
+                            git_ui::toast_for_repo(
+                                &store,
+                                &context,
+                                t("gitChanges", "operationSucceeded").to_string(),
+                                Tone::Info,
+                                cx,
+                            );
+                        }
+                    }
                     Err(err) => git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
                         git_ui::repo_text(&context, git_ui::error_text(err)),
@@ -1492,30 +1532,6 @@ impl GitChanges {
             );
     }
 
-    /// 冲突文件采用一侧。
-    fn take_side(
-        &mut self,
-        paths: Vec<String>,
-        side: ConflictSide,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.metadata_warning.is_some() || self.load_error.is_some() {
-            return;
-        }
-        self.run_op(
-            move |repo| {
-                for path in &paths {
-                    repo.resolve_conflict_with(path, side)?;
-                }
-                Ok(())
-            },
-            None,
-            window,
-            cx,
-        );
-    }
-
     /// 标记为已解决:先在后台看一眼工作区里还有没有 `<<<<<<<`,有就先确认。
     fn mark_resolved(&mut self, paths: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if paths.is_empty() {
@@ -1530,7 +1546,7 @@ impl GitChanges {
         let context = repo.clone();
         cx.spawn_in(window, async move |this, cx| {
             let checked = paths.clone();
-            let marked = mt_remote::run_git(move || {
+            let marked = mt_remote::run_git_on(&repo.clone(), move || {
                 checked
                     .into_iter()
                     .filter_map(|path| match repo.has_conflict_markers(&path) {
@@ -1737,7 +1753,7 @@ impl GitChanges {
         {
             return Some(t("gitChanges", "metadataUnavailable").to_string());
         }
-        if self.amend && self.amend_info.is_none() {
+        if self.amend && (self.amend_info.is_none() || self.amend_verifying) {
             return Some(t("gitChanges", "metadataUnavailable").to_string());
         }
         if self.committing {
@@ -1839,39 +1855,28 @@ impl GitChanges {
                         Tone::Info,
                         cx,
                     );
-                } else if let Err(err) = &result {
-                    git_ui::show_git_error(
-                        t("gitChanges", "operationFailedTitle"),
-                        git_ui::repo_text(&context, git_ui::error_text(err)),
-                        window,
-                        cx,
-                    );
                 }
                 let _ = this.update(cx, |this: &mut Self, cx| {
+                    if let Err(err) = &result {
+                        this.present_commit_failure(&context, err, window, cx);
+                    } else {
+                        this.amend_drafts.remove(&context.key());
+                    }
                     let current = this.context.as_ref() == Some(&context);
                     if current {
                         this.committing = false;
-                        match result {
-                            Ok(_) => {
-                                this.amend = false;
-                                this.amend_info = None;
-                                this.amend_prefill = None;
-                                this.amend_key = None;
-                                this.commit_error = None;
-                                this.load(cx);
-                                git_watch::request_refresh(git_watch::Subscriber::FileTree);
-                                cx.emit(GitChangesEvent::Committed {
-                                    open_push,
-                                    context: context.clone(),
-                                });
-                            }
-                            Err(err) => {
-                                this.commit_error = Some(tr!(
-                                    "gitChanges",
-                                    "commitFailed",
-                                    detail = git_ui::repo_text(&context, git_ui::error_text(&err))
-                                ))
-                            }
+                        if result.is_ok() {
+                            this.amend = false;
+                            this.amend_info = None;
+                            this.amend_prefill = None;
+                            this.amend_key = None;
+                            this.commit_error = None;
+                            this.load(cx);
+                            git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                            cx.emit(GitChangesEvent::Committed {
+                                open_push,
+                                context: context.clone(),
+                            });
                         }
                         cx.notify();
                     } else if succeeded && open_push {
@@ -1909,25 +1914,78 @@ impl GitChanges {
         self.commit(true, false, window, cx);
     }
 
-    /// 勾 / 取消「修改上次提交」。勾上时取 HEAD 的消息(输入框为空就预填)与「已推送」判定。
-    /// 历史区「撤销提交」后回填它的消息(IDEA 的 Undo Commit 口径)。用户已经在框里
-    /// 写了东西就不覆盖;Amend 勾着时先收起 —— 被撤销的那条已经不是 HEAD 了。
-    pub fn restore_message(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.sync_input(window, cx);
-        if self.amend {
-            self.toggle_amend(window, cx);
+    fn present_commit_failure(
+        &mut self,
+        context: &GitContext,
+        err: &anyhow::Error,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context.as_ref() == Some(context) {
+            self.commit_error = Some(tr!(
+                "gitChanges",
+                "commitFailed",
+                detail = git_ui::repo_text(context, git_ui::error_text(err))
+            ));
+            cx.notify();
+        } else {
+            git_ui::show_git_error(
+                t("gitChanges", "operationFailedTitle"),
+                git_ui::repo_text(context, git_ui::error_text(err)),
+                window,
+                cx,
+            );
         }
-        if !self.commit_input.read(cx).value().trim().is_empty() {
-            return;
-        }
+    }
+
+    /// Restore undo results to their captured repository, preserving user text.
+    /// Conflicting messages remain available in the message-history menu.
+    pub fn restore_message_on(
+        &mut self,
+        context: &GitContext,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = context.key();
         let message = message.trim_end().to_string();
-        self.commit_input
-            .update(cx, |state, cx| state.set_value(message, window, cx));
+        if self.context.as_ref() == Some(context) {
+            self.sync_input(window, cx);
+            if self.amend {
+                self.toggle_amend(window, cx);
+            }
+            if self.commit_input.read(cx).value().trim().is_empty() {
+                self.commit_input
+                    .update(cx, |state, cx| state.set_value(message, window, cx));
+            } else {
+                self.pending_messages.entry(key).or_default().push(message);
+            }
+        } else {
+            let prefill = self
+                .amend_drafts
+                .remove(&key)
+                .and_then(|(_, prefill)| prefill);
+            let input = if self.input_key.as_deref() == Some(key.as_str()) {
+                Some(self.commit_input.clone())
+            } else {
+                self.drafts.get(&key).map(|draft| draft.input.clone())
+            };
+            if let Some(input) = input {
+                let current = input.read(cx).value().to_string();
+                if current.trim().is_empty() || prefill.as_deref() == Some(current.as_str()) {
+                    input.update(cx, |state, cx| state.set_value(message, window, cx));
+                } else {
+                    self.pending_messages.entry(key).or_default().push(message);
+                }
+            } else {
+                self.pending_messages.entry(key).or_default().push(message);
+            }
+        }
         cx.notify();
     }
 
     fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.has_head || self.committing {
+        if (!self.has_head && !self.amend) || self.committing {
             return;
         }
         self.amend = !self.amend;
@@ -1951,10 +2009,14 @@ impl GitChanges {
         let input = self.commit_input.clone();
         let context = repo.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let (key, result) =
-                mt_remote::run_git(move || (amend_key_of(&repo), repo.amend_info())).await;
+            let (key, result) = mt_remote::run_git_on(&repo.clone(), move || {
+                (amend_key_of(&repo), repo.amend_info())
+            })
+            .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                if let Err(err) = &result {
+                if let Err(err) = &result
+                    && this.context.as_ref() != Some(&context)
+                {
                     git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
                         git_ui::repo_text(&context, git_ui::error_text(err)),
@@ -1979,12 +2041,10 @@ impl GitChanges {
                     }
                     // 空仓库:没有上次提交可改
                     Ok(None) => {
-                        this.amend = false;
                         this.has_head = false;
                     }
                     Err(err) => {
                         eprintln!("[git] 读取上次提交失败: {err:#}");
-                        this.amend = false;
                         this.commit_error = Some(tr!(
                             "gitCommit",
                             "amendInfoFailed",
@@ -1999,6 +2059,41 @@ impl GitChanges {
         cx.notify();
     }
 
+    fn restore_pending_message(
+        &mut self,
+        context: &GitContext,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = context.key();
+        let Some(messages) = self.pending_messages.get_mut(&key) else {
+            return;
+        };
+        if index >= messages.len() {
+            return;
+        }
+        let message = messages.remove(index);
+        let input = if self.input_key.as_deref() == Some(key.as_str()) {
+            Some(self.commit_input.clone())
+        } else {
+            self.drafts.get(&key).map(|draft| draft.input.clone())
+        };
+        if let Some(input) = input {
+            let current = input.read(cx).value().to_string();
+            if !current.trim().is_empty() {
+                self.pending_messages.entry(key).or_default().push(current);
+            }
+            input.update(cx, |state, cx| state.set_value(message, window, cx));
+        } else {
+            self.pending_messages
+                .entry(key)
+                .or_default()
+                .insert(0, message);
+        }
+        cx.notify();
+    }
+
     /// 提交消息历史:后台取最近 20 条,取回来在按钮处弹菜单,选中把整段消息填进输入框。
     fn show_history(
         &mut self,
@@ -2010,6 +2105,30 @@ impl GitChanges {
         if self.history_loading || self.context.is_none() {
             return;
         }
+        // Undo recovery entries must remain available without another Git read.
+        if let Some(context) = self.context.clone()
+            && let Some(messages) = self.pending_messages.get(&context.key())
+            && !messages.is_empty()
+        {
+            let owner = cx.entity();
+            let entries = messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    let (owner, context) = (owner.clone(), context.clone());
+                    MenuItem::new(message.lines().next().unwrap_or("").to_string())
+                        .detail(t("gitCommit", "undoMessagePending"))
+                        .on_click(move |window, cx| {
+                            owner.update(cx, |this, cx| {
+                                this.restore_pending_message(&context, index, window, cx);
+                            })
+                        })
+                        .into()
+                })
+                .collect();
+            menu::show(position, entries, window, cx);
+            return;
+        }
         self.history_loading = true;
         cx.notify();
         let Some(repo) = self.context.clone() else {
@@ -2018,8 +2137,10 @@ impl GitChanges {
         let context = repo.clone();
         let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result =
-                mt_remote::run_git(move || repo.recent_commit_messages(HISTORY_LIMIT)).await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || {
+                repo.recent_commit_messages(HISTORY_LIMIT)
+            })
+            .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
                 let current = this.context.as_ref() == Some(&context);
                 if current {
@@ -2052,33 +2173,74 @@ impl GitChanges {
     fn sync_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.context.as_ref().map(GitContext::key);
         if self.input_key == key {
+            if self.amend
+                && let Some(info) = self.amend_info.as_ref()
+                && let Some(prefill) = self.amend_prefill.as_ref()
+                && self.commit_input.read(cx).value().as_ref() == prefill
+            {
+                let message = info.message.trim_end().to_string();
+                if &message != prefill {
+                    self.commit_input
+                        .update(cx, |state, cx| state.set_value(message.clone(), window, cx));
+                    self.amend_prefill = Some(message);
+                }
+            }
             return;
         }
-        if let Some(old) = self.input_key.take() {
-            self.drafts.insert(
-                old,
-                (self.commit_input.clone(), self.input_revision.clone()),
-            );
+        let old = CommitDraft {
+            input: self.commit_input.clone(),
+            revision: self.input_revision.clone(),
+            _subscription: self
+                .input_subscription
+                .take()
+                .expect("active draft subscription"),
+        };
+        if let Some(old_key) = self.input_key.take() {
+            self.drafts.insert(old_key, old);
+        } else {
+            self.blank_draft = Some(old);
         }
-        let (input, revision) = key
-            .as_ref()
-            .and_then(|key| self.drafts.remove(key))
-            .unwrap_or_else(|| {
-                let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8));
-                let revision = Rc::new(Cell::new(0u64));
-                let changed = revision.clone();
-                self._subs
-                    .push(cx.subscribe(&input, move |_, _, event: &InputEvent, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            changed.set(changed.get().wrapping_add(1));
-                            cx.notify();
-                        }
-                    }));
-                (input, revision)
+        let saved = match &key {
+            Some(key) => self.drafts.remove(key),
+            None => self.blank_draft.take(),
+        };
+        let draft = saved.unwrap_or_else(|| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8));
+            let revision = Rc::new(Cell::new(0u64));
+            let changed = revision.clone();
+            let subscription = cx.subscribe(&input, move |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    changed.set(changed.get().wrapping_add(1));
+                    cx.notify();
+                }
             });
-        self.commit_input = input;
-        self.input_revision = revision;
-        self.input_key = key;
+            CommitDraft {
+                input,
+                revision,
+                _subscription: subscription,
+            }
+        });
+        self.commit_input = draft.input;
+        self.input_revision = draft.revision;
+        self.input_subscription = Some(draft._subscription);
+        self.input_key = key.clone();
+        if let Some(key) = key {
+            if let Some((amend, prefill)) = self.amend_drafts.remove(&key) {
+                self.amend = amend;
+                self.amend_prefill = prefill;
+                self.amend_info = None;
+                self.amend_key = None;
+                self.refresh_amend(cx);
+            }
+            if self.commit_input.read(cx).value().trim().is_empty()
+                && let Some(messages) = self.pending_messages.get_mut(&key)
+                && !messages.is_empty()
+            {
+                let message = messages.remove(0);
+                self.commit_input
+                    .update(cx, |state, cx| state.set_value(message, window, cx));
+            }
+        }
         self.placeholder = None;
     }
 
@@ -2266,16 +2428,16 @@ fn history_entries(
             MenuItem::new(label)
                 .detail(format_date(entry.timestamp))
                 .on_click(move |window, cx| {
-                    if owner.read(cx).context.as_ref() != Some(&context) {
-                        return;
-                    }
+                    let current = owner.read(cx).context.as_ref() == Some(&context);
                     let message = message.clone();
                     let end = text_end(&message);
                     input.update(cx, |state, cx| {
                         state.set_value(message, window, cx);
                         // 多行输入框 set_value 后光标在开头;接着往下写是常态,挪到末尾
                         // (set_cursor_position 顺带聚焦)
-                        state.set_cursor_position(end, window, cx);
+                        if current {
+                            state.set_cursor_position(end, window, cx);
+                        }
                     });
                     // set_value 不发 Change 事件,得自己叫一声重画(字数 / 提示 / 按钮)
                     owner.update(cx, |_, cx| cx.notify());
@@ -2810,13 +2972,25 @@ impl GitChanges {
                 single.to_string()
             }
         };
+        let diff_files = self.model(cx);
+        let diff_order = diff_files.order(area);
+        let captured_files = self.diff_files(diff_order, area);
+        let captured_current = diff_order.iter().position(|&i| i == index).unwrap_or(0);
         let view_diff = {
             let this = this.clone();
             let context = context.clone();
             menu::item(t("gitChanges", "contextViewDiff"), move |window, cx| {
                 this.update(cx, |this, cx| {
-                    if this.context == context {
-                        this.view_diff(index, area, window, cx);
+                    if let Some(context) = context.clone() {
+                        git_diff::open_file_diff_with(
+                            this.store.clone(),
+                            context,
+                            captured_files.clone(),
+                            captured_current,
+                            git_diff::FileDiffHooks::default(),
+                            window,
+                            cx,
+                        );
                     }
                 });
             })
@@ -2845,8 +3019,19 @@ impl GitChanges {
                             .on_click(move |window, cx| {
                                 let paths = paths.clone();
                                 this.update(cx, |this, cx| {
-                                    if this.context == context {
-                                        this.take_side(paths, side, window, cx);
+                                    if let Some(context) = context.clone() {
+                                        this.run_op_on(
+                                            &context,
+                                            move |repo| {
+                                                for path in &paths {
+                                                    repo.resolve_conflict_with(path, side)?;
+                                                }
+                                                Ok(())
+                                            },
+                                            None,
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 });
                             });
@@ -2865,6 +3050,14 @@ impl GitChanges {
                             this2.update(cx, |this, cx| {
                                 if this.context == context {
                                     this.mark_resolved(paths, window, cx);
+                                } else if let Some(context) = context.as_ref() {
+                                    git_ui::toast_for_repo(
+                                        &this.store,
+                                        context,
+                                        t("gitChanges", "contextChanged").to_string(),
+                                        Tone::Attention,
+                                        cx,
+                                    );
                                 }
                             });
                         })
@@ -2884,8 +3077,14 @@ impl GitChanges {
                         .on_click(move |window, cx| {
                             let paths = paths.clone();
                             this.update(cx, |this, cx| {
-                                if this.context == context {
-                                    this.unstage(paths, None, window, cx);
+                                if let Some(context) = context.as_ref() {
+                                    this.run_op_on(
+                                        context,
+                                        move |repo| repo.git_unstage(&paths),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             });
                         })
@@ -2904,8 +3103,14 @@ impl GitChanges {
                             .on_click(move |window, cx| {
                                 let paths = paths.clone();
                                 this.update(cx, |this, cx| {
-                                    if this.context == context {
-                                        this.stage(paths, None, window, cx);
+                                    if let Some(context) = context.as_ref() {
+                                        this.run_op_on(
+                                            context,
+                                            move |repo| repo.git_stage(&paths),
+                                            None,
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 });
                             })
@@ -2928,6 +3133,14 @@ impl GitChanges {
                             this.update(cx, |this, cx| {
                                 if this.context == context {
                                     this.discard(area, paths, window, cx);
+                                } else if let Some(context) = context.as_ref() {
+                                    git_ui::toast_for_repo(
+                                        &this.store,
+                                        context,
+                                        t("gitChanges", "contextChanged").to_string(),
+                                        Tone::Attention,
+                                        cx,
+                                    );
                                 }
                             });
                         })
@@ -2983,7 +3196,7 @@ impl GitChanges {
         };
 
         // ── 工具条 ──
-        let amend_enabled = self.has_head && !self.committing;
+        let amend_enabled = (self.has_head || self.amend) && !self.committing;
         let amend_toggle = git_ui::check_row(
             "git-commit-amend",
             self.amend,
@@ -3030,6 +3243,14 @@ impl GitChanges {
             .gap(px(8.0))
             .child(amend_toggle)
             .child(history)
+            .when(
+                self.context.as_ref().is_some_and(|context| {
+                    self.pending_messages
+                        .get(&context.key())
+                        .is_some_and(|messages| !messages.is_empty())
+                }),
+                |el| el.child(git_ui::hint_line(t("gitCommit", "undoMessagePending"))),
+            )
             .child(div().flex_1())
             .children(counter);
 
@@ -3236,6 +3457,14 @@ impl GitChanges {
                     this.update(cx, |this, cx| {
                         if this.context == context {
                             this.commit(true, false, window, cx);
+                        } else if let Some(context) = context.as_ref() {
+                            git_ui::toast_for_repo(
+                                &this.store,
+                                context,
+                                t("gitChanges", "contextChanged").to_string(),
+                                Tone::Attention,
+                                cx,
+                            );
                         }
                     });
                 })
@@ -3250,6 +3479,14 @@ impl GitChanges {
                     this.update(cx, |this, cx| {
                         if this.context == context {
                             this.commit(false, true, window, cx);
+                        } else if let Some(context) = context.as_ref() {
+                            git_ui::toast_for_repo(
+                                &this.store,
+                                context,
+                                t("gitChanges", "contextChanged").to_string(),
+                                Tone::Attention,
+                                cx,
+                            );
                         }
                     });
                 })
@@ -3262,6 +3499,14 @@ impl GitChanges {
                 this.update(cx, |this, cx| {
                     if this.context == context {
                         this.open_stash_save(window, cx);
+                    } else if let Some(context) = context.as_ref() {
+                        git_ui::toast_for_repo(
+                            &this.store,
+                            context,
+                            t("gitChanges", "contextChanged").to_string(),
+                            Tone::Attention,
+                            cx,
+                        );
                     }
                 });
             });
@@ -3297,6 +3542,168 @@ impl GitChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn undo_drafts_amend_and_subscriptions_follow_captured_repository(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.skip_drawing();
+        // run_git_on uses real blocking I/O: explicitly permit external wakes
+        // and await its UI landing before the scheduler/test context is dropped.
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let (changes, a_input, b_input, b_revision, blank) = cx
+            .update_window(window.into(), |_, window, cx| {
+                let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+                let a = GitContext::local("/consumer-draft-a");
+                let b = GitContext::local("/consumer-draft-b");
+                let (a_input, b_input, b_revision, blank) = changes.update(cx, |this, cx| {
+                    this.context = Some(a.clone());
+                    this.sync_input(window, cx);
+                    let a_input = this.commit_input.clone();
+                    let a_revision = this.input_revision.clone();
+                    a_input.update(cx, |input, cx| input.set_value("A user draft", window, cx));
+                    this.context = Some(b.clone());
+                    this.sync_input(window, cx);
+                    this.commit_input
+                        .update(cx, |input, cx| input.set_value("B user draft", window, cx));
+                    let b_input = this.commit_input.clone();
+                    let b_revision = this.input_revision.clone();
+                    this.restore_message_on(&a, "undone A", window, cx);
+                    assert_eq!(this.commit_input.read(cx).value().as_ref(), "B user draft");
+                    assert_eq!(a_input.read(cx).value().as_ref(), "A user draft");
+                    assert_eq!(this.pending_messages[&a.key()], ["undone A"]);
+                    this.restore_pending_message(&a, 0, window, cx);
+                    assert_eq!(a_input.read(cx).value().as_ref(), "undone A");
+                    assert_eq!(this.pending_messages[&a.key()], ["A user draft"]);
+                    assert_eq!(this.commit_input.read(cx).value().as_ref(), "B user draft");
+                    this.context = Some(a.clone());
+                    this.sync_input(window, cx);
+                    assert_eq!(this.commit_input.entity_id(), a_input.entity_id());
+                    assert!(Rc::ptr_eq(&this.input_revision, &a_revision));
+                    this.has_head = true;
+                    this.amend = true;
+                    this.amend_prefill = Some("old HEAD message".into());
+                    this.commit_input.update(cx, |input, cx| {
+                        input.set_value("old HEAD message", window, cx)
+                    });
+                    // Actual switch consumer saves intent and resets verification.
+                    this.set_repo(None, cx);
+                    this.sync_input(window, cx);
+                    let blank = this.commit_input.entity_id();
+                    this.context = Some(a.clone());
+                    this.sync_input(window, cx);
+                    assert!(
+                        this.amend,
+                        "amend must never become ordinary submit on return"
+                    );
+                    assert!(this.amend_info.is_none());
+                    assert!(this.amend_verifying);
+                    this.loaded_once = true;
+                    this.has_head = true;
+                    assert!(this.commit_blocker(false, cx).is_some());
+                    (a_input, b_input, b_revision, blank)
+                });
+                (changes, a_input, b_input, b_revision, blank)
+            })
+            .unwrap();
+        cx.condition(&changes, |this, _| !this.amend_verifying)
+            .await;
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            changes.update(cx, |this, cx| {
+                assert!(
+                    this.amend,
+                    "failed metadata verification must retain amend intent"
+                );
+                assert!(
+                    this.amend_info.is_none(),
+                    "missing fixture repository cannot verify HEAD"
+                );
+                assert!(this.commit_blocker(false, cx).is_some());
+                this.amend_info = Some(AmendInfo {
+                    message: "new HEAD message".into(),
+                    pushed: false,
+                });
+                let a = this.context.clone().unwrap();
+                this.sync_input(window, cx);
+                assert_eq!(
+                    this.commit_input.read(cx).value().as_ref(),
+                    "new HEAD message"
+                );
+                for _ in 0..8 {
+                    this.context = None;
+                    this.sync_input(window, cx);
+                    assert_eq!(this.commit_input.entity_id(), blank);
+                    this.context = Some(a.clone());
+                    this.sync_input(window, cx);
+                    assert_eq!(this.commit_input.entity_id(), a_input.entity_id());
+                }
+                assert_eq!(this.drafts.len(), 1, "only inactive B draft is retained");
+                assert!(this.input_subscription.is_some());
+                assert!(this.blank_draft.is_some());
+                this.drafts.clear();
+                // Dropping the inactive draft drops its callback, not just its input handle.
+                b_input.update(cx, |_, cx| cx.emit(InputEvent::Change));
+                assert_eq!(b_revision.get(), 0);
+                assert_eq!(Rc::strong_count(&b_revision), 1);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        drop(changes);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn commit_failure_is_inline_only_until_source_context_changes(cx: &mut gpui::TestAppContext) {
+        cx.skip_drawing();
+        cx.update(gpui_component::init);
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+            let source = GitContext::local("/consumer-original-repo");
+            changes.update(cx, |this, cx| {
+                this.context = Some(source.clone());
+                this.sync_input(window, cx);
+                this.commit_input.update(cx, |input, cx| {
+                    input.set_value("keep this draft", window, cx)
+                });
+                let error = anyhow::anyhow!("original pre-commit failure");
+                this.present_commit_failure(&source, &error, window, cx);
+                assert!(
+                    this.commit_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("original pre-commit failure")
+                );
+                assert!(!crate::prompt::is_open(crate::prompt::kind::GIT_ERROR));
+                this.context = Some(GitContext::local("/consumer-another-repo"));
+                this.commit_error = None;
+                this.present_commit_failure(&source, &error, window, cx);
+                assert!(
+                    this.commit_error.is_none(),
+                    "do not put A failure on B inline form"
+                );
+                assert!(crate::prompt::is_open(crate::prompt::kind::GIT_ERROR));
+                crate::prompt::close_guarded(crate::prompt::kind::GIT_ERROR, window, cx);
+                assert_eq!(
+                    this.commit_input.read(cx).value().as_ref(),
+                    "keep this draft"
+                );
+            });
+        })
+        .unwrap();
+    }
     #[test]
     fn auxiliary_metadata_failure_keeps_consumer_file_groups() {
         let files = vec![

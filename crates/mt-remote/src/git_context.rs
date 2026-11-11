@@ -14,6 +14,7 @@ use crate::{RemoteGitWorkspace, connection_fingerprint, lock};
 static REMOTES: LazyLock<Mutex<Vec<Weak<RemoteBackend>>>> = LazyLock::new(Default::default);
 
 struct RemoteBackend {
+    project_id: String,
     connection: SshConnection,
     fingerprint: u64,
     root: String,
@@ -56,7 +57,7 @@ impl GitContext {
         }
     }
 
-    pub fn remote(connection: SshConnection, root: String) -> Self {
+    pub fn remote(project_id: String, connection: SshConnection, root: String) -> Self {
         let fingerprint = connection_fingerprint(&connection);
         let mut remotes = lock(&REMOTES);
         remotes.retain(|remote| remote.strong_count() != 0);
@@ -64,13 +65,19 @@ impl GitContext {
             .iter()
             .filter_map(Weak::upgrade)
             .find(|remote| {
-                remote.connection.id == connection.id
+                remote.project_id == project_id
+                    && remote.connection.id == connection.id
                     && remote.fingerprint == fingerprint
                     && remote.root == root
             })
             .unwrap_or_else(|| {
                 let backend = Arc::new(RemoteBackend {
-                    workspace: RemoteGitWorkspace::new(connection.clone(), root.clone()),
+                    workspace: RemoteGitWorkspace::new(
+                        project_id.clone(),
+                        connection.clone(),
+                        root.clone(),
+                    ),
+                    project_id,
                     connection,
                     fingerprint,
                     root: root.clone(),
@@ -99,7 +106,25 @@ impl GitContext {
     pub fn path(&self) -> &str {
         &self.path
     }
+    /// Context identity binds attribution and permission to the source project/root.
     pub fn key(&self) -> String {
+        match &self.backend {
+            Backend::Remote(remote) => format!(
+                "project|{}:{}|{}:{}|{}:{}|{:016x}|{}",
+                remote.project_id.len(),
+                remote.project_id,
+                remote.root.len(),
+                remote.root,
+                remote.connection.id.len(),
+                remote.connection.id,
+                remote.fingerprint,
+                self.repository_key()
+            ),
+            _ => self.repository_key(),
+        }
+    }
+    /// Backend + repository identity used for shared mutation gates, not authorization.
+    pub fn repository_key(&self) -> String {
         match &self.backend {
             Backend::Local => {
                 #[cfg(windows)]
@@ -110,14 +135,7 @@ impl GitContext {
             }
             Backend::Remote(remote) => {
                 let path = mt_core::path_key::posix_trim_trailing(&self.path);
-                format!(
-                    "ssh|{}:{}|{:016x}|{}:{}",
-                    remote.connection.id.len(),
-                    remote.connection.id,
-                    remote.fingerprint,
-                    path.len(),
-                    path
-                )
+                crate::git_service::repository_identity(&remote.connection, path)
             }
             Backend::Broken(message) => format!(
                 "broken|{}:{message}|{}:{}",
@@ -142,6 +160,12 @@ impl GitContext {
     pub fn connection_id(&self) -> Option<&str> {
         self.connection().map(|connection| connection.id.as_str())
     }
+    pub fn project_id(&self) -> Option<&str> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(&remote.project_id),
+            _ => None,
+        }
+    }
     pub fn close(&self) {
         if let Backend::Remote(remote) = &self.backend {
             remote.workspace.close();
@@ -152,14 +176,33 @@ impl GitContext {
         matches!(&self.backend, Backend::Remote(remote) if remote.workspace.write_outcome_unknown())
     }
 
-    pub fn verify_unknown_write(&self) -> Result<()> {
+    pub fn unknown_write(&self) -> Option<crate::RemoteGitUnknownWrite> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.workspace.unknown_write(),
+            _ => None,
+        }
+    }
+    pub fn write_running(&self) -> bool {
+        matches!(&self.backend, Backend::Remote(remote) if remote.workspace.write_running())
+    }
+    pub fn recovery_snapshot(&self) -> Result<crate::RemoteGitRecoverySnapshot> {
         match &self.backend {
             Backend::Remote(remote) => remote
                 .workspace
-                .verify_unknown_write_blocking(&self.path)
+                .recovery_snapshot_blocking()
                 .map_err(mt_git_helper::GitFailure::into_error),
             Backend::Broken(message) => bail!("{message}"),
-            Backend::Local => Ok(()),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
+        }
+    }
+    pub fn acknowledge_recovery(&self, snapshot: &crate::RemoteGitRecoverySnapshot) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .acknowledge_recovery_blocking(snapshot)
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
         }
     }
 
@@ -435,8 +478,8 @@ mod tests {
 
     #[test]
     fn remote_identity_is_host_scoped_and_construction_reuses_workspace() {
-        let a = GitContext::remote(connection(), "/Project".into());
-        let same = GitContext::remote(connection(), "/Project".into());
+        let a = GitContext::remote("project".into(), connection(), "/Project".into());
+        let same = GitContext::remote("project".into(), connection(), "/Project".into());
         let (Backend::Remote(a_backend), Backend::Remote(same_backend)) =
             (&a.backend, &same.backend)
         else {
@@ -448,14 +491,30 @@ mod tests {
         assert_eq!(a.with_path("/Project/Repo"), a.with_path("/Project/Repo/"));
         let mut other = connection();
         other.host = "two.invalid".into();
-        assert_ne!(a, GitContext::remote(other, "/Project".into()));
+        assert_ne!(
+            a,
+            GitContext::remote("project".into(), other, "/Project".into())
+        );
         assert!(a.local_path().is_none());
         assert_eq!(a.connection_id(), Some("git-context-identity-test"));
-        let other_root = GitContext::remote(connection(), "/OtherProject".into());
-        assert_eq!(
+        let other_root = GitContext::remote("project".into(), connection(), "/OtherProject".into());
+        assert_ne!(
             a.with_path("/Shared/repo"),
             other_root.with_path("/Shared/repo")
         );
+        assert_eq!(
+            a.with_path("/Shared/repo").repository_key(),
+            other_root.with_path("/Shared/repo").repository_key()
+        );
+        let other_project = GitContext::remote("other".into(), connection(), "/Project".into());
+        assert_ne!(a, other_project);
+        assert_eq!(a.repository_key(), other_project.repository_key());
+        let mut credentials = connection();
+        credentials.password = Some("rotated".into());
+        let credentials = GitContext::remote("project".into(), credentials, "/Project".into());
+        assert_ne!(a, credentials);
+        assert_eq!(a.repository_key(), credentials.repository_key());
+        assert_eq!(a.project_id(), Some("project"));
     }
 
     #[cfg(not(windows))]
@@ -487,7 +546,7 @@ mod tests {
                 .to_string()
                 .contains("missing SSH connection")
         );
-        assert!(broken.verify_unknown_write().is_err());
+        assert!(broken.recovery_snapshot().is_err());
     }
 
     #[test]

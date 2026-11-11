@@ -415,8 +415,15 @@ pub(super) fn file_menu(
                 let rel = row.rel.clone();
                 let label = row.git.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
                 menu::item(t("fileTree", "menu.viewDiff"), move |window, cx| {
-                    if remote && !crate::git_backend::remote_git_enabled(store.read(cx)) {
-                        crate::git_backend::request_enable(store.clone(), window, cx);
+                    if remote
+                        && !crate::git_backend::remote_git_enabled(store.read(cx), &project_id)
+                    {
+                        crate::git_backend::request_enable(
+                            store.clone(),
+                            project_id.clone(),
+                            window,
+                            cx,
+                        );
                         return;
                     }
                     let repo = crate::git_backend::project_context(store.read(cx), &project_id);
@@ -444,8 +451,15 @@ pub(super) fn file_menu(
                 let rel = row.rel.clone();
                 let project_id = context.project_id.clone();
                 menu::item(t("gitLog", "fileHistory.menu"), move |window, cx| {
-                    if remote && !crate::git_backend::remote_git_enabled(store.read(cx)) {
-                        crate::git_backend::request_enable(store.clone(), window, cx);
+                    if remote
+                        && !crate::git_backend::remote_git_enabled(store.read(cx), &project_id)
+                    {
+                        crate::git_backend::request_enable(
+                            store.clone(),
+                            project_id.clone(),
+                            window,
+                            cx,
+                        );
                         return;
                     }
                     let project = crate::git_backend::project_context(store.read(cx), &project_id);

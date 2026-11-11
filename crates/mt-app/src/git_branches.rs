@@ -468,7 +468,7 @@ impl BranchPopup {
             *snapshot = current;
         } else {
             snapshot.busy = None;
-            snapshot.gated = git_ui::gate::is_busy_key(&snapshot.context.key());
+            snapshot.gated = git_ui::gate::is_busy_key(&snapshot.context.repository_key());
         }
         snapshot.clone()
     }
@@ -742,7 +742,7 @@ impl Render for BranchPopup {
                         let busy = panel.upgrade().is_some_and(|p| {
                             let snap = p.read(cx).branch_snapshot();
                             snap.context == context && !snap.writable()
-                        }) || git_ui::gate::is_busy_key(&context.key());
+                        }) || git_ui::gate::is_busy_key(&context.repository_key());
                         if busy {
                             git_ui::gate_busy_text().into()
                         } else {
@@ -786,7 +786,7 @@ impl Render for BranchPopup {
                             snap.context == context
                                 && !snap.writable()
                                 && snap.busy != Some(GitBusy::Fetch)
-                        }) || git_ui::gate::is_busy_key(&context.key());
+                        }) || git_ui::gate::is_busy_key(&context.repository_key());
                         if waiting {
                             git_ui::gate_busy_text().into()
                         } else {

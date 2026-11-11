@@ -1543,7 +1543,7 @@ fn run_hunk_op(
         (c.context.clone(), c.file().path.clone())
     };
     // 按块操作同样写暂存区 / 工作区:与面板上的其它写操作共用一道闸,被占时就地说明
-    let Some(guard) = git_ui::gate::try_acquire_key(&repo.key()) else {
+    let Some(guard) = git_ui::gate::try_acquire_key(&repo.repository_key()) else {
         ctl.update(cx, |c, cx| {
             c.op_error = Some(git_ui::gate_busy_text().to_string());
             c.stale = false;
@@ -1560,7 +1560,8 @@ fn run_hunk_op(
     });
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || match op {
+        let executor = repo.clone();
+        let result = mt_remote::run_git_on(&executor, move || match op {
             HunkOp::Stage => repo.stage_hunk(&path, &diff, hunk),
             HunkOp::Unstage => repo.unstage_hunk(&path, &diff, hunk),
             HunkOp::Discard => repo.discard_hunk(&path, &diff, hunk),
@@ -1636,7 +1637,8 @@ fn load_file(
     });
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || {
+        let executor = repo.clone();
+        let result = mt_remote::run_git_on(&executor, move || {
             repo.get_git_diff_from(&file.path, file.old_path.as_deref(), file.side)
         })
         .await;
@@ -2286,7 +2288,8 @@ pub fn open_commit_diff_loading(
 ) -> gpui::Task<()> {
     let (task_repo, task_hash) = (repo_path.clone(), commit_hash.clone());
     window.spawn(cx, async move |cx| {
-        let files = mt_remote::run_git(move || task_repo.get_commit_files(&task_hash)).await;
+        let files =
+            mt_remote::run_git_on(&repo_path, move || task_repo.get_commit_files(&task_hash)).await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_commit_diff_at(
                 store,
@@ -2350,8 +2353,10 @@ pub fn open_combined_diff_loading(
 ) -> gpui::Task<()> {
     let (task_repo, task_hashes) = (repo_path.clone(), hashes.clone());
     window.spawn(cx, async move |cx| {
-        let files =
-            mt_remote::run_git(move || task_repo.get_combined_commit_files(&task_hashes)).await;
+        let files = mt_remote::run_git_on(&repo_path, move || {
+            task_repo.get_combined_commit_files(&task_hashes)
+        })
+        .await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_combined_diff(store, repo_path, hashes, files, initial, window, cx),
             Err(err) => {
@@ -2842,7 +2847,7 @@ fn load_modal_file(
         }
         ModalFileSource::Revisions { base, head } => {
             let (repo, base, head) = (repo_path.clone(), base.clone(), head.clone());
-            load_diff_with(state, cx, move || {
+            load_diff_with(state, repo_path, cx, move || {
                 repo.get_revision_file_diff(base.as_ref(), head.as_ref())
             });
         }
@@ -2859,7 +2864,7 @@ fn load_commit_file_at(
     cx: &mut App,
 ) {
     let (repo, hash, path) = (repo_path.clone(), commit_hash.to_string(), path.to_string());
-    load_diff_with(state, cx, move || {
+    load_diff_with(state, repo_path, cx, move || {
         repo.get_commit_file_diff(&hash, &path, old_path.as_deref())
     });
 }
@@ -2867,6 +2872,7 @@ fn load_commit_file_at(
 /// 换一份 diff:状态复位、令牌 +1,`fetch` 丢后台跑,回来时令牌对得上才落地。
 fn load_diff_with(
     state: &Entity<DiffState>,
+    context: &GitContext,
     cx: &mut App,
     fetch: impl FnOnce() -> anyhow::Result<GitDiffResult> + Send + 'static,
 ) {
@@ -2886,8 +2892,9 @@ fn load_diff_with(
     });
 
     let state = state.clone();
+    let context = context.clone();
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(fetch).await;
+        let result = mt_remote::run_git_on(&context, fetch).await;
         let _ = state.update(cx, |s: &mut DiffState, cx| {
             if s.request != req {
                 return;

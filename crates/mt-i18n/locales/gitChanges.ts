@@ -22,6 +22,7 @@ export const gitChanges = {
     operationSucceeded: "Git 操作已完成",
     metadataWarning: "变更已读取，但部分仓库状态不可用：{detail}",
     metadataUnavailable: "仓库状态尚未确认，请刷新后再提交或处理冲突。",
+    contextChanged: "仓库已切换，请返回原仓库重试。",
   },
   en: {
     discardConfirm: "Discard changes to {count} file(s)?\nThis action cannot be undone.",
@@ -46,5 +47,6 @@ export const gitChanges = {
     operationSucceeded: "Git operation completed",
     metadataWarning: "Changes loaded, but some repository metadata is unavailable: {detail}",
     metadataUnavailable: "Repository state is unverified. Refresh before committing or resolving conflicts.",
+    contextChanged: "The repository changed. Return to the original repository and try again.",
   },
 } as const;

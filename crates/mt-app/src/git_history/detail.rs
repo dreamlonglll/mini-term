@@ -429,11 +429,16 @@ impl GitHistoryContent {
         cx.spawn(async move |this, cx| {
             // 详情与行数一起开跑,详情先回来先画
             let (detail_repo, detail_hash) = (repo.clone(), hash.clone());
-            let detail_task =
-                mt_remote::run_git(move || detail_repo.get_commit_detail(&detail_hash));
+            let detail_context = detail_repo.clone();
+            let detail_task = mt_remote::run_git_on(&detail_context, move || {
+                detail_repo.get_commit_detail(&detail_hash)
+            });
             let stats_hash = hash.clone();
             let stats_task = cx.background_executor().spawn(async move {
-                mt_remote::run_git(move || repo.get_commit_line_stats(&stats_hash)).await
+                mt_remote::run_git_on(&repo.clone(), move || {
+                    repo.get_commit_line_stats(&stats_hash)
+                })
+                .await
             });
 
             let result = detail_task.await;
@@ -488,7 +493,10 @@ impl GitHistoryContent {
         let req = self.detail.containing_request;
         cx.spawn(async move |this, cx| {
             let task_hash = hash.clone();
-            let result = mt_remote::run_git(move || repo.get_branches_containing(&task_hash)).await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || {
+                repo.get_branches_containing(&task_hash)
+            })
+            .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.detail.containing_request != req {
                     return;
@@ -521,8 +529,10 @@ impl GitHistoryContent {
         self.detail.loading = true;
         cx.spawn(async move |this, cx| {
             let task_hashes = hashes.clone();
-            let result =
-                mt_remote::run_git(move || repo.get_combined_commit_files(&task_hashes)).await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || {
+                repo.get_combined_commit_files(&task_hashes)
+            })
+            .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.detail.request != req {
                     return;

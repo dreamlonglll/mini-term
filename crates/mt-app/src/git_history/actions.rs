@@ -123,7 +123,7 @@ pub(super) fn open_commit_menu(
     let repo_key = repo.key();
     let hash = commit.hash.clone();
     cx.spawn_in(window, async move |this, cx| {
-        let (relation, remotes) = mt_remote::run_git(move || {
+        let (relation, remotes) = mt_remote::run_git_on(&repo.clone(), move || {
             let relation = repo.commit_relation(&hash).map_err(|e| error_text(&e));
             let remotes = repo.list_remote_names().unwrap_or_default();
             (relation, remotes)
@@ -228,7 +228,7 @@ fn commit_menu(
     let busy = this.busy.and_then(|_| reason("reason.busy")).or_else(|| {
         this.context
             .as_ref()
-            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.repository_key()))
             .then(|| git_ui::gate_busy_text().to_string())
     });
     let (rel, rel_error) = match relation {
@@ -507,7 +507,7 @@ impl GitHistoryContent {
             move |result, window, cx| {
                 if let Err(err) = &result {
                     git_ui::show_git_error(
-                        t("gitLog", action),
+                        tr!("gitBranch", "opFailed", op = t("gitLog", action)),
                         git_ui::repo_text(&context, error_text(err)),
                         window,
                         cx,
@@ -602,7 +602,12 @@ impl GitHistoryContent {
                             });
                             // 等待期间框被 Esc 关了:原因不能丢,退到提示框
                             if !is_open(dialog) {
-                                show_alert(t("gitLog", action), message, window, cx);
+                                show_alert(
+                                    tr!("gitBranch", "opFailed", op = t("gitLog", action)),
+                                    message,
+                                    window,
+                                    cx,
+                                );
                             }
                         }
                     }
@@ -849,8 +854,11 @@ impl GitHistoryContent {
                     );
                     if current {
                         this.select_after(parent, window, cx);
-                        cx.emit(GitHistoryEvent::CommitUndone { message });
                     }
+                    cx.emit(GitHistoryEvent::CommitUndone {
+                        context: repo.clone(),
+                        message,
+                    });
                 },
                 window,
                 cx,
@@ -1354,7 +1362,9 @@ impl GitHistoryContent {
         {
             let (repo, target, form) = (repo, hash.clone(), form.clone());
             cx.spawn(async move |_, cx| {
-                let drops = mt_remote::run_git(move || repo.reset_drops_pushed(&target)).await;
+                let drops =
+                    mt_remote::run_git_on(&repo.clone(), move || repo.reset_drops_pushed(&target))
+                        .await;
                 let drops = drops.unwrap_or_else(|err| {
                     eprintln!("[git] 重置前的推送判定失败(不显示警告): {err:#}");
                     false

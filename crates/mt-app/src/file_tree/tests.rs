@@ -67,80 +67,300 @@ fn 远程下载上下文要求项目根目录和连接身份完全一致() {
     }
 }
 
-/// 保留旧测试名，断言实际能力边界而非排列。
+/// 文件菜单完整白名单：本机打开入口、分隔线与 Git 分组的顺序都是可见契约。
 #[test]
 fn 文件菜单项序与原版一致() {
-    for remote in [false, true] {
-        let dirty = file_menu_actions(false, true, true, remote, true);
-        assert!(dirty.contains(&Some(ViewDiff)) && dirty.contains(&Some(GitHistory)));
-        let clean = file_menu_actions(false, false, true, remote, true);
-        assert!(clean.contains(&Some(GitHistory)));
-        assert!(!clean.contains(&Some(ViewDiff)));
-        let outside = file_menu_actions(false, false, false, remote, true);
-        assert!(!outside.contains(&Some(GitHistory)));
-        assert!(!outside.contains(&Some(ViewDiff)));
-        for required in [
-            CopyEntry,
-            CopyRelativePath,
-            CopyAbsolutePath,
-            OpenInTerminal,
-            Rename,
-            MoveTo,
-            Delete,
-        ] {
-            assert!(outside.contains(&Some(required)));
-        }
-        assert!(!outside.contains(&Some(NewFile)) && !outside.contains(&Some(NewFolder)));
-    }
+    assert_eq!(
+        file_menu_actions(false, true, true, false, true),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(ViewDiff),
+            Some(GitHistory),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, false, true, false, true),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(GitHistory),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, false, false, false, true),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+        ]
+    );
+    // 状态缓存可能先于仓库归属缓存落地；此时只给 diff，不冒充已有历史归属。
+    assert_eq!(
+        file_menu_actions(false, true, false, false, true),
+        vec![
+            Some(OpenWithDefault),
+            Some(CopyEntry),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(RevealInFolder),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(ViewDiff),
+        ]
+    );
 }
 
 #[test]
 fn 目录菜单项序与原版一致() {
-    for remote in [false, true] {
-        let actions = file_menu_actions(true, true, true, remote, true);
-        for required in [
-            CopyEntry,
-            Paste,
-            OpenInTerminal,
-            Rename,
-            MoveTo,
-            Delete,
-            NewFile,
-            NewFolder,
-        ] {
-            assert!(actions.contains(&Some(required)));
+    for has_git_status in [false, true] {
+        for in_git_repo in [false, true] {
+            assert_eq!(
+                file_menu_actions(true, has_git_status, in_git_repo, false, true),
+                vec![
+                    Some(CopyEntry),
+                    Some(Paste),
+                    None,
+                    Some(CopyRelativePath),
+                    Some(CopyAbsolutePath),
+                    Some(RevealInFolder),
+                    Some(OpenInTerminal),
+                    Some(SearchInDirectory),
+                    None,
+                    Some(Rename),
+                    Some(MoveTo),
+                    Some(Delete),
+                    None,
+                    Some(NewFile),
+                    Some(NewFolder),
+                ],
+                "has_git_status={has_git_status} in_git_repo={in_git_repo}"
+            );
         }
-        for hidden in [OpenWithDefault, ViewDiff, GitHistory] {
-            assert!(!actions.contains(&Some(hidden)));
-        }
-        assert_eq!(actions.contains(&Some(SearchInDirectory)), !remote);
-        assert_eq!(actions.contains(&Some(RevealInFolder)), !remote);
     }
 }
 
 #[test]
 fn 远程菜单不暴露本机动作并提供传输入口() {
-    for is_dir in [false, true] {
-        for enabled in [false, true] {
-            let actions = file_menu_actions(is_dir, true, true, true, enabled);
-            for hidden in [OpenWithDefault, RevealInFolder, SearchInDirectory] {
-                assert!(!actions.contains(&Some(hidden)));
+    let file_without_git = vec![
+        Some(CopyEntry),
+        Some(Download),
+        None,
+        Some(CopyRelativePath),
+        Some(CopyAbsolutePath),
+        Some(OpenInTerminal),
+        None,
+        Some(Rename),
+        Some(MoveTo),
+        Some(Delete),
+    ];
+    assert_eq!(
+        file_menu_actions(false, true, true, true, true),
+        vec![
+            Some(CopyEntry),
+            Some(Download),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(ViewDiff),
+            Some(GitHistory),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, false, true, true, true),
+        vec![
+            Some(CopyEntry),
+            Some(Download),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(GitHistory),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, true, false, true, true),
+        vec![
+            Some(CopyEntry),
+            Some(Download),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(ViewDiff),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, false, false, true, true),
+        file_without_git
+    );
+    for has_git_status in [false, true] {
+        for in_git_repo in [false, true] {
+            // 即使后台尚有脏文件和归属缓存，关闭授权也必须退回完整非 Git 白名单。
+            assert_eq!(
+                file_menu_actions(false, has_git_status, in_git_repo, true, false),
+                file_without_git
+            );
+            for enabled in [false, true] {
+                assert_eq!(
+                    file_menu_actions(true, has_git_status, in_git_repo, true, enabled),
+                    vec![
+                        Some(CopyEntry),
+                        Some(Paste),
+                        Some(Download),
+                        Some(UploadFiles),
+                        Some(UploadFolder),
+                        None,
+                        Some(CopyRelativePath),
+                        Some(CopyAbsolutePath),
+                        Some(OpenInTerminal),
+                        None,
+                        Some(Rename),
+                        Some(MoveTo),
+                        Some(Delete),
+                        None,
+                        Some(NewFile),
+                        Some(NewFolder),
+                    ],
+                    "has_git_status={has_git_status} in_git_repo={in_git_repo} enabled={enabled}"
+                );
             }
-            assert!(actions.contains(&Some(Download)));
-            assert_eq!(actions.contains(&Some(UploadFiles)), is_dir);
-            assert_eq!(actions.contains(&Some(UploadFolder)), is_dir);
-            assert_eq!(actions.contains(&Some(ViewDiff)), enabled && !is_dir);
-            assert_eq!(actions.contains(&Some(GitHistory)), enabled && !is_dir);
         }
     }
 }
 
 #[test]
+fn 项目授权独立控制文件树缓存和菜单能力() {
+    let connection = mt_config::SshConnection {
+        id: "shared-ssh".into(),
+        name: "开发机".into(),
+        host: "host".into(),
+        port: 22,
+        user: "user".into(),
+        password: None,
+        identity_file: None,
+        group: None,
+        extra: Default::default(),
+    };
+    let mut project_a = project_config("project-a", "/workspace/repo");
+    project_a.ssh_connection_id = Some(connection.id.clone());
+    let mut project_b = project_config("project-b", "/workspace/repo");
+    project_b.ssh_connection_id = Some(connection.id.clone());
+    project_a.set_remote_git_enabled(Some(&connection), true);
+
+    let repos = vec![PathBuf::from("/workspace/repo")];
+    let path = Path::new("/workspace/repo/dirty.rs");
+    let cached_membership = cached_repo_contains_file(&repos, path, true);
+    assert!(cached_membership);
+    let allowed_a = git_io_allowed(true, project_a.remote_git_enabled(&connection), false);
+    let allowed_b = git_io_allowed(true, project_b.remote_git_enabled(&connection), false);
+    assert!(allowed_a);
+    assert!(!allowed_b, "同连接、同路径也不能继承另一个项目的授权");
+    assert_eq!(
+        file_menu_actions(false, true, cached_membership && allowed_a, true, allowed_a),
+        vec![
+            Some(CopyEntry),
+            Some(Download),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+            None,
+            Some(ViewDiff),
+            Some(GitHistory),
+        ]
+    );
+    assert_eq!(
+        file_menu_actions(false, true, cached_membership && allowed_b, true, allowed_b),
+        vec![
+            Some(CopyEntry),
+            Some(Download),
+            None,
+            Some(CopyRelativePath),
+            Some(CopyAbsolutePath),
+            Some(OpenInTerminal),
+            None,
+            Some(Rename),
+            Some(MoveTo),
+            Some(Delete),
+        ]
+    );
+
+    project_b.set_remote_git_enabled(Some(&connection), true);
+    project_a.set_remote_git_enabled(Some(&connection), false);
+    assert!(!git_io_allowed(
+        true,
+        project_a.remote_git_enabled(&connection),
+        false
+    ));
+    assert!(git_io_allowed(
+        true,
+        project_b.remote_git_enabled(&connection),
+        false
+    ));
+}
+
+#[test]
 fn 远程_git_关闭不安排任何_git_io() {
-    assert!(git_io_allowed(false, false, false));
-    assert!(!git_io_allowed(true, false, false));
-    assert!(git_io_allowed(true, true, false));
-    assert!(!git_io_allowed(true, true, true));
+    for enabled in [false, true] {
+        assert!(git_io_allowed(false, enabled, false));
+        assert!(!git_io_allowed(false, enabled, true));
+        assert_eq!(git_io_allowed(true, enabled, false), enabled);
+        assert!(!git_io_allowed(true, enabled, true));
+    }
 }
 
 #[test]
@@ -150,6 +370,12 @@ fn 仓库归属按后台缓存且不混同名前缀目录() {
         PathBuf::from("/workspace/nested/git"),
     ];
     for remote in [false, true] {
+        // 合成路径不需要存在于磁盘；已缓存的仓库根本身不是单文件历史的目标。
+        assert!(!cached_repo_contains_file(
+            &repos,
+            Path::new("/workspace/repo"),
+            remote
+        ));
         assert!(cached_repo_contains_file(
             &repos,
             Path::new("/workspace/repo/clean.rs"),
@@ -184,6 +410,16 @@ fn 仓库归属按后台缓存且不混同名前缀目录() {
     assert!(!cached_repo_contains_file(
         &repos,
         Path::new(r"/workspace/repo\file"),
+        true
+    ));
+    assert!(cached_repo_contains_file(
+        &[PathBuf::from("/workspace/repo/")],
+        Path::new("/workspace/repo/clean.rs"),
+        true
+    ));
+    assert!(cached_repo_contains_file(
+        &[PathBuf::from("/")],
+        Path::new("/workspace/repo/clean.rs"),
         true
     ));
 }

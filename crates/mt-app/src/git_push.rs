@@ -152,7 +152,7 @@ pub(crate) fn open(
         let pushing = s.pushing;
         let force = s.force;
         // 别的区正在写这个仓库(推送自己在跑时闸也占着,那由 `pushing` 管)
-        let gated = !pushing && git_ui::gate::is_busy_key(&s.repo.key());
+        let gated = !pushing && git_ui::gate::is_busy_key(&s.repo.repository_key());
         let can_push = !pushing && !gated && matches!(s.plan, Some(PushPlan::Ready(_)));
         let push_label = if pushing {
             t("gitBranch", "pushing")
@@ -163,7 +163,12 @@ pub(crate) fn open(
         };
         let state_for_ok = state.clone();
         dialog
-            .title(t("gitBranch", "pushTitle"))
+            .title(git_ui::repo_title(
+                s.panel.read(cx).store(),
+                &s.repo,
+                t("gitBranch", "pushTitle"),
+                cx,
+            ))
             .w(px(git_ui::DIALOG_W_LG))
             // 推送进行中别让一下误点遮罩把框收了(结果回来要在框里显示)
             .overlay_closable(!pushing)
@@ -205,7 +210,7 @@ fn load(state: &Entity<PushDialog>, cx: &mut App) {
     };
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || {
+        let result = mt_remote::run_git_on(&repo.clone(), move || {
             let branch = branch.as_deref();
             let plan = repo.push_plan(branch)?;
             let outgoing = repo.outgoing_commits(branch, OUTGOING_LIMIT)?;
@@ -625,12 +630,15 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     .when(pushing, |el| {
         el.child(git_ui::busy_line(t("gitBranch", "pushing")))
     })
-    .when(!pushing && git_ui::gate::is_busy_key(&s.repo.key()), |el| {
-        el.child(git_ui::notice_line(
-            git_ui::gate_busy_text(),
-            ui::color_warning(),
-        ))
-    })
+    .when(
+        !pushing && git_ui::gate::is_busy_key(&s.repo.repository_key()),
+        |el| {
+            el.child(git_ui::notice_line(
+                git_ui::gate_busy_text(),
+                ui::color_warning(),
+            ))
+        },
+    )
     .into_any_element()
 }
 

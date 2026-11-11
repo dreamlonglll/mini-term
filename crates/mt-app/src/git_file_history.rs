@@ -169,7 +169,10 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
     };
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || root.get_file_log(&rel, after, PAGE_SIZE)).await;
+        let executor = root.clone();
+        let result =
+            mt_remote::run_git_on(&executor, move || root.get_file_log(&rel, after, PAGE_SIZE))
+                .await;
         cx.update(|cx| {
             let need_more = state.update(cx, |s, cx| {
                 s.loading = false;

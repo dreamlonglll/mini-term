@@ -21,9 +21,9 @@
 //! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
 //!
 //! [`RemoteGitWorkspace`] manages lazy packaged-helper deployment and persistent Git channels.
-//! Managed Git IO runs through [`run_git`] or the workspace's bounded async request queue;
+//! Managed Git IO runs through [`run_git_on`] or the workspace's bounded async request queue;
 //! GPUI executor threads only await and never wait on a blocking service mutex.
-//! [`set_remote_git_enabled`] controls a default-denied, dynamically revocable desktop gate.
+//! [`set_project_git_permission`] controls default-denied, project/endpoint/root scoped grants.
 //! Explicit-path [`RemoteGitClient`] remains a synchronous transport independent of that gate.
 //!
 //! # 线程口径(与 Tauri 版的唯一结构性差异)
@@ -35,7 +35,7 @@
 //!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
 //!   工作线程、进程内唯一;
 //! - Existing synchronous SSH APIs retain their blocking boundary. Git UI callers use
-//!   `run_git(move || context.some_git_method()).await`, which admits blocking closures
+//!   `run_git_on(&context, move || captured.some_git_method()).await`, which admits closures
 //!   asynchronously onto the service-owned executor. Managed synchronous requests reject
 //!   calls outside that executor; local core methods remain direct synchronous calls.
 //!
@@ -59,10 +59,18 @@
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
 //!
-//! Managed Git workspaces share connection/configuration/root identity and never replay
-//! uncertain writes. Idle channels close only outside in-flight requests. Closing a pane
-//! is not a completion proof; explicit recovery requires the old helper's write barrier
-//! followed by a new-channel HEAD/index/status verification.
+//! Managed workspaces bind permission and UI identity to project/configuration/root. Repository
+//! mutation gates share host/port/user/path identity independent of saved credentials. A
+//! credential-only successor retains the originating project's unknown operation and routes
+//! recovery through its original actor using the newly granted credentials. Running writes
+//! are distinct from uncertain
+//! outcomes; neither is replayed. Recovery snapshots retain the original repository, attempt the
+//! old helper's barrier, and observe HEAD/index/operation/status through a reusable read channel.
+//! Explicit acknowledgement re-probes and rejects changed evidence, generations or grants. A
+//! lost barrier requires the user to accept that the original operation may still finish later.
+//! Source configuration mutations hold [`remote_git_source_change_guard`] across their
+//! pending check, mutation and grant synchronization; dispatch atomically publishes Running
+//! under the same guard before releasing it for network IO.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -91,7 +99,10 @@ pub use dirs::*;
 pub use files::*;
 pub use git::RemoteGitClient;
 pub use git_context::GitContext;
-pub use git_service::{RemoteGitWorkspace, run_git, set_remote_git_enabled};
+pub use git_service::{
+    RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace,
+    remote_git_source_change_guard, run_git, run_git_on, set_project_git_permission,
+};
 pub use mt_git_helper::GitFailure;
 pub use paths::*;
 pub use session_delete::*;

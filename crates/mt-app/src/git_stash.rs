@@ -187,7 +187,7 @@ impl StashDialog {
 
     /// 改写类按钮要不要锁住:自己有操作在跑,或别的区占着仓库的写操作闸。
     fn locked(&self) -> bool {
-        self.busy.is_some() || git_ui::gate::is_busy_key(&self.repo_path.key())
+        self.busy.is_some() || git_ui::gate::is_busy_key(&self.repo_path.repository_key())
     }
 }
 
@@ -273,7 +273,7 @@ pub fn open_list(
     let repo = repo_path;
     window
         .spawn(cx, async move |cx| {
-            let result = mt_remote::run_git(move || repo.list_stashes()).await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || repo.list_stashes()).await;
             let _ = cx.update(|window, cx| {
                 // 读取期间入口又被点了一次,那一次已经把弹窗开出来了
                 if is_open(kind::GIT_STASH) {
@@ -342,7 +342,12 @@ pub fn open_smart_checkout(
         window,
         cx,
         move |dialog, _window, cx| {
-            let title = tr!("gitStash", "checkout.title", branch = branch.as_str());
+            let title = git_ui::repo_title(
+                &store,
+                &repo_path,
+                &tr!("gitStash", "checkout.title", branch = branch.as_str()),
+                cx,
+            );
             let f = form.read(cx);
             if let Some((text, files, detail)) = f.outcome.clone() {
                 // 终态:已经检出,但恢复不顺 —— 只剩「知道了」
@@ -446,7 +451,7 @@ fn reload(state: &Entity<StashDialog>, cx: &mut App) {
     });
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || repo.list_stashes()).await;
+        let result = mt_remote::run_git_on(&repo.clone(), move || repo.list_stashes()).await;
         cx.update(|cx| apply_list(&state, request, result, cx));
     })
     .detach();
@@ -529,7 +534,7 @@ fn load_files(state: &Entity<StashDialog>, hash: Option<String>, cx: &mut App) {
     };
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = mt_remote::run_git(move || repo.stash_files(&hash)).await;
+        let result = mt_remote::run_git_on(&repo.clone(), move || repo.stash_files(&hash)).await;
         cx.update(|cx| {
             let any = state.update(cx, |s, cx| {
                 if s.files_request != request {

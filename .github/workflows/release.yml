@@ -18,6 +18,10 @@ name: Build & Release
 #   deb 的 Depends 由 dpkg-shlibdeps 在构建时按二进制实际链接的库算出)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
 #   该目录收集 —— 目录布局即最终包布局
+# - 每个桌面安装包都带齐 Linux x64/arm64 与 macOS x64/arm64 四种远端 Git helper;
+#   remote-git-helpers 全平台成功后 build-gpui 才组装,stage-git-helpers --verify-all
+#   拒绝缺失或动态链接的 Linux helper。手动补建即使只选一个桌面平台也不缩减 helper
+#   矩阵;任一 helper 构建 / 兼容性冒烟失败同样阻止打包与 publish。
 # - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
 #   各平台只向其上传产物,避免并行抢建 release;全部平台构建成功后 publish 作业
 #   算出 SHA256SUMS.txt 一并上传,再把 draft 转正。匿名请求看不到 draft ——
@@ -203,11 +207,13 @@ jobs:
         shell: bash
         env:
           HELPER_TARGET: ${{ matrix.target }}
-        # Dated Ubuntu 20.04 image, not a floating latest/20.04 tag. Docker chooses
-        # the native x86_64/aarch64 image; Python also asserts glibc < 2.34.
+        # Pin the Ubuntu 20.04 multiarch index shared with CI, not a mutable tag
+        # or one architecture's manifest. Docker selects native x86_64/aarch64;
+        # Python also asserts glibc < 2.34.
         run: |
           sudo docker run --rm -v "$PWD:/workspace:ro" -w /workspace \
-            -e HELPER_TARGET="$HELPER_TARGET" ubuntu:focal-20250404 bash -euc '
+            -e HELPER_TARGET="$HELPER_TARGET" \
+            ubuntu:focal-20250404@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 bash -euc '
               apt-get update
               apt-get install -y --no-install-recommends git python3 ca-certificates
               python3 scripts/smoke-git-helper-old-glibc.py \

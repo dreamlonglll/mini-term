@@ -193,8 +193,66 @@ impl AppStore {
     /// 需要**额外副作用**的那几项(主题 / 字号 / 字族 / 回滚行数 / 停留时长)
     /// 各有自己的 setter,不要拿这个入口去改它们 —— 热更新会漏。
     pub fn patch_config(&mut self, edit: impl FnOnce(&mut AppConfig), cx: &mut Context<Self>) {
-        edit(&mut self.config);
-        mt_remote::set_remote_git_enabled(self.config.remote_git_helper_enabled);
+        let source_change = mt_remote::remote_git_source_change_guard();
+        let pending_sources: Vec<_> = self
+            .config
+            .projects
+            .iter()
+            .filter(|project| self.remote_git_source_pending(project))
+            .map(|project| project.id.clone())
+            .collect();
+        let granted: Vec<_> = self
+            .config
+            .projects
+            .iter()
+            .filter_map(|project| {
+                project.remote_git_permission.as_ref()?;
+                let connection = self.config.ssh_connections.iter().find(|connection| {
+                    project.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+                });
+                Some((
+                    project.id.clone(),
+                    project.path.clone(),
+                    connection.map(mt_remote::connection_fingerprint),
+                ))
+            })
+            .collect();
+        if let Some(id) = super::projects::patch_preserving_remote_git_sources(
+            &mut self.config,
+            &pending_sources,
+            edit,
+        ) {
+            self.notify_remote_git_source_blocked(&id, cx);
+            return;
+        }
+        for (id, root, fingerprint) in granted {
+            let project = self
+                .config
+                .projects
+                .iter_mut()
+                .find(|project| project.id == id);
+            let unchanged = project.as_ref().is_some_and(|project| {
+                project.path == root
+                    && self
+                        .config
+                        .ssh_connections
+                        .iter()
+                        .find(|connection| {
+                            project.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+                        })
+                        .map(mt_remote::connection_fingerprint)
+                        == fingerprint
+            });
+            if !unchanged {
+                if let Some(project) = project {
+                    project.remote_git_permission = None;
+                }
+                mt_remote::set_project_git_permission(&id, None, "", false);
+            }
+        }
+        self.config.clear_invalid_remote_git_permissions();
+        crate::git_backend::sync_remote_git_permissions(&self.config);
+        drop(source_change);
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }

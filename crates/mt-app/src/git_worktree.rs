@@ -24,7 +24,8 @@
 //! # 阻塞调用
 //!
 //! `add_worktree`(120s)/ `remove_worktree`(60s)/ `prune_worktrees`(30s)
-//! 全是阻塞 IO，一律走 `mt_remote::run_git` 的独立工作线程。
+//! 全是阻塞 IO，一律走 `mt_remote::run_git_on` 的本地/远程独立配额工作线程。
+//! 创建、删除与清理先在 UI 线程按 `repository_key()` 占写操作闸；分组仍按来源上下文 `key()` 区分。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -513,28 +514,34 @@ pub fn open(
     cx: &mut App,
 ) {
     let store = AppStore::global(cx);
-    let remote_project = project_id
+    let source_project_id = context
+        .project_id()
+        .map(str::to_string)
+        .or_else(|| project_id.clone())
+        .or_else(|| store.read(cx).active_project_id.clone());
+    let remote_project = source_project_id
         .as_deref()
-        .or(store.read(cx).active_project_id.as_deref())
         .and_then(|id| store.read(cx).project(id))
         .is_some_and(crate::ssh_conn::is_remote_project);
-    if (context.is_remote() || remote_project)
-        && !crate::git_backend::remote_git_enabled(store.read(cx))
-    {
-        crate::git_backend::request_enable(store, window, cx);
-        return;
+    if context.is_remote() || remote_project {
+        let Some(source_id) = source_project_id.as_deref() else {
+            return;
+        };
+        if !crate::git_backend::remote_git_enabled(store.read(cx), source_id) {
+            crate::git_backend::request_enable(store, source_id.to_string(), window, cx);
+            return;
+        }
     }
     if context.path().is_empty() {
         return;
     }
     let repo_path = context.path().to_string();
-    let project_id = project_id
-        .or_else(|| store.read(cx).active_project_id.clone())
-        .filter(|id| {
-            store.read(cx).project(id).is_some_and(|project| {
-                project.ssh_connection_id.as_deref() == context.connection_id()
-            })
-        });
+    let project_id = source_project_id.filter(|id| {
+        store
+            .read(cx)
+            .project(id)
+            .is_some_and(|project| project.ssh_connection_id.as_deref() == context.connection_id())
+    });
     let root_name = context_base_name(&context, &repo_path).to_string();
     let state = cx.new(|cx| WorktreeModal {
         store,
@@ -594,7 +601,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
     let state = state.clone();
     cx.spawn(async move |cx| {
         let repo_for_task = context.clone();
-        let loaded = mt_remote::run_git(move || {
+        let loaded = mt_remote::run_git_on(&context, move || {
             let paths: Vec<String> = if discover {
                 match repo_for_task.discover_git_repos() {
                     Ok(repos) => repos
@@ -676,7 +683,9 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
             s.branches_by_repo.insert(key.clone(), Rc::default());
         });
         cx.spawn(async move |cx| {
-            let result = mt_remote::run_git(move || context.get_repo_branches()).await;
+            let execution = context.clone();
+            let result =
+                mt_remote::run_git_on(&execution, move || context.get_repo_branches()).await;
             state.update(cx, |s: &mut WorktreeModal, cx| {
                 match result {
                     Ok(list) => {
@@ -1583,6 +1592,18 @@ fn create(
             s.add_as_project,
         )
     };
+    let mut guards = Vec::with_capacity(targets.len());
+    for (context, _) in &targets {
+        let Some(guard) = git_ui::gate::try_acquire_key(&context.repository_key()) else {
+            state.update(cx, |s, cx| {
+                s.create_error = Some(git_ui::gate_busy_text().into());
+                cx.notify();
+            });
+            return;
+        };
+        guards.push(guard);
+    }
+    cx.refresh_windows();
 
     state.update(cx, |s, cx| {
         s.creating = true;
@@ -1598,7 +1619,8 @@ fn create(
             for (context, target) in targets {
                 let (branch, base) = (branch.clone(), base.clone());
                 let target_for_task = target.clone();
-                let result = mt_remote::run_git(move || {
+                let execution = context.clone();
+                let result = mt_remote::run_git_on(&execution, move || {
                     // ⚠️ add_worktree 是 120s 阻塞 CLI
                     context.add_worktree(&target_for_task, &branch, create_branch, base.as_deref())
                 })
@@ -1608,8 +1630,10 @@ fn create(
                     result.map(|_| ()).map_err(|err| git_ui::error_text(&err)),
                 ));
             }
+            drop(guards);
 
             let _ = cx.update(|window, cx| {
+                cx.refresh_windows();
                 // 无论成败先通知外面 + 清掉分支缓存(分支集合已变)
                 let on_changed = state.read(cx).on_changed.clone();
                 on_changed(cx);
@@ -1902,6 +1926,15 @@ fn remove_worktree(
     }
     let force = form.read(cx).force;
     let store = state.read(cx).store.clone();
+    let Some(guard) = git_ui::gate::try_acquire_key(&group.context.repository_key()) else {
+        form.update(cx, |f, cx| {
+            f.removing = false;
+            f.error = Some(git_ui::gate_busy_text().into());
+            cx.notify();
+        });
+        return;
+    };
+    cx.refresh_windows();
     // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败。
     //    ⚠️ 这一步必须在 remove **之前**:删失败时终端也已关掉(项目还在,pane 呈
     //    断开态、可重开),代价换来的是 Windows 上能删得掉,别为「失败不关终端」调序
@@ -1929,12 +1962,15 @@ fn remove_worktree(
     let form = form.clone();
     window
         .spawn(cx, async move |cx| {
-            let result = mt_remote::run_git(move || {
+            let execution = context.clone();
+            let result = mt_remote::run_git_on(&execution, move || {
                 // ⚠️ 60s 阻塞 CLI
                 context.remove_worktree(&wt_path, force)
             })
             .await;
+            drop(guard);
             let _ = cx.update(|window, cx| {
+                cx.refresh_windows();
                 match result {
                     Ok(_) => {
                         // ② 成功之后才删项目(不留断链项目)
@@ -2020,6 +2056,14 @@ fn prune_and_probe(
 
 /// 清理失效条目。只有同 backend 复核目录确实不存在后才删除关联项目。
 fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
+    let Some(guard) = git_ui::gate::try_acquire_key(&group.context.repository_key()) else {
+        state.update(cx, |s, cx| {
+            s.load_error = Some(git_ui::gate_busy_text().into());
+            cx.notify();
+        });
+        return;
+    };
+    cx.refresh_windows();
     let invalid: Vec<String> = group
         .worktrees
         .iter()
@@ -2035,10 +2079,14 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
     cx.spawn(async move |cx| {
         let invalid_for_task = invalid.clone();
         let context_for_task = context.clone();
-        let result =
-            mt_remote::run_git(move || prune_and_probe(&context_for_task, &invalid_for_task)).await;
+        let result = mt_remote::run_git_on(&context, move || {
+            prune_and_probe(&context_for_task, &invalid_for_task)
+        })
+        .await;
+        drop(guard);
 
         cx.update(|cx| {
+            cx.refresh_windows();
             state.update(cx, |s, cx| {
                 s.pruning_key = None;
                 cx.notify();
@@ -2145,6 +2193,7 @@ mod tests {
 
     fn remote_context(connection_id: &str) -> GitContext {
         GitContext::remote(
+            "source-project".into(),
             mt_config::SshConnection {
                 id: connection_id.into(),
                 name: "test".into(),
@@ -2158,6 +2207,26 @@ mod tests {
             },
             "/repo".into(),
         )
+    }
+
+    #[test]
+    fn 同仓库跨项目共用写闸但保留分组来源身份() {
+        let source = remote_context("shared-worktree-gate");
+        let other = GitContext::remote(
+            "other-project".into(),
+            source.connection().unwrap().clone(),
+            "/repo".into(),
+        );
+        assert_ne!(source.key(), other.key());
+        assert_eq!(source.repository_key(), other.repository_key());
+        let guard = git_ui::gate::try_acquire_key(&source.repository_key()).unwrap();
+        assert!(git_ui::gate::try_acquire_key(&other.repository_key()).is_none());
+        assert!(
+            git_ui::gate::try_acquire_key(&source.with_path("/another-repo").repository_key())
+                .is_some()
+        );
+        drop(guard);
+        assert!(git_ui::gate::try_acquire_key(&other.repository_key()).is_some());
     }
 
     #[test]

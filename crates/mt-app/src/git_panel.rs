@@ -374,7 +374,7 @@ pub struct GitPanel {
     /// 正在跑的写操作(见模块注释「写操作」)。
     busy: Option<GitBusy>,
     feedback_context: Option<GitContext>,
-    enable_prompted: bool,
+    enable_prompted: std::collections::HashSet<String>,
     /// 抽屉里显示的是不是本面板。收着时不扫盘。
     visible: bool,
     /// 收着的时候项目切过 → 打开时补拉一次。
@@ -499,9 +499,10 @@ impl GitPanel {
                     this.changes.update(cx, |c, cx| c.load(cx));
                     git_watch::request_check(git_watch::Subscriber::FileTree);
                 }
-                GitHistoryEvent::CommitUndone { message } => {
-                    this.changes
-                        .update(cx, |c, cx| c.restore_message(message, window, cx));
+                GitHistoryEvent::CommitUndone { context, message } => {
+                    this.changes.update(cx, |c, cx| {
+                        c.restore_message_on(context, message, window, cx)
+                    });
                 }
             },
         ));
@@ -576,7 +577,7 @@ impl GitPanel {
             branch_data: RefCell::new(None),
             busy: None,
             feedback_context: None,
-            enable_prompted: false,
+            enable_prompted: std::collections::HashSet::new(),
             visible: false,
             stale: true,
             project_path,
@@ -623,6 +624,11 @@ impl GitPanel {
         self.visible = visible;
         let context = self.active_project_context(cx);
         let project_id = self.store.read(cx).active_project_id.clone();
+        if context.as_ref().is_some_and(GitContext::is_remote)
+            && let Some(id) = &project_id
+        {
+            self.enable_prompted.insert(id.clone());
+        }
         if context != self.project_context || project_id != self.project_id {
             self.replace_project_context(context, project_id);
             self.stale = true;
@@ -812,24 +818,24 @@ impl GitPanel {
 
     fn remote_git_disabled(&self, cx: &App) -> bool {
         let store = self.store.read(cx);
-        store
-            .active_project()
-            .is_some_and(|project| project.ssh_connection_id.is_some())
-            && !crate::git_backend::remote_git_enabled(store)
+        store.active_project().is_some_and(|project| {
+            project.ssh_connection_id.is_some()
+                && !crate::git_backend::remote_git_enabled(store, &project.id)
+        })
     }
 
     fn replace_project_context(&mut self, context: Option<GitContext>, project_id: Option<String>) {
+        if context.as_ref().is_some_and(GitContext::is_remote)
+            && let Some(id) = &project_id
+        {
+            self.enable_prompted.insert(id.clone());
+        }
         self.repo_request += 1;
         self.watch_request += 1;
         self.hidden_request += 1;
         self.reset_repo_state();
         self.repos.clear();
         self.selected_repo.clear();
-        if self.project_context != context
-            && let Some(previous) = self.project_context.as_ref()
-        {
-            previous.close();
-        }
         self.project_path = context.as_ref().map(|context| context.path().to_string());
         self.project_context = context;
         self.project_id = project_id;
@@ -904,7 +910,9 @@ impl GitPanel {
         self.repo_request += 1;
         let req = self.repo_request;
         cx.spawn(async move |this, cx| {
-            let result = mt_remote::run_git(move || context.discover_git_repos()).await;
+            let executor = context.clone();
+            let result =
+                mt_remote::run_git_on(&executor, move || context.discover_git_repos()).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.repo_request != req
                     || this.project_context.as_ref().map(GitContext::key).as_ref() != Some(&key)
@@ -996,7 +1004,9 @@ impl GitPanel {
         let req = self.branch_request;
         let repo = context.clone();
         cx.spawn(async move |this, cx| {
-            let result = mt_remote::run_git(move || load_branch_snapshot(&context)).await;
+            let executor = context.clone();
+            let result =
+                mt_remote::run_git_on(&executor, move || load_branch_snapshot(&context)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 // 迟到响应丢弃:换仓库后的旧响应不许覆盖(换仓库时令牌已前移)
                 if this.branch_request != req {
@@ -1104,7 +1114,7 @@ impl GitPanel {
     }
 
     fn verify_remote_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = self.repo_context().filter(GitContext::is_remote) else {
+        let Some(repo) = self.project_context.clone().filter(GitContext::is_remote) else {
             return;
         };
         let captured = repo.clone();
@@ -1112,21 +1122,107 @@ impl GitPanel {
         let panel = cx.entity().downgrade();
         window
             .spawn(cx, async move |cx| {
-                let result = mt_remote::run_git(move || repo.verify_unknown_write()).await;
+                let result =
+                    mt_remote::run_git_on(&captured, move || repo.recovery_snapshot()).await;
                 let _ = cx.update(|window, cx| match result {
-                    Ok(()) => {
-                        git_ui::toast_for_repo(
-                            &store,
-                            &captured,
-                            t("gitHistory", "writeVerified").to_string(),
-                            Tone::Info,
-                            cx,
-                        );
-                        let _ = panel.update(cx, |panel, cx| {
-                            if panel.repo_context().as_ref() == Some(&captured) {
-                                panel.refresh_after_write(cx);
-                            }
-                        });
+                    Ok(snapshot) => {
+                        let observed = snapshot
+                            .observed
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let occurred = snapshot
+                            .occurred
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let message = if snapshot.completion_proven {
+                            t("gitHistory", "recoveryProven")
+                        } else {
+                            t("gitHistory", "recoveryRisk")
+                        };
+                        let mut detail = vec![
+                            git_ui::repo_label(&captured.with_path(snapshot.repo.clone())),
+                            snapshot.operation.clone(),
+                            tr!("gitHistory", "recoveryOccurred", timestamp = occurred),
+                            format!("HEAD: {}", snapshot.head.as_deref().unwrap_or("∅")),
+                            tr!(
+                                "gitHistory",
+                                "recoverySignature",
+                                refs = snapshot.signature.refs,
+                                index = snapshot.signature.index
+                            ),
+                            tr!(
+                                "gitHistory",
+                                "recoveryOperation",
+                                operation = format!("{:?}", snapshot.op.kind),
+                                conflicts = snapshot.op.conflicted
+                            ),
+                            tr!(
+                                "gitHistory",
+                                "recoveryFiles",
+                                count = snapshot.files.len(),
+                                timestamp = observed
+                            ),
+                        ];
+                        detail.extend(snapshot.files.iter().take(20).map(|file| {
+                            format!(
+                                "{} {:?} {:?}",
+                                file.path, file.staged_status, file.unstaged_status
+                            )
+                        }));
+                        let context = captured.clone();
+                        Confirm::new(t("gitHistory", "verifyWrite"), message)
+                            .detail(detail)
+                            .ok_text(t("gitHistory", "acknowledgeRecovery"))
+                            .open(
+                                move |window, cx| {
+                                    let context = context.clone();
+                                    let executor = context.clone();
+                                    let snapshot = snapshot.clone();
+                                    let store = store.clone();
+                                    let panel = panel.clone();
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            let result =
+                                                mt_remote::run_git_on(&executor, move || {
+                                                    context.acknowledge_recovery(&snapshot)
+                                                })
+                                                .await;
+                                            let _ = cx.update(|window, cx| match result {
+                                                Ok(()) => {
+                                                    git_ui::toast_for_repo(
+                                                        &store,
+                                                        &executor,
+                                                        t("gitHistory", "writeVerified")
+                                                            .to_string(),
+                                                        Tone::Info,
+                                                        cx,
+                                                    );
+                                                    let _ = panel.update(cx, |panel, cx| {
+                                                        if panel
+                                                            .project_context
+                                                            .as_ref()
+                                                            .and_then(GitContext::project_id)
+                                                            == executor.project_id()
+                                                        {
+                                                            panel.refresh_after_write(cx);
+                                                        }
+                                                    });
+                                                }
+                                                Err(err) => git_ui::show_git_error(
+                                                    t("gitHistory", "verifyWrite"),
+                                                    git_ui::error_text(&err),
+                                                    window,
+                                                    cx,
+                                                ),
+                                            });
+                                        })
+                                        .detach();
+                                },
+                                window,
+                                cx,
+                            );
                     }
                     Err(err) => git_ui::show_git_error(
                         t("gitHistory", "verifyWrite"),
@@ -1240,7 +1336,7 @@ impl GitPanel {
         self.busy.is_none()
             && self
                 .repo_context()
-                .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+                .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.repository_key()))
     }
 
     pub(crate) fn repo_context(&self) -> Option<GitContext> {
@@ -1930,7 +2026,8 @@ impl GitPanel {
         let req = self.sig_request;
         let task_repo = repo.clone();
         cx.spawn(async move |this, cx| {
-            let (observed, dirs) = mt_remote::run_git(move || {
+            let executor = task_repo.clone();
+            let (observed, dirs) = mt_remote::run_git_on(&executor, move || {
                 let at = Instant::now();
                 let observed = RepoObservation {
                     at,
@@ -2555,11 +2652,16 @@ impl Render for GitPanel {
             ));
         }
         if self.remote_git_disabled(cx) {
-            if self.visible && !self.enable_prompted {
-                self.enable_prompted = true;
+            let project_id = self
+                .store
+                .read(cx)
+                .active_project_id
+                .clone()
+                .unwrap_or_default();
+            if self.visible && self.enable_prompted.insert(project_id.clone()) {
                 let store = self.store.clone();
                 _window.defer(cx, move |window, cx| {
-                    crate::git_backend::request_enable(store, window, cx)
+                    crate::git_backend::request_enable(store, project_id, window, cx)
                 });
             }
             return div()
@@ -2576,7 +2678,9 @@ impl Render for GitPanel {
                         t("gitHistory", "enableEntry"),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        crate::git_backend::request_enable(this.store.clone(), window, cx);
+                        if let Some(id) = this.store.read(cx).active_project_id.clone() {
+                            crate::git_backend::request_enable(this.store.clone(), id, window, cx);
+                        }
                     })),
                 );
         }
@@ -2643,15 +2747,17 @@ impl Render for GitPanel {
         if let Some(error) = &self.load_error {
             root = root.child(git_ui::error_block(error.clone()));
         }
-        if self
-            .repo_context()
-            .is_some_and(|repo| repo.write_outcome_unknown())
+        if let Some(unknown) = self
+            .project_context
+            .as_ref()
+            .and_then(GitContext::unknown_write)
         {
             root = root.child(
-                crate::prompt::footer_button("verify-remote-write", t("gitHistory", "verifyWrite"))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.verify_remote_write(window, cx)),
-                    ),
+                crate::prompt::footer_button(
+                    "verify-remote-write",
+                    tr!("gitHistory", "verifyRepository", repo = unknown.repo),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.verify_remote_write(window, cx))),
             );
         }
 

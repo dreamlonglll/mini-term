@@ -8,7 +8,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 - **UI/渲染**: [gpui-pre](https://crates.io/crates/gpui-pre) 0.3.5（Zed 快照，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-pre-platform`）+ gpui-component 0.6.2（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
-- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉四家 AI 工具里的 hook 注册，升级不摘）+ macOS dmg + Linux deb/tar.gz
+- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉四家 AI 工具里的 hook 注册，升级不摘）+ macOS dmg + Linux deb/tar.gz。各桌面发布包还随附 `remote-git-helpers/<platform>/mt-git-helper` 四平台资源：`linux-x86_64` / `linux-aarch64`（musl 静态构建）、`macos-x86_64` / `macos-aarch64`；按 SSH 服务器平台选择，不按桌面平台选择，缺失资源明确报错且不回落本机 Git。目标与打包范围不表示已完成所有平台或服务器环境验证
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
 
 ## 开发命令
@@ -84,7 +84,7 @@ tools/promo/build.sh
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
 | `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连只看连接配置本身（`target.rs`）。⚠️ `~/.ssh` 里**只碰 `known_hosts`**：不读 `~/.ssh/config`（不认别名 / ProxyJump）、不试默认私钥 `~/.ssh/id_*`（用户明确要求，曾加过又撤回，别加回来）。`auth.rs` 依次试连接私钥 / ssh-agent / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开 |
-| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、托管 SSH Git 会话与连接身份失效；默认拒绝，须用户授权。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。不依赖 gpui |
+| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、项目级授权校验（默认拒绝，绑定 SSH 端点与远端根目录，变化即重新授权）、托管 SSH Git 会话与身份失效；写结果未知时阻止后续写入，支持原通道 barrier/proof 核对及通道丢失后的只读快照，两条路径均须用户明确确认且重核快照有效性后恢复，不自动重放写操作，不将丢失原通道后的确认视为旧进程已退出。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。不依赖 gpui |
 | `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价；models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路（`models_dev.rs`，拉网那一跳由 mt-app 的 `pricing.rs` 注入） |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
