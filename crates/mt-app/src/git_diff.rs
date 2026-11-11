@@ -1332,7 +1332,8 @@ struct DiffState {
     /// 请求令牌:换文件时旧响应不许覆盖。
     request: u64,
     /// 静默重取([`Fetch::Refresh`])在途:页签切回来、仓库变了、点刷新会凑到一起,在途时
-    /// 不再叠一趟。被换文件 / 块操作后的重取顶掉时随之清掉
+    /// 不再叠一趟。被换文件 / 块操作后的重取顶掉、或块操作开跑时被作废
+    /// ([`DiffState::cancel_refresh`]),随之清掉
     refreshing: bool,
     split: Entity<ResizableState>,
     /// 三个列表各自的滚动句柄:跳转要用,并排两栏还要靠它对齐。
@@ -1475,6 +1476,19 @@ impl DiffState {
         }
         self.apply(result);
         true
+    }
+
+    /// 作废在途的静默重取(块操作开跑时调,见 [`run_hunk_op`]):它要是在操作期间落地,行模型
+    /// 就换了一套,操作成功后 [`DiffState::mark_applied`] 再按点按钮时的块号去扣勾选就错位了。
+    ///
+    /// 只在确有一趟 `Refresh` 在途时动令牌:`refreshing` 为真说明最新的一趟就是它(`Fresh` /
+    /// `AfterOp` 发起时会把它清掉),令牌 +1 只作废它一个。操作后的那趟 `AfterOp` 在这之后
+    /// 才发起、拿的是更新的令牌,不受影响。
+    fn cancel_refresh(&mut self) {
+        if self.refreshing {
+            self.refreshing = false;
+            self.request += 1;
+        }
     }
 
     /// 这份 diff 能不能按行勾选:打开方允许(见 [`DiffState::pickable`]),且不是二进制 /
@@ -2571,6 +2585,8 @@ fn run_hunk_op(
         c.stale = false;
         cx.notify();
     });
+    // 操作期间屏幕上这份 diff 不能被在途的静默重取换掉(`busy` 只挡得住新发起的)
+    state.update(cx, |s, _| s.cancel_refresh());
     let (state, ctl) = (state.clone(), ctl.clone());
     let applied = picks.clone();
     cx.spawn(async move |cx| {

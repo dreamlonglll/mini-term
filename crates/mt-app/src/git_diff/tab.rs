@@ -8,20 +8,23 @@
 //!
 //! | 视图 | 身份 | 已开着时再打开 |
 //! |---|---|---|
-//! | 单文件 diff | 文件(仓库 + 路径拼成的绝对路径)+ 侧别(已暂存 / 未暂存 / 工作区) | 换上新的文件序列与回调,原地静默重取 |
+//! | 单文件 diff | 文件(仓库 + 路径拼成的绝对路径)+ 侧别(已暂存 / 未暂存 / 工作区) | 换上新的仓库、文件序列与回调,原地静默重取(仓库或文件变了就从头取) |
 //! | 提交 diff | 仓库 + 提交号 | 带着初始文件的,在左栏选中它 |
 //! | 合并变更 | 仓库 + 那组提交(按历史列表的顺序) | 同上 |
 //! | 单文件历史 | 文件(项目根 + 相对路径拼成的绝对路径) | 只是切过去 |
-//! | 磁盘对比 | 那个文档(文件页签的身份) | 换上新取的两侧内容 |
+//! | 磁盘对比 | 那个文档(文件页签的身份) | 换上新取的两侧内容与发起的文件页签 |
 //!
 //! 路径一律规范化后再比(分隔符统一成 `/`、去掉末尾的 `/`,Windows 上不分大小写 —— 与文件
 //! 页签同口径),「仓库 + 路径」拼成绝对路径再比:文件树按项目根传、更改列表与文件页 gutter
-//! 按仓库根传的同一个文件认得出是同一个。页签归打开那一刻的**活动项目**(Git 面板的仓库属于
-//! 它,项目里的子仓库 / worktree 也一样;远程项目没有 Git 面板)。
+//! 按仓库根传的同一个文件认得出是同一个(撞上时连仓库一起换,见 `FilePage::adopt`)。页签归
+//! 打开那一刻的**活动项目**(Git 面板的仓库属于它,项目里的子仓库 / worktree 也一样;远程
+//! 项目没有 Git 面板)。提交 / 合并变更要先在后台取文件列表,归属在发起时就记下:取数期间
+//! 切了项目,页签只放进原项目、不切过去(见 [`Home`])。
 //!
 //! 单文件 diff 里 Alt+← / Alt+→ 换文件(或块操作后当前文件离开了分组、换到下一个)时**在
 //! 当前页签里换**,身份与标题跟着变([`DiffTabEvent::Retarget`]);换到的目标恰好已有另一个
-//! 页签时,当前页签接管目标、旧的那个关掉(取舍见 `workbench_area::retarget_plan`)。
+//! 页签时只留一个:撞上的那个正是活动页就留它、关掉换身份的这个(后台页签),否则换身份的
+//! 这个接管目标、旧的那个关掉(取舍见 `workbench_area::retarget_plan`)。
 //!
 //! # 打开一律延到这一轮更新之后
 //!
@@ -400,12 +403,15 @@ impl DiffTab {
         let (repo, file) = page.current(cx);
         let target = DiffTarget::file(&repo, &file.path, file.side);
         let title = file_tab_title(&file.path, file.side);
-        if target == self.key.target && title == self.title {
+        // 再次打开时可能只换了仓库的写法(文件树按项目根、gutter 按仓库根,见
+        // `FilePage::adopt`):身份与标题不变,提示里的完整路径也跟上
+        let tip = file_tab_tip(&repo, &file.path, file.side);
+        if target == self.key.target && title == self.title && tip == self.tip {
             return;
         }
         self.key.target = target;
         self.title = title;
-        self.tip = file_tab_tip(&repo, &file.path, file.side);
+        self.tip = tip;
         cx.emit(DiffTabEvent::Retarget);
         cx.notify();
     }
@@ -445,9 +451,15 @@ impl Render for DiffTab {
 
 // ─── 打开 ─────────────────────────────────────────────────────
 
-/// 打开(或切到)一个 diff 页签:延到这一轮更新之后,按活动项目 + `target` 找已开着的。
-/// `open` 拿到找到的那个(`Some`:在它身上补做点事,返回 `None`)或 `None`(建一个新的
-/// 返回)。没有活动项目时什么都不做。
+/// diff 页签归哪个项目。
+enum Home {
+    /// 打开那一刻的活动项目(当场就开的入口)
+    Active,
+    /// 发起时记下的项目:提交 / 合并变更先在后台取文件列表,回来时活动项目可能已经换了
+    Project(String),
+}
+
+/// 打开(或切到)一个归活动项目的 diff 页签(当场就开的入口),见 [`open_tab_in`]。
 fn open_tab(
     target: DiffTarget,
     window: &mut Window,
@@ -460,9 +472,46 @@ fn open_tab(
     ) -> Option<Entity<DiffTab>>
     + 'static,
 ) {
+    open_tab_in(Home::Active, target, window, cx, open);
+}
+
+/// 打开(或切到)一个 diff 页签:延到这一轮更新之后,按 `home` 定下的项目 + `target` 找
+/// 已开着的。`open` 拿到找到的那个(`Some`:在它身上补做点事,返回 `None`)或 `None`(建一个
+/// 新的返回)。没有活动项目、或记下的项目已经被移除时什么都不做。
+///
+/// 记下的项目此刻已经不是活动项目(后台取数期间切走了):页签只放进那个项目的页签区,
+/// 不切项目、不切页、不抢焦点,回到那个项目时它在页签条上。
+fn open_tab_in(
+    home: Home,
+    target: DiffTarget,
+    window: &mut Window,
+    cx: &mut App,
+    open: impl FnOnce(
+        Option<&Entity<DiffTab>>,
+        DiffKey,
+        &mut Window,
+        &mut App,
+    ) -> Option<Entity<DiffTab>>
+    + 'static,
+) {
     window.defer(cx, move |window, cx| {
-        let Some(project_id) = AppStore::global(cx).read(cx).active_project_id.clone() else {
-            return;
+        let (project_id, foreground) = {
+            let store = AppStore::global(cx);
+            let store = store.read(cx);
+            let active = store.active_project_id.as_deref();
+            match home {
+                Home::Active => match active {
+                    Some(id) => (id.to_string(), true),
+                    None => return,
+                },
+                Home::Project(id) => {
+                    if store.project(&id).is_none() {
+                        return;
+                    }
+                    let foreground = active == Some(id.as_str());
+                    (id, foreground)
+                }
+            }
         };
         let key = DiffKey { project_id, target };
         let tab = match workbench_area::find_diff_tab(&key, cx) {
@@ -475,7 +524,11 @@ fn open_tab(
                 None => return,
             },
         };
-        workbench_area::show_diff_tab(tab, window, cx);
+        if foreground {
+            workbench_area::show_diff_tab(tab, window, cx);
+        } else {
+            workbench_area::add_diff_tab(tab, cx);
+        }
     });
 }
 
@@ -521,7 +574,7 @@ pub fn open_file_diff_with(
         if let Some(tab) = existing {
             tab.update(cx, |tab, cx| {
                 if let Page::File(page) = &tab.page {
-                    page.adopt(files, current, hooks, cx);
+                    page.adopt(repo_path, files, current, hooks, cx);
                 }
             });
             return None;
@@ -554,12 +607,11 @@ pub fn open_commit_diff_loading(
 ) -> Task<()> {
     let target = DiffTarget::commit(&repo_path, &commit_hash);
     window.spawn(cx, async move |cx| {
-        let reused = cx
-            .update(|window, cx| reveal_existing(&target, initial.as_deref(), window, cx))
-            .unwrap_or(true);
-        if reused {
+        let started =
+            cx.update(|window, cx| begin_files_tab(&target, initial.as_deref(), window, cx));
+        let Ok(Some(project_id)) = started else {
             return;
-        }
+        };
         let (task_repo, task_hash) = (PathBuf::from(&repo_path), commit_hash.clone());
         let files = cx
             .background_executor()
@@ -575,6 +627,7 @@ pub fn open_commit_diff_loading(
                     .map(|file| ModalFile::from_commit(&commit_hash, file))
                     .collect();
                 open_files_tab(
+                    Home::Project(project_id),
                     target,
                     FilesSpec {
                         store,
@@ -615,12 +668,11 @@ pub fn open_combined_diff_loading(
 ) -> Task<()> {
     let target = DiffTarget::combined(&repo_path, &hashes);
     window.spawn(cx, async move |cx| {
-        let reused = cx
-            .update(|window, cx| reveal_existing(&target, initial.as_deref(), window, cx))
-            .unwrap_or(true);
-        if reused {
+        let started =
+            cx.update(|window, cx| begin_files_tab(&target, initial.as_deref(), window, cx));
+        let Ok(Some(project_id)) = started else {
             return;
-        }
+        };
         let (task_repo, task_hashes) = (PathBuf::from(&repo_path), hashes.clone());
         let files = cx
             .background_executor()
@@ -629,7 +681,10 @@ pub fn open_combined_diff_loading(
             )
             .await;
         let _ = cx.update(|window, cx| match files {
-            Ok(files) => open_combined_diff(store, repo_path, hashes, files, initial, window, cx),
+            Ok(files) => {
+                let spec = combined_spec(store, repo_path, &hashes, files, initial);
+                open_files_tab(Home::Project(project_id), target, spec, window, cx);
+            }
             Err(err) => {
                 eprintln!("[git] 合并 {} 个提交的改动失败: {err:#}", hashes.len());
                 git_ui::show_git_error(
@@ -654,16 +709,27 @@ pub fn open_combined_diff(
     cx: &mut App,
 ) {
     let target = DiffTarget::combined(&repo_path, &hashes);
-    let spec = FilesSpec {
+    let spec = combined_spec(store, repo_path, &hashes, files, initial);
+    open_files_tab(Home::Active, target, spec, window, cx);
+}
+
+/// 合并变更页签要的东西。
+fn combined_spec(
+    store: Entity<AppStore>,
+    repo_path: String,
+    hashes: &[String],
+    files: Vec<mt_project::git::CombinedFileChange>,
+    initial: Option<String>,
+) -> FilesSpec {
+    FilesSpec {
         store,
         repo_path,
-        heading: combined_heading(&hashes),
+        heading: combined_heading(hashes),
         files: files.into_iter().map(ModalFile::from_combined).collect(),
         initial,
-        title: combined_tab_title(&hashes),
-        tip: combined_tab_tip(&hashes),
-    };
-    open_files_tab(target, spec, window, cx);
+        title: combined_tab_title(hashes),
+        tip: combined_tab_tip(hashes),
+    }
 }
 
 /// 提交 / 合并变更页签要的全部东西(文件列表已经取好)。
@@ -677,8 +743,14 @@ struct FilesSpec {
     tip: String,
 }
 
-fn open_files_tab(target: DiffTarget, spec: FilesSpec, window: &mut Window, cx: &mut App) {
-    open_tab(target, window, cx, move |existing, key, _window, cx| {
+fn open_files_tab(
+    home: Home,
+    target: DiffTarget,
+    spec: FilesSpec,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_tab_in(home, target, window, cx, move |existing, key, _, cx| {
         if let Some(tab) = existing {
             // 后台取文件列表的这段时间里同一目标已经开好了(连点两下):在它身上选中初始文件
             if let Some(path) = spec.initial.as_deref() {
@@ -700,29 +772,28 @@ fn open_files_tab(target: DiffTarget, spec: FilesSpec, window: &mut Window, cx: 
     });
 }
 
-/// 提交 / 合并变更已经开着:切过去,带着 `initial` 的在左栏选中它。返回有没有开着。
-fn reveal_existing(
+/// 提交 / 合并变更起步:记下页签归属的项目(发起这一刻的活动项目,见 [`Home`])。这个目标
+/// 在那个项目里已经开着就切过去(带着 `initial` 的在左栏选中它)、返回 `None`;没开着返回
+/// 记下的项目,调用方接着去后台取文件列表。没有活动项目也就没有页签区,返回 `None`,别去取了。
+fn begin_files_tab(
     target: &DiffTarget,
     initial: Option<&str>,
     window: &mut Window,
     cx: &mut App,
-) -> bool {
-    let Some(project_id) = AppStore::global(cx).read(cx).active_project_id.clone() else {
-        // 没有活动项目也就没有页签区:别去取文件列表了
-        return true;
-    };
+) -> Option<String> {
+    let project_id = AppStore::global(cx).read(cx).active_project_id.clone()?;
     let key = DiffKey {
         project_id,
         target: target.clone(),
     };
     let Some(tab) = workbench_area::find_diff_tab(&key, cx) else {
-        return false;
+        return Some(key.project_id);
     };
     if let Some(path) = initial {
         tab.update(cx, |tab, cx| tab.select_path(path, cx));
     }
     workbench_area::show_diff_tab(tab, window, cx);
-    true
+    None
 }
 
 /// 打开某个文件的单文件历史页签。`project_root` 可以是仓库里的子目录,`file_rel` 是
@@ -779,8 +850,8 @@ pub fn open_text_diff(spec: TextDiffSpec, window: &mut Window, cx: &mut App) {
         } = spec;
         if let Some(tab) = existing {
             tab.update(cx, |tab, cx| {
-                if let Page::Text(page) = &tab.page {
-                    page.set_texts(disk, mine, cx);
+                if let Page::Text(page) = &mut tab.page {
+                    page.set_texts(viewer, disk, mine, cx);
                 }
             });
             return None;

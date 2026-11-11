@@ -10,7 +10,8 @@
 //! - **diff 页签**([`DiffTab`]):单文件 diff / 提交 diff / 合并变更 / 单文件历史 / 磁盘对比,
 //!   身份是 [`DiffKey`](项目 + diff 目标,口径见 `git_diff::tab` 的模块注释)。只读、没有
 //!   「未保存」,关闭不确认;单文件 diff 里换文件时身份跟着变(见
-//!   [`WorkbenchArea::retarget_diff_tab`])。diff 页签一律归打开那一刻的活动项目。
+//!   [`WorkbenchArea::retarget_diff_tab`])。diff 页签归打开那一刻的活动项目;提交 / 合并变更
+//!   归发起那一刻的,后台取数期间切了项目就只放进原项目、不切过去([`add_diff_tab`])。
 //!
 //! 两种页签共用页签条:单击切换、× 与中键关闭、右键「关闭 / 关闭其他 / 关闭右边 / 关闭左边」,
 //! 终端页右键「关闭所有」;切项目时各项目各留各的页签,移除项目时随项目一起回收。
@@ -226,32 +227,57 @@ impl ProjectDocuments {
     }
 }
 
-/// diff 页签换了身份(单文件 diff 里换了文件)之后页签区该怎么收拾:返回要顺手关掉的
-/// **同身份旧页签**的下标(没有就 `None`),以及换完之后的活动页。
+/// diff 页签换了身份之后页签区怎么收拾(见 [`retarget_plan`])。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Retarget {
+    /// 换身份的这个页签改用新身份。`close` 是要顺手关掉的同身份旧页签的下标(没撞上就是
+    /// `None`),`active` 是换完之后的活动页
+    Take {
+        close: Option<usize>,
+        active: WorkbenchPage,
+    },
+    /// 撞上的同身份页签正是活动页:它留着、活动页不动,换身份的这个(后台)页签关掉
+    Yield,
+}
+
+/// diff 页签换了身份(单文件 diff 里换了文件)之后页签区该怎么收拾。
 ///
-/// 换到的目标恰好已有另一个页签时,**换文件的这个页签接管目标、旧的那个关掉**:用户正在
-/// 这个页签里按 Alt+←/→ 往下看,它手上的文件序列(连同更改列表的回调)才是要接着用的;
-/// 旧页签多半是早先点开、内容已经过时的同一份 diff。这样页签条上不会出现两个一模一样的
-/// 页签,也不会把用户从正在看的页签里拽走。活动页原本指着换文件的这个页签的,跟着新身份走。
+/// 换到的目标恰好已有另一个页签时,页签条上只留一个,留哪个看用户眼前是谁:
+///
+/// - 撞上的那个**正是活动页** → [`Retarget::Yield`]:留下活动页,关掉换身份的这个。换身份的
+///   这时只可能是后台页签(在它里面做了取消暂存 / 丢弃最后一块,操作在途时切走了,列表重载后
+///   它被带到了眼前这一页的目标上),不能把用户正在看的页签连同焦点从眼前换掉;
+/// - 其余情况 → [`Retarget::Take`]:**换身份的这个接管目标、旧的那个关掉**。用户正在这个
+///   页签里按 Alt+←/→ 往下看,它手上的文件序列(连同更改列表的回调)才是要接着用的;旧页签
+///   多半是早先点开、内容已经过时的同一份 diff。活动页原本指着换身份的这个页签的,跟着新身份走。
 fn retarget_plan(
     keys: &[TabKey],
     active: &WorkbenchPage,
     index: usize,
     new_key: &TabKey,
-) -> (Option<usize>, WorkbenchPage) {
+) -> Retarget {
     let Some(old_key) = keys.get(index) else {
-        return (None, active.clone());
+        return Retarget::Take {
+            close: None,
+            active: active.clone(),
+        };
     };
     let duplicate = keys
         .iter()
         .enumerate()
         .find(|(i, key)| *i != index && *key == new_key)
         .map(|(i, _)| i);
+    if duplicate.is_some() && matches!(active, WorkbenchPage::Tab(key) if key == new_key) {
+        return Retarget::Yield;
+    }
     let active = match active {
         WorkbenchPage::Tab(key) if key == old_key => WorkbenchPage::Tab(new_key.clone()),
         _ => active.clone(),
     };
-    (duplicate, active)
+    Retarget::Take {
+        close: duplicate,
+        active,
+    }
 }
 
 fn next_document_after_close(remaining: &[TabKey], removed_index: usize) -> Option<TabKey> {
@@ -445,6 +471,18 @@ pub fn show_diff_tab(diff: Entity<DiffTab>, window: &mut Window, cx: &mut App) {
         return;
     };
     area.update(cx, |area, cx| area.show_diff_tab(diff, window, cx));
+}
+
+/// 把 diff 页签放进它所属项目的页签区,**不切过去**:那个项目已经不是活动项目了(提交 /
+/// 合并变更在后台取文件列表期间切走了)。活动页、焦点都不动,回到那个项目时它在页签条上。
+/// 已经在了就什么都不做。调用方的约束同 [`show_diff_tab`]。
+pub fn add_diff_tab(diff: Entity<DiffTab>, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| {
+        area.insert_diff_tab(&diff, cx);
+    });
 }
 
 /// 这个 diff 页签是不是用户眼前那一页(活动项目的活动页)。后台页签的迟到结果只更新
@@ -739,6 +777,17 @@ impl WorkbenchArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (project_id, key) = self.insert_diff_tab(&diff, cx);
+        self.activate_document(&project_id, &key, window, cx);
+    }
+
+    /// 把 diff 页签放进它所属项目的页签区,不切换活动页;同一个实体或同身份的页签已经在了
+    /// 就不放。返回所属项目与页签身份。
+    fn insert_diff_tab(
+        &mut self,
+        diff: &Entity<DiffTab>,
+        cx: &mut Context<Self>,
+    ) -> (String, TabKey) {
         let (key, title, tip) = {
             let tab = diff.read(cx);
             (
@@ -750,17 +799,18 @@ impl WorkbenchArea {
         let project_id = key.project_id().to_string();
         let key = TabKey::Diff(key);
         let project = self.projects.entry(project_id.clone()).or_default();
-        if project.index_of_diff(&diff).is_none() && project.index_of(&key).is_none() {
-            cx.subscribe(&diff, Self::on_diff_tab_event).detach();
+        if project.index_of_diff(diff).is_none() && project.index_of(&key).is_none() {
+            cx.subscribe(diff, Self::on_diff_tab_event).detach();
             project.tabs.push(DocumentTab {
                 key: key.clone(),
                 title,
                 tip: Some(tip),
-                content: TabContent::Diff(diff),
+                content: TabContent::Diff(diff.clone()),
                 local_path: None,
             });
+            cx.notify();
         }
-        self.activate_document(&project_id, &key, window, cx);
+        (project_id, key)
     }
 
     fn on_diff_tab_event(
@@ -775,8 +825,8 @@ impl WorkbenchArea {
     }
 
     /// diff 页签换了身份 / 标题(单文件 diff 里 Alt+←/→ 换了文件,或块操作后换到了组里的
-    /// 下一个):页签区跟着改,同身份的旧页签按 [`retarget_plan`] 关掉。页签已经被关掉
-    /// (后台任务晚到)就什么都不做。
+    /// 下一个):页签区跟着改,撞上同身份的页签时按 [`retarget_plan`] 关掉其中一个。页签
+    /// 已经被关掉(后台任务晚到)就什么都不做。
     fn retarget_diff_tab(&mut self, diff: &Entity<DiffTab>, cx: &mut Context<Self>) {
         let (key, title, tip) = {
             let tab = diff.read(cx);
@@ -796,20 +846,41 @@ impl WorkbenchArea {
                 .iter()
                 .map(|tab| tab.key.clone())
                 .collect::<Vec<_>>();
-            let (duplicate, active) = retarget_plan(&keys, &project.active, index, &new_key);
-            let old_key = std::mem::replace(&mut project.tabs[index].key, new_key.clone());
-            project.tabs[index].title = title;
-            project.tabs[index].tip = Some(tip);
-            if let Some(duplicate) = duplicate {
-                project.tabs.remove(duplicate);
-            }
-            // 还是同一页,别让 render 把它当成「切过来了」再交一次焦点、再刷一次
-            if self.last_rendered_project.as_deref() == Some(project_id.as_str())
-                && self.last_rendered_page == Some(WorkbenchPage::Tab(old_key))
+            // 上一帧画的是这个项目的哪一页(画的不是这个项目就是 `None`);下面两处都按换身份
+            // 之前的样子比
+            let rendered = if self.last_rendered_project.as_deref() == Some(project_id.as_str()) {
+                self.last_rendered_page.clone()
+            } else {
+                None
+            };
+            let closed = match retarget_plan(&keys, &project.active, index, &new_key) {
+                Retarget::Yield => {
+                    // 活动页不动;换身份的这个后台页签连同它的实体一起回收
+                    project.tabs.remove(index);
+                    Some(keys[index].clone())
+                }
+                Retarget::Take { close, active } => {
+                    project.tabs[index].key = new_key.clone();
+                    project.tabs[index].title = title;
+                    project.tabs[index].tip = Some(tip);
+                    if let Some(close) = close {
+                        project.tabs.remove(close);
+                    }
+                    // 还是同一页,别让 render 把它当成「切过来了」再交一次焦点、再刷一次
+                    if rendered == Some(WorkbenchPage::Tab(keys[index].clone())) {
+                        self.last_rendered_page = Some(active.clone());
+                    }
+                    project.active = active;
+                    close.map(|close| keys[close].clone())
+                }
+            };
+            // 兜底:关掉的正是上一帧画着的那一页(它的实体随之释放,焦点还挂在上面)→ 让
+            // render 当成「切过来了」,给眼下的活动页重新交一次焦点
+            if let Some(closed) = closed
+                && rendered == Some(WorkbenchPage::Tab(closed))
             {
-                self.last_rendered_page = Some(active.clone());
+                self.last_rendered_page = None;
             }
-            project.active = active;
             cx.notify();
             return;
         }
@@ -1631,51 +1702,80 @@ mod tests {
         WorkbenchPage::Tab(key(path))
     }
 
+    fn take(close: Option<usize>, active: WorkbenchPage) -> Retarget {
+        Retarget::Take { close, active }
+    }
+
     /// diff 页签换了身份:没有撞上别的页签时只是活动页跟着新身份走(原本停在它上面的话)。
     #[test]
     fn 换身份时活动页跟着走() {
         let keys = [key("a"), key("b"), key("c")];
         assert_eq!(
             retarget_plan(&keys, &page("b"), 1, &key("x")),
-            (None, page("x"))
+            take(None, page("x"))
         );
         // 活动页是别的页签 / 终端页:不动
         assert_eq!(
             retarget_plan(&keys, &page("a"), 1, &key("x")),
-            (None, page("a"))
+            take(None, page("a"))
         );
         assert_eq!(
             retarget_plan(&keys, &WorkbenchPage::Terminal, 1, &key("x")),
-            (None, WorkbenchPage::Terminal)
+            take(None, WorkbenchPage::Terminal)
         );
         // 身份没变(只是标题刷新):什么都不关
         assert_eq!(
             retarget_plan(&keys, &page("b"), 1, &key("b")),
-            (None, page("b"))
+            take(None, page("b"))
         );
     }
 
-    /// 换到的目标已经有另一个页签:换文件的这个接管,旧的那个要关掉;活动页仍是换文件的这个
-    /// (身份已是新的)。原本就停在旧的那个上面时,活动页落到接管的这个身上(同一身份)。
+    /// 换到的目标已经有另一个页签、那个页签不是活动页:换身份的这个接管,旧的那个要关掉。
+    /// 活动页是换身份的这个时跟着新身份走;是别的页签 / 终端页时不动。
     #[test]
     fn 换到已开着的目标时关掉旧页签() {
         let keys = [key("a"), key("b"), key("c")];
         assert_eq!(
             retarget_plan(&keys, &page("b"), 1, &key("c")),
-            (Some(2), page("c"))
+            take(Some(2), page("c"))
         );
         assert_eq!(
             retarget_plan(&keys, &page("b"), 1, &key("a")),
-            (Some(0), page("a"))
+            take(Some(0), page("a"))
+        );
+        // 换身份的是后台页签、撞上的也不在眼前:照样接管,活动页不动
+        assert_eq!(
+            retarget_plan(&keys, &page("a"), 1, &key("c")),
+            take(Some(2), page("a"))
         );
         assert_eq!(
-            retarget_plan(&keys, &page("c"), 1, &key("c")),
-            (Some(2), page("c"))
+            retarget_plan(&keys, &WorkbenchPage::Terminal, 1, &key("c")),
+            take(Some(2), WorkbenchPage::Terminal)
         );
         // 下标越界(不该出现,防御):什么都不动
         assert_eq!(
             retarget_plan(&keys, &page("b"), 9, &key("a")),
-            (None, page("b"))
+            take(None, page("b"))
+        );
+    }
+
+    /// 后台页签被换到了眼前这一页的目标上(在 b 里做块操作、在途时切到 c,列表重载后 b 被带到
+    /// c 的文件上):留下眼前的 c,关掉换身份的 b —— 不把用户正在看的页签连同焦点换掉。
+    #[test]
+    fn 撞上的同身份页签是活动页时关掉换身份的后台页签() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            retarget_plan(&keys, &page("c"), 1, &key("c")),
+            Retarget::Yield
+        );
+        assert_eq!(
+            retarget_plan(&keys, &page("a"), 2, &key("a")),
+            Retarget::Yield
+        );
+        // 没撞上任何页签时,活动页的身份恰好等于新身份也谈不上让(不会出现,防御)
+        assert_eq!(
+            retarget_plan(&[key("a"), key("b")], &page("x"), 1, &key("x")),
+            take(None, page("x"))
         );
     }
 

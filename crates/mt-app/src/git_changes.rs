@@ -1623,25 +1623,39 @@ impl GitChanges {
         let order = model.order(area);
         let files = self.diff_files(order, area);
         let current = order.iter().position(|&i| i == index).unwrap_or(0);
+        // 两个回调都只认打开那一刻的仓库:页签活得比面板上的仓库久,面板之后换了仓库(切项目 /
+        // 切子仓库)再拿新仓库的分组序列去换页签的文件、或让新仓库的选中项跟着页签跳,都是错的
+        let repo = self.repo_path.clone();
         let weak = cx.entity().downgrade();
-        let reload_files: git_diff::ReloadFiles = Rc::new(
-            move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
-                Some(this) => this.update(cx, |this, cx| {
-                    this.diff_waiters.push((area, done));
-                    this.load(cx);
-                }),
-                None => done(None, cx),
-            },
-        );
+        let reload_files: git_diff::ReloadFiles = {
+            let repo = repo.clone();
+            Rc::new(
+                move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
+                    Some(this) if this.read(cx).repo_path == repo => this.update(cx, |this, cx| {
+                        this.diff_waiters.push((area, done));
+                        this.load(cx);
+                    }),
+                    // 列表没了 / 换了仓库:以 `None` 交回,页签沿用旧序列原地重取,块操作按钮
+                    // 随那一趟重取落地放开
+                    _ => done(None, cx),
+                },
+            )
+        };
         let weak = cx.entity().downgrade();
-        let on_switch: git_diff::OnSwitch =
+        let on_switch: git_diff::OnSwitch = {
+            let repo = repo.clone();
             Rc::new(move |file: &git_diff::DiffFile, cx: &mut App| {
                 let path = file.path.clone();
-                let _ = weak.update(cx, |this, cx| this.follow_diff(area, &path, cx));
-            });
+                let _ = weak.update(cx, |this, cx| {
+                    if this.repo_path == repo {
+                        this.follow_diff(area, &path, cx);
+                    }
+                });
+            })
+        };
         git_diff::open_file_diff_with(
             self.store.clone(),
-            self.repo_path.clone(),
+            repo,
             files,
             current,
             git_diff::FileDiffHooks {

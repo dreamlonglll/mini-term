@@ -108,10 +108,16 @@ impl FilePage {
         (c.repo_path.clone(), c.file().clone())
     }
 
-    /// 已开着的页签被再次打开(更改列表里又双击了同一个文件):换上新的文件序列与回调(列表
-    /// 眼下的分组顺序),原地静默重取。块操作在途时不换 —— 序列与回调留到它收尾再说。
+    /// 已开着的页签被再次打开(更改列表里又双击了同一个文件):换上新的仓库、文件序列与回调
+    /// (列表眼下的分组顺序)。仓库与当前文件都没变就原地静默重取,任一变了就从头取。
+    ///
+    /// 仓库也要换:身份按「仓库 + 路径」拼出的绝对路径认,文件树传「项目根 + 相对项目根的
+    /// 路径」、文件页 gutter 传「仓库根 + 仓库相对路径」,项目根是仓库的子目录(或项目里有
+    /// 嵌套的子仓库)时两者撞到同一个页签上 —— 只换路径的话,拿旧仓库去取新路径,不是报错
+    /// 就是显示成另一个文件。块操作在途时不换 —— 序列与回调留到它收尾再说。
     pub(super) fn adopt(
         &self,
+        repo_path: String,
         files: Vec<DiffFile>,
         current: usize,
         hooks: FileDiffHooks,
@@ -121,7 +127,9 @@ impl FilePage {
             if c.busy.is_some() || files.is_empty() {
                 return None;
             }
+            let same_repo = c.repo_path == repo_path;
             let before = c.file().path.clone();
+            c.repo_path = repo_path;
             c.current = current.min(files.len() - 1);
             c.files = files;
             c.on_changed = hooks.on_changed;
@@ -130,11 +138,11 @@ impl FilePage {
             c.op_error = None;
             c.stale = false;
             cx.notify();
-            Some(c.file().path == before)
+            Some(same_repo && c.file().path == before)
         });
         match adopted {
             Some(true) => self.refresh(cx),
-            // 身份按规范化路径认,大小写不同的两种写法会落到这里:按换了文件处理
+            // 换了仓库,或身份按规范化路径认、大小写不同的两种写法落到这里:按换了文件处理
             Some(false) => load_file(&self.state, &self.ctl, Fetch::Fresh, cx),
             None => {}
         }
@@ -534,7 +542,7 @@ pub(super) struct TextPage {
     /// 工具栏抬头(「对比:a.rs」)
     heading: String,
     /// 那个文件页签:刷新时现取它编辑器里的内容与磁盘上的版本。文件页签关了就停在最后一次
-    /// 取到的那份
+    /// 取到的那份;再点一次「对比」时换成发起的那个(见 [`Self::set_texts`])
     viewer: WeakEntity<FileViewer>,
 }
 
@@ -560,8 +568,16 @@ impl TextPage {
     }
 
     /// 已开着的页签被再次打开(提示条上又点了「对比」):换上这一次取到的两侧内容(比在途的
-    /// 静默重取新,它回来也落不了地);与屏幕上一样就什么都不动。
-    pub(super) fn set_texts(&self, disk: String, mine: String, cx: &mut App) {
+    /// 静默重取新,它回来也落不了地)与发起的那个文件页签 —— 原先那个可能已经关掉、文件
+    /// 重开过,旧的弱引用升不起来,之后切回来 / 刷新就都静默不动了。内容与屏幕上一样就不重画。
+    pub(super) fn set_texts(
+        &mut self,
+        viewer: WeakEntity<FileViewer>,
+        disk: String,
+        mine: String,
+        cx: &mut App,
+    ) {
+        self.viewer = viewer;
         let result = Ok(mt_project::git::diff_two_texts(disk, mine));
         self.state.update(cx, |s, cx| {
             s.request += 1;
