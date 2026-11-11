@@ -19,7 +19,9 @@ key="${target//-/_}"
 upper="$(printf '%s' "$key" | tr '[:lower:]' '[:upper:]')"
 export "CC_${key}=musl-gcc" "AR_${key}=ar"
 export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
-export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static"
+# Ubuntu's musl-gcc specs can inject an interpreter for Rust's static-PIE mode.
+# Request a static executable explicitly; staging still rejects PT_INTERP/DT_NEEDED.
+export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static -C relocation-model=static"
 export OPENSSL_STATIC=1 OPENSSL_NO_VENDOR=0
 cargo build --locked --release --target "$target" --package mt-git-helper
 printf 'Helper: target/%s/release/mt-git-helper\n' "$target"

@@ -298,10 +298,10 @@ cargo build --release -p mt-app
 
 #### Building the remote Git helper from source
 
-Build the helper for the **server**, not the desktop. Linux x86_64/aarch64 use static musl targets to avoid depending on the server's glibc version; macOS uses its native x86_64/arm64 targets. These targets are not a claim of real-machine verification, and missing matching assets never fall back to local Git. With the appropriate Rust target and cross-compilation toolchain installed, for example for Linux x86_64:
+Build the helper for the **server**, not the desktop. Linux x86_64/aarch64 use static musl targets to avoid depending on the server's glibc version; macOS uses its native x86_64/arm64 targets. These targets are not a claim of real-machine verification, and missing matching assets never fall back to local Git. On a matching native Linux host, install `musl-tools`, `build-essential`, `binutils`, `perl`, `pkg-config` and the Rust musl target, then use the shared CI/release script to select static executable linking. For Linux x86_64:
 
 ```bash
-cargo build --locked --release -p mt-git-helper --target x86_64-unknown-linux-musl
+bash scripts/build-git-helper-musl.sh x86_64-unknown-linux-musl
 node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary target/x86_64-unknown-linux-musl/release/mt-git-helper --output target/release/remote-git-helpers
 ```
 

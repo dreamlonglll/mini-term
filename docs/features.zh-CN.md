@@ -298,10 +298,10 @@ cargo build --release -p mt-app
 
 #### 远端 Git helper：源码构建
 
-helper 必须匹配**服务器**而非桌面平台。Linux x86_64/aarch64 使用 musl 静态目标以避免服务器的 glibc 版本依赖；macOS 对应 x86_64/arm64 原生目标。这些目标不代表均已真机验证，缺少匹配资源时不会回落本机 Git。准备好对应 Rust target 与交叉编译工具链后，例如 Linux x86_64：
+helper 必须匹配**服务器**而非桌面平台。Linux x86_64/aarch64 使用 musl 静态目标以避免服务器的 glibc 版本依赖；macOS 对应 x86_64/arm64 原生目标。这些目标不代表均已真机验证，缺少匹配资源时不会回落本机 Git。在同架构的原生 Linux 上安装 `musl-tools`、`build-essential`、`binutils`、`perl`、`pkg-config` 与 Rust musl target，再运行 CI/发布共用脚本以固定静态可执行文件链接模式。例如 Linux x86_64：
 
 ```bash
-cargo build --locked --release -p mt-git-helper --target x86_64-unknown-linux-musl
+bash scripts/build-git-helper-musl.sh x86_64-unknown-linux-musl
 node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary target/x86_64-unknown-linux-musl/release/mt-git-helper --output target/release/remote-git-helpers
 ```
 
