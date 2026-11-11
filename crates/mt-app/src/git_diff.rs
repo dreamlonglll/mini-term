@@ -75,6 +75,7 @@ pub use mt_project::git::DiffSide;
 use mt_project::git::{
     CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, StaleDiff,
 };
+use mt_remote::GitContext;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -1393,7 +1394,7 @@ enum HunkOp {
 ///
 /// 与 [`DiffState`] 分开:后者是两个弹窗共用的「diff 内容」,这些是单文件弹窗独有的。
 struct FileDiff {
-    repo_path: String,
+    context: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     on_changed: Option<OnChanged>,
@@ -1539,10 +1540,10 @@ fn run_hunk_op(
         if c.busy.is_some() {
             return;
         }
-        (c.repo_path.clone(), c.file().path.clone())
+        (c.context.clone(), c.file().path.clone())
     };
     // 按块操作同样写暂存区 / 工作区:与面板上的其它写操作共用一道闸,被占时就地说明
-    let Some(guard) = git_ui::gate::try_acquire(&repo) else {
+    let Some(guard) = git_ui::gate::try_acquire_key(&repo.key()) else {
         ctl.update(cx, |c, cx| {
             c.op_error = Some(git_ui::gate_busy_text().to_string());
             c.stale = false;
@@ -1562,11 +1563,10 @@ fn run_hunk_op(
         let result = cx
             .background_executor()
             .spawn(async move {
-                let repo = std::path::Path::new(&repo);
                 match op {
-                    HunkOp::Stage => mt_project::git::stage_hunk(repo, &path, &diff, hunk),
-                    HunkOp::Unstage => mt_project::git::unstage_hunk(repo, &path, &diff, hunk),
-                    HunkOp::Discard => mt_project::git::discard_hunk(repo, &path, &diff, hunk),
+                    HunkOp::Stage => repo.stage_hunk(&path, &diff, hunk),
+                    HunkOp::Unstage => repo.unstage_hunk(&path, &diff, hunk),
+                    HunkOp::Discard => repo.discard_hunk(&path, &diff, hunk),
                 }
             })
             .await;
@@ -1622,7 +1622,7 @@ fn load_file(
 ) {
     let (repo, file) = {
         let c = ctl.read(cx);
-        (c.repo_path.clone(), c.file().clone())
+        (c.context.clone(), c.file().clone())
     };
     let req = state.update(cx, |s, cx| {
         if after_op.is_none() {
@@ -1643,12 +1643,7 @@ fn load_file(
         let result = cx
             .background_executor()
             .spawn(async move {
-                mt_project::git::get_git_diff_from(
-                    std::path::Path::new(&repo),
-                    &file.path,
-                    file.old_path.as_deref(),
-                    file.side,
-                )
+                repo.get_git_diff_from(&file.path, file.old_path.as_deref(), file.side)
             })
             .await;
         state.update(cx, |s: &mut DiffState, cx| {
@@ -2005,7 +2000,7 @@ fn error_bar(
 /// (更改列表传自己的重载,文件树传 `None`)。
 pub fn open_file_diff(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     on_changed: Option<OnChanged>,
@@ -2023,7 +2018,7 @@ pub fn open_file_diff(
 /// 跟着走)与 `reload_files`(块操作后按重载过的更改列表换文件序列,见 [`ReloadFiles`])。
 pub fn open_file_diff_with(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     hooks: FileDiffHooks,
@@ -2032,14 +2027,14 @@ pub fn open_file_diff_with(
 ) {
     // 守卫要在建实体之前判:已经开着一个的话,下面的取数与聚焦都是白干
     // (聚焦还会把焦点送给一个永远不会画出来的元素,见 `prompt::autofocus`)
-    if repo_path.is_empty() || files.is_empty() || crate::prompt::is_open(kind::GIT_DIFF) {
+    if repo_path.path().is_empty() || files.is_empty() || crate::prompt::is_open(kind::GIT_DIFF) {
         return;
     }
     let current = current.min(files.len() - 1);
     let font_size = store.read(cx).config().terminal_font_size as f32;
     let state = cx.new(|cx| DiffState::new(font_size, cx));
     let ctl = cx.new(|cx| FileDiff {
-        repo_path,
+        context: repo_path,
         files,
         current,
         on_changed: hooks.on_changed,
@@ -2288,18 +2283,18 @@ impl Render for CommitPick {
 /// 其余直接 `detach`。
 pub fn open_commit_diff_loading(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     commit_hash: String,
     commit_message: String,
     initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Task<()> {
-    let (task_repo, task_hash) = (std::path::PathBuf::from(&repo_path), commit_hash.clone());
+    let (task_repo, task_hash) = (repo_path.clone(), commit_hash.clone());
     window.spawn(cx, async move |cx| {
         let files = cx
             .background_executor()
-            .spawn(async move { mt_project::git::get_commit_files(&task_repo, &task_hash) })
+            .spawn(async move { task_repo.get_commit_files(&task_hash) })
             .await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_commit_diff_at(
@@ -2330,7 +2325,7 @@ pub fn open_commit_diff_loading(
 #[allow(clippy::too_many_arguments)]
 fn open_commit_diff_at(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     commit_hash: String,
     commit_message: String,
     files: Vec<CommitFileInfo>,
@@ -2356,18 +2351,18 @@ fn open_commit_diff_at(
 /// 失败口径同 [`open_commit_diff_loading`]。
 pub fn open_combined_diff_loading(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     hashes: Vec<String>,
     initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> gpui::Task<()> {
-    let (task_repo, task_hashes) = (std::path::PathBuf::from(&repo_path), hashes.clone());
+    let (task_repo, task_hashes) = (repo_path.clone(), hashes.clone());
     window.spawn(cx, async move |cx| {
         let files = cx
             .background_executor()
             .spawn(
-                async move { mt_project::git::get_combined_commit_files(&task_repo, &task_hashes) },
+                async move { task_repo.get_combined_commit_files(&task_hashes) },
             )
             .await;
         let _ = cx.update(|window, cx| match files {
@@ -2389,7 +2384,7 @@ pub fn open_combined_diff_loading(
 /// 标题写明「N 个提交的合并变更」,副标题是最新 … 最旧两个短哈希。
 pub fn open_combined_diff(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     hashes: Vec<String>,
     files: Vec<CombinedFileChange>,
     initial: Option<String>,
@@ -2459,7 +2454,7 @@ fn choose_modal_file(
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
     files: &[ModalFile],
-    repo_path: &str,
+    repo_path: &GitContext,
     index: usize,
     cx: &mut App,
 ) {
@@ -2480,7 +2475,7 @@ fn step_modal_file(
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
     files: &[ModalFile],
-    repo_path: &str,
+    repo_path: &GitContext,
     scroll: &UniformListScrollHandle,
     delta: isize,
     cx: &mut App,
@@ -2508,7 +2503,7 @@ fn modal_row(
     files: &Rc<Vec<ModalFile>>,
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
-    repo_path: &SharedString,
+    repo_path: &GitContext,
     selected: usize,
     tree: bool,
 ) -> Option<AnyElement> {
@@ -2572,7 +2567,7 @@ fn modal_row(
 /// diff;先选中路径为 `initial` 的文件,`None` 或找不到时选第一个。
 fn open_files_diff(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     heading: ModalHeading,
     files: Vec<ModalFile>,
     initial: Option<String>,
@@ -2607,7 +2602,6 @@ fn open_files_diff(
     }
 
     let files = Rc::new(files);
-    let repo_path = SharedString::from(repo_path);
     // 正文的 Ctrl/Cmd+C / A 挂在弹窗的焦点容器上(见下面 builder 末尾)。已经开着一个时
     // 守卫会拦下这次打开,那就不能再聚焦 —— 焦点会落进一个永远画不出来的元素
     let focus = cx.focus_handle();
@@ -2848,20 +2842,16 @@ fn open_files_diff(
 ///
 /// ⚠️ **单提交里重命名的文件必须带旧路径**(`CommitDiffModal.tsx:57`),否则父树里查
 /// 不到旧内容,diff 会显示成「整文件新增」。
-fn load_modal_file(state: &Entity<DiffState>, repo_path: &str, file: &ModalFile, cx: &mut App) {
+fn load_modal_file(state: &Entity<DiffState>, repo_path: &GitContext, file: &ModalFile, cx: &mut App) {
     match &file.source {
         ModalFileSource::Commit(hash) => {
             let old_path = file.old_path.clone();
             load_commit_file_at(state, repo_path, hash, &file.path, old_path, cx);
         }
         ModalFileSource::Revisions { base, head } => {
-            let (repo, base, head) = (repo_path.to_string(), base.clone(), head.clone());
+            let (repo, base, head) = (repo_path.clone(), base.clone(), head.clone());
             load_diff_with(state, cx, move || {
-                mt_project::git::get_revision_file_diff(
-                    std::path::Path::new(&repo),
-                    base.as_ref(),
-                    head.as_ref(),
-                )
+                repo.get_revision_file_diff(base.as_ref(), head.as_ref())
             });
         }
     }
@@ -2870,24 +2860,19 @@ fn load_modal_file(state: &Entity<DiffState>, repo_path: &str, file: &ModalFile,
 /// 某个提交里一个文件的 diff:旧路径由调用方给(单文件历史没有整份文件列表)。
 fn load_commit_file_at(
     state: &Entity<DiffState>,
-    repo_path: &str,
+    repo_path: &GitContext,
     commit_hash: &str,
     path: &str,
     old_path: Option<String>,
     cx: &mut App,
 ) {
     let (repo, hash, path) = (
-        repo_path.to_string(),
+        repo_path.clone(),
         commit_hash.to_string(),
         path.to_string(),
     );
     load_diff_with(state, cx, move || {
-        mt_project::git::get_commit_file_diff(
-            std::path::Path::new(&repo),
-            &hash,
-            &path,
-            old_path.as_deref(),
-        )
+        repo.get_commit_file_diff(&hash, &path, old_path.as_deref())
     });
 }
 
@@ -2951,7 +2936,7 @@ impl CommitFileDiffPane {
     /// 换成另一个(提交, 文件)。重命名过的文件要给 `old_path`,否则父树里查不到旧内容。
     pub(crate) fn load(
         &self,
-        repo_path: &str,
+        repo_path: &GitContext,
         commit_hash: &str,
         path: &str,
         old_path: Option<String>,

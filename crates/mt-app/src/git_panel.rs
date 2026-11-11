@@ -97,6 +97,11 @@
 //! 窗口最小化(不可见)时节拍暂停、替文件树取批次的任务也停,监听照记,恢复可见时补比一次
 //! 签名、把攒下的那批交掉;只是失焦照旧跑。
 //!
+//! SSH projects use these same mounted sections and dialogs. A three-second visible-only
+//! tick quietly refreshes worktree status and compares repository signatures; unchanged
+//! observations never reset history or request a repaint. Only local contexts install
+//! filesystem watchers. Repository caches are keyed by the captured backend identity.
+//!
 //! 仓库栏的刷新按钮只在手动 ↻(或还一条分支都没有)时转圈,自动刷新不转 —— 结果没变时
 //! 整轮都不重画。
 //!
@@ -108,7 +113,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -124,6 +129,7 @@ use mt_project::git::{
     BranchInfo, BranchTracking, GitRepoInfo, PullConfig, PullMode, PullOutcome, PushPlan,
     RepoOpKind, RepoOpState, RepoSignature, WorktreeWatchDirs,
 };
+use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
@@ -156,7 +162,7 @@ thread_local! {
         })
     };
 
-    /// `src/utils/projectDataCache.ts` 的对应物:项目路径 → (仓库列表, 选中仓库)。
+    /// `src/utils/projectDataCache.ts` 的对应物:后端身份键 → (仓库列表, 选中仓库)。
     /// 换项目回来时先吃缓存再重新发现,避免每次都白屏一下。
     static REPO_CACHE: RefCell<HashMap<String, (Vec<GitRepoInfo>, String)>> =
         RefCell::new(HashMap::new());
@@ -181,6 +187,8 @@ const RECENT_LIMIT: usize = 5;
 /// (见 `git_dir_watch` 模块注释「递归子树」)。大仓库上一次 status 是几百毫秒,10s 一次
 /// 约占半个百分点的单核。
 const PARTIAL_POLL: Duration = Duration::from_secs(10);
+/// Remote workspaces have no local filesystem watcher; poll quietly while presented.
+const REMOTE_POLL: Duration = Duration::from_secs(3);
 
 /// 正在跑的写操作。同一时刻只跑一个 —— git 自己也靠 `index.lock` 互斥,并发点两下
 /// 只会让第二个报「另一个 git 进程正在运行」。
@@ -277,8 +285,8 @@ fn meta_view_eq(a: &RepoMeta, b: &RepoMeta) -> bool {
 ///
 /// 一次开库取齐([`mt_project::git::repo_panel_snapshot`]),签名在其余各项之前算 ——
 /// 读快照期间仓库又变了的话,签名停在旧状态,`.git` 监听下一次比对就认得出「变了」。
-fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMeta)> {
-    let snap = mt_project::git::repo_panel_snapshot(repo, RECENT_LIMIT)?;
+fn load_branch_snapshot(repo: &GitContext) -> anyhow::Result<(Vec<BranchInfo>, RepoMeta)> {
+    let snap = repo.repo_panel_snapshot(RECENT_LIMIT)?;
     let meta = RepoMeta {
         head_label: snap.head_label,
         head_tracking: snap.head_tracking,
@@ -301,6 +309,7 @@ fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMet
 #[derive(Clone)]
 pub(crate) struct BranchSnapshot {
     pub repo: String,
+    pub context: GitContext,
     pub data: Rc<BranchData>,
     /// HEAD 所在的本地分支;detached / 空仓库为 `None`。
     pub head: Option<String>,
@@ -368,8 +377,11 @@ pub struct GitPanel {
     visible: bool,
     /// 收着的时候项目切过 → 打开时补拉一次。
     stale: bool,
-    /// 当前挂着的项目路径(判断项目有没有换)。
+    /// Captured backend identity; identical paths on different hosts never share state.
+    project_context: Option<GitContext>,
     project_path: Option<String>,
+    project_id: Option<String>,
+    load_error: Option<String>,
     /// 迟到响应丢弃(换仓库后旧的分支响应不许覆盖)。
     branch_request: u64,
     repo_request: u64,
@@ -379,6 +391,7 @@ pub struct GitPanel {
     watch_request: u64,
     /// 监听触发的签名检查正在后台跑。
     sig_checking: bool,
+    sig_request: u64,
     /// 检查在跑期间又来了一批变化:等它回来再查一轮,别把这批漏掉。
     sig_recheck: bool,
     /// `meta.signature` / `meta.op` 是哪一刻读的(见模块注释「签名的先后」)。
@@ -429,6 +442,11 @@ pub struct GitPanel {
 
 impl GitPanel {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project_context = store.read(cx).active_project().map(|project| {
+            crate::git_backend::project_context(store.read(cx), &project.id)
+        });
+        let project_path = project_context.as_ref().map(|context| context.path().to_string());
+        let project_id = store.read(cx).active_project_id.clone();
         let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
         let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
         let detail_pane = cx.new(|cx| CommitDetailPane::new(history.clone(), cx));
@@ -476,19 +494,20 @@ impl GitPanel {
                 }
             },
         ));
-        // render 读活动项目(空态 / 远程)与更改视图模式,任何变化都照旧重画
+        // Original renderer and view-mode state remain shared by both backends.
         subs.push(cx.observe(&store, |_, _, cx| cx.notify()));
         // 项目路径的比对只在活动项目可能变了时做(`StoreEvent::touches_active_project`),
         // 不再被 OSC 标题 / AI 状态这些与仓库无关的变化叫醒
         subs.push(
             cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
-                if !event.touches_active_project() {
+                if !event.touches_active_project() && !event.touches_ssh_connections() {
                     return;
                 }
-                let path = this.store.read(cx).active_project().map(|p| p.path.clone());
-                if path != this.project_path {
-                    this.project_path = path;
-                    if this.visible {
+                let context = this.active_project_context(cx);
+                let project_id = this.store.read(cx).active_project_id.clone();
+                if context != this.project_context || project_id != this.project_id {
+                    this.replace_project_context(context, project_id);
+                    if this.visible && (this.window_visible || this.local_project()) {
                         this.on_project_changed(cx);
                     } else {
                         // 收着的时候不扫盘 —— 原版收起时组件根本没挂载。替文件树挂的工作区
@@ -531,12 +550,16 @@ impl GitPanel {
             busy: None,
             visible: false,
             stale: true,
-            project_path: None,
+            project_path,
+            project_context,
+            project_id,
+            load_error: None,
             branch_request: 0,
             repo_request: 0,
             dir_watch: GitDirWatch::new(),
             watch_request: 0,
             sig_checking: false,
+            sig_request: 0,
             sig_recheck: false,
             sig_observed_at: None,
             round_issued: None,
@@ -569,12 +592,17 @@ impl GitPanel {
             return;
         }
         self.visible = visible;
-        git_watch::set_enabled(visible);
+        let context = self.active_project_context(cx);
+        let project_id = self.store.read(cx).active_project_id.clone();
+        if context != self.project_context || project_id != self.project_id {
+            self.replace_project_context(context, project_id);
+            self.stale = true;
+        }
+        git_watch::set_enabled(visible && self.local_project());
         if visible {
-            self.project_path = self.store.read(cx).active_project().map(|p| p.path.clone());
-            if self.stale {
+            if self.stale && (self.window_visible || self.local_project()) {
                 self.on_project_changed(cx);
-            } else if !self.selected_repo.is_empty() && !self.is_remote_project(cx) {
+            } else if !self.stale && !self.selected_repo.is_empty() && (self.window_visible || self.local_project()) {
                 // 同项目再打开(见模块注释「抽屉与窗口」):收着时 `.git` 监听与节拍都停、
                 // 工作区那一路只把路径交给了文件树,「更改」只能重取一次补上;引用 / 索引
                 // 变没变等 `.git` 监听挂上后比一次签名再定,不重新发现仓库
@@ -588,6 +616,9 @@ impl GitPanel {
             self._tick = None;
             self.catch_up = false;
             self.pty_hit_at = None;
+            if let Some(context) = self.project_context.as_ref().filter(|c| c.is_remote()) {
+                context.close();
+            }
             // 收着不重取「更改」,重新打开时整份重取
             self.index_lock.reset();
         }
@@ -614,15 +645,25 @@ impl GitPanel {
             return;
         }
         if visible {
-            self.start_tick(cx);
-            self.check_git_dir_change(cx);
+            if self.stale {
+                self.on_project_changed(cx);
+            } else {
+                self.start_tick(cx);
+                if self.project_context.as_ref().is_some_and(GitContext::is_remote) {
+                    self.changes.update(cx, |changes, cx| changes.load(cx));
+                }
+                self.check_git_dir_change(cx);
+            }
         } else {
             self._tick = None;
+            if let Some(context) = self.project_context.as_ref().filter(|c| c.is_remote()) {
+                context.close();
+            }
         }
     }
 
     /// 抽屉左侧要挂的「提交详情」栏(见 `git_history::detail` 模块注释)。没选中提交、
-    /// 详情被关上、「提交历史」区收着、面板正显示空态(没有项目 / 远程项目)时为 `None`。
+    /// 详情被关上、「提交历史」区收着、面板没有项目时为 `None`。
     ///
     /// 不看 [`Self::visible`]:抽屉收起的退场动画期间面板已置为不可见,详情栏要跟着
     /// 抽屉一起滑出去,不该先没了。
@@ -630,7 +671,6 @@ impl GitPanel {
         let history_open = SECTION_UI.with(|s| s.borrow().history_open);
         let shown = history_open
             && self.store.read(cx).active_project().is_some()
-            && !self.is_remote_project(cx)
             && self.history.read(cx).detail_shown();
         shown.then(|| self.detail_pane.clone())
     }
@@ -639,10 +679,15 @@ impl GitPanel {
     /// 只叫它比签名;否则通知两个子面板,**各自** 500ms 去抖,原版是两个独立定时器)。
     /// 同一拍顺带问一声 `.git` / 工作区监听有没有攒够一批安静下来的变化。
     fn start_tick(&mut self, cx: &mut Context<Self>) {
+        let interval = if self.project_context.as_ref().is_some_and(GitContext::is_remote) {
+            REMOTE_POLL
+        } else {
+            Duration::from_millis(git_watch::POLL_MS)
+        };
         self._tick = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
-                    .timer(Duration::from_millis(git_watch::POLL_MS))
+                    .timer(interval)
                     .await;
                 let alive = this
                     .update(cx, |this: &mut Self, cx| this.on_tick(cx))
@@ -655,6 +700,14 @@ impl GitPanel {
     }
 
     fn on_tick(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !self.window_visible {
+            return;
+        }
+        if self.project_context.as_ref().is_some_and(GitContext::is_remote) {
+            self.changes.update(cx, |c, cx| c.load(cx));
+            self.check_git_dir_change(cx);
+            return;
+        }
         if git_watch::drain_hit() {
             let watching = self.dir_watch.repo() == Some(self.selected_repo.as_str());
             match pty_route(watching) {
@@ -707,16 +760,38 @@ impl GitPanel {
         }
     }
 
-    fn is_remote_project(&self, cx: &App) -> bool {
-        self.store
-            .read(cx)
-            .active_project()
-            .is_some_and(|p| p.ssh_connection_id.is_some())
+    fn active_project_context(&self, cx: &App) -> Option<GitContext> {
+        let store = self.store.read(cx);
+        store.active_project().map(|project| {
+            crate::git_backend::project_context(store, &project.id)
+        })
+    }
+
+    fn local_project(&self) -> bool {
+        self.project_context.as_ref().and_then(GitContext::local_path).is_some()
+    }
+
+    fn replace_project_context(&mut self, context: Option<GitContext>, project_id: Option<String>) {
+        self.repo_request += 1;
+        self.watch_request += 1;
+        self.hidden_request += 1;
+        self.reset_repo_state();
+        self.repos.clear();
+        self.selected_repo.clear();
+        if self.project_context != context {
+            if let Some(previous) = self.project_context.as_ref() {
+                previous.close();
+            }
+        }
+        self.project_path = context.as_ref().map(|context| context.path().to_string());
+        self.project_context = context;
+        self.project_id = project_id;
     }
 
     /// 换仓库 / 换项目:分支、元数据、签名的先后记录全部作废;在途的分支快照也作废 ——
     /// 它属于上一个仓库,且不作废的话「在途」标记会一直挂着(签名检查就一直被压着)。
     fn reset_repo_state(&mut self) {
+        self.busy = None;
         self.view_branch = None;
         self.branches.clear();
         self.meta = RepoMeta::default();
@@ -729,14 +804,21 @@ impl GitPanel {
         self.round_issued = None;
         self.deferred_check = None;
         self.pty_hit_at = None;
+        self.sig_checking = false;
+        self.sig_request += 1;
+        self.sig_recheck = false;
+        self.load_error = None;
     }
 
     /// 项目变了:先吃缓存(没有就清空)→ 重新发现仓库。
     fn on_project_changed(&mut self, cx: &mut Context<Self>) {
         self.stale = false;
         self.reset_repo_state();
-        let path = self.project_path.clone().unwrap_or_default();
-        let cached = REPO_CACHE.with(|c| c.borrow().get(&path).cloned());
+        self.repo_request += 1;
+        git_watch::set_enabled(self.visible && self.local_project());
+        if self.visible && self.window_visible { self.start_tick(cx); }
+        let key = self.project_context.as_ref().map(GitContext::key).unwrap_or_default();
+        let cached = REPO_CACHE.with(|c| c.borrow().get(&key).cloned());
         match cached {
             Some((repos, selected)) => {
                 self.repos = repos;
@@ -752,31 +834,30 @@ impl GitPanel {
         self.retarget_watch(cx);
     }
 
-    /// 发现仓库(**重**:首次扫盘深度 5)。远程项目直接 return。只在换项目、手动 ↻、
+    /// 发现仓库(**重**:首次扫盘深度 5)。两种后端共用原面板与仓库缓存。
     /// Worktree 管理弹窗改过之后跑(见模块注释「什么时候重新发现仓库」)。
     fn load_repos(&mut self, cx: &mut Context<Self>) {
-        if self.is_remote_project(cx) {
-            return;
-        }
-        let Some(path) = self.project_path.clone() else {
+        let Some(context) = self.project_context.clone() else {
             return;
         };
+        let key = context.key();
         self.repo_request += 1;
         let req = self.repo_request;
-        let task_path = std::path::PathBuf::from(&path);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::discover_git_repos(&task_path) })
+                .spawn(async move { context.discover_git_repos() })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                if this.repo_request != req {
+                if this.repo_request != req || this.project_context.as_ref().map(GitContext::key).as_ref() != Some(&key) {
                     return;
                 }
                 let before = this.selected_repo.clone();
                 let repos_before = repo_list_key(&this.repos);
+                let error_before = this.load_error.clone();
                 match result {
                     Ok(repos) => {
+                        this.load_error = None;
                         // 选中仓库保持原值(若仍在列表里),否则取第一个
                         let keep = repos
                             .iter()
@@ -790,15 +871,22 @@ impl GitPanel {
                         this.repos = repos;
                         REPO_CACHE.with(|c| {
                             c.borrow_mut().insert(
-                                path.clone(),
+                                key.clone(),
                                 (this.repos.clone(), this.selected_repo.clone()),
                             )
                         });
                     }
                     Err(err) => {
                         eprintln!("[git] 发现仓库失败: {err:#}");
+                        this.load_error = Some(git_ui::error_text(&err));
                         this.repos.clear();
+                        this.selected_repo.clear();
                     }
+                }
+                if before != this.selected_repo {
+                    let error = this.load_error.take();
+                    this.reset_repo_state();
+                    this.load_error = error;
                 }
                 this.push_repo_down(cx);
                 if branches_stale_after_discovery(
@@ -811,7 +899,7 @@ impl GitPanel {
                 }
                 this.retarget_watch(cx);
                 // 扫出来的与眼下一样(手动 ↻ 的常态)就不重画:分支快照那边自己会画
-                if before != this.selected_repo || repos_before != repo_list_key(&this.repos) {
+                if this.load_error != error_before || before != this.selected_repo || repos_before != repo_list_key(&this.repos) {
                     cx.notify();
                 }
             });
@@ -828,15 +916,14 @@ impl GitPanel {
     /// `spin` = 仓库栏的刷新按钮转圈(手动 ↻);还一条分支都没有时也转(弹窗里是「加载中」
     /// 占位)。自动刷新不转圈,结果与眼下相同时整趟不重画(见模块注释)。
     fn load_branches_with(&mut self, spin: bool, cx: &mut Context<Self>) {
-        let repo = self.selected_repo.clone();
-        if repo.is_empty() {
+        let Some(context) = self.repo_context() else {
             self.branches.clear();
             self.meta = RepoMeta::default();
             self.branches_loading = false;
             self.snapshot_in_flight = false;
             self.branch_gen += 1;
             return;
-        }
+        };
         let spin = spin || self.branches.is_empty();
         let spinner_changed = spin && !self.branches_loading;
         self.branches_loading |= spin;
@@ -845,11 +932,11 @@ impl GitPanel {
         let issued = Instant::now();
         self.branch_request += 1;
         let req = self.branch_request;
-        let task_repo = std::path::PathBuf::from(&repo);
+        let repo = context.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { load_branch_snapshot(&task_repo) })
+                .spawn(async move { load_branch_snapshot(&context) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 // 迟到响应丢弃:换仓库后的旧响应不许覆盖(换仓库时令牌已前移)
@@ -857,7 +944,7 @@ impl GitPanel {
                     return;
                 }
                 this.snapshot_in_flight = false;
-                if this.selected_repo != repo {
+                if this.repo_context().as_ref() != Some(&repo) {
                     // 令牌没换、仓库却换了(不该出现):在途标记照样收掉,别把检查一直压着
                     this.branches_loading = false;
                     return;
@@ -866,6 +953,7 @@ impl GitPanel {
                 let mut changed = std::mem::take(&mut this.branches_loading);
                 match result {
                     Ok((list, mut meta)) => {
+                        changed |= this.load_error.take().is_some();
                         // 正在查看的分支没了(被删 / 改名):回到跟随 HEAD,
                         // 否则历史区拿着一个不存在的分支名去查
                         if this
@@ -899,7 +987,12 @@ impl GitPanel {
                         this.meta = meta;
                         this.branch_gen += 1;
                     }
-                    Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
+                    Err(err) => {
+                        eprintln!("[git] 取分支失败: {err:#}");
+                        let error = git_ui::error_text(&err);
+                        changed |= this.load_error.as_ref() != Some(&error);
+                        this.load_error = Some(error);
+                    }
                 }
                 this.push_repo_down(cx);
                 if changed {
@@ -907,7 +1000,9 @@ impl GitPanel {
                 }
                 // 在途期间压着的那次检查:拿刚落地的签名再比
                 if let Some(observed) = this.deferred_check.take() {
-                    this.apply_observation(observed, cx);
+                    if this.local_project() || (this.visible && this.window_visible) {
+                        this.apply_observation(observed, cx);
+                    }
                 }
             });
         })
@@ -951,14 +1046,14 @@ impl GitPanel {
 
     /// 把仓库 / 分支透给两个子面板。
     fn push_repo_down(&mut self, cx: &mut Context<Self>) {
-        let repo = self.selected_repo.clone();
+        let repo = self.repo_context();
         let branches = self.branches.clone();
         let head_branch = self.current_branch().map(str::to_string);
         let view_branch = self.view_branch.clone();
-        self.changes.update(cx, |c, cx| c.set_repo(&repo, cx));
+        self.changes.update(cx, |c, cx| c.set_repo(repo.clone(), cx));
         self.history.update(cx, |h, cx| {
             h.sync(
-                &repo,
+                repo,
                 &branches,
                 head_branch.as_deref(),
                 view_branch.as_deref(),
@@ -974,7 +1069,7 @@ impl GitPanel {
         self.selected_repo = path;
         // 换仓库:分支清空、viewBranch 复位、元数据清掉
         self.reset_repo_state();
-        if let Some(project) = self.project_path.clone() {
+        if let Some(project) = self.project_context.as_ref().map(GitContext::key) {
             REPO_CACHE.with(|c| {
                 c.borrow_mut()
                     .insert(project, (self.repos.clone(), self.selected_repo.clone()))
@@ -1011,6 +1106,7 @@ impl GitPanel {
     pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
         BranchSnapshot {
             repo: self.selected_repo.clone(),
+            context: self.repo_context().unwrap_or_else(|| GitContext::broken("No Git repository selected".to_string())),
             data: self.branch_data(),
             head: self.head_branch().map(str::to_string),
             detached: self
@@ -1043,11 +1139,15 @@ impl GitPanel {
 
     /// 面板自己没在跑写操作,但仓库的写操作闸被别的区占着(见模块注释「写操作」)。
     fn gated(&self) -> bool {
-        self.busy.is_none() && git_ui::gate::is_busy(&self.selected_repo)
+        self.busy.is_none() && self.repo_context().is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
     }
 
-    pub(crate) fn repo_path(&self) -> &str {
-        &self.selected_repo
+
+    pub(crate) fn repo_context(&self) -> Option<GitContext> {
+        if self.selected_repo.is_empty() {
+            return None;
+        }
+        self.project_context.as_ref().map(|context| context.with_path(self.selected_repo.clone()))
     }
 
     pub(crate) fn store(&self) -> &Entity<AppStore> {
@@ -1075,23 +1175,42 @@ impl GitPanel {
     pub(crate) fn run_write_op<T: Send + 'static>(
         &mut self,
         busy: GitBusy,
-        op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+        op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
         done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.selected_repo.is_empty() || self.busy.is_some() {
+        let Some(repo) = self.repo_context() else { return; };
+        self.run_write_op_on(&repo, busy, op, done, window, cx);
+    }
+
+    pub(crate) fn run_write_op_on<T: Send + 'static>(
+        &mut self,
+        repo: &GitContext,
+        busy: GitBusy,
+        op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let active = self.repo_context().as_ref() == Some(repo);
+        if active && self.busy.is_some() {
             return;
         }
+        let completed_repo = repo.clone();
         let this = cx.entity().downgrade();
         let started = git_ui::spawn_gated(
-            &self.selected_repo,
+            repo,
             op,
             move |result, window, cx| {
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    this.busy = None;
+                    let active = this.repo_context().as_ref() == Some(&completed_repo);
+                    if active {
+                        this.busy = None;
+                    }
                     match result {
-                        Ok(value) => done(this, value, window, cx),
+                        Ok(value) if active => done(this, value, window, cx),
+                        Ok(_) => {}
                         Err(err) => {
                             eprintln!("[git] {}失败: {err:#}", busy.label());
                             git_ui::show_git_error(
@@ -1102,8 +1221,10 @@ impl GitPanel {
                             );
                         }
                     }
-                    this.refresh_after_write(cx);
-                    cx.notify();
+                    if active {
+                        this.refresh_after_write(cx);
+                        cx.notify();
+                    }
                 });
             },
             window,
@@ -1113,15 +1234,17 @@ impl GitPanel {
             self.notify_result(git_ui::gate_busy_text().to_string(), Tone::Attention, cx);
             return;
         }
-        self.busy = Some(busy);
-        cx.notify();
+        if active {
+            self.busy = Some(busy);
+            cx.notify();
+        }
     }
 
     /// `git fetch --all`。
     pub(crate) fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.run_write_op(
             GitBusy::Fetch,
-            mt_project::git::git_fetch_all,
+            GitContext::git_fetch_all,
             |this, outcome, _window, cx| {
                 let message = if outcome.updated_refs == 0 {
                     t("gitBranch", "fetchUpToDate").to_string()
@@ -1155,8 +1278,8 @@ impl GitPanel {
         self.run_write_op(
             GitBusy::Pull,
             move |repo| match mode {
-                Some(mode) => mt_project::git::git_pull_with(repo, mode),
-                None => mt_project::git::git_pull_by_config(repo),
+                Some(mode) => repo.git_pull_with(mode),
+                None => repo.git_pull_by_config(),
             },
             |this, outcome, _window, cx| {
                 let (message, tone) = match outcome {
@@ -1189,7 +1312,8 @@ impl GitPanel {
         if self.selected_repo.is_empty() || self.busy.is_some() {
             return;
         }
-        crate::git_push::open(cx.entity(), self.selected_repo.clone(), branch, window, cx);
+        let Some(repo) = self.repo_context() else { return; };
+        crate::git_push::open(cx.entity(), repo, branch, window, cx);
     }
 
     /// 打开贮藏列表(仓库栏贮藏按钮)。有写操作在跑时不开 —— 贮藏的改写同样要抢
@@ -1198,10 +1322,11 @@ impl GitPanel {
         if self.selected_repo.is_empty() || self.busy.is_some() {
             return;
         }
+        let Some(repo) = self.repo_context() else { return; };
         let on_changed = self.stash_on_changed(false, cx);
         crate::git_stash::open_list(
             self.store.clone(),
-            self.selected_repo.clone(),
+            repo,
             on_changed,
             window,
             cx,
@@ -1220,10 +1345,11 @@ impl GitPanel {
         if self.selected_repo.is_empty() {
             return;
         }
+        let Some(repo) = self.repo_context() else { return; };
         let on_changed = self.stash_on_changed(true, cx);
         crate::git_stash::open_smart_checkout(
             self.store.clone(),
-            self.selected_repo.clone(),
+            repo,
             branch,
             conflicts,
             on_changed,
@@ -1236,8 +1362,10 @@ impl GitPanel {
     /// 同普通检出)。弱引用:回调跟着弹窗走,面板没了就什么都不做。
     fn stash_on_changed(&self, follow_head: bool, cx: &mut Context<Self>) -> Rc<dyn Fn(&mut App)> {
         let panel = cx.entity().downgrade();
+        let repo = self.repo_context();
         Rc::new(move |cx: &mut App| {
             let _ = panel.update(cx, |p, cx| {
+                if p.repo_context() != repo { return; }
                 if follow_head {
                     p.set_view_branch(None, cx);
                 }
@@ -1256,7 +1384,7 @@ impl GitPanel {
     fn continue_op(&mut self, kind: RepoOpKind, window: &mut Window, cx: &mut Context<Self>) {
         self.run_write_op(
             GitBusy::Continue,
-            move |repo| mt_project::git::continue_operation(repo, kind),
+            move |repo| repo.continue_operation(kind),
             move |this, state, _window, cx| {
                 let noun = op_noun(kind);
                 let (message, tone) = match state.kind {
@@ -1282,6 +1410,7 @@ impl GitPanel {
     /// 横幅「中止」:先确认(已做的冲突解决会丢)。
     fn confirm_abort(&mut self, kind: RepoOpKind, window: &mut Window, cx: &mut Context<Self>) {
         let noun = op_noun(kind);
+        let Some(repo) = self.repo_context() else { return; };
         let this = cx.entity();
         Confirm::new(
             tr!("gitBranch", "abortTitle", op = noun),
@@ -1292,9 +1421,10 @@ impl GitPanel {
         .open(
             move |window, cx| {
                 this.update(cx, |this, cx| {
-                    this.run_write_op(
+                    this.run_write_op_on(
+                        &repo,
                         GitBusy::Abort,
-                        move |repo| mt_project::git::abort_operation(repo, kind),
+                        move |repo| repo.abort_operation(kind),
                         move |this, (), _window, cx| {
                             this.notify_result(
                                 tr!("gitBranch", "opAborted", op = op_noun(kind)),
@@ -1318,9 +1448,10 @@ impl GitPanel {
     /// 工作区那一路替文件树听 [`Self::hidden_repo`](见模块注释「抽屉与窗口」)。两路各自比,
     /// 没变的那一路不动(抽屉开合时工作区监听不必撤了重挂)。目录在后台列(要读盘)。
     fn retarget_watch(&mut self, cx: &mut Context<Self>) {
-        let local = !self.is_remote_project(cx);
-        let want_dir = (self.visible && !self.selected_repo.is_empty() && local)
-            .then(|| self.selected_repo.clone());
+        let local = self.local_project();
+        let want_dir = self.repo_context().and_then(|context| {
+            self.visible.then(|| context.local_path().map(|path| path.to_string_lossy().into_owned())).flatten()
+        });
         let want_work = if self.visible {
             want_dir.clone()
         } else {
@@ -1351,19 +1482,21 @@ impl GitPanel {
             return;
         }
         let req = self.watch_request;
-        let (dir_task, work_task) = (dir_repo.clone(), work_repo.clone());
+        // These targets were obtained only through local_path in the watcher gate.
+        let dir_task = dir_repo.as_ref().map(PathBuf::from);
+        let work_task = work_repo.as_ref().map(PathBuf::from);
         cx.spawn(async move |this, cx| {
             let (git_dirs, work_dirs) = cx
                 .background_executor()
                 .spawn(async move {
                     let git_dirs = dir_task.map(|repo| {
-                        mt_project::git::git_dir_layout(Path::new(&repo)).map(|layout| {
+                        mt_project::git::git_dir_layout(&repo).map(|layout| {
                             let dirs = mt_project::git::git_watch_dirs(&layout);
                             (layout, dirs)
                         })
                     });
                     let work_dirs = work_task
-                        .map(|repo| mt_project::git::worktree_watch_dirs(Path::new(&repo)));
+                        .map(|repo| mt_project::git::worktree_watch_dirs(&repo));
                     (git_dirs, work_dirs)
                 })
                 .await;
@@ -1406,19 +1539,14 @@ impl GitPanel {
         if self.visible {
             return;
         }
-        let project = self
-            .store
-            .read(cx)
-            .active_project()
-            .filter(|p| p.ssh_connection_id.is_none())
-            .map(|p| p.path.clone());
+        let project = self.project_context.clone().filter(|context| context.local_path().is_some());
         let Some(project) = project else {
             self.hidden_repo = None;
             self.retarget_watch(cx);
             return;
         };
         let known = if !self.stale
-            && self.project_path.as_deref() == Some(project.as_str())
+            && self.project_context.as_ref() == Some(&project)
             && !self.selected_repo.is_empty()
         {
             Some(self.selected_repo.clone())
@@ -1426,7 +1554,7 @@ impl GitPanel {
             REPO_CACHE
                 .with(|c| {
                     c.borrow()
-                        .get(&project)
+                        .get(&project.key())
                         .map(|(_, selected)| selected.clone())
                 })
                 .filter(|selected| !selected.is_empty())
@@ -1440,7 +1568,7 @@ impl GitPanel {
         cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::enclosing_repo(Path::new(&project)) })
+                .spawn(async move { project.local_path().and_then(mt_project::git::enclosing_repo) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.hidden_request != req || this.visible {
@@ -1529,8 +1657,10 @@ impl GitPanel {
             });
             return;
         }
+        let Some(path) = self.project_context.as_ref()
+            .map(|context| context.with_path(repo.clone()))
+            .and_then(|context| context.local_path().map(std::path::Path::to_path_buf)) else { return; };
         self.work_checking = true;
-        let path = PathBuf::from(&repo);
         cx.spawn(async move |this, cx| {
             let plan = cx
                 .background_executor()
@@ -1564,8 +1694,10 @@ impl GitPanel {
             }
             return;
         }
+        let Some(path) = self.project_context.as_ref()
+            .map(|context| context.with_path(repo.clone()))
+            .and_then(|context| context.local_path().map(std::path::Path::to_path_buf)) else { return; };
         self.work_checking = true;
-        let path = PathBuf::from(&repo);
         let git_dir = self
             .dir_watch
             .layout()
@@ -1629,31 +1761,44 @@ impl GitPanel {
     /// 后台读一份 [`RepoObservation`],按「签名的先后」决定刷什么(见模块注释)。顺带重列
     /// 监听目录(新出现的分支前缀目录要补挂)。监听没挂上时什么都不做。
     fn check_git_dir_change(&mut self, cx: &mut Context<Self>) {
-        let (Some(repo), Some(layout)) = (
-            self.dir_watch.repo().map(str::to_string),
-            self.dir_watch.layout(),
-        ) else {
-            return;
+        let Some(repo) = self.repo_context() else { return; };
+        let layout = if repo.local_path().is_some() {
+            if self.dir_watch.repo() != Some(repo.path()) { return; }
+            let Some(layout) = self.dir_watch.layout() else { return; };
+            Some(layout)
+        } else {
+            None
         };
         if self.sig_checking {
             self.sig_recheck = true;
             return;
         }
         self.sig_checking = true;
-        let path = PathBuf::from(&repo);
+        self.sig_request += 1;
+        let req = self.sig_request;
+        let task_repo = repo.clone();
         cx.spawn(async move |this, cx| {
             let (observed, dirs) = cx
                 .background_executor()
                 .spawn(async move {
-                    (
-                        RepoObservation::read(&path),
-                        mt_project::git::git_watch_dirs(&layout),
-                    )
+                    let at = Instant::now();
+                    let observed = RepoObservation {
+                        at,
+                        signature: task_repo.repo_signature().ok(),
+                        op: task_repo.repo_operation_state().ok(),
+                    };
+                    let dirs = layout.map(|layout| mt_project::git::git_watch_dirs(&layout));
+                    (observed, dirs)
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.sig_request != req || this.repo_context().as_ref() != Some(&repo) {
+                    return;
+                }
                 this.sig_checking = false;
-                if this.dir_watch.repo() != Some(repo.as_str()) || this.selected_repo != repo {
+                if repo.is_remote() && (!this.visible || !this.window_visible || observed.signature.is_none()) {
+                    // Retain the last history snapshot during hidden or failed polls.
+                    // Changes loading reports transport errors without resetting history.
                     this.sig_recheck = false;
                     return;
                 }
@@ -1661,7 +1806,9 @@ impl GitPanel {
                     // 期间又有变化:这份签名可能已经旧了,下一拍重查(变化时刻按现在算)
                     this.dir_watch.poke();
                 }
-                this.dir_watch.update_dirs(dirs);
+                if let Some(dirs) = dirs {
+                    this.dir_watch.update_dirs(dirs);
+                }
                 let known = this.round_issued.max(this.sig_observed_at);
                 match check_fate(observed.at, known, this.snapshot_in_flight) {
                     // 这份读得比手上的旧(或之后已整轮重取过):没什么可补的
@@ -2255,17 +2402,6 @@ impl Render for GitPanel {
                 t("gitHistory", "selectProject"),
             ));
         }
-        if self.is_remote_project(cx) {
-            // git 命令跑在本地,对远程路径无意义(远程 Git 二期)
-            return div()
-                .size_full()
-                .border_t_1()
-                .border_color(ui::border_subtle())
-                .child(centered_hint(
-                    git_ui::ICON_REMOTE,
-                    t("gitHistory", "remoteNotSupported"),
-                ));
-        }
 
         let section = SECTION_UI.with(|s| *s.borrow());
         let both_open = section.changes_open && section.history_open;
@@ -2325,6 +2461,9 @@ impl Render for GitPanel {
             if let Some(banner) = self.render_op_banner(cx) {
                 root = root.child(banner);
             }
+        }
+        if let Some(error) = &self.load_error {
+            root = root.child(git_ui::error_block(error.clone()));
         }
 
         root = root
@@ -3138,6 +3277,7 @@ impl GitPanel {
     /// 区分,缩进与标题对齐 —— `✓ ` / 全角空格前缀本身就占一格。
     fn repo_menu(&self, cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
         let this = cx.entity();
+        let project = self.project_context.clone();
         self.repos
             .iter()
             .map(|repo| {
@@ -3160,9 +3300,12 @@ impl GitPanel {
                     });
                 }
                 let this = this.clone();
+                let project = project.clone();
                 item.on_click(move |_window, cx| {
                     let path = path.clone();
-                    this.update(cx, |this, cx| this.select_repo(path, cx));
+                    this.update(cx, |this, cx| {
+                        if this.project_context == project { this.select_repo(path, cx); }
+                    });
                 })
                 .into()
             })
@@ -3175,18 +3318,24 @@ impl GitPanel {
             return Vec::new();
         };
         let store = self.store.clone();
-        let project_id = self.store.read(cx).active_project_id.clone();
+        let project_id = self.project_id.clone();
         let project_path = self.project_path.clone().unwrap_or_default();
         let repo_path = repo.path.to_string_lossy().to_string();
         // 项目根仓库不带 cwd 覆盖(默认就是项目根)
-        let same_as_root = is_project_root_repo(&repo_path, &project_path);
+        let same_as_root = if self.project_context.as_ref().is_some_and(GitContext::is_remote) {
+            repo_path.trim_end_matches('/') == project_path.trim_end_matches('/')
+        } else {
+            is_project_root_repo(&repo_path, &project_path)
+        };
         let title = if repo.is_worktree {
             format!("⎇ {}", repo.current_branch.clone().unwrap_or(repo.name.clone()))
         } else {
             repo.name.clone()
         };
         let this = cx.entity();
-        let repo_for_worktree = repo_path.clone();
+        let Some(repo_for_worktree) = self.repo_context() else { return Vec::new(); };
+        let worktree_project_id = project_id.clone();
+        let worktree_project = self.project_context.clone();
 
         vec![
             menu::item(
@@ -3218,13 +3367,16 @@ impl GitPanel {
                 t("gitHistoryContent", "manageWorktrees"),
                 move |window, cx| {
                     let this = this.clone();
+                    let project = worktree_project.clone();
                     crate::git_worktree::open(
                         // 单仓库模式:discover_repos = false
                         repo_for_worktree.clone(),
                         false,
-                        None,
+                        worktree_project_id.clone(),
                         move |cx| {
-                            this.update(cx, |this, cx| this.load_repos(cx));
+                            this.update(cx, |this, cx| {
+                                if this.project_context == project { this.load_repos(cx); }
+                            });
                         },
                         window,
                         cx,

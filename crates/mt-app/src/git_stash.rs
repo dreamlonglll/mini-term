@@ -37,7 +37,6 @@
 //! 列表弹窗:↑/↓ 换贮藏、Enter 应用(Dialog 的 Confirm)、Delete 删除(先确认)、Esc 关闭;
 //! 没有贮藏时 Enter = 贮藏当前改动。其余弹窗 Enter 确认 / Esc 取消。
 
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
@@ -52,6 +51,7 @@ use mt_project::git::{
     self, BranchNameIssue, GitStatus, SmartCheckoutOutcome, StashApplyOutcome, StashFileInfo,
     StashInfo, StashSaveOptions, StashSaveOutcome,
 };
+use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -146,7 +146,7 @@ enum Notice {
 
 struct StashDialog {
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: OnChanged,
     stashes: Vec<StashInfo>,
     list_loading: bool,
@@ -187,7 +187,7 @@ impl StashDialog {
 
     /// 改写类按钮要不要锁住:自己有操作在跑,或别的区占着仓库的写操作闸。
     fn locked(&self) -> bool {
-        self.busy.is_some() || git_ui::gate::is_busy(&self.repo_path)
+        self.busy.is_some() || git_ui::gate::is_busy_key(&self.repo_path.key())
     }
 }
 
@@ -237,12 +237,12 @@ impl Render for Form {
 /// 先在后台把列表读回来再开窗:空列表是个小空态框、非空是大弹窗,开窗后再变尺寸会闪一下。
 pub fn open_list(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH) {
         return;
     }
     let diff = CommitFileDiffPane::new(&store, cx);
@@ -270,12 +270,12 @@ pub fn open_list(
         files_scroll: UniformListScrollHandle::new(),
         focus: cx.focus_handle(),
     });
-    let repo = PathBuf::from(repo_path);
+    let repo = repo_path;
     window
         .spawn(cx, async move |cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { git::list_stashes(&repo) })
+                .spawn(async move { repo.list_stashes() })
                 .await;
             let _ = cx.update(|window, cx| {
                 // 读取期间入口又被点了一次,那一次已经把弹窗开出来了
@@ -293,7 +293,7 @@ pub fn open_list(
 /// 没有可贮藏的改动时就地提示、弹窗留着。
 pub fn open_save(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
@@ -327,14 +327,14 @@ pub fn open_save(
 /// 检出本身失败 → 就地红字(贮藏已恢复回去)。每种结局都调 `on_changed`。
 pub fn open_smart_checkout(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     branch: String,
     conflicts: Vec<String>,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH_CHECKOUT) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH_CHECKOUT) {
         return;
     }
     let form = cx.new(|_| Form::new());
@@ -443,13 +443,13 @@ fn reload(state: &Entity<StashDialog>, cx: &mut App) {
         s.list_request += 1;
         s.list_loading = true;
         cx.notify();
-        (PathBuf::from(&s.repo_path), s.list_request)
+        (s.repo_path.clone(), s.list_request)
     });
     let state = state.clone();
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
-            .spawn(async move { git::list_stashes(&repo) })
+            .spawn(async move { repo.list_stashes() })
             .await;
         cx.update(|cx| apply_list(&state, request, result, cx));
     })
@@ -524,7 +524,7 @@ fn load_files(state: &Entity<StashDialog>, hash: Option<String>, cx: &mut App) {
         s.files_request += 1;
         s.files_loading = hash.is_some();
         cx.notify();
-        Some((PathBuf::from(&s.repo_path), s.files_request))
+        Some((s.repo_path.clone(), s.files_request))
     }) else {
         return;
     };
@@ -535,7 +535,7 @@ fn load_files(state: &Entity<StashDialog>, hash: Option<String>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
-            .spawn(async move { git::stash_files(&repo, &hash) })
+            .spawn(async move { repo.stash_files(&hash) })
             .await;
         cx.update(|cx| {
             let any = state.update(cx, |s, cx| {
@@ -632,7 +632,7 @@ fn refocus(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App) {
 fn run_op<T: Send + 'static>(
     state: &Entity<StashDialog>,
     busy: Busy,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     on_ok: impl FnOnce(T) -> Notice + 'static,
     window: &mut Window,
     cx: &mut App,
@@ -723,9 +723,9 @@ fn apply_selected(state: &Entity<StashDialog>, pop: bool, window: &mut Window, c
         busy,
         move |repo| {
             if pop {
-                git::stash_pop(repo, index, reinstate, Some(&hash))
+                repo.stash_pop(index, reinstate, Some(&hash))
             } else {
-                git::stash_apply(repo, index, reinstate, Some(&hash))
+                repo.stash_apply(index, reinstate, Some(&hash))
             }
         },
         move |outcome| match outcome {
@@ -773,7 +773,7 @@ fn confirm_drop(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App) 
             run_op(
                 &state,
                 Busy::Drop,
-                move |repo| git::stash_drop(repo, index, Some(&hash)),
+                move |repo| repo.stash_drop(index, Some(&hash)),
                 move |()| Notice::Info(tr!("gitStash", "result.dropped", reference = reference)),
                 window,
                 cx,
@@ -804,7 +804,7 @@ fn confirm_clear(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App)
             run_op(
                 &state,
                 Busy::Clear,
-                git::stash_clear,
+                GitContext::stash_clear,
                 |()| Notice::Info(t("gitStash", "result.cleared").to_string()),
                 window,
                 cx,
@@ -1589,7 +1589,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
     let Some(stash) = s.selected_stash().cloned() else {
         return;
     };
-    let repo = PathBuf::from(&s.repo_path);
+    let repo = s.repo_path.clone();
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitBranch", "namePlaceholder")));
     let form = cx.new(|cx| {
@@ -1694,7 +1694,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
                         kind::GIT_STASH_BRANCH,
                         "result.failedTitle",
                         repo.clone(),
-                        move |repo| git::stash_branch(repo, &op_name, index, Some(&hash)),
+                        move |repo| repo.stash_branch(&op_name, index, Some(&hash)),
                         move |outcome, _form, window, cx| {
                             close_guarded(kind::GIT_STASH_BRANCH, window, cx);
                             let notice = match outcome {
@@ -1729,17 +1729,27 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
 // ─── 新建贮藏 ─────────────────────────────────────────────────
 
 /// [`open_save`] 的本体:成功回调拿得到 `window`(从列表里打开时要把焦点还给列表)。
-fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx: &mut App) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH_SAVE) {
+fn open_save_with(repo_path: GitContext, on_saved: OnSaved, window: &mut Window, cx: &mut App) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH_SAVE) {
         return;
     }
     let form = cx.new(|_| Form::new());
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitStash", "save.placeholder")));
-    let repo_name = Path::new(&repo_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| repo_path.clone());
+    let repo_name = if repo_path.is_remote() {
+        repo_path
+            .path()
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(repo_path.path())
+            .to_string()
+    } else {
+        std::path::Path::new(repo_path.path())
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| repo_path.path().to_string())
+    };
     let focus_input = input.clone();
 
     open_guarded(
@@ -1755,7 +1765,7 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
             let (form_ok, input_ok, repo, on_saved) = (
                 form.clone(),
                 input.clone(),
-                PathBuf::from(&repo_path),
+                repo_path.clone(),
                 on_saved.clone(),
             );
             dialog
@@ -1844,7 +1854,7 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
                         kind::GIT_STASH_SAVE,
                         "save.failedTitle",
                         repo.clone(),
-                        move |repo| git::stash_save(repo, &options),
+                        move |repo| repo.stash_save(&options),
                         move |outcome, form, window, cx| match outcome {
                             StashSaveOutcome::Saved { reference } => {
                                 close_guarded(kind::GIT_STASH_SAVE, window, cx);
@@ -1878,7 +1888,7 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
 fn submit_smart_checkout(
     form: &Entity<Form>,
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     branch: String,
     on_changed: OnChanged,
     window: &mut Window,
@@ -1889,8 +1899,8 @@ fn submit_smart_checkout(
         form,
         kind::GIT_STASH_CHECKOUT,
         "checkout.failedTitle",
-        PathBuf::from(repo_path),
-        move |repo| git::checkout_with_stash(repo, &target),
+        repo_path,
+        move |repo| repo.checkout_with_stash(&target),
         move |outcome, form, window, cx| {
             let branch = branch.as_str();
             // 自动贮藏总在栈顶;恢复不顺时它就留在那儿
@@ -1987,8 +1997,8 @@ fn run_form_op<T: Send + 'static>(
     form: &Entity<Form>,
     dialog: &'static str,
     failed_title_key: &'static str,
-    repo: PathBuf,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    repo: GitContext,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     on_ok: impl FnOnce(T, &Entity<Form>, &mut Window, &mut App) + 'static,
     on_settled: Option<OnChanged>,
     window: &mut Window,
@@ -2007,7 +2017,7 @@ fn run_form_op<T: Send + 'static>(
     }
     let done_form = form.clone();
     let started = git_ui::spawn_gated(
-        &repo.to_string_lossy(),
+        &repo,
         op,
         move |result, window, cx| {
             let form = done_form;

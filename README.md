@@ -146,6 +146,35 @@ cargo build --release -p mt-app      # 产物 target/release/mini-term(.exe)
 
 > hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布包已带齐；源码运行要完整体验，先跑一次 `stage-sidecars.mjs`（release 构建对应 `--release`，就位到 `target/release/`）。
 
+### 远端 Git helper
+
+SSH 项目复用原 Git 面板、diff、提交历史、分支、贮藏与 Worktree 弹窗；统一 `GitContext` 在本地或服务器调用同一 `mt-project::git` 核心。首次使用自动检测服务器平台，将随包 helper 经 SFTP 部署到 SSH 用户的 `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`，校验内容后通过 SSH stdio 启动。服务器需要 Git 和可执行的用户缓存目录，不需要 Rust、GPUI、Node、root 权限或新监听端口。
+
+源码开发需构建匹配**服务器**平台的 helper，再执行 `node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary <Linux产物>`，将其放在桌面 exe 旁的 `remote-git-helpers/<平台>/mt-git-helper`。支持 Linux x86_64/aarch64 与 macOS x86_64/arm64；缺少资源或平台不支持会明确报错，不回落本机 Git。下面的 CLI 仍可指定 helper 路径用于排障：
+
+```bash
+# SSH 服务器上的源码副本
+cargo build --locked -p mt-git-helper --bin mt-git-helper
+
+# 本机：使用应用已保存的 SSH 连接，只读其 config.json 投影与同目录凭据库
+cargo build --locked -p mt-remote --bin mt-remote-git
+./target/debug/mt-remote-git \
+  --connection '连接名称或ID' \
+  --helper '/绝对路径/mt-git-helper' \
+  --root '/远端工作区' \
+  discover
+```
+
+其余命令为 `status <仓库根>`、`diff <仓库根> <文件相对路径> [staged|unstaged|working]`、`stage/unstage <仓库根> <路径...>`、`stage-all/unstage-all <仓库根>`、`commit <仓库根> <提交信息>`；每个路径和提交信息须作为一个本机参数传入。仓库根取 `discover` 返回的绝对路径；协议接口另支持重命名 diff 的旧路径。结果为 JSON，错误退出非零。可用 `--config <投影文件>` 显式选择投影及同目录 `credential.key`，不迁移或写回配置；缺省与 SSH sidecar 一样忽略 `MT_APP_DATA_DIR`。
+
+helper 经 SSH stdio 接收 4 字节大端长度前缀的 UTF-8 JSON，单帧最多 16 MiB，先核对协议版本再执行；使用 `mt-project::git`，不把操作参数拼进 shell。hooks、过滤器、签名、提交身份及拉推凭据沿用服务器配置，没有新增交互式凭据 UI。`--root` 按既有规则发现项目、祖先、子目录仓库及注册的 linked worktree，**不是 OS 沙箱**；只连接可信服务器和仓库。写请求断线或超时不会自动重放，必须先核对远端状态。远端面板可见时轮询，保留快照并静默刷新；本地继续原文件监听。
+
+已在“上海01”的隔离临时仓库验证 Ubuntu 24.04 x86_64、Git 2.43.0 的 SSH 链路：自动部署、状态与 diff、提交、修改提交消息、标签、Worktree 创建/读取/删除、Mixed reset；原桌面 Git 抽屉已实际显示远端数据，用户测试通过。后端与协议测试 97 项、桌面 Git 相关测试 226 项通过。早期 CLI 验证另覆盖部分暂存、空仓库、重命名、特殊 POSIX 文件名、hook 拒绝及断线不重放。这些结果不代表其它服务器平台和所有拉推认证环境均已真机验证。
+
+生命周期与异常验证另覆盖：正常 `close`、客户端 `Drop`、应用 SSH 池关闭及空闲 channel 断开后，远端 helper PID 均退出；20 秒握手超时、180 秒写响应超时、helper 缺失 / 无执行权限、错误根路径、外部 `index.lock`、只读 Git 目录、hook 拒绝、协议类型错配和大 stderr 均有明确失败或恢复结果。`Drop` 在后台有界等待远端结束确认；版本、请求 ID 或结果类型不匹配会使该客户端失效。工作区根在会话中被删除时返回错误而非空仓库列表，恢复目录后可继续。二进制工作区 / HEAD 及大文件 diff 保留标记，不渲染为文本。
+
+**断连不等于取消**：实测提交中强杀客户端或 helper 后，Git 子进程仍可完成一次提交；必须重新查询 HEAD / index，不能直接重复提交。桌面写闸包含后端身份与仓库路径，不同服务器同名路径互不干扰；不同应用进程同时写仍依赖 Git 锁。上述生命周期结果不保证静默网络分区时立即回收。
+
 ---
 
 ## 更多

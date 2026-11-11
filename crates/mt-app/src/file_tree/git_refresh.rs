@@ -269,6 +269,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@e"])

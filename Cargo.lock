@@ -5451,6 +5451,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-git-helper"
+version = "1.13.30"
+dependencies = [
+ "anyhow",
+ "mt-project",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mt-i18n"
 version = "1.13.30"
 dependencies = [
@@ -5526,14 +5536,18 @@ dependencies = [
 name = "mt-remote"
 version = "1.13.30"
 dependencies = [
+ "anyhow",
  "mt-ai",
  "mt-config",
  "mt-core",
+ "mt-git-helper",
  "mt-project",
  "mt-pty",
  "mt-secret",
  "mt-ssh",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
 ]
 

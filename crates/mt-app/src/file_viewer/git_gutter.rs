@@ -883,7 +883,7 @@ impl FileViewer {
         let Some(head) = self.gutter.head_base() else {
             return;
         };
-        let root = head.repo.root.to_string_lossy().into_owned();
+        let root = mt_remote::GitContext::local(head.repo.root.to_string_lossy().into_owned());
         let rel = head.repo.rel_path.clone();
         self.gutter.popup = None;
         cx.notify();

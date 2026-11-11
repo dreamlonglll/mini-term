@@ -142,6 +142,7 @@ mt-i18n = { path = "crates/mt-i18n" }
 # 红线只有一条:绝不让 `mt-core` 依赖任何带 rusqlite 的 crate。
 mt-layout = { path = "crates/mt-layout" }
 mt-project = { path = "crates/mt-project" }
+mt-git-helper = { path = "crates/mt-git-helper" }
 mt-pty = { path = "crates/mt-pty" }
 mt-relay = { path = "crates/mt-relay" }
 # 已存 SSH 密码的封存层(AES-256-GCM 信封 + `credential.key` 主密钥,Windows 走 DPAPI)。

@@ -32,6 +32,8 @@
 //!   [`AUTO_LOAD_LIMIT`] 条之后停下,列表末尾换成「加载更多」按钮,点一下续一页 ——
 //!   视口停在底部时不会一页接一页地一路续到头;
 //! - **请求令牌**:换仓库 / 换分支时令牌 +1,迟到响应直接丢弃。
+//! - 后台查询与改写始终捕获 [`GitContext`],仓库 / 列表身份使用 backend key,同路径的
+//!   不同 SSH 主机不会共用内容或接收彼此的迟到响应。过滤、拓扑与选择派生仍在本机执行。
 //!
 //! # 过滤
 //!
@@ -85,7 +87,6 @@ pub use detail::CommitDetailPane;
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -101,6 +102,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use mt_project::git::{
     BranchInfo, GitCommitInfo, GitLogCursor, LoadedLog, LogFilter, LogPage, TagInfo,
 };
+use mt_remote::GitContext;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::git_graph::{
@@ -289,8 +291,8 @@ impl FilterState {
 
 pub struct GitHistoryContent {
     store: Entity<AppStore>,
-    /// 空串 = 无仓库。
-    repo_path: String,
+    /// 当前仓库及其后端;后台任务与弹窗持有自己的快照。
+    context: Option<GitContext>,
     /// 只用来给提交行标注分支胶囊。
     branches: Vec<BranchInfo>,
     /// HEAD 所在的分支名;detached 时是 `"(1a2b3c4)"` 那种短 hash,查不到分支就当没有。
@@ -448,12 +450,12 @@ fn keep_caret_in_view(input: &Entity<InputState>, cx: &mut App) {
 }
 
 /// 与历史首页同一时刻读的引用(见 [`GitHistoryContent::sync`])。读不到给 `None`,
-/// 沿用容器透下来的那份。纯 git2 只读。
-fn read_history_refs(repo: &std::path::Path) -> Option<HistoryRefs> {
-    let branches = mt_project::git::get_repo_branches(repo).ok()?;
+/// 沿用容器透下来的那份。查询始终使用这一轮捕获的仓库后端。
+fn read_history_refs(repo: &GitContext) -> Option<HistoryRefs> {
+    let branches = repo.get_repo_branches().ok()?;
     Some(HistoryRefs {
         head: head_label_of(&branches, || {
-            mt_project::git::current_head_label(repo).ok().flatten()
+            repo.current_head_label().ok().flatten()
         }),
         branches,
     })
@@ -489,7 +491,7 @@ impl GitHistoryContent {
         Self {
             detail: detail::DetailState::new(window, cx),
             store,
-            repo_path: String::new(),
+            context: None,
             branches: Vec::new(),
             head_branch: None,
             head_hash: None,
@@ -548,16 +550,16 @@ impl GitHistoryContent {
     /// E2E r4 A12)。
     pub fn sync(
         &mut self,
-        repo_path: &str,
+        context: Option<GitContext>,
         branches: &[BranchInfo],
         head_branch: Option<&str>,
         view_branch: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         let tags_changed = self.branches != branches || self.head_branch.as_deref() != head_branch;
-        let repo_changed = self.repo_path != repo_path;
+        let repo_changed = self.context != context;
         let reload = repo_changed || self.view_branch.as_deref() != view_branch;
-        self.repo_path = repo_path.to_string();
+        self.context = context;
         self.view_branch = view_branch.map(str::to_string);
         if reload {
             // 胶囊挂哪几条分支随查看分支变(它自己与它的上游)
@@ -576,6 +578,9 @@ impl GitHistoryContent {
             }
         }
         if repo_changed {
+            self.busy = None;
+            self.filter.email = None;
+            self.filter.no_email = false;
             // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
             self.selection.clear();
             self.detail.clear();
@@ -684,16 +689,18 @@ impl GitHistoryContent {
     /// 抽屉左边,不占这里的高度。)
     pub fn natural_height(&self) -> Option<f32> {
         let unsure =
-            self.repo_path.is_empty() || self.loading || self.has_more || self.commits.is_empty();
+            self.context.is_none() || self.loading || self.has_more || self.commits.is_empty();
         (!unsure).then_some(44.0 + 8.0 + 2.0 + self.commits.len() as f32 * GRAPH_ROW_HEIGHT)
     }
 
     fn load_page(&mut self, first: bool, cx: &mut Context<Self>) {
-        if self.repo_path.is_empty() || self.loading {
+        if self.loading {
             return;
         }
+        let Some(repo) = self.context.clone() else {
+            return;
+        };
         let req = self.request;
-        let repo = PathBuf::from(&self.repo_path);
         // 首页带 branch;续页的游标由已加载列表还原(见模块注释),不需要 branch
         let branch = if first {
             self.view_branch.clone()
@@ -718,15 +725,14 @@ impl GitHistoryContent {
                 let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
-                        let page = mt_project::git::get_git_log_filtered(
-                            &repo,
+                        let page = repo.get_git_log_filtered(
                             after,
                             PAGE_SIZE,
                             branch.as_deref(),
                             &filter,
                         );
                         let tags =
-                            first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
+                            first.then(|| repo.list_tags().unwrap_or_default());
                         let refs = first.then(|| read_history_refs(&repo)).flatten();
                         (page.map(|page| (page, tags)), refs)
                     })
@@ -761,14 +767,13 @@ impl GitHistoryContent {
                 let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
-                        let page = mt_project::git::get_git_log(
-                            &repo,
+                        let page = repo.get_git_log(
                             after.as_deref(),
                             Some(limit),
                             branch.as_deref(),
                         );
                         let tags =
-                            first.then(|| mt_project::git::list_tags(&repo).unwrap_or_default());
+                            first.then(|| repo.list_tags().unwrap_or_default());
                         let refs = first.then(|| read_history_refs(&repo)).flatten();
                         (page.map(|page| (page, tags)), refs)
                     })
@@ -853,7 +858,7 @@ impl GitHistoryContent {
     /// 之后取,HEAD 名才是与首页同一时刻的。
     fn list_identity(&self) -> ListIdentity {
         ListIdentity::new(
-            &self.repo_path,
+            &self.context.as_ref().map_or_else(String::new, GitContext::key),
             self.view_branch.as_deref(),
             self.head_branch.as_deref(),
             self.filter.active().then(|| self.filter.as_filter()),
@@ -1092,18 +1097,19 @@ impl GitHistoryContent {
 
     /// 查当前仓库的 `user.email`,查完按新条件重来。
     fn resolve_my_email(&mut self, cx: &mut Context<Self>) {
-        if self.repo_path.is_empty() {
+        let Some(repo) = self.context.clone() else {
             return;
-        }
-        let repo = PathBuf::from(&self.repo_path);
-        let repo_key = self.repo_path.clone();
+        };
+        let repo_key = repo.key();
         cx.spawn(async move |this, cx| {
             let email = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::config_user_email(&repo) })
+                .spawn(async move { repo.config_user_email() })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                if this.repo_path != repo_key || !this.filter.only_mine {
+                if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str())
+                    || !this.filter.only_mine
+                {
                     return;
                 }
                 this.filter.no_email = email.is_none();
@@ -1347,7 +1353,10 @@ impl GitHistoryContent {
             }
             return;
         }
-        let (store, repo) = (self.store.clone(), self.repo_path.clone());
+        let Some(repo) = self.context.clone() else {
+            return;
+        };
+        let store = self.store.clone();
         match self.detail.combined_files(&hashes) {
             Some(files) => {
                 git_diff::open_combined_diff(store, repo, hashes, files, initial, window, cx);
@@ -1369,9 +1378,12 @@ impl GitHistoryContent {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(repo) = self.context.clone() else {
+            return;
+        };
         git_diff::open_commit_diff_loading(
             self.store.clone(),
-            self.repo_path.clone(),
+            repo,
             hash,
             message,
             initial,
@@ -1724,7 +1736,7 @@ impl Render for GitHistoryContent {
                 .size_full()
             });
 
-        if self.repo_path.is_empty() {
+        if self.context.is_none() {
             return root.child(
                 empty_state(ICON_COMMIT, t("gitHistoryContent", "noRepos"), None).size_full(),
             );

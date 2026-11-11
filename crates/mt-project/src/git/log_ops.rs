@@ -25,7 +25,7 @@ use super::{
 };
 
 /// `git reset` 的四种模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResetMode {
     /// 只移动分支指针,暂存区与工作区原样 —— 被「撤掉」的提交的改动留在暂存区。
     Soft,
@@ -54,7 +54,7 @@ impl ResetMode {
 }
 
 /// 拣选 / 还原的结果。冲突**不是错误**:仓库停在进行中状态,等用户在「更改」区解决。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PickOutcome {
     /// 已生成新提交;`new_head` 是之后的 HEAD。
     Done { new_head: String },
@@ -63,7 +63,7 @@ pub enum PickOutcome {
 }
 
 /// 一个提交与 HEAD / 远程的关系。右键菜单据此决定哪些项可用。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommitRelation {
     /// 就是 HEAD 本身。
     pub is_head: bool,

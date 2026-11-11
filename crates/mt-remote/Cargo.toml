@@ -18,6 +18,8 @@ mt-config.workspace = true
 mt-core.workspace = true
 # 远程文件树与本地树同构:`FileEntry` / `TextGitignore` / 自然排序 / 本地分流。
 mt-project.workspace = true
+# Shared bounded framing and Git operation wire types.
+mt-git-helper.workspace = true
 # 远程会话扫描复用本地那套解析与全局会话缓存。
 mt-ai.workspace = true
 # 远程 pane 的 ssh 客户端探测与 argv 拼装(`mt_pty::ssh`)。
@@ -25,7 +27,11 @@ mt-pty.workspace = true
 # autofill 前解开已存密码的信封(`prepare_remote_launch`)。直连底层而不是回调
 # mt-app:mt-secret 只在 mt-core 之上,不会成环,凭据库又是进程级单例。
 mt-secret.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true
+# Immutable remote helper cache identity and upload integrity verification.
+sha2.workspace = true
 # 本 crate 自持的 tokio 边界:russh / russh-sftp 的 IO 要 tokio driver,
 # gpui 的执行器喂不动。工作区里已有这一行(mt-relay 用同一份 feature 集)。
 #

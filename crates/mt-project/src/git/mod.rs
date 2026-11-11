@@ -214,7 +214,12 @@ struct RawStatus {
 }
 
 fn slash_path(p: &Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
+    let text = p.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
 }
 
 /// 跑一次 status(`show` 决定比哪两侧),再配暂存区一侧的重命名。
@@ -711,7 +716,7 @@ fn repo_relative_path(workdir: &Path, project_path: &Path, abs_file: &Path) -> O
                 Component::ParentDir | Component::Prefix(_) | Component::RootDir
             )
         });
-        let text = rel.to_string_lossy().replace('\\', "/");
+        let text = slash_path(&rel);
         (!escapes && !text.is_empty()).then_some(text)
     };
     if let Some(rel) = diff_paths(abs_file, workdir).and_then(inside) {
@@ -1034,6 +1039,48 @@ pub struct GitLogCursor {
     frontier: Vec<Oid>,
 }
 
+// Oids have no serde representation in git2. Keep frontier order (date-topology
+// tie-breaking depends on it), while sorting the unordered loaded set on wire.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitLogCursorWire {
+    loaded: Vec<String>,
+    frontier: Vec<String>,
+}
+
+impl Serialize for GitLogCursor {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut loaded: Vec<_> = self.loaded.iter().map(ToString::to_string).collect();
+        loaded.sort_unstable();
+        GitLogCursorWire {
+            loaded,
+            frontier: self.frontier.iter().map(ToString::to_string).collect(),
+        }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for GitLogCursor {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let wire = GitLogCursorWire::deserialize(deserializer)?;
+        let parse = |field: &str, values: Vec<String>| -> std::result::Result<Vec<Oid>, D::Error> {
+            values.into_iter().enumerate().map(|(index, value)| {
+                if value.len() != 40 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "GitLogCursor.{field}[{index}] must be a full 40-character hexadecimal Oid"
+                    )));
+                }
+                Oid::from_str(&value).map_err(|error| serde::de::Error::custom(format!(
+                    "invalid GitLogCursor.{field}[{index}]: {error}"
+                )))
+            }).collect()
+        };
+        Ok(Self {
+            loaded: parse("loaded", wire.loaded)?.into_iter().collect(),
+            frontier: parse("frontier", wire.frontier)?,
+        })
+    }
+}
+
 impl GitLogCursor {
     /// 按已加载列表(UI 手上那份,顺序即展示顺序)还原游标。
     pub fn from_loaded(loaded: &[GitCommitInfo]) -> Self {
@@ -1057,6 +1104,19 @@ impl GitLogCursor {
             loaded: set,
             frontier,
         }
+    }
+
+    /// Advance a remote/stateless continuation without losing previously loaded
+    /// commits or the ordering of the still-pending frontier.
+    pub fn advance(&self, commits: &[GitCommitInfo]) -> Self {
+        let page = Self::from_loaded(commits);
+        let mut loaded = self.loaded.clone();
+        loaded.extend(page.loaded);
+        let mut queued = HashSet::new();
+        let frontier = self.frontier.iter().copied().chain(page.frontier)
+            .filter(|oid| !loaded.contains(oid) && queued.insert(*oid))
+            .collect();
+        Self { loaded, frontier }
     }
 }
 
@@ -1650,17 +1710,6 @@ fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>>
     }
 }
 
-/// diff 旧侧取 HEAD 版本:`Ok(None)` = 超过上限(整份不做 diff);空仓库 / HEAD 里没有
-/// 这个文件是空文本;二进制照旧报错(与此前的口径一致)。
-fn head_side_text(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
-    match head_text(repo, rel_path)? {
-        None => Ok(Some(String::new())),
-        Some(SideText::Text(s)) => Ok(Some(s)),
-        Some(SideText::Binary) => bail!("binary"),
-        Some(SideText::TooLarge) => Ok(None),
-    }
-}
-
 /// 两段行序列的公共前缀 / 后缀行数(前缀优先,后缀在剩下的范围里数)。
 fn common_affix(old_lines: &[&str], new_lines: &[&str]) -> (usize, usize) {
     let max = old_lines.len().min(new_lines.len());
@@ -1929,7 +1978,7 @@ fn full_replace_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
 }
 
 /// 单文件 diff 比的是哪两侧(与 `git diff` 家族同口径)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiffSide {
     /// HEAD → 暂存区(`git diff --cached`,「已暂存」分组)
     Staged,
@@ -1999,6 +2048,9 @@ pub fn get_git_diff_from(
                 if new_bytes.len() > MAX_DIFF_BYTES {
                     return Ok(too_large_diff_result());
                 }
+                if new_bytes.contains(&0) {
+                    return Ok(binary_diff_result());
+                }
                 match String::from_utf8(new_bytes) {
                     Ok(s) => s,
                     Err(_) => return Ok(binary_diff_result()),
@@ -2014,16 +2066,20 @@ pub fn get_git_diff_from(
             Some(SideText::Binary) => return Ok(binary_diff_result()),
             Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
             // 冲突中的文件没有 stage 0 条目 —— 退回 HEAD(ours),不能当成新增
-            None if is_conflicted(&repo, &rel_str)? => match head_side_text(&repo, &rel_str)? {
-                Some(text) => text,
-                None => return Ok(too_large_diff_result()),
+            None if is_conflicted(&repo, &rel_str)? => match head_text(&repo, &rel_str)? {
+                Some(SideText::Text(text)) => text,
+                Some(SideText::Binary) => return Ok(binary_diff_result()),
+                Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
+                None => String::new(),
             },
             // 不在暂存区 = 未跟踪 / 已暂存删除,全部算新增
             None => String::new(),
         },
-        DiffSide::Staged | DiffSide::Working => match head_side_text(&repo, &head_rel)? {
-            Some(text) => text,
-            None => return Ok(too_large_diff_result()),
+        DiffSide::Staged | DiffSide::Working => match head_text(&repo, &head_rel)? {
+            Some(SideText::Text(text)) => text,
+            Some(SideText::Binary) => return Ok(binary_diff_result()),
+            Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
+            None => String::new(),
         },
     };
 
@@ -2861,7 +2917,7 @@ pub fn git_discard_file(repo_path: &Path, files: &[String]) -> Result<()> {
 // Worktree 管理
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeInfo {
     pub name: String,

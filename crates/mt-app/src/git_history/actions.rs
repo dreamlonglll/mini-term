@@ -19,8 +19,8 @@
 //! 过滤栏右侧显示「拣选中…」这类状态;对话框的确认键在等待期间换成「执行中…」并禁用。
 //! 跨区的防重入走仓库的写操作闸(`git_ui::gate`):面板在拉取、更改区在提交时,菜单里的
 //! 改写项同样置灰并写明原因,点进来也不执行。
+//! 菜单与表单保留打开时的 [`GitContext`],确认前切换项目不会把操作送往另一个后端。
 
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
@@ -31,6 +31,7 @@ use gpui::{
 use gpui_component::dialog::{Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use mt_project::git::{self, CommitRelation, GitCommitInfo, PickOutcome, ResetMode};
+use mt_remote::GitContext;
 
 use super::{GitHistoryContent, GitHistoryEvent};
 use crate::git_ui::{self, FormOp, error_text};
@@ -52,6 +53,7 @@ pub(crate) const REWORD_CONTEXT: &str = "GitLogReword";
 
 /// 对话框的表单状态。Dialog 的 builder 每帧重跑,可变状态得放实体里。
 struct DialogForm {
+    context: GitContext,
     /// 执行中 / 上一次失败的原文(git 的 stderr,就地红字)。
     op: FormOp,
     /// 新建分支:创建后检出(默认勾)。
@@ -67,8 +69,9 @@ struct DialogForm {
 }
 
 impl DialogForm {
-    fn new() -> Self {
+    fn new(context: GitContext) -> Self {
         Self {
+            context,
             op: FormOp::default(),
             checkout: true,
             mode: ResetMode::Mixed,
@@ -79,7 +82,7 @@ impl DialogForm {
     }
 
     /// 带名字输入框的表单(新建分支 / 标签):输入框一有改动就置 `touched`。
-    fn watching(input: &Entity<InputState>, cx: &mut App) -> Entity<Self> {
+    fn watching(context: GitContext, input: &Entity<InputState>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let sub = cx.subscribe(input, |form: &mut Self, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) && !form.touched {
@@ -89,7 +92,7 @@ impl DialogForm {
             });
             Self {
                 _sub: Some(sub),
-                ..Self::new()
+                ..Self::new(context)
             }
         })
     }
@@ -114,21 +117,23 @@ pub(super) fn open_commit_menu(
     let Some(commit) = this.commits.get(index).cloned() else {
         return;
     };
-    let repo_key = this.repo_path.clone();
-    let repo = PathBuf::from(&this.repo_path);
+    let Some(repo) = this.context.clone() else {
+        return;
+    };
+    let repo_key = repo.key();
     let hash = commit.hash.clone();
     cx.spawn_in(window, async move |this, cx| {
         let (relation, remotes) = cx
             .background_executor()
             .spawn(async move {
-                let relation = git::commit_relation(&repo, &hash).map_err(|e| error_text(&e));
-                let remotes = git::list_remote_names(&repo).unwrap_or_default();
+                let relation = repo.commit_relation(&hash).map_err(|e| error_text(&e));
+                let remotes = repo.list_remote_names().unwrap_or_default();
                 (relation, remotes)
             })
             .await;
         let _ = this.update_in(cx, |this: &mut GitHistoryContent, window, cx| {
             // 算的这会儿换了仓库:菜单作废
-            if this.repo_path != repo_key {
+            if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str()) {
                 return;
             }
             let entries = commit_menu(this, &commit, relation, remotes, cx);
@@ -150,7 +155,12 @@ pub(super) fn open_multi_menu(
     let full: Vec<&str> = picked.iter().map(|c| c.hash.as_str()).collect();
     let short: Vec<&str> = picked.iter().map(|c| c.short_hash.as_str()).collect();
     let (full, short) = (full.join("\n"), short.join("\n"));
-    let entity = cx.entity();
+    let Some(repo) = this.context.clone() else {
+        return;
+    };
+    let store = this.store.clone();
+    let hashes = this.combined_hashes();
+    let files = this.detail.combined_files(&hashes);
     let entries: Vec<MenuEntry> = vec![
         menu::item(t("gitLog", "menu.copyFullHash"), move |_window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
@@ -161,7 +171,15 @@ pub(super) fn open_multi_menu(
         menu::separator(),
         MenuItem::new(t("gitHistoryContent", "viewChanges"))
             .on_click(move |window, cx| {
-                entity.update(cx, |this, cx| this.view_selected_combined(None, window, cx));
+                if let Some(files) = files.clone() {
+                    crate::git_diff::open_combined_diff(
+                        store.clone(), repo.clone(), hashes.clone(), files, None, window, cx,
+                    );
+                } else {
+                    crate::git_diff::open_combined_diff_loading(
+                        store.clone(), repo.clone(), hashes.clone(), None, window, cx,
+                    ).detach();
+                }
             })
             .into(),
     ];
@@ -193,9 +211,13 @@ fn commit_menu(
     cx: &mut Context<GitHistoryContent>,
 ) -> Vec<MenuEntry> {
     let entity = cx.entity();
+    let Some(context) = this.context.clone() else {
+        return Vec::new();
+    };
     // 自己的改写还在跑 → 另一区的写操作占着这个仓库的闸
     let busy = this.busy.and_then(|_| reason("reason.busy")).or_else(|| {
-        git_ui::gate::is_busy(&this.repo_path).then(|| git_ui::gate_busy_text().to_string())
+        this.context.as_ref().is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+            .then(|| git_ui::gate_busy_text().to_string())
     });
     let (rel, rel_error) = match relation {
         Ok(rel) => (Some(rel), None),
@@ -216,6 +238,7 @@ fn commit_menu(
     // 每个菜单项各要一份
     let with = |f: fn(
         &mut GitHistoryContent,
+        GitContext,
         &GitCommitInfo,
         &CommitRelation,
         &mut Window,
@@ -224,14 +247,17 @@ fn commit_menu(
         let entity = entity.clone();
         let commit = commit.clone();
         let rel = rel.clone();
+        let context = context.clone();
         move |window: &mut Window, cx: &mut App| {
-            entity.update(cx, |this, cx| f(this, &commit, &rel, window, cx));
+            entity.update(cx, |this, cx| f(this, context.clone(), &commit, &rel, window, cx));
         }
     };
 
     let hash = commit.hash.clone();
     let short = commit.short_hash.clone();
-    let index = this.commits.iter().position(|c| c.hash == commit.hash);
+    let (diff_repo, diff_store, diff_hash, diff_message) = (
+        context.clone(), this.store.clone(), commit.hash.clone(), commit.message.clone(),
+    );
     let mut entries: Vec<MenuEntry> = vec![
         menu::item(t("gitLog", "menu.copyFullHash"), move |_window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()));
@@ -241,12 +267,12 @@ fn commit_menu(
         }),
         menu::separator(),
         {
-            let entity = entity.clone();
             MenuItem::new(t("gitHistoryContent", "viewChanges"))
                 .on_click(move |window, cx| {
-                    if let Some(index) = index {
-                        entity.update(cx, |this, cx| this.view_commit(index, window, cx));
-                    }
+                    crate::git_diff::open_commit_diff_loading(
+                        diff_store.clone(), diff_repo.clone(), diff_hash.clone(),
+                        diff_message.clone(), None, window, cx,
+                    ).detach();
                 })
                 .into()
         },
@@ -263,7 +289,7 @@ fn commit_menu(
                     .then(|| reason("reason.alreadyCheckedOut"))
                     .flatten()
             }),
-            with(|this, commit, _rel, window, cx| this.confirm_checkout(commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| this.confirm_checkout(repo, commit, window, cx)),
         )
         .into(),
     );
@@ -271,7 +297,7 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.newBranch"),
             busy.clone(),
-            with(|this, commit, _rel, window, cx| this.open_branch_dialog(commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| this.open_branch_dialog(repo, commit, window, cx)),
         )
         .into(),
     );
@@ -279,7 +305,7 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.newTag"),
             busy.clone(),
-            with(|this, commit, _rel, window, cx| this.open_tag_dialog(commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| this.open_tag_dialog(repo, commit, window, cx)),
         )
         .into(),
     );
@@ -293,7 +319,7 @@ fn commit_menu(
                 .then(|| reason("reason.inHistory"))
                 .flatten()
         }),
-        with(|this, commit, rel, window, cx| this.cherry_pick(commit, rel, window, cx)),
+        with(|this, repo, commit, rel, window, cx| this.cherry_pick(repo, commit, rel, window, cx)),
     );
     let mut revert = action_item(
         t("gitLog", "menu.revert"),
@@ -302,7 +328,7 @@ fn commit_menu(
                 .then(|| reason("reason.notInHistory"))
                 .flatten()
         }),
-        with(|this, commit, rel, window, cx| this.revert(commit, rel, window, cx)),
+        with(|this, repo, commit, rel, window, cx| this.revert(repo, commit, rel, window, cx)),
     );
     if is_merge {
         // 合并提交:以第一个父为主线(-m 1),确认框里还会再说一遍
@@ -322,7 +348,7 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.reset"),
             base.clone(),
-            with(|this, commit, rel, window, cx| this.open_reset_dialog(commit, rel, window, cx)),
+            with(|this, repo, commit, rel, window, cx| this.open_reset_dialog(repo, commit, rel, window, cx)),
         )
         .into(),
     );
@@ -336,12 +362,12 @@ fn commit_menu(
                 1 => None,
                 _ => reason("reason.merge"),
             }),
-        with(|this, commit, rel, window, cx| this.undo_commit(commit, rel, window, cx)),
+        with(|this, repo, commit, rel, window, cx| this.undo_commit(repo, commit, rel, window, cx)),
     );
     let mut reword = action_item(
         t("gitLog", "menu.reword"),
         base.clone().or_else(head_only),
-        with(|this, commit, rel, window, cx| this.open_reword_dialog(commit, rel, window, cx)),
+        with(|this, repo, commit, rel, window, cx| this.open_reword_dialog(repo, commit, rel, window, cx)),
     );
     if rel.pushed {
         if undo.is_actionable() {
@@ -368,12 +394,13 @@ fn commit_menu(
         {
             let entity = entity.clone();
             let tag = tag.clone();
+            let repo = context.clone();
             sub.push(
                 action_item(
                     t("gitLog", "menu.deleteTag"),
                     busy.clone(),
                     move |window, cx| {
-                        entity.update(cx, |this, cx| this.confirm_delete_tag(&tag, window, cx));
+                        entity.update(cx, |this, cx| this.confirm_delete_tag(repo.clone(), &tag, window, cx));
                     },
                 )
                 .danger()
@@ -391,13 +418,14 @@ fn commit_menu(
         for remote in &remotes {
             let entity = entity.clone();
             let (tag, remote_name) = (tag.clone(), remote.clone());
+            let repo = context.clone();
             sub.push(
                 action_item(
                     tr!("gitLog", "menu.pushTag", remote = remote),
                     busy.clone(),
                     move |window, cx| {
                         let (tag, remote) = (tag.clone(), remote_name.clone());
-                        entity.update(cx, |this, cx| this.push_tag(tag, remote, window, cx));
+                        entity.update(cx, |this, cx| this.push_tag(repo.clone(), tag, remote, window, cx));
                     },
                 )
                 .into(),
@@ -420,15 +448,13 @@ impl GitHistoryContent {
     fn run_op<T: Send + 'static>(
         &mut self,
         action: &'static str,
-        op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+        repo: GitContext,
+        op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
         on_ok: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.repo_path.is_empty() {
-            return;
-        }
-        if let Some(running) = self.busy {
+        if let Some(running) = self.busy.filter(|_| self.context.as_ref() == Some(&repo)) {
             self.toast_info(
                 tr!("gitLog", "toast.busy", action = t("gitLog", running)),
                 cx,
@@ -436,11 +462,18 @@ impl GitHistoryContent {
             return;
         }
         let this = cx.entity().downgrade();
+        let repo_key = repo.key();
         let started = git_ui::spawn_gated(
-            &self.repo_path,
+            &repo,
             op,
             move |result, window, cx| {
                 let _ = this.update(cx, |this: &mut Self, cx| {
+                    if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str()) {
+                        if let Err(err) = result {
+                            this.show_failure(action, &err, window, cx);
+                        }
+                        return;
+                    }
                     this.busy = None;
                     match result {
                         Ok(value) => on_ok(this, value, window, cx),
@@ -462,7 +495,9 @@ impl GitHistoryContent {
             );
             return;
         }
-        self.busy = Some(action);
+        if self.context.as_ref() == Some(&repo) {
+            self.busy = Some(action);
+        }
         cx.notify();
     }
 
@@ -475,18 +510,20 @@ impl GitHistoryContent {
         dialog: &'static str,
         form: Entity<DialogForm>,
         action: &'static str,
-        op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+        op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
         on_ok: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let repo = form.read(cx).context.clone();
+        let repo_key = repo.key();
         let refuse = |message: String, cx: &mut Context<Self>| {
             form.update(cx, |f, cx| {
                 f.op.fail(message);
                 cx.notify();
             });
         };
-        if let Some(running) = self.busy {
+        if let Some(running) = self.busy.filter(|_| self.context.as_ref() == Some(&repo)) {
             refuse(
                 tr!("gitLog", "toast.busy", action = t("gitLog", running)),
                 cx,
@@ -496,16 +533,21 @@ impl GitHistoryContent {
         let this = cx.entity().downgrade();
         let form_done = form.clone();
         let started = git_ui::spawn_gated(
-            &self.repo_path,
+            &repo,
             op,
             move |result, window, cx| {
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    this.busy = None;
+                    let current = this.context.as_ref().map(GitContext::key).as_deref() == Some(repo_key.as_str());
+                    if current {
+                        this.busy = None;
+                    }
                     match result {
                         Ok(value) => {
                             form_done.update(cx, |f, _| f.op.finish());
                             close_guarded(dialog, window, cx);
-                            on_ok(this, value, window, cx);
+                            if current {
+                                on_ok(this, value, window, cx);
+                            }
                         }
                         Err(err) => {
                             eprintln!("[git] {action} 失败: {err:#}");
@@ -520,7 +562,9 @@ impl GitHistoryContent {
                             }
                         }
                     }
-                    this.finish_mutation(cx);
+                    if current {
+                        this.finish_mutation(cx);
+                    }
                 });
             },
             window,
@@ -530,7 +574,9 @@ impl GitHistoryContent {
             refuse(git_ui::gate_busy_text().to_string(), cx);
             return;
         }
-        self.busy = Some(action);
+        if self.context.as_ref() == Some(&repo) {
+            self.busy = Some(action);
+        }
         cx.notify();
     }
 
@@ -551,6 +597,7 @@ impl GitHistoryContent {
 
     fn confirm_checkout(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -571,11 +618,13 @@ impl GitHistoryContent {
         .open(
             move |window, cx| {
                 let (hash, short) = (hash.clone(), short.clone());
+                let repo = repo.clone();
                 entity.update(cx, |this, cx| {
                     let op_hash = hash.clone();
                     this.run_op(
                         "action.checkout",
-                        move |repo| git::checkout_commit(repo, &op_hash),
+                        repo,
+                        move |repo| repo.checkout_commit(&op_hash),
                         move |this, (), _window, cx| {
                             this.toast_info(tr!("gitLog", "toast.checkedOut", hash = short), cx);
                         },
@@ -593,27 +642,30 @@ impl GitHistoryContent {
 
     fn cherry_pick(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         rel: &CommitRelation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.pick_like(commit, rel.parent_count > 1, false, window, cx);
+        self.pick_like(repo, commit, rel.parent_count > 1, false, window, cx);
     }
 
     fn revert(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         rel: &CommitRelation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.pick_like(commit, rel.parent_count > 1, true, window, cx);
+        self.pick_like(repo, commit, rel.parent_count > 1, true, window, cx);
     }
 
     /// 拣选 / 还原:合并提交先弹确认(说明 `-m 1`),普通提交直接做(IDEA 同款)。
     fn pick_like(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         merge: bool,
         revert: bool,
@@ -633,11 +685,12 @@ impl GitHistoryContent {
             let short = short.clone();
             this.run_op(
                 action,
+                repo.clone(),
                 move |repo| {
                     if revert {
-                        git::revert_commit(repo, &op_hash)
+                        repo.revert_commit(&op_hash)
                     } else {
-                        git::cherry_pick(repo, &op_hash)
+                        repo.cherry_pick(&op_hash)
                     }
                 },
                 move |this, outcome, window, cx| match outcome {
@@ -710,6 +763,7 @@ impl GitHistoryContent {
 
     fn undo_commit(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         rel: &CommitRelation,
         window: &mut Window,
@@ -724,7 +778,8 @@ impl GitHistoryContent {
             let (op_hash, short, message) = (hash.clone(), short.clone(), message.clone());
             this.run_op(
                 "action.undo",
-                move |repo| git::undo_last_commit(repo, &op_hash),
+                repo.clone(),
+                move |repo| repo.undo_last_commit(&op_hash),
                 move |this, parent, window, cx| {
                     this.toast_info(tr!("gitLog", "toast.undone", hash = short), cx);
                     this.select_after(parent, window, cx);
@@ -761,7 +816,7 @@ impl GitHistoryContent {
 
     // ── 标签:删除 / 推送 ─────────────────────────────────
 
-    fn confirm_delete_tag(&mut self, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete_tag(&mut self, repo: GitContext, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.entity();
         let name = tag.to_string();
         danger_confirm(
@@ -770,11 +825,13 @@ impl GitHistoryContent {
             t("gitLog", "confirm.deleteTagOk").into(),
             move |window, cx| {
                 let name = name.clone();
+                let repo = repo.clone();
                 entity.update(cx, |this, cx| {
                     let op_name = name.clone();
                     this.run_op(
                         "action.deleteTag",
-                        move |repo| git::delete_tag(repo, &op_name),
+                        repo,
+                        move |repo| repo.delete_tag(&op_name),
                         move |this, (), _window, cx| {
                             this.toast_info(tr!("gitLog", "toast.tagDeleted", name = name), cx);
                         },
@@ -790,6 +847,7 @@ impl GitHistoryContent {
 
     fn push_tag(
         &mut self,
+        repo: GitContext,
         tag: String,
         remote: String,
         window: &mut Window,
@@ -798,7 +856,8 @@ impl GitHistoryContent {
         let (op_tag, op_remote) = (tag.clone(), remote.clone());
         self.run_op(
             "action.pushTag",
-            move |repo| git::push_tag(repo, &op_remote, &op_tag),
+            repo,
+            move |repo| repo.push_tag(&op_remote, &op_tag),
             move |this, (), _window, cx| {
                 this.toast_info(
                     tr!("gitLog", "toast.tagPushed", name = tag, remote = remote),
@@ -814,6 +873,7 @@ impl GitHistoryContent {
 
     fn open_branch_dialog(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -824,7 +884,7 @@ impl GitHistoryContent {
         let entity = cx.entity();
         let input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "branch.placeholder")));
-        let form = DialogForm::watching(&input, cx);
+        let form = DialogForm::watching(repo, &input, cx);
         let existing: Vec<String> = self
             .branches
             .iter()
@@ -914,7 +974,7 @@ impl GitHistoryContent {
                                 form,
                                 "action.createBranch",
                                 move |repo| {
-                                    git::create_branch_at(repo, &op_name, &op_hash, checkout)
+                                    repo.create_branch_at(&op_name, &op_hash, checkout)
                                 },
                                 move |this, (), _window, cx| {
                                     let key = if checkout {
@@ -939,6 +999,7 @@ impl GitHistoryContent {
 
     fn open_tag_dialog(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -949,7 +1010,7 @@ impl GitHistoryContent {
         let entity = cx.entity();
         let name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "tag.placeholder")));
-        let form = DialogForm::watching(&name_input, cx);
+        let form = DialogForm::watching(repo, &name_input, cx);
         // ⚠️ 高度只认 `auto_grow`:普通多行模式下 `rows` 不参与布局(恒为一行高),
         // 见 `git_ui::error_text_state` 的注释
         let message_input = cx.new(|cx| {
@@ -1033,7 +1094,7 @@ impl GitHistoryContent {
                                 "action.createTag",
                                 move |repo| {
                                     let message = Some(message.as_str()).filter(|m| !m.is_empty());
-                                    git::create_tag(repo, &op_name, &op_hash, message)
+                                    repo.create_tag(&op_name, &op_hash, message)
                                 },
                                 move |this, (), _window, cx| {
                                     this.toast_info(
@@ -1056,6 +1117,7 @@ impl GitHistoryContent {
 
     fn open_reword_dialog(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         rel: &CommitRelation,
         window: &mut Window,
@@ -1065,7 +1127,7 @@ impl GitHistoryContent {
             return;
         }
         let entity = cx.entity();
-        let form = cx.new(|_| DialogForm::new());
+        let form = cx.new(|_| DialogForm::new(repo));
         // 预填完整消息(标题 + 正文)
         let full = match commit.body.as_deref().filter(|b| !b.trim().is_empty()) {
             Some(body) => format!("{}\n\n{}", commit.message, body.trim_end()),
@@ -1146,7 +1208,7 @@ impl GitHistoryContent {
                                 kind::GIT_LOG_REWORD,
                                 form,
                                 "action.reword",
-                                move |repo| git::reword_head(repo, &op_hash, &message),
+                                move |repo| repo.reword_head(&op_hash, &message),
                                 move |this, new_head: String, window, cx| {
                                     let short: String = new_head.chars().take(7).collect();
                                     this.toast_info(
@@ -1170,6 +1232,7 @@ impl GitHistoryContent {
 
     fn open_reset_dialog(
         &mut self,
+        repo: GitContext,
         commit: &GitCommitInfo,
         rel: &CommitRelation,
         window: &mut Window,
@@ -1179,7 +1242,7 @@ impl GitHistoryContent {
             return;
         }
         let entity = cx.entity();
-        let form = cx.new(|_| DialogForm::new());
+        let form = cx.new(|_| DialogForm::new(repo.clone()));
         let branch = rel
             .head_branch
             .clone()
@@ -1195,11 +1258,11 @@ impl GitHistoryContent {
         let (hash, short) = (commit.hash.clone(), commit.short_hash.clone());
         // 会不会丢掉已推送的提交:要走图可达判定,放后台;回来之前不显示警告
         {
-            let (repo, target, form) = (PathBuf::from(&self.repo_path), hash.clone(), form.clone());
+            let (repo, target, form) = (repo, hash.clone(), form.clone());
             cx.spawn(async move |_, cx| {
                 let drops = cx
                     .background_executor()
-                    .spawn(async move { git::reset_drops_pushed(&repo, &target) })
+                    .spawn(async move { repo.reset_drops_pushed(&target) })
                     .await;
                 let drops = drops.unwrap_or_else(|err| {
                     eprintln!("[git] 重置前的推送判定失败(不显示警告): {err:#}");
@@ -1299,7 +1362,7 @@ impl GitHistoryContent {
                                     kind::GIT_LOG_RESET,
                                     form,
                                     "action.reset",
-                                    move |repo| git::reset_to(repo, &op_hash, mode),
+                                    move |repo| repo.reset_to(&op_hash, mode),
                                     move |this, (), window, cx| {
                                         this.toast_info(
                                             tr!(

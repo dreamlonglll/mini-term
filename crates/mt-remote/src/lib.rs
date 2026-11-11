@@ -20,6 +20,9 @@
 //! | `ssh_remote_ai_sessions` | [`ai_sessions`] |
 //! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
 //!
+//! [`RemoteGitWorkspace`] manages lazy packaged-helper deployment and persistent Git channels.
+//! [`RemoteGitClient`] remains the explicit-path transport. Both block; use a background thread.
+//!
 //! # 线程口径(与 Tauri 版的唯一结构性差异)
 //!
 //! 原版是 `#[tauri::command(async)]`,跑在 Tauri 自带的全局 tokio runtime 上。
@@ -54,6 +57,9 @@
 //! 主线程的 `AppStore` 里,后台任务读不到,于是**调用方在主线程取好
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
+//!
+//! Managed Git workspaces keep connection/configuration/root identity isolated and never replay
+//! uncertain writes. Closing a pane schedules helper cleanup without blocking the UI.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -69,6 +75,9 @@ use mt_ssh::{CachedSession, SftpHandle, SshPool};
 mod delete;
 mod dirs;
 mod files;
+mod git;
+mod git_context;
+mod git_service;
 mod paths;
 mod session_delete;
 mod sessions;
@@ -77,6 +86,9 @@ mod transfer;
 pub use delete::*;
 pub use dirs::*;
 pub use files::*;
+pub use git::RemoteGitClient;
+pub use git_context::GitContext;
+pub use git_service::RemoteGitWorkspace;
 pub use paths::*;
 pub use session_delete::*;
 pub use sessions::*;
@@ -271,6 +283,7 @@ pub fn state() -> &'static RemoteSshState {
 
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。
 pub fn shutdown_on_exit() {
+    git_service::shutdown_workspaces();
     state().shutdown_pool_blocking();
 }
 
@@ -278,6 +291,7 @@ pub fn shutdown_on_exit() {
 /// [`RemoteSshState::invalidate_connection`])。**由 `AppStore` 的写入侧调用**,
 /// 主线程直接调即可,不阻塞。
 pub fn invalidate_connection(conn_id: &str) {
+    git_service::invalidate_workspaces(conn_id);
     state().invalidate_connection(conn_id);
 }
 

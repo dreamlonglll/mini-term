@@ -596,22 +596,23 @@ impl FileTree {
             self.git.clear();
             return;
         };
-        if !matches!(&context.backend, FileBackendIdentity::Local) {
-            self.git_plan = GitRefreshPlan::default();
-            self.git.clear();
-            return;
-        }
         let Some(token) = self.git_flight.begin(Instant::now()) else {
             return;
         };
         let plan = std::mem::take(&mut self.git_plan);
         let known = self.git_sigs.clone();
         let root = context.root.clone();
+        let backend = crate::git_backend::project_context(self.store.read(cx), &context.project_id);
         cx.spawn(async move |this, cx| {
             // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
+                    if backend.local_path().is_none() {
+                        let files = backend.get_git_status();
+                        let labels = files.map(|files| GitLabels::new(git_status_table(files))).unwrap_or_default();
+                        return Some((Vec::new(), labels));
+                    }
                     git_refresh::run_plan(&root, &plan, known.as_ref()).map(|(sigs, files)| {
                         let labels = files
                             .map(|files| GitLabels::new(git_status_table(files)))
@@ -727,10 +728,7 @@ impl FileTree {
             self.root_loading = true;
             self.load_dir(root.clone(), root, cx);
             // 原版第一条:切项目时与 `list_directory` 并发拉一次。
-            // 远程项目跳过(远程 Git 二期)
-            if !remote {
-                self.load_git_status(cx);
-            }
+            self.load_git_status(cx);
         } else {
             self.root_loading = false;
         }
@@ -996,9 +994,7 @@ impl FileTree {
         // 手动刷新时强制重读远程根 `.gitignore`(原版 `loadRootEntries(true)`);
         // 本地那一路后端不认这个参数,传什么都一样
         self.load_dir_with(root.clone(), root, remote, true, cx);
-        if !remote {
-            self.load_git_status(cx);
-        }
+        self.load_git_status(cx);
         cx.notify();
     }
 

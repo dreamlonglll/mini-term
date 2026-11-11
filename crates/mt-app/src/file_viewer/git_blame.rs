@@ -574,7 +574,7 @@ impl FileViewer {
         self.annotate.clear_hover();
         cx.notify();
         let store = crate::store::AppStore::global(cx);
-        let root = view.repo.root.to_string_lossy().into_owned();
+        let root = mt_remote::GitContext::local(view.repo.root.to_string_lossy().into_owned());
         let opening = crate::git_diff::open_commit_diff_loading(
             store,
             root,

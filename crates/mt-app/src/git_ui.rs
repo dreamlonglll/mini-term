@@ -51,7 +51,6 @@ mod icons;
 pub use change_tree::*;
 pub use icons::*;
 
-use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla,
@@ -63,6 +62,7 @@ use gpui_component::button::ButtonVariants as _;
 use gpui_component::dialog::{Cancel, Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::GitStatus;
+use mt_remote::GitContext;
 use mt_ui::icons::{FileIcon, Shape};
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -1337,26 +1337,26 @@ pub fn gate_busy_text() -> &'static str {
 /// 写操作的公共骨架(见模块注释):占 `repo` 的写操作闸 → 后台执行 `op` → 放闸 → 回 UI
 /// 线程把结果交给 `done`。闸被占时什么都不做、返回 `false`,由调用方就地提示。
 ///
-/// 占闸与放闸后各请求一次整窗重画:别的区按 [`gate::is_busy`] 画的禁用态要跟着变。
+/// 占闸与放闸后各请求一次整窗重画:别的区按 [`gate::is_busy_key`] 画的禁用态要跟着变。
 /// 窗口在等待期间关掉的话 `done` 不再调,闸照样随任务结束放掉。
 pub fn spawn_gated<T: Send + 'static>(
-    repo: &str,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    repo: &GitContext,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     done: impl FnOnce(anyhow::Result<T>, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let Some(guard) = gate::try_acquire(repo) else {
+    let Some(guard) = gate::try_acquire_key(&repo.key()) else {
         return false;
     };
     cx.refresh_windows();
-    let path = PathBuf::from(repo);
+    let context = repo.clone();
     window
         .spawn(cx, async move |cx| {
             // ⚠️ 全是阻塞调用(git CLI 最多 120s),必须后台执行器
             let result = cx
                 .background_executor()
-                .spawn(async move { op(&path) })
+                .spawn(async move { op(&context) })
                 .await;
             drop(guard);
             let _ = cx.update(|window, cx| {

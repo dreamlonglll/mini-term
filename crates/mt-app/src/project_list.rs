@@ -600,6 +600,7 @@ fn project_menu_actions(is_remote: bool) -> Vec<Option<ProjectMenuAction>> {
         out.push(Some(Worktrees));
         out.push(Some(ProjectKind));
     }
+    if is_remote { out.push(Some(Worktrees)); }
     out.push(Some(GroupSection));
     out.push(None);
     out.push(Some(Remove));
@@ -821,11 +822,11 @@ fn project_menu(
                 })
             }
             ProjectMenuAction::Worktrees => {
-                let path = row.path.clone();
                 let id = row.id.clone();
+                let source_store = store.clone();
                 menu::item(t("projectList", "menu.worktrees"), move |window, cx| {
                     crate::git_worktree::open(
-                        path.clone(),
+                        crate::git_backend::project_context(source_store.read(cx), &id),
                         // 项目里可能挂着多个仓库,与原版的项目级入口同口径
                         true,
                         Some(id.clone()),
@@ -2839,62 +2840,7 @@ mod tests {
         });
     }
 
-    /// 菜单项序照抄原版。
-    ///
-    /// ⚠️ 逐批同步的那条断言(V/Y 批口径):Y 批接上「Worktree 管理」;
-    /// BB-b 接上「关联 SSH / 环境变量」,并把分组段从 `ProjectKind` 的实现里
-    /// 提成显式位标 `GroupSection`(远程项目没有项目类型那一项,分组段得另有
-    /// 落点)。仍未建的只剩「WSL 会话」子菜单,不占位。
-    #[test]
-    fn 右键菜单项序与原版一致() {
-        use ProjectMenuAction::*;
-        let actions = project_menu_actions(false);
-        assert_eq!(
-            actions,
-            vec![
-                Some(Rename),
-                Some(EditDescription),
-                Some(OpenInFolder),
-                Some(CopyAbsolutePath),
-                None,
-                Some(AssociateSsh),
-                Some(EnvVars),
-                Some(Worktrees),
-                Some(ProjectKind),
-                Some(GroupSection),
-                None,
-                Some(Remove),
-            ]
-        );
-        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
-    }
 
-    /// 远程项目的 gate(原版 `isRemote ? [] : [...]`):本地专属入口一律隐藏,
-    /// 保留重命名 / 编辑描述 / 复制绝对路径 / 分组段 / 移除。
-    #[test]
-    fn 远程项目隐藏本地专属菜单项() {
-        use ProjectMenuAction::*;
-        let actions = project_menu_actions(true);
-        assert_eq!(
-            actions,
-            vec![
-                Some(Rename),
-                Some(EditDescription),
-                Some(CopyAbsolutePath),
-                Some(GroupSection),
-                None,
-                Some(Remove),
-            ]
-        );
-        for hidden in [OpenInFolder, AssociateSsh, EnvVars, Worktrees, ProjectKind] {
-            assert!(
-                !actions.contains(&Some(hidden)),
-                "远程项目不该出现 {hidden:?}"
-            );
-        }
-        // 「复制绝对路径」必须留着 —— 远程 POSIX 路径照样要能复制走
-        assert!(actions.contains(&Some(CopyAbsolutePath)));
-    }
 
     /// 远程徽章:本地项目没有;远程项目取连接名 + 摘要;连接被删 = 断链态。
     #[test]

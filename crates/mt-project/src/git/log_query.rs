@@ -35,7 +35,8 @@ use super::{
 pub const SCAN_BUDGET: usize = 20_000;
 
 /// 历史区过滤条件。几项同时给时取交集。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LogFilter {
     /// 匹配提交标题 / 正文、哈希前缀、作者名 / 邮箱(忽略大小写)。空串 = 不按文本过滤。
     pub text: String,
@@ -70,7 +71,7 @@ pub fn normalize_log_path(input: &str) -> Option<String> {
 }
 
 /// 一页带条件的历史。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogPage {
     pub commits: Vec<GitCommitInfo>,
     /// 续页游标;`None` = 历史已经走完。
@@ -269,7 +270,7 @@ pub struct FileLogEntry {
 }
 
 /// 一页单文件历史。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileLogPage {
     /// 文件所属仓库的工作区根。取 diff 要用它。
     pub repo_root: PathBuf,

@@ -12,8 +12,6 @@
 //!
 //! 尺寸与提交 diff 弹窗同一口径(`git_diff::modal_size`)。
 
-use std::path::PathBuf;
-
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
     FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -21,6 +19,7 @@ use gpui::{
     UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use mt_project::git::{FileLogEntry, GitLogCursor};
+use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_diff::{self, CommitFileDiffPane};
@@ -54,10 +53,10 @@ const LIST_WIDTH: f32 = 320.0;
 
 struct FileHistory {
     store: Entity<AppStore>,
-    project_root: PathBuf,
+    project_root: GitContext,
     file_rel: String,
     /// 后端换算出来的「仓库根 + 仓库内路径」(取 diff 用)。首页回来之前是 `None`。
-    repo_root: Option<String>,
+    repo_root: Option<GitContext>,
     path_in_repo: Option<String>,
     entries: Vec<FileLogEntry>,
     cursor: Option<GitLogCursor>,
@@ -85,7 +84,7 @@ impl Render for FileHistory {
 /// 相对它的路径(`/` 或 `\` 分隔都行);所属仓库由后端就近发现。
 pub fn open(
     store: Entity<AppStore>,
-    project_root: PathBuf,
+    project_root: GitContext,
     file_rel: String,
     window: &mut Window,
     cx: &mut App,
@@ -94,7 +93,11 @@ pub fn open(
         return;
     }
     let diff = CommitFileDiffPane::new(&store, cx);
-    let file_rel = file_rel.replace('\\', "/");
+    let file_rel = if project_root.is_remote() {
+        file_rel
+    } else {
+        file_rel.replace('\\', "/")
+    };
     let state = cx.new(|cx| FileHistory {
         store,
         project_root,
@@ -168,14 +171,16 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
-            .spawn(async move { mt_project::git::get_file_log(&root, &rel, after, PAGE_SIZE) })
+            .spawn(async move { root.get_file_log(&rel, after, PAGE_SIZE) })
             .await;
         cx.update(|cx| {
             let need_more = state.update(cx, |s, cx| {
                 s.loading = false;
                 match result {
                     Ok(page) => {
-                        s.repo_root = Some(page.repo_root.to_string_lossy().to_string());
+                        s.repo_root = Some(
+                            s.project_root.with_path(page.repo_root.to_string_lossy().into_owned()),
+                        );
                         s.path_in_repo = Some(page.path_in_repo);
                         s.scanned += page.scanned;
                         for entry in page.entries {

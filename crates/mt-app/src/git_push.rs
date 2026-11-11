@@ -21,7 +21,7 @@
 //! detached HEAD / 没有远程时推送按钮禁用并说明原因。强推要再确认一次。
 //! 推送占着仓库的写操作闸(`git_ui::gate`);别的区正在写这个仓库时推送键禁用并写明原因。
 
-use std::path::Path;
+use mt_remote::GitContext;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
@@ -43,7 +43,7 @@ const OUTGOING_LIMIT: usize = 100;
 
 struct PushDialog {
     panel: Entity<GitPanel>,
-    repo: String,
+    repo: GitContext,
     /// 要推的本地分支;`None` = 当前分支。
     branch: Option<String>,
     /// `None` = 还在加载。
@@ -126,12 +126,12 @@ pub(crate) fn upstream_note(target: &PushTarget) -> Option<String> {
 /// 「实体正被更新」的借用。
 pub(crate) fn open(
     panel: Entity<GitPanel>,
-    repo: String,
+    repo: GitContext,
     branch: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if prompt::is_open(kind::GIT_PUSH) || repo.is_empty() {
+    if prompt::is_open(kind::GIT_PUSH) || repo.path().is_empty() {
         return;
     }
     let state = cx.new(|_| PushDialog {
@@ -152,7 +152,7 @@ pub(crate) fn open(
         let pushing = s.pushing;
         let force = s.force;
         // 别的区正在写这个仓库(推送自己在跑时闸也占着,那由 `pushing` 管)
-        let gated = !pushing && git_ui::gate::is_busy(&s.repo);
+        let gated = !pushing && git_ui::gate::is_busy_key(&s.repo.key());
         let can_push = !pushing && !gated && matches!(s.plan, Some(PushPlan::Ready(_)));
         let push_label = if pushing {
             t("gitBranch", "pushing")
@@ -208,10 +208,9 @@ fn load(state: &Entity<PushDialog>, cx: &mut App) {
         let result = cx
             .background_executor()
             .spawn(async move {
-                let path = Path::new(&repo);
                 let branch = branch.as_deref();
-                let plan = mt_project::git::push_plan(path, branch)?;
-                let outgoing = mt_project::git::outgoing_commits(path, branch, OUTGOING_LIMIT)?;
+                let plan = repo.push_plan(branch)?;
+                let outgoing = repo.outgoing_commits(branch, OUTGOING_LIMIT)?;
                 anyhow::Ok((plan, outgoing))
             })
             .await;
@@ -287,18 +286,26 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
     };
     let done_state = state.clone();
     let done_panel = panel.clone();
+    let context = repo.clone();
     // ⚠️ 网络操作,最多阻塞 120s(后台执行器上跑,占着仓库的写操作闸)
     let started = git_ui::spawn_gated(
         &repo,
-        move |repo| mt_project::git::git_push_with(repo, &options),
+        move |repo| repo.git_push_with(&options),
         move |result, window, cx| {
             let (state, panel) = (done_state, done_panel);
-            panel.update(cx, |p, cx| p.set_push_busy(false, cx));
+            panel.update(cx, |p, cx| {
+                if p.repo_context().as_ref() == Some(&context) {
+                    p.set_push_busy(false, cx);
+                }
+            });
             let failure = match result {
                 Ok(PushOutcome::Pushed(target)) => {
                     close_guarded(kind::GIT_PUSH, window, cx);
                     let message = pushed_summary(&target, count, truncated, force);
                     panel.update(cx, |p, cx| {
+                        if p.repo_context().as_ref() != Some(&context) {
+                            return;
+                        }
                         p.notify_result(message, Tone::Info, cx);
                         p.refresh_after_write(cx);
                     });
@@ -334,7 +341,11 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                 s.error = Some((text_state, hint));
                 cx.notify();
             });
-            panel.update(cx, |p, cx| p.refresh_after_write(cx));
+            panel.update(cx, |p, cx| {
+                if p.repo_context().as_ref() == Some(&context) {
+                    p.refresh_after_write(cx);
+                }
+            });
         },
         window,
         cx,
@@ -353,7 +364,11 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
         s.error = None;
         cx.notify();
     });
-    panel.update(cx, |p, cx| p.set_push_busy(true, cx));
+    panel.update(cx, |p, cx| {
+        if p.repo_context().as_ref() == Some(&repo) {
+            p.set_push_busy(true, cx);
+        }
+    });
 }
 
 /// 点一条待推送提交:取文件列表,开提交 diff 弹窗(叠在推送对话框之上)。
@@ -610,7 +625,7 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     .when(pushing, |el| {
         el.child(git_ui::busy_line(t("gitBranch", "pushing")))
     })
-    .when(!pushing && git_ui::gate::is_busy(&s.repo), |el| {
+    .when(!pushing && git_ui::gate::is_busy_key(&s.repo.key()), |el| {
         el.child(git_ui::notice_line(
             git_ui::gate_busy_text(),
             ui::color_warning(),
