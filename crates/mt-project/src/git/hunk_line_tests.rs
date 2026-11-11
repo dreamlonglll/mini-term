@@ -579,6 +579,50 @@ fn 按行拼接的末尾换行() {
     );
 }
 
+/// 块里最后一处改动整段选上了:末尾换行按整块的口径跟随来源侧(否则这处差异会落在重算出来
+/// 的块够不着的地方,见模块注释「按行操作」)。只选了最后一处的一部分、或只选了前面那处,
+/// 照旧保持被写那一侧原来的样子。不管先动哪一处,两处都动完都正好是另一侧。
+#[test]
+fn 最后一处改动整段选上时末尾换行跟随来源侧() {
+    use HunkDirection::{Apply, Revert};
+    // 两处改动隔着 6 行上下文,同在一块;后一处在文件末尾,来源侧没有末尾换行
+    let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n";
+    let new = "l1\nl2\nL3\nl4\nl5\nl6\nl7\nl8\nl9\nL10";
+    let tail = [("delete", "l10"), ("add", "L10")];
+    let head = [("delete", "l3"), ("add", "L3")];
+    assert_eq!(
+        splice_lines(old, new, &tail, Apply),
+        "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nL10"
+    );
+    assert_eq!(
+        splice_lines(old, new, &tail, Revert),
+        "l1\nl2\nL3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
+    );
+    // 只选了最后一处的一半 / 只选了前面那处:保持被写那一侧
+    assert_eq!(
+        splice_lines(old, new, &[("add", "L10")], Apply),
+        "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nL10\n"
+    );
+    assert_eq!(
+        splice_lines(old, new, &head, Apply),
+        "l1\nl2\nL3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n"
+    );
+    // 两种先后都收敛到另一侧(第二步时块里只剩一处,增删行全选 = 整块)
+    let finish = |cur: String, goal: &str, wanted: &[(&str, &str)], dir: HunkDirection| {
+        let (old, new) = match dir {
+            Apply => (cur.as_str(), goal),
+            Revert => (goal, cur.as_str()),
+        };
+        splice_lines(old, new, wanted, dir)
+    };
+    for (first, second) in [(&tail, &head), (&head, &tail)] {
+        let staged = splice_lines(old, new, first, Apply);
+        assert_eq!(finish(staged, new, second, Apply), new);
+        let discarded = splice_lines(old, new, first, Revert);
+        assert_eq!(finish(discarded, old, second, Revert), old);
+    }
+}
+
 /// 几块一趟拼:与「先拼第一块、重算 diff、再拼第二块」结果一样,第二块用整块。
 #[test]
 fn 多块一趟拼() {

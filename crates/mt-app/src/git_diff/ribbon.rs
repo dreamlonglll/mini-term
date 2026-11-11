@@ -46,8 +46,8 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use super::split::{ChangeKind, LEFT, RIGHT, SideRow, SplitFrame};
 use super::{
-    Busy, CHECK_W, DiffSide, DiffState, GUTTER, HunkOp, HunkUi, OpScope, Tick, fold, fold_bg,
-    fold_hover_bg, line_check, op_key, op_label, request_hunk_op, tick_mark,
+    Busy, CHECK_W, ChangeKey, DiffSide, DiffState, GUTTER, HunkOp, HunkUi, OpScope, Tick, fold,
+    fold_bg, fold_hover_bg, line_check, op_key, op_label, request_hunk_op, still_there, tick_mark,
 };
 use crate::i18n::{t, tr};
 use crate::ui;
@@ -389,34 +389,36 @@ fn change_controls(
     let xs = mid.slots();
     let total = s.flat.change_lines(c).len();
     let picked = s.picks_in_change(c);
+    let key = s.flat.change_key(c);
     let (left_op, right_op) = match hunk_ui.side {
         DiffSide::Unstaged => (Some(HunkOp::Discard), Some(HunkOp::Stage)),
         DiffSide::Staged => (Some(HunkOp::Unstage), None),
         DiffSide::Working => (None, None),
     };
+    let target = ArrowTarget {
+        change: c,
+        key,
+        total,
+        picked,
+    };
     let mut out = Vec::new();
     let arrow = |op: HunkOp, glyph: &'static str, x: f32, y: Option<f32>| {
-        y.map(|y| {
-            let target = ArrowTarget {
-                change: c,
-                total,
-                picked,
-            };
-            op_button(hunk_ui, op, glyph, (x, y), target)
-        })
+        y.map(|y| op_button(hunk_ui, op, glyph, (x, y), target))
     };
     out.extend(left_op.and_then(|op| arrow(op, "»", xs[0], ys[0])));
     if s.can_pick() && total > 0 {
-        out.extend(ys[1].map(|y| change_check(state, c, (xs[1], y), total, picked)));
+        out.extend(ys[1].map(|y| change_check(state, target, (xs[1], y))));
     }
     out.extend(right_op.and_then(|op| arrow(op, "«", xs[2], ys[2])));
     out
 }
 
-/// 箭头按钮作用的那一处改动:第几处、能勾的行数、勾了几行。
+/// 按钮作用的那一处改动:第几处、它的身份(点下去时核对序号还指不指着它,见
+/// [`ChangeKey`])、能勾的行数、勾了几行。
 #[derive(Debug, Clone, Copy)]
 struct ArrowTarget {
     change: usize,
+    key: Option<ChangeKey>,
     total: usize,
     picked: usize,
 }
@@ -481,6 +483,7 @@ fn op_button(
         ui::accent()
     };
     let (state, ctl) = (hunk_ui.state.clone(), hunk_ui.ctl.clone());
+    let key = target.key;
     chip(
         SharedString::from(format!("git-diff-ribbon-{}-{c}", op_key(op))),
         center,
@@ -493,7 +496,9 @@ fn op_button(
             .hover(move |el| el.border_color(color))
             .on_click(move |_: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                request_hunk_op(&state, &ctl, op, OpScope::Change(c), window, cx);
+                if still_there(&state, cx, |s| s.change_is(c, key)) {
+                    request_hunk_op(&state, &ctl, op, OpScope::Change(c), window, cx);
+                }
             })
     })
     .tip(tip)
@@ -501,13 +506,13 @@ fn op_button(
 }
 
 /// 中间那颗三态勾选框:一下勾上 / 取消这一处所有能勾的行(`total` 行里勾了 `picked` 行)。
-fn change_check(
-    state: &Entity<DiffState>,
-    c: usize,
-    center: (f32, f32),
-    total: usize,
-    picked: usize,
-) -> AnyElement {
+fn change_check(state: &Entity<DiffState>, target: ArrowTarget, center: (f32, f32)) -> AnyElement {
+    let ArrowTarget {
+        change: c,
+        key,
+        total,
+        picked,
+    } = target;
     let state = state.clone();
     chip(
         SharedString::from(format!("git-diff-ribbon-pick-{c}")),
@@ -519,7 +524,10 @@ fn change_check(
     .on_click(move |_: &ClickEvent, _window, cx| {
         cx.stop_propagation();
         state.update(cx, |s, cx| {
-            s.toggle_change_picks(c);
+            // 序号还指着渲染时那一处才翻(见 [`ChangeKey`])
+            if s.change_is(c, key) {
+                s.toggle_change_picks(c);
+            }
             cx.notify();
         });
     })

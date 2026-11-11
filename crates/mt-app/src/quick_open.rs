@@ -57,7 +57,8 @@
 //! 点遮罩是 Dialog 自带的。打开文件**先关窗再打开**:`close_dialog` 会把焦点还给打开面板之前的
 //! 那个元素,文件页的聚焦排在它后面才落得到编辑器上。
 //!
-//! 列号目前只解析不定位:文件页的定位([`LineTarget`])只到行。
+//! 列号目前只解析不定位:文件页的定位([`LineTarget`])只到行。跳到的行滚到视口正中
+//! ([`LineTarget::centered`],对标 IDEA 的 Ctrl+G);终端文件链接、全局搜索仍是顶到视口顶上。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -617,7 +618,7 @@ impl QuickOpenPanel {
         let Target::Local { project_id, .. } = self.target.clone() else {
             return;
         };
-        let line = self.goto.map(|goto| LineTarget::line(goto.line));
+        let line = self.goto.map(|goto| LineTarget::line(goto.line).centered());
         let path = if self.goto_only {
             crate::workbench_area::active_document_path(&project_id, cx)
         } else {

@@ -31,8 +31,8 @@ fn 命中行定位拒绝越界行号() {
     // 范围的终点夹到末行
     let range = |line, end| {
         Some(LineTarget {
-            line,
             end: Some(end),
+            ..LineTarget::line(line)
         })
     };
     assert_eq!(highlight_target(range(1, 222), text), range(1, 3));

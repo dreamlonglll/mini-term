@@ -948,9 +948,9 @@ impl DiffState {
             f32::from(view.top()),
             f32::from(view.bottom()),
         );
-        if let Some(side) = drag.pane.side() {
-            // 并排两栏:纵向改共用的滚动位置、横向改这一栏(另一栏跟上),当场写回两个列表
-            if (dx != 0.0 || dy != 0.0) && self.scroll_split(side, dx, dy) {
+        if drag.pane.side().is_some() {
+            // 并排两栏:纵横都改两栏共用的位置(见 `DiffState::scroll_split`),当场写回两个列表
+            if (dx != 0.0 || dy != 0.0) && self.scroll_split(dx, dy) {
                 cx.notify();
             }
         } else if dx != 0.0 || dy != 0.0 {
