@@ -761,7 +761,10 @@ fn text_pane(
             }
         },
     )
+    // ⚠️ 必须钉 top/left:绝对定位不写 inset 会落在静态位置(列表之后),整层往下偏一个视口高
     .absolute()
+    .top_0()
+    .left_0()
     .size_full();
 
     let body = div()
@@ -877,6 +880,8 @@ fn scroll_layer(
         },
     )
     .absolute()
+    .top_0()
+    .left_0()
     .size_full()
 }
 

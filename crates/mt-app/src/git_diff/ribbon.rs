@@ -282,6 +282,8 @@ pub(super) fn middle(
         },
     )
     .absolute()
+    .top_0()
+    .left_0()
     .size_full();
 
     let mut strip = div()
