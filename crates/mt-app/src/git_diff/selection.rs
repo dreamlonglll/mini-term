@@ -23,8 +23,9 @@
 //!
 //! - 并排视图的选区限定在**起拖的那一栏**([`Pane`]),复制只给那一侧,对侧是空占位的行跳过;
 //! - 行内视图复制的是行内容本身,不带行号、不带 `+` / `-`(它们本来就不在正文里);
-//! - hunk 头、行号列不可选:按下去不起选区、不弹菜单,块操作按钮照常点;拖选途经
-//!   hunk 头时它只占一个行位,复制时跳过。
+//! - hunk 头、折叠上下文的分隔行、行号列(含最左那列勾选框)不可选:按下去不起选区、
+//!   不弹菜单,块操作 / 展开按钮与勾选框照常点;拖选途经 hunk 头 / 分隔行时它只占一个
+//!   行位,复制时跳过。展开出来的上下文行是普通的行,照样能选、能复制。
 //!
 //! # 底色叠放
 //!
@@ -95,34 +96,41 @@ impl Flat {
         }
     }
 
-    /// 某栏第 `row` 行对应的拍平行([`Flat::lines`] 的下标)。hunk 头、并排视图里对侧
-    /// 占位的空格子都是 `None`。
+    /// 某栏第 `row` 行对应的拍平行([`Flat::lines`] 的下标)。hunk 头、折叠分隔行、并排
+    /// 视图里对侧占位的空格子都是 `None`。
     fn line_at(&self, pane: Pane, row: usize) -> Option<usize> {
         match pane {
             Pane::Inline => match self.inline_rows.get(row)? {
                 InlineRow::Line(ix) => Some(*ix),
-                InlineRow::Head(_) => None,
+                InlineRow::Head(_) | InlineRow::Fold(_) => None,
             },
             Pane::Old => match self.pair_rows.get(row)? {
                 PairRow::Line(left, _) => *left,
-                PairRow::Head(_) => None,
+                PairRow::Head(_) | PairRow::Fold(_) => None,
             },
             Pane::New => match self.pair_rows.get(row)? {
                 PairRow::Line(_, right) => *right,
-                PairRow::Head(_) => None,
+                PairRow::Head(_) | PairRow::Fold(_) => None,
             },
         }
     }
 
-    fn is_head(&self, pane: Pane, row: usize) -> bool {
+    /// 这一行是不是 hunk 头 / 折叠分隔行(不可选、按下去不起选区,上面的按钮照常点)。
+    fn is_divider(&self, pane: Pane, row: usize) -> bool {
         match pane {
-            Pane::Inline => matches!(self.inline_rows.get(row), Some(InlineRow::Head(_))),
-            Pane::Old | Pane::New => matches!(self.pair_rows.get(row), Some(PairRow::Head(_))),
+            Pane::Inline => matches!(
+                self.inline_rows.get(row),
+                Some(InlineRow::Head(_) | InlineRow::Fold(_))
+            ),
+            Pane::Old | Pane::New => matches!(
+                self.pair_rows.get(row),
+                Some(PairRow::Head(_) | PairRow::Fold(_))
+            ),
         }
     }
 
-    /// 拍平行的**原始**文本(tab 未展开):复制给的就是它。
-    fn raw_line(&self, ix: usize) -> &str {
+    /// 拍平行的**原始**文本(tab 未展开):复制给的就是它,勾选的内容键也按它算。
+    pub(super) fn raw_line(&self, ix: usize) -> &str {
         self.raw[ix].as_deref().unwrap_or(&self.lines[ix].content)
     }
 
@@ -440,6 +448,17 @@ fn row_at(y: f32, item_h: f32, count: usize) -> Option<usize> {
     (row < count).then_some(row)
 }
 
+/// 第 `at` 行(分隔行)展开后,它之后的行整体挪了 `delta`:选区端点在它之后的跟着挪,
+/// 在它之前的不动;落在分隔行本身上的留在原行号(展开后那里是第一行露出来的内容,或仍是
+/// 缩短了的分隔行)。
+fn shift_row(row: usize, at: usize, delta: isize) -> usize {
+    if row > at {
+        row.saturating_add_signed(delta).max(at)
+    } else {
+        row
+    }
+}
+
 /// 光标落点:离 `x` 最近的字符边界(显示文本的字节偏移)。
 ///
 /// gpui 的 `closest_index_for_x` 指针一越过最后一个字形的起点就直接给行尾,不比中点 ——
@@ -708,11 +727,16 @@ impl DiffState {
         handle.0.borrow().base_handle.clone()
     }
 
+    /// 某栏钉在左缘、不可选的行号栏有多宽:允许按行勾选时最左多一列勾选框。
+    fn gutter_w(&self, pane: Pane) -> f32 {
+        pane.gutter() + self.check_w()
+    }
+
     /// 指针 → 选区里的点。
     ///
-    /// `clamp = false`(按下):落在视口外、行号列、hunk 头上都不算(`None`);落在最后一行
-    /// 之下算最后一行的行尾。`clamp = true`(拖动):先把指针钳回正文可见区,hunk 头也算
-    /// (只占一个行位)。
+    /// `clamp = false`(按下):落在视口外、行号栏(含勾选框)、hunk 头 / 折叠分隔行上都
+    /// 不算(`None`);落在最后一行之下算最后一行的行尾。`clamp = true`(拖动):先把指针
+    /// 钳回正文可见区,hunk 头与分隔行也算(只占一个行位)。
     fn hit(&self, pane: Pane, pos: Point<Pixels>, clamp: bool) -> Option<Hit> {
         let count = self.flat.row_count(pane);
         if count == 0 {
@@ -725,7 +749,7 @@ impl DiffState {
         if right <= left || bottom <= top {
             return None;
         }
-        let text_left = left + pane.gutter();
+        let text_left = left + self.gutter_w(pane);
         let (mut x, mut y) = (f32::from(pos.x), f32::from(pos.y));
         if clamp {
             x = x.clamp(text_left.min(right), right);
@@ -739,7 +763,7 @@ impl DiffState {
             Some(row) => (row, false),
             None => (count - 1, true),
         };
-        if !clamp && !past_end && self.flat.is_head(pane, row) {
+        if !clamp && !past_end && self.flat.is_divider(pane, row) {
             return None;
         }
         let Some(raw) = self.flat.row_text(pane, row) else {
@@ -917,7 +941,7 @@ impl DiffState {
         let view = scroll.bounds();
         let dx = edge_speed(
             f32::from(drag.pointer.x),
-            f32::from(view.left()) + drag.pane.gutter(),
+            f32::from(view.left()) + self.gutter_w(drag.pane),
             f32::from(view.right()),
         );
         let dy = edge_speed(
@@ -954,6 +978,23 @@ impl DiffState {
         self.end_drag();
         self.select.selection = None;
         self.select.layouts.borrow_mut().clear();
+    }
+
+    /// 展开了一条分隔行:行内视图里它在第 `inline.0` 行、之后的行整体挪了 `inline.1` 行,
+    /// 并排视图同理(`pair`)。选区按它所在的视图跟着挪,选中的还是那几个字;排版登记的
+    /// 行下标对不上了,清掉(下一帧重新登记)。
+    pub(super) fn shift_selection(&mut self, inline: (usize, isize), pair: (usize, isize)) {
+        self.end_drag();
+        self.select.layouts.borrow_mut().clear();
+        let Some(sel) = self.select.selection.as_mut() else {
+            return;
+        };
+        let (at, delta) = match sel.pane {
+            Pane::Inline => inline,
+            Pane::Old | Pane::New => pair,
+        };
+        sel.anchor.row = shift_row(sel.anchor.row, at, delta);
+        sel.head.row = shift_row(sel.head.row, at, delta);
     }
 
     /// 选区里的文本。没有选区、或只框住了 hunk 头 / 空占位 → `None`。
@@ -1444,6 +1485,50 @@ mod tests {
         // 两层半透明:合成后的不透明度 = 0.5 + 0.5 × 0.5,颜色按各自的权重混
         let both = over(half_white, rgba(0.0, 0.0, 0.0, 0.5));
         assert!(close(both, rgba(2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.75)));
+    }
+
+    /// 展开分隔行后选区端点跟着挪:之后的整体平移,之前的与分隔行本身不动。
+    #[test]
+    fn 展开后选区行号平移() {
+        assert_eq!(shift_row(3, 5, 20), 3);
+        assert_eq!(shift_row(5, 5, 20), 5);
+        assert_eq!(shift_row(6, 5, 20), 26);
+        assert_eq!(shift_row(9, 5, 0), 9);
+        // 只剩一行的分隔行直接显示、行数不变;整段展开时 delta = 露出的行数 - 1
+        assert_eq!(shift_row(6, 5, 12), 18);
+    }
+
+    /// 折叠分隔行与 hunk 头一样不可选:复制跳过它、按下去不起选区;展开出来的上下文行能选能复制。
+    #[test]
+    fn 分隔行不进复制_展开行照常复制() {
+        use mt_project::git::diff_two_texts;
+        let old: String = (1..=30).map(|i| format!("l{i}\n")).collect();
+        let new = old.replacen("l15\n", "FIFTEEN\n", 1);
+        let diff = diff_two_texts(old.clone(), new);
+        let (f, _) = super::super::flatten_diff(&diff, &super::super::fold::Revealed::default());
+        // 行内视图:分隔(1..=11) / 头 / 12..=18(含删增两行) / 分隔(19..=30)
+        assert!(f.is_divider(Pane::Inline, 0));
+        assert!(f.is_divider(Pane::Inline, 1));
+        assert!(!f.is_divider(Pane::Inline, 2));
+        let last = f.inline_rows.len() - 1;
+        assert!(f.is_divider(Pane::Inline, last));
+        assert_eq!(
+            selected_text(&f, &sel(Pane::Inline, (0, 0), (2, 3))),
+            "l12",
+            "从分隔行拖起:分隔行与 hunk 头都跳过"
+        );
+
+        // 首段全部展开后:那 11 行是普通的上下文行,能复制
+        let mut revealed = super::super::fold::Revealed::default();
+        for no in 1..=11 {
+            revealed.insert(no, no, &format!("l{no}"));
+        }
+        let (f, _) = super::super::flatten_diff(&diff, &revealed);
+        assert!(!f.is_divider(Pane::Inline, 0));
+        assert_eq!(
+            selected_text(&f, &sel(Pane::Old, (9, 0), (12, 3))),
+            "l10\nl11\nl12"
+        );
     }
 
     /// 纵坐标换行号:按恒定行高取整,落在最后一行之下是 `None`。

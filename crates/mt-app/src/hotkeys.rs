@@ -567,6 +567,13 @@ pub fn bind_keys(cx: &mut App) {
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
     ));
+    // Esc 先清行勾选(按行暂存);没有勾选时处理器 `propagate`,落到 Dialog 自己那条
+    // Esc → 关弹窗。谓词比 Dialog 深,先试这一条(与提交历史过滤框的 Esc 同一手法)
+    bindings.push(KeyBinding::new(
+        "escape",
+        git_diff::GitDiffClearPicks,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
     // 提交 diff 弹窗:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换提交同一
     // 手感)。谓词是弹窗焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
     bindings.push(KeyBinding::new(

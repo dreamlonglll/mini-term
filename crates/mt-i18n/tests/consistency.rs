@@ -201,8 +201,12 @@ use mt_i18n::{
 /// 文件禁用按块操作的说明（`gitCommit.{hunkNonUtf8,hunkUnknownEncoding}`）；外部改动提示条的
 /// 「对比 / 保留我的」与对比弹窗（`fileViewer.{compareDisk,keepMine,keepMineTip,compareTitle,
 /// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
+/// 1564 → 1575：单文件 diff 按行暂存 —— 块头 / 工具栏「暂存 / 取消暂存 / 丢弃所选 N 行」、
+/// 按行丢弃的确认框、清除勾选按钮与提示（`gitCommit.{stageLines,unstageLines,discardLines,
+/// discardLinesTitle,discardLinesConfirm,clearPicks,clearPicksTip}`）；diff 正文折叠上下文的
+/// 分隔行与三颗展开按钮（`gitCommit.{foldedLines,expandDown,expandUp,expandAll}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1564;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1575;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
