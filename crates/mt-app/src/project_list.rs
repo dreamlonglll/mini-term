@@ -600,7 +600,9 @@ fn project_menu_actions(is_remote: bool) -> Vec<Option<ProjectMenuAction>> {
         out.push(Some(Worktrees));
         out.push(Some(ProjectKind));
     }
-    if is_remote { out.push(Some(Worktrees)); }
+    if is_remote {
+        out.push(Some(Worktrees));
+    }
     out.push(Some(GroupSection));
     out.push(None);
     out.push(Some(Remove));
@@ -2839,8 +2841,6 @@ mod tests {
             assert!(!tr.running(), "reduce 下一帧都不该请求");
         });
     }
-
-
 
     /// 远程徽章:本地项目没有;远程项目取连接名 + 摘要;连接被删 = 断链态。
     #[test]

@@ -454,9 +454,7 @@ fn keep_caret_in_view(input: &Entity<InputState>, cx: &mut App) {
 fn read_history_refs(repo: &GitContext) -> Option<HistoryRefs> {
     let branches = repo.get_repo_branches().ok()?;
     Some(HistoryRefs {
-        head: head_label_of(&branches, || {
-            repo.current_head_label().ok().flatten()
-        }),
+        head: head_label_of(&branches, || repo.current_head_label().ok().flatten()),
         branches,
     })
 }
@@ -725,14 +723,9 @@ impl GitHistoryContent {
                 let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
-                        let page = repo.get_git_log_filtered(
-                            after,
-                            PAGE_SIZE,
-                            branch.as_deref(),
-                            &filter,
-                        );
-                        let tags =
-                            first.then(|| repo.list_tags().unwrap_or_default());
+                        let page =
+                            repo.get_git_log_filtered(after, PAGE_SIZE, branch.as_deref(), &filter);
+                        let tags = first.then(|| repo.list_tags().unwrap_or_default());
                         let refs = first.then(|| read_history_refs(&repo)).flatten();
                         (page.map(|page| (page, tags)), refs)
                     })
@@ -767,13 +760,9 @@ impl GitHistoryContent {
                 let (result, refs) = cx
                     .background_executor()
                     .spawn(async move {
-                        let page = repo.get_git_log(
-                            after.as_deref(),
-                            Some(limit),
-                            branch.as_deref(),
-                        );
-                        let tags =
-                            first.then(|| repo.list_tags().unwrap_or_default());
+                        let page =
+                            repo.get_git_log(after.as_deref(), Some(limit), branch.as_deref());
+                        let tags = first.then(|| repo.list_tags().unwrap_or_default());
                         let refs = first.then(|| read_history_refs(&repo)).flatten();
                         (page.map(|page| (page, tags)), refs)
                     })
@@ -858,7 +847,10 @@ impl GitHistoryContent {
     /// 之后取,HEAD 名才是与首页同一时刻的。
     fn list_identity(&self) -> ListIdentity {
         ListIdentity::new(
-            &self.context.as_ref().map_or_else(String::new, GitContext::key),
+            &self
+                .context
+                .as_ref()
+                .map_or_else(String::new, GitContext::key),
             self.view_branch.as_deref(),
             self.head_branch.as_deref(),
             self.filter.active().then(|| self.filter.as_filter()),

@@ -57,18 +57,29 @@ fn cursor_wire_is_deterministic_preserves_order_and_rejects_invalid_oids() {
     let c = "3333333333333333333333333333333333333333";
     let cursor: GitLogCursor = serde_json::from_value(json!({
         "loaded":[b,a], "frontier":[c,b,a]
-    })).unwrap();
+    }))
+    .unwrap();
     let wire = serde_json::to_value(&cursor).unwrap();
     assert_eq!(wire, json!({"loaded":[a,b],"frontier":[c,b,a]}));
-    assert_eq!(cursor, serde_json::from_value::<GitLogCursor>(wire).unwrap());
+    assert_eq!(
+        cursor,
+        serde_json::from_value::<GitLogCursor>(wire).unwrap()
+    );
     for field in ["loaded", "frontier"] {
         let mut value = json!({"loaded":[],"frontier":[]});
         value[field] = json!(["not-an-oid"]);
-        assert!(serde_json::from_value::<GitLogCursor>(value).unwrap_err()
-            .to_string().contains(&format!("GitLogCursor.{field}[0]")));
+        assert!(
+            serde_json::from_value::<GitLogCursor>(value)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("GitLogCursor.{field}[0]"))
+        );
     }
     assert!(serde_json::from_value::<GitLogCursor>(json!({"loaded":[12],"frontier":[]})).is_err());
-    assert!(serde_json::from_value::<GitLogCursor>(json!({"loaded":[],"frontier":[],"unknown":[]})).is_err());
+    assert!(
+        serde_json::from_value::<GitLogCursor>(json!({"loaded":[],"frontier":[],"unknown":[]}))
+            .is_err()
+    );
 }
 
 #[test]
@@ -76,12 +87,21 @@ fn typed_worktree_failures_reconstruct_original_errors() {
     use mt_git_helper::GitFailure;
     use mt_project::git::WorktreeRemoveError;
     for original in [
-        WorktreeRemoveError::InUse { path: "/repo/wt".into(), busy: "/repo/wt/sub".into() },
-        WorktreeRemoveError::Leftover { path: "/repo/wt".into(), detail: "permission denied".into() },
+        WorktreeRemoveError::InUse {
+            path: "/repo/wt".into(),
+            busy: "/repo/wt/sub".into(),
+        },
+        WorktreeRemoveError::Leftover {
+            path: "/repo/wt".into(),
+            detail: "permission denied".into(),
+        },
     ] {
         let failure = GitFailure::from_error(original.clone().into());
         let wire = serde_json::to_vec(&failure).unwrap();
         let restored: GitFailure = serde_json::from_slice(&wire).unwrap();
-        assert_eq!(restored.into_error().downcast_ref::<WorktreeRemoveError>(), Some(&original));
+        assert_eq!(
+            restored.into_error().downcast_ref::<WorktreeRemoveError>(),
+            Some(&original)
+        );
     }
 }

@@ -2361,9 +2361,7 @@ pub fn open_combined_diff_loading(
     window.spawn(cx, async move |cx| {
         let files = cx
             .background_executor()
-            .spawn(
-                async move { task_repo.get_combined_commit_files(&task_hashes) },
-            )
+            .spawn(async move { task_repo.get_combined_commit_files(&task_hashes) })
             .await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_combined_diff(store, repo_path, hashes, files, initial, window, cx),
@@ -2842,7 +2840,12 @@ fn open_files_diff(
 ///
 /// ⚠️ **单提交里重命名的文件必须带旧路径**(`CommitDiffModal.tsx:57`),否则父树里查
 /// 不到旧内容,diff 会显示成「整文件新增」。
-fn load_modal_file(state: &Entity<DiffState>, repo_path: &GitContext, file: &ModalFile, cx: &mut App) {
+fn load_modal_file(
+    state: &Entity<DiffState>,
+    repo_path: &GitContext,
+    file: &ModalFile,
+    cx: &mut App,
+) {
     match &file.source {
         ModalFileSource::Commit(hash) => {
             let old_path = file.old_path.clone();
@@ -2866,11 +2869,7 @@ fn load_commit_file_at(
     old_path: Option<String>,
     cx: &mut App,
 ) {
-    let (repo, hash, path) = (
-        repo_path.clone(),
-        commit_hash.to_string(),
-        path.to_string(),
-    );
+    let (repo, hash, path) = (repo_path.clone(), commit_hash.to_string(), path.to_string());
     load_diff_with(state, cx, move || {
         repo.get_commit_file_diff(&hash, &path, old_path.as_deref())
     });

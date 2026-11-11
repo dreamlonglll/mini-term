@@ -162,10 +162,14 @@ impl RemoteGitClient {
     /// Send exactly once. A transport/protocol failure permanently invalidates this client.
     /// A helper-reported operation error does not invalidate an otherwise synchronized stream.
     pub fn request(&mut self, operation: Operation) -> Result<Reply, String> {
-        self.request_typed(operation).map_err(|error| error.to_string())
+        self.request_typed(operation)
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn request_typed(&mut self, operation: Operation) -> Result<Reply, mt_git_helper::GitFailure> {
+    pub(crate) fn request_typed(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Reply, mt_git_helper::GitFailure> {
         if self.transport.is_none() {
             return Err(
                 "remote Git client is closed; reconnect explicitly (never replay a failed write)"
@@ -201,13 +205,13 @@ impl RemoteGitClient {
                         response.protocol_version, response.id
                     ));
                 }
-                if let Ok(reply) = &response.result {
-                    if reply.kind() != expected_reply {
-                        return Err(format!(
-                            "remote Git response kind mismatch: expected {expected_reply}, got {}",
-                            reply.kind()
-                        ));
-                    }
+                if let Ok(reply) = &response.result
+                    && reply.kind() != expected_reply
+                {
+                    return Err(format!(
+                        "remote Git response kind mismatch: expected {expected_reply}, got {}",
+                        reply.kind()
+                    ));
                 }
                 transport.session.touch();
                 Ok(response.result)

@@ -24,8 +24,8 @@ const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const ASSET_ROOT_ENV: &str = "MT_REMOTE_GIT_HELPERS_DIR";
 static PARTIAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 type DeploymentLock = tokio::sync::Mutex<()>;
-static DEPLOYMENTS: LazyLock<Mutex<HashMap<(String, u64), Weak<DeploymentLock>>>> =
-    LazyLock::new(Default::default);
+type DeploymentRegistry = HashMap<(String, u64), Weak<DeploymentLock>>;
+static DEPLOYMENTS: LazyLock<Mutex<DeploymentRegistry>> = LazyLock::new(Default::default);
 
 fn deployment_lock(connection: &SshConnection) -> Arc<DeploymentLock> {
     let key = (connection.id.clone(), connection_fingerprint(connection));
@@ -50,14 +50,21 @@ pub(super) fn ensure_helper(connection: &SshConnection) -> Result<String, String
             let session = acquire_session(&pool, connection).await?;
             let result = deploy(connection, &pool, &session, deadline).await;
             if result.is_err() && session.is_unhealthy_now() {
-                let _ = tokio::time::timeout(Duration::from_secs(2),
-                    pool.evict_if_same(&connection.id, &session)).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    pool.evict_if_same(&connection.id, &session),
+                )
+                .await;
             }
             result
-        }).await.unwrap_or_else(|_| Err(format!(
-            "remote Git helper deployment timed out ({}s); no Git request was sent",
-            DEPLOY_TIMEOUT.as_secs(),
-        )))
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "remote Git helper deployment timed out ({}s); no Git request was sent",
+                DEPLOY_TIMEOUT.as_secs(),
+            ))
+        })
     })
 }
 
@@ -76,9 +83,14 @@ async fn deploy(
         let asset = select_asset(&executable, root.as_deref(), target)?;
         let digest = hash_asset(&asset)?;
         Ok::<_, String>((asset, digest))
-    }).await.map_err(|e| format!("reading remote Git helper asset: {e}"))??;
-    let sftp = Arc::new(SftpHandle::open_on_session(session.clone(), EXEC_TIMEOUT).await
-        .map_err(|e| format!("opening helper deployment SFTP: {}", e.message()))?);
+    })
+    .await
+    .map_err(|e| format!("reading remote Git helper asset: {e}"))??;
+    let sftp = Arc::new(
+        SftpHandle::open_on_session(session.clone(), EXEC_TIMEOUT)
+            .await
+            .map_err(|e| format!("opening helper deployment SFTP: {}", e.message()))?,
+    );
     let mut partial: Option<PartialCleanup> = None;
     let result = async {
         // Do not use the connection-ID-only home cache: configuration identity matters.
@@ -138,12 +150,17 @@ async fn deploy(
     // Cleanup also runs on every failure. Cancellation gets its own bounded background
     // cleanup through the guard, since an outer hard deadline can drop this future.
     if let Some(mut partial) = partial.take() {
-        match tokio::time::timeout(Duration::from_secs(3),
-            remove_partial(&sftp, &partial.path)).await
+        match tokio::time::timeout(Duration::from_secs(3), remove_partial(&sftp, &partial.path))
+            .await
         {
             Ok(Ok(())) => partial.armed = false,
-            _ => return Err(format!("{}; remote helper partial cleanup unconfirmed: '{}'",
-                result.err().unwrap_or_else(|| "helper deployed".into()), partial.path)),
+            _ => {
+                return Err(format!(
+                    "{}; remote helper partial cleanup unconfirmed: '{}'",
+                    result.err().unwrap_or_else(|| "helper deployed".into()),
+                    partial.path
+                ));
+            }
         }
     }
     // Dropping the last SFTP reference closes its channel and releases its session lease.
@@ -159,7 +176,12 @@ struct PartialCleanup {
 
 impl PartialCleanup {
     fn new(sftp: Arc<SftpHandle>, path: String) -> Self {
-        Self { sftp, path, runtime: tokio::runtime::Handle::current(), armed: true }
+        Self {
+            sftp,
+            path,
+            runtime: tokio::runtime::Handle::current(),
+            armed: true,
+        }
     }
 }
 
@@ -172,8 +194,9 @@ impl Drop for PartialCleanup {
                 // The upload primitive can finish its atomic promotion after cancellation.
                 // Wait for its request grace before removing our uniquely named partial.
                 tokio::time::sleep(FINISH_GRACE).await;
-                let cleanup = tokio::time::timeout(Duration::from_secs(5),
-                    remove_partial(&sftp, &path)).await;
+                let cleanup =
+                    tokio::time::timeout(Duration::from_secs(5), remove_partial(&sftp, &path))
+                        .await;
                 if !matches!(cleanup, Ok(Ok(()))) {
                     eprintln!("[remote-git] helper partial cleanup unconfirmed: '{path}'");
                 }
@@ -183,25 +206,40 @@ impl Drop for PartialCleanup {
 }
 
 async fn remove_partial(sftp: &SftpHandle, path: &str) -> Result<(), String> {
-    match sftp.try_node_kind(path).await.map_err(|e| e.message().to_string())? {
+    match sftp
+        .try_node_kind(path)
+        .await
+        .map_err(|e| e.message().to_string())?
+    {
         None => Ok(()),
-        Some(SftpNodeKind::File | SftpNodeKind::Symlink) =>
-            sftp.remove_file(path).await.map_err(|e| e.message().to_string()),
+        Some(SftpNodeKind::File | SftpNodeKind::Symlink) => sftp
+            .remove_file(path)
+            .await
+            .map_err(|e| e.message().to_string()),
         Some(_) => Err(format!("unsafe helper staging entry type at '{path}'")),
     }
 }
 
 async fn require_kind(sftp: &SftpHandle, path: &str, expected: SftpNodeKind) -> Result<(), String> {
-    let actual = sftp.try_node_kind(path).await.map_err(|e| e.message().to_string())?;
+    let actual = sftp
+        .try_node_kind(path)
+        .await
+        .map_err(|e| e.message().to_string())?;
     if actual != Some(expected) {
-        return Err(format!("unsafe remote Git helper path '{path}': expected {expected:?}, got {actual:?}"));
+        return Err(format!(
+            "unsafe remote Git helper path '{path}': expected {expected:?}, got {actual:?}"
+        ));
     }
     Ok(())
 }
 
 fn secure_directory_command(directory: &str, private: bool) -> String {
     let path = quote_posix(directory);
-    let permissions = if private { format!(" && chmod 700 {path}") } else { String::new() };
+    let permissions = if private {
+        format!(" && chmod 700 {path}")
+    } else {
+        String::new()
+    };
     format!(
         "if test -L {path}; then exit 73; fi; \
          if test ! -e {path}; then (umask 077; mkdir {path}) || test -d {path} || exit 73; fi; \
@@ -219,14 +257,20 @@ async fn verify_helper(
     deadline: Instant,
 ) -> Result<(), String> {
     let path_arg = quote_posix(path);
-    let hash = if target.starts_with("linux-") { "sha256sum" } else { "shasum -a 256" };
+    let hash = if target.starts_with("linux-") {
+        "sha256sum"
+    } else {
+        "shasum -a 256"
+    };
     let command = format!(
         "test ! -L {path_arg} && test -f {path_arg} && test -O {path_arg} && test -x {path_arg} && {hash} {path_arg}",
     );
     let output = exec(connection, pool, session, &command, deadline).await?;
     let actual = output.split_ascii_whitespace().next().unwrap_or_default();
     if actual != digest {
-        return Err(format!("remote Git helper SHA-256 mismatch at '{path}'; cached executable was not replaced"));
+        return Err(format!(
+            "remote Git helper SHA-256 mismatch at '{path}'; cached executable was not replaced"
+        ));
     }
     Ok(())
 }
@@ -242,23 +286,38 @@ async fn exec(
     if remaining <= FINISH_GRACE {
         return Err("remote Git helper deployment deadline reached".into());
     }
-    let output = run_bounded_exec_on_session(session, command,
-        EXEC_TIMEOUT.min(remaining - FINISH_GRACE), OUTPUT_CAP).await.map_err(|error| {
-            session.mark_unhealthy(Duration::from_secs(30));
-            format!("remote Git helper deployment SSH exec failed: {error}")
-        })?;
+    let output = run_bounded_exec_on_session(
+        session,
+        command,
+        EXEC_TIMEOUT.min(remaining - FINISH_GRACE),
+        OUTPUT_CAP,
+    )
+    .await
+    .map_err(|error| {
+        session.mark_unhealthy(Duration::from_secs(30));
+        format!("remote Git helper deployment SSH exec failed: {error}")
+    })?;
     if output.requires_session_retirement() {
         session.mark_unhealthy(Duration::from_secs(30));
-        let _ = tokio::time::timeout(Duration::from_secs(2),
-            pool.evict_if_same(&connection.id, session)).await;
-        return Err("remote Git helper deployment channel cleanup uncertain; SSH session retired".into());
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.evict_if_same(&connection.id, session),
+        )
+        .await;
+        return Err(
+            "remote Git helper deployment channel cleanup uncertain; SSH session retired".into(),
+        );
     }
-    if output.timed_out || output.exit_code != Some(0)
-        || output.stdout_truncated || output.stderr_truncated
+    if output.timed_out
+        || output.exit_code != Some(0)
+        || output.stdout_truncated
+        || output.stderr_truncated
     {
         return Err(format!(
             "remote Git helper deployment command failed (exit {:?}, timeout={}): {}",
-            output.exit_code, output.timed_out, String::from_utf8_lossy(&output.stderr).trim(),
+            output.exit_code,
+            output.timed_out,
+            String::from_utf8_lossy(&output.stderr).trim(),
         ));
     }
     String::from_utf8(output.stdout)
@@ -277,44 +336,71 @@ fn parse_target(platform: &str) -> Result<&'static str, String> {
         ("Linux", "aarch64" | "arm64") => Ok("linux-aarch64"),
         ("Darwin", "arm64" | "aarch64") => Ok("macos-aarch64"),
         ("Darwin", "x86_64" | "amd64") => Ok("macos-x86_64"),
-        _ => Err(format!("remote Git helper does not support server platform {os:?}/{arch:?}")),
+        _ => Err(format!(
+            "remote Git helper does not support server platform {os:?}/{arch:?}"
+        )),
     }
 }
 
-fn select_asset(executable: &Path, configured: Option<&Path>, target: &str) -> Result<PathBuf, String> {
-    let parent = executable.parent().ok_or("application executable has no resource directory")?;
-    let bundled = parent.join("remote-git-helpers").join(target).join("mt-git-helper");
+fn select_asset(
+    executable: &Path,
+    configured: Option<&Path>,
+    target: &str,
+) -> Result<PathBuf, String> {
+    let parent = executable
+        .parent()
+        .ok_or("application executable has no resource directory")?;
+    let bundled = parent
+        .join("remote-git-helpers")
+        .join(target)
+        .join("mt-git-helper");
     let asset = match std::fs::symlink_metadata(&bundled) {
         Ok(_) => bundled,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured
-            .map(|root| root.join(target).join("mt-git-helper")).unwrap_or(bundled),
-        Err(error) => return Err(format!("inspecting remote Git helper asset '{}': {error}", bundled.display())),
+            .map(|root| root.join(target).join("mt-git-helper"))
+            .unwrap_or(bundled),
+        Err(error) => {
+            return Err(format!(
+                "inspecting remote Git helper asset '{}': {error}",
+                bundled.display()
+            ));
+        }
     };
     let metadata = std::fs::symlink_metadata(&asset).map_err(|error| format!(
         "remote Git helper asset for {target} is unavailable at '{}': {error}; install a build containing remote-git-helpers/{target}/mt-git-helper",
         asset.display(),
     ))?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_ASSET_BYTES {
-        return Err(format!("remote Git helper asset '{}' must be a nonempty regular file of at most {MAX_ASSET_BYTES} bytes", asset.display()));
+        return Err(format!(
+            "remote Git helper asset '{}' must be a nonempty regular file of at most {MAX_ASSET_BYTES} bytes",
+            asset.display()
+        ));
     }
     Ok(asset)
 }
 
 fn hash_asset(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|e| format!("opening helper asset '{}': {e}", path.display()))?;
+    let mut file =
+        File::open(path).map_err(|e| format!("opening helper asset '{}': {e}", path.display()))?;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
-        let size = file.read(&mut buffer).map_err(|e| format!("reading helper asset '{}': {e}", path.display()))?;
-        if size == 0 { break }
+        let size = file
+            .read(&mut buffer)
+            .map_err(|e| format!("reading helper asset '{}': {e}", path.display()))?;
+        if size == 0 {
+            break;
+        }
         total += size as u64;
         if total > MAX_ASSET_BYTES {
             return Err("remote Git helper asset exceeded size limit while hashing".into());
         }
         hash.update(&buffer[..size]);
     }
-    if total == 0 { return Err("remote Git helper asset is empty".into()) }
+    if total == 0 {
+        return Err("remote Git helper asset is empty".into());
+    }
     use std::fmt::Write as _;
     let mut digest = String::with_capacity(64);
     for byte in hash.finalize() {
@@ -325,9 +411,14 @@ fn hash_asset(path: &Path) -> Result<String, String> {
 
 fn partial_path(directory: &str) -> String {
     let sequence = PARTIAL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default().as_nanos();
-    format!("{directory}/.mt-git-helper-{}-{time:x}-{sequence:x}.partial", std::process::id())
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{directory}/.mt-git-helper-{}-{time:x}-{sequence:x}.partial",
+        std::process::id()
+    )
 }
 
 #[cfg(test)]

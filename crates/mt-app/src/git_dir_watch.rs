@@ -107,7 +107,6 @@ pub struct RepoObservation {
     pub op: Option<RepoOpState>,
 }
 
-
 /// `old` → `new` 的差额:要撤掉的、要新挂的(各自保持 `new` / `old` 里的先后)。
 /// 两边都有上限(`WORKTREE_WATCH_DIR_LIMIT`,Linux 上 1024),主线程上不必 N² 地逐个 `contains`。
 fn dir_diff(old: &[PathBuf], new: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {

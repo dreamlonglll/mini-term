@@ -113,7 +113,8 @@ pub(super) fn file_menu(
     let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
     let mut entries = Vec::new();
     // 只做 stat、不开仓库(菜单是右键当场在 UI 线程上建的),远程 / 目录不查
-    let in_git_repo = !row.is_dir && (remote || mt_project::git::is_inside_git_repo(&root, &row.path));
+    let in_git_repo =
+        !row.is_dir && (remote || mt_project::git::is_inside_git_repo(&root, &row.path));
     for action in file_menu_actions(row.is_dir, row.git.is_some(), in_git_repo, remote) {
         let Some(action) = action else {
             entries.push(menu::separator());
@@ -405,8 +406,13 @@ pub(super) fn file_menu(
                 // HEAD → 工作区:文件树里看的是「相对上次提交改了什么」,暂存与否都算
                 let store = store.clone();
                 let repo = match connection.as_ref() {
-                    Some(connection) => mt_remote::GitContext::remote(connection.clone(), root.to_string_lossy().into_owned()),
-                    None if remote => mt_remote::GitContext::broken("SSH connection was removed".to_string()),
+                    Some(connection) => mt_remote::GitContext::remote(
+                        connection.clone(),
+                        root.to_string_lossy().into_owned(),
+                    ),
+                    None if remote => {
+                        mt_remote::GitContext::broken("SSH connection was removed".to_string())
+                    }
                     None => mt_remote::GitContext::local(root.to_string_lossy().into_owned()),
                 };
                 let rel = row.rel.clone();
@@ -435,8 +441,13 @@ pub(super) fn file_menu(
                 let store = store.clone();
                 let rel = row.rel.clone();
                 let project = match connection.as_ref() {
-                    Some(connection) => mt_remote::GitContext::remote(connection.clone(), root.to_string_lossy().into_owned()),
-                    None if remote => mt_remote::GitContext::broken("SSH connection was removed".to_string()),
+                    Some(connection) => mt_remote::GitContext::remote(
+                        connection.clone(),
+                        root.to_string_lossy().into_owned(),
+                    ),
+                    None if remote => {
+                        mt_remote::GitContext::broken("SSH connection was removed".to_string())
+                    }
                     None => mt_remote::GitContext::local(root.to_string_lossy().into_owned()),
                 };
                 menu::item(t("gitLog", "fileHistory.menu"), move |window, cx| {

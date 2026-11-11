@@ -6,8 +6,11 @@ struct Assets(PathBuf);
 
 impl Assets {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("mt-git-assets-test-{}-{}",
-            std::process::id(), TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "mt-git-assets-test-{}-{}",
+            std::process::id(),
+            TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -21,7 +24,9 @@ impl Assets {
 }
 
 impl Drop for Assets {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -34,7 +39,12 @@ fn platform_probe_selects_only_supported_exact_targets() {
     ] {
         assert_eq!(parse_target(probe).unwrap(), target);
     }
-    for unsupported in ["Linux\nriscv64\n", "FreeBSD\nx86_64\n", "Linux\n", "Linux\nx86_64\nnoise\n"] {
+    for unsupported in [
+        "Linux\nriscv64\n",
+        "FreeBSD\nx86_64\n",
+        "Linux\n",
+        "Linux\nx86_64\nnoise\n",
+    ] {
         assert!(parse_target(unsupported).is_err(), "{unsupported:?}");
     }
 }
@@ -45,7 +55,12 @@ fn bundled_assets_take_precedence_over_explicit_development_root() {
     let bundled = fixture.asset("remote-git-helpers", "linux-x86_64", b"bundled");
     fixture.asset("development", "linux-x86_64", b"development");
     let executable = fixture.0.join("mini-term");
-    let selected = select_asset(&executable, Some(&fixture.0.join("development")), "linux-x86_64").unwrap();
+    let selected = select_asset(
+        &executable,
+        Some(&fixture.0.join("development")),
+        "linux-x86_64",
+    )
+    .unwrap();
     assert_eq!(selected, bundled);
 }
 
@@ -54,7 +69,15 @@ fn explicit_resource_root_is_used_only_if_bundle_is_absent() {
     let fixture = Assets::new();
     let development = fixture.asset("development", "linux-aarch64", b"configured");
     let executable = fixture.0.join("mini-term");
-    assert_eq!(select_asset(&executable, Some(&fixture.0.join("development")), "linux-aarch64").unwrap(), development);
+    assert_eq!(
+        select_asset(
+            &executable,
+            Some(&fixture.0.join("development")),
+            "linux-aarch64"
+        )
+        .unwrap(),
+        development
+    );
     let error = select_asset(&executable, None, "linux-aarch64").unwrap_err();
     assert!(error.contains("linux-aarch64"));
     assert!(error.contains("unavailable"));
@@ -72,7 +95,14 @@ fn invalid_bundled_asset_never_silently_uses_development_asset() {
     let fixture = Assets::new();
     fixture.asset("remote-git-helpers", "linux-x86_64", b"");
     fixture.asset("development", "linux-x86_64", b"valid");
-    assert!(select_asset(&fixture.0.join("mini-term"), Some(&fixture.0.join("development")), "linux-x86_64").is_err());
+    assert!(
+        select_asset(
+            &fixture.0.join("mini-term"),
+            Some(&fixture.0.join("development")),
+            "linux-x86_64"
+        )
+        .is_err()
+    );
 }
 
 #[cfg(unix)]
@@ -80,7 +110,9 @@ fn invalid_bundled_asset_never_silently_uses_development_asset() {
 fn helper_asset_symlinks_are_rejected() {
     let fixture = Assets::new();
     let real = fixture.asset("development", "linux-x86_64", b"valid");
-    let bundled = fixture.0.join("remote-git-helpers/linux-x86_64/mt-git-helper");
+    let bundled = fixture
+        .0
+        .join("remote-git-helpers/linux-x86_64/mt-git-helper");
     std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real, &bundled).unwrap();
     assert!(select_asset(&fixture.0.join("mini-term"), None, "linux-x86_64").is_err());

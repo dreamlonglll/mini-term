@@ -179,7 +179,8 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
                 match result {
                     Ok(page) => {
                         s.repo_root = Some(
-                            s.project_root.with_path(page.repo_root.to_string_lossy().into_owned()),
+                            s.project_root
+                                .with_path(page.repo_root.to_string_lossy().into_owned()),
                         );
                         s.path_in_repo = Some(page.path_in_repo);
                         s.scanned += page.scanned;

@@ -1049,18 +1049,24 @@ struct GitLogCursorWire {
 }
 
 impl Serialize for GitLogCursor {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         let mut loaded: Vec<_> = self.loaded.iter().map(ToString::to_string).collect();
         loaded.sort_unstable();
         GitLogCursorWire {
             loaded,
             frontier: self.frontier.iter().map(ToString::to_string).collect(),
-        }.serialize(serializer)
+        }
+        .serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for GitLogCursor {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let wire = GitLogCursorWire::deserialize(deserializer)?;
         let parse = |field: &str, values: Vec<String>| -> std::result::Result<Vec<Oid>, D::Error> {
             values.into_iter().enumerate().map(|(index, value)| {
@@ -1113,7 +1119,11 @@ impl GitLogCursor {
         let mut loaded = self.loaded.clone();
         loaded.extend(page.loaded);
         let mut queued = HashSet::new();
-        let frontier = self.frontier.iter().copied().chain(page.frontier)
+        let frontier = self
+            .frontier
+            .iter()
+            .copied()
+            .chain(page.frontier)
             .filter(|oid| !loaded.contains(oid) && queued.insert(*oid))
             .collect();
         Self { loaded, frontier }

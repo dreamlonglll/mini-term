@@ -41,10 +41,11 @@ impl Drop for WriteGuard {
     }
 }
 
-
 /// Occupy an already backend-qualified identity without host path normalization.
 pub fn try_acquire_key(key: &str) -> Option<WriteGuard> {
-    if key.is_empty() { return None; }
+    if key.is_empty() {
+        return None;
+    }
     let key = key.to_string();
     let inserted = HELD.with(|held| held.borrow_mut().insert(key.clone()));
     inserted.then_some(WriteGuard {
@@ -52,7 +53,6 @@ pub fn try_acquire_key(key: &str) -> Option<WriteGuard> {
         _ui_thread: PhantomData,
     })
 }
-
 
 /// Test an already backend-qualified identity; remote POSIX case is significant.
 pub fn is_busy_key(key: &str) -> bool {
@@ -70,7 +70,10 @@ mod tests {
         assert!(!is_busy_key(repo));
         let guard = try_acquire_key(repo).expect("空闲时占得到");
         assert!(is_busy_key(repo));
-        assert!(try_acquire_key(repo).is_none(), "同一仓库不许第二个写操作进去");
+        assert!(
+            try_acquire_key(repo).is_none(),
+            "同一仓库不许第二个写操作进去"
+        );
         let other = try_acquire_key("/tmp/gate-b").expect("别的仓库不受影响");
         drop(guard);
         assert!(!is_busy_key(repo));

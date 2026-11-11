@@ -144,7 +144,11 @@ impl AppStore {
     }
 
     /// Git worktrees are identified by execution backend as well as path.
-    pub fn find_project_by_backend_path(&self, connection_id: Option<&str>, path: &str) -> Option<&ProjectConfig> {
+    pub fn find_project_by_backend_path(
+        &self,
+        connection_id: Option<&str>,
+        path: &str,
+    ) -> Option<&ProjectConfig> {
         match connection_id {
             None => self.find_project_by_path(path),
             Some(connection_id) => self.config.projects.iter().find(|project| {
@@ -169,22 +173,29 @@ impl AppStore {
             return self.add_project_at(Path::new(&path), parent.as_deref(), cx);
         };
         let id = self.fresh_project_id();
-        let parent = parent.filter(|id| self.config.projects.iter().any(|project| {
-            project.id == *id && project.ssh_connection_id.as_deref() == Some(connection_id.as_str())
-        }));
+        let parent = parent.filter(|id| {
+            self.config.projects.iter().any(|project| {
+                project.id == *id
+                    && project.ssh_connection_id.as_deref() == Some(connection_id.as_str())
+            })
+        });
         self.config.projects.push(ProjectConfig {
             ssh_connection_id: Some(connection_id),
             parent_project_id: parent.clone(),
             ..ProjectConfig::new(id.clone(), name, path)
         });
         if parent.is_none() {
-            self.config.project_tree.get_or_insert_with(Vec::new)
+            self.config
+                .project_tree
+                .get_or_insert_with(Vec::new)
                 .push(mt_config::ProjectTreeItem::ProjectId(id.clone()));
         }
         self.project_states.insert(id.clone(), ProjectState::new());
         self.expanded_dirs.insert(id.clone(), HashSet::new());
         self.save_config_soon(cx);
-        if parent.is_none() { cx.emit(StoreEvent::ProjectTreeChanged); }
+        if parent.is_none() {
+            cx.emit(StoreEvent::ProjectTreeChanged);
+        }
         cx.changed(StoreEvent::ProjectsChanged);
         id
     }

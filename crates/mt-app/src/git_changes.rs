@@ -1248,7 +1248,9 @@ impl GitChanges {
     /// 仓库的写操作闸被别的区占着(面板在拉取、历史区在拣选…):行内 / 组操作与提交
     /// 按钮按它禁用。自己在跑的那一件由 `busy_ops` / `committing` 管。
     fn gated(&self) -> bool {
-        self.context.as_ref().is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+        self.context
+            .as_ref()
+            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
     }
 
     /// 整文件操作能不能点:自己没在跑、闸也没被别人占。render 里只问一次、传给每一行
@@ -1371,12 +1373,7 @@ impl GitChanges {
         if paths.is_empty() {
             return;
         }
-        self.run_op(
-            move |repo| repo.git_stage(&paths),
-            reselect,
-            window,
-            cx,
-        );
+        self.run_op(move |repo| repo.git_stage(&paths), reselect, window, cx);
     }
 
     fn unstage(
@@ -1389,12 +1386,7 @@ impl GitChanges {
         if paths.is_empty() {
             return;
         }
-        self.run_op(
-            move |repo| repo.git_unstage(&paths),
-            reselect,
-            window,
-            cx,
-        );
+        self.run_op(move |repo| repo.git_unstage(&paths), reselect, window, cx);
     }
 
     /// 某个分组的全部路径。
@@ -1499,9 +1491,7 @@ impl GitChanges {
                 .spawn(async move {
                     checked
                         .into_iter()
-                        .filter(|p| {
-                            repo.has_conflict_markers(p).unwrap_or(false)
-                        })
+                        .filter(|p| repo.has_conflict_markers(p).unwrap_or(false))
                         .collect()
                 })
                 .await;
@@ -1972,9 +1962,7 @@ impl GitChanges {
 /// 「已推送」判定的缓存键:引用那一半签名(HEAD + 全部引用)。只看 HEAD 不够 —— 推送 /
 /// fetch 挪了远程跟踪分支,同一个 HEAD 的判定也会变。读不到为 `None`(当作变了)。
 fn amend_key_of(repo: &GitContext) -> Option<u64> {
-    repo.repo_signature()
-        .ok()
-        .map(|sig| sig.refs)
+    repo.repo_signature().ok().map(|sig| sig.refs)
 }
 
 /// 手上那份 amend 信息还作不作数:键读不到、或与取它时的键不同,都要重取。
@@ -2734,11 +2722,7 @@ impl GitChanges {
             && let Some(file) = self.changes.get(index)
             && let Some(repo) = self.context.clone()
         {
-            let (store, repo, rel) = (
-                self.store.clone(),
-                repo,
-                file.path.clone(),
-            );
+            let (store, repo, rel) = (self.store.clone(), repo, file.path.clone());
             entries.push(menu::separator());
             entries.push(menu::item(
                 t("gitLog", "fileHistory.menu"),
@@ -3087,13 +3071,7 @@ impl GitChanges {
                 }
             });
         });
-        crate::git_stash::open_save(
-            self.store.clone(),
-            repo,
-            on_changed,
-            window,
-            cx,
-        );
+        crate::git_stash::open_save(self.store.clone(), repo, on_changed, window, cx);
     }
 }
 

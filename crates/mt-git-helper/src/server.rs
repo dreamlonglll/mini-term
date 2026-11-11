@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail, ensure};
 use mt_project::git;
 
 use crate::{
-    ChangesSnapshot, Hello, HistoryPage, Operation, PROTOCOL_VERSION, PushPreview,
-    Reply, Request, Response, encode_frame, read_frame, write_frame,
+    ChangesSnapshot, Hello, HistoryPage, Operation, PROTOCOL_VERSION, PushPreview, Reply, Request,
+    Response, encode_frame, read_frame, write_frame,
 };
 
 mod advanced;
@@ -42,7 +42,9 @@ pub fn serve(root: &Path, mut reader: impl Read, mut writer: impl Write) -> Resu
                 request.protocol_version
             )))
         } else {
-            server.dispatch(request.operation).map_err(crate::GitFailure::from_error)
+            server
+                .dispatch(request.operation)
+                .map_err(crate::GitFailure::from_error)
         };
         let response = Response {
             protocol_version: PROTOCOL_VERSION,
@@ -194,7 +196,13 @@ impl Server {
                     amend: git::amend_info(&repo)?,
                 })
             }
-            Operation::Log { repo, after, limit, branch, filter } => {
+            Operation::Log {
+                repo,
+                after,
+                limit,
+                branch,
+                filter,
+            } => {
                 let repo = self.repository(&repo)?;
                 ensure!(limit > 0, "history page limit must be greater than zero");
                 let (commits, next, scanned) = if let Some(filter) = filter {
@@ -205,10 +213,12 @@ impl Server {
                             validate_path(&repo, &path, false)?;
                         }
                     }
-                    let page = git::get_git_log_filtered(&repo, after, limit, branch.as_deref(), &filter)?;
+                    let page =
+                        git::get_git_log_filtered(&repo, after, limit, branch.as_deref(), &filter)?;
                     (page.commits, page.next, page.scanned)
                 } else {
-                    let commits = git::get_git_log(&repo, after.as_ref(), Some(limit), branch.as_deref())?;
+                    let commits =
+                        git::get_git_log(&repo, after.as_ref(), Some(limit), branch.as_deref())?;
                     let cursor = match after {
                         Some(after) => after.advance(&commits),
                         None => git::GitLogCursor::from_loaded(&commits),
@@ -218,7 +228,12 @@ impl Server {
                     let scanned = commits.len();
                     (commits, has_next.then_some(cursor), scanned)
                 };
-                data(HistoryPage { commits, next, scanned, tags: git::list_tags(&repo)? })
+                data(HistoryPage {
+                    commits,
+                    next,
+                    scanned,
+                    tags: git::list_tags(&repo)?,
+                })
             }
             Operation::CommitDetail { repo, hash } => {
                 let repo = self.repository(&repo)?;
@@ -228,15 +243,29 @@ impl Server {
                 let repo = self.repository(&repo)?;
                 data(git::get_commit_files(&repo, &hash)?)
             }
-            Operation::CommitDiff { repo, hash, path, old_path } => {
+            Operation::CommitDiff {
+                repo,
+                hash,
+                path,
+                old_path,
+            } => {
                 let repo = self.repository(&repo)?;
                 validate_path(&repo, &path, false)?;
                 if let Some(old_path) = &old_path {
                     validate_path(&repo, old_path, false)?;
                 }
-                data(git::get_commit_file_diff(&repo, &hash, &path, old_path.as_deref())?)
+                data(git::get_commit_file_diff(
+                    &repo,
+                    &hash,
+                    &path,
+                    old_path.as_deref(),
+                )?)
             }
-            Operation::CommitWith { repo, message, amend } => {
+            Operation::CommitWith {
+                repo,
+                message,
+                amend,
+            } => {
                 let repo = self.repository(&repo)?;
                 data(git::git_commit_with(&repo, &message, amend)?)
             }
@@ -246,25 +275,44 @@ impl Server {
                 git::discard_unstaged(&repo, &paths)?;
                 data(())
             }
-            Operation::StageHunk { repo, path, diff, hunk } => {
+            Operation::StageHunk {
+                repo,
+                path,
+                diff,
+                hunk,
+            } => {
                 let project = self.project_directory(&repo)?;
                 let (repo, path) = self.resolve_file(&project, &path, true)?;
                 git::stage_hunk(&repo, &path, &diff, hunk)?;
                 data(())
             }
-            Operation::UnstageHunk { repo, path, diff, hunk } => {
+            Operation::UnstageHunk {
+                repo,
+                path,
+                diff,
+                hunk,
+            } => {
                 let project = self.project_directory(&repo)?;
                 let (repo, path) = self.resolve_file(&project, &path, true)?;
                 git::unstage_hunk(&repo, &path, &diff, hunk)?;
                 data(())
             }
-            Operation::DiscardHunk { repo, path, diff, hunk } => {
+            Operation::DiscardHunk {
+                repo,
+                path,
+                diff,
+                hunk,
+            } => {
                 let project = self.project_directory(&repo)?;
                 let (repo, path) = self.resolve_file(&project, &path, true)?;
                 git::discard_hunk(&repo, &path, &diff, hunk)?;
                 data(())
             }
-            Operation::Checkout { repo, branch, remote } => {
+            Operation::Checkout {
+                repo,
+                branch,
+                remote,
+            } => {
                 let repo = self.repository(&repo)?;
                 let outcome = if remote {
                     Some(git::checkout_remote_branch(&repo, &branch)?)
@@ -274,7 +322,12 @@ impl Server {
                 };
                 data(outcome)
             }
-            Operation::CreateBranch { repo, name, start, checkout } => {
+            Operation::CreateBranch {
+                repo,
+                name,
+                start,
+                checkout,
+            } => {
                 let repo = self.repository(&repo)?;
                 git::create_branch(&repo, &name, start.as_deref(), checkout)?;
                 data(())
@@ -299,7 +352,11 @@ impl Server {
                     None => git::git_pull_by_config(&repo)?,
                 })
             }
-            Operation::PushPreview { repo, branch, limit } => {
+            Operation::PushPreview {
+                repo,
+                branch,
+                limit,
+            } => {
                 let repo = self.repository(&repo)?;
                 data(PushPreview {
                     plan: git::push_plan(&repo, branch.as_deref())?,
@@ -318,7 +375,13 @@ impl Server {
                 let repo = self.repository(&repo)?;
                 data(git::stash_save(&repo, &options)?)
             }
-            Operation::ApplyStash { repo, index, hash, pop, reinstate } => {
+            Operation::ApplyStash {
+                repo,
+                index,
+                hash,
+                pop,
+                reinstate,
+            } => {
                 let repo = self.repository(&repo)?;
                 data(if pop {
                     git::stash_pop(&repo, index, reinstate, Some(&hash))?
@@ -357,16 +420,23 @@ impl Server {
 }
 
 fn data(value: impl serde::Serialize) -> Result<Reply> {
-    Ok(Reply::Data { value: serde_json::to_value(value).context("encoding Git reply data")? })
+    Ok(Reply::Data {
+        value: serde_json::to_value(value).context("encoding Git reply data")?,
+    })
 }
 
 fn validate_file_repository(repo: &Path, path: &str) -> Result<()> {
     // Core working-tree diff/hunk operations discover from the file's directory.
     // Never silently switch to an undiscovered nested repository.
     let file = repo.join(path);
-    let parent = file.ancestors().skip(1).find(|parent| parent.is_dir()).unwrap_or(repo);
+    let parent = file
+        .ancestors()
+        .skip(1)
+        .find(|parent| parent.is_dir())
+        .unwrap_or(repo);
     let enclosing = git::enclosing_repo(parent)
-        .context("file is not in a discoverable repository")?.canonicalize()?;
+        .context("file is not in a discoverable repository")?
+        .canonicalize()?;
     ensure!(enclosing == repo, "file belongs to a different repository");
     Ok(())
 }

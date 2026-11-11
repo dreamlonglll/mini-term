@@ -61,18 +61,27 @@ impl RemoteGitWorkspace {
         // Length-prefix strings because connection IDs and POSIX paths may contain `|`.
         format!(
             "ssh|{}:{}|{:016x}|{}:{}|{}:{}",
-            self.inner.connection.id.len(), self.inner.connection.id, self.inner.fingerprint,
-            self.inner.root.len(), self.inner.root, repo.len(), repo,
+            self.inner.connection.id.len(),
+            self.inner.connection.id,
+            self.inner.fingerprint,
+            self.inner.root.len(),
+            self.inner.root,
+            repo.len(),
+            repo,
         )
     }
 
     /// Send one operation, once. A failed write is never replayed, including on reconnect.
     /// After an uncertain write, an explicit successful read is required before another write.
     pub fn request(&self, operation: Operation) -> Result<Reply, String> {
-        self.request_typed(operation).map_err(|error| error.to_string())
+        self.request_typed(operation)
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn request_typed(&self, operation: Operation) -> Result<Reply, mt_git_helper::GitFailure> {
+    pub(crate) fn request_typed(
+        &self,
+        operation: Operation,
+    ) -> Result<Reply, mt_git_helper::GitFailure> {
         self.inner.ensure_active()?;
         validate_absolute_path(&self.inner.root, "root")?;
         let epoch = self.inner.epoch.load(Ordering::Acquire);
@@ -97,7 +106,9 @@ impl RemoteGitWorkspace {
                 return Err("remote Git workspace was closed during helper deployment".into());
             }
             slot.client = Some(RemoteGitClient::connect(
-                &self.inner.connection, &helper, &self.inner.root,
+                &self.inner.connection,
+                &helper,
+                &self.inner.root,
             )?);
         }
         if let Err(error) = self.inner.ensure_active() {
@@ -135,7 +146,9 @@ impl WorkspaceInner {
             return Err("remote Git service is shutting down".into());
         }
         if self.invalidated.load(Ordering::Acquire) {
-            return Err("SSH connection configuration changed; reopen this remote Git workspace".into());
+            return Err(
+                "SSH connection configuration changed; reopen this remote Git workspace".into(),
+            );
         }
         Ok(())
     }

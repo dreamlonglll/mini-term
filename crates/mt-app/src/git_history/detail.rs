@@ -429,9 +429,9 @@ impl GitHistoryContent {
         cx.spawn(async move |this, cx| {
             // 详情与行数一起开跑,详情先回来先画
             let (detail_repo, detail_hash) = (repo.clone(), hash.clone());
-            let detail_task = cx.background_executor().spawn(async move {
-                detail_repo.get_commit_detail(&detail_hash)
-            });
+            let detail_task = cx
+                .background_executor()
+                .spawn(async move { detail_repo.get_commit_detail(&detail_hash) });
             let stats_hash = hash.clone();
             let stats_task = cx
                 .background_executor()
@@ -527,9 +527,7 @@ impl GitHistoryContent {
             let task_hashes = hashes.clone();
             let result = cx
                 .background_executor()
-                .spawn(
-                    async move { repo.get_combined_commit_files(&task_hashes) },
-                )
+                .spawn(async move { repo.get_combined_commit_files(&task_hashes) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.detail.request != req {

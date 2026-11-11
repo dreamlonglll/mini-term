@@ -4,23 +4,41 @@ use std::time::{Duration, Instant};
 
 fn connection() -> SshConnection {
     SshConnection {
-        id: "managed-git-unit-test".into(), name: "test".into(), host: "example.invalid".into(),
-        port: 22, user: "tester".into(), password: None, identity_file: None,
-        group: None, extra: Default::default(),
+        id: "managed-git-unit-test".into(),
+        name: "test".into(),
+        host: "example.invalid".into(),
+        port: 22,
+        user: "tester".into(),
+        password: None,
+        identity_file: None,
+        group: None,
+        extra: Default::default(),
     }
 }
 
 #[test]
 fn repository_identity_includes_endpoint_root_and_case_sensitive_repo() {
     let base = RemoteGitWorkspace::new(connection(), "/Project".into());
-    assert_eq!(base.repository_key("/Project/Repo"), base.clone().repository_key("/Project/Repo"));
-    assert_ne!(base.repository_key("/Project/Repo"), base.repository_key("/Project/repo"));
+    assert_eq!(
+        base.repository_key("/Project/Repo"),
+        base.clone().repository_key("/Project/Repo")
+    );
+    assert_ne!(
+        base.repository_key("/Project/Repo"),
+        base.repository_key("/Project/repo")
+    );
     let root = RemoteGitWorkspace::new(connection(), "/project".into());
-    assert_ne!(base.repository_key("/Project/Repo"), root.repository_key("/Project/Repo"));
+    assert_ne!(
+        base.repository_key("/Project/Repo"),
+        root.repository_key("/Project/Repo")
+    );
     let mut changed = connection();
     changed.host = "other.invalid".into();
     let endpoint = RemoteGitWorkspace::new(changed, "/Project".into());
-    assert_ne!(base.repository_key("/Project/Repo"), endpoint.repository_key("/Project/Repo"));
+    assert_ne!(
+        base.repository_key("/Project/Repo"),
+        endpoint.repository_key("/Project/Repo")
+    );
     // Separators inside strings cannot alias another identity.
     let mut a = connection();
     a.id = "id|x".into();
@@ -60,7 +78,10 @@ fn closing_never_waits_for_the_workspace_request_mutex() {
     let elapsed = start.elapsed();
     release_tx.send(()).unwrap();
     worker.join().unwrap();
-    assert!(elapsed < Duration::from_millis(250), "close blocked for {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "close blocked for {elapsed:?}"
+    );
 }
 
 #[test]

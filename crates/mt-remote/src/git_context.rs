@@ -35,37 +35,70 @@ pub struct GitContext {
 
 impl std::fmt::Debug for GitContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitContext").field("key", &self.key()).field("path", &self.path).finish()
+        f.debug_struct("GitContext")
+            .field("key", &self.key())
+            .field("path", &self.path)
+            .finish()
     }
 }
-impl PartialEq for GitContext { fn eq(&self, other: &Self) -> bool { self.key() == other.key() } }
+impl PartialEq for GitContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
 impl Eq for GitContext {}
 
 impl GitContext {
-    pub fn local(path: impl Into<String>) -> Self { Self { backend: Backend::Local, path: path.into() } }
+    pub fn local(path: impl Into<String>) -> Self {
+        Self {
+            backend: Backend::Local,
+            path: path.into(),
+        }
+    }
 
     pub fn remote(connection: SshConnection, root: String) -> Self {
         let fingerprint = connection_fingerprint(&connection);
         let mut remotes = lock(&REMOTES);
         remotes.retain(|remote| remote.strong_count() != 0);
-        let backend = remotes.iter().filter_map(Weak::upgrade).find(|remote|
-            remote.connection.id == connection.id && remote.fingerprint == fingerprint && remote.root == root
-        ).unwrap_or_else(|| {
-            let backend = Arc::new(RemoteBackend {
-                workspace: RemoteGitWorkspace::new(connection.clone(), root.clone()),
-                connection, fingerprint, root: root.clone(),
+        let backend = remotes
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|remote| {
+                remote.connection.id == connection.id
+                    && remote.fingerprint == fingerprint
+                    && remote.root == root
+            })
+            .unwrap_or_else(|| {
+                let backend = Arc::new(RemoteBackend {
+                    workspace: RemoteGitWorkspace::new(connection.clone(), root.clone()),
+                    connection,
+                    fingerprint,
+                    root: root.clone(),
+                });
+                remotes.push(Arc::downgrade(&backend));
+                backend
             });
-            remotes.push(Arc::downgrade(&backend));
-            backend
-        });
-        Self { backend: Backend::Remote(backend), path: root }
+        Self {
+            backend: Backend::Remote(backend),
+            path: root,
+        }
     }
 
     pub fn broken(message: impl Into<String>) -> Self {
-        Self { backend: Backend::Broken(Arc::from(message.into())), path: String::new() }
+        Self {
+            backend: Backend::Broken(Arc::from(message.into())),
+            path: String::new(),
+        }
     }
-    pub fn with_path(&self, path: impl Into<String>) -> Self { Self { backend: self.backend.clone(), path: path.into() } }
-    pub fn path(&self) -> &str { &self.path }
+    pub fn with_path(&self, path: impl Into<String>) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            path: path.into(),
+        }
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
     pub fn key(&self) -> String {
         match &self.backend {
             Backend::Local => {
@@ -77,94 +110,190 @@ impl GitContext {
             }
             Backend::Remote(remote) => {
                 let path = mt_core::path_key::posix_trim_trailing(&self.path);
-                format!("ssh|{}:{}|{:016x}|{}:{}",
-                    remote.connection.id.len(), remote.connection.id, remote.fingerprint, path.len(), path)
+                format!(
+                    "ssh|{}:{}|{:016x}|{}:{}",
+                    remote.connection.id.len(),
+                    remote.connection.id,
+                    remote.fingerprint,
+                    path.len(),
+                    path
+                )
             }
-            Backend::Broken(message) => format!("broken|{}:{message}|{}:{}", message.len(), self.path.len(), self.path),
+            Backend::Broken(message) => format!(
+                "broken|{}:{message}|{}:{}",
+                message.len(),
+                self.path.len(),
+                self.path
+            ),
         }
     }
-    pub fn is_remote(&self) -> bool { matches!(self.backend, Backend::Remote(_)) }
-    pub fn local_path(&self) -> Option<&Path> { matches!(self.backend, Backend::Local).then(|| Path::new(&self.path)) }
-    pub fn connection(&self) -> Option<&SshConnection> { match &self.backend { Backend::Remote(remote) => Some(&remote.connection), _ => None } }
-    pub fn connection_id(&self) -> Option<&str> { self.connection().map(|connection| connection.id.as_str()) }
-    pub fn close(&self) { if let Backend::Remote(remote) = &self.backend { remote.workspace.close(); } }
+    pub fn is_remote(&self) -> bool {
+        matches!(self.backend, Backend::Remote(_))
+    }
+    pub fn local_path(&self) -> Option<&Path> {
+        matches!(self.backend, Backend::Local).then(|| Path::new(&self.path))
+    }
+    pub fn connection(&self) -> Option<&SshConnection> {
+        match &self.backend {
+            Backend::Remote(remote) => Some(&remote.connection),
+            _ => None,
+        }
+    }
+    pub fn connection_id(&self) -> Option<&str> {
+        self.connection().map(|connection| connection.id.as_str())
+    }
+    pub fn close(&self) {
+        if let Backend::Remote(remote) = &self.backend {
+            remote.workspace.close();
+        }
+    }
 
     fn request(&self, operation: O) -> Result<Reply> {
         match &self.backend {
-            Backend::Remote(remote) => remote.workspace.request_typed(operation).map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Remote(remote) => remote
+                .workspace
+                .request_typed(operation)
+                .map_err(mt_git_helper::GitFailure::into_error),
             Backend::Broken(message) => bail!("{message}"),
             Backend::Local => unreachable!("local calls dispatch directly to core"),
         }
     }
     fn data<T: DeserializeOwned>(&self, operation: O) -> Result<T> {
-        self.request(operation)?.decode().map_err(anyhow::Error::msg)
+        self.request(operation)?
+            .decode()
+            .map_err(anyhow::Error::msg)
     }
     fn query<T: DeserializeOwned>(&self, query: Q) -> Result<T> {
-        self.data(O::Query { repo: self.path.clone(), query })
+        self.data(O::Query {
+            repo: self.path.clone(),
+            query,
+        })
     }
     fn mutate<T: DeserializeOwned>(&self, mutation: M) -> Result<T> {
-        self.data(O::Mutate { repo: self.path.clone(), mutation })
+        self.data(O::Mutate {
+            repo: self.path.clone(),
+            mutation,
+        })
     }
 
     pub fn head_exists(&self) -> bool {
-        match &self.backend { Backend::Local => git::head_exists(Path::new(&self.path)), _ => self.query(Q::HeadExists).unwrap_or(false) }
+        match &self.backend {
+            Backend::Local => git::head_exists(Path::new(&self.path)),
+            _ => self.query(Q::HeadExists).unwrap_or(false),
+        }
     }
     pub fn config_user_email(&self) -> Option<String> {
-        match &self.backend { Backend::Local => git::config_user_email(Path::new(&self.path)), _ => self.query(Q::ConfigUserEmail).ok().flatten() }
+        match &self.backend {
+            Backend::Local => git::config_user_email(Path::new(&self.path)),
+            _ => self.query(Q::ConfigUserEmail).ok().flatten(),
+        }
     }
     pub fn is_inside_git_repo(&self, abs_file: &Path) -> bool {
         match &self.backend {
             Backend::Local => git::is_inside_git_repo(Path::new(&self.path), abs_file),
-            _ => self.query(Q::IsInsideGitRepo { abs_file: abs_file.to_string_lossy().into_owned() }).unwrap_or(false),
+            _ => self
+                .query(Q::IsInsideGitRepo {
+                    abs_file: abs_file.to_string_lossy().into_owned(),
+                })
+                .unwrap_or(false),
         }
     }
     pub fn existing_directories(&self, paths: &[String]) -> Result<Vec<String>> {
         match &self.backend {
-            Backend::Local => Ok(paths.iter().filter(|path| Path::new(path).is_dir()).cloned().collect()),
-            _ => self.query(Q::ExistingDirectories { paths: paths.to_vec() }),
+            Backend::Local => Ok(paths
+                .iter()
+                .filter(|path| Path::new(path).is_dir())
+                .cloned()
+                .collect()),
+            _ => self.query(Q::ExistingDirectories {
+                paths: paths.to_vec(),
+            }),
         }
     }
     pub fn get_git_diff(&self, file_path: &str, side: git::DiffSide) -> Result<GitDiffResult> {
         self.get_git_diff_from(file_path, None, side)
     }
     pub fn get_changes_status(&self) -> Result<Vec<ChangeFileStatus>> {
-        if let Backend::Local = &self.backend { return git::get_changes_status(Path::new(&self.path)); }
-        match self.request(O::Status { repo: self.path.clone() })? {
-            Reply::Status { files } => Ok(files), other => bail!("expected status reply, got {}", other.kind()),
+        if let Backend::Local = &self.backend {
+            return git::get_changes_status(Path::new(&self.path));
+        }
+        match self.request(O::Status {
+            repo: self.path.clone(),
+        })? {
+            Reply::Status { files } => Ok(files),
+            other => bail!("expected status reply, got {}", other.kind()),
         }
     }
-    pub fn git_stage(&self, files: &[String]) -> Result<()> { self.update_files(files, true) }
-    pub fn git_unstage(&self, files: &[String]) -> Result<()> { self.update_files(files, false) }
+    pub fn git_stage(&self, files: &[String]) -> Result<()> {
+        self.update_files(files, true)
+    }
+    pub fn git_unstage(&self, files: &[String]) -> Result<()> {
+        self.update_files(files, false)
+    }
     fn update_files(&self, files: &[String], stage: bool) -> Result<()> {
         if let Backend::Local = &self.backend {
-            return if stage { git::git_stage(Path::new(&self.path), files) } else { git::git_unstage(Path::new(&self.path), files) };
+            return if stage {
+                git::git_stage(Path::new(&self.path), files)
+            } else {
+                git::git_unstage(Path::new(&self.path), files)
+            };
         }
         let repo = self.path.clone();
         let paths = files.to_vec();
-        match self.request(if stage { O::Stage { repo, paths } } else { O::Unstage { repo, paths } })? {
-            Reply::Updated => Ok(()), other => bail!("expected updated reply, got {}", other.kind()),
+        match self.request(if stage {
+            O::Stage { repo, paths }
+        } else {
+            O::Unstage { repo, paths }
+        })? {
+            Reply::Updated => Ok(()),
+            other => bail!("expected updated reply, got {}", other.kind()),
         }
     }
-    pub fn git_stage_all(&self) -> Result<()> { self.update_all(true) }
-    pub fn git_unstage_all(&self) -> Result<()> { self.update_all(false) }
+    pub fn git_stage_all(&self) -> Result<()> {
+        self.update_all(true)
+    }
+    pub fn git_unstage_all(&self) -> Result<()> {
+        self.update_all(false)
+    }
     fn update_all(&self, stage: bool) -> Result<()> {
         if let Backend::Local = &self.backend {
-            return if stage { git::git_stage_all(Path::new(&self.path)) } else { git::git_unstage_all(Path::new(&self.path)) };
+            return if stage {
+                git::git_stage_all(Path::new(&self.path))
+            } else {
+                git::git_unstage_all(Path::new(&self.path))
+            };
         }
         let repo = self.path.clone();
-        match self.request(if stage { O::StageAll { repo } } else { O::UnstageAll { repo } })? {
-            Reply::Updated => Ok(()), other => bail!("expected updated reply, got {}", other.kind()),
+        match self.request(if stage {
+            O::StageAll { repo }
+        } else {
+            O::UnstageAll { repo }
+        })? {
+            Reply::Updated => Ok(()),
+            other => bail!("expected updated reply, got {}", other.kind()),
         }
     }
     pub fn checkout_branch(&self, name: &str) -> Result<()> {
-        if let Backend::Local = &self.backend { return git::checkout_branch(Path::new(&self.path), name); }
-        let _: Option<RemoteCheckout> = self.data(O::Checkout { repo: self.path.clone(), branch: name.into(), remote: false })?;
+        if let Backend::Local = &self.backend {
+            return git::checkout_branch(Path::new(&self.path), name);
+        }
+        let _: Option<RemoteCheckout> = self.data(O::Checkout {
+            repo: self.path.clone(),
+            branch: name.into(),
+            remote: false,
+        })?;
         Ok(())
     }
     pub fn checkout_remote_branch(&self, remote_branch: &str) -> Result<RemoteCheckout> {
-        if let Backend::Local = &self.backend { return git::checkout_remote_branch(Path::new(&self.path), remote_branch); }
-        self.data::<Option<RemoteCheckout>>(O::Checkout { repo: self.path.clone(), branch: remote_branch.into(), remote: true })?
-            .ok_or_else(|| anyhow::anyhow!("remote checkout returned no outcome"))
+        if let Backend::Local = &self.backend {
+            return git::checkout_remote_branch(Path::new(&self.path), remote_branch);
+        }
+        self.data::<Option<RemoteCheckout>>(O::Checkout {
+            repo: self.path.clone(),
+            branch: remote_branch.into(),
+            remote: true,
+        })?
+        .ok_or_else(|| anyhow::anyhow!("remote checkout returned no outcome"))
     }
 }
 
@@ -265,9 +394,15 @@ mod tests {
 
     fn connection() -> SshConnection {
         SshConnection {
-            id: "git-context-identity-test".into(), name: "test".into(),
-            host: "one.invalid".into(), port: 22, user: "tester".into(),
-            password: None, identity_file: None, group: None, extra: Default::default(),
+            id: "git-context-identity-test".into(),
+            name: "test".into(),
+            host: "one.invalid".into(),
+            port: 22,
+            user: "tester".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+            extra: Default::default(),
         }
     }
 
@@ -275,7 +410,11 @@ mod tests {
     fn remote_identity_is_host_scoped_and_construction_reuses_workspace() {
         let a = GitContext::remote(connection(), "/Project".into());
         let same = GitContext::remote(connection(), "/Project".into());
-        let (Backend::Remote(a_backend), Backend::Remote(same_backend)) = (&a.backend, &same.backend) else { panic!("remote"); };
+        let (Backend::Remote(a_backend), Backend::Remote(same_backend)) =
+            (&a.backend, &same.backend)
+        else {
+            panic!("remote");
+        };
         assert!(Arc::ptr_eq(a_backend, same_backend));
         assert_eq!(a, same);
         assert_ne!(a.with_path("/Project/Repo"), a.with_path("/Project/repo"));
@@ -286,14 +425,20 @@ mod tests {
         assert!(a.local_path().is_none());
         assert_eq!(a.connection_id(), Some("git-context-identity-test"));
         let other_root = GitContext::remote(connection(), "/OtherProject".into());
-        assert_eq!(a.with_path("/Shared/repo"), other_root.with_path("/Shared/repo"));
+        assert_eq!(
+            a.with_path("/Shared/repo"),
+            other_root.with_path("/Shared/repo")
+        );
     }
 
     #[cfg(not(windows))]
     #[test]
     fn unix_identity_preserves_case_and_literal_backslashes() {
         assert_ne!(GitContext::local("/Repo"), GitContext::local("/repo"));
-        assert_ne!(GitContext::local("/repo\\name"), GitContext::local("/repo/name"));
+        assert_ne!(
+            GitContext::local("/repo\\name"),
+            GitContext::local("/repo/name")
+        );
         assert_eq!(GitContext::local("/repo/"), GitContext::local("/repo"));
     }
 
@@ -301,7 +446,19 @@ mod tests {
     fn broken_context_never_falls_back_to_local_io() {
         let broken = GitContext::broken("missing SSH connection").with_path("/");
         assert!(broken.local_path().is_none());
-        assert!(broken.get_changes_status().unwrap_err().to_string().contains("missing SSH connection"));
-        assert!(broken.git_stage_all().unwrap_err().to_string().contains("missing SSH connection"));
+        assert!(
+            broken
+                .get_changes_status()
+                .unwrap_err()
+                .to_string()
+                .contains("missing SSH connection")
+        );
+        assert!(
+            broken
+                .git_stage_all()
+                .unwrap_err()
+                .to_string()
+                .contains("missing SSH connection")
+        );
     }
 }

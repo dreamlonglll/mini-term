@@ -51,7 +51,6 @@ mod icons;
 pub use change_tree::*;
 pub use icons::*;
 
-
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,

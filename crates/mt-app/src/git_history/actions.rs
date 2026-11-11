@@ -173,12 +173,24 @@ pub(super) fn open_multi_menu(
             .on_click(move |window, cx| {
                 if let Some(files) = files.clone() {
                     crate::git_diff::open_combined_diff(
-                        store.clone(), repo.clone(), hashes.clone(), files, None, window, cx,
+                        store.clone(),
+                        repo.clone(),
+                        hashes.clone(),
+                        files,
+                        None,
+                        window,
+                        cx,
                     );
                 } else {
                     crate::git_diff::open_combined_diff_loading(
-                        store.clone(), repo.clone(), hashes.clone(), None, window, cx,
-                    ).detach();
+                        store.clone(),
+                        repo.clone(),
+                        hashes.clone(),
+                        None,
+                        window,
+                        cx,
+                    )
+                    .detach();
                 }
             })
             .into(),
@@ -216,7 +228,9 @@ fn commit_menu(
     };
     // 自己的改写还在跑 → 另一区的写操作占着这个仓库的闸
     let busy = this.busy.and_then(|_| reason("reason.busy")).or_else(|| {
-        this.context.as_ref().is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
+        this.context
+            .as_ref()
+            .is_some_and(|repo| git_ui::gate::is_busy_key(&repo.key()))
             .then(|| git_ui::gate_busy_text().to_string())
     });
     let (rel, rel_error) = match relation {
@@ -249,14 +263,19 @@ fn commit_menu(
         let rel = rel.clone();
         let context = context.clone();
         move |window: &mut Window, cx: &mut App| {
-            entity.update(cx, |this, cx| f(this, context.clone(), &commit, &rel, window, cx));
+            entity.update(cx, |this, cx| {
+                f(this, context.clone(), &commit, &rel, window, cx)
+            });
         }
     };
 
     let hash = commit.hash.clone();
     let short = commit.short_hash.clone();
     let (diff_repo, diff_store, diff_hash, diff_message) = (
-        context.clone(), this.store.clone(), commit.hash.clone(), commit.message.clone(),
+        context.clone(),
+        this.store.clone(),
+        commit.hash.clone(),
+        commit.message.clone(),
     );
     let mut entries: Vec<MenuEntry> = vec![
         menu::item(t("gitLog", "menu.copyFullHash"), move |_window, cx| {
@@ -270,9 +289,15 @@ fn commit_menu(
             MenuItem::new(t("gitHistoryContent", "viewChanges"))
                 .on_click(move |window, cx| {
                     crate::git_diff::open_commit_diff_loading(
-                        diff_store.clone(), diff_repo.clone(), diff_hash.clone(),
-                        diff_message.clone(), None, window, cx,
-                    ).detach();
+                        diff_store.clone(),
+                        diff_repo.clone(),
+                        diff_hash.clone(),
+                        diff_message.clone(),
+                        None,
+                        window,
+                        cx,
+                    )
+                    .detach();
                 })
                 .into()
         },
@@ -289,7 +314,9 @@ fn commit_menu(
                     .then(|| reason("reason.alreadyCheckedOut"))
                     .flatten()
             }),
-            with(|this, repo, commit, _rel, window, cx| this.confirm_checkout(repo, commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| {
+                this.confirm_checkout(repo, commit, window, cx)
+            }),
         )
         .into(),
     );
@@ -297,7 +324,9 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.newBranch"),
             busy.clone(),
-            with(|this, repo, commit, _rel, window, cx| this.open_branch_dialog(repo, commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| {
+                this.open_branch_dialog(repo, commit, window, cx)
+            }),
         )
         .into(),
     );
@@ -305,7 +334,9 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.newTag"),
             busy.clone(),
-            with(|this, repo, commit, _rel, window, cx| this.open_tag_dialog(repo, commit, window, cx)),
+            with(|this, repo, commit, _rel, window, cx| {
+                this.open_tag_dialog(repo, commit, window, cx)
+            }),
         )
         .into(),
     );
@@ -348,7 +379,9 @@ fn commit_menu(
         action_item(
             t("gitLog", "menu.reset"),
             base.clone(),
-            with(|this, repo, commit, rel, window, cx| this.open_reset_dialog(repo, commit, rel, window, cx)),
+            with(|this, repo, commit, rel, window, cx| {
+                this.open_reset_dialog(repo, commit, rel, window, cx)
+            }),
         )
         .into(),
     );
@@ -367,7 +400,9 @@ fn commit_menu(
     let mut reword = action_item(
         t("gitLog", "menu.reword"),
         base.clone().or_else(head_only),
-        with(|this, repo, commit, rel, window, cx| this.open_reword_dialog(repo, commit, rel, window, cx)),
+        with(|this, repo, commit, rel, window, cx| {
+            this.open_reword_dialog(repo, commit, rel, window, cx)
+        }),
     );
     if rel.pushed {
         if undo.is_actionable() {
@@ -400,7 +435,9 @@ fn commit_menu(
                     t("gitLog", "menu.deleteTag"),
                     busy.clone(),
                     move |window, cx| {
-                        entity.update(cx, |this, cx| this.confirm_delete_tag(repo.clone(), &tag, window, cx));
+                        entity.update(cx, |this, cx| {
+                            this.confirm_delete_tag(repo.clone(), &tag, window, cx)
+                        });
                     },
                 )
                 .danger()
@@ -425,7 +462,9 @@ fn commit_menu(
                     busy.clone(),
                     move |window, cx| {
                         let (tag, remote) = (tag.clone(), remote_name.clone());
-                        entity.update(cx, |this, cx| this.push_tag(repo.clone(), tag, remote, window, cx));
+                        entity.update(cx, |this, cx| {
+                            this.push_tag(repo.clone(), tag, remote, window, cx)
+                        });
                     },
                 )
                 .into(),
@@ -468,7 +507,9 @@ impl GitHistoryContent {
             op,
             move |result, window, cx| {
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str()) {
+                    if this.context.as_ref().map(GitContext::key).as_deref()
+                        != Some(repo_key.as_str())
+                    {
                         if let Err(err) = result {
                             this.show_failure(action, &err, window, cx);
                         }
@@ -537,7 +578,8 @@ impl GitHistoryContent {
             op,
             move |result, window, cx| {
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    let current = this.context.as_ref().map(GitContext::key).as_deref() == Some(repo_key.as_str());
+                    let current = this.context.as_ref().map(GitContext::key).as_deref()
+                        == Some(repo_key.as_str());
                     if current {
                         this.busy = None;
                     }
@@ -816,7 +858,13 @@ impl GitHistoryContent {
 
     // ── 标签:删除 / 推送 ─────────────────────────────────
 
-    fn confirm_delete_tag(&mut self, repo: GitContext, tag: &str, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_delete_tag(
+        &mut self,
+        repo: GitContext,
+        tag: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entity = cx.entity();
         let name = tag.to_string();
         danger_confirm(
@@ -973,9 +1021,7 @@ impl GitHistoryContent {
                                 kind::GIT_LOG_NEW_BRANCH,
                                 form,
                                 "action.createBranch",
-                                move |repo| {
-                                    repo.create_branch_at(&op_name, &op_hash, checkout)
-                                },
+                                move |repo| repo.create_branch_at(&op_name, &op_hash, checkout),
                                 move |this, (), _window, cx| {
                                     let key = if checkout {
                                         "toast.branchCreatedCheckedOut"

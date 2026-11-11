@@ -610,7 +610,9 @@ impl FileTree {
                 .spawn(async move {
                     if backend.local_path().is_none() {
                         let files = backend.get_git_status();
-                        let labels = files.map(|files| GitLabels::new(git_status_table(files))).unwrap_or_default();
+                        let labels = files
+                            .map(|files| GitLabels::new(git_status_table(files)))
+                            .unwrap_or_default();
                         return Some((Vec::new(), labels));
                     }
                     git_refresh::run_plan(&root, &plan, known.as_ref()).map(|(sigs, files)| {

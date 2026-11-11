@@ -1000,9 +1000,17 @@ fn fixed_time_commit(repo: &Path, message: &str) {
         .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
         .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
-        .output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1015,39 +1023,68 @@ fn desktop_history_serialized_cursors_cross_many_equal_time_merge_pages() {
     fixed_time_commit(&repo, "keep root");
     let original_branch = git(&repo, &["branch", "--show-current"]);
     git(&repo, &["checkout", "-b", "side"]);
-    for i in 0..4 { fixed_time_commit(&repo, &format!("keep side {i}")); }
+    for i in 0..4 {
+        fixed_time_commit(&repo, &format!("keep side {i}"));
+    }
     git(&repo, &["checkout", &original_branch]);
-    for i in 0..6 { fixed_time_commit(&repo, &format!("main {i}")); }
+    for i in 0..6 {
+        fixed_time_commit(&repo, &format!("main {i}"));
+    }
     git(&repo, &["merge", "--no-ff", "--no-commit", "side"]);
     fixed_time_commit(&repo, "keep merge");
     git(&repo, &["tag", "history-tag"]);
     let mut helper = Helper::start(&repo);
 
-    for filter in [None, Some(LogFilter { text: "keep".into(), ..Default::default() })] {
+    for filter in [
+        None,
+        Some(LogFilter {
+            text: "keep".into(),
+            ..Default::default()
+        }),
+    ] {
         let expected = match &filter {
-            Some(filter) => git::get_git_log_filtered(&repo, None, 100, None, filter).unwrap().commits,
+            Some(filter) => {
+                git::get_git_log_filtered(&repo, None, 100, None, filter)
+                    .unwrap()
+                    .commits
+            }
             None => git::get_git_log(&repo, None, Some(100), None).unwrap(),
         };
         let mut after: Option<GitLogCursor> = None;
         let mut hashes = Vec::new();
         let mut pages = 0;
         loop {
-            let page: HistoryPage = helper.success(Operation::Log {
-                repo: path(&repo), after, limit: 1, branch: None, filter: filter.clone(),
-            }).decode().unwrap();
+            let page: HistoryPage = helper
+                .success(Operation::Log {
+                    repo: path(&repo),
+                    after,
+                    limit: 1,
+                    branch: None,
+                    filter: filter.clone(),
+                })
+                .decode()
+                .unwrap();
             pages += 1;
             assert!(pages < 30, "continuation must converge");
             assert_eq!(page.tags.len(), 1);
             hashes.extend(page.commits.into_iter().map(|commit| commit.hash));
             match page.next {
                 // Simulate clients storing opaque cursors between actions.
-                Some(next) => after = Some(serde_json::from_slice(
-                    &serde_json::to_vec(&next).unwrap()).unwrap()),
+                Some(next) => {
+                    after =
+                        Some(serde_json::from_slice(&serde_json::to_vec(&next).unwrap()).unwrap())
+                }
                 None => break,
             }
         }
         assert!(pages > 3);
-        assert_eq!(hashes, expected.into_iter().map(|commit| commit.hash).collect::<Vec<_>>());
+        assert_eq!(
+            hashes,
+            expected
+                .into_iter()
+                .map(|commit| commit.hash)
+                .collect::<Vec<_>>()
+        );
         let unique: std::collections::HashSet<_> = hashes.iter().collect();
         assert_eq!(unique.len(), hashes.len(), "pages must not repeat commits");
     }
@@ -1065,59 +1102,191 @@ fn desktop_snapshots_hunks_commit_details_branches_and_stashes_use_real_core() {
     git(&repo, &["add", "file"]);
     fixed_time_commit(&repo, "initial");
     let mut helper = Helper::start(&repo);
-    let panel: git::RepoPanelSnapshot = helper.success(Operation::PanelSnapshot {
-        repo: path(&repo), recent_limit: 8,
-    }).decode().unwrap();
+    let panel: git::RepoPanelSnapshot = helper
+        .success(Operation::PanelSnapshot {
+            repo: path(&repo),
+            recent_limit: 8,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(panel.branches.len(), 1);
-    let snapshot: ChangesSnapshot = helper.success(Operation::ChangesSnapshot { repo: path(&repo) }).decode().unwrap();
+    let snapshot: ChangesSnapshot = helper
+        .success(Operation::ChangesSnapshot { repo: path(&repo) })
+        .decode()
+        .unwrap();
     assert!(snapshot.has_head);
     assert!(snapshot.files.is_empty());
     assert!(snapshot.amend.is_some());
     assert!(matches!(snapshot.target, CommitTarget::Branch(_)));
     std::fs::write(repo.join("file"), "edited\n").unwrap();
-    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged)) else { panic!("diff"); };
-    helper.success(Operation::StageHunk { repo: path(&repo), path: "file".into(), diff: patch, hunk: 0 }).decode::<()>().unwrap();
-    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Staged)) else { panic!("diff"); };
-    helper.success(Operation::UnstageHunk { repo: path(&repo), path: "file".into(), diff: patch, hunk: 0 }).decode::<()>().unwrap();
-    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged)) else { panic!("diff"); };
-    helper.success(Operation::DiscardHunk { repo: path(&repo), path: "file".into(), diff: patch, hunk: 0 }).decode::<()>().unwrap();
-    assert_eq!(std::fs::read_to_string(repo.join("file")).unwrap(), "base\n");
+    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+    else {
+        panic!("diff");
+    };
+    helper
+        .success(Operation::StageHunk {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: patch,
+            hunk: 0,
+        })
+        .decode::<()>()
+        .unwrap();
+    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Staged)) else {
+        panic!("diff");
+    };
+    helper
+        .success(Operation::UnstageHunk {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: patch,
+            hunk: 0,
+        })
+        .decode::<()>()
+        .unwrap();
+    let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+    else {
+        panic!("diff");
+    };
+    helper
+        .success(Operation::DiscardHunk {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: patch,
+            hunk: 0,
+        })
+        .decode::<()>()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file")).unwrap(),
+        "base\n"
+    );
     std::fs::write(repo.join("file"), "committed\n").unwrap();
     helper.success(Operation::StageAll { repo: path(&repo) });
-    let outcome: CommitOutcome = helper.success(Operation::CommitWith {
-        repo: path(&repo), message: "desktop commit".into(), amend: false,
-    }).decode().unwrap();
+    let outcome: CommitOutcome = helper
+        .success(Operation::CommitWith {
+            repo: path(&repo),
+            message: "desktop commit".into(),
+            amend: false,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(outcome.summary, "desktop commit");
     let hash = git(&repo, &["rev-parse", "HEAD"]);
-    let detail: git::CommitDetail = helper.success(Operation::CommitDetail { repo: path(&repo), hash: hash.clone() }).decode().unwrap();
+    let detail: git::CommitDetail = helper
+        .success(Operation::CommitDetail {
+            repo: path(&repo),
+            hash: hash.clone(),
+        })
+        .decode()
+        .unwrap();
     assert_eq!(detail.hash, hash);
-    let commit_files: Vec<git::CommitFileInfo> = helper.success(Operation::CommitFiles { repo: path(&repo), hash: hash.clone() }).decode().unwrap();
+    let commit_files: Vec<git::CommitFileInfo> = helper
+        .success(Operation::CommitFiles {
+            repo: path(&repo),
+            hash: hash.clone(),
+        })
+        .decode()
+        .unwrap();
     assert_eq!(commit_files[0].path, "file");
-    let commit_diff: git::GitDiffResult = helper.success(Operation::CommitDiff {
-        repo: path(&repo), hash, path: "file".into(), old_path: None,
-    }).decode().unwrap();
+    let commit_diff: git::GitDiffResult = helper
+        .success(Operation::CommitDiff {
+            repo: path(&repo),
+            hash,
+            path: "file".into(),
+            old_path: None,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(commit_diff.new_content, "committed\n");
-    helper.success(Operation::CreateBranch { repo: path(&repo), name: "topic".into(), start: None, checkout: false }).decode::<()>().unwrap();
-    helper.success(Operation::RenameBranch { repo: path(&repo), old: "topic".into(), name: "renamed".into() }).decode::<()>().unwrap();
-    let deleted: git::DeleteOutcome = helper.success(Operation::DeleteBranch { repo: path(&repo), name: "renamed".into(), force: false }).decode().unwrap();
+    helper
+        .success(Operation::CreateBranch {
+            repo: path(&repo),
+            name: "topic".into(),
+            start: None,
+            checkout: false,
+        })
+        .decode::<()>()
+        .unwrap();
+    helper
+        .success(Operation::RenameBranch {
+            repo: path(&repo),
+            old: "topic".into(),
+            name: "renamed".into(),
+        })
+        .decode::<()>()
+        .unwrap();
+    let deleted: git::DeleteOutcome = helper
+        .success(Operation::DeleteBranch {
+            repo: path(&repo),
+            name: "renamed".into(),
+            force: false,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(deleted, git::DeleteOutcome::Deleted);
-    let preview: PushPreview = helper.success(Operation::PushPreview { repo: path(&repo), branch: None, limit: 10 }).decode().unwrap();
+    let preview: PushPreview = helper
+        .success(Operation::PushPreview {
+            repo: path(&repo),
+            branch: None,
+            limit: 10,
+        })
+        .decode()
+        .unwrap();
     assert!(matches!(preview.plan, git::PushPlan::NoRemote { .. }));
     std::fs::write(repo.join("file"), "stash me\n").unwrap();
-    let saved: StashSaveOutcome = helper.success(Operation::SaveStash {
-        repo: path(&repo), options: git::StashSaveOptions::default(),
-    }).decode().unwrap();
+    let saved: StashSaveOutcome = helper
+        .success(Operation::SaveStash {
+            repo: path(&repo),
+            options: git::StashSaveOptions::default(),
+        })
+        .decode()
+        .unwrap();
     assert!(matches!(saved, StashSaveOutcome::Saved { .. }));
-    let stashes: Vec<git::StashInfo> = helper.success(Operation::ListStashes { repo: path(&repo) }).decode().unwrap();
+    let stashes: Vec<git::StashInfo> = helper
+        .success(Operation::ListStashes { repo: path(&repo) })
+        .decode()
+        .unwrap();
     assert_eq!(stashes.len(), 1);
-    let applied: StashApplyOutcome = helper.success(Operation::ApplyStash {
-        repo: path(&repo), index: 0, hash: stashes[0].hash.clone(), pop: false, reinstate: false,
-    }).decode().unwrap();
+    let applied: StashApplyOutcome = helper
+        .success(Operation::ApplyStash {
+            repo: path(&repo),
+            index: 0,
+            hash: stashes[0].hash.clone(),
+            pop: false,
+            reinstate: false,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(applied, StashApplyOutcome::Applied);
-    helper.success(Operation::Discard { repo: path(&repo), paths: vec!["file".into()] }).decode::<()>().unwrap();
-    helper.success(Operation::DropStash { repo: path(&repo), index: 0, hash: stashes[0].hash.clone() }).decode::<()>().unwrap();
-    assert_eq!(std::fs::read_to_string(repo.join("file")).unwrap(), "committed\n");
-    assert!(helper.request(Operation::Pull { repo: path(&repo), mode: None }).result.is_err());
+    helper
+        .success(Operation::Discard {
+            repo: path(&repo),
+            paths: vec!["file".into()],
+        })
+        .decode::<()>()
+        .unwrap();
+    helper
+        .success(Operation::DropStash {
+            repo: path(&repo),
+            index: 0,
+            hash: stashes[0].hash.clone(),
+        })
+        .decode::<()>()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file")).unwrap(),
+        "committed\n"
+    );
+    assert!(
+        helper
+            .request(Operation::Pull {
+                repo: path(&repo),
+                mode: None
+            })
+            .result
+            .is_err()
+    );
     helper.finish();
 }
 
@@ -1128,37 +1297,143 @@ fn every_desktop_operation_checks_repository_scope_before_core() {
     let repo = fixture.repo("workspace");
     let outside_fixture = Fixture::new("desktop-outside");
     let outside = path(&outside_fixture.repo("outside"));
-    let patch = GitDiffResult { old_content: String::new(), new_content: String::new(),
-        hunks: Vec::new(), is_binary: false, too_large: false };
+    let patch = GitDiffResult {
+        old_content: String::new(),
+        new_content: String::new(),
+        hunks: Vec::new(),
+        is_binary: false,
+        too_large: false,
+    };
     let mut helper = Helper::start(&repo);
     let operations = vec![
-        Operation::PanelSnapshot { repo: outside.clone(), recent_limit: 1 },
-        Operation::ChangesSnapshot { repo: outside.clone() },
-        Operation::Log { repo: outside.clone(), after: None, limit: 1, branch: None, filter: None },
-        Operation::CommitDetail { repo: outside.clone(), hash: "bad".into() },
-        Operation::CommitFiles { repo: outside.clone(), hash: "bad".into() },
-        Operation::CommitDiff { repo: outside.clone(), hash: "bad".into(), path: "file".into(), old_path: None },
-        Operation::CommitWith { repo: outside.clone(), message: "message".into(), amend: false },
-        Operation::Discard { repo: outside.clone(), paths: vec![] },
-        Operation::StageHunk { repo: outside.clone(), path: "file".into(), diff: patch.clone(), hunk: 0 },
-        Operation::UnstageHunk { repo: outside.clone(), path: "file".into(), diff: patch.clone(), hunk: 0 },
-        Operation::DiscardHunk { repo: outside.clone(), path: "file".into(), diff: patch.clone(), hunk: 0 },
-        Operation::Checkout { repo: outside.clone(), branch: "topic".into(), remote: false },
-        Operation::CreateBranch { repo: outside.clone(), name: "topic".into(), start: None, checkout: false },
-        Operation::RenameBranch { repo: outside.clone(), old: "topic".into(), name: "new".into() },
-        Operation::DeleteBranch { repo: outside.clone(), name: "topic".into(), force: false },
-        Operation::Fetch { repo: outside.clone() },
-        Operation::Pull { repo: outside.clone(), mode: None },
-        Operation::PushPreview { repo: outside.clone(), branch: None, limit: 1 },
-        Operation::Push { repo: outside.clone(), options: Default::default() },
-        Operation::ListStashes { repo: outside.clone() },
-        Operation::SaveStash { repo: outside.clone(), options: Default::default() },
-        Operation::ApplyStash { repo: outside.clone(), index: 0, hash: "bad".into(), pop: false, reinstate: false },
-        Operation::DropStash { repo: outside.clone(), index: 0, hash: "bad".into() },
-        Operation::OperationContinue { repo: outside.clone(), kind: RepoOpKind::Merge },
-        Operation::OperationAbort { repo: outside.clone(), kind: RepoOpKind::Merge },
-        Operation::ResolveConflict { repo: outside.clone(), path: "file".into(), side: ConflictSide::Ours },
-        Operation::MarkResolved { repo: outside, path: "file".into() },
+        Operation::PanelSnapshot {
+            repo: outside.clone(),
+            recent_limit: 1,
+        },
+        Operation::ChangesSnapshot {
+            repo: outside.clone(),
+        },
+        Operation::Log {
+            repo: outside.clone(),
+            after: None,
+            limit: 1,
+            branch: None,
+            filter: None,
+        },
+        Operation::CommitDetail {
+            repo: outside.clone(),
+            hash: "bad".into(),
+        },
+        Operation::CommitFiles {
+            repo: outside.clone(),
+            hash: "bad".into(),
+        },
+        Operation::CommitDiff {
+            repo: outside.clone(),
+            hash: "bad".into(),
+            path: "file".into(),
+            old_path: None,
+        },
+        Operation::CommitWith {
+            repo: outside.clone(),
+            message: "message".into(),
+            amend: false,
+        },
+        Operation::Discard {
+            repo: outside.clone(),
+            paths: vec![],
+        },
+        Operation::StageHunk {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            hunk: 0,
+        },
+        Operation::UnstageHunk {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            hunk: 0,
+        },
+        Operation::DiscardHunk {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            hunk: 0,
+        },
+        Operation::Checkout {
+            repo: outside.clone(),
+            branch: "topic".into(),
+            remote: false,
+        },
+        Operation::CreateBranch {
+            repo: outside.clone(),
+            name: "topic".into(),
+            start: None,
+            checkout: false,
+        },
+        Operation::RenameBranch {
+            repo: outside.clone(),
+            old: "topic".into(),
+            name: "new".into(),
+        },
+        Operation::DeleteBranch {
+            repo: outside.clone(),
+            name: "topic".into(),
+            force: false,
+        },
+        Operation::Fetch {
+            repo: outside.clone(),
+        },
+        Operation::Pull {
+            repo: outside.clone(),
+            mode: None,
+        },
+        Operation::PushPreview {
+            repo: outside.clone(),
+            branch: None,
+            limit: 1,
+        },
+        Operation::Push {
+            repo: outside.clone(),
+            options: Default::default(),
+        },
+        Operation::ListStashes {
+            repo: outside.clone(),
+        },
+        Operation::SaveStash {
+            repo: outside.clone(),
+            options: Default::default(),
+        },
+        Operation::ApplyStash {
+            repo: outside.clone(),
+            index: 0,
+            hash: "bad".into(),
+            pop: false,
+            reinstate: false,
+        },
+        Operation::DropStash {
+            repo: outside.clone(),
+            index: 0,
+            hash: "bad".into(),
+        },
+        Operation::OperationContinue {
+            repo: outside.clone(),
+            kind: RepoOpKind::Merge,
+        },
+        Operation::OperationAbort {
+            repo: outside.clone(),
+            kind: RepoOpKind::Merge,
+        },
+        Operation::ResolveConflict {
+            repo: outside.clone(),
+            path: "file".into(),
+            side: ConflictSide::Ours,
+        },
+        Operation::MarkResolved {
+            repo: outside,
+            path: "file".into(),
+        },
     ];
     for operation in operations {
         let error = helper.request(operation).result.unwrap_err();
@@ -1166,16 +1441,58 @@ fn every_desktop_operation_checks_repository_scope_before_core() {
     }
     for bad in ["../outside/file", "/absolute", "", "nul\0byte"] {
         for operation in [
-            Operation::Discard { repo: path(&repo), paths: vec![bad.into()] },
-            Operation::StageHunk { repo: path(&repo), path: bad.into(), diff: patch.clone(), hunk: 0 },
-            Operation::UnstageHunk { repo: path(&repo), path: bad.into(), diff: patch.clone(), hunk: 0 },
-            Operation::DiscardHunk { repo: path(&repo), path: bad.into(), diff: patch.clone(), hunk: 0 },
-            Operation::CommitDiff { repo: path(&repo), hash: "bad".into(), path: bad.into(), old_path: None },
-            Operation::CommitDiff { repo: path(&repo), hash: "bad".into(), path: "file".into(), old_path: Some(bad.into()) },
-            Operation::ResolveConflict { repo: path(&repo), path: bad.into(), side: ConflictSide::Theirs },
-            Operation::MarkResolved { repo: path(&repo), path: bad.into() },
+            Operation::Discard {
+                repo: path(&repo),
+                paths: vec![bad.into()],
+            },
+            Operation::StageHunk {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                hunk: 0,
+            },
+            Operation::UnstageHunk {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                hunk: 0,
+            },
+            Operation::DiscardHunk {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                hunk: 0,
+            },
+            Operation::CommitDiff {
+                repo: path(&repo),
+                hash: "bad".into(),
+                path: bad.into(),
+                old_path: None,
+            },
+            Operation::CommitDiff {
+                repo: path(&repo),
+                hash: "bad".into(),
+                path: "file".into(),
+                old_path: Some(bad.into()),
+            },
+            Operation::ResolveConflict {
+                repo: path(&repo),
+                path: bad.into(),
+                side: ConflictSide::Theirs,
+            },
+            Operation::MarkResolved {
+                repo: path(&repo),
+                path: bad.into(),
+            },
         ] {
-            assert!(helper.request(operation).result.unwrap_err().to_string().contains("file path"));
+            assert!(
+                helper
+                    .request(operation)
+                    .result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("file path")
+            );
         }
     }
     helper.finish();
@@ -1196,37 +1513,111 @@ fn desktop_sync_and_conflict_replies_preserve_real_outcomes() {
     git(&remote, &["init", "--bare", "--template=", "."]);
     git(&repo, &["remote", "add", "origin", &path(&remote)]);
     let mut helper = Helper::start(&repo);
-    let preview: PushPreview = helper.success(Operation::PushPreview { repo: path(&repo), branch: None, limit: 10 }).decode().unwrap();
+    let preview: PushPreview = helper
+        .success(Operation::PushPreview {
+            repo: path(&repo),
+            branch: None,
+            limit: 10,
+        })
+        .decode()
+        .unwrap();
     assert!(matches!(preview.plan, git::PushPlan::Ready(_)));
-    let pushed: git::PushOutcome = helper.success(Operation::Push { repo: path(&repo), options: Default::default() }).decode().unwrap();
+    let pushed: git::PushOutcome = helper
+        .success(Operation::Push {
+            repo: path(&repo),
+            options: Default::default(),
+        })
+        .decode()
+        .unwrap();
     assert!(matches!(pushed, git::PushOutcome::Pushed(_)));
-    let _: git::FetchOutcome = helper.success(Operation::Fetch { repo: path(&repo) }).decode().unwrap();
-    let pulled: git::PullOutcome = helper.success(Operation::Pull { repo: path(&repo), mode: Some(git::PullMode::FfOnly) }).decode().unwrap();
+    let _: git::FetchOutcome = helper
+        .success(Operation::Fetch { repo: path(&repo) })
+        .decode()
+        .unwrap();
+    let pulled: git::PullOutcome = helper
+        .success(Operation::Pull {
+            repo: path(&repo),
+            mode: Some(git::PullMode::FfOnly),
+        })
+        .decode()
+        .unwrap();
     assert_eq!(pulled, git::PullOutcome::UpToDate);
 
-    helper.success(Operation::CreateBranch { repo: path(&repo), name: "side".into(), start: None, checkout: true }).decode::<()>().unwrap();
+    helper
+        .success(Operation::CreateBranch {
+            repo: path(&repo),
+            name: "side".into(),
+            start: None,
+            checkout: true,
+        })
+        .decode::<()>()
+        .unwrap();
     std::fs::write(repo.join("file"), "theirs\n").unwrap();
     git(&repo, &["add", "file"]);
     fixed_time_commit(&repo, "side change");
-    let checkout: Option<git::RemoteCheckout> = helper.success(Operation::Checkout { repo: path(&repo), branch: original, remote: false }).decode().unwrap();
+    let checkout: Option<git::RemoteCheckout> = helper
+        .success(Operation::Checkout {
+            repo: path(&repo),
+            branch: original,
+            remote: false,
+        })
+        .decode()
+        .unwrap();
     assert!(checkout.is_none());
     std::fs::write(repo.join("file"), "ours\n").unwrap();
     git(&repo, &["add", "file"]);
     fixed_time_commit(&repo, "main change");
     for finish in [false, true] {
-        let merged = Command::new("git").args(["merge", "--no-edit", "side"]).current_dir(&repo).output().unwrap();
+        let merged = Command::new("git")
+            .args(["merge", "--no-edit", "side"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
         assert!(!merged.status.success());
-        let snapshot: ChangesSnapshot = helper.success(Operation::ChangesSnapshot { repo: path(&repo) }).decode().unwrap();
+        let snapshot: ChangesSnapshot = helper
+            .success(Operation::ChangesSnapshot { repo: path(&repo) })
+            .decode()
+            .unwrap();
         assert_eq!(snapshot.operation.kind, Some(RepoOpKind::Merge));
         assert_eq!(snapshot.conflicts.len(), 1);
-        assert!(helper.request(Operation::OperationContinue { repo: path(&repo), kind: RepoOpKind::Merge }).result.is_err());
+        assert!(
+            helper
+                .request(Operation::OperationContinue {
+                    repo: path(&repo),
+                    kind: RepoOpKind::Merge
+                })
+                .result
+                .is_err()
+        );
         if !finish {
-            helper.success(Operation::OperationAbort { repo: path(&repo), kind: RepoOpKind::Merge }).decode::<()>().unwrap();
+            helper
+                .success(Operation::OperationAbort {
+                    repo: path(&repo),
+                    kind: RepoOpKind::Merge,
+                })
+                .decode::<()>()
+                .unwrap();
         } else {
-            helper.success(Operation::ResolveConflict { repo: path(&repo), path: "file".into(), side: ConflictSide::Theirs }).decode::<()>().unwrap();
-            let state: git::RepoOpState = helper.success(Operation::OperationContinue { repo: path(&repo), kind: RepoOpKind::Merge }).decode().unwrap();
+            helper
+                .success(Operation::ResolveConflict {
+                    repo: path(&repo),
+                    path: "file".into(),
+                    side: ConflictSide::Theirs,
+                })
+                .decode::<()>()
+                .unwrap();
+            let state: git::RepoOpState = helper
+                .success(Operation::OperationContinue {
+                    repo: path(&repo),
+                    kind: RepoOpKind::Merge,
+                })
+                .decode()
+                .unwrap();
             assert_eq!(state.kind, None);
-            assert_eq!(std::fs::read_to_string(repo.join("file")).unwrap(), "theirs\n");
+            assert_eq!(
+                std::fs::read_to_string(repo.join("file")).unwrap(),
+                "theirs\n"
+            );
         }
     }
     helper.finish();
@@ -1242,15 +1633,27 @@ fn stale_hunk_failure_retains_type_and_never_stages_new_content() {
     fixed_time_commit(&repo, "base");
     std::fs::write(repo.join("file"), "displayed\n").unwrap();
     let mut helper = Helper::start(&repo);
-    let Reply::Diff { diff: displayed } = helper.success(diff(&repo, "file", DiffSide::Unstaged)) else { panic!("diff"); };
+    let Reply::Diff { diff: displayed } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+    else {
+        panic!("diff");
+    };
     std::fs::write(repo.join("file"), "new external edit\n").unwrap();
-    let failure = helper.request(Operation::StageHunk {
-        repo: path(&repo), path: "file".into(), diff: displayed, hunk: 0,
-    }).result.unwrap_err();
+    let failure = helper
+        .request(Operation::StageHunk {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: displayed,
+            hunk: 0,
+        })
+        .result
+        .unwrap_err();
     assert_eq!(failure, GitFailure::StaleDiff);
     assert!(failure.into_error().is::<mt_project::git::StaleDiff>());
     assert!(git(&repo, &["diff", "--cached", "--name-only"]).is_empty());
-    assert_eq!(std::fs::read_to_string(repo.join("file")).unwrap(), "new external edit\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("file")).unwrap(),
+        "new external edit\n"
+    );
     helper.finish();
 }
 
@@ -1266,35 +1669,80 @@ fn linked_worktree_scope_supports_cross_root_actions_and_rejects_unregistered_ta
     let linked = fixture.0.join("linked");
     git(&main, &["worktree", "add", "-b", "linked", &path(&linked)]);
     let mut helper = Helper::start(&linked);
-    let trees: Vec<WorktreeInfo> = helper.success(Operation::Query {
-        repo: path(&linked), query: Q::ListWorktrees,
-    }).decode().unwrap();
-    assert!(trees.iter().any(|tree| tree.is_main && Path::new(&tree.path) == main));
-    let branches: Vec<BranchInfo> = helper.success(Operation::Query {
-        repo: path(&main), query: Q::GetRepoBranches,
-    }).decode().unwrap();
+    let trees: Vec<WorktreeInfo> = helper
+        .success(Operation::Query {
+            repo: path(&linked),
+            query: Q::ListWorktrees,
+        })
+        .decode()
+        .unwrap();
+    assert!(
+        trees
+            .iter()
+            .any(|tree| tree.is_main && Path::new(&tree.path) == main)
+    );
+    let branches: Vec<BranchInfo> = helper
+        .success(Operation::Query {
+            repo: path(&main),
+            query: Q::GetRepoBranches,
+        })
+        .decode()
+        .unwrap();
     assert!(branches.iter().any(|branch| branch.name == "linked"));
     let sibling = fixture.0.join("new-sibling");
-    helper.success(Operation::Mutate { repo: path(&main), mutation: M::AddWorktree {
-        worktree_path: path(&sibling), branch: "new-sibling".into(), create_branch: true, base: None,
-    } }).decode::<String>().unwrap();
-    let _: Vec<BranchInfo> = helper.success(Operation::Query {
-        repo: path(&sibling), query: Q::GetRepoBranches,
-    }).decode().unwrap();
+    helper
+        .success(Operation::Mutate {
+            repo: path(&main),
+            mutation: M::AddWorktree {
+                worktree_path: path(&sibling),
+                branch: "new-sibling".into(),
+                create_branch: true,
+                base: None,
+            },
+        })
+        .decode::<String>()
+        .unwrap();
+    let _: Vec<BranchInfo> = helper
+        .success(Operation::Query {
+            repo: path(&sibling),
+            query: Q::GetRepoBranches,
+        })
+        .decode()
+        .unwrap();
     let unrelated_fixture = Fixture::new("unregistered");
     let unrelated = unrelated_fixture.repo("repo");
-    let failure = helper.request(Operation::Mutate { repo: path(&main), mutation: M::RemoveWorktree {
-        worktree_path: path(&unrelated), force: true,
-    } }).result.unwrap_err();
+    let failure = helper
+        .request(Operation::Mutate {
+            repo: path(&main),
+            mutation: M::RemoveWorktree {
+                worktree_path: path(&unrelated),
+                force: true,
+            },
+        })
+        .result
+        .unwrap_err();
     assert!(failure.to_string().contains("registered linked worktree"));
     assert!(unrelated.join(".git").is_dir());
-    helper.success(Operation::Mutate { repo: path(&main), mutation: M::RemoveWorktree {
-        worktree_path: path(&sibling), force: false,
-    } }).decode::<String>().unwrap();
+    helper
+        .success(Operation::Mutate {
+            repo: path(&main),
+            mutation: M::RemoveWorktree {
+                worktree_path: path(&sibling),
+                force: false,
+            },
+        })
+        .decode::<String>()
+        .unwrap();
     assert!(!sibling.exists());
-    let directories: Vec<String> = helper.success(Operation::Query {
-        repo: path(&main), query: Q::ExistingDirectories { paths: vec![path(&linked), path(&sibling)] },
-    }).decode().unwrap();
+    let directories: Vec<String> = helper
+        .success(Operation::Query {
+            repo: path(&main),
+            query: Q::ExistingDirectories {
+                paths: vec![path(&linked), path(&sibling)],
+            },
+        })
+        .decode()
+        .unwrap();
     assert_eq!(directories, vec![path(&linked)]);
     helper.finish();
 }
@@ -1315,36 +1763,106 @@ fn advanced_history_guards_reword_reset_tags_and_project_relative_file_history()
     fixed_time_commit(&repo, "second");
     let second = git(&repo, &["rev-parse", "HEAD"]);
     let mut helper = Helper::start(&repo.join("sub"));
-    let page: FileLogPage = helper.success(Operation::Query { repo: path(&repo.join("sub")),
-        query: Q::GetFileLog { file_rel: "file".into(), after: None, limit: 1 },
-    }).decode().unwrap();
+    let page: FileLogPage = helper
+        .success(Operation::Query {
+            repo: path(&repo.join("sub")),
+            query: Q::GetFileLog {
+                file_rel: "file".into(),
+                after: None,
+                limit: 1,
+            },
+        })
+        .decode()
+        .unwrap();
     assert_eq!(page.path_in_repo, "sub/file");
     assert_eq!(page.entries[0].commit.hash, second);
-    let next: FileLogPage = helper.success(Operation::Query { repo: path(&repo.join("sub")),
-        query: Q::GetFileLog { file_rel: "file".into(), after: page.next, limit: 1 },
-    }).decode().unwrap();
+    let next: FileLogPage = helper
+        .success(Operation::Query {
+            repo: path(&repo.join("sub")),
+            query: Q::GetFileLog {
+                file_rel: "file".into(),
+                after: page.next,
+                limit: 1,
+            },
+        })
+        .decode()
+        .unwrap();
     assert_eq!(next.entries[0].commit.hash, first);
-    assert!(helper.request(Operation::Mutate { repo: path(&repo), mutation: M::RewordHead {
-        expected_head: first.clone(), message: "must not apply".into(),
-    } }).result.is_err());
+    assert!(
+        helper
+            .request(Operation::Mutate {
+                repo: path(&repo),
+                mutation: M::RewordHead {
+                    expected_head: first.clone(),
+                    message: "must not apply".into(),
+                }
+            })
+            .result
+            .is_err()
+    );
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), second);
-    let rewritten: String = helper.success(Operation::Mutate { repo: path(&repo), mutation: M::RewordHead {
-        expected_head: second, message: "rewritten message".into(),
-    } }).decode().unwrap();
-    assert_eq!(git(&repo, &["log", "-1", "--format=%s"]), "rewritten message");
-    helper.success(Operation::Mutate { repo: path(&repo), mutation: M::CreateTag {
-        name: "annotated".into(), hash: rewritten.clone(), message: Some("tag body".into()),
-    } }).decode::<()>().unwrap();
-    let tags: Vec<TagInfo> = helper.success(Operation::Query { repo: path(&repo), query: Q::ListTags }).decode().unwrap();
+    let rewritten: String = helper
+        .success(Operation::Mutate {
+            repo: path(&repo),
+            mutation: M::RewordHead {
+                expected_head: second,
+                message: "rewritten message".into(),
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s"]),
+        "rewritten message"
+    );
+    helper
+        .success(Operation::Mutate {
+            repo: path(&repo),
+            mutation: M::CreateTag {
+                name: "annotated".into(),
+                hash: rewritten.clone(),
+                message: Some("tag body".into()),
+            },
+        })
+        .decode::<()>()
+        .unwrap();
+    let tags: Vec<TagInfo> = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::ListTags,
+        })
+        .decode()
+        .unwrap();
     assert_eq!(tags[0].target_hash, rewritten);
     assert_eq!(git(&repo, &["cat-file", "-t", "annotated"]), "tag");
-    helper.success(Operation::Mutate { repo: path(&repo), mutation: M::ResetTo {
-        hash: first.clone(), mode: ResetMode::Soft,
-    } }).decode::<()>().unwrap();
+    helper
+        .success(Operation::Mutate {
+            repo: path(&repo),
+            mutation: M::ResetTo {
+                hash: first.clone(),
+                mode: ResetMode::Soft,
+            },
+        })
+        .decode::<()>()
+        .unwrap();
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), first);
     assert_eq!(git(&repo, &["show", ":sub/file"]), "second");
-    helper.success(Operation::Mutate { repo: path(&repo), mutation: M::DeleteTag { name: "annotated".into() } }).decode::<()>().unwrap();
-    let tags: Vec<TagInfo> = helper.success(Operation::Query { repo: path(&repo), query: Q::ListTags }).decode().unwrap();
+    helper
+        .success(Operation::Mutate {
+            repo: path(&repo),
+            mutation: M::DeleteTag {
+                name: "annotated".into(),
+            },
+        })
+        .decode::<()>()
+        .unwrap();
+    let tags: Vec<TagInfo> = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::ListTags,
+        })
+        .decode()
+        .unwrap();
     assert!(tags.is_empty());
     helper.finish();
 }

@@ -29,11 +29,13 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use mt_project::git::{self, GitLogCursor, LogFilter, PullMode, PushOptions,
-    StashSaveOptions, RepoOpKind, ConflictSide, GitDiffResult};
-mod server;
+use mt_project::git::{
+    self, ConflictSide, GitDiffResult, GitLogCursor, LogFilter, PullMode, PushOptions, RepoOpKind,
+    StashSaveOptions,
+};
 mod failure;
 mod operations;
+mod server;
 pub use failure::GitFailure;
 pub use operations::{GitMutation, GitQuery};
 pub use server::serve;
@@ -117,36 +119,144 @@ pub enum Operation {
         repo: String,
         message: String,
     },
-    PanelSnapshot { repo: String, recent_limit: usize },
-    ChangesSnapshot { repo: String },
-    Log { repo: String, after: Option<GitLogCursor>, limit: usize,
-        branch: Option<String>, filter: Option<LogFilter> },
-    CommitDetail { repo: String, hash: String },
-    CommitFiles { repo: String, hash: String },
-    CommitDiff { repo: String, hash: String, path: String, old_path: Option<String> },
-    CommitWith { repo: String, message: String, amend: bool },
-    Discard { repo: String, paths: Vec<String> },
-    StageHunk { repo: String, path: String, diff: GitDiffResult, hunk: usize },
-    UnstageHunk { repo: String, path: String, diff: GitDiffResult, hunk: usize },
-    DiscardHunk { repo: String, path: String, diff: GitDiffResult, hunk: usize },
-    Checkout { repo: String, branch: String, remote: bool },
-    CreateBranch { repo: String, name: String, start: Option<String>, checkout: bool },
-    RenameBranch { repo: String, old: String, name: String },
-    DeleteBranch { repo: String, name: String, force: bool },
-    Fetch { repo: String },
-    Pull { repo: String, mode: Option<PullMode> },
-    PushPreview { repo: String, branch: Option<String>, limit: usize },
-    Push { repo: String, options: PushOptions },
-    ListStashes { repo: String },
-    SaveStash { repo: String, options: StashSaveOptions },
-    ApplyStash { repo: String, index: usize, hash: String, pop: bool, reinstate: bool },
-    DropStash { repo: String, index: usize, hash: String },
-    OperationContinue { repo: String, #[serde(rename = "operationKind")] kind: RepoOpKind },
-    OperationAbort { repo: String, #[serde(rename = "operationKind")] kind: RepoOpKind },
-    ResolveConflict { repo: String, path: String, side: ConflictSide },
-    MarkResolved { repo: String, path: String },
-    Query { repo: String, query: GitQuery },
-    Mutate { repo: String, mutation: GitMutation },
+    PanelSnapshot {
+        repo: String,
+        recent_limit: usize,
+    },
+    ChangesSnapshot {
+        repo: String,
+    },
+    Log {
+        repo: String,
+        after: Option<GitLogCursor>,
+        limit: usize,
+        branch: Option<String>,
+        filter: Option<LogFilter>,
+    },
+    CommitDetail {
+        repo: String,
+        hash: String,
+    },
+    CommitFiles {
+        repo: String,
+        hash: String,
+    },
+    CommitDiff {
+        repo: String,
+        hash: String,
+        path: String,
+        old_path: Option<String>,
+    },
+    CommitWith {
+        repo: String,
+        message: String,
+        amend: bool,
+    },
+    Discard {
+        repo: String,
+        paths: Vec<String>,
+    },
+    StageHunk {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        hunk: usize,
+    },
+    UnstageHunk {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        hunk: usize,
+    },
+    DiscardHunk {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        hunk: usize,
+    },
+    Checkout {
+        repo: String,
+        branch: String,
+        remote: bool,
+    },
+    CreateBranch {
+        repo: String,
+        name: String,
+        start: Option<String>,
+        checkout: bool,
+    },
+    RenameBranch {
+        repo: String,
+        old: String,
+        name: String,
+    },
+    DeleteBranch {
+        repo: String,
+        name: String,
+        force: bool,
+    },
+    Fetch {
+        repo: String,
+    },
+    Pull {
+        repo: String,
+        mode: Option<PullMode>,
+    },
+    PushPreview {
+        repo: String,
+        branch: Option<String>,
+        limit: usize,
+    },
+    Push {
+        repo: String,
+        options: PushOptions,
+    },
+    ListStashes {
+        repo: String,
+    },
+    SaveStash {
+        repo: String,
+        options: StashSaveOptions,
+    },
+    ApplyStash {
+        repo: String,
+        index: usize,
+        hash: String,
+        pop: bool,
+        reinstate: bool,
+    },
+    DropStash {
+        repo: String,
+        index: usize,
+        hash: String,
+    },
+    OperationContinue {
+        repo: String,
+        #[serde(rename = "operationKind")]
+        kind: RepoOpKind,
+    },
+    OperationAbort {
+        repo: String,
+        #[serde(rename = "operationKind")]
+        kind: RepoOpKind,
+    },
+    ResolveConflict {
+        repo: String,
+        path: String,
+        side: ConflictSide,
+    },
+    MarkResolved {
+        repo: String,
+        path: String,
+    },
+    Query {
+        repo: String,
+        query: GitQuery,
+    },
+    Mutate {
+        repo: String,
+        mutation: GitMutation,
+    },
 }
 
 impl Operation {
@@ -154,22 +264,43 @@ impl Operation {
     /// an interrupted request can have changed the repository.
     pub fn is_write(&self) -> bool {
         match self {
-            Self::Discover | Self::Status { .. } | Self::Diff { .. }
-                | Self::Query { .. }
-                | Self::PanelSnapshot { .. } | Self::ChangesSnapshot { .. }
-                | Self::Log { .. } | Self::CommitDetail { .. } | Self::CommitFiles { .. }
-                | Self::CommitDiff { .. } | Self::PushPreview { .. }
-                | Self::ListStashes { .. } => false,
-            Self::Stage { .. } | Self::Unstage { .. } | Self::StageAll { .. }
-                | Self::UnstageAll { .. } | Self::Commit { .. } | Self::CommitWith { .. }
-                | Self::Discard { .. } | Self::StageHunk { .. } | Self::UnstageHunk { .. }
-                | Self::DiscardHunk { .. } | Self::Checkout { .. } | Self::CreateBranch { .. }
-                | Self::RenameBranch { .. } | Self::DeleteBranch { .. } | Self::Fetch { .. }
-                | Self::Pull { .. } | Self::Push { .. } | Self::SaveStash { .. }
-                | Self::Mutate { .. }
-                | Self::ApplyStash { .. } | Self::DropStash { .. }
-                | Self::OperationContinue { .. } | Self::OperationAbort { .. }
-                | Self::ResolveConflict { .. } | Self::MarkResolved { .. } => true,
+            Self::Discover
+            | Self::Status { .. }
+            | Self::Diff { .. }
+            | Self::Query { .. }
+            | Self::PanelSnapshot { .. }
+            | Self::ChangesSnapshot { .. }
+            | Self::Log { .. }
+            | Self::CommitDetail { .. }
+            | Self::CommitFiles { .. }
+            | Self::CommitDiff { .. }
+            | Self::PushPreview { .. }
+            | Self::ListStashes { .. } => false,
+            Self::Stage { .. }
+            | Self::Unstage { .. }
+            | Self::StageAll { .. }
+            | Self::UnstageAll { .. }
+            | Self::Commit { .. }
+            | Self::CommitWith { .. }
+            | Self::Discard { .. }
+            | Self::StageHunk { .. }
+            | Self::UnstageHunk { .. }
+            | Self::DiscardHunk { .. }
+            | Self::Checkout { .. }
+            | Self::CreateBranch { .. }
+            | Self::RenameBranch { .. }
+            | Self::DeleteBranch { .. }
+            | Self::Fetch { .. }
+            | Self::Pull { .. }
+            | Self::Push { .. }
+            | Self::SaveStash { .. }
+            | Self::Mutate { .. }
+            | Self::ApplyStash { .. }
+            | Self::DropStash { .. }
+            | Self::OperationContinue { .. }
+            | Self::OperationAbort { .. }
+            | Self::ResolveConflict { .. }
+            | Self::MarkResolved { .. } => true,
         }
     }
 
@@ -179,26 +310,51 @@ impl Operation {
             Self::Status { .. } => "status",
             Self::Diff { .. } => "diff",
             Self::Query { .. } | Self::Mutate { .. } => "data",
-            Self::Stage { .. } | Self::Unstage { .. } | Self::StageAll { .. }
-                | Self::UnstageAll { .. } => "updated",
+            Self::Stage { .. }
+            | Self::Unstage { .. }
+            | Self::StageAll { .. }
+            | Self::UnstageAll { .. } => "updated",
             Self::Commit { .. } => "committed",
-            Self::PanelSnapshot { .. } | Self::ChangesSnapshot { .. } | Self::Log { .. }
-                | Self::CommitDetail { .. } | Self::CommitFiles { .. } | Self::CommitDiff { .. }
-                | Self::CommitWith { .. } | Self::Discard { .. } | Self::StageHunk { .. }
-                | Self::UnstageHunk { .. } | Self::DiscardHunk { .. } | Self::Checkout { .. }
-                | Self::CreateBranch { .. } | Self::RenameBranch { .. } | Self::DeleteBranch { .. }
-                | Self::Fetch { .. } | Self::Pull { .. } | Self::PushPreview { .. }
-                | Self::Push { .. } | Self::ListStashes { .. } | Self::SaveStash { .. }
-                | Self::ApplyStash { .. } | Self::DropStash { .. } | Self::OperationContinue { .. }
-                | Self::OperationAbort { .. } | Self::ResolveConflict { .. }
-                | Self::MarkResolved { .. } => "data",
+            Self::PanelSnapshot { .. }
+            | Self::ChangesSnapshot { .. }
+            | Self::Log { .. }
+            | Self::CommitDetail { .. }
+            | Self::CommitFiles { .. }
+            | Self::CommitDiff { .. }
+            | Self::CommitWith { .. }
+            | Self::Discard { .. }
+            | Self::StageHunk { .. }
+            | Self::UnstageHunk { .. }
+            | Self::DiscardHunk { .. }
+            | Self::Checkout { .. }
+            | Self::CreateBranch { .. }
+            | Self::RenameBranch { .. }
+            | Self::DeleteBranch { .. }
+            | Self::Fetch { .. }
+            | Self::Pull { .. }
+            | Self::PushPreview { .. }
+            | Self::Push { .. }
+            | Self::ListStashes { .. }
+            | Self::SaveStash { .. }
+            | Self::ApplyStash { .. }
+            | Self::DropStash { .. }
+            | Self::OperationContinue { .. }
+            | Self::OperationAbort { .. }
+            | Self::ResolveConflict { .. }
+            | Self::MarkResolved { .. } => "data",
         }
     }
 
     /// Smart checkout can run stash, checkout and restore, each with its own
     /// core timeout. Never time out the transport before that business budget.
     pub fn needs_smart_checkout_timeout(&self) -> bool {
-        matches!(self, Self::Mutate { mutation: GitMutation::CheckoutWithStash { .. }, .. })
+        matches!(
+            self,
+            Self::Mutate {
+                mutation: GitMutation::CheckoutWithStash { .. },
+                ..
+            }
+        )
     }
 }
 
@@ -222,7 +378,9 @@ pub enum Reply {
     Committed {
         output: String,
     },
-    Data { value: serde_json::Value },
+    Data {
+        value: serde_json::Value,
+    },
 }
 
 impl Reply {
@@ -241,9 +399,16 @@ impl Reply {
     /// silently accepting a mismatched original reply variant.
     pub fn decode<T: DeserializeOwned>(self) -> Result<T, String> {
         match self {
-            Self::Data { value } => serde_json::from_value(value)
-                .map_err(|error| format!("invalid Git reply data for {}: {error}", std::any::type_name::<T>())),
-            other => Err(format!("expected Git data reply, received {}", other.kind())),
+            Self::Data { value } => serde_json::from_value(value).map_err(|error| {
+                format!(
+                    "invalid Git reply data for {}: {error}",
+                    std::any::type_name::<T>()
+                )
+            }),
+            other => Err(format!(
+                "expected Git data reply, received {}",
+                other.kind()
+            )),
         }
     }
 }
