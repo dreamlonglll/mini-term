@@ -1649,7 +1649,52 @@ impl GitChanges {
 
     /// 提交。`open_push` = 「提交并推送」:提交成功后让容器打开推送对话框(见模块注释);
     /// `stage_first` = 先暂存全部已跟踪改动(未暂存组,不含未跟踪文件)。
+    ///
+    /// 「全部暂存并提交」遇到**部分暂存**的文件先确认:按整文件 `git add` 会把用户按块 /
+    /// 按行挑好的暂存内容连同剩下的改动一起暂存,挑的那一步就白做了,而且提交以后才看得出来。
+    /// 没有部分暂存的文件时不打扰,直接提交。
     fn commit(
+        &mut self,
+        open_push: bool,
+        stage_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_blocker(stage_first, cx).is_some() {
+            return;
+        }
+        if stage_first {
+            let partial = partially_staged_paths(&self.changes);
+            if !partial.is_empty() {
+                let this = cx.entity();
+                Confirm::new(
+                    t("gitCommit", "stageAllAndCommit"),
+                    tr!(
+                        "gitCommit",
+                        "stageAllPartialConfirm",
+                        count = partial.len().to_string()
+                    ),
+                )
+                .detail(preview_paths(&partial))
+                .ok_text(t("gitCommit", "stageAllPartialOk"))
+                .open(
+                    move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.commit_confirmed(open_push, true, window, cx)
+                        });
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        self.commit_confirmed(open_push, stage_first, window, cx);
+    }
+
+    /// [`Self::commit`] 过了确认之后的那一段。确认框开着的时候状态可能变了(提交框清空、
+    /// 别处起了 git 操作),所以这里再判一次能不能提交。
+    fn commit_confirmed(
         &mut self,
         open_push: bool,
         stage_first: bool,
@@ -1959,6 +2004,15 @@ fn take_side_key(side: ConflictSide, deleted: bool, op: Option<RepoOpKind>) -> &
 }
 
 /// 确认框里列出的文件(最多 5 个,多出的写「…等 N 个」)。
+/// 部分暂存的文件(同时在已暂存与未暂存两组里,口径见 [`in_area`]),按列表原顺序。
+fn partially_staged_paths(changes: &[ChangeFileStatus]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| in_area(c, Area::Staged) && in_area(c, Area::Unstaged))
+        .map(|c| c.path.clone())
+        .collect()
+}
+
 fn preview_paths(paths: &[String]) -> Vec<String> {
     const LIMIT: usize = 5;
     let mut lines: Vec<String> = paths.iter().take(LIMIT).map(|p| format!("• {p}")).collect();
@@ -3104,6 +3158,29 @@ mod tests {
         assert_eq!(group(&changes, Area::Staged), vec!["a.rs", "b.rs"]);
         assert_eq!(group(&changes, Area::Unstaged), vec!["b.rs", "c.rs"]);
         assert_eq!(group(&changes, Area::Untracked), vec!["d.rs"]);
+    }
+
+    /// 「全部暂存并提交」要先确认的只有部分暂存的文件:只在一组里的、未跟踪的、
+    /// 冲突中的都不算(冲突时提交按钮本来就被拦下)。
+    #[test]
+    fn 全部暂存并提交只为部分暂存的文件确认() {
+        let changes = [
+            change("a.rs", Some(GitStatus::Added), None),
+            change("b.rs", Some(GitStatus::Modified), Some(GitStatus::Modified)),
+            change("c.rs", None, Some(GitStatus::Modified)),
+            change("d.rs", None, Some(GitStatus::Untracked)),
+            change("e.rs", Some(GitStatus::Added), Some(GitStatus::Deleted)),
+            change(
+                "f.rs",
+                Some(GitStatus::Conflicted),
+                Some(GitStatus::Conflicted),
+            ),
+        ];
+        assert_eq!(partially_staged_paths(&changes), vec!["b.rs", "e.rs"]);
+        assert!(partially_staged_paths(&changes[..1]).is_empty());
+        // 确认框正文里真带着文件数
+        let text = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitCommit", "stageAllPartialConfirm");
+        assert!(text.contains("{count}"), "{text}");
     }
 
     /// 列表高度按眼下的数据算(E2E r4 A12:外部改动多出「未暂存」组的那一帧,按上一帧量的

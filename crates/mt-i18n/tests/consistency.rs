@@ -201,8 +201,10 @@ use mt_i18n::{
 /// 文件禁用按块操作的说明（`gitCommit.{hunkNonUtf8,hunkUnknownEncoding}`）；外部改动提示条的
 /// 「对比 / 保留我的」与对比弹窗（`fileViewer.{compareDisk,keepMine,keepMineTip,compareTitle,
 /// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
+/// 1564 → 1566：「全部暂存并提交」遇到部分暂存的文件先确认
+/// （`gitCommit.{stageAllPartialConfirm,stageAllPartialOk}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1564;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1566;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

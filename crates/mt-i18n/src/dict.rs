@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1564;
+pub const ZH_ENTRY_COUNT: usize = 1566;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1564;
+pub const EN_ENTRY_COUNT: usize = 1566;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1066,6 +1066,8 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("stageAll", "全部暂存"),
     ("stageAllAndCommit", "全部暂存并提交"),
     ("stageAllAndCommitDetail", "暂存全部已跟踪的改动（不含未跟踪文件）后提交"),
+    ("stageAllPartialConfirm", "{count} 个文件目前只暂存了一部分。\n「全部暂存并提交」会把它们剩下的改动也一起暂存并提交。确定继续吗？"),
+    ("stageAllPartialOk", "全部暂存并提交"),
     ("stageHunk", "暂存此块"),
     ("stageSelected", "暂存所选 {count} 个文件"),
     ("statusAdded", "新增"),
@@ -1150,6 +1152,8 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("stageAll", "Stage all"),
     ("stageAllAndCommit", "Stage All and Commit"),
     ("stageAllAndCommitDetail", "Stages all tracked changes (untracked files excluded), then commits"),
+    ("stageAllPartialConfirm", "{count} file(s) are only partially staged.\n\"Stage All and Commit\" will stage and commit their remaining changes too. Continue?"),
+    ("stageAllPartialOk", "Stage all and commit"),
     ("stageHunk", "Stage hunk"),
     ("stageSelected", "Stage {count} selected files"),
     ("statusAdded", "Added"),
