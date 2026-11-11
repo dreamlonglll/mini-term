@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1566;
+pub const ZH_ENTRY_COUNT: usize = 1582;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1566;
+pub const EN_ENTRY_COUNT: usize = 1582;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2226,6 +2226,21 @@ static SEARCH_ZH: &[(&str, &str)] = &[
     ("modeFilename", "文件名"),
     ("placeholderContent", "搜索文件内容..."),
     ("placeholderFilename", "搜索文件名（含 / 则按路径匹配）..."),
+    ("quickOpen.empty", "这个项目里没有可列出的文件"),
+    ("quickOpen.fileCount", "{count} 个文件"),
+    ("quickOpen.gotoInCurrent", "按 Enter 在当前文件中跳到第 {line} 行"),
+    ("quickOpen.gotoLine", "打开后跳到第 {line} 行"),
+    ("quickOpen.gotoNoDocument", "当前没有打开的文件。输入文件名再加 :行号，例如 main.rs:42"),
+    ("quickOpen.incompleteTimeout", "结果不完整：建立索引超时，只收录了一部分"),
+    ("quickOpen.incompleteTooMany", "结果不完整：文件超过 {count} 个，只收录了一部分"),
+    ("quickOpen.indexing", "正在建立文件索引…"),
+    ("quickOpen.matchCount", "{count} 个匹配"),
+    ("quickOpen.noMatch", "没有匹配的文件"),
+    ("quickOpen.noProject", "还没有打开项目，请先在左侧选择一个项目"),
+    ("quickOpen.placeholder", "按文件名查找，末尾加 :行号 可跳到该行（如 main.rs:42）"),
+    ("quickOpen.recent", "最近打开"),
+    ("quickOpen.refreshing", "正在刷新索引…"),
+    ("quickOpen.remoteUnsupported", "远程（SSH）项目暂不支持快速打开文件，请在左侧文件树中浏览"),
     ("regexTitle", "正则表达式"),
     ("remoteUnsupported", "远程项目暂不支持全局搜索。"),
     ("scopeClear", "清除范围，搜索整个项目"),
@@ -2249,6 +2264,21 @@ static SEARCH_EN: &[(&str, &str)] = &[
     ("modeFilename", "Filename"),
     ("placeholderContent", "Search file contents..."),
     ("placeholderFilename", "Search filenames (include / to match paths)..."),
+    ("quickOpen.empty", "This project has no files to list"),
+    ("quickOpen.fileCount", "{count} files"),
+    ("quickOpen.gotoInCurrent", "Press Enter to go to line {line} in the current file"),
+    ("quickOpen.gotoLine", "Jumps to line {line} after opening"),
+    ("quickOpen.gotoNoDocument", "No file is open. Type a file name followed by :line, e.g. main.rs:42"),
+    ("quickOpen.incompleteTimeout", "Incomplete: indexing timed out, only part of the project is indexed"),
+    ("quickOpen.incompleteTooMany", "Incomplete: more than {count} files, only part of the project is indexed"),
+    ("quickOpen.indexing", "Indexing files…"),
+    ("quickOpen.matchCount", "{count} matches"),
+    ("quickOpen.noMatch", "No matching files"),
+    ("quickOpen.noProject", "No project is open. Select a project on the left first"),
+    ("quickOpen.placeholder", "Find a file by name; add :line to jump to that line (e.g. main.rs:42)"),
+    ("quickOpen.recent", "recently opened"),
+    ("quickOpen.refreshing", "Refreshing index…"),
+    ("quickOpen.remoteUnsupported", "Quick open is not available for remote (SSH) projects yet. Browse them in the file tree on the left"),
     ("regexTitle", "Regular Expression"),
     ("remoteUnsupported", "Global search is not available for remote projects yet."),
     ("scopeClear", "Clear and search the whole project"),
@@ -2586,6 +2616,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.openSettings", "打开设置"),
     ("shortcuts.pasteToTerminal", "粘贴到终端"),
     ("shortcuts.prevPane", "切到上一个终端标签"),
+    ("shortcuts.quickOpen", "快速打开文件"),
     ("shortcuts.renamePane", "重命名当前终端"),
     ("shortcuts.selectPaneN", "切到第 N 个终端标签"),
     ("shortcuts.splitDown", "向下分屏"),
@@ -2849,6 +2880,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.openSettings", "Open settings"),
     ("shortcuts.pasteToTerminal", "Paste into terminal"),
     ("shortcuts.prevPane", "Previous terminal tab"),
+    ("shortcuts.quickOpen", "Quick open file"),
     ("shortcuts.renamePane", "Rename current terminal"),
     ("shortcuts.selectPaneN", "Go to Nth terminal tab"),
     ("shortcuts.splitDown", "Split down"),

@@ -203,8 +203,11 @@ use mt_i18n::{
 /// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
 /// 1564 → 1566：「全部暂存并提交」遇到部分暂存的文件先确认
 /// （`gitCommit.{stageAllPartialConfirm,stageAllPartialOk}`）。
+/// 1566 → 1582：快速打开文件（Ctrl+Shift+O）—— 面板的占位 / 索引中 / 刷新中 / 无匹配 / 空项目 /
+/// 无项目 / 远程不支持 / 文件数与匹配数 / 两种「结果不完整」/ 最近打开标签 / 三条跳行提示
+/// （`search.quickOpen.*` 15 条），设置页快捷键表的描述（`settings.shortcuts.quickOpen`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1566;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1582;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

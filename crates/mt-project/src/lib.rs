@@ -10,6 +10,7 @@
 //! | `src-tauri/src/fs.rs` | [`fs`] + [`watch`] | 目录列举(`.gitignore` 过滤)+ 文件增删改 / `notify` 监听 |
 //! | `src-tauri/src/git.rs` | [`git`] | git2 状态/diff/log/stage/commit/worktree 全套 |
 //! | `src-tauri/src/search.rs` | [`search`] | 全文搜索(可取消) |
+//! | (新增,移植自 Winc) | [`quick_open`] | 快速打开文件:内存文件索引 + 模糊打分 + `文件:行:列` |
 //! | `src-tauri/src/editor.rs` | [`editor`] | 用外部编辑器 / 默认程序打开路径 |
 //! | `src-tauri/src/wsl_distros.rs` | [`wsl_distros`] | 读 `HKCU\...\Lxss` 注册表枚举发行版 |
 //! | `mt-app/src/project_kind.rs` + mt-ui `icons/tech_art.rs` 里的枚举 | [`project_kind`] | 技术栈枚举 `ProjectKind`(落盘)+ 目录标记文件探测 |
@@ -52,6 +53,7 @@ pub mod encoding;
 pub mod fs;
 pub mod git;
 pub mod project_kind;
+pub mod quick_open;
 pub mod search;
 pub mod watch;
 pub mod wsl_distros;

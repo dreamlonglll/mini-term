@@ -64,6 +64,8 @@ pub mod kind {
     pub const GLOBAL_SEARCH: &str = "global-search";
     /// 项目快速切换器(Ctrl+Shift+P)。
     pub const PROJECT_SWITCHER: &str = "project-switcher";
+    /// 快速打开文件(Ctrl+Shift+O)。
+    pub const QUICK_OPEN: &str = "quick-open";
     /// 终端内查找条(Ctrl+F)。**逐 pane 一条**,slot 存 `pty_id`。
     pub const TERMINAL_SEARCH: &str = "terminal-search";
     /// AI 任务标记浮层(tab 栏上那个 ⚑ 按钮弹出来的列表)。
