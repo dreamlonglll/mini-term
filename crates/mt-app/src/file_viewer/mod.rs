@@ -93,12 +93,13 @@ use gpui::{
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{EditorState, Escape, InputEvent, Search, TabSize};
+use mt_project::encoding::{EncodeError, TextEncoding};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::{FsWatcher, WATCH_READY_BUDGET, WatchReady};
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::image_lightbox::ImageLightbox;
 use crate::tab_expansion::TAB_WIDTH;
 use crate::ui;
@@ -277,6 +278,57 @@ fn editor_font_fallbacks() -> gpui::FontFallbacks {
     ])
 }
 
+/// 本地保存失败的提示原文。编码表示不了草稿里的字符 / 只读打开的,换成本地化文案
+/// (后端那条是固定中文);其余照旧按 `{err:#}` 原样显示。
+fn save_error_text(err: &anyhow::Error) -> String {
+    match err.downcast_ref::<EncodeError>() {
+        Some(EncodeError::Unmappable { ch, line, encoding }) => tr!(
+            "fileViewer",
+            "unencodable",
+            line = line,
+            ch = ch,
+            encoding = encoding
+        ),
+        Some(EncodeError::ReadOnly) => t("fileViewer", "lossyReadOnly").to_string(),
+        None => format!("{err:#}"),
+    }
+}
+
+/// 工具栏文件名后面那枚编码徽标:只给非 UTF-8 的文件画(UTF-8 一切照旧,不添噪声)。
+/// 解码有损的画成警示色的「只读」,悬停说明原因。
+fn encoding_badge(encoding: TextEncoding) -> Option<gpui::Stateful<gpui::Div>> {
+    if encoding.is_utf8() {
+        return None;
+    }
+    let (label, tip, color) = if encoding.writable() {
+        (
+            encoding.label().to_string(),
+            tr!("fileViewer", "encodingTip", encoding = encoding.label()),
+            ui::text_muted(),
+        )
+    } else {
+        (
+            t("fileViewer", "lossyBadge").to_string(),
+            t("fileViewer", "lossyReadOnly").to_string(),
+            ui::color_warning(),
+        )
+    };
+    Some(
+        div()
+            .id("file-viewer-encoding")
+            .flex_none()
+            .px(px(8.0))
+            .py(px(2.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(ui::border_default())
+            .text_size(ui::font_px(12.0))
+            .text_color(color)
+            .tip(tip)
+            .child(label),
+    )
+}
+
 /// 工具栏上的描边小按钮(「用浏览器打开」「使用默认工具打开」),点击由调用方挂。
 fn toolbar_outline_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
@@ -371,6 +423,8 @@ pub struct FileViewer {
     web_preview: RefCell<webview::WebPreview>,
 
     preview: bool,
+    /// 外部改动提示条「对比」没能打开(重读磁盘失败 / 盘上变成了二进制)的原因。
+    compare_error: Option<String>,
 
     watcher: Arc<FsWatcher>,
     watched: Option<PathBuf>,
@@ -454,6 +508,7 @@ impl FileViewer {
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight.is_none(),
+            compare_error: None,
             watcher,
             watched: None,
             focus: cx.focus_handle(),
@@ -956,6 +1011,7 @@ impl FileViewer {
         let Some(SaveStart {
             generation,
             on_disk,
+            encoding,
         }) = self.doc.begin_save(&text)
         else {
             return;
@@ -967,10 +1023,13 @@ impl FileViewer {
             DocumentSource::Local { project_root, .. } => {
                 cx.spawn(async move |this, cx| {
                     let probe = (project_root, path.clone(), on_disk);
+                    // 按读进来时的编码写回;表示不了的字符在碰盘之前就被拒绝(原文件不动)
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
-                            mt_project::fs::write_file_content(&probe.0, &probe.1, &probe.2)
+                            mt_project::fs::write_file_content_as(
+                                &probe.0, &probe.1, &probe.2, encoding,
+                            )
                         })
                         .await;
                     let _ = this.update(cx, |view: &mut FileViewer, cx| {
@@ -981,7 +1040,7 @@ impl FileViewer {
                         let editor = view.editor.as_ref();
                         view.doc.on_local_save_result(
                             text.clone(),
-                            outcome.map_err(|err| format!("{err:#}")),
+                            outcome.map_err(|err| save_error_text(&err)),
                             Instant::now(),
                             || editor_text(editor, cx),
                         );
@@ -1179,10 +1238,17 @@ impl FileViewer {
             && self.preview
             && is_markdown_file(&path)
             && self.md_outline_available();
-        let can_edit =
-            !self.doc.remote_source_invalid() && can_edit(self.is_img(), self.doc.result());
+        // 只读(解码有损)的不画保存按钮:编辑器本身也拒绝修改
+        let can_edit = !self.doc.remote_source_invalid()
+            && !self.doc.read_only()
+            && can_edit(self.is_img(), self.doc.result());
         let dirty = self.doc.is_dirty();
         let saving = self.doc.is_saving();
+        let badge = self
+            .doc
+            .result()
+            .filter(|result| !result.is_binary && !result.too_large)
+            .and_then(|result| encoding_badge(result.encoding));
 
         div()
             .flex()
@@ -1220,6 +1286,8 @@ impl FileViewer {
                                 .tip(t("fileViewer", "unsaved")),
                         )
                     })
+                    // 编码徽标:非 UTF-8 才有(GB18030 / UTF-16 LE / 只读)
+                    .children(badge)
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -1474,6 +1542,20 @@ impl FileViewer {
                     )
                 },
             )
+            .when_some(self.compare_error.clone(), |el, err| {
+                el.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_warning())
+                        .truncate()
+                        .child(format!("{}: {}", t("fileViewer", "compareFailed"), err)),
+                )
+            })
             .when(self.doc.ext_changed(), |el| {
                 el.child(
                     div()
@@ -1502,9 +1584,75 @@ impl FileViewer {
                                         this.reload(window, cx);
                                     }))
                                 }),
+                        )
+                        // 对比:磁盘上的版本 ↔ 编辑器里未保存的修改(只读 diff 弹窗)
+                        .child(
+                            div()
+                                .id("file-viewer-compare-disk")
+                                .cursor_pointer()
+                                .hover(|el| el.text_color(ui::text_primary()))
+                                .child(t("fileViewer", "compareDisk"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.compare_with_disk(window, cx);
+                                })),
+                        )
+                        // 保留我的:收起提示条继续编辑,下次保存覆盖磁盘上的版本
+                        .child(
+                            div()
+                                .id("file-viewer-keep-mine")
+                                .cursor_pointer()
+                                .hover(|el| el.text_color(ui::text_primary()))
+                                .tip(t("fileViewer", "keepMineTip"))
+                                .child(t("fileViewer", "keepMine"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.doc.keep_mine();
+                                    this.compare_error = None;
+                                    cx.notify();
+                                })),
                         ),
                 )
             })
+    }
+
+    /// 外部改动提示条的「对比」:后台重读磁盘,左侧磁盘上的版本、右侧编辑器里未保存的
+    /// 内容,开一个只读 diff 弹窗。两侧都折成 `\n` 行尾、Tab 按落盘形态还原,只比内容
+    /// 不比行尾。读盘失败(文件被删 / 变成二进制)就地挂在保存错误那一条上。
+    fn compare_with_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let DocumentSource::Local { project_root, .. } = self.source.clone() else {
+            return;
+        };
+        self.compare_error = None;
+        let draft = self.draft(cx);
+        let mine = normalize_to_lf(&self.doc.to_disk_form(&draft));
+        let path = self.current_path.clone();
+        let name = self.file_name();
+        cx.spawn_in(window, async move |this, cx| {
+            let probe = (project_root, path.clone());
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { mt_project::fs::read_file_content(&probe.0, &probe.1) })
+                .await;
+            let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+                if view.current_path != path {
+                    return;
+                }
+                match outcome {
+                    Ok(disk) if !disk.is_binary && !disk.too_large => {
+                        let disk = normalize_to_lf(&disk.content);
+                        crate::git_diff::open_text_diff(&name, disk, mine, window, cx);
+                    }
+                    Ok(_) => {
+                        view.compare_error = Some(t("fileViewer", "compareUnavailable").into());
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        view.compare_error = Some(format!("{err:#}"));
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// 居中一行字 +「使用默认工具打开」「打开文件所在文件夹」两个按钮

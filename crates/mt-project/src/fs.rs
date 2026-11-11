@@ -17,6 +17,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use ignore::gitignore::Gitignore;
 use serde::Serialize;
 
+use crate::encoding::{Decoded, TextEncoding};
+
 /// 原子写文件:先写到同目录的临时文件,fsync 后再 rename 覆盖目标。
 ///
 /// 收尾-1 批把工作区里的三份逐字副本(本模块、`mt_config::config`、`mt_ai::util`)
@@ -352,6 +354,55 @@ pub struct FileContentResult {
     pub content: String,
     pub is_binary: bool,
     pub too_large: bool,
+    /// 文本的编码(见 [`crate::encoding`])。二进制 / 过大的记 [`TextEncoding::Utf8`]
+    /// (没有内容,无所谓);[`TextEncoding::Lossy`] = 只读。
+    pub encoding: TextEncoding,
+}
+
+impl FileContentResult {
+    /// 一份文本内容。
+    pub fn text(content: String, encoding: TextEncoding) -> Self {
+        Self {
+            content,
+            is_binary: false,
+            too_large: false,
+            encoding,
+        }
+    }
+
+    /// 二进制(不读成文本)。
+    pub fn binary() -> Self {
+        Self {
+            content: String::new(),
+            is_binary: true,
+            too_large: false,
+            encoding: TextEncoding::Utf8,
+        }
+    }
+
+    /// 超过 [`MAX_FILE_VIEW_SIZE`](不读内容)。
+    pub fn too_large() -> Self {
+        Self {
+            content: String::new(),
+            is_binary: false,
+            too_large: true,
+            encoding: TextEncoding::Utf8,
+        }
+    }
+
+    /// 整份字节 → 结果。识别顺序见 [`crate::encoding::decode_in`];合法 UTF-8 原样
+    /// 返回、不复制。远程文档(`mt-remote`)与本地同一把尺子。
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        match crate::encoding::decode(bytes) {
+            Decoded::Text { text, encoding } => Self::text(text, encoding),
+            Decoded::Binary => Self::binary(),
+        }
+    }
+
+    /// 只读:能显示,但解码有损,按原编码写回会把文件写坏。
+    pub fn read_only(&self) -> bool {
+        !self.is_binary && !self.too_large && !self.encoding.writable()
+    }
 }
 
 /// 内置查看器/编辑器能打开的最大文件尺寸,读写两侧共用。
@@ -364,38 +415,44 @@ pub fn read_file_content(project_root: &Path, path: &Path) -> Result<FileContent
     }
     let metadata = fs::metadata(&p)?;
     if metadata.len() > MAX_FILE_VIEW_SIZE {
-        return Ok(FileContentResult {
-            content: String::new(),
-            is_binary: false,
-            too_large: true,
-        });
+        return Ok(FileContentResult::too_large());
     }
-    let bytes = fs::read(&p)?;
-    match String::from_utf8(bytes) {
-        Ok(s) => Ok(FileContentResult {
-            content: s,
-            is_binary: false,
-            too_large: false,
-        }),
-        Err(_) => Ok(FileContentResult {
-            content: String::new(),
-            is_binary: true,
-            too_large: false,
-        }),
-    }
+    Ok(FileContentResult::from_bytes(fs::read(&p)?))
 }
 
+/// 按 UTF-8 写回(`content` 的字节原样落盘),即
+/// `write_file_content_as(.., TextEncoding::Utf8)`。
 pub fn write_file_content(project_root: &Path, path: &Path, content: &str) -> Result<()> {
+    write_file_content_as(project_root, path, content, TextEncoding::Utf8)
+}
+
+/// 按文件读进来时的编码写回(UTF-16 带回 BOM;UTF-8 的 BOM 本来就在 `content` 里)。
+///
+/// 编码表示不了 `content` 里的字符、或文件是只读打开的([`TextEncoding::Lossy`]),
+/// 在**碰盘之前**报 [`crate::encoding::EncodeError`](界面 `downcast_ref` 出来换成
+/// 本地化文案),原文件一字不动 —— 绝不静默写出一个与编辑器里不一样的文件。
+pub fn write_file_content_as(
+    project_root: &Path,
+    path: &Path,
+    content: &str,
+    encoding: TextEncoding,
+) -> Result<()> {
     // 与读侧同一上限:编辑器根本打不开 >1MB 的文件,超限内容只可能来自
     // 绕过编辑器直接调本函数的路径,这一层不依赖调用方的约束
     if content.len() as u64 > MAX_FILE_VIEW_SIZE {
+        bail!("内容过大(>1MB),拒绝写入");
+    }
+    let bytes = encoding.encode(content)?;
+    // UTF-16 一个 ASCII 字符占两字节:编出来的字节同样不能越过读侧的上限,否则存完
+    // 就再也打不开了
+    if bytes.len() as u64 > MAX_FILE_VIEW_SIZE {
         bail!("内容过大(>1MB),拒绝写入");
     }
     let p = verify_followed_under_project_root(project_root, path)?;
     if !p.is_file() {
         bail!("不是文件: {}", path.display());
     }
-    atomic_write(&p, content.as_bytes())?;
+    atomic_write(&p, &bytes)?;
     Ok(())
 }
 
@@ -1233,6 +1290,142 @@ mod tests {
         assert!(err.contains("过大"));
         // 拒绝发生在写入之前,原文件必须一字未动
         assert_eq!(fs::read(&file).unwrap(), before);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 非 UTF-8 文件读 → 改 → 按原编码写回:GBK(记作 GB18030)、GB18030 四字节字符、
+    /// 带 BOM 的 UTF-16 LE / BE、Shift_JIS。没改动的部分逐字节不变,BOM 保留。
+    #[test]
+    fn non_utf8_files_round_trip_through_read_and_write() {
+        let (root, _) = make_test_project();
+        let gbk = TextEncoding::Legacy(encoding_rs::GBK);
+        let samples: [(&str, Vec<u8>, &str, &str); 5] = [
+            (
+                "gbk.c",
+                gbk.encode("// 你好，世界。这是一段用来猜编码的中文注释。\nint main() {}\n")
+                    .unwrap(),
+                "int main() {}",
+                "int main() { return 0; } // 改过",
+            ),
+            (
+                "gb18030.txt",
+                TextEncoding::Legacy(encoding_rs::GB18030)
+                    .encode("生僻字 𠀀 与表情 😀,只有 GB18030 写得出来。这是一段中文。\n")
+                    .unwrap(),
+                "😀",
+                "😀😀",
+            ),
+            (
+                "utf16le.txt",
+                TextEncoding::Utf16Le
+                    .encode("中文 ok\r\nline2\r\n")
+                    .unwrap(),
+                "line2",
+                "第二行",
+            ),
+            (
+                "utf16be.txt",
+                TextEncoding::Utf16Be.encode("abc\n").unwrap(),
+                "abc",
+                "日本語",
+            ),
+            (
+                "sjis.txt",
+                TextEncoding::Legacy(encoding_rs::SHIFT_JIS)
+                    .encode("これは日本語の文章です。エンコーディングを推測します。\n")
+                    .unwrap(),
+                "推測",
+                "判定",
+            ),
+        ];
+        for (name, bytes, from, to) in samples {
+            let file = root.join(name);
+            fs::write(&file, &bytes).unwrap();
+            let res = read_file_content(&root, &file).unwrap();
+            assert!(!res.is_binary && !res.read_only(), "{name}: {res:?}");
+            assert_ne!(res.encoding, TextEncoding::Utf8, "{name}");
+            // 原样写回:逐字节相同(含 UTF-16 的 BOM)
+            write_file_content_as(&root, &file, &res.content, res.encoding).unwrap();
+            assert_eq!(fs::read(&file).unwrap(), bytes, "{name} 原样写回");
+            // 改一处再写回:再读出来就是改过的文本,编码不变
+            let edited = res.content.replacen(from, to, 1);
+            assert_ne!(edited, res.content, "{name}");
+            write_file_content_as(&root, &file, &edited, res.encoding).unwrap();
+            let again = read_file_content(&root, &file).unwrap();
+            assert_eq!(again.content, edited, "{name}");
+            assert_eq!(again.encoding, res.encoding, "{name}");
+            assert_eq!(
+                fs::read(&file).unwrap(),
+                res.encoding.encode(&edited).unwrap()
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// UTF-8 文件的读写与接入编码识别之前逐字节一致:BOM 留在文本里,写回原样落盘。
+    #[test]
+    fn utf8_files_are_unchanged_by_encoding_detection() {
+        let (root, _) = make_test_project();
+        let file = root.join("bom.txt");
+        let bytes = b"\xEF\xBB\xBFfirst\r\n\xE4\xB8\xAD\r\n".to_vec();
+        fs::write(&file, &bytes).unwrap();
+        let res = read_file_content(&root, &file).unwrap();
+        assert_eq!(res.encoding, TextEncoding::Utf8);
+        assert_eq!(res.content.as_bytes(), bytes.as_slice());
+        write_file_content(&root, &file, &res.content).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), bytes);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 含 NUL 的非 UTF-8 仍是二进制;解码有损的只读,不许保存。
+    #[test]
+    fn binary_and_lossy_files_are_not_writable() {
+        let (root, _) = make_test_project();
+        let bin = root.join("blob.bin");
+        fs::write(&bin, [0x00, 0x9F, 0x92, 0x96, 0xC4, 0x00]).unwrap();
+        let res = read_file_content(&root, &bin).unwrap();
+        assert!(res.is_binary && res.content.is_empty());
+
+        let broken = root.join("broken.txt");
+        let mut bytes = "大体是合法的 UTF-8 中文文本,末尾坏了一个字节"
+            .as_bytes()
+            .to_vec();
+        bytes.push(0xFF);
+        fs::write(&broken, &bytes).unwrap();
+        let res = read_file_content(&root, &broken).unwrap();
+        assert!(res.read_only(), "{res:?}");
+        let err = write_file_content_as(&root, &broken, &res.content, res.encoding).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::encoding::EncodeError>(),
+            Some(&crate::encoding::EncodeError::ReadOnly)
+        );
+        assert_eq!(fs::read(&broken).unwrap(), bytes, "拒绝发生在写入之前");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 编码表示不了的字符:拒绝保存,原文件一字不动,错误能 downcast 出字符与行号。
+    #[test]
+    fn unmappable_characters_refuse_to_save() {
+        let (root, _) = make_test_project();
+        let file = root.join("sjis.txt");
+        let sjis = TextEncoding::Legacy(encoding_rs::SHIFT_JIS);
+        let bytes = sjis
+            .encode("これは日本語の文章です。エンコーディングを推測します。\n")
+            .unwrap();
+        fs::write(&file, &bytes).unwrap();
+        let res = read_file_content(&root, &file).unwrap();
+        assert_eq!(res.encoding, sjis);
+        let edited = format!("{}二行目に絵文字 😀\n", res.content);
+        let err = write_file_content_as(&root, &file, &edited, res.encoding).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::encoding::EncodeError>(),
+            Some(&crate::encoding::EncodeError::Unmappable {
+                ch: '😀',
+                line: 2,
+                encoding: "Shift_JIS",
+            })
+        );
+        assert_eq!(fs::read(&file).unwrap(), bytes, "不可映射时绝不碰盘");
         fs::remove_dir_all(&root).ok();
     }
 

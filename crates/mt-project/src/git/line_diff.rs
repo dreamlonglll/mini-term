@@ -34,8 +34,8 @@ use git2::{ObjectType, Repository};
 
 use super::slide::compact_ops;
 use super::{
-    MAX_LCS_CELLS, blob_too_large, common_affix, discover_repo_for, edit_script, lcs_workload,
-    repo_relative_path,
+    MAX_LCS_CELLS, blob_too_large, common_affix, decode_side, discover_repo_for, edit_script,
+    lcs_workload, repo_relative_path,
 };
 
 /// Myers 允许的最大编辑距离。超过它说明改动面已经大到「整段重写」的量级,
@@ -330,7 +330,7 @@ pub enum HeadFile {
     NotInRepo,
     /// 在仓库里但 HEAD 里没有这个文件(未跟踪、刚加进暂存区、仓库还没有提交)
     NotInHead(RepoFile),
-    /// HEAD 里的版本是二进制 / 非 UTF-8
+    /// HEAD 里的版本是二进制(含解不出文本的非 UTF-8)
     Binary(RepoFile),
     /// HEAD 里的版本超过 diff 上限
     TooLarge(RepoFile),
@@ -382,15 +382,14 @@ pub fn head_file(project_path: &Path, abs_file: &Path) -> Result<HeadFile> {
         return Ok(HeadFile::TooLarge(repo_file));
     }
     let blob = repo.find_blob(oid)?;
-    if blob.is_binary() {
-        return Ok(HeadFile::Binary(repo_file));
-    }
-    Ok(match std::str::from_utf8(blob.content()) {
-        Ok(text) => HeadFile::Text {
+    // 与 diff 弹窗同一把尺子:UTF-8 原样,GBK / UTF-16 这类按编码识别解出来 —— 编辑器里
+    // 那份是同一套规则解的,两边才逐行对得上
+    Ok(match decode_side(blob.content(), blob.is_binary()) {
+        Some((text, _)) => HeadFile::Text {
             repo: repo_file,
-            text: text.to_string(),
+            text,
         },
-        Err(_) => HeadFile::Binary(repo_file),
+        None => HeadFile::Binary(repo_file),
     })
 }
 

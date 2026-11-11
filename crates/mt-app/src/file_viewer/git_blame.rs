@@ -451,8 +451,8 @@ impl FileViewer {
             cx.notify();
             return;
         }
-        // 喂给 git 的是落盘形态(Tab、行尾按原文件),否则每一行都会被当成改过
-        let on_disk = self.doc.to_disk_form(&text);
+        // 喂给 git 的是落盘形态(Tab、行尾、编码都按原文件),否则每一行都会被当成改过
+        let on_disk = self.doc.to_disk_bytes(&text);
         let repo = head.repo.clone();
         let annotate = &mut self.annotate;
         annotate.request = annotate.request.wrapping_add(1);

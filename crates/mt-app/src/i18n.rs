@@ -87,6 +87,21 @@ pub fn system_locale() -> Locale {
     mt_i18n::detect_from_env()
 }
 
+/// 把系统语言交给编码识别当地区提示(`mt_project::encoding::set_region_from_language`):
+/// 简体中文用户的短 GBK 文本才不会被猜成 EUC-KR / Big5。跟的是**系统**语言而不是界面
+/// 语言 —— 文件是在这台机器上写的,与界面挑了哪种语言无关。启动时调一次。
+pub fn install_encoding_region() {
+    #[cfg(windows)]
+    let tag = win32_user_locale_name();
+    #[cfg(not(windows))]
+    let tag = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()));
+    if let Some(tag) = tag {
+        mt_project::encoding::set_region_from_language(&tag);
+    }
+}
+
 /// `GetUserDefaultLocaleName` 的安全包装,返回形如 `"zh-CN"` / `"en-US"` 的标签。
 #[cfg(windows)]
 fn win32_user_locale_name() -> Option<String> {
@@ -353,10 +368,22 @@ const USED_KEYS: &[&str] = &[
     "fileViewer.closeTab",
     "fileViewer.closeToLeft",
     "fileViewer.closeToRight",
+    "fileViewer.compareDisk",
+    "fileViewer.compareFailed",
+    "fileViewer.compareIdentical",
+    "fileViewer.compareSideDisk",
+    "fileViewer.compareSideUnsaved",
+    "fileViewer.compareTitle",
+    "fileViewer.compareUnavailable",
+    "fileViewer.encodingTip",
     "fileViewer.externallyChanged",
     "fileViewer.forceSave",
     "fileViewer.htmlPreviewNote",
+    "fileViewer.keepMine",
+    "fileViewer.keepMineTip",
     "fileViewer.loading",
+    "fileViewer.lossyBadge",
+    "fileViewer.lossyReadOnly",
     "fileViewer.openContainingFolder",
     "fileViewer.openInBrowser",
     "fileViewer.openWithDefaultApp",
@@ -376,6 +403,7 @@ const USED_KEYS: &[&str] = &[
     "fileViewer.saving",
     "fileViewer.source",
     "fileViewer.tooLarge",
+    "fileViewer.unencodable",
     "fileViewer.unsaved",
     "fileViewer.unsavedBatchMessage",
     "fileViewer.unsavedMessage",
@@ -597,7 +625,9 @@ const USED_KEYS: &[&str] = &[
     "gitCommit.hintTitleTooLong",
     "gitCommit.historyEmpty",
     "gitCommit.hunkFailed",
+    "gitCommit.hunkNonUtf8",
     "gitCommit.hunkStale",
+    "gitCommit.hunkUnknownEncoding",
     "gitCommit.hunkWorking",
     "gitCommit.markResolved",
     "gitCommit.markResolvedConfirm",

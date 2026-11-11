@@ -23,6 +23,11 @@ git2 = { version = "0.19", features = ["vendored-openssl"] }
 notify = "7"
 ignore = "0.4"
 pathdiff = "0.2"
+# 非 UTF-8 文本的编解码(`encoding` 模块:GBK / Shift_JIS / UTF-16 …)。依赖树里本来就有
+# 这一份(gpui 栈带进来的),版本对齐 Cargo.lock,只是提成直接依赖。
+encoding_rs = "0.8.41"
+# 猜编码(Firefox 同款检测器),取舍见 `encoding` 模块注释。
+chardetng = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。

@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use mt_config::SshConnection;
+use mt_project::encoding::TextEncoding;
 use mt_project::fs::FileContentResult;
 use mt_ssh::SftpHandle;
 use mt_ssh::sftp::{SftpBoundedFileRead, SftpFileReplaceResult};
@@ -20,10 +21,12 @@ pub enum FileConflictStrategy {
     KeepBoth,
 }
 
-/// Opaque optimistic-concurrency token returned only for editable UTF-8 files.
-/// Callers retain it with the draft and must send it back to
-/// [`save_file_content`]. Raw bytes stay private so UI code cannot fabricate a
-/// baseline for a binary or oversized file.
+/// Opaque optimistic-concurrency token returned only for editable text files
+/// (UTF-8, or a non-UTF-8 encoding that round-trips losslessly — see
+/// `mt_project::encoding`). Callers retain it with the draft and must send it
+/// back to [`save_file_content`]. Raw bytes stay private so UI code cannot
+/// fabricate a baseline for a binary, lossy or oversized file; the encoding
+/// rides along so a save writes the draft back in the file's own encoding.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RemoteFileBaseline {
     pub(super) connection_id: String,
@@ -31,6 +34,7 @@ pub struct RemoteFileBaseline {
     pub(super) canonical_root: String,
     pub(super) canonical_path: String,
     pub(super) bytes: Arc<[u8]>,
+    pub(super) encoding: TextEncoding,
 }
 
 impl std::fmt::Debug for RemoteFileBaseline {
@@ -39,6 +43,7 @@ impl std::fmt::Debug for RemoteFileBaseline {
             .debug_struct("RemoteFileBaseline")
             .field("connection_id", &self.connection_id)
             .field("byte_len", &self.bytes.len())
+            .field("encoding", &self.encoding)
             .finish()
     }
 }
@@ -52,7 +57,8 @@ impl RemoteFileBaseline {
 }
 
 /// Result of a bounded remote document read. `baseline` is present only when
-/// `content` is editable UTF-8 text.
+/// `content` is editable text (UTF-8 or a losslessly round-tripping legacy /
+/// UTF-16 encoding).
 #[derive(Clone)]
 pub struct RemoteFileReadResult {
     pub content: FileContentResult,
@@ -94,42 +100,24 @@ pub(super) fn build_remote_file_read_result(
     let fingerprint = connection_fingerprint(conn);
     match read {
         SftpBoundedFileRead::TooLarge => RemoteFileReadResult {
-            content: FileContentResult {
-                content: String::new(),
-                is_binary: false,
-                too_large: true,
-            },
+            content: FileContentResult::too_large(),
             baseline: None,
         },
         SftpBoundedFileRead::Complete(bytes) => {
-            let decoded = std::str::from_utf8(&bytes).map(str::to_owned);
-            match decoded {
-                Ok(content) => {
-                    let baseline = RemoteFileBaseline {
-                        connection_id: conn.id.clone(),
-                        connection_fingerprint: fingerprint,
-                        canonical_root: canonical_root.clone(),
-                        canonical_path: canonical_path.clone(),
-                        bytes: Arc::from(bytes),
-                    };
-                    RemoteFileReadResult {
-                        content: FileContentResult {
-                            content,
-                            is_binary: false,
-                            too_large: false,
-                        },
-                        baseline: Some(baseline),
-                    }
-                }
-                Err(_) => RemoteFileReadResult {
-                    content: FileContentResult {
-                        content: String::new(),
-                        is_binary: true,
-                        too_large: false,
-                    },
-                    baseline: None,
-                },
-            }
+            // 与本地文档同一把尺子(`mt_project::encoding`):UTF-8 原样,GBK / UTF-16 这类
+            // 能逐字节写回的照样可编辑,解码有损的只读(没有基线 = 保存一律拒绝)
+            let baseline_bytes: Arc<[u8]> = Arc::from(bytes.as_slice());
+            let content = FileContentResult::from_bytes(bytes);
+            let editable = !content.is_binary && content.encoding.writable();
+            let baseline = editable.then(|| RemoteFileBaseline {
+                connection_id: conn.id.clone(),
+                connection_fingerprint: fingerprint,
+                canonical_root,
+                canonical_path,
+                bytes: baseline_bytes,
+                encoding: content.encoding,
+            });
+            RemoteFileReadResult { content, baseline }
         }
     }
 }
@@ -222,7 +210,9 @@ pub fn read_file_content(
     })
 }
 
-/// Safely save one previously loaded remote UTF-8 document.
+/// Safely save one previously loaded remote text document, written back in
+/// the encoding recorded in `expected` (UTF-8 unchanged; a draft the encoding
+/// cannot represent is refused before touching the remote file).
 ///
 /// A normal save (`force = false`) re-reads the bounded remote contents and
 /// returns [`RemoteFileSaveResult::ExternalChange`] instead of writing when the
@@ -242,6 +232,15 @@ pub fn save_file_content(
     }
     if expected.bytes.len() > REMOTE_DOCUMENT_MAX_BYTES {
         return Err("远程文件基线无效，请重新打开文件".into());
+    }
+    // 按打开时的编码写回(UTF-8 原样)。编码表示不了的字符在连远端之前就拒绝,
+    // 远程文件一字不动
+    let encoded = expected
+        .encoding
+        .encode(content)
+        .map_err(|error| error.to_string())?;
+    if encoded.len() > REMOTE_DOCUMENT_MAX_BYTES {
+        return Err("内容过大(>1MB)，拒绝写入远程文件".into());
     }
     validate_remote_file_baseline_connection(conn, expected)?;
 
@@ -289,7 +288,7 @@ pub fn save_file_content(
         let replace_result = sftp
             .replace_file_contents(
                 &commit_path,
-                content.as_bytes(),
+                &encoded,
                 REMOTE_DOCUMENT_MAX_BYTES,
                 expected_at_commit,
             )
@@ -328,7 +327,8 @@ pub fn save_file_content(
                 connection_fingerprint: connection_fingerprint(conn),
                 canonical_root: commit_root,
                 canonical_path: commit_path,
-                bytes: Arc::from(content.as_bytes()),
+                bytes: Arc::from(encoded.as_slice()),
+                encoding: expected.encoding,
             },
             warning: cleanup_warning,
         })

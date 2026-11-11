@@ -325,6 +325,16 @@ fn pick_hunk(diff: &GitDiffResult, hunk_index: usize) -> Result<&DiffHunk> {
     if diff.is_binary || diff.too_large {
         bail!("二进制 / 过大的文件只能整文件操作");
     }
+    // 块操作按 UTF-8 文本拼接、再把拼出来的字节写回暂存区 / 工作区:GBK、UTF-16 这类
+    // 文件这么一拼就整个变成 UTF-8(或写出乱码),只能整文件操作。UI 已把按钮禁用,
+    // 这里是兜底
+    if let Some(encoding) = diff.encoding {
+        let label = match encoding.label() {
+            "" => "无法识别的编码",
+            label => label,
+        };
+        bail!("该文件不是 UTF-8 编码({label}),只能整文件暂存 / 取消暂存 / 丢弃");
+    }
     diff.hunks.get(hunk_index).ok_or_else(|| StaleDiff.into())
 }
 
@@ -961,6 +971,97 @@ mod tests {
         let diff = get_git_diff(&project, "x.txt", DiffSide::Unstaged).unwrap();
         stage_hunk(&project, "x.txt", &diff, 0).unwrap();
         assert_eq!(index_blob(&root, rel_in_repo), edited);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn index_bytes(root: &Path, rel: &str) -> Vec<u8> {
+        let repo = Repository::open(root).unwrap();
+        let index = repo.index().unwrap();
+        let entry = index.get_path(Path::new(rel), 0).unwrap();
+        repo.find_blob(entry.id).unwrap().content().to_vec()
+    }
+
+    /// 非 UTF-8(GBK)文件:两侧照常解出来、diff 标上编码;三种块操作一律拒绝,暂存区与
+    /// 工作区一个字节都不动。整文件暂存不受影响。
+    #[test]
+    fn 非_utf8_文件能看_diff_但拒绝按块操作() {
+        use crate::encoding::TextEncoding;
+        let rel = "gbk.c";
+        let root = init_repo_with_file("hunk-gbk", rel, "");
+        let gbk = TextEncoding::Legacy(encoding_rs::GBK);
+        let head = "// 你好，世界。这是一段用来猜编码的中文注释。\nint a = 1;\n";
+        let base = gbk.encode(head).unwrap();
+        std::fs::write(root.join(rel), &base).unwrap();
+        git_stage(&root, &[rel.to_string()]).unwrap();
+        super::super::test_support::git(&root, &["commit", "-qm", "gbk"]);
+        let edited = gbk
+            .encode(&head.replace("int a = 1;", "int a = 2; // 改成二"))
+            .unwrap();
+        std::fs::write(root.join(rel), &edited).unwrap();
+
+        let gb18030 = Some(TextEncoding::Legacy(encoding_rs::GB18030));
+        let unstaged = get_git_diff(&root, rel, DiffSide::Unstaged).unwrap();
+        assert!(!unstaged.is_binary && !unstaged.too_large);
+        assert_eq!(unstaged.encoding, gb18030);
+        assert_eq!(
+            changed(&unstaged),
+            vec![
+                pair("delete", "int a = 1;"),
+                pair("add", "int a = 2; // 改成二")
+            ]
+        );
+        assert!(unstaged.old_content.contains("你好"));
+        for err in [
+            stage_hunk(&root, rel, &unstaged, 0).unwrap_err(),
+            discard_hunk(&root, rel, &unstaged, 0).unwrap_err(),
+        ] {
+            assert!(format!("{err:#}").contains("UTF-8"), "实际: {err:#}");
+        }
+        assert_eq!(std::fs::read(root.join(rel)).unwrap(), edited, "工作区不动");
+        assert_eq!(index_bytes(&root, rel), base, "暂存区不动");
+
+        // 整文件暂存照常;已暂存那一侧同样标编码、同样拒绝按块取消暂存
+        git_stage(&root, &[rel.to_string()]).unwrap();
+        assert_eq!(index_bytes(&root, rel), edited);
+        let staged = get_git_diff(&root, rel, DiffSide::Staged).unwrap();
+        assert_eq!(staged.encoding, gb18030);
+        assert_eq!(staged.hunks.len(), 1);
+        assert!(unstage_hunk(&root, rel, &staged, 0).is_err());
+        assert_eq!(index_bytes(&root, rel), edited);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 带 BOM 的 UTF-16:git 自己把它当二进制,这里照样解得出来看 diff;UTF-8 文件的
+    /// diff 不带编码标记(块操作照旧可用)。
+    #[test]
+    fn utf16_文件能看_diff_而_utf8_不带编码标记() {
+        use crate::encoding::TextEncoding;
+        let rel = "wide.txt";
+        let root = init_repo_with_file("hunk-utf16", rel, "");
+        let base = TextEncoding::Utf16Le.encode("第一行\nsecond\n").unwrap();
+        std::fs::write(root.join(rel), &base).unwrap();
+        git_stage(&root, &[rel.to_string()]).unwrap();
+        super::super::test_support::git(&root, &["commit", "-qm", "utf16"]);
+        let edited = TextEncoding::Utf16Le.encode("第一行\n第二行\n").unwrap();
+        std::fs::write(root.join(rel), &edited).unwrap();
+
+        let working = get_git_diff(&root, rel, DiffSide::Working).unwrap();
+        assert!(!working.is_binary);
+        assert_eq!(working.encoding, Some(TextEncoding::Utf16Le));
+        assert_eq!(
+            changed(&working),
+            vec![pair("delete", "second"), pair("add", "第二行")]
+        );
+
+        let utf8_rel = "plain.txt";
+        std::fs::write(root.join(utf8_rel), "a\nb\n").unwrap();
+        git_stage(&root, &[utf8_rel.to_string()]).unwrap();
+        super::super::test_support::git(&root, &["commit", "-qm", "plain"]);
+        std::fs::write(root.join(utf8_rel), "a\nB\n").unwrap();
+        let plain = get_git_diff(&root, utf8_rel, DiffSide::Unstaged).unwrap();
+        assert_eq!(plain.encoding, None);
+        stage_hunk(&root, utf8_rel, &plain, 0).unwrap();
+        assert_eq!(index_blob(&root, utf8_rel), "a\nB\n");
         std::fs::remove_dir_all(&root).ok();
     }
 }
