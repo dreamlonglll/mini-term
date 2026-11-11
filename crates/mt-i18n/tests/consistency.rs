@@ -201,8 +201,11 @@ use mt_i18n::{
 /// 文件禁用按块操作的说明（`gitCommit.{hunkNonUtf8,hunkUnknownEncoding}`）；外部改动提示条的
 /// 「对比 / 保留我的」与对比弹窗（`fileViewer.{compareDisk,keepMine,keepMineTip,compareTitle,
 /// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
+/// 1564 → 1615：冲突文件逐段解决 —— 右键菜单项、弹窗的标题 / 进度 / 两侧与 base 的方向文案
+/// （变基时另一套）/ 四种选择 / 底部按钮 / 结果与失败提示，以及不能逐段解决的七种原因
+/// （`gitCommit.segments.*` 51 条）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1564;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1615;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

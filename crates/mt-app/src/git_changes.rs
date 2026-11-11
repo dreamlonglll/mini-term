@@ -28,6 +28,13 @@
 //! 那部分一起没了。现在与 `git restore` / IDEA 的回滚一致:从**暂存区**检出
 //! (`mt_project::git::discard_unstaged`),已暂存的部分保留;未跟踪文件照旧删除。
 //!
+//! # 冲突:整文件与逐段
+//!
+//! 冲突行的右键菜单有整文件的「采用一侧 / 标记为已解决」,也有「逐段解决…」(行内按钮
+//! 同一个入口):后者开 [`crate::git_conflict`] 的弹窗,一段一段选采用哪边再一次写回。
+//! 能不能逐段解决随列表一起取([`SegmentStatus`],有冲突时才读那几个文件),删除 / 修改
+//! 冲突、没有成对标记、二进制、编码认不出、过大时菜单项禁用并写明原因。
+//!
 //! # 失败要让用户看得见
 //!
 //! 原版每个 `invoke` 的 catch 都只 `console.error`(不弹 toast、不显红)。这里
@@ -103,7 +110,7 @@ use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
-    GitStatus, RepoOpKind,
+    GitStatus, RepoOpKind, SegmentStatus,
 };
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -111,15 +118,15 @@ use crate::git_dir_watch::RepoObservation;
 use crate::git_ui::flight::{Flight, Landing};
 use crate::git_ui::{
     self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
-    ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
-    icon_button, mono, status_color, status_label_for,
+    ICON_HISTORY, ICON_MERGE, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone,
+    danger_icon_button, icon_button, mono, status_color, status_label_for,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
 use crate::prompt::Confirm;
 use crate::store::AppStore;
 use crate::ui;
-use crate::{git_diff, git_watch};
+use crate::{git_conflict, git_diff, git_watch};
 
 gpui::actions!(
     mini_term,
@@ -517,6 +524,9 @@ fn reveal_offset(offset_y: f32, top: f32, bottom: f32, viewport: f32) -> f32 {
 struct Snapshot {
     changes: Vec<ChangeFileStatus>,
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应(读一遍文件判成对标记 / 编码,
+    /// 冲突行的「逐段解决…」按它启用或写明原因)
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基…(冲突菜单「采用 ours / theirs」的文案随它翻转)
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
@@ -528,6 +538,7 @@ struct Snapshot {
 struct Landed<'a> {
     changes: &'a [ChangeFileStatus],
     conflicts: &'a [ConflictInfo],
+    segments: &'a [SegmentStatus],
     op_kind: Option<RepoOpKind>,
     target: Option<&'a CommitTarget>,
     has_head: bool,
@@ -544,6 +555,7 @@ impl Landed<'_> {
         let amend = self.amend && snap.has_head;
         !same_changes(self.changes, &snap.changes)
             || self.conflicts != snap.conflicts.as_slice()
+            || self.segments != snap.segments.as_slice()
             || self.op_kind != snap.op_kind
             || self.target != snap.target.as_ref()
             || self.has_head != snap.has_head
@@ -555,6 +567,7 @@ impl Landed<'_> {
     fn differs_on_error(&self, error: &str) -> bool {
         !self.changes.is_empty()
             || !self.conflicts.is_empty()
+            || !self.segments.is_empty()
             || self.op_kind.is_some()
             || self.load_error != Some(error)
     }
@@ -580,6 +593,8 @@ pub struct GitChanges {
     changes: Vec<ChangeFileStatus>,
     /// 冲突文件的三方条目在不在(删除 / 修改冲突时有一侧缺席),随列表一起取
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应,随列表一起取
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基 / 拣选 / 还原,随列表一起取。变基时 git 的 ours / theirs
     /// 与直觉相反,冲突菜单据此换成写清方向的文案
     op_kind: Option<RepoOpKind>,
@@ -667,6 +682,7 @@ impl GitChanges {
             repo_path: String::new(),
             changes: Vec::new(),
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             loading: false,
             load_error: None,
@@ -751,6 +767,7 @@ impl GitChanges {
         self.repo_path = repo_path.to_string();
         self.changes.clear();
         self.conflicts.clear();
+        self.segments.clear();
         self.op_kind = None;
         self.collapsed_dirs.clear();
         self.invalidate_model();
@@ -899,6 +916,7 @@ impl GitChanges {
                 let changed = self.landed().differs(&snap);
                 self.changes = snap.changes;
                 self.conflicts = snap.conflicts;
+                self.segments = snap.segments;
                 self.op_kind = snap.op_kind;
                 self.target = snap.target;
                 self.has_head = snap.has_head;
@@ -916,6 +934,7 @@ impl GitChanges {
                 let changed = self.landed().differs_on_error(&error);
                 self.changes.clear();
                 self.conflicts.clear();
+                self.segments.clear();
                 self.op_kind = None;
                 self.load_error = Some(error);
                 changed
@@ -940,6 +959,7 @@ impl GitChanges {
         Landed {
             changes: &self.changes,
             conflicts: &self.conflicts,
+            segments: &self.segments,
             op_kind: self.op_kind,
             target: self.target.as_ref(),
             has_head: self.has_head,
@@ -1508,6 +1528,52 @@ impl GitChanges {
         .detach();
     }
 
+    /// 冲突文件能不能逐段解决:能就是 `Ok(段数)`,不能就是禁用说明(菜单项的副标题、
+    /// 行内按钮的 tooltip)。随列表一起取的状态里找不到它(刚换仓库、读冲突细节失败)
+    /// 按「已不在冲突中,请刷新」算。
+    fn segment_availability(&self, path: &str) -> Result<usize, &'static str> {
+        let status = self
+            .conflicts
+            .iter()
+            .position(|c| c.path == path)
+            .and_then(|i| self.segments.get(i).copied());
+        match status {
+            Some(SegmentStatus::Ready { blocks }) => Ok(blocks),
+            Some(SegmentStatus::Blocked(blocker)) => {
+                Err(t("gitCommit", git_conflict::blocker_key(blocker)))
+            }
+            None => Err(t("gitCommit", "segments.blockedNotConflicted")),
+        }
+    }
+
+    /// 打开某个冲突文件的逐段解决弹窗(见 `git_conflict`)。写完(成败都算)重取列表、
+    /// 重算文件树的 git 标记,并把写完当场读的签名交给面板 —— 与 [`Self::run_op`] 同一口径。
+    fn open_segments(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo_path.is_empty() || self.segment_availability(&path).is_err() {
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let on_written: git_conflict::OnWritten =
+            Rc::new(move |observed: Option<RepoObservation>, cx: &mut App| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.load(cx);
+                    git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                    if let Some(observed) = observed {
+                        cx.emit(GitChangesEvent::IndexWritten(observed));
+                    }
+                });
+            });
+        git_conflict::open(
+            self.store.clone(),
+            self.repo_path.clone(),
+            path,
+            self.op_kind,
+            on_written,
+            window,
+            cx,
+        );
+    }
+
     /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
     fn diff_files(&self, order: &[usize], area: Area) -> Vec<git_diff::DiffFile> {
         order.iter().map(|&i| self.diff_file(i, area)).collect()
@@ -1920,6 +1986,9 @@ fn fetch_amend(repo: &Path, known: Option<u64>) -> Option<(Option<u64>, Option<A
 
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
 /// amend 的「已推送」判定不在这里(见 [`GitChanges::refresh_amend`])。
+///
+/// 有冲突时每个冲突文件再读一遍、判能不能逐段解决([`SegmentStatus`]):只在冲突期间
+/// 才有这份开销,文件过大(`MAX_SEGMENT_FILE_BYTES`)的只看大小不读内容。
 fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     let changes = mt_project::git::get_changes_status(repo)?;
     let conflicts = if changes.iter().any(is_conflicted) {
@@ -1927,12 +1996,17 @@ fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     } else {
         Vec::new()
     };
+    let segments = conflicts
+        .iter()
+        .map(|info| mt_project::git::conflict_segment_status(repo, info))
+        .collect();
     let op_kind = mt_project::git::repo_operation_state(repo)
         .ok()
         .and_then(|state| state.kind);
     Ok(Snapshot {
         changes,
         conflicts,
+        segments,
         op_kind,
         target: mt_project::git::commit_target(repo).ok(),
         has_head: mt_project::git::head_exists(repo),
@@ -2457,7 +2531,21 @@ impl GitChanges {
                     }))
                 }));
             }
-            Area::Conflicts => {}
+            // 逐段解决(只管这一行,不跟选中集走):用不了时按钮压淡,tooltip 写明原因
+            Area::Conflicts => {
+                let available = self.segment_availability(&path);
+                let usable = enabled && available.is_ok();
+                let tip =
+                    available.map_or_else(|reason| reason, |_| t("gitCommit", "segments.menu"));
+                let seg_path = path.clone();
+                actions = actions.child(
+                    icon_button(id_of("segments"), ICON_MERGE, tip, usable).when(usable, |el| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_segments(seg_path.clone(), window, cx);
+                        }))
+                    }),
+                );
+            }
         }
 
         git_ui::list_row(row_id, selected)
@@ -2540,6 +2628,30 @@ impl GitChanges {
         let mut entries = Vec::new();
         match area {
             Area::Conflicts => {
+                // 逐段解决:一次一个文件;删除 / 修改冲突、没有成对标记、二进制、编码认不出、
+                // 过大时禁用并在副标题写明原因(状态随列表一起取,见 `load_snapshot`)
+                let path = self
+                    .changes
+                    .get(index)
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default();
+                let available = if many {
+                    Err(t("gitCommit", "segments.blockedMany"))
+                } else {
+                    self.segment_availability(&path)
+                };
+                let segments_this = this.clone();
+                let mut segments = MenuItem::new(t("gitCommit", "segments.menu"))
+                    .disabled(!enabled || available.is_err())
+                    .on_click(move |window, cx| {
+                        let path = path.clone();
+                        segments_this.update(cx, |this, cx| this.open_segments(path, window, cx));
+                    });
+                if let Err(reason) = available {
+                    segments = segments.detail(reason);
+                }
+                entries.push(segments.into());
+                entries.push(menu::separator());
                 let info = (!many)
                     .then(|| self.changes.get(index))
                     .flatten()
@@ -3559,6 +3671,7 @@ mod tests {
         Snapshot {
             changes,
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             target: Some(CommitTarget::Branch("main".into())),
             has_head: true,
@@ -3569,6 +3682,7 @@ mod tests {
         Landed {
             changes: &snap.changes,
             conflicts: &snap.conflicts,
+            segments: &snap.segments,
             op_kind: snap.op_kind,
             target: snap.target.as_ref(),
             has_head: snap.has_head,
@@ -3603,6 +3717,12 @@ mod tests {
             theirs: false,
         }];
         assert!(landed.differs(&next), "冲突细节变了(菜单文案跟着它)");
+        let mut next = snapshot(files.clone());
+        next.segments = vec![SegmentStatus::Ready { blocks: 2 }];
+        assert!(
+            landed.differs(&next),
+            "能不能逐段解决变了(菜单项与行内按钮跟着它)"
+        );
         let mut next = snapshot(files.clone());
         next.op_kind = Some(RepoOpKind::Rebase);
         assert!(landed.differs(&next), "进行中的操作变了");
