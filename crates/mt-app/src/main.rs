@@ -106,6 +106,7 @@ mod project_switcher;
 mod project_tree;
 mod prompt;
 mod pty_slot;
+mod quick_open;
 mod redraw;
 mod remote_directory_picker;
 mod remote_notify;
@@ -209,6 +210,8 @@ actions!(
         TerminalSearch,
         /// 全局搜索(Ctrl+Shift+F,toggle)
         GlobalSearch,
+        /// 快速打开文件(Ctrl+Shift+O,toggle)
+        QuickOpenFile,
         /// 项目快速切换器(Ctrl+Shift+P)
         SwitchProject,
         /// 跳到上一个 AI 任务标记(Ctrl+Shift+↑)
@@ -1152,6 +1155,27 @@ impl Workspace {
     /// toggle 实际做不到。这里让它真的 toggle(按注释的意图,不是按它的 bug)。
     fn on_global_search(&mut self, _: &GlobalSearch, window: &mut Window, cx: &mut Context<Self>) {
         search_modal::toggle(self.store.clone(), window, cx);
+    }
+
+    /// Ctrl+Shift+O:开合快速打开文件。
+    ///
+    /// 两道闸只加覆盖物那一道:
+    ///
+    /// - **不看**「焦点在输入框里」([`yields_to_typing`]):文件页的代码编辑器就是输入框,
+    ///   看着代码想跳到另一个文件正是最常用的场合,让路就等于这个键在文件页里废了;
+    ///   Ctrl+Shift+O 在输入框里也没有别的含义;
+    /// - **看**覆盖物栈:设置之类的弹窗压着时不在它上面再叠一层(从那里打开的文件落在弹窗
+    ///   底下看不见)。
+    ///
+    /// toggle 的「关」排在让路之前:面板开着时它自己就在覆盖物栈里(同命令库那条)。
+    fn on_quick_open(&mut self, _: &QuickOpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        if prompt::close_guarded(overlay::kind::QUICK_OPEN, window, cx) {
+            return;
+        }
+        if !overlay::allows(overlay::Yield::ToOverlay) {
+            return;
+        }
+        quick_open::open(self.store.clone(), window, cx);
     }
 
     /// Ctrl+Shift+↑:跳到上一个 AI 任务标记。首次按跳**最新一条**,
@@ -2249,6 +2273,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_focus_down))
             .on_action(cx.listener(Self::on_terminal_search))
             .on_action(cx.listener(Self::on_global_search))
+            .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_switch_project))
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))

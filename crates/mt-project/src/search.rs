@@ -240,7 +240,10 @@ fn worker_threads() -> usize {
 }
 
 /// `max_filesize` 只给内容搜索用:文件名搜索要能按名字找到大文件。
-fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel {
+///
+/// 快速打开的文件索引([`crate::quick_open::FileIndex::build`])也走这一个 walker,两边的
+/// 忽略规则因此不会各说各话。
+pub(crate) fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel {
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .hidden(false)

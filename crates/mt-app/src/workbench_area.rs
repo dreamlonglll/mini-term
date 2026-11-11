@@ -89,14 +89,26 @@ struct DocumentTab {
     key: DocumentKey,
     title: String,
     document: Entity<FileViewer>,
+    /// 本地文件的原样路径(`key` 里那份在 Windows 上是小写化的,不能拿来打开)。远程为 `None`。
+    /// 只给「最近打开」([`ProjectDocuments::recent`])记账用。
+    local_path: Option<PathBuf>,
 }
 
 type RenderDocumentTab = (DocumentKey, String, Entity<FileViewer>);
 type ActiveWorkbenchSnapshot = (String, WorkbenchPage, Vec<RenderDocumentTab>);
 
+/// 「最近打开」每个项目最多记几条。快速打开的空查询把它们列在最前,一屏放得下的三四倍就够了。
+const MAX_RECENT_FILES: usize = 50;
+
 struct ProjectDocuments {
     tabs: Vec<DocumentTab>,
     active: WorkbenchPage,
+    /// 最近在文件页里打开 / 切到过的**本地**文件,新的在前、去重。给快速打开
+    /// (`quick_open`)排序用:空查询列在最前,有查询时同分靠前。
+    ///
+    /// 只放内存:关掉页签不删(关掉的文件仍是「最近打开过」),项目被移除时随整个
+    /// `ProjectDocuments` 一起回收,重启清空。
+    recent: Vec<PathBuf>,
 }
 
 impl Default for ProjectDocuments {
@@ -104,6 +116,7 @@ impl Default for ProjectDocuments {
         Self {
             tabs: Vec::new(),
             active: WorkbenchPage::Terminal,
+            recent: Vec::new(),
         }
     }
 }
@@ -111,6 +124,13 @@ impl Default for ProjectDocuments {
 impl ProjectDocuments {
     fn index_of(&self, key: &DocumentKey) -> Option<usize> {
         self.tabs.iter().position(|tab| &tab.key == key)
+    }
+
+    /// 把一个本地文件记到「最近打开」最前面。
+    fn note_recent(&mut self, path: Option<&Path>) {
+        if let Some(path) = path {
+            push_recent(&mut self.recent, path, MAX_RECENT_FILES);
+        }
     }
 
     fn close(&mut self, key: &DocumentKey) -> Option<Entity<FileViewer>> {
@@ -329,6 +349,45 @@ pub fn is_document_active(source: &DocumentSource, cx: &App) -> bool {
             .is_some_and(|project| project.active == WorkbenchPage::Document(key))
 }
 
+/// 该项目「最近打开」的本地文件,新的在前(见 [`ProjectDocuments::recent`])。
+/// 快速打开(`quick_open`)用它排序。
+pub fn recent_files(project_id: &str, cx: &App) -> Vec<PathBuf> {
+    global(cx)
+        .and_then(|area| {
+            area.read(cx)
+                .projects
+                .get(project_id)
+                .map(|project| project.recent.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// 该项目当前停在哪个本地文件页上;停在终端页、或活动页签是远程文件时为 `None`。
+///
+/// 快速打开用它做两件事:空查询时把它排除出「最近打开」(第一条就是上一个文件,
+/// 打开面板直接回车即可切回),以及只输 `:行号` 时在它里面跳行。
+pub fn active_document_path(project_id: &str, cx: &App) -> Option<PathBuf> {
+    let area = global(cx)?;
+    let area = area.read(cx);
+    let project = area.projects.get(project_id)?;
+    let WorkbenchPage::Document(key) = &project.active else {
+        return None;
+    };
+    let index = project.index_of(key)?;
+    project.tabs[index].local_path.clone()
+}
+
+/// 把 `path` 放到 `recent` 最前面(已在表里就挪上来),只留前 `cap` 条。
+///
+/// 比较按 [`normalize_local_document_path`] 的口径:Windows 上大小写不同的两种写法是同一个
+/// 文件,页签去重也是这么认的。
+fn push_recent(recent: &mut Vec<PathBuf>, path: &Path, cap: usize) {
+    let normalized = normalize_local_document_path(path);
+    recent.retain(|existing| normalize_local_document_path(existing) != normalized);
+    recent.insert(0, path.to_path_buf());
+    recent.truncate(cap);
+}
+
 /// Restore focus after a modal overlay closes without capturing the document
 /// that happened to be active before the close. The active project and page
 /// are resolved at handoff time, and `FileViewer::on_activated` performs the
@@ -463,7 +522,12 @@ impl WorkbenchArea {
     ) {
         let project_id = source.project_id().to_string();
         let key = DocumentKey::from_source(&source);
+        let local_path = match &source {
+            DocumentSource::Local { path, .. } => Some(path.clone()),
+            DocumentSource::Remote { .. } => None,
+        };
         let project = self.projects.entry(project_id).or_default();
+        project.note_recent(local_path.as_deref());
         if let Some(index) = project.index_of(&key) {
             let document = project.tabs[index].document.clone();
             project.active = WorkbenchPage::Document(key);
@@ -485,6 +549,7 @@ impl WorkbenchArea {
             key: key.clone(),
             title,
             document: document.clone(),
+            local_path,
         });
         project.active = WorkbenchPage::Document(key);
         window.defer(cx, move |window, cx| {
@@ -521,6 +586,9 @@ impl WorkbenchArea {
             return;
         };
         let document = project.tabs[index].document.clone();
+        // 点页签切过去也算「最近打开」(与 VS Code 的快速打开同口径)
+        let local_path = project.tabs[index].local_path.clone();
+        project.note_recent(local_path.as_deref());
         project.active = WorkbenchPage::Document(key.clone());
         window.defer(cx, move |window, cx| {
             document.update(cx, |document, cx| {
@@ -1431,5 +1499,30 @@ mod tests {
             Some(key("b"))
         );
         assert_eq!(next_document_after_close(&[], 0), None);
+    }
+
+    /// 最近打开:新的在前、重复的挪到最前而不是再记一条、封顶;Windows 上只差大小写算同一个。
+    #[test]
+    fn 最近打开去重挪前并封顶() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, Path::new("/p/a.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/b.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/a.rs"), 3);
+        assert_eq!(recent, [PathBuf::from("/p/a.rs"), PathBuf::from("/p/b.rs")]);
+        push_recent(&mut recent, Path::new("/p/c.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/d.rs"), 3);
+        assert_eq!(
+            recent,
+            [
+                PathBuf::from("/p/d.rs"),
+                PathBuf::from("/p/c.rs"),
+                PathBuf::from("/p/a.rs")
+            ]
+        );
+        if cfg!(windows) {
+            push_recent(&mut recent, Path::new(r"\P\A.RS"), 3);
+            assert_eq!(recent.len(), 3, "只差大小写与分隔符的是同一个文件");
+            assert_eq!(recent[0], PathBuf::from(r"\P\A.RS"));
+        }
     }
 }

@@ -30,10 +30,10 @@ use gpui::{App, KeyBinding, NoAction};
 
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
-    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
-    SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
-    ToggleSessions, ToggleUsage, command_library, git_changes, git_diff, git_file_history,
-    git_history, git_stash, project_switcher,
+    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane,
+    SelectPane, SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary,
+    ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_diff,
+    git_file_history, git_history, git_stash, project_switcher, quick_open,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -230,6 +230,17 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Global,
         G_GLOBAL,
         "shortcuts.toggleGlobalSearch",
+    ),
+    // 快速打开文件(VS Code 的 Ctrl+P)。裸 Ctrl+P 是 shell 的上一条历史,按开头的原则走
+    // Ctrl+Shift;Ctrl+Shift+P 已是项目切换器,取「Open」的 O。终端里的 Ctrl+Shift+O 在传统
+    // 编码下与 Ctrl+O 同字节,shell / TUI 要的那个 Ctrl+O 不受影响
+    def(
+        "quickOpen",
+        Some("ctrl-shift-o"),
+        combo(true, true, false, "O"),
+        Scope::Global,
+        G_GLOBAL,
+        "shortcuts.quickOpen",
     ),
     def(
         "terminalSearch",
@@ -428,6 +439,21 @@ pub fn bind_keys(cx: &mut App) {
         "down",
         project_switcher::SwitcherNext,
         Some("ProjectSwitcher > Input"),
+    ));
+
+    // 快速打开的方向键。与项目切换器同一套理由:弹窗内部键位不进表,谓词要与 `Input`
+    // 同深度才压得过它自带的 up/down(机制见 project_switcher 模块注释)
+    let quick_open_input = format!("{} > Input", quick_open::CONTEXT);
+    let quick_open_input = Some(quick_open_input.as_str());
+    bindings.push(KeyBinding::new(
+        "up",
+        quick_open::QuickOpenPrev,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        quick_open::QuickOpenNext,
+        quick_open_input,
     ));
 
     // 命令库浮层的方向键 / Ctrl+↵(issue #81)。与项目切换器同一套理由:
@@ -743,6 +769,7 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "focusDown" => KeyBinding::new(keystroke, FocusDown, Some(WORKSPACE)),
         "switchProject" => KeyBinding::new(keystroke, SwitchProject, Some(WORKSPACE)),
         "globalSearch" => KeyBinding::new(keystroke, GlobalSearch, Some(WORKSPACE)),
+        "quickOpen" => KeyBinding::new(keystroke, QuickOpenFile, Some(WORKSPACE)),
         "terminalSearch" => KeyBinding::new(keystroke, TerminalSearch, Some(WORKSPACE)),
         "openSettings" => KeyBinding::new(keystroke, OpenTerminalSettings, Some(WORKSPACE)),
         "toggleSidebar" => KeyBinding::new(keystroke, ToggleMiddleColumn, Some(WORKSPACE)),
@@ -878,6 +905,18 @@ mod tests {
         let (bindings, _) =
             keymap.bindings_for_input(&[Keystroke::parse("tab").unwrap()], &outside);
         assert_eq!(bindings.len(), 1, "终端之外 Tab 仍该是焦点导航");
+    }
+
+    /// 绑上去的键位串不重复 —— 两条撞同一个键,后注册的那条静默吃掉前一条
+    /// (新加 Ctrl+Shift+O 时核过一遍没被占)。
+    #[test]
+    fn 全局键位串不重复() {
+        let mut keystrokes: Vec<&str> = HOTKEYS.iter().filter_map(|d| d.keystroke).collect();
+        keystrokes.sort_unstable();
+        let count = keystrokes.len();
+        keystrokes.dedup();
+        assert_eq!(keystrokes.len(), count);
+        assert!(binding_for("quickOpen", "ctrl-shift-o").is_some());
     }
 
     /// id 不重复 —— 设置页拿 id 当行 key。
