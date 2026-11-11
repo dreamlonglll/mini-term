@@ -167,9 +167,7 @@ pub fn git_dir_layout(repo_path: &Path) -> Result<GitDirLayout> {
                 git_dir.join(raw)
             };
             // 相对路径里的 `..` 要解掉:监听的 key 与事件路径都按字面比
-            std::fs::canonicalize(&joined)
-                .map(crate::fs::strip_verbatim_prefix)
-                .unwrap_or(joined)
+            mt_core::path::canonicalize(&joined).unwrap_or(joined)
         }
         _ => git_dir.clone(),
     };
@@ -705,8 +703,8 @@ mod tests {
         assert!(wt_layout.git_dir.join("HEAD").is_file());
         assert!(wt_layout.common_dir.join("refs").is_dir());
         assert_eq!(
-            std::fs::canonicalize(&wt_layout.common_dir).unwrap(),
-            std::fs::canonicalize(&layout.common_dir).unwrap()
+            mt_core::path::canonicalize(&wt_layout.common_dir).unwrap(),
+            mt_core::path::canonicalize(&layout.common_dir).unwrap()
         );
 
         // 监听目录:两个 git 目录 + refs 下逐层(含 feature/ 前缀目录)

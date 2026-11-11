@@ -1111,7 +1111,7 @@ pub fn download_entries(
         .map_err(|e| format!("无法创建下载目录 {}: {e}", download_dir.display()))?;
     mt_config::AppConfig::validate_download_dir(download_dir)
         .map_err(|e| format!("下载目录不可用: {e:#}"))?;
-    let download_root = std::fs::canonicalize(download_dir)
+    let download_root = mt_core::path::canonicalize(download_dir)
         .map_err(|e| format!("无法解析下载目录 {}: {e}", download_dir.display()))?;
     let st = state();
     st.block_on(async move {

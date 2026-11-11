@@ -25,3 +25,8 @@ memchr = "2"
 # 它的 bin 编出来,于是 `cargo test -p mt-app` 要替换 `target/debug/mini-term.exe`,
 # 与运行中的 dev 实例抢文件锁。挪到这里后 mt-app 不再有集成测试。
 mt-pty.workspace = true
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

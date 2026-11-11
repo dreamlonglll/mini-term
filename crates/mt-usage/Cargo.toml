@@ -22,3 +22,8 @@ toml_edit = "0.22"
 mt-ai.workspace = true
 # 路径比较键(项目 scope 的 cwd 匹配,`path_key::windows_eq_key`)
 mt-core.workspace = true
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

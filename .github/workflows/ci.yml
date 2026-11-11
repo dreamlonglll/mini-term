@@ -89,13 +89,14 @@ jobs:
       # 缓存,反过来不行;main 推送又不跑本 workflow,所以缓存只能靠那边预热)。
       # 这里不再保存 —— 此前每个 tag 各存一份约 6.6 GB,tag 之间互相看不见、从没命中过,
       # 两个 tag 就把仓库 10 GB 额度顶满。
-      # ⚠️ shared-key / workspaces 两项与 cache-warm.yml 的 ci-linux 作业逐字一致,键才对得上;
+      # ⚠️ prefix-key / shared-key / workspaces 三项与 cache-warm.yml 的 ci-linux 作业逐字一致,键才对得上;
       # 改一边必须改另一边。workspaces 的 target 是**相对 workspace 根**的路径
       # (rust-cache 按 path.join(root, target) 解析),`sidecars -> sidecars/target`
       # 会落到 sidecars/sidecars/target,sidecar 缓存从来没生效过。
       - name: Rust cache
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: v1-rust
           shared-key: ci
           save-if: false
           workspaces: |
@@ -118,10 +119,10 @@ jobs:
           git diff --exit-code -- crates/mt-i18n/src/dict.rs
 
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Sidecar check
-        run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
+        run: cargo check --locked --manifest-path sidecars/Cargo.toml --all-targets
 
       # 全工作区 clippy,只拦**本次变更行**上的 warning(基线存量不算,见
       # check_changed_clippy.mjs)。deny 级 lint 是 error,clippy 自己就非零退出,
@@ -131,7 +132,7 @@ jobs:
         run: |
           base="${{ steps.diff-base.outputs.sha }}"
           set +e
-          cargo clippy --no-deps --workspace --all-targets --message-format=json \
+          cargo clippy --locked --no-deps --workspace --all-targets --message-format=json \
             | tee /tmp/clippy-messages.jsonl
           clippy_status=${PIPESTATUS[0]}
           set -e
@@ -142,14 +143,14 @@ jobs:
             "$base" /tmp/clippy-messages.jsonl
 
       - name: Cargo test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Sidecar test
-        run: cargo test --manifest-path sidecars/Cargo.toml
+        run: cargo test --locked --manifest-path sidecars/Cargo.toml
 
       # 线上部署的中转服务(协议边界、鉴权、fail-closed),此前 CI 连编译都没有
       - name: Relay server test
-        run: cargo test --manifest-path relay-server/Cargo.toml
+        run: cargo test --locked --manifest-path relay-server/Cargo.toml
 
       # tests/*.test.cjs:便携 ConPTY 包的 staging 脚本 + 依赖图里 OpenSSL 必须 vendored
       # (后者跑 `cargo tree --target aarch64-apple-darwin`,只解析依赖图,不需要装该 target)
@@ -209,11 +210,12 @@ jobs:
           rustup toolchain install --no-self-update
           rustc -vV
 
-      # 只读缓存,理由同 Linux 作业;shared-key / workspaces 与 cache-warm.yml 的
+      # 只读缓存,理由同 Linux 作业;prefix-key / shared-key / workspaces 与 cache-warm.yml 的
       # ci-windows 作业逐字一致
       - name: Rust cache
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: v1-rust
           shared-key: ci
           save-if: false
           workspaces: |
@@ -221,10 +223,10 @@ jobs:
             sidecars -> target
 
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Sidecar check
-        run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
+        run: cargo check --locked --manifest-path sidecars/Cargo.toml --all-targets
 
       - name: Clippy workspace (changed lines)
         shell: bash
@@ -232,7 +234,7 @@ jobs:
           base="${{ steps.diff-base.outputs.sha }}"
           messages="$RUNNER_TEMP/clippy-messages.jsonl"
           set +e
-          cargo clippy --no-deps --workspace --all-targets --message-format=json \
+          cargo clippy --locked --no-deps --workspace --all-targets --message-format=json \
             | tee "$messages"
           clippy_status=${PIPESTATUS[0]}
           set -e
@@ -252,8 +254,8 @@ jobs:
         shell: bash
         run: |
           pkgs="$(node .github/scripts/non_gpui_packages.mjs)"
-          cargo test $pkgs
+          cargo test --locked $pkgs
 
       # 命名管道 ACL(仅当前用户可连)等 sidecar 的 Windows 专属用例
       - name: Sidecar test
-        run: cargo test --manifest-path sidecars/Cargo.toml
+        run: cargo test --locked --manifest-path sidecars/Cargo.toml

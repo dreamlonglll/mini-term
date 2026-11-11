@@ -40,7 +40,8 @@ const ext = triple.includes('windows') ? '.exe' : '';
 // portable-conpty 都就位到这里，与运行时 exe 同目录解析对齐。
 const EXE_DIR = join('target', profile);
 
-const cargoArgs = ['build', '--manifest-path', MANIFEST];
+// --locked:Cargo.lock 与清单对不上就报错,不在构建途中悄悄改锁(CI 与发版同口径)
+const cargoArgs = ['build', '--locked', '--manifest-path', MANIFEST];
 if (release) cargoArgs.push('--release');
 if (explicitTarget) cargoArgs.push('--target', explicitTarget);
 for (const name of SIDECARS) cargoArgs.push('--bin', name);

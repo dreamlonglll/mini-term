@@ -319,18 +319,14 @@ pub fn arrow_bytes(dir: Arrow, app_cursor: bool) -> Vec<u8> {
 ///
 /// 无论哪种模式都要先把 `\r\n` / `\n` 归一成 `\r`:PTY 那头把 `\n` 当作
 /// 「换行但不回车」,粘多行会出阶梯。
+///
+/// bracketed 编码(含剔除正文里的开始 / 结束标记,防粘贴内容提前「结束粘贴」、
+/// 后半段被当按键执行)与移动端指令共用 [`mt_core::paste::bracketed_paste`]。
 pub fn paste_to_bytes(text: &str, mode: TermMode) -> Vec<u8> {
-    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     if mode.contains(TermMode::BRACKETED_PASTE) {
-        // bracketed paste 里不许出现结束标记本身,否则能被粘贴内容劫持。
-        let sanitized = normalized.replace("\x1b[201~", "");
-        let mut out = Vec::with_capacity(sanitized.len() + 12);
-        out.extend_from_slice(b"\x1b[200~");
-        out.extend_from_slice(sanitized.as_bytes());
-        out.extend_from_slice(b"\x1b[201~");
-        out
+        mt_core::paste::bracketed_paste(text).into_bytes()
     } else {
-        normalized.into_bytes()
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
 }
 
@@ -491,6 +487,12 @@ mod tests {
     #[test]
     fn 粘贴内容不能劫持结束标记() {
         let out = paste_to_bytes("a\x1b[201~b", TermMode::BRACKETED_PASTE);
+        assert_eq!(out, b"\x1b[200~ab\x1b[201~".to_vec());
+        // 删掉一个标记后前后两段会重新拼出 `ESC[201~`:也得去掉
+        let out = paste_to_bytes("a\x1b[201\x1b[201~~; id\n", TermMode::BRACKETED_PASTE);
+        assert_eq!(out, b"\x1b[200~a; id\r\x1b[201~".to_vec());
+        // 开始标记同样剔掉
+        let out = paste_to_bytes("a\x1b[200~b", TermMode::BRACKETED_PASTE);
         assert_eq!(out, b"\x1b[200~ab\x1b[201~".to_vec());
     }
 

@@ -260,21 +260,18 @@ fn build_walker(root: &Path, max_filesize: Option<u64>) -> ignore::WalkParallel 
 ///
 /// 两边都先 `canonicalize`:Windows 上的大小写与分隔符由此归一(拿到的是磁盘上的真实
 /// 写法),`..` 逃逸与指向项目外的链接(符号链接 / junction)也在这里现形。不直接拿规范化
-/// 结果去遍历:它在 Windows 上是 `\\?\` 形态,而 [`collect_candidates`] 靠
-/// `strip_prefix(project_root)` 算相对路径。
+/// 结果去遍历:它的大小写、8.3 短名展开都可能与项目根的写法不同,而
+/// [`collect_candidates`] 靠 `strip_prefix(project_root)` 算相对路径。
 ///
 /// 范围就是项目根本身时返回项目根,与不带范围完全一致。
 ///
 /// 这里要碰盘(WSL 路径可能还要等 VM 冷启动),只在搜索线程上调。
 pub fn resolve_scope(project_root: &Path, scope: &Path) -> Result<PathBuf, ScopeError> {
-    let canonical_root = project_root
-        .canonicalize()
-        .map_err(|_| ScopeError::Missing)?;
+    let canonical_root =
+        mt_core::path::canonicalize(project_root).map_err(|_| ScopeError::Missing)?;
     // `join` 遇到绝对路径直接取后者,相对路径则算在项目根下
-    let canonical_scope = project_root
-        .join(scope)
-        .canonicalize()
-        .map_err(|_| ScopeError::Missing)?;
+    let canonical_scope =
+        mt_core::path::canonicalize(project_root.join(scope)).map_err(|_| ScopeError::Missing)?;
     let rel = relative_within(&canonical_root, &canonical_scope).ok_or(ScopeError::OutsideRoot)?;
     if !canonical_scope.is_dir() {
         return Err(ScopeError::Missing);

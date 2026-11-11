@@ -636,8 +636,9 @@ fn projection_reaches(projection_dir: &Path, sidecar_dir: Option<&Path>) -> bool
 /// 分隔符比较。
 fn same_path(a: &Path, b: &Path) -> bool {
     fn key(path: &Path) -> String {
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let resolved = mt_core::path::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let text = resolved.to_string_lossy().into_owned();
+        // canonicalize 已剥过;这里兜的是它失败时原样留下的输入本身就是 verbatim 形态
         let text = mt_core::path_key::strip_verbatim_prefix(&text).into_owned();
         if cfg!(any(windows, target_os = "macos")) {
             mt_core::path_key::windows_eq_key(&text)

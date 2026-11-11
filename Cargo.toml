@@ -160,10 +160,24 @@ mt-usage = { path = "crates/mt-usage" }
 # SSH 远程项目的服务层(自 mt-app 的 `remote_ssh/` 下沉,不依赖 gpui)。
 mt-remote = { path = "crates/mt-remote" }
 
-# 迁移期把编译时间压下来:GPUI + wgpu/blade 的依赖树很大，
-# dev 下依赖走 opt-level 1，自己的 crate 保持 0 以留调试信息。
+# dev 构建(含 `cargo test`)的调试信息只留行号表:panic 的 backtrace 照样有函数名与
+# file:line(含内联帧),但不再给局部变量 / 类型写完整的调试信息 —— target 目录与
+# Windows 上的 PDB 明显变小,链接也快一截。
+# 要用调试器看局部变量、单步时,本地临时改回 `debug = true`(或只对这一次构建设
+# `CARGO_PROFILE_DEV_DEBUG=true`),别提交。
+#
+# ⚠️ rust-cache 的键不看根 Cargo.toml 的 profile,改这一段要给 ci 那组 rust-cache 换
+# prefix-key 强制换代(见 cache-warm.yml 头部注释)。
+[profile.dev]
+debug = "line-tables-only"
+
+# GPUI + wgpu/blade 的依赖树很大:dev 下依赖走 opt-level 1 把运行速度提上来,自己的
+# crate 保持 0。依赖连行号表也不留(`debug = false`):调试信息的大头在这棵树上,
+# 代价是 backtrace 里第三方库的帧没有行号(Windows 上函数名也可能只是就近的公共
+# 符号)—— 够判断卡在哪个库;要进依赖里单步时同上,本地临时改回。
 [profile.dev.package."*"]
 opt-level = 1
+debug = false
 
 # 发布构建。只调这四项:前三项是「体积/运行时换构建时间」的保守档位,`debug` 是给
 # Windows 崩溃排查留的行号表(不进 exe,见该项注释)。

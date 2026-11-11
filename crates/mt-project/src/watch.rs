@@ -1012,6 +1012,12 @@ fn print_logs(logs: Vec<String>) {
 ///
 /// 校验只做纵深防御(见 [`FsWatcher::watch`]);物理身份要**完整** canonicalize(连叶子
 /// 符号链接一起解开)—— 后端监听本来就跟随链接,身份得是它真正盯着的那个目录。
+///
+/// 这里**刻意保留** std 给的 verbatim 形态(`\\?\C:\…`),不走 `mt_core::path::canonicalize`:
+/// notify 的 Windows 后端把路径原样交给 `CreateFileW`,不像 std 那样替超过 MAX_PATH 的
+/// 路径补 `\\?\`,剥掉前缀后深目录就挂不上。这个形态只在后端内部当 key 用,分发时
+/// 改写回订阅者的字面路径(见模块注释「分发规则」),不会外泄;报错展示时另行剥掉。
+#[allow(clippy::disallowed_methods)]
 fn resolve(key: &Path, project_path: &str) -> Result<PathBuf> {
     crate::fs::verify_under_project_root(Path::new(project_path), key, true)?;
     std::fs::canonicalize(key).with_context(|| format!("监听目录失败: {}", key.display()))
@@ -1102,6 +1108,8 @@ mod tests {
         dir.to_string_lossy().to_string()
     }
 
+    /// 后端 key 的形态:与 `resolve` 一样是 std 原样给的(Windows 上带 `\\?\`)。
+    #[allow(clippy::disallowed_methods)]
     fn canon(dir: &Path) -> PathBuf {
         std::fs::canonicalize(dir).unwrap()
     }

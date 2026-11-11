@@ -219,7 +219,7 @@ jobs:
         run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
       - name: Build GPUI app
-        run: cargo build --release --package mt-app
+        run: cargo build --locked --release --package mt-app
 
       - name: Build NSIS installer (Windows)
         if: matrix.platform == 'windows-latest'
