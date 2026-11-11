@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1633;
+pub const ZH_ENTRY_COUNT: usize = 1644;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1633;
+pub const EN_ENTRY_COUNT: usize = 1644;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1019,6 +1019,8 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("blockNothingStagedHint", "暂存区为空：先暂存要提交的改动，或用 ▾ 里的「全部暂存并提交」"),
     ("blockNothingToStage", "没有可暂存的已跟踪改动"),
     ("changeTotal", "共 {count} 处"),
+    ("clearPicks", "清除勾选"),
+    ("clearPicksTip", "清除全部勾选（Esc）"),
     ("commitAndPush", "提交并推送…"),
     ("commitAndPushDetail", "提交成功后打开推送对话框，确认后才推送"),
     ("committedToast", "已提交 {hash}：{title}"),
@@ -1031,10 +1033,17 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("discardHunk", "丢弃此块"),
     ("discardHunkConfirm", "确定丢弃这一块未暂存的修改吗？\n只影响这一块，已暂存的内容不受影响。\n此操作不可恢复。"),
     ("discardHunkTitle", "丢弃此块"),
+    ("discardLines", "丢弃所选 {count} 行"),
+    ("discardLinesConfirm", "确定丢弃勾选的 {count} 行未暂存修改吗？\n只影响勾选的行，没勾选的改动与已暂存的内容不受影响。\n此操作不可恢复。"),
+    ("discardLinesTitle", "丢弃所选行"),
     ("discardSelected", "丢弃所选 {count} 个文件的修改"),
     ("discardUnstagedConfirm", "确定丢弃 {count} 个文件的未暂存修改吗？\n已暂存的部分会保留。此操作不可恢复。"),
     ("discardUntrackedConfirm", "确定删除 {count} 个未跟踪文件吗？\n此操作不可恢复。"),
     ("dismiss", "关闭"),
+    ("expandAll", "全部展开"),
+    ("expandDown", "向下展开 {count} 行"),
+    ("expandUp", "向上展开 {count} 行"),
+    ("foldedLines", "{count} 行未改动"),
     ("hintBlankLine", "标题与正文之间建议空一行"),
     ("hintTitleTooLong", "标题 {count} 个字符，建议不超过 72"),
     ("historyEmpty", "还没有你的提交消息"),
@@ -1120,6 +1129,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("stageAllPartialConfirm", "{count} 个文件目前只暂存了一部分。\n「全部暂存并提交」会把它们剩下的改动也一起暂存并提交。确定继续吗？"),
     ("stageAllPartialOk", "全部暂存并提交"),
     ("stageHunk", "暂存此块"),
+    ("stageLines", "暂存所选 {count} 行"),
     ("stageSelected", "暂存所选 {count} 个文件"),
     ("statusAdded", "新增"),
     ("statusConflicted", "冲突"),
@@ -1137,6 +1147,7 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("takeTheirsRebaseDeleted", "采用正在重放的提交（theirs，你的改动：删除此文件）"),
     ("unstageAll", "全部取消暂存"),
     ("unstageHunk", "取消暂存此块"),
+    ("unstageLines", "取消暂存所选 {count} 行"),
     ("unstageSelected", "取消暂存所选 {count} 个文件"),
 ];
 #[rustfmt::skip]
@@ -1156,6 +1167,8 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("blockNothingStagedHint", "Nothing staged: stage the changes you want to commit, or use \"Stage All and Commit\" under ▾"),
     ("blockNothingToStage", "No tracked changes to stage"),
     ("changeTotal", "{count} change(s)"),
+    ("clearPicks", "Clear selection"),
+    ("clearPicksTip", "Uncheck all lines (Esc)"),
     ("commitAndPush", "Commit and Push…"),
     ("commitAndPushDetail", "Opens the push dialog after committing; nothing is pushed until you confirm"),
     ("committedToast", "Committed {hash}: {title}"),
@@ -1168,10 +1181,17 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("discardHunk", "Discard hunk"),
     ("discardHunkConfirm", "Discard this unstaged hunk?\nOnly this hunk is affected; staged content is kept. This cannot be undone."),
     ("discardHunkTitle", "Discard Hunk"),
+    ("discardLines", "Discard {count} selected line(s)"),
+    ("discardLinesConfirm", "Discard {count} checked unstaged line(s)?\nOnly the checked lines are affected; unchecked changes and staged content are kept. This cannot be undone."),
+    ("discardLinesTitle", "Discard Selected Lines"),
     ("discardSelected", "Discard changes in {count} selected files"),
     ("discardUnstagedConfirm", "Discard unstaged changes in {count} file(s)?\nStaged parts are kept. This cannot be undone."),
     ("discardUntrackedConfirm", "Delete {count} untracked file(s)?\nThis cannot be undone."),
     ("dismiss", "Dismiss"),
+    ("expandAll", "Expand all"),
+    ("expandDown", "Expand {count} down"),
+    ("expandUp", "Expand {count} up"),
+    ("foldedLines", "{count} unchanged line(s)"),
     ("hintBlankLine", "Separate the subject from the body with a blank line"),
     ("hintTitleTooLong", "Subject is {count} characters; keep it within 72"),
     ("historyEmpty", "No commit messages of yours yet"),
@@ -1257,6 +1277,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("stageAllPartialConfirm", "{count} file(s) are only partially staged.\n\"Stage All and Commit\" will stage and commit their remaining changes too. Continue?"),
     ("stageAllPartialOk", "Stage all and commit"),
     ("stageHunk", "Stage hunk"),
+    ("stageLines", "Stage {count} selected line(s)"),
     ("stageSelected", "Stage {count} selected files"),
     ("statusAdded", "Added"),
     ("statusConflicted", "Conflicted"),
@@ -1274,6 +1295,7 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("takeTheirsRebaseDeleted", "Accept the commit being replayed (theirs: your change, delete this file)"),
     ("unstageAll", "Unstage all"),
     ("unstageHunk", "Unstage hunk"),
+    ("unstageLines", "Unstage {count} selected line(s)"),
     ("unstageSelected", "Unstage {count} selected files"),
 ];
 

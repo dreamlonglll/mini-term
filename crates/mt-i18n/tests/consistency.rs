@@ -209,8 +209,12 @@ use mt_i18n::{
 /// 1582 → 1633：冲突文件逐段解决 —— 右键菜单项、弹窗的标题 / 进度 / 两侧与 base 的方向文案
 /// （变基时另一套）/ 四种选择 / 底部按钮 / 结果与失败提示，以及不能逐段解决的七种原因
 /// （`gitCommit.segments.*` 51 条）。
+/// 1633 → 1644：单文件 diff 按行暂存 —— 块头 / 工具栏「暂存 / 取消暂存 / 丢弃所选 N 行」、
+/// 按行丢弃的确认框、清除勾选按钮与提示（`gitCommit.{stageLines,unstageLines,discardLines,
+/// discardLinesTitle,discardLinesConfirm,clearPicks,clearPicksTip}`）；diff 正文折叠上下文的
+/// 分隔行与三颗展开按钮（`gitCommit.{foldedLines,expandDown,expandUp,expandAll}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1633;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1644;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

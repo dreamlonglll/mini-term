@@ -52,24 +52,37 @@
 //!     拖出视口自动滚动;Ctrl/Cmd+C 复制、Ctrl/Cmd+A 全选、右键「复制 / 全选」。并排视图
 //!     只选起拖的那一栏,行内视图不带行号与 `+`/`-`,tab 按原文复制。原版的行是 DOM,
 //!     浏览器白给选区;这里行是虚拟化的自绘元素,整套在 [`selection`] 里。
+//! 12. **单文件 diff 能按行暂存 / 取消暂存 / 丢弃**(对标 IDEA 的行勾选,见 [`picks`]):
+//!     允许块操作的文件,行号栏最左多一列勾选框 —— 行内视图每条增删行一个,并排视图删除行
+//!     勾在左栏、新增行勾在右栏;hunk 头上的勾选框一下勾上 / 取消这一块(并排视图里左栏头
+//!     管这一块的删除行、右栏头管新增行)。某块里勾了行,块头按钮换成「暂存所选 N 行」这类、
+//!     只对勾上的行生效;工具栏另有跨块的一组,一次交给多块后端
+//!     (`mt_project::git::{stage_hunks, unstage_hunks, discard_hunks}`),不逐块落盘。
+//!     原地重取后勾选按内容认回来(见 [`picks`] 模块注释);Esc / 「清除勾选」清空,换文件清空。
+//! 13. **折叠的上下文能展开**(对标 GitHub,见 [`fold`]):块与块之间、文件头尾没改动的行
+//!     折成一条分隔行,写明折了多少行;点它整段展开,行上另有「向下 / 向上展开 20 行」。
+//!     展开纯前端做(diff 结果带两侧全文),五个用到 diff 正文的地方都能展开;展开出来的行
+//!     只是上下文 —— 没有勾选框、不属于任何块、F7 不停在上面,能拖选复制。
 //!
 //! # 判定顺序不能换
 //!
 //! `loading → error → isBinary → tooLarge → 正常`(`DiffModal.tsx:233-259`)。
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
 
+mod fold;
+mod picks;
 mod selection;
 mod word_diff;
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Pixels, Point,
-    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, ElementId, Entity,
+    FocusHandle, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement,
+    Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
     UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
@@ -77,14 +90,16 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use mt_project::encoding::TextEncoding;
 pub use mt_project::git::DiffSide;
 use mt_project::git::{
-    CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, StaleDiff,
+    CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, HunkPick,
+    StaleDiff,
 };
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::git_ui::{
-    self, ChangeTreeRow, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT,
-    ICON_CLEAN, ICON_CLOSE, ICON_COPY, ICON_REFRESH, icon_button, mono, pill, text_button,
+    self, ButtonKind, ChangeTreeRow, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_LEFT,
+    ICON_CHEVRON_RIGHT, ICON_CLEAN, ICON_CLOSE, ICON_COPY, ICON_MINUS, ICON_REFRESH, action_button,
+    icon_button, mono, pill, text_button,
 };
 use crate::i18n::{t, tr};
 use crate::prompt::{Confirm, kind, open_guarded};
@@ -112,6 +127,8 @@ gpui::actions!(
         GitDiffCopy,
         /// 三个 diff 弹窗:全选当前栏(Ctrl/Cmd+A)
         GitDiffSelectAll,
+        /// 单文件 diff:清空行勾选(Esc;没有勾选时放行,Esc 照旧关弹窗)
+        GitDiffClearPicks,
     ]
 );
 
@@ -349,19 +366,23 @@ fn intra_line_marks_within(old: &str, new: &str, budget: &mut usize) -> Option<P
 // ─── 拍平后的行模型 ───────────────────────────────────────────
 
 /// inline 视图的一行。
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineRow {
     /// 第 n 个 hunk 的 `@@` 头
     Head(usize),
     /// [`Flat::lines`] 的下标
     Line(usize),
+    /// 折着的上下文([`Flat::folds`] 的下标)
+    Fold(usize),
 }
 
 /// 并排视图的一行。两栏行数必须**完全一致**,否则左右对不上。
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairRow {
     Head(usize),
     Line(Option<usize>, Option<usize>),
+    /// 折着的上下文:两栏各画一条分隔行,同一段
+    Fold(usize),
 }
 
 /// hunk 头的三种写法:inline 一整串,并排视图左右各半(各显示自己那侧的区间)。
@@ -405,16 +426,29 @@ struct FlatLine {
 }
 
 /// 一次 diff 结果算好的**全部派生数据**。结果一到就算一次,不在每帧的
-/// uniform_list 回调里重算。
+/// uniform_list 回调里重算;展开折叠只重排行模型([`Flat::relayout`]),不重算词级高亮。
 #[derive(Default)]
 struct Flat {
-    /// 拍平的行(两个视图共用一份)。`content` 是 **tab 展开后**的显示文本
+    /// 拍平的行(两个视图共用一份)。`content` 是 **tab 展开后**的显示文本。前
+    /// [`Flat::hunk_lines`] 行出自块,其后是展开出来的上下文行(每次重排重建)
     lines: Vec<FlatLine>,
     /// 与 [`Flat::lines`] 等长:含 tab 的行展开前的原文(复制要给它),没有 tab 的是 `None`
     raw: Vec<Option<String>>,
     /// 与 [`Flat::lines`] 等长:每行的行内改动片段。空 = 整行一个底色
     marks: Vec<Vec<Range<usize>>>,
+    /// [`Flat::lines`] 里前多少行出自块。勾选与块操作只认这些行,展开出来的上下文行在它之后
+    hunk_lines: usize,
+    /// 第 k 块的第一行在 [`Flat::lines`] 里的下标;末尾多一个 = [`Flat::hunk_lines`]。
+    /// 块里第 i 行就是 `DiffHunk::lines[i]`(按行操作的行号就按它换算)
+    hunk_base: Vec<usize>,
+    /// 各块的并排配对([`Flat::lines`] 下标),第 k 块是 `pairs[pair_base[k]..pair_base[k + 1]]`
+    pairs: Vec<(Option<usize>, Option<usize>)>,
+    pair_base: Vec<usize>,
     heads: Vec<HunkHead>,
+    /// 折掉的上下文,共 `heads.len() + 1` 段(见 [`fold`])。拿着两侧全文拍平时才有
+    gaps: Vec<fold::Gap>,
+    /// 眼下仍折着的段,视图里各占一条分隔行
+    folds: Vec<fold::Fold>,
     inline_rows: Vec<InlineRow>,
     pair_rows: Vec<PairRow>,
     /// 「上一处/下一处改动」的落点 = 每个 hunk 头所在的行下标
@@ -449,83 +483,297 @@ fn text_cols(s: &str) -> usize {
         .sum()
 }
 
-/// hunk 列表 → [`Flat`]。配对本身仍走 [`pair_rows`](逐 hunk 调用,保持
+/// 一行原文 → 显示用的 [`FlatLine`] + 复制用的原文。
+///
+/// `\t` 在 gpui 文本里是零宽(见 `tab_expansion` 模块注释),显示前按制表位展开。
+/// 词级高亮与量宽都在展开后的文本上算,字节区间才对得上;原文另存一份给复制用。
+/// 显示文本在这里一次转成 `SharedString`(见 [`FlatLine::content`])
+fn flat_line(
+    kind: String,
+    content: String,
+    old_lineno: Option<u32>,
+    new_lineno: Option<u32>,
+) -> (FlatLine, Option<String>) {
+    let (content, raw) = match expand_line(&content, TAB_WIDTH) {
+        Cow::Owned(expanded) => (expanded, Some(content)),
+        Cow::Borrowed(_) => (content, None),
+    };
+    let line = FlatLine {
+        kind,
+        content: content.into(),
+        old_lineno,
+        new_lineno,
+    };
+    (line, raw)
+}
+
+/// hunk 列表 → [`Flat`] 里与折叠无关的那一半(块里的行、配对、词级高亮、hunk 头),行模型
+/// 还没排([`Flat::relayout`] 排)。配对本身仍走 [`pair_rows`](逐 hunk 调用,保持
 /// 「配对不跨 hunk」那条不变量);词级高亮按改动块算([`mark_blocks`]),整份 diff 共用
 /// 一份工作量预算。
-fn flatten(hunks: &[DiffHunk]) -> Flat {
+fn flatten_hunks(hunks: &[DiffHunk]) -> Flat {
     let mut f = Flat::default();
     let mut budget = word_diff::DIFF_BUDGET;
 
-    for (hi, hunk) in hunks.iter().enumerate() {
+    for hunk in hunks {
         let base = f.lines.len();
         let (lines, pairs) = pair_rows(std::slice::from_ref(hunk));
-        // `\t` 在 gpui 文本里是零宽(见 `tab_expansion` 模块注释),显示前按制表位展开。
-        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上;原文另存一份给复制用。
-        // 显示文本在这里一次转成 `SharedString`(见 [`FlatLine::content`])
-        let lines: Vec<(FlatLine, Option<String>)> = lines
-            .into_iter()
-            .map(|line| {
-                let (content, raw) = match expand_line(&line.content, TAB_WIDTH) {
-                    Cow::Owned(expanded) => (expanded, Some(line.content)),
-                    Cow::Borrowed(_) => (line.content, None),
-                };
-                let line = FlatLine {
-                    kind: line.kind,
-                    content: content.into(),
-                    old_lineno: line.old_lineno,
-                    new_lineno: line.new_lineno,
-                };
-                (line, raw)
-            })
-            .collect();
-
         f.heads.push(hunk_head(hunk));
-        f.inline_jumps.push(f.inline_rows.len());
-        f.inline_rows.push(InlineRow::Head(hi));
-        f.pair_jumps.push(f.pair_rows.len());
-        f.pair_rows.push(PairRow::Head(hi));
-
-        f.inline_rows
-            .extend((0..lines.len()).map(|i| InlineRow::Line(base + i)));
+        f.hunk_base.push(base);
+        f.pair_base.push(f.pairs.len());
         f.marks.extend((0..lines.len()).map(|_| Vec::new()));
-        for (line, raw) in lines {
+        for line in lines {
+            let (line, raw) = flat_line(line.kind, line.content, line.old_lineno, line.new_lineno);
             f.lines.push(line);
             f.raw.push(raw);
         }
-
-        for (left, right) in pairs {
-            let (left, right) = (left.map(|i| i + base), right.map(|i| i + base));
-            f.pair_rows.push(PairRow::Line(left, right));
-        }
+        f.pairs.extend(
+            pairs
+                .into_iter()
+                .map(|(left, right)| (left.map(|i| i + base), right.map(|i| i + base))),
+        );
         let end = f.lines.len();
         mark_blocks(&mut f, base..end, &mut budget);
     }
 
-    // 三个量宽下标一起算完再写回 —— 闭包借着 `f`,不能边借边写。hunk 头不参与:它钉在
-    // 左缘不随横向滚动(见 `hunk_row`),整行内容是绝对定位的、量出来宽度为 0
-    let (inline_ix, left_ix, right_ix) = {
-        let cols_of = |ix: Option<usize>| ix.map_or(0, |i| text_cols(&f.lines[i].content));
-        (
-            widest(&f.inline_rows, |row| match row {
-                InlineRow::Head(_) => 0,
-                InlineRow::Line(i) => cols_of(Some(*i)),
-            }),
-            widest(&f.pair_rows, |row| match row {
-                PairRow::Head(_) => 0,
-                PairRow::Line(l, _) => cols_of(*l),
-            }),
-            widest(&f.pair_rows, |row| match row {
-                PairRow::Head(_) => 0,
-                PairRow::Line(_, r) => cols_of(*r),
-            }),
-        )
-    };
-    f.widest_inline = inline_ix;
-    f.widest_left = left_ix;
-    f.widest_right = right_ix;
+    f.hunk_lines = f.lines.len();
+    f.hunk_base.push(f.hunk_lines);
+    f.pair_base.push(f.pairs.len());
     f.adds = f.lines.iter().filter(|l| l.kind == "add").count();
     f.deletes = f.lines.iter().filter(|l| l.kind == "delete").count();
     f
+}
+
+/// hunk 列表 → [`Flat`](没有两侧全文,不折叠:块与块直接相接)。
+#[cfg(test)]
+fn flatten(hunks: &[DiffHunk]) -> Flat {
+    let mut f = flatten_hunks(hunks);
+    f.relayout("", &fold::Revealed::default());
+    f
+}
+
+/// 一份 diff 结果 → [`Flat`],块与块之间没改动的行按 `revealed` 展开 / 折叠(见 [`fold`])。
+/// 一并返回重新认过的展开记忆(只留这一次真认出来的行,见 [`Flat::relayout`])。
+fn flatten_diff(diff: &GitDiffResult, revealed: &fold::Revealed) -> (Flat, fold::Revealed) {
+    let mut f = flatten_hunks(&diff.hunks);
+    f.gaps = fold::gaps(
+        &diff.hunks,
+        diff.old_content.lines().count(),
+        diff.new_content.lines().count(),
+    );
+    let kept = f.relayout(&diff.old_content, revealed);
+    (f, kept)
+}
+
+impl Flat {
+    /// 排行模型:折叠段([`Flat::gaps`])与块交替排下去 —— 每段 gap 按 `revealed` 切成展开的行
+    /// 与分隔行,每块是 hunk 头 + 块里的行。展开出来的上下文行追加在 [`Flat::lines`] 末尾
+    /// (块里的行下标不变,勾选不受影响)。跳转落点、量宽一并重算。
+    ///
+    /// `old_text` 是旧侧全文(gap 里的行两侧逐行相等,取旧侧那份)。返回这一次真认出来的
+    /// 展开记忆:对不上的旧条目丢掉(见 [`fold`] 模块注释);只隔一行而直接显示的不算展开过。
+    fn relayout(&mut self, old_text: &str, revealed: &fold::Revealed) -> fold::Revealed {
+        self.lines.truncate(self.hunk_lines);
+        self.raw.truncate(self.hunk_lines);
+        self.marks.truncate(self.hunk_lines);
+        self.folds.clear();
+        self.inline_rows.clear();
+        self.pair_rows.clear();
+        self.inline_jumps.clear();
+        self.pair_jumps.clear();
+        let old_lines: Vec<&str> = if self.gaps.is_empty() {
+            Vec::new()
+        } else {
+            old_text.lines().collect()
+        };
+        let mut kept = fold::Revealed::default();
+        let hunks = self.heads.len();
+        for g in 0..=hunks {
+            if let Some(gap) = self.gaps.get(g).copied() {
+                self.layout_gap(g, gap, &old_lines, revealed, &mut kept);
+            }
+            if g == hunks {
+                break;
+            }
+            self.inline_jumps.push(self.inline_rows.len());
+            self.inline_rows.push(InlineRow::Head(g));
+            self.pair_jumps.push(self.pair_rows.len());
+            self.pair_rows.push(PairRow::Head(g));
+            self.inline_rows
+                .extend((self.hunk_base[g]..self.hunk_base[g + 1]).map(InlineRow::Line));
+            let pairs = &self.pairs[self.pair_base[g]..self.pair_base[g + 1]];
+            self.pair_rows.extend(
+                pairs
+                    .iter()
+                    .map(|&(left, right)| PairRow::Line(left, right)),
+            );
+        }
+        self.measure();
+        kept
+    }
+
+    /// 第 `g` 段 gap 排成行:展开的行逐行一行(两栏同一行),折着的一段一条分隔行。
+    fn layout_gap(
+        &mut self,
+        g: usize,
+        gap: fold::Gap,
+        old_lines: &[&str],
+        revealed: &fold::Revealed,
+        kept: &mut fold::Revealed,
+    ) {
+        if gap.len == 0 {
+            return;
+        }
+        let text = |off: u32| {
+            old_lines
+                .get((gap.old_from + off) as usize - 1)
+                .copied()
+                .unwrap_or("")
+        };
+        // 一段几千行的 gap 一次都没展开过(绝大多数情况):不必逐行查
+        let shown: Vec<bool> = if revealed.is_empty() {
+            Vec::new()
+        } else {
+            (0..gap.len)
+                .map(|off| revealed.contains(gap.old_from + off, gap.new_from + off, text(off)))
+                .collect()
+        };
+        let is_shown = |off: u32| shown.get(off as usize).copied().unwrap_or(false);
+        let hunks = self.heads.len();
+        for run in fold::gap_runs(gap.len, is_shown) {
+            match run {
+                fold::Run::Shown(range) => {
+                    for off in range {
+                        let (old, new, raw) = (gap.old_from + off, gap.new_from + off, text(off));
+                        if is_shown(off) {
+                            kept.insert(old, new, raw);
+                        }
+                        self.push_context(old, new, raw);
+                    }
+                }
+                fold::Run::Folded(range) => {
+                    let ix = self.folds.len();
+                    self.folds.push(fold::Fold {
+                        gap: g,
+                        start: range.start,
+                        len: range.end - range.start,
+                        above: range.start > 0 || g > 0,
+                        below: range.end < gap.len || g < hunks,
+                        inline_row: self.inline_rows.len(),
+                        pair_row: self.pair_rows.len(),
+                    });
+                    self.inline_rows.push(InlineRow::Fold(ix));
+                    self.pair_rows.push(PairRow::Fold(ix));
+                }
+            }
+        }
+    }
+
+    /// 展开第 `gap` 段里从偏移 `start` 起的那条分隔行:露出来的行记进 `revealed`,再重排
+    /// ([`Flat::relayout`],`revealed` 换成重新认过的那份)。返回被展开的那条分隔行(重排前
+    /// 的样子,调用方据它平移选区);没有这条分隔行(行模型已经换过)是 `None`,什么都不动。
+    fn expand_fold(
+        &mut self,
+        old_text: &str,
+        revealed: &mut fold::Revealed,
+        gap: usize,
+        start: u32,
+        how: fold::Expand,
+    ) -> Option<fold::Fold> {
+        let target = self
+            .folds
+            .iter()
+            .copied()
+            .find(|f| f.gap == gap && f.start == start)?;
+        let g = self.gaps.get(gap).copied()?;
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        for off in fold::reveal_range(&target, how) {
+            let (old, new) = (g.old_from + off, g.new_from + off);
+            let raw = old_lines.get(old as usize - 1).copied().unwrap_or("");
+            revealed.insert(old, new, raw);
+        }
+        *revealed = self.relayout(old_text, revealed);
+        Some(target)
+    }
+
+    /// 展开出来的一行上下文:追加进 [`Flat::lines`](没有词级高亮),两个视图各一行。
+    fn push_context(&mut self, old_no: u32, new_no: u32, raw: &str) {
+        let ix = self.lines.len();
+        let (line, raw) = flat_line(
+            "context".to_string(),
+            raw.to_string(),
+            Some(old_no),
+            Some(new_no),
+        );
+        self.lines.push(line);
+        self.raw.push(raw);
+        self.marks.push(Vec::new());
+        self.inline_rows.push(InlineRow::Line(ix));
+        self.pair_rows.push(PairRow::Line(Some(ix), Some(ix)));
+    }
+
+    /// 三个量宽下标(展开出来的行也算)。一起算完再写回 —— 闭包借着 `self`,不能边借边写。
+    /// hunk 头与分隔行不参与:它们钉在左缘不随横向滚动(见 `hunk_row` / `fold_row`),整行
+    /// 内容是绝对定位的、量出来宽度为 0
+    fn measure(&mut self) {
+        let (inline_ix, left_ix, right_ix) = {
+            let cols_of = |ix: Option<usize>| ix.map_or(0, |i| text_cols(&self.lines[i].content));
+            (
+                widest(&self.inline_rows, |row| match row {
+                    InlineRow::Head(_) | InlineRow::Fold(_) => 0,
+                    InlineRow::Line(i) => cols_of(Some(*i)),
+                }),
+                widest(&self.pair_rows, |row| match row {
+                    PairRow::Head(_) | PairRow::Fold(_) => 0,
+                    PairRow::Line(l, _) => cols_of(*l),
+                }),
+                widest(&self.pair_rows, |row| match row {
+                    PairRow::Head(_) | PairRow::Fold(_) => 0,
+                    PairRow::Line(_, r) => cols_of(*r),
+                }),
+            )
+        };
+        self.widest_inline = inline_ix;
+        self.widest_left = left_ix;
+        self.widest_right = right_ix;
+    }
+
+    /// 块里各行的 `(kind, 原文)`,按拍平顺序(勾选的内容键按它算,见 [`picks`])。
+    fn pick_lines(&self) -> Vec<(&str, &str)> {
+        (0..self.hunk_lines)
+            .map(|ix| (self.lines[ix].kind.as_str(), self.raw_line(ix)))
+            .collect()
+    }
+
+    /// 第 `hunk` 块里能打勾的行。`side`:`Some(true)` 只要新增行、`Some(false)` 只要删除行
+    /// (并排视图两栏的块头各管一种),`None` 都要。
+    fn pickable_in(&self, hunk: usize, side: Option<bool>) -> Vec<usize> {
+        let (Some(&from), Some(&to)) = (self.hunk_base.get(hunk), self.hunk_base.get(hunk + 1))
+        else {
+            return Vec::new();
+        };
+        (from..to)
+            .filter(|&ix| {
+                picks::pickable_kind(&self.lines[ix].kind)
+                    .is_some_and(|add| side.is_none_or(|want| want == add))
+            })
+            .collect()
+    }
+
+    /// 一次块操作真正落下去的行([`Flat::lines`] 下标):整块 = 块里全部增删行,按行 = 勾上的。
+    fn applied_lines(&self, picks: &[HunkPick]) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        for pick in picks {
+            let Some(&base) = self.hunk_base.get(pick.hunk) else {
+                continue;
+            };
+            match &pick.lines {
+                Some(lines) => out.extend(lines.iter().map(|i| base + i)),
+                None => out.extend(self.pickable_in(pick.hunk, None)),
+            }
+        }
+        out
+    }
 }
 
 fn widest<T>(rows: &[T], cols: impl Fn(&T) -> usize) -> usize {
@@ -607,6 +855,9 @@ const INLINE_NUM: f32 = 44.0;
 const INLINE_SIGN: f32 = 16.0;
 const INLINE_GUTTER: f32 = INLINE_NUM * 2.0 + INLINE_SIGN;
 
+/// 行号栏最左那一列勾选框的宽(只在允许按行操作时出现,两个视图都加在行号列之前)。
+const CHECK_W: f32 = 24.0;
+
 /// 行内高亮的底色(与整行底色叠在一起,所以要更实)。
 fn word_bg(kind: &str) -> gpui::Hsla {
     if kind == "add" {
@@ -629,10 +880,12 @@ fn pinned(scroll_x: Pixels) -> gpui::Div {
 
 /// 一行:若干行号列 + 内容列。`gutters` 是各行号列的 `(文本, 宽)`(并排视图一列,
 /// inline 视图旧 / 新两列 + 符号列),`marks` 是这一行里**真正变了的片段**
-/// (空 = 整行一个底色,与原版一致)。
+/// (空 = 整行一个底色,与原版一致)。`check` 是行号栏最左那一列勾选框(宽 [`CHECK_W`],
+/// 只在允许按行操作时给;不能勾的行给空格子占住列宽)。
 ///
 /// 行号列钉在左缘([`pinned`]),正文从它底下横向滚过:行号列先铺一层不透明的正文底、
-/// 再叠这一行的增删底色,滚过去的字不会透出来;正文左侧留出行号列的宽。
+/// 再叠这一行的增删底色,滚过去的字不会透出来;正文左侧留出行号列的宽。勾选框是行号列的
+/// 一部分,随它一起钉住;按在上面不起拖选(行号列本来就不可选,见 [`selection`])。
 ///
 /// 行根 `w_full()`:横向不受限的 uniform_list 里行宽 = 内容区宽,少了它增删行的底色
 /// 只涂到文字为止,长短行参差不齐。
@@ -643,6 +896,7 @@ fn pinned(scroll_x: Pixels) -> gpui::Div {
 fn diff_line_row(
     line: &FlatLine,
     gutters: &[(String, f32)],
+    check: Option<AnyElement>,
     line_height: f32,
     marks: &[Range<usize>],
     scroll: Point<Pixels>,
@@ -651,7 +905,8 @@ fn diff_line_row(
     let kind = line.kind.as_str();
     // 只加引用计数,不复制整行(见 [`FlatLine::content`])
     let content = line.content.clone();
-    let gutter_w: f32 = gutters.iter().map(|(_, width)| *width).sum();
+    let check_w = if check.is_some() { CHECK_W } else { 0.0 };
+    let gutter_w: f32 = check_w + gutters.iter().map(|(_, width)| *width).sum::<f32>();
     // `whitespace-pre`:diff 行不换行 —— 少了它 gpui 会把长行回绕,而行高是恒定的
     // (uniform_list 的前提),回绕出来的第二行直接被裁掉,看着像「缺了半行」。
     // `flex_none`:宽度就是整行文字的宽,uniform_list 按它量横向可滚范围
@@ -676,6 +931,7 @@ fn diff_line_row(
             // 行号列不可选:光标照旧是箭头
             .cursor_default()
             .when_some(line_bg(kind), |el, bg| el.bg(bg))
+            .children(check)
             // 行号直接用 muted,不再叠 0.6 的透明度:叠上之后深浅两套主题里都只剩
             // 2:1 上下的对比,行号基本读不出来
             .children(gutters.iter().map(|(no, width)| {
@@ -710,17 +966,23 @@ fn diff_line_row(
 /// ⚠️ 高度必须**恰好**是 `line_height`:uniform_list 按「量到的那一行」的高度
 /// 摆所有行,这里多一像素边框,整份 diff 的行位就会与滚动条对不上。分隔靠底色;
 /// 按钮比行高矮 4px、居中摆。
+///
+/// `gutter` 是整个行号栏的宽(含勾选框列);`check` 是块头的勾选框(一下勾上 / 取消这一块,
+/// 宽 [`CHECK_W`]),占在行号栏最左。
 fn hunk_row(
     text: SharedString,
     line_height: f32,
     gutter: f32,
+    check: Option<AnyElement>,
     actions: Option<AnyElement>,
     scroll_x: Pixels,
 ) -> AnyElement {
+    let check_w = if check.is_some() { CHECK_W } else { 0.0 };
     let head = pinned(scroll_x)
         .flex()
         .items_center()
-        .child(div().w(px(gutter)).flex_none())
+        .children(check)
+        .child(div().w(px(gutter - check_w)).flex_none())
         .child(
             div()
                 .flex_none()
@@ -746,6 +1008,226 @@ fn hunk_row(
         .bg(ui::bg_elevated())
         .child(head)
         .into_any_element()
+}
+
+/// 折着的上下文:一条可点的分隔行(点它 = 整段展开),写明折了多少行;`buttons` 时后面再跟
+/// 「向下展开 20 行」「向上展开 20 行」「全部展开」(哪几颗见 [`fold::step_buttons`])。
+/// 并排视图只有右栏带按钮(同一段别出两组,与块操作按钮同一取舍),两栏的分隔行都能点。
+///
+/// 与 [`hunk_row`] 同一套:整块钉在左缘、高度**恰好**一行。分隔行按 `(gap, start)` 认是
+/// 哪一段(见 [`DiffState::expand`]),点下去时行模型换过了也不会展开错。
+fn fold_row(
+    state: &Entity<DiffState>,
+    fold: &fold::Fold,
+    pane: Pane,
+    line_height: f32,
+    gutter: f32,
+    buttons: bool,
+    scroll_x: Pixels,
+) -> AnyElement {
+    let (gap, start) = (fold.gap, fold.start);
+    let expand = |how: fold::Expand| {
+        let state = state.clone();
+        move |cx: &mut App| {
+            state.update(cx, |s, cx| {
+                s.expand(gap, start, how);
+                cx.notify();
+            })
+        }
+    };
+    let button = |key: &str, label: SharedString, how: fold::Expand| {
+        let run = expand(how);
+        text_button(
+            SharedString::from(format!("git-diff-fold-{key}-{gap}-{start}")),
+            label,
+            true,
+            false,
+        )
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            // 别让分隔行自己的点击(整段展开)也跟着触发
+            cx.stop_propagation();
+            run(cx);
+        })
+    };
+    let actions = buttons.then(|| {
+        let (down, up) = fold::step_buttons(fold);
+        let step = fold::EXPAND_STEP.to_string();
+        div()
+            .flex_none()
+            .h(px((line_height - 4.0).max(16.0)))
+            .ml(px(8.0))
+            .flex()
+            .items_stretch()
+            .gap(px(8.0))
+            .when(down, |el| {
+                el.child(button(
+                    "down",
+                    tr!("gitCommit", "expandDown", count = step.clone()).into(),
+                    fold::Expand::Down,
+                ))
+            })
+            .when(up, |el| {
+                el.child(button(
+                    "up",
+                    tr!("gitCommit", "expandUp", count = step.clone()).into(),
+                    fold::Expand::Up,
+                ))
+            })
+            .child(button(
+                "all",
+                t("gitCommit", "expandAll").into(),
+                fold::Expand::All,
+            ))
+    });
+    let head = pinned(scroll_x)
+        .flex()
+        .items_center()
+        .child(div().w(px(gutter)).flex_none())
+        .child(
+            div()
+                .flex_none()
+                .px(px(8.0))
+                .whitespace_nowrap()
+                .text_color(ui::text_secondary())
+                .child(tr!(
+                    "gitCommit",
+                    "foldedLines",
+                    count = fold.len.to_string()
+                )),
+        )
+        .children(actions);
+    let all = expand(fold::Expand::All);
+    let pane_key = match pane {
+        Pane::Inline => "inline",
+        Pane::Old => "old",
+        Pane::New => "new",
+    };
+    div()
+        .id(SharedString::from(format!(
+            "git-diff-fold-{pane_key}-{gap}-{start}"
+        )))
+        .relative()
+        .w_full()
+        .h(px(line_height))
+        .cursor_pointer()
+        .bg(ui::with_alpha(ui::accent(), 0.07))
+        .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.14)))
+        .on_click(move |_: &ClickEvent, _window, cx| all(cx))
+        .child(head)
+        .into_any_element()
+}
+
+/// 勾选框的三种样子(块头的勾选框会有「勾了一部分」)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tick {
+    Off,
+    Partial,
+    On,
+}
+
+impl Tick {
+    /// 块里能勾的 `total` 行勾了 `picked` 行。
+    fn of(picked: usize, total: usize) -> Self {
+        if picked == 0 {
+            Tick::Off
+        } else if picked >= total {
+            Tick::On
+        } else {
+            Tick::Partial
+        }
+    }
+}
+
+/// 勾选框那一格(宽 [`CHECK_W`]、高一整行)。点它只翻勾选:停止冒泡,不碰块操作与拖选。
+fn check_cell(
+    id: impl Into<ElementId>,
+    tick: Tick,
+    on_toggle: impl Fn(&mut App) + 'static,
+) -> AnyElement {
+    let mark = match tick {
+        Tick::On => git_ui::check_box(true, ui::accent()),
+        Tick::Off => git_ui::check_box(false, ui::accent()),
+        Tick::Partial => div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(14.0))
+            .rounded(px(3.0))
+            .border_1()
+            .border_color(ui::accent())
+            .bg(ui::accent())
+            .child(git_ui::icon(ICON_MINUS, 11.0, ui::bg_base())),
+    };
+    div()
+        .id(id)
+        .w(px(CHECK_W))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .child(mark)
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            on_toggle(cx);
+        })
+        .into_any_element()
+}
+
+/// 勾选框列里不能勾的格子(上下文行、展开出来的行、块里没有这一种行的块头):占住列宽对齐。
+fn check_blank() -> AnyElement {
+    div().w(px(CHECK_W)).h_full().flex_none().into_any_element()
+}
+
+/// 增删行的勾选框;不能勾的行(见 [`DiffState::pickable_line`])给空格子。
+fn line_check(state: &Entity<DiffState>, s: &DiffState, ix: usize) -> AnyElement {
+    if !s.pickable_line(ix) {
+        return check_blank();
+    }
+    let state = state.clone();
+    check_cell(
+        ("git-diff-pick", ix),
+        Tick::of(usize::from(s.picks.contains(&ix)), 1),
+        move |cx| {
+            state.update(cx, |s, cx| {
+                s.toggle_pick(ix);
+                cx.notify();
+            })
+        },
+    )
+}
+
+/// 块头的勾选框:一下勾上 / 取消这一块能勾的行(`side` 见 [`Flat::pickable_in`]),勾了一部分
+/// 时画成「−」。块里没有这种行(并排视图里纯新增块的左栏头)给空格子。
+fn hunk_check(
+    state: &Entity<DiffState>,
+    s: &DiffState,
+    hunk: usize,
+    side: Option<bool>,
+) -> AnyElement {
+    let lines = s.flat.pickable_in(hunk, side);
+    if lines.is_empty() {
+        return check_blank();
+    }
+    let picked = lines.iter().filter(|ix| s.picks.contains(ix)).count();
+    let side_key = match side {
+        None => "all",
+        Some(true) => "add",
+        Some(false) => "del",
+    };
+    let state = state.clone();
+    check_cell(
+        SharedString::from(format!("git-diff-pick-hunk-{side_key}-{hunk}")),
+        Tick::of(picked, lines.len()),
+        move |cx| {
+            state.update(cx, |s, cx| {
+                s.toggle_hunk_picks(hunk, side);
+                cx.notify();
+            })
+        },
+    )
 }
 
 // ─── 弹窗外框尺寸 ─────────────────────────────────────────────
@@ -784,13 +1266,13 @@ pub(crate) fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, g
 /// 原先是「`bg_base` + 30% 不透明度」—— 叠在同为 `bg_base` 的正文底上等于什么都没画,
 /// 空格子与上下文行分不出来。改成前景色的一层薄纱(与悬停底同一手法),深浅主题里
 /// 都看得出「这一侧没有内容」。
-fn empty_cell(line_height: f32) -> AnyElement {
+fn empty_cell(line_height: f32, gutter: f32) -> AnyElement {
     div()
         .w_full()
         .flex()
         .h(px(line_height))
         .bg(ui::with_alpha(ui::text_primary(), 0.05))
-        .child(div().w(px(GUTTER)).flex_none())
+        .child(div().w(px(gutter)).flex_none())
         // 空格子里也能起拖(复制时这一行跳过),光标与正文一致
         .child(div().flex_1().cursor_text())
         .into_any_element()
@@ -822,6 +1304,16 @@ struct DiffState {
     jump: Option<usize>,
     /// 正文的选区、拖选与排版登记(见 [`selection`])
     select: SelectState,
+    /// 展开过的上下文行(见 [`fold`])。换一份 diff 时清空;原地重取时按行号 + 内容重新认
+    revealed: fold::Revealed,
+    /// 允不允许按行勾选:单文件 diff 且该文件支持块操作时由 [`load_file`] 打开,其余弹窗恒为
+    /// `false`。真正画不画勾选框还要看这份 diff 本身(见 [`DiffState::can_pick`])
+    pickable: bool,
+    /// 勾上的增删行([`Flat::lines`] 的下标,只落在块里,见 [`picks`])
+    picks: BTreeSet<usize>,
+    /// 上一次块操作已经落下去的行:原地重取时数勾选的「第几次出现」要先剔掉它们
+    /// (见 [`picks::pick_keys`]),用过即清
+    pick_skip: BTreeSet<usize>,
 }
 
 impl DiffState {
@@ -842,6 +1334,10 @@ impl DiffState {
             synced_right: Point::default(),
             jump: None,
             select: SelectState::default(),
+            revealed: fold::Revealed::default(),
+            pickable: false,
+            picks: BTreeSet::new(),
+            pick_skip: BTreeSet::new(),
         }
     }
 
@@ -849,23 +1345,180 @@ impl DiffState {
         (self.font_size * 1.6).round()
     }
 
+    /// 换一份 diff(换文件 / 首次打开):勾选与展开都不带过去。原地重取不调它 —— 那时两样
+    /// 都要按内容 / 行号认回来(见 [`DiffState::apply`])。
+    fn forget_lines(&mut self) {
+        self.picks.clear();
+        self.pick_skip.clear();
+        self.revealed = fold::Revealed::default();
+    }
+
     fn apply(&mut self, result: anyhow::Result<GitDiffResult>) {
         self.loading = false;
         self.jump = None;
         // 行换了一套(换文件 / 块操作后原地重取):旧选区的行下标已对不上
         self.clear_selection();
+        // 原地重取:勾选按内容键认回来(换文件时调用方已先清空,这里是空操作)
+        let skip = std::mem::take(&mut self.pick_skip);
+        let keys = picks::pick_keys(&self.flat.pick_lines(), &self.picks, &skip);
         match result {
             Ok(diff) => {
-                self.flat = flatten(&diff.hunks);
+                let (flat, revealed) = flatten_diff(&diff, &self.revealed);
+                self.flat = flat;
+                self.revealed = revealed;
                 self.result = Some(diff);
                 self.error = None;
+                self.picks = if self.can_pick() {
+                    picks::remap_picks(&self.flat.pick_lines(), &keys)
+                } else {
+                    BTreeSet::new()
+                };
             }
             Err(err) => {
                 self.error = Some(format!("{err:#}"));
                 self.result = None;
                 self.flat = Flat::default();
+                self.forget_lines();
             }
         }
+    }
+
+    /// 这份 diff 能不能按行勾选:打开方允许(见 [`DiffState::pickable`]),且不是二进制 /
+    /// 过大 / 非 UTF-8(块操作按 UTF-8 文本拼接,别的编码一律只能整文件操作)。
+    fn can_pick(&self) -> bool {
+        self.pickable
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|r| !r.is_binary && !r.too_large && r.encoding.is_none())
+    }
+
+    /// 勾选框列的宽:能勾时 [`CHECK_W`],否则 0。
+    fn check_w(&self) -> f32 {
+        if self.can_pick() { CHECK_W } else { 0.0 }
+    }
+
+    /// 第 `ix` 行([`Flat::lines`] 下标)能不能打勾:块里的增删行。展开出来的上下文行不能。
+    fn pickable_line(&self, ix: usize) -> bool {
+        self.can_pick()
+            && ix < self.flat.hunk_lines
+            && picks::pickable_kind(&self.flat.lines[ix].kind).is_some()
+    }
+
+    fn toggle_pick(&mut self, ix: usize) {
+        if self.pickable_line(ix) && !self.picks.remove(&ix) {
+            self.picks.insert(ix);
+        }
+    }
+
+    /// 块头的勾选框:这一块能勾的行(`side` 见 [`Flat::pickable_in`])全勾上了就全取消,
+    /// 否则全勾上。
+    fn toggle_hunk_picks(&mut self, hunk: usize, side: Option<bool>) {
+        if !self.can_pick() {
+            return;
+        }
+        let lines = self.flat.pickable_in(hunk, side);
+        if lines.iter().all(|ix| self.picks.contains(ix)) {
+            for ix in lines {
+                self.picks.remove(&ix);
+            }
+        } else {
+            self.picks.extend(lines);
+        }
+    }
+
+    /// 清空勾选(Esc / 工具栏「清除勾选」)。本来就没有勾选返回 `false`(Esc 据此放行去关弹窗)。
+    fn clear_picks(&mut self) -> bool {
+        let had = !self.picks.is_empty();
+        self.picks.clear();
+        had
+    }
+
+    /// 第 `hunk` 块里勾了几行。
+    fn picks_in_hunk(&self, hunk: usize) -> usize {
+        match (
+            self.flat.hunk_base.get(hunk),
+            self.flat.hunk_base.get(hunk + 1),
+        ) {
+            (Some(&from), Some(&to)) => self.picks.range(from..to).count(),
+            _ => 0,
+        }
+    }
+
+    /// 点块操作按钮那一刻要交给后端的东西:屏幕上的这份 diff + 要动的块与行(见 [`OpTarget`])。
+    /// 没有 diff、块号越界、跨块操作却一行都没勾 → `None`。
+    fn op_target(&self, scope: OpScope) -> Option<OpTarget> {
+        let diff = self.result.clone()?;
+        match scope {
+            OpScope::Hunk(hunk) => {
+                if hunk >= diff.hunks.len() {
+                    return None;
+                }
+                let mut picks = picks::group_picks(&self.flat.hunk_base, &self.picks, Some(hunk));
+                let lines = picks
+                    .first()
+                    .and_then(|pick| pick.lines.as_ref())
+                    .map(|lines| lines.len());
+                if picks.is_empty() {
+                    picks.push(HunkPick::whole(hunk));
+                }
+                Some(OpTarget {
+                    diff,
+                    picks,
+                    busy: Busy::Hunk(hunk),
+                    land: hunk,
+                    lines,
+                })
+            }
+            OpScope::Picked => {
+                let picks = picks::group_picks(&self.flat.hunk_base, &self.picks, None);
+                let land = picks.first()?.hunk;
+                let lines = picks
+                    .iter()
+                    .filter_map(|pick| pick.lines.as_ref())
+                    .map(|lines| lines.len())
+                    .sum();
+                Some(OpTarget {
+                    diff,
+                    picks,
+                    busy: Busy::Lines,
+                    land,
+                    lines: Some(lines),
+                })
+            }
+        }
+    }
+
+    /// 块操作成功、重取之前:落下去的行从勾选里拿掉(它们马上就从 diff 里消失了),并记进
+    /// [`DiffState::pick_skip`],好让剩下的勾选在新 diff 里按内容认得准。
+    fn mark_applied(&mut self, picks: &[HunkPick]) {
+        let applied = self.flat.applied_lines(picks);
+        self.picks.retain(|ix| !applied.contains(ix));
+        self.pick_skip = applied;
+    }
+
+    /// 展开一条分隔行(按 `(gap, start)` 认是哪一段:点击回调里记的下标可能已过期)。
+    /// 只重排行模型,块里的行、词级高亮、勾选都不动;选区按行号平移过去(见
+    /// [`DiffState::shift_selection`])。
+    fn expand(&mut self, gap: usize, start: u32, how: fold::Expand) {
+        let Some(diff) = self.result.as_ref() else {
+            return;
+        };
+        let before = (self.flat.inline_rows.len(), self.flat.pair_rows.len());
+        let Some(target) =
+            self.flat
+                .expand_fold(&diff.old_content, &mut self.revealed, gap, start, how)
+        else {
+            return;
+        };
+        let delta = |after: usize, before: usize| after as isize - before as isize;
+        self.shift_selection(
+            (
+                target.inline_row,
+                delta(self.flat.inline_rows.len(), before.0),
+            ),
+            (target.pair_row, delta(self.flat.pair_rows.len(), before.1)),
+        );
     }
 
     /// 并排两栏的同步,纵向横向都同步。
@@ -1076,13 +1729,27 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
             let s = rows_state.read(cx);
             s.retain_layouts(Pane::Inline, &range);
             let scroll = s.inline_scroll.0.borrow().base_handle.offset();
+            let can_pick = s.can_pick();
+            let gutter = INLINE_GUTTER + s.check_w();
             range
                 .map(|i| match s.flat.inline_rows[i] {
                     InlineRow::Head(h) => hunk_row(
                         s.flat.heads[h].inline.clone(),
                         line_height,
-                        INLINE_GUTTER,
-                        hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                        gutter,
+                        can_pick.then(|| hunk_check(&rows_state, s, h, None)),
+                        hunks
+                            .as_ref()
+                            .map(|ui| hunk_actions(ui, h, s.picks_in_hunk(h))),
+                        scroll.x,
+                    ),
+                    InlineRow::Fold(f) => fold_row(
+                        &rows_state,
+                        &s.flat.folds[f],
+                        Pane::Inline,
+                        line_height,
+                        gutter,
+                        true,
                         scroll.x,
                     ),
                     InlineRow::Line(ix) => {
@@ -1100,6 +1767,7 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                                 (no(line.new_lineno), INLINE_NUM),
                                 (sign.to_string(), INLINE_SIGN),
                             ],
+                            can_pick.then(|| line_check(&rows_state, s, ix)),
                             line_height,
                             &s.flat.marks[ix],
                             scroll,
@@ -1179,6 +1847,8 @@ fn render_side_by_side(
                 let s = rows_state.read(cx);
                 s.retain_layouts(pane, &range);
                 let scroll = handle.0.borrow().base_handle.offset();
+                let can_pick = s.can_pick();
+                let gutter = GUTTER + s.check_w();
                 range
                     .map(|i| match s.flat.pair_rows[i] {
                         // 两栏各显示自己那侧的区间,行数仍一一对应
@@ -1189,18 +1859,32 @@ fn render_side_by_side(
                             } else {
                                 head.right.clone()
                             };
+                            // 块头的勾选框各管自己那一栏的行:左栏删除行、右栏新增行
                             hunk_row(
                                 text,
                                 line_height,
-                                GUTTER,
-                                hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                                gutter,
+                                can_pick.then(|| hunk_check(&rows_state, s, h, Some(!side_left))),
+                                hunks
+                                    .as_ref()
+                                    .map(|ui| hunk_actions(ui, h, s.picks_in_hunk(h))),
                                 scroll.x,
                             )
                         }
+                        // 分隔行两栏都画、都能点;展开按钮只在右栏(与块操作按钮同一取舍)
+                        PairRow::Fold(f) => fold_row(
+                            &rows_state,
+                            &s.flat.folds[f],
+                            pane,
+                            line_height,
+                            gutter,
+                            !side_left,
+                            scroll.x,
+                        ),
                         PairRow::Line(left, right) => {
                             let index = if side_left { left } else { right };
                             match index {
-                                None => empty_cell(line_height),
+                                None => empty_cell(line_height, gutter),
                                 Some(index) => {
                                     let line = &s.flat.lines[index];
                                     // 左栏显示 oldLineno、右栏显示 newLineno
@@ -1209,9 +1893,12 @@ fn render_side_by_side(
                                     } else {
                                         line.new_lineno
                                     };
+                                    // 删除行只出现在左栏、新增行只出现在右栏:勾选框
+                                    // 自然各在各的栏里;上下文行两栏都是空格子
                                     diff_line_row(
                                         line,
                                         &[(no.map(|n| n.to_string()).unwrap_or_default(), GUTTER)],
+                                        can_pick.then(|| line_check(&rows_state, s, index)),
                                         line_height,
                                         &s.flat.marks[index],
                                         scroll,
@@ -1448,6 +2135,37 @@ enum HunkOp {
     Discard,
 }
 
+/// 进行中的块操作是从哪颗按钮点的(「处理中…」画在哪)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    /// 某一块头上的按钮(整块,或块里勾上的行)
+    Hunk(usize),
+    /// 工具栏上跨块的「所选行」
+    Lines,
+}
+
+/// 块操作作用在哪:某一块(块里勾了行就只动勾上的,没勾就整块),或跨块的全部勾选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpScope {
+    Hunk(usize),
+    Picked,
+}
+
+/// 一次块操作交给后端的全部东西,在**点按钮那一刻**取好(见 [`DiffState::op_target`]):
+/// 丢弃要先确认,确认框开着时屏幕上的 diff 与勾选不会变,落下去的就是用户看到的那些;
+/// 后端再重读两侧防陈旧。
+#[derive(Clone)]
+struct OpTarget {
+    diff: GitDiffResult,
+    /// 要动的块(块号递增)与各块生效的行(`None` = 整块)
+    picks: Vec<HunkPick>,
+    busy: Busy,
+    /// 操作后原地重取时停在第几块(原位置上的那一块 / 下一块)
+    land: usize,
+    /// 按行操作时一共几行(确认框文案用);整块是 `None`
+    lines: Option<usize>,
+}
+
 /// 单文件 diff 弹窗的控制面:文件序列、当前下标、进行中的块操作与就地错误。
 ///
 /// 与 [`DiffState`] 分开:后者是两个弹窗共用的「diff 内容」,这些是单文件弹窗独有的。
@@ -1458,8 +2176,8 @@ struct FileDiff {
     on_changed: Option<OnChanged>,
     on_switch: Option<OnSwitch>,
     reload_files: Option<ReloadFiles>,
-    /// 进行中的块操作(第几块)。`Some` 时全部块按钮禁用,防重复点击
-    busy: Option<usize>,
+    /// 进行中的块操作。`Some` 时全部块按钮(连同工具栏的「所选行」)禁用,防重复点击
+    busy: Option<Busy>,
     /// 块操作失败的原文。就地显示在工具栏下方 —— toast 画在弹窗遮罩底下,看不见
     op_error: Option<String>,
     /// 失败是因为 diff 过期:错误条上给「刷新」
@@ -1487,72 +2205,161 @@ struct HunkUi {
     state: Entity<DiffState>,
     ctl: Entity<FileDiff>,
     side: DiffSide,
-    /// 进行中的块操作(第几块)
-    busy: Option<usize>,
+    /// 进行中的块操作
+    busy: Option<Busy>,
     /// 文件不是 UTF-8 时按钮一律禁用,悬停给这句原因(块操作按 UTF-8 拼接写回,
     /// 会把 GBK / UTF-16 文件写坏;整文件暂存不受影响)
     blocked: Option<SharedString>,
 }
 
-/// hunk 头上的块操作按钮:未暂存侧「暂存此块 / 丢弃此块」,已暂存侧「取消暂存此块」。
+/// 「处理中…」(块头 / 工具栏上正在跑的那颗按钮换成它)。
+fn working_label() -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .px(px(8.0))
+        .text_size(ui::font_px(11.0))
+        .text_color(ui::text_muted())
+        .child(t("gitCommit", "hunkWorking"))
+}
+
+/// 块操作按钮上的字:块里勾了行(`picked > 0`)就是「暂存所选 N 行」这类,只动勾上的行;
+/// 没勾就是「暂存此块」这类整块操作。
+fn op_label(op: HunkOp, picked: usize) -> SharedString {
+    if picked == 0 {
+        return match op {
+            HunkOp::Stage => t("gitCommit", "stageHunk"),
+            HunkOp::Unstage => t("gitCommit", "unstageHunk"),
+            HunkOp::Discard => t("gitCommit", "discardHunk"),
+        }
+        .into();
+    }
+    let count = picked.to_string();
+    match op {
+        HunkOp::Stage => tr!("gitCommit", "stageLines", count = count),
+        HunkOp::Unstage => tr!("gitCommit", "unstageLines", count = count),
+        HunkOp::Discard => tr!("gitCommit", "discardLines", count = count),
+    }
+    .into()
+}
+
+/// 这一侧给哪几种块操作:未暂存侧「暂存 / 丢弃」,已暂存侧「取消暂存」。
+fn side_ops(side: DiffSide) -> &'static [HunkOp] {
+    match side {
+        DiffSide::Unstaged => &[HunkOp::Stage, HunkOp::Discard],
+        DiffSide::Staged => &[HunkOp::Unstage],
+        DiffSide::Working => &[],
+    }
+}
+
+fn op_key(op: HunkOp) -> &'static str {
+    match op {
+        HunkOp::Stage => "stage",
+        HunkOp::Unstage => "unstage",
+        HunkOp::Discard => "discard",
+    }
+}
+
+/// hunk 头上的块操作按钮:未暂存侧「暂存此块 / 丢弃此块」,已暂存侧「取消暂存此块」;
+/// 块里勾了 `picked` 行时换成「暂存所选 N 行」这类、只对勾上的行生效。
 /// 正在处理的那一块换成「处理中…」,其余块的按钮一并禁用。
-fn hunk_actions(hunk_ui: &HunkUi, hunk: usize) -> AnyElement {
-    if hunk_ui.busy == Some(hunk) {
-        return div()
-            .flex()
-            .items_center()
-            .px(px(8.0))
-            .text_size(ui::font_px(11.0))
-            .text_color(ui::text_muted())
-            .child(t("gitCommit", "hunkWorking"))
-            .into_any_element();
+fn hunk_actions(hunk_ui: &HunkUi, hunk: usize, picked: usize) -> AnyElement {
+    if hunk_ui.busy == Some(Busy::Hunk(hunk)) {
+        return working_label().into_any_element();
     }
     let enabled = hunk_ui.busy.is_none() && hunk_ui.blocked.is_none();
     let blocked = hunk_ui.blocked.clone();
-    let button = |key: &str, label: &'static str, op: HunkOp, danger: bool| {
+    let button = |op: HunkOp| {
         let (state, ctl) = (hunk_ui.state.clone(), hunk_ui.ctl.clone());
         text_button(
-            SharedString::from(format!("git-hunk-{key}-{hunk}")),
-            label,
+            SharedString::from(format!("git-hunk-{}-{hunk}", op_key(op))),
+            op_label(op, picked),
             enabled,
-            danger,
+            op == HunkOp::Discard,
         )
         .when_some(blocked.clone(), |el, reason| el.tip(reason))
         .when(enabled, move |el| {
             el.on_click(move |_: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                request_hunk_op(&state, &ctl, op, hunk, window, cx);
+                request_hunk_op(&state, &ctl, op, OpScope::Hunk(hunk), window, cx);
             })
         })
     };
-    let mut row = div().h_full().flex().items_stretch().gap(px(8.0));
-    match hunk_ui.side {
-        DiffSide::Unstaged => {
-            row = row
-                .child(button(
-                    "stage",
-                    t("gitCommit", "stageHunk"),
-                    HunkOp::Stage,
-                    false,
-                ))
-                .child(button(
-                    "discard",
-                    t("gitCommit", "discardHunk"),
-                    HunkOp::Discard,
-                    true,
-                ));
-        }
-        DiffSide::Staged => {
-            row = row.child(button(
-                "unstage",
-                t("gitCommit", "unstageHunk"),
-                HunkOp::Unstage,
-                false,
-            ));
-        }
-        DiffSide::Working => {}
+    div()
+        .h_full()
+        .flex()
+        .items_stretch()
+        .gap(px(8.0))
+        .children(side_ops(hunk_ui.side).iter().map(|&op| button(op)))
+        .into_any_element()
+}
+
+/// 工具栏上跨块的「暂存所选 N 行 / 丢弃所选 N 行 / 取消暂存所选 N 行」+「清除勾选」。只在
+/// 勾了行时出现(没勾时不占工具栏);跨块一次交给多块后端,不逐块落盘(见 [`picks`])。
+fn picks_toolbar(
+    state: &Entity<DiffState>,
+    ctl: &Entity<FileDiff>,
+    side: DiffSide,
+    busy: Option<Busy>,
+    cx: &App,
+) -> Option<AnyElement> {
+    let s = state.read(cx);
+    if !s.can_pick() || s.picks.is_empty() {
+        return None;
     }
-    row.into_any_element()
+    let group = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(8.0))
+        .mr(px(16.0));
+    if busy == Some(Busy::Lines) {
+        return Some(group.child(working_label()).into_any_element());
+    }
+    let enabled = busy.is_none();
+    let picked = s.picks.len();
+    let button = |op: HunkOp| {
+        let (state, ctl) = (state.clone(), ctl.clone());
+        let kind = if op == HunkOp::Discard {
+            ButtonKind::Danger
+        } else {
+            ButtonKind::Ghost
+        };
+        action_button(
+            SharedString::from(format!("git-diff-picks-{}", op_key(op))),
+            op_label(op, picked),
+            kind,
+            enabled,
+        )
+        .when(enabled, move |el| {
+            el.on_click(move |_: &ClickEvent, window, cx| {
+                request_hunk_op(&state, &ctl, op, OpScope::Picked, window, cx);
+            })
+        })
+    };
+    let clear = {
+        let state = state.clone();
+        action_button(
+            "git-diff-picks-clear",
+            t("gitCommit", "clearPicks"),
+            ButtonKind::Ghost,
+            true,
+        )
+        .tip(t("gitCommit", "clearPicksTip"))
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            state.update(cx, |s, cx| {
+                if s.clear_picks() {
+                    cx.notify();
+                }
+            });
+        })
+    };
+    Some(
+        group
+            .children(side_ops(side).iter().map(|&op| button(op)))
+            .child(clear)
+            .into_any_element(),
+    )
 }
 
 /// 非 UTF-8 文件的块操作按钮为什么是灰的(悬停说明)。
@@ -1670,49 +2477,70 @@ pub fn open_text_diff(
     window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
 }
 
-/// 点了块操作按钮。丢弃先确认(不可恢复);确认框种类与 diff 弹窗不同,能叠在它上面。
+/// 点了块操作按钮(块头上的,或工具栏上跨块的「所选行」)。要动的块与行在这一刻取好
+/// ([`DiffState::op_target`])。丢弃先确认(不可恢复);确认框种类与 diff 弹窗不同,能叠在
+/// 它上面。按行丢弃的确认文案写明行数。
 fn request_hunk_op(
     state: &Entity<DiffState>,
     ctl: &Entity<FileDiff>,
     op: HunkOp,
-    hunk: usize,
+    scope: OpScope,
     window: &mut Window,
     cx: &mut App,
 ) {
     if ctl.read(cx).busy.is_some() {
         return;
     }
+    let Some(target) = state.read(cx).op_target(scope) else {
+        return;
+    };
     if op != HunkOp::Discard {
-        run_hunk_op(state, ctl, op, hunk, cx);
+        run_hunk_op(state, ctl, op, target, cx);
         return;
     }
+    let (title, message): (&str, SharedString) = match target.lines {
+        None => (
+            t("gitCommit", "discardHunkTitle"),
+            t("gitCommit", "discardHunkConfirm").into(),
+        ),
+        Some(lines) => (
+            t("gitCommit", "discardLinesTitle"),
+            tr!(
+                "gitCommit",
+                "discardLinesConfirm",
+                count = lines.to_string()
+            )
+            .into(),
+        ),
+    };
     let (state, ctl) = (state.clone(), ctl.clone());
-    Confirm::new(
-        t("gitCommit", "discardHunkTitle"),
-        t("gitCommit", "discardHunkConfirm"),
-    )
-    .ok_text(t("gitChanges", "discardOk"))
-    .danger()
-    .open(
-        move |_window, cx| run_hunk_op(&state, &ctl, op, hunk, cx),
-        window,
-        cx,
-    );
+    Confirm::new(title, message)
+        .ok_text(t("gitChanges", "discardOk"))
+        .danger()
+        .open(
+            move |_window, cx| run_hunk_op(&state, &ctl, op, target.clone(), cx),
+            window,
+            cx,
+        );
 }
 
-/// 真正执行块操作:拿**当前显示的这份 diff**(两侧全文 + 块)交给后端,后端重读两侧
-/// 比对,对不上就拒绝(见 `mt_project::git::hunk` 模块注释)。成功后通知更改列表并
-/// 原地重取 diff;失败就地红字。
+/// 真正执行块操作:拿点按钮时那份 diff(两侧全文 + 块)与要动的块 / 行交给多块后端,后端
+/// 重读两侧比对,对不上就拒绝(见 `mt_project::git::hunk` 模块注释)。几块一趟拼完、只落
+/// 一次盘。成功后通知更改列表并原地重取 diff;失败就地红字。
 fn run_hunk_op(
     state: &Entity<DiffState>,
     ctl: &Entity<FileDiff>,
     op: HunkOp,
-    hunk: usize,
+    target: OpTarget,
     cx: &mut App,
 ) {
-    let Some(diff) = state.read(cx).result.clone() else {
-        return;
-    };
+    let OpTarget {
+        diff,
+        picks,
+        busy,
+        land,
+        ..
+    } = target;
     let (repo, path) = {
         let c = ctl.read(cx);
         if c.busy.is_some() {
@@ -1731,21 +2559,22 @@ fn run_hunk_op(
     };
     cx.refresh_windows();
     ctl.update(cx, |c, cx| {
-        c.busy = Some(hunk);
+        c.busy = Some(busy);
         c.op_error = None;
         c.stale = false;
         cx.notify();
     });
     let (state, ctl) = (state.clone(), ctl.clone());
+    let applied = picks.clone();
     cx.spawn(async move |cx| {
         let result = cx
             .background_executor()
             .spawn(async move {
                 let repo = std::path::Path::new(&repo);
                 match op {
-                    HunkOp::Stage => mt_project::git::stage_hunk(repo, &path, &diff, hunk),
-                    HunkOp::Unstage => mt_project::git::unstage_hunk(repo, &path, &diff, hunk),
-                    HunkOp::Discard => mt_project::git::discard_hunk(repo, &path, &diff, hunk),
+                    HunkOp::Stage => mt_project::git::stage_hunks(repo, &path, &diff, &picks),
+                    HunkOp::Unstage => mt_project::git::unstage_hunks(repo, &path, &diff, &picks),
+                    HunkOp::Discard => mt_project::git::discard_hunks(repo, &path, &diff, &picks),
                 }
             })
             .await;
@@ -1753,6 +2582,11 @@ fn run_hunk_op(
         cx.update(|cx| cx.refresh_windows());
         cx.update(|cx| match result {
             Ok(()) => {
+                // 落下去的行从勾选里拿掉,剩下的勾选在重取后按内容认回来
+                state.update(cx, |s, cx| {
+                    s.mark_applied(&applied);
+                    cx.notify();
+                });
                 let (on_changed, reload_files) = {
                     let c = ctl.read(cx);
                     (c.on_changed.clone(), c.reload_files.clone())
@@ -1766,10 +2600,10 @@ fn run_hunk_op(
                     // 文件序列跟着更改列表走:取消暂存最后一块后文件就离开了「已暂存」组,
                     // 序号与 Alt+←/→ 不能还按打开时的快照
                     Some(reload) => reload(
-                        Box::new(move |files, cx| resync_files(&state, &ctl, files, hunk, cx)),
+                        Box::new(move |files, cx| resync_files(&state, &ctl, files, land, cx)),
                         cx,
                     ),
-                    None => load_file(&state, &ctl, Some(hunk), cx),
+                    None => load_file(&state, &ctl, Some(land), cx),
                 }
             }
             Err(err) => ctl.update(cx, |c, cx| {
@@ -1790,9 +2624,10 @@ fn run_hunk_op(
 
 /// 取当前文件的 diff。
 ///
-/// `after_op = Some(k)`:按块操作后原地重取 —— 不清空旧内容、不回「加载中」(否则整页
-/// 闪一下),结果到了视图模式不变、落到第 k 块(原位置上的下一块),并清掉块操作的
-/// `busy`。`None` 是换文件 / 首次打开:清空并回到顶部。
+/// `after_op = Some(k)`:按块操作后原地重取(错误条上的「刷新」也走这条)—— 不清空旧内容、
+/// 不回「加载中」(否则整页闪一下),结果到了视图模式不变、落到第 k 块(原位置上的下一块),
+/// 并清掉块操作的 `busy`;行勾选按内容认回来、展开过的上下文按行号认回来(见
+/// [`DiffState::apply`])。`None` 是换文件 / 首次打开:清空(勾选与展开一并清掉)并回到顶部。
 fn load_file(
     state: &Entity<DiffState>,
     ctl: &Entity<FileDiff>,
@@ -1804,6 +2639,8 @@ fn load_file(
         (c.repo_path.clone(), c.file().clone())
     };
     let req = state.update(cx, |s, cx| {
+        // 按行勾选与块操作同一口径(见 `DiffFile::hunk_actions`):换了文件跟着换
+        s.pickable = file.hunk_actions && file.side != DiffSide::Working;
         if after_op.is_none() {
             s.loading = true;
             s.error = None;
@@ -1811,6 +2648,7 @@ fn load_file(
             s.flat = Flat::default();
             s.jump = None;
             s.clear_selection();
+            s.forget_lines();
             s.reset_scroll();
         }
         s.request += 1;
@@ -2285,6 +3123,7 @@ pub fn open_file_diff_with(
                     .flex()
                     .flex_none()
                     .items_center()
+                    .children(picks_toolbar(&state, &ctl, file.side, busy, cx))
                     .children(file_nav(&state, &ctl, current, total))
                     .child(view_toggle(
                         &state,
@@ -2303,6 +3142,7 @@ pub fn open_file_diff_with(
         let (width, body_h) = modal_size(viewport);
         let (next_change, prev_change) = (state.clone(), state.clone());
         let (next_file, prev_file) = ((state.clone(), ctl.clone()), (state.clone(), ctl.clone()));
+        let clear_picks = state.clone();
         dialog
             .w(width)
             // 见 [`modal_size`]:不清零内边距的话面板会比统计弹窗高出 48px
@@ -2315,10 +3155,22 @@ pub fn open_file_diff_with(
             .close_button(false)
             .child(
                 // F7 / Shift+F7 / Alt+← / Alt+→ 与正文的 Ctrl/Cmd+C / A 挂在这里;
-                // Esc 冒泡到 Dialog 关窗
+                // Esc 先清行勾选,没有勾选时放行、冒泡到 Dialog 关窗
                 selection::text_actions(div(), &state)
                     .track_focus(&focus)
                     .key_context(FILE_DIFF_CONTEXT)
+                    .on_action(move |_: &GitDiffClearPicks, _window, cx| {
+                        let cleared = clear_picks.update(cx, |s, cx| {
+                            let cleared = s.clear_picks();
+                            if cleared {
+                                cx.notify();
+                            }
+                            cleared
+                        });
+                        if !cleared {
+                            cx.propagate();
+                        }
+                    })
                     .on_action(move |_: &GitDiffNextChange, _window, cx| {
                         next_change.update(cx, |s, cx| {
                             s.jump_by(1);
@@ -3089,9 +3941,10 @@ fn load_diff_with(
         s.result = None;
         s.flat = Flat::default();
         // 换文件 = 换一份 diff:跳转计数与滚动位置(连同两栏同步基准)都要归零,否则新文件
-        // 一进来就显示「3/12」,而两栏还停在上一份的偏移上;选区同理
+        // 一进来就显示「3/12」,而两栏还停在上一份的偏移上;选区与展开过的上下文同理
         s.jump = None;
         s.clear_selection();
+        s.forget_lines();
         s.reset_scroll();
         s.request += 1;
         cx.notify();
@@ -3660,5 +4513,334 @@ mod tests {
         assert_eq!(counter_text(Some(1), 3), "2/3");
         let total = counter_text(None, 3);
         assert!(total.contains('3') && !total.contains('/'), "{total}");
+    }
+
+    // ── 折叠的上下文 / 按行勾选 ─────────────────────────────
+
+    use mt_project::git::{HunkDirection, diff_two_texts, splice_hunks};
+
+    fn numbered(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("l{i}")).collect()
+    }
+
+    fn text(lines: &[String]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    /// 100 行的文件改了第 10、80 行:两块 + 三段折叠(首块之前 6 行、块间 63 行、末块之后 17 行)。
+    fn two_far_changes() -> GitDiffResult {
+        let old = numbered(100);
+        let mut new = old.clone();
+        new[9] = "TEN".into();
+        new[79] = "EIGHTY".into();
+        diff_two_texts(text(&old), text(&new))
+    }
+
+    fn fold_lens(f: &Flat) -> Vec<u32> {
+        f.folds.iter().map(|fold| fold.len).collect()
+    }
+
+    /// 拍平时块与块之间没改动的行折成分隔行;跳转落点只落在 hunk 头上;分隔行两个视图各一行、
+    /// 记着自己在两个视图里的行号;首段只能向上展开、末段只能向下。
+    #[test]
+    fn 折叠_行模型与跳转() {
+        let diff = two_far_changes();
+        let (f, kept) = flatten_diff(&diff, &fold::Revealed::default());
+        assert!(kept.is_empty());
+        assert_eq!(fold_lens(&f), vec![6, 63, 17]);
+        assert_eq!(f.inline_rows[0], InlineRow::Fold(0));
+        assert_eq!(f.inline_rows[1], InlineRow::Head(0));
+        assert_eq!(f.pair_rows[0], PairRow::Fold(0));
+        for &j in &f.inline_jumps {
+            assert!(matches!(f.inline_rows[j], InlineRow::Head(_)));
+        }
+        for &j in &f.pair_jumps {
+            assert!(matches!(f.pair_rows[j], PairRow::Head(_)));
+        }
+        for (ix, fold) in f.folds.iter().enumerate() {
+            assert_eq!(f.inline_rows[fold.inline_row], InlineRow::Fold(ix));
+            assert_eq!(f.pair_rows[fold.pair_row], PairRow::Fold(ix));
+        }
+        assert_eq!((f.folds[0].above, f.folds[0].below), (false, true));
+        assert_eq!((f.folds[1].above, f.folds[1].below), (true, true));
+        assert_eq!((f.folds[2].above, f.folds[2].below), (true, false));
+        // 折起来的行不进 lines:只有块里的行
+        assert_eq!(f.lines.len(), f.hunk_lines);
+        // 没有两侧全文的老口径(`flatten`)不折叠
+        assert!(flatten(&diff.hunks).folds.is_empty());
+    }
+
+    /// 向下展开露出紧挨上一块的 20 行、向上展开露出紧挨下一块的 20 行,剩下的仍折着;
+    /// 全部展开之后分隔行消失,露出来的行号连续、两栏同一行。
+    #[test]
+    fn 折叠_分段展开与全部展开() {
+        let diff = two_far_changes();
+        let (mut f, mut revealed) = flatten_diff(&diff, &fold::Revealed::default());
+        let extra = f.inline_rows.len() - f.pair_rows.len();
+        let mid = f.folds[1];
+        assert_eq!((mid.start, mid.len), (0, 63));
+
+        let target = f
+            .expand_fold(&diff.old_content, &mut revealed, 1, 0, fold::Expand::Down)
+            .expect("有这条分隔行");
+        assert_eq!(target.len, 63);
+        assert_eq!(fold_lens(&f), vec![6, 43, 17]);
+        // 块一占 7..=13:露出来的是 14..=33,紧跟在块一后面
+        let first = f.hunk_lines;
+        assert_eq!(f.lines[first].old_lineno, Some(14));
+        assert_eq!(f.lines.last().unwrap().old_lineno, Some(33));
+        assert_eq!(f.lines.len() - f.hunk_lines, 20);
+
+        let mid = f.folds[1];
+        assert_eq!((mid.start, mid.len), (20, 43));
+        f.expand_fold(&diff.old_content, &mut revealed, 1, 20, fold::Expand::Up);
+        assert_eq!(fold_lens(&f), vec![6, 23, 17]);
+        // 向上展开的 20 行紧挨着块二(77..=83):57..=76
+        let block_two = f.inline_jumps[1];
+        let InlineRow::Line(ix) = f.inline_rows[block_two - 1] else {
+            panic!("块二的头上面应是露出来的行");
+        };
+        assert_eq!(f.lines[ix].old_lineno, Some(76));
+
+        f.expand_fold(&diff.old_content, &mut revealed, 1, 20, fold::Expand::All);
+        assert_eq!(fold_lens(&f), vec![6, 17]);
+        // 块一与块二之间的行连续(14..=76 全露出来了)、两栏同一行
+        let between: Vec<u32> = f.pair_rows[f.pair_jumps[0]..f.pair_jumps[1]]
+            .iter()
+            .filter_map(|row| match row {
+                PairRow::Line(Some(l), Some(r)) if l == r && *l >= f.hunk_lines => {
+                    f.lines[*l].old_lineno
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(between, (14..=76).collect::<Vec<u32>>());
+        // 行内视图比并排视图多出来的只是删增配对省下的行:展开只加上下文行,两个视图加得
+        // 一样多,差值不变
+        assert_eq!(f.inline_rows.len() - f.pair_rows.len(), extra);
+        // 已经展开掉的分隔行再点(过期的回调):什么都不动
+        assert!(
+            f.expand_fold(&diff.old_content, &mut revealed, 1, 0, fold::Expand::All)
+                .is_none()
+        );
+    }
+
+    /// 展开出来的行只是上下文:没有块归属、不能打勾、整块操作也不把它算进去;F7 落点不变。
+    #[test]
+    fn 折叠_展开行不参与块操作() {
+        let diff = two_far_changes();
+        let (mut f, mut revealed) = flatten_diff(&diff, &fold::Revealed::default());
+        let jumps_before = f.heads.len();
+        for (gap, start) in [(0, 0), (1, 0), (2, 0)] {
+            f.expand_fold(
+                &diff.old_content,
+                &mut revealed,
+                gap,
+                start,
+                fold::Expand::All,
+            );
+        }
+        assert!(f.folds.is_empty(), "全展开了");
+        assert_eq!(f.inline_jumps.len(), jumps_before);
+        for ix in f.hunk_lines..f.lines.len() {
+            assert_eq!(f.lines[ix].kind, "context");
+            assert_eq!(picks::hunk_of(&f.hunk_base, ix), None);
+        }
+        for hunk in 0..f.heads.len() {
+            assert!(
+                f.pickable_in(hunk, None)
+                    .iter()
+                    .all(|&ix| ix < f.hunk_lines)
+            );
+        }
+        let whole = f.applied_lines(&[HunkPick::whole(0), HunkPick::whole(1)]);
+        assert_eq!(whole.len(), 4, "两块各一删一增");
+        assert!(whole.iter().all(|&ix| ix < f.hunk_lines));
+        // 勾选里混进块外的下标(不该出现):分组时跳过,不会交给后端
+        let stray = BTreeSet::from([f.hunk_lines + 3]);
+        assert!(picks::group_picks(&f.hunk_base, &stray, None).is_empty());
+    }
+
+    /// 量宽算上展开出来的行:折着时最宽的是块里的行,展开后换成那条超长的上下文行。
+    #[test]
+    fn 折叠_量宽算上展开的行() {
+        let mut old = numbered(40);
+        old[24] = "x".repeat(300);
+        let mut new = old.clone();
+        new[4] = "FIVE".into();
+        let diff = diff_two_texts(text(&old), text(&new));
+        let (mut f, mut revealed) = flatten_diff(&diff, &fold::Revealed::default());
+        let cols = |f: &Flat, row: InlineRow| match row {
+            InlineRow::Line(ix) => text_cols(&f.lines[ix].content),
+            _ => 0,
+        };
+        assert!(cols(&f, f.inline_rows[f.widest_inline]) < 300);
+        let tail = f.folds.last().copied().unwrap();
+        f.expand_fold(
+            &diff.old_content,
+            &mut revealed,
+            tail.gap,
+            tail.start,
+            fold::Expand::All,
+        );
+        assert_eq!(cols(&f, f.inline_rows[f.widest_inline]), 300);
+        assert!(matches!(
+            f.pair_rows[f.widest_left],
+            PairRow::Line(Some(_), _)
+        ));
+        assert_eq!(f.widest_left, f.widest_right);
+    }
+
+    /// 原地重取后展开状态按行号 + 内容认回来:暂存了前面那块(旧侧行号整体挪了)照样按新侧
+    /// 行号认出;丢弃了那块(新侧挪了)按旧侧认出;认不出的收回去。
+    #[test]
+    fn 折叠_重取后按行号重新对齐() {
+        let old = numbered(60);
+        let mut new = old.clone();
+        new.insert(5, "a".into());
+        new.insert(6, "b".into());
+        new[51] = "FIFTY".into(); // 旧侧第 50 行
+        let diff = diff_two_texts(text(&old), text(&new));
+        let (mut f, mut revealed) = flatten_diff(&diff, &fold::Revealed::default());
+        // 块间那段:旧侧 9..、新侧 11..;向下露 20 行 = 旧侧 l9..l28
+        let mid = f.folds.iter().copied().find(|fold| fold.gap == 1).unwrap();
+        f.expand_fold(
+            &diff.old_content,
+            &mut revealed,
+            1,
+            mid.start,
+            fold::Expand::Down,
+        );
+        let shown = |f: &Flat| -> Vec<SharedString> {
+            (f.hunk_lines..f.lines.len())
+                .map(|ix| f.lines[ix].content.clone())
+                .collect()
+        };
+        let expect: Vec<SharedString> = (9..=28).map(|i| format!("l{i}").into()).collect();
+        assert_eq!(shown(&f), expect);
+
+        // 暂存了插入那块:暂存区多了 a、b,旧侧行号 +2,新侧不变
+        let staged = {
+            let mut lines = old.clone();
+            lines.insert(5, "a".into());
+            lines.insert(6, "b".into());
+            text(&lines)
+        };
+        let after_stage = diff_two_texts(staged, text(&new));
+        let (f2, kept) = flatten_diff(&after_stage, &revealed);
+        assert_eq!(shown(&f2), expect, "按新侧行号认回来");
+        assert!(!kept.is_empty());
+
+        // 丢弃了插入那块:工作区没了 a、b,新侧行号 -2,旧侧不变
+        let discarded = {
+            let mut lines = old.clone();
+            lines[49] = "FIFTY".into();
+            text(&lines)
+        };
+        let after_discard = diff_two_texts(text(&old), discarded.clone());
+        let (f3, _) = flatten_diff(&after_discard, &revealed);
+        assert_eq!(shown(&f3), expect, "按旧侧行号认回来");
+
+        // 行号没动、内容变了(外部改动把 l10..l29 两侧都改成了 m10..m29):对不上的收回去,
+        // 只剩内容还对得上的 l9;重新认过的记忆里也只剩它
+        let rewrite = |s: String| s.replace("\nl1", "\nm1").replace("\nl2", "\nm2");
+        let elsewhere = diff_two_texts(rewrite(text(&old)), rewrite(discarded));
+        let (f4, kept4) = flatten_diff(&elsewhere, &revealed);
+        assert_eq!(shown(&f4), vec![SharedString::from("l9")]);
+        assert!(kept4.contains(9, 9, "l9"));
+        assert!(!kept4.contains(10, 10, "l10"));
+    }
+
+    /// 按行暂存的整条链路:勾了两块里各一行,只暂存第一块里勾的那行(块头按钮的口径)→ 后端
+    /// 拼接 → 重取;第二块里的勾选按内容认回来,落下去的那行不再勾着。
+    #[test]
+    fn 按行勾选_暂存后剩下的勾选认回来() {
+        let old = numbered(30);
+        let mut new = old.clone();
+        new[4] = "X5".into();
+        new[5] = "X6".into();
+        new[19] = "X20".into();
+        let diff = diff_two_texts(text(&old), text(&new));
+        let (f, _) = flatten_diff(&diff, &fold::Revealed::default());
+        let find = |f: &Flat, kind: &str, content: &str| {
+            (0..f.hunk_lines)
+                .find(|&ix| f.lines[ix].kind == kind && f.lines[ix].content.as_ref() == content)
+                .unwrap()
+        };
+        let (x6, x20) = (find(&f, "add", "X6"), find(&f, "add", "X20"));
+        let mut picked = BTreeSet::from([x6, x20]);
+
+        // 第一块的按钮只拿第一块里勾的那一行
+        let first = picks::group_picks(&f.hunk_base, &picked, Some(0));
+        assert_eq!(first.len(), 1);
+        let pick = &first[0];
+        let lines = pick.lines.as_ref().unwrap();
+        assert_eq!(lines.len(), 1);
+        let staged = splice_hunks(
+            &diff.old_content,
+            &diff.new_content,
+            &[(&diff.hunks[0], Some(lines))],
+            HunkDirection::Apply,
+            "\n",
+        )
+        .unwrap();
+        assert!(
+            staged.contains("l5\nl6\nX6\nl7"),
+            "只搬进勾上的 X6:{staged}"
+        );
+
+        // 成功后:落下去的行拿掉、记进 skip,再按内容认回剩下的
+        let applied = f.applied_lines(&first);
+        picked.retain(|ix| !applied.contains(ix));
+        let keys = picks::pick_keys(&f.pick_lines(), &picked, &applied);
+        let after = diff_two_texts(staged, text(&new));
+        let (f2, _) = flatten_diff(&after, &fold::Revealed::default());
+        let remapped = picks::remap_picks(&f2.pick_lines(), &keys);
+        assert_eq!(remapped, BTreeSet::from([find(&f2, "add", "X20")]));
+        // 第一块剩下的增删行(没勾的 X5、两行删除)都还在,只是没勾
+        assert!((0..f2.hunk_lines).any(|ix| f2.lines[ix].content.as_ref() == "X5"));
+    }
+
+    /// 块头勾选框按栏分:并排视图左栏头管删除行、右栏头管新增行,行内视图都管。
+    #[test]
+    fn 块头勾选框按栏分() {
+        let h = hunk(vec![
+            line_with("context", "a"),
+            line_with("delete", "b"),
+            line_with("delete", "c"),
+            line_with("add", "B"),
+            line_with("context", "d"),
+        ]);
+        let f = flatten(&[h]);
+        assert_eq!(f.pickable_in(0, None), vec![1, 2, 3]);
+        assert_eq!(f.pickable_in(0, Some(false)), vec![1, 2]);
+        assert_eq!(f.pickable_in(0, Some(true)), vec![3]);
+        assert!(f.pickable_in(5, None).is_empty(), "块号越界");
+        assert_eq!(Tick::of(0, 3), Tick::Off);
+        assert_eq!(Tick::of(2, 3), Tick::Partial);
+        assert_eq!(Tick::of(3, 3), Tick::On);
+        // 按行操作的块内下标换回拍平下标
+        assert_eq!(
+            f.applied_lines(&[HunkPick::lines(0, [2usize].into())]),
+            BTreeSet::from([2])
+        );
+    }
+
+    /// 块头按钮上的字:没勾 = 整块,勾了 = 「所选 N 行」;按侧给哪几种操作。
+    #[test]
+    fn 块操作按钮的文案与种类() {
+        assert_eq!(
+            op_label(HunkOp::Stage, 0).as_ref(),
+            t("gitCommit", "stageHunk")
+        );
+        let lines = op_label(HunkOp::Discard, 3);
+        assert!(lines.contains('3'), "{lines}");
+        assert_ne!(lines.as_ref(), t("gitCommit", "discardHunk"));
+        assert_eq!(
+            side_ops(DiffSide::Unstaged),
+            &[HunkOp::Stage, HunkOp::Discard]
+        );
+        assert_eq!(side_ops(DiffSide::Staged), &[HunkOp::Unstage]);
+        assert!(side_ops(DiffSide::Working).is_empty());
     }
 }

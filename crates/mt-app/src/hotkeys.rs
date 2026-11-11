@@ -593,6 +593,13 @@ pub fn bind_keys(cx: &mut App) {
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
     ));
+    // Esc 先清行勾选(按行暂存);没有勾选时处理器 `propagate`,落到 Dialog 自己那条
+    // Esc → 关弹窗。谓词比 Dialog 深,先试这一条(与提交历史过滤框的 Esc 同一手法)
+    bindings.push(KeyBinding::new(
+        "escape",
+        git_diff::GitDiffClearPicks,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
     // 冲突文件「逐段解决」弹窗:F7 / Shift+F7 跳下一段 / 上一段(与上面跳改动同一对键)。
     // 谓词同样是弹窗自己的 context;两侧原文框是只读的 Textarea,不绑 F7,按键照常冒上来
     bindings.push(KeyBinding::new(
