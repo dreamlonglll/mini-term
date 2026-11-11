@@ -36,8 +36,32 @@
 //! - 末尾换行:块一直延伸到两侧文件末尾时,结果的「末行有没有换行」跟随来源侧 ——
 //!   与 git 的 patch 语义一致(`\ No newline at end of file` 本来就是末行的一部分)。
 //!   块没碰到末尾就一个字节都不动。
+//!
+//! # 按行操作
+//!
+//! 只勾了块里的几行增删行时(diff 弹窗行号栏的勾选框),只让这几行生效 —— 与
+//! `git add -p` 里手改 hunk 同一口径:
+//!
+//! | 操作 | 选中的行 | 没选中的行 |
+//! |---|---|---|
+//! | 暂存 | 删除行删掉、新增行加进暂存区 | 删除行留作上下文、新增行不加 |
+//! | 取消暂存 / 丢弃 | 反向还原(新增行拿掉、删除行放回) | 原样留着 |
+//!
+//! 一句话:没选中的行,被写那一侧有的原样保留、没有的不搬进来。防陈旧照旧**逐行**对账
+//! (没选中的行也对),块外与上下文的字节、搬进来的行用哪种换行都照旧;唯一的区别在文件
+//! 末尾 —— 末尾换行的有无在 diff 里看不见(按 `lines()` 切行),整块操作时跟随来源侧
+//! (上一节),按行操作时**保持被写那一侧原来的样子**(原来末尾有换行,结果也有;原来
+//! 没有,结果也没有),不管哪一行落到了末尾。看不见的那处差异勾不中,按行操作就不碰它 ——
+//! 否则删掉末行之后,倒数第二行带着自己的换行成了末行,文件凭空多出一个末尾换行,而这个
+//! 差异 diff 里又看不见、没法再暂存回去。被写那一侧是空文件时没有「原来的样子」,末行
+//! 跟随搬进来那一行在来源侧的写法。块里的增删行全选上 = 整块,与不传选择逐字节一致。
+//!
+//! 一次可以动好几块([`splice_hunks`]):块按位置先后排、互不重叠,一趟拼完再落盘 ——
+//! 逐块落盘的话,第一块写下去,后面几块对应的那份 diff 就过期了。
 
+use std::collections::BTreeSet;
 use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
@@ -139,29 +163,51 @@ fn advance(next: &mut Option<usize>, first: &mut Option<usize>, ix: usize) -> Re
     Ok(())
 }
 
-/// 按块拼接的纯函数:`old` / `new` 是 diff 两侧的全文,`hunk` 是其中一块。
-///
-/// - [`HunkDirection::Apply`]:返回「`old` 里补上这一块」之后的 `old`;
-/// - [`HunkDirection::Revert`]:返回「`new` 里把这一块还原」之后的 `new`。
-///
-/// `fallback_eol` 只在被写那一侧一个换行都没有时才用(空文件 / 单行文件)。
-///
-/// 块里的每一行都会与对应行号上的文本对账,对不上(或行号不连续)就返回
-/// [`StaleDiff`] —— 只有「块与全文完全吻合」时才有资格落盘。
-pub fn splice_hunk(
-    old: &str,
-    new: &str,
+/// 块里要生效的增删行:[`DiffHunk::lines`] 的下标(按行操作,见模块注释)。
+/// 上下文行写进来不起作用。
+pub type LinePick = BTreeSet<usize>;
+
+/// 一次按块 / 按行操作里的一块:第几块 + 块里哪些行生效(`None` = 整块)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkPick {
+    pub hunk: usize,
+    pub lines: Option<LinePick>,
+}
+
+impl HunkPick {
+    /// 整块。
+    pub fn whole(hunk: usize) -> Self {
+        Self { hunk, lines: None }
+    }
+
+    /// 块里的这几行。
+    pub fn lines(hunk: usize, lines: LinePick) -> Self {
+        Self {
+            hunk,
+            lines: Some(lines),
+        }
+    }
+}
+
+/// 一块对完账之后的拼法(还没落进全文)。
+struct Plan {
+    /// 块在被写那一侧占的行区间
+    target: Range<usize>,
+    /// 块在来源侧占的行区间
+    source: Range<usize>,
+    pieces: Vec<Piece>,
+    /// 只有一部分增删行生效(按行操作;末尾换行的口径不同,见模块注释)
+    partial: bool,
+}
+
+/// 对账一块并排出它的拼法。`lines` 是按行操作时生效的行(`None` = 整块)。
+fn plan_hunk(
+    target: &[RawLine<'_>],
+    source: &[RawLine<'_>],
     hunk: &DiffHunk,
     dir: HunkDirection,
-    fallback_eol: &str,
-) -> Result<String> {
-    let old_lines = split_raw(old);
-    let new_lines = split_raw(new);
-    // target = 被写的那一侧,source = 搬行过来的那一侧
-    let (target, source) = match dir {
-        HunkDirection::Apply => (&old_lines, &new_lines),
-        HunkDirection::Revert => (&new_lines, &old_lines),
-    };
+    lines: Option<&LinePick>,
+) -> Result<Plan> {
     // 「另一侧有、这一侧没有」的行要搬进来;「这一侧有、另一侧没有」的行要拿掉
     let (insert_kind, drop_kind) = match dir {
         HunkDirection::Apply => ("add", "delete"),
@@ -175,11 +221,24 @@ pub fn splice_hunk(
         HunkDirection::Apply => line.new_lineno,
         HunkDirection::Revert => line.old_lineno,
     };
+    let changed = |i: usize| hunk.lines[i].kind != "context";
+    if let Some(set) = lines {
+        // 越界的下标 = 选择与这一块对不上(选的时候看的不是这一份 diff)
+        if set.iter().any(|&i| i >= hunk.lines.len()) {
+            return Err(StaleDiff.into());
+        }
+        if !set.iter().any(|&i| changed(i)) {
+            bail!("没有选中任何改动行");
+        }
+    }
+    let picked = |i: usize| lines.is_none_or(|set| set.contains(&i));
+    // 增删行全选上了就是整块:与不传选择逐字节一致
+    let partial = (0..hunk.lines.len()).any(|i| changed(i) && !picked(i));
 
     let mut pieces: Vec<Piece> = Vec::with_capacity(hunk.lines.len());
     let (mut target_first, mut target_next) = (None, None);
     let (mut source_first, mut source_next) = (None, None);
-    for line in &hunk.lines {
+    for (i, line) in hunk.lines.iter().enumerate() {
         let kind = line.kind.as_str();
         if kind == "context" {
             let t = line_index(target_no(line), target.len())?;
@@ -196,13 +255,20 @@ pub fn splice_hunk(
                 return Err(StaleDiff.into());
             }
             advance(&mut target_next, &mut target_first, t)?;
+            // 没选中:这一行留在被写那一侧,当上下文
+            if !picked(i) {
+                pieces.push(Piece::Keep(t));
+            }
         } else if kind == insert_kind {
             let s = line_index(source_no(line), source.len())?;
             if source[s].text != line.content {
                 return Err(StaleDiff.into());
             }
             advance(&mut source_next, &mut source_first, s)?;
-            pieces.push(Piece::Insert(s));
+            // 没选中:不搬进来
+            if picked(i) {
+                pieces.push(Piece::Insert(s));
+            }
         } else {
             return Err(StaleDiff.into());
         }
@@ -219,21 +285,78 @@ pub fn splice_hunk(
     let target_end = target_next.unwrap_or(target_begin);
     let source_begin = source_first.unwrap_or_else(|| header_start(source_header, source.len()));
     let source_end = source_next.unwrap_or(source_begin);
-    // 块碰到了两侧的文件末尾:末行有没有换行要跟随来源侧(见模块注释)
-    let at_eof = target_end == target.len() && source_end == source.len();
+    Ok(Plan {
+        target: target_begin..target_end,
+        source: source_begin..source_end,
+        pieces,
+        partial,
+    })
+}
+
+/// 按块 / 按行拼接的纯函数:`old` / `new` 是 diff 两侧的全文,`picks` 是要动的块与各自
+/// 生效的行(`None` = 整块),按位置先后排、互不重叠。
+///
+/// - [`HunkDirection::Apply`]:返回「`old` 里补上这些块」之后的 `old`;
+/// - [`HunkDirection::Revert`]:返回「`new` 里把这些块还原」之后的 `new`。
+///
+/// `fallback_eol` 只在被写那一侧一个换行都没有时才用(空文件 / 单行文件)。
+///
+/// 块里的每一行(没选中的也算)都会与对应行号上的文本对账,对不上(或行号不连续、
+/// 块与块重叠)就返回 [`StaleDiff`] —— 只有「块与全文完全吻合」时才有资格落盘。
+pub fn splice_hunks(
+    old: &str,
+    new: &str,
+    picks: &[(&DiffHunk, Option<&LinePick>)],
+    dir: HunkDirection,
+    fallback_eol: &str,
+) -> Result<String> {
+    let old_lines = split_raw(old);
+    let new_lines = split_raw(new);
+    // target = 被写的那一侧,source = 搬行过来的那一侧
+    let (target, source) = match dir {
+        HunkDirection::Apply => (&old_lines, &new_lines),
+        HunkDirection::Revert => (&new_lines, &old_lines),
+    };
+    let plans = picks
+        .iter()
+        .map(|&(hunk, lines)| plan_hunk(target, source, hunk, dir, lines))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(tail_plan) = plans.last() else {
+        bail!("没有要操作的块");
+    };
+    // 一趟从前往后拼:块必须按位置先后排、互不重叠(同一块给两次也算重叠)
+    if plans
+        .windows(2)
+        .any(|w| w[0].target.end > w[1].target.start || w[0].source.end > w[1].source.start)
+    {
+        return Err(StaleDiff.into());
+    }
 
     let eol = dominant_eol(target).unwrap_or(fallback_eol);
-    let mut out: Vec<(&str, &str)> = Vec::with_capacity(target.len() + pieces.len());
-    out.extend(target[..target_begin].iter().map(|l| (l.text, l.eol)));
-    let hunk_from = out.len();
-    for piece in &pieces {
-        out.push(match *piece {
-            Piece::Keep(t) => (target[t].text, target[t].eol),
-            Piece::Insert(s) => (source[s].text, eol),
-        });
+    let pieces: usize = plans.iter().map(|plan| plan.pieces.len()).sum();
+    let mut out: Vec<(&str, &str)> = Vec::with_capacity(target.len() + pieces);
+    let (mut at, mut hunk_from, mut hunk_to) = (0, 0, 0);
+    for plan in &plans {
+        out.extend(
+            target[at..plan.target.start]
+                .iter()
+                .map(|l| (l.text, l.eol)),
+        );
+        hunk_from = out.len();
+        for piece in &plan.pieces {
+            out.push(match *piece {
+                Piece::Keep(t) => (target[t].text, target[t].eol),
+                // 按行操作:来源侧的末行没有换行,搬进来也不带(不是结果的末行时下面会补上)
+                Piece::Insert(s) if plan.partial && source[s].eol.is_empty() => {
+                    (source[s].text, "")
+                }
+                Piece::Insert(s) => (source[s].text, eol),
+            });
+        }
+        hunk_to = out.len();
+        at = plan.target.end;
     }
-    let hunk_to = out.len();
-    out.extend(target[target_end..].iter().map(|l| (l.text, l.eol)));
+    out.extend(target[at..].iter().map(|l| (l.text, l.eol)));
 
     // 原先的末行(没有换行)被挤到了中间:补上换行,否则两行会粘成一行。
     // 只可能发生在块的范围里 —— 块没碰到末尾时原末行仍是末行
@@ -243,11 +366,25 @@ pub fn splice_hunk(
             line.1 = eol;
         }
     }
-    // 末行换行跟随来源侧 —— 只在结果的末行正是块里的行时才动(块外一个字节都不碰)
-    if at_eof && hunk_to > hunk_from && hunk_to == out.len() {
-        let source_has_final_eol = source.last().is_none_or(|l| !l.eol.is_empty());
-        let tail = &mut out[last];
-        if !source_has_final_eol {
+    // 末尾换行(见模块注释)。只有最后一块可能碰到末尾,也只在结果的末行正是块里的行时
+    // 才动(块外一个字节都不碰):
+    // - 整块碰到了两侧的文件末尾:跟随来源侧;
+    // - 按行操作碰到了被写那一侧的末尾:保持被写那一侧原来有没有末尾换行(空文件没有
+    //   「原来」,末行留着搬进来时的写法)。落到末尾的是空行时它的换行不能拿掉 —— 拿掉
+    //   这一行就没了,内容比末尾换行要紧
+    let at_eof = tail_plan.target.end == target.len() && tail_plan.source.end == source.len();
+    let final_eol = if tail_plan.partial {
+        target
+            .last()
+            .filter(|_| tail_plan.target.end == target.len())
+            .map(|l| !l.eol.is_empty())
+    } else if at_eof && hunk_to > hunk_from && hunk_to == out.len() {
+        Some(source.last().is_none_or(|l| !l.eol.is_empty()))
+    } else {
+        None
+    };
+    if let (Some(keep), Some(tail)) = (final_eol, out.last_mut()) {
+        if !keep && !(tail_plan.partial && tail.0.is_empty()) {
             tail.1 = "";
         } else if tail.1.is_empty() {
             tail.1 = eol;
@@ -260,6 +397,19 @@ pub fn splice_hunk(
         text.push_str(line_eol);
     }
     Ok(text)
+}
+
+/// 单块的 [`splice_hunks`]:`old` / `new` 是 diff 两侧的全文,`hunk` 是其中一块,`lines`
+/// 是块里生效的行(`None` = 整块,与按块拼接的老口径逐字节一致)。
+pub fn splice_hunk(
+    old: &str,
+    new: &str,
+    hunk: &DiffHunk,
+    dir: HunkDirection,
+    fallback_eol: &str,
+    lines: Option<&LinePick>,
+) -> Result<String> {
+    splice_hunks(old, new, &[(hunk, lines)], dir, fallback_eol)
 }
 
 // ---------------------------------------------------------------------------
@@ -320,8 +470,12 @@ fn locate(project_path: &Path, file_path: &str) -> Result<Located> {
     Ok(Located { repo, rel, abs })
 }
 
-/// diff 本身能不能按块操作、以及要操作的那一块。
-fn pick_hunk(diff: &GitDiffResult, hunk_index: usize) -> Result<&DiffHunk> {
+/// 一组块的拼接输入:块本身 + 块里生效的行(`None` = 整块)。
+type Picked<'a> = Vec<(&'a DiffHunk, Option<&'a LinePick>)>;
+
+/// diff 本身能不能按块操作、以及要操作的那几块。块号必须严格递增(拼接从前往后
+/// 一趟走完,同一块给两次没有定义);块号越界算陈旧。
+fn pick_hunks<'a>(diff: &'a GitDiffResult, picks: &'a [HunkPick]) -> Result<Picked<'a>> {
     if diff.is_binary || diff.too_large {
         bail!("二进制 / 过大的文件只能整文件操作");
     }
@@ -335,7 +489,19 @@ fn pick_hunk(diff: &GitDiffResult, hunk_index: usize) -> Result<&DiffHunk> {
         };
         bail!("该文件不是 UTF-8 编码({label}),只能整文件暂存 / 取消暂存 / 丢弃");
     }
-    diff.hunks.get(hunk_index).ok_or_else(|| StaleDiff.into())
+    if picks.is_empty() {
+        bail!("没有要操作的块");
+    }
+    if picks.windows(2).any(|w| w[0].hunk >= w[1].hunk) {
+        bail!("要操作的块必须按先后排列且不重复");
+    }
+    picks
+        .iter()
+        .map(|pick| {
+            let hunk = diff.hunks.get(pick.hunk).ok_or(StaleDiff)?;
+            Ok((hunk, pick.lines.as_ref()))
+        })
+        .collect()
 }
 
 /// 暂存区里该路径的 stage 0 条目 —— 只认普通文件(符号链接 / 子模块的「内容」不是文本)。
@@ -414,16 +580,17 @@ fn refuse_conflicted(loc: &Located) -> Result<()> {
     Ok(())
 }
 
-/// 暂存此块:`diff` 必须是 [`super::DiffSide::Unstaged`] 那一侧(暂存区 → 工作区)。
+/// 暂存这几块(或块里勾上的行):`diff` 必须是 [`super::DiffSide::Unstaged`] 那一侧
+/// (暂存区 → 工作区)。几块一趟拼完、只写一次暂存区。
 ///
 /// `project_path` 与 `get_git_diff` 一样可以是仓库内的子目录。
-pub fn stage_hunk(
+pub fn stage_hunks(
     project_path: &Path,
     file_path: &str,
     diff: &GitDiffResult,
-    hunk_index: usize,
+    picks: &[HunkPick],
 ) -> Result<()> {
-    let hunk = pick_hunk(diff, hunk_index)?;
+    let hunks = pick_hunks(diff, picks)?;
     let loc = locate(project_path, file_path)?;
     refuse_conflicted(&loc)?;
     let mut index = loc.repo.index()?;
@@ -432,21 +599,37 @@ pub fn stage_hunk(
     let worktree = worktree_text(&loc.abs, diff.new_content.len())?;
     ensure_fresh(diff, &staged, &worktree)?;
     let fallback = fallback_eol(&loc.repo, true, &worktree);
-    let next = splice_hunk(&staged, &worktree, hunk, HunkDirection::Apply, fallback)?;
+    let next = splice_hunks(&staged, &worktree, &hunks, HunkDirection::Apply, fallback)?;
     write_index_text(&mut index, entry, &next)
 }
 
-/// 取消暂存此块:`diff` 必须是 [`super::DiffSide::Staged`] 那一侧(HEAD → 暂存区)。
-///
-/// 新增文件(HEAD 里没有)的最后一块也取消之后,暂存区里只剩一个空文件 —— 那不是
-/// 「取消暂存」该有的样子,这时直接把它移出暂存区(回到未跟踪),与整文件取消暂存一致。
-pub fn unstage_hunk(
+/// 暂存此块(整块的 [`stage_hunks`])。
+pub fn stage_hunk(
     project_path: &Path,
     file_path: &str,
     diff: &GitDiffResult,
     hunk_index: usize,
 ) -> Result<()> {
-    let hunk = pick_hunk(diff, hunk_index)?;
+    stage_hunks(
+        project_path,
+        file_path,
+        diff,
+        &[HunkPick::whole(hunk_index)],
+    )
+}
+
+/// 取消暂存这几块(或块里勾上的行):`diff` 必须是 [`super::DiffSide::Staged`] 那一侧
+/// (HEAD → 暂存区)。
+///
+/// 新增文件(HEAD 里没有)取消到暂存区里只剩一个空文件时 —— 那不是「取消暂存」该有的
+/// 样子,直接把它移出暂存区(回到未跟踪),与整文件取消暂存一致。
+pub fn unstage_hunks(
+    project_path: &Path,
+    file_path: &str,
+    diff: &GitDiffResult,
+    picks: &[HunkPick],
+) -> Result<()> {
+    let hunks = pick_hunks(diff, picks)?;
     let loc = locate(project_path, file_path)?;
     refuse_conflicted(&loc)?;
     let mut index = loc.repo.index()?;
@@ -457,7 +640,7 @@ pub fn unstage_hunk(
         .unwrap_or_default();
     ensure_fresh(diff, &head, &staged)?;
     let fallback = fallback_eol(&loc.repo, true, &head);
-    let next = splice_hunk(&head, &staged, hunk, HunkDirection::Revert, fallback)?;
+    let next = splice_hunks(&head, &staged, &hunks, HunkDirection::Revert, fallback)?;
     if next.is_empty() && !in_head(&loc.repo, &loc.rel) {
         index.remove_path(Path::new(&loc.rel))?;
         index.write()?;
@@ -466,15 +649,30 @@ pub fn unstage_hunk(
     write_index_text(&mut index, entry, &next)
 }
 
-/// 丢弃此块:`diff` 必须是 [`super::DiffSide::Unstaged`] 那一侧;只改工作区文件,
-/// 暂存区不动。**不可恢复**,UI 先确认。
-pub fn discard_hunk(
+/// 取消暂存此块(整块的 [`unstage_hunks`])。
+pub fn unstage_hunk(
     project_path: &Path,
     file_path: &str,
     diff: &GitDiffResult,
     hunk_index: usize,
 ) -> Result<()> {
-    let hunk = pick_hunk(diff, hunk_index)?;
+    unstage_hunks(
+        project_path,
+        file_path,
+        diff,
+        &[HunkPick::whole(hunk_index)],
+    )
+}
+
+/// 丢弃这几块(或块里勾上的行):`diff` 必须是 [`super::DiffSide::Unstaged`] 那一侧;
+/// 只改工作区文件,暂存区不动。**不可恢复**,UI 先确认。
+pub fn discard_hunks(
+    project_path: &Path,
+    file_path: &str,
+    diff: &GitDiffResult,
+    picks: &[HunkPick],
+) -> Result<()> {
+    let hunks = pick_hunks(diff, picks)?;
     let loc = locate(project_path, file_path)?;
     refuse_conflicted(&loc)?;
     let index = loc.repo.index()?;
@@ -483,11 +681,26 @@ pub fn discard_hunk(
     let worktree = worktree_text(&loc.abs, diff.new_content.len())?;
     ensure_fresh(diff, &staged, &worktree)?;
     let fallback = fallback_eol(&loc.repo, false, &staged);
-    let next = splice_hunk(&staged, &worktree, hunk, HunkDirection::Revert, fallback)?;
+    let next = splice_hunks(&staged, &worktree, &hunks, HunkDirection::Revert, fallback)?;
     // 原地覆写(不走「写临时文件再改名」):改名会换掉文件身份与权限位,
     // 编辑器里开着的这个文件也会被当成「被删后重建」
     std::fs::write(&loc.abs, next)?;
     Ok(())
+}
+
+/// 丢弃此块(整块的 [`discard_hunks`])。
+pub fn discard_hunk(
+    project_path: &Path,
+    file_path: &str,
+    diff: &GitDiffResult,
+    hunk_index: usize,
+) -> Result<()> {
+    discard_hunks(
+        project_path,
+        file_path,
+        diff,
+        &[HunkPick::whole(hunk_index)],
+    )
 }
 
 fn in_head(repo: &Repository, rel: &str) -> bool {
@@ -506,7 +719,7 @@ mod tests {
     /// 两侧文本 → diff → 对第 `ix` 块做 `dir` 方向的拼接。
     fn splice(old: &str, new: &str, ix: usize, dir: HunkDirection) -> String {
         let diff = diff_two_texts(old.to_string(), new.to_string());
-        splice_hunk(old, new, &diff.hunks[ix], dir, "\n").unwrap()
+        splice_hunk(old, new, &diff.hunks[ix], dir, "\n", None).unwrap()
     }
 
     fn hunk_count(old: &str, new: &str) -> usize {
@@ -649,7 +862,15 @@ mod tests {
         let diff = diff_two_texts(step.clone(), new.clone());
         assert_eq!(diff.hunks.len(), 1);
         assert_eq!(
-            splice_hunk(&step, &new, &diff.hunks[0], HunkDirection::Apply, "\n").unwrap(),
+            splice_hunk(
+                &step,
+                &new,
+                &diff.hunks[0],
+                HunkDirection::Apply,
+                "\n",
+                None
+            )
+            .unwrap(),
             new
         );
     }
@@ -674,6 +895,7 @@ mod tests {
             &diff.hunks[1],
             HunkDirection::Apply,
             "\n",
+            None,
         )
         .unwrap();
         let mut expect = base.clone();
@@ -688,6 +910,7 @@ mod tests {
             &diff.hunks[0],
             HunkDirection::Revert,
             "\n",
+            None,
         )
         .unwrap();
         let mut expect = changed.clone();
@@ -744,20 +967,28 @@ mod tests {
         let diff = diff_two_texts(old.clone(), new.clone());
         let mut hunk = diff.hunks[0].clone();
         hunk.lines[0].content = "tampered".into();
-        let err = splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n").unwrap_err();
+        let err = splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n", None).unwrap_err();
         assert!(err.is::<StaleDiff>());
 
         let mut hunk = diff.hunks[0].clone();
         hunk.lines[0].old_lineno = Some(99);
-        assert!(splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n").is_err());
+        assert!(splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n", None).is_err());
 
         let mut hunk = diff.hunks[0].clone();
         hunk.lines.remove(1);
-        let err = splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n").unwrap_err();
+        let err = splice_hunk(&old, &new, &hunk, HunkDirection::Apply, "\n", None).unwrap_err();
         assert!(err.is::<StaleDiff>(), "跳行 = 块不连续");
         // 两侧换个文本:块就对不上了
         let other = join(&numbered(10), "\n").replacen("l2\n", "x\n", 1);
-        assert!(splice_hunk(&other, &new, &diff.hunks[0], HunkDirection::Apply, "\n").is_err());
+        let stale = splice_hunk(
+            &other,
+            &new,
+            &diff.hunks[0],
+            HunkDirection::Apply,
+            "\n",
+            None,
+        );
+        assert!(stale.is_err());
     }
 
     // ── 真仓库 ──────────────────────────────────────────────
@@ -1065,3 +1296,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 }
+
+/// 按行操作、多块一趟拼,以及整块口径的逐字节回归(对照改造前的实现)。
+#[cfg(test)]
+#[path = "hunk_line_tests.rs"]
+mod line_tests;

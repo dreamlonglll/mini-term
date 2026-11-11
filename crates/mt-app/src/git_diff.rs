@@ -31,8 +31,10 @@
 //!    头里纯新增 / 纯删除那一侧的起点按 git 的写法(插入点之前那一行,见 [`head_start`])。
 //! 5. **并排视图两栏纵向、横向都同步**([`DiffState::sync_columns`])。原版两栏各滚各的,
 //!    对照着看要来回对齐;只有一栏有长行时另一栏停在自己的尽头。
-//! 6. **配对成功的删/增行做词级高亮**([`intra_line_marks`])。原版一行里改一个字符
-//!    也是整行涂红/绿。
+//! 6. **改动块做词级高亮**([`word_diff`]):一块连续的删 / 增行两侧各拼成一段(换行也
+//!    参与比较)做一次词级 diff,再按行切回 —— 一行拆两行、中间插一行时不会因逐行配对
+//!    错位而整行涂色;块太大时退回逐对配对([`intra_line_marks_within`])。原版一行里改
+//!    一个字符也是整行涂红/绿。
 //! 7. **正文用等宽字体**(与文件查看器同一条 mono 链)。原版是 `font-mono`,
 //!    GPUI 侧字族不自己挂就会继承界面字体,列对不齐。
 //! 8. **两个弹窗的外框与用量统计面板同尺寸**(见 [`modal_size`])。原版是
@@ -57,6 +59,7 @@
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
 
 mod selection;
+mod word_diff;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -255,10 +258,21 @@ fn merge_ranges(mut ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
     out
 }
 
-/// 一对 delete/add 行的词级差异 → 两侧各自「变了的字节区间」。
+/// 一对删 / 增行各自「变了的字节区间」。
+type PairMarks = (Vec<Range<usize>>, Vec<Range<usize>>);
+
+/// 不限预算的 [`intra_line_marks_within`](单测用)。
+#[cfg(test)]
+fn intra_line_marks(old: &str, new: &str) -> Option<PairMarks> {
+    let mut unlimited = usize::MAX;
+    intra_line_marks_within(old, new, &mut unlimited)
+}
+
+/// 一对 delete/add 行的词级差异 → 两侧各自「变了的字节区间」。按块比放弃时的退路
+/// (见 [`word_diff`]),DP 格子数从这份 diff 的预算 `budget` 里扣。
 ///
-/// `None` = 不细分(两行相同 / 太长 / 改动占比过高)。
-fn intra_line_marks(old: &str, new: &str) -> Option<(Vec<Range<usize>>, Vec<Range<usize>>)> {
+/// `None` = 不细分(两行相同 / 太长 / 改动占比过高 / 预算用完)。
+fn intra_line_marks_within(old: &str, new: &str, budget: &mut usize) -> Option<PairMarks> {
     if old == new || old.is_empty() || new.is_empty() {
         return None;
     }
@@ -284,9 +298,11 @@ fn intra_line_marks(old: &str, new: &str) -> Option<(Vec<Range<usize>>, Vec<Rang
     if am.is_empty() && bm.is_empty() {
         return None;
     }
-    if am.len() * bm.len() > INTRA_LINE_MAX_CELLS {
+    let cells = am.len() * bm.len();
+    if cells > INTRA_LINE_MAX_CELLS || cells > *budget {
         return None;
     }
+    *budget -= cells;
 
     // LCS DP(u32 足够:词元数被 INTRA_LINE_MAX_CELLS 间接钳住)
     let (m, n) = (am.len(), bm.len());
@@ -434,9 +450,11 @@ fn text_cols(s: &str) -> usize {
 }
 
 /// hunk 列表 → [`Flat`]。配对本身仍走 [`pair_rows`](逐 hunk 调用,保持
-/// 「配对不跨 hunk」那条不变量)。
+/// 「配对不跨 hunk」那条不变量);词级高亮按改动块算([`mark_blocks`]),整份 diff 共用
+/// 一份工作量预算。
 fn flatten(hunks: &[DiffHunk]) -> Flat {
     let mut f = Flat::default();
+    let mut budget = word_diff::DIFF_BUDGET;
 
     for (hi, hunk) in hunks.iter().enumerate() {
         let base = f.lines.len();
@@ -477,17 +495,10 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
 
         for (left, right) in pairs {
             let (left, right) = (left.map(|i| i + base), right.map(|i| i + base));
-            if let (Some(li), Some(ri)) = (left, right)
-                && f.lines[li].kind == "delete"
-                && f.lines[ri].kind == "add"
-                && let Some((del, add)) =
-                    intra_line_marks(&f.lines[li].content, &f.lines[ri].content)
-            {
-                f.marks[li] = del;
-                f.marks[ri] = add;
-            }
             f.pair_rows.push(PairRow::Line(left, right));
         }
+        let end = f.lines.len();
+        mark_blocks(&mut f, base..end, &mut budget);
     }
 
     // 三个量宽下标一起算完再写回 —— 闭包借着 `f`,不能边借边写。hunk 头不参与:它钉在
@@ -522,6 +533,53 @@ fn widest<T>(rows: &[T], cols: impl Fn(&T) -> usize) -> usize {
         .enumerate()
         .max_by_key(|(_, row)| cols(row))
         .map_or(0, |(ix, _)| ix)
+}
+
+/// 一个 hunk 的词级标记(`lines` 是它在 [`Flat::lines`] 里的区间):连续的增删行算一块,
+/// 整块交给 [`word_diff::block_marks`];块太大 / 编辑太多时退回逐对配对(块里第 i 条删除行
+/// 配第 i 条新增行,还是老算法)。纯新增 / 纯删除的块整行一个底色。
+fn mark_blocks(f: &mut Flat, lines: Range<usize>, budget: &mut usize) {
+    let mut at = lines.start;
+    while at < lines.end {
+        if f.lines[at].kind == "context" {
+            at += 1;
+            continue;
+        }
+        let (mut dels, mut adds) = (Vec::new(), Vec::new());
+        while at < lines.end && f.lines[at].kind != "context" {
+            match f.lines[at].kind.as_str() {
+                "delete" => dels.push(at),
+                "add" => adds.push(at),
+                _ => {}
+            }
+            at += 1;
+        }
+        if dels.is_empty() || adds.is_empty() {
+            continue;
+        }
+        let text = |ix: &usize| f.lines[*ix].content.as_ref();
+        let old_text: Vec<&str> = dels.iter().map(text).collect();
+        let new_text: Vec<&str> = adds.iter().map(text).collect();
+        match word_diff::block_marks(&old_text, &new_text, budget) {
+            word_diff::BlockMarks::Lines { old, new } => {
+                for (ix, marks) in dels.iter().zip(old).chain(adds.iter().zip(new)) {
+                    f.marks[*ix] = marks;
+                }
+            }
+            word_diff::BlockMarks::Fallback => {
+                for (&del, &add) in dels.iter().zip(&adds) {
+                    if let Some((old, new)) = intra_line_marks_within(
+                        &f.lines[del].content,
+                        &f.lines[add].content,
+                        budget,
+                    ) {
+                        f.marks[del] = old;
+                        f.marks[add] = new;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn line_bg(kind: &str) -> Option<gpui::Hsla> {
@@ -3497,6 +3555,39 @@ mod tests {
         assert!(!f.marks[0].is_empty(), "配对的 delete 行应有高亮");
         assert!(!f.marks[1].is_empty(), "配对的 add 行应有高亮");
         assert!(f.marks[2].is_empty(), "没配上的 add 行整行涂色即可");
+    }
+
+    /// 词级高亮按整块算:中间插了一行时,「let c = 3;」不再配给插进来的那行、点出 c/b
+    /// 两处假改动,只点出真正改了的「3」;插进来的那行整行一个底色。
+    #[test]
+    fn 拍平_词级高亮按块不因插行错位() {
+        let h = hunk(vec![
+            line_with("delete", "let a = 1;"),
+            line_with("delete", "let c = 3;"),
+            line_with("add", "let a = 10;"),
+            line_with("add", "let b = 2;"),
+            line_with("add", "let c = 30;"),
+        ]);
+        let f = flatten(&[h]);
+        assert_eq!(f.marks[0], vec![8..9]);
+        assert_eq!(f.marks[1], vec![8..9]);
+        // 逐对配对的老算法在这里会点出两处
+        let (old, _) = intra_line_marks("let c = 3;", "let b = 2;").unwrap();
+        assert_eq!(old.len(), 2);
+    }
+
+    /// 超大块退回逐对配对:照样点出每对里改了的那个数,不会整块放弃。
+    #[test]
+    fn 拍平_超大块退回逐对配对() {
+        let n = 300;
+        let mut lines: Vec<DiffLine> = (0..n)
+            .map(|i| line_with("delete", &format!("value = {i};")))
+            .collect();
+        lines.extend((0..n).map(|i| line_with("add", &format!("value = {i}x;"))));
+        let f = flatten(&[hunk(lines)]);
+        // 「value = 0;」→「value = 0x;」:旧侧点出 `0`,新侧点出 `0x`
+        assert_eq!(f.marks[0], vec![8..9]);
+        assert_eq!(f.marks[n], vec![8..10]);
     }
 
     /// uniform_list 只量一行来定内容宽,量宽下标必须指向**最宽**那一行。
