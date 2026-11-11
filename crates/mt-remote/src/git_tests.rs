@@ -36,6 +36,8 @@ enum Answer {
     Disconnect,
     ErrorOnce,
     StderrFlood,
+    UnknownOnce,
+    BadDataOnce,
     Silent,
     Large,
 }
@@ -159,6 +161,12 @@ impl server::Handler for Handler {
         self.input.drain(..size + 4);
         let number = self.counts.requests.fetch_add(1, Ordering::SeqCst);
         let reply = match &request.operation {
+            Operation::Barrier { completed_id } => Reply::Completed {
+                completed_id: *completed_id,
+            },
+            Operation::CommitWith { .. } => Reply::Data {
+                value: serde_json::value::to_raw_value(&()).unwrap(),
+            },
             Operation::Discover => Reply::Repositories { repos: Vec::new() },
             Operation::Status { .. } => Reply::Status { files: Vec::new() },
             Operation::Commit { .. } => Reply::Committed {
@@ -181,6 +189,19 @@ impl server::Handler for Handler {
             Answer::WrongKind => response.result = Ok(Reply::Updated),
             Answer::ErrorOnce if number == 0 => {
                 response.result = Err("repository rejected operation".into())
+            }
+            Answer::UnknownOnce if number == 0 => {
+                response.result = Err(mt_git_helper::GitFailure::outcome_unknown(
+                    "response encoding failed after execution",
+                ));
+            }
+            Answer::BadDataOnce if number == 0 => {
+                response.result = Ok(Reply::Data {
+                    value: serde_json::value::RawValue::from_string(
+                        r#""invalid commit outcome""#.into(),
+                    )
+                    .unwrap(),
+                });
             }
             Answer::StderrFlood => {
                 session.extended_data(channel, 1, vec![b'e'; 3 * 1024 * 1024])?;
@@ -559,7 +580,13 @@ fn stderr_flood_is_drained_across_windows_but_diagnostics_are_bounded() {
     let error = client.request(status()).unwrap_err();
     assert!(error.contains("invalid Git protocol JSON"), "{error}");
     let stderr = error.split("; helper stderr: ").nth(1).unwrap();
-    assert_eq!(stderr, format!("{} [truncated]", "e".repeat(STDERR_CAP)));
+    assert!(error.len() <= mt_git_helper::MAX_ERROR_BYTES);
+    assert!(!stderr.is_empty());
+    assert!(stderr.starts_with('e'));
+    assert!(
+        stderr.len() < STDERR_CAP,
+        "the consumer diagnostic budget includes its protocol-error prefix"
+    );
     assert!(client.request(status()).is_err());
 }
 
@@ -607,4 +634,87 @@ fn unconfirmed_close_is_bounded_and_retires_session() {
     assert!(session.is_unhealthy_now());
     assert!(client.transport.is_none());
     fixture.wait_count(&fixture.counts.closed, 1);
+}
+
+#[test]
+fn helper_unknown_is_typed_and_only_original_stream_barrier_proves_completion() {
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::UnknownOnce,
+        ..Default::default()
+    });
+    let mut client = fixture.connect().unwrap();
+    assert!(matches!(
+        client.request_typed(commit()),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(client.is_connected());
+    assert!(client.pending_write.is_some());
+    let pending = client.pending_write;
+    client.request_typed(status()).unwrap();
+    assert_eq!(client.pending_write, pending);
+    let dispatched = fixture.counts.requests.load(Ordering::SeqCst);
+    assert!(matches!(
+        client.request_typed(commit()),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), dispatched);
+    client.prove_pending_write_completed().unwrap();
+    assert!(client.pending_write.is_none());
+    client.request_typed(commit()).unwrap();
+    client.close().unwrap();
+}
+
+#[test]
+fn malformed_typed_write_payload_is_unknown_but_read_payload_failure_is_known() {
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::BadDataOnce,
+        ..Default::default()
+    });
+    let mut client = fixture.connect().unwrap();
+    let operation = Operation::CommitWith {
+        repo: "/repo".into(),
+        message: "commit".into(),
+        amend: false,
+    };
+    assert!(matches!(
+        client.request_data::<mt_project::git::CommitOutcome>(operation),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(client.pending_write.is_some());
+    assert!(client.is_connected());
+    client.prove_pending_write_completed().unwrap();
+    client.close().unwrap();
+
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::BadDataOnce,
+        ..Default::default()
+    });
+    let mut client = fixture.connect().unwrap();
+    let operation = Operation::PanelSnapshot {
+        repo: "/repo".into(),
+        recent_limit: 1,
+    };
+    assert!(matches!(
+        client.request_data::<mt_project::git::RepoPanelSnapshot>(operation),
+        Err(mt_git_helper::GitFailure::Message { .. })
+    ));
+    assert!(client.pending_write.is_none());
+    client.close().unwrap();
+}
+
+#[test]
+fn lost_original_channel_cannot_supply_completion_receipt() {
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::Disconnect,
+        ..Default::default()
+    });
+    let mut client = fixture.connect().unwrap();
+    assert!(matches!(
+        client.request_typed(commit()),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(client.pending_write.is_some());
+    assert!(client.prove_pending_write_completed().is_err());
+    assert!(client.pending_write.is_some());
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), 1);
 }

@@ -1560,16 +1560,12 @@ fn run_hunk_op(
     });
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                match op {
-                    HunkOp::Stage => repo.stage_hunk(&path, &diff, hunk),
-                    HunkOp::Unstage => repo.unstage_hunk(&path, &diff, hunk),
-                    HunkOp::Discard => repo.discard_hunk(&path, &diff, hunk),
-                }
-            })
-            .await;
+        let result = mt_remote::run_git(move || match op {
+            HunkOp::Stage => repo.stage_hunk(&path, &diff, hunk),
+            HunkOp::Unstage => repo.unstage_hunk(&path, &diff, hunk),
+            HunkOp::Discard => repo.discard_hunk(&path, &diff, hunk),
+        })
+        .await;
         drop(guard);
         cx.update(|cx| cx.refresh_windows());
         cx.update(|cx| match result {
@@ -1640,12 +1636,10 @@ fn load_file(
     });
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                repo.get_git_diff_from(&file.path, file.old_path.as_deref(), file.side)
-            })
-            .await;
+        let result = mt_remote::run_git(move || {
+            repo.get_git_diff_from(&file.path, file.old_path.as_deref(), file.side)
+        })
+        .await;
         state.update(cx, |s: &mut DiffState, cx| {
             if s.request != req {
                 return;
@@ -2292,10 +2286,7 @@ pub fn open_commit_diff_loading(
 ) -> gpui::Task<()> {
     let (task_repo, task_hash) = (repo_path.clone(), commit_hash.clone());
     window.spawn(cx, async move |cx| {
-        let files = cx
-            .background_executor()
-            .spawn(async move { task_repo.get_commit_files(&task_hash) })
-            .await;
+        let files = mt_remote::run_git(move || task_repo.get_commit_files(&task_hash)).await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_commit_diff_at(
                 store,
@@ -2359,10 +2350,8 @@ pub fn open_combined_diff_loading(
 ) -> gpui::Task<()> {
     let (task_repo, task_hashes) = (repo_path.clone(), hashes.clone());
     window.spawn(cx, async move |cx| {
-        let files = cx
-            .background_executor()
-            .spawn(async move { task_repo.get_combined_commit_files(&task_hashes) })
-            .await;
+        let files =
+            mt_remote::run_git(move || task_repo.get_combined_commit_files(&task_hashes)).await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => open_combined_diff(store, repo_path, hashes, files, initial, window, cx),
             Err(err) => {
@@ -2898,7 +2887,7 @@ fn load_diff_with(
 
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx.background_executor().spawn(async move { fetch() }).await;
+        let result = mt_remote::run_git(fetch).await;
         let _ = state.update(cx, |s: &mut DiffState, cx| {
             if s.request != req {
                 return;

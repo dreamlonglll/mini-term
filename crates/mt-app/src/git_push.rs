@@ -205,15 +205,13 @@ fn load(state: &Entity<PushDialog>, cx: &mut App) {
     };
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                let branch = branch.as_deref();
-                let plan = repo.push_plan(branch)?;
-                let outgoing = repo.outgoing_commits(branch, OUTGOING_LIMIT)?;
-                anyhow::Ok((plan, outgoing))
-            })
-            .await;
+        let result = mt_remote::run_git(move || {
+            let branch = branch.as_deref();
+            let plan = repo.push_plan(branch)?;
+            let outgoing = repo.outgoing_commits(branch, OUTGOING_LIMIT)?;
+            anyhow::Ok((plan, outgoing))
+        })
+        .await;
         state.update(cx, |s: &mut PushDialog, cx| {
             match result {
                 Ok((plan, outgoing)) => {
@@ -286,6 +284,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
     };
     let done_state = state.clone();
     let done_panel = panel.clone();
+    let store = panel.read(cx).store().clone();
     let context = repo.clone();
     // ⚠️ 网络操作,最多阻塞 120s(后台执行器上跑,占着仓库的写操作闸)
     let started = git_ui::spawn_gated(
@@ -302,11 +301,11 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                 Ok(PushOutcome::Pushed(target)) => {
                     close_guarded(kind::GIT_PUSH, window, cx);
                     let message = pushed_summary(&target, count, truncated, force);
+                    git_ui::toast_for_repo(&store, &context, message.clone(), Tone::Info, cx);
                     panel.update(cx, |p, cx| {
                         if p.repo_context().as_ref() != Some(&context) {
                             return;
                         }
-                        p.notify_result(message, Tone::Info, cx);
                         p.refresh_after_write(cx);
                     });
                     None
@@ -320,6 +319,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
             let Some((detail, hint)) = failure else {
                 return;
             };
+            let detail = git_ui::repo_text(&context, detail);
             eprintln!("[git] 推送失败: {detail}");
             // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
             if !prompt::is_open(kind::GIT_PUSH) {

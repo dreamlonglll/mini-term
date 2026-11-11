@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1549;
+pub const ZH_ENTRY_COUNT: usize = 1577;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1549;
+pub const EN_ENTRY_COUNT: usize = 1577;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -946,7 +946,10 @@ static GIT_CHANGES_ZH: &[(&str, &str)] = &[
     ("empty", "暂无变更"),
     ("loadFailed", "读取变更失败：{detail}"),
     ("loading", "加载中..."),
+    ("metadataUnavailable", "仓库状态尚未确认，请刷新后再提交或处理冲突。"),
+    ("metadataWarning", "变更已读取，但部分仓库状态不可用：{detail}"),
     ("operationFailedTitle", "Git 操作失败"),
+    ("operationSucceeded", "Git 操作已完成"),
     ("refresh", "刷新"),
     ("stageAll", "↑ 全部暂存"),
     ("switchToList", "切换到列表视图"),
@@ -968,7 +971,10 @@ static GIT_CHANGES_EN: &[(&str, &str)] = &[
     ("empty", "No changes"),
     ("loadFailed", "Failed to read changes: {detail}"),
     ("loading", "Loading..."),
+    ("metadataUnavailable", "Repository state is unverified. Refresh before committing or resolving conflicts."),
+    ("metadataWarning", "Changes loaded, but some repository metadata is unavailable: {detail}"),
     ("operationFailedTitle", "Git operation failed"),
+    ("operationSucceeded", "Git operation completed"),
     ("refresh", "Refresh"),
     ("stageAll", "↑ Stage all"),
     ("switchToList", "Switch to list view"),
@@ -1186,15 +1192,57 @@ static GIT_GUTTER_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static GIT_HISTORY_ZH: &[(&str, &str)] = &[
+    ("connectionChanged", "SSH 连接配置已更改，请重新打开远端 Git。"),
+    ("connectionFailed", "无法建立远端 Git 通道，请检查 SSH 连接。"),
+    ("connectionRemoved", "SSH 连接已移除，请重新关联连接。"),
+    ("deploymentFailed", "部署远端 Git helper 失败，请检查服务器平台、缓存目录权限和随包资源。"),
+    ("enableAction", "允许并启用"),
+    ("enableBoundary", "服务器需要 Git 和可执行的用户缓存目录；不需要 root，不新增监听端口。可在设置 → 系统 → 常规关闭；关闭不会取消已经发出的写操作。"),
+    ("enableEntry", "启用远端 Git"),
+    ("enableMessage", "Mini-Term 将向 SSH 服务器上传匹配平台的 Git helper，并以该 SSH 用户身份运行。启用后，此设置适用于所有 SSH 项目。"),
+    ("enableTitle", "允许部署远端 Git helper？"),
+    ("invalidReply", "远端 Git 响应无效，未能确认仓库状态。"),
+    ("invalidRoot", "远端 Git 项目路径无效，需要服务器上的绝对目录路径。"),
+    ("permissionChanged", "远端 Git 授权已关闭或更改，尚未发出的请求未执行。"),
+    ("projectRemoved", "项目已移除，无法继续读取 Git。"),
+    ("protocolMismatch", "随包 Git helper 与桌面程序协议版本不匹配，请更新匹配的 helper 资源；SSH 连接已建立。"),
+    ("remoteDisabled", "远端 Git 尚未启用，不会上传或运行 helper。"),
     ("remoteNotSupported", "远程项目暂不支持 Git 面板"),
+    ("requestFailed", "远端 Git 请求失败，请检查下方详细信息。"),
     ("selectProject", "选择一个项目"),
     ("selectRepo", "选择仓库"),
+    ("serviceBusy", "远端 Git 请求队列已满，请稍后重试。"),
+    ("serviceUnavailable", "远端 Git 服务当前不可用，请重新打开项目后重试。"),
+    ("verifyWrite", "核对远端写入状态"),
+    ("verifyWriteFailed", "无法确认先前写入已经结束；请在服务器核对 HEAD、暂存区及运行中的 Git 进程，不要重复提交。"),
+    ("writeVerified", "先前远端写入已结束，仓库状态已重新读取。"),
 ];
 #[rustfmt::skip]
 static GIT_HISTORY_EN: &[(&str, &str)] = &[
+    ("connectionChanged", "SSH connection settings changed. Reopen remote Git."),
+    ("connectionFailed", "Could not open the remote Git channel. Check the SSH connection."),
+    ("connectionRemoved", "The SSH connection was removed. Associate a connection again."),
+    ("deploymentFailed", "Could not deploy the Git helper. Check the server platform, cache permissions and bundled resources."),
+    ("enableAction", "Allow and enable"),
+    ("enableBoundary", "The server needs Git and an executable user cache. No root access or listening port is required. Disable under Settings → System → General; this does not cancel writes already sent."),
+    ("enableEntry", "Enable remote Git"),
+    ("enableMessage", "Mini-Term will upload a platform-matched Git helper to the SSH server and run it as the SSH user. Enabling this setting applies to all SSH projects."),
+    ("enableTitle", "Allow remote Git helper deployment?"),
+    ("invalidReply", "The remote Git response is invalid; repository state could not be verified."),
+    ("invalidRoot", "Remote Git needs a valid absolute directory path on the server."),
+    ("permissionChanged", "Remote Git permission was revoked or changed. Requests not yet sent were not executed."),
+    ("projectRemoved", "The project was removed; Git is unavailable."),
+    ("protocolMismatch", "The bundled Git helper protocol does not match the desktop. Update the helper assets; the SSH connection was established."),
+    ("remoteDisabled", "Remote Git is disabled. No helper will be uploaded or started."),
     ("remoteNotSupported", "Git panel is not yet available for remote projects"),
+    ("requestFailed", "The remote Git request failed. See the diagnostic details below."),
     ("selectProject", "Select a project"),
     ("selectRepo", "Select repository"),
+    ("serviceBusy", "The remote Git request queue is full. Try again shortly."),
+    ("serviceUnavailable", "Remote Git is unavailable. Reopen the project and try again."),
+    ("verifyWrite", "Verify remote write outcome"),
+    ("verifyWriteFailed", "The previous write cannot be confirmed complete. Check HEAD, the index and running Git processes on the server before any retry."),
+    ("writeVerified", "The previous remote write has completed and repository state was reloaded."),
 ];
 
 #[rustfmt::skip]
@@ -1389,6 +1437,7 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("toast.checkedOut", "已检出 {hash}（分离头指针）"),
     ("toast.conflicts", "{action} {hash} 出现冲突，请在「更改」区解决后继续"),
     ("toast.copied", "已复制 {hash}"),
+    ("toast.operationSucceeded", "{action}已完成"),
     ("toast.picked", "已拣选 {hash}"),
     ("toast.reset", "已将 {branch} 重置到 {hash}（{mode}）"),
     ("toast.reverted", "已还原 {hash}"),
@@ -1556,6 +1605,7 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("toast.checkedOut", "Checked out {hash} (detached HEAD)"),
     ("toast.conflicts", "{action} {hash} hit conflicts. Resolve them in Changes, then continue"),
     ("toast.copied", "Copied {hash}"),
+    ("toast.operationSucceeded", "{action} completed"),
     ("toast.picked", "Cherry-picked {hash}"),
     ("toast.reset", "Reset {branch} to {hash} ({mode})"),
     ("toast.reverted", "Reverted {hash}"),
@@ -2579,6 +2629,9 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("system.fpsForegroundDesc", "窗口在前台时，终端输出的最高重绘帧率（10~240），默认 30。调高滚动更顺滑，GPU / CPU 占用也随之上升；实际帧率不会超过显示器刷新率"),
     ("system.fpsForegroundTitle", "前台帧率"),
     ("system.performanceGroup", "性能"),
+    ("system.remoteGitDesc", "默认关闭。启用前会确认上传与执行权限；适用于所有 SSH 项目。关闭后停止新请求，但不会取消已经发出的写操作。"),
+    ("system.remoteGitGroup", "远端 Git"),
+    ("system.remoteGitTitle", "允许在 SSH 服务器上部署 Git helper"),
     ("system.startupGroup", "启动"),
     ("system.trayClickFocusDesc", "左键点状态栏图标时，除唤起窗口外还跳到「下一个该我处理」的会话（待确认 > 最先完成 > 处理中），与标题栏状态灯一致；右键菜单点项目则定位到该项目内最该处理的那个。关闭后只唤起窗口，不改变当前视图"),
     ("system.trayClickFocusTitle", "点击图标定位到会话"),
@@ -2842,6 +2895,9 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("system.fpsForegroundDesc", "Maximum redraw rate for terminal output while the window is focused (10–240, default 30). Higher is smoother but uses more GPU / CPU; the actual rate never exceeds your display's refresh rate"),
     ("system.fpsForegroundTitle", "Foreground frame rate"),
     ("system.performanceGroup", "Performance"),
+    ("system.remoteGitDesc", "Off by default. Enabling asks permission to upload and run the helper for all SSH projects. Disabling stops new requests but does not cancel writes already sent."),
+    ("system.remoteGitGroup", "Remote Git"),
+    ("system.remoteGitTitle", "Allow Git helper deployment on SSH servers"),
     ("system.startupGroup", "Startup"),
     ("system.trayClickFocusDesc", "Left-clicking the status bar icon also jumps to the session that needs you next (awaiting confirmation > earliest finished > working), same as the title bar status light; picking a project from the right-click menu jumps to that project's most urgent pane. Turn off to only summon the window without changing the current view"),
     ("system.trayClickFocusTitle", "Click icon to jump to session"),

@@ -196,6 +196,8 @@ struct FilterState {
     only_mine: bool,
     /// 「仅我的」对应的邮箱(开关打开 / 换仓库时查一次 `user.email`)。
     email: Option<String>,
+    email_pending: bool,
+    email_generation: u64,
     /// 「仅我的」开着但仓库没配 `user.email`。
     no_email: bool,
     /// 续页游标(后端交回的那个,见模块注释)。`None` = 到底 / 还没开始。
@@ -215,6 +217,14 @@ fn filter_active(text: &str, path: Option<&str>, only_mine: bool, email: Option<
     !text.is_empty()
         || path.and_then(mt_project::git::normalize_log_path).is_some()
         || (only_mine && email.is_some())
+}
+
+fn history_page_ready(only_mine: bool, email_pending: bool) -> bool {
+    !only_mine || !email_pending
+}
+
+fn email_response_current(generation: u64, request: u64, only_mine: bool) -> bool {
+    generation == request && only_mine
 }
 
 /// 过滤框的输入 → `(关键词, 路径)`。
@@ -518,6 +528,8 @@ impl GitHistoryContent {
                 path: None,
                 only_mine: false,
                 email: None,
+                email_pending: false,
+                email_generation: 0,
                 no_email: false,
                 cursor: None,
                 scanned: 0,
@@ -577,6 +589,8 @@ impl GitHistoryContent {
         }
         if repo_changed {
             self.busy = None;
+            self.filter.email_generation = self.filter.email_generation.wrapping_add(1);
+            self.filter.email_pending = false;
             self.filter.email = None;
             self.filter.no_email = false;
             // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
@@ -692,7 +706,7 @@ impl GitHistoryContent {
     }
 
     fn load_page(&mut self, first: bool, cx: &mut Context<Self>) {
-        if self.loading {
+        if self.loading || !history_page_ready(self.filter.only_mine, self.filter.email_pending) {
             return;
         }
         let Some(repo) = self.context.clone() else {
@@ -720,16 +734,14 @@ impl GitHistoryContent {
             self.loading = true;
             self.refs_in_flight |= first;
             cx.spawn(async move |this, cx| {
-                let (result, refs) = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let page =
-                            repo.get_git_log_filtered(after, PAGE_SIZE, branch.as_deref(), &filter);
-                        let tags = first.then(|| repo.list_tags().unwrap_or_default());
-                        let refs = first.then(|| read_history_refs(&repo)).flatten();
-                        (page.map(|page| (page, tags)), refs)
-                    })
-                    .await;
+                let (result, refs) = mt_remote::run_git(move || {
+                    let page =
+                        repo.get_git_log_filtered(after, PAGE_SIZE, branch.as_deref(), &filter);
+                    let tags = first.then(|| repo.list_tags().unwrap_or_default());
+                    let refs = first.then(|| read_history_refs(&repo)).flatten();
+                    (page.map(|page| (page, tags)), refs)
+                })
+                .await;
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     if this.request != req {
                         return;
@@ -757,16 +769,13 @@ impl GitHistoryContent {
             let after = (!first).then(|| self.log.cursor());
             let limit = self.page_limit(first);
             cx.spawn(async move |this, cx| {
-                let (result, refs) = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let page =
-                            repo.get_git_log(after.as_deref(), Some(limit), branch.as_deref());
-                        let tags = first.then(|| repo.list_tags().unwrap_or_default());
-                        let refs = first.then(|| read_history_refs(&repo)).flatten();
-                        (page.map(|page| (page, tags)), refs)
-                    })
-                    .await;
+                let (result, refs) = mt_remote::run_git(move || {
+                    let page = repo.get_git_log(after.as_deref(), Some(limit), branch.as_deref());
+                    let tags = first.then(|| repo.list_tags().unwrap_or_default());
+                    let refs = first.then(|| read_history_refs(&repo)).flatten();
+                    (page.map(|page| (page, tags)), refs)
+                })
+                .await;
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     if this.request != req {
                         return;
@@ -1061,6 +1070,8 @@ impl GitHistoryContent {
     fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let had_mine = self.filter.only_mine;
         self.filter.only_mine = false;
+        self.filter.email_generation = self.filter.email_generation.wrapping_add(1);
+        self.filter.email_pending = false;
         self.filter.no_email = false;
         self.filter
             .input
@@ -1079,31 +1090,40 @@ impl GitHistoryContent {
         if self.filter.only_mine {
             self.resolve_my_email(cx);
         } else {
+            self.filter.email_generation = self.filter.email_generation.wrapping_add(1);
+            self.filter.email_pending = false;
             self.filter.no_email = false;
-            if self.filter.email.is_some() {
-                self.restart(cx);
-            }
+            self.restart(cx);
         }
         cx.notify();
     }
 
     /// 查当前仓库的 `user.email`,查完按新条件重来。
     fn resolve_my_email(&mut self, cx: &mut Context<Self>) {
+        self.filter.email_generation = self.filter.email_generation.wrapping_add(1);
+        let generation = self.filter.email_generation;
+        self.filter.email = None;
+        self.filter.no_email = false;
+        self.filter.email_pending = self.context.is_some();
+        // 立即作废旧页，邮箱未定之前绝不能发无作者过滤的首页。
+        self.restart(cx);
         let Some(repo) = self.context.clone() else {
             return;
         };
         let repo_key = repo.key();
         cx.spawn(async move |this, cx| {
-            let email = cx
-                .background_executor()
-                .spawn(async move { repo.config_user_email() })
-                .await;
+            let email = mt_remote::run_git(move || repo.config_user_email()).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str())
-                    || !this.filter.only_mine
+                    || !email_response_current(
+                        this.filter.email_generation,
+                        generation,
+                        this.filter.only_mine,
+                    )
                 {
                     return;
                 }
+                this.filter.email_pending = false;
                 this.filter.no_email = email.is_none();
                 this.filter.email = email;
                 this.restart(cx);
@@ -1433,24 +1453,6 @@ impl GitHistoryContent {
     /// 成功摘要(信息档:`i` 图标,点击只关闭)。
     fn toast_info(&self, message: String, cx: &mut App) {
         git_ui::toast(&self.store, message, Tone::Info, cx);
-    }
-
-    /// 菜单直接触发的操作失败:弹可选中复制原文的详情框(与面板上的操作同一口径,见
-    /// [`git_ui::show_git_error`])。`action` 是 `gitLog.action.*` 的 key。
-    fn show_failure(
-        &self,
-        action: &'static str,
-        err: &anyhow::Error,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        eprintln!("[git] {action} 失败: {err:#}");
-        git_ui::show_git_error(
-            tr!("gitBranch", "opFailed", op = t("gitLog", action)),
-            git_ui::error_text(err),
-            window,
-            cx,
-        );
     }
 }
 
@@ -2404,6 +2406,31 @@ fn paint_circle(
 mod tests {
     use super::*;
     use crate::git_graph::test_commit;
+
+    #[test]
+    fn 仅我的邮箱未定时不拉无过滤页() {
+        assert!(!history_page_ready(true, true));
+        assert!(history_page_ready(true, false));
+        assert!(history_page_ready(false, true));
+        assert!(history_page_ready(false, false));
+    }
+
+    #[test]
+    fn 仅我的邮箱响应必须匹配当前代次() {
+        assert!(email_response_current(7, 7, true));
+        assert!(
+            !email_response_current(8, 7, true),
+            "A→B→A 仍拒收第一次 A 的邮箱"
+        );
+        assert!(
+            !email_response_current(7, 7, false),
+            "关掉仅我的后不接旧邮箱"
+        );
+        assert!(
+            !email_response_current(9, 7, true),
+            "关闭再打开也不接旧请求"
+        );
+    }
 
     /// 一页页合并的现场:列表 + 常驻索引 + 拓扑图。
     #[derive(Default)]

@@ -173,7 +173,8 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 
 ### Git Integration
 
-- **Remote Git** — SSH projects reuse the original Git panel and interactions for status, three-side diffs, hunk staging, commits, history/details, branches, synchronization, stash and worktrees. A shared backend reuses `mt-project::git` on the server. First use deploys the bundled platform-matched helper over SFTP and verifies SHA-256. Remote polling runs while visible and preserves stable snapshots; local projects retain file watching. Disconnected or timed-out writes are never replayed and report an unknown outcome. Authentication, hooks and signing use server configuration; no new credential UI. [Build details and boundaries](../README.en.md#remote-git-helper).
+- **Remote Git** — SSH projects reuse the original Git panel and interactions for status, three-side diffs, hunk staging, commits, history/details, branches, synchronization, stash and worktrees. Disabled by default: opening remote Git for the first time asks for permission to upload and run the helper. Only after consent does Mini-Term deploy the bundled server-platform-matched helper over SFTP and verify SHA-256. After cancellation, use the enable entry point to try again without repeated automatic prompts. Manage this global permission under Settings → System → General; enabling it there also requires confirmation. Remote polling runs while visible and preserves stable snapshots; local projects retain file watching.
+- **Remote Git safety and cleanup** — The server needs Git and an executable user cache, but no Rust, root access or new listening port. Helpers are cached under `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`. Use trusted servers and repositories only: authentication, hooks, filters and signing follow server configuration, with no new credential UI; the project root and repository discovery scope are not an operating-system sandbox. Disabling permission stops new remote Git operations, not writes already started. Disconnected or timed-out writes are never replayed; inspect remote HEAD, index and working tree when the outcome is unknown. Before cleanup, disable the entry point and wait for all Git operations and related child processes to finish; delete only the helper cache, never project directories. [Usage details](../README.en.md#remote-git-helper).
 - **File status** — The file tree shows Git status colors (modified / added / deleted / conflict).
 - **Changes / history in one view** — The Git panel stacks two collapsible sections: Changes on top and commit history below, with a draggable divider (clamped 15%–85%) and animated collapse / expand, remembering fold state and ratio for the session. The repo bar at the top has two halves — on the left the repo dropdown (worktree entries marked ⎇), the current-branch pill and ↑ to-push / ↓ to-pull counts; on the right five icon buttons for Fetch / Pull / Push / Stash / Refresh (the stash button shows how many stashes exist) — and when space runs out the left half truncates first so the buttons never get squeezed out; right-clicking the repo name opens it in a terminal or enters worktree management. Icons, pills, section headers, empty / loading states and selection styling are one shared set across the whole panel (28px rows, four type sizes, contrast tuned separately for the light theme).
 - **Auto refresh** — The repo's `.git` directory is watched (HEAD / index / refs / merge and rebase state / stash), refreshing after a 500ms debounce and skipping the refresh when the repo signature hasn't changed; git run inside AI terminals or commits made by external tools show up immediately (previously only a few keywords in plain-terminal output were recognised).
@@ -292,21 +293,34 @@ cargo build --release -p mt-app
 
 > Hook reporting and the portable ConPTY locate sidecars and resources **next to the exe** — the release bundles ship them all. For the full experience when running from source, run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
 
+#### Building the remote Git helper from source
+
+Build the helper for the **server**, not the desktop. Linux x86_64/aarch64 use static musl targets to avoid depending on the server's glibc version; macOS uses its native x86_64/arm64 targets. These targets are not a claim of real-machine verification, and missing matching assets never fall back to local Git. With the appropriate Rust target and cross-compilation toolchain installed, for example for Linux x86_64:
+
+```bash
+cargo build --locked --release -p mt-git-helper --target x86_64-unknown-linux-musl
+node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary target/x86_64-unknown-linux-musl/release/mt-git-helper --output target/release/remote-git-helpers
+```
+
+Stage the helper beside the desktop executable under `remote-git-helpers/<platform>/mt-git-helper`. The staging script accepts `linux-x86_64`, `linux-aarch64`, `macos-x86_64` and `macos-aarch64`; development builds can use its default output, `target/debug/remote-git-helpers`. Building from source does not bypass the desktop deployment confirmation.
+
 ## Project Structure
 
 ```
 mini-term/
-├── crates/                       # Main workspace (12 crates)
+├── crates/                       # Main workspace
 │   ├── mt-app/                   # GPUI app shell: Workspace component tree, AppStore global state, SplitNode layout tree, panels / dialogs / tray / title bar
 │   ├── mt-ui/                    # GPUI rendering layer: terminal view / element, theme bridge (no business logic)
 │   ├── mt-terminal/              # VT state machine + grid model (alacritty_terminal wrapper, gpui-free)
 │   ├── mt-pty/                   # PTY lifecycle (spawn / read / write / resize / kill) + portable ConPTY preload
 │   ├── mt-ai/                    # AI awareness: hook server (authoritative), hook registration, input-detection fallback, status verdicts, session record reading
 │   ├── mt-project/               # File tree, directory watching, search, Git (git2), external editors, WSL distro enumeration
+│   ├── mt-git-helper/            # Remote Git helper: shared Git core over SSH stdio, no GPUI
 │   ├── mt-config/                # Config persistence & theme packs (gpui-free)
 │   ├── mt-i18n/                  # Bilingual copy layer (dictionary source in locales/*.ts; dict.rs is generated)
 │   ├── mt-relay/                 # Mobile relay, desktop side: outbound WSS link, pairing, project snapshots / deltas, conversation mirror, command write-through
 │   ├── mt-ssh/                   # Shared SSH layer (persistent russh session pool + SFTP primitives, used by both the app and sidecars)
+│   ├── mt-remote/                # Remote project services and managed Git: platform detection, helper deployment, SSH Git sessions
 │   ├── mt-usage/                 # Usage stats: session turn parsing / SQLite ledger / aggregation / pricing
 │   └── mt-core/                  # Leaf shared library (WSL UNC parsing / SSH prompt scanning / atomic writes, etc.)
 ├── sidecars/                     # Standalone workspace for the sidecar binaries (independently versioned, not released with the app)
@@ -320,6 +334,7 @@ mini-term/
 ├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands / start / rename)
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds the sidecars and stages them (plus the portable ConPTY) next to the app exe
+│   ├── stage-git-helpers.mjs     # Stages a server-platform-matched helper beside the desktop executable
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
 ├── tests/                        # Node-side tests (2 files: ConPTY bundling / vendored-openssl guard)
 └── docs/                         # Documentation (feature list / relay deployment / theme pack example, etc.)

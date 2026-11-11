@@ -146,32 +146,13 @@ cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 
 ### Remote Git helper
 
-SSH projects reuse the original Git panel, diff, history, branches, stash and worktree dialogs. A shared `GitContext` dispatches to the same `mt-project::git` core locally or remotely. First use detects the server platform, uploads the bundled helper over SFTP to `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`, verifies its content, and launches it over SSH stdio. The server needs Git and an executable user cache, but no Rust, GPUI, Node, root access or new listening port.
+SSH projects can use the existing Git panel for changes, diffs, commit history, branches, stash and worktrees. **Remote Git is disabled by default**; manage global permission to deploy the Git helper on SSH servers under **Settings → System → General**. The first time you open Git for an SSH project, Mini-Term asks for confirmation before uploading and starting the bundled helper matched to the server platform. It uploads over SFTP to the SSH user's `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`, verifies the content, and runs it over the existing SSH connection. After cancellation, use the enable entry point to try again without repeated automatic prompts; enabling it in Settings also requires confirmation.
 
-For source builds, compile for the **server** and run `node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary <Linux-binary>` to stage it beside the desktop executable under `remote-git-helpers/<platform>/mt-git-helper`. Supported targets are Linux x86_64/aarch64 and macOS x86_64/arm64. Missing assets or unsupported platforms fail explicitly, never falling back to local Git. The CLI remains available for diagnostics with an explicit helper path:
+The server needs Git and permission to execute programs in its user cache; no Rust, root access or new listening port is required. Linux helpers use static musl builds to avoid depending on the server's glibc version. Target platforms are Linux x86_64/aarch64 and macOS x86_64/arm64; **this does not mean every platform or server environment has been verified on real machines**. Missing matching assets or unsupported platforms produce an explicit error, never a fallback to local Git.
 
-```bash
-# Source checkout on the SSH server
-cargo build --locked -p mt-git-helper --bin mt-git-helper
+**Use trusted servers and repositories only.** Git hooks, filters, signing, commit identity and push/pull credentials follow server configuration; there is no new interactive credential UI. The project root and repository discovery scope are **not an operating-system sandbox**. Disconnected or timed-out writes are never replayed automatically; their outcome may be unknown, so inspect the remote HEAD, index and working tree before retrying.
 
-# Local machine: reads a saved connection's projection and adjacent credential key
-cargo build --locked -p mt-remote --bin mt-remote-git
-./target/debug/mt-remote-git \
-  --connection 'saved name or id' \
-  --helper '/absolute/path/mt-git-helper' \
-  --root '/remote/workspace' \
-  discover
-```
-
-Other commands: `status <repo-root>`, `diff <repo-root> <relative-path> [staged|unstaged|working]`, `stage/unstage <repo-root> <paths...>`, `stage-all/unstage-all <repo-root>`, and `commit <repo-root> <message>`. Pass each path/message as one local argument; use absolute repo roots returned by `discover`. The protocol additionally accepts an old path for renamed-file diffs. Replies are JSON; errors exit nonzero. `--config <projection>` selects a projection and its adjacent `credential.key` read-only, without migration or writeback; by default the locator matches SSH sidecars and ignores `MT_APP_DATA_DIR`.
-
-The helper uses SSH stdio with a four-byte big-endian length prefix and UTF-8 JSON, capped at 16 MiB per frame, and checks protocol versions before dispatch. Operations reuse `mt-project::git`; arguments are never interpolated into a shell. Hooks, filters, signing, identity and push/pull credentials use server Git configuration; there is no new interactive credential UI. `--root` follows existing project/ancestor/child-repository and registered linked-worktree discovery rules; it is **not an OS sandbox**. Use trusted hosts and repositories. Writes are never replayed after disconnect or timeout: inspect remote state first. Visible remote panels poll and preserve stable snapshots without repeated loading; local projects retain file watching.
-
-Verified through SSH in an isolated Shanghai01 repository on Ubuntu 24.04 x86_64 / Git 2.43.0: automatic deployment, status/diff, commit, HEAD reword, tags, worktree creation/read/removal and Mixed reset. The original desktop Git drawer displayed remote data and user testing passed. Backend/protocol tests: 97 passed; desktop Git-related tests: 226 passed. Earlier CLI checks also covered partial staging, unborn repositories, renames, unusual POSIX names, hook refusal and disconnect without replay. Other server platforms and every push/pull authentication environment have not been verified on real machines.
-
-Lifecycle/failure checks additionally verified remote helper PID exit after normal `close`, client `Drop`, application SSH-pool shutdown and idle-channel disconnection. Real 20-second handshake and 180-second write-response timeouts, missing/non-executable helpers, invalid roots, a foreign `index.lock`, read-only Git directories, hook refusal, mismatched reply kinds and large stderr all produced explicit failure or recovery results. `Drop` waits for bounded remote completion in the background; version, request-ID or reply-kind mismatches invalidate the client. Removing the workspace root during a session reports an error rather than an empty repository list; restoring it allows further requests. Binary working-tree/HEAD and oversized diffs remain marked rather than rendered as text.
-
-**Disconnection is not cancellation:** killing the client or helper during a commit can leave its Git child completing that commit once. Requery HEAD/index before retrying. Desktop write gates include backend identity and repository path, so identical paths on different servers are independent. Separate app processes still rely on Git locks. The lifecycle checks do not guarantee immediate cleanup during a silent network partition.
+Turning permission off stops new remote Git operations; **it does not cancel writes already started**, and Git or related child processes may continue. To clean up, disable the entry point first, confirm that all Git operations and related child processes have finished, and only then delete the server's `~/.cache/mini-term/git-helper/` cache. Do not delete project directories. See the [full feature list](docs/features.md#building-the-remote-git-helper-from-source) for source-build and staging instructions.
 
 ---
 

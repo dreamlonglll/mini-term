@@ -6,8 +6,8 @@ rust-version.workspace = true
 authors.workspace = true
 
 # SSH 远程项目的服务层(SFTP 文件操作 / 目录列举 / 远程会话扫描 / 启动预检),
-# 自 mt-app 的 `remote_ssh/` 模块整块下沉而来。**不依赖 gpui**:入口全是同步阻塞
-# 函数,由 mt-app 丢进 background executor 调用(线程口径见 lib.rs 模块注释)。
+# 自 mt-app 的 `remote_ssh/` 模块整块下沉而来。**不依赖 gpui**:managed Git IO
+# 通过异步 run_git / bounded workspace actor 转移到自持运行时，旧 SSH API 保留同步边界。
 
 [dependencies]
 # russh 持久会话池 + SFTP 只读/上传原语(audit #28)。

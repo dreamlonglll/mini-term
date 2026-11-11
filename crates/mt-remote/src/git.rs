@@ -41,6 +41,7 @@ pub struct RemoteGitClient {
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Option<GitChannel>,
     next_id: u64,
+    pending_write: Option<u64>,
 }
 
 struct GitChannel {
@@ -156,6 +157,7 @@ impl RemoteGitClient {
             runtime,
             transport: Some(transport),
             next_id: 1,
+            pending_write: None,
         })
     }
 
@@ -175,6 +177,11 @@ impl RemoteGitClient {
                 "remote Git client is closed; reconnect explicitly (never replay a failed write)"
                     .into(),
             );
+        }
+        if operation.is_write() && self.pending_write.is_some() {
+            return Err(mt_git_helper::GitFailure::outcome_unknown(
+                "a previous write still requires explicit completion verification",
+            ));
         }
         let id = self.next_id;
         self.next_id = id.checked_add(1).ok_or("remote Git request id exhausted")?;
@@ -196,6 +203,7 @@ impl RemoteGitClient {
         let result = self.runtime.block_on(async {
             tokio::time::timeout(timeout, async {
                 transport.session.touch();
+                // From this point delivery is ambiguous even if SSH data fails.
                 transport.channel.data(frame.as_slice()).await
                     .map_err(|e| format!("sending remote Git request: {e}"))?;
                 let response: Response = transport.read_frame().await?;
@@ -218,18 +226,76 @@ impl RemoteGitClient {
             }).await.unwrap_or_else(|_| Err(format!("remote Git request timed out ({timeout:?})")))
         });
         match result {
-            Ok(reply) => reply,
+            Ok(reply) => {
+                if is_write
+                    && matches!(
+                        &reply,
+                        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+                    )
+                {
+                    self.pending_write = Some(id);
+                }
+                reply
+            }
             Err(error) => {
                 let transport = self.transport.take().expect("checked above");
                 let mut error = transport.with_stderr(error);
                 if is_write {
-                    error.push_str("; remote outcome unknown: verify the repository before any further write; this request was not retried");
+                    self.pending_write = Some(id);
                 }
                 if let Err(cleanup) = self.runtime.block_on(transport.shutdown(false)) {
                     error.push_str(&format!("; {cleanup}"));
                 }
-                Err(error.into())
+                Err(if is_write {
+                    mt_git_helper::GitFailure::outcome_unknown(format_args!(
+                        "{error}; verify the repository before any further write; this request was not retried"
+                    ))
+                } else {
+                    error.into()
+                })
             }
+        }
+    }
+
+    /// Decode while the originating client still owns its request identity.
+    pub fn request_data<T: DeserializeOwned>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<T, mt_git_helper::GitFailure> {
+        let is_write = operation.is_write();
+        let reply = self.request_typed(operation)?;
+        reply.decode().map_err(|message| {
+            if is_write {
+                self.mark_last_write_unknown();
+                mt_git_helper::GitFailure::outcome_unknown(message)
+            } else {
+                message.into()
+            }
+        })
+    }
+
+    pub(crate) fn mark_last_write_unknown(&mut self) {
+        self.pending_write = self.next_id.checked_sub(1);
+    }
+
+    /// Only a receipt from the original sequential helper proves completion.
+    /// A newly connected helper or a repository read cannot supply this proof.
+    pub(crate) fn prove_pending_write_completed(
+        &mut self,
+    ) -> Result<(), mt_git_helper::GitFailure> {
+        let completed_id = self
+            .pending_write
+            .ok_or_else(|| mt_git_helper::GitFailure::from("no pending remote write"))?;
+        match self.request_typed(Operation::Barrier { completed_id })? {
+            Reply::Completed {
+                completed_id: received,
+            } if received == completed_id => {
+                self.pending_write = None;
+                Ok(())
+            }
+            _ => Err(mt_git_helper::GitFailure::outcome_unknown(
+                "invalid write completion receipt",
+            )),
         }
     }
 
@@ -308,7 +374,7 @@ impl GitChannel {
                         }
                         bytes.extend_from_slice(remaining);
                         if bytes.len() == size + 4 {
-                            return serde_json::from_slice(&bytes[4..]).map_err(|e| {
+                            return mt_git_helper::decode_json(&bytes[4..]).map_err(|e| {
                                 format!(
                                     "invalid Git protocol JSON ({:?}, line {}, column {})",
                                     e.classify(),

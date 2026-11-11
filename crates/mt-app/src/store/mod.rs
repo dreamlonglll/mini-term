@@ -613,6 +613,7 @@ impl AppStore {
                 (AppConfig::default(), 0, Some(format!("{err:#}")))
             }
         };
+        mt_remote::set_remote_git_enabled(config.remote_git_helper_enabled);
 
         // 布局库:开库 →(首次)从 config.json 灌一次 → 把库里的值覆盖回
         // `config` 的对应字段。**覆盖这一步是整个改造的支点** —— 各处 getter

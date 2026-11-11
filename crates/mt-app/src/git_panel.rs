@@ -373,6 +373,8 @@ pub struct GitPanel {
     branch_data: RefCell<Option<Rc<BranchData>>>,
     /// 正在跑的写操作(见模块注释「写操作」)。
     busy: Option<GitBusy>,
+    feedback_context: Option<GitContext>,
+    enable_prompted: bool,
     /// 抽屉里显示的是不是本面板。收着时不扫盘。
     visible: bool,
     /// 收着的时候项目切过 → 打开时补拉一次。
@@ -462,13 +464,19 @@ impl GitPanel {
                 // 提交成功:历史整体重来 + 重载分支(分支头已前移);「更改」区自己已重取,
                 // 这三样凑成一整轮(紧接着那次 `.git` 检查据此短路)。「提交并推送」接着开
                 // 推送对话框(预选当前分支),在那里看清待推送的提交再确认
-                GitChangesEvent::Committed { open_push } => {
+                GitChangesEvent::Committed { open_push, context } => {
+                    if this.repo_context().as_ref() != Some(context) {
+                        return;
+                    }
                     this.round_issued = Some(Instant::now());
                     this.history.update(cx, |h, cx| h.reload(cx));
                     this.load_branches(cx);
                     if *open_push {
                         this.open_push_dialog(None, window, cx);
                     }
+                }
+                GitChangesEvent::OpenPush(context) => {
+                    crate::git_push::open(cx.entity(), context.clone(), None, window, cx);
                 }
                 // 更改区里贮藏了改动:工作区与贮藏数都变了,整面板刷新
                 GitChangesEvent::Stashed => this.refresh_after_write(cx),
@@ -503,6 +511,22 @@ impl GitPanel {
         // 不再被 OSC 标题 / AI 状态这些与仓库无关的变化叫醒
         subs.push(
             cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+                if matches!(
+                    event,
+                    StoreEvent::Config(crate::store::ConfigSection::Settings)
+                ) {
+                    let context = this.active_project_context(cx);
+                    let project_id = this.store.read(cx).active_project_id.clone();
+                    if context != this.project_context {
+                        this.replace_project_context(context, project_id);
+                        this.stale = true;
+                        if this.visible {
+                            this.on_project_changed(cx);
+                        }
+                        cx.notify();
+                    }
+                    return;
+                }
                 if !event.touches_active_project() && !event.touches_ssh_connections() {
                     return;
                 }
@@ -551,6 +575,8 @@ impl GitPanel {
             branch_gen: 0,
             branch_data: RefCell::new(None),
             busy: None,
+            feedback_context: None,
+            enable_prompted: false,
             visible: false,
             stale: true,
             project_path,
@@ -622,9 +648,6 @@ impl GitPanel {
             self._tick = None;
             self.catch_up = false;
             self.pty_hit_at = None;
-            if let Some(context) = self.project_context.as_ref().filter(|c| c.is_remote()) {
-                context.close();
-            }
             // 收着不重取「更改」,重新打开时整份重取
             self.index_lock.reset();
         }
@@ -666,9 +689,6 @@ impl GitPanel {
             }
         } else {
             self._tick = None;
-            if let Some(context) = self.project_context.as_ref().filter(|c| c.is_remote()) {
-                context.close();
-            }
         }
     }
 
@@ -790,6 +810,14 @@ impl GitPanel {
             .is_some()
     }
 
+    fn remote_git_disabled(&self, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        store
+            .active_project()
+            .is_some_and(|project| project.ssh_connection_id.is_some())
+            && !crate::git_backend::remote_git_enabled(store)
+    }
+
     fn replace_project_context(&mut self, context: Option<GitContext>, project_id: Option<String>) {
         self.repo_request += 1;
         self.watch_request += 1;
@@ -834,6 +862,13 @@ impl GitPanel {
         self.stale = false;
         self.reset_repo_state();
         self.repo_request += 1;
+        if self.remote_git_disabled(cx) {
+            self._tick = None;
+            self.repos.clear();
+            self.selected_repo.clear();
+            self.push_repo_down(cx);
+            return;
+        }
         git_watch::set_enabled(self.visible && self.local_project());
         if self.visible && self.window_visible {
             self.start_tick(cx);
@@ -869,10 +904,7 @@ impl GitPanel {
         self.repo_request += 1;
         let req = self.repo_request;
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { context.discover_git_repos() })
-                .await;
+            let result = mt_remote::run_git(move || context.discover_git_repos()).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.repo_request != req
                     || this.project_context.as_ref().map(GitContext::key).as_ref() != Some(&key)
@@ -964,10 +996,7 @@ impl GitPanel {
         let req = self.branch_request;
         let repo = context.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { load_branch_snapshot(&context) })
-                .await;
+            let result = mt_remote::run_git(move || load_branch_snapshot(&context)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 // 迟到响应丢弃:换仓库后的旧响应不许覆盖(换仓库时令牌已前移)
                 if this.branch_request != req {
@@ -1074,6 +1103,42 @@ impl GitPanel {
         self.reload_views(Round::Write, cx);
     }
 
+    fn verify_remote_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo_context().filter(GitContext::is_remote) else {
+            return;
+        };
+        let captured = repo.clone();
+        let store = self.store.clone();
+        let panel = cx.entity().downgrade();
+        window
+            .spawn(cx, async move |cx| {
+                let result = mt_remote::run_git(move || repo.verify_unknown_write()).await;
+                let _ = cx.update(|window, cx| match result {
+                    Ok(()) => {
+                        git_ui::toast_for_repo(
+                            &store,
+                            &captured,
+                            t("gitHistory", "writeVerified").to_string(),
+                            Tone::Info,
+                            cx,
+                        );
+                        let _ = panel.update(cx, |panel, cx| {
+                            if panel.repo_context().as_ref() == Some(&captured) {
+                                panel.refresh_after_write(cx);
+                            }
+                        });
+                    }
+                    Err(err) => git_ui::show_git_error(
+                        t("gitHistory", "verifyWrite"),
+                        git_ui::error_text(&err),
+                        window,
+                        cx,
+                    ),
+                });
+            })
+            .detach();
+    }
+
     /// 把仓库 / 分支透给两个子面板。
     fn push_repo_down(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_context();
@@ -1139,7 +1204,7 @@ impl GitPanel {
             repo: self.selected_repo.clone(),
             context: self
                 .repo_context()
-                .unwrap_or_else(|| GitContext::broken("No Git repository selected".to_string())),
+                .unwrap_or_else(|| GitContext::broken(t("gitHistory", "selectRepo").to_string())),
             data: self.branch_data(),
             head: self.head_branch().map(str::to_string),
             detached: self
@@ -1200,7 +1265,11 @@ impl GitPanel {
 
     /// 推一条结果 toast(标题是当前项目名)。
     pub(crate) fn notify_result(&self, message: String, tone: Tone, cx: &mut App) {
-        git_ui::toast(&self.store, message, tone, cx);
+        if let Some(repo) = &self.feedback_context {
+            git_ui::toast_for_repo(&self.store, repo, message, tone, cx);
+        } else {
+            git_ui::toast(&self.store, message, tone, cx);
+        }
     }
 
     /// 跑一个 git 写操作(见模块注释「写操作」)。
@@ -1248,12 +1317,18 @@ impl GitPanel {
                         this.busy = None;
                     }
                     match result {
-                        Ok(value) if active => done(this, value, window, cx),
-                        Ok(_) => {}
+                        Ok(value) => {
+                            this.feedback_context = Some(completed_repo.clone());
+                            done(this, value, window, cx);
+                            this.feedback_context = None;
+                        }
                         Err(err) => {
                             eprintln!("[git] {}失败: {err:#}", busy.label());
                             git_ui::show_git_error(
-                                tr!("gitBranch", "opFailed", op = busy.label()),
+                                git_ui::repo_text(
+                                    &completed_repo,
+                                    tr!("gitBranch", "opFailed", op = busy.label()),
+                                ),
                                 git_ui::error_text(&err),
                                 window,
                                 cx,
@@ -1264,6 +1339,7 @@ impl GitPanel {
                         this.refresh_after_write(cx);
                         cx.notify();
                     }
+                    this.feedback_context = None;
                 });
             },
             window,
@@ -1372,20 +1448,16 @@ impl GitPanel {
 
     /// 检出 `branch` 会被本地改动挡住(分支弹窗检出前的预检,见 `git_branches::checkout`):
     /// 开「贮藏后检出」确认框。
-    pub(crate) fn open_smart_checkout(
+    pub(crate) fn open_smart_checkout_on(
         &mut self,
+        repo: &GitContext,
         branch: String,
         conflicts: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.selected_repo.is_empty() {
-            return;
-        }
-        let Some(repo) = self.repo_context() else {
-            return;
-        };
-        let on_changed = self.stash_on_changed(true, cx);
+        let repo = repo.clone();
+        let on_changed = self.stash_on_changed_on(Some(repo.clone()), true, cx);
         crate::git_stash::open_smart_checkout(
             self.store.clone(),
             repo,
@@ -1400,8 +1472,16 @@ impl GitPanel {
     /// 贮藏弹窗操作之后的回调:整面板刷新。`follow_head` = 顺带回到跟随 HEAD(检出类,
     /// 同普通检出)。弱引用:回调跟着弹窗走,面板没了就什么都不做。
     fn stash_on_changed(&self, follow_head: bool, cx: &mut Context<Self>) -> Rc<dyn Fn(&mut App)> {
+        self.stash_on_changed_on(self.repo_context(), follow_head, cx)
+    }
+
+    fn stash_on_changed_on(
+        &self,
+        repo: Option<GitContext>,
+        follow_head: bool,
+        cx: &mut Context<Self>,
+    ) -> Rc<dyn Fn(&mut App)> {
         let panel = cx.entity().downgrade();
-        let repo = self.repo_context();
         Rc::new(move |cx: &mut App| {
             let _ = panel.update(cx, |p, cx| {
                 if p.repo_context() != repo {
@@ -1850,19 +1930,17 @@ impl GitPanel {
         let req = self.sig_request;
         let task_repo = repo.clone();
         cx.spawn(async move |this, cx| {
-            let (observed, dirs) = cx
-                .background_executor()
-                .spawn(async move {
-                    let at = Instant::now();
-                    let observed = RepoObservation {
-                        at,
-                        signature: task_repo.repo_signature().ok(),
-                        op: task_repo.repo_operation_state().ok(),
-                    };
-                    let dirs = layout.map(|layout| mt_project::git::git_watch_dirs(&layout));
-                    (observed, dirs)
-                })
-                .await;
+            let (observed, dirs) = mt_remote::run_git(move || {
+                let at = Instant::now();
+                let observed = RepoObservation {
+                    at,
+                    signature: task_repo.repo_signature().ok(),
+                    op: task_repo.repo_operation_state().ok(),
+                };
+                let dirs = layout.map(|layout| mt_project::git::git_watch_dirs(&layout));
+                (observed, dirs)
+            })
+            .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.sig_request != req || this.repo_context().as_ref() != Some(&repo) {
                     return;
@@ -2476,6 +2554,32 @@ impl Render for GitPanel {
                 t("gitHistory", "selectProject"),
             ));
         }
+        if self.remote_git_disabled(cx) {
+            if self.visible && !self.enable_prompted {
+                self.enable_prompted = true;
+                let store = self.store.clone();
+                _window.defer(cx, move |window, cx| {
+                    crate::git_backend::request_enable(store, window, cx)
+                });
+            }
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(12.0))
+                .child(ui::desc_text(t("gitHistory", "remoteDisabled")))
+                .child(
+                    crate::prompt::footer_button(
+                        "enable-remote-git",
+                        t("gitHistory", "enableEntry"),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        crate::git_backend::request_enable(this.store.clone(), window, cx);
+                    })),
+                );
+        }
 
         let section = SECTION_UI.with(|s| *s.borrow());
         let both_open = section.changes_open && section.history_open;
@@ -2538,6 +2642,17 @@ impl Render for GitPanel {
         }
         if let Some(error) = &self.load_error {
             root = root.child(git_ui::error_block(error.clone()));
+        }
+        if self
+            .repo_context()
+            .is_some_and(|repo| repo.write_outcome_unknown())
+        {
+            root = root.child(
+                crate::prompt::footer_button("verify-remote-write", t("gitHistory", "verifyWrite"))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.verify_remote_write(window, cx)),
+                    ),
+            );
         }
 
         root = root

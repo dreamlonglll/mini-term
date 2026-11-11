@@ -33,8 +33,8 @@
 //!
 //! # git 状态着色(Y 批)
 //!
-//! 数据是 [`mt_project::git::get_git_status`](mt_project::git::get_git_status)
-//! (阻塞,丢后台),键为**以 `/` 分隔的相对路径**,与 `FileTree.tsx:496-507` 同构。
+//! Git IO 通过 `mt_remote::run_git` 在服务独立线程执行，键为以 `/` 分隔的相对路径。
+//! 远程授权关闭时，切项目、刷新、计划和菜单全部停在入口，不安排任何 Git IO。
 //! 刷新时机照抄原版四条:切项目 / `fs-change`(500ms 去抖)/ 终端里跑过 git 命令
 //! (同一个去抖)/ 头部刷新按钮。第三条走 [`crate::git_watch`] 的**输出旁路**,
 //! 本模块是它的第二个订阅者([`git_watch::Subscriber::FileTree`])——
@@ -42,8 +42,9 @@
 //!
 //! 文件树是常驻面板,所以这两条都**按需唤醒**,不挂常驻节拍:旁路有新字节时由
 //! reader 线程经唤醒口叫醒(见 `git_watch` 模块注释「唤醒」),去抖计时任务只在
-//! 真排了一次刷新时才存在。没项目 / 远程项目 / 终端没输出时主线程一次都不被叫。
+//! 真排了一次刷新时才存在。没项目 / 未授权远程项目 / 终端没输出时不被叫醒。
 //! 目录行的汇总字母在状态加载完成时一次性预算成表(见 [`GitLabels`]),render 只查表。
+//! 仓库根同批在后台发现并缓存，菜单只查缓存，干净文件有历史、非仓库文件没有。
 //!
 //! 去抖期间攒的是一份**刷新计划**([`git_refresh`]):`.git` 内部的变化只记「比签名」、
 //! 工作区文件的变化记下路径,到点在后台先比签名 / 过忽略规则,真有必要才跑全量 status
@@ -234,6 +235,9 @@ pub struct FileTree {
     drop_target: Option<DropTarget>,
     /// git 状态表 + 目录汇总表(相对项目根的 `/` 分隔路径 → 状态字母)。
     git: GitLabels,
+    /// 后台发现的仓库根；菜单只读，干净文件也能按归属显示历史。
+    git_repos: Vec<PathBuf>,
+    git_enabled: bool,
     /// 排着的 git 状态刷新(去抖到点时刻);`None` = 没排。
     git_refresh_at: Option<Instant>,
     /// 去抖计时任务在不在睡。只在排了刷新时才起一个,见 [`Self::schedule_git_refresh`]。
@@ -262,6 +266,29 @@ pub struct FileTree {
     row_focus: HashMap<PathBuf, gpui::FocusHandle>,
     _fs_task: Task<()>,
     _git_task: Task<()>,
+}
+
+fn git_io_allowed(remote: bool, remote_enabled: bool, broken: bool) -> bool {
+    !broken && (!remote || remote_enabled)
+}
+
+fn cached_repo_contains_file(repos: &[PathBuf], path: &Path, remote: bool) -> bool {
+    repos.iter().any(|root| {
+        if remote {
+            let path = path.to_string_lossy();
+            let root = root.to_string_lossy();
+            let root = root.trim_end_matches('/');
+            path.strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+        } else if cfg!(windows) {
+            let path = mt_core::path_key::windows_eq_key(&path.to_string_lossy());
+            let root = mt_core::path_key::windows_eq_key(&root.to_string_lossy());
+            path.strip_prefix(&root)
+                .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+        } else {
+            path != root && path.starts_with(root)
+        }
+    })
 }
 
 impl FileTree {
@@ -443,6 +470,8 @@ impl FileTree {
             suppressed_subtrees: HashSet::new(),
             drop_target: None,
             git: GitLabels::default(),
+            git_repos: Vec::new(),
+            git_enabled: false,
             git_refresh_at: None,
             git_refresh_armed: false,
             git_plan: GitRefreshPlan::default(),
@@ -467,6 +496,9 @@ impl FileTree {
     /// 发现被顺延了会按剩余时长再睡一觉([`Self::fire_git_refresh`]);
     /// 没排的时候什么都不跑。
     fn schedule_git_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.git_io_allowed(cx) {
+            return;
+        }
         let delay = Duration::from_millis(git_watch::DEBOUNCE_MS);
         self.git_refresh_at = Some(Instant::now() + delay);
         if self.git_refresh_armed {
@@ -510,6 +542,9 @@ impl FileTree {
     fn on_git_output(&mut self, cx: &mut Context<Self>) {
         let hit = git_watch::drain_hit_for(git_watch::Subscriber::FileTree);
         let requests = git_watch::take_requests(git_watch::Subscriber::FileTree);
+        if !self.git_io_allowed(cx) {
+            return;
+        }
         let mut queued = false;
         if hit || requests.overflow {
             self.git_plan.force = true;
@@ -550,7 +585,7 @@ impl FileTree {
         let git_internal = self
             .project_root(cx)
             .is_some_and(|root| git_refresh::is_git_internal(&root, &path));
-        if git_internal && !structural {
+        if git_internal && !structural && self.git_io_allowed(cx) {
             // `.git` 里的东西被改写(Windows 的非递归监听会报一条「.git 被修改」):`.git`
             // 永远隐藏,目录列表不会变,不重列;git 标记只按签名核一遍(见 `git_refresh`)
             self.git_plan.check = true;
@@ -563,20 +598,23 @@ impl FileTree {
         self.invalidate(dir, cx);
         // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
         // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
-        if git_internal {
-            // `.git` 出现 / 消失(git init / clone / 删仓库):仓库集合变了,发现缓存作废、
-            // 无条件重拉
-            mt_project::git::invalidate_repo_cache();
-            self.git_plan.force = true;
-        } else {
-            self.git_plan.add_path(path.clone());
+        if self.git_io_allowed(cx) {
+            if git_internal {
+                mt_project::git::invalidate_repo_cache();
+                self.git_plan.force = true;
+            } else {
+                self.git_plan.add_path(path.clone());
+            }
+            self.schedule_git_refresh(cx);
         }
-        self.schedule_git_refresh(cx);
         self.invalidate_dir_kind(&path, dir, cx);
     }
 
     /// 无条件拉一次 git 状态(切项目 / 手动刷新),不等去抖。
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
+        if !self.git_io_allowed(cx) {
+            return;
+        }
         self.git_plan.force = true;
         self.run_git_plan(cx);
     }
@@ -588,6 +626,10 @@ impl FileTree {
     /// 失败一律清空(原版 `.catch(() => setGitStatusMap(new Map()))`):
     /// 不是 git 仓库 / 仓库坏了的时候,留着上一个项目的状态字母比没有更糟。
     fn run_git_plan(&mut self, cx: &mut Context<Self>) {
+        if !self.git_io_allowed(cx) {
+            self.git_plan = GitRefreshPlan::default();
+            return;
+        }
         if self.git_plan.is_empty() {
             return;
         }
@@ -605,24 +647,29 @@ impl FileTree {
         let backend = crate::git_backend::project_context(self.store.read(cx), &context.project_id);
         cx.spawn(async move |this, cx| {
             // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    if backend.local_path().is_none() {
-                        let files = backend.get_git_status();
-                        let labels = files
-                            .map(|files| GitLabels::new(git_status_table(files)))
-                            .unwrap_or_default();
-                        return Some((Vec::new(), labels));
-                    }
-                    git_refresh::run_plan(&root, &plan, known.as_ref()).map(|(sigs, files)| {
-                        let labels = files
-                            .map(|files| GitLabels::new(git_status_table(files)))
-                            .unwrap_or_default();
-                        (sigs, labels)
-                    })
+            let outcome = mt_remote::run_git(move || {
+                if backend.local_path().is_none() {
+                    let repos = backend
+                        .discover_git_repos()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|repo| repo.path)
+                        .collect();
+                    let labels = backend
+                        .get_git_status()
+                        .map(|files| GitLabels::new(git_status_table(files)))
+                        .unwrap_or_default();
+                    return Some((Vec::new(), labels, repos));
+                }
+                git_refresh::run_plan(&root, &plan, known.as_ref()).map(|(sigs, files)| {
+                    let labels = files
+                        .map(|files| GitLabels::new(git_status_table(files)))
+                        .unwrap_or_default();
+                    let repos = sigs.iter().map(|(path, _)| path.clone()).collect();
+                    (sigs, labels, repos)
                 })
-                .await;
+            })
+            .await;
             let _ = this.update(cx, |tree: &mut FileTree, cx| {
                 // 换项目时令牌已作废;另外回来时项目、连接或 source generation 都可能已经
                 // 变化:完整上下文不相等就丢弃,避免同路径项目之间串入迟到的 git 状态。
@@ -630,14 +677,16 @@ impl FileTree {
                     Landing::Stale => return,
                     Landing::Done { rerun } => rerun,
                 };
-                if tree.operation_context(cx).as_ref() != Some(&context) {
+                if !tree.git_io_allowed(cx) || tree.operation_context(cx).as_ref() != Some(&context)
+                {
                     return;
                 }
-                if let Some((sigs, labels)) = outcome {
+                if let Some((sigs, labels, repos)) = outcome {
                     tree.git_sigs = Some(sigs);
-                    // 整树是拍平重建的:状态与眼下一样就不重画
-                    if tree.git != labels {
+                    // 菜单能力变化同样需要重画，不能只比较脏文件状态。
+                    if tree.git != labels || tree.git_repos != repos {
                         tree.git = labels;
+                        tree.git_repos = repos;
                         cx.notify();
                     }
                 }
@@ -651,7 +700,7 @@ impl FileTree {
 
     /// 活动项目变了:清空缓存与监听,重列根目录。返回是否真换了(调用方据此重画)。
     fn sync_project(&mut self, cx: &mut Context<Self>) -> bool {
-        let (project_id, root, remote, broken, signature) = {
+        let (project_id, root, broken, signature) = {
             let store = self.store.read(cx);
             match store.active_project() {
                 Some(p) => {
@@ -670,18 +719,33 @@ impl FileTree {
                     (
                         Some(p.id.clone()),
                         Some(PathBuf::from(&p.path)),
-                        conn.is_some(),
                         // 断链 = 是远程项目但连接查不到
                         is_remote && conn.is_none(),
                         Some(signature),
                     )
                 }
-                None => (None, None, false, false, None),
+                None => (None, None, false, None),
             }
         };
+        let git_enabled = self.git_io_allowed(cx);
         if signature == self.source_signature {
-            return false;
+            if self.git_enabled == git_enabled {
+                return false;
+            }
+            self.git_enabled = git_enabled;
+            self.git.clear();
+            self.git_repos.clear();
+            self.git_refresh_at = None;
+            self.git_plan = GitRefreshPlan::default();
+            self.git_flight.reset();
+            self.git_sigs = None;
+            git_watch::set_enabled_for(git_watch::Subscriber::FileTree, git_enabled);
+            if git_enabled {
+                self.load_git_status(cx);
+            }
+            return true;
         }
+        self.git_enabled = git_enabled;
         for dir in std::mem::take(&mut self.watched) {
             self.watcher.unwatch(&dir);
         }
@@ -691,6 +755,7 @@ impl FileTree {
         self.pending_reload.clear();
         self.chain_owner.clear();
         self.git.clear();
+        self.git_repos.clear();
         // 排着的去抖刷新作废;在睡的计时任务醒来看到 `None` 自己收摊。攒的计划、在途的
         // 那趟、记下的签名都属于上一个项目
         self.git_refresh_at = None;
@@ -714,12 +779,8 @@ impl FileTree {
         }
         self.drop_target = None;
         self.remote_broken = broken;
-        // 没有项目 / 远程项目都把旁路那一份关掉:远程不拉 git 状态,
-        // reader 线程上那道总闸能少开一个人是一个
-        git_watch::set_enabled_for(
-            git_watch::Subscriber::FileTree,
-            root.is_some() && !remote && !broken,
-        );
+        // 授权关闭的远程项目完全不订阅 Git 输出旁路。
+        git_watch::set_enabled_for(git_watch::Subscriber::FileTree, git_enabled);
         if broken {
             // 断链:不发任何请求,直接给那句明确提示(项目仍可见、可删)
             self.root_loading = false;
@@ -754,6 +815,19 @@ impl FileTree {
             &self.entries,
             &|key| store.is_dir_expanded(project_id, key),
             &|key| store.dir_kind(key),
+        )
+    }
+
+    fn git_io_allowed(&self, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        let Some(project) = store.active_project() else {
+            return false;
+        };
+        let remote = store.is_remote_project(&project.id);
+        git_io_allowed(
+            remote,
+            crate::git_backend::remote_git_enabled(store),
+            remote && store.remote_connection_of(&project.id).is_none(),
         )
     }
 
@@ -2356,6 +2430,13 @@ impl FileTree {
                         clipboard.can_paste_into(&context)
                             && !clipboard.would_copy_into_itself(&row_for_menu.path)
                     });
+                    let git_enabled = this.git_io_allowed(cx);
+                    let in_git_repo = git_enabled
+                        && cached_repo_contains_file(
+                            &this.git_repos,
+                            &row_for_menu.path,
+                            this.is_remote(cx),
+                        );
                     let entries = file_menu(
                         &cx.entity(),
                         &store,
@@ -2363,6 +2444,7 @@ impl FileTree {
                         context,
                         connection,
                         can_paste,
+                        (git_enabled, in_git_repo),
                     );
                     crate::menu::show(event.position, entries, window, cx);
                 }),

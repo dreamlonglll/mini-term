@@ -6,8 +6,8 @@
 //! Struct fields and enum kinds use camelCase; `Response.result` uses serde's
 //! external Result representation (`{"Ok": reply}` / `{"Err": typed_failure}`).
 //!
-//! Protocol v3 is a hard cutover. Typed query/mutation operations cover the
-//! original desktop Git backend; original CLI operations keep their replies:
+//! Protocol v4 is a hard cutover with externally tagged operations and replies.
+//! Typed query/mutation operations cover the desktop Git backend:
 //! - PanelSnapshot → git::RepoPanelSnapshot; ChangesSnapshot → ChangesSnapshot.
 //! - Log → HistoryPage (the next cursor is opaque, store and send it unchanged).
 //! - CommitDetail → git::CommitDetail; CommitFiles → Vec<git::CommitFileInfo>;
@@ -20,10 +20,19 @@
 //! - Discard, all hunk operations, CreateBranch, RenameBranch, DropStash,
 //!   OperationAbort, ResolveConflict and MarkResolved → ().
 //!
-//! OperationContinue/OperationAbort keep the Rust `kind` field but serialize it
-//! as `operationKind` to distinguish it from the operation's `kind` tag.
+//! Operations and replies use serde's external enum representation, so decoding
+//! never buffers an internally tagged enum's complete payload.
 //! Branch/sync/stash conflict and warning outcomes are returned unchanged; a
 //! successful RPC transport alone does not mean the requested mutation finished.
+//!
+//! `Reply::Data` retains raw JSON until its operation-specific typed decode; neither
+//! endpoint builds a JSON Value tree. Frame preflight bounds container cardinality,
+//! total nodes, paths and identifiers before allocating typed collections. Payload
+//! strings remain bounded by the 16 MiB frame, not an arbitrary smaller diff cap.
+//! Failures cap diagnostic fields at 16 KiB. A dispatched write whose response cannot
+//! be encoded is `OutcomeUnknown`, not a known Git rejection. Barrier receipts are
+//! valid only on the original sequential helper stream and for its last write ID;
+//! reads or receipts from a newly started helper never prove the old process ended.
 
 use std::io::{self, Read, Write};
 
@@ -34,13 +43,17 @@ use mt_project::git::{
     StashSaveOptions,
 };
 mod failure;
+mod limits;
 mod operations;
 mod server;
 pub use failure::GitFailure;
+pub use limits::{
+    MAX_COLLECTION_ITEMS, MAX_ERROR_BYTES, MAX_IDENTIFIER_BYTES, MAX_PATH_BYTES, decode_json,
+};
 pub use operations::{GitMutation, GitQuery};
 pub use server::serve;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,13 +98,12 @@ impl From<DiffSide> for mt_project::git::DiffSide {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Operation {
     Discover,
+    Barrier {
+        completed_id: u64,
+    },
     Status {
         repo: String,
     },
@@ -264,6 +276,7 @@ impl Operation {
     /// an interrupted request can have changed the repository.
     pub fn is_write(&self) -> bool {
         match self {
+            Self::Barrier { .. } => false,
             Self::Discover
             | Self::Status { .. }
             | Self::Diff { .. }
@@ -307,6 +320,7 @@ impl Operation {
     pub fn expected_reply_kind(&self) -> &'static str {
         match self {
             Self::Discover => "repositories",
+            Self::Barrier { .. } => "completed",
             Self::Status { .. } => "status",
             Self::Diff { .. } => "diff",
             Self::Query { .. } | Self::Mutate { .. } => "data",
@@ -359,12 +373,11 @@ impl Operation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Reply {
+    Completed {
+        completed_id: u64,
+    },
     Repositories {
         repos: Vec<mt_project::git::GitRepoInfo>,
     },
@@ -379,13 +392,14 @@ pub enum Reply {
         output: String,
     },
     Data {
-        value: serde_json::Value,
+        value: Box<serde_json::value::RawValue>,
     },
 }
 
 impl Reply {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Completed { .. } => "completed",
             Self::Repositories { .. } => "repositories",
             Self::Status { .. } => "status",
             Self::Diff { .. } => "diff",
@@ -399,10 +413,13 @@ impl Reply {
     /// silently accepting a mismatched original reply variant.
     pub fn decode<T: DeserializeOwned>(self) -> Result<T, String> {
         match self {
-            Self::Data { value } => serde_json::from_value(value).map_err(|error| {
+            Self::Data { value } => decode_json(value.get().as_bytes()).map_err(|error| {
                 format!(
-                    "invalid Git reply data for {}: {error}",
-                    std::any::type_name::<T>()
+                    "invalid Git reply data for {} ({:?}, line {}, column {})",
+                    std::any::type_name::<T>(),
+                    error.classify(),
+                    error.line(),
+                    error.column()
                 )
             }),
             other => Err(format!(
@@ -446,7 +463,7 @@ struct FrameBuffer(Vec<u8>);
 
 impl Write for FrameBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_FRAME_BYTES + 4 - self.0.len() {
+        if bytes.len() > (MAX_FRAME_BYTES + 4).saturating_sub(self.0.len()) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "JSON frame exceeds MAX_FRAME_BYTES",
@@ -464,6 +481,8 @@ impl Write for FrameBuffer {
 pub fn encode_frame<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     let mut buffer = FrameBuffer(vec![0; 4]);
     serde_json::to_writer(&mut buffer, value)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    limits::validate_json(&buffer.0[4..])
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let length = (buffer.0.len() - 4) as u32;
     buffer.0[..4].copy_from_slice(&length.to_be_bytes());
@@ -492,7 +511,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Opt
     }
     let mut payload = vec![0; length];
     reader.read_exact(&mut payload)?;
-    serde_json::from_slice(&payload)
+    decode_json(&payload)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }

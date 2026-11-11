@@ -1109,7 +1109,10 @@ enum CheckoutStep {
 fn blocking_changes(repo: &GitContext, branch: &str) -> Vec<String> {
     repo.local_changes_conflict_with(branch)
         .unwrap_or_else(|err| {
-            eprintln!("[git] 检出前预检失败(照常检出): {err:#}");
+            eprintln!(
+                "[git] {}: 检出前预检失败(照常检出): {err:#}",
+                git_ui::repo_label(repo)
+            );
             Vec::new()
         })
 }
@@ -1143,6 +1146,7 @@ fn checkout(
     } else {
         Some(name.clone())
     };
+    let checkout_context = snap.context.clone();
     panel.update(cx, |p, cx| {
         let shown = name.clone();
         p.run_write_op_on(
@@ -1170,11 +1174,13 @@ fn checkout(
                 let outcome = match step {
                     CheckoutStep::Done(outcome) => outcome,
                     CheckoutStep::Blocked { branch, conflicts } => {
-                        p.open_smart_checkout(branch, conflicts, window, cx);
+                        p.open_smart_checkout_on(&checkout_context, branch, conflicts, window, cx);
                         return;
                     }
                 };
-                p.set_view_branch(None, cx);
+                if p.repo_context().as_ref() == Some(&checkout_context) {
+                    p.set_view_branch(None, cx);
+                }
                 // 本地行:检出的分支名;远程行:那条远程分支的全名
                 let shown = shown.as_str();
                 let (message, tone) = match outcome {
@@ -1723,6 +1729,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
     let (name, mode_for_task) = (value.clone(), mode.clone());
     let done_form = form.clone();
     let context = repo.clone();
+    let store = panel.read(cx).store().clone();
     let started = git_ui::spawn_gated(
         &repo,
         move |repo| match &mode_for_task {
@@ -1747,6 +1754,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
                         new = value.as_str()
                     ),
                 };
+                git_ui::toast_for_repo(&store, &context, message.clone(), Tone::Info, cx);
                 panel.update(cx, |p, cx| {
                     if p.repo_context().as_ref() != Some(&context) {
                         return;
@@ -1754,12 +1762,11 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
                     if checkout || matches!(mode, NameMode::Rename { .. }) {
                         p.set_view_branch(None, cx);
                     }
-                    p.notify_result(message, Tone::Info, cx);
                     p.refresh_after_write(cx);
                 });
             }
             Err(err) => {
-                let message = git_ui::error_text(&err);
+                let message = git_ui::repo_text(&context, git_ui::error_text(&err));
                 done_form.update(cx, |f, cx| {
                     f.op.fail(message.clone());
                     cx.notify();

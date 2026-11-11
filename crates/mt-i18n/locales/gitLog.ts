@@ -42,6 +42,7 @@ export const gitLog = {
       reword: "修改提交消息",
     },
     toast: {
+      operationSucceeded: "{action}已完成",
       busy: "「{action}」还在进行中，请稍候",
       checkedOut: "已检出 {hash}（分离头指针）",
       branchCreated: "已创建分支 {name}",
@@ -236,6 +237,7 @@ export const gitLog = {
       reword: "Edit message",
     },
     toast: {
+      operationSucceeded: "{action} completed",
       busy: "\"{action}\" is still running, please wait",
       checkedOut: "Checked out {hash} (detached HEAD)",
       branchCreated: "Created branch {name}",

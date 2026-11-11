@@ -77,13 +77,14 @@ tools/promo/build.sh
 | `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载；mt-app `main()` 启动时调一次，必须早于任何 spawn） |
 | `mt-ai` | AI 感知：hook server（权威）、hook 注册（`hook_registry.rs`）、输入检测降级（`detect.rs`）、状态判定（`monitor.rs`/`perception.rs`）、会话记录读取（`sessions.rs`）、SSH 工具 skill 按项目启停（`ssh_registry.rs`）。两个 registry 共动 `~/.claude/settings.json`，读改写统一走 `claude_settings.rs`（原子写 + 进程内串行） |
 | `mt-project` | 文件树、目录监听、搜索、Git（git2，vendored-openssl 必须保留）、外部编辑器、WSL 发行版枚举、技术栈探测与 `ProjectKind` 枚举（`project_kind`；枚举与 mt-ui 的徽标形状表同由 `crates/mt-ui/tools/gen_tech_icons.mjs` 生成，禁止手改） |
+| `mt-git-helper` | 无 GPUI 的远端 Git helper：经 SSH stdio 处理版本化 Git 协议，复用 `mt-project::git` 核心，在服务器执行仓库读写操作；不提供监听端口或操作系统沙箱 |
 | `mt-config` | 配置持久化(`config.db`,rusqlite)。主题包文件层再导出自 `mt-theme-packs`(`mt_config::ThemePacks` 原路径不变,目录口径 `themes_dir` 留在这里)。不依赖 gpui。`config.json` 已退化成给 sidecar 读的 SSH 投影(见下节);界面布局另见 `mt-layout` |
 | `mt-theme-packs` | 外置主题包的文件层：`themes/` 目录的列举 / 导入(zip + manifest sha256 校验) / 删除 / 资源读取。自 mt-config 拆出，好让 mt-ui 不经 mt-config 连带依赖 rusqlite；依赖表只许 anyhow/serde/serde_json/sha2/zip |
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
 | `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连只看连接配置本身（`target.rs`）。⚠️ `~/.ssh` 里**只碰 `known_hosts`**：不读 `~/.ssh/config`（不认别名 / ProxyJump）、不试默认私钥 `~/.ssh/id_*`（用户明确要求，曾加过又撤回，别加回来）。`auth.rs` 依次试连接私钥 / ssh-agent / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开 |
-| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。自持小 tokio 运行时，入口全是同步阻塞函数（调用方丢 background executor）。不依赖 gpui |
+| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、托管 SSH Git 会话与连接身份失效；默认拒绝，须用户授权。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。不依赖 gpui |
 | `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价；models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路（`models_dev.rs`，拉网那一跳由 mt-app 的 `pricing.rs` 注入） |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |

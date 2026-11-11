@@ -21,7 +21,10 @@
 //! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
 //!
 //! [`RemoteGitWorkspace`] manages lazy packaged-helper deployment and persistent Git channels.
-//! [`RemoteGitClient`] remains the explicit-path transport. Both block; use a background thread.
+//! Managed Git IO runs through [`run_git`] or the workspace's bounded async request queue;
+//! GPUI executor threads only await and never wait on a blocking service mutex.
+//! [`set_remote_git_enabled`] controls a default-denied, dynamically revocable desktop gate.
+//! Explicit-path [`RemoteGitClient`] remains a synchronous transport independent of that gate.
 //!
 //! # 线程口径(与 Tauri 版的唯一结构性差异)
 //!
@@ -31,12 +34,10 @@
 //! - **本模块自持一个小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`),
 //!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
 //!   工作线程、进程内唯一;
-//! - **公开入口全是同步阻塞函数**,内部 `block_on`。调用方(mt-app 的视图层)
-//!   **必须**把它们丢进 `cx.background_executor().spawn(...)`,与 `mt_project::git`
-//!   / mt-app 的 `pricing::fetch_models_dev` 同一条纪律。主线程直接调 = 卡界面。
-//!   为什么不做成 `async fn` 让 gpui 的执行器 await:那样整条链路要一个
-//!   tokio-compat 的反应堆(russh 的 IO 依赖 tokio driver),不如把 tokio 的边界
-//!   收在本模块内部一层。
+//! - Existing synchronous SSH APIs retain their blocking boundary. Git UI callers use
+//!   `run_git(move || context.some_git_method()).await`, which admits blocking closures
+//!   asynchronously onto the service-owned executor. Managed synchronous requests reject
+//!   calls outside that executor; local core methods remain direct synchronous calls.
 //!
 //! # 池 / 缓存的归属
 //!
@@ -58,8 +59,10 @@
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
 //!
-//! Managed Git workspaces keep connection/configuration/root identity isolated and never replay
-//! uncertain writes. Closing a pane schedules helper cleanup without blocking the UI.
+//! Managed Git workspaces share connection/configuration/root identity and never replay
+//! uncertain writes. Idle channels close only outside in-flight requests. Closing a pane
+//! is not a completion proof; explicit recovery requires the old helper's write barrier
+//! followed by a new-channel HEAD/index/status verification.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -88,7 +91,8 @@ pub use dirs::*;
 pub use files::*;
 pub use git::RemoteGitClient;
 pub use git_context::GitContext;
-pub use git_service::RemoteGitWorkspace;
+pub use git_service::{RemoteGitWorkspace, run_git, set_remote_git_enabled};
+pub use mt_git_helper::GitFailure;
 pub use paths::*;
 pub use session_delete::*;
 pub use sessions::*;

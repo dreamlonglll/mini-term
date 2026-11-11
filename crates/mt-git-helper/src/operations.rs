@@ -4,11 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Reads missing from the original CLI protocol. Paths are interpreted only on
 /// the helper host; callers never inspect them with the desktop filesystem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum GitQuery {
     DiscoverGitRepos,
     GetGitStatus,
@@ -95,11 +91,7 @@ pub enum GitQuery {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum GitMutation {
     CheckoutCommit {
         hash: String,

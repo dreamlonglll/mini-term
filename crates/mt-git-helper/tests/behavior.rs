@@ -1870,3 +1870,94 @@ fn advanced_history_guards_reword_reset_tags_and_project_relative_file_history()
     assert!(tags.is_empty());
     helper.finish();
 }
+
+#[test]
+fn completion_receipt_belongs_to_original_helper_and_exact_write() {
+    let fixture = Fixture::new("completion-receipt");
+    let repo = fixture.repo("repo");
+    let mut helper = Helper::start(&repo);
+    assert!(
+        helper
+            .request(Operation::Barrier { completed_id: 0 })
+            .result
+            .is_err()
+    );
+    let write = helper.request(Operation::StageAll { repo: path(&repo) });
+    write.result.unwrap();
+    let id = write.id;
+    helper.success(Operation::Status { repo: path(&repo) });
+    assert!(
+        matches!(helper.success(Operation::Barrier { completed_id: id }), Reply::Completed { completed_id } if completed_id == id)
+    );
+    assert!(
+        helper
+            .request(Operation::Barrier {
+                completed_id: id + 1
+            })
+            .result
+            .is_err()
+    );
+    let mut other = Helper::start(&repo);
+    assert!(
+        other
+            .request(Operation::Barrier { completed_id: id })
+            .result
+            .is_err()
+    );
+    other.finish();
+    helper.finish();
+}
+
+#[test]
+fn existing_directories_omits_only_missing_and_rejects_files() {
+    use mt_git_helper::GitQuery;
+    let fixture = Fixture::new("directory-errors");
+    let repo = fixture.repo("repo");
+    let mut helper = Helper::start(&repo);
+    let existing: Vec<String> = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: GitQuery::ExistingDirectories {
+                paths: vec![path(&repo), path(&repo.join("missing"))],
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(existing, vec![path(&repo)]);
+    let canonical = repo.canonicalize().unwrap();
+    let aliases: Vec<String> = helper
+        .success(Operation::Query {
+            repo: path(&canonical),
+            query: GitQuery::ExistingDirectories {
+                paths: vec![path(&canonical), path(&canonical.join("missing"))],
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(aliases, vec![path(&canonical)]);
+    let unrelated = Fixture::new("directory-outside-scope");
+    assert!(
+        helper
+            .request(Operation::Query {
+                repo: path(&repo),
+                query: GitQuery::ExistingDirectories {
+                    paths: vec![path(&unrelated.0.join("missing"))],
+                },
+            })
+            .result
+            .is_err()
+    );
+    std::fs::write(repo.join("file"), "not directory").unwrap();
+    assert!(
+        helper
+            .request(Operation::Query {
+                repo: path(&repo),
+                query: GitQuery::ExistingDirectories {
+                    paths: vec![path(&repo.join("file"))]
+                }
+            })
+            .result
+            .is_err()
+    );
+    helper.finish();
+}

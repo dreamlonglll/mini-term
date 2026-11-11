@@ -1320,6 +1320,33 @@ pub fn error_text_box(state: &Entity<TextareaState>) -> AnyElement {
 /// 失败的可展示原因:错误链原文收掉首尾空白;空的(git 没吭声就非零退出)给句兜底。
 /// Git 界面里唯一的一份(历史区、贮藏弹窗、更改区都用它)。
 pub fn error_text(err: &anyhow::Error) -> String {
+    if let Some(failure) = err.downcast_ref::<mt_remote::GitFailure>() {
+        let (key, detail) = match failure {
+            mt_remote::GitFailure::OutcomeUnknown { message } => ("verifyWriteFailed", message),
+            mt_remote::GitFailure::Service { code, message } => {
+                let key = match code.as_str() {
+                    "remote_git_disabled" => "remoteDisabled",
+                    "remote_git_queue_full" => "serviceBusy",
+                    "remote_git_connection_changed" => "connectionChanged",
+                    "remote_git_permission_changed" | "remote_git_request_cancelled" => {
+                        "permissionChanged"
+                    }
+                    "remote_git_invalid_root" => "invalidRoot",
+                    "remote_git_deployment_failed" => "deploymentFailed",
+                    "remote_git_connection_failed" => "connectionFailed",
+                    "remote_git_protocol_mismatch" => "protocolMismatch",
+                    "remote_git_request_failed" => "requestFailed",
+                    "remote_git_reply_decode_failed"
+                    | "remote_git_recovery_decode_failed"
+                    | "remote_git_recovery_invalid_status" => "invalidReply",
+                    _ => "serviceUnavailable",
+                };
+                (key, message)
+            }
+            _ => return format!("{failure}"),
+        };
+        return format!("{}\n\n{}", t("gitHistory", key), detail.trim());
+    }
     let text = format!("{err:#}");
     match text.trim() {
         "" => t("gitBranch", "errorNoOutput").to_string(),
@@ -1350,13 +1377,19 @@ pub fn spawn_gated<T: Send + 'static>(
     };
     cx.refresh_windows();
     let context = repo.clone();
+    let identity = repo_label(repo);
     window
         .spawn(cx, async move |cx| {
             // ⚠️ 全是阻塞调用(git CLI 最多 120s),必须后台执行器
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&context) })
-                .await;
+            let result = mt_remote::run_git(move || {
+                let result = op(&context);
+                match &result {
+                    Ok(_) => eprintln!("[git] {identity}: operation completed"),
+                    Err(err) => eprintln!("[git] {identity}: operation failed: {err:#}"),
+                }
+                result
+            })
+            .await;
             drop(guard);
             let _ = cx.update(|window, cx| {
                 cx.refresh_windows();
@@ -1498,6 +1531,32 @@ pub fn toast(store: &Entity<AppStore>, message: String, tone: Tone, cx: &mut App
         Tone::Attention => ToastKind::Error,
     };
     crate::toast::push_message(kind, project_id, project_name, message, cx);
+}
+
+/// Captured backend identity, never the project selected when an operation finishes.
+pub fn repo_label(repo: &GitContext) -> String {
+    match repo.connection() {
+        Some(connection) => format!("{} · {}", connection.id, repo.path()),
+        None => repo.path().to_string(),
+    }
+}
+
+pub fn repo_text(repo: &GitContext, message: impl AsRef<str>) -> String {
+    format!("{}\n{}", repo_label(repo), message.as_ref())
+}
+
+pub fn toast_for_repo(
+    _store: &Entity<AppStore>,
+    repo: &GitContext,
+    message: String,
+    tone: Tone,
+    cx: &mut App,
+) {
+    let kind = match tone {
+        Tone::Info => ToastKind::Info,
+        Tone::Attention => ToastKind::Error,
+    };
+    crate::toast::push_message(kind, String::new(), repo_label(repo), message, cx);
 }
 
 #[cfg(test)]

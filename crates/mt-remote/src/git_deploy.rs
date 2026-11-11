@@ -39,16 +39,21 @@ fn deployment_lock(connection: &SshConnection) -> Arc<DeploymentLock> {
     deployment
 }
 
-pub(super) fn ensure_helper(connection: &SshConnection) -> Result<String, String> {
+pub(super) fn ensure_helper(
+    connection: &SshConnection,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<String, String> {
+    check()?;
     let runtime = state().runtime()?;
     runtime.block_on(async {
         let deadline = Instant::now() + DEPLOY_TIMEOUT;
         tokio::time::timeout_at(deadline, async {
             let deployment = deployment_lock(connection);
             let _guard = deployment.lock().await;
+            check()?;
             let pool = state().pool();
             let session = acquire_session(&pool, connection).await?;
-            let result = deploy(connection, &pool, &session, deadline).await;
+            let result = deploy(connection, &pool, &session, deadline, check).await;
             if result.is_err() && session.is_unhealthy_now() {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(2),
@@ -73,8 +78,18 @@ async fn deploy(
     pool: &Arc<SshPool>,
     session: &Arc<CachedSession>,
     deadline: Instant,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<String, String> {
-    let platform = exec(connection, pool, session, "uname -s; uname -m", deadline).await?;
+    check()?;
+    let platform = exec_checked(
+        connection,
+        pool,
+        session,
+        "uname -s; uname -m",
+        deadline,
+        check,
+    )
+    .await?;
     let target = parse_target(&platform)?;
     let (asset, digest) = tokio::task::spawn_blocking(move || {
         let executable = std::env::current_exe()
@@ -92,6 +107,7 @@ async fn deploy(
             .map_err(|e| format!("opening helper deployment SFTP: {}", e.message()))?,
     );
     let mut partial: Option<PartialCleanup> = None;
+    let expected = (digest.as_str(), target);
     let result = async {
         // Do not use the connection-ID-only home cache: configuration identity matters.
         let home = sftp.canonicalize(".").await
@@ -104,13 +120,13 @@ async fn deploy(
             directory.push_str(component);
             let command = secure_directory_command(&directory,
                 component == "git-helper" || component == digest.as_str());
-            exec(connection, pool, session, &command, deadline).await?;
+            exec_checked(connection, pool, session, &command, deadline, check).await?;
             require_kind(&sftp, &directory, SftpNodeKind::Directory).await?;
         }
         let helper = format!("{directory}/mt-git-helper");
         match sftp.try_node_kind(&helper).await.map_err(|e| e.message().to_string())? {
             Some(SftpNodeKind::File) => {
-                verify_helper(connection, pool, session, &helper, &digest, target, deadline).await?;
+                verify_helper(connection, pool, session, &helper, expected, deadline, check).await?;
                 return Ok(helper);
             }
             Some(kind) => return Err(format!(
@@ -125,6 +141,7 @@ async fn deploy(
         partial = Some(PartialCleanup::new(sftp.clone(), staging.clone()));
         let local_path = asset.to_str().ok_or_else(||
             format!("remote Git helper asset path is not UTF-8: {}", asset.display()))?;
+        check()?;
         mt_ssh::run_sftp_upload_until(session, local_path, &staging, deadline - FINISH_GRACE)
             .await.map_err(|e| format!("uploading remote Git helper: {}", e.message()))?;
         require_kind(&sftp, &staging, SftpNodeKind::File).await?;
@@ -133,18 +150,19 @@ async fn deploy(
             "test ! -L {path} && test -f {path} && chmod 700 {path}",
             path = quote_posix(&staging),
         );
-        exec(connection, pool, session, &command, deadline).await?;
-        verify_helper(connection, pool, session, &staging, &digest, target, deadline).await?;
+        exec_checked(connection, pool, session, &command, deadline, check).await?;
+        verify_helper(connection, pool, session, &staging, expected, deadline, check).await?;
         // SFTP v3 rename fails if destination exists; never replace an executing helper.
+        check()?;
         if let Err(error) = sftp.rename(&staging, &helper).await {
             // A different app process may have published the same SHA concurrently. Only
             // accept the immutable verified final file, never overwrite it or blindly retry.
             require_kind(&sftp, &helper, SftpNodeKind::File).await.map_err(|state|
                 format!("publishing remote Git helper failed: {}; {state}", error.message()))?;
-            verify_helper(connection, pool, session, &helper, &digest, target, deadline).await?;
+            verify_helper(connection, pool, session, &helper, expected, deadline, check).await?;
         }
         require_kind(&sftp, &helper, SftpNodeKind::File).await?;
-        verify_helper(connection, pool, session, &helper, &digest, target, deadline).await?;
+        verify_helper(connection, pool, session, &helper, expected, deadline, check).await?;
         Ok(helper)
     }.await;
     // Cleanup also runs on every failure. Cancellation gets its own bounded background
@@ -252,10 +270,11 @@ async fn verify_helper(
     pool: &Arc<SshPool>,
     session: &Arc<CachedSession>,
     path: &str,
-    digest: &str,
-    target: &str,
+    expected: (&str, &str),
     deadline: Instant,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
 ) -> Result<(), String> {
+    let (digest, target) = expected;
     let path_arg = quote_posix(path);
     let hash = if target.starts_with("linux-") {
         "sha256sum"
@@ -265,7 +284,7 @@ async fn verify_helper(
     let command = format!(
         "test ! -L {path_arg} && test -f {path_arg} && test -O {path_arg} && test -x {path_arg} && {hash} {path_arg}",
     );
-    let output = exec(connection, pool, session, &command, deadline).await?;
+    let output = exec_checked(connection, pool, session, &command, deadline, check).await?;
     let actual = output.split_ascii_whitespace().next().unwrap_or_default();
     if actual != digest {
         return Err(format!(
@@ -273,6 +292,18 @@ async fn verify_helper(
         ));
     }
     Ok(())
+}
+
+async fn exec_checked(
+    connection: &SshConnection,
+    pool: &Arc<SshPool>,
+    session: &Arc<CachedSession>,
+    command: &str,
+    deadline: Instant,
+    check: &(dyn Fn() -> Result<(), String> + Sync),
+) -> Result<String, String> {
+    check()?;
+    exec(connection, pool, session, command, deadline).await
 }
 
 async fn exec(

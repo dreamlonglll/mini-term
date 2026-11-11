@@ -15,16 +15,16 @@
 //!    见 [`panes_inside`])→ 再 `remove_worktree`(自带占用预检:还被别的程序占着就
 //!    一步不做,报原因与下一步)→ **成功了才**删项目(失败时项目还在,终端呈断开态
 //!    可重开);
-//! 2. **清理失效**(`:466-468`):`prune_worktrees` 之后必须用同 backend 的
-//!    `existing_directories` 复核「目录确实已不存在」才删项目 —— `isValid=false`
-//!    但目录还在(元数据损坏)时项目要保留;
+//! 2. **清理失效**:prune 失败不阻断存在性复核；只有同 backend 的
+//!    `existing_directories` 明确确认 NotFound 才删项目。权限 / 网络错误必须保留项目；
+//!    `isValid=false` 但目录还在(元数据损坏)时项目也要保留。
 //! 3. **归并**(`:145-172`):扫描可能同时发现主仓库与它在项目目录内的 worktree,
 //!    两者的 `list_worktrees` 结果**完全相同**,按 `isMain` 的路径归并才不会重复展示。
 //!
 //! # 阻塞调用
 //!
 //! `add_worktree`(120s)/ `remove_worktree`(60s)/ `prune_worktrees`(30s)
-//! 全是 CLI,一律丢 `cx.background_executor()`。
+//! 全是阻塞 IO，一律走 `mt_remote::run_git` 的独立工作线程。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -512,10 +512,21 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let store = AppStore::global(cx);
+    let remote_project = project_id
+        .as_deref()
+        .or(store.read(cx).active_project_id.as_deref())
+        .and_then(|id| store.read(cx).project(id))
+        .is_some_and(crate::ssh_conn::is_remote_project);
+    if (context.is_remote() || remote_project)
+        && !crate::git_backend::remote_git_enabled(store.read(cx))
+    {
+        crate::git_backend::request_enable(store, window, cx);
+        return;
+    }
     if context.path().is_empty() {
         return;
     }
-    let store = AppStore::global(cx);
     let repo_path = context.path().to_string();
     let project_id = project_id
         .or_else(|| store.read(cx).active_project_id.clone())
@@ -583,32 +594,30 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
     let state = state.clone();
     cx.spawn(async move |cx| {
         let repo_for_task = context.clone();
-        let loaded = cx
-            .background_executor()
-            .spawn(async move {
-                let paths: Vec<String> = if discover {
-                    match repo_for_task.discover_git_repos() {
-                        Ok(repos) => repos
-                            .into_iter()
-                            .map(|r| r.path.to_string_lossy().to_string())
-                            .collect(),
-                        Err(err) => return Err(format!("{err:#}")),
-                    }
-                } else {
-                    vec![repo_for_task.path().to_string()]
-                };
-                Ok(paths
-                    .into_iter()
-                    .map(|path| {
-                        let result = repo_for_task
-                            .with_path(path.clone())
-                            .list_worktrees()
-                            .map_err(|err| format!("{err:#}"));
-                        (path, result)
-                    })
-                    .collect::<Vec<_>>())
-            })
-            .await;
+        let loaded = mt_remote::run_git(move || {
+            let paths: Vec<String> = if discover {
+                match repo_for_task.discover_git_repos() {
+                    Ok(repos) => repos
+                        .into_iter()
+                        .map(|r| r.path.to_string_lossy().to_string())
+                        .collect(),
+                    Err(err) => return Err(git_ui::error_text(&err)),
+                }
+            } else {
+                vec![repo_for_task.path().to_string()]
+            };
+            Ok(paths
+                .into_iter()
+                .map(|path| {
+                    let result = repo_for_task
+                        .with_path(path.clone())
+                        .list_worktrees()
+                        .map_err(|err| git_ui::error_text(&err));
+                    (path, result)
+                })
+                .collect::<Vec<_>>())
+        })
+        .await;
 
         state.update(cx, |s: &mut WorktreeModal, cx| {
             match loaded {
@@ -667,10 +676,7 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
             s.branches_by_repo.insert(key.clone(), Rc::default());
         });
         cx.spawn(async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { context.get_repo_branches() })
-                .await;
+            let result = mt_remote::run_git(move || context.get_repo_branches()).await;
             state.update(cx, |s: &mut WorktreeModal, cx| {
                 match result {
                     Ok(list) => {
@@ -678,7 +684,7 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
                     }
                     Err(err) => {
                         eprintln!("[git] 取分支失败: {err:#}");
-                        s.create_error = Some(format!("{err:#}"));
+                        s.create_error = Some(git_ui::error_text(&err));
                     }
                 }
                 cx.notify();
@@ -1592,19 +1598,15 @@ fn create(
             for (context, target) in targets {
                 let (branch, base) = (branch.clone(), base.clone());
                 let target_for_task = target.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        // ⚠️ add_worktree 是 120s 阻塞 CLI
-                        context.add_worktree(
-                            &target_for_task,
-                            &branch,
-                            create_branch,
-                            base.as_deref(),
-                        )
-                    })
-                    .await;
-                results.push((target, result.map(|_| ()).map_err(|err| format!("{err:#}"))));
+                let result = mt_remote::run_git(move || {
+                    // ⚠️ add_worktree 是 120s 阻塞 CLI
+                    context.add_worktree(&target_for_task, &branch, create_branch, base.as_deref())
+                })
+                .await;
+                results.push((
+                    target,
+                    result.map(|_| ()).map_err(|err| git_ui::error_text(&err)),
+                ));
             }
 
             let _ = cx.update(|window, cx| {
@@ -1927,13 +1929,11 @@ fn remove_worktree(
     let form = form.clone();
     window
         .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    // ⚠️ 60s 阻塞 CLI
-                    context.remove_worktree(&wt_path, force)
-                })
-                .await;
+            let result = mt_remote::run_git(move || {
+                // ⚠️ 60s 阻塞 CLI
+                context.remove_worktree(&wt_path, force)
+            })
+            .await;
             let _ = cx.update(|window, cx| {
                 match result {
                     Ok(_) => {
@@ -1986,11 +1986,36 @@ fn remove_worktree(
 /// 删除失败的可展示原因。`run_git_command` 把 git 的 stderr 原样装进错误,
 /// 末尾带换行,这里收掉首尾空白;万一是空的(git 没吭声就非零退出)也别画一行空白。
 fn remove_error_text(err: &anyhow::Error) -> String {
-    let text = format!("{err:#}");
-    match text.trim() {
-        "" => "git worktree remove failed".to_string(),
-        trimmed => trimmed.to_string(),
-    }
+    git_ui::error_text(err)
+}
+
+/// A successful probe may omit only explicit NotFound results. Any ambiguous
+/// metadata/network error invalidates the probe and must never authorize removal.
+fn confirmed_missing_paths<'a>(
+    context: &GitContext,
+    candidates: &'a [String],
+    existing: Result<&[String], ()>,
+) -> Vec<&'a String> {
+    let Ok(existing) = existing else {
+        return Vec::new();
+    };
+    let present: HashSet<String> = existing
+        .iter()
+        .map(|path| path_key(context.is_remote(), path))
+        .collect();
+    candidates
+        .iter()
+        .filter(|path| !present.contains(&path_key(context.is_remote(), path)))
+        .collect()
+}
+
+fn prune_and_probe(
+    context: &GitContext,
+    invalid: &[String],
+) -> (anyhow::Result<String>, anyhow::Result<Vec<String>>) {
+    let pruned = context.prune_worktrees();
+    let existing = context.existing_directories(invalid);
+    (pruned, existing)
 }
 
 /// 清理失效条目。只有同 backend 复核目录确实不存在后才删除关联项目。
@@ -2010,31 +2035,21 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
     cx.spawn(async move |cx| {
         let invalid_for_task = invalid.clone();
         let context_for_task = context.clone();
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                context_for_task.prune_worktrees()?;
-                context_for_task.existing_directories(&invalid_for_task)
-            })
-            .await;
+        let result =
+            mt_remote::run_git(move || prune_and_probe(&context_for_task, &invalid_for_task)).await;
 
         cx.update(|cx| {
             state.update(cx, |s, cx| {
                 s.pruning_key = None;
                 cx.notify();
             });
-            match result {
+            let (pruned, existing) = result;
+            match existing {
                 Ok(still_there) => {
-                    let present: HashSet<String> = still_there
-                        .iter()
-                        .map(|path| path_key(context.is_remote(), path))
-                        .collect();
+                    let missing = confirmed_missing_paths(&context, &invalid, Ok(&still_there));
                     let store = state.read(cx).store.clone();
                     store.update(cx, |store, cx| {
-                        for path in &invalid {
-                            if present.contains(&path_key(context.is_remote(), path)) {
-                                continue;
-                            }
+                        for path in missing {
                             let id = store
                                 .find_project_by_backend_path(context.connection_id(), path)
                                 .map(|p| p.id.clone());
@@ -2046,7 +2061,7 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
                 }
                 Err(err) => {
                     state.update(cx, |s, cx| {
-                        s.load_error = Some(format!("{err:#}"));
+                        s.load_error = Some(git_ui::error_text(&err));
                         cx.notify();
                     });
                     return;
@@ -2055,6 +2070,12 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
             let on_changed = state.read(cx).on_changed.clone();
             on_changed(cx);
             load(&state, cx);
+            if let Err(err) = pruned {
+                state.update(cx, |s, cx| {
+                    s.load_error = Some(git_ui::error_text(&err));
+                    cx.notify();
+                });
+            }
         });
     })
     .detach();
@@ -2063,6 +2084,64 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune失败仍可确认不存在且保留存在目录() {
+        let root = std::env::temp_dir().join(format!(
+            "mt-worktree-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let kept = root.join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        let missing = root.join("gone");
+        let candidates = vec![
+            kept.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let context = GitContext::local(root.to_string_lossy().into_owned());
+        // 真实的非仓库路径让 git worktree prune 失败，但不阻断 metadata 核查。
+        let (pruned, existing) = prune_and_probe(&context, &candidates);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(pruned.is_err());
+        let existing = existing.expect("prune 失败不影响目录核查");
+        assert_eq!(
+            confirmed_missing_paths(&context, &candidates, Ok(&existing)),
+            vec![&candidates[1]]
+        );
+    }
+
+    #[test]
+    fn 清理只删除成功核查中明确缺失的目录() {
+        let candidates = vec!["/repo/kept".into(), "/repo/gone".into()];
+        let existing = vec!["/repo/kept".into()];
+        for context in [GitContext::local("/repo"), remote_context("ssh1")] {
+            let missing = confirmed_missing_paths(&context, &candidates, Ok(&existing));
+            assert_eq!(missing, vec![&candidates[1]]);
+            assert!(
+                confirmed_missing_paths(&context, &candidates, Err(())).is_empty(),
+                "权限或网络错误不得授权删除任何项目"
+            );
+            assert!(
+                confirmed_missing_paths(&context, &candidates, Ok(&candidates)).is_empty(),
+                "prune 后仍存在的失效目录必须保留"
+            );
+        }
+    }
+
+    #[test]
+    fn 远程清理存在性比较不混大小写目录() {
+        let candidates = vec!["/repo/Worktree".into(), "/repo/worktree".into()];
+        let existing = vec!["/repo/Worktree/".into()];
+        assert_eq!(
+            confirmed_missing_paths(&remote_context("ssh1"), &candidates, Ok(&existing)),
+            vec![&candidates[1]]
+        );
+    }
 
     fn remote_context(connection_id: &str) -> GitContext {
         GitContext::remote(

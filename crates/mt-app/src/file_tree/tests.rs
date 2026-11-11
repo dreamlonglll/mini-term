@@ -67,17 +67,137 @@ fn 远程下载上下文要求项目根目录和连接身份完全一致() {
     }
 }
 
+/// 保留旧测试名，断言实际能力边界而非排列。
+#[test]
+fn 文件菜单项序与原版一致() {
+    for remote in [false, true] {
+        let dirty = file_menu_actions(false, true, true, remote, true);
+        assert!(dirty.contains(&Some(ViewDiff)) && dirty.contains(&Some(GitHistory)));
+        let clean = file_menu_actions(false, false, true, remote, true);
+        assert!(clean.contains(&Some(GitHistory)));
+        assert!(!clean.contains(&Some(ViewDiff)));
+        let outside = file_menu_actions(false, false, false, remote, true);
+        assert!(!outside.contains(&Some(GitHistory)));
+        assert!(!outside.contains(&Some(ViewDiff)));
+        for required in [
+            CopyEntry,
+            CopyRelativePath,
+            CopyAbsolutePath,
+            OpenInTerminal,
+            Rename,
+            MoveTo,
+            Delete,
+        ] {
+            assert!(outside.contains(&Some(required)));
+        }
+        assert!(!outside.contains(&Some(NewFile)) && !outside.contains(&Some(NewFolder)));
+    }
+}
+
+#[test]
+fn 目录菜单项序与原版一致() {
+    for remote in [false, true] {
+        let actions = file_menu_actions(true, true, true, remote, true);
+        for required in [
+            CopyEntry,
+            Paste,
+            OpenInTerminal,
+            Rename,
+            MoveTo,
+            Delete,
+            NewFile,
+            NewFolder,
+        ] {
+            assert!(actions.contains(&Some(required)));
+        }
+        for hidden in [OpenWithDefault, ViewDiff, GitHistory] {
+            assert!(!actions.contains(&Some(hidden)));
+        }
+        assert_eq!(actions.contains(&Some(SearchInDirectory)), !remote);
+        assert_eq!(actions.contains(&Some(RevealInFolder)), !remote);
+    }
+}
+
+#[test]
+fn 远程菜单不暴露本机动作并提供传输入口() {
+    for is_dir in [false, true] {
+        for enabled in [false, true] {
+            let actions = file_menu_actions(is_dir, true, true, true, enabled);
+            for hidden in [OpenWithDefault, RevealInFolder, SearchInDirectory] {
+                assert!(!actions.contains(&Some(hidden)));
+            }
+            assert!(actions.contains(&Some(Download)));
+            assert_eq!(actions.contains(&Some(UploadFiles)), is_dir);
+            assert_eq!(actions.contains(&Some(UploadFolder)), is_dir);
+            assert_eq!(actions.contains(&Some(ViewDiff)), enabled && !is_dir);
+            assert_eq!(actions.contains(&Some(GitHistory)), enabled && !is_dir);
+        }
+    }
+}
+
+#[test]
+fn 远程_git_关闭不安排任何_git_io() {
+    assert!(git_io_allowed(false, false, false));
+    assert!(!git_io_allowed(true, false, false));
+    assert!(git_io_allowed(true, true, false));
+    assert!(!git_io_allowed(true, true, true));
+}
+
+#[test]
+fn 仓库归属按后台缓存且不混同名前缀目录() {
+    let repos = vec![
+        PathBuf::from("/workspace/repo"),
+        PathBuf::from("/workspace/nested/git"),
+    ];
+    for remote in [false, true] {
+        assert!(cached_repo_contains_file(
+            &repos,
+            Path::new("/workspace/repo/clean.rs"),
+            remote
+        ));
+        assert!(cached_repo_contains_file(
+            &repos,
+            Path::new("/workspace/nested/git/file"),
+            remote
+        ));
+        assert!(!cached_repo_contains_file(
+            &repos,
+            Path::new("/workspace/repository/file"),
+            remote
+        ));
+        assert!(!cached_repo_contains_file(
+            &repos,
+            Path::new("/workspace/not-git/file"),
+            remote
+        ));
+        assert!(!cached_repo_contains_file(
+            &[],
+            Path::new("/workspace/repo/clean.rs"),
+            remote
+        ));
+    }
+    assert!(!cached_repo_contains_file(
+        &repos,
+        Path::new("/workspace/Repo/file"),
+        true
+    ));
+    assert!(!cached_repo_contains_file(
+        &repos,
+        Path::new(r"/workspace/repo\file"),
+        true
+    ));
+}
 
 /// 「查看变更」只给**有 git 状态的文件**:目录哪怕汇总出了字母也不给
 /// (原版判定是 `entryGitStatus && !entry.isDir`,单文件 diff 对目录没意义);
 /// 而「默认工具打开」只对文件出现。
 #[test]
 fn 目录与文件的差别只在两处() {
-    let file: Vec<_> = file_menu_actions(false, false, false, false)
+    let file: Vec<_> = file_menu_actions(false, false, false, false, true)
         .into_iter()
         .flatten()
         .collect();
-    let dir: Vec<_> = file_menu_actions(true, false, false, false)
+    let dir: Vec<_> = file_menu_actions(true, false, false, false, true)
         .into_iter()
         .flatten()
         .collect();
@@ -89,7 +209,7 @@ fn 目录与文件的差别只在两处() {
     assert!(dir.contains(&SearchInDirectory));
     assert!(!file.contains(&SearchInDirectory));
     // 有状态的目录同样不给 ViewDiff
-    let dirty_dir: Vec<_> = file_menu_actions(true, true, true, false)
+    let dirty_dir: Vec<_> = file_menu_actions(true, true, true, false, true)
         .into_iter()
         .flatten()
         .collect();

@@ -24,6 +24,7 @@ pub fn serve(root: &Path, mut reader: impl Read, mut writer: impl Write) -> Resu
         root,
         allowed: None,
         known_worktrees: HashSet::new(),
+        last_completed_write: None,
     };
     write_frame(
         &mut writer,
@@ -36,47 +37,59 @@ pub fn serve(root: &Path, mut reader: impl Read, mut writer: impl Write) -> Resu
     while let Some(request) = read_frame::<Request>(&mut reader).context("reading request frame")? {
         // Version is checked before even lazy discovery, and certainly before
         // any Git operation. IDs are opaque and echoed, not replay protection.
+        let is_write = request.operation.is_write();
+        let id = request.id;
         let result = if request.protocol_version != PROTOCOL_VERSION {
             Err(crate::GitFailure::from(format!(
                 "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
                 request.protocol_version
             )))
         } else {
-            server
-                .dispatch(request.operation)
-                .map_err(crate::GitFailure::from_error)
+            let result = server.dispatch(request.operation);
+            if is_write {
+                server.last_completed_write = Some(id);
+            }
+            result.map_err(|error| {
+                if is_write && error.is::<ReplyEncodingFailure>() {
+                    crate::GitFailure::outcome_unknown(error)
+                } else {
+                    crate::GitFailure::from_error(error)
+                }
+            })
         };
         let response = Response {
             protocol_version: PROTOCOL_VERSION,
             id: request.id,
             result,
         };
-        match encode_frame(&response) {
-            Ok(frame) => writer.write_all(&frame)?,
-            Err(error) => {
-                // The result may already describe a completed mutation. Never
-                // imply this is safe to retry just because serialization failed.
-                write_frame(
-                    &mut writer,
-                    &Response {
-                        protocol_version: PROTOCOL_VERSION,
-                        id: response.id,
-                        result: Err(crate::GitFailure::from(format!(
-                            "cannot encode bounded response: {error}; operation may have completed, verify repository before retrying"
-                        ))),
-                    },
-                )?;
-            }
-        }
+        writer.write_all(&response_frame(&response, is_write)?)?;
         writer.flush()?;
     }
     Ok(())
+}
+
+fn response_frame(response: &Response, is_write: bool) -> std::io::Result<Vec<u8>> {
+    match encode_frame(response) {
+        Ok(frame) => Ok(frame),
+        Err(error) => encode_frame(&Response {
+            protocol_version: PROTOCOL_VERSION,
+            id: response.id,
+            result: Err(if is_write {
+                crate::GitFailure::outcome_unknown(format_args!(
+                    "cannot encode bounded response: {error}"
+                ))
+            } else {
+                crate::GitFailure::from(format!("cannot encode bounded response: {error}"))
+            }),
+        }),
+    }
 }
 
 struct Server {
     root: PathBuf,
     allowed: Option<HashSet<PathBuf>>,
     known_worktrees: HashSet<PathBuf>,
+    last_completed_write: Option<u64>,
 }
 
 impl Server {
@@ -126,6 +139,13 @@ impl Server {
             "workspace root is no longer an existing directory"
         );
         match operation {
+            Operation::Barrier { completed_id } => {
+                ensure!(
+                    self.last_completed_write == Some(completed_id),
+                    "no matching completed write on this helper stream"
+                );
+                Ok(Reply::Completed { completed_id })
+            }
             Operation::Discover => Ok(Reply::Repositories {
                 repos: self.discover()?,
             }),
@@ -419,10 +439,28 @@ impl Server {
     }
 }
 
+#[derive(Debug)]
+struct ReplyEncodingFailure(std::io::Error);
+impl std::fmt::Display for ReplyEncodingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "encoding Git reply data: {}", self.0)
+    }
+}
+impl std::error::Error for ReplyEncodingFailure {}
+
 fn data(value: impl serde::Serialize) -> Result<Reply> {
-    Ok(Reply::Data {
-        value: serde_json::to_value(value).context("encoding Git reply data")?,
-    })
+    let mut buffer = crate::FrameBuffer(Vec::new());
+    serde_json::to_writer(&mut buffer, &value).map_err(|error| {
+        ReplyEncodingFailure(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    crate::limits::validate_json(&buffer.0).map_err(|error| {
+        ReplyEncodingFailure(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    let json = String::from_utf8(buffer.0).expect("JSON serializer emits UTF-8");
+    let value = serde_json::value::RawValue::from_string(json).map_err(|error| {
+        ReplyEncodingFailure(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })?;
+    Ok(Reply::Data { value })
 }
 
 fn validate_file_repository(repo: &Path, path: &str) -> Result<()> {
@@ -504,4 +542,34 @@ fn validate_path(repo: &Path, input: &str, reads_worktree: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unencodable_write_reply_is_unknown_but_read_failure_is_known() {
+        let response = Response {
+            protocol_version: PROTOCOL_VERSION,
+            id: 7,
+            result: Ok(Reply::Committed {
+                output: "x".repeat(crate::MAX_FRAME_BYTES),
+            }),
+        };
+        for is_write in [true, false] {
+            let frame = response_frame(&response, is_write).unwrap();
+            let decoded = read_frame::<Response>(&mut std::io::Cursor::new(frame))
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.id, response.id);
+            assert_eq!(
+                matches!(
+                    decoded.result,
+                    Err(crate::GitFailure::OutcomeUnknown { .. })
+                ),
+                is_write
+            );
+        }
+    }
 }

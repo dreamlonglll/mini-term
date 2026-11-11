@@ -194,6 +194,7 @@ impl AppStore {
     /// 各有自己的 setter,不要拿这个入口去改它们 —— 热更新会漏。
     pub fn patch_config(&mut self, edit: impl FnOnce(&mut AppConfig), cx: &mut Context<Self>) {
         edit(&mut self.config);
+        mt_remote::set_remote_git_enabled(self.config.remote_git_helper_enabled);
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }

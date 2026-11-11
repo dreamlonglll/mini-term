@@ -557,9 +557,9 @@ struct ExternalDrag {
 ///
 /// # 远程项目 gate(原版 `isRemote ? [] : [...]`)
 ///
-/// 本地专属入口一律隐藏:**资源管理器打开 / 关联 SSH / 环境变量 / Worktree 管理
-/// / 项目类型**。理由照抄原版注释:agent 已在远程机、envVars 不注入远程 shell
-/// (二期)、路径也不是本机可打开的位置、远程项目领位固定 SSH 图标。
+/// 本地专属入口一律隐藏:**资源管理器打开 / 关联 SSH / 环境变量 / 项目类型**。
+/// 远程 Worktree 管理与本地共用入口，由授权确认拦住尚未启用的 helper；
+/// 路径始终按所属 backend 解释，不拿远端路径打开本机位置。
 /// 保留的是重命名 / 编辑描述 / 复制绝对路径(远程 POSIX)/ 分组操作 / 移除。
 ///
 /// **分组那一段不在这张表里**:它是条件段(有没有分组、是不是子项目各不相同),
@@ -827,6 +827,12 @@ fn project_menu(
                 let id = row.id.clone();
                 let source_store = store.clone();
                 menu::item(t("projectList", "menu.worktrees"), move |window, cx| {
+                    if source_store.read(cx).is_remote_project(&id)
+                        && !crate::git_backend::remote_git_enabled(source_store.read(cx))
+                    {
+                        crate::git_backend::request_enable(source_store.clone(), window, cx);
+                        return;
+                    }
                     crate::git_worktree::open(
                         crate::git_backend::project_context(source_store.read(cx), &id),
                         // 项目里可能挂着多个仓库,与原版的项目级入口同口径
@@ -2840,6 +2846,62 @@ mod tests {
             assert_eq!(tr.progress(), 1.0);
             assert!(!tr.running(), "reduce 下一帧都不该请求");
         });
+    }
+
+    /// 保留原测试名；验证能力集合，不再钉住无关的菜单排列。
+    #[test]
+    fn 右键菜单项序与原版一致() {
+        use ProjectMenuAction::*;
+        let actions = project_menu_actions(false);
+        for required in [
+            Rename,
+            EditDescription,
+            OpenInFolder,
+            CopyAbsolutePath,
+            AssociateSsh,
+            EnvVars,
+            Worktrees,
+            ProjectKind,
+            GroupSection,
+            Remove,
+        ] {
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| **action == Some(required))
+                    .count(),
+                1,
+                "本地能力 {required:?} 不可丢失或重复"
+            );
+        }
+    }
+
+    #[test]
+    fn 远程项目隐藏本地专属菜单项() {
+        use ProjectMenuAction::*;
+        let actions = project_menu_actions(true);
+        for hidden in [OpenInFolder, AssociateSsh, EnvVars, ProjectKind] {
+            assert!(
+                !actions.contains(&Some(hidden)),
+                "远端不能调用本机能力 {hidden:?}"
+            );
+        }
+        for required in [
+            Rename,
+            EditDescription,
+            CopyAbsolutePath,
+            Worktrees,
+            GroupSection,
+            Remove,
+        ] {
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| **action == Some(required))
+                    .count(),
+                1
+            );
+        }
     }
 
     /// 远程徽章:本地项目没有;远程项目取连接名 + 摘要;连接被删 = 断链态。

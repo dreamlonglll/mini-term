@@ -155,6 +155,9 @@ pub struct AppConfig {
     /// 两处共用这一个开关;与「更改」区的 `gitChangesViewMode` 各管各的。
     #[serde(default = "default_git_commit_files_view_mode")]
     pub git_commit_files_view_mode: String,
+    /// Explicit consent to upload and execute the bundled Git helper on SSH hosts.
+    #[serde(default)]
+    pub remote_git_helper_enabled: bool,
     #[serde(default = "default_true")]
     pub long_paste_to_file: bool,
     #[serde(default = "default_long_paste_line_threshold")]
@@ -844,6 +847,7 @@ impl Default for AppConfig {
             vscode_path: None,
             git_changes_view_mode: default_git_changes_view_mode(),
             git_commit_files_view_mode: default_git_commit_files_view_mode(),
+            remote_git_helper_enabled: false,
             long_paste_to_file: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),

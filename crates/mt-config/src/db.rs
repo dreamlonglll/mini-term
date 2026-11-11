@@ -765,6 +765,29 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn remote_git_permission_is_opt_in_and_persists_revocation() {
+        let dir = temp_dir("remote-git-permission");
+        let db = ConfigDb::open_at(&dir).unwrap();
+        let mut config = AppConfig::default();
+        db.save(&config).unwrap();
+        assert!(!db.load().unwrap().unwrap().remote_git_helper_enabled);
+        config.remote_git_helper_enabled = true;
+        db.save(&config).unwrap();
+        assert!(db.load().unwrap().unwrap().remote_git_helper_enabled);
+        config.remote_git_helper_enabled = false;
+        db.save(&config).unwrap();
+        assert!(!db.load().unwrap().unwrap().remote_git_helper_enabled);
+        put_raw(
+            &db,
+            "DELETE FROM settings WHERE key = ?1",
+            &["remoteGitHelperEnabled"],
+        );
+        assert!(!db.load().unwrap().unwrap().remote_git_helper_enabled);
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn project(id: &str, name: &str) -> ProjectConfig {
         ProjectConfig::new(id, name, format!("D:/{id}"))
     }

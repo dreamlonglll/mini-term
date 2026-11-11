@@ -19,6 +19,9 @@ export const gitChanges = {
     commitFailed: "提交失败：{detail}",
     loadFailed: "读取变更失败：{detail}",
     operationFailedTitle: "Git 操作失败",
+    operationSucceeded: "Git 操作已完成",
+    metadataWarning: "变更已读取，但部分仓库状态不可用：{detail}",
+    metadataUnavailable: "仓库状态尚未确认，请刷新后再提交或处理冲突。",
   },
   en: {
     discardConfirm: "Discard changes to {count} file(s)?\nThis action cannot be undone.",
@@ -40,5 +43,8 @@ export const gitChanges = {
     commitFailed: "Commit failed: {detail}",
     loadFailed: "Failed to read changes: {detail}",
     operationFailedTitle: "Git operation failed",
+    operationSucceeded: "Git operation completed",
+    metadataWarning: "Changes loaded, but some repository metadata is unavailable: {detail}",
+    metadataUnavailable: "Repository state is unverified. Refresh before committing or resolving conflicts.",
   },
 } as const;

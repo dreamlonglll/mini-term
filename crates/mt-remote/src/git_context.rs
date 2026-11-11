@@ -148,6 +148,21 @@ impl GitContext {
         }
     }
 
+    pub fn write_outcome_unknown(&self) -> bool {
+        matches!(&self.backend, Backend::Remote(remote) if remote.workspace.write_outcome_unknown())
+    }
+
+    pub fn verify_unknown_write(&self) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .verify_unknown_write_blocking(&self.path)
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => Ok(()),
+        }
+    }
+
     fn request(&self, operation: O) -> Result<Reply> {
         match &self.backend {
             Backend::Remote(remote) => remote
@@ -158,18 +173,23 @@ impl GitContext {
             Backend::Local => unreachable!("local calls dispatch directly to core"),
         }
     }
-    fn data<T: DeserializeOwned>(&self, operation: O) -> Result<T> {
-        self.request(operation)?
-            .decode()
-            .map_err(anyhow::Error::msg)
+    fn data<T: DeserializeOwned + Send + 'static>(&self, operation: O) -> Result<T> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .request_data(operation)
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => unreachable!("local calls dispatch directly to core"),
+        }
     }
-    fn query<T: DeserializeOwned>(&self, query: Q) -> Result<T> {
+    fn query<T: DeserializeOwned + Send + 'static>(&self, query: Q) -> Result<T> {
         self.data(O::Query {
             repo: self.path.clone(),
             query,
         })
     }
-    fn mutate<T: DeserializeOwned>(&self, mutation: M) -> Result<T> {
+    fn mutate<T: DeserializeOwned + Send + 'static>(&self, mutation: M) -> Result<T> {
         self.data(O::Mutate {
             repo: self.path.clone(),
             mutation,
@@ -200,11 +220,18 @@ impl GitContext {
     }
     pub fn existing_directories(&self, paths: &[String]) -> Result<Vec<String>> {
         match &self.backend {
-            Backend::Local => Ok(paths
-                .iter()
-                .filter(|path| Path::new(path).is_dir())
-                .cloned()
-                .collect()),
+            Backend::Local => {
+                let mut existing = Vec::new();
+                for path in paths {
+                    match std::fs::metadata(path) {
+                        Ok(metadata) if metadata.is_dir() => existing.push(path.clone()),
+                        Ok(_) => bail!("directory target is not a directory: {path}"),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Ok(existing)
+            }
             _ => self.query(Q::ExistingDirectories {
                 paths: paths.to_vec(),
             }),
@@ -460,5 +487,28 @@ mod tests {
                 .to_string()
                 .contains("missing SSH connection")
         );
+        assert!(broken.verify_unknown_write().is_err());
+    }
+
+    #[test]
+    fn local_directory_probe_does_not_treat_files_as_missing() {
+        let root =
+            std::env::temp_dir().join(format!("mt-context-directories-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let context = GitContext::local(root.to_string_lossy());
+        assert!(
+            context
+                .existing_directories(&[file.to_string_lossy().into_owned()])
+                .is_err()
+        );
+        assert!(
+            context
+                .existing_directories(&[root.join("missing").to_string_lossy().into_owned()])
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

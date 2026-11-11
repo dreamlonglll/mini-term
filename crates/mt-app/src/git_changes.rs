@@ -55,8 +55,8 @@
 //!
 //! # 阻塞调用
 //!
-//! 全部 git 调用(git2 的同步 IO 与带超时的 git CLI)一律丢 `cx.background_executor()`
-//! (范式照 `file_tree.rs:138-156`);异步回包用请求令牌防迟到。
+//! 全部 git 调用(git2 的同步 IO 与带超时的 git CLI)经 `mt_remote::run_git`
+//! 执行;异步回包用请求令牌防迟到。
 //!
 //! # 取数调度
 //!
@@ -88,7 +88,7 @@
 //!   重算也不重画 —— 监听与 pty 嗅探触发的重取,绝大多数回包都没变。
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -158,7 +158,12 @@ const HISTORY_LIMIT: usize = 20;
 pub enum GitChangesEvent {
     /// 提交成功 —— 容器要刷新历史与分支(分支头已前移)。`open_push` = 这是「提交并推送」,
     /// 接着打开推送对话框(预选当前分支,见模块注释「提交并推送」)。
-    Committed { open_push: bool },
+    Committed {
+        open_push: bool,
+        context: GitContext,
+    },
+    /// Open the push preview for the backend captured by a completed commit.
+    OpenPush(GitContext),
     /// ▾ 菜单「贮藏当前改动…」贮藏成功 —— 工作区与贮藏数都变了,容器整面板刷新。
     Stashed,
     /// 暂存 / 取消暂存 / 丢弃 / 冲突处理写完了(成败都算):写完当场、重取列表**之前**读的
@@ -521,6 +526,7 @@ struct Snapshot {
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
     has_head: bool,
+    metadata_warning: Option<String>,
 }
 
 /// 取数落地会改到的那几样,落地前拿来比「这份快照收下之后界面变不变」
@@ -533,6 +539,7 @@ struct Landed<'a> {
     has_head: bool,
     amend: bool,
     load_error: Option<&'a str>,
+    metadata_warning: Option<&'a str>,
 }
 
 impl Landed<'_> {
@@ -548,6 +555,7 @@ impl Landed<'_> {
             || self.target != snap.target.as_ref()
             || self.has_head != snap.has_head
             || self.amend != amend
+            || self.metadata_warning != snap.metadata_warning.as_deref()
             || self.load_error.is_some()
     }
 
@@ -586,6 +594,7 @@ pub struct GitChanges {
     loaded_once: bool,
     /// 上一次取变更失败的原文;`Some` 时列表区显示它而不是空态。
     load_error: Option<String>,
+    metadata_warning: Option<String>,
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
     collapsed_groups: HashSet<Area>,
@@ -622,6 +631,9 @@ pub struct GitChanges {
 
     // ── 提交区 ──
     commit_input: Entity<TextareaState>,
+    drafts: HashMap<String, (Entity<TextareaState>, Rc<Cell<u64>>)>,
+    input_key: Option<String>,
+    input_revision: Rc<Cell<u64>>,
     /// 占位符里写的分支(随列表一起取)
     target: Option<CommitTarget>,
     /// 当前占位符的文本 —— 只在变化时改,render 里改别的实体要克制
@@ -656,12 +668,16 @@ impl GitChanges {
                 .auto_grow(3, 8)
                 .placeholder(t("panels", "commitPlaceholder"))
         });
-        // 消息一改就重画:标题字数 / 软提示 / 提交按钮的可用态都跟着消息走
-        let subs = vec![cx.subscribe(&commit_input, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })];
+        let input_revision = Rc::new(Cell::new(0u64));
+        let revision = input_revision.clone();
+        let subs = vec![
+            cx.subscribe(&commit_input, move |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    revision.set(revision.get().wrapping_add(1));
+                    cx.notify();
+                }
+            }),
+        ];
         Self {
             store,
             context: None,
@@ -671,6 +687,7 @@ impl GitChanges {
             loading: false,
             loaded_once: false,
             load_error: None,
+            metadata_warning: None,
             collapsed_dirs: HashSet::new(),
             collapsed_groups: HashSet::new(),
             flight: Flight::default(),
@@ -687,6 +704,9 @@ impl GitChanges {
             list_scroll: VirtualListScrollHandle::new(),
             reveal_cursor: false,
             commit_input,
+            drafts: HashMap::new(),
+            input_key: None,
+            input_revision,
             target: None,
             placeholder: None,
             has_head: false,
@@ -750,7 +770,12 @@ impl GitChanges {
             return;
         }
         self.context = repo;
+        // Inputs are retained by backend key. Until render attaches the selected
+        // draft, no keyboard action may submit the previous repository's input.
+        self.placeholder = None;
         self.loading = false;
+        self.reselect = None;
+        self.debounce_until = None;
         self.loaded_once = false;
         self.busy_ops = 0;
         self.committing = false;
@@ -773,6 +798,7 @@ impl GitChanges {
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
+        self.metadata_warning = None;
         // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
         self.flush_diff_waiters(false, cx);
         // 上一个仓库在途的那趟作废:回来一律丢,新仓库这趟不必等它
@@ -823,10 +849,7 @@ impl GitChanges {
         };
         self.loading = !self.loaded_once;
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { load_snapshot(&repo) })
-                .await;
+            let result = mt_remote::run_git(move || load_snapshot(&repo)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 let rerun = match this.flight.finish(token) {
                     Landing::Stale => return,
@@ -860,10 +883,7 @@ impl GitChanges {
         };
         let known = self.amend_key;
         cx.spawn(async move |this, cx| {
-            let fetched = cx
-                .background_executor()
-                .spawn(async move { fetch_amend(&repo, known) })
-                .await;
+            let fetched = mt_remote::run_git(move || fetch_amend(&repo, known)).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 let rerun = match this.amend_flight.finish(token) {
                     Landing::Stale => return,
@@ -875,6 +895,11 @@ impl GitChanges {
                     && let Some((key, info)) = fetched
                 {
                     this.amend_key = key;
+                    if info.is_none() {
+                        this.commit_error =
+                            Some(t("gitChanges", "metadataUnavailable").to_string());
+                        cx.notify();
+                    }
                     if this.amend_info != info {
                         this.amend_info = info;
                         cx.notify();
@@ -918,6 +943,7 @@ impl GitChanges {
                     self.amend = false;
                 }
                 self.load_error = None;
+                self.metadata_warning = snap.metadata_warning;
                 changed
             }
             Err(err) => {
@@ -930,6 +956,7 @@ impl GitChanges {
                 self.conflicts.clear();
                 self.op_kind = None;
                 self.load_error = Some(error);
+                self.metadata_warning = None;
                 changed
             }
         };
@@ -957,6 +984,7 @@ impl GitChanges {
             has_head: self.has_head,
             amend: self.amend,
             load_error: self.load_error.as_deref(),
+            metadata_warning: self.metadata_warning.as_deref(),
         }
     }
 
@@ -1290,6 +1318,7 @@ impl GitChanges {
     ) {
         let selected = self.context.as_ref() == Some(repo);
         let context = repo.clone();
+        let store = self.store.clone();
         let this = cx.entity().downgrade();
         let started = git_ui::spawn_gated(
             repo,
@@ -1310,22 +1339,28 @@ impl GitChanges {
                     Ok((result, observed)) => (result, Some(observed)),
                     Err(err) => (Err(err), None),
                 };
+                match &result {
+                    Ok(()) => git_ui::toast_for_repo(
+                        &store,
+                        &context,
+                        t("gitChanges", "operationSucceeded").to_string(),
+                        Tone::Info,
+                        cx,
+                    ),
+                    Err(err) => git_ui::show_git_error(
+                        t("gitChanges", "operationFailedTitle"),
+                        git_ui::repo_text(&context, git_ui::error_text(err)),
+                        window,
+                        cx,
+                    ),
+                }
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     if this.context.as_ref() != Some(&context) {
                         return;
                     }
                     this.busy_ops = this.busy_ops.saturating_sub(1);
-                    match result {
-                        Ok(()) => this.reselect = reselect,
-                        Err(err) => {
-                            eprintln!("[git] 变更操作失败: {err:#}");
-                            git_ui::show_git_error(
-                                t("gitChanges", "operationFailedTitle"),
-                                git_ui::error_text(&err),
-                                window,
-                                cx,
-                            );
-                        }
+                    if result.is_ok() {
+                        this.reselect = reselect;
                     }
                     this.load(cx);
                     // 丢弃改了工作区、解决冲突改了状态:文件树的 git 标记跟着重算
@@ -1339,7 +1374,13 @@ impl GitChanges {
             cx,
         );
         if !started {
-            self.notify_gate_busy(cx);
+            git_ui::toast_for_repo(
+                &self.store,
+                repo,
+                git_ui::gate_busy_text().to_string(),
+                Tone::Attention,
+                cx,
+            );
             return;
         }
         if selected {
@@ -1356,11 +1397,6 @@ impl GitChanges {
             Tone::Attention,
             cx,
         );
-    }
-
-    /// 成功类的提示(已提交)。信息档 toast,点击只关闭。
-    fn notify_info(&self, message: String, cx: &mut Context<Self>) {
-        git_ui::toast(&self.store, message, Tone::Info, cx);
     }
 
     fn stage(
@@ -1439,7 +1475,9 @@ impl GitChanges {
                 move |window, cx| {
                     let paths = paths.clone();
                     this.update(cx, |this, cx| {
-                        let reselect = this.selection_anchor_pos(area, cx).map(|pos| (area, pos));
+                        let reselect = (this.context.as_ref() == Some(&repo))
+                            .then(|| this.selection_anchor_pos(area, cx).map(|pos| (area, pos)))
+                            .flatten();
                         this.run_op_on(
                             &repo,
                             move |repo| repo.discard_unstaged(&paths),
@@ -1462,6 +1500,9 @@ impl GitChanges {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.metadata_warning.is_some() || self.load_error.is_some() {
+            return;
+        }
         self.run_op(
             move |repo| {
                 for path in &paths {
@@ -1480,24 +1521,56 @@ impl GitChanges {
         if paths.is_empty() {
             return;
         }
+        if self.metadata_warning.is_some() || self.load_error.is_some() {
+            return;
+        }
         let Some(repo) = self.context.clone() else {
             return;
         };
         let context = repo.clone();
         cx.spawn_in(window, async move |this, cx| {
             let checked = paths.clone();
-            let marked: Vec<String> = cx
-                .background_executor()
-                .spawn(async move {
-                    checked
-                        .into_iter()
-                        .filter(|p| repo.has_conflict_markers(p).unwrap_or(false))
-                        .collect()
-                })
-                .await;
+            let marked = mt_remote::run_git(move || {
+                checked
+                    .into_iter()
+                    .filter_map(|path| match repo.has_conflict_markers(&path) {
+                        Ok(true) => Some(Ok(path)),
+                        Ok(false) => None,
+                        Err(err) => Some(Err(err)),
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
+                let marked = match marked {
+                    Ok(marked) => marked,
+                    Err(err) => {
+                        git_ui::show_git_error(
+                            t("gitChanges", "operationFailedTitle"),
+                            git_ui::repo_text(&context, git_ui::error_text(&err)),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                };
                 let resolve =
                     move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+                        // Metadata may have failed while checking markers or
+                        // while the confirmation was open. Never use that stale
+                        // permission to resolve conflicts on the current repo.
+                        if this.context.as_ref() == Some(&context)
+                            && (this.metadata_warning.is_some() || this.load_error.is_some())
+                        {
+                            git_ui::toast_for_repo(
+                                &this.store,
+                                &context,
+                                t("gitChanges", "metadataUnavailable").to_string(),
+                                Tone::Attention,
+                                cx,
+                            );
+                            return;
+                        }
                         this.run_op_on(
                             &context,
                             move |repo| {
@@ -1657,6 +1730,16 @@ impl GitChanges {
         if self.context.is_none() {
             return Some(t("gitCommit", "blockNoRepo").to_string());
         }
+        if self.input_key != self.context.as_ref().map(GitContext::key)
+            || !self.loaded_once
+            || self.load_error.is_some()
+            || self.metadata_warning.is_some()
+        {
+            return Some(t("gitChanges", "metadataUnavailable").to_string());
+        }
+        if self.amend && self.amend_info.is_none() {
+            return Some(t("gitChanges", "metadataUnavailable").to_string());
+        }
         if self.committing {
             return Some(t("gitCommit", "blockBusy").to_string());
         }
@@ -1702,6 +1785,7 @@ impl GitChanges {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_input(window, cx);
         if self.commit_blocker(stage_first, cx).is_some() {
             return;
         }
@@ -1717,6 +1801,10 @@ impl GitChanges {
             Vec::new()
         };
         let input = self.commit_input.clone();
+        let submitted_text = input.read(cx).value().to_string();
+        let revision = self.input_revision.clone();
+        let submitted_revision = revision.get();
+        let store = self.store.clone();
         let this = cx.entity().downgrade();
         // git_commit 走 git CLI(60s 超时兜底 GPG/pre-commit hook 挂起)——
         // 即便如此也不上主线程跑,hook 慢的仓库会把 UI 卡满整个超时窗口
@@ -1729,43 +1817,66 @@ impl GitChanges {
                 repo.git_commit_with(&message, amend)
             },
             move |result, window, cx| {
+                let succeeded = result.is_ok();
+                if let Ok(outcome) = &result {
+                    if draft_matches(
+                        submitted_revision,
+                        revision.get(),
+                        &submitted_text,
+                        input.read(cx).value().as_ref(),
+                    ) {
+                        input.update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                    git_ui::toast_for_repo(
+                        &store,
+                        &context,
+                        tr!(
+                            "gitCommit",
+                            "committedToast",
+                            hash = outcome.short_hash.clone(),
+                            title = outcome.summary.clone()
+                        ),
+                        Tone::Info,
+                        cx,
+                    );
+                } else if let Err(err) = &result {
+                    git_ui::show_git_error(
+                        t("gitChanges", "operationFailedTitle"),
+                        git_ui::repo_text(&context, git_ui::error_text(err)),
+                        window,
+                        cx,
+                    );
+                }
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    if this.context.as_ref() != Some(&context) {
-                        return;
-                    }
-                    this.committing = false;
-                    match result {
-                        Ok(outcome) => {
-                            input.update(cx, |state, cx| state.set_value("", window, cx));
-                            this.amend = false;
-                            this.amend_info = None;
-                            this.amend_prefill = None;
-                            this.amend_key = None;
-                            this.notify_info(
-                                tr!(
-                                    "gitCommit",
-                                    "committedToast",
-                                    hash = outcome.short_hash.clone(),
-                                    title = outcome.summary.clone()
-                                ),
-                                cx,
-                            );
-                            this.load(cx);
-                            git_watch::request_refresh(git_watch::Subscriber::FileTree);
-                            cx.emit(GitChangesEvent::Committed { open_push });
+                    let current = this.context.as_ref() == Some(&context);
+                    if current {
+                        this.committing = false;
+                        match result {
+                            Ok(_) => {
+                                this.amend = false;
+                                this.amend_info = None;
+                                this.amend_prefill = None;
+                                this.amend_key = None;
+                                this.commit_error = None;
+                                this.load(cx);
+                                git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                                cx.emit(GitChangesEvent::Committed {
+                                    open_push,
+                                    context: context.clone(),
+                                });
+                            }
+                            Err(err) => {
+                                this.commit_error = Some(tr!(
+                                    "gitChanges",
+                                    "commitFailed",
+                                    detail = git_ui::repo_text(&context, git_ui::error_text(&err))
+                                ))
+                            }
                         }
-                        Err(err) => {
-                            // 提交消息留在框里不清,改完(或修好 hook)直接再点;提交失败
-                            // 就不打开推送对话框
-                            eprintln!("[git] 提交失败: {err:#}");
-                            this.commit_error = Some(tr!(
-                                "gitChanges",
-                                "commitFailed",
-                                detail = format!("{err:#}")
-                            ));
-                        }
+                        cx.notify();
+                    } else if succeeded && open_push {
+                        cx.emit(GitChangesEvent::OpenPush(context));
                     }
-                    cx.notify();
                 });
             },
             window,
@@ -1802,6 +1913,7 @@ impl GitChanges {
     /// 历史区「撤销提交」后回填它的消息(IDEA 的 Undo Commit 口径)。用户已经在框里
     /// 写了东西就不覆盖;Amend 勾着时先收起 —— 被撤销的那条已经不是 HEAD 了。
     pub fn restore_message(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_input(window, cx);
         if self.amend {
             self.toggle_amend(window, cx);
         }
@@ -1837,15 +1949,19 @@ impl GitChanges {
             return;
         };
         let input = self.commit_input.clone();
+        let context = repo.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let (key, result) = cx
-                .background_executor()
-                .spawn(async move {
-                    // 顺带记下这份是在哪份引用签名下取的:之后随列表重取时没变就不再取
-                    (amend_key_of(&repo), repo.amend_info())
-                })
-                .await;
+            let (key, result) =
+                mt_remote::run_git(move || (amend_key_of(&repo), repo.amend_info())).await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
+                if let Err(err) = &result {
+                    git_ui::show_git_error(
+                        t("gitChanges", "operationFailedTitle"),
+                        git_ui::repo_text(&context, git_ui::error_text(err)),
+                        window,
+                        cx,
+                    );
+                }
                 if this.amend_request != req || !this.amend {
                     return;
                 }
@@ -1872,7 +1988,7 @@ impl GitChanges {
                         this.commit_error = Some(tr!(
                             "gitCommit",
                             "amendInfoFailed",
-                            detail = format!("{err:#}")
+                            detail = git_ui::repo_text(&context, git_ui::error_text(&err))
                         ));
                     }
                 }
@@ -1890,6 +2006,7 @@ impl GitChanges {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sync_input(window, cx);
         if self.history_loading || self.context.is_none() {
             return;
         }
@@ -1901,34 +2018,68 @@ impl GitChanges {
         let context = repo.clone();
         let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { repo.recent_commit_messages(HISTORY_LIMIT) })
-                .await;
+            let result =
+                mt_remote::run_git(move || repo.recent_commit_messages(HISTORY_LIMIT)).await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                if this.context.as_ref() != Some(&context) {
-                    return;
+                let current = this.context.as_ref() == Some(&context);
+                if current {
+                    this.history_loading = false;
+                    cx.notify();
                 }
-                this.history_loading = false;
-                cx.notify();
                 let list = match result {
                     Ok(list) => list,
                     Err(err) => {
                         eprintln!("[git] 读取提交消息历史失败: {err:#}");
                         git_ui::show_git_error(
                             t("gitChanges", "operationFailedTitle"),
-                            git_ui::error_text(&err),
+                            git_ui::repo_text(&context, git_ui::error_text(&err)),
                             window,
                             cx,
                         );
                         return;
                     }
                 };
+                if !current {
+                    return;
+                }
                 let entries = history_entries(list, &input, cx.entity(), context);
                 menu::show(position, entries, window, cx);
             });
         })
         .detach();
+    }
+
+    fn sync_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.context.as_ref().map(GitContext::key);
+        if self.input_key == key {
+            return;
+        }
+        if let Some(old) = self.input_key.take() {
+            self.drafts.insert(
+                old,
+                (self.commit_input.clone(), self.input_revision.clone()),
+            );
+        }
+        let (input, revision) = key
+            .as_ref()
+            .and_then(|key| self.drafts.remove(key))
+            .unwrap_or_else(|| {
+                let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(3, 8));
+                let revision = Rc::new(Cell::new(0u64));
+                let changed = revision.clone();
+                self._subs
+                    .push(cx.subscribe(&input, move |_, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            changed.set(changed.get().wrapping_add(1));
+                            cx.notify();
+                        }
+                    }));
+                (input, revision)
+            });
+        self.commit_input = input;
+        self.input_revision = revision;
+        self.input_key = key;
+        self.placeholder = None;
     }
 
     /// 占位符跟着目标分支走(「提交到 main(Ctrl+Enter)」)。只在文本变了时才改 ——
@@ -1959,6 +2110,11 @@ impl GitChanges {
     }
 }
 
+/// Both the text and its edit generation must match: changing away and back to
+/// the submitted text still creates a new draft that a pending commit cannot erase.
+fn draft_matches(submitted: u64, current: u64, text: &str, now: &str) -> bool {
+    submitted == current && text == now
+}
 /// 「已推送」判定的缓存键:引用那一半签名(HEAD + 全部引用)。只看 HEAD 不够 —— 推送 /
 /// fetch 挪了远程跟踪分支,同一个 HEAD 的判定也会变。读不到为 `None`(当作变了)。
 fn amend_key_of(repo: &GitContext) -> Option<u64> {
@@ -1974,25 +2130,79 @@ fn amend_stale(known: Option<u64>, now: Option<u64>) -> bool {
 /// `Some((新键, 信息))` —— 信息读失败 / 空仓库为 `None`,与原先随列表取时同一口径。
 fn fetch_amend(repo: &GitContext, known: Option<u64>) -> Option<(Option<u64>, Option<AmendInfo>)> {
     let key = amend_key_of(repo);
-    amend_stale(known, key).then(|| (key, repo.amend_info().ok().flatten()))
+    amend_stale(known, key).then(|| {
+        let info = repo.amend_info().unwrap_or_else(|err| {
+            eprintln!(
+                "[git] {}: amend metadata failed: {err:#}",
+                git_ui::repo_label(repo)
+            );
+            None
+        });
+        (key, info)
+    })
 }
 
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
 /// amend 的「已推送」判定不在这里(见 [`GitChanges::refresh_amend`])。
 fn load_snapshot(repo: &GitContext) -> anyhow::Result<Snapshot> {
-    let changes = repo.get_changes_status()?;
+    let changes = repo
+        .get_changes_status()
+        .map_err(|err| err.context(git_ui::repo_label(repo)))?;
+    let mut snapshot = snapshot_with_metadata(
+        changes,
+        || repo.list_conflicts(),
+        || repo.repo_operation_state().map(|state| state.kind),
+        || repo.commit_target(),
+        || repo.head_exists(),
+    )?;
+    snapshot.metadata_warning = snapshot
+        .metadata_warning
+        .map(|warning| git_ui::repo_text(repo, warning));
+    Ok(snapshot)
+}
+
+/// Status is authoritative; auxiliary failures retain the file groups but make
+/// unsafe actions unavailable until a complete metadata read succeeds.
+fn snapshot_with_metadata(
+    changes: Vec<ChangeFileStatus>,
+    conflicts: impl FnOnce() -> anyhow::Result<Vec<ConflictInfo>>,
+    operation: impl FnOnce() -> anyhow::Result<Option<RepoOpKind>>,
+    target: impl FnOnce() -> anyhow::Result<CommitTarget>,
+    head: impl FnOnce() -> bool,
+) -> anyhow::Result<Snapshot> {
+    let mut warnings = Vec::new();
     let conflicts = if changes.iter().any(is_conflicted) {
-        repo.list_conflicts()?
+        match conflicts() {
+            Ok(conflicts) => conflicts,
+            Err(err) => {
+                warnings.push(git_ui::error_text(&err));
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
-    let op_kind = repo.repo_operation_state()?.kind;
+    let op_kind = match operation() {
+        Ok(kind) => kind,
+        Err(err) => {
+            warnings.push(git_ui::error_text(&err));
+            None
+        }
+    };
+    let target = match target() {
+        Ok(target) => Some(target),
+        Err(err) => {
+            warnings.push(git_ui::error_text(&err));
+            None
+        }
+    };
     Ok(Snapshot {
         changes,
         conflicts,
         op_kind,
-        target: Some(repo.commit_target()?),
-        has_head: repo.head_exists(),
+        target,
+        has_head: head(),
+        metadata_warning: (!warnings.is_empty()).then(|| warnings.join("\n\n")),
     })
 }
 
@@ -2112,6 +2322,7 @@ const ROW_GROUP: &str = "git-file-row";
 
 impl Render for GitChanges {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_input(window, cx);
         self.sync_placeholder(window, cx);
         // 写操作闸每帧只问一次:行内 / 组操作按钮与提交按钮都按它画
         let gated = self.gated();
@@ -2128,6 +2339,12 @@ impl Render for GitChanges {
             .key_context(CHANGES_CONTEXT)
             .on_action(cx.listener(Self::on_commit_action))
             .on_action(cx.listener(Self::on_commit_push_action))
+            .when_some(self.metadata_warning.as_ref(), |el, warning| {
+                el.child(git_ui::notice_line(
+                    tr!("gitChanges", "metadataWarning", detail = warning),
+                    ui::color_attention(),
+                ))
+            })
             .child(list)
             .child(commit_area)
     }
@@ -2608,6 +2825,8 @@ impl GitChanges {
         let mut entries = Vec::new();
         match area {
             Area::Conflicts => {
+                let enabled =
+                    enabled && self.metadata_warning.is_none() && self.load_error.is_none();
                 let info = (!many)
                     .then(|| self.changes.get(index))
                     .flatten()
@@ -3078,6 +3297,125 @@ impl GitChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auxiliary_metadata_failure_keeps_consumer_file_groups() {
+        let files = vec![
+            change("staged", Some(GitStatus::Modified), None),
+            change(
+                "conflict",
+                Some(GitStatus::Conflicted),
+                Some(GitStatus::Conflicted),
+            ),
+        ];
+        let snap = snapshot_with_metadata(
+            files,
+            || anyhow::bail!("conflict metadata unavailable"),
+            || anyhow::bail!("operation metadata unavailable"),
+            || anyhow::bail!("commit metadata unavailable"),
+            || true,
+        )
+        .unwrap();
+        assert_eq!(group(&snap.changes, Area::Staged), ["staged"]);
+        assert_eq!(group(&snap.changes, Area::Conflicts), ["conflict"]);
+        let warning = snap.metadata_warning.as_deref().unwrap();
+        for detail in ["conflict metadata", "operation metadata", "commit metadata"] {
+            assert!(warning.contains(detail));
+        }
+        assert!(load_snapshot(&GitContext::broken("status unavailable")).is_err());
+    }
+
+    #[test]
+    fn pending_commit_cannot_clear_a_revised_draft() {
+        assert!(draft_matches(3, 3, "submitted", "submitted"));
+        assert!(!draft_matches(3, 4, "submitted", "new draft"));
+        assert!(!draft_matches(3, 5, "submitted", "submitted"));
+        assert!(!draft_matches(3, 3, "submitted", "another repository"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_hook_commit_keeps_captured_backend_and_failure_feedback() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-pending-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let a = root.join("a");
+        let b = root.join("b");
+        for path in [&a, &b] {
+            std::fs::create_dir_all(path).unwrap();
+            for args in [
+                vec!["init", "-q"],
+                vec!["config", "user.name", "Test"],
+                vec!["config", "user.email", "t@e"],
+            ] {
+                assert!(
+                    std::process::Command::new("git")
+                        .args(args)
+                        .current_dir(path)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            }
+            std::fs::write(path.join("file"), "staged\n").unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["add", "file"])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let context = GitContext::local(a.to_string_lossy().into_owned());
+        let other = GitContext::local(b.to_string_lossy().into_owned());
+        let hook = a.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\ntouch .git/hook-pending\nwhile [ ! -f .git/hook-release ]; do sleep 0.02; done\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let captured = context.clone();
+        let pending = std::thread::spawn(move || captured.git_commit_with("submitted A", false));
+        let until = Instant::now() + Duration::from_secs(10);
+        while !a.join(".git/hook-pending").exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            a.join(".git/hook-pending").exists(),
+            "hook did not enter pending state"
+        );
+        // These are exactly the generation/text checks used by the UI completion.
+        let mut drafts =
+            HashMap::from([(context.key(), ("new A", 2)), (other.key(), ("draft B", 1))]);
+        std::fs::write(a.join(".git/hook-release"), "").unwrap();
+        let outcome = pending.join().unwrap().unwrap();
+        let draft = drafts.get_mut(&context.key()).unwrap();
+        if draft_matches(1, draft.1, "submitted A", draft.0) {
+            draft.0 = "";
+        }
+        assert_eq!(drafts[&context.key()].0, "new A");
+        assert_eq!(drafts[&other.key()].0, "draft B");
+        assert!(context.head_exists());
+        assert!(!other.head_exists(), "completion must not operate on B");
+        assert!(git_ui::repo_text(&context, &outcome.summary).contains(a.to_str().unwrap()));
+        std::fs::write(a.join("file"), "failure\n").unwrap();
+        context.git_stage(&["file".to_string()]).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho hook-rejected-original-A >&2\nexit 1\n",
+        )
+        .unwrap();
+        let failure = context.git_commit_with("failed draft", false).unwrap_err();
+        let feedback = git_ui::repo_text(&context, git_ui::error_text(&failure));
+        assert!(feedback.contains("hook-rejected-original-A"));
+        assert!(feedback.contains(a.to_str().unwrap()));
+        assert!(!feedback.contains(b.to_str().unwrap()));
+        assert_eq!(drafts[&context.key()].0, "new A", "failure retains draft");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// 变基中「采用 ours / theirs」换成写清方向的文案(ours = 变基目标,theirs = 你的
     /// 改动);合并 / 拣选 / 还原 / 没有进行中的操作时维持「我方 / 对方」。
@@ -3666,6 +4004,7 @@ mod tests {
             op_kind: None,
             target: Some(CommitTarget::Branch("main".into())),
             has_head: true,
+            metadata_warning: None,
         }
     }
 
@@ -3678,6 +4017,7 @@ mod tests {
             has_head: snap.has_head,
             amend: false,
             load_error: None,
+            metadata_warning: snap.metadata_warning.as_deref(),
         }
     }
 

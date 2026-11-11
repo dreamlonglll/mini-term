@@ -25,7 +25,6 @@ thread_local! {
     static HELD: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
-
 /// 占着闸的凭证。drop 即放闸。
 #[must_use = "守卫一 drop 闸就放开了:要一直攥到写操作结束"]
 pub struct WriteGuard {

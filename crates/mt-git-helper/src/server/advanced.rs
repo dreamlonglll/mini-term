@@ -116,20 +116,29 @@ impl Server {
                 self.project_directory(&requested)?;
                 // Validate every entry before inspecting any target. Prune callers
                 // may query vanished registered worktrees, so canonicalize parents.
+                let root = mt_project::fs::strip_verbatim_prefix(self.root.clone());
                 for path in &paths {
-                    let path = Path::new(path);
+                    let path = mt_project::fs::strip_verbatim_prefix(PathBuf::from(path));
                     ensure!(
                         path.is_absolute()
                             && !path.components().any(|c| matches!(c, Component::ParentDir)),
                         "invalid directory path"
                     );
                     ensure!(
-                        path == self.root
-                            || path.starts_with(&self.root)
-                            || self.known_worktrees.contains(path),
+                        path == root
+                            || path.starts_with(&root)
+                            || self.known_worktrees.iter().any(|known| {
+                                mt_project::fs::strip_verbatim_prefix(known.clone()) == path
+                            }),
                         "directory is outside the discovered allowlist"
                     );
-                    if path.exists() {
+                    let metadata = match std::fs::metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error).context("checking directory metadata"),
+                    };
+                    ensure!(metadata.is_dir(), "directory target is not a directory");
+                    {
                         let canonical = path.canonicalize()?;
                         ensure!(
                             canonical.starts_with(&self.root)
@@ -146,12 +155,18 @@ impl Server {
                         );
                     }
                 }
-                data(
-                    paths
-                        .into_iter()
-                        .filter(|path| Path::new(path).is_dir())
-                        .collect::<Vec<_>>(),
-                )
+                let mut existing = Vec::new();
+                for path in paths {
+                    match std::fs::metadata(&path) {
+                        Ok(metadata) => {
+                            ensure!(metadata.is_dir(), "directory target is not a directory");
+                            existing.push(path);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error).context("checking directory metadata"),
+                    }
+                }
+                data(existing)
             }
             query => {
                 let repo = self.repository(&requested)?;

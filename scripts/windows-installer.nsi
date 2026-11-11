@@ -279,8 +279,16 @@ Section "$(SEC_MAIN_NAME)" SecMain
   File "${SOURCE_DIR}\miniterm-hook.exe"
   File "${SOURCE_DIR}\mt-ssh-cli.exe"
   File "${SOURCE_DIR}\mt-ssh-mcp.exe"
-  SetOutPath "$INSTDIR\remote-git-helpers"
-  File /r "${SOURCE_DIR}\remote-git-helpers\*"
+  ; Explicit required files: a partial helper directory must never compile into
+  ; a publishable installer. release.yml validates all four binary formats too.
+  SetOutPath "$INSTDIR\remote-git-helpers\linux-x86_64"
+  File "${SOURCE_DIR}\remote-git-helpers\linux-x86_64\mt-git-helper"
+  SetOutPath "$INSTDIR\remote-git-helpers\linux-aarch64"
+  File "${SOURCE_DIR}\remote-git-helpers\linux-aarch64\mt-git-helper"
+  SetOutPath "$INSTDIR\remote-git-helpers\macos-aarch64"
+  File "${SOURCE_DIR}\remote-git-helpers\macos-aarch64\mt-git-helper"
+  SetOutPath "$INSTDIR\remote-git-helpers\macos-x86_64"
+  File "${SOURCE_DIR}\remote-git-helpers\macos-x86_64\mt-git-helper"
   SetOutPath "$INSTDIR\portable-conpty"
   File /r "${SOURCE_DIR}\portable-conpty\*"
   SetOutPath "$INSTDIR"

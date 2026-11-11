@@ -143,6 +143,8 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
         run: node .github/scripts/release_matrix.mjs
 
+  # Linux assets are static musl helpers, built natively without a GPUI target.
+  # Asset directory names remain the remote deployment target-map keys.
   remote-git-helpers:
     strategy:
       fail-fast: false
@@ -150,26 +152,67 @@ jobs:
         include:
           - platform: ubuntu-22.04
             target: linux-x86_64
+            rust-target: x86_64-unknown-linux-musl
           - platform: ubuntu-24.04-arm
             target: linux-aarch64
+            rust-target: aarch64-unknown-linux-musl
           - platform: macos-latest
             target: macos-aarch64
+            rust-target: aarch64-apple-darwin
           - platform: macos-15-intel
             target: macos-x86_64
+            rust-target: x86_64-apple-darwin
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Setup Rust
-        run: rustup toolchain install --no-self-update
-      - name: Build remote Git helper
-        run: cargo build --locked --release -p mt-git-helper
-      - name: Stage target asset
+      - name: Install native musl build prerequisites (Linux)
+        if: runner.os == 'Linux'
         run: |
-          mkdir -p "helper-assets/${{ matrix.target }}"
-          cp target/release/mt-git-helper "helper-assets/${{ matrix.target }}/mt-git-helper"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools build-essential binutils perl pkg-config
+      - name: Setup Rust
+        shell: bash
+        env:
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$HELPER_RUST_TARGET"
+      - name: Build remote Git helper
+        shell: bash
+        env:
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            bash scripts/build-git-helper-musl.sh "$HELPER_RUST_TARGET"
+          else
+            cargo build --locked --release --target "$HELPER_RUST_TARGET" --package mt-git-helper
+          fi
+      - name: Validate binary and stage target asset
+        shell: bash
+        env:
+          HELPER_TARGET: ${{ matrix.target }}
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          node scripts/stage-git-helpers.mjs --target "$HELPER_TARGET" \
+            --binary "target/$HELPER_RUST_TARGET/release/mt-git-helper" --output helper-assets
+      - name: Framed discover/status with system Git on glibc 2.31 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          HELPER_TARGET: ${{ matrix.target }}
+        # Dated Ubuntu 20.04 image, not a floating latest/20.04 tag. Docker chooses
+        # the native x86_64/aarch64 image; Python also asserts glibc < 2.34.
+        run: |
+          sudo docker run --rm -v "$PWD:/workspace:ro" -w /workspace \
+            -e HELPER_TARGET="$HELPER_TARGET" ubuntu:focal-20250404 bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends git python3 ca-certificates
+              python3 scripts/smoke-git-helper-old-glibc.py \
+                "/workspace/helper-assets/$HELPER_TARGET/mt-git-helper"
+            '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: remote-git-helper-${{ matrix.target }}
@@ -180,7 +223,7 @@ jobs:
     needs: [create-release, plan, remote-git-helpers]
     # 手动补建时 create-release 是 skipped,默认隐含的 success() 会把本作业一起
     # 跳掉;显式写状态函数(!cancelled())才能覆盖那个默认,再自己放行 skipped
-    if: needs.plan.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    if: needs.plan.result == 'success' && needs.remote-git-helpers.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -260,6 +303,12 @@ jobs:
 
       - name: Build GPUI app
         run: cargo build --release --package mt-app
+
+      # Required for every desktop matrix row, including Windows. The validator
+      # reads binary headers itself (no host file/readelf dependency), rejects
+      # dynamic Linux helpers and fails if any of the four assets is missing.
+      - name: Require all remote Git helper resources before packaging
+        run: node scripts/stage-git-helpers.mjs --verify-all --output target/release/remote-git-helpers
 
       - name: Build NSIS installer (Windows)
         if: matrix.platform == 'windows-latest'

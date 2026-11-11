@@ -123,14 +123,12 @@ pub(super) fn open_commit_menu(
     let repo_key = repo.key();
     let hash = commit.hash.clone();
     cx.spawn_in(window, async move |this, cx| {
-        let (relation, remotes) = cx
-            .background_executor()
-            .spawn(async move {
-                let relation = repo.commit_relation(&hash).map_err(|e| error_text(&e));
-                let remotes = repo.list_remote_names().unwrap_or_default();
-                (relation, remotes)
-            })
-            .await;
+        let (relation, remotes) = mt_remote::run_git(move || {
+            let relation = repo.commit_relation(&hash).map_err(|e| error_text(&e));
+            let remotes = repo.list_remote_names().unwrap_or_default();
+            (relation, remotes)
+        })
+        .await;
         let _ = this.update_in(cx, |this: &mut GitHistoryContent, window, cx| {
             // 算的这会儿换了仓库:菜单作废
             if this.context.as_ref().map(GitContext::key).as_deref() != Some(repo_key.as_str()) {
@@ -489,7 +487,7 @@ impl GitHistoryContent {
         action: &'static str,
         repo: GitContext,
         op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
-        on_ok: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        on_ok: impl FnOnce(&mut Self, T, &GitContext, bool, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -502,26 +500,31 @@ impl GitHistoryContent {
         }
         let this = cx.entity().downgrade();
         let repo_key = repo.key();
+        let context = repo.clone();
         let started = git_ui::spawn_gated(
             &repo,
             op,
             move |result, window, cx| {
+                if let Err(err) = &result {
+                    git_ui::show_git_error(
+                        t("gitLog", action),
+                        git_ui::repo_text(&context, error_text(err)),
+                        window,
+                        cx,
+                    );
+                }
                 let _ = this.update(cx, |this: &mut Self, cx| {
-                    if this.context.as_ref().map(GitContext::key).as_deref()
-                        != Some(repo_key.as_str())
-                    {
-                        if let Err(err) = result {
-                            this.show_failure(action, &err, window, cx);
-                        }
-                        return;
+                    let current = this.context.as_ref().map(GitContext::key).as_deref()
+                        == Some(repo_key.as_str());
+                    if current {
+                        this.busy = None;
                     }
-                    this.busy = None;
-                    match result {
-                        Ok(value) => on_ok(this, value, window, cx),
-                        Err(err) => this.show_failure(action, &err, window, cx),
+                    if let Ok(value) = result {
+                        on_ok(this, value, &context, current, window, cx);
                     }
-                    // 失败也可能动过仓库(拣选停在半路之类):一律重载
-                    this.finish_mutation(cx);
+                    if current {
+                        this.finish_mutation(cx);
+                    }
                 });
             },
             window,
@@ -530,7 +533,7 @@ impl GitHistoryContent {
         if !started {
             git_ui::toast(
                 &self.store,
-                git_ui::gate_busy_text().to_string(),
+                git_ui::repo_text(&repo, git_ui::gate_busy_text()),
                 git_ui::Tone::Attention,
                 cx,
             );
@@ -552,7 +555,7 @@ impl GitHistoryContent {
         form: Entity<DialogForm>,
         action: &'static str,
         op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
-        on_ok: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        on_ok: impl FnOnce(&mut Self, T, &GitContext, bool, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -573,6 +576,7 @@ impl GitHistoryContent {
         }
         let this = cx.entity().downgrade();
         let form_done = form.clone();
+        let context = repo.clone();
         let started = git_ui::spawn_gated(
             &repo,
             op,
@@ -587,13 +591,11 @@ impl GitHistoryContent {
                         Ok(value) => {
                             form_done.update(cx, |f, _| f.op.finish());
                             close_guarded(dialog, window, cx);
-                            if current {
-                                on_ok(this, value, window, cx);
-                            }
+                            on_ok(this, value, &context, current, window, cx);
                         }
                         Err(err) => {
                             eprintln!("[git] {action} 失败: {err:#}");
-                            let message = error_text(&err);
+                            let message = git_ui::repo_text(&context, error_text(&err));
                             form_done.update(cx, |f, cx| {
                                 f.op.fail(message.clone());
                                 cx.notify();
@@ -667,8 +669,14 @@ impl GitHistoryContent {
                         "action.checkout",
                         repo,
                         move |repo| repo.checkout_commit(&op_hash),
-                        move |this, (), _window, cx| {
-                            this.toast_info(tr!("gitLog", "toast.checkedOut", hash = short), cx);
+                        move |this, (), repo, _current, _window, cx| {
+                            git_ui::toast_for_repo(
+                                &this.store,
+                                repo,
+                                tr!("gitLog", "toast.checkedOut", hash = short),
+                                git_ui::Tone::Info,
+                                cx,
+                            );
                         },
                         window,
                         cx,
@@ -735,19 +743,28 @@ impl GitHistoryContent {
                         repo.cherry_pick(&op_hash)
                     }
                 },
-                move |this, outcome, window, cx| match outcome {
+                move |this, outcome, repo, current, window, cx| match outcome {
                     PickOutcome::Done { new_head } => {
                         let key = if revert {
                             "toast.reverted"
                         } else {
                             "toast.picked"
                         };
-                        this.toast_info(tr!("gitLog", key, hash = short), cx);
-                        this.select_after(new_head, window, cx);
+                        git_ui::toast_for_repo(
+                            &this.store,
+                            repo,
+                            tr!("gitLog", key, hash = short),
+                            git_ui::Tone::Info,
+                            cx,
+                        );
+                        if current {
+                            this.select_after(new_head, window, cx);
+                        }
                     }
                     PickOutcome::Conflicts => {
-                        git_ui::toast(
+                        git_ui::toast_for_repo(
                             &this.store,
+                            repo,
                             tr!(
                                 "gitLog",
                                 "toast.conflicts",
@@ -822,10 +839,18 @@ impl GitHistoryContent {
                 "action.undo",
                 repo.clone(),
                 move |repo| repo.undo_last_commit(&op_hash),
-                move |this, parent, window, cx| {
-                    this.toast_info(tr!("gitLog", "toast.undone", hash = short), cx);
-                    this.select_after(parent, window, cx);
-                    cx.emit(GitHistoryEvent::CommitUndone { message });
+                move |this, parent, repo, current, window, cx| {
+                    git_ui::toast_for_repo(
+                        &this.store,
+                        repo,
+                        tr!("gitLog", "toast.undone", hash = short),
+                        git_ui::Tone::Info,
+                        cx,
+                    );
+                    if current {
+                        this.select_after(parent, window, cx);
+                        cx.emit(GitHistoryEvent::CommitUndone { message });
+                    }
                 },
                 window,
                 cx,
@@ -880,8 +905,14 @@ impl GitHistoryContent {
                         "action.deleteTag",
                         repo,
                         move |repo| repo.delete_tag(&op_name),
-                        move |this, (), _window, cx| {
-                            this.toast_info(tr!("gitLog", "toast.tagDeleted", name = name), cx);
+                        move |this, (), repo, _current, _window, cx| {
+                            git_ui::toast_for_repo(
+                                &this.store,
+                                repo,
+                                tr!("gitLog", "toast.tagDeleted", name = name),
+                                git_ui::Tone::Info,
+                                cx,
+                            );
                         },
                         window,
                         cx,
@@ -906,9 +937,12 @@ impl GitHistoryContent {
             "action.pushTag",
             repo,
             move |repo| repo.push_tag(&op_remote, &op_tag),
-            move |this, (), _window, cx| {
-                this.toast_info(
+            move |this, (), repo, _current, _window, cx| {
+                git_ui::toast_for_repo(
+                    &this.store,
+                    repo,
                     tr!("gitLog", "toast.tagPushed", name = tag, remote = remote),
+                    git_ui::Tone::Info,
                     cx,
                 );
             },
@@ -1022,13 +1056,19 @@ impl GitHistoryContent {
                                 form,
                                 "action.createBranch",
                                 move |repo| repo.create_branch_at(&op_name, &op_hash, checkout),
-                                move |this, (), _window, cx| {
+                                move |this, (), repo, _current, _window, cx| {
                                     let key = if checkout {
                                         "toast.branchCreatedCheckedOut"
                                     } else {
                                         "toast.branchCreated"
                                     };
-                                    this.toast_info(tr!("gitLog", key, name = name), cx);
+                                    git_ui::toast_for_repo(
+                                        &this.store,
+                                        repo,
+                                        tr!("gitLog", key, name = name),
+                                        git_ui::Tone::Info,
+                                        cx,
+                                    );
                                 },
                                 window,
                                 cx,
@@ -1142,9 +1182,12 @@ impl GitHistoryContent {
                                     let message = Some(message.as_str()).filter(|m| !m.is_empty());
                                     repo.create_tag(&op_name, &op_hash, message)
                                 },
-                                move |this, (), _window, cx| {
-                                    this.toast_info(
+                                move |this, (), repo, _current, _window, cx| {
+                                    git_ui::toast_for_repo(
+                                        &this.store,
+                                        repo,
                                         tr!("gitLog", "toast.tagCreated", name = name),
+                                        git_ui::Tone::Info,
                                         cx,
                                     );
                                 },
@@ -1255,13 +1298,18 @@ impl GitHistoryContent {
                                 form,
                                 "action.reword",
                                 move |repo| repo.reword_head(&op_hash, &message),
-                                move |this, new_head: String, window, cx| {
+                                move |this, new_head: String, repo, current, window, cx| {
                                     let short: String = new_head.chars().take(7).collect();
-                                    this.toast_info(
+                                    git_ui::toast_for_repo(
+                                        &this.store,
+                                        repo,
                                         tr!("gitLog", "toast.reworded", hash = short),
+                                        git_ui::Tone::Info,
                                         cx,
                                     );
-                                    this.select_after(new_head, window, cx);
+                                    if current {
+                                        this.select_after(new_head, window, cx);
+                                    }
                                 },
                                 window,
                                 cx,
@@ -1306,10 +1354,7 @@ impl GitHistoryContent {
         {
             let (repo, target, form) = (repo, hash.clone(), form.clone());
             cx.spawn(async move |_, cx| {
-                let drops = cx
-                    .background_executor()
-                    .spawn(async move { repo.reset_drops_pushed(&target) })
-                    .await;
+                let drops = mt_remote::run_git(move || repo.reset_drops_pushed(&target)).await;
                 let drops = drops.unwrap_or_else(|err| {
                     eprintln!("[git] 重置前的推送判定失败(不显示警告): {err:#}");
                     false
@@ -1409,8 +1454,10 @@ impl GitHistoryContent {
                                     form,
                                     "action.reset",
                                     move |repo| repo.reset_to(&op_hash, mode),
-                                    move |this, (), window, cx| {
-                                        this.toast_info(
+                                    move |this, (), repo, current, window, cx| {
+                                        git_ui::toast_for_repo(
+                                            &this.store,
+                                            repo,
                                             tr!(
                                                 "gitLog",
                                                 "toast.reset",
@@ -1418,9 +1465,12 @@ impl GitHistoryContent {
                                                 hash = short,
                                                 mode = mode.name()
                                             ),
+                                            git_ui::Tone::Info,
                                             cx,
                                         );
-                                        this.select_after(hash, window, cx);
+                                        if current {
+                                            this.select_after(hash, window, cx);
+                                        }
                                     },
                                     window,
                                     cx,

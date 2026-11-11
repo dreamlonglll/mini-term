@@ -27,8 +27,7 @@ use super::{FileTree, Row};
 /// 非目录、且这个文件在 git 状态表里有条目,前置一条分隔线接在最末。
 /// 「移动到 ▸」(`MoveTo`)原版没有,GPUI 版补的,紧跟「重命名」——
 /// 两者都是「换路径」的操作,本地/远程、文件/目录一律有。
-/// 「Git 历史」(`GitHistory`,IDEA 的 Show History)也是 GPUI 版补的,与「查看变更」
-/// 同组:本地、非目录、文件落在 git 仓库里就给 —— **不要求有改动**。
+/// 「Git 历史」与「查看变更」同组，只给后台确认属于仓库的文件；不要求有改动。
 /// 「在此目录搜索内容」(`SearchInDirectory`)同样是 GPUI 版补的,只给本地目录:
 /// SSH 项目本来就不支持全局搜索(`search_modal::open` 那道拦截)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +57,7 @@ pub(super) fn file_menu_actions(
     has_git_status: bool,
     in_git_repo: bool,
     remote: bool,
+    git_enabled: bool,
 ) -> Vec<Option<FileMenuAction>> {
     use FileMenuAction::*;
     let mut actions = Vec::new();
@@ -88,7 +88,7 @@ pub(super) fn file_menu_actions(
     }
     // 目录没有单文件 diff 可看 —— 原版这条判定是 `entryGitStatus && !entry.isDir`。
     // 「Git 历史」与它同组:只要文件在仓库里就给(没改动也有历史)
-    if !is_dir && (has_git_status || in_git_repo) {
+    if git_enabled && !is_dir && (has_git_status || in_git_repo) {
         actions.push(None);
         if has_git_status {
             actions.push(Some(ViewDiff));
@@ -108,14 +108,20 @@ pub(super) fn file_menu(
     context: FileOperationContext,
     connection: Option<mt_config::SshConnection>,
     can_paste: bool,
+    git_capability: (bool, bool),
 ) -> Vec<MenuEntry> {
+    let (git_enabled, in_git_repo) = git_capability;
     let root = context.root.clone();
     let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
     let mut entries = Vec::new();
-    // 只做 stat、不开仓库(菜单是右键当场在 UI 线程上建的),远程 / 目录不查
-    let in_git_repo =
-        !row.is_dir && (remote || mt_project::git::is_inside_git_repo(&root, &row.path));
-    for action in file_menu_actions(row.is_dir, row.git.is_some(), in_git_repo, remote) {
+    // 仓库归属由树的后台任务发现；右键构建菜单绝不发 SSH 请求。
+    for action in file_menu_actions(
+        row.is_dir,
+        row.git.is_some(),
+        in_git_repo,
+        remote,
+        git_enabled,
+    ) {
         let Some(action) = action else {
             entries.push(menu::separator());
             continue;
@@ -405,19 +411,15 @@ pub(super) fn file_menu(
                 // 传的就是**项目根**,文件那一侧是状态表里的相对路径 —— 照抄。
                 // HEAD → 工作区:文件树里看的是「相对上次提交改了什么」,暂存与否都算
                 let store = store.clone();
-                let repo = match connection.as_ref() {
-                    Some(connection) => mt_remote::GitContext::remote(
-                        connection.clone(),
-                        root.to_string_lossy().into_owned(),
-                    ),
-                    None if remote => {
-                        mt_remote::GitContext::broken("SSH connection was removed".to_string())
-                    }
-                    None => mt_remote::GitContext::local(root.to_string_lossy().into_owned()),
-                };
+                let project_id = context.project_id.clone();
                 let rel = row.rel.clone();
                 let label = row.git.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
                 menu::item(t("fileTree", "menu.viewDiff"), move |window, cx| {
+                    if remote && !crate::git_backend::remote_git_enabled(store.read(cx)) {
+                        crate::git_backend::request_enable(store.clone(), window, cx);
+                        return;
+                    }
+                    let repo = crate::git_backend::project_context(store.read(cx), &project_id);
                     // 单元素序列、不支持按块操作(HEAD → 工作区两侧都不是能写回的那一侧)
                     crate::git_diff::open_file_diff(
                         store.clone(),
@@ -440,17 +442,13 @@ pub(super) fn file_menu(
                 // 项目根 + 相对路径;所属仓库(可能在项目根之上 / 嵌套子仓库)由后端就近发现
                 let store = store.clone();
                 let rel = row.rel.clone();
-                let project = match connection.as_ref() {
-                    Some(connection) => mt_remote::GitContext::remote(
-                        connection.clone(),
-                        root.to_string_lossy().into_owned(),
-                    ),
-                    None if remote => {
-                        mt_remote::GitContext::broken("SSH connection was removed".to_string())
-                    }
-                    None => mt_remote::GitContext::local(root.to_string_lossy().into_owned()),
-                };
+                let project_id = context.project_id.clone();
                 menu::item(t("gitLog", "fileHistory.menu"), move |window, cx| {
+                    if remote && !crate::git_backend::remote_git_enabled(store.read(cx)) {
+                        crate::git_backend::request_enable(store.clone(), window, cx);
+                        return;
+                    }
+                    let project = crate::git_backend::project_context(store.read(cx), &project_id);
                     crate::git_file_history::open(
                         store.clone(),
                         project.clone(),
