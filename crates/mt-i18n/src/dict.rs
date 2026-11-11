@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1644;
+pub const ZH_ENTRY_COUNT: usize = 1652;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1644;
+pub const EN_ENTRY_COUNT: usize = 1652;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -199,6 +199,7 @@ static COMMAND_LIBRARY_EN: &[(&str, &str)] = &[
 #[rustfmt::skip]
 static COMMIT_DIFF_ZH: &[(&str, &str)] = &[
     ("binaryFile", "二进制文件，不支持 diff 预览"),
+    ("combinedTabTitle", "合并 {count} 个提交"),
     ("combinedTitle", "{count} 个提交的合并变更"),
     ("fileCount", "{count} 个文件变更"),
     ("inline", "内联"),
@@ -207,11 +208,13 @@ static COMMIT_DIFF_ZH: &[(&str, &str)] = &[
     ("noChanges", "该提交无文件变更"),
     ("prevChange", "上一处改动"),
     ("sideBySide", "并排"),
+    ("tabTitle", "提交 {hash} {subject}"),
     ("tooLarge", "文件过大（>1MB），不支持 diff 预览"),
 ];
 #[rustfmt::skip]
 static COMMIT_DIFF_EN: &[(&str, &str)] = &[
     ("binaryFile", "Binary file, diff preview not supported"),
+    ("combinedTabTitle", "{count} commits combined"),
     ("combinedTitle", "Combined changes of {count} commits"),
     ("fileCount", "{count} files changed"),
     ("inline", "Inline"),
@@ -220,6 +223,7 @@ static COMMIT_DIFF_EN: &[(&str, &str)] = &[
     ("noChanges", "No file changes in this commit"),
     ("prevChange", "Previous change"),
     ("sideBySide", "Side by side"),
+    ("tabTitle", "Commit {hash} {subject}"),
     ("tooLarge", "File too large (>1MB), diff preview not supported"),
 ];
 
@@ -231,6 +235,10 @@ static DIFF_MODAL_ZH: &[(&str, &str)] = &[
     ("nextChange", "下一处改动"),
     ("prevChange", "上一处改动"),
     ("sideBySide", "并排"),
+    ("tabStaged", "已暂存"),
+    ("tabTitle", "{name}（{side}）"),
+    ("tabUnstaged", "未暂存"),
+    ("tabWorking", "工作区"),
     ("tooLarge", "文件过大（>1MB），不支持 diff 预览"),
 ];
 #[rustfmt::skip]
@@ -241,6 +249,10 @@ static DIFF_MODAL_EN: &[(&str, &str)] = &[
     ("nextChange", "Next change"),
     ("prevChange", "Previous change"),
     ("sideBySide", "Side by side"),
+    ("tabStaged", "Staged"),
+    ("tabTitle", "{name} ({side})"),
+    ("tabUnstaged", "Unstaged"),
+    ("tabWorking", "Working tree"),
     ("tooLarge", "File too large (>1MB), diff preview not supported"),
 ];
 
@@ -505,6 +517,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("compareIdentical", "两侧内容相同"),
     ("compareSideDisk", "磁盘上的版本"),
     ("compareSideUnsaved", "未保存的修改"),
+    ("compareTabTitle", "{name} ↔ 磁盘"),
     ("compareTitle", "对比：{name}"),
     ("compareUnavailable", "磁盘上的文件已不是可对比的文本（二进制或过大）"),
     ("encodingTip", "文件编码：{encoding}，保存时按此编码写回"),
@@ -567,6 +580,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("compareIdentical", "Both sides are identical"),
     ("compareSideDisk", "Version on disk"),
     ("compareSideUnsaved", "Unsaved changes"),
+    ("compareTabTitle", "{name} ↔ Disk"),
     ("compareTitle", "Compare: {name}"),
     ("compareUnavailable", "The file on disk is no longer comparable text (binary or too large)"),
     ("encodingTip", "File encoding: {encoding}; saving writes it back in this encoding"),
@@ -1463,6 +1477,7 @@ static GIT_LOG_ZH: &[(&str, &str)] = &[
     ("fileHistory.noRename", "不跟随重命名"),
     ("fileHistory.scanning", "已扫描 {count} 个提交…"),
     ("fileHistory.selectHint", "选择左侧的提交，查看这个文件的改动"),
+    ("fileHistory.tabTitle", "{name} 的历史"),
     ("fileHistory.title", "{name} 的 Git 历史"),
     ("fileHistory.viewInCommit", "在完整提交 diff 中查看"),
     ("filter.clear", "清除"),
@@ -1630,6 +1645,7 @@ static GIT_LOG_EN: &[(&str, &str)] = &[
     ("fileHistory.noRename", "Renames not followed"),
     ("fileHistory.scanning", "{count} commits scanned…"),
     ("fileHistory.selectHint", "Select a commit on the left to see its changes to this file"),
+    ("fileHistory.tabTitle", "History of {name}"),
     ("fileHistory.title", "Git History of {name}"),
     ("fileHistory.viewInCommit", "View in full commit diff"),
     ("filter.clear", "Clear"),

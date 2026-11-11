@@ -1004,7 +1004,7 @@ pub fn status_color(status: Option<&GitStatus>) -> Hsla {
     text_fg(color)
 }
 
-/// 单字符状态 → 颜色(diff 弹窗标题栏的状态胶囊只拿得到字母)。
+/// 单字符状态 → 颜色(单文件 diff 页签标题栏的状态胶囊只拿得到字母)。
 pub fn status_color_for_label(label: &str) -> Hsla {
     let status = match label.trim() {
         "M" => Some(GitStatus::Modified),

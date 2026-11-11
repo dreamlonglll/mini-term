@@ -570,9 +570,9 @@ pub fn bind_keys(cx: &mut App) {
         list,
     ));
 
-    // 单文件 diff 弹窗:F7 / Shift+F7 跳改动,Alt+← / Alt+→ 换文件(IDEA 的键位)。
-    // 谓词是弹窗正文自己的 context;弹窗画在 Workspace 之外,与全局的 Alt+方向键
-    // (切 pane 焦点)不在一条派发链上,互不抢。
+    // 单文件 diff 页签(磁盘对比页签同一个 context):F7 / Shift+F7 跳改动,Alt+← / Alt+→
+    // 换文件(IDEA 的键位)。谓词是页签正文自己的 context,比 `Workspace` 深,焦点在页签里时
+    // 先试这一条;全局的 Alt+方向键(切 pane 焦点)只在终端页生效,页签页上本来就不动。
     bindings.push(KeyBinding::new(
         "f7",
         git_diff::GitDiffNextChange,
@@ -593,8 +593,8 @@ pub fn bind_keys(cx: &mut App) {
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
     ));
-    // Esc 先清行勾选(按行暂存);没有勾选时处理器 `propagate`,落到 Dialog 自己那条
-    // Esc → 关弹窗。谓词比 Dialog 深,先试这一条(与提交历史过滤框的 Esc 同一手法)
+    // Esc 先清行勾选(按行暂存);没有勾选时处理器 `propagate`,按键照常往外走(页签里
+    // 没有弹窗可关,焦点也不动)
     bindings.push(KeyBinding::new(
         "escape",
         git_diff::GitDiffClearPicks,
@@ -612,8 +612,8 @@ pub fn bind_keys(cx: &mut App) {
         git_conflict::GitConflictPrevSegment,
         Some(git_conflict::SEGMENTS_CONTEXT),
     ));
-    // 提交 diff 弹窗:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换提交同一
-    // 手感)。谓词是弹窗焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
+    // 提交 diff / 合并变更页签:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换
+    // 提交同一手感)。谓词是页签焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
     bindings.push(KeyBinding::new(
         "down",
         git_diff::GitCommitDiffNextFile,
@@ -692,7 +692,7 @@ pub fn bind_keys(cx: &mut App) {
             Some(reword_input.as_str()),
         ));
     }
-    // 单文件历史弹窗:↑/↓ 换提交
+    // 单文件历史页签:↑/↓ 换提交
     bindings.push(KeyBinding::new(
         "up",
         git_file_history::FileHistoryPrev,
@@ -703,8 +703,8 @@ pub fn bind_keys(cx: &mut App) {
         git_file_history::FileHistoryNext,
         Some(git_file_history::FILE_HISTORY_CONTEXT),
     ));
-    // 三个 diff 弹窗(单文件 / 提交 / 单文件历史)的正文选中复制:Ctrl/Cmd+C 复制选区、
-    // Ctrl/Cmd+A 全选当前栏。谓词是各弹窗焦点容器自己的 context;没有可复制 / 可选的
+    // 三种 diff 页签(单文件 / 提交 / 单文件历史)的正文选中复制:Ctrl/Cmd+C 复制选区、
+    // Ctrl/Cmd+A 全选当前栏。谓词是各页签焦点容器自己的 context;没有可复制 / 可选的
     // 内容时处理器 `propagate`,按键照常往外走。F7 / Alt+←→ / ↑↓ / Esc 不受影响
     for context in [
         git_diff::FILE_DIFF_CONTEXT,

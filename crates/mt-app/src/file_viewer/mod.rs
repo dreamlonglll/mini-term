@@ -194,6 +194,25 @@ impl DocumentSource {
     }
 }
 
+/// 「对比」右侧(编辑器里未保存的修改)连同读磁盘那侧要的定位,见
+/// [`FileViewer::disk_compare_input`]。
+pub struct DiskCompareInput {
+    pub project_root: PathBuf,
+    pub path: PathBuf,
+    /// 编辑器里的内容:`\n` 行尾、Tab 按落盘形态还原
+    pub mine: String,
+}
+
+/// 「对比」左侧:读磁盘上的版本(阻塞,丢后台调),折成 `\n` 行尾。盘上已经不是可对比的
+/// 文本(二进制 / 过大)或读失败,给一句能直接显示的原因。
+pub fn read_compare_disk(project_root: &Path, path: &Path) -> Result<String, String> {
+    match mt_project::fs::read_file_content(project_root, path) {
+        Ok(disk) if !disk.is_binary && !disk.too_large => Ok(normalize_to_lf(&disk.content)),
+        Ok(_) => Err(t("fileViewer", "compareUnavailable").to_string()),
+        Err(err) => Err(format!("{err:#}")),
+    }
+}
+
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
 
 /// 该定位到哪(1-based),`None` = 不动。
@@ -1585,7 +1604,7 @@ impl FileViewer {
                                     }))
                                 }),
                         )
-                        // 对比:磁盘上的版本 ↔ 编辑器里未保存的修改(只读 diff 弹窗)
+                        // 对比:磁盘上的版本 ↔ 编辑器里未保存的修改(只读的磁盘对比页签)
                         .child(
                             div()
                                 .id("file-viewer-compare-disk")
@@ -1614,39 +1633,55 @@ impl FileViewer {
             })
     }
 
+    /// 「对比」右侧的取数口径:本地来源返回 (项目根, 文件路径, 编辑器里的内容);远程来源
+    /// `None`。内容折成 `\n` 行尾、Tab 按落盘形态还原 —— 与 [`read_compare_disk`] 读的磁盘
+    /// 那侧同一把尺子,只比内容不比行尾。提示条的「对比」与磁盘对比页签的刷新共用。
+    pub fn disk_compare_input(&self, cx: &App) -> Option<DiskCompareInput> {
+        let DocumentSource::Local { project_root, .. } = &self.source else {
+            return None;
+        };
+        let draft = self.draft(cx);
+        Some(DiskCompareInput {
+            project_root: project_root.clone(),
+            path: self.current_path.clone(),
+            mine: normalize_to_lf(&self.doc.to_disk_form(&draft)),
+        })
+    }
+
     /// 外部改动提示条的「对比」:后台重读磁盘,左侧磁盘上的版本、右侧编辑器里未保存的
-    /// 内容,开一个只读 diff 弹窗。两侧都折成 `\n` 行尾、Tab 按落盘形态还原,只比内容
-    /// 不比行尾。读盘失败(文件被删 / 变成二进制)就地挂在保存错误那一条上。
+    /// 内容,开一个只读的磁盘对比页签(同一个文件已经开着就换上这一次的两侧内容)。读盘
+    /// 失败(文件被删 / 变成二进制)就地挂在保存错误那一条上。
     fn compare_with_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let DocumentSource::Local { project_root, .. } = self.source.clone() else {
+        let Some(input) = self.disk_compare_input(cx) else {
             return;
         };
         self.compare_error = None;
-        let draft = self.draft(cx);
-        let mine = normalize_to_lf(&self.doc.to_disk_form(&draft));
-        let path = self.current_path.clone();
         let name = self.file_name();
+        let source = self.source.clone();
+        let viewer = cx.entity().downgrade();
         cx.spawn_in(window, async move |this, cx| {
-            let probe = (project_root, path.clone());
+            let (root, path) = (input.project_root.clone(), input.path.clone());
             let outcome = cx
                 .background_executor()
-                .spawn(async move { mt_project::fs::read_file_content(&probe.0, &probe.1) })
+                .spawn(async move { read_compare_disk(&root, &path) })
                 .await;
             let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
-                if view.current_path != path {
+                if view.current_path != input.path {
                     return;
                 }
                 match outcome {
-                    Ok(disk) if !disk.is_binary && !disk.too_large => {
-                        let disk = normalize_to_lf(&disk.content);
-                        crate::git_diff::open_text_diff(&name, disk, mine, window, cx);
-                    }
-                    Ok(_) => {
-                        view.compare_error = Some(t("fileViewer", "compareUnavailable").into());
-                        cx.notify();
+                    Ok(disk) => {
+                        let spec = crate::git_diff::TextDiffSpec {
+                            name,
+                            source,
+                            viewer,
+                            disk,
+                            mine: input.mine,
+                        };
+                        crate::git_diff::open_text_diff(spec, window, cx);
                     }
                     Err(err) => {
-                        view.compare_error = Some(format!("{err:#}"));
+                        view.compare_error = Some(err);
                         cx.notify();
                     }
                 }

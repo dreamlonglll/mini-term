@@ -213,8 +213,12 @@ use mt_i18n::{
 /// 按行丢弃的确认框、清除勾选按钮与提示（`gitCommit.{stageLines,unstageLines,discardLines,
 /// discardLinesTitle,discardLinesConfirm,clearPicks,clearPicksTip}`）；diff 正文折叠上下文的
 /// 分隔行与三颗展开按钮（`gitCommit.{foldedLines,expandDown,expandUp,expandAll}`）。
+/// 1644 → 1652：diff 从弹窗改成工作区页签 —— 五种 diff 页签的标题：单文件 diff 的
+/// 「文件名（侧别）」与三种侧别（`diffModal.{tabTitle,tabStaged,tabUnstaged,tabWorking}`）、
+/// 提交 / 合并变更（`commitDiff.{tabTitle,combinedTabTitle}`）、单文件历史
+/// （`gitLog.fileHistory.tabTitle`）、磁盘对比（`fileViewer.compareTabTitle`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1644;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1652;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

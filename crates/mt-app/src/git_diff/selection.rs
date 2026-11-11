@@ -973,7 +973,7 @@ impl DiffState {
     }
 
     /// 清空选区。换文件、重取 diff(含块操作后原地刷新)、切换并排 / 行内时调;
-    /// 关弹窗时整个状态随弹窗释放。
+    /// 关页签(或贮藏弹窗)时整个状态随之释放。
     pub(super) fn clear_selection(&mut self) {
         self.end_drag();
         self.select.selection = None;
@@ -1133,7 +1133,7 @@ fn show_menu(
 }
 
 /// 拖选期间的窗口级鼠标监听:`on_mouse_move` / `on_mouse_up` 只在悬停时触发,指针拖出
-/// 列表、拖出弹窗就收不到了。这里走 `window.on_mouse_event`(每帧注册、随帧清掉),
+/// 列表、拖出页签区就收不到了。这里走 `window.on_mouse_event`(每帧注册、随帧清掉),
 /// 捕获相处理,不怕途经的元素停止冒泡。不在拖选时只读一下状态就返回。
 pub(super) fn drag_listener(state: &Entity<DiffState>) -> impl IntoElement {
     let state = state.clone();
@@ -1184,8 +1184,8 @@ fn select_all(state: &Entity<DiffState>, pane: Option<Pane>, cx: &mut App) -> bo
     })
 }
 
-/// 弹窗焦点容器上挂 Ctrl/Cmd+C、Ctrl/Cmd+A(键位绑在 `hotkeys.rs`,三个 diff 弹窗各自
-/// 的 key context 上)。没有可复制 / 可选的内容时 `propagate`,按键照常往外走。
+/// 宿主(diff 页签 / 贮藏弹窗)的焦点容器上挂 Ctrl/Cmd+C、Ctrl/Cmd+A(键位绑在 `hotkeys.rs`,
+/// 各宿主各自的 key context 上)。没有可复制 / 可选的内容时 `propagate`,按键照常往外走。
 pub(super) fn text_actions(el: Div, state: &Entity<DiffState>) -> Div {
     let (copy, all) = (state.clone(), state.clone());
     el.on_action(move |_: &GitDiffCopy, _window, cx| {

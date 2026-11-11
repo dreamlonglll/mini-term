@@ -1,12 +1,17 @@
-//! 两个 diff 弹窗:
+//! diff 的内容与渲染。原版是两个弹窗(`src/components/DiffModal.tsx` /
+//! `CommitDiffModal.tsx`),GPUI 版改成**工作区页签区里的 diff 页签**(宿主、身份与复用、
+//! 焦点、防陈旧见 [`tab`] 模块注释,三种正文的外框见 [`pages`]):
 //!
-//! - [`open_file_diff`] —— 工作区 / 暂存区的**单文件** diff(`src/components/DiffModal.tsx`)
-//! - [`open_commit_diff_loading`] —— 某次 commit 的**多文件** diff(`src/components/CommitDiffModal.tsx`);
-//!   历史区多选时同一个弹窗也装「一组提交的合并变更」([`open_combined_diff_loading`],
-//!   左栏是合并后的文件,右栏是两个版本之间的 diff)
+//! - [`open_file_diff`] —— 工作区 / 暂存区的**单文件** diff
+//! - [`open_commit_diff_loading`] —— 某次 commit 的**多文件** diff;历史区多选时同一种页签
+//!   也装「一组提交的合并变更」([`open_combined_diff_loading`],左栏是合并后的文件,右栏是
+//!   两个版本之间的 diff)
+//! - [`open_text_diff`] —— 文件页「磁盘上的版本 ↔ 未保存的修改」
+//! - 单文件历史(`git_file_history`)的右栏同样是这里的正文
 //!
 //! 两个视图(`InlineView` / `SideBySideView`)在原版是 `DiffModal.tsx` 导出、
 //! 由 `CommitDiffModal` 复用的;这里同样只有一份([`render_inline`] / [`render_side_by_side`])。
+//! 贮藏弹窗与单文件历史嵌的「某个提交里的一个文件」见 [`CommitFileDiffPane`]。
 //!
 //! # 与原版的偏差(全部是有意的)
 //!
@@ -16,8 +21,9 @@
 //!    天然适配 uniform_list。这是**改进**而非偏差(规格 §6.6 明写)。
 //! 2. **`staged` 依赖漏项顺修**。原版 effect 的依赖数组是 `[open, projectPath, status.path]`
 //!    (`DiffModal.tsx:179`),**漏了 `staged`** —— 同一路径先点 staged 行再点 unstaged 行
-//!    不会重新拉 diff。这里每次打开都是一个新弹窗、按 `(repo, path, staged)` 三元组
-//!    取一次数,那个 bug 自然不存在(规格 §11 第 17 条建议顺修并注明)。
+//!    不会重新拉 diff。这里页签的身份就带着侧别(见 [`tab`]),同一文件的已暂存 / 未暂存
+//!    是两个页签,各按 `(repo, path, side)` 取数,那个 bug 自然不存在(规格 §11 第 17 条
+//!    建议顺修并注明)。
 //! 3. **长行可横向滚动**。原版内容区是 `overflow-auto` + `whitespace-pre`,长行拖着看;
 //!    `uniform_list` 默认只竖滚、且文字会回绕后被固定行高裁掉 —— 靠
 //!    [`ListHorizontalSizingBehavior::Unconstrained`] + 「按最宽那一行量宽」
@@ -37,17 +43,18 @@
 //!    一个字符也是整行涂红/绿。
 //! 7. **正文用等宽字体**(与文件查看器同一条 mono 链)。原版是 `font-mono`,
 //!    GPUI 侧字族不自己挂就会继承界面字体,列对不齐。
-//! 8. **两个弹窗的外框与用量统计面板同尺寸**(见 [`modal_size`])。原版是
-//!    `90vw×80vh` / `92vw×85vh` 两个值。
+//! 8. **不是弹窗,是工作区页签**(见 [`tab`]):正文铺满页签区,能与 Git 抽屉并排看
+//!    (停在 diff 页签上时抽屉挤窄页签区而不是盖在上面)。原版是 `90vw×80vh` /
+//!    `92vw×85vh` 两个弹窗;[`modal_size`] 留给仍是弹窗的贮藏 / 逐段解决冲突。
 //! 9. **单文件 diff 能按块暂存 / 取消暂存 / 丢弃**(hunk 头上的按钮,见 [`HunkUi`]):
 //!    后端 `mt_project::git::{stage_hunk, unstage_hunk, discard_hunk}` 拿 diff 两侧全文
-//!    与该块的精确行号做文本拼接,执行前重读两侧防陈旧。操作后弹窗**原地**重取 diff、
+//!    与该块的精确行号做文本拼接,执行前重读两侧防陈旧。操作后页签**原地**重取 diff、
 //!    视图模式不变、滚到原位置上的下一块;同时回调 `on_changed` 让更改列表重载。
 //!    从更改列表打开的走 `reload_files`:列表重载落地后文件序列跟着换,当前文件离开了
 //!    分组(取消暂存 / 丢弃了最后一块)就换到原位置上的下一个(见 [`resync_index`])。
-//! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮),
-//!     F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。提交 diff 弹窗左栏 ↑ / ↓
-//!     换文件(按左栏看得见的行序走,见 [`step_file`])。
+//! 10. **能在打开它的那个分组里前后换文件**(Alt+← / Alt+→ 或标题栏按钮,在当前页签里换,
+//!     页签的标题与身份跟着变),F7 / Shift+F7 跳下一处 / 上一处改动。原版两样都没有。
+//!     提交 diff 左栏 ↑ / ↓ 换文件(按左栏看得见的行序走,见 [`step_file`])。
 //! 11. **正文能拖选复制**(对标 IDEA):拖选 / 双击选词 / 三击选行 / Shift+单击延伸,
 //!     拖出视口自动滚动;Ctrl/Cmd+C 复制、Ctrl/Cmd+A 全选、右键「复制 / 全选」。并排视图
 //!     只选起拖的那一栏,行内视图不带行号与 `+`/`-`,tab 按原文复制。原版的行是 DOM,
@@ -70,8 +77,10 @@
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
 
 mod fold;
+mod pages;
 mod picks;
 mod selection;
+mod tab;
 mod word_diff;
 
 use std::borrow::Cow;
@@ -81,8 +90,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, ElementId, Entity,
-    FocusHandle, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement,
-    Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement, Pixels, Point,
+    Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
     UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
@@ -102,11 +111,17 @@ use crate::git_ui::{
     icon_button, mono, pill, text_button,
 };
 use crate::i18n::{t, tr};
-use crate::prompt::{Confirm, kind, open_guarded};
+use crate::prompt::Confirm;
 use crate::store::AppStore;
 use crate::tab_expansion::{TAB_WIDTH, expand_line};
 use crate::ui;
 use selection::{Pane, RowText, SelectState};
+pub(crate) use tab::open_file_history;
+pub use tab::{
+    DiffKey, DiffTab, DiffTabEvent, TextDiffSpec, notify_repo_changed, open_combined_diff,
+    open_combined_diff_loading, open_commit_diff_loading, open_file_diff, open_file_diff_with,
+    open_text_diff,
+};
 
 gpui::actions!(
     mini_term,
@@ -123,19 +138,20 @@ gpui::actions!(
         GitCommitDiffNextFile,
         /// 提交 diff:左栏的上一个文件(↑)
         GitCommitDiffPrevFile,
-        /// 三个 diff 弹窗:复制正文选区(Ctrl/Cmd+C)
+        /// diff 页签(与贮藏弹窗里嵌的 diff):复制正文选区(Ctrl/Cmd+C)
         GitDiffCopy,
-        /// 三个 diff 弹窗:全选当前栏(Ctrl/Cmd+A)
+        /// diff 页签(与贮藏弹窗里嵌的 diff):全选当前栏(Ctrl/Cmd+A)
         GitDiffSelectAll,
-        /// 单文件 diff:清空行勾选(Esc;没有勾选时放行,Esc 照旧关弹窗)
+        /// 单文件 diff:清空行勾选(Esc;没有勾选时放行 —— 页签里没有弹窗可关,按键照常往外走)
         GitDiffClearPicks,
     ]
 );
 
-/// 单文件 diff 弹窗的 key context(键位绑在 `hotkeys.rs` 的表外段)。
+/// 单文件 diff 页签(与磁盘对比页签)的 key context(键位绑在 `hotkeys.rs` 的表外段)。
 pub const FILE_DIFF_CONTEXT: &str = "GitFileDiff";
 
-/// 提交 diff 弹窗的 key context(左栏换文件的 ↑ / ↓、正文的 Ctrl/Cmd+C / A 挂在它上面)。
+/// 提交 diff / 合并变更页签的 key context(左栏换文件的 ↑ / ↓、正文的 Ctrl/Cmd+C / A
+/// 挂在它上面)。
 pub const COMMIT_DIFF_CONTEXT: &str = "GitCommitDiff";
 
 /// 视图模式。**组件态,不落盘**;默认 side-by-side(`DiffModal.tsx:158`)。
@@ -1232,24 +1248,24 @@ fn hunk_check(
 
 // ─── 弹窗外框尺寸 ─────────────────────────────────────────────
 //
-// 两个 diff 弹窗与**用量统计面板**同一口径(`main.rs` 的 `usage_layer`:
+// diff 本身已经改成页签(见 [`tab`]),这一口径留给仍是弹窗、里面也嵌着 diff 正文的
+// 贮藏列表与逐段解决冲突:与**用量统计面板**同一口径(`main.rs` 的 `usage_layer`:
 // 左右各留 10vw、顶 10vh、底 5vh → 80vw × 85vh)。`Dialog` 的默认顶距正好是
-// `视口高/10`(`dialog.rs:367`),所以只要宽取 80vw、正文高取 85vh,两个弹窗
+// `视口高/10`(`dialog.rs:367`),所以只要宽取 80vw、正文高取 85vh,弹窗
 // 的外框就与用量面板完全重合。
 //
 // ⚠️ 配套必须 `p_0()`:`Dialog` 默认 `pt/pb 24 + 左右 24`,不清零的话面板实际
-// 高是 85vh+48px(底边越过 95vh),工具栏也不会像原版那样贴着面板边。
+// 高是 85vh+48px(底边越过 95vh),工具栏也不会贴着面板边。
 //
-// 原版这两个弹窗各是 `w-[90vw] h-[80vh]` / `w-[92vw] h-[85vh]`
-// (`DiffModal.tsx:186`、`CommitDiffModal.tsx:87`),此处按「与统计弹窗一致」
-// 的要求统一收口,是**有意偏差**。
+// 原版两个 diff 弹窗各是 `w-[90vw] h-[80vh]` / `w-[92vw] h-[85vh]`
+// (`DiffModal.tsx:186`、`CommitDiffModal.tsx:87`)。
 const MODAL_W_RATIO: f32 = 0.8;
 const MODAL_H_RATIO: f32 = 0.85;
 
-/// 三个 diff 弹窗(单文件 / 提交 / 单文件历史)右栏顶部工具栏的统一高度:
-/// 标题区、跳转组、视图段控件、关闭按钮都在这一条上垂直居中。
+/// diff 页签(单文件 / 提交 / 单文件历史 / 磁盘对比)与贮藏、冲突弹窗里右栏顶部工具栏的
+/// 统一高度:标题区、跳转组、视图段控件、刷新(页签)或关闭(弹窗)按钮都在这一条上垂直居中。
 pub(crate) const TOOLBAR_H: f32 = 48.0;
-/// 提交 diff / 单文件历史左栏的头部与页脚的左右内边距。
+/// 提交 diff / 单文件历史 / 贮藏左栏的头部与页脚的左右内边距。
 pub(crate) const SIDE_PAD: f32 = 12.0;
 
 /// 返回 `(面板宽, 正文高)`。builder 每帧重跑,拖窗口改大小时跟着变。
@@ -1278,9 +1294,33 @@ fn empty_cell(line_height: f32, gutter: f32) -> AnyElement {
         .into_any_element()
 }
 
-// ─── 弹窗内的状态实体 ─────────────────────────────────────────
+/// 两份 diff 结果是不是同一份:两侧全文、二进制 / 过大标记、编码都一样。块是由两侧全文
+/// 算出来的(同样的输入算出同样的块),不必再逐块比。
+fn same_diff(a: &GitDiffResult, b: &GitDiffResult) -> bool {
+    a.old_content == b.old_content
+        && a.new_content == b.new_content
+        && a.is_binary == b.is_binary
+        && a.too_large == b.too_large
+        && a.encoding == b.encoding
+}
 
-/// 两个弹窗共用的 diff 内容状态。
+/// 静默重取([`Fetch::Refresh`])拿回来的 `result` 与屏幕上这份(`current` 是正文、`error`
+/// 是就地的错误原文)是不是一回事:同一份 diff,或者同一句错误。
+fn refresh_unchanged(
+    current: Option<&GitDiffResult>,
+    error: Option<&str>,
+    result: &anyhow::Result<GitDiffResult>,
+) -> bool {
+    match (result, current, error) {
+        (Ok(new), Some(old), None) => same_diff(old, new),
+        (Err(err), None, Some(old)) => format!("{err:#}") == old,
+        _ => false,
+    }
+}
+
+// ─── diff 内容的状态实体 ───────────────────────────────────────
+
+/// 各种 diff 页签(与贮藏弹窗里嵌的 diff)共用的 diff 内容状态。
 struct DiffState {
     loading: bool,
     error: Option<String>,
@@ -1291,6 +1331,10 @@ struct DiffState {
     font_size: f32,
     /// 请求令牌:换文件时旧响应不许覆盖。
     request: u64,
+    /// 静默重取([`Fetch::Refresh`])在途:页签切回来、仓库变了、点刷新会凑到一起,在途时
+    /// 不再叠一趟。被换文件 / 块操作后的重取顶掉、或块操作开跑时被作废
+    /// ([`DiffState::cancel_refresh`]),随之清掉
+    refreshing: bool,
     split: Entity<ResizableState>,
     /// 三个列表各自的滚动句柄:跳转要用,并排两栏还要靠它对齐。
     inline_scroll: UniformListScrollHandle,
@@ -1306,8 +1350,8 @@ struct DiffState {
     select: SelectState,
     /// 展开过的上下文行(见 [`fold`])。换一份 diff 时清空;原地重取时按行号 + 内容重新认
     revealed: fold::Revealed,
-    /// 允不允许按行勾选:单文件 diff 且该文件支持块操作时由 [`load_file`] 打开,其余弹窗恒为
-    /// `false`。真正画不画勾选框还要看这份 diff 本身(见 [`DiffState::can_pick`])
+    /// 允不允许按行勾选:单文件 diff 且该文件支持块操作时由 [`load_file`] 打开,其余 diff
+    /// 恒为 `false`。真正画不画勾选框还要看这份 diff 本身(见 [`DiffState::can_pick`])
     pickable: bool,
     /// 勾上的增删行([`Flat::lines`] 的下标,只落在块里,见 [`picks`])
     picks: BTreeSet<usize>,
@@ -1326,6 +1370,7 @@ impl DiffState {
             view: ViewMode::SideBySide,
             font_size,
             request: 0,
+            refreshing: false,
             split: cx.new(|_| ResizableState::default()),
             inline_scroll: UniformListScrollHandle::new(),
             left_scroll: UniformListScrollHandle::new(),
@@ -1383,6 +1428,69 @@ impl DiffState {
         }
     }
 
+    /// 发起一趟取数:按 [`Fetch`] 复位(`Fresh` 清空并回到顶部),令牌 +1。`Refresh` 撞上
+    /// 已经在途的一趟(加载中 / 另一趟静默重取)就不发,返回 `false`。
+    fn begin_fetch(&mut self, fetch: Fetch) -> bool {
+        if fetch == Fetch::Refresh {
+            if self.loading || self.refreshing {
+                return false;
+            }
+            self.refreshing = true;
+        } else {
+            // 换文件 / 块操作后的重取顶掉在途的静默重取(令牌一换,它回来也落不了地)
+            self.refreshing = false;
+        }
+        if fetch == Fetch::Fresh {
+            self.loading = true;
+            self.error = None;
+            self.result = None;
+            self.flat = Flat::default();
+            // 换文件 = 换一份 diff:跳转计数与滚动位置(连同两栏同步基准)都要归零,否则新文件
+            // 一进来就显示「3/12」,而两栏还停在上一份的偏移上;选区与展开过的上下文同理
+            self.jump = None;
+            self.clear_selection();
+            self.forget_lines();
+            self.reset_scroll();
+        }
+        self.request += 1;
+        true
+    }
+
+    /// 一趟取数回来了:令牌对不上(被更新的一趟顶掉)就丢;`Refresh` 拿回来的与屏幕上这份
+    /// 一样也不动 —— 选区、跳转计数、滚动位置都留着(页签切回来时绝大多数是这种)。真落了地
+    /// 返回 `true`。
+    fn land_fetch(
+        &mut self,
+        req: u64,
+        fetch: Fetch,
+        result: anyhow::Result<GitDiffResult>,
+    ) -> bool {
+        if self.request != req {
+            return false;
+        }
+        self.refreshing = false;
+        if fetch == Fetch::Refresh
+            && refresh_unchanged(self.result.as_ref(), self.error.as_deref(), &result)
+        {
+            return false;
+        }
+        self.apply(result);
+        true
+    }
+
+    /// 作废在途的静默重取(块操作开跑时调,见 [`run_hunk_op`]):它要是在操作期间落地,行模型
+    /// 就换了一套,操作成功后 [`DiffState::mark_applied`] 再按点按钮时的块号去扣勾选就错位了。
+    ///
+    /// 只在确有一趟 `Refresh` 在途时动令牌:`refreshing` 为真说明最新的一趟就是它(`Fresh` /
+    /// `AfterOp` 发起时会把它清掉),令牌 +1 只作废它一个。操作后的那趟 `AfterOp` 在这之后
+    /// 才发起、拿的是更新的令牌,不受影响。
+    fn cancel_refresh(&mut self) {
+        if self.refreshing {
+            self.refreshing = false;
+            self.request += 1;
+        }
+    }
+
     /// 这份 diff 能不能按行勾选:打开方允许(见 [`DiffState::pickable`]),且不是二进制 /
     /// 过大 / 非 UTF-8(块操作按 UTF-8 文本拼接,别的编码一律只能整文件操作)。
     fn can_pick(&self) -> bool {
@@ -1427,7 +1535,7 @@ impl DiffState {
         }
     }
 
-    /// 清空勾选(Esc / 工具栏「清除勾选」)。本来就没有勾选返回 `false`(Esc 据此放行去关弹窗)。
+    /// 清空勾选(Esc / 工具栏「清除勾选」)。本来就没有勾选返回 `false`(Esc 据此放行)。
     fn clear_picks(&mut self) -> bool {
         let had = !self.picks.is_empty();
         self.picks.clear();
@@ -1523,8 +1631,8 @@ impl DiffState {
 
     /// 并排两栏的同步,纵向横向都同步。
     ///
-    /// `Dialog` 的 builder 每帧重跑(滚轮改了偏移就 `notify`),这里比对两个句柄与
-    /// 上一帧同步后的值:谁动了谁当主,另一边跟上。
+    /// 宿主(diff 页签 / 贮藏弹窗)每帧重画正文(滚轮改了偏移就 `notify`),这里比对两个
+    /// 句柄与上一帧同步后的值:谁动了谁当主,另一边跟上。
     ///
     /// - 纵向:两栏行数与行高完全一致 ⇒ 可滚范围一致,照抄;
     /// - 横向:两栏的内容宽各按自己最宽那一行量,可滚范围不一样。跟随的一边**先按自己的
@@ -1613,8 +1721,8 @@ impl DiffState {
 }
 
 impl Render for DiffState {
-    /// `DiffState` 只当状态盒子用(Dialog 的 builder 是 `Fn`,每帧重跑,
-    /// 编辑中的状态不能藏在闭包捕获里)。它自己不画东西。
+    /// `DiffState` 只当状态盒子用:正文由宿主(diff 页签 / 贮藏弹窗的 builder)按它现画,
+    /// 行回调、按钮回调里拿着它的句柄改状态。它自己不画东西。
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
     }
@@ -1635,7 +1743,7 @@ fn centered(text: impl Into<SharedString>, color: gpui::Hsla) -> AnyElement {
 }
 
 /// 内容区的五选一(顺序不能换,见模块注释)。`labels` 是四条文案
-/// (loading / binary / tooLarge / 额外的空态),两个弹窗各给各的命名空间。
+/// (loading / binary / tooLarge / 额外的空态),单文件与提交两种 diff 各给各的命名空间。
 ///
 /// `empty` 是「没有任何 hunk」时的空态文案(单文件 diff 按块处理完最后一块就落到这里);
 /// `None` 时照旧画一张空列表(提交 diff 的口径不变)。`hunks` 是块操作按钮的上下文,
@@ -1941,7 +2049,7 @@ fn render_side_by_side(
         .into_any_element()
 }
 
-/// 工具栏右上角那组控件的文案。两个弹窗各有各的命名空间(`diffModal` /
+/// 工具栏右上角那组控件的文案。单文件与提交两种 diff 各有各的命名空间(`diffModal` /
 /// `commitDiff`),所以只能由调用方喂进来。
 struct ToolbarLabels {
     side: &'static str,
@@ -2023,12 +2131,30 @@ fn jump_group(
     )
 }
 
-/// 跳转组 + 视图段控件 + ✕(两个弹窗共用的右上角)。
+/// 工具栏最右端那一颗。
+pub(crate) enum ToolbarTail {
+    /// 嵌在弹窗里(贮藏列表):✕ 关掉这种弹窗(值是它的覆盖物种类)
+    Close(&'static str),
+    /// diff 页签:「刷新」(页签自己的 × 在页签条上,中键 / Ctrl+W 也关得掉)
+    Refresh(AnyElement),
+}
+
+/// 页签工具栏上的「刷新」图标按钮(`on_refresh` 是点下去要做的事)。
+pub(crate) fn refresh_button(
+    id: impl Into<ElementId>,
+    on_refresh: impl Fn(&mut App) + 'static,
+) -> AnyElement {
+    icon_button(id, ICON_REFRESH, t("gitCommit", "refresh"), true)
+        .on_click(move |_: &ClickEvent, _window, cx| on_refresh(cx))
+        .into_any_element()
+}
+
+/// 跳转组 + 视图段控件 + 最右端那一颗(✕ 或刷新,见 [`ToolbarTail`])。
 fn view_toggle(
     state: &Entity<DiffState>,
     id_prefix: &'static str,
     labels: ToolbarLabels,
-    close_kind: &'static str,
+    tail: ToolbarTail,
     cx: &mut App,
 ) -> AnyElement {
     let (side_label, inline_label) = (labels.side, labels.inline);
@@ -2066,30 +2192,32 @@ fn view_toggle(
         );
     }
 
+    let tail = match tail {
+        ToolbarTail::Close(kind) => icon_button(
+            SharedString::from(format!("{id_prefix}-close")),
+            ICON_CLOSE,
+            t("prompt", "close"),
+            true,
+        )
+        .on_click(move |_: &ClickEvent, window, cx| {
+            crate::prompt::close_guarded(kind, window, cx);
+        })
+        .into_any_element(),
+        ToolbarTail::Refresh(button) => button,
+    };
     div()
         .flex()
         .flex_none()
         .items_center()
         .children(jumps)
         .child(seg)
-        .child(
-            icon_button(
-                SharedString::from(format!("{id_prefix}-close")),
-                ICON_CLOSE,
-                t("prompt", "close"),
-                true,
-            )
-            .ml(px(8.0))
-            .on_click(move |_: &ClickEvent, window, cx| {
-                crate::prompt::close_guarded(close_kind, window, cx);
-            }),
-        )
+        .child(div().flex_none().ml(px(8.0)).child(tail))
         .into_any_element()
 }
 
-// ─── DiffModal(工作区/暂存区单文件) ──────────────────────────
+// ─── 单文件 diff(工作区 / 暂存区,原版 DiffModal) ─────────────────
 
-/// 单文件 diff 弹窗里能前后切换的一个文件。
+/// 单文件 diff 页签里能前后切换的一个文件。
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     /// 相对 `repo_path` 的路径
@@ -2116,7 +2244,7 @@ pub type OnSwitch = Rc<dyn Fn(&DiffFile, &mut App)>;
 pub type ReloadFiles = Rc<dyn Fn(FilesDone, &mut App)>;
 
 /// [`ReloadFiles`] 的回执:`None` = 没取到(重载失败、换了仓库),沿用旧序列。
-/// **必须调一次** —— 弹窗的块操作按钮等它回来才放开。
+/// **必须调一次** —— 页签的块操作按钮等它回来才放开(页签已经关了就什么都不做)。
 pub type FilesDone = Box<dyn FnOnce(Option<Vec<DiffFile>>, &mut App)>;
 
 /// [`open_file_diff_with`] 的回调。
@@ -2166,9 +2294,10 @@ struct OpTarget {
     lines: Option<usize>,
 }
 
-/// 单文件 diff 弹窗的控制面:文件序列、当前下标、进行中的块操作与就地错误。
+/// 单文件 diff 页签的控制面:文件序列、当前下标、进行中的块操作与就地错误。
 ///
-/// 与 [`DiffState`] 分开:后者是两个弹窗共用的「diff 内容」,这些是单文件弹窗独有的。
+/// 与 [`DiffState`] 分开:后者是各种 diff 共用的「diff 内容」,这些是单文件 diff 独有的。
+/// 页签观察它:换了文件(`current` / `files` 变了)就跟着改身份与标题(见 [`tab`])。
 struct FileDiff {
     repo_path: String,
     files: Vec<DiffFile>,
@@ -2178,12 +2307,10 @@ struct FileDiff {
     reload_files: Option<ReloadFiles>,
     /// 进行中的块操作。`Some` 时全部块按钮(连同工具栏的「所选行」)禁用,防重复点击
     busy: Option<Busy>,
-    /// 块操作失败的原文。就地显示在工具栏下方 —— toast 画在弹窗遮罩底下,看不见
+    /// 块操作失败的原文。就地显示在工具栏下方(多行原文,toast 装不下)
     op_error: Option<String>,
     /// 失败是因为 diff 过期:错误条上给「刷新」
     stale: bool,
-    /// 弹窗正文的焦点:F7 / Alt+← 这些键位挂在它的 key context 上
-    focus: FocusHandle,
 }
 
 impl FileDiff {
@@ -2371,115 +2498,9 @@ fn non_utf8_hunk_reason(encoding: TextEncoding) -> SharedString {
     tr!("gitCommit", "hunkNonUtf8", encoding = label).into()
 }
 
-/// 两段文本的只读 diff 弹窗:文件页外部改动提示条的「对比」(左 = 磁盘上的版本,
-/// 右 = 编辑器里未保存的修改)。复用单文件 diff 的正文渲染(并排 / 行内、F7 跳改动、
-/// 选中复制),没有块操作、不换文件;占的是同一个弹窗种类,不会与 Git diff 叠开。
-pub fn open_text_diff(
-    name: &str,
-    old_text: String,
-    new_text: String,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if crate::prompt::is_open(kind::GIT_DIFF) {
-        return;
-    }
-    let font_size = AppStore::global(cx).read(cx).config().terminal_font_size as f32;
-    let state = cx.new(|cx| DiffState::new(font_size, cx));
-    state.update(cx, |s, _| {
-        s.apply(Ok(mt_project::git::diff_two_texts(old_text, new_text)));
-    });
-    let focus = cx.focus_handle();
-    let initial_focus = focus.clone();
-    let title = tr!("fileViewer", "compareTitle", name = name);
-    let sides = format!(
-        "{} → {}",
-        t("fileViewer", "compareSideDisk"),
-        t("fileViewer", "compareSideUnsaved")
-    );
-
-    open_guarded(kind::GIT_DIFF, window, cx, move |dialog, window, cx| {
-        let viewport = window.viewport_size();
-        let body = render_body(
-            &state,
-            t("diffModal", "loading"),
-            t("diffModal", "binaryNotSupported"),
-            t("diffModal", "tooLarge"),
-            Some(t("fileViewer", "compareIdentical")),
-            None,
-            cx,
-        );
-        let toolbar = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.0))
-            .h(px(TOOLBAR_H))
-            .px(px(16.0))
-            .flex_none()
-            .border_b_1()
-            .border_color(ui::border_subtle())
-            .child(
-                file_heading(&title, None).child(
-                    div()
-                        .flex_none()
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .child(sides.clone()),
-                ),
-            )
-            .child(div().flex().flex_none().items_center().child(view_toggle(
-                &state,
-                "text-diff",
-                ToolbarLabels {
-                    side: t("diffModal", "sideBySide"),
-                    inline: t("diffModal", "inline"),
-                    prev: t("gitCommit", "prevChange"),
-                    next: t("gitCommit", "nextChange"),
-                },
-                kind::GIT_DIFF,
-                cx,
-            )));
-        let (width, body_h) = modal_size(viewport);
-        let (next_change, prev_change) = (state.clone(), state.clone());
-        dialog.w(width).p_0().close_button(false).child(
-            selection::text_actions(div(), &state)
-                .track_focus(&focus)
-                .key_context(FILE_DIFF_CONTEXT)
-                .on_action(move |_: &GitDiffNextChange, _window, cx| {
-                    next_change.update(cx, |s, cx| {
-                        s.jump_by(1);
-                        cx.notify();
-                    });
-                })
-                .on_action(move |_: &GitDiffPrevChange, _window, cx| {
-                    prev_change.update(cx, |s, cx| {
-                        s.jump_by(-1);
-                        cx.notify();
-                    });
-                })
-                .w_full()
-                .h(body_h)
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .child(toolbar)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_hidden()
-                        .bg(ui::bg_base())
-                        .child(body),
-                ),
-        )
-    });
-    window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
-}
-
 /// 点了块操作按钮(块头上的,或工具栏上跨块的「所选行」)。要动的块与行在这一刻取好
-/// ([`DiffState::op_target`])。丢弃先确认(不可恢复);确认框种类与 diff 弹窗不同,能叠在
-/// 它上面。按行丢弃的确认文案写明行数。
+/// ([`DiffState::op_target`])。丢弃先确认(不可恢复),确认框开着时屏幕上的 diff 与勾选
+/// 不会变。按行丢弃的确认文案写明行数。
 fn request_hunk_op(
     state: &Entity<DiffState>,
     ctl: &Entity<FileDiff>,
@@ -2564,6 +2585,8 @@ fn run_hunk_op(
         c.stale = false;
         cx.notify();
     });
+    // 操作期间屏幕上这份 diff 不能被在途的静默重取换掉(`busy` 只挡得住新发起的)
+    state.update(cx, |s, _| s.cancel_refresh());
     let (state, ctl) = (state.clone(), ctl.clone());
     let applied = picks.clone();
     cx.spawn(async move |cx| {
@@ -2599,11 +2622,19 @@ fn run_hunk_op(
                 match reload_files {
                     // 文件序列跟着更改列表走:取消暂存最后一块后文件就离开了「已暂存」组,
                     // 序号与 Alt+←/→ 不能还按打开时的快照
-                    Some(reload) => reload(
-                        Box::new(move |files, cx| resync_files(&state, &ctl, files, land, cx)),
-                        cx,
-                    ),
-                    None => load_file(&state, &ctl, Some(land), cx),
+                    // 回执只拿弱引用:列表重载落地前页签可能已经被关掉,那就什么都不做
+                    Some(reload) => {
+                        let (state, ctl) = (state.downgrade(), ctl.downgrade());
+                        reload(
+                            Box::new(move |files, cx| {
+                                if let (Some(state), Some(ctl)) = (state.upgrade(), ctl.upgrade()) {
+                                    resync_files(&state, &ctl, files, land, cx);
+                                }
+                            }),
+                            cx,
+                        );
+                    }
+                    None => load_file(&state, &ctl, Fetch::AfterOp(land), cx),
                 }
             }
             Err(err) => ctl.update(cx, |c, cx| {
@@ -2622,39 +2653,39 @@ fn run_hunk_op(
     .detach();
 }
 
-/// 取当前文件的 diff。
-///
-/// `after_op = Some(k)`:按块操作后原地重取(错误条上的「刷新」也走这条)—— 不清空旧内容、
-/// 不回「加载中」(否则整页闪一下),结果到了视图模式不变、落到第 k 块(原位置上的下一块),
-/// 并清掉块操作的 `busy`;行勾选按内容认回来、展开过的上下文按行号认回来(见
-/// [`DiffState::apply`])。`None` 是换文件 / 首次打开:清空(勾选与展开一并清掉)并回到顶部。
-fn load_file(
-    state: &Entity<DiffState>,
-    ctl: &Entity<FileDiff>,
-    after_op: Option<usize>,
-    cx: &mut App,
-) {
+/// 取一份 diff 的三种时机(决定落地时动不动旧内容、滚动位置与勾选)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetch {
+    /// 换文件 / 首次打开:清空(勾选与展开一并清掉)、回「加载中」、回到顶部
+    Fresh,
+    /// 按块操作后原地重取(错误条上的「刷新」也走这条):不清空旧内容、不回「加载中」(否则
+    /// 整页闪一下),落到第 k 块(原位置上的下一块),并清掉块操作的 `busy`
+    AfterOp(usize),
+    /// 页签切回来 / 工具栏「刷新」/ 仓库变了:静默原地重取。拿回来的与屏幕上的一样就什么都
+    /// 不动(见 [`DiffState::refresh_unchanged`]);变了照旧按内容认回勾选、按行号认回展开,
+    /// 滚动位置不动、不跳块。已经有一趟在途(加载中 / 另一趟静默重取)就不叠
+    Refresh,
+}
+
+/// 取当前文件的 diff([`Fetch`] 决定时机)。后两种的行勾选按内容认回来、展开过的上下文
+/// 按行号认回来(见 [`DiffState::apply`])。
+fn load_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, fetch: Fetch, cx: &mut App) {
     let (repo, file) = {
         let c = ctl.read(cx);
         (c.repo_path.clone(), c.file().clone())
     };
     let req = state.update(cx, |s, cx| {
+        if !s.begin_fetch(fetch) {
+            return None;
+        }
         // 按行勾选与块操作同一口径(见 `DiffFile::hunk_actions`):换了文件跟着换
         s.pickable = file.hunk_actions && file.side != DiffSide::Working;
-        if after_op.is_none() {
-            s.loading = true;
-            s.error = None;
-            s.result = None;
-            s.flat = Flat::default();
-            s.jump = None;
-            s.clear_selection();
-            s.forget_lines();
-            s.reset_scroll();
-        }
-        s.request += 1;
         cx.notify();
-        s.request
+        Some(s.request)
     });
+    let Some(req) = req else {
+        return;
+    };
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
         let result = cx
@@ -2669,17 +2700,16 @@ fn load_file(
             })
             .await;
         state.update(cx, |s: &mut DiffState, cx| {
-            if s.request != req {
+            if !s.land_fetch(req, fetch, result) {
                 return;
             }
-            s.apply(result);
-            if let Some(next) = after_op {
+            if let Fetch::AfterOp(next) = fetch {
                 s.jump_to(next);
             }
             cx.notify();
         });
         // 被更新的请求顶掉了也照样放开:最坏是下一次点击拿到过期的块,后端会按陈旧拒绝
-        if after_op.is_some() {
+        if matches!(fetch, Fetch::AfterOp(_)) {
             ctl.update(cx, |c, cx| {
                 c.busy = None;
                 cx.notify();
@@ -2717,7 +2747,7 @@ fn resync_files(
     cx: &mut App,
 ) {
     let Some(files) = files else {
-        load_file(state, ctl, Some(hunk), cx);
+        load_file(state, ctl, Fetch::AfterOp(hunk), cx);
         return;
     };
     let switched = ctl.update(cx, |c, cx| {
@@ -2745,9 +2775,9 @@ fn resync_files(
             if let Some(on_switch) = on_switch {
                 on_switch(&file, cx);
             }
-            load_file(state, ctl, None, cx);
+            load_file(state, ctl, Fetch::Fresh, cx);
         }
-        None => load_file(state, ctl, Some(hunk), cx),
+        None => load_file(state, ctl, Fetch::AfterOp(hunk), cx),
     }
 }
 
@@ -2769,7 +2799,7 @@ fn switch_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, delta: isize, 
         if let Some(on_switch) = on_switch {
             on_switch(&file, cx);
         }
-        load_file(state, ctl, None, cx);
+        load_file(state, ctl, Fetch::Fresh, cx);
     }
 }
 
@@ -2796,7 +2826,7 @@ fn side_label(side: DiffSide) -> &'static str {
 const COMMIT_LIST_W: f32 = 280.0;
 
 /// diff 工具栏左半的文件抬头:文件图标 + 文件名(14px 半粗)+ 弱化的目录 + 状态胶囊。
-/// 三个 diff 弹窗共用(单文件 diff 在后面再接「+12 −3」与当前侧)。
+/// 各种 diff 页签共用(单文件 diff 在后面再接「+12 −3」与当前侧)。
 fn file_heading(path: &str, status: Option<(&str, gpui::Hsla)>) -> gpui::Div {
     let (dir, name) = match path.rsplit_once(['/', '\\']) {
         Some((dir, name)) => (dir.to_string(), name.to_string()),
@@ -2993,7 +3023,7 @@ fn error_bar(
                         cx.notify();
                     });
                     let at = refresh_state.read(cx).jump.unwrap_or(0);
-                    load_file(&refresh_state, &refresh_ctl, Some(at), cx);
+                    load_file(&refresh_state, &refresh_ctl, Fetch::AfterOp(at), cx);
                 }),
             )
         })
@@ -3015,210 +3045,13 @@ fn error_bar(
         .into_any_element()
 }
 
-/// 打开单文件 diff。
-///
-/// `files` 是打开它的那个分组的文件序列(更改列表传整组,文件树传单元素),`current`
-/// 是点开的那一个;Alt+← / Alt+→ 在序列里前后换。`on_changed` 在按块操作成功后调用
-/// (更改列表传自己的重载,文件树传 `None`)。
-pub fn open_file_diff(
-    store: Entity<AppStore>,
-    repo_path: String,
-    files: Vec<DiffFile>,
-    current: usize,
-    on_changed: Option<OnChanged>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let hooks = FileDiffHooks {
-        on_changed,
-        ..FileDiffHooks::default()
-    };
-    open_file_diff_with(store, repo_path, files, current, hooks, window, cx);
-}
-
-/// 同 [`open_file_diff`],回调多两个:`on_switch`(弹窗里换了文件时调,更改列表让选中项
-/// 跟着走)与 `reload_files`(块操作后按重载过的更改列表换文件序列,见 [`ReloadFiles`])。
-pub fn open_file_diff_with(
-    store: Entity<AppStore>,
-    repo_path: String,
-    files: Vec<DiffFile>,
-    current: usize,
-    hooks: FileDiffHooks,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    // 守卫要在建实体之前判:已经开着一个的话,下面的取数与聚焦都是白干
-    // (聚焦还会把焦点送给一个永远不会画出来的元素,见 `prompt::autofocus`)
-    if repo_path.is_empty() || files.is_empty() || crate::prompt::is_open(kind::GIT_DIFF) {
-        return;
-    }
-    let current = current.min(files.len() - 1);
-    let font_size = store.read(cx).config().terminal_font_size as f32;
-    let state = cx.new(|cx| DiffState::new(font_size, cx));
-    let ctl = cx.new(|cx| FileDiff {
-        repo_path,
-        files,
-        current,
-        on_changed: hooks.on_changed,
-        on_switch: hooks.on_switch,
-        reload_files: hooks.reload_files,
-        busy: None,
-        op_error: None,
-        stale: false,
-        focus: cx.focus_handle(),
-    });
-    // 取数:`(repo, path, side)` 三元组一次到位(原版漏了 staged,见模块注释)
-    load_file(&state, &ctl, None, cx);
-    let focus = ctl.read(cx).focus.clone();
-    let initial_focus = focus.clone();
-
-    open_guarded(kind::GIT_DIFF, window, cx, move |dialog, window, cx| {
-        let viewport = window.viewport_size();
-        let (file, current, total, busy, op_error, stale) = {
-            let c = ctl.read(cx);
-            (
-                c.file().clone(),
-                c.current,
-                c.files.len(),
-                c.busy,
-                c.op_error.clone(),
-                c.stale,
-            )
-        };
-        let blocked = state
-            .read(cx)
-            .result
-            .as_ref()
-            .and_then(|result| result.encoding)
-            .map(non_utf8_hunk_reason);
-        let hunk_ui = (file.hunk_actions && file.side != DiffSide::Working).then(|| HunkUi {
-            state: state.clone(),
-            ctl: ctl.clone(),
-            side: file.side,
-            busy,
-            blocked,
-        });
-        let body = render_body(
-            &state,
-            t("diffModal", "loading"),
-            t("diffModal", "binaryNotSupported"),
-            t("diffModal", "tooLarge"),
-            Some(empty_text(&file)),
-            hunk_ui,
-            cx,
-        );
-        let toolbar = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(16.0))
-            .h(px(TOOLBAR_H))
-            .px(px(16.0))
-            .flex_none()
-            .border_b_1()
-            .border_color(ui::border_subtle())
-            .child(title_block(&file, &state, cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .children(picks_toolbar(&state, &ctl, file.side, busy, cx))
-                    .children(file_nav(&state, &ctl, current, total))
-                    .child(view_toggle(
-                        &state,
-                        "git-diff",
-                        ToolbarLabels {
-                            side: t("diffModal", "sideBySide"),
-                            inline: t("diffModal", "inline"),
-                            prev: t("gitCommit", "prevChange"),
-                            next: t("gitCommit", "nextChange"),
-                        },
-                        kind::GIT_DIFF,
-                        cx,
-                    )),
-            );
-
-        let (width, body_h) = modal_size(viewport);
-        let (next_change, prev_change) = (state.clone(), state.clone());
-        let (next_file, prev_file) = ((state.clone(), ctl.clone()), (state.clone(), ctl.clone()));
-        let clear_picks = state.clone();
-        dialog
-            .w(width)
-            // 见 [`modal_size`]:不清零内边距的话面板会比统计弹窗高出 48px
-            .p_0()
-            // `Dialog` 自带的 ✕ 是绝对定位的,`p_0()` 之下贴到 8,8,正压着工具栏
-            // 这边自绘的 ✕ 与视图切换。与设置面板同一取舍。(2026-09-19 补记:
-            // 原先记的是「0.5.1 没有 svg 资产 → 渲染成空白,等于埋一块看不见的
-            // 可点区」—— 入口已挂 `gpui_kit_assets::Assets`,它现在画得出来了,
-            // 于是从「看不见的可点区」变成「看得见的第二颗 ✕」,照样得关掉)
-            .close_button(false)
-            .child(
-                // F7 / Shift+F7 / Alt+← / Alt+→ 与正文的 Ctrl/Cmd+C / A 挂在这里;
-                // Esc 先清行勾选,没有勾选时放行、冒泡到 Dialog 关窗
-                selection::text_actions(div(), &state)
-                    .track_focus(&focus)
-                    .key_context(FILE_DIFF_CONTEXT)
-                    .on_action(move |_: &GitDiffClearPicks, _window, cx| {
-                        let cleared = clear_picks.update(cx, |s, cx| {
-                            let cleared = s.clear_picks();
-                            if cleared {
-                                cx.notify();
-                            }
-                            cleared
-                        });
-                        if !cleared {
-                            cx.propagate();
-                        }
-                    })
-                    .on_action(move |_: &GitDiffNextChange, _window, cx| {
-                        next_change.update(cx, |s, cx| {
-                            s.jump_by(1);
-                            cx.notify();
-                        });
-                    })
-                    .on_action(move |_: &GitDiffPrevChange, _window, cx| {
-                        prev_change.update(cx, |s, cx| {
-                            s.jump_by(-1);
-                            cx.notify();
-                        });
-                    })
-                    .on_action(move |_: &GitDiffNextFile, _window, cx| {
-                        switch_file(&next_file.0, &next_file.1, 1, cx);
-                    })
-                    .on_action(move |_: &GitDiffPrevFile, _window, cx| {
-                        switch_file(&prev_file.0, &prev_file.1, -1, cx);
-                    })
-                    .w_full()
-                    .h(body_h)
-                    .flex()
-                    .flex_col()
-                    // 工具栏/正文各自有底色,不裁会盖掉面板的圆角
-                    .overflow_hidden()
-                    .child(toolbar)
-                    .children(op_error.map(|err| error_bar(&state, &ctl, err, stale)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .overflow_hidden()
-                            .bg(ui::bg_base())
-                            .child(body),
-                    ),
-            )
-    });
-
-    // 打开即可按 F7 / Alt+→,不必先点一下正文(时机讲究见 `prompt::autofocus`)
-    window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
-}
-
-// ─── CommitDiffModal(某次 commit / 一组提交合并后的多文件) ────
+// ─── 提交 diff(某次 commit / 一组提交合并后的多文件,原版 CommitDiffModal) ────
 
 // 左栏文件列表的状态字母表(`CommitDiffModal.tsx:21-26`)收在
 // `git_ui::commit_file_status`:提交详情与单文件历史用的是同一张表。
 
-/// 提交 diff 弹窗左栏的一个文件。单提交与合并变更两种来源在这里拍成同一种形状,
-/// 弹窗本体只有一份。
+/// 提交 diff 页签左栏的一个文件。单提交与合并变更两种来源在这里拍成同一种形状,
+/// 页签正文只有一份(见 [`pages`] 的 `FilesPage`)。
 #[derive(Clone)]
 struct ModalFile {
     path: String,
@@ -3273,7 +3106,7 @@ struct ModalHeading {
     empty: &'static str,
 }
 
-/// 左栏选中项与视图状态。放进实体是因为 Dialog 的 builder 每帧重跑。
+/// 左栏选中项与视图状态。放进实体:行回调、↑ / ↓ 拿着它的句柄改选中项。
 struct CommitPick {
     /// 选中第几个文件。按下标认而不是按路径:合并变更在极端的非连续选择下可能出现
     /// 同一路径的两条(见 `mt_project::git::combined` 的模块注释)。
@@ -3287,9 +3120,9 @@ struct CommitPick {
 }
 
 impl CommitPick {
-    /// 左栏的行。文件列表在弹窗的一生里不变,行只随视图与收起的目录变,所以缓存着:
-    /// 弹窗开着时 builder 每帧重跑(右栏滚动、拖选),大提交几千个文件、合并查看两百个提交
-    /// 时不能每帧重新建一遍树。选中项不在行里(画的时候才比),换选中不必重算。
+    /// 左栏的行。文件列表在页签的一生里不变,行只随视图与收起的目录变,所以缓存着:
+    /// 页签每帧都重画(右栏滚动、拖选),大提交几千个文件、合并查看两百个提交时不能每帧
+    /// 重新建一遍树。选中项不在行里(画的时候才比),换选中不必重算。
     fn rows(&mut self, files: &[ModalFile]) -> Rc<Vec<ChangeTreeRow>> {
         self.rows
             .get_or_insert_with(|| Rc::new(modal_rows(files, self.tree, &self.collapsed)))
@@ -3316,129 +3149,24 @@ impl Render for CommitPick {
     }
 }
 
-/// 后台取某个提交的改动文件,回来再打开它的多文件 diff(`initial` = 先选中哪个文件)。
-///
-/// 历史区(双击 / 详情区点文件)、推送对话框的待推送提交、单文件历史「在完整提交 diff
-/// 中查看」、文件页注解列点提交,四处同一条路。取文件失败弹可选中复制的详情框
-/// ([`git_ui::show_git_error`]):这几处多半开在弹窗里,toast 在遮罩下看不见。
-///
-/// 返回的任务在弹窗开出来(或失败框弹出)之后结束,要「打开中」防连点的调用方可以等它,
-/// 其余直接 `detach`。
-pub fn open_commit_diff_loading(
-    store: Entity<AppStore>,
-    repo_path: String,
-    commit_hash: String,
-    commit_message: String,
-    initial: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) -> gpui::Task<()> {
-    let (task_repo, task_hash) = (std::path::PathBuf::from(&repo_path), commit_hash.clone());
-    window.spawn(cx, async move |cx| {
-        let files = cx
-            .background_executor()
-            .spawn(async move { mt_project::git::get_commit_files(&task_repo, &task_hash) })
-            .await;
-        let _ = cx.update(|window, cx| match files {
-            Ok(files) => open_commit_diff_at(
-                store,
-                repo_path,
-                commit_hash,
-                commit_message,
-                files,
-                initial,
-                window,
-                cx,
-            ),
-            Err(err) => {
-                eprintln!("[git] 取提交 {commit_hash} 的文件失败: {err:#}");
-                git_ui::show_git_error(
-                    t("gitBranch", "viewCommitFailed"),
-                    git_ui::error_text(&err),
-                    window,
-                    cx,
-                );
-            }
-        });
-    })
-}
-
-/// 拿着已取到的文件列表打开某次 commit 的多文件 diff,先选中 `initial` 这个文件(提交
-/// 详情区点文件、单文件历史「在完整提交 diff 中查看」用)。`None` 或不在列表里时选第一个。
-#[allow(clippy::too_many_arguments)]
-fn open_commit_diff_at(
-    store: Entity<AppStore>,
-    repo_path: String,
-    commit_hash: String,
-    commit_message: String,
-    files: Vec<CommitFileInfo>,
-    initial: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let heading = ModalHeading {
-        title: commit_message,
-        subtitle: commit_hash.chars().take(7).collect(),
+/// 单提交的左栏头部:标题是提交信息,副标题是短哈希。
+fn commit_heading(hash: &str, message: String) -> ModalHeading {
+    ModalHeading {
+        title: message,
+        subtitle: hash.chars().take(7).collect(),
         subtitle_tip: None,
         empty: t("commitDiff", "noChanges"),
-    };
-    let files = files
-        .into_iter()
-        .map(|file| ModalFile::from_commit(&commit_hash, file))
-        .collect();
-    open_files_diff(store, repo_path, heading, files, initial, window, cx);
+    }
 }
 
-/// 历史区多选的「查看变更」:后台合并这组提交的改动文件(口径见
-/// `mt_project::git::combined`),回来打开合并 diff。`hashes` 按历史列表的顺序(新 → 旧)。
-/// 失败口径同 [`open_commit_diff_loading`]。
-pub fn open_combined_diff_loading(
-    store: Entity<AppStore>,
-    repo_path: String,
-    hashes: Vec<String>,
-    initial: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) -> gpui::Task<()> {
-    let (task_repo, task_hashes) = (std::path::PathBuf::from(&repo_path), hashes.clone());
-    window.spawn(cx, async move |cx| {
-        let files = cx
-            .background_executor()
-            .spawn(
-                async move { mt_project::git::get_combined_commit_files(&task_repo, &task_hashes) },
-            )
-            .await;
-        let _ = cx.update(|window, cx| match files {
-            Ok(files) => open_combined_diff(store, repo_path, hashes, files, initial, window, cx),
-            Err(err) => {
-                eprintln!("[git] 合并 {} 个提交的改动失败: {err:#}", hashes.len());
-                git_ui::show_git_error(
-                    t("gitLog", "multi.viewFailed"),
-                    git_ui::error_text(&err),
-                    window,
-                    cx,
-                );
-            }
-        });
-    })
-}
-
-/// 拿着已合并好的文件打开合并 diff(历史区详情已经合并过同一组提交时直接用)。
-/// 标题写明「N 个提交的合并变更」,副标题是最新 … 最旧两个短哈希。
-pub fn open_combined_diff(
-    store: Entity<AppStore>,
-    repo_path: String,
-    hashes: Vec<String>,
-    files: Vec<CombinedFileChange>,
-    initial: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
+/// 合并变更的左栏头部:标题写明「N 个提交的合并变更」,副标题是最新 … 最旧两个短哈希
+/// (`hashes` 按历史列表的顺序,新 → 旧)。
+fn combined_heading(hashes: &[String]) -> ModalHeading {
     let short = |hash: Option<&String>| -> String {
         hash.map(|h| h.chars().take(7).collect())
             .unwrap_or_default()
     };
-    let heading = ModalHeading {
+    ModalHeading {
         title: tr!(
             "commitDiff",
             "combinedTitle",
@@ -3447,9 +3175,7 @@ pub fn open_combined_diff(
         subtitle: format!("{} … {}", short(hashes.first()), short(hashes.last())),
         subtitle_tip: Some(t("gitLog", "multi.rangeTip")),
         empty: t("gitLog", "multi.noFiles"),
-    };
-    let files = files.into_iter().map(ModalFile::from_combined).collect();
-    open_files_diff(store, repo_path, heading, files, initial, window, cx);
+    }
 }
 
 /// 左栏的行:树形按目录分组(共用的 [`git_ui::build_change_tree`]),平铺一个文件一行。
@@ -3509,7 +3235,7 @@ fn choose_modal_file(
         cx.notify();
     });
     if let Some(file) = files.get(index) {
-        load_modal_file(state, repo_path, file, cx);
+        load_modal_file(state, repo_path, file, Fetch::Fresh, cx);
     }
 }
 
@@ -3606,295 +3332,26 @@ fn modal_row(
     }
 }
 
-/// 多文件 diff 弹窗本体(单提交 / 合并变更共用)。左栏文件树 / 列表,右栏选中文件的
-/// diff;先选中路径为 `initial` 的文件,`None` 或找不到时选第一个。
-fn open_files_diff(
-    store: Entity<AppStore>,
-    repo_path: String,
-    heading: ModalHeading,
-    files: Vec<ModalFile>,
-    initial: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let font_size = store.read(cx).config().terminal_font_size as f32;
-    let tree = store.read(cx).git_commit_files_tree();
-    let state = cx.new(|cx| DiffState::new(font_size, cx));
-    let initial_ix = initial
-        .as_deref()
-        .and_then(|p| files.iter().position(|f| f.path == p));
-    let first = initial_ix.unwrap_or(0);
-    // 选中的文件可能排在很后面:左栏滚到它那一行(下一次布局时生效)。树形里行序与文件
-    // 序不同,按拍平后的行找
-    let file_scroll = UniformListScrollHandle::new();
-    if let Some(row) = initial_ix.and_then(|ix| file_row_of(&files, tree, ix)) {
-        file_scroll.scroll_to_item(row, ScrollStrategy::Nearest);
-    }
-    let pick = cx.new(|_| CommitPick {
-        selected: first,
-        tree,
-        collapsed: HashSet::new(),
-        rows: None,
-    });
-
-    match files.get(first) {
-        Some(file) => load_modal_file(&state, &repo_path, file, cx),
-        None => state.update(cx, |s, _| {
-            s.loading = false;
-        }),
-    }
-
-    let files = Rc::new(files);
-    let repo_path = SharedString::from(repo_path);
-    // 正文的 Ctrl/Cmd+C / A 挂在弹窗的焦点容器上(见下面 builder 末尾)。已经开着一个时
-    // 守卫会拦下这次打开,那就不能再聚焦 —— 焦点会落进一个永远画不出来的元素
-    let focus = cx.focus_handle();
-    let initial_focus = focus.clone();
-    let already_open = crate::prompt::is_open(kind::GIT_COMMIT_DIFF);
-
-    open_guarded(
-        kind::GIT_COMMIT_DIFF,
-        window,
-        cx,
-        move |dialog, window, cx| {
-            let viewport = window.viewport_size();
-            let (selected, tree) = {
-                let p = pick.read(cx);
-                (p.selected, p.tree)
-            };
-            let rows = pick.update(cx, |p, _| p.rows(&files));
-
-            // 左栏文件列表:与提交详情同一种文件行(FileIcon + 状态色文件名 + 弱化目录
-            // + 状态字母;树形按目录分组、单链目录压缩),选中 = accent 淡底 + 左侧竖条。
-            // 行等高,走 uniform_list:只给可视区里的那几行建元素
-            let file_list = {
-                let (files, pick, state, repo_path) = (
-                    files.clone(),
-                    pick.clone(),
-                    state.clone(),
-                    repo_path.clone(),
-                );
-                div().flex_1().min_h(px(0.0)).child(
-                    uniform_list(
-                        "git-commit-files",
-                        rows.len(),
-                        move |range, _window, _cx: &mut App| {
-                            range
-                                .map(|ix| {
-                                    rows.get(ix)
-                                        .and_then(|row| {
-                                            modal_row(
-                                                row, &files, &pick, &state, &repo_path, selected,
-                                                tree,
-                                            )
-                                        })
-                                        // 数不上的行(不会出现)占住一行高,别把后面的行挤乱
-                                        .unwrap_or_else(|| {
-                                            div().h(px(git_ui::ROW_H)).into_any_element()
-                                        })
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    )
-                    .size_full()
-                    .track_scroll(&file_scroll)
-                    .p(px(4.0)),
-                )
-            };
-
-            // 左栏头部:标题(与单文件历史左栏头部同一档:14px 半粗)+ 等宽副标题,
-            // 副标题那一行右侧是「列表 / 树形」切换
-            let toggle = {
-                let (pick, store) = (pick.clone(), store.clone());
-                git_ui::view_mode_toggle("git-commit-files-view-mode", tree).on_click(
-                    move |_: &ClickEvent, _window, cx| {
-                        let next = !pick.read(cx).tree;
-                        pick.update(cx, |p, cx| {
-                            p.set_tree(next);
-                            cx.notify();
-                        });
-                        store.update(cx, |s, cx| s.set_git_commit_files_tree(next, cx));
-                    },
-                )
-            };
-            let subtitle = mono(div())
-                .id("git-commit-diff-subtitle")
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(ui::font_px(12.0))
-                .text_color(ui::text_muted())
-                .when_some(heading.subtitle_tip, |el, tip| el.tip(tip))
-                .child(heading.subtitle.clone());
-            let left = div()
-                .w(px(COMMIT_LIST_W))
-                .flex_none()
-                .h_full()
-                .flex()
-                .flex_col()
-                .border_r_1()
-                .border_color(ui::border_subtle())
-                .bg(ui::bg_elevated())
-                .child(
-                    div()
-                        .px(px(SIDE_PAD))
-                        .py(px(10.0))
-                        .flex_none()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .border_b_1()
-                        .border_color(ui::border_subtle())
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(ui::font_px(14.0))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(ui::text_primary())
-                                .child(heading.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(subtitle)
-                                .when(!files.is_empty(), |el| el.child(toggle)),
-                        ),
-                )
-                .child(file_list)
-                .child(
-                    div()
-                        .px(px(SIDE_PAD))
-                        .py(px(8.0))
-                        .flex_none()
-                        .border_t_1()
-                        .border_color(ui::border_subtle())
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::text_muted())
-                        .child(tr!(
-                            "commitDiff",
-                            "fileCount",
-                            count = files.len().to_string()
-                        )),
-                );
-
-            // 右栏
-            let selected_file = files.get(selected);
-            let selected_path = selected_file.map(|f| f.path.clone()).unwrap_or_default();
-            let selected_status = selected_file.map(|f| git_ui::commit_file_status(&f.status));
-            // 纯重命名的文件没有改动块:与单文件 diff 同一句说明,别留一片空白
-            let rename_only = selected_file
-                .filter(|f| f.status == "renamed")
-                .map(|_| t("gitCommit", "renameOnly"));
-            let body = if files.is_empty() {
-                git_ui::empty_state(ICON_CLEAN, heading.empty, None)
-                    .size_full()
-                    .into_any_element()
-            } else {
-                render_body(
-                    &state,
-                    t("commitDiff", "loading"),
-                    t("commitDiff", "binaryFile"),
-                    t("commitDiff", "tooLarge"),
-                    rename_only,
-                    None,
-                    cx,
-                )
-            };
-            let right = div()
-                .flex_1()
-                .min_w(px(0.0))
-                .h_full()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(16.0))
-                        .h(px(TOOLBAR_H))
-                        .px(px(16.0))
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(ui::border_subtle())
-                        .child(file_heading(&selected_path, selected_status))
-                        .child(view_toggle(
-                            &state,
-                            "git-commit-diff",
-                            ToolbarLabels {
-                                side: t("commitDiff", "sideBySide"),
-                                inline: t("commitDiff", "inline"),
-                                prev: t("commitDiff", "prevChange"),
-                                next: t("commitDiff", "nextChange"),
-                            },
-                            kind::GIT_COMMIT_DIFF,
-                            cx,
-                        )),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_hidden()
-                        .bg(ui::bg_base())
-                        .child(body),
-                );
-
-            let (width, body_h) = modal_size(viewport);
-            // 左栏换文件:↑ / ↓ 挂在整个弹窗的焦点容器上(焦点就这一个,正文的拖选 / 滚动
-            // 不占方向键),右栏跟着换、选中行滚到看得见
-            let step = {
-                let (pick, state, files, repo_path, scroll) = (
-                    pick.clone(),
-                    state.clone(),
-                    files.clone(),
-                    repo_path.clone(),
-                    file_scroll.clone(),
-                );
-                move |delta: isize, cx: &mut App| {
-                    step_modal_file(&pick, &state, &files, &repo_path, &scroll, delta, cx);
-                }
-            };
-            let step = Rc::new(step);
-            let (step_next, step_prev) = (step.clone(), step);
-            dialog.w(width).p_0().close_button(false).child(
-                // 左栏的 ↑ / ↓ 与正文的 Ctrl/Cmd+C / A 挂在这里;Esc 冒泡到 Dialog 关窗
-                selection::text_actions(div(), &state)
-                    .track_focus(&focus)
-                    .key_context(COMMIT_DIFF_CONTEXT)
-                    .on_action(move |_: &GitCommitDiffNextFile, _window, cx| step_next(1, cx))
-                    .on_action(move |_: &GitCommitDiffPrevFile, _window, cx| step_prev(-1, cx))
-                    .w_full()
-                    .h(body_h)
-                    .flex()
-                    .overflow_hidden()
-                    .child(left)
-                    .child(right),
-            )
-        },
-    );
-    // 打开即可 Ctrl+A,不必先点一下正文(时机讲究见 `prompt::autofocus`)
-    if !already_open {
-        window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
-    }
-}
-
-/// 取左栏一个文件的 diff(按它的来源:单提交 / 两个版本之间)。
+/// 取左栏一个文件的 diff(按它的来源:单提交 / 两个版本之间)。`fetch` 是 [`Fetch::Fresh`]
+/// (换文件)或 [`Fetch::Refresh`](刷新按钮:原地重取,内容没变就不动)。
 ///
 /// ⚠️ **单提交里重命名的文件必须带旧路径**(`CommitDiffModal.tsx:57`),否则父树里查
 /// 不到旧内容,diff 会显示成「整文件新增」。
-fn load_modal_file(state: &Entity<DiffState>, repo_path: &str, file: &ModalFile, cx: &mut App) {
+fn load_modal_file(
+    state: &Entity<DiffState>,
+    repo_path: &str,
+    file: &ModalFile,
+    fetch: Fetch,
+    cx: &mut App,
+) {
     match &file.source {
         ModalFileSource::Commit(hash) => {
             let old_path = file.old_path.clone();
-            load_commit_file_at(state, repo_path, hash, &file.path, old_path, cx);
+            load_commit_file_at(state, repo_path, hash, &file.path, old_path, fetch, cx);
         }
         ModalFileSource::Revisions { base, head } => {
             let (repo, base, head) = (repo_path.to_string(), base.clone(), head.clone());
-            load_diff_with(state, cx, move || {
+            load_diff_with(state, fetch, cx, move || {
                 mt_project::git::get_revision_file_diff(
                     std::path::Path::new(&repo),
                     base.as_ref(),
@@ -3912,6 +3369,7 @@ fn load_commit_file_at(
     commit_hash: &str,
     path: &str,
     old_path: Option<String>,
+    fetch: Fetch,
     cx: &mut App,
 ) {
     let (repo, hash, path) = (
@@ -3919,7 +3377,7 @@ fn load_commit_file_at(
         commit_hash.to_string(),
         path.to_string(),
     );
-    load_diff_with(state, cx, move || {
+    load_diff_with(state, fetch, cx, move || {
         mt_project::git::get_commit_file_diff(
             std::path::Path::new(&repo),
             &hash,
@@ -3929,48 +3387,44 @@ fn load_commit_file_at(
     });
 }
 
-/// 换一份 diff:状态复位、令牌 +1,`fetch` 丢后台跑,回来时令牌对得上才落地。
+/// 取一份 diff:按 [`Fetch`] 复位、令牌 +1,`load` 丢后台跑,回来时令牌对得上才落地
+/// (见 [`DiffState::begin_fetch`] / [`DiffState::land_fetch`])。
 fn load_diff_with(
     state: &Entity<DiffState>,
+    fetch: Fetch,
     cx: &mut App,
-    fetch: impl FnOnce() -> anyhow::Result<GitDiffResult> + Send + 'static,
+    load: impl FnOnce() -> anyhow::Result<GitDiffResult> + Send + 'static,
 ) {
     let req = state.update(cx, |s, cx| {
-        s.loading = true;
-        s.error = None;
-        s.result = None;
-        s.flat = Flat::default();
-        // 换文件 = 换一份 diff:跳转计数与滚动位置(连同两栏同步基准)都要归零,否则新文件
-        // 一进来就显示「3/12」,而两栏还停在上一份的偏移上;选区与展开过的上下文同理
-        s.jump = None;
-        s.clear_selection();
-        s.forget_lines();
-        s.reset_scroll();
-        s.request += 1;
+        if !s.begin_fetch(fetch) {
+            return None;
+        }
         cx.notify();
-        s.request
+        Some(s.request)
     });
+    let Some(req) = req else {
+        return;
+    };
 
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx.background_executor().spawn(async move { fetch() }).await;
-        let _ = state.update(cx, |s: &mut DiffState, cx| {
-            if s.request != req {
-                return;
+        let result = cx.background_executor().spawn(async move { load() }).await;
+        state.update(cx, |s: &mut DiffState, cx| {
+            if s.land_fetch(req, fetch, result) {
+                cx.notify();
             }
-            s.apply(result);
-            cx.notify();
         });
     })
     .detach();
 }
 
-// ─── 嵌入式单文件提交 diff(单文件历史弹窗用) ────────────────
+// ─── 嵌入式单文件提交 diff(单文件历史页签 / 贮藏弹窗用) ──────
 
-/// 「某个提交里的某一个文件」的 diff 面板,给别的弹窗嵌进去用(单文件历史)。
+/// 「某个提交里的某一个文件」的 diff 面板,给别的视图嵌进去用(单文件历史页签的右栏、
+/// 贮藏弹窗的右栏)。
 ///
-/// 只是把 [`open_commit_diff_loading`] 右栏那一套(状态 + 取数 + 正文 + 右上角工具组)
-/// 包了一层,行为与那边一致;文案沿用 `commitDiff` 命名空间。
+/// 只是把提交 diff 右栏那一套(状态 + 取数 + 正文 + 右上角工具组)包了一层,行为与那边
+/// 一致;文案沿用 `commitDiff` 命名空间。
 #[derive(Clone)]
 pub(crate) struct CommitFileDiffPane {
     state: Entity<DiffState>,
@@ -3998,10 +3452,18 @@ impl CommitFileDiffPane {
     ) {
         self.renamed
             .set(old_path.as_deref().is_some_and(|old| old != path));
-        load_commit_file_at(&self.state, repo_path, commit_hash, path, old_path, cx);
+        load_commit_file_at(
+            &self.state,
+            repo_path,
+            commit_hash,
+            path,
+            old_path,
+            Fetch::Fresh,
+            cx,
+        );
     }
 
-    /// 正文(加载中 / 出错 / 二进制 / 过大 / 正常 五选一)。纯重命名与提交 diff 弹窗
+    /// 正文(加载中 / 出错 / 二进制 / 过大 / 正常 五选一)。纯重命名与提交 diff 页签
     /// 同一句说明,别留一片空白。
     pub(crate) fn body(&self, cx: &mut App) -> AnyElement {
         let rename_only = self.renamed.get().then(|| t("gitCommit", "renameOnly"));
@@ -4016,17 +3478,18 @@ impl CommitFileDiffPane {
         )
     }
 
-    /// 给宿主弹窗的焦点容器挂上正文的 Ctrl/Cmd+C、Ctrl/Cmd+A(键位按宿主的 key context
+    /// 给宿主的焦点容器挂上正文的 Ctrl/Cmd+C、Ctrl/Cmd+A(键位按宿主的 key context
     /// 绑在 `hotkeys.rs`)。
     pub(crate) fn text_actions(&self, el: gpui::Div) -> gpui::Div {
         selection::text_actions(el, &self.state)
     }
 
-    /// 右上角:改动跳转 + 并排 / 行内切换 + ✕(关的是 `close_kind` 那个弹窗)。
+    /// 右上角:改动跳转 + 并排 / 行内切换 + 最右端那一颗(弹窗里是关掉它的 ✕,页签里是刷新,
+    /// 见 [`ToolbarTail`])。
     pub(crate) fn toolbar(
         &self,
         id_prefix: &'static str,
-        close_kind: &'static str,
+        tail: ToolbarTail,
         cx: &mut App,
     ) -> AnyElement {
         view_toggle(
@@ -4038,7 +3501,7 @@ impl CommitFileDiffPane {
                 prev: t("commitDiff", "prevChange"),
                 next: t("commitDiff", "nextChange"),
             },
-            close_kind,
+            tail,
             cx,
         )
     }
@@ -4842,5 +4305,29 @@ mod tests {
         );
         assert_eq!(side_ops(DiffSide::Staged), &[HunkOp::Unstage]);
         assert!(side_ops(DiffSide::Working).is_empty());
+    }
+
+    /// 静默重取(页签切回来 / 刷新 / 仓库变了):拿回来的与屏幕上一样(同样的两侧全文、同一句
+    /// 错误)就什么都不动 —— 选区、跳转计数、滚动位置都留着;内容或标记变了、正文与错误互换、
+    /// 屏幕上还什么都没有,才落地。
+    #[test]
+    fn 静默重取没变就不动() {
+        let a = diff_two_texts("x\ny\n".into(), "x\nz\n".into());
+        let same = diff_two_texts("x\ny\n".into(), "x\nz\n".into());
+        let other = diff_two_texts("x\ny\n".into(), "x\nw\n".into());
+        assert!(same_diff(&a, &same));
+        assert!(!same_diff(&a, &other));
+        let mut binary = same.clone();
+        binary.is_binary = true;
+        assert!(!same_diff(&a, &binary), "标记变了也算变");
+
+        assert!(refresh_unchanged(Some(&a), None, &Ok(same)));
+        assert!(!refresh_unchanged(Some(&a), None, &Ok(other)));
+        let err = || anyhow::anyhow!("文件不存在");
+        assert!(refresh_unchanged(None, Some("文件不存在"), &Err(err())));
+        assert!(!refresh_unchanged(None, Some("权限不足"), &Err(err())));
+        assert!(!refresh_unchanged(Some(&a), None, &Err(err())));
+        assert!(!refresh_unchanged(None, Some("文件不存在"), &Ok(a.clone())));
+        assert!(!refresh_unchanged(None, None, &Ok(a)), "还在加载:照常落地");
     }
 }

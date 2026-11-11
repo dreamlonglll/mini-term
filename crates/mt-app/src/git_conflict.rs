@@ -39,7 +39,7 @@
 //!
 //! # 键盘
 //!
-//! F7 / Shift+F7 跳下一段 / 上一段(与 diff 弹窗跳改动同一对键);Esc 关闭。回车**不**
+//! F7 / Shift+F7 跳下一段 / 上一段(与 diff 页签跳改动同一对键);Esc 关闭。回车**不**
 //! 写入 —— 改工作区文件的动作只认明确的点击。
 
 use std::collections::HashSet;
@@ -310,7 +310,7 @@ pub fn open(
             let keep = s.writing.is_some() || s.picks.iter().any(Option::is_some);
             dialog
                 .w(width)
-                // 正文自己排工具栏 / 列表 / 底部按钮,与 diff 弹窗同一手法
+                // 正文自己排工具栏 / 列表 / 底部按钮,与贮藏弹窗同一手法
                 .p_0()
                 .overlay_closable(!keep)
                 .child(render(&state, body_h, cx))
