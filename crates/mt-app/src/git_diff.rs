@@ -71,6 +71,7 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use mt_project::encoding::TextEncoding;
 pub use mt_project::git::DiffSide;
 use mt_project::git::{
     CombinedFileChange, CommitFileInfo, DiffHunk, DiffLine, FileRevision, GitDiffResult, StaleDiff,
@@ -1430,6 +1431,9 @@ struct HunkUi {
     side: DiffSide,
     /// 进行中的块操作(第几块)
     busy: Option<usize>,
+    /// 文件不是 UTF-8 时按钮一律禁用,悬停给这句原因(块操作按 UTF-8 拼接写回,
+    /// 会把 GBK / UTF-16 文件写坏;整文件暂存不受影响)
+    blocked: Option<SharedString>,
 }
 
 /// hunk 头上的块操作按钮:未暂存侧「暂存此块 / 丢弃此块」,已暂存侧「取消暂存此块」。
@@ -1445,7 +1449,8 @@ fn hunk_actions(hunk_ui: &HunkUi, hunk: usize) -> AnyElement {
             .child(t("gitCommit", "hunkWorking"))
             .into_any_element();
     }
-    let enabled = hunk_ui.busy.is_none();
+    let enabled = hunk_ui.busy.is_none() && hunk_ui.blocked.is_none();
+    let blocked = hunk_ui.blocked.clone();
     let button = |key: &str, label: &'static str, op: HunkOp, danger: bool| {
         let (state, ctl) = (hunk_ui.state.clone(), hunk_ui.ctl.clone());
         text_button(
@@ -1454,6 +1459,7 @@ fn hunk_actions(hunk_ui: &HunkUi, hunk: usize) -> AnyElement {
             enabled,
             danger,
         )
+        .when_some(blocked.clone(), |el, reason| el.tip(reason))
         .when(enabled, move |el| {
             el.on_click(move |_: &ClickEvent, window, cx| {
                 cx.stop_propagation();
@@ -1489,6 +1495,121 @@ fn hunk_actions(hunk_ui: &HunkUi, hunk: usize) -> AnyElement {
         DiffSide::Working => {}
     }
     row.into_any_element()
+}
+
+/// 非 UTF-8 文件的块操作按钮为什么是灰的(悬停说明)。
+fn non_utf8_hunk_reason(encoding: TextEncoding) -> SharedString {
+    let label = match encoding.label() {
+        "" => t("gitCommit", "hunkUnknownEncoding"),
+        label => label,
+    };
+    tr!("gitCommit", "hunkNonUtf8", encoding = label).into()
+}
+
+/// 两段文本的只读 diff 弹窗:文件页外部改动提示条的「对比」(左 = 磁盘上的版本,
+/// 右 = 编辑器里未保存的修改)。复用单文件 diff 的正文渲染(并排 / 行内、F7 跳改动、
+/// 选中复制),没有块操作、不换文件;占的是同一个弹窗种类,不会与 Git diff 叠开。
+pub fn open_text_diff(
+    name: &str,
+    old_text: String,
+    new_text: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if crate::prompt::is_open(kind::GIT_DIFF) {
+        return;
+    }
+    let font_size = AppStore::global(cx).read(cx).config().terminal_font_size as f32;
+    let state = cx.new(|cx| DiffState::new(font_size, cx));
+    state.update(cx, |s, _| {
+        s.apply(Ok(mt_project::git::diff_two_texts(old_text, new_text)));
+    });
+    let focus = cx.focus_handle();
+    let initial_focus = focus.clone();
+    let title = tr!("fileViewer", "compareTitle", name = name);
+    let sides = format!(
+        "{} → {}",
+        t("fileViewer", "compareSideDisk"),
+        t("fileViewer", "compareSideUnsaved")
+    );
+
+    open_guarded(kind::GIT_DIFF, window, cx, move |dialog, window, cx| {
+        let viewport = window.viewport_size();
+        let body = render_body(
+            &state,
+            t("diffModal", "loading"),
+            t("diffModal", "binaryNotSupported"),
+            t("diffModal", "tooLarge"),
+            Some(t("fileViewer", "compareIdentical")),
+            None,
+            cx,
+        );
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(16.0))
+            .h(px(TOOLBAR_H))
+            .px(px(16.0))
+            .flex_none()
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(
+                file_heading(&title, None).child(
+                    div()
+                        .flex_none()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .child(sides.clone()),
+                ),
+            )
+            .child(div().flex().flex_none().items_center().child(view_toggle(
+                &state,
+                "text-diff",
+                ToolbarLabels {
+                    side: t("diffModal", "sideBySide"),
+                    inline: t("diffModal", "inline"),
+                    prev: t("gitCommit", "prevChange"),
+                    next: t("gitCommit", "nextChange"),
+                },
+                kind::GIT_DIFF,
+                cx,
+            )));
+        let (width, body_h) = modal_size(viewport);
+        let (next_change, prev_change) = (state.clone(), state.clone());
+        dialog.w(width).p_0().close_button(false).child(
+            selection::text_actions(div(), &state)
+                .track_focus(&focus)
+                .key_context(FILE_DIFF_CONTEXT)
+                .on_action(move |_: &GitDiffNextChange, _window, cx| {
+                    next_change.update(cx, |s, cx| {
+                        s.jump_by(1);
+                        cx.notify();
+                    });
+                })
+                .on_action(move |_: &GitDiffPrevChange, _window, cx| {
+                    prev_change.update(cx, |s, cx| {
+                        s.jump_by(-1);
+                        cx.notify();
+                    });
+                })
+                .w_full()
+                .h(body_h)
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(toolbar)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .bg(ui::bg_base())
+                        .child(body),
+                ),
+        )
+    });
+    window.defer(cx, move |window, cx| window.focus(&initial_focus, cx));
 }
 
 /// 点了块操作按钮。丢弃先确认(不可恢复);确认框种类与 diff 弹窗不同,能叠在它上面。
@@ -2068,11 +2189,18 @@ pub fn open_file_diff_with(
                 c.stale,
             )
         };
+        let blocked = state
+            .read(cx)
+            .result
+            .as_ref()
+            .and_then(|result| result.encoding)
+            .map(non_utf8_hunk_reason);
         let hunk_ui = (file.hunk_actions && file.side != DiffSide::Working).then(|| HunkUi {
             state: state.clone(),
             ctl: ctl.clone(),
             side: file.side,
             busy,
+            blocked,
         });
         let body = render_body(
             &state,

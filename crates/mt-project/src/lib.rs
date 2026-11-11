@@ -48,6 +48,7 @@
 //! 远程文件树复用 [`fs::natural_cmp`],与本地树保持同一排序观感。
 
 pub mod editor;
+pub mod encoding;
 pub mod fs;
 pub mod git;
 pub mod project_kind;

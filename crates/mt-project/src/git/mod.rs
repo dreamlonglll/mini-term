@@ -30,6 +30,8 @@ use parking_lot::Mutex;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 
+use crate::encoding::{Decoded, TextEncoding};
+
 // ---------------------------------------------------------------------------
 // Data structures
 // ---------------------------------------------------------------------------
@@ -91,6 +93,12 @@ pub struct GitDiffResult {
     pub hunks: Vec<DiffHunk>,
     pub is_binary: bool,
     pub too_large: bool,
+    /// 有一侧不是 UTF-8 时解出来的编码(新的一侧优先;两侧都是 UTF-8 时为 `None`)。
+    /// 有值时 diff 照常显示,但**按块暂存 / 取消暂存 / 丢弃一律拒绝**:块操作是按 UTF-8
+    /// 文本拼接再写回字节的,非 UTF-8 文件拼回去就写坏了(见 [`hunk`] 的 `pick_hunk`)。
+    /// 只在进程内传递,不序列化。
+    #[serde(skip)]
+    pub encoding: Option<TextEncoding>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1497,31 +1505,57 @@ pub fn get_commit_file_diff(
     )
 }
 
-/// 树里一个文件的文本内容(diff 的一侧)。
+/// 树里一个文件的文本内容(diff 的一侧)。`Text` 的第二项见 [`decode_side`]。
 enum TreeText {
-    Text(String),
+    Text(String, Option<TextEncoding>),
     Binary,
     TooLarge,
 }
 
 /// 读 `tree` 里 `path` 这个文件的文本。树里没有这个路径(新增 / 删除的那一侧)当空文本;
-/// 不是 blob、不是 UTF-8 报错(与提交 diff 一直以来的口径一致)。超过 [`MAX_DIFF_BYTES`]
-/// 的整份不做 diff —— 先从对象头取大小再决定读不读,不把几百 MB 的 blob 整份读进内存。
+/// 不是 blob 报错。非 UTF-8 的按 [`decode_side`] 解(GBK 源码也看得了提交 diff),解不出来
+/// 当二进制。超过 [`MAX_DIFF_BYTES`] 的整份不做 diff —— 先从对象头取大小再决定读不读,
+/// 不把几百 MB 的 blob 整份读进内存。
 fn read_tree_text(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> Result<TreeText> {
     let entry = match tree.get_path(Path::new(path)) {
         Ok(entry) => entry,
-        Err(_) => return Ok(TreeText::Text(String::new())),
+        Err(_) => return Ok(TreeText::Text(String::new(), None)),
     };
     if blob_too_large(repo, entry.id())? {
         return Ok(TreeText::TooLarge);
     }
     let obj = entry.to_object(repo)?;
     let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
-    if blob.is_binary() {
-        return Ok(TreeText::Binary);
+    Ok(match decode_side(blob.content(), blob.is_binary()) {
+        Some((text, encoding)) => TreeText::Text(text, encoding),
+        None => TreeText::Binary,
+    })
+}
+
+/// blob / 工作区文件的字节 → diff 一侧的文本,第二项是非 UTF-8 时解出来的编码
+/// (`None` = 原样的 UTF-8,按块操作只认这种);整体 `None` = 二进制。`git_binary` 是
+/// git 自己的判定(`Blob::is_binary`;工作区那一侧没有,传 `false`)。
+///
+/// - 合法 UTF-8 走原来那条路,一字不变(BOM 也原样留着,按块暂存拼回去才对得上);
+/// - git 判成二进制的只放行带 UTF-16 BOM 的 —— git 一律把 UTF-16 当二进制;
+/// - 其余非 UTF-8 交给 [`crate::encoding::decode`](GBK / Shift_JIS …),有 NUL 的仍是二进制。
+fn decode_side(bytes: &[u8], git_binary: bool) -> Option<(String, Option<TextEncoding>)> {
+    if !git_binary {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return Some((text.to_owned(), None));
+        }
+    } else if !crate::encoding::has_utf16_bom(bytes) {
+        return None;
     }
-    let text = std::str::from_utf8(blob.content()).map_err(|_| anyhow!("binary"))?;
-    Ok(TreeText::Text(text.to_string()))
+    match crate::encoding::decode(bytes.to_vec()) {
+        Decoded::Text { text, encoding } => Some((text, (!encoding.is_utf8()).then_some(encoding))),
+        Decoded::Binary => None,
+    }
+}
+
+/// diff 结果上记哪一侧的编码:新的一侧优先(用户眼前那份),两侧都是 UTF-8 时 `None`。
+fn diff_encoding(old: Option<TextEncoding>, new: Option<TextEncoding>) -> Option<TextEncoding> {
+    new.or(old)
 }
 
 /// 两棵树里各一个文件 → diff。`None` 的一侧当空文本(文件新增 / 删除)。
@@ -1537,23 +1571,25 @@ pub(crate) fn diff_tree_texts(
     old: Option<(&git2::Tree<'_>, &str)>,
     new: Option<(&git2::Tree<'_>, &str)>,
 ) -> Result<GitDiffResult> {
-    let new_content = match new {
+    let (new_content, new_encoding) = match new {
         Some((tree, path)) => match read_tree_text(repo, tree, path)? {
-            TreeText::Text(text) => text,
+            TreeText::Text(text, encoding) => (text, encoding),
             TreeText::Binary => return Ok(binary_diff_result()),
             TreeText::TooLarge => return Ok(too_large_diff_result()),
         },
-        None => String::new(),
+        None => (String::new(), None),
     };
-    let old_content = match old {
+    let (old_content, old_encoding) = match old {
         Some((tree, path)) => match read_tree_text(repo, tree, path)? {
-            TreeText::Text(text) => text,
+            TreeText::Text(text, encoding) => (text, encoding),
             TreeText::Binary => return Ok(binary_diff_result()),
             TreeText::TooLarge => return Ok(too_large_diff_result()),
         },
-        None => String::new(),
+        None => (String::new(), None),
     };
-    Ok(diff_two_texts(old_content, new_content))
+    let mut result = diff_two_texts(old_content, new_content);
+    result.encoding = diff_encoding(old_encoding, new_encoding);
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,6 +1621,7 @@ fn binary_diff_result() -> GitDiffResult {
         hunks: Vec::new(),
         is_binary: true,
         too_large: false,
+        encoding: None,
     }
 }
 
@@ -1595,11 +1632,15 @@ fn too_large_diff_result() -> GitDiffResult {
         hunks: Vec::new(),
         is_binary: false,
         too_large: true,
+        encoding: None,
     }
 }
 
 /// 两段文本 → 完整 diff 结果(改动面太大时退化为整块替换,见 [`build_hunks`])。
-fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
+///
+/// 公开给不经 git 的两段文本比较用(文件页「磁盘版本 ↔ 未保存的修改」的对比);
+/// 结果的 `encoding` 恒为 `None`,由调用方按需补。
+pub fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
     let hunks = build_hunks(&old_lines, &new_lines);
@@ -1610,6 +1651,7 @@ fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
         hunks,
         is_binary: false,
         too_large: false,
+        encoding: None,
     }
 }
 
@@ -1623,28 +1665,26 @@ fn head_text(repo: &Repository, rel_path: &str) -> Result<Option<SideText>> {
     let tree = head.peel_to_tree()?;
     let entry = match tree.get_path(Path::new(rel_path)) {
         Ok(e) => e,
-        Err(_) => return Ok(Some(SideText::Text(String::new()))), // 文件还没进 HEAD
+        Err(_) => return Ok(Some(SideText::Text(String::new(), None))), // 文件还没进 HEAD
     };
     if blob_too_large(repo, entry.id())? {
         return Ok(Some(SideText::TooLarge));
     }
     let obj = entry.to_object(repo)?;
     let blob = obj.as_blob().ok_or_else(|| anyhow!("not a blob"))?;
-    if blob.is_binary() {
-        return Ok(Some(SideText::Binary));
-    }
-    Ok(Some(match std::str::from_utf8(blob.content()) {
-        Ok(s) => SideText::Text(s.to_string()),
-        Err(_) => SideText::Binary,
+    Ok(Some(match decode_side(blob.content(), blob.is_binary()) {
+        Some((text, encoding)) => SideText::Text(text, encoding),
+        None => SideText::Binary,
     }))
 }
 
-/// HEAD 版本的文本(按块操作用:要拿它拼回暂存区)。二进制 / 过大都是错误 ——
-/// 这两种文件的 diff 本来就没有块可操作。
+/// HEAD 版本的文本(按块操作用:要拿它拼回暂存区)。二进制 / 过大 / 非 UTF-8 都是
+/// 错误 —— 块操作按 UTF-8 文本拼接再写回字节,非 UTF-8 的拼回去就写坏了。
 fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
     match head_text(repo, rel_path)? {
         None => Ok(None),
-        Some(SideText::Text(s)) => Ok(Some(s)),
+        Some(SideText::Text(s, None)) => Ok(Some(s)),
+        Some(SideText::Text(_, Some(_))) => bail!("not utf-8"),
         Some(SideText::Binary) => bail!("binary"),
         Some(SideText::TooLarge) => bail!("too large"),
     }
@@ -1652,10 +1692,13 @@ fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>>
 
 /// diff 旧侧取 HEAD 版本:`Ok(None)` = 超过上限(整份不做 diff);空仓库 / HEAD 里没有
 /// 这个文件是空文本;二进制照旧报错(与此前的口径一致)。
-fn head_side_text(repo: &Repository, rel_path: &str) -> Result<Option<String>> {
+fn head_side_text(
+    repo: &Repository,
+    rel_path: &str,
+) -> Result<Option<(String, Option<TextEncoding>)>> {
     match head_text(repo, rel_path)? {
-        None => Ok(Some(String::new())),
-        Some(SideText::Text(s)) => Ok(Some(s)),
+        None => Ok(Some((String::new(), None))),
+        Some(SideText::Text(s, encoding)) => Ok(Some((s, encoding))),
         Some(SideText::Binary) => bail!("binary"),
         Some(SideText::TooLarge) => Ok(None),
     }
@@ -1979,16 +2022,16 @@ pub fn get_git_diff_from(
         .unwrap_or_else(|| rel_str.clone());
 
     // 新侧:暂存区取 index,否则取工作区(已删除的文件 = 空)
-    let new_content = match side {
+    let (new_content, new_encoding) = match side {
         DiffSide::Staged => match index_text(&repo, &rel_str)? {
-            Some(SideText::Text(s)) => s,
+            Some(SideText::Text(s, encoding)) => (s, encoding),
             Some(SideText::Binary) => return Ok(binary_diff_result()),
             Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
-            None => String::new(),
+            None => (String::new(), None),
         },
         DiffSide::Unstaged | DiffSide::Working => match std::fs::metadata(&abs_file) {
             // 不存在(工作区里已删除)= 空
-            Err(_) => String::new(),
+            Err(_) => (String::new(), None),
             // 先看大小再读:超限的文件不整份读进内存
             Ok(meta) if meta.len() > MAX_DIFF_BYTES as u64 => {
                 return Ok(too_large_diff_result());
@@ -1999,40 +2042,47 @@ pub fn get_git_diff_from(
                 if new_bytes.len() > MAX_DIFF_BYTES {
                     return Ok(too_large_diff_result());
                 }
+                // UTF-8 照旧原样收下(不复制);不是的才交给编码识别
                 match String::from_utf8(new_bytes) {
-                    Ok(s) => s,
-                    Err(_) => return Ok(binary_diff_result()),
+                    Ok(s) => (s, None),
+                    Err(err) => match decode_side(err.as_bytes(), false) {
+                        Some(side) => side,
+                        None => return Ok(binary_diff_result()),
+                    },
                 }
             }
         },
     };
 
     // 旧侧:未暂存比暂存区,其余比 HEAD。两侧同一条大小上限(旧侧超限同样报「过大」)
-    let old_content = match side {
+    let (old_content, old_encoding) = match side {
         DiffSide::Unstaged => match index_text(&repo, &rel_str)? {
-            Some(SideText::Text(s)) => s,
+            Some(SideText::Text(s, encoding)) => (s, encoding),
             Some(SideText::Binary) => return Ok(binary_diff_result()),
             Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
             // 冲突中的文件没有 stage 0 条目 —— 退回 HEAD(ours),不能当成新增
             None if is_conflicted(&repo, &rel_str)? => match head_side_text(&repo, &rel_str)? {
-                Some(text) => text,
+                Some(side) => side,
                 None => return Ok(too_large_diff_result()),
             },
             // 不在暂存区 = 未跟踪 / 已暂存删除,全部算新增
-            None => String::new(),
+            None => (String::new(), None),
         },
         DiffSide::Staged | DiffSide::Working => match head_side_text(&repo, &head_rel)? {
-            Some(text) => text,
+            Some(side) => side,
             None => return Ok(too_large_diff_result()),
         },
     };
 
-    Ok(diff_two_texts(old_content, new_content))
+    let mut result = diff_two_texts(old_content, new_content);
+    result.encoding = diff_encoding(old_encoding, new_encoding);
+    Ok(result)
 }
 
-/// index / blob 一侧的取值结果。
+/// index / blob 一侧的取值结果。`Text` 的第二项见 [`decode_side`]:`None` = 原样的
+/// UTF-8,`Some` = 非 UTF-8 解出来的(diff 照常显示,块操作一律拒绝)。
 enum SideText {
-    Text(String),
+    Text(String, Option<TextEncoding>),
     Binary,
     TooLarge,
 }
@@ -2048,12 +2098,9 @@ fn index_text(repo: &Repository, rel_path: &str) -> Result<Option<SideText>> {
         return Ok(Some(SideText::TooLarge));
     }
     let blob = repo.find_blob(entry.id)?;
-    if blob.is_binary() {
-        return Ok(Some(SideText::Binary));
-    }
-    Ok(Some(match std::str::from_utf8(blob.content()) {
-        Ok(s) => SideText::Text(s.to_string()),
-        Err(_) => SideText::Binary,
+    Ok(Some(match decode_side(blob.content(), blob.is_binary()) {
+        Some((text, encoding)) => SideText::Text(text, encoding),
+        None => SideText::Binary,
     }))
 }
 

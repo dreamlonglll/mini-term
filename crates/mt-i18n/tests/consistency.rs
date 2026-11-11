@@ -196,8 +196,13 @@ use mt_i18n::{
 /// 1545 → 1547（issue #94）：「移动端」面板复制配对链接（`mobileRelay.modal.{copyLink,linkCopied}`）。
 /// 1547 → 1548：工作区「终端」页签右键「关闭所有」（`fileViewer.closeAll`）。
 /// 1548 → 1549：分支弹窗行右键「复制分支名」（`gitBranch.menuCopyName`）。
+/// 1549 → 1564：非 UTF-8 文件的编码识别 —— 文件页编码徽标 / 只读 / 不可映射字符拒绝保存
+/// （`fileViewer.{encodingTip,lossyBadge,lossyReadOnly,unencodable}`）、diff 弹窗里非 UTF-8
+/// 文件禁用按块操作的说明（`gitCommit.{hunkNonUtf8,hunkUnknownEncoding}`）；外部改动提示条的
+/// 「对比 / 保留我的」与对比弹窗（`fileViewer.{compareDisk,keepMine,keepMineTip,compareTitle,
+/// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1549;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1564;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

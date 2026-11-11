@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use mt_ai::sessions::AiSessionMessage;
+use mt_project::encoding::{TextEncoding, encoding_rs};
 use mt_ssh::sftp::SftpBoundedFileRead;
 
 use super::*;
@@ -27,6 +28,7 @@ fn remote_baseline(conn: &SshConnection, bytes: &[u8]) -> RemoteFileBaseline {
         canonical_root: "/srv/project".into(),
         canonical_path: "/srv/project/src/main.rs".into(),
         bytes: Arc::from(bytes),
+        encoding: TextEncoding::Utf8,
     }
 }
 
@@ -93,11 +95,12 @@ fn remote_document_read_classifies_text_binary_and_oversize() {
         Some(8)
     );
 
+    // 非 UTF-8 且开头有 NUL 才是二进制(单独的 `FF FE` 是空的 UTF-16 文件,见下一个用例)
     let binary = build_remote_file_read_result(
         &connection,
         "/srv/project".into(),
         "/srv/project/image.bin".into(),
-        SftpBoundedFileRead::Complete(vec![0xff, 0xfe]),
+        SftpBoundedFileRead::Complete(vec![0x89, b'P', b'N', b'G', 0x00, 0xff, 0xfe]),
     );
     assert!(binary.content.is_binary);
     assert!(!binary.content.too_large);
@@ -112,6 +115,71 @@ fn remote_document_read_classifies_text_binary_and_oversize() {
     assert!(oversize.content.too_large);
     assert!(!oversize.content.is_binary);
     assert!(oversize.baseline.is_none());
+}
+
+/// 远程的 GBK / UTF-16 文件与本地同一把尺子解出来:可编辑,基线记原字节与编码;解码
+/// 有损的只读(没有基线,保存一律拒绝)。
+#[test]
+fn remote_document_read_decodes_non_utf8_text() {
+    let connection = conn("a");
+    let gbk = TextEncoding::Legacy(encoding_rs::GBK);
+    let bytes = gbk
+        .encode("// 你好，世界。这是一段用来猜编码的中文注释。\nint main() {}\n")
+        .unwrap();
+    let read = build_remote_file_read_result(
+        &connection,
+        "/srv/project".into(),
+        "/srv/project/main.c".into(),
+        SftpBoundedFileRead::Complete(bytes.clone()),
+    );
+    assert!(!read.content.is_binary && !read.content.read_only());
+    assert!(read.content.content.contains("你好"));
+    let baseline = read.baseline.expect("可编辑的文本要有基线");
+    assert_eq!(baseline.byte_len(), bytes.len());
+    assert_eq!(baseline.encoding, read.content.encoding);
+    assert_ne!(baseline.encoding, TextEncoding::Utf8);
+
+    let utf16 = build_remote_file_read_result(
+        &connection,
+        "/srv/project".into(),
+        "/srv/project/empty.txt".into(),
+        SftpBoundedFileRead::Complete(vec![0xff, 0xfe]),
+    );
+    assert_eq!(utf16.content.content, "");
+    assert_eq!(utf16.content.encoding, TextEncoding::Utf16Le);
+    assert!(utf16.baseline.is_some());
+
+    let mut broken = "大体是合法的 UTF-8 中文文本,末尾坏了一个字节"
+        .as_bytes()
+        .to_vec();
+    broken.push(0xff);
+    let lossy = build_remote_file_read_result(
+        &connection,
+        "/srv/project".into(),
+        "/srv/project/broken.txt".into(),
+        SftpBoundedFileRead::Complete(broken),
+    );
+    assert!(lossy.content.read_only());
+    assert!(lossy.baseline.is_none());
+}
+
+/// 编码表示不了草稿里的字符:连远端之前就拒绝(这里没有可连的主机,能拿到这条错误本身
+/// 就说明拒绝发生在任何网络操作之前)。
+#[test]
+fn remote_save_refuses_unmappable_characters_before_connecting() {
+    let connection = conn("a");
+    let mut baseline = remote_baseline(&connection, b"original");
+    baseline.encoding = TextEncoding::Legacy(encoding_rs::SHIFT_JIS);
+    let err = save_file_content(
+        &connection,
+        "/srv/project",
+        "/srv/project/src/main.rs",
+        "日本語 😀\n",
+        &baseline,
+        false,
+    )
+    .unwrap_err();
+    assert!(err.contains('😀') && err.contains("Shift_JIS"), "{err}");
 }
 
 #[test]

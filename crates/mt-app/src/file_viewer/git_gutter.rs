@@ -935,7 +935,9 @@ impl FileViewer {
                     Editor::new(editor)
                         .h_full()
                         .appearance(false)
-                        .bordered(false),
+                        .bordered(false)
+                        // 解码有损的文件只读打开(能选中复制,不能改)
+                        .readonly(self.doc.read_only()),
                 ),
             )
             .child(gutter_overlay(overlay))

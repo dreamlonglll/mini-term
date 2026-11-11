@@ -1,11 +1,10 @@
 use super::*;
 
 fn result(content: &str) -> FileContentResult {
-    FileContentResult {
-        content: content.to_string(),
-        is_binary: false,
-        too_large: false,
-    }
+    FileContentResult::text(
+        content.to_string(),
+        mt_project::encoding::TextEncoding::Utf8,
+    )
 }
 
 #[test]
@@ -86,9 +85,9 @@ fn 二进制与超限探测走真文件() {
     let dir = std::env::temp_dir().join(format!("mt-fv-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
 
-    // 非 UTF-8 → is_binary
+    // 非 UTF-8 且开头有 NUL → is_binary(`FF FE` 开头的是 UTF-16 文本,不再算二进制)
     let bin = dir.join("bin.dat");
-    std::fs::write(&bin, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    std::fs::write(&bin, [0x89, 0x50, 0x00, 0x01, 0xff]).unwrap();
     let res = mt_project::fs::read_file_content(&dir, &bin).unwrap();
     assert!(res.is_binary && !res.too_large);
     assert_eq!(branch_of(false, false, false, Some(&res)), Branch::Binary);

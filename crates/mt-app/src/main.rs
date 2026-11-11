@@ -2564,6 +2564,7 @@ fn main() {
         // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
         // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
         i18n::install(locale.as_deref());
+        i18n::install_encoding_region();
 
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
         // 走 mt_config::app_data_dir(),端口文件与装机版落在同一处。
