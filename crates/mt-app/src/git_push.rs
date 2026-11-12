@@ -319,7 +319,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
                     let hint = rejected_hint(&detail);
                     Some((detail, Some(hint)))
                 }
-                Err(err) => Some((git_ui::error_text(&err), None)),
+                Err(err) => Some((git_ui::error_text_for_store(&err, &store, cx), None)),
             };
             let Some((detail, hint)) = failure else {
                 return;

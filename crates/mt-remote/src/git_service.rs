@@ -484,6 +484,34 @@ impl RemoteGitWorkspace {
             })
             .collect()
     }
+    /// Metadata-only listing for the project root and nested repositories. It does not
+    /// discover repositories, require a grant, or grant any owner's recovery authority.
+    /// Keep `recovery_blockers` for exact selected-repository mutation gates.
+    pub fn recovery_blockers_in_scope(&self) -> Vec<RemoteGitRecoveryBlocker> {
+        let Ok(root) = super::paths::normalize_absolute_posix(&self.inner.root) else {
+            return Vec::new();
+        };
+        lock(&UNKNOWN_WORKSPACES)
+            .iter()
+            .filter_map(|owner| {
+                if !same_endpoint(&owner.connection, &self.inner.connection) {
+                    return None;
+                }
+                let unknown = lock(&owner.unknown);
+                let write = unknown.as_ref()?;
+                let repo = super::paths::normalize_absolute_posix(&write.repo).ok()?;
+                let within = repo == root
+                    || (root == "/" && repo.starts_with('/'))
+                    || repo
+                        .strip_prefix(root.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'));
+                within.then(|| RemoteGitRecoveryBlocker {
+                    owner_project_id: owner.project_id.clone(),
+                    write: write.clone(),
+                })
+            })
+            .collect()
+    }
     pub fn prepare_offline_abandon(
         &self,
     ) -> Result<RemoteGitOfflineAbandonConfirmation, GitFailure> {
@@ -850,14 +878,10 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
             if write && repo.is_none() {
                 return Err(service_error("remote_git_missing_repository"));
             }
-            if write && repository_blocked(&lease.inner.connection, repo.expect("write repository"))
-            {
-                return Err(unknown_failure("remote_git_write_verification_required"));
+            if write && let Some(blocker) = write_blocker(lease, repo.expect("write repository")) {
+                return Err(blocker);
             }
-            if lock(&lease.inner.unknown).is_some() {
-                if write {
-                    return Err(unknown_failure("remote_git_write_verification_required"));
-                }
+            if !write && lock(&lease.inner.unknown).is_some() {
                 return read(slot, lease, operation, decoder);
             }
             // A read-only liveness round trip on a reused channel precedes a write. Only
@@ -884,9 +908,8 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
                 let _source = remote_git_source_change_guard();
                 lease.check()?;
                 if write {
-                    if repository_blocked(&lease.inner.connection, repo.expect("write repository"))
-                    {
-                        return Err(unknown_failure("remote_git_write_verification_required"));
+                    if let Some(blocker) = write_blocker(lease, repo.expect("write repository")) {
+                        return Err(blocker);
                     }
                     lease.inner.running.store(true, Ordering::Release);
                 }
@@ -1259,13 +1282,41 @@ fn clear_unknown(owner: &Arc<WorkspaceInner>, generation: u64) -> Result<(), Git
     Ok(())
 }
 
-fn repository_blocked(connection: &SshConnection, repo: &str) -> bool {
-    lock(&UNKNOWN_WORKSPACES).iter().any(|other| {
-        same_endpoint(&other.connection, connection)
+/// Return the actual uncertain repository and every owner, never imply the rejected
+/// candidate itself was dispatched. Caller holds SOURCE_LIFECYCLE at final dispatch.
+fn write_blocker(lease: &WorkspaceLease, repo: &str) -> Option<GitFailure> {
+    let registry = lock(&UNKNOWN_WORKSPACES);
+    let matches_repo = |other: &WorkspaceInner, repo: &str| {
+        same_endpoint(&other.connection, &lease.inner.connection)
             && lock(&other.unknown).as_ref().is_some_and(|unknown| {
                 mt_core::path_key::posix_trim_trailing(&unknown.repo)
                     == mt_core::path_key::posix_trim_trailing(repo)
             })
+    };
+    let owner = registry
+        .iter()
+        .find(|other| matches_repo(other, repo))
+        .or_else(|| {
+            // An actor with an uncertain write cannot dispatch a second repository write
+            // either; credential successors retain that original owner and repository.
+            registry.iter().find(|other| {
+                other.project_id == lease.inner.project_id
+                    && other.root == lease.inner.root
+                    && same_endpoint(&other.connection, &lease.inner.connection)
+                    && lock(&other.unknown).is_some()
+            })
+        })?;
+    let repo = lock(&owner.unknown).as_ref()?.repo.clone();
+    let mut owner_project_ids: Vec<_> = registry
+        .iter()
+        .filter(|other| matches_repo(other, &repo))
+        .map(|other| other.project_id.clone())
+        .collect();
+    owner_project_ids.sort_unstable();
+    owner_project_ids.dedup();
+    Some(GitFailure::RepositoryBlocked {
+        repo,
+        owner_project_ids,
     })
 }
 

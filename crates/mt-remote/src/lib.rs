@@ -72,6 +72,10 @@
 //! the actor or network, deploying, connecting, or issuing Git requests. Existing channels
 //! still receive normal bounded asynchronous EOF/close cleanup; this is not cancellation
 //! or proof that the original remote write has finished.
+//! Shared repository write rejections preserve the actual unknown repository and all
+//! owner project IDs in [`GitFailure::RepositoryBlocked`], not an unknown outcome for
+//! the rejected caller. Workspace recovery metadata can list the configured root and
+//! nested repositories without discovery or a grant; metadata never grants recovery.
 //! Source configuration mutations hold [`remote_git_source_change_guard`] across their
 //! pending check, mutation and grant synchronization; dispatch atomically publishes Running
 //! under the same guard before releasing it for network IO.

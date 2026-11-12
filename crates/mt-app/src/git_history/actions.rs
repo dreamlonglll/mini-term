@@ -509,7 +509,12 @@ impl GitHistoryContent {
                 if let Err(err) = &result {
                     git_ui::show_git_error(
                         tr!("gitBranch", "opFailed", op = t("gitLog", action)),
-                        git_ui::repo_text(&source_store, &context, error_text(err), cx),
+                        git_ui::repo_text(
+                            &source_store,
+                            &context,
+                            git_ui::error_text_for_store(err, &source_store, cx),
+                            cx,
+                        ),
                         window,
                         cx,
                     );
@@ -597,8 +602,12 @@ impl GitHistoryContent {
                         }
                         Err(err) => {
                             eprintln!("[git] {action} 失败: {err:#}");
-                            let message =
-                                git_ui::repo_text(&this.store, &context, error_text(&err), cx);
+                            let message = git_ui::repo_text(
+                                &this.store,
+                                &context,
+                                git_ui::error_text_for_store(&err, &this.store, cx),
+                                cx,
+                            );
                             form_done.update(cx, |f, cx| {
                                 f.op.fail(message.clone());
                                 cx.notify();

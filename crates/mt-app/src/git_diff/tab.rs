@@ -1054,7 +1054,7 @@ mod tests {
         });
         let landed = std::rc::Rc::new(std::cell::RefCell::new(None));
         cx.update_window(window.into(), |_, window, cx| {
-            let repo = GitContext::local("/source-a");
+            let repo = crate::git_backend::project_context(store.read(cx), "a");
             let home = Home::capture(&store, &repo, cx);
             let done = landed.clone();
             open_tab_in(
@@ -1132,6 +1132,28 @@ mod tests {
         let tip = file_tab_tip_on(&a, "A\\B.rs", DiffSide::Unstaged);
         assert!(tip.starts_with("/Repo/A\\B.rs\n"), "{tip}");
         assert!(file_tab_title_on(&a, "A\\B.rs", DiffSide::Unstaged).contains("A\\B.rs"));
+    }
+
+    #[test]
+    fn local_tabs_keep_captured_source_separate_from_repository_identity() {
+        let parent = GitContext::local_for_project("parent", "/work");
+        let repo = parent.with_path("/work/repo");
+        let child = GitContext::local_for_project("child", "/work/repo");
+        let key = DiffKey {
+            project_id: "parent".into(),
+            backend: backend_key(&repo),
+            target: DiffTarget::file_on(&repo, "file", DiffSide::Unstaged),
+        };
+        assert_eq!(repo.repository_key(), child.repository_key());
+        assert_eq!(backend_key(&parent), backend_key(&repo));
+        assert_ne!(backend_key(&repo), backend_key(&child));
+        assert_ne!(
+            backend_key(&repo),
+            backend_key(&GitContext::local("/work/repo"))
+        );
+        assert!(key.follows_repo(&repo));
+        assert!(!key.follows_repo(&child));
+        assert!(!key.follows_repo(&GitContext::local("/work/repo")));
     }
 
     /// 同一个文件,文件树按项目根(子目录)传、更改列表 / gutter 按仓库根传,拼出来是同一个

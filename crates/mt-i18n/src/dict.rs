@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1768;
+pub const ZH_ENTRY_COUNT: usize = 1769;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1768;
+pub const EN_ENTRY_COUNT: usize = 1769;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1479,6 +1479,7 @@ static GIT_HISTORY_ZH: &[(&str, &str)] = &[
     ("recoveryUnchanged", "无变更"),
     ("remoteDisabled", "远端 Git 尚未启用，不会上传或运行 helper。"),
     ("remoteNotSupported", "远程项目暂不支持 Git 面板"),
+    ("repositoryBlocked", "仓库 {repo} 暂停写入：来源项目「{projects}」有结果未知的操作。请前往来源项目核对或阅读风险提示后放弃核对；本次操作未发送。"),
     ("requestCancelled", "项目或请求上下文已失效，尚未发送的请求未执行。"),
     ("requestFailed", "远端 Git 请求失败，请检查下方详细信息。"),
     ("selectProject", "选择一个项目"),
@@ -1582,6 +1583,7 @@ static GIT_HISTORY_EN: &[(&str, &str)] = &[
     ("recoveryUnchanged", "Unchanged"),
     ("remoteDisabled", "Remote Git is disabled. No helper will be uploaded or started."),
     ("remoteNotSupported", "Git panel is not yet available for remote projects"),
+    ("repositoryBlocked", "Writes to {repo} are blocked by unknown operations from project(s) “{projects}”. Verify or explicitly abandon verification in the source project. This operation was not sent."),
     ("requestCancelled", "The project or request context expired. Requests not yet sent were not executed."),
     ("requestFailed", "The remote Git request failed. See the diagnostic details below."),
     ("selectProject", "Select a project"),

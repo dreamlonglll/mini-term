@@ -973,7 +973,7 @@ fn service_password_rotation_preserves_unknown_generation_and_never_replays_writ
     let pool = fixture.pool.clone();
     let read_connection = connection.clone();
     let successor = crate::git_service::testing_workspace(
-        project_id,
+        project_id.clone(),
         connection,
         "/test".into(),
         Arc::new(move || {
@@ -993,10 +993,18 @@ fn service_password_rotation_preserves_unknown_generation_and_never_replays_writ
         }),
     );
     assert_eq!(successor.unknown_write(), Some(unknown.clone()));
-    assert!(matches!(
-        fixture.runtime.block_on(successor.request_async(commit())),
-        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
-    ));
+    let dispatched = fixture.counts.requests.load(Ordering::SeqCst);
+    assert_eq!(
+        fixture
+            .runtime
+            .block_on(successor.request_async(commit()))
+            .unwrap_err(),
+        mt_git_helper::GitFailure::RepositoryBlocked {
+            repo: unknown.repo.clone(),
+            owner_project_ids: vec![project_id],
+        }
+    );
+    assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), dispatched);
     let snapshot = fixture
         .runtime
         .block_on(successor.recovery_snapshot())

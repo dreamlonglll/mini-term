@@ -59,7 +59,7 @@ use crate::git_diff::{self, CommitFileDiffPane};
 use crate::git_history::{format_absolute_time, format_relative_time};
 use crate::git_ui::{
     self, ButtonKind, FormOp, ICON_ALERT, ICON_CHECK, ICON_CLEAN, ICON_PLUS, ICON_REFRESH,
-    ICON_STASH, ICON_TRASH, SectionHeader, Tone, error_text, mono,
+    ICON_STASH, ICON_TRASH, SectionHeader, Tone, mono,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -662,7 +662,12 @@ fn run_op<T: Send + 'static>(
                     error @ Notice::Error(_) => error,
                 },
                 Err(err) => {
-                    let detail = git_ui::repo_text(&source_store, &context, error_text(&err), cx);
+                    let detail = git_ui::repo_text(
+                        &source_store,
+                        &context,
+                        git_ui::error_text_for_store(&err, &source_store, cx),
+                        cx,
+                    );
                     eprintln!("[git] 贮藏操作 {busy:?} 失败: {detail}");
                     // 等待期间弹窗被关掉了:原因不能丢
                     if !is_open(kind::GIT_STASH) {
@@ -2063,7 +2068,12 @@ fn run_form_op<T: Send + 'static>(
                     on_ok(value, &form, window, cx);
                 }
                 Err(err) => {
-                    let detail = git_ui::repo_text(&source_store, &context, error_text(&err), cx);
+                    let detail = git_ui::repo_text(
+                        &source_store,
+                        &context,
+                        git_ui::error_text_for_store(&err, &source_store, cx),
+                        cx,
+                    );
                     eprintln!("[git] {dialog} 失败: {detail}");
                     if is_open(dialog) {
                         let state = git_ui::error_text_state(&detail, 8, window, cx);

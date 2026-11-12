@@ -210,7 +210,7 @@ fn unknown_survives_reads_close_disposal_and_reuses_one_reader() {
     assert!(workspace.write_outcome_unknown());
     assert!(matches!(
         runtime.block_on(workspace.request_async(write())),
-        Err(GitFailure::OutcomeUnknown { .. })
+        Err(GitFailure::RepositoryBlocked { .. })
     ));
     let inner = Arc::downgrade(&workspace.inner);
     drop(workspace);
@@ -271,7 +271,7 @@ fn dispatched_decode_failure_is_unknown_and_never_replayed() {
     assert_eq!(transport.decode_unknown.load(Ordering::SeqCst), 1);
     assert!(matches!(
         runtime.block_on(workspace.request_async(write())),
-        Err(GitFailure::OutcomeUnknown { .. })
+        Err(GitFailure::RepositoryBlocked { .. })
     ));
     assert_eq!(lock(&transport.requests).len(), 1);
     recover(&workspace);
@@ -637,31 +637,63 @@ fn all_remote_slots_cannot_starve_local_and_cancelled_closures_keep_admission() 
 fn unknown_blocks_other_granted_project_without_granting_recovery_authority() {
     let _serial = lock(&TEST_LOCK);
     let runtime = state().runtime().unwrap();
-    let (origin, transport) = fixture(Duration::from_secs(60));
-    let other = RemoteGitWorkspace::new(
-        "other-granted-project".into(),
-        origin.inner.connection.clone(),
-        origin.inner.root.clone(),
-    );
-    set_project_git_permission(
-        &other.inner.project_id,
-        Some(&other.inner.connection),
-        &other.inner.root,
-        true,
-    );
-    lose_write(&origin, &transport);
-    assert!(matches!(
-        runtime.block_on(other.request_async(write())),
-        Err(GitFailure::OutcomeUnknown { .. })
-    ));
-    assert_code(
-        runtime.block_on(other.recovery_snapshot()).unwrap_err(),
-        "remote_git_no_unknown_write",
-    );
-    assert_eq!(lock(&transport.requests).len(), 1);
-    set_project_git_permission(&other.inner.project_id, None, "", false);
-    assert!(origin.inner.ensure_active().is_ok());
-    recover(&origin);
+    for same_root in [true, false] {
+        let (origin, transport) = fixture(Duration::from_secs(60));
+        let root = if same_root {
+            origin.inner.root.clone()
+        } else {
+            "/other-grant-root".into()
+        };
+        let other = RemoteGitWorkspace::new(
+            format!("other-granted-project-{same_root}"),
+            origin.inner.connection.clone(),
+            root,
+        );
+        set_project_git_permission(
+            &other.inner.project_id,
+            Some(&other.inner.connection),
+            &other.inner.root,
+            true,
+        );
+        lose_write(&origin, &transport);
+        assert_eq!(
+            runtime.block_on(other.request_async(write())).unwrap_err(),
+            GitFailure::RepositoryBlocked {
+                repo: "/repo".into(),
+                owner_project_ids: vec![origin.inner.project_id.clone()],
+            }
+        );
+        assert!(!other.write_outcome_unknown());
+        assert_eq!(
+            lock(&transport.requests).len(),
+            1,
+            "blocked write was not dispatched"
+        );
+        assert_code(
+            runtime.block_on(other.recovery_snapshot()).unwrap_err(),
+            "remote_git_no_unknown_write",
+        );
+        assert!(other.prepare_offline_abandon().is_err());
+        assert!(other.recovery_consent().is_err());
+        let snapshot = runtime.block_on(origin.recovery_snapshot()).unwrap();
+        assert_code(
+            runtime
+                .block_on(other.acknowledge_recovery(snapshot))
+                .unwrap_err(),
+            "remote_git_recovery_stale",
+        );
+        let before = lock(&transport.requests).len();
+        let confirmation = origin.prepare_offline_abandon().unwrap();
+        assert_code(
+            other.abandon_recovery(confirmation).unwrap_err(),
+            "remote_git_recovery_stale",
+        );
+        assert_eq!(lock(&transport.requests).len(), before);
+        assert!(origin.write_outcome_unknown());
+        set_project_git_permission(&other.inner.project_id, None, "", false);
+        assert!(origin.inner.ensure_active().is_ok());
+        recover(&origin);
+    }
 }
 
 #[test]
@@ -780,7 +812,7 @@ fn credential_rotation_preserves_original_unknown_until_new_grant_snapshot_ack()
     );
     assert!(matches!(
         runtime.block_on(successor.request_async(write())),
-        Err(GitFailure::OutcomeUnknown { .. })
+        Err(GitFailure::RepositoryBlocked { .. })
     ));
     assert_code(
         runtime
@@ -809,7 +841,7 @@ fn credential_rotation_preserves_original_unknown_until_new_grant_snapshot_ack()
     );
     assert!(matches!(
         runtime.block_on(other.request_async(write())),
-        Err(GitFailure::OutcomeUnknown { .. })
+        Err(GitFailure::RepositoryBlocked { .. })
     ));
     assert_code(
         runtime
@@ -1157,6 +1189,31 @@ fn all_shared_repository_blockers_expose_owners_but_not_recovery_authority() {
             .iter()
             .any(|blocker| blocker.owner_project_id == second.inner.project_id)
     );
+    set_project_git_permission(
+        &observer.inner.project_id,
+        Some(&observer.inner.connection),
+        &observer.inner.root,
+        true,
+    );
+    let mut expected_ids = vec![
+        first.inner.project_id.clone(),
+        second.inner.project_id.clone(),
+    ];
+    expected_ids.sort_unstable();
+    assert_eq!(
+        state()
+            .runtime()
+            .unwrap()
+            .block_on(observer.request_async(write()))
+            .unwrap_err(),
+        GitFailure::RepositoryBlocked {
+            repo: "/repo".into(),
+            owner_project_ids: expected_ids,
+        }
+    );
+    assert!(lock(&observer.inner.sender).is_some());
+    assert!(!observer.write_outcome_unknown());
+    assert_eq!(first_transport.connects.load(Ordering::SeqCst), 1);
     assert!(observer.prepare_offline_abandon().is_err());
     assert!(observer.recovery_consent().is_err());
     let confirmation = first.prepare_offline_abandon().unwrap();
@@ -1170,6 +1227,116 @@ fn all_shared_repository_blockers_expose_owners_but_not_recovery_authority() {
     second
         .abandon_recovery(second.prepare_offline_abandon().unwrap())
         .unwrap();
+}
+
+#[test]
+fn own_unknown_on_another_repository_reports_the_original_repository() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    let before = lock(&transport.requests).len();
+    assert_eq!(
+        runtime
+            .block_on(workspace.request_async(Operation::StageAll {
+                repo: "/another-repository".into(),
+            }))
+            .unwrap_err(),
+        GitFailure::RepositoryBlocked {
+            repo: "/repo".into(),
+            owner_project_ids: vec![workspace.inner.project_id.clone()],
+        }
+    );
+    assert_eq!(lock(&transport.requests).len(), before);
+    assert_eq!(workspace.unknown_write().unwrap().repo, "/repo");
+    workspace
+        .abandon_recovery(workspace.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn revoked_workspace_scope_metadata_includes_nested_repos_not_siblings_or_other_endpoints() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (root_owner, _) = fixture(Duration::from_secs(60));
+    let root = root_owner.inner.root.clone();
+    let repos = [
+        root.clone(),
+        format!("{root}/nested/repository/"),
+        format!("{root}-sibling/repository"),
+        format!("{root}/case-sensitive"),
+        format!("{root}/../sibling/repository"),
+        format!("{}/nested", root.to_uppercase()),
+    ];
+    let mut owners = Vec::new();
+    for (index, repo) in repos.iter().enumerate() {
+        let (owner, transport) = fixture(Duration::from_secs(60));
+        let owner = if index == 3 {
+            let mut endpoint = owner.inner.connection.clone();
+            endpoint.host = "another-server.invalid".into();
+            credential_successor(&owner, endpoint)
+        } else {
+            owner
+        };
+        {
+            let _source = remote_git_source_change_guard();
+            let mut registry = lock(&UNKNOWN_WORKSPACES);
+            *lock(&owner.inner.unknown) = Some(RemoteGitUnknownWrite {
+                generation: SEQUENCE.fetch_add(1, Ordering::AcqRel),
+                repo: repo.clone(),
+                operation: RemoteGitOperationKind::StageAll,
+                occurred: SystemTime::now(),
+            });
+            registry.push(owner.inner.clone());
+        }
+        owners.push((owner, transport));
+    }
+    let observer = RemoteGitWorkspace::new(
+        "revoked-scope-observer".into(),
+        root_owner.inner.connection.clone(),
+        format!("{root}/"),
+    );
+    set_project_git_permission(
+        &observer.inner.project_id,
+        Some(&observer.inner.connection),
+        &observer.inner.root,
+        true,
+    );
+    set_project_git_permission(&observer.inner.project_id, None, "", false);
+    let blockers = observer.recovery_blockers_in_scope();
+    assert_eq!(blockers.len(), 2);
+    assert!(
+        blockers
+            .iter()
+            .any(|blocker| blocker.write.repo == repos[0])
+    );
+    assert!(
+        blockers
+            .iter()
+            .any(|blocker| blocker.write.repo == repos[1])
+    );
+    assert_eq!(
+        observer.recovery_blockers(&root).len(),
+        1,
+        "exact API stays exact"
+    );
+    assert!(observer.unknown_write().is_none());
+    assert!(observer.prepare_offline_abandon().is_err());
+    assert!(observer.recovery_consent().is_err());
+    assert!(lock(&observer.inner.sender).is_none());
+    assert_code(
+        runtime
+            .block_on(observer.request_async(Operation::Discover))
+            .unwrap_err(),
+        "remote_git_disabled",
+    );
+    for (owner, transport) in owners {
+        assert_eq!(transport.factories.load(Ordering::SeqCst), 0);
+        assert!(lock(&transport.requests).is_empty());
+        owner
+            .abandon_recovery(owner.prepare_offline_abandon().unwrap())
+            .unwrap();
+    }
 }
 
 #[test]
@@ -1222,10 +1389,13 @@ fn write_rechecks_shared_unknown_after_transport_setup_before_dispatch() {
         registry.push(origin.inner.clone());
     }
     drop(source);
-    assert!(matches!(
-        runtime.block_on(task).unwrap(),
-        Err(GitFailure::OutcomeUnknown { .. })
-    ));
+    assert_eq!(
+        runtime.block_on(task).unwrap().unwrap_err(),
+        GitFailure::RepositoryBlocked {
+            repo: "/repo".into(),
+            owner_project_ids: vec![origin.inner.project_id.clone()],
+        }
+    );
     assert!(lock(&candidate_transport.requests).is_empty());
     assert!(!candidate.write_running());
     assert!(!candidate.write_outcome_unknown());

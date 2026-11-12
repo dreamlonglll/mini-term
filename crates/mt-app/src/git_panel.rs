@@ -521,6 +521,16 @@ pub(crate) fn current_repo_for_project(store: &AppStore, project_id: &str) -> Op
     })
 }
 
+#[cfg(test)]
+pub(crate) fn set_test_selected_repo(store: &AppStore, project_id: &str, repo: &str) {
+    let key = crate::git_backend::project_context(store, project_id).key();
+    REPO_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(key, (Vec::new(), repo.to_owned()));
+    });
+}
+
 pub(crate) fn project_has_multiple_repos(store: &AppStore, project_id: Option<&str>) -> bool {
     let Some(id) = project_id else {
         return false;
@@ -1243,14 +1253,12 @@ impl GitPanel {
                     ),
                 );
         }
-        let repo = if self.selected_repo.is_empty() {
-            context.path()
+        let blockers = if self.selected_repo.is_empty() {
+            context.recovery_blockers_in_scope()
         } else {
-            &self.selected_repo
+            context.with_path(&self.selected_repo).recovery_blockers()
         };
-        for blocker in context
-            .with_path(repo)
-            .recovery_blockers()
+        for blocker in blockers
             .into_iter()
             .filter(|blocker| blocker.owner_project_id != id)
         {
@@ -1697,7 +1705,7 @@ impl GitPanel {
                                     tr!("gitBranch", "opFailed", op = busy.label()),
                                     cx,
                                 ),
-                                git_ui::error_text(&err),
+                                git_ui::error_text_for_store(&err, &this.store, cx),
                                 window,
                                 cx,
                             );

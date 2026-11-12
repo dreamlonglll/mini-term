@@ -154,6 +154,8 @@ The server needs Git and permission to execute programs in its user cache; no Ru
 
 If the server is unreachable, the Git panel offers explicit risk-confirmed abandonment. This only removes the local guard; remote work may continue. It does not stop processes, replay requests or restore project permission. Recovery remains available after revocation; online inspection asks for one-time read-only verification consent (which may upload and start the helper), not ordinary Git permission.
 
+When projects share a remote repository, an unknown operation blocks further writes to that repository. Errors identify the source projects, and the Git panel can navigate to the owner for verification. Related nested-repository records remain visible after revocation; another project never gains the owner's recovery authority.
+
 Revoking a project's permission stops new remote Git operations for that project; **it does not cancel writes already started**, and Git or related child processes may continue. To clean up the cache, first stop remote Git operations and revoke permission for every project using it. Confirm that all Git operations and related child processes have finished, and only then delete the server's `~/.cache/mini-term/git-helper/` cache. Do not delete project directories. See the [full feature list](docs/features.md#building-the-remote-git-helper-from-source) for source-build and staging instructions.
 
 ---

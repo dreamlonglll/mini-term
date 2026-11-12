@@ -1766,7 +1766,12 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
                 });
             }
             Err(err) => {
-                let message = git_ui::repo_text(&store, &context, git_ui::error_text(&err), cx);
+                let message = git_ui::repo_text(
+                    &store,
+                    &context,
+                    git_ui::error_text_for_store(&err, &store, cx),
+                    cx,
+                );
                 done_form.update(cx, |f, cx| {
                     f.op.fail(message.clone());
                     cx.notify();

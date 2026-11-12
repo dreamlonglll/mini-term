@@ -563,7 +563,12 @@ fn finish_write(
             git_ui::toast_for_repo(&store, &repo, message, Tone::Info, cx);
         }
         Err(err) => {
-            let detail = git_ui::repo_text(&store, &repo, git_ui::error_text(&err), cx);
+            let detail = git_ui::repo_text(
+                &store,
+                &repo,
+                git_ui::error_text_for_store(&err, &store, cx),
+                cx,
+            );
             eprintln!("[git] 逐段解决 {path} 失败: {detail}");
             let notice = if err.is::<StaleConflictFile>() {
                 Notice::Stale

@@ -13,6 +13,17 @@ pub enum GitFailure {
         #[serde(deserialize_with = "bounded_error")]
         message: String,
     },
+    /// A write was not dispatched because an earlier operation needs owner recovery.
+    /// Metadata only; these project IDs never confer recovery authority.
+    RepositoryBlocked {
+        #[serde(deserialize_with = "bounded_path")]
+        repo: String,
+        #[serde(
+            deserialize_with = "bounded_owner_project_ids",
+            serialize_with = "serialize_owner_project_ids"
+        )]
+        owner_project_ids: Vec<String>,
+    },
     Service {
         #[serde(deserialize_with = "bounded_identifier")]
         code: String,
@@ -71,6 +82,7 @@ impl GitFailure {
         match self {
             Self::Message { message } => anyhow::Error::msg(message),
             unknown @ Self::OutcomeUnknown { .. } => unknown.into(),
+            blocked @ Self::RepositoryBlocked { .. } => blocked.into(),
             service @ Self::Service { .. } => service.into(),
             Self::StaleDiff => StaleDiff.into(),
             Self::StaleConflictFile => StaleConflictFile.into(),
@@ -103,6 +115,22 @@ impl std::fmt::Display for GitFailure {
             Self::Message { message } => formatter.write_str(message),
             Self::OutcomeUnknown { message } => {
                 write!(formatter, "remote outcome unknown: {message}")
+            }
+            Self::RepositoryBlocked {
+                repo,
+                owner_project_ids,
+            } => {
+                write!(
+                    formatter,
+                    "remote Git write blocked by unverified operation in {repo} (owner projects: "
+                )?;
+                for (index, id) in owner_project_ids.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    formatter.write_str(id)?;
+                }
+                formatter.write_str(")")
             }
             Self::Service { code, message } => write!(formatter, "{code}: {message}"),
             Self::StaleDiff => StaleDiff.fmt(formatter),
@@ -193,4 +221,56 @@ fn bounded_path<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Err
 }
 fn bounded_identifier<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     bounded_string(d, crate::MAX_IDENTIFIER_BYTES)
+}
+
+fn serialize_owner_project_ids<S: serde::Serializer>(
+    ids: &[String],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut bytes = 0usize;
+    for id in ids {
+        bytes = bytes.saturating_add(id.len()).saturating_add(4);
+        if id.len() > crate::MAX_IDENTIFIER_BYTES || bytes > crate::MAX_ERROR_BYTES {
+            return Err(serde::ser::Error::custom(
+                "Git blocker owner IDs exceed limit",
+            ));
+        }
+    }
+    ids.serialize(serializer)
+}
+
+fn bounded_owner_project_ids<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    struct Identifier(String);
+    impl<'de> Deserialize<'de> for Identifier {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            bounded_identifier(d).map(Self)
+        }
+    }
+    struct Owners;
+    impl<'de> serde::de::Visitor<'de> for Owners {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("bounded Git blocker owner project IDs")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut ids = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(Identifier(id)) = sequence.next_element()? {
+                bytes = bytes.saturating_add(id.len()).saturating_add(4);
+                if bytes > crate::MAX_ERROR_BYTES {
+                    return Err(serde::de::Error::custom(
+                        "Git blocker owner IDs exceed limit",
+                    ));
+                }
+                ids.push(id);
+            }
+            Ok(ids)
+        }
+    }
+    deserializer.deserialize_seq(Owners)
 }

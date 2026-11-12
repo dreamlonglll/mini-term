@@ -222,8 +222,9 @@ use mt_i18n::{
 /// discardChangeTip,discardChangeTitle,discardChangeConfirm,toggleChangeTip}`），一侧为空时
 /// 那一栏的「空文件」（`gitCommit.emptySide`）。
 /// 1659 → 1768：合入远端 Git 项目授权与第三轮恢复出口、操作摘要及草稿历史文案。
+/// 1768 → 1769：共享仓库写入阻挡错误展示来源项目名。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1768;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1769;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

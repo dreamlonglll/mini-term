@@ -21,6 +21,12 @@ struct RemoteBackend {
     workspace: RemoteGitWorkspace,
 }
 
+/// Local source is captured separately from the physical repository/write gate.
+struct LocalSource {
+    project_id: String,
+    root: String,
+}
+
 #[derive(Clone)]
 enum Backend {
     Local,
@@ -31,6 +37,7 @@ enum Backend {
 #[derive(Clone)]
 pub struct GitContext {
     backend: Backend,
+    local_source: Option<Arc<LocalSource>>,
     path: String,
 }
 
@@ -53,7 +60,26 @@ impl GitContext {
     pub fn local(path: impl Into<String>) -> Self {
         Self {
             backend: Backend::Local,
+            local_source: None,
             path: path.into(),
+        }
+    }
+
+    /// Capture the initiating local project before discovery or asynchronous work.
+    /// `with_path` may select a repository outside its root without changing source.
+    pub fn local_for_project(project_id: impl Into<String>, path: impl Into<String>) -> Self {
+        let path = path.into();
+        #[cfg(windows)]
+        let root = mt_core::path_key::windows_eq_key(&path);
+        #[cfg(not(windows))]
+        let root = mt_core::path_key::posix_trim_trailing(&path).to_string();
+        Self {
+            backend: Backend::Local,
+            local_source: Some(Arc::new(LocalSource {
+                project_id: project_id.into(),
+                root,
+            })),
+            path,
         }
     }
 
@@ -87,6 +113,7 @@ impl GitContext {
             });
         Self {
             backend: Backend::Remote(backend),
+            local_source: None,
             path: root,
         }
     }
@@ -94,12 +121,14 @@ impl GitContext {
     pub fn broken(message: impl Into<String>) -> Self {
         Self {
             backend: Backend::Broken(Arc::from(message.into())),
+            local_source: None,
             path: String::new(),
         }
     }
     pub fn with_path(&self, path: impl Into<String>) -> Self {
         Self {
             backend: self.backend.clone(),
+            local_source: self.local_source.clone(),
             path: path.into(),
         }
     }
@@ -109,6 +138,17 @@ impl GitContext {
     /// Context identity binds attribution and permission to the source project/root.
     pub fn key(&self) -> String {
         match &self.backend {
+            Backend::Local if self.local_source.is_some() => {
+                let source = self.local_source.as_ref().expect("captured local source");
+                format!(
+                    "project|{}:{}|{}:{}|{}",
+                    source.project_id.len(),
+                    source.project_id,
+                    source.root.len(),
+                    source.root,
+                    self.repository_key()
+                )
+            }
             Backend::Remote(remote) => format!(
                 "project|{}:{}|{}:{}|{}:{}|{:016x}|{}",
                 remote.project_id.len(),
@@ -162,6 +202,10 @@ impl GitContext {
     }
     pub fn project_id(&self) -> Option<&str> {
         match &self.backend {
+            Backend::Local => self
+                .local_source
+                .as_ref()
+                .map(|source| source.project_id.as_str()),
             Backend::Remote(remote) => Some(&remote.project_id),
             _ => None,
         }
@@ -209,6 +253,13 @@ impl GitContext {
     pub fn recovery_blockers(&self) -> Vec<crate::RemoteGitRecoveryBlocker> {
         match &self.backend {
             Backend::Remote(remote) => remote.workspace.recovery_blockers(&self.path),
+            _ => Vec::new(),
+        }
+    }
+    /// Recovery blockers beneath the captured SSH project root, not its selection.
+    pub fn recovery_blockers_in_scope(&self) -> Vec<crate::RemoteGitRecoveryBlocker> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.workspace.recovery_blockers_in_scope(),
             _ => Vec::new(),
         }
     }
@@ -592,6 +643,29 @@ mod tests {
         assert_ne!(a, credentials);
         assert_eq!(a.repository_key(), credentials.repository_key());
         assert_eq!(a.project_id(), Some("project"));
+    }
+
+    #[test]
+    fn captured_local_source_survives_selection_without_splitting_write_identity() {
+        let source = GitContext::local_for_project("parent", "/work");
+        let selected = source.with_path("/work/repo");
+        let child = GitContext::local_for_project("child", "/work/repo");
+        let raw = GitContext::local("/work/repo");
+        assert_eq!(selected.project_id(), Some("parent"));
+        assert_eq!(selected.local_path(), Some(Path::new("/work/repo")));
+        assert_eq!(selected, source.with_path("/work/repo/"));
+        assert_ne!(selected, child);
+        assert_ne!(selected, raw);
+        assert_eq!(selected.repository_key(), child.repository_key());
+        assert_eq!(selected.repository_key(), raw.repository_key());
+        assert_ne!(
+            source,
+            GitContext::local_for_project("parent", "/other").with_path("/work")
+        );
+        assert_eq!(
+            source,
+            GitContext::local_for_project("parent", "/work/").with_path("/work")
+        );
     }
 
     #[cfg(not(windows))]

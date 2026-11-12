@@ -2573,7 +2573,15 @@ fn run_hunk_op(
                 c.op_error = Some(if c.stale {
                     t("gitCommit", "hunkStale").to_string()
                 } else {
-                    tr!("gitCommit", "hunkFailed", detail = format!("{err:#}"))
+                    let detail = if matches!(
+                        err.downcast_ref::<mt_remote::GitFailure>(),
+                        Some(mt_remote::GitFailure::RepositoryBlocked { .. })
+                    ) {
+                        git_ui::error_text_for_store(&err, &AppStore::global(cx), cx)
+                    } else {
+                        git_ui::error_text(&err)
+                    };
+                    tr!("gitCommit", "hunkFailed", detail = detail)
                 });
                 cx.notify();
             }),

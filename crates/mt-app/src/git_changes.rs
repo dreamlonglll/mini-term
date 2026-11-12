@@ -1428,7 +1428,12 @@ impl GitChanges {
                     }
                     Err(err) => git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
-                        git_ui::repo_text(&store, &context, git_ui::error_text(err), cx),
+                        git_ui::repo_text(
+                            &store,
+                            &context,
+                            git_ui::error_text_for_store(err, &store, cx),
+                            cx,
+                        ),
                         window,
                         cx,
                     ),
@@ -1602,7 +1607,12 @@ impl GitChanges {
                     Err(err) => {
                         git_ui::show_git_error(
                             t("gitChanges", "operationFailedTitle"),
-                            git_ui::repo_text(&this.store, &context, git_ui::error_text(&err), cx),
+                            git_ui::repo_text(
+                                &this.store,
+                                &context,
+                                git_ui::error_text_for_store(&err, &this.store, cx),
+                                cx,
+                            ),
                             window,
                             cx,
                         );
@@ -2085,13 +2095,23 @@ impl GitChanges {
             self.commit_error = Some(tr!(
                 "gitChanges",
                 "commitFailed",
-                detail = git_ui::repo_text(&self.store, context, git_ui::error_text(err), cx)
+                detail = git_ui::repo_text(
+                    &self.store,
+                    context,
+                    git_ui::error_text_for_store(err, &self.store, cx),
+                    cx
+                )
             ));
             cx.notify();
         } else {
             git_ui::show_git_error(
                 t("gitChanges", "operationFailedTitle"),
-                git_ui::repo_text(&self.store, context, git_ui::error_text(err), cx),
+                git_ui::repo_text(
+                    &self.store,
+                    context,
+                    git_ui::error_text_for_store(err, &self.store, cx),
+                    cx,
+                ),
                 window,
                 cx,
             );
@@ -2237,7 +2257,12 @@ impl GitChanges {
                 {
                     git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
-                        git_ui::repo_text(&this.store, &context, git_ui::error_text(err), cx),
+                        git_ui::repo_text(
+                            &this.store,
+                            &context,
+                            git_ui::error_text_for_store(err, &this.store, cx),
+                            cx,
+                        ),
                         window,
                         cx,
                     );
@@ -2270,7 +2295,7 @@ impl GitChanges {
                             detail = git_ui::repo_text(
                                 &this.store,
                                 &context,
-                                git_ui::error_text(&err),
+                                git_ui::error_text_for_store(&err, &this.store, cx),
                                 cx
                             )
                         ));
@@ -2342,7 +2367,12 @@ impl GitChanges {
                         eprintln!("[git] 读取提交消息历史失败: {err:#}");
                         git_ui::show_git_error(
                             t("gitChanges", "operationFailedTitle"),
-                            git_ui::repo_text(&this.store, &context, git_ui::error_text(&err), cx),
+                            git_ui::repo_text(
+                                &this.store,
+                                &context,
+                                git_ui::error_text_for_store(&err, &this.store, cx),
+                                cx,
+                            ),
                             window,
                             cx,
                         );
@@ -3886,6 +3916,139 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn parent_commits_selected_child_repo_but_switching_blocks_submission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.skip_drawing();
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        cx.update(crate::toast::init);
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-parent-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        let parent_id = format!("parent-{}", root.file_name().unwrap().to_string_lossy());
+        let child_id = format!("child-{parent_id}");
+        let other_id = format!("other-{parent_id}");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "t@e"]);
+        std::fs::write(repo.join("file"), "first\n").unwrap();
+        git(&["add", "file"]);
+        let config = mt_config::AppConfig {
+            projects: vec![
+                test_project(&parent_id, root.to_str().unwrap()),
+                test_project(&child_id, repo.to_str().unwrap()),
+                test_project(&other_id, root.join("other").to_str().unwrap()),
+            ],
+            last_active_project_id: Some(parent_id.clone()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let context = cx.update(|cx| {
+            crate::git_panel::set_test_selected_repo(
+                store.read(cx),
+                &parent_id,
+                repo.to_str().unwrap(),
+            );
+            crate::git_backend::project_context(store.read(cx), &parent_id)
+                .with_path(repo.to_string_lossy())
+        });
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let changes = cx
+            .update_window(window.into(), |_, window, cx| {
+                let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
+                changes.update(cx, |this, cx| {
+                    this.context = Some(context.clone());
+                    this.sync_input(window, cx);
+                    this.apply_snapshot(load_snapshot(&context), false, cx);
+                    this.commit_input.update(cx, |input, cx| {
+                        input.set_value("parent submission", window, cx)
+                    });
+                    assert!(git_ui::repo_is_current(&store, &context, cx));
+                    assert_eq!(
+                        git_ui::repo_project_id(&store, &context, cx).as_deref(),
+                        Some(parent_id.as_str())
+                    );
+                    assert!(this.commit_blocker(false, cx).is_none());
+                    this.commit(false, false, window, cx);
+                    assert!(
+                        this.committing,
+                        "parent source must submit its selected child repository"
+                    );
+                });
+                changes
+            })
+            .unwrap();
+        cx.condition(&changes, |this, _| {
+            !this.committing && this.loaded_once && this.changes.is_empty()
+        })
+        .await;
+        assert_eq!(
+            git(&["log", "-1", "--format=%s"]).trim(),
+            "parent submission"
+        );
+        let committed = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("file"), "second\n").unwrap();
+        git(&["add", "file"]);
+        cx.update_window(window.into(), |_, window, cx| {
+            store.update(cx, |state, _| {
+                state.active_project_id = Some(other_id.clone())
+            });
+            changes.update(cx, |this, cx| {
+                this.apply_snapshot(load_snapshot(&context), false, cx);
+                this.commit_input.update(cx, |input, cx| {
+                    input.set_value("must remain draft", window, cx)
+                });
+                assert_eq!(this.context.as_ref(), Some(&context));
+                assert!(!git_ui::repo_is_current(&store, &context, cx));
+                assert!(
+                    this.commit_blocker(false, cx).is_none(),
+                    "only changed source blocks submission"
+                );
+                this.commit(false, false, window, cx);
+                assert!(
+                    !this.committing,
+                    "hidden parent must not submit after switching projects"
+                );
+                assert_eq!(
+                    this.commit_input.read(cx).value().as_ref(),
+                    "must remain draft"
+                );
+            });
+            crate::git_panel::set_test_selected_repo(store.read(cx), &parent_id, "");
+        })
+        .unwrap();
+        assert_eq!(git(&["rev-parse", "HEAD"]), committed);
+        assert_eq!(git(&["diff", "--cached", "--name-only"]).trim(), "file");
+        drop(changes);
+        cx.run_until_parked();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     async fn diff_reload_follows_last_staged_file_and_periodic_amend_stays_enabled(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3920,7 +4083,7 @@ mod tests {
         git(&["commit", "-q", "-m", "first"]);
         std::fs::write(root.join("file"), "modified\n").unwrap();
         git(&["add", "file"]);
-        let context = GitContext::local(root.to_string_lossy().into_owned());
+        let context = GitContext::local_for_project("source", root.to_string_lossy());
         let config = mt_config::AppConfig {
             projects: vec![test_project("source", root.to_str().unwrap())],
             last_active_project_id: Some("source".into()),
@@ -4313,8 +4476,8 @@ mod tests {
                     .success()
             );
         }
-        let context = GitContext::local(a.to_string_lossy().into_owned());
-        let other = GitContext::local(b.to_string_lossy().into_owned());
+        let context = GitContext::local_for_project("a", a.to_string_lossy());
+        let other = GitContext::local_for_project("b", b.to_string_lossy());
         let hook = a.join(".git/hooks/pre-commit");
         std::fs::write(&hook, "#!/bin/sh\ntouch .git/hook-pending\nwhile [ ! -f .git/hook-release ]; do sleep 0.02; done\necho hook-rejected-original-A >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();

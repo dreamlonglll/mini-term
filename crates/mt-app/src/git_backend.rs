@@ -1,6 +1,7 @@
 //! Capture Git execution identity on the UI thread before asynchronous work.
 //! Helper consent is project-scoped and bound to the displayed execution target.
 //! Consent separates the project/SSH target, repository path and helper cache path.
+//! Local contexts also retain the initiating project across repository selection.
 use crate::i18n::t;
 use crate::store::AppStore;
 use crate::ui;
@@ -13,7 +14,7 @@ pub fn project_context(store: &AppStore, project_id: &str) -> GitContext {
         return GitContext::broken(t("gitHistory", "projectRemoved").to_string());
     };
     match project.ssh_connection_id.as_deref() {
-        None => GitContext::local(project.path.clone()),
+        None => GitContext::local_for_project(project.id.clone(), project.path.clone()),
         Some(connection_id) => match store
             .ssh_connections()
             .iter()

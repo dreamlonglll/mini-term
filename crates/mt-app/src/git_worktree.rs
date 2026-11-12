@@ -1615,7 +1615,7 @@ fn create(
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {
-            let mut results: Vec<(String, Result<(), String>)> = Vec::new();
+            let mut results: Vec<(String, anyhow::Result<()>)> = Vec::new();
             for (context, target) in targets {
                 let (branch, base) = (branch.clone(), base.clone());
                 let target_for_task = target.clone();
@@ -1625,10 +1625,7 @@ fn create(
                     context.add_worktree(&target_for_task, &branch, create_branch, base.as_deref())
                 })
                 .await;
-                results.push((
-                    target,
-                    result.map(|_| ()).map_err(|err| git_ui::error_text(&err)),
-                ));
+                results.push((target, result.map(|_| ())));
             }
             drop(guards);
 
@@ -1643,9 +1640,17 @@ fn create(
                     cx.notify();
                 });
 
+                let store = state.read(cx).store.clone();
                 let failures: Vec<(String, String)> = results
                     .iter()
-                    .filter_map(|(t, r)| r.as_ref().err().map(|e| (t.clone(), e.clone())))
+                    .filter_map(|(target, result)| {
+                        result.as_ref().err().map(|error| {
+                            (
+                                target.clone(),
+                                git_ui::error_text_for_store(error, &store, cx),
+                            )
+                        })
+                    })
                     .collect();
                 let successes: Vec<String> = results
                     .iter()
@@ -1984,7 +1989,11 @@ fn remove_worktree(
                     }
                     Err(err) => {
                         eprintln!("[git] 删除 worktree 失败: {err:#}");
-                        let message = remove_failure_text(&err);
+                        let message = if err.is::<mt_project::git::WorktreeRemoveError>() {
+                            remove_failure_text(&err)
+                        } else {
+                            git_ui::error_text_for_store(&err, &store, cx)
+                        };
                         // 删到一半、登记已经没了:列表里不会再有这一条,框里再点「删除」
                         // 也无从删起 —— 关框、刷新列表,原因与下一步退到提示框
                         if matches!(
@@ -2108,8 +2117,10 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
                     });
                 }
                 Err(err) => {
+                    let store = state.read(cx).store.clone();
+                    let message = git_ui::error_text_for_store(&err, &store, cx);
                     state.update(cx, |s, cx| {
-                        s.load_error = Some(git_ui::error_text(&err));
+                        s.load_error = Some(message);
                         cx.notify();
                     });
                     return;
@@ -2119,8 +2130,10 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
             on_changed(cx);
             load(&state, cx);
             if let Err(err) = pruned {
+                let store = state.read(cx).store.clone();
+                let message = git_ui::error_text_for_store(&err, &store, cx);
                 state.update(cx, |s, cx| {
-                    s.load_error = Some(git_ui::error_text(&err));
+                    s.load_error = Some(message);
                     cx.notify();
                 });
             }

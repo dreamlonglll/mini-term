@@ -219,6 +219,46 @@ fn error_caps_are_utf8_safe_and_unknown_survives_anyhow() {
 }
 
 #[test]
+fn repository_blockers_preserve_all_owner_ids_and_bound_wire_metadata() {
+    use mt_git_helper::{GitFailure, MAX_ERROR_BYTES, MAX_IDENTIFIER_BYTES, MAX_PATH_BYTES};
+    let failure = GitFailure::RepositoryBlocked {
+        repo: "/original/repository".into(),
+        owner_project_ids: vec!["owner-a".into(), "owner-b".into()],
+    };
+    let frame = encode_frame(&failure).unwrap();
+    let restored = read_frame::<GitFailure>(&mut Cursor::new(frame))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored, failure);
+    let text = restored.to_string();
+    assert!(text.contains("/original/repository"));
+    assert!(text.contains("owner-a") && text.contains("owner-b"));
+    let error = restored.into_error();
+    assert_eq!(error.downcast_ref::<GitFailure>(), Some(&failure));
+    assert_eq!(GitFailure::from_error(error), failure);
+    for value in [
+        serde_json::json!({"repo": "x".repeat(MAX_PATH_BYTES + 1), "ownerProjectIds": []}),
+        serde_json::json!({"repo": "/repo", "ownerProjectIds": ["x".repeat(MAX_IDENTIFIER_BYTES + 1)]}),
+        serde_json::json!({"repo": "/repo", "ownerProjectIds": vec![""; MAX_ERROR_BYTES / 4 + 1]}),
+    ] {
+        let wire = serde_json::to_vec(&serde_json::json!({"repositoryBlocked": value})).unwrap();
+        assert!(serde_json::from_slice::<GitFailure>(&wire).is_err());
+        assert!(mt_git_helper::decode_json::<GitFailure>(&wire).is_err());
+    }
+    for owner_project_ids in [
+        vec!["x".repeat(MAX_IDENTIFIER_BYTES + 1)],
+        vec![String::new(); MAX_ERROR_BYTES / 4 + 1],
+    ] {
+        let oversized = GitFailure::RepositoryBlocked {
+            repo: "/repo".into(),
+            owner_project_ids,
+        };
+        assert!(serde_json::to_vec(&oversized).is_err());
+        assert!(encode_frame(&oversized).is_err());
+    }
+}
+
+#[test]
 fn preflight_rejects_amplifying_collection_before_deserializer_runs() {
     struct MustNotDeserialize;
     impl<'de> serde::Deserialize<'de> for MustNotDeserialize {
