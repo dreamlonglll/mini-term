@@ -677,7 +677,8 @@ fn kbd(label: &'static str) -> impl IntoElement {
         .child(label)
 }
 
-fn hint(keys: &[&'static str], label: &'static str) -> impl IntoElement {
+/// 底部提示条里的一组「键帽 + 说明」。快速打开(`quick_open`)的底栏也用它,两个浮层同一观感。
+pub(crate) fn hint(keys: &[&'static str], label: &'static str) -> impl IntoElement {
     let mut row = div().flex().items_center().gap(px(2.0));
     for key in keys {
         row = row.child(kbd(key));

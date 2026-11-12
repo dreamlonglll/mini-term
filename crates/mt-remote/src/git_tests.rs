@@ -1015,3 +1015,99 @@ fn service_password_rotation_preserves_unknown_generation_and_never_replays_writ
     assert!(!successor.write_outcome_unknown());
     assert_eq!(fixture.counts.lost_writes.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn service_real_ssh_revoked_recovery_is_scoped_and_offline_exit_opens_no_channel() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::LostWriteOnce,
+        ..Default::default()
+    });
+    let workspace = fixture.workspace();
+    assert!(matches!(
+        fixture.runtime.block_on(workspace.request_async(commit())),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    let project_id = format!("ssh-recovery-{}", fixture.connection.port);
+    crate::set_project_git_permission(&project_id, None, "", false);
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    let consent = workspace.recovery_consent().unwrap();
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(status()))
+            .is_err()
+    );
+    let snapshot = fixture
+        .runtime
+        .block_on(workspace.recovery_snapshot_with_consent(consent))
+        .unwrap();
+    assert!(!snapshot.completion_proven);
+    fixture
+        .runtime
+        .block_on(workspace.acknowledge_recovery(snapshot))
+        .unwrap();
+    assert!(!workspace.write_outcome_unknown());
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(commit()))
+            .is_err()
+    );
+    assert_eq!(fixture.counts.lost_writes.load(Ordering::SeqCst), 1);
+
+    crate::set_project_git_permission(&project_id, Some(&fixture.connection), "/test", true);
+    fixture.counts.lost_writes.store(0, Ordering::SeqCst);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(commit()))
+            .is_err()
+    );
+    crate::set_project_git_permission(&project_id, None, "", false);
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    let requests = fixture.counts.requests.load(Ordering::SeqCst);
+    let confirmation = workspace.prepare_offline_abandon().unwrap();
+    workspace.abandon_recovery(confirmation).unwrap();
+    assert!(!workspace.write_outcome_unknown());
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), requests);
+    assert!(
+        fixture
+            .runtime
+            .block_on(workspace.request_async(status()))
+            .is_err()
+    );
+}
+
+#[test]
+fn offline_abandon_returns_before_live_channel_cleanup_without_new_git_requests() {
+    let _serial = crate::lock(&crate::git_service::tests::TEST_LOCK);
+    let fixture = Fixture::new(Behavior {
+        answer: Answer::UnknownOnce,
+        ignore_eof: true,
+        ..Default::default()
+    });
+    let workspace = fixture.workspace();
+    assert!(matches!(
+        fixture.runtime.block_on(workspace.request_async(commit())),
+        Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(workspace.write_outcome_unknown());
+    assert_eq!(fixture.counts.eof.load(Ordering::SeqCst), 0);
+    let channels = fixture.counts.channels.load(Ordering::SeqCst);
+    let requests = fixture.counts.requests.load(Ordering::SeqCst);
+    let confirmation = workspace.prepare_offline_abandon().unwrap();
+    let started = Instant::now();
+    workspace.abandon_recovery(confirmation).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert!(!workspace.write_outcome_unknown());
+    // The peer ignores EOF and cannot finish. Ordinary bounded Drop cleanup is
+    // permitted, but local abandonment must neither await it nor issue Git work.
+    fixture.wait_count(&fixture.counts.eof, 1);
+    fixture.wait_count(&fixture.counts.closed, 1);
+    assert_eq!(fixture.counts.finished.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
+    assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), requests);
+}

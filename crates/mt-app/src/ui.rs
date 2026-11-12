@@ -554,6 +554,49 @@ pub fn diff_del_word_bg() -> Hsla {
     alpha(token(|p| p.diff_del_text), 0.3)
 }
 
+// --- 并排 diff 按改动种类的三组色(修改蓝 / 新增绿 / 删除灰) ---
+//
+// 并排视图按「一处改动两侧有没有行」上色(对标 Winc / IDEA):两侧都有 = 修改、只有右侧 =
+// 新增、只有左侧 = 删除。新增沿用上面的 `diff_add_*`,修改、删除两组在这里;每组三档 ——
+// 行底色(也是连接带的底色)、改了的词(深一档)、带子的边与插入线(再深一档)。与词级底色
+// 同一手法:主题包没有对应槽位,按主题色 + 固定透明度派生 —— 蓝取 `color_info`,灰取
+// `text_muted`,深浅两套主题、换肤主题都跟着走。删除用中性灰而不是红:红留给冲突与报错。
+
+/// 修改(两侧都有行):行底色与带子。
+pub fn diff_mod_bg() -> Hsla {
+    alpha(token(|p| p.color_info), 0.16)
+}
+
+/// 修改:改了的词。
+pub fn diff_mod_word_bg() -> Hsla {
+    alpha(token(|p| p.color_info), 0.32)
+}
+
+/// 修改:带子的边。
+pub fn diff_mod_edge() -> Hsla {
+    alpha(token(|p| p.color_info), 0.55)
+}
+
+/// 新增(只有右侧有行):带子的边与插入线(底色与词沿用 `diff_add_bg` / `diff_add_word_bg`)。
+pub fn diff_add_edge() -> Hsla {
+    alpha(token(|p| p.diff_add_text), 0.55)
+}
+
+/// 删除(只有左侧有行):行底色与带子。
+pub fn diff_gray_bg() -> Hsla {
+    alpha(token(|p| p.text_muted), 0.18)
+}
+
+/// 删除:改了的词(纯删除没有词级标记,留给按块比对时用得上的一档)。
+pub fn diff_gray_word_bg() -> Hsla {
+    alpha(token(|p| p.text_muted), 0.34)
+}
+
+/// 删除:带子的边与插入线。
+pub fn diff_gray_edge() -> Hsla {
+    alpha(token(|p| p.text_muted), 0.6)
+}
+
 // --- 缓动 ---
 
 /// CSS `cubic-bezier(x1, y1, x2, y2)` 的等价缓动函数。

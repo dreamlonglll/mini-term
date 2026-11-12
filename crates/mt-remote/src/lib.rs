@@ -66,8 +66,12 @@
 //! are distinct from uncertain
 //! outcomes; neither is replayed. Recovery snapshots retain the original repository, attempt the
 //! old helper's barrier, and observe HEAD/index/operation/status through a reusable read channel.
-//! Explicit acknowledgement re-probes and rejects changed evidence, generations or grants. A
-//! lost barrier requires the user to accept that the original operation may still finish later.
+//! Lost barriers require explicit risk acknowledgement; revoked projects may instead give a
+//! single-use recovery-only consent (fixed observation/ack, never a normal grant). Offline
+//! abandonment consumes an owner/generation/source-bound confirmation without waiting for
+//! the actor or network, deploying, connecting, or issuing Git requests. Existing channels
+//! still receive normal bounded asynchronous EOF/close cleanup; this is not cancellation
+//! or proof that the original remote write has finished.
 //! Source configuration mutations hold [`remote_git_source_change_guard`] across their
 //! pending check, mutation and grant synchronization; dispatch atomically publishes Running
 //! under the same guard before releasing it for network IO.
@@ -100,7 +104,8 @@ pub use files::*;
 pub use git::RemoteGitClient;
 pub use git_context::GitContext;
 pub use git_service::{
-    RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace,
+    RemoteGitOfflineAbandonConfirmation, RemoteGitOperationKind, RemoteGitRecoveryBlocker,
+    RemoteGitRecoveryConsent, RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace,
     remote_git_source_change_guard, run_git, run_git_on, set_project_git_permission,
 };
 pub use mt_git_helper::GitFailure;

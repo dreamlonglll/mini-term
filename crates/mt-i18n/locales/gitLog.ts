@@ -182,6 +182,7 @@ export const gitLog = {
       noRename: "不跟随重命名",
       viewInCommit: "在完整提交 diff 中查看",
       selectHint: "选择左侧的提交，查看这个文件的改动",
+      tabTitle: "{name} 的历史",
     },
     ref: {
       head: "HEAD",
@@ -377,6 +378,7 @@ export const gitLog = {
       noRename: "Renames not followed",
       viewInCommit: "View in full commit diff",
       selectHint: "Select a commit on the left to see its changes to this file",
+      tabTitle: "History of {name}",
     },
     ref: {
       head: "HEAD",

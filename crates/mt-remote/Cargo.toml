@@ -40,3 +40,8 @@ sha2.workspace = true
 # 「there is no reactor running」。目前 `net` 靠 russh 的特性统一带进来,
 # 但那是**别人的**依赖声明 —— 显式写出来,免得哪天依赖树一变就静默失灵。
 tokio = { workspace = true, features = ["net"] }
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

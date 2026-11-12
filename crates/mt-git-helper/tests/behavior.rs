@@ -24,9 +24,7 @@ impl Fixture {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&root).unwrap();
-        Self(mt_project::fs::strip_verbatim_prefix(
-            root.canonicalize().unwrap(),
-        ))
+        Self(mt_core::path::canonicalize(&root).unwrap())
     }
 
     fn repo(&self, name: &str) -> PathBuf {
@@ -325,8 +323,8 @@ fn discovery_preserves_multiple_repositories_and_ancestor_context() {
         panic!("expected repos")
     };
     assert_eq!(repos.len(), 2);
-    let first_canonical = first.canonicalize().unwrap();
-    let second_canonical = second.canonicalize().unwrap();
+    let first_canonical = mt_core::path::canonicalize(&first).unwrap();
+    let second_canonical = mt_core::path::canonicalize(&second).unwrap();
     assert!(repos.iter().any(|repo| repo.path == first_canonical));
     assert!(repos.iter().any(|repo| repo.path == second_canonical));
     let child = first.join("child/deep");
@@ -894,8 +892,10 @@ fn binary_and_oversized_diff_markers_survive_worktree_index_and_head() {
     let fixture = Fixture::new("diff-markers");
     let repo = fixture.repo("repo");
     let cases: [(&str, Vec<u8>, bool, bool); 4] = [
-        ("binary-nul.bin", b"\0binary\x01".to_vec(), true, false),
-        ("invalid.bin", vec![0xff, 0xfe, 0x80], true, false),
+        // A binary fixture must be neither valid UTF-8 (main permits it in
+        // worktree text) nor UTF-16 BOM (main previews it, possibly lossily).
+        ("binary-nul.bin", b"\0binary\xff\x01".to_vec(), true, false),
+        ("invalid.bin", vec![0xff, 0x00, 0x80], true, false),
         ("large.txt", vec![b'x'; 1_048_577], false, true),
         ("large.bin", vec![0; 1_048_577], false, true),
     ];
@@ -1307,6 +1307,7 @@ fn every_desktop_operation_checks_repository_scope_before_core() {
         hunks: Vec::new(),
         is_binary: false,
         too_large: false,
+        encoding: None,
     };
     let mut helper = Helper::start(&repo);
     let operations = vec![
@@ -1364,6 +1365,49 @@ fn every_desktop_operation_checks_repository_scope_before_core() {
             path: "file".into(),
             diff: patch.clone(),
             hunk: 0,
+        },
+        Operation::StageHunks {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            picks: vec![],
+        },
+        Operation::UnstageHunks {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            picks: vec![],
+        },
+        Operation::DiscardHunks {
+            repo: outside.clone(),
+            path: "file".into(),
+            diff: patch.clone(),
+            picks: vec![],
+        },
+        Operation::WriteConflictResolution {
+            repo: outside.clone(),
+            snapshot: mt_project::git::ConflictSnapshot {
+                path: "file".into(),
+                digest: "invalid".into(),
+            },
+            picks: vec![],
+            mark_resolved: false,
+        },
+        Operation::Query {
+            repo: outside.clone(),
+            query: mt_git_helper::GitQuery::HeadSignature {
+                rel_path: "file".into(),
+            },
+        },
+        Operation::Query {
+            repo: outside.clone(),
+            query: mt_git_helper::GitQuery::LoadConflictFile {
+                file: "file".into(),
+            },
+        },
+        Operation::Query {
+            repo: outside.clone(),
+            query: mt_git_helper::GitQuery::ConflictSegmentStatuses { infos: vec![] },
         },
         Operation::Checkout {
             repo: outside.clone(),
@@ -1466,6 +1510,43 @@ fn every_desktop_operation_checks_repository_scope_before_core() {
                 path: bad.into(),
                 diff: patch.clone(),
                 hunk: 0,
+            },
+            Operation::StageHunks {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                picks: vec![],
+            },
+            Operation::UnstageHunks {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                picks: vec![],
+            },
+            Operation::DiscardHunks {
+                repo: path(&repo),
+                path: bad.into(),
+                diff: patch.clone(),
+                picks: vec![],
+            },
+            Operation::WriteConflictResolution {
+                repo: path(&repo),
+                snapshot: mt_project::git::ConflictSnapshot {
+                    path: bad.into(),
+                    digest: "invalid".into(),
+                },
+                picks: vec![],
+                mark_resolved: false,
+            },
+            Operation::Query {
+                repo: path(&repo),
+                query: mt_git_helper::GitQuery::HeadSignature {
+                    rel_path: bad.into(),
+                },
+            },
+            Operation::Query {
+                repo: path(&repo),
+                query: mt_git_helper::GitQuery::LoadConflictFile { file: bad.into() },
             },
             Operation::CommitDiff {
                 repo: path(&repo),
@@ -1924,7 +2005,7 @@ fn existing_directories_omits_only_missing_and_rejects_files() {
         .decode()
         .unwrap();
     assert_eq!(existing, vec![path(&repo)]);
-    let canonical = repo.canonicalize().unwrap();
+    let canonical = mt_core::path::canonicalize(&repo).unwrap();
     let aliases: Vec<String> = helper
         .success(Operation::Query {
             repo: path(&canonical),
@@ -1958,6 +2039,491 @@ fn existing_directories_omits_only_missing_and_rejects_files() {
             })
             .result
             .is_err()
+    );
+    helper.finish();
+}
+
+#[test]
+fn atomic_multi_hunk_and_line_rpcs_match_real_index_and_worktree() {
+    use mt_project::git::HunkPick;
+    let fixture = Fixture::new("atomic-lines");
+    let repo = fixture.repo("repo");
+    let base_lines: Vec<String> = (1..=45).map(|i| format!("line{i}")).collect();
+    for (eol, bom, trailing) in [("\n", "", true), ("\r\n", "\u{feff}", false)] {
+        let render = |lines: &[String]| {
+            format!(
+                "{bom}{}{}",
+                lines.join(eol),
+                if trailing { eol } else { "" }
+            )
+        };
+        let base = render(&base_lines);
+        std::fs::write(repo.join("file"), &base).unwrap();
+        git(&repo, &["add", "file"]);
+        fixed_time_commit(&repo, "base");
+        let mut changed = base_lines.clone();
+        for line in [2, 3, 22, 43] {
+            changed[line - 1] = format!("edited{line}");
+        }
+        let worktree = render(&changed);
+        std::fs::write(repo.join("file"), &worktree).unwrap();
+        let mut helper = Helper::start(&repo);
+        let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+        else {
+            panic!("diff")
+        };
+        assert_eq!(patch.hunks.len(), 3);
+        let selected = patch.hunks[0]
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.content == "line2" || line.content == "edited2")
+            .map(|(ix, _)| ix)
+            .collect();
+        let picks = vec![HunkPick::lines(0, selected), HunkPick::whole(2)];
+        // A rejected later selection cannot leave the valid earlier hunk staged.
+        assert!(
+            helper
+                .request(Operation::StageHunks {
+                    repo: path(&repo),
+                    path: "file".into(),
+                    diff: patch.clone(),
+                    picks: vec![HunkPick::whole(0), HunkPick::whole(999)]
+                })
+                .result
+                .is_err()
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", ":file"]),
+            git(&repo, &["rev-parse", "HEAD:file"])
+        );
+        helper
+            .success(Operation::StageHunks {
+                repo: path(&repo),
+                path: "file".into(),
+                diff: patch,
+                picks,
+            })
+            .decode::<()>()
+            .unwrap();
+        let mut staged_lines = base_lines.clone();
+        for line in [2, 43] {
+            staged_lines[line - 1] = format!("edited{line}");
+        }
+        // Same expectation as main's hunk_line_tests::按行暂存与取消暂存后暂存区逐字节正确:
+        // selected deletion is removed, then the insertion follows unselected deletions.
+        staged_lines.swap(1, 2);
+        let expected = render(&staged_lines);
+        let actual = Command::new("git")
+            .args(["show", ":file"])
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(actual.status.success());
+        assert_eq!(actual.stdout, expected.as_bytes());
+        let Reply::Diff { diff: staged } = helper.success(diff(&repo, "file", DiffSide::Staged))
+        else {
+            panic!("diff")
+        };
+        let all = (0..staged.hunks.len()).map(HunkPick::whole).collect();
+        helper
+            .success(Operation::UnstageHunks {
+                repo: path(&repo),
+                path: "file".into(),
+                diff: staged,
+                picks: all,
+            })
+            .decode::<()>()
+            .unwrap();
+        assert!(git(&repo, &["diff", "--cached", "--name-only"]).is_empty());
+        let Reply::Diff { diff: patch } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+        else {
+            panic!("diff")
+        };
+        assert!(
+            helper
+                .request(Operation::DiscardHunks {
+                    repo: path(&repo),
+                    path: "file".into(),
+                    diff: patch.clone(),
+                    picks: vec![HunkPick::whole(0), HunkPick::whole(999)]
+                })
+                .result
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(repo.join("file")).unwrap(),
+            worktree.as_bytes()
+        );
+        let all = (0..patch.hunks.len()).map(HunkPick::whole).collect();
+        helper
+            .success(Operation::DiscardHunks {
+                repo: path(&repo),
+                path: "file".into(),
+                diff: patch,
+                picks: all,
+            })
+            .decode::<()>()
+            .unwrap();
+        assert_eq!(std::fs::read(repo.join("file")).unwrap(), base.as_bytes());
+        let signature: mt_project::git::HeadSignature = helper
+            .success(Operation::Query {
+                repo: path(&repo),
+                query: mt_git_helper::GitQuery::HeadSignature {
+                    rel_path: "file".into(),
+                },
+            })
+            .decode()
+            .unwrap();
+        assert_eq!(signature.head, Some(git(&repo, &["rev-parse", "HEAD"])));
+        assert_eq!(
+            signature.blob,
+            Some(git(&repo, &["rev-parse", "HEAD:file"]))
+        );
+        helper.finish();
+    }
+}
+
+#[test]
+fn forged_utf8_hunk_metadata_cannot_rewrite_non_utf8_files() {
+    use mt_project::{encoding::TextEncoding, git::HunkPick};
+    let fixture = Fixture::new("forged-encoding");
+    let repo = fixture.repo("repo");
+    let encoding = TextEncoding::Utf16Le;
+    std::fs::write(repo.join("file"), encoding.encode("before\n").unwrap()).unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "base");
+    let original = encoding.encode("after\n").unwrap();
+    std::fs::write(repo.join("file"), &original).unwrap();
+    let mut helper = Helper::start(&repo);
+    let Reply::Diff { mut diff } = helper.success(diff(&repo, "file", DiffSide::Unstaged)) else {
+        panic!("diff")
+    };
+    assert_eq!(diff.encoding, Some(encoding));
+    diff.encoding = None;
+    for operation in [
+        Operation::StageHunks {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: diff.clone(),
+            picks: vec![HunkPick::whole(0)],
+        },
+        Operation::DiscardHunks {
+            repo: path(&repo),
+            path: "file".into(),
+            diff: diff.clone(),
+            picks: vec![HunkPick::whole(0)],
+        },
+    ] {
+        assert!(helper.request(operation).result.is_err());
+        assert_eq!(std::fs::read(repo.join("file")).unwrap(), original);
+        assert!(git(&repo, &["diff", "--cached", "--name-only"]).is_empty());
+    }
+    helper.finish();
+}
+
+#[test]
+fn conflict_rpc_preserves_original_encoding_partial_writes_and_stale_guards() {
+    use mt_git_helper::{GitFailure, GitQuery as Q};
+    use mt_project::{
+        encoding::TextEncoding,
+        git::{ConflictFile, ConflictPick, SegmentStatus},
+    };
+    let fixture = Fixture::new("conflict-snapshots");
+    let repo = fixture.repo("repo");
+    std::fs::write(repo.join("file"), "base\n").unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "base");
+    let original_branch = git(&repo, &["branch", "--show-current"]);
+    git(&repo, &["checkout", "-b", "other"]);
+    std::fs::write(repo.join("file"), "other\n").unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "other");
+    git(&repo, &["checkout", &original_branch]);
+    std::fs::write(repo.join("file"), "ours\n").unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "ours");
+    let merged = Command::new("git")
+        .args(["merge", "--no-edit", "other"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(!merged.status.success());
+    let sample = "头\r\n<<<<<<< HEAD\r\n甲\r\n||||||| base\r\n祖\r\n=======\r\n乙\r\n>>>>>>> other\r\n中\r\n<<<<<<< HEAD\r\nx\r\n=======\r\ny\r\n>>>>>>> other\r\n尾";
+    let encoding = TextEncoding::Utf16Le;
+    std::fs::write(repo.join("file"), encoding.encode(sample).unwrap()).unwrap();
+    let mut helper = Helper::start(&repo);
+    let infos = mt_project::git::list_conflicts(&repo).unwrap();
+    let statuses: Vec<SegmentStatus> = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::ConflictSegmentStatuses {
+                infos: infos.clone(),
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(statuses, [SegmentStatus::Ready { blocks: 2 }]);
+    let file: ConflictFile = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::LoadConflictFile {
+                file: "file".into(),
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(file.encoding, encoding);
+    assert_eq!(file.base_text(&file.blocks[0]), Some("祖\r\n"));
+    let snapshot = file.snapshot().unwrap();
+    let before = std::fs::read(repo.join("file")).unwrap();
+    assert!(
+        helper
+            .request(Operation::WriteConflictResolution {
+                repo: path(&repo),
+                snapshot: snapshot.clone(),
+                picks: vec![Some(ConflictPick::Ours), None],
+                mark_resolved: true
+            })
+            .result
+            .is_err()
+    );
+    assert_eq!(std::fs::read(repo.join("file")).unwrap(), before);
+    helper
+        .success(Operation::WriteConflictResolution {
+            repo: path(&repo),
+            snapshot: snapshot.clone(),
+            picks: vec![Some(ConflictPick::TheirsThenOurs), None],
+            mark_resolved: false,
+        })
+        .decode::<()>()
+        .unwrap();
+    let partial = std::fs::read(repo.join("file")).unwrap();
+    assert!(partial.starts_with(&[0xff, 0xfe]));
+    assert_eq!(mt_project::git::list_conflicts(&repo).unwrap().len(), 1);
+    let failure = helper
+        .request(Operation::WriteConflictResolution {
+            repo: path(&repo),
+            snapshot,
+            picks: vec![Some(ConflictPick::Ours), Some(ConflictPick::Ours)],
+            mark_resolved: true,
+        })
+        .result
+        .unwrap_err();
+    assert_eq!(failure, GitFailure::StaleConflictFile);
+    assert!(
+        failure
+            .into_error()
+            .is::<mt_project::git::StaleConflictFile>()
+    );
+    assert_eq!(std::fs::read(repo.join("file")).unwrap(), partial);
+    let file: ConflictFile = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::LoadConflictFile {
+                file: "file".into(),
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(file.blocks.len(), 1);
+    let stale = file.snapshot().unwrap();
+    // Even an edit removing every marker must be a typed stale rejection.
+    std::fs::write(repo.join("file"), encoding.encode("external edit").unwrap()).unwrap();
+    assert_eq!(
+        helper
+            .request(Operation::WriteConflictResolution {
+                repo: path(&repo),
+                snapshot: stale,
+                picks: vec![Some(ConflictPick::Theirs)],
+                mark_resolved: true
+            })
+            .result
+            .unwrap_err(),
+        GitFailure::StaleConflictFile
+    );
+    std::fs::write(repo.join("file"), &partial).unwrap();
+    helper
+        .success(Operation::WriteConflictResolution {
+            repo: path(&repo),
+            snapshot: file.snapshot().unwrap(),
+            picks: vec![Some(ConflictPick::Theirs)],
+            mark_resolved: true,
+        })
+        .decode::<()>()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(repo.join("file")).unwrap(),
+        encoding.encode("头\r\n乙\r\n甲\r\n中\r\ny\r\n尾").unwrap()
+    );
+    assert!(mt_project::git::list_conflicts(&repo).unwrap().is_empty());
+    let error = helper
+        .request(Operation::Query {
+            repo: path(&repo),
+            query: Q::LoadConflictFile {
+                file: "file".into(),
+            },
+        })
+        .result
+        .unwrap_err()
+        .into_error();
+    assert_eq!(
+        error.downcast_ref::<mt_project::git::SegmentBlocker>(),
+        Some(&mt_project::git::SegmentBlocker::NotConflicted)
+    );
+    helper.finish();
+}
+
+#[test]
+fn full_eight_mib_conflict_roundtrips_through_bounded_frames() {
+    use mt_git_helper::GitQuery as Q;
+    use mt_project::git::{ConflictFile, ConflictPick};
+    let fixture = Fixture::new("large-conflict");
+    let repo = fixture.repo("repo");
+    std::fs::write(repo.join("file"), "base\n").unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "base");
+    // Real stage 1/2/3 index entries avoid relying on an in-memory ConflictFile.
+    let oid = git(&repo, &["rev-parse", "HEAD:file"]);
+    git(&repo, &["update-index", "--force-remove", "file"]);
+    let entries = format!("100644 {oid} 1\tfile\n100644 {oid} 2\tfile\n100644 {oid} 3\tfile\n");
+    let mut child = Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(entries.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let prefix = "<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n";
+    let mut original = prefix.as_bytes().to_vec();
+    original.resize(mt_project::git::MAX_SEGMENT_FILE_BYTES as usize, b'\\');
+    std::fs::write(repo.join("file"), &original).unwrap();
+    let mut helper = Helper::start(&repo);
+    let file: ConflictFile = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::LoadConflictFile {
+                file: "file".into(),
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(file.text.len(), original.len());
+    helper
+        .success(Operation::WriteConflictResolution {
+            repo: path(&repo),
+            snapshot: file.snapshot().unwrap(),
+            picks: vec![Some(ConflictPick::Ours)],
+            mark_resolved: true,
+        })
+        .decode::<()>()
+        .unwrap();
+    let mut expected = b"a\n".to_vec();
+    expected.extend_from_slice(&original[prefix.len()..]);
+    assert_eq!(std::fs::read(repo.join("file")).unwrap(), expected);
+    assert!(mt_project::git::list_conflicts(&repo).unwrap().is_empty());
+    helper.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn conflicted_leaf_symlink_is_one_blocker_without_hiding_regular_segments() {
+    use mt_git_helper::GitQuery as Q;
+    use mt_project::git::{ConflictInfo, SegmentBlocker, SegmentStatus};
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new("conflict-symlink-status");
+    let repo = fixture.repo("repo");
+    std::fs::write(repo.join("normal"), "base\n").unwrap();
+    git(&repo, &["add", "normal"]);
+    fixed_time_commit(&repo, "base");
+    let oid = git(&repo, &["rev-parse", "HEAD:normal"]);
+    git(&repo, &["update-index", "--force-remove", "normal"]);
+    let entries = format!(
+        "100644 {oid} 1\tnormal\n100644 {oid} 2\tnormal\n100644 {oid} 3\tnormal\n120000 {oid} 1\tlink\n120000 {oid} 2\tlink\n120000 {oid} 3\tlink\n"
+    );
+    let mut child = Command::new("git")
+        .args(["update-index", "--index-info"])
+        .current_dir(&repo)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(entries.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::write(
+        repo.join("normal"),
+        "<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n",
+    )
+    .unwrap();
+    let outside = fixture.0.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("target"), "must not read or change\n").unwrap();
+    symlink(outside.join("target"), repo.join("link")).unwrap();
+    symlink(&outside, repo.join("escaped-parent")).unwrap();
+    let actual = mt_project::git::list_conflicts(&repo).unwrap();
+    let normal = actual
+        .iter()
+        .find(|info| info.path == "normal")
+        .unwrap()
+        .clone();
+    let link = actual
+        .iter()
+        .find(|info| info.path == "link")
+        .unwrap()
+        .clone();
+    let mut helper = Helper::start(&repo);
+    let statuses: Vec<SegmentStatus> = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::ConflictSegmentStatuses {
+                infos: vec![normal, link.clone()],
+            },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            SegmentStatus::Ready { blocks: 1 },
+            SegmentStatus::Blocked(SegmentBlocker::Unreadable)
+        ]
+    );
+    let status: SegmentStatus = helper
+        .success(Operation::Query {
+            repo: path(&repo),
+            query: Q::ConflictSegmentStatus { info: link },
+        })
+        .decode()
+        .unwrap();
+    assert_eq!(status, SegmentStatus::Blocked(SegmentBlocker::Unreadable));
+    let escaped = ConflictInfo {
+        path: "escaped-parent/target".into(),
+        ours: true,
+        theirs: true,
+    };
+    let error = helper
+        .request(Operation::Query {
+            repo: path(&repo),
+            query: Q::ConflictSegmentStatuses {
+                infos: vec![escaped],
+            },
+        })
+        .result
+        .unwrap_err();
+    assert!(error.to_string().contains("escapes repository"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("target")).unwrap(),
+        "must not read or change\n"
     );
     helper.finish();
 }

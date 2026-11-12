@@ -11,6 +11,18 @@ pub enum GitQuery {
     RepoSignature,
     RepoOperationState,
     ListConflicts,
+    HeadSignature {
+        rel_path: String,
+    },
+    ConflictSegmentStatus {
+        info: git::ConflictInfo,
+    },
+    ConflictSegmentStatuses {
+        infos: Vec<git::ConflictInfo>,
+    },
+    LoadConflictFile {
+        file: String,
+    },
     HasConflictMarkers {
         file: String,
     },

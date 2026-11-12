@@ -32,3 +32,8 @@ futures-util = "0.3"
 # 有任一持锁者 panic 就整把锁中毒,下一个 .lock().unwrap() 把主线程也带走;
 # parking_lot 无中毒概念(与 mt-app/mt-pty/mt-terminal 同款)。
 parking_lot.workspace = true
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

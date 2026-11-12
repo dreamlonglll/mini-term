@@ -324,7 +324,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
             let Some((detail, hint)) = failure else {
                 return;
             };
-            let detail = git_ui::repo_text(&context, detail);
+            let detail = git_ui::repo_text(&store, &context, detail, cx);
             eprintln!("[git] 推送失败: {detail}");
             // 等结果期间对话框被 Esc 关了:原因不能丢,退到详情框
             if !prompt::is_open(kind::GIT_PUSH) {
@@ -376,7 +376,9 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
     });
 }
 
-/// 点一条待推送提交:取文件列表,开提交 diff 弹窗(叠在推送对话框之上)。
+/// 点一条待推送提交:在工作区开它的提交 diff 页签。页签开在对话框底下是看不见的,所以先
+/// 把推送对话框收起来(与「后台推送」那颗同一条路:推送已经发出去的照样在后台跑完,结果走
+/// toast / 失败详情框),要推再从仓库栏打开。
 fn view_commit(
     state: &Entity<PushDialog>,
     hash: String,
@@ -388,6 +390,7 @@ fn view_commit(
         let s = state.read(cx);
         (s.repo.clone(), s.panel.read(cx).store().clone())
     };
+    close_guarded(kind::GIT_PUSH, window, cx);
     crate::git_diff::open_commit_diff_loading(store, repo, hash, message, None, window, cx)
         .detach();
 }

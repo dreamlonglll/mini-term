@@ -1336,7 +1336,7 @@ impl GitHistoryContent {
 
     // ── 打开 diff ─────────────────────────────────────────
 
-    /// 双击行 / Enter / 右键「查看变更」:先取文件列表,再开 CommitDiffModal。
+    /// 双击行 / Enter / 右键「查看变更」:先取文件列表,再开提交 diff 页签(已开着就切过去)。
     fn view_commit(&self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(commit) = self.commits.get(index) else {
             return;

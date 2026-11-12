@@ -28,6 +28,13 @@
 //! 那部分一起没了。现在与 `git restore` / IDEA 的回滚一致:从**暂存区**检出
 //! (`mt_project::git::discard_unstaged`),已暂存的部分保留;未跟踪文件照旧删除。
 //!
+//! # 冲突:整文件与逐段
+//!
+//! 冲突行的右键菜单有整文件的「采用一侧 / 标记为已解决」,也有「逐段解决…」(行内按钮
+//! 同一个入口):后者开 [`crate::git_conflict`] 的弹窗,一段一段选采用哪边再一次写回。
+//! 能不能逐段解决随列表一起取([`SegmentStatus`],有冲突时才读那几个文件),删除 / 修改
+//! 冲突、没有成对标记、二进制、编码认不出、过大时菜单项禁用并写明原因。
+//!
 //! # 失败要让用户看得见
 //!
 //! 原版每个 `invoke` 的 catch 都只 `console.error`(不弹 toast、不显红)。这里
@@ -60,14 +67,20 @@
 //!
 //! # 取数调度
 //!
-//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 弹窗
+//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 页签
 //! 按块操作),大仓库一次 status 又要两三秒。[`GitChanges::load`] 因此是**单飞**的
 //! ([`git_ui::flight`]):同一时刻只跑一份,期间再要只记脏位,跑完当场补一趟;在途那份照样
-//! 落地,但「操作后落回的位置」与在等的 diff 弹窗留给补跑那份(在途那份可能还不含那次操作)。
+//! 落地,但「操作后落回的位置」与在等的 diff 页签留给补跑那份(在途那份可能还不含那次操作)。
+//! 每次落地还顺手告诉 diff 页签「这个仓库变了」(`git_diff::notify_repo_changed`):挤在
+//! Git 抽屉旁边、眼前那一页 diff 当场静默重取,不必切走再切回来。
 //!
 //! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
 //! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
 //! 分支都没动就不重取。
+//! 首次勾选 / 恢复 amend 草稿时阻挡提交,之后的周期核验不让按钮闪灰;读不到新 HEAD
+//! 元数据仍保留 amend 意图。撤销消息、普通草稿历史、最近提交消息分组共存,恢复消息
+//! 保存被替换草稿而不把它重新放回待恢复队列,菜单以稳定身份消费原仓库的条目。
+//! 异步提交失败同时核对 store 活动项目与已选仓库,隐藏抽屉保留的旧 context 不能吞掉错误。
 //!
 //! 暂存 / 丢弃 / 冲突处理写完,在同一趟后台里**先**读一份签名([`RepoObservation`])再重取
 //! 列表,经 [`GitChangesEvent::IndexWritten`] 交给面板记作「已知」:紧接着那次 `.git` 检查
@@ -83,7 +96,7 @@
 //!   那几行建元素;加载中 / 失败 / 空态这类整块占位仍是普通滚动容器;
 //! - 分组 + 树形拍平后的行([`ListRow`])、每行高度、摊开总高、四组的显示顺序收在派生
 //!   模型 [`ListModel`] 里,**只在数据落地、折叠切换、切视图模式之后**算一次;render、
-//!   面板分高度、键盘导航、Shift 连选、diff 弹窗的文件序列都读这一份;
+//!   面板分高度、键盘导航、Shift 连选、diff 页签的文件序列都读这一份;
 //! - 取数落地([`GitChanges::apply_snapshot`])先比一次,与眼下的数据一模一样就既不
 //!   重算也不重画 —— 监听与 pty 嗅探触发的重取,绝大多数回包都没变。
 
@@ -102,7 +115,7 @@ use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
-    GitStatus, RepoOpKind,
+    GitStatus, RepoOpKind, SegmentStatus,
 };
 use mt_remote::GitContext;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
@@ -111,15 +124,15 @@ use crate::git_dir_watch::RepoObservation;
 use crate::git_ui::flight::{Flight, Landing};
 use crate::git_ui::{
     self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
-    ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
-    icon_button, mono, status_color, status_label_for,
+    ICON_HISTORY, ICON_MERGE, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone,
+    danger_icon_button, icon_button, mono, status_color, status_label_for,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
 use crate::prompt::Confirm;
 use crate::store::AppStore;
 use crate::ui;
-use crate::{git_diff, git_watch};
+use crate::{git_conflict, git_diff, git_watch};
 
 gpui::actions!(
     mini_term,
@@ -376,7 +389,7 @@ struct ListModel {
     /// 四个分组各自的文件下标(`changes` 里的原顺序),按 [`Area::slot`] 摆
     members: [Vec<usize>; 4],
     /// 四个分组的文件**显示顺序**:列表视图同 `members`;树形视图按树走,收起的目录里
-    /// 的文件不算。**不看分组折叠** —— 折起来的分组照样能 Shift 连选、diff 弹窗照样能
+    /// 的文件不算。**不看分组折叠** —— 折起来的分组照样能 Shift 连选、diff 页签照样能
     /// 前后换文件(与此前现算的 `area_order` 同一口径)
     order: [Vec<usize>; 4],
     /// 界面上的行序:每个非空分组一个标题,展开的分组接着它的文件 / 目录行
@@ -522,6 +535,9 @@ fn reveal_offset(offset_y: f32, top: f32, bottom: f32, viewport: f32) -> f32 {
 struct Snapshot {
     changes: Vec<ChangeFileStatus>,
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应(读一遍文件判成对标记 / 编码,
+    /// 冲突行的「逐段解决…」按它启用或写明原因)
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基…(冲突菜单「采用 ours / theirs」的文案随它翻转)
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
@@ -534,10 +550,10 @@ struct Snapshot {
 struct Landed<'a> {
     changes: &'a [ChangeFileStatus],
     conflicts: &'a [ConflictInfo],
+    segments: &'a [SegmentStatus],
     op_kind: Option<RepoOpKind>,
     target: Option<&'a CommitTarget>,
     has_head: bool,
-    amend: bool,
     load_error: Option<&'a str>,
     metadata_warning: Option<&'a str>,
 }
@@ -547,14 +563,13 @@ impl Landed<'_> {
     /// 进行中的操作只进菜单,也照样算 —— 宁可多画一帧,不能让菜单拿着旧数据。
     /// 「已推送」判定不在快照里(另走一趟,见 [`GitChanges::refresh_amend`],变了自己重画)。
     fn differs(&self, snap: &Snapshot) -> bool {
-        // 没有 HEAD 了 amend 收起
-        let amend = self.amend && snap.has_head;
+        // Amend intent survives a missing HEAD; metadata independently blocks it.
         !same_changes(self.changes, &snap.changes)
             || self.conflicts != snap.conflicts.as_slice()
+            || self.segments != snap.segments.as_slice()
             || self.op_kind != snap.op_kind
             || self.target != snap.target.as_ref()
             || self.has_head != snap.has_head
-            || self.amend != amend
             || self.metadata_warning != snap.metadata_warning.as_deref()
             || self.load_error.is_some()
     }
@@ -563,6 +578,7 @@ impl Landed<'_> {
     fn differs_on_error(&self, error: &str) -> bool {
         !self.changes.is_empty()
             || !self.conflicts.is_empty()
+            || !self.segments.is_empty()
             || self.op_kind.is_some()
             || self.load_error != Some(error)
     }
@@ -586,6 +602,12 @@ struct CommitDraft {
     _subscription: Subscription,
 }
 
+#[derive(Clone)]
+struct SavedMessage {
+    id: u64,
+    message: String,
+}
+
 pub struct GitChanges {
     store: Entity<AppStore>,
     /// 捕获的仓库后端;`None` 时停在空态,不发起任何 IO。
@@ -593,6 +615,8 @@ pub struct GitChanges {
     changes: Vec<ChangeFileStatus>,
     /// 冲突文件的三方条目在不在(删除 / 修改冲突时有一侧缺席),随列表一起取
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应,随列表一起取
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基 / 拣选 / 还原,随列表一起取。变基时 git 的 ours / theirs
     /// 与直觉相反,冲突菜单据此换成写清方向的文案
     op_kind: Option<RepoOpKind>,
@@ -609,7 +633,7 @@ pub struct GitChanges {
     /// 派生模型的缓存(见 [`Self::model`])。改了 `changes` / 两种折叠态的地方都要
     /// [`Self::invalidate_model`];视图模式不归这里管,`model` 自己比
     list_model: RefCell<Option<Rc<ListModel>>>,
-    /// diff 弹窗按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
+    /// diff 页签按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
     /// 序列交回去(见 `git_diff::ReloadFiles`)。换仓库时以 `None` 交回。
     diff_waiters: Vec<(Area, git_diff::FilesDone)>,
     /// pty-output 嗅探的 500ms 去抖终点。
@@ -631,7 +655,7 @@ pub struct GitChanges {
     /// 列表的滚动位置。虚拟列表与加载中 / 空态那几种普通滚动容器共用(后者走它底下那个
     /// `ScrollHandle`);必须存在视图上,每帧新建等于每帧把滚动清零
     list_scroll: VirtualListScrollHandle,
-    /// 下一帧把键盘游标所在的行滚进视野(键盘走动、操作后落回、diff 弹窗里换了文件)。
+    /// 下一帧把键盘游标所在的行滚进视野(键盘走动、操作后落回、diff 页签里换了文件)。
     /// 到 render 时才按当帧的行序找行,prepaint 时按当帧的视口算偏移
     reveal_cursor: bool,
 
@@ -641,7 +665,9 @@ pub struct GitChanges {
     blank_draft: Option<CommitDraft>,
     input_subscription: Option<Subscription>,
     amend_drafts: HashMap<String, (bool, Option<String>)>,
-    pending_messages: HashMap<String, Vec<String>>,
+    pending_messages: HashMap<String, Vec<SavedMessage>>,
+    saved_messages: HashMap<String, Vec<SavedMessage>>,
+    next_message_id: u64,
     input_key: Option<String>,
     input_revision: Rc<Cell<u64>>,
     /// 占位符里写的分支(随列表一起取)
@@ -691,6 +717,7 @@ impl GitChanges {
             context: None,
             changes: Vec::new(),
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             loading: false,
             loaded_once: false,
@@ -717,6 +744,8 @@ impl GitChanges {
             input_subscription: Some(subscription),
             amend_drafts: HashMap::new(),
             pending_messages: HashMap::new(),
+            saved_messages: HashMap::new(),
+            next_message_id: 0,
             input_key: None,
             input_revision,
             target: None,
@@ -801,6 +830,7 @@ impl GitChanges {
         self.amend_request += 1;
         self.changes.clear();
         self.conflicts.clear();
+        self.segments.clear();
         self.op_kind = None;
         self.collapsed_dirs.clear();
         self.invalidate_model();
@@ -824,7 +854,7 @@ impl GitChanges {
         self.load_error = None;
         self.commit_error = None;
         self.metadata_warning = None;
-        // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
+        // 在等序列的 diff 页签属于上一个仓库:沿用它们的旧序列
         self.flush_diff_waiters(false, cx);
         // 上一个仓库在途的那趟作废:回来一律丢,新仓库这趟不必等它
         self.flight.reset();
@@ -902,7 +932,7 @@ impl GitChanges {
         let Some(token) = self.amend_flight.begin(Instant::now()) else {
             return;
         };
-        self.amend_verifying = true;
+        self.amend_verifying = self.amend_info.is_none();
         let req = self.amend_request;
         let Some(repo) = self.context.clone() else {
             return;
@@ -923,7 +953,7 @@ impl GitChanges {
                     && this.amend_request == req
                     && let Some((key, info)) = fetched
                 {
-                    this.amend_key = key;
+                    this.amend_key = info.as_ref().and(key);
                     if info.is_none() {
                         this.commit_error =
                             Some(t("gitChanges", "metadataUnavailable").to_string());
@@ -947,8 +977,10 @@ impl GitChanges {
     /// 都无条件 notify,监听 / pty 嗅探触发的每一趟都是一次整窗帧。
     ///
     /// `rerun` = 在途期间又有人要过、落地后当场补跑:这份照样落(比画着的新),但它可能
-    /// 还不含触发补跑的那次操作 ——「操作后落回的位置」与在等的 diff 弹窗留给补跑那份。
-    /// 不补跑时 diff 弹窗的回执照交(它要的是「这一次重取落地了」,不管变没变)。
+    /// 还不含触发补跑的那次操作 ——「操作后落回的位置」与在等的 diff 页签留给补跑那份。
+    /// 不补跑时 diff 页签的回执照交(它要的是「这一次重取落地了」,不管变没变)。取到了
+    /// 还告诉 diff 页签这个仓库变了(见模块注释「取数调度」),不管列表这边变没变 ——
+    /// 已经改过的文件接着改,状态字母不变,内容却变了。
     fn apply_snapshot(
         &mut self,
         result: anyhow::Result<Snapshot>,
@@ -965,6 +997,7 @@ impl GitChanges {
                 let changed = self.landed().differs(&snap);
                 self.changes = snap.changes;
                 self.conflicts = snap.conflicts;
+                self.segments = snap.segments;
                 self.op_kind = snap.op_kind;
                 self.target = snap.target;
                 self.has_head = snap.has_head;
@@ -981,6 +1014,7 @@ impl GitChanges {
                 let changed = self.landed().differs_on_error(&error);
                 self.changes.clear();
                 self.conflicts.clear();
+                self.segments.clear();
                 self.op_kind = None;
                 self.load_error = Some(error);
                 self.metadata_warning = None;
@@ -996,6 +1030,10 @@ impl GitChanges {
         } else {
             self.flush_diff_waiters(loaded, cx);
         }
+        if loaded && let Some(repo) = self.context.clone() {
+            // Diff callbacks may re-enter this list, so notify after this update.
+            cx.defer(move |cx| git_diff::notify_repo_changed(&repo, cx));
+        }
         if changed || reselected || loading_shown != self.shows_loading() {
             cx.notify();
         }
@@ -1006,10 +1044,10 @@ impl GitChanges {
         Landed {
             changes: &self.changes,
             conflicts: &self.conflicts,
+            segments: &self.segments,
             op_kind: self.op_kind,
             target: self.target.as_ref(),
             has_head: self.has_head,
-            amend: self.amend,
             load_error: self.load_error.as_deref(),
             metadata_warning: self.metadata_warning.as_deref(),
         }
@@ -1020,8 +1058,8 @@ impl GitChanges {
         self.loading && self.changes.is_empty() && self.load_error.is_none()
     }
 
-    /// 把在等序列的 diff 弹窗回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
-    /// `None`(弹窗沿用旧序列)。回执改的是弹窗的实体、还可能回调本列表(换了文件时让
+    /// 把在等序列的 diff 页签回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
+    /// `None`(页签沿用旧序列)。回执改的是页签的实体、还可能回调本列表(换了文件时让
     /// 选中项跟过去),延到这一轮更新之后再调,免得本实体正被借着时重入。
     fn flush_diff_waiters(&mut self, loaded: bool, cx: &mut Context<Self>) {
         if self.diff_waiters.is_empty() {
@@ -1374,9 +1412,10 @@ impl GitChanges {
                 };
                 match &result {
                     Ok(()) => {
-                        let current = this
-                            .upgrade()
-                            .is_some_and(|this| this.read(cx).context.as_ref() == Some(&context));
+                        let current = git_ui::repo_is_current(&store, &context, cx)
+                            && this.upgrade().is_some_and(|this| {
+                                this.read(cx).context.as_ref() == Some(&context)
+                            });
                         if !current {
                             git_ui::toast_for_repo(
                                 &store,
@@ -1389,7 +1428,7 @@ impl GitChanges {
                     }
                     Err(err) => git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
-                        git_ui::repo_text(&context, git_ui::error_text(err)),
+                        git_ui::repo_text(&store, &context, git_ui::error_text(err), cx),
                         window,
                         cx,
                     ),
@@ -1563,7 +1602,7 @@ impl GitChanges {
                     Err(err) => {
                         git_ui::show_git_error(
                             t("gitChanges", "operationFailedTitle"),
-                            git_ui::repo_text(&context, git_ui::error_text(&err)),
+                            git_ui::repo_text(&this.store, &context, git_ui::error_text(&err), cx),
                             window,
                             cx,
                         );
@@ -1630,7 +1669,63 @@ impl GitChanges {
         .detach();
     }
 
-    /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
+    /// 冲突文件能不能逐段解决:能就是 `Ok(段数)`,不能就是禁用说明(菜单项的副标题、
+    /// 行内按钮的 tooltip)。随列表一起取的状态里找不到它(刚换仓库、读冲突细节失败)
+    /// 按「已不在冲突中,请刷新」算。
+    fn segment_availability(&self, path: &str) -> Result<usize, &'static str> {
+        let status = self
+            .conflicts
+            .iter()
+            .position(|c| c.path == path)
+            .and_then(|i| self.segments.get(i).copied());
+        match status {
+            Some(SegmentStatus::Ready { blocks }) => Ok(blocks),
+            Some(SegmentStatus::Blocked(blocker)) => {
+                Err(t("gitCommit", git_conflict::blocker_key(blocker)))
+            }
+            None => Err(t("gitCommit", "segments.blockedNotConflicted")),
+        }
+    }
+
+    /// 打开某个冲突文件的逐段解决弹窗(见 `git_conflict`)。写完(成败都算)重取列表、
+    /// 重算文件树的 git 标记,并把写完当场读的签名交给面板 —— 与 [`Self::run_op`] 同一口径。
+    fn open_segments(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.segment_availability(&path).is_err()
+            || self.metadata_warning.is_some()
+            || self.load_error.is_some()
+        {
+            return;
+        }
+        let Some(context) = self.context.clone() else {
+            return;
+        };
+        let written_context = context.clone();
+        let weak = cx.entity().downgrade();
+        let on_written: git_conflict::OnWritten =
+            Rc::new(move |observed: Option<RepoObservation>, cx: &mut App| {
+                let _ = weak.update(cx, |this, cx| {
+                    if this.context.as_ref() != Some(&written_context) {
+                        return;
+                    }
+                    this.load(cx);
+                    git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                    if let Some(observed) = observed {
+                        cx.emit(GitChangesEvent::IndexWritten(observed));
+                    }
+                });
+            });
+        git_conflict::open(
+            self.store.clone(),
+            context,
+            path,
+            self.op_kind,
+            on_written,
+            window,
+            cx,
+        );
+    }
+
+    /// diff 页签里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
     fn diff_files(&self, order: &[usize], area: Area) -> Vec<git_diff::DiffFile> {
         order.iter().map(|&i| self.diff_file(i, area)).collect()
     }
@@ -1662,58 +1757,61 @@ impl GitChanges {
         }
     }
 
-    /// 打开某一行的 diff,文件序列 = 它所在分组的显示顺序(弹窗里 Alt+←/→ 前后换)。
+    /// 打开某一行的 diff 页签(已开着就切过去),文件序列 = 它所在分组的显示顺序(页签里
+    /// Alt+←/→ 前后换)。焦点随之交给 diff 页签(口径见 `git_diff::tab` 模块注释「焦点」)。
     /// 按块操作之后序列跟着重载过的列表走(取消暂存最后一块,文件就离开了「已暂存」)。
     fn view_diff(&self, index: usize, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repo) = self.context.clone() else {
             return;
         };
-        let context = repo.clone();
+        let hooks = self.diff_hooks(&repo, area, cx);
         let model = self.model(cx);
         let order = model.order(area);
         let files = self.diff_files(order, area);
         let current = order.iter().position(|&i| i == index).unwrap_or(0);
+        git_diff::open_file_diff_with(self.store.clone(), repo, files, current, hooks, window, cx);
+    }
+
+    /// Both consumers stay attached to the captured backend, never its path alone.
+    fn diff_hooks(
+        &self,
+        context: &GitContext,
+        area: Area,
+        cx: &mut Context<Self>,
+    ) -> git_diff::FileDiffHooks {
+        let context = context.clone();
         let weak = cx.entity().downgrade();
-        let reload_files: git_diff::ReloadFiles = Rc::new(
-            move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
-                Some(this) => this.update(cx, |this, cx| {
-                    if this.context.as_ref() != Some(&context) {
-                        done(None, cx);
-                        return;
+        let reload_files: git_diff::ReloadFiles = {
+            let context = context.clone();
+            Rc::new(
+                move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
+                    Some(this) if this.read(cx).context.as_ref() == Some(&context) => {
+                        this.update(cx, |this, cx| {
+                            this.diff_waiters.push((area, done));
+                            this.load(cx);
+                        });
                     }
-                    this.diff_waiters.push((area, done));
-                    this.load(cx);
-                }),
-                None => done(None, cx),
-            },
-        );
+                    _ => done(None, cx),
+                },
+            )
+        };
         let weak = cx.entity().downgrade();
-        let context = repo.clone();
         let on_switch: git_diff::OnSwitch =
             Rc::new(move |file: &git_diff::DiffFile, cx: &mut App| {
-                let path = file.path.clone();
                 let _ = weak.update(cx, |this, cx| {
                     if this.context.as_ref() == Some(&context) {
-                        this.follow_diff(area, &path, cx);
+                        this.follow_diff(area, &file.path, cx);
                     }
                 });
             });
-        git_diff::open_file_diff_with(
-            self.store.clone(),
-            repo,
-            files,
-            current,
-            git_diff::FileDiffHooks {
-                on_switch: Some(on_switch),
-                reload_files: Some(reload_files),
-                ..git_diff::FileDiffHooks::default()
-            },
-            window,
-            cx,
-        );
+        git_diff::FileDiffHooks {
+            on_switch: Some(on_switch),
+            reload_files: Some(reload_files),
+            ..git_diff::FileDiffHooks::default()
+        }
     }
 
-    /// diff 弹窗里换了文件:列表的选中项跟过去(并滚进视野),关掉弹窗时停在看到的那个。
+    /// diff 页签里换了文件:列表的选中项跟过去(并滚进视野),回到列表时停在看到的那个。
     fn follow_diff(&mut self, area: Area, path: &str, cx: &mut Context<Self>) {
         let Some(index) = self
             .changes
@@ -1794,6 +1892,10 @@ impl GitChanges {
 
     /// 提交。`open_push` = 「提交并推送」:提交成功后让容器打开推送对话框(见模块注释);
     /// `stage_first` = 先暂存全部已跟踪改动(未暂存组,不含未跟踪文件)。
+    ///
+    /// 「全部暂存并提交」遇到**部分暂存**的文件先确认:按整文件 `git add` 会把用户按块 /
+    /// 按行挑好的暂存内容连同剩下的改动一起暂存,挑的那一步就白做了,而且提交以后才看得出来。
+    /// 没有部分暂存的文件时不打扰,直接提交。
     fn commit(
         &mut self,
         open_push: bool,
@@ -1805,10 +1907,66 @@ impl GitChanges {
         if self.commit_blocker(stage_first, cx).is_some() {
             return;
         }
-        let Some(repo) = self.context.clone() else {
+        let Some(context) = self.context.clone() else {
             return;
         };
-        let context = repo.clone();
+        if stage_first {
+            let partial = partially_staged_paths(&self.changes);
+            if !partial.is_empty() {
+                let this = cx.entity();
+                Confirm::new(
+                    t("gitCommit", "stageAllAndCommit"),
+                    tr!(
+                        "gitCommit",
+                        "stageAllPartialConfirm",
+                        count = partial.len().to_string()
+                    ),
+                )
+                .detail(preview_paths(&partial))
+                .ok_text(t("gitCommit", "stageAllPartialOk"))
+                .open(
+                    move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.commit_confirmed(&context, open_push, true, window, cx)
+                        });
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        self.commit_confirmed(&context, open_push, stage_first, window, cx);
+    }
+
+    /// Confirmation is bound to its original backend; switching never submits
+    /// another repository's draft or reuses its partially staged file list.
+    fn commit_confirmed(
+        &mut self,
+        context: &GitContext,
+        open_push: bool,
+        stage_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context.as_ref() != Some(context)
+            || !git_ui::repo_is_current(&self.store, context, cx)
+        {
+            git_ui::toast_for_repo(
+                &self.store,
+                context,
+                t("gitChanges", "contextChanged").to_string(),
+                Tone::Attention,
+                cx,
+            );
+            return;
+        }
+        self.sync_input(window, cx);
+        if self.commit_blocker(stage_first, cx).is_some() {
+            return;
+        }
+        let repo = context.clone();
+        let context = context.clone();
         let message = self.commit_input.read(cx).value().trim().to_string();
         let amend = self.amend;
         let stage_paths = if stage_first {
@@ -1921,17 +2079,19 @@ impl GitChanges {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.context.as_ref() == Some(context) {
+        if self.context.as_ref() == Some(context)
+            && git_ui::repo_is_current(&self.store, context, cx)
+        {
             self.commit_error = Some(tr!(
                 "gitChanges",
                 "commitFailed",
-                detail = git_ui::repo_text(context, git_ui::error_text(err))
+                detail = git_ui::repo_text(&self.store, context, git_ui::error_text(err), cx)
             ));
             cx.notify();
         } else {
             git_ui::show_git_error(
                 t("gitChanges", "operationFailedTitle"),
-                git_ui::repo_text(context, git_ui::error_text(err)),
+                git_ui::repo_text(&self.store, context, git_ui::error_text(err), cx),
                 window,
                 cx,
             );
@@ -1958,7 +2118,7 @@ impl GitChanges {
                 self.commit_input
                     .update(cx, |state, cx| state.set_value(message, window, cx));
             } else {
-                self.pending_messages.entry(key).or_default().push(message);
+                self.queue_pending_message(key, message);
             }
         } else {
             let prefill = self
@@ -1975,13 +2135,68 @@ impl GitChanges {
                 if current.trim().is_empty() || prefill.as_deref() == Some(current.as_str()) {
                     input.update(cx, |state, cx| state.set_value(message, window, cx));
                 } else {
-                    self.pending_messages.entry(key).or_default().push(message);
+                    self.queue_pending_message(key, message);
                 }
             } else {
-                self.pending_messages.entry(key).or_default().push(message);
+                self.queue_pending_message(key, message);
             }
         }
         cx.notify();
+    }
+
+    fn queue_pending_message(&mut self, key: String, message: String) {
+        let entry = self.saved_message(message);
+        self.pending_messages.entry(key).or_default().push(entry);
+    }
+
+    fn saved_message(&mut self, message: String) -> SavedMessage {
+        let id = self.next_message_id;
+        self.next_message_id = self
+            .next_message_id
+            .checked_add(1)
+            .expect("message identity overflow");
+        SavedMessage { id, message }
+    }
+
+    fn replace_message_on(
+        &mut self,
+        context: &GitContext,
+        message: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = context.key();
+        let draft = if self.input_key.as_deref() == Some(key.as_str()) {
+            Some((self.commit_input.clone(), self.input_revision.clone()))
+        } else {
+            self.drafts
+                .get(&key)
+                .map(|draft| (draft.input.clone(), draft.revision.clone()))
+        };
+        let Some((input, revision)) = draft else {
+            return false;
+        };
+        let current = input.read(cx).value().to_string();
+        if !current.trim().is_empty() && current != message {
+            let entry = self.saved_message(current);
+            let saved = self.saved_messages.entry(key).or_default();
+            saved.push(entry);
+            if saved.len() > HISTORY_LIMIT {
+                saved.remove(0);
+            }
+        }
+        let end = text_end(&message);
+        let current = self.context.as_ref() == Some(context)
+            && git_ui::repo_is_current(&self.store, context, cx);
+        revision.set(revision.get().wrapping_add(1));
+        input.update(cx, |state, cx| {
+            state.set_value(message, window, cx);
+            if current {
+                state.set_cursor_position(end, window, cx);
+            }
+        });
+        cx.notify();
+        true
     }
 
     fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1990,6 +2205,8 @@ impl GitChanges {
         }
         self.amend = !self.amend;
         self.amend_request += 1;
+        self.amend_flight.reset();
+        self.amend_verifying = self.amend;
         if !self.amend {
             // 预填的消息一个字没动过 —— 那是 HEAD 的旧消息,不是用户写的,收起时带走
             let current = self.commit_input.read(cx).value().to_string();
@@ -2015,11 +2232,12 @@ impl GitChanges {
             .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
                 if let Err(err) = &result
-                    && this.context.as_ref() != Some(&context)
+                    && (this.context.as_ref() != Some(&context)
+                        || !git_ui::repo_is_current(&this.store, &context, cx))
                 {
                     git_ui::show_git_error(
                         t("gitChanges", "operationFailedTitle"),
-                        git_ui::repo_text(&context, git_ui::error_text(err)),
+                        git_ui::repo_text(&this.store, &context, git_ui::error_text(err), cx),
                         window,
                         cx,
                     );
@@ -2027,6 +2245,7 @@ impl GitChanges {
                 if this.amend_request != req || !this.amend {
                     return;
                 }
+                this.amend_verifying = false;
                 match result {
                     Ok(Some(info)) => {
                         if input.read(cx).value().trim().is_empty() {
@@ -2048,7 +2267,12 @@ impl GitChanges {
                         this.commit_error = Some(tr!(
                             "gitCommit",
                             "amendInfoFailed",
-                            detail = git_ui::repo_text(&context, git_ui::error_text(&err))
+                            detail = git_ui::repo_text(
+                                &this.store,
+                                &context,
+                                git_ui::error_text(&err),
+                                cx
+                            )
                         ));
                     }
                 }
@@ -2062,34 +2286,23 @@ impl GitChanges {
     fn restore_pending_message(
         &mut self,
         context: &GitContext,
-        index: usize,
+        id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let key = context.key();
-        let Some(messages) = self.pending_messages.get_mut(&key) else {
+        let Some(entry) = self
+            .pending_messages
+            .get(&key)
+            .and_then(|messages| messages.iter().find(|entry| entry.id == id))
+            .cloned()
+        else {
             return;
         };
-        if index >= messages.len() {
-            return;
-        }
-        let message = messages.remove(index);
-        let input = if self.input_key.as_deref() == Some(key.as_str()) {
-            Some(self.commit_input.clone())
-        } else {
-            self.drafts.get(&key).map(|draft| draft.input.clone())
-        };
-        if let Some(input) = input {
-            let current = input.read(cx).value().to_string();
-            if !current.trim().is_empty() {
-                self.pending_messages.entry(key).or_default().push(current);
-            }
-            input.update(cx, |state, cx| state.set_value(message, window, cx));
-        } else {
-            self.pending_messages
-                .entry(key)
-                .or_default()
-                .insert(0, message);
+        if self.replace_message_on(context, entry.message, window, cx)
+            && let Some(messages) = self.pending_messages.get_mut(&key)
+        {
+            messages.retain(|entry| entry.id != id);
         }
         cx.notify();
     }
@@ -2105,45 +2318,21 @@ impl GitChanges {
         if self.history_loading || self.context.is_none() {
             return;
         }
-        // Undo recovery entries must remain available without another Git read.
-        if let Some(context) = self.context.clone()
-            && let Some(messages) = self.pending_messages.get(&context.key())
-            && !messages.is_empty()
-        {
-            let owner = cx.entity();
-            let entries = messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    let (owner, context) = (owner.clone(), context.clone());
-                    MenuItem::new(message.lines().next().unwrap_or("").to_string())
-                        .detail(t("gitCommit", "undoMessagePending"))
-                        .on_click(move |window, cx| {
-                            owner.update(cx, |this, cx| {
-                                this.restore_pending_message(&context, index, window, cx);
-                            })
-                        })
-                        .into()
-                })
-                .collect();
-            menu::show(position, entries, window, cx);
-            return;
-        }
         self.history_loading = true;
         cx.notify();
         let Some(repo) = self.context.clone() else {
             return;
         };
         let context = repo.clone();
-        let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
             let result = mt_remote::run_git_on(&repo.clone(), move || {
                 repo.recent_commit_messages(HISTORY_LIMIT)
             })
             .await;
             let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                let current = this.context.as_ref() == Some(&context);
-                if current {
+                let same_context = this.context.as_ref() == Some(&context);
+                let current = same_context && git_ui::repo_is_current(&this.store, &context, cx);
+                if same_context {
                     this.history_loading = false;
                     cx.notify();
                 }
@@ -2153,21 +2342,86 @@ impl GitChanges {
                         eprintln!("[git] 读取提交消息历史失败: {err:#}");
                         git_ui::show_git_error(
                             t("gitChanges", "operationFailedTitle"),
-                            git_ui::repo_text(&context, git_ui::error_text(&err)),
+                            git_ui::repo_text(&this.store, &context, git_ui::error_text(&err), cx),
                             window,
                             cx,
                         );
+                        if current {
+                            let entries = this.message_history_entries(Vec::new(), &context, cx);
+                            menu::show(position, entries, window, cx);
+                        }
                         return;
                     }
                 };
                 if !current {
                     return;
                 }
-                let entries = history_entries(list, &input, cx.entity(), context);
+                let entries = this.message_history_entries(list, &context, cx);
                 menu::show(position, entries, window, cx);
             });
         })
         .detach();
+    }
+
+    fn message_history_entries(
+        &self,
+        recent: Vec<CommitMessageEntry>,
+        context: &GitContext,
+        cx: &mut Context<Self>,
+    ) -> Vec<menu::MenuEntry> {
+        let key = context.key();
+        let mut entries = Vec::new();
+        for (messages, heading, pending) in [
+            (self.pending_messages.get(&key), "historyPending", true),
+            (self.saved_messages.get(&key), "historyDrafts", false),
+        ] {
+            let Some(messages) = messages.filter(|messages| !messages.is_empty()) else {
+                continue;
+            };
+            if !entries.is_empty() {
+                entries.push(menu::separator());
+            }
+            entries.push(menu::MenuEntry::Header(t("gitCommit", heading).into()));
+            for entry in messages.iter().rev() {
+                let owner = cx.entity();
+                let context = context.clone();
+                let entry = entry.clone();
+                entries.push(
+                    MenuItem::new(message_label(&entry.message))
+                        .detail(t(
+                            "gitCommit",
+                            if pending {
+                                "undoMessagePending"
+                            } else {
+                                "savedDraft"
+                            },
+                        ))
+                        .on_click(move |window, cx| {
+                            owner.update(cx, |this, cx| {
+                                if pending {
+                                    this.restore_pending_message(&context, entry.id, window, cx);
+                                } else {
+                                    this.replace_message_on(
+                                        &context,
+                                        entry.message.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            });
+                        })
+                        .into(),
+                );
+            }
+        }
+        if !entries.is_empty() {
+            entries.push(menu::separator());
+        }
+        entries.push(menu::MenuEntry::Header(
+            t("gitCommit", "historyRecent").into(),
+        ));
+        entries.extend(history_entries(recent, cx.entity(), context.clone()));
+        entries
     }
 
     fn sync_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2238,7 +2492,7 @@ impl GitChanges {
             {
                 let message = messages.remove(0);
                 self.commit_input
-                    .update(cx, |state, cx| state.set_value(message, window, cx));
+                    .update(cx, |state, cx| state.set_value(message.message, window, cx));
             }
         }
         self.placeholder = None;
@@ -2310,24 +2564,21 @@ fn load_snapshot(repo: &GitContext) -> anyhow::Result<Snapshot> {
     let changes = repo
         .get_changes_status()
         .map_err(|err| err.context(git_ui::repo_label(repo)))?;
-    let mut snapshot = snapshot_with_metadata(
+    snapshot_with_metadata(
         changes,
         || repo.list_conflicts(),
+        |info| repo.conflict_segment_status(info),
         || repo.repo_operation_state().map(|state| state.kind),
         || repo.commit_target(),
         || repo.head_exists(),
-    )?;
-    snapshot.metadata_warning = snapshot
-        .metadata_warning
-        .map(|warning| git_ui::repo_text(repo, warning));
-    Ok(snapshot)
+    )
 }
 
-/// Status is authoritative; auxiliary failures retain the file groups but make
-/// unsafe actions unavailable until a complete metadata read succeeds.
+/// Auxiliary failures retain groups, but never enable unsafe conflict actions.
 fn snapshot_with_metadata(
     changes: Vec<ChangeFileStatus>,
     conflicts: impl FnOnce() -> anyhow::Result<Vec<ConflictInfo>>,
+    mut segment: impl FnMut(&ConflictInfo) -> anyhow::Result<SegmentStatus>,
     operation: impl FnOnce() -> anyhow::Result<Option<RepoOpKind>>,
     target: impl FnOnce() -> anyhow::Result<CommitTarget>,
     head: impl FnOnce() -> bool,
@@ -2343,6 +2594,17 @@ fn snapshot_with_metadata(
         }
     } else {
         Vec::new()
+    };
+    let segments = conflicts
+        .iter()
+        .map(&mut segment)
+        .collect::<anyhow::Result<Vec<_>>>();
+    let segments = match segments {
+        Ok(segments) => segments,
+        Err(err) => {
+            warnings.push(git_ui::error_text(&err));
+            Vec::new()
+        }
     };
     let op_kind = match operation() {
         Ok(kind) => kind,
@@ -2361,6 +2623,7 @@ fn snapshot_with_metadata(
     Ok(Snapshot {
         changes,
         conflicts,
+        segments,
         op_kind,
         target,
         has_head: head(),
@@ -2388,6 +2651,15 @@ fn take_side_key(side: ConflictSide, deleted: bool, op: Option<RepoOpKind>) -> &
 }
 
 /// 确认框里列出的文件(最多 5 个,多出的写「…等 N 个」)。
+/// 部分暂存的文件(同时在已暂存与未暂存两组里,口径见 [`in_area`]),按列表原顺序。
+fn partially_staged_paths(changes: &[ChangeFileStatus]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| in_area(c, Area::Staged) && in_area(c, Area::Unstaged))
+        .map(|c| c.path.clone())
+        .collect()
+}
+
 fn preview_paths(paths: &[String]) -> Vec<String> {
     const LIMIT: usize = 5;
     let mut lines: Vec<String> = paths.iter().take(LIMIT).map(|p| format!("• {p}")).collect();
@@ -2404,7 +2676,6 @@ fn preview_paths(paths: &[String]) -> Vec<String> {
 /// 提交消息历史的菜单项。标题截到 60 个字符,detail 放日期。
 fn history_entries(
     list: Vec<CommitMessageEntry>,
-    input: &Entity<TextareaState>,
     owner: Entity<GitChanges>,
     context: GitContext,
 ) -> Vec<menu::MenuEntry> {
@@ -2417,34 +2688,29 @@ fn history_entries(
     }
     list.into_iter()
         .map(|entry| {
-            let label: String = if entry.summary.chars().count() > 60 {
-                entry.summary.chars().take(60).chain(['…']).collect()
-            } else {
-                entry.summary.clone()
-            };
-            let (input, owner) = (input.clone(), owner.clone());
+            let label = message_label(&entry.summary);
+            let owner = owner.clone();
             let context = context.clone();
             let message = entry.message;
             MenuItem::new(label)
                 .detail(format_date(entry.timestamp))
                 .on_click(move |window, cx| {
-                    let current = owner.read(cx).context.as_ref() == Some(&context);
-                    let message = message.clone();
-                    let end = text_end(&message);
-                    input.update(cx, |state, cx| {
-                        state.set_value(message, window, cx);
-                        // 多行输入框 set_value 后光标在开头;接着往下写是常态,挪到末尾
-                        // (set_cursor_position 顺带聚焦)
-                        if current {
-                            state.set_cursor_position(end, window, cx);
-                        }
+                    owner.update(cx, |this, cx| {
+                        this.replace_message_on(&context, message.clone(), window, cx);
                     });
-                    // set_value 不发 Change 事件,得自己叫一声重画(字数 / 提示 / 按钮)
-                    owner.update(cx, |_, cx| cx.notify());
                 })
                 .into()
         })
         .collect()
+}
+
+fn message_label(message: &str) -> String {
+    let title = message.lines().next().unwrap_or("");
+    if title.chars().count() > 60 {
+        title.chars().take(60).chain(['…']).collect()
+    } else {
+        title.to_string()
+    }
 }
 
 /// 一段文本末尾的光标位置(行、列都从 0 数,列按字符)。
@@ -2898,7 +3164,21 @@ impl GitChanges {
                     }))
                 }));
             }
-            Area::Conflicts => {}
+            // 逐段解决(只管这一行,不跟选中集走):用不了时按钮压淡,tooltip 写明原因
+            Area::Conflicts => {
+                let available = self.segment_availability(&path);
+                let usable = enabled && available.is_ok();
+                let tip =
+                    available.map_or_else(|reason| reason, |_| t("gitCommit", "segments.menu"));
+                let seg_path = path.clone();
+                actions = actions.child(
+                    icon_button(id_of("segments"), ICON_MERGE, tip, usable).when(usable, |el| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_segments(seg_path.clone(), window, cx);
+                        }))
+                    }),
+                );
+            }
         }
 
         git_ui::list_row(row_id, selected)
@@ -2979,9 +3259,18 @@ impl GitChanges {
         let view_diff = {
             let this = this.clone();
             let context = context.clone();
+            let path = self.changes.get(index).map(|file| file.path.clone());
             menu::item(t("gitChanges", "contextViewDiff"), move |window, cx| {
                 this.update(cx, |this, cx| {
                     if let Some(context) = context.clone() {
+                        if this.context.as_ref() == Some(&context)
+                            && let Some(index) = this.changes.iter().position(|file| {
+                                Some(&file.path) == path.as_ref() && in_area(file, area)
+                            })
+                        {
+                            this.view_diff(index, area, window, cx);
+                            return;
+                        }
                         git_diff::open_file_diff_with(
                             this.store.clone(),
                             context,
@@ -3001,6 +3290,43 @@ impl GitChanges {
             Area::Conflicts => {
                 let enabled =
                     enabled && self.metadata_warning.is_none() && self.load_error.is_none();
+                // 逐段解决:一次一个文件;删除 / 修改冲突、没有成对标记、二进制、编码认不出、
+                // 过大时禁用并在副标题写明原因(状态随列表一起取,见 `load_snapshot`)
+                let path = self
+                    .changes
+                    .get(index)
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default();
+                let available = if many {
+                    Err(t("gitCommit", "segments.blockedMany"))
+                } else {
+                    self.segment_availability(&path)
+                };
+                let segments_this = this.clone();
+                let segments_context = context.clone();
+                let mut segments = MenuItem::new(t("gitCommit", "segments.menu"))
+                    .disabled(!enabled || available.is_err())
+                    .on_click(move |window, cx| {
+                        let path = path.clone();
+                        segments_this.update(cx, |this, cx| {
+                            if this.context == segments_context {
+                                this.open_segments(path, window, cx);
+                            } else if let Some(context) = segments_context.as_ref() {
+                                git_ui::toast_for_repo(
+                                    &this.store,
+                                    context,
+                                    t("gitChanges", "contextChanged").to_string(),
+                                    Tone::Attention,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                if let Err(reason) = available {
+                    segments = segments.detail(reason);
+                }
+                entries.push(segments.into());
+                entries.push(menu::separator());
                 let info = (!many)
                     .then(|| self.changes.get(index))
                     .flatten()
@@ -3239,6 +3565,7 @@ impl GitChanges {
         let toolbar = div()
             .mt(px(8.0))
             .flex()
+            .min_w_0()
             .items_center()
             .gap(px(8.0))
             .child(amend_toggle)
@@ -3249,7 +3576,13 @@ impl GitChanges {
                         .get(&context.key())
                         .is_some_and(|messages| !messages.is_empty())
                 }),
-                |el| el.child(git_ui::hint_line(t("gitCommit", "undoMessagePending"))),
+                |el| {
+                    el.child(
+                        git_ui::hint_line(t("gitCommit", "undoMessagePending"))
+                            .min_w_0()
+                            .flex_1(),
+                    )
+                },
             )
             .child(div().flex_1())
             .children(counter);
@@ -3543,6 +3876,129 @@ impl GitChanges {
 mod tests {
     use super::*;
 
+    fn test_project(id: &str, path: &str) -> mt_config::ProjectConfig {
+        mt_config::ProjectConfig {
+            id: id.into(),
+            name: id.into(),
+            path: path.into(),
+            ..Default::default()
+        }
+    }
+
+    #[gpui::test]
+    async fn diff_reload_follows_last_staged_file_and_periodic_amend_stays_enabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.skip_drawing();
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-diff-consumer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(["-c", "user.name=Test", "-c", "user.email=t@e"])
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("file"), "base\n").unwrap();
+        git(&["add", "file"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(root.join("file"), "modified\n").unwrap();
+        git(&["add", "file"]);
+        let context = GitContext::local(root.to_string_lossy().into_owned());
+        let config = mt_config::AppConfig {
+            projects: vec![test_project("source", root.to_str().unwrap())],
+            last_active_project_id: Some("source".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let (changes, hooks) = cx
+            .update_window(window.into(), |_, window, cx| {
+                let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+                let hooks = changes.update(cx, |this, cx| {
+                    this.context = Some(context.clone());
+                    this.sync_input(window, cx);
+                    this.apply_snapshot(load_snapshot(&context), false, cx);
+                    this.diff_hooks(&context, Area::Staged, cx)
+                });
+                (changes, hooks)
+            })
+            .unwrap();
+        let file = cx.update(|cx| changes.read(cx).diff_file(0, Area::Staged));
+        cx.update(|cx| hooks.on_switch.as_ref().unwrap()(&file, cx));
+        cx.update(|cx| {
+            assert_eq!(
+                changes.read(cx).cursor.as_ref(),
+                Some(&(Area::Staged, "file".into()))
+            )
+        });
+        // A real unstage of the final staged file must return an empty new sequence.
+        context.git_unstage(&["file".into()]).unwrap();
+        let landed = Rc::new(RefCell::new(None));
+        let result = landed.clone();
+        cx.update(|cx| {
+            hooks.reload_files.as_ref().unwrap()(
+                Box::new(move |files, _| {
+                    *result.borrow_mut() = Some(files);
+                }),
+                cx,
+            )
+        });
+        cx.condition(&changes, |_, _| landed.borrow().is_some())
+            .await;
+        assert!(
+            landed
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            changes.update(cx, |this, cx| {
+                this.amend = true;
+                this.amend_info = context.amend_info().unwrap();
+                this.amend_key = None;
+                this.commit_input
+                    .update(cx, |input, cx| input.set_value("amended", window, cx));
+                assert!(this.commit_blocker(false, cx).is_none());
+                this.refresh_amend(cx);
+                assert!(
+                    !this.amend_verifying,
+                    "periodic verification must not flash disabled"
+                );
+                assert!(this.commit_blocker(false, cx).is_none());
+            });
+        })
+        .unwrap();
+        cx.condition(&changes, |this, _| this.amend_key.is_some())
+            .await;
+        drop(hooks);
+        drop(changes);
+        cx.run_until_parked();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[gpui::test]
     async fn undo_drafts_amend_and_subscriptions_follow_captured_repository(
         cx: &mut gpui::TestAppContext,
@@ -3577,11 +4033,38 @@ mod tests {
                     this.restore_message_on(&a, "undone A", window, cx);
                     assert_eq!(this.commit_input.read(cx).value().as_ref(), "B user draft");
                     assert_eq!(a_input.read(cx).value().as_ref(), "A user draft");
-                    assert_eq!(this.pending_messages[&a.key()], ["undone A"]);
-                    this.restore_pending_message(&a, 0, window, cx);
+                    let pending = this.pending_messages[&a.key()][0].clone();
+                    assert_eq!(pending.message, "undone A");
+                    this.restore_pending_message(&a, pending.id, window, cx);
                     assert_eq!(a_input.read(cx).value().as_ref(), "undone A");
-                    assert_eq!(this.pending_messages[&a.key()], ["A user draft"]);
+                    assert!(this.pending_messages[&a.key()].is_empty());
+                    assert_eq!(this.saved_messages[&a.key()][0].message, "A user draft");
                     assert_eq!(this.commit_input.read(cx).value().as_ref(), "B user draft");
+                    // Stable ids prevent a stale menu from consuming the next pending item.
+                    this.queue_pending_message(a.key(), "second undone A".into());
+                    this.restore_pending_message(&a, pending.id, window, cx);
+                    assert_eq!(this.pending_messages[&a.key()].len(), 1);
+                    assert_eq!(
+                        this.pending_messages[&a.key()][0].message,
+                        "second undone A"
+                    );
+                    let groups = this.message_history_entries(
+                        vec![CommitMessageEntry {
+                            message: "recent commit".into(),
+                            summary: "recent commit".into(),
+                            timestamp: 0,
+                        }],
+                        &a,
+                        cx,
+                    );
+                    assert_eq!(
+                        groups
+                            .iter()
+                            .filter(|entry| matches!(entry, menu::MenuEntry::Header(_)))
+                            .count(),
+                        3,
+                        "pending, saved drafts and recent commits all remain available"
+                    );
                     this.context = Some(a.clone());
                     this.sync_input(window, cx);
                     assert_eq!(this.commit_input.entity_id(), a_input.entity_id());
@@ -3606,7 +4089,21 @@ mod tests {
                     assert!(this.amend_verifying);
                     this.loaded_once = true;
                     this.has_head = true;
-                    assert!(this.commit_blocker(false, cx).is_some());
+                    this.amend_info = Some(AmendInfo {
+                        message: "verified".into(),
+                        pushed: false,
+                    });
+                    assert!(
+                        this.commit_blocker(false, cx).is_some(),
+                        "verification alone blocks amend"
+                    );
+                    this.amend_verifying = false;
+                    assert!(
+                        this.commit_blocker(false, cx).is_none(),
+                        "all other amend requirements met"
+                    );
+                    this.amend_verifying = true;
+                    this.amend_info = None;
                     (a_input, b_input, b_revision, blank)
                 });
                 (changes, a_input, b_input, b_revision, blank)
@@ -3647,15 +4144,26 @@ mod tests {
                 assert_eq!(this.drafts.len(), 1, "only inactive B draft is retained");
                 assert!(this.input_subscription.is_some());
                 assert!(this.blank_draft.is_some());
-                this.drafts.clear();
-                // Dropping the inactive draft drops its callback, not just its input handle.
+                // Prove the inactive subscription is live before dropping it.
                 b_input.update(cx, |_, cx| cx.emit(InputEvent::Change));
-                assert_eq!(b_revision.get(), 0);
-                assert_eq!(Rc::strong_count(&b_revision), 1);
             });
         })
         .unwrap();
         cx.run_until_parked();
+        let live_revision = b_revision.get();
+        assert!(
+            live_revision > 0,
+            "live subscription must receive a drained event"
+        );
+        cx.update(|cx| changes.update(cx, |this, _| this.drafts.clear()));
+        assert_eq!(Rc::strong_count(&b_revision), 1);
+        cx.update(|cx| b_input.update(cx, |_, cx| cx.emit(InputEvent::Change)));
+        cx.run_until_parked();
+        assert_eq!(
+            b_revision.get(),
+            live_revision,
+            "released subscription cannot receive events"
+        );
         drop(changes);
         cx.run_until_parked();
     }
@@ -3664,13 +4172,21 @@ mod tests {
     fn commit_failure_is_inline_only_until_source_context_changes(cx: &mut gpui::TestAppContext) {
         cx.skip_drawing();
         cx.update(gpui_component::init);
-        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let config = mt_config::AppConfig {
+            projects: vec![
+                test_project("source", "/consumer-original-repo"),
+                test_project("other", "/consumer-another-repo"),
+            ],
+            last_active_project_id: Some("source".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
         let window = cx.add_window(|window, cx| {
             let empty = cx.new(|_| gpui::Empty);
             gpui_component::Root::new(empty, window, cx)
         });
         cx.update_window(window.into(), |_, window, cx| {
-            let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+            let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
             let source = GitContext::local("/consumer-original-repo");
             changes.update(cx, |this, cx| {
                 this.context = Some(source.clone());
@@ -3687,6 +4203,17 @@ mod tests {
                         .contains("original pre-commit failure")
                 );
                 assert!(!crate::prompt::is_open(crate::prompt::kind::GIT_ERROR));
+                store.update(cx, |state, _| {
+                    state.active_project_id = Some("other".into())
+                });
+                this.commit_error = None;
+                this.present_commit_failure(&source, &error, window, cx);
+                assert!(
+                    this.commit_error.is_none(),
+                    "hidden stale A context must not swallow failure"
+                );
+                assert!(crate::prompt::is_open(crate::prompt::kind::GIT_ERROR));
+                crate::prompt::close_guarded(crate::prompt::kind::GIT_ERROR, window, cx);
                 this.context = Some(GitContext::local("/consumer-another-repo"));
                 this.commit_error = None;
                 this.present_commit_failure(&source, &error, window, cx);
@@ -3717,6 +4244,7 @@ mod tests {
         let snap = snapshot_with_metadata(
             files,
             || anyhow::bail!("conflict metadata unavailable"),
+            |_| unreachable!("no conflict metadata"),
             || anyhow::bail!("operation metadata unavailable"),
             || anyhow::bail!("commit metadata unavailable"),
             || true,
@@ -3740,11 +4268,17 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn slow_hook_commit_keeps_captured_backend_and_failure_feedback() {
+    #[gpui::test]
+    async fn slow_hook_commit_keeps_captured_backend_and_failure_feedback(
+        cx: &mut gpui::TestAppContext,
+    ) {
         use std::os::unix::fs::PermissionsExt;
+        cx.skip_drawing();
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        cx.update(crate::toast::init);
         let root = std::env::temp_dir().join(format!(
-            "mini-term-pending-commit-{}-{}",
+            "mini-term-commit-consumer-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3782,45 +4316,100 @@ mod tests {
         let context = GitContext::local(a.to_string_lossy().into_owned());
         let other = GitContext::local(b.to_string_lossy().into_owned());
         let hook = a.join(".git/hooks/pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\ntouch .git/hook-pending\nwhile [ ! -f .git/hook-release ]; do sleep 0.02; done\n").unwrap();
+        std::fs::write(&hook, "#!/bin/sh\ntouch .git/hook-pending\nwhile [ ! -f .git/hook-release ]; do sleep 0.02; done\necho hook-rejected-original-A >&2\nexit 1\n").unwrap();
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let captured = context.clone();
-        let pending = std::thread::spawn(move || captured.git_commit_with("submitted A", false));
+        let config = mt_config::AppConfig {
+            projects: vec![
+                test_project("a", a.to_str().unwrap()),
+                test_project("b", b.to_str().unwrap()),
+            ],
+            last_active_project_id: Some("a".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let changes = cx
+            .update_window(window.into(), |_, window, cx| {
+                let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
+                changes.update(cx, |this, cx| {
+                    this.context = Some(context.clone());
+                    this.sync_input(window, cx);
+                    this.apply_snapshot(load_snapshot(&context), false, cx);
+                    this.commit_input
+                        .update(cx, |input, cx| input.set_value("submitted A", window, cx));
+                    assert!(this.commit_blocker(false, cx).is_none());
+                    this.commit(false, false, window, cx);
+                    assert!(this.committing);
+                });
+                changes
+            })
+            .unwrap();
+        // The UI executor must remain free while the actual commit hook waits.
+        let pending_path = a.join(".git/hook-pending");
         let until = Instant::now() + Duration::from_secs(10);
-        while !a.join(".git/hook-pending").exists() && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(10));
+        while !pending_path.exists() && Instant::now() < until {
+            cx.background_executor
+                .timer(Duration::from_millis(10))
+                .await;
         }
         assert!(
-            a.join(".git/hook-pending").exists(),
-            "hook did not enter pending state"
+            pending_path.exists(),
+            "actual GitChanges commit did not enter hook"
         );
-        // These are exactly the generation/text checks used by the UI completion.
-        let mut drafts =
-            HashMap::from([(context.key(), ("new A", 2)), (other.key(), ("draft B", 1))]);
-        std::fs::write(a.join(".git/hook-release"), "").unwrap();
-        let outcome = pending.join().unwrap().unwrap();
-        let draft = drafts.get_mut(&context.key()).unwrap();
-        if draft_matches(1, draft.1, "submitted A", draft.0) {
-            draft.0 = "";
-        }
-        assert_eq!(drafts[&context.key()].0, "new A");
-        assert_eq!(drafts[&other.key()].0, "draft B");
-        assert!(context.head_exists());
-        assert!(!other.head_exists(), "completion must not operate on B");
-        assert!(git_ui::repo_text(&context, &outcome.summary).contains(a.to_str().unwrap()));
-        std::fs::write(a.join("file"), "failure\n").unwrap();
-        context.git_stage(&["file".to_string()]).unwrap();
-        std::fs::write(
-            &hook,
-            "#!/bin/sh\necho hook-rejected-original-A >&2\nexit 1\n",
-        )
+        cx.update_window(window.into(), |_, window, cx| {
+            changes.update(cx, |this, cx| {
+                this.commit_input
+                    .update(cx, |input, cx| input.set_value("new A", window, cx));
+                // Hidden drawer: store changes, while GitChanges intentionally stays on A.
+                store.update(cx, |state, _| state.active_project_id = Some("b".into()));
+                assert_eq!(this.context.as_ref(), Some(&context));
+                assert!(!git_ui::repo_is_current(&store, &context, cx));
+            });
+        })
         .unwrap();
-        let failure = context.git_commit_with("failed draft", false).unwrap_err();
-        let feedback = git_ui::repo_text(&context, git_ui::error_text(&failure));
-        assert!(feedback.contains("hook-rejected-original-A"));
-        assert!(feedback.contains(a.to_str().unwrap()));
-        assert!(!feedback.contains(b.to_str().unwrap()));
-        assert_eq!(drafts[&context.key()].0, "new A", "failure retains draft");
+        std::fs::write(a.join(".git/hook-release"), "").unwrap();
+        cx.condition(&changes, |this, _| !this.committing).await;
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            changes.update(cx, |this, cx| {
+                assert!(
+                    this.commit_error.is_none(),
+                    "hidden A failure must be visible, not inline"
+                );
+                assert!(crate::prompt::is_open(crate::prompt::kind::GIT_ERROR));
+                crate::prompt::close_guarded(crate::prompt::kind::GIT_ERROR, window, cx);
+                assert_eq!(this.commit_input.read(cx).value().as_ref(), "new A");
+                this.context = Some(other.clone());
+                this.sync_input(window, cx);
+                this.commit_input
+                    .update(cx, |input, cx| input.set_value("draft B", window, cx));
+                // An old stage-all confirmation cannot commit B after switching.
+                this.loaded_once = true;
+                this.changes = vec![change(
+                    "file",
+                    Some(GitStatus::Added),
+                    Some(GitStatus::Modified),
+                )];
+                this.invalidate_model();
+                this.commit_confirmed(&context, false, true, window, cx);
+                assert!(!this.committing);
+                assert_eq!(this.commit_input.read(cx).value().as_ref(), "draft B");
+            });
+        })
+        .unwrap();
+        assert!(
+            !context.head_exists(),
+            "rejected A commit must not move HEAD"
+        );
+        assert!(
+            !other.head_exists(),
+            "captured A confirmation must not submit B"
+        );
+        drop(changes);
+        cx.run_until_parked();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3955,6 +4544,29 @@ mod tests {
         assert_eq!(group(&changes, Area::Untracked), vec!["d.rs"]);
     }
 
+    /// 「全部暂存并提交」要先确认的只有部分暂存的文件:只在一组里的、未跟踪的、
+    /// 冲突中的都不算(冲突时提交按钮本来就被拦下)。
+    #[test]
+    fn 全部暂存并提交只为部分暂存的文件确认() {
+        let changes = [
+            change("a.rs", Some(GitStatus::Added), None),
+            change("b.rs", Some(GitStatus::Modified), Some(GitStatus::Modified)),
+            change("c.rs", None, Some(GitStatus::Modified)),
+            change("d.rs", None, Some(GitStatus::Untracked)),
+            change("e.rs", Some(GitStatus::Added), Some(GitStatus::Deleted)),
+            change(
+                "f.rs",
+                Some(GitStatus::Conflicted),
+                Some(GitStatus::Conflicted),
+            ),
+        ];
+        assert_eq!(partially_staged_paths(&changes), vec!["b.rs", "e.rs"]);
+        assert!(partially_staged_paths(&changes[..1]).is_empty());
+        // 确认框正文里真带着文件数
+        let text = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitCommit", "stageAllPartialConfirm");
+        assert!(text.contains("{count}"), "{text}");
+    }
+
     /// 列表高度按眼下的数据算(E2E r4 A12:外部改动多出「未暂存」组的那一帧,按上一帧量的
     /// 高度分区,「未跟踪」组被挤出可见区)。分组标题 28 + 上边距 4、行 28、内边距 12;
     /// 折起来的分组只算标题;树形视图把目录行也算上;没有变更时说不准。
@@ -4059,7 +4671,7 @@ mod tests {
         assert!(matches!(rows[1], ChangeTreeRow::File { depth: 1, .. }));
     }
 
-    /// 树形视图的行序(渲染、键盘、Shift 连选、diff 弹窗前后换文件都按它):目录在前、
+    /// 树形视图的行序(渲染、键盘、Shift 连选、diff 页签前后换文件都按它):目录在前、
     /// 单链目录压缩成一行;键盘走的文件顺序与画出来的行序一致。
     #[test]
     fn 树形行序与键盘顺序一致() {
@@ -4408,6 +5020,7 @@ mod tests {
         Snapshot {
             changes,
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             target: Some(CommitTarget::Branch("main".into())),
             has_head: true,
@@ -4419,10 +5032,10 @@ mod tests {
         Landed {
             changes: &snap.changes,
             conflicts: &snap.conflicts,
+            segments: &snap.segments,
             op_kind: snap.op_kind,
             target: snap.target.as_ref(),
             has_head: snap.has_head,
-            amend: false,
             load_error: None,
             metadata_warning: snap.metadata_warning.as_deref(),
         }
@@ -4455,6 +5068,12 @@ mod tests {
         }];
         assert!(landed.differs(&next), "冲突细节变了(菜单文案跟着它)");
         let mut next = snapshot(files.clone());
+        next.segments = vec![SegmentStatus::Ready { blocks: 2 }];
+        assert!(
+            landed.differs(&next),
+            "能不能逐段解决变了(菜单项与行内按钮跟着它)"
+        );
+        let mut next = snapshot(files.clone());
         next.op_kind = Some(RepoOpKind::Rebase);
         assert!(landed.differs(&next), "进行中的操作变了");
         let mut next = snapshot(files.clone());
@@ -4471,18 +5090,14 @@ mod tests {
         assert!(errored.differs(&snapshot(files)), "上次失败、这次成功");
     }
 
-    /// 勾着 amend 时回包没变就不算变(「已推送」判定另走一趟);HEAD 没了 amend 收起算变。
+    /// A missing HEAD changes metadata, never silently clears amend intent.
     #[test]
     fn 取数落地的_amend_口径() {
         let base = snapshot(Vec::new());
-        let amending = Landed {
-            amend: true,
-            ..landed_from(&base)
-        };
         let mut next = snapshot(Vec::new());
-        assert!(!amending.differs(&next), "数据没变");
+        assert!(!landed_from(&base).differs(&next), "数据没变");
         next.has_head = false;
-        assert!(amending.differs(&next), "HEAD 没了:amend 收起");
+        assert!(landed_from(&base).differs(&next), "HEAD changed");
         assert!(
             !landed_from(&base).differs(&snapshot(Vec::new())),
             "没勾 amend"

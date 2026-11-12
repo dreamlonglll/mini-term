@@ -150,7 +150,7 @@ fn run(args: Arguments) -> Result<(), String> {
         );
     }
     if explicit_config {
-        let absolute = std::fs::canonicalize(&config)
+        let absolute = mt_core::path::canonicalize(&config)
             .map_err(|e| format!("cannot resolve SSH projection path: {e}"))?;
         let directory = absolute
             .parent()

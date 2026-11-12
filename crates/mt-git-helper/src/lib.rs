@@ -6,7 +6,7 @@
 //! Struct fields and enum kinds use camelCase; `Response.result` uses serde's
 //! external Result representation (`{"Ok": reply}` / `{"Err": typed_failure}`).
 //!
-//! Protocol v4 is a hard cutover with externally tagged operations and replies.
+//! Protocol v5 adds atomic multi-hunk/line writes and compact conflict snapshots.
 //! Typed query/mutation operations cover the desktop Git backend:
 //! - PanelSnapshot → git::RepoPanelSnapshot; ChangesSnapshot → ChangesSnapshot.
 //! - Log → HistoryPage (the next cursor is opaque, store and send it unchanged).
@@ -53,7 +53,7 @@ pub use limits::{
 pub use operations::{GitMutation, GitQuery};
 pub use server::serve;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +186,31 @@ pub enum Operation {
         diff: GitDiffResult,
         hunk: usize,
     },
+    StageHunks {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        picks: Vec<git::HunkPick>,
+    },
+    UnstageHunks {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        picks: Vec<git::HunkPick>,
+    },
+    DiscardHunks {
+        repo: String,
+        path: String,
+        diff: GitDiffResult,
+        picks: Vec<git::HunkPick>,
+    },
+    WriteConflictResolution {
+        repo: String,
+        snapshot: git::ConflictSnapshot,
+        #[serde(with = "conflict_picks")]
+        picks: Vec<Option<git::ConflictPick>>,
+        mark_resolved: bool,
+    },
     Checkout {
         repo: String,
         branch: String,
@@ -299,6 +324,10 @@ impl Operation {
             | Self::StageHunk { .. }
             | Self::UnstageHunk { .. }
             | Self::DiscardHunk { .. }
+            | Self::StageHunks { .. }
+            | Self::UnstageHunks { .. }
+            | Self::DiscardHunks { .. }
+            | Self::WriteConflictResolution { .. }
             | Self::Checkout { .. }
             | Self::CreateBranch { .. }
             | Self::RenameBranch { .. }
@@ -340,6 +369,10 @@ impl Operation {
             | Self::StageHunk { .. }
             | Self::UnstageHunk { .. }
             | Self::DiscardHunk { .. }
+            | Self::StageHunks { .. }
+            | Self::UnstageHunks { .. }
+            | Self::DiscardHunks { .. }
+            | Self::WriteConflictResolution { .. }
             | Self::Checkout { .. }
             | Self::CreateBranch { .. }
             | Self::RenameBranch { .. }
@@ -518,4 +551,57 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<Opt
 
 pub fn write_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
     writer.write_all(&encode_frame(value)?)
+}
+
+// A supported 8 MiB file can contain more tiny conflict blocks than the generic
+// JSON collection cap. One ASCII byte per choice retains that capability
+// without relaxing preflight allocation guards for any array.
+mod conflict_picks {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        picks: &[Option<git::ConflictPick>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let encoded: String = picks
+            .iter()
+            .map(|pick| match pick {
+                None => '.',
+                Some(git::ConflictPick::Ours) => 'o',
+                Some(git::ConflictPick::Theirs) => 't',
+                Some(git::ConflictPick::OursThenTheirs) => 'b',
+                Some(git::ConflictPick::TheirsThenOurs) => 'r',
+            })
+            .collect();
+        serializer.serialize_str(&encoded)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Option<git::ConflictPick>>, D::Error> {
+        struct Picks;
+        impl serde::de::Visitor<'_> for Picks {
+            type Value = Vec<Option<git::ConflictPick>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("compact conflict choices")
+            }
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                // The three marker lines occupy at least 23 bytes.
+                if text.len() > git::MAX_SEGMENT_FILE_BYTES as usize / 23 {
+                    return Err(E::custom("too many conflict choices"));
+                }
+                text.bytes()
+                    .map(|byte| {
+                        Ok(match byte {
+                            b'.' => None,
+                            b'o' => Some(git::ConflictPick::Ours),
+                            b't' => Some(git::ConflictPick::Theirs),
+                            b'b' => Some(git::ConflictPick::OursThenTheirs),
+                            b'r' => Some(git::ConflictPick::TheirsThenOurs),
+                            _ => return Err(E::custom("invalid conflict choice")),
+                        })
+                    })
+                    .collect()
+            }
+        }
+        deserializer.deserialize_str(Picks)
+    }
 }

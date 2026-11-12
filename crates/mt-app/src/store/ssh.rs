@@ -24,6 +24,20 @@ use super::{AppStore, ConfigSection, ProjectState, SshAssocOutcome, StoreEvent};
 // BB-b 已把消费方全部接上(三个弹窗 + 远程项目 UI + 断线遮罩 + 文件树/会话
 // 面板的远程分流),BB-a 留的 `allow(dead_code)` 随之删除 —— 从此这里多一个
 // 没人调的函数就会在 `cargo check` 里红。
+/// Whether a connection edit was rejected before any save, or saved without its password.
+pub enum SshSaveError {
+    NotSaved(String),
+    PasswordUnavailable(String),
+}
+
+impl SshSaveError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotSaved(message) | Self::PasswordUnavailable(message) => message,
+        }
+    }
+}
+
 impl AppStore {
     /// 已保存的 SSH 连接(`config.sshConnections`)。
     pub fn ssh_connections(&self) -> &[SshConnection] {
@@ -56,7 +70,7 @@ impl AppStore {
         &mut self,
         conn: SshConnection,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SshSaveError> {
         let source_change = mt_remote::remote_git_source_change_guard();
         if self.config.ssh_connections.iter().any(|existing| {
             existing.id == conn.id && super::projects::remote_git_endpoint_changed(existing, &conn)
@@ -64,7 +78,9 @@ impl AppStore {
             project.ssh_connection_id.as_deref() == Some(conn.id.as_str())
                 && self.remote_git_source_pending(project)
         }) {
-            return Err(crate::i18n::t("gitHistory", "recoverySourceBlocked").to_string());
+            return Err(SshSaveError::NotSaved(
+                crate::i18n::t("gitHistory", "recoverySourceBlocked").to_string(),
+            ));
         }
         let mut conn = conn;
         let id = conn.id.clone();
@@ -110,11 +126,11 @@ impl AppStore {
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         match seal_error {
-            Some(err) => Err(crate::i18n::tr!(
+            Some(err) => Err(SshSaveError::PasswordUnavailable(crate::i18n::tr!(
                 "sshModal",
                 "passwordSealFailed",
                 error = err
-            )),
+            ))),
             None => Ok(()),
         }
     }

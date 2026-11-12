@@ -69,18 +69,23 @@ impl BlameResult {
     }
 }
 
-/// 对仓库 `repo_root` 里的 `rel_path` 跑 blame,内容取 `contents`(落盘形态)。
+/// 对仓库 `repo_root` 里的 `rel_path` 跑 blame,内容取 `contents`(落盘形态的**字节**:
+/// GBK / UTF-16 文件要按原编码编好再喂,否则每一行都和 HEAD 对不上)。
 ///
 /// 文件不在 HEAD 里(未跟踪 / 新加入暂存区)时 git 报 `no such path`,原样作为错误
 /// 返回 —— 调用方本该在 HEAD 取数那一步就把这种文件挡掉。
 ///
 /// **阻塞最多 30s**,必须在后台线程上调用。
-pub fn blame_file(repo_root: &Path, rel_path: &str, contents: &str) -> Result<BlameResult> {
+pub fn blame_file(
+    repo_root: &Path,
+    rel_path: &str,
+    contents: impl AsRef<[u8]>,
+) -> Result<BlameResult> {
     let out = run_git_command_with_input(
         repo_root,
         &["blame", "--porcelain", "--contents", "-", "--", rel_path],
         "blame",
-        contents.as_bytes().to_vec(),
+        contents.as_ref().to_vec(),
         // 历史很长的大文件也就几秒,30s 足够分辨「卡死」
         QUICK_OP_TIMEOUT,
         ",文件历史可能过长",

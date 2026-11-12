@@ -29,3 +29,8 @@ parking_lot.workspace = true
 # SSH 工具(CLI + Skill)按项目启用时的能力令牌(UUID v4),`ssh_registry` 用。
 # 工作区里已有这一行(mt-app 同款),净新增 crate = 0。
 uuid.workspace = true
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

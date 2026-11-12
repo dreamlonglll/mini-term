@@ -206,6 +206,77 @@ impl GitContext {
         }
     }
 
+    pub fn recovery_blockers(&self) -> Vec<crate::RemoteGitRecoveryBlocker> {
+        match &self.backend {
+            Backend::Remote(remote) => remote.workspace.recovery_blockers(&self.path),
+            _ => Vec::new(),
+        }
+    }
+    pub fn prepare_offline_abandon(&self) -> Result<crate::RemoteGitOfflineAbandonConfirmation> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .prepare_offline_abandon()
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
+        }
+    }
+    pub fn abandon_recovery(
+        &self,
+        confirmation: crate::RemoteGitOfflineAbandonConfirmation,
+    ) -> Result<()> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .abandon_recovery(confirmation)
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
+        }
+    }
+    pub fn recovery_consent(&self) -> Result<crate::RemoteGitRecoveryConsent> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .recovery_consent()
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
+        }
+    }
+    pub fn recovery_snapshot_with_consent(
+        &self,
+        consent: crate::RemoteGitRecoveryConsent,
+    ) -> Result<crate::RemoteGitRecoverySnapshot> {
+        match &self.backend {
+            Backend::Remote(remote) => remote
+                .workspace
+                .recovery_snapshot_with_consent_blocking(consent)
+                .map_err(mt_git_helper::GitFailure::into_error),
+            Backend::Broken(message) => bail!("{message}"),
+            Backend::Local => bail!("remote_git_no_unknown_write"),
+        }
+    }
+
+    pub fn conflict_segment_status(&self, info: &ConflictInfo) -> Result<SegmentStatus> {
+        match &self.backend {
+            Backend::Local => Ok(git::conflict_segment_status(Path::new(&self.path), info)),
+            _ => self.query(Q::ConflictSegmentStatus { info: info.clone() }),
+        }
+    }
+    pub fn conflict_segment_statuses(&self, infos: &[ConflictInfo]) -> Result<Vec<SegmentStatus>> {
+        match &self.backend {
+            Backend::Local => Ok(infos
+                .iter()
+                .map(|info| git::conflict_segment_status(Path::new(&self.path), info))
+                .collect()),
+            _ => self.query(Q::ConflictSegmentStatuses {
+                infos: infos.to_vec(),
+            }),
+        }
+    }
+
     fn request(&self, operation: O) -> Result<Reply> {
         match &self.backend {
             Backend::Remote(remote) => remote
@@ -397,6 +468,9 @@ methods! {
     resolve_conflict_with(file: &str, side: ConflictSide) -> () => s, s.data(O::ResolveConflict { repo: s.path.clone(), path: file.into(), side });
     mark_conflict_resolved(file: &str) -> () => s, s.data(O::MarkResolved { repo: s.path.clone(), path: file.into() });
     has_conflict_markers(file: &str) -> bool => s, s.query(Q::HasConflictMarkers { file: file.into() });
+    load_conflict_file(file: &str) -> ConflictFile => s, s.query(Q::LoadConflictFile { file: file.into() });
+    write_conflict_resolution(file: &ConflictFile, picks: &[Option<ConflictPick>], mark_resolved: bool) -> () => s, s.data(O::WriteConflictResolution { repo: s.path.clone(), snapshot: file.snapshot()?, picks: picks.to_vec(), mark_resolved });
+    head_signature(rel_path: &str) -> HeadSignature => s, s.query(Q::HeadSignature { rel_path: rel_path.into() });
     discard_unstaged(files: &[String]) -> () => s, s.data(O::Discard { repo: s.path.clone(), paths: files.to_vec() });
     git_commit_with(message: &str, amend: bool) -> CommitOutcome => s, s.data(O::CommitWith { repo: s.path.clone(), message: message.into(), amend });
     amend_info() -> Option<AmendInfo> => s, s.query(Q::AmendInfo);
@@ -431,6 +505,9 @@ methods! {
     stage_hunk(file_path: &str, diff: &GitDiffResult, hunk_index: usize) -> () => s, s.data(O::StageHunk { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), hunk: hunk_index });
     unstage_hunk(file_path: &str, diff: &GitDiffResult, hunk_index: usize) -> () => s, s.data(O::UnstageHunk { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), hunk: hunk_index });
     discard_hunk(file_path: &str, diff: &GitDiffResult, hunk_index: usize) -> () => s, s.data(O::DiscardHunk { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), hunk: hunk_index });
+    stage_hunks(file_path: &str, diff: &GitDiffResult, picks: &[HunkPick]) -> () => s, s.data(O::StageHunks { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), picks: picks.to_vec() });
+    unstage_hunks(file_path: &str, diff: &GitDiffResult, picks: &[HunkPick]) -> () => s, s.data(O::UnstageHunks { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), picks: picks.to_vec() });
+    discard_hunks(file_path: &str, diff: &GitDiffResult, picks: &[HunkPick]) -> () => s, s.data(O::DiscardHunks { repo: s.path.clone(), path: file_path.into(), diff: diff.clone(), picks: picks.to_vec() });
     local_changes_conflict_with(branch: &str) -> Vec<String> => s, s.query(Q::LocalChangesConflictWith { branch: branch.into() });
     create_branch(name: &str, start: Option<&str>, checkout: bool) -> () => s, s.data(O::CreateBranch { repo: s.path.clone(), name: name.into(), start: start.map(Into::into), checkout });
     rename_branch(old: &str, new: &str) -> () => s, s.data(O::RenameBranch { repo: s.path.clone(), old: old.into(), name: new.into() });

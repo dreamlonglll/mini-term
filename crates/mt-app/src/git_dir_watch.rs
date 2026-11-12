@@ -760,6 +760,14 @@ mod tests {
     /// notify 在 Windows 上有几十毫秒级延迟,给足预算但不无限等。
     const BUDGET: Duration = Duration::from_secs(10);
 
+    /// These scenarios share the process-wide native watcher. On macOS each
+    /// registration change rebuilds its FSEvents stream, so one scenario must
+    /// not restart delivery while another is waiting for a single file write.
+    fn native_watch_test() -> parking_lot::MutexGuard<'static, ()> {
+        static NATIVE_TEST: Mutex<()> = Mutex::new(());
+        NATIVE_TEST.lock()
+    }
+
     /// 临时仓库:目录名带 pid + 纳秒 + 进程内序号;根 canonicalize 后剥掉 `\\?\`(与监听回报的
     /// 字面形态、libgit2 的 realpath 都对得上)。
     fn temp_repo(tag: &str) -> PathBuf {
@@ -774,7 +782,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let dir = mt_project::fs::strip_verbatim_prefix(std::fs::canonicalize(&dir).unwrap());
+        let dir = mt_core::path::canonicalize(&dir).unwrap();
         let out = std::process::Command::new("git")
             .args(["init", "-q"])
             .current_dir(&dir)
@@ -804,6 +812,7 @@ mod tests {
     /// 撤掉监听之后再动也不报。
     #[test]
     fn 相关变化去抖后报一次_噪声与撤销后不报() {
+        let _native = native_watch_test();
         let root = temp_repo("due");
         let layout = mt_project::git::git_dir_layout(&root).unwrap();
         let dirs = mt_project::git::git_watch_dirs(&layout);
@@ -862,6 +871,7 @@ mod tests {
     /// 新建目录要求重列清单;撤掉之后再动不报。
     #[test]
     fn 工作区变化去抖后交出_git_目录不算() {
+        let _native = native_watch_test();
         let root = temp_repo("worktree");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("a.ts"), "a\n").unwrap();
@@ -943,6 +953,7 @@ mod tests {
     /// 被跳过目录里面的丢掉(目录自己那条照常交);唤醒口一批只叫一声、交出去才复位。
     #[test]
     fn 递归子树深处的改动交得出_被跳过的目录里不交() {
+        let _native = native_watch_test();
         let root = temp_repo("worktree-tree");
         let src = root.join("src");
         let deep = src.join("d005").join("s00");

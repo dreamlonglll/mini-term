@@ -308,7 +308,7 @@ jobs:
         run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
       - name: Build GPUI app
-        run: cargo build --release --package mt-app
+        run: cargo build --locked --release --package mt-app
 
       # Required for every desktop matrix row, including Windows. The validator
       # reads binary headers itself (no host file/readelf dependency), rejects

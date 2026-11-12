@@ -28,7 +28,7 @@ fn new_repo(tag: &str) -> PathBuf {
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
+    let root = mt_core::path::canonicalize(&root).unwrap();
     let repo = Repository::init(&root).unwrap();
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "mini-term").unwrap();

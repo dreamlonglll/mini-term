@@ -1,19 +1,22 @@
-//! 单文件历史弹窗(对标 IDEA 的 Show History):左栏是改动过这个文件的提交,
-//! 右栏是所选提交里这个文件的 diff。
+//! 单文件历史(对标 IDEA 的 Show History):工作区里的一个 diff 页签,左栏是改动过这个
+//! 文件的提交,右栏是所选提交里这个文件的 diff。页签的宿主、身份与复用(同一个文件只开一个
+//! 历史页签)见 `git_diff::tab`。
 //!
-//! - 入口:文件树右键「Git 历史」;对外只有 [`open`],别处(变更列表、文件查看器)
-//!   要接入时直接调它;
-//! - 数据:[`mt_project::git::get_file_log`](判定 = 相对第一个父提交改动了该路径,
-//!   **不跟随重命名**),分页游标由后端交回;后端每批最多扫 `SCAN_BUDGET` 个提交,
+//! - 入口:文件树右键「Git 历史」、更改列表右键;对外只有 [`open`],别处要接入时直接调它;
+//! - 数据:捕获的 `GitContext::get_file_log`(相对第一个父提交改动了该路径,
+//!   **不跟随重命名**);本地与 SSH 统一通过 `run_git_on` 调用,分页游标由后端交回;
 //!   没凑满一页就接着要;
 //! - 右栏复用 `git_diff` 的渲染([`git_diff::CommitFileDiffPane`]),并排 / 行内、
-//!   改动跳转与提交 diff 弹窗完全一致;
-//! - 键盘:打开即选中第一条;↑/↓ 换提交,右栏跟着换;Esc 关闭(Dialog 自带)。
-//!
-//! 尺寸与提交 diff 弹窗同一口径(`git_diff::modal_size`)。
+//!   改动跳转与提交 diff 页签完全一致;双击 / 右键「在完整提交 diff 中查看」另开一个
+//!   提交 diff 页签;
+//! - 键盘:打开即选中第一条;↑/↓ 换提交,右栏跟着换;
+//! - 防陈旧:工具栏的「刷新」整张列表重拉(选中的提交按哈希认回);页签切回来、更改列表的
+//!   取数落地时比一次 HEAD([`HistoryPage::check_head`]),变了才重拉 —— 历史只随提交变,
+//!   不必像单文件 diff 那样每次都重取。
+
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
+    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle,
     FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
     UniformListScrollHandle, Window, div, px, uniform_list,
@@ -22,12 +25,11 @@ use mt_project::git::{FileLogEntry, GitLogCursor};
 use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::git_diff::{self, CommitFileDiffPane};
+use crate::git_diff::{self, CommitFileDiffPane, ToolbarTail};
 use crate::git_history::{format_absolute_time, format_relative_time};
 use crate::git_ui::{self, ButtonKind, ICON_HISTORY, commit_file_status, empty_state, mono};
 use crate::i18n::{t, tr};
 use crate::menu;
-use crate::prompt::{is_open, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -41,10 +43,10 @@ gpui::actions!(
     ]
 );
 
-/// 单文件历史弹窗的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓)。
+/// 单文件历史页签的键位上下文(`hotkeys.rs` 按它绑 ↑ / ↓)。
 pub(crate) const FILE_HISTORY_CONTEXT: &str = "GitFileHistory";
 
-/// 每页条数。弹窗里一屏能放二十来条,一页给够两屏。
+/// 每页条数。页签里一屏能放二十来条,一页给够两屏。
 const PAGE_SIZE: usize = 50;
 /// 左栏行高(两行布局)。uniform_list 要求等高。
 const ROW_HEIGHT: f32 = 52.0;
@@ -65,23 +67,42 @@ struct FileHistory {
     loading: bool,
     error: Option<String>,
     scanned: usize,
-    /// 想要凑满的条数:首屏一页,触底加一页。
+    /// 想要凑满的条数:首屏一页,触底加一页;重拉时取重拉前已有的条数。
     want: usize,
     selected: Option<usize>,
+    /// 重拉之后要认回的提交(重拉前选中的那条);认到了或拉完了还没有就清掉。
+    reselect: Option<String>,
+    /// 请求令牌:重拉时 +1,旧的那一趟回来不许落地。
+    request: u64,
+    /// 首页那一刻的 HEAD(切回来时比它,变了才重拉)。没提交过的仓库是 `None`。
+    head: Option<String>,
+    /// 比 HEAD 的那一趟在途(切回来与仓库变了会凑到一起)。
+    checking: bool,
     diff: CommitFileDiffPane,
     scroll: UniformListScrollHandle,
+    /// 页签的焦点(行点击时要回来,之后 ↑/↓ 才有人接)。
     focus: FocusHandle,
 }
 
+impl FileHistory {
+    fn file_name(&self) -> String {
+        self.file_rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.file_rel)
+            .to_string()
+    }
+}
+
 impl Render for FileHistory {
-    /// 只当状态盒子用(Dialog 的 builder 每帧重跑)。
+    /// 只当状态盒子用(页签每帧按它现画)。
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
     }
 }
 
-/// 打开某个文件的 Git 历史。`project_root` 可以是仓库里的子目录,`file_rel` 是
-/// 相对它的路径(`/` 或 `\` 分隔都行);所属仓库由后端就近发现。
+/// 打开某个文件的 Git 历史页签(已开着就切过去)。`project_root` 可以是仓库里的子目录,
+/// `file_rel` 是相对它的路径;SSH 保留 POSIX 文件名中的反斜杠。所属仓库由后端就近发现。
 pub fn open(
     store: Entity<AppStore>,
     project_root: GitContext,
@@ -89,100 +110,192 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if is_open(kind::GIT_FILE_HISTORY) {
-        return;
-    }
-    let diff = CommitFileDiffPane::new(&store, cx);
-    let file_rel = if project_root.is_remote() {
-        file_rel
-    } else {
-        file_rel.replace('\\', "/")
-    };
-    let state = cx.new(|cx| FileHistory {
-        store,
-        project_root,
-        file_rel: file_rel.clone(),
-        repo_root: None,
-        path_in_repo: None,
-        entries: Vec::new(),
-        cursor: None,
-        started: false,
-        loading: false,
-        error: None,
-        scanned: 0,
-        want: PAGE_SIZE,
-        selected: None,
-        diff,
-        scroll: UniformListScrollHandle::new(),
-        focus: cx.focus_handle(),
-    });
-    load_page(&state, cx);
-
-    let file_name = file_rel.rsplit('/').next().unwrap_or(&file_rel).to_string();
-    let focus = state.read(cx).focus.clone();
-
-    open_guarded(
-        kind::GIT_FILE_HISTORY,
-        window,
-        cx,
-        move |dialog, window, cx| {
-            let viewport = window.viewport_size();
-            let (width, body_h) = git_diff::modal_size(viewport);
-            let (prev, next) = (state.clone(), state.clone());
-            let (focus, diff) = {
-                let s = state.read(cx);
-                (s.focus.clone(), s.diff.clone())
-            };
-            dialog.w(width).p_0().close_button(false).child(
-                // 右栏 diff 正文的 Ctrl/Cmd+C / A 也挂在这个焦点容器上
-                diff.text_actions(div())
-                    .w_full()
-                    .h(body_h)
-                    .flex()
-                    .overflow_hidden()
-                    .key_context(FILE_HISTORY_CONTEXT)
-                    .track_focus(&focus)
-                    .on_action(move |_: &FileHistoryPrev, _window, cx| {
-                        move_selection(&prev, -1, cx)
-                    })
-                    .on_action(move |_: &FileHistoryNext, _window, cx| move_selection(&next, 1, cx))
-                    .child(render_list_column(&state, &file_name, cx))
-                    .child(render_diff_column(&state, cx)),
-            )
-        },
-    );
-    // 方向键要落在弹窗里:等弹窗抢完焦点再交给列表(同 `prompt::autofocus`)
-    window.defer(cx, move |window, cx| window.focus(&focus, cx));
+    git_diff::open_file_history(store, project_root, file_rel, window, cx);
 }
 
-/// 要下一页(首页 / 触底 / 没凑满自动续)。到底或在途时什么都不做。
+/// 单文件历史页签的正文(宿主见 `git_diff::tab`)。
+pub(crate) struct HistoryPage {
+    state: Entity<FileHistory>,
+}
+
+impl HistoryPage {
+    /// 建页并拉首页。`focus` 是页签的焦点句柄(左栏点行时要回来)。
+    pub(crate) fn new(
+        store: Entity<AppStore>,
+        project_root: GitContext,
+        file_rel: String,
+        focus: FocusHandle,
+        cx: &mut App,
+    ) -> Self {
+        let diff = CommitFileDiffPane::new(&store, cx);
+        let file_rel = if project_root.is_remote() {
+            file_rel
+        } else {
+            file_rel.replace('\\', "/")
+        };
+        let state = cx.new(|_| FileHistory {
+            store,
+            project_root,
+            file_rel,
+            repo_root: None,
+            path_in_repo: None,
+            entries: Vec::new(),
+            cursor: None,
+            started: false,
+            loading: false,
+            error: None,
+            scanned: 0,
+            want: PAGE_SIZE,
+            selected: None,
+            reselect: None,
+            request: 0,
+            head: None,
+            checking: false,
+            diff,
+            scroll: UniformListScrollHandle::new(),
+            focus,
+        });
+        load_page(&state, cx);
+        Self { state }
+    }
+
+    /// 工具栏「刷新」:整张列表重拉(见 [`reload`])。
+    pub(crate) fn reload(&self, cx: &mut App) {
+        reload(&self.state, cx);
+    }
+
+    /// 页签切回来 / 仓库变了:后台比一次 HEAD,与首页那一刻的不一样(别处提交了、切了分支)
+    /// 才整张重拉。还没拉到首页、正在拉、或已经在比的时候什么都不做。
+    pub(crate) fn check_head(&self, cx: &mut App) {
+        let Some((root, rel, known, request)) = self.state.update(cx, |s, _| {
+            if s.loading || s.checking {
+                return None;
+            }
+            let root = s.repo_root.clone()?;
+            let rel = s.path_in_repo.clone()?;
+            s.checking = true;
+            Some((root, rel, s.head.clone(), s.request))
+        }) else {
+            return;
+        };
+        let state = self.state.clone();
+        cx.spawn(async move |cx| {
+            let executor = root.clone();
+            let signature =
+                mt_remote::run_git_on(&executor, move || root.head_signature(&rel)).await;
+            cx.update(|cx| {
+                // 读不到(仓库被删 / 正被别的 git 进程改写)就等下一次
+                let changed = state.update(cx, |s, _| {
+                    if s.request != request {
+                        return false;
+                    }
+                    s.checking = false;
+                    signature.is_ok_and(|signature| signature.head != known)
+                });
+                if changed {
+                    reload(&state, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn render(&self, focus: &FocusHandle, refresh: AnyElement, cx: &mut App) -> Div {
+        let state = &self.state;
+        let (prev, next) = (state.clone(), state.clone());
+        let (diff, file_name) = {
+            let s = state.read(cx);
+            (s.diff.clone(), s.file_name())
+        };
+        // 右栏 diff 正文的 Ctrl/Cmd+C / A 也挂在这个焦点容器上;Esc 没有绑定,照常往外走
+        diff.text_actions(div())
+            .track_focus(focus)
+            .key_context(FILE_HISTORY_CONTEXT)
+            .on_action(move |_: &FileHistoryPrev, _window, cx| move_selection(&prev, -1, cx))
+            .on_action(move |_: &FileHistoryNext, _window, cx| move_selection(&next, 1, cx))
+            .flex()
+            .overflow_hidden()
+            .child(render_list_column(state, &file_name, cx))
+            .child(render_diff_column(state, refresh, cx))
+    }
+}
+
+/// 整张列表重拉:清空、令牌 +1(在途的那一趟回来落不了地),按重拉前的条数拉回来,选中的
+/// 提交按哈希认回(认不到就选第一条)。
+fn reload(state: &Entity<FileHistory>, cx: &mut App) {
+    state.update(cx, |s, cx| {
+        s.reselect = s
+            .selected
+            .and_then(|index| s.entries.get(index))
+            .map(|entry| entry.commit.hash.clone())
+            .or_else(|| s.reselect.take());
+        s.want = s.entries.len().max(PAGE_SIZE);
+        s.request += 1;
+        s.entries.clear();
+        s.cursor = None;
+        s.started = false;
+        s.loading = false;
+        s.error = None;
+        s.scanned = 0;
+        s.selected = None;
+        s.head = None;
+        s.checking = false;
+        cx.notify();
+    });
+    load_page(state, cx);
+}
+
+/// 要下一页(首页 / 触底 / 没凑满自动续)。到底或在途时什么都不做。首页那一趟顺手记下
+/// 当时的 HEAD(见 [`HistoryPage::check_head`])。
 fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
-    let Some((root, rel, after)) = state.update(cx, |s, _| {
+    let Some((root, rel, after, req)) = state.update(cx, |s, _| {
         if s.loading || (s.started && s.cursor.is_none()) {
             return None;
         }
         s.loading = true;
         s.started = true;
-        Some((s.project_root.clone(), s.file_rel.clone(), s.cursor.take()))
+        Some((
+            s.project_root.clone(),
+            s.file_rel.clone(),
+            s.cursor.take(),
+            s.request,
+        ))
     }) else {
         return;
     };
+    let first_page = after.is_none();
     let state = state.clone();
     cx.spawn(async move |cx| {
         let executor = root.clone();
-        let result =
-            mt_remote::run_git_on(&executor, move || root.get_file_log(&rel, after, PAGE_SIZE))
-                .await;
+        let result = mt_remote::run_git_on(&executor, move || {
+            let page = root.get_file_log(&rel, after, PAGE_SIZE)?;
+            let head = if first_page {
+                root.with_path(page.repo_root.to_string_lossy().into_owned())
+                    .head_signature(&page.path_in_repo)
+                    .ok()
+                    .and_then(|signature| signature.head)
+            } else {
+                None
+            };
+            anyhow::Ok((page, head))
+        })
+        .await;
         cx.update(|cx| {
-            let need_more = state.update(cx, |s, cx| {
+            let landed = state.update(cx, |s, cx| {
+                if s.request != req {
+                    return None;
+                }
                 s.loading = false;
                 match result {
-                    Ok(page) => {
+                    Ok((page, head)) => {
                         s.repo_root = Some(
                             s.project_root
                                 .with_path(page.repo_root.to_string_lossy().into_owned()),
                         );
                         s.path_in_repo = Some(page.path_in_repo);
+                        if first_page {
+                            s.head = head;
+                        }
                         s.scanned += page.scanned;
                         for entry in page.entries {
                             if !s.entries.iter().any(|e| e.commit.hash == entry.commit.hash) {
@@ -198,11 +311,25 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
                     }
                 }
                 cx.notify();
-                s.cursor.is_some() && s.entries.len() < s.want
+                let need_more = s.cursor.is_some() && s.entries.len() < s.want;
+                let pick = if s.selected.is_some() {
+                    None
+                } else {
+                    let hashes: Vec<&str> =
+                        s.entries.iter().map(|e| e.commit.hash.as_str()).collect();
+                    let (pick, keep) = pick_after_load(&hashes, s.reselect.as_deref(), need_more);
+                    if !keep {
+                        s.reselect = None;
+                    }
+                    pick
+                };
+                Some((need_more, pick))
             });
-            // 打开即选中第一条
-            if state.read(cx).selected.is_none() && !state.read(cx).entries.is_empty() {
-                select(&state, 0, cx);
+            let Some((need_more, pick)) = landed else {
+                return;
+            };
+            if let Some(index) = pick {
+                select(&state, index, cx);
             }
             if need_more {
                 load_page(&state, cx);
@@ -210,6 +337,29 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// 还没选中过任何一条时,一批落地之后该选中哪一条:返回 `(选中的下标, 要认回的提交还留不留着)`。
+///
+/// `hashes` 是眼下列表里的提交,`reselect` 是重拉前选中的那条。有要认回的就等它出现(出现了
+/// 选它;还有下一批就再等;拉完了还没有就放弃、选第一条),没有就打开即选中第一条。列表还空着
+/// 时什么都不选,要认回的留着。
+fn pick_after_load(
+    hashes: &[&str],
+    reselect: Option<&str>,
+    need_more: bool,
+) -> (Option<usize>, bool) {
+    if hashes.is_empty() {
+        return (None, reselect.is_some());
+    }
+    let Some(hash) = reselect else {
+        return (Some(0), false);
+    };
+    match hashes.iter().position(|h| *h == hash) {
+        Some(index) => (Some(index), false),
+        None if need_more => (None, true),
+        None => (Some(0), false),
+    }
 }
 
 /// 触底:多要一页。
@@ -269,7 +419,7 @@ fn move_selection(state: &Entity<FileHistory>, delta: isize, cx: &mut App) {
     }
 }
 
-/// 打开该提交的完整 diff(多文件弹窗,叠在本弹窗之上),先选中这个文件。
+/// 打开该提交的完整 diff(另一个提交 diff 页签),先选中这个文件。
 fn open_in_commit_diff(
     state: &Entity<FileHistory>,
     index: usize,
@@ -291,7 +441,7 @@ fn open_in_commit_diff(
     let Some((store, repo, hash, message, path)) = target else {
         return;
     };
-    // 弹窗遮罩下 toast 看不见:取文件失败弹详情框(见 `open_commit_diff_loading`)
+    // 取文件失败弹详情框(见 `open_commit_diff_loading`)
     git_diff::open_commit_diff_loading(store, repo, hash, message, Some(path), window, cx).detach();
 }
 
@@ -529,7 +679,11 @@ fn render_row(state: &Entity<FileHistory>, index: usize, cx: &mut App) -> AnyEle
     .into_any_element()
 }
 
-fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
+fn render_diff_column(
+    state: &Entity<FileHistory>,
+    refresh: AnyElement,
+    cx: &mut App,
+) -> AnyElement {
     let (picked, diff) = {
         let s = state.read(cx);
         (
@@ -538,9 +692,9 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
             s.diff.clone(),
         )
     };
-    let toolbar = diff.toolbar("git-file-history", kind::GIT_FILE_HISTORY, cx);
+    let toolbar = diff.toolbar("git-file-history", ToolbarTail::Refresh(refresh), cx);
 
-    // 与另两个 diff 弹窗的工具栏同高同距
+    // 与另几种 diff 页签的工具栏同高同距
     let mut head = div()
         .flex_none()
         .flex()
@@ -616,4 +770,30 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
                 .child(body),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 重拉之后认回原先选中的提交:在这一批里就选它;还有下一批就先等;拉完了还没有(提交
+    /// 被改写掉了)就放弃、选第一条。没有要认回的就打开即选中第一条;列表空着什么都不选。
+    #[test]
+    fn 重拉后按哈希认回选中的提交() {
+        assert_eq!(
+            pick_after_load(&["a", "b", "c"], None, true),
+            (Some(0), false)
+        );
+        assert_eq!(
+            pick_after_load(&["a", "b", "c"], Some("c"), true),
+            (Some(2), false)
+        );
+        assert_eq!(pick_after_load(&["a", "b"], Some("z"), true), (None, true));
+        assert_eq!(
+            pick_after_load(&["a", "b"], Some("z"), false),
+            (Some(0), false)
+        );
+        assert_eq!(pick_after_load(&[], Some("z"), false), (None, true));
+        assert_eq!(pick_after_load(&[], None, false), (None, false));
+    }
 }

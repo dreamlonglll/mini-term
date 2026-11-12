@@ -73,15 +73,15 @@ def smoke(binary):
                 return json.loads(exact(length))
 
             hello = frame()
-            assert hello["protocolVersion"] == 4 and hello["helperVersion"], hello
+            assert hello["protocolVersion"] == 5 and hello["helperVersion"], hello
 
             def request(identifier, operation):
-                payload = json.dumps({"protocolVersion": 4, "id": identifier,
+                payload = json.dumps({"protocolVersion": 5, "id": identifier,
                                       "operation": operation}).encode()
                 child.stdin.write(struct.pack(">I", len(payload)) + payload)
                 child.stdin.flush()
                 response = frame()
-                assert response["protocolVersion"] == 4 and response["id"] == identifier, response
+                assert response["protocolVersion"] == 5 and response["id"] == identifier, response
                 assert set(response["result"]) == {"Ok"}, response
                 return response["result"]["Ok"]
 

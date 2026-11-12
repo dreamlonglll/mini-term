@@ -168,11 +168,89 @@ pub(crate) fn repository_identity(connection: &SshConnection, repo: &str) -> Str
     )
 }
 
+/// Stable UI-facing operation categories; never retain diffs, messages or Debug payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteGitOperationKind {
+    Stage,
+    Unstage,
+    StageAll,
+    UnstageAll,
+    Commit,
+    Amend,
+    Discard,
+    StageHunks,
+    UnstageHunks,
+    DiscardHunks,
+    Checkout,
+    CreateBranch,
+    RenameBranch,
+    DeleteBranch,
+    Fetch,
+    Pull,
+    Push,
+    SaveStash,
+    ApplyStash,
+    PopStash,
+    DropStash,
+    ClearStashes,
+    StashBranch,
+    Continue,
+    Abort,
+    ResolveConflict,
+    MarkResolved,
+    CherryPick,
+    Revert,
+    Reset,
+    UndoCommit,
+    RewordCommit,
+    CreateTag,
+    DeleteTag,
+    PushTag,
+    DeleteRemoteBranch,
+    Merge,
+    Rebase,
+    AddWorktree,
+    RemoveWorktree,
+    PruneWorktrees,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteGitRecoveryBlocker {
+    pub owner_project_id: String,
+    pub write: RemoteGitUnknownWrite,
+}
+
+/// Local risk confirmation, bound to its original owner and source generation.
+/// Deliberately opaque and non-Clone; consuming it never contacts the actor.
+pub struct RemoteGitOfflineAbandonConfirmation {
+    owner: Arc<WorkspaceInner>,
+    authority: Arc<WorkspaceInner>,
+    generation: u64,
+    epoch: u64,
+    authority_epoch: u64,
+}
+
+/// Single-use permission for fixed recovery observations and their acknowledgement only.
+/// The caller must first explain that this may upload/start a helper on the server.
+pub struct RemoteGitRecoveryConsent {
+    authority: Arc<RecoveryAuthority>,
+}
+
+#[derive(Debug)]
+struct RecoveryAuthority {
+    owner: Weak<WorkspaceInner>,
+    authority: Weak<WorkspaceInner>,
+    generation: u64,
+    epoch: u64,
+    authority_epoch: u64,
+    token: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteGitUnknownWrite {
     pub generation: u64,
     pub repo: String,
-    pub operation: String,
+    pub operation: RemoteGitOperationKind,
     pub occurred: SystemTime,
 }
 
@@ -182,7 +260,7 @@ pub struct RemoteGitUnknownWrite {
 pub struct RemoteGitRecoverySnapshot {
     pub generation: u64,
     pub repo: String,
-    pub operation: String,
+    pub operation: RemoteGitOperationKind,
     pub occurred: SystemTime,
     pub head: Option<String>,
     pub signature: RepoSignature,
@@ -193,6 +271,7 @@ pub struct RemoteGitRecoverySnapshot {
     token: u64,
     epoch: u64,
     permission: u64,
+    recovery: Option<Arc<RecoveryAuthority>>,
 }
 
 #[derive(Clone)]
@@ -259,10 +338,28 @@ struct WorkspaceLease {
     epoch: u64,
     authority_epoch: u64,
     permission: u64,
+    recovery: Option<Arc<RecoveryAuthority>>,
 }
 impl WorkspaceLease {
     fn check(&self) -> Result<(), GitFailure> {
-        let permission = self.inner.ensure_active()?;
+        let permission = if let Some(recovery) = &self.recovery {
+            if SHUTTING_DOWN.load(Ordering::Acquire)
+                || self.inner.invalidated.load(Ordering::Acquire)
+                || !recovery.owner.ptr_eq(&Arc::downgrade(&self.owner))
+                || !recovery.authority.ptr_eq(&Arc::downgrade(&self.inner))
+                || recovery.epoch != self.epoch
+                || recovery.authority_epoch != self.authority_epoch
+                || lock(&self.owner.unknown)
+                    .as_ref()
+                    .map(|write| write.generation)
+                    != Some(recovery.generation)
+            {
+                return Err(service_error("remote_git_recovery_stale"));
+            }
+            recovery.token
+        } else {
+            self.inner.ensure_active()?
+        };
         if self.epoch != self.owner.epoch.load(Ordering::Acquire)
             || self.authority_epoch != self.inner.epoch.load(Ordering::Acquire)
         {
@@ -301,6 +398,8 @@ struct WorkspaceClient {
     snapshot: Option<RemoteGitRecoverySnapshot>,
     authority: Weak<WorkspaceInner>,
     permission: u64,
+    recovery: Option<Arc<RecoveryAuthority>>,
+    authority_epoch: u64,
 }
 
 impl RemoteGitWorkspace {
@@ -367,6 +466,113 @@ impl RemoteGitWorkspace {
             })
             .cloned()
     }
+    /// List every owner blocking this repository, without granting recovery authority.
+    pub fn recovery_blockers(&self, repo: &str) -> Vec<RemoteGitRecoveryBlocker> {
+        lock(&UNKNOWN_WORKSPACES)
+            .iter()
+            .filter_map(|owner| {
+                if !same_endpoint(&owner.connection, &self.inner.connection) {
+                    return None;
+                }
+                let write = lock(&owner.unknown).clone()?;
+                (mt_core::path_key::posix_trim_trailing(&write.repo)
+                    == mt_core::path_key::posix_trim_trailing(repo))
+                .then(|| RemoteGitRecoveryBlocker {
+                    owner_project_id: owner.project_id.clone(),
+                    write,
+                })
+            })
+            .collect()
+    }
+    pub fn prepare_offline_abandon(
+        &self,
+    ) -> Result<RemoteGitOfflineAbandonConfirmation, GitFailure> {
+        let _source = remote_git_source_change_guard();
+        if self.write_running() {
+            return Err(service_error("remote_git_write_running"));
+        }
+        let owner = self
+            .unknown_owner()
+            .ok_or_else(|| service_error("remote_git_no_unknown_write"))?;
+        let generation = lock(&owner.unknown)
+            .as_ref()
+            .expect("owner retains unknown")
+            .generation;
+        Ok(RemoteGitOfflineAbandonConfirmation {
+            generation,
+            epoch: owner.epoch.load(Ordering::Acquire),
+            authority_epoch: self.inner.epoch.load(Ordering::Acquire),
+            owner,
+            authority: self.inner.clone(),
+        })
+    }
+    /// Clear only this local generation, without waiting for the actor or network.
+    /// Never deploys, connects, issues a Git request, restores a grant or cancels Git.
+    /// Existing channels may send EOF/close during normal bounded background cleanup;
+    /// that cleanup neither proves completion nor guarantees the remote write stops.
+    pub fn abandon_recovery(
+        &self,
+        confirmation: RemoteGitOfflineAbandonConfirmation,
+    ) -> Result<(), GitFailure> {
+        let _source = remote_git_source_change_guard();
+        if self.write_running() {
+            return Err(service_error("remote_git_write_running"));
+        }
+        if !Arc::ptr_eq(&confirmation.authority, &self.inner)
+            || confirmation.owner.project_id != self.inner.project_id
+            || confirmation.epoch != confirmation.owner.epoch.load(Ordering::Acquire)
+            || confirmation.authority_epoch != self.inner.epoch.load(Ordering::Acquire)
+        {
+            return Err(service_error("remote_git_recovery_stale"));
+        }
+        clear_unknown(&confirmation.owner, confirmation.generation)?;
+        confirmation.owner.schedule_close();
+        Ok(())
+    }
+    pub fn recovery_consent(&self) -> Result<RemoteGitRecoveryConsent, GitFailure> {
+        let _source = remote_git_source_change_guard();
+        if self.write_running() {
+            return Err(service_error("remote_git_write_running"));
+        }
+        if SHUTTING_DOWN.load(Ordering::Acquire) || self.inner.invalidated.load(Ordering::Acquire) {
+            return Err(service_error("remote_git_connection_changed"));
+        }
+        let owner = self
+            .unknown_owner()
+            .ok_or_else(|| service_error("remote_git_no_unknown_write"))?;
+        let generation = lock(&owner.unknown)
+            .as_ref()
+            .expect("owner retains unknown")
+            .generation;
+        Ok(RemoteGitRecoveryConsent {
+            authority: Arc::new(RecoveryAuthority {
+                owner: Arc::downgrade(&owner),
+                authority: Arc::downgrade(&self.inner),
+                generation,
+                epoch: owner.epoch.load(Ordering::Acquire),
+                authority_epoch: self.inner.epoch.load(Ordering::Acquire),
+                token: SEQUENCE.fetch_add(1, Ordering::AcqRel),
+            }),
+        })
+    }
+    pub async fn recovery_snapshot_with_consent(
+        &self,
+        consent: RemoteGitRecoveryConsent,
+    ) -> Result<RemoteGitRecoverySnapshot, GitFailure> {
+        let (sender, receiver) = oneshot::channel();
+        self.enqueue_scoped(Command::Snapshot(sender), Some(consent.authority))
+            .await?;
+        receiver
+            .await
+            .map_err(|_| service_error("remote_git_actor_stopped"))
+    }
+    pub fn recovery_snapshot_with_consent_blocking(
+        &self,
+        consent: RemoteGitRecoveryConsent,
+    ) -> Result<RemoteGitRecoverySnapshot, GitFailure> {
+        require_executor()?;
+        runtime()?.block_on(self.recovery_snapshot_with_consent(consent))
+    }
     pub fn request(&self, operation: Operation) -> Result<Reply, String> {
         self.request_typed(operation)
             .map_err(|error| error.to_string())
@@ -412,7 +618,8 @@ impl RemoteGitWorkspace {
         &self,
         snapshot: RemoteGitRecoverySnapshot,
     ) -> Result<(), GitFailure> {
-        self.enqueue(Command::Acknowledge(snapshot))
+        let recovery = snapshot.recovery.clone();
+        self.enqueue_scoped(Command::Acknowledge(snapshot), recovery)
             .await
             .map(|_| ())
     }
@@ -424,7 +631,17 @@ impl RemoteGitWorkspace {
         runtime()?.block_on(self.acknowledge_recovery(snapshot.clone()))
     }
     async fn enqueue(&self, command: Command) -> Result<Reply, GitFailure> {
-        let permission = self.inner.ensure_active()?;
+        self.enqueue_scoped(command, None).await
+    }
+    async fn enqueue_scoped(
+        &self,
+        command: Command,
+        recovery_authority: Option<Arc<RecoveryAuthority>>,
+    ) -> Result<Reply, GitFailure> {
+        let permission = match &recovery_authority {
+            Some(authority) => authority.token,
+            None => self.inner.ensure_active()?,
+        };
         validate_absolute_path(&self.inner.root, "root")
             .map_err(|e| failure("remote_git_invalid_root", e))?;
         let recovery = matches!(&command, Command::Snapshot(_) | Command::Acknowledge(_));
@@ -439,6 +656,7 @@ impl RemoteGitWorkspace {
             owner: owner.clone(),
             authority_epoch: self.inner.epoch.load(Ordering::Acquire),
             permission,
+            recovery: recovery_authority,
         };
         lease.check()?;
         let (reply, receiver) = oneshot::channel();
@@ -517,6 +735,21 @@ fn connect_transport(lease: &WorkspaceLease) -> Result<Box<dyn WorkspaceTranspor
     Ok(Box::new(client))
 }
 
+fn slot_active(slot: &WorkspaceClient, owner: &Arc<WorkspaceInner>) -> bool {
+    let Some(authority) = slot.authority.upgrade() else {
+        return owner.ensure_active().is_ok();
+    };
+    WorkspaceLease {
+        inner: authority,
+        owner: owner.clone(),
+        epoch: slot.epoch,
+        authority_epoch: slot.authority_epoch,
+        permission: slot.permission,
+        recovery: slot.recovery.clone(),
+    }
+    .check()
+    .is_ok()
+}
 async fn actor(inner: Weak<WorkspaceInner>, mut receiver: mpsc::Receiver<QueuedRequest>) {
     let mut slot = WorkspaceClient::default();
     loop {
@@ -525,14 +758,7 @@ async fn actor(inner: Weak<WorkspaceInner>, mut receiver: mpsc::Receiver<QueuedR
         };
         let timeout = workspace.idle_timeout;
         let changed = workspace.changed.clone();
-        let active = slot.authority.upgrade().map_or_else(
-            || workspace.ensure_active().is_ok(),
-            |authority| {
-                authority
-                    .ensure_active()
-                    .is_ok_and(|permission| permission == slot.permission)
-            },
-        );
+        let active = slot_active(&slot, &workspace);
         if !active {
             if lock(&workspace.unknown).is_none() {
                 slot.client.take();
@@ -545,8 +771,7 @@ async fn actor(inner: Weak<WorkspaceInner>, mut receiver: mpsc::Receiver<QueuedR
             request = receiver.recv() => request,
             _ = changed.notified() => {
                 if let Some(workspace) = inner.upgrade() {
-                    let active = slot.authority.upgrade().map_or_else(|| workspace.ensure_active().is_ok(),
-                        |authority| authority.ensure_active().is_ok_and(|permission| permission == slot.permission));
+                    let active = slot_active(&slot, &workspace);
                     if slot.epoch != workspace.epoch.load(Ordering::Acquire) || !active {
                         slot.reader.take(); slot.snapshot.take();
                         if lock(&workspace.unknown).is_none() { slot.client.take(); }
@@ -601,32 +826,31 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
     }
     slot.authority = Arc::downgrade(&lease.inner);
     slot.permission = lease.permission;
+    slot.recovery = lease.recovery.clone();
+    slot.authority_epoch = lease.authority_epoch;
     match std::mem::replace(
         &mut request.command,
         Command::Request(Operation::Discover, None),
     ) {
         Command::Snapshot(sender) => {
             let snapshot = snapshot(slot, lease)?;
+            let _source = remote_git_source_change_guard();
+            lease.check()?;
+            ensure_unknown_generation(&lease.owner, snapshot.generation)?;
             let _ = sender.send(snapshot);
             Ok(Reply::Updated)
         }
         Command::Acknowledge(snapshot) => acknowledge(slot, lease, &snapshot),
         Command::Request(operation, decoder) => {
+            if lease.recovery.is_some() {
+                return Err(service_error("remote_git_disabled"));
+            }
             let write = operation.is_write();
             let repo = write.then(|| operation_repo(&operation)).flatten();
             if write && repo.is_none() {
                 return Err(service_error("remote_git_missing_repository"));
             }
-            if write
-                && lock(&UNKNOWN_WORKSPACES).iter().any(|other| {
-                    same_endpoint(&other.connection, &lease.inner.connection)
-                        && lock(&other.unknown).as_ref().is_some_and(|unknown| {
-                            repo.is_some_and(|repo| {
-                                mt_core::path_key::posix_trim_trailing(&unknown.repo)
-                                    == mt_core::path_key::posix_trim_trailing(repo)
-                            })
-                        })
-                })
+            if write && repository_blocked(&lease.inner.connection, repo.expect("write repository"))
             {
                 return Err(unknown_failure("remote_git_write_verification_required"));
             }
@@ -653,13 +877,17 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
             let identity = write.then(|| RemoteGitUnknownWrite {
                 generation: SEQUENCE.fetch_add(1, Ordering::AcqRel),
                 repo: repo.expect("write repository checked above").to_owned(),
-                operation: format!("{operation:?}"),
+                operation: operation_kind(&operation).expect("write operation kind"),
                 occurred: SystemTime::now(),
             });
             {
                 let _source = remote_git_source_change_guard();
                 lease.check()?;
                 if write {
+                    if repository_blocked(&lease.inner.connection, repo.expect("write repository"))
+                    {
+                        return Err(unknown_failure("remote_git_write_verification_required"));
+                    }
                     lease.inner.running.store(true, Ordering::Release);
                 }
             }
@@ -669,24 +897,93 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
                 .map_err(request_failure)
                 .and_then(|reply| decode_reply(reply, decoder, write, client.as_mut()));
             // Publish the uncertain identity before leaving Running, never the reverse.
-            if write && matches!(&result, Err(GitFailure::OutcomeUnknown { .. })) {
-                let mut identity = identity;
-                if let Some(identity) = identity.as_mut() {
-                    identity.occurred = SystemTime::now();
+            let disconnected = !client.is_connected();
+            {
+                let _source = remote_git_source_change_guard();
+                if write && matches!(&result, Err(GitFailure::OutcomeUnknown { .. })) {
+                    let mut identity = identity;
+                    if let Some(identity) = identity.as_mut() {
+                        identity.occurred = SystemTime::now();
+                    }
+                    let mut registry = lock(&UNKNOWN_WORKSPACES);
+                    *lock(&lease.inner.unknown) = identity;
+                    if !registry
+                        .iter()
+                        .any(|owner| Arc::ptr_eq(owner, &lease.inner))
+                    {
+                        registry.push(lease.inner.clone());
+                    }
+                    slot.completion_proven = false;
+                    slot.snapshot = None;
                 }
-                *lock(&lease.inner.unknown) = identity;
-                lock(&UNKNOWN_WORKSPACES).push(lease.inner.clone());
-                slot.completion_proven = false;
-                slot.snapshot = None;
-            } else if !client.is_connected() {
-                slot.client.take();
+                if write {
+                    lease.inner.running.store(false, Ordering::Release);
+                }
             }
-            if write {
-                lease.inner.running.store(false, Ordering::Release);
+            if disconnected && !matches!(&result, Err(GitFailure::OutcomeUnknown { .. })) {
+                slot.client.take();
             }
             result
         }
     }
+}
+
+fn operation_kind(operation: &Operation) -> Option<RemoteGitOperationKind> {
+    use RemoteGitOperationKind as K;
+    Some(match operation {
+        Operation::Stage { .. } => K::Stage,
+        Operation::Unstage { .. } => K::Unstage,
+        Operation::StageAll { .. } => K::StageAll,
+        Operation::UnstageAll { .. } => K::UnstageAll,
+        Operation::Commit { .. } | Operation::CommitWith { amend: false, .. } => K::Commit,
+        Operation::CommitWith { amend: true, .. } => K::Amend,
+        Operation::Discard { .. } => K::Discard,
+        Operation::StageHunk { .. } | Operation::StageHunks { .. } => K::StageHunks,
+        Operation::UnstageHunk { .. } | Operation::UnstageHunks { .. } => K::UnstageHunks,
+        Operation::DiscardHunk { .. } | Operation::DiscardHunks { .. } => K::DiscardHunks,
+        Operation::Checkout { .. } => K::Checkout,
+        Operation::CreateBranch { .. } => K::CreateBranch,
+        Operation::RenameBranch { .. } => K::RenameBranch,
+        Operation::DeleteBranch { .. } => K::DeleteBranch,
+        Operation::Fetch { .. } => K::Fetch,
+        Operation::Pull { .. } => K::Pull,
+        Operation::Push { .. } => K::Push,
+        Operation::SaveStash { .. } => K::SaveStash,
+        Operation::ApplyStash { pop: false, .. } => K::ApplyStash,
+        Operation::ApplyStash { pop: true, .. } => K::PopStash,
+        Operation::DropStash { .. } => K::DropStash,
+        Operation::OperationContinue { .. } => K::Continue,
+        Operation::OperationAbort { .. } => K::Abort,
+        Operation::ResolveConflict { .. } | Operation::WriteConflictResolution { .. } => {
+            K::ResolveConflict
+        }
+        Operation::MarkResolved { .. } => K::MarkResolved,
+        Operation::Mutate { mutation, .. } => match mutation {
+            mt_git_helper::GitMutation::CheckoutCommit { .. }
+            | mt_git_helper::GitMutation::CheckoutWithStash { .. } => K::Checkout,
+            mt_git_helper::GitMutation::CreateBranchAt { .. } => K::CreateBranch,
+            mt_git_helper::GitMutation::CherryPick { .. } => K::CherryPick,
+            mt_git_helper::GitMutation::RevertCommit { .. } => K::Revert,
+            mt_git_helper::GitMutation::ResetTo { .. } => K::Reset,
+            mt_git_helper::GitMutation::UndoLastCommit { .. } => K::UndoCommit,
+            mt_git_helper::GitMutation::RewordHead { .. } => K::RewordCommit,
+            mt_git_helper::GitMutation::CreateTag { .. } => K::CreateTag,
+            mt_git_helper::GitMutation::DeleteTag { .. } => K::DeleteTag,
+            mt_git_helper::GitMutation::PushTag { .. } => K::PushTag,
+            mt_git_helper::GitMutation::DeleteRemoteBranch { .. } => K::DeleteRemoteBranch,
+            mt_git_helper::GitMutation::MergeBranch { .. } => K::Merge,
+            mt_git_helper::GitMutation::RebaseOnto { .. } => K::Rebase,
+            mt_git_helper::GitMutation::StashApply { .. } => K::ApplyStash,
+            mt_git_helper::GitMutation::StashPop { .. } => K::PopStash,
+            mt_git_helper::GitMutation::StashDrop { .. } => K::DropStash,
+            mt_git_helper::GitMutation::StashClear => K::ClearStashes,
+            mt_git_helper::GitMutation::StashBranch { .. } => K::StashBranch,
+            mt_git_helper::GitMutation::AddWorktree { .. } => K::AddWorktree,
+            mt_git_helper::GitMutation::RemoveWorktree { .. } => K::RemoveWorktree,
+            mt_git_helper::GitMutation::PruneWorktrees => K::PruneWorktrees,
+        },
+        _ => return None,
+    })
 }
 
 fn operation_repo(operation: &Operation) -> Option<&str> {
@@ -702,6 +999,10 @@ fn operation_repo(operation: &Operation) -> Option<&str> {
         | Operation::StageHunk { repo, .. }
         | Operation::UnstageHunk { repo, .. }
         | Operation::DiscardHunk { repo, .. }
+        | Operation::StageHunks { repo, .. }
+        | Operation::UnstageHunks { repo, .. }
+        | Operation::DiscardHunks { repo, .. }
+        | Operation::WriteConflictResolution { repo, .. }
         | Operation::Checkout { repo, .. }
         | Operation::CreateBranch { repo, .. }
         | Operation::RenameBranch { repo, .. }
@@ -752,9 +1053,12 @@ fn read(
         .request(operation)
         .map_err(request_failure)
         .and_then(|reply| decode_reply(reply, decoder, false, reader.as_mut()));
-    // Even a malformed typed payload invalidates a recovery probe channel. Only reads
-    // reconnect on the next request; an acknowledgement never reuses failed evidence.
-    if result.is_err() || !reader.is_connected() {
+    // A normal business error leaves a synchronized stream and its evidence intact.
+    // Recovery-specific failures invalidate evidence in recovery_read below.
+    if !reader.is_connected()
+        || matches!(&result,
+        Err(GitFailure::Service { code, .. }) if code == "remote_git_reply_decode_failed")
+    {
         slot.reader.take();
         slot.snapshot.take();
     }
@@ -787,7 +1091,7 @@ fn query<T: serde::de::DeserializeOwned>(
     repo: &str,
     query: GitQuery,
 ) -> Result<T, GitFailure> {
-    let reply = read(
+    let reply = recovery_read(
         slot,
         lease,
         Operation::Query {
@@ -801,6 +1105,19 @@ fn query<T: serde::de::DeserializeOwned>(
         slot.snapshot.take();
         failure("remote_git_recovery_decode_failed", e)
     })
+}
+fn recovery_read(
+    slot: &mut WorkspaceClient,
+    lease: &WorkspaceLease,
+    operation: Operation,
+    decoder: Option<Decoder>,
+) -> Result<Reply, GitFailure> {
+    let result = read(slot, lease, operation, decoder);
+    if result.is_err() {
+        slot.reader.take();
+        slot.snapshot.take();
+    }
+    result
 }
 fn snapshot(
     slot: &mut WorkspaceClient,
@@ -824,7 +1141,7 @@ fn snapshot(
         },
     )?;
     let head = commits.into_iter().next().map(|commit| commit.hash);
-    let files = match read(
+    let files = match recovery_read(
         slot,
         lease,
         Operation::Status {
@@ -839,7 +1156,9 @@ fn snapshot(
             return Err(service_error("remote_git_recovery_invalid_status"));
         }
     };
+    let _source = remote_git_source_change_guard();
     lease.check()?;
+    ensure_unknown_generation(&lease.owner, unknown.generation)?;
     let snapshot = RemoteGitRecoverySnapshot {
         generation: unknown.generation,
         repo: unknown.repo,
@@ -854,6 +1173,7 @@ fn snapshot(
         epoch: lease.epoch,
         permission: lease.permission,
         occurred: unknown.occurred,
+        recovery: lease.recovery.clone(),
     };
     slot.snapshot = Some(snapshot.clone());
     Ok(snapshot)
@@ -896,15 +1216,57 @@ fn acknowledge(
     {
         return Err(service_error("remote_git_recovery_changed"));
     }
-    lease.check()?;
-    // Never reuse the uncertain writer, even when the user accepts the risk that it
-    // could still finish later. No operation is replayed as part of acknowledgement.
-    slot.client = slot.reader.take();
+    {
+        let _source = remote_git_source_change_guard();
+        lease.check()?;
+        clear_unknown(&lease.owner, unknown.generation)?;
+        // Invalidates queued old requests and any consent or offline confirmation.
+        lease.owner.schedule_close();
+        slot.epoch = lease.owner.epoch.load(Ordering::Acquire);
+        slot.authority_epoch = lease.inner.epoch.load(Ordering::Acquire);
+    }
+    // Recovery-only channels never become a normal Git grant or writer.
+    slot.client = if lease.recovery.is_none() {
+        slot.reader.take()
+    } else {
+        None
+    };
+    if lease.recovery.is_some() {
+        slot.reader.take();
+    }
     slot.snapshot = None;
     slot.completion_proven = false;
-    *lock(&lease.owner.unknown) = None;
-    lock(&UNKNOWN_WORKSPACES).retain(|inner| !Arc::ptr_eq(inner, &lease.owner));
     Ok(Reply::Updated)
+}
+
+fn ensure_unknown_generation(owner: &WorkspaceInner, generation: u64) -> Result<(), GitFailure> {
+    if lock(&owner.unknown).as_ref().map(|write| write.generation) == Some(generation) {
+        Ok(())
+    } else {
+        Err(service_error("remote_git_recovery_stale"))
+    }
+}
+
+/// Caller holds SOURCE_LIFECYCLE. Lock order matches registry readers/publication.
+fn clear_unknown(owner: &Arc<WorkspaceInner>, generation: u64) -> Result<(), GitFailure> {
+    let mut registry = lock(&UNKNOWN_WORKSPACES);
+    let mut unknown = lock(&owner.unknown);
+    if unknown.as_ref().map(|write| write.generation) != Some(generation) {
+        return Err(service_error("remote_git_recovery_stale"));
+    }
+    *unknown = None;
+    registry.retain(|inner| !Arc::ptr_eq(inner, owner));
+    Ok(())
+}
+
+fn repository_blocked(connection: &SshConnection, repo: &str) -> bool {
+    lock(&UNKNOWN_WORKSPACES).iter().any(|other| {
+        same_endpoint(&other.connection, connection)
+            && lock(&other.unknown).as_ref().is_some_and(|unknown| {
+                mt_core::path_key::posix_trim_trailing(&unknown.repo)
+                    == mt_core::path_key::posix_trim_trailing(repo)
+            })
+    })
 }
 
 impl WorkspaceInner {

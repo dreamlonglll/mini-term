@@ -133,10 +133,12 @@ impl<'de> DeserializeSeed<'de> for Key {
                     "Ok" => crate::MAX_FRAME_BYTES,
                     "Err" => MAX_ERROR_BYTES,
                     "repo" | "path" | "paths" | "file" | "filePath" | "oldPath" | "fileRel"
-                    | "absFile" | "worktreePath" => MAX_PATH_BYTES,
+                    | "relPath" | "absFile" | "worktreePath" => MAX_PATH_BYTES,
                     "code" | "hash" | "hashes" | "expectedHash" | "expectedHead" | "stashHash"
                     | "branch" | "remoteBranch" | "remote" | "name" | "old" | "onto" | "target"
-                    | "start" | "base" | "loaded" | "frontier" => MAX_IDENTIFIER_BYTES,
+                    | "start" | "base" | "loaded" | "frontier" | "digest" | "encoding" => {
+                        MAX_IDENTIFIER_BYTES
+                    }
                     "busy" | "detail" => MAX_ERROR_BYTES,
                     _ => crate::MAX_FRAME_BYTES,
                 })

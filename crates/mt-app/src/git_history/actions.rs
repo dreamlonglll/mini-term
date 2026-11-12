@@ -501,6 +501,7 @@ impl GitHistoryContent {
         let this = cx.entity().downgrade();
         let repo_key = repo.key();
         let context = repo.clone();
+        let source_store = self.store.clone();
         let started = git_ui::spawn_gated(
             &repo,
             op,
@@ -508,7 +509,7 @@ impl GitHistoryContent {
                 if let Err(err) = &result {
                     git_ui::show_git_error(
                         tr!("gitBranch", "opFailed", op = t("gitLog", action)),
-                        git_ui::repo_text(&context, error_text(err)),
+                        git_ui::repo_text(&source_store, &context, error_text(err), cx),
                         window,
                         cx,
                     );
@@ -531,9 +532,10 @@ impl GitHistoryContent {
             cx,
         );
         if !started {
-            git_ui::toast(
+            git_ui::toast_for_repo(
                 &self.store,
-                git_ui::repo_text(&repo, git_ui::gate_busy_text()),
+                &repo,
+                git_ui::gate_busy_text().to_string(),
                 git_ui::Tone::Attention,
                 cx,
             );
@@ -595,7 +597,8 @@ impl GitHistoryContent {
                         }
                         Err(err) => {
                             eprintln!("[git] {action} 失败: {err:#}");
-                            let message = git_ui::repo_text(&context, error_text(&err));
+                            let message =
+                                git_ui::repo_text(&this.store, &context, error_text(&err), cx);
                             form_done.update(cx, |f, cx| {
                                 f.op.fail(message.clone());
                                 cx.notify();

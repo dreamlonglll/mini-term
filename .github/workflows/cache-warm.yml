@@ -12,7 +12,7 @@ name: Cache warm
 #   + 环境哈希(已装的**全部**工具链的 rustc -vV,加上 CARGO* / CC* / CFLAGS* / CXX* /
 #   CMAKE* / RUST* 环境变量)+ 依赖哈希(rust-toolchain.toml + 各 workspace 成员的
 #   Cargo.toml 规整后 + Cargo.lock 里的注册表包)。所以本文件每个作业的 **workflow 级
-#   env、装工具链的步骤、shared-key、workspaces** 都要与对应的消费方逐字一致,编译命令
+#   env、装工具链的步骤、prefix-key、shared-key、workspaces** 都要与对应的消费方逐字一致,编译命令
 #   也要一致(profile / target / feature 统一范围不同,命中了产物也用不上):
 #
 #   作业          消费方                                 shared-key  workspaces
@@ -26,8 +26,12 @@ name: Cache warm
 #   环境)下最新的一份做部分恢复,大部分依赖照样不用重编。
 #   ⚠️ 反过来,只改根 Cargo.toml 的 [profile.*] / [workspace.dependencies] 的 feature、
 #   或改了下面的编译命令时键**不变**,缓存内容不会自动跟上(精确命中就不再保存):
-#   这种时候给三个 workflow 里全部六处 rust-cache 一起加上同一个 prefix-key
-#   (如 v1-rust,默认是 v0-rust)强制换代。
+#   这种时候给受影响那组(shared-key 相同)的 rust-cache 一起换 prefix-key 强制换代
+#   (默认是 v0-rust;两组都受影响就六处一起换)。只动 [profile.dev] 不影响 release 组,
+#   别顺手换它 —— 换了前缀就没法从旧缓存做部分恢复,macos-15-intel 要冷编一轮。
+#   当前取值:ci 组 v1-rust(dev profile 改为只留行号表时换代,共四处:本文件 ci-linux /
+#   ci-windows 与 ci.yml 的两个作业),release 组仍是默认 v0-rust。
+#   `--locked` 只拦 Cargo.lock 与清单对不上,不改变产物,不用换代(两边命令照样逐字一致)。
 #
 # 预热范围:release 四个平台全做 —— publish 要等最慢的那个,macos-15-intel 冷编约 40
 # 分钟,正是发版的瓶颈,只做其它平台发版一分钟都快不了。ci 两个作业也做(PR 的必过
@@ -115,6 +119,7 @@ jobs:
         id: rust-cache
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: v1-rust
           shared-key: ci
           workspaces: |
             . -> target
@@ -125,15 +130,15 @@ jobs:
       - name: Cargo check
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
-          cargo check --workspace --all-targets
-          cargo check --manifest-path sidecars/Cargo.toml --all-targets
+          cargo check --locked --workspace --all-targets
+          cargo check --locked --manifest-path sidecars/Cargo.toml --all-targets
 
       - name: Build tests
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
-          cargo test --workspace --no-run
-          cargo test --manifest-path sidecars/Cargo.toml --no-run
-          cargo test --manifest-path relay-server/Cargo.toml --no-run
+          cargo test --locked --workspace --no-run
+          cargo test --locked --manifest-path sidecars/Cargo.toml --no-run
+          cargo test --locked --manifest-path relay-server/Cargo.toml --no-run
 
       # 只为让 setup-node 的收尾步骤把 ~/.npm 存成 main 作用域的缓存
       - name: Mobile npm install
@@ -167,6 +172,7 @@ jobs:
         id: rust-cache
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          prefix-key: v1-rust
           shared-key: ci
           workspaces: |
             . -> target
@@ -175,8 +181,8 @@ jobs:
       - name: Cargo check
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
-          cargo check --workspace --all-targets
-          cargo check --manifest-path sidecars/Cargo.toml --all-targets
+          cargo check --locked --workspace --all-targets
+          cargo check --locked --manifest-path sidecars/Cargo.toml --all-targets
 
       # `-p` 名单必须与 ci.yml 完全相同(同一个脚本给),否则 feature 统一的结果不同
       - name: Build tests
@@ -184,8 +190,8 @@ jobs:
         shell: bash
         run: |
           pkgs="$(node .github/scripts/non_gpui_packages.mjs)"
-          cargo test $pkgs --no-run
-          cargo test --manifest-path sidecars/Cargo.toml --no-run
+          cargo test --locked $pkgs --no-run
+          cargo test --locked --manifest-path sidecars/Cargo.toml --no-run
 
   # 平台表取自 release_matrix.mjs(与 release.yml 同一份,push 口径 = 全量四条)
   plan:
@@ -257,4 +263,4 @@ jobs:
 
       - name: Build GPUI app
         if: steps.rust-cache.outputs.cache-hit != 'true'
-        run: cargo build --release --package mt-app
+        run: cargo build --locked --release --package mt-app

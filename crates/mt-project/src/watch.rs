@@ -1012,6 +1012,12 @@ fn print_logs(logs: Vec<String>) {
 ///
 /// 校验只做纵深防御(见 [`FsWatcher::watch`]);物理身份要**完整** canonicalize(连叶子
 /// 符号链接一起解开)—— 后端监听本来就跟随链接,身份得是它真正盯着的那个目录。
+///
+/// 这里**刻意保留** std 给的 verbatim 形态(`\\?\C:\…`),不走 `mt_core::path::canonicalize`:
+/// notify 的 Windows 后端把路径原样交给 `CreateFileW`,不像 std 那样替超过 MAX_PATH 的
+/// 路径补 `\\?\`,剥掉前缀后深目录就挂不上。这个形态只在后端内部当 key 用,分发时
+/// 改写回订阅者的字面路径(见模块注释「分发规则」),不会外泄;报错展示时另行剥掉。
+#[allow(clippy::disallowed_methods)]
 fn resolve(key: &Path, project_path: &str) -> Result<PathBuf> {
     crate::fs::verify_under_project_root(Path::new(project_path), key, true)?;
     std::fs::canonicalize(key).with_context(|| format!("监听目录失败: {}", key.display()))
@@ -1082,6 +1088,19 @@ mod tests {
     /// notify 在 Windows 上有几十毫秒级延迟,给足预算但不无限等。
     const BUDGET: Duration = Duration::from_secs(10);
 
+    /// FSEvents rebuilds its stream when a watched path is added or removed.
+    /// Keep native scenarios separate: another test's registration churn must
+    /// not erase this test's single write before its stream starts delivering.
+    fn native_watch_test() -> parking_lot::MutexGuard<'static, ()> {
+        static NATIVE_TEST: Mutex<()> = Mutex::new(());
+        let guard = NATIVE_TEST.lock();
+        assert!(
+            Hub::global().wait_idle(BUDGET),
+            "previous native registrations must settle"
+        );
+        guard
+    }
+
     fn temp_dir(tag: &str) -> PathBuf {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let ts = std::time::SystemTime::now()
@@ -1102,6 +1121,8 @@ mod tests {
         dir.to_string_lossy().to_string()
     }
 
+    /// 后端 key 的形态:与 `resolve` 一样是 std 原样给的(Windows 上带 `\\?\`)。
+    #[allow(clippy::disallowed_methods)]
     fn canon(dir: &Path) -> PathBuf {
         std::fs::canonicalize(dir).unwrap()
     }
@@ -1362,10 +1383,11 @@ mod tests {
         }
     }
 
-    // ── 订阅者内语义(全局单例;断言都按本订阅者/本目录过滤,不怕并行测试) ──
+    // ── Native subscriber semantics; serialized registration/teardown ──
 
     #[test]
     fn watch_refcounts_same_path() {
+        let _native = native_watch_test();
         let dir = temp_dir("refcount");
         let (w, _rx) = FsWatcher::with_channel();
 
@@ -1387,6 +1409,7 @@ mod tests {
 
     #[test]
     fn sink_receives_change_for_watched_dir() {
+        let _native = native_watch_test();
         let dir = temp_dir("sink");
         let (w, rx) = FsWatcher::with_channel();
         let root = proj(&dir);
@@ -1413,6 +1436,7 @@ mod tests {
 
     #[test]
     fn custom_sink_is_invoked() {
+        let _native = native_watch_test();
         // 注入任意闭包(不只是 channel):验证回调形态本身
         let dir = temp_dir("closure");
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1438,6 +1462,7 @@ mod tests {
 
     #[test]
     fn watch_nonexistent_path_fails_and_can_retry() {
+        let _native = native_watch_test();
         let (w, _rx) = FsWatcher::with_channel();
         let root = temp_dir("missing-root");
         let missing = root.join("definitely-missing-xyz");
@@ -1464,6 +1489,7 @@ mod tests {
 
     #[test]
     fn watch_rejects_path_outside_project_root() {
+        let _native = native_watch_test();
         // root/sub 与 root 平级的 outside:拿 `..` 逃出去的路径不许开监听
         let root = temp_dir("escape-root");
         let outside = temp_dir("escape-outside");
@@ -1497,6 +1523,7 @@ mod tests {
 
     #[test]
     fn global_hub_is_shared_and_creates_one_notify_watcher() {
+        let _native = native_watch_test();
         let (a, _ra) = FsWatcher::with_channel();
         let (b, _rb) = FsWatcher::with_channel();
         assert!(Arc::ptr_eq(&a.hub, &b.hub), "所有句柄都挂在同一个单例上");
@@ -1525,6 +1552,7 @@ mod tests {
 
     #[test]
     fn one_notify_watcher_per_hub_across_subscribers_and_dirs() {
+        let _native = native_watch_test();
         let hub = Hub::real();
         let root = temp_dir("one-backend");
         let dirs: Vec<PathBuf> = (0..3)
@@ -1631,6 +1659,7 @@ mod tests {
 
     #[test]
     fn same_dir_different_projects_each_get_their_own() {
+        let _native = native_watch_test();
         // 嵌套项目:外层项目与内层项目同时监听内层目录,project_path 各收各的
         let hub = Hub::real();
         let root = temp_dir("nested");
@@ -1658,6 +1687,7 @@ mod tests {
         assert_eq!(c2.project_path, proj(&pkg));
 
         drop((outer, inner));
+        assert!(hub.wait_idle(BUDGET));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1819,6 +1849,7 @@ mod tests {
     /// 真后端:递归监听报得出子树深处的变化,路径改写回字面形态;撤掉后不残留。
     #[test]
     fn real_tree_watch_reports_deep_changes() {
+        let _native = native_watch_test();
         let hub = Hub::real();
         let root = temp_dir("tree-real");
         let deep = root.join("a").join("b");
@@ -1969,6 +2000,7 @@ mod tests {
     /// 父目录订阅收得到删与建两条结构变化,撤掉重挂之后新目录里的变化照常有事件。
     #[test]
     fn recreated_dir_resumes_after_rewatch() {
+        let _native = native_watch_test();
         let hub = Hub::real();
         let root = temp_dir("recreate");
         let dir = root.join("e2e-dir");
@@ -2007,6 +2039,7 @@ mod tests {
         );
 
         drop(w);
+        assert!(hub.wait_idle(BUDGET));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2121,6 +2154,7 @@ mod tests {
 
     #[test]
     fn churn_with_live_writes_does_not_deadlock() {
+        let _native = native_watch_test();
         let (done_tx, done_rx) = channel();
         let body = std::thread::spawn(move || {
             let hub = Hub::real();

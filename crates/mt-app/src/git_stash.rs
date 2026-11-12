@@ -644,6 +644,7 @@ fn run_op<T: Send + 'static>(
     }
     let done_state = state.clone();
     let context = repo.clone();
+    let source_store = state.read(cx).store.clone();
     let started = git_ui::spawn_gated(
         &repo,
         op,
@@ -651,15 +652,17 @@ fn run_op<T: Send + 'static>(
             let state = done_state;
             let notice = match result {
                 Ok(value) => match on_ok(value) {
-                    Notice::Info(text) => Notice::Info(git_ui::repo_text(&context, text)),
+                    Notice::Info(text) => {
+                        Notice::Info(git_ui::repo_text(&source_store, &context, text, cx))
+                    }
                     Notice::Attention { text, files } => Notice::Attention {
-                        text: git_ui::repo_text(&context, text),
+                        text: git_ui::repo_text(&source_store, &context, text, cx),
                         files,
                     },
                     error @ Notice::Error(_) => error,
                 },
                 Err(err) => {
-                    let detail = git_ui::repo_text(&context, error_text(&err));
+                    let detail = git_ui::repo_text(&source_store, &context, error_text(&err), cx);
                     eprintln!("[git] 贮藏操作 {busy:?} 失败: {detail}");
                     // 等待期间弹窗被关掉了:原因不能丢
                     if !is_open(kind::GIT_STASH) {
@@ -1225,7 +1228,11 @@ fn render_row(state: &Entity<StashDialog>, index: usize, now: i64, cx: &mut App)
 
 fn render_detail_column(state: &Entity<StashDialog>, cx: &mut App) -> AnyElement {
     let diff = state.read(cx).diff.clone();
-    let toolbar = diff.toolbar("git-stash-diff", kind::GIT_STASH, cx);
+    let toolbar = diff.toolbar(
+        "git-stash-diff",
+        git_diff::ToolbarTail::Close(kind::GIT_STASH),
+        cx,
+    );
     let has_file = state.read(cx).selected_file.is_some();
     let diff_body = has_file.then(|| diff.body(cx));
     let s = state.read(cx);
@@ -1971,7 +1978,7 @@ fn submit_smart_checkout(
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
                         git_ui::show_git_error(
                             tr!("gitStash", "checkout.title", branch = branch),
-                            git_ui::repo_text(&context, format!("{text}\n\n{detail}")),
+                            git_ui::repo_text(&store, &context, format!("{text}\n\n{detail}"), cx),
                             window,
                             cx,
                         );
@@ -1989,7 +1996,7 @@ fn submit_smart_checkout(
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
                         git_ui::show_git_error(
                             tr!("gitStash", "checkout.title", branch = branch),
-                            git_ui::repo_text(&context, format!("{text}\n\n{detail}")),
+                            git_ui::repo_text(&store, &context, format!("{text}\n\n{detail}"), cx),
                             window,
                             cx,
                         );
@@ -2041,6 +2048,7 @@ fn run_form_op<T: Send + 'static>(
     }
     let done_form = form.clone();
     let context = repo.clone();
+    let source_store = AppStore::global(cx);
     let started = git_ui::spawn_gated(
         &repo,
         op,
@@ -2055,7 +2063,7 @@ fn run_form_op<T: Send + 'static>(
                     on_ok(value, &form, window, cx);
                 }
                 Err(err) => {
-                    let detail = git_ui::repo_text(&context, error_text(&err));
+                    let detail = git_ui::repo_text(&source_store, &context, error_text(&err), cx);
                     eprintln!("[git] {dialog} 失败: {detail}");
                     if is_open(dialog) {
                         let state = git_ui::error_text_state(&detail, 8, window, cx);

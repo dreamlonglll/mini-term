@@ -77,7 +77,7 @@ fn fetch_local_preview_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
 
     let canonical =
-        std::fs::canonicalize(path).with_context(|| format!("读不到 {}", path.display()))?;
+        mt_core::path::canonicalize(path).with_context(|| format!("读不到 {}", path.display()))?;
     let metadata = std::fs::symlink_metadata(&canonical)
         .with_context(|| format!("无法检查 {}", canonical.display()))?;
     anyhow::ensure!(

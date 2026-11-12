@@ -11,9 +11,7 @@ impl Server {
         if self.allowed.is_none() {
             self.discover()?;
         }
-        let path = path
-            .canonicalize()
-            .context("canonicalizing project directory")?;
+        let path = canonicalize(path).context("canonicalizing project directory")?;
         ensure!(path.is_dir(), "project path must be a directory");
         ensure!(
             path == self.root
@@ -35,7 +33,7 @@ impl Server {
             if worktree.is_valid {
                 self.allowed
                     .get_or_insert_with(HashSet::new)
-                    .insert(path.canonicalize()?);
+                    .insert(canonicalize(&path)?);
             }
         }
         Ok(worktrees)
@@ -116,9 +114,9 @@ impl Server {
                 self.project_directory(&requested)?;
                 // Validate every entry before inspecting any target. Prune callers
                 // may query vanished registered worktrees, so canonicalize parents.
-                let root = mt_project::fs::strip_verbatim_prefix(self.root.clone());
+                let root = mt_core::path::strip_verbatim(self.root.clone());
                 for path in &paths {
-                    let path = mt_project::fs::strip_verbatim_prefix(PathBuf::from(path));
+                    let path = mt_core::path::strip_verbatim(PathBuf::from(path));
                     ensure!(
                         path.is_absolute()
                             && !path.components().any(|c| matches!(c, Component::ParentDir)),
@@ -128,7 +126,7 @@ impl Server {
                         path == root
                             || path.starts_with(&root)
                             || self.known_worktrees.iter().any(|known| {
-                                mt_project::fs::strip_verbatim_prefix(known.clone()) == path
+                                mt_core::path::strip_verbatim(known.clone()) == path
                             }),
                         "directory is outside the discovered allowlist"
                     );
@@ -139,18 +137,18 @@ impl Server {
                     };
                     ensure!(metadata.is_dir(), "directory target is not a directory");
                     {
-                        let canonical = path.canonicalize()?;
+                        let canonical = canonicalize(&path)?;
                         ensure!(
                             canonical.starts_with(&self.root)
                                 || self
                                     .allowed
                                     .as_ref()
                                     .is_some_and(|allowed| allowed.contains(&canonical))
-                                || self.known_worktrees.iter().any(|known| known
-                                    .canonicalize()
-                                    .ok()
-                                    .as_ref()
-                                    == Some(&canonical)),
+                                || self
+                                    .known_worktrees
+                                    .iter()
+                                    .any(|known| canonicalize(known).ok().as_ref()
+                                        == Some(&canonical)),
                             "directory escapes the discovered allowlist"
                         );
                     }
@@ -174,6 +172,23 @@ impl Server {
                     GitQuery::RepoSignature => data(git::repo_signature(&repo)?),
                     GitQuery::RepoOperationState => data(git::repo_operation_state(&repo)?),
                     GitQuery::ListConflicts => data(git::list_conflicts(&repo)?),
+                    GitQuery::HeadSignature { rel_path } => {
+                        validate_path(&repo, &rel_path, false)?;
+                        validate_file_repository(&repo, &rel_path)?;
+                        data(git::head_signature(&repo, &rel_path)?)
+                    }
+                    GitQuery::LoadConflictFile { file } => {
+                        validate_path(&repo, &file, true)?;
+                        validate_file_repository(&repo, &file)?;
+                        data(git::load_conflict_file(&repo, &file)?)
+                    }
+                    GitQuery::ConflictSegmentStatus { info } => {
+                        let mut statuses = conflict_statuses(&repo, &[info])?;
+                        data(statuses.remove(0))
+                    }
+                    GitQuery::ConflictSegmentStatuses { infos } => {
+                        data(conflict_statuses(&repo, &infos)?)
+                    }
                     GitQuery::HasConflictMarkers { file } => {
                         validate_path(&repo, &file, true)?;
                         data(git::has_conflict_markers(&repo, &file)?)
@@ -381,10 +396,9 @@ impl Server {
                     .iter()
                     .find(|entry| {
                         Path::new(&entry.path) == target
-                            || target
-                                .canonicalize()
+                            || canonicalize(target)
                                 .ok()
-                                .zip(Path::new(&entry.path).canonicalize().ok())
+                                .zip(canonicalize(Path::new(&entry.path)).ok())
                                 .is_some_and(|(a, b)| a == b)
                     })
                     .filter(|entry| !entry.is_main)
@@ -396,7 +410,7 @@ impl Server {
                 // cleanup query, but revoke repository operations immediately.
                 if let Some(allowed) = &mut self.allowed {
                     allowed.remove(target);
-                    if let Ok(canonical) = target.canonicalize() {
+                    if let Ok(canonical) = canonicalize(target) {
                         allowed.remove(&canonical);
                     }
                 }
@@ -411,4 +425,27 @@ impl Server {
             }
         }
     }
+}
+
+fn conflict_statuses(repo: &Path, infos: &[git::ConflictInfo]) -> Result<Vec<git::SegmentStatus>> {
+    // Core does not follow the final component: a conflicted symlink is an
+    // Unreadable blocker, not a batch RPC failure. Parent containment remains
+    // mandatory, so no metadata/content read can escape through a directory.
+    for info in infos {
+        validate_path(repo, &info.path, false)?;
+        validate_file_repository(repo, &info.path)?;
+    }
+    let actual = git::list_conflicts(repo)?;
+    Ok(infos
+        .iter()
+        .map(|info| {
+            actual
+                .iter()
+                .find(|entry| entry.path == info.path)
+                .map(|entry| git::conflict_segment_status(repo, entry))
+                .unwrap_or(git::SegmentStatus::Blocked(
+                    git::SegmentBlocker::NotConflicted,
+                ))
+        })
+        .collect())
 }

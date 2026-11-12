@@ -1,5 +1,5 @@
 //! 路径字符串的**比较键**与**形态变换**。纯字符串运算,不碰磁盘、不解析符号链接
-//! (要物理身份请 `canonicalize`,见 `mt-project::watch`)。
+//! (要物理身份请 [`crate::path::canonicalize`],用例见 `mt-project::watch`)。
 //!
 //! 同一条路径在程序里有好几种写法:用户填的 `D:\Git\x`、libgit2 给的 `D:/Git/x/`、
 //! `canonicalize` 给的 `\\?\D:\Git\x`、notify 回来的大小写变体……比较前都得先归一,

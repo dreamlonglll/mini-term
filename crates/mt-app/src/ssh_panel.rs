@@ -959,14 +959,16 @@ fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
         conn.id = crate::tree::gen_unique_id("ssh", |id| existing.iter().any(|c| c.id == id));
     }
     let sealed = state.update(cx, |panel, cx| {
-        panel.form = None;
-        // Store errors are display-ready: target changes can be blocked before saving,
-        // whereas a sealing failure saves the connection without its password.
         let saved = panel
             .store
             .update(cx, |store, cx| store.upsert_ssh_connection(conn, cx));
         let sealed = saved.is_ok();
-        panel.notice = saved.err().map(SharedString::from);
+        if !matches!(&saved, Err(crate::store::SshSaveError::NotSaved(_))) {
+            panel.form = None;
+        }
+        panel.notice = saved
+            .err()
+            .map(|error| SharedString::from(error.message().to_owned()));
         cx.notify();
         sealed
     });

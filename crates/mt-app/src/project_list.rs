@@ -859,30 +859,36 @@ fn project_menu(
                 let id = row.id.clone();
                 let source_store = store.clone();
                 let enabled = crate::git_backend::remote_git_enabled(store.read(cx), &id);
-                menu::item(
-                    t(
-                        "projectList",
-                        if enabled {
-                            "menu.disableRemoteGit"
-                        } else {
-                            "menu.enableRemoteGit"
-                        },
-                    ),
-                    move |window, cx| {
-                        if enabled {
-                            source_store.update(cx, |store, cx| {
-                                store.set_project_remote_git_enabled(&id, false, cx)
-                            });
-                        } else {
-                            crate::git_backend::request_enable(
-                                source_store.clone(),
-                                id.clone(),
-                                window,
-                                cx,
-                            );
-                        }
+                let broken = store.read(cx).remote_connection_of(&id).is_none();
+                MenuItem::new(t(
+                    "projectList",
+                    if enabled {
+                        "menu.disableRemoteGit"
+                    } else {
+                        "menu.enableRemoteGit"
                     },
-                )
+                ))
+                .disabled(broken)
+                .detail(if broken {
+                    t("gitHistory", "connectionRemoved")
+                } else {
+                    ""
+                })
+                .on_click(move |window, cx| {
+                    if enabled {
+                        source_store.update(cx, |store, cx| {
+                            store.set_project_remote_git_enabled(&id, false, cx)
+                        });
+                    } else {
+                        crate::git_backend::request_enable(
+                            source_store.clone(),
+                            id.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                .into()
             }
             ProjectMenuAction::EditDescription => {
                 let store = store.clone();

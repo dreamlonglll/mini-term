@@ -23,6 +23,9 @@ fn connection() -> SshConnection {
 struct FakeState {
     requests: Mutex<Vec<String>>,
     results: Mutex<VecDeque<Result<Reply, GitFailure>>>,
+    factories: AtomicU64,
+    deployments: AtomicU64,
+    connections: Mutex<Vec<Arc<AtomicBool>>>,
     connects: AtomicU64,
     drops: AtomicU64,
     proofs: AtomicU64,
@@ -31,7 +34,7 @@ struct FakeState {
     entered: Mutex<Option<sync_mpsc::Sender<()>>>,
     release: Mutex<Option<sync_mpsc::Receiver<()>>>,
 }
-struct FakeTransport(Arc<FakeState>);
+struct FakeTransport(Arc<FakeState>, Arc<AtomicBool>);
 impl Drop for FakeTransport {
     fn drop(&mut self) {
         self.0.drops.fetch_add(1, Ordering::SeqCst);
@@ -39,6 +42,9 @@ impl Drop for FakeTransport {
 }
 impl WorkspaceTransport for FakeTransport {
     fn request(&mut self, operation: Operation) -> Result<Reply, GitFailure> {
+        if !self.1.load(Ordering::Acquire) {
+            return Err(service_error("test_disconnected"));
+        }
         lock(&self.0.requests).push(format!("{operation:?}"));
         if let Some(entered) = lock(&self.0.entered).take() {
             entered.send(()).unwrap();
@@ -68,7 +74,7 @@ impl WorkspaceTransport for FakeTransport {
     }
     fn confirm_pending_write(&mut self) -> Result<(), GitFailure> {
         self.0.proofs.fetch_add(1, Ordering::SeqCst);
-        if self.0.proof_lost.load(Ordering::Acquire) {
+        if !self.1.load(Ordering::Acquire) || self.0.proof_lost.load(Ordering::Acquire) {
             Err(unknown_failure("test_old_channel_lost"))
         } else {
             Ok(())
@@ -78,7 +84,7 @@ impl WorkspaceTransport for FakeTransport {
         self.0.decode_unknown.fetch_add(1, Ordering::SeqCst);
     }
     fn is_connected(&self) -> bool {
-        true
+        self.1.load(Ordering::Acquire)
     }
 }
 fn data(value: impl serde::Serialize) -> Reply {
@@ -108,9 +114,14 @@ fn fixture(idle_timeout: Duration) -> (RemoteGitWorkspace, Arc<FakeState>) {
         sender: Mutex::new(None),
         changed: Arc::new(Notify::new()),
         factory: Arc::new(move |lease| {
+            factory_state.factories.fetch_add(1, Ordering::SeqCst);
+            lease.check()?;
+            factory_state.deployments.fetch_add(1, Ordering::SeqCst);
             lease.check()?;
             factory_state.connects.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(FakeTransport(factory_state.clone())))
+            let connected = Arc::new(AtomicBool::new(true));
+            lock(&factory_state.connections).push(connected.clone());
+            Ok(Box::new(FakeTransport(factory_state.clone(), connected)))
         }),
         idle_timeout,
     });
@@ -276,7 +287,7 @@ fn hard_lost_recovery_requires_original_repo_snapshot_and_explicit_ack() {
     let snapshot = runtime.block_on(workspace.recovery_snapshot()).unwrap();
     assert!(!snapshot.completion_proven);
     assert_eq!(snapshot.repo, "/repo");
-    assert!(snapshot.operation.contains("StageAll"));
+    assert_eq!(snapshot.operation, RemoteGitOperationKind::StageAll);
     assert!(workspace.write_outcome_unknown());
     assert!(
         lock(&transport.requests)
@@ -441,7 +452,9 @@ fn close_and_idle_preserve_inflight_transport_and_cancel_old_queue() {
     wait_until(|| lock(&workspace.inner.sender).as_ref().unwrap().capacity() < QUEUE_CAPACITY);
     std::thread::sleep(Duration::from_millis(40));
     assert_eq!(transport.drops.load(Ordering::SeqCst), 0);
+    let close_started = Instant::now();
     workspace.close();
+    assert!(close_started.elapsed() < Duration::from_millis(250));
     assert_eq!(transport.drops.load(Ordering::SeqCst), 0);
     release.send(()).unwrap();
     runtime.block_on(task).unwrap().unwrap();
@@ -449,6 +462,7 @@ fn close_and_idle_preserve_inflight_transport_and_cancel_old_queue() {
         runtime.block_on(queued_task).unwrap().unwrap_err(),
         "remote_git_request_cancelled",
     );
+    assert_eq!(lock(&transport.requests).len(), 1);
     wait_until(|| transport.drops.load(Ordering::SeqCst) == 1);
     runtime
         .block_on(workspace.request_async(Operation::Discover))
@@ -885,4 +899,382 @@ fn dispatched_network_io_does_not_hold_source_lifecycle_lock() {
     drop(source);
     release.send(()).unwrap();
     runtime.block_on(task).unwrap().unwrap();
+}
+
+#[test]
+fn revoked_offline_abandon_never_waits_for_actor_or_restores_permission() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    set_project_git_permission(&workspace.inner.project_id, None, "", false);
+    let confirmation = workspace.prepare_offline_abandon().unwrap();
+    let (entered, release) = block_transport(&transport);
+    let request = workspace.clone();
+    let consent = workspace.recovery_consent().unwrap();
+    let snapshot =
+        runtime.spawn(async move { request.recovery_snapshot_with_consent(consent).await });
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    let requests = lock(&transport.requests).len();
+    let connects = transport.connects.load(Ordering::SeqCst);
+    let started = Instant::now();
+    workspace.abandon_recovery(confirmation).unwrap();
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(!workspace.write_outcome_unknown());
+    assert_eq!(transport.connects.load(Ordering::SeqCst), connects);
+    assert_eq!(lock(&transport.requests).len(), requests);
+    assert!(!lock(&GRANTS).contains_key(&workspace.inner.project_id));
+    release.send(()).unwrap();
+    assert!(runtime.block_on(snapshot).unwrap().is_err());
+    assert_code(
+        runtime
+            .block_on(workspace.request_async(write()))
+            .unwrap_err(),
+        "remote_git_disabled",
+    );
+}
+
+#[test]
+fn offline_confirmation_rejects_running_epoch_successor_and_new_generation() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    let (entered, release) = block_transport(&transport);
+    let request = workspace.clone();
+    let running = runtime.spawn(async move { request.request_async(write()).await });
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert!(
+        matches!(workspace.prepare_offline_abandon(), Err(GitFailure::Service { code, .. }) if code == "remote_git_write_running")
+    );
+    release.send(()).unwrap();
+    runtime.block_on(running).unwrap().unwrap();
+    lose_write(&workspace, &transport);
+    let old = workspace.prepare_offline_abandon().unwrap();
+    workspace.close();
+    assert_code(
+        workspace.abandon_recovery(old).unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    let old = workspace.prepare_offline_abandon().unwrap();
+    let mut credentials = workspace.inner.connection.clone();
+    credentials.password = Some("replacement".into());
+    let successor = credential_successor(&workspace, credentials.clone());
+    set_project_git_permission(
+        &workspace.inner.project_id,
+        Some(&credentials),
+        &workspace.inner.root,
+        true,
+    );
+    assert_code(
+        successor.abandon_recovery(old).unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    let old = successor.prepare_offline_abandon().unwrap();
+    recover(&successor);
+    lock(&transport.results).push_back(Err(unknown_failure("test_new_generation")));
+    assert!(matches!(
+        runtime.block_on(successor.request_async(write())),
+        Err(GitFailure::OutcomeUnknown { .. })
+    ));
+    let new_generation = successor.unknown_write().unwrap().generation;
+    assert_code(
+        successor.abandon_recovery(old).unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    assert_eq!(
+        successor.unknown_write().unwrap().generation,
+        new_generation
+    );
+    successor
+        .abandon_recovery(successor.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn recovery_only_consent_observes_and_acknowledges_without_git_grant() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    set_project_git_permission(&workspace.inner.project_id, None, "", false);
+    let before = lock(&transport.requests).len();
+    let consent = workspace.recovery_consent().unwrap();
+    assert_eq!(lock(&transport.requests).len(), before);
+    assert_code(
+        runtime
+            .block_on(workspace.request_async(Operation::Discover))
+            .unwrap_err(),
+        "remote_git_disabled",
+    );
+    let snapshot = runtime
+        .block_on(workspace.recovery_snapshot_with_consent(consent))
+        .unwrap();
+    assert!(!lock(&GRANTS).contains_key(&workspace.inner.project_id));
+    let requests = lock(&transport.requests);
+    assert!(
+        requests[before..]
+            .iter()
+            .all(|request| request.starts_with("Query") || request.starts_with("Status"))
+    );
+    drop(requests);
+    let late_confirmation = workspace.prepare_offline_abandon().unwrap();
+    runtime
+        .block_on(workspace.acknowledge_recovery(snapshot.clone()))
+        .unwrap();
+    assert!(!workspace.write_outcome_unknown());
+    assert_code(
+        workspace.abandon_recovery(late_confirmation).unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    assert!(
+        runtime
+            .block_on(workspace.acknowledge_recovery(snapshot))
+            .is_err()
+    );
+    assert_code(
+        runtime
+            .block_on(workspace.request_async(write()))
+            .unwrap_err(),
+        "remote_git_disabled",
+    );
+    assert_eq!(
+        lock(&transport.requests)
+            .iter()
+            .filter(|request| request.starts_with("StageAll"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn business_read_errors_preserve_reader_and_snapshot_but_recovery_errors_do_not() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    let snapshot = runtime.block_on(workspace.recovery_snapshot()).unwrap();
+    let connects = transport.connects.load(Ordering::SeqCst);
+    lock(&transport.results).push_back(Err("ordinary missing ref".into()));
+    assert!(
+        runtime
+            .block_on(workspace.request_async(Operation::Discover))
+            .is_err()
+    );
+    runtime
+        .block_on(workspace.acknowledge_recovery(snapshot))
+        .unwrap();
+    assert_eq!(transport.connects.load(Ordering::SeqCst), connects);
+    lose_write(&workspace, &transport);
+    let snapshot = runtime.block_on(workspace.recovery_snapshot()).unwrap();
+    lock(&transport.results).push_back(Err("recovery business failure".into()));
+    assert!(runtime.block_on(workspace.recovery_snapshot()).is_err());
+    assert_code(
+        runtime
+            .block_on(workspace.acknowledge_recovery(snapshot))
+            .unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    recover(&workspace);
+}
+
+#[test]
+fn actual_reader_disconnect_reconnects_only_its_own_connection() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    let snapshot = runtime.block_on(workspace.recovery_snapshot()).unwrap();
+    let connections = lock(&transport.connections);
+    connections[1].store(false, Ordering::Release);
+    assert!(connections[0].load(Ordering::Acquire));
+    drop(connections);
+    assert!(
+        runtime
+            .block_on(workspace.request_async(Operation::Discover))
+            .is_err()
+    );
+    assert_code(
+        runtime
+            .block_on(workspace.acknowledge_recovery(snapshot))
+            .unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    recover(&workspace);
+    assert_eq!(transport.connects.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn denied_permission_reaches_neither_factory_deployment_nor_connect() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    set_project_git_permission(&workspace.inner.project_id, None, "", false);
+    assert_code(
+        runtime
+            .block_on(workspace.request_async(Operation::Discover))
+            .unwrap_err(),
+        "remote_git_disabled",
+    );
+    assert_eq!(transport.factories.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.deployments.load(Ordering::SeqCst), 0);
+    assert_eq!(transport.connects.load(Ordering::SeqCst), 0);
+    assert!(lock(&workspace.inner.sender).is_none());
+}
+
+#[test]
+fn all_shared_repository_blockers_expose_owners_but_not_recovery_authority() {
+    let _serial = lock(&TEST_LOCK);
+    let (first, first_transport) = fixture(Duration::from_secs(60));
+    let (second, _) = fixture(Duration::from_secs(60));
+    lose_write(&first, &first_transport);
+    // Represent another independently dispatched operation that became unknown before
+    // either project's result was published; both identities must be visible.
+    {
+        let _source = remote_git_source_change_guard();
+        let mut registry = lock(&UNKNOWN_WORKSPACES);
+        *lock(&second.inner.unknown) = Some(RemoteGitUnknownWrite {
+            generation: SEQUENCE.fetch_add(1, Ordering::AcqRel),
+            repo: "/repo".into(),
+            operation: RemoteGitOperationKind::Push,
+            occurred: SystemTime::now(),
+        });
+        registry.push(second.inner.clone());
+    }
+    let observer = RemoteGitWorkspace::new(
+        "metadata-only-observer".into(),
+        first.inner.connection.clone(),
+        first.inner.root.clone(),
+    );
+    let blockers = observer.recovery_blockers("/repo/");
+    assert_eq!(blockers.len(), 2);
+    assert!(
+        blockers
+            .iter()
+            .any(|blocker| blocker.owner_project_id == first.inner.project_id)
+    );
+    assert!(
+        blockers
+            .iter()
+            .any(|blocker| blocker.owner_project_id == second.inner.project_id)
+    );
+    assert!(observer.prepare_offline_abandon().is_err());
+    assert!(observer.recovery_consent().is_err());
+    let confirmation = first.prepare_offline_abandon().unwrap();
+    assert_code(
+        observer.abandon_recovery(confirmation).unwrap_err(),
+        "remote_git_recovery_stale",
+    );
+    first
+        .abandon_recovery(first.prepare_offline_abandon().unwrap())
+        .unwrap();
+    second
+        .abandon_recovery(second.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn offline_abandon_wins_over_inflight_ack_without_clearing_next_generation() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    let snapshot = runtime.block_on(workspace.recovery_snapshot()).unwrap();
+    let confirmation = workspace.prepare_offline_abandon().unwrap();
+    let (entered, release) = block_transport(&transport);
+    let request = workspace.clone();
+    let ack = runtime.spawn(async move { request.acknowledge_recovery(snapshot).await });
+    entered.recv_timeout(Duration::from_secs(3)).unwrap();
+    workspace.abandon_recovery(confirmation).unwrap();
+    release.send(()).unwrap();
+    assert!(runtime.block_on(ack).unwrap().is_err());
+    assert!(!workspace.write_outcome_unknown());
+    lock(&transport.results).push_back(Err(unknown_failure("next_write_lost")));
+    assert!(matches!(
+        runtime.block_on(workspace.request_async(write())),
+        Err(GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(workspace.write_outcome_unknown());
+    workspace
+        .abandon_recovery(workspace.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn write_rechecks_shared_unknown_after_transport_setup_before_dispatch() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (origin, origin_transport) = fixture(Duration::from_secs(60));
+    let (candidate, candidate_transport) = fixture(Duration::from_secs(60));
+    let source = remote_git_source_change_guard();
+    let request = candidate.clone();
+    let task = runtime.spawn(async move { request.request_async(write()).await });
+    wait_until(|| candidate_transport.connects.load(Ordering::SeqCst) == 1);
+    // The operation passed admission before this independently completed write became
+    // unknown, but has not crossed the final lifecycle-protected dispatch boundary.
+    {
+        let mut registry = lock(&UNKNOWN_WORKSPACES);
+        *lock(&origin.inner.unknown) = Some(RemoteGitUnknownWrite {
+            generation: SEQUENCE.fetch_add(1, Ordering::AcqRel),
+            repo: "/repo".into(),
+            operation: RemoteGitOperationKind::Push,
+            occurred: SystemTime::now(),
+        });
+        registry.push(origin.inner.clone());
+    }
+    drop(source);
+    assert!(matches!(
+        runtime.block_on(task).unwrap(),
+        Err(GitFailure::OutcomeUnknown { .. })
+    ));
+    assert!(lock(&candidate_transport.requests).is_empty());
+    assert!(!candidate.write_running());
+    assert!(!candidate.write_outcome_unknown());
+    assert_eq!(origin_transport.connects.load(Ordering::SeqCst), 0);
+    origin
+        .abandon_recovery(origin.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn old_recovery_consent_is_rejected_before_connect_after_source_epoch_change() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lose_write(&workspace, &transport);
+    set_project_git_permission(&workspace.inner.project_id, None, "", false);
+    let consent = workspace.recovery_consent().unwrap();
+    let connects = transport.connects.load(Ordering::SeqCst);
+    workspace.close();
+    assert!(
+        matches!(runtime.block_on(workspace.recovery_snapshot_with_consent(consent)),
+        Err(GitFailure::Service { code, .. }) if code == "remote_git_recovery_stale")
+    );
+    assert_eq!(transport.connects.load(Ordering::SeqCst), connects);
+    assert!(workspace.write_outcome_unknown());
+    workspace
+        .abandon_recovery(workspace.prepare_offline_abandon().unwrap())
+        .unwrap();
+}
+
+#[test]
+fn unknown_metadata_retains_operation_kind_not_commit_message_payload() {
+    let _serial = lock(&TEST_LOCK);
+    let runtime = state().runtime().unwrap();
+    let (workspace, transport) = fixture(Duration::from_secs(60));
+    lock(&transport.results).push_back(Err(unknown_failure("commit_lost")));
+    assert!(matches!(
+        runtime.block_on(workspace.request_async(Operation::CommitWith {
+            repo: "/repo".into(),
+            message: "private commit payload".repeat(4096),
+            amend: true,
+        })),
+        Err(GitFailure::OutcomeUnknown { .. })
+    ));
+    assert_eq!(
+        workspace.unknown_write().unwrap().operation,
+        RemoteGitOperationKind::Amend
+    );
+    workspace
+        .abandon_recovery(workspace.prepare_offline_abandon().unwrap())
+        .unwrap();
 }

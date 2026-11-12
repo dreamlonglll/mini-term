@@ -1,4 +1,4 @@
-use mt_project::git::{StaleDiff, WorktreeRemoveError};
+use mt_project::git::{SegmentBlocker, StaleConflictFile, StaleDiff, WorktreeRemoveError};
 use serde::{Deserialize, Serialize};
 
 /// Business failures retain their concrete type across the helper boundary.
@@ -20,6 +20,10 @@ pub enum GitFailure {
         message: String,
     },
     StaleDiff,
+    StaleConflictFile,
+    SegmentBlocked {
+        blocker: SegmentBlocker,
+    },
     WorktreeInUse {
         #[serde(deserialize_with = "bounded_path")]
         path: String,
@@ -42,6 +46,12 @@ impl GitFailure {
         if error.is::<StaleDiff>() {
             return Self::StaleDiff;
         }
+        if error.is::<StaleConflictFile>() {
+            return Self::StaleConflictFile;
+        }
+        if let Some(blocker) = error.downcast_ref::<SegmentBlocker>() {
+            return Self::SegmentBlocked { blocker: *blocker };
+        }
         match error.downcast_ref::<WorktreeRemoveError>() {
             Some(WorktreeRemoveError::InUse { path, busy }) => Self::WorktreeInUse {
                 path: capped(path, crate::MAX_PATH_BYTES),
@@ -63,6 +73,8 @@ impl GitFailure {
             unknown @ Self::OutcomeUnknown { .. } => unknown.into(),
             service @ Self::Service { .. } => service.into(),
             Self::StaleDiff => StaleDiff.into(),
+            Self::StaleConflictFile => StaleConflictFile.into(),
+            Self::SegmentBlocked { blocker } => blocker.into(),
             Self::WorktreeInUse { path, busy } => WorktreeRemoveError::InUse { path, busy }.into(),
             Self::WorktreeLeftover { path, detail } => {
                 WorktreeRemoveError::Leftover { path, detail }.into()
@@ -94,6 +106,8 @@ impl std::fmt::Display for GitFailure {
             }
             Self::Service { code, message } => write!(formatter, "{code}: {message}"),
             Self::StaleDiff => StaleDiff.fmt(formatter),
+            Self::StaleConflictFile => StaleConflictFile.fmt(formatter),
+            Self::SegmentBlocked { blocker } => blocker.fmt(formatter),
             Self::WorktreeInUse { path, busy } => write!(
                 formatter,
                 "worktree 目录正被占用,未做任何改动: {path}(占用处: {busy})"

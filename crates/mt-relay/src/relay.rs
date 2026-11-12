@@ -1295,18 +1295,15 @@ fn handle_mobile_command(
 
 /// 移动端指令正文 → 写进 PTY 的那一段(不含提交回车)。
 ///
-/// - bracketed paste 开着:与桌面端粘贴(mt-ui `paste_to_bytes`)同一编码 —— 换行
-///   归一成 `\r`、剔掉正文里的结束标记(防正文提前「结束粘贴」、后半段被当按键)、
+/// - bracketed paste 开着:与桌面端粘贴(mt-ui `paste_to_bytes`)共用
+///   [`mt_core::paste::bracketed_paste`] —— 换行归一成 `\r`、剔掉正文里的开始 /
+///   结束标记(含剔掉之后重新拼出来的;防正文提前「结束粘贴」、后半段被当按键)、
 ///   包上 `ESC[200~ … ESC[201~`。多行指令因此整块是粘贴内容,中途不会提交;
 /// - 没开:裸写,换行一律归一成 `\n`(LF = Ctrl+J,Claude Code 输入框里是「插入
 ///   换行」),只让随后单独写的那个 `\r` 承担提交。
 fn mobile_command_body(text: &str, bracketed: bool) -> String {
     if bracketed {
-        let body = text
-            .replace("\r\n", "\r")
-            .replace('\n', "\r")
-            .replace("\x1b[201~", "");
-        format!("\x1b[200~{body}\x1b[201~")
+        mt_core::paste::bracketed_paste(text)
     } else {
         text.replace("\r\n", "\n").replace('\r', "\n")
     }
@@ -2278,7 +2275,7 @@ mod tests {
     }
 
     /// 正文编码:裸写时换行一律归一成 LF(只让最后单独的 `\r` 提交);包裹时与
-    /// 桌面粘贴同口径 —— 换行归一成 CR、剔掉内嵌的结束标记。
+    /// 桌面粘贴同口径 —— 换行归一成 CR、剔掉内嵌的开始 / 结束标记。
     #[test]
     fn mobile_command_body_encoding() {
         assert_eq!(mobile_command_body("a\r\nb\rc\nd", false), "a\nb\nc\nd");
@@ -2288,6 +2285,15 @@ mod tests {
         );
         assert_eq!(
             mobile_command_body("x\x1b[201~y", true),
+            "\x1b[200~xy\x1b[201~"
+        );
+        // 删掉一个标记后拼出来的结束标记同样剔掉,后半段不会溢出成按键
+        assert_eq!(
+            mobile_command_body("x\x1b[201\x1b[201~~\nrm -rf ~", true),
+            "\x1b[200~x\rrm -rf ~\x1b[201~"
+        );
+        assert_eq!(
+            mobile_command_body("x\x1b[200~y", true),
             "\x1b[200~xy\x1b[201~"
         );
     }

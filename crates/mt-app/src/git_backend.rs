@@ -14,21 +14,33 @@ pub fn project_context(store: &AppStore, project_id: &str) -> GitContext {
     };
     match project.ssh_connection_id.as_deref() {
         None => GitContext::local(project.path.clone()),
-        Some(_) if !remote_git_enabled(store, project_id) => {
-            GitContext::broken(t("gitHistory", "remoteDisabled").to_string())
-                .with_path(project.path.clone())
-        }
         Some(connection_id) => match store
             .ssh_connections()
             .iter()
             .find(|connection| connection.id == connection_id)
         {
-            Some(connection) => {
+            Some(connection) if project.remote_git_enabled(connection) => {
                 GitContext::remote(project.id.clone(), connection.clone(), project.path.clone())
             }
+            Some(_) => GitContext::broken(t("gitHistory", "remoteDisabled").to_string())
+                .with_path(project.path.clone()),
             None => GitContext::broken(t("gitHistory", "connectionRemoved").to_string()),
         },
     }
+}
+
+/// Pure identity lookup for recovery metadata; ordinary Git still uses project_context.
+pub fn recovery_context(store: &AppStore, project_id: &str) -> Option<GitContext> {
+    let project = store.project(project_id)?;
+    let connection = store
+        .ssh_connections()
+        .iter()
+        .find(|connection| project.ssh_connection_id.as_deref() == Some(connection.id.as_str()))?;
+    Some(GitContext::remote(
+        project.id.clone(),
+        connection.clone(),
+        project.path.clone(),
+    ))
 }
 
 pub fn remote_git_enabled(store: &AppStore, project_id: &str) -> bool {
@@ -88,9 +100,21 @@ pub fn request_enable(
         return;
     }
     let Some(project) = state.project(&project_id) else {
+        crate::prompt::show_alert(
+            t("gitHistory", "enableTitle"),
+            t("gitHistory", "projectRemoved"),
+            window,
+            cx,
+        );
         return;
     };
     let Some(target) = EnableTarget::capture(project, state.config()) else {
+        crate::prompt::show_alert(
+            t("gitHistory", "enableTitle"),
+            t("gitHistory", "connectionRemoved"),
+            window,
+            cx,
+        );
         return;
     };
     let Some(connection) = state

@@ -16,3 +16,8 @@ serde_json.workspace = true
 # 主题包导入:zip 解包 + manifest.json 的 sha256 校验。版本收在工作区(与 mt-relay 共用)。
 sha2.workspace = true
 zip = "8.6.0"
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

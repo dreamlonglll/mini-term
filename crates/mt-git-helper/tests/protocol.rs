@@ -107,9 +107,9 @@ fn typed_worktree_failures_reconstruct_original_errors() {
 }
 
 #[test]
-fn v4_external_enums_decode_raw_data_without_value_materialization() {
+fn v5_external_enums_decode_raw_data_without_value_materialization() {
     use mt_git_helper::{Operation, PROTOCOL_VERSION, Reply, Request, Response};
-    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(PROTOCOL_VERSION, 5);
     let request = Request {
         protocol_version: PROTOCOL_VERSION,
         id: 9,
@@ -122,7 +122,7 @@ fn v4_external_enums_decode_raw_data_without_value_materialization() {
         r#"{"status":{"repo":"/repo"}}"#
     );
     assert!(serde_json::from_str::<Operation>(r#"{"kind":"status","repo":"/repo"}"#).is_err());
-    let json = r#"{"protocolVersion":4,"id":9,"result":{"Ok":{"data":{"value":["one","two"]}}}}"#;
+    let json = r#"{"protocolVersion":5,"id":9,"result":{"Ok":{"data":{"value":["one","two"]}}}}"#;
     let response: Response = mt_git_helper::decode_json(json.as_bytes()).unwrap();
     assert_eq!(
         response.result.unwrap().decode::<Vec<String>>().unwrap(),
@@ -178,6 +178,7 @@ fn near_frame_limit_diff_is_not_truncated() {
         hunks: Vec::new(),
         is_binary: false,
         too_large: false,
+        encoding: None,
     };
     let response = Response {
         protocol_version: PROTOCOL_VERSION,
@@ -227,4 +228,107 @@ fn preflight_rejects_amplifying_collection_before_deserializer_runs() {
     }
     let wire = format!("[{}0]", "0,".repeat(mt_git_helper::MAX_COLLECTION_ITEMS));
     assert!(mt_git_helper::decode_json::<MustNotDeserialize>(wire.as_bytes()).is_err());
+}
+
+#[test]
+fn encoding_metadata_is_required_canonical_and_safety_preserving() {
+    use mt_project::encoding::{TextEncoding, encoding_rs};
+    use mt_project::git::GitDiffResult;
+    for encoding in [
+        TextEncoding::Utf8,
+        TextEncoding::Utf16Le,
+        TextEncoding::Utf16Be,
+        TextEncoding::Legacy(encoding_rs::GB18030),
+        TextEncoding::Legacy(encoding_rs::SHIFT_JIS),
+        TextEncoding::Legacy(encoding_rs::WINDOWS_1252),
+        TextEncoding::Lossy,
+    ] {
+        let mut diff = mt_project::git::diff_two_texts("a\n".into(), "b\n".into());
+        diff.encoding = Some(encoding);
+        let bytes = serde_json::to_vec(&diff).unwrap();
+        assert_eq!(
+            mt_git_helper::decode_json::<GitDiffResult>(&bytes)
+                .unwrap()
+                .encoding,
+            Some(encoding)
+        );
+    }
+    let mut value =
+        serde_json::to_value(mt_project::git::diff_two_texts("a".into(), "b".into())).unwrap();
+    for name in [
+        "unknown",
+        "replacement",
+        "UTF-7",
+        "utf-8",
+        "unicode",
+        "iso-2022-cn",
+        "windows-1252",
+    ] {
+        value["encoding"] = name.into();
+        assert!(
+            mt_git_helper::decode_json::<GitDiffResult>(&serde_json::to_vec(&value).unwrap())
+                .is_err(),
+            "{name}"
+        );
+    }
+    value.as_object_mut().unwrap().remove("encoding");
+    assert!(
+        mt_git_helper::decode_json::<GitDiffResult>(&serde_json::to_vec(&value).unwrap()).is_err()
+    );
+}
+
+#[test]
+fn conflict_failures_restore_concrete_types() {
+    use mt_git_helper::GitFailure;
+    use mt_project::git::{SegmentBlocker, StaleConflictFile};
+    for blocker in [
+        SegmentBlocker::DeleteModify,
+        SegmentBlocker::NotConflicted,
+        SegmentBlocker::Unreadable,
+        SegmentBlocker::TooLarge,
+        SegmentBlocker::Binary,
+        SegmentBlocker::Lossy,
+        SegmentBlocker::NoMarkers,
+    ] {
+        let failure = GitFailure::from_error(blocker.into());
+        let decoded: GitFailure =
+            mt_git_helper::decode_json(&serde_json::to_vec(&failure).unwrap()).unwrap();
+        assert_eq!(
+            decoded.into_error().downcast_ref::<SegmentBlocker>(),
+            Some(&blocker)
+        );
+    }
+    assert!(
+        GitFailure::from_error(StaleConflictFile.into())
+            .into_error()
+            .is::<StaleConflictFile>()
+    );
+}
+
+#[test]
+fn dense_conflict_choices_keep_full_file_capacity_without_array_exemption() {
+    use mt_git_helper::Operation;
+    let count = mt_git_helper::MAX_COLLECTION_ITEMS + 1;
+    let operation = Operation::WriteConflictResolution {
+        repo: "/repo".into(),
+        snapshot: mt_project::git::ConflictSnapshot {
+            path: "file".into(),
+            digest: "proof".into(),
+        },
+        picks: vec![Some(mt_project::git::ConflictPick::TheirsThenOurs); count],
+        mark_resolved: true,
+    };
+    let encoded = encode_frame(&operation).unwrap();
+    let decoded: Operation = read_frame(&mut Cursor::new(encoded)).unwrap().unwrap();
+    let Operation::WriteConflictResolution { picks, .. } = decoded else {
+        panic!("wrong operation")
+    };
+    assert_eq!(picks.len(), count);
+    assert!(
+        picks
+            .iter()
+            .all(|pick| *pick == Some(mt_project::git::ConflictPick::TheirsThenOurs))
+    );
+    let invalid = r#"{"writeConflictResolution":{"repo":"/r","snapshot":{"path":"f","digest":"p"},"picks":"x","markResolved":false}}"#;
+    assert!(mt_git_helper::decode_json::<Operation>(invalid.as_bytes()).is_err());
 }

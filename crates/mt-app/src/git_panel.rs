@@ -442,6 +442,98 @@ pub struct GitPanel {
     _subs: Vec<Subscription>,
 }
 
+fn remote_operation_label(operation: mt_remote::RemoteGitOperationKind) -> &'static str {
+    match operation {
+        mt_remote::RemoteGitOperationKind::Stage => t("gitHistory", "operationStage"),
+        mt_remote::RemoteGitOperationKind::Unstage => t("gitHistory", "operationUnstage"),
+        mt_remote::RemoteGitOperationKind::StageAll => t("gitHistory", "operationStageAll"),
+        mt_remote::RemoteGitOperationKind::UnstageAll => t("gitHistory", "operationUnstageAll"),
+        mt_remote::RemoteGitOperationKind::Commit => t("gitHistory", "operationCommit"),
+        mt_remote::RemoteGitOperationKind::Amend => t("gitHistory", "operationAmend"),
+        mt_remote::RemoteGitOperationKind::Discard => t("gitHistory", "operationDiscard"),
+        mt_remote::RemoteGitOperationKind::StageHunks => t("gitHistory", "operationStageHunks"),
+        mt_remote::RemoteGitOperationKind::UnstageHunks => t("gitHistory", "operationUnstageHunks"),
+        mt_remote::RemoteGitOperationKind::DiscardHunks => t("gitHistory", "operationDiscardHunks"),
+        mt_remote::RemoteGitOperationKind::Checkout => t("gitHistory", "operationCheckout"),
+        mt_remote::RemoteGitOperationKind::CreateBranch => t("gitHistory", "operationCreateBranch"),
+        mt_remote::RemoteGitOperationKind::RenameBranch => t("gitHistory", "operationRenameBranch"),
+        mt_remote::RemoteGitOperationKind::DeleteBranch => t("gitHistory", "operationDeleteBranch"),
+        mt_remote::RemoteGitOperationKind::Fetch => t("gitHistory", "operationFetch"),
+        mt_remote::RemoteGitOperationKind::Pull => t("gitHistory", "operationPull"),
+        mt_remote::RemoteGitOperationKind::Push => t("gitHistory", "operationPush"),
+        mt_remote::RemoteGitOperationKind::SaveStash => t("gitHistory", "operationSaveStash"),
+        mt_remote::RemoteGitOperationKind::ApplyStash => t("gitHistory", "operationApplyStash"),
+        mt_remote::RemoteGitOperationKind::PopStash => t("gitHistory", "operationPopStash"),
+        mt_remote::RemoteGitOperationKind::DropStash => t("gitHistory", "operationDropStash"),
+        mt_remote::RemoteGitOperationKind::ClearStashes => t("gitHistory", "operationClearStashes"),
+        mt_remote::RemoteGitOperationKind::StashBranch => t("gitHistory", "operationStashBranch"),
+        mt_remote::RemoteGitOperationKind::Continue => t("gitHistory", "operationContinue"),
+        mt_remote::RemoteGitOperationKind::Abort => t("gitHistory", "operationAbort"),
+        mt_remote::RemoteGitOperationKind::ResolveConflict => {
+            t("gitHistory", "operationResolveConflict")
+        }
+        mt_remote::RemoteGitOperationKind::MarkResolved => t("gitHistory", "operationMarkResolved"),
+        mt_remote::RemoteGitOperationKind::CherryPick => t("gitHistory", "operationCherryPick"),
+        mt_remote::RemoteGitOperationKind::Revert => t("gitHistory", "operationRevert"),
+        mt_remote::RemoteGitOperationKind::Reset => t("gitHistory", "operationReset"),
+        mt_remote::RemoteGitOperationKind::UndoCommit => t("gitHistory", "operationUndoCommit"),
+        mt_remote::RemoteGitOperationKind::RewordCommit => t("gitHistory", "operationRewordCommit"),
+        mt_remote::RemoteGitOperationKind::CreateTag => t("gitHistory", "operationCreateTag"),
+        mt_remote::RemoteGitOperationKind::DeleteTag => t("gitHistory", "operationDeleteTag"),
+        mt_remote::RemoteGitOperationKind::PushTag => t("gitHistory", "operationPushTag"),
+        mt_remote::RemoteGitOperationKind::DeleteRemoteBranch => {
+            t("gitHistory", "operationDeleteRemoteBranch")
+        }
+        mt_remote::RemoteGitOperationKind::Merge => t("gitHistory", "operationMerge"),
+        mt_remote::RemoteGitOperationKind::Rebase => t("gitHistory", "operationRebase"),
+        mt_remote::RemoteGitOperationKind::AddWorktree => t("gitHistory", "operationAddWorktree"),
+        mt_remote::RemoteGitOperationKind::RemoveWorktree => {
+            t("gitHistory", "operationRemoveWorktree")
+        }
+        mt_remote::RemoteGitOperationKind::PruneWorktrees => {
+            t("gitHistory", "operationPruneWorktrees")
+        }
+    }
+}
+
+fn recovery_status_label(status: Option<&mt_project::git::GitStatus>) -> &'static str {
+    match status {
+        Some(mt_project::git::GitStatus::Modified) => t("gitCommit", "statusModified"),
+        Some(mt_project::git::GitStatus::Added) => t("gitCommit", "statusAdded"),
+        Some(mt_project::git::GitStatus::Deleted) => t("gitCommit", "statusDeleted"),
+        Some(mt_project::git::GitStatus::Renamed) => t("gitCommit", "statusRenamed"),
+        Some(mt_project::git::GitStatus::Untracked) => t("gitCommit", "statusUntracked"),
+        Some(mt_project::git::GitStatus::Conflicted) => t("gitCommit", "statusConflicted"),
+        None => t("gitHistory", "recoveryUnchanged"),
+    }
+}
+
+/// Captured selection for feedback; never discovers repositories or performs I/O.
+pub(crate) fn current_repo_for_project(store: &AppStore, project_id: &str) -> Option<GitContext> {
+    let project = crate::git_backend::project_context(store, project_id);
+    REPO_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&project.key())
+            .and_then(|(_, selected)| {
+                (!selected.is_empty()).then(|| project.with_path(selected.clone()))
+            })
+    })
+}
+
+pub(crate) fn project_has_multiple_repos(store: &AppStore, project_id: Option<&str>) -> bool {
+    let Some(id) = project_id else {
+        return false;
+    };
+    let key = crate::git_backend::project_context(store, id).key();
+    REPO_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key)
+            .is_some_and(|(repos, _)| repos.len() > 1)
+    })
+}
+
 impl GitPanel {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let project_context = store
@@ -452,6 +544,11 @@ impl GitPanel {
             .as_ref()
             .map(|context| context.path().to_string());
         let project_id = store.read(cx).active_project_id.clone();
+        let enable_prompted = project_id
+            .iter()
+            .filter(|id| crate::git_backend::remote_git_enabled(store.read(cx), id))
+            .cloned()
+            .collect();
         let changes = cx.new(|cx| GitChanges::new(store.clone(), window, cx));
         let history = cx.new(|cx| GitHistoryContent::new(store.clone(), window, cx));
         let detail_pane = cx.new(|cx| CommitDetailPane::new(history.clone(), cx));
@@ -577,7 +674,7 @@ impl GitPanel {
             branch_data: RefCell::new(None),
             busy: None,
             feedback_context: None,
-            enable_prompted: std::collections::HashSet::new(),
+            enable_prompted,
             visible: false,
             stale: true,
             project_path,
@@ -1113,37 +1210,211 @@ impl GitPanel {
         self.reload_views(Round::Write, cx);
     }
 
+    fn recovery_controls(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let state = self.store.read(cx);
+        let id = state.active_project_id.as_deref()?;
+        let context = crate::git_backend::recovery_context(state, id)?;
+        let mut controls = div().flex().flex_col().gap(px(8.0)).p(px(10.0));
+        let mut any = false;
+        if let Some(unknown) = context.unknown_write() {
+            any = true;
+            controls = controls
+                .child(ui::desc_text(tr!(
+                    "gitHistory",
+                    "verifyRepository",
+                    repo = unknown.repo
+                )))
+                .child(
+                    crate::prompt::footer_button(
+                        "verify-remote-write",
+                        t("gitHistory", "verifyWrite"),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.verify_remote_write(window, cx)),
+                    ),
+                )
+                .child(
+                    crate::prompt::footer_button(
+                        "abandon-remote-write",
+                        t("gitHistory", "abandonAction"),
+                    )
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.abandon_remote_write(window, cx)),
+                    ),
+                );
+        }
+        let repo = if self.selected_repo.is_empty() {
+            context.path()
+        } else {
+            &self.selected_repo
+        };
+        for blocker in context
+            .with_path(repo)
+            .recovery_blockers()
+            .into_iter()
+            .filter(|blocker| blocker.owner_project_id != id)
+        {
+            any = true;
+            let owner = blocker.owner_project_id;
+            let name = state
+                .project(&owner)
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| owner.clone());
+            let store = self.store.clone();
+            controls = controls
+                .child(ui::desc_text(tr!(
+                    "gitHistory",
+                    "blockedByProject",
+                    project = name,
+                    repo = blocker.write.repo
+                )))
+                .child(
+                    crate::prompt::footer_button(
+                        "recovery-owner-project",
+                        tr!("gitHistory", "goToRecoveryProject", project = name),
+                    )
+                    .on_click(move |_, _, cx| {
+                        store.update(cx, |store, cx| store.set_active_project(&owner, cx))
+                    }),
+                );
+        }
+        any.then(|| controls.into_any_element())
+    }
+
     fn verify_remote_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(repo) = self.project_context.clone().filter(GitContext::is_remote) else {
+        let state = self.store.read(cx);
+        let Some(id) = state.active_project_id.clone() else {
             return;
         };
+        let Some(repo) = crate::git_backend::recovery_context(state, &id) else {
+            return;
+        };
+        if !crate::git_backend::remote_git_enabled(state, &id) {
+            let panel = cx.entity().downgrade();
+            let consent = match repo.recovery_consent() {
+                Ok(consent) => Rc::new(RefCell::new(Some(consent))),
+                Err(error) => {
+                    git_ui::show_git_error(
+                        t("gitHistory", "verifyWrite"),
+                        git_ui::error_text(&error),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            };
+            Confirm::new(
+                t("gitHistory", "recoveryReadConsentTitle"),
+                t("gitHistory", "recoveryReadConsentMessage"),
+            )
+            .detail(vec![git_ui::repo_label(&repo)])
+            .ok_text(t("gitHistory", "recoveryReadConsentAction"))
+            .open(
+                move |window, cx| {
+                    let Some(consent) = consent.borrow_mut().take() else {
+                        return;
+                    };
+                    let _ = panel.update(cx, |panel, cx| {
+                        panel.load_recovery_snapshot(repo.clone(), Some(consent), window, cx)
+                    });
+                },
+                window,
+                cx,
+            );
+        } else {
+            self.load_recovery_snapshot(repo, None, window, cx);
+        }
+    }
+
+    fn abandon_remote_write(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.store.read(cx);
+        let Some(id) = state.active_project_id.as_deref() else {
+            return;
+        };
+        let Some(repo) = crate::git_backend::recovery_context(state, id) else {
+            return;
+        };
+        let confirmation = match repo.prepare_offline_abandon() {
+            Ok(confirmation) => Rc::new(RefCell::new(Some(confirmation))),
+            Err(error) => {
+                git_ui::show_git_error(
+                    t("gitHistory", "abandonTitle"),
+                    git_ui::error_text(&error),
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        let panel = cx.entity().downgrade();
+        Confirm::new(
+            t("gitHistory", "abandonTitle"),
+            t("gitHistory", "abandonWarning"),
+        )
+        .detail(vec![git_ui::repo_label(&repo)])
+        .danger()
+        .ok_text(t("gitHistory", "abandonAction"))
+        .open(
+            move |window, cx| {
+                let Some(confirmation) = confirmation.borrow_mut().take() else {
+                    return;
+                };
+                match repo.abandon_recovery(confirmation) {
+                    Ok(()) => {
+                        let _ = panel.update(cx, |panel, cx| {
+                            git_ui::toast_for_repo(
+                                &panel.store,
+                                &repo,
+                                t("gitHistory", "abandoned").to_string(),
+                                Tone::Attention,
+                                cx,
+                            );
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => git_ui::show_git_error(
+                        t("gitHistory", "abandonTitle"),
+                        git_ui::error_text(&error),
+                        window,
+                        cx,
+                    ),
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn load_recovery_snapshot(
+        &mut self,
+        repo: GitContext,
+        consent: Option<mt_remote::RemoteGitRecoveryConsent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let captured = repo.clone();
         let store = self.store.clone();
         let panel = cx.entity().downgrade();
-        window
-            .spawn(cx, async move |cx| {
-                let result =
-                    mt_remote::run_git_on(&captured, move || repo.recovery_snapshot()).await;
+        let recovery_only = consent.is_some();
+        window.spawn(cx, async move |cx| {
+                let result = mt_remote::run_git_on(&captured, move || {
+                    if let Some(consent) = consent { repo.recovery_snapshot_with_consent(consent) }
+                    else { repo.recovery_snapshot() }
+                }).await;
                 let _ = cx.update(|window, cx| match result {
                     Ok(snapshot) => {
-                        let observed = snapshot
-                            .observed
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let occurred = snapshot
-                            .occurred
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        let message = if snapshot.completion_proven {
-                            t("gitHistory", "recoveryProven")
-                        } else {
-                            t("gitHistory", "recoveryRisk")
+                        let format_time = |time: std::time::SystemTime| crate::git_history::format_absolute_time(time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs().min(i64::MAX as u64) as i64);
+                        let observed = format_time(snapshot.observed);
+                        let occurred = format_time(snapshot.occurred);
+                        let message = match (recovery_only, snapshot.completion_proven) {
+                            (true, true) => t("gitHistory", "recoveryOnlyProven"),
+                            (true, false) => t("gitHistory", "recoveryOnlyRisk"),
+                            (false, true) => t("gitHistory", "recoveryProven"),
+                            (false, false) => t("gitHistory", "recoveryRisk"),
                         };
                         let mut detail = vec![
                             git_ui::repo_label(&captured.with_path(snapshot.repo.clone())),
-                            snapshot.operation.clone(),
+                            remote_operation_label(snapshot.operation).to_string(),
                             tr!("gitHistory", "recoveryOccurred", timestamp = occurred),
                             format!("HEAD: {}", snapshot.head.as_deref().unwrap_or("∅")),
                             tr!(
@@ -1155,7 +1426,7 @@ impl GitPanel {
                             tr!(
                                 "gitHistory",
                                 "recoveryOperation",
-                                operation = format!("{:?}", snapshot.op.kind),
+                                operation = snapshot.op.kind.map(|kind| match kind { RepoOpKind::Merge => t("gitBranch", "opMerge"), RepoOpKind::Rebase => t("gitBranch", "opRebase"), RepoOpKind::CherryPick => t("gitLog", "action.cherryPick"), RepoOpKind::Revert => t("gitLog", "action.revert") }).unwrap_or_else(|| t("gitHistory", "recoveryClean")),
                                 conflicts = snapshot.op.conflicted
                             ),
                             tr!(
@@ -1166,15 +1437,14 @@ impl GitPanel {
                             ),
                         ];
                         detail.extend(snapshot.files.iter().take(20).map(|file| {
-                            format!(
-                                "{} {:?} {:?}",
-                                file.path, file.staged_status, file.unstaged_status
-                            )
+                            format!("{} · {} / {}", file.path,
+                                recovery_status_label(file.staged_status.as_ref()),
+                                recovery_status_label(file.unstaged_status.as_ref()))
                         }));
                         let context = captured.clone();
                         Confirm::new(t("gitHistory", "verifyWrite"), message)
                             .detail(detail)
-                            .ok_text(t("gitHistory", "acknowledgeRecovery"))
+                            .ok_text(t("gitHistory", if recovery_only { "acknowledgeReadOnlyRecovery" } else { "acknowledgeRecovery" }))
                             .open(
                                 move |window, cx| {
                                     let context = context.clone();
@@ -1194,7 +1464,7 @@ impl GitPanel {
                                                     git_ui::toast_for_repo(
                                                         &store,
                                                         &executor,
-                                                        t("gitHistory", "writeVerified")
+                                                        t("gitHistory", if recovery_only { "readOnlyVerified" } else { "writeVerified" })
                                                             .to_string(),
                                                         Tone::Info,
                                                         cx,
@@ -1206,7 +1476,7 @@ impl GitPanel {
                                                             .and_then(GitContext::project_id)
                                                             == executor.project_id()
                                                         {
-                                                            panel.refresh_after_write(cx);
+                                                            if crate::git_backend::remote_git_enabled(panel.store.read(cx), executor.project_id().unwrap_or("")) { panel.refresh_after_write(cx); } else { cx.notify(); }
                                                         }
                                                     });
                                                 }
@@ -1422,8 +1692,10 @@ impl GitPanel {
                             eprintln!("[git] {}失败: {err:#}", busy.label());
                             git_ui::show_git_error(
                                 git_ui::repo_text(
+                                    &this.store,
                                     &completed_repo,
                                     tr!("gitBranch", "opFailed", op = busy.label()),
+                                    cx,
                                 ),
                                 git_ui::error_text(&err),
                                 window,
@@ -2651,6 +2923,20 @@ impl Render for GitPanel {
                 t("gitHistory", "selectProject"),
             ));
         }
+        let broken_remote = self.store.read(cx).active_project().is_some_and(|project| {
+            project.ssh_connection_id.is_some()
+                && self
+                    .store
+                    .read(cx)
+                    .remote_connection_of(&project.id)
+                    .is_none()
+        });
+        if broken_remote {
+            return div().size_full().child(centered_hint(
+                git_ui::ICON_REPO,
+                t("gitHistory", "connectionRemoved"),
+            ));
+        }
         if self.remote_git_disabled(cx) {
             let project_id = self
                 .store
@@ -2658,7 +2944,9 @@ impl Render for GitPanel {
                 .active_project_id
                 .clone()
                 .unwrap_or_default();
-            if self.visible && self.enable_prompted.insert(project_id.clone()) {
+            let recovery = self.recovery_controls(cx);
+            if recovery.is_none() && self.visible && self.enable_prompted.insert(project_id.clone())
+            {
                 let store = self.store.clone();
                 _window.defer(cx, move |window, cx| {
                     crate::git_backend::request_enable(store, project_id, window, cx)
@@ -2672,6 +2960,7 @@ impl Render for GitPanel {
                 .justify_center()
                 .gap(px(12.0))
                 .child(ui::desc_text(t("gitHistory", "remoteDisabled")))
+                .children(recovery)
                 .child(
                     crate::prompt::footer_button(
                         "enable-remote-git",
@@ -2747,18 +3036,8 @@ impl Render for GitPanel {
         if let Some(error) = &self.load_error {
             root = root.child(git_ui::error_block(error.clone()));
         }
-        if let Some(unknown) = self
-            .project_context
-            .as_ref()
-            .and_then(GitContext::unknown_write)
-        {
-            root = root.child(
-                crate::prompt::footer_button(
-                    "verify-remote-write",
-                    tr!("gitHistory", "verifyRepository", repo = unknown.repo),
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.verify_remote_write(window, cx))),
-            );
+        if let Some(recovery) = self.recovery_controls(cx) {
+            root = root.child(recovery);
         }
 
         root = root

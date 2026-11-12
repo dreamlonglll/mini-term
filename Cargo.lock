@@ -1123,6 +1123,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chardetng"
+version = "0.1.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
+dependencies = [
+ "cfg-if",
+ "encoding_rs",
+ "memchr",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5499,6 +5510,7 @@ name = "mt-git-helper"
 version = "1.13.30"
 dependencies = [
  "anyhow",
+ "mt-core",
  "mt-project",
  "serde",
  "serde_json",
@@ -5527,6 +5539,9 @@ name = "mt-project"
 version = "1.13.30"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chardetng",
+ "encoding_rs",
  "git2",
  "ignore",
  "mt-core",
@@ -5660,6 +5675,7 @@ dependencies = [
  "gpui-component",
  "gpui-pre",
  "image",
+ "mt-core",
  "mt-terminal",
  "mt-theme-packs",
  "serde",

@@ -579,6 +579,9 @@ impl FileTree {
         dir: &Path,
         cx: &mut Context<Self>,
     ) {
+        // 有文件 / 目录出现或消失:快速打开的文件索引标脏,下次打开面板时重建。排在下面那道
+        // 「自己的操作」抑制之前 —— 抑制的只是树的重列,文件集合确实变了
+        crate::quick_open::note_fs_change(&path, structural, cx);
         if self.path_is_suppressed(&path) {
             return;
         }
@@ -2433,11 +2436,12 @@ impl FileTree {
                     });
                     let git_enabled = this.git_io_allowed(cx);
                     let in_git_repo = git_enabled
-                        && cached_repo_contains_file(
-                            &this.git_repos,
-                            &row_for_menu.path,
-                            this.is_remote(cx),
-                        );
+                        && !row_for_menu.is_dir
+                        && if this.is_remote(cx) {
+                            cached_repo_contains_file(&this.git_repos, &row_for_menu.path, true)
+                        } else {
+                            mt_project::git::is_inside_git_repo(&context.root, &row_for_menu.path)
+                        };
                     let entries = file_menu(
                         &cx.entity(),
                         &store,

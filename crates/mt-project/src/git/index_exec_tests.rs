@@ -166,7 +166,7 @@ fn 空仓库取消暂存() {
         .as_nanos();
     let root = std::env::temp_dir().join(format!("mini-term-git-unborn-{ts}"));
     std::fs::create_dir_all(&root).unwrap();
-    let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
+    let root = mt_core::path::canonicalize(&root).unwrap();
     Repository::init(&root).unwrap();
     std::fs::write(root.join("f.txt"), "f\n").unwrap();
     std::fs::write(root.join("g.txt"), "g\n").unwrap();

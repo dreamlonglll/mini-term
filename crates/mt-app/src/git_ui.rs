@@ -1003,7 +1003,7 @@ pub fn status_color(status: Option<&GitStatus>) -> Hsla {
     text_fg(color)
 }
 
-/// 单字符状态 → 颜色(diff 弹窗标题栏的状态胶囊只拿得到字母)。
+/// 单字符状态 → 颜色(单文件 diff 页签标题栏的状态胶囊只拿得到字母)。
 pub fn status_color_for_label(label: &str) -> Hsla {
     let status = match label.trim() {
         "M" => Some(GitStatus::Modified),
@@ -1333,6 +1333,7 @@ pub fn error_text(err: &anyhow::Error) -> String {
                     "remote_git_recovery_stale" => "recoveryStale",
                     "remote_git_recovery_changed" => "recoveryChanged",
                     "remote_git_no_unknown_write" => "noUnknownWrite",
+                    "remote_git_write_running" => "writeRunning",
                     "remote_git_invalid_root" => "invalidRoot",
                     "remote_git_deployment_failed" => "deploymentFailed",
                     "remote_git_connection_failed" => "connectionFailed",
@@ -1543,8 +1544,98 @@ pub fn repo_label(repo: &GitContext) -> String {
     }
 }
 
-pub fn repo_text(repo: &GitContext, message: impl AsRef<str>) -> String {
-    format!("{}\n{}", repo_label(repo), message.as_ref())
+pub fn repo_text(
+    store: &Entity<AppStore>,
+    repo: &GitContext,
+    message: impl AsRef<str>,
+    cx: &App,
+) -> String {
+    if needs_repo_label(store, repo, cx) {
+        format!("{}\n{}", repo_label(repo), message.as_ref())
+    } else {
+        message.as_ref().to_string()
+    }
+}
+
+fn local_path_key(path: &str) -> String {
+    let path = mt_core::path_key::strip_verbatim_prefix(path);
+    if cfg!(windows) {
+        mt_core::path_key::windows_eq_key(&path)
+    } else {
+        mt_core::path_key::posix_trim_trailing(&path).to_string()
+    }
+}
+
+fn local_project_for_repo<'a>(
+    store: &'a AppStore,
+    repo: &str,
+) -> Option<&'a mt_config::ProjectConfig> {
+    let repo = local_path_key(repo);
+    store
+        .projects()
+        .iter()
+        .filter(|project| project.ssh_connection_id.is_none())
+        .filter_map(|project| {
+            let root = local_path_key(&project.path);
+            let contained = repo == root
+                || repo
+                    .strip_prefix(&root)
+                    .is_some_and(|rest| rest.starts_with('/') || root == "/");
+            contained.then_some((project, root.len()))
+        })
+        .max_by_key(|(_, length)| *length)
+        .map(|(project, _)| project)
+}
+
+pub fn repo_is_current(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> bool {
+    let state = store.read(cx);
+    let Some(active) = state.active_project() else {
+        return false;
+    };
+    let source = repo_project_id(store, repo, cx);
+    if source.as_deref() != Some(active.id.as_str()) {
+        return false;
+    }
+    if repo.is_remote()
+        && crate::git_backend::project_context(state, &active.id).with_path(repo.path()) != *repo
+    {
+        return false;
+    }
+    crate::git_panel::current_repo_for_project(state, &active.id)
+        .is_none_or(|selected| selected.repository_key() == repo.repository_key())
+}
+
+fn needs_repo_label(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> bool {
+    repo.is_remote()
+        || !repo_is_current(store, repo, cx)
+        || crate::git_panel::project_has_multiple_repos(
+            store.read(cx),
+            repo.project_id()
+                .map(str::to_string)
+                .or_else(|| {
+                    local_project_for_repo(store.read(cx), repo.path())
+                        .map(|project| project.id.clone())
+                })
+                .as_deref(),
+        )
+}
+
+pub fn repo_project_id(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> Option<String> {
+    repo.project_id().map(str::to_string).or_else(|| {
+        let state = store.read(cx);
+        local_project_for_repo(state, repo.path())
+            .or_else(|| {
+                let project = state
+                    .active_project()
+                    .filter(|project| project.ssh_connection_id.is_none())?;
+                let root = local_path_key(&project.path);
+                let repository = local_path_key(repo.path());
+                root.strip_prefix(&repository)
+                    .is_some_and(|rest| rest.starts_with('/') || repository == "/")
+                    .then_some(project)
+            })
+            .map(|project| project.id.clone())
+    })
 }
 
 pub fn toast_for_repo(
@@ -1559,24 +1650,15 @@ pub fn toast_for_repo(
         Tone::Attention => ToastKind::Error,
     };
     let (project_id, title) = repo_attribution(store, repo, cx);
-    crate::toast::push_message(
-        kind,
-        project_id,
-        title,
-        format!("{}\n{message}", repo.path()),
-        cx,
-    );
+    let message = repo_text(store, repo, message, cx);
+    crate::toast::push_message(kind, project_id, title, message, cx);
 }
 
 fn repo_attribution(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> (String, String) {
     let store = store.read(cx);
     let project = match repo.project_id() {
         Some(id) => store.projects().iter().find(|project| project.id == id),
-        None => store.projects().iter().find(|project| {
-            project.ssh_connection_id.is_none()
-                && (project.path == repo.path()
-                    || std::path::Path::new(repo.path()).starts_with(&project.path))
-        }),
+        None => local_project_for_repo(store, repo.path()),
     };
     let project_id = project
         .map(|project| project.id.clone())
@@ -1593,8 +1675,12 @@ fn repo_attribution(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> (S
 }
 
 pub fn repo_title(store: &Entity<AppStore>, repo: &GitContext, action: &str, cx: &App) -> String {
-    let (_, title) = repo_attribution(store, repo, cx);
-    format!("{action} — {title} · {}", repo.path())
+    if needs_repo_label(store, repo, cx) {
+        let (_, title) = repo_attribution(store, repo, cx);
+        format!("{action} — {title} · {}", repo.path())
+    } else {
+        action.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1626,6 +1712,50 @@ mod tests {
             assert!(title.contains("Production SSH"));
             assert!(title.contains("/srv/project/nested-repo"));
             assert!(!title.contains("internal-connection-id"));
+        });
+    }
+
+    #[gpui::test]
+    fn local_feedback_uses_specific_project_and_keeps_single_repo_plain(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = mt_config::AppConfig {
+            projects: vec![
+                mt_config::ProjectConfig::new("parent", "Parent", "/work"),
+                mt_config::ProjectConfig::new("child", "Child", "/work/repo"),
+            ],
+            last_active_project_id: Some("child".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let repo = GitContext::local("/work/repo");
+        cx.update(|cx| {
+            assert_eq!(
+                repo_attribution(&store, &repo, cx),
+                ("child".into(), "Child".into())
+            );
+            assert_eq!(
+                repo_text(&store, &repo, "hook rejected", cx),
+                "hook rejected"
+            );
+            assert_eq!(
+                repo_title(&store, &repo, "Push commits", cx),
+                "Push commits"
+            );
+            assert_eq!(
+                repo_project_id(&store, &GitContext::local("/work/repo/deep"), cx).as_deref(),
+                Some("child")
+            );
+            assert_eq!(
+                repo_project_id(&store, &GitContext::local("/work/repository"), cx).as_deref(),
+                Some("parent")
+            );
+            store.update(cx, |state, cx| state.set_active_project("parent", cx));
+            assert_eq!(
+                repo_text(&store, &repo, "hook rejected", cx),
+                "/work/repo\nhook rejected"
+            );
+            assert_eq!(repo_attribution(&store, &repo, cx).0, "child");
         });
     }
 

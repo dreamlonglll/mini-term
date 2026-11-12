@@ -984,10 +984,7 @@ mod tests {
         let project = root.join("pkg");
         let (repo_root, rel) = resolve_repo_file(&project, "src/lib.rs").unwrap();
         assert_eq!(rel, "pkg/src/lib.rs");
-        assert_eq!(
-            crate::fs::strip_verbatim_prefix(repo_root.canonicalize().unwrap()),
-            root
-        );
+        assert_eq!(mt_core::path::canonicalize(&repo_root).unwrap(), root);
         let page = get_file_log(&project, "src/lib.rs", None, 30).unwrap();
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].status, "added");

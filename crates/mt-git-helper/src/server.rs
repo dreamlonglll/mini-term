@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
+use mt_core::path::canonicalize;
 use mt_project::git;
 
 use crate::{
@@ -18,7 +19,7 @@ mod advanced;
 /// mt-project's ancestor/depth/worktree rules, including repositories above root.
 pub fn serve(root: &Path, mut reader: impl Read, mut writer: impl Write) -> Result<()> {
     ensure!(root.is_absolute(), "--root must be an absolute directory");
-    let root = root.canonicalize().context("canonicalizing --root")?;
+    let root = canonicalize(root).context("canonicalizing --root")?;
     ensure!(root.is_dir(), "--root must be a directory");
     let mut server = Server {
         root,
@@ -97,10 +98,7 @@ impl Server {
         let mut repos = git::discover_git_repos(&self.root)?;
         let mut allowed = HashSet::with_capacity(repos.len());
         for repo in &mut repos {
-            repo.path = repo
-                .path
-                .canonicalize()
-                .context("canonicalizing discovered repository")?;
+            repo.path = canonicalize(&repo.path).context("canonicalizing discovered repository")?;
             allowed.insert(repo.path.clone());
         }
         repos.retain(|repo| {
@@ -121,9 +119,7 @@ impl Server {
         if self.allowed.is_none() {
             self.discover()?;
         }
-        let canonical = requested
-            .canonicalize()
-            .context("canonicalizing repository path")?;
+        let canonical = canonicalize(requested).context("canonicalizing repository path")?;
         ensure!(
             self.allowed
                 .as_ref()
@@ -328,6 +324,53 @@ impl Server {
                 git::discard_hunk(&repo, &path, &diff, hunk)?;
                 data(())
             }
+            Operation::StageHunks {
+                repo,
+                path,
+                diff,
+                picks,
+            } => {
+                let project = self.project_directory(&repo)?;
+                let (repo, path) = self.resolve_file(&project, &path, true)?;
+                git::stage_hunks(&repo, &path, &diff, &picks)?;
+                data(())
+            }
+            Operation::UnstageHunks {
+                repo,
+                path,
+                diff,
+                picks,
+            } => {
+                let project = self.project_directory(&repo)?;
+                let (repo, path) = self.resolve_file(&project, &path, true)?;
+                git::unstage_hunks(&repo, &path, &diff, &picks)?;
+                data(())
+            }
+            Operation::DiscardHunks {
+                repo,
+                path,
+                diff,
+                picks,
+            } => {
+                let project = self.project_directory(&repo)?;
+                let (repo, path) = self.resolve_file(&project, &path, true)?;
+                git::discard_hunks(&repo, &path, &diff, &picks)?;
+                data(())
+            }
+            Operation::WriteConflictResolution {
+                repo,
+                snapshot,
+                picks,
+                mark_resolved,
+            } => {
+                let repo = self.repository(&repo)?;
+                validate_path(&repo, &snapshot.path, true)?;
+                validate_file_repository(&repo, &snapshot.path)?;
+                // Client encoding, display text and offsets are never trusted.
+                let file = git::reload_conflict_file(&repo, &snapshot)?;
+                git::write_conflict_resolution(&repo, &file, &picks, mark_resolved)?;
+                data(())
+            }
             Operation::Checkout {
                 repo,
                 branch,
@@ -472,9 +515,9 @@ fn validate_file_repository(repo: &Path, path: &str) -> Result<()> {
         .skip(1)
         .find(|parent| parent.is_dir())
         .unwrap_or(repo);
-    let enclosing = git::enclosing_repo(parent)
-        .context("file is not in a discoverable repository")?
-        .canonicalize()?;
+    let enclosing = canonicalize(
+        git::enclosing_repo(parent).context("file is not in a discoverable repository")?,
+    )?;
     ensure!(enclosing == repo, "file belongs to a different repository");
     Ok(())
 }
@@ -518,7 +561,7 @@ fn validate_path(repo: &Path, input: &str, reads_worktree: bool) -> Result<()> {
         }
         match std::fs::symlink_metadata(ancestor) {
             Ok(_) => {
-                let canonical = ancestor.canonicalize().context("resolving file parent")?;
+                let canonical = canonicalize(ancestor).context("resolving file parent")?;
                 ensure!(
                     canonical.starts_with(repo),
                     "file parent escapes repository through a symlink"
@@ -532,7 +575,7 @@ fn validate_path(repo: &Path, input: &str, reads_worktree: bool) -> Result<()> {
     // staging/unstaging. Core working-tree diff reads the target, so it needs an
     // additional containment check (including for Staged, for uniform safety).
     if reads_worktree {
-        match absolute.canonicalize() {
+        match canonicalize(&absolute) {
             Ok(canonical) if !canonical.starts_with(repo) => {
                 bail!("file target escapes repository through a symlink")
             }
