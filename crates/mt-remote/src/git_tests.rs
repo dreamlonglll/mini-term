@@ -1095,6 +1095,10 @@ fn offline_abandon_returns_before_live_channel_cleanup_without_new_git_requests(
         Err(mt_git_helper::GitFailure::OutcomeUnknown { .. })
     ));
     assert!(workspace.write_outcome_unknown());
+    let session = fixture
+        .runtime
+        .block_on(fixture.pool.acquire(&fixture.connection))
+        .unwrap();
     assert_eq!(fixture.counts.eof.load(Ordering::SeqCst), 0);
     let channels = fixture.counts.channels.load(Ordering::SeqCst);
     let requests = fixture.counts.requests.load(Ordering::SeqCst);
@@ -1106,7 +1110,18 @@ fn offline_abandon_returns_before_live_channel_cleanup_without_new_git_requests(
     // The peer ignores EOF and cannot finish. Ordinary bounded Drop cleanup is
     // permitted, but local abandonment must neither await it nor issue Git work.
     fixture.wait_count(&fixture.counts.eof, 1);
-    fixture.wait_count(&fixture.counts.closed, 1);
+    // Close only enqueues an SSH packet; retiring and dropping the last session
+    // can close the socket before the peer dispatches channel_close. Observe the
+    // exact local session retirement guarantee, not a remote close acknowledgement.
+    fixture.runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !session.is_unhealthy_now() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("abandoned channel cleanup retires its original session");
+    });
     assert_eq!(fixture.counts.finished.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.counts.channels.load(Ordering::SeqCst), channels);
     assert_eq!(fixture.counts.requests.load(Ordering::SeqCst), requests);
