@@ -29,7 +29,7 @@ pub(crate) fn init_repo_with_file(tag: &str, rel: &str, content: &str) -> PathBu
         std::process::id()
     ));
     std::fs::create_dir_all(&root).unwrap();
-    let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
+    let root = mt_core::path::canonicalize(&root).unwrap();
     let repo = Repository::init(&root).unwrap();
     {
         let mut config = repo.config().unwrap();

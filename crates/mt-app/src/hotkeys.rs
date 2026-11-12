@@ -30,10 +30,10 @@ use gpui::{App, KeyBinding, NoAction};
 
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
-    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
-    SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
-    ToggleSessions, ToggleUsage, command_library, git_changes, git_diff, git_file_history,
-    git_history, git_stash, project_switcher,
+    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane,
+    SelectPane, SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary,
+    ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_conflict,
+    git_diff, git_file_history, git_history, git_stash, project_switcher, quick_open,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -230,6 +230,17 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Global,
         G_GLOBAL,
         "shortcuts.toggleGlobalSearch",
+    ),
+    // 快速打开文件(VS Code 的 Ctrl+P)。裸 Ctrl+P 是 shell 的上一条历史,按开头的原则走
+    // Ctrl+Shift;Ctrl+Shift+P 已是项目切换器,取「Open」的 O。终端里的 Ctrl+Shift+O 在传统
+    // 编码下与 Ctrl+O 同字节,shell / TUI 要的那个 Ctrl+O 不受影响
+    def(
+        "quickOpen",
+        Some("ctrl-shift-o"),
+        combo(true, true, false, "O"),
+        Scope::Global,
+        G_GLOBAL,
+        "shortcuts.quickOpen",
     ),
     def(
         "terminalSearch",
@@ -430,6 +441,21 @@ pub fn bind_keys(cx: &mut App) {
         Some("ProjectSwitcher > Input"),
     ));
 
+    // 快速打开的方向键。与项目切换器同一套理由:弹窗内部键位不进表,谓词要与 `Input`
+    // 同深度才压得过它自带的 up/down(机制见 project_switcher 模块注释)
+    let quick_open_input = format!("{} > Input", quick_open::CONTEXT);
+    let quick_open_input = Some(quick_open_input.as_str());
+    bindings.push(KeyBinding::new(
+        "up",
+        quick_open::QuickOpenPrev,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        quick_open::QuickOpenNext,
+        quick_open_input,
+    ));
+
     // 命令库浮层的方向键 / Ctrl+↵(issue #81)。与项目切换器同一套理由:
     // 弹窗内部键位不进表,谓词要与 `Input` 同深度才压得过它自带的 up/down。
     bindings.push(KeyBinding::new(
@@ -544,9 +570,9 @@ pub fn bind_keys(cx: &mut App) {
         list,
     ));
 
-    // 单文件 diff 弹窗:F7 / Shift+F7 跳改动,Alt+← / Alt+→ 换文件(IDEA 的键位)。
-    // 谓词是弹窗正文自己的 context;弹窗画在 Workspace 之外,与全局的 Alt+方向键
-    // (切 pane 焦点)不在一条派发链上,互不抢。
+    // 单文件 diff 页签(磁盘对比页签同一个 context):F7 / Shift+F7 跳改动,Alt+← / Alt+→
+    // 换文件(IDEA 的键位)。谓词是页签正文自己的 context,比 `Workspace` 深,焦点在页签里时
+    // 先试这一条;全局的 Alt+方向键(切 pane 焦点)只在终端页生效,页签页上本来就不动。
     bindings.push(KeyBinding::new(
         "f7",
         git_diff::GitDiffNextChange,
@@ -567,8 +593,27 @@ pub fn bind_keys(cx: &mut App) {
         git_diff::GitDiffPrevFile,
         Some(git_diff::FILE_DIFF_CONTEXT),
     ));
-    // 提交 diff 弹窗:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换提交同一
-    // 手感)。谓词是弹窗焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
+    // Esc 先清行勾选(按行暂存);没有勾选时处理器 `propagate`,按键照常往外走(页签里
+    // 没有弹窗可关,焦点也不动)
+    bindings.push(KeyBinding::new(
+        "escape",
+        git_diff::GitDiffClearPicks,
+        Some(git_diff::FILE_DIFF_CONTEXT),
+    ));
+    // 冲突文件「逐段解决」弹窗:F7 / Shift+F7 跳下一段 / 上一段(与上面跳改动同一对键)。
+    // 谓词同样是弹窗自己的 context;两侧原文框是只读的 Textarea,不绑 F7,按键照常冒上来
+    bindings.push(KeyBinding::new(
+        "f7",
+        git_conflict::GitConflictNextSegment,
+        Some(git_conflict::SEGMENTS_CONTEXT),
+    ));
+    bindings.push(KeyBinding::new(
+        "shift-f7",
+        git_conflict::GitConflictPrevSegment,
+        Some(git_conflict::SEGMENTS_CONTEXT),
+    ));
+    // 提交 diff / 合并变更页签:↑ / ↓ 换左栏的上一个 / 下一个文件(与单文件历史的 ↑ / ↓ 换
+    // 提交同一手感)。谓词是页签焦点容器自己的 context,正文没有方向键绑定,不抢它的拖选 / 滚动
     bindings.push(KeyBinding::new(
         "down",
         git_diff::GitCommitDiffNextFile,
@@ -647,7 +692,7 @@ pub fn bind_keys(cx: &mut App) {
             Some(reword_input.as_str()),
         ));
     }
-    // 单文件历史弹窗:↑/↓ 换提交
+    // 单文件历史页签:↑/↓ 换提交
     bindings.push(KeyBinding::new(
         "up",
         git_file_history::FileHistoryPrev,
@@ -658,8 +703,8 @@ pub fn bind_keys(cx: &mut App) {
         git_file_history::FileHistoryNext,
         Some(git_file_history::FILE_HISTORY_CONTEXT),
     ));
-    // 三个 diff 弹窗(单文件 / 提交 / 单文件历史)的正文选中复制:Ctrl/Cmd+C 复制选区、
-    // Ctrl/Cmd+A 全选当前栏。谓词是各弹窗焦点容器自己的 context;没有可复制 / 可选的
+    // 三种 diff 页签(单文件 / 提交 / 单文件历史)的正文选中复制:Ctrl/Cmd+C 复制选区、
+    // Ctrl/Cmd+A 全选当前栏。谓词是各页签焦点容器自己的 context;没有可复制 / 可选的
     // 内容时处理器 `propagate`,按键照常往外走。F7 / Alt+←→ / ↑↓ / Esc 不受影响
     for context in [
         git_diff::FILE_DIFF_CONTEXT,
@@ -743,6 +788,7 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "focusDown" => KeyBinding::new(keystroke, FocusDown, Some(WORKSPACE)),
         "switchProject" => KeyBinding::new(keystroke, SwitchProject, Some(WORKSPACE)),
         "globalSearch" => KeyBinding::new(keystroke, GlobalSearch, Some(WORKSPACE)),
+        "quickOpen" => KeyBinding::new(keystroke, QuickOpenFile, Some(WORKSPACE)),
         "terminalSearch" => KeyBinding::new(keystroke, TerminalSearch, Some(WORKSPACE)),
         "openSettings" => KeyBinding::new(keystroke, OpenTerminalSettings, Some(WORKSPACE)),
         "toggleSidebar" => KeyBinding::new(keystroke, ToggleMiddleColumn, Some(WORKSPACE)),
@@ -878,6 +924,18 @@ mod tests {
         let (bindings, _) =
             keymap.bindings_for_input(&[Keystroke::parse("tab").unwrap()], &outside);
         assert_eq!(bindings.len(), 1, "终端之外 Tab 仍该是焦点导航");
+    }
+
+    /// 绑上去的键位串不重复 —— 两条撞同一个键,后注册的那条静默吃掉前一条
+    /// (新加 Ctrl+Shift+O 时核过一遍没被占)。
+    #[test]
+    fn 全局键位串不重复() {
+        let mut keystrokes: Vec<&str> = HOTKEYS.iter().filter_map(|d| d.keystroke).collect();
+        keystrokes.sort_unstable();
+        let count = keystrokes.len();
+        keystrokes.dedup();
+        assert_eq!(keystrokes.len(), count);
+        assert!(binding_for("quickOpen", "ctrl-shift-o").is_some());
     }
 
     /// id 不重复 —— 设置页拿 id 当行 key。

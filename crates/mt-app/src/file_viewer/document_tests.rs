@@ -132,11 +132,7 @@ impl RemoteContent for FakeRemote {
 type Session = DocumentSession<FakeRemote>;
 
 fn text(content: &str) -> FileContentResult {
-    FileContentResult {
-        content: content.to_string(),
-        is_binary: false,
-        too_large: false,
-    }
+    FileContentResult::text(content.to_string(), TextEncoding::Utf8)
 }
 
 fn remote(content: &str, baseline: u32) -> FakeRemote {

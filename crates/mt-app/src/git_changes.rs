@@ -28,6 +28,13 @@
 //! 那部分一起没了。现在与 `git restore` / IDEA 的回滚一致:从**暂存区**检出
 //! (`mt_project::git::discard_unstaged`),已暂存的部分保留;未跟踪文件照旧删除。
 //!
+//! # 冲突:整文件与逐段
+//!
+//! 冲突行的右键菜单有整文件的「采用一侧 / 标记为已解决」,也有「逐段解决…」(行内按钮
+//! 同一个入口):后者开 [`crate::git_conflict`] 的弹窗,一段一段选采用哪边再一次写回。
+//! 能不能逐段解决随列表一起取([`SegmentStatus`],有冲突时才读那几个文件),删除 / 修改
+//! 冲突、没有成对标记、二进制、编码认不出、过大时菜单项禁用并写明原因。
+//!
 //! # 失败要让用户看得见
 //!
 //! 原版每个 `invoke` 的 catch 都只 `console.error`(不弹 toast、不显红)。这里
@@ -60,10 +67,12 @@
 //!
 //! # 取数调度
 //!
-//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 弹窗
+//! 列表取数要的人多(工作区监听每 2s 一批、`.git` 监听、pty 嗅探、自己的写操作、diff 页签
 //! 按块操作),大仓库一次 status 又要两三秒。[`GitChanges::load`] 因此是**单飞**的
 //! ([`git_ui::flight`]):同一时刻只跑一份,期间再要只记脏位,跑完当场补一趟;在途那份照样
-//! 落地,但「操作后落回的位置」与在等的 diff 弹窗留给补跑那份(在途那份可能还不含那次操作)。
+//! 落地,但「操作后落回的位置」与在等的 diff 页签留给补跑那份(在途那份可能还不含那次操作)。
+//! 每次落地还顺手告诉 diff 页签「这个仓库变了」(`git_diff::notify_repo_changed`):挤在
+//! Git 抽屉旁边、眼前那一页 diff 当场静默重取,不必切走再切回来。
 //!
 //! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
 //! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
@@ -83,7 +92,7 @@
 //!   那几行建元素;加载中 / 失败 / 空态这类整块占位仍是普通滚动容器;
 //! - 分组 + 树形拍平后的行([`ListRow`])、每行高度、摊开总高、四组的显示顺序收在派生
 //!   模型 [`ListModel`] 里,**只在数据落地、折叠切换、切视图模式之后**算一次;render、
-//!   面板分高度、键盘导航、Shift 连选、diff 弹窗的文件序列都读这一份;
+//!   面板分高度、键盘导航、Shift 连选、diff 页签的文件序列都读这一份;
 //! - 取数落地([`GitChanges::apply_snapshot`])先比一次,与眼下的数据一模一样就既不
 //!   重算也不重画 —— 监听与 pty 嗅探触发的重取,绝大多数回包都没变。
 
@@ -103,7 +112,7 @@ use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
-    GitStatus, RepoOpKind,
+    GitStatus, RepoOpKind, SegmentStatus,
 };
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -111,15 +120,15 @@ use crate::git_dir_watch::RepoObservation;
 use crate::git_ui::flight::{Flight, Landing};
 use crate::git_ui::{
     self, ButtonKind, ChangeTreeRow, ICON_ALERT, ICON_CHEVRON_DOWN, ICON_CLEAN, ICON_COPY,
-    ICON_HISTORY, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone, danger_icon_button,
-    icon_button, mono, status_color, status_label_for,
+    ICON_HISTORY, ICON_MERGE, ICON_MINUS, ICON_PLUS, ICON_UNDO, SectionHeader, Tone,
+    danger_icon_button, icon_button, mono, status_color, status_label_for,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
 use crate::prompt::Confirm;
 use crate::store::AppStore;
 use crate::ui;
-use crate::{git_diff, git_watch};
+use crate::{git_conflict, git_diff, git_watch};
 
 gpui::actions!(
     mini_term,
@@ -371,7 +380,7 @@ struct ListModel {
     /// 四个分组各自的文件下标(`changes` 里的原顺序),按 [`Area::slot`] 摆
     members: [Vec<usize>; 4],
     /// 四个分组的文件**显示顺序**:列表视图同 `members`;树形视图按树走,收起的目录里
-    /// 的文件不算。**不看分组折叠** —— 折起来的分组照样能 Shift 连选、diff 弹窗照样能
+    /// 的文件不算。**不看分组折叠** —— 折起来的分组照样能 Shift 连选、diff 页签照样能
     /// 前后换文件(与此前现算的 `area_order` 同一口径)
     order: [Vec<usize>; 4],
     /// 界面上的行序:每个非空分组一个标题,展开的分组接着它的文件 / 目录行
@@ -517,6 +526,9 @@ fn reveal_offset(offset_y: f32, top: f32, bottom: f32, viewport: f32) -> f32 {
 struct Snapshot {
     changes: Vec<ChangeFileStatus>,
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应(读一遍文件判成对标记 / 编码,
+    /// 冲突行的「逐段解决…」按它启用或写明原因)
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基…(冲突菜单「采用 ours / theirs」的文案随它翻转)
     op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
@@ -528,6 +540,7 @@ struct Snapshot {
 struct Landed<'a> {
     changes: &'a [ChangeFileStatus],
     conflicts: &'a [ConflictInfo],
+    segments: &'a [SegmentStatus],
     op_kind: Option<RepoOpKind>,
     target: Option<&'a CommitTarget>,
     has_head: bool,
@@ -544,6 +557,7 @@ impl Landed<'_> {
         let amend = self.amend && snap.has_head;
         !same_changes(self.changes, &snap.changes)
             || self.conflicts != snap.conflicts.as_slice()
+            || self.segments != snap.segments.as_slice()
             || self.op_kind != snap.op_kind
             || self.target != snap.target.as_ref()
             || self.has_head != snap.has_head
@@ -555,6 +569,7 @@ impl Landed<'_> {
     fn differs_on_error(&self, error: &str) -> bool {
         !self.changes.is_empty()
             || !self.conflicts.is_empty()
+            || !self.segments.is_empty()
             || self.op_kind.is_some()
             || self.load_error != Some(error)
     }
@@ -580,6 +595,8 @@ pub struct GitChanges {
     changes: Vec<ChangeFileStatus>,
     /// 冲突文件的三方条目在不在(删除 / 修改冲突时有一侧缺席),随列表一起取
     conflicts: Vec<ConflictInfo>,
+    /// 每个冲突文件能不能逐段解决,与 `conflicts` 一一对应,随列表一起取
+    segments: Vec<SegmentStatus>,
     /// 进行中的合并 / 变基 / 拣选 / 还原,随列表一起取。变基时 git 的 ours / theirs
     /// 与直觉相反,冲突菜单据此换成写清方向的文案
     op_kind: Option<RepoOpKind>,
@@ -594,7 +611,7 @@ pub struct GitChanges {
     /// 派生模型的缓存(见 [`Self::model`])。改了 `changes` / 两种折叠态的地方都要
     /// [`Self::invalidate_model`];视图模式不归这里管,`model` 自己比
     list_model: RefCell<Option<Rc<ListModel>>>,
-    /// diff 弹窗按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
+    /// diff 页签按块操作后在等的回执:最新一次重取落地后,按那时的列表把该分组的新文件
     /// 序列交回去(见 `git_diff::ReloadFiles`)。换仓库时以 `None` 交回。
     diff_waiters: Vec<(Area, git_diff::FilesDone)>,
     /// pty-output 嗅探的 500ms 去抖终点。
@@ -616,7 +633,7 @@ pub struct GitChanges {
     /// 列表的滚动位置。虚拟列表与加载中 / 空态那几种普通滚动容器共用(后者走它底下那个
     /// `ScrollHandle`);必须存在视图上,每帧新建等于每帧把滚动清零
     list_scroll: VirtualListScrollHandle,
-    /// 下一帧把键盘游标所在的行滚进视野(键盘走动、操作后落回、diff 弹窗里换了文件)。
+    /// 下一帧把键盘游标所在的行滚进视野(键盘走动、操作后落回、diff 页签里换了文件)。
     /// 到 render 时才按当帧的行序找行,prepaint 时按当帧的视口算偏移
     reveal_cursor: bool,
 
@@ -667,6 +684,7 @@ impl GitChanges {
             repo_path: String::new(),
             changes: Vec::new(),
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             loading: false,
             load_error: None,
@@ -751,6 +769,7 @@ impl GitChanges {
         self.repo_path = repo_path.to_string();
         self.changes.clear();
         self.conflicts.clear();
+        self.segments.clear();
         self.op_kind = None;
         self.collapsed_dirs.clear();
         self.invalidate_model();
@@ -766,7 +785,7 @@ impl GitChanges {
         // 错误都属于上一个仓库
         self.load_error = None;
         self.commit_error = None;
-        // 在等序列的 diff 弹窗属于上一个仓库:沿用它们的旧序列
+        // 在等序列的 diff 页签属于上一个仓库:沿用它们的旧序列
         self.flush_diff_waiters(false, cx);
         // 上一个仓库在途的那趟作废:回来一律丢,新仓库这趟不必等它
         self.flight.reset();
@@ -882,8 +901,10 @@ impl GitChanges {
     /// 都无条件 notify,监听 / pty 嗅探触发的每一趟都是一次整窗帧。
     ///
     /// `rerun` = 在途期间又有人要过、落地后当场补跑:这份照样落(比画着的新),但它可能
-    /// 还不含触发补跑的那次操作 ——「操作后落回的位置」与在等的 diff 弹窗留给补跑那份。
-    /// 不补跑时 diff 弹窗的回执照交(它要的是「这一次重取落地了」,不管变没变)。
+    /// 还不含触发补跑的那次操作 ——「操作后落回的位置」与在等的 diff 页签留给补跑那份。
+    /// 不补跑时 diff 页签的回执照交(它要的是「这一次重取落地了」,不管变没变)。取到了
+    /// 还告诉 diff 页签这个仓库变了(见模块注释「取数调度」),不管列表这边变没变 ——
+    /// 已经改过的文件接着改,状态字母不变,内容却变了。
     fn apply_snapshot(
         &mut self,
         result: anyhow::Result<Snapshot>,
@@ -899,6 +920,7 @@ impl GitChanges {
                 let changed = self.landed().differs(&snap);
                 self.changes = snap.changes;
                 self.conflicts = snap.conflicts;
+                self.segments = snap.segments;
                 self.op_kind = snap.op_kind;
                 self.target = snap.target;
                 self.has_head = snap.has_head;
@@ -916,6 +938,7 @@ impl GitChanges {
                 let changed = self.landed().differs_on_error(&error);
                 self.changes.clear();
                 self.conflicts.clear();
+                self.segments.clear();
                 self.op_kind = None;
                 self.load_error = Some(error);
                 changed
@@ -930,6 +953,11 @@ impl GitChanges {
         } else {
             self.flush_diff_waiters(loaded, cx);
         }
+        if loaded {
+            // diff 页签回读页签区、可能回调本列表:延到这一轮更新之后
+            let repo = self.repo_path.clone();
+            cx.defer(move |cx| git_diff::notify_repo_changed(&repo, cx));
+        }
         if changed || reselected || loading_shown != self.shows_loading() {
             cx.notify();
         }
@@ -940,6 +968,7 @@ impl GitChanges {
         Landed {
             changes: &self.changes,
             conflicts: &self.conflicts,
+            segments: &self.segments,
             op_kind: self.op_kind,
             target: self.target.as_ref(),
             has_head: self.has_head,
@@ -953,8 +982,8 @@ impl GitChanges {
         self.loading && self.changes.is_empty() && self.load_error.is_none()
     }
 
-    /// 把在等序列的 diff 弹窗回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
-    /// `None`(弹窗沿用旧序列)。回执改的是弹窗的实体、还可能回调本列表(换了文件时让
+    /// 把在等序列的 diff 页签回执交出去:`loaded` 时按眼下的列表给该分组的新序列,否则
+    /// `None`(页签沿用旧序列)。回执改的是页签的实体、还可能回调本列表(换了文件时让
     /// 选中项跟过去),延到这一轮更新之后再调,免得本实体正被借着时重入。
     fn flush_diff_waiters(&mut self, loaded: bool, cx: &mut Context<Self>) {
         if self.diff_waiters.is_empty() {
@@ -1508,7 +1537,53 @@ impl GitChanges {
         .detach();
     }
 
-    /// diff 弹窗里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
+    /// 冲突文件能不能逐段解决:能就是 `Ok(段数)`,不能就是禁用说明(菜单项的副标题、
+    /// 行内按钮的 tooltip)。随列表一起取的状态里找不到它(刚换仓库、读冲突细节失败)
+    /// 按「已不在冲突中,请刷新」算。
+    fn segment_availability(&self, path: &str) -> Result<usize, &'static str> {
+        let status = self
+            .conflicts
+            .iter()
+            .position(|c| c.path == path)
+            .and_then(|i| self.segments.get(i).copied());
+        match status {
+            Some(SegmentStatus::Ready { blocks }) => Ok(blocks),
+            Some(SegmentStatus::Blocked(blocker)) => {
+                Err(t("gitCommit", git_conflict::blocker_key(blocker)))
+            }
+            None => Err(t("gitCommit", "segments.blockedNotConflicted")),
+        }
+    }
+
+    /// 打开某个冲突文件的逐段解决弹窗(见 `git_conflict`)。写完(成败都算)重取列表、
+    /// 重算文件树的 git 标记,并把写完当场读的签名交给面板 —— 与 [`Self::run_op`] 同一口径。
+    fn open_segments(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.repo_path.is_empty() || self.segment_availability(&path).is_err() {
+            return;
+        }
+        let weak = cx.entity().downgrade();
+        let on_written: git_conflict::OnWritten =
+            Rc::new(move |observed: Option<RepoObservation>, cx: &mut App| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.load(cx);
+                    git_watch::request_refresh(git_watch::Subscriber::FileTree);
+                    if let Some(observed) = observed {
+                        cx.emit(GitChangesEvent::IndexWritten(observed));
+                    }
+                });
+            });
+        git_conflict::open(
+            self.store.clone(),
+            self.repo_path.clone(),
+            path,
+            self.op_kind,
+            on_written,
+            window,
+            cx,
+        );
+    }
+
+    /// diff 页签里能前后换的文件序列:某个分组的显示顺序(`order`,取自派生模型)。
     fn diff_files(&self, order: &[usize], area: Area) -> Vec<git_diff::DiffFile> {
         order.iter().map(|&i| self.diff_file(i, area)).collect()
     }
@@ -1540,32 +1615,47 @@ impl GitChanges {
         }
     }
 
-    /// 打开某一行的 diff,文件序列 = 它所在分组的显示顺序(弹窗里 Alt+←/→ 前后换)。
+    /// 打开某一行的 diff 页签(已开着就切过去),文件序列 = 它所在分组的显示顺序(页签里
+    /// Alt+←/→ 前后换)。焦点随之交给 diff 页签(口径见 `git_diff::tab` 模块注释「焦点」)。
     /// 按块操作之后序列跟着重载过的列表走(取消暂存最后一块,文件就离开了「已暂存」)。
     fn view_diff(&self, index: usize, area: Area, window: &mut Window, cx: &mut Context<Self>) {
         let model = self.model(cx);
         let order = model.order(area);
         let files = self.diff_files(order, area);
         let current = order.iter().position(|&i| i == index).unwrap_or(0);
+        // 两个回调都只认打开那一刻的仓库:页签活得比面板上的仓库久,面板之后换了仓库(切项目 /
+        // 切子仓库)再拿新仓库的分组序列去换页签的文件、或让新仓库的选中项跟着页签跳,都是错的
+        let repo = self.repo_path.clone();
         let weak = cx.entity().downgrade();
-        let reload_files: git_diff::ReloadFiles = Rc::new(
-            move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
-                Some(this) => this.update(cx, |this, cx| {
-                    this.diff_waiters.push((area, done));
-                    this.load(cx);
-                }),
-                None => done(None, cx),
-            },
-        );
+        let reload_files: git_diff::ReloadFiles = {
+            let repo = repo.clone();
+            Rc::new(
+                move |done: git_diff::FilesDone, cx: &mut App| match weak.upgrade() {
+                    Some(this) if this.read(cx).repo_path == repo => this.update(cx, |this, cx| {
+                        this.diff_waiters.push((area, done));
+                        this.load(cx);
+                    }),
+                    // 列表没了 / 换了仓库:以 `None` 交回,页签沿用旧序列原地重取,块操作按钮
+                    // 随那一趟重取落地放开
+                    _ => done(None, cx),
+                },
+            )
+        };
         let weak = cx.entity().downgrade();
-        let on_switch: git_diff::OnSwitch =
+        let on_switch: git_diff::OnSwitch = {
+            let repo = repo.clone();
             Rc::new(move |file: &git_diff::DiffFile, cx: &mut App| {
                 let path = file.path.clone();
-                let _ = weak.update(cx, |this, cx| this.follow_diff(area, &path, cx));
-            });
+                let _ = weak.update(cx, |this, cx| {
+                    if this.repo_path == repo {
+                        this.follow_diff(area, &path, cx);
+                    }
+                });
+            })
+        };
         git_diff::open_file_diff_with(
             self.store.clone(),
-            self.repo_path.clone(),
+            repo,
             files,
             current,
             git_diff::FileDiffHooks {
@@ -1578,7 +1668,7 @@ impl GitChanges {
         );
     }
 
-    /// diff 弹窗里换了文件:列表的选中项跟过去(并滚进视野),关掉弹窗时停在看到的那个。
+    /// diff 页签里换了文件:列表的选中项跟过去(并滚进视野),回到列表时停在看到的那个。
     fn follow_diff(&mut self, area: Area, path: &str, cx: &mut Context<Self>) {
         let Some(index) = self
             .changes
@@ -1649,7 +1739,52 @@ impl GitChanges {
 
     /// 提交。`open_push` = 「提交并推送」:提交成功后让容器打开推送对话框(见模块注释);
     /// `stage_first` = 先暂存全部已跟踪改动(未暂存组,不含未跟踪文件)。
+    ///
+    /// 「全部暂存并提交」遇到**部分暂存**的文件先确认:按整文件 `git add` 会把用户按块 /
+    /// 按行挑好的暂存内容连同剩下的改动一起暂存,挑的那一步就白做了,而且提交以后才看得出来。
+    /// 没有部分暂存的文件时不打扰,直接提交。
     fn commit(
+        &mut self,
+        open_push: bool,
+        stage_first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.commit_blocker(stage_first, cx).is_some() {
+            return;
+        }
+        if stage_first {
+            let partial = partially_staged_paths(&self.changes);
+            if !partial.is_empty() {
+                let this = cx.entity();
+                Confirm::new(
+                    t("gitCommit", "stageAllAndCommit"),
+                    tr!(
+                        "gitCommit",
+                        "stageAllPartialConfirm",
+                        count = partial.len().to_string()
+                    ),
+                )
+                .detail(preview_paths(&partial))
+                .ok_text(t("gitCommit", "stageAllPartialOk"))
+                .open(
+                    move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.commit_confirmed(open_push, true, window, cx)
+                        });
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
+        self.commit_confirmed(open_push, stage_first, window, cx);
+    }
+
+    /// [`Self::commit`] 过了确认之后的那一段。确认框开着的时候状态可能变了(提交框清空、
+    /// 别处起了 git 操作),所以这里再判一次能不能提交。
+    fn commit_confirmed(
         &mut self,
         open_push: bool,
         stage_first: bool,
@@ -1920,6 +2055,9 @@ fn fetch_amend(repo: &Path, known: Option<u64>) -> Option<(Option<u64>, Option<A
 
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
 /// amend 的「已推送」判定不在这里(见 [`GitChanges::refresh_amend`])。
+///
+/// 有冲突时每个冲突文件再读一遍、判能不能逐段解决([`SegmentStatus`]):只在冲突期间
+/// 才有这份开销,文件过大(`MAX_SEGMENT_FILE_BYTES`)的只看大小不读内容。
 fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     let changes = mt_project::git::get_changes_status(repo)?;
     let conflicts = if changes.iter().any(is_conflicted) {
@@ -1927,12 +2065,17 @@ fn load_snapshot(repo: &Path) -> anyhow::Result<Snapshot> {
     } else {
         Vec::new()
     };
+    let segments = conflicts
+        .iter()
+        .map(|info| mt_project::git::conflict_segment_status(repo, info))
+        .collect();
     let op_kind = mt_project::git::repo_operation_state(repo)
         .ok()
         .and_then(|state| state.kind);
     Ok(Snapshot {
         changes,
         conflicts,
+        segments,
         op_kind,
         target: mt_project::git::commit_target(repo).ok(),
         has_head: mt_project::git::head_exists(repo),
@@ -1959,6 +2102,15 @@ fn take_side_key(side: ConflictSide, deleted: bool, op: Option<RepoOpKind>) -> &
 }
 
 /// 确认框里列出的文件(最多 5 个,多出的写「…等 N 个」)。
+/// 部分暂存的文件(同时在已暂存与未暂存两组里,口径见 [`in_area`]),按列表原顺序。
+fn partially_staged_paths(changes: &[ChangeFileStatus]) -> Vec<String> {
+    changes
+        .iter()
+        .filter(|c| in_area(c, Area::Staged) && in_area(c, Area::Unstaged))
+        .map(|c| c.path.clone())
+        .collect()
+}
+
 fn preview_paths(paths: &[String]) -> Vec<String> {
     const LIMIT: usize = 5;
     let mut lines: Vec<String> = paths.iter().take(LIMIT).map(|p| format!("• {p}")).collect();
@@ -2457,7 +2609,21 @@ impl GitChanges {
                     }))
                 }));
             }
-            Area::Conflicts => {}
+            // 逐段解决(只管这一行,不跟选中集走):用不了时按钮压淡,tooltip 写明原因
+            Area::Conflicts => {
+                let available = self.segment_availability(&path);
+                let usable = enabled && available.is_ok();
+                let tip =
+                    available.map_or_else(|reason| reason, |_| t("gitCommit", "segments.menu"));
+                let seg_path = path.clone();
+                actions = actions.child(
+                    icon_button(id_of("segments"), ICON_MERGE, tip, usable).when(usable, |el| {
+                        el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_segments(seg_path.clone(), window, cx);
+                        }))
+                    }),
+                );
+            }
         }
 
         git_ui::list_row(row_id, selected)
@@ -2540,6 +2706,30 @@ impl GitChanges {
         let mut entries = Vec::new();
         match area {
             Area::Conflicts => {
+                // 逐段解决:一次一个文件;删除 / 修改冲突、没有成对标记、二进制、编码认不出、
+                // 过大时禁用并在副标题写明原因(状态随列表一起取,见 `load_snapshot`)
+                let path = self
+                    .changes
+                    .get(index)
+                    .map(|file| file.path.clone())
+                    .unwrap_or_default();
+                let available = if many {
+                    Err(t("gitCommit", "segments.blockedMany"))
+                } else {
+                    self.segment_availability(&path)
+                };
+                let segments_this = this.clone();
+                let mut segments = MenuItem::new(t("gitCommit", "segments.menu"))
+                    .disabled(!enabled || available.is_err())
+                    .on_click(move |window, cx| {
+                        let path = path.clone();
+                        segments_this.update(cx, |this, cx| this.open_segments(path, window, cx));
+                    });
+                if let Err(reason) = available {
+                    segments = segments.detail(reason);
+                }
+                entries.push(segments.into());
+                entries.push(menu::separator());
                 let info = (!many)
                     .then(|| self.changes.get(index))
                     .flatten()
@@ -3106,6 +3296,29 @@ mod tests {
         assert_eq!(group(&changes, Area::Untracked), vec!["d.rs"]);
     }
 
+    /// 「全部暂存并提交」要先确认的只有部分暂存的文件:只在一组里的、未跟踪的、
+    /// 冲突中的都不算(冲突时提交按钮本来就被拦下)。
+    #[test]
+    fn 全部暂存并提交只为部分暂存的文件确认() {
+        let changes = [
+            change("a.rs", Some(GitStatus::Added), None),
+            change("b.rs", Some(GitStatus::Modified), Some(GitStatus::Modified)),
+            change("c.rs", None, Some(GitStatus::Modified)),
+            change("d.rs", None, Some(GitStatus::Untracked)),
+            change("e.rs", Some(GitStatus::Added), Some(GitStatus::Deleted)),
+            change(
+                "f.rs",
+                Some(GitStatus::Conflicted),
+                Some(GitStatus::Conflicted),
+            ),
+        ];
+        assert_eq!(partially_staged_paths(&changes), vec!["b.rs", "e.rs"]);
+        assert!(partially_staged_paths(&changes[..1]).is_empty());
+        // 确认框正文里真带着文件数
+        let text = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitCommit", "stageAllPartialConfirm");
+        assert!(text.contains("{count}"), "{text}");
+    }
+
     /// 列表高度按眼下的数据算(E2E r4 A12:外部改动多出「未暂存」组的那一帧,按上一帧量的
     /// 高度分区,「未跟踪」组被挤出可见区)。分组标题 28 + 上边距 4、行 28、内边距 12;
     /// 折起来的分组只算标题;树形视图把目录行也算上;没有变更时说不准。
@@ -3210,7 +3423,7 @@ mod tests {
         assert!(matches!(rows[1], ChangeTreeRow::File { depth: 1, .. }));
     }
 
-    /// 树形视图的行序(渲染、键盘、Shift 连选、diff 弹窗前后换文件都按它):目录在前、
+    /// 树形视图的行序(渲染、键盘、Shift 连选、diff 页签前后换文件都按它):目录在前、
     /// 单链目录压缩成一行;键盘走的文件顺序与画出来的行序一致。
     #[test]
     fn 树形行序与键盘顺序一致() {
@@ -3559,6 +3772,7 @@ mod tests {
         Snapshot {
             changes,
             conflicts: Vec::new(),
+            segments: Vec::new(),
             op_kind: None,
             target: Some(CommitTarget::Branch("main".into())),
             has_head: true,
@@ -3569,6 +3783,7 @@ mod tests {
         Landed {
             changes: &snap.changes,
             conflicts: &snap.conflicts,
+            segments: &snap.segments,
             op_kind: snap.op_kind,
             target: snap.target.as_ref(),
             has_head: snap.has_head,
@@ -3603,6 +3818,12 @@ mod tests {
             theirs: false,
         }];
         assert!(landed.differs(&next), "冲突细节变了(菜单文案跟着它)");
+        let mut next = snapshot(files.clone());
+        next.segments = vec![SegmentStatus::Ready { blocks: 2 }];
+        assert!(
+            landed.differs(&next),
+            "能不能逐段解决变了(菜单项与行内按钮跟着它)"
+        );
         let mut next = snapshot(files.clone());
         next.op_kind = Some(RepoOpKind::Rebase);
         assert!(landed.differs(&next), "进行中的操作变了");

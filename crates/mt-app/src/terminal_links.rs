@@ -93,8 +93,8 @@ pub fn open(link: &FileLink, window: &mut Window, cx: &mut App) {
         AppStore::global(cx),
         link.path.clone(),
         link.line.map(|line| LineTarget {
-            line,
             end: link.end_line,
+            ..LineTarget::line(line)
         }),
         window,
         cx,

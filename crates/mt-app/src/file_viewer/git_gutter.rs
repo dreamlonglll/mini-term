@@ -888,7 +888,8 @@ impl FileViewer {
         self.gutter.popup = None;
         cx.notify();
         let store = crate::store::AppStore::global(cx);
-        // 打开的是弹窗:等本实体的这次 update 收口再开,免得弹窗回读页签状态时撞租约
+        // 开的是另一个(diff)页签:等本实体的这次 update 收口再开,免得页签区回读页签状态时
+        // 撞租约(`open_file_diff` 自己也会再延一轮,这里先延是为了让小窗先收起来)
         window.defer(cx, move |window, cx| {
             let file = crate::git_diff::DiffFile {
                 path: rel,
@@ -935,7 +936,9 @@ impl FileViewer {
                     Editor::new(editor)
                         .h_full()
                         .appearance(false)
-                        .bordered(false),
+                        .bordered(false)
+                        // 解码有损的文件只读打开(能选中复制,不能改)
+                        .readonly(self.doc.read_only()),
                 ),
             )
             .child(gutter_overlay(overlay))

@@ -1,0 +1,10 @@
+# clippy 配置。clippy 从 crate 目录一路向上找配置文件,所以 `sidecars/`、`relay-server/`
+# 这两个独立工作区里的 crate 也吃这一份。
+
+disallowed-methods = [
+    # Windows 上 std 的 canonicalize 给 verbatim 形态(`\\?\C:\…`),与用户填的、libgit2 /
+    # notify 回报的路径一比就对不上。全仓统一走剥过前缀的封装;真要 verbatim 形态的地方
+    # (如交给 notify 的 Windows 后端、它不替长路径补前缀)就地 allow 并写明理由。
+    { path = "std::fs::canonicalize", reason = '用 mt_core::path::canonicalize(调完 std 顺带剥掉 Windows 的 \\?\ 前缀);确实要 verbatim 形态时就地 #[allow(clippy::disallowed_methods)] 并写明理由' },
+    { path = "std::path::Path::canonicalize", reason = '用 mt_core::path::canonicalize(调完 std 顺带剥掉 Windows 的 \\?\ 前缀);确实要 verbatim 形态时就地 #[allow(clippy::disallowed_methods)] 并写明理由' },
+]

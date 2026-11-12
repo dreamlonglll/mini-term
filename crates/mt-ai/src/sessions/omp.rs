@@ -155,7 +155,7 @@ pub(super) fn project_session_dirs_in(
     }
 
     let mut project_paths = vec![project_path.to_string()];
-    if let Ok(canonical) = PathBuf::from(project_path).canonicalize()
+    if let Ok(canonical) = mt_core::path::canonicalize(project_path)
         && canonical.to_string_lossy() != project_path
     {
         project_paths.push(canonical.to_string_lossy().into_owned());

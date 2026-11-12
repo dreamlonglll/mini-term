@@ -238,8 +238,8 @@ fn head_取到已跟踪文件的原文() {
     assert_eq!(repo.rel_path, "src/lib.rs");
     assert!(repo.signature.head.is_some() && repo.signature.blob.is_some());
     assert_eq!(
-        std::fs::canonicalize(&repo.root).unwrap(),
-        std::fs::canonicalize(&root).unwrap()
+        mt_core::path::canonicalize(&repo.root).unwrap(),
+        mt_core::path::canonicalize(&root).unwrap()
     );
     std::fs::remove_dir_all(&root).ok();
 }
@@ -285,7 +285,7 @@ fn head_二进制与空仓库() {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("mini-term-git-head-unborn-{ts}"));
     std::fs::create_dir_all(&dir).unwrap();
-    let dir = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&dir).unwrap());
+    let dir = mt_core::path::canonicalize(&dir).unwrap();
     Repository::init(&dir).unwrap();
     std::fs::write(dir.join("x.txt"), "x\n").unwrap();
     let head = head_file(&dir, &dir.join("x.txt")).unwrap();

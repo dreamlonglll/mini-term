@@ -544,6 +544,9 @@ impl FileTree {
         dir: &Path,
         cx: &mut Context<Self>,
     ) {
+        // 有文件 / 目录出现或消失:快速打开的文件索引标脏,下次打开面板时重建。排在下面那道
+        // 「自己的操作」抑制之前 —— 抑制的只是树的重列,文件集合确实变了
+        crate::quick_open::note_fs_change(&path, structural, cx);
         if self.path_is_suppressed(&path) {
             return;
         }

@@ -20,10 +20,16 @@
 //! 反向 `pub use` 过去(config.json 仍是它的持久化归属方,回归测试也留在那边)。
 //!
 //! 路径的比较键与形态变换(大小写/分隔符/尾随分隔符/`\\?\` 前缀)统一住在
-//! [`path_key`],按语义分函数;各 crate 不再各写一份归一化。
+//! [`path_key`],按语义分函数;各 crate 不再各写一份归一化。要碰磁盘取物理身份
+//! (canonicalize)一律走 [`path::canonicalize`],它顺带剥掉 Windows 的 verbatim 前缀
+//! (根目录 `clippy.toml` 禁了直接调 std 的两个入口)。
+//!
+//! bracketed paste 的编码(桌面端粘贴与移动端指令共用)在 [`paste`]。
 
 mod atomic_file;
 mod config_reader;
+pub mod paste;
+pub mod path;
 pub mod path_key;
 mod ssh_connection;
 mod ssh_key;

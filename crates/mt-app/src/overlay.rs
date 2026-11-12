@@ -64,6 +64,8 @@ pub mod kind {
     pub const GLOBAL_SEARCH: &str = "global-search";
     /// 项目快速切换器(Ctrl+Shift+P)。
     pub const PROJECT_SWITCHER: &str = "project-switcher";
+    /// 快速打开文件(Ctrl+Shift+O)。
+    pub const QUICK_OPEN: &str = "quick-open";
     /// 终端内查找条(Ctrl+F)。**逐 pane 一条**,slot 存 `pty_id`。
     pub const TERMINAL_SEARCH: &str = "terminal-search";
     /// AI 任务标记浮层(tab 栏上那个 ⚑ 按钮弹出来的列表)。
@@ -74,10 +76,8 @@ pub mod kind {
     /// 登记之后 Esc 关闭是 GPUI 结构性免费的(按键沿焦点链派发)—— 比原版多一条
     /// 关闭路,记为改善。
     pub const MARKER_LIST: &str = "marker-list";
-    /// 工作区 / 暂存区的单文件 diff(`DiffModal`)。
-    pub const GIT_DIFF: &str = "git-diff";
-    /// 某次 commit 的多文件 diff(`CommitDiffModal`)。
-    pub const GIT_COMMIT_DIFF: &str = "git-commit-diff";
+    // 单文件 diff / 提交 diff / 单文件历史不再是弹窗(改成工作区的 diff 页签,见
+    // `git_diff::tab`),原先的 `git-diff` / `git-commit-diff` / `git-file-history` 三种随之下线。
     /// worktree 管理弹窗。
     pub const GIT_WORKTREE: &str = "git-worktree";
     /// worktree 删除确认。**与 [`GIT_WORKTREE`] 不同种类**,所以能叠在它之上
@@ -133,8 +133,6 @@ pub mod kind {
     /// 提交历史的危险操作二次确认(Hard 重置 / 删标签 / 撤销已推送的提交)。
     /// 与 [`GIT_LOG_RESET`] **不同种类**:Hard 的二次确认叠在重置框之上。
     pub const GIT_LOG_DANGER: &str = "git-log-danger";
-    /// 单文件 Git 历史(文件树右键「Git 历史」)。完整提交 diff 能叠在它之上。
-    pub const GIT_FILE_HISTORY: &str = "git-file-history";
     /// 贮藏列表(左列表 + 右侧改动与 diff)。下面四种都能叠在它之上。
     pub const GIT_STASH: &str = "git-stash";
     /// 新建贮藏(消息 / 保留暂存区 / 含未跟踪文件)。
@@ -145,6 +143,9 @@ pub mod kind {
     pub const GIT_STASH_DANGER: &str = "git-stash-danger";
     /// 检出被本地改动挡住时的「贮藏后检出」确认框。
     pub const GIT_STASH_CHECKOUT: &str = "git-stash-checkout";
+    /// 冲突文件「逐段解决」弹窗(更改列表冲突行的右键菜单 / 行内按钮)。种类唯一:
+    /// 同一时刻只解决一个文件,连点两次不叠开。
+    pub const GIT_CONFLICT_SEGMENTS: &str = "git-conflict-segments";
 }
 
 /// 栈里的一条。

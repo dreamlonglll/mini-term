@@ -196,8 +196,33 @@ use mt_i18n::{
 /// 1545 → 1547（issue #94）：「移动端」面板复制配对链接（`mobileRelay.modal.{copyLink,linkCopied}`）。
 /// 1547 → 1548：工作区「终端」页签右键「关闭所有」（`fileViewer.closeAll`）。
 /// 1548 → 1549：分支弹窗行右键「复制分支名」（`gitBranch.menuCopyName`）。
+/// 1549 → 1564：非 UTF-8 文件的编码识别 —— 文件页编码徽标 / 只读 / 不可映射字符拒绝保存
+/// （`fileViewer.{encodingTip,lossyBadge,lossyReadOnly,unencodable}`）、diff 弹窗里非 UTF-8
+/// 文件禁用按块操作的说明（`gitCommit.{hunkNonUtf8,hunkUnknownEncoding}`）；外部改动提示条的
+/// 「对比 / 保留我的」与对比弹窗（`fileViewer.{compareDisk,keepMine,keepMineTip,compareTitle,
+/// compareSideDisk,compareSideUnsaved,compareIdentical,compareUnavailable,compareFailed}`）。
+/// 1564 → 1566：「全部暂存并提交」遇到部分暂存的文件先确认
+/// （`gitCommit.{stageAllPartialConfirm,stageAllPartialOk}`）。
+/// 1566 → 1582：快速打开文件（Ctrl+Shift+O）—— 面板的占位 / 索引中 / 刷新中 / 无匹配 / 空项目 /
+/// 无项目 / 远程不支持 / 文件数与匹配数 / 两种「结果不完整」/ 最近打开标签 / 三条跳行提示
+/// （`search.quickOpen.*` 15 条），设置页快捷键表的描述（`settings.shortcuts.quickOpen`）。
+/// 1582 → 1633：冲突文件逐段解决 —— 右键菜单项、弹窗的标题 / 进度 / 两侧与 base 的方向文案
+/// （变基时另一套）/ 四种选择 / 底部按钮 / 结果与失败提示，以及不能逐段解决的七种原因
+/// （`gitCommit.segments.*` 51 条）。
+/// 1633 → 1644：单文件 diff 按行暂存 —— 块头 / 工具栏「暂存 / 取消暂存 / 丢弃所选 N 行」、
+/// 按行丢弃的确认框、清除勾选按钮与提示（`gitCommit.{stageLines,unstageLines,discardLines,
+/// discardLinesTitle,discardLinesConfirm,clearPicks,clearPicksTip}`）；diff 正文折叠上下文的
+/// 分隔行与三颗展开按钮（`gitCommit.{foldedLines,expandDown,expandUp,expandAll}`）。
+/// 1644 → 1652：diff 从弹窗改成工作区页签 —— 五种 diff 页签的标题：单文件 diff 的
+/// 「文件名（侧别）」与三种侧别（`diffModal.{tabTitle,tabStaged,tabUnstaged,tabWorking}`）、
+/// 提交 / 合并变更（`commitDiff.{tabTitle,combinedTabTitle}`）、单文件历史
+/// （`gitLog.fileHistory.tabTitle`）、磁盘对比（`fileViewer.compareTabTitle`）。
+/// 1652 → 1659：并排 diff 改成两栏连续排行 + 中间连接带 —— 中间栏每处改动上「»」「«」与
+/// 勾选框的悬停说明、整处丢弃的确认框（`gitCommit.{stageChangeTip,unstageChangeTip,
+/// discardChangeTip,discardChangeTitle,discardChangeConfirm,toggleChangeTip}`），一侧为空时
+/// 那一栏的「空文件」（`gitCommit.emptySide`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1549;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1659;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

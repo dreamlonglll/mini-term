@@ -58,6 +58,7 @@
 
 use std::time::{Duration, Instant};
 
+use mt_project::encoding::TextEncoding;
 use mt_project::fs::FileContentResult;
 use mt_remote::{RemoteFileBaseline, RemoteFileReadResult, RemoteFileSaveResult};
 
@@ -208,6 +209,8 @@ pub(super) struct SaveStart {
     pub(super) generation: u64,
     /// 已还原 Tab 与行尾的落盘文本
     pub(super) on_disk: String,
+    /// 按什么编码写回(读进来时识别的那个;远程文档的编码在基线里,不看这个)
+    pub(super) encoding: TextEncoding,
 }
 
 /// [`DocumentSession::on_refresh_loaded`] 的结论。
@@ -348,6 +351,27 @@ impl<R: RemoteContent> DocumentSession<R> {
         self.ext_changed
     }
 
+    /// 文件读进来时识别的编码(还没读到内容时按 UTF-8)。
+    pub(super) fn encoding(&self) -> TextEncoding {
+        self.result
+            .as_ref()
+            .map_or(TextEncoding::Utf8, |result| result.encoding)
+    }
+
+    /// 解码有损、只读打开:编辑器不许改,Ctrl+S 静默不存(见
+    /// [`FileContentResult::read_only`])。
+    pub(super) fn read_only(&self) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(FileContentResult::read_only)
+    }
+
+    /// 外部改动提示条的「保留我的」:收起提示条、草稿照旧,下次保存覆盖磁盘上的版本
+    /// (本地保存不比对基线,本来就是覆盖写)。
+    pub(super) fn keep_mine(&mut self) {
+        self.ext_changed = false;
+    }
+
     pub(super) fn remote_source_invalid(&self) -> bool {
         self.remote_source_invalid
     }
@@ -370,6 +394,13 @@ impl<R: RemoteContent> DocumentSession<R> {
     /// `file_viewer` 模块注释)。只算不写,保存与 Git 注解(`blame --contents`)共用。
     pub(super) fn to_disk_form(&self, text: &str) -> String {
         restore_line_ending(&self.tabs.restore(text), self.line_ending)
+    }
+
+    /// [`Self::to_disk_form`] 再按文件的编码编成字节(GBK / UTF-16 文件喂给
+    /// `git blame --contents` 要的是原编码的字节)。表示不了的字符按替换写法编,
+    /// **只给比较用,不落盘**。
+    pub(super) fn to_disk_bytes(&self, text: &str) -> Vec<u8> {
+        self.encoding().encode_lossy(&self.to_disk_form(text))
     }
 
     // ── 载入 ───────────────────────────────────────────────
@@ -496,6 +527,7 @@ impl<R: RemoteContent> DocumentSession<R> {
         let loaded = content.content();
         let editable = has_editor && !loaded.is_binary && !loaded.too_large;
         let unchanged = editable
+            && loaded.encoding == self.encoding()
             && LineEnding::detect(&loaded.content) == self.line_ending
             && normalize_to_lf(&loaded.content) == self.saved;
         if unchanged {
@@ -559,7 +591,8 @@ impl<R: RemoteContent> DocumentSession<R> {
     /// 保存第一步:干净或在保存中时不存(Ctrl+S 是肌肉记忆,静默返回);要存就先
     /// 作废在飞的激活刷新。随后视图复核连接身份,再 [`Self::begin_save`]。
     pub(super) fn prepare_save(&mut self, text: &str) -> bool {
-        if self.saving || text == self.saved {
+        // 只读(解码有损)的也静默不存:写回会把原文件写坏
+        if self.saving || self.read_only() || text == self.saved {
             return false;
         }
         if self.remote_refreshing {
@@ -584,6 +617,7 @@ impl<R: RemoteContent> DocumentSession<R> {
         Some(SaveStart {
             generation: self.load_generation,
             on_disk: self.to_disk_form(text),
+            encoding: self.encoding(),
         })
     }
 

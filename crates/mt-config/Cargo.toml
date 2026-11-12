@@ -27,3 +27,8 @@ mt-theme-packs.workspace = true
 # `backup` 供每启动一代的库备份:WAL 模式下直接 copy 主库文件会漏掉还没
 # checkpoint 的那部分。
 rusqlite = { workspace = true, features = ["backup"] }
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
+# (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。
+[lints.rust]
+unsafe_code = "forbid"

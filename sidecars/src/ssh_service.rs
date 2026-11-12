@@ -1226,7 +1226,7 @@ fn resolve_lenient(path: &std::path::Path) -> std::path::PathBuf {
     let components: Vec<Component> = absolute.components().collect();
     for split in (1..=components.len()).rev() {
         let prefix: PathBuf = components[..split].iter().collect();
-        if let Ok(mut resolved) = std::fs::canonicalize(&prefix) {
+        if let Ok(mut resolved) = mt_core::path::canonicalize(&prefix) {
             push_lexically(&mut resolved, &components[split..]);
             return resolved;
         }

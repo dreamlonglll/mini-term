@@ -269,8 +269,8 @@ fn verify_target(root: &Path, path: &Path, expect_dir: bool) -> Result<(), Sessi
     let (Some(parent), Some(_)) = (path.parent(), path.file_name()) else {
         return Err(refuse());
     };
-    let canonical_root = root.canonicalize().map_err(|e| io_error(root, e))?;
-    let canonical_parent = parent.canonicalize().map_err(|e| io_error(parent, e))?;
+    let canonical_root = mt_core::path::canonicalize(root).map_err(|e| io_error(root, e))?;
+    let canonical_parent = mt_core::path::canonicalize(parent).map_err(|e| io_error(parent, e))?;
     if !canonical_parent.starts_with(&canonical_root) {
         return Err(refuse());
     }

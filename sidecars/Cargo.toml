@@ -107,6 +107,11 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Threading",
 ] }
 
+# dev 构建(含 `cargo test`)只留行号表,理由同根 Cargo.toml 的 [profile.dev]:panic 的
+# backtrace 照样有 file:line,target 与 PDB 小一大截;要看局部变量时本地临时改回 `true`。
+[profile.dev]
+debug = "line-tables-only"
+
 # 发布构建。与根 Cargo.toml 同款三项，这里的体积收益更实在：
 # miniterm-hook **每次 hook 事件都要冷启动一次**，二进制小一圈就是每次事件都省一点
 # 加载与页面调入；三个 sidecar 还要随安装包平铺到 exe 同目录，体积直接进装机包。

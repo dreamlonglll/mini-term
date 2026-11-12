@@ -1,28 +1,44 @@
-//! 主内容工作区：常驻终端页 + 项目级文件页签。
+//! 主内容工作区：常驻终端页 + 项目级页签（文件页签与 diff 页签）。
 //!
-//! 文件页签是纯运行时状态，不进入 `SplitNode`、PTY 映射或布局数据库。切到文件页
-//! 只是不渲染 [`TerminalArea`]，终端实体及其全部后台会话仍由 `AppStore` 保活。
+//! 页签是纯运行时状态，不进入 `SplitNode`、PTY 映射或布局数据库。切到页签页只是
+//! 不渲染 [`TerminalArea`]，终端实体及其全部后台会话仍由 `AppStore` 保活。
+//!
+//! # 两种页签
+//!
+//! - **文件页签**([`FileViewer`]):文件树 / 搜索 / 快速打开 / Markdown 链接打开的文件,
+//!   身份是 [`DocumentKey`](项目 + 后端连接 + 路径);
+//! - **diff 页签**([`DiffTab`]):单文件 diff / 提交 diff / 合并变更 / 单文件历史 / 磁盘对比,
+//!   身份是 [`DiffKey`](项目 + diff 目标,口径见 `git_diff::tab` 的模块注释)。只读、没有
+//!   「未保存」,关闭不确认;单文件 diff 里换文件时身份跟着变(见
+//!   [`WorkbenchArea::retarget_diff_tab`])。diff 页签归打开那一刻的活动项目;提交 / 合并变更
+//!   归发起那一刻的,后台取数期间切了项目就只放进原项目、不切过去([`add_diff_tab`])。
+//!
+//! 两种页签共用页签条:单击切换、× 与中键关闭、右键「关闭 / 关闭其他 / 关闭右边 / 关闭左边」,
+//! 终端页右键「关闭所有」;切项目时各项目各留各的页签,移除项目时随项目一起回收。
+//! 「最近打开」与未保存检查只认文件页签。
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::file_viewer::{DocumentSource, FileViewer, LineTarget};
+use crate::git_diff::{DiffKey, DiffTab, DiffTabEvent};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_alert};
 use crate::store::{AppStore, StoreEvent};
 use crate::terminal_area::TerminalArea;
-use crate::ui;
+use crate::{git_ui, ui};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DocumentBackendKey {
@@ -79,24 +95,90 @@ fn normalize_remote_document_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// 页签的身份:文件页签按文档身份,diff 页签按 diff 目标。同一项目里同一身份只开一个页签,
+/// 再次打开就切过去。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TabKey {
+    Document(DocumentKey),
+    Diff(DiffKey),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WorkbenchPage {
     Terminal,
-    Document(DocumentKey),
+    Tab(TabKey),
+}
+
+/// 页签里装的东西。
+#[derive(Clone)]
+enum TabContent {
+    File(Entity<FileViewer>),
+    Diff(Entity<DiffTab>),
+}
+
+impl TabContent {
+    /// 有没有未保存的修改(只有文件页签会有)。
+    fn is_dirty(&self, cx: &App) -> bool {
+        match self {
+            TabContent::File(document) => document.read(cx).is_dirty(),
+            TabContent::Diff(_) => false,
+        }
+    }
+
+    fn view(&self) -> AnyElement {
+        match self {
+            TabContent::File(document) => document.clone().into_any_element(),
+            TabContent::Diff(diff) => diff.clone().into_any_element(),
+        }
+    }
+
+    /// 切到这一页之后(延到这一轮更新收口)交焦点、按需刷新 —— 文件页签见
+    /// [`FileViewer::on_activated`],diff 页签见 [`DiffTab::on_activated`]。
+    fn activate_later(&self, window: &mut Window, cx: &mut App) {
+        match self.clone() {
+            TabContent::File(document) => window.defer(cx, move |window, cx| {
+                document.update(cx, |document, cx| document.on_activated(window, cx));
+            }),
+            TabContent::Diff(diff) => window.defer(cx, move |window, cx| {
+                diff.update(cx, |diff, cx| diff.on_activated(window, cx));
+            }),
+        }
+    }
 }
 
 struct DocumentTab {
-    key: DocumentKey,
+    key: TabKey,
     title: String,
-    document: Entity<FileViewer>,
+    /// 悬停提示:diff 页签写完整路径 / 提交信息(标题装不下的那部分);文件页签没有。
+    tip: Option<String>,
+    content: TabContent,
+    /// 本地文件的原样路径(`key` 里那份在 Windows 上是小写化的,不能拿来打开)。远程文件与
+    /// diff 页签为 `None`。只给「最近打开」([`ProjectDocuments::recent`])记账用。
+    local_path: Option<PathBuf>,
 }
 
-type RenderDocumentTab = (DocumentKey, String, Entity<FileViewer>);
-type ActiveWorkbenchSnapshot = (String, WorkbenchPage, Vec<RenderDocumentTab>);
+/// 渲染一帧要的页签快照(不在渲染途中借着 `projects` 建元素)。
+struct TabSnapshot {
+    key: TabKey,
+    title: String,
+    tip: Option<String>,
+    content: TabContent,
+}
+
+type ActiveWorkbenchSnapshot = (String, WorkbenchPage, Vec<TabSnapshot>);
+
+/// 「最近打开」每个项目最多记几条。快速打开的空查询把它们列在最前,一屏放得下的三四倍就够了。
+const MAX_RECENT_FILES: usize = 50;
 
 struct ProjectDocuments {
     tabs: Vec<DocumentTab>,
     active: WorkbenchPage,
+    /// 最近在文件页里打开 / 切到过的**本地**文件,新的在前、去重。给快速打开
+    /// (`quick_open`)排序用:空查询列在最前,有查询时同分靠前。
+    ///
+    /// 只放内存:关掉页签不删(关掉的文件仍是「最近打开过」),项目被移除时随整个
+    /// `ProjectDocuments` 一起回收,重启清空。
+    recent: Vec<PathBuf>,
 }
 
 impl Default for ProjectDocuments {
@@ -104,36 +186,101 @@ impl Default for ProjectDocuments {
         Self {
             tabs: Vec::new(),
             active: WorkbenchPage::Terminal,
+            recent: Vec::new(),
         }
     }
 }
 
 impl ProjectDocuments {
-    fn index_of(&self, key: &DocumentKey) -> Option<usize> {
+    fn index_of(&self, key: &TabKey) -> Option<usize> {
         self.tabs.iter().position(|tab| &tab.key == key)
     }
 
-    fn close(&mut self, key: &DocumentKey) -> Option<Entity<FileViewer>> {
+    /// 某个 diff 页签实体在第几个(按实体认,不按身份:换文件时身份会变)。
+    fn index_of_diff(&self, diff: &Entity<DiffTab>) -> Option<usize> {
+        self.tabs.iter().position(|tab| {
+            matches!(&tab.content, TabContent::Diff(entity) if entity.entity_id() == diff.entity_id())
+        })
+    }
+
+    /// 把一个本地文件记到「最近打开」最前面。
+    fn note_recent(&mut self, path: Option<&Path>) {
+        if let Some(path) = path {
+            push_recent(&mut self.recent, path, MAX_RECENT_FILES);
+        }
+    }
+
+    fn close(&mut self, key: &TabKey) -> Option<TabContent> {
         let index = self.index_of(key)?;
-        let removed = self.tabs.remove(index).document;
-        if self.active == WorkbenchPage::Document(key.clone()) {
+        let removed = self.tabs.remove(index).content;
+        if self.active == WorkbenchPage::Tab(key.clone()) {
             let remaining = self
                 .tabs
                 .iter()
                 .map(|tab| tab.key.clone())
                 .collect::<Vec<_>>();
             self.active = next_document_after_close(&remaining, index)
-                .map(WorkbenchPage::Document)
+                .map(WorkbenchPage::Tab)
                 .unwrap_or(WorkbenchPage::Terminal);
         }
         Some(removed)
     }
 }
 
-fn next_document_after_close(
-    remaining: &[DocumentKey],
-    removed_index: usize,
-) -> Option<DocumentKey> {
+/// diff 页签换了身份之后页签区怎么收拾(见 [`retarget_plan`])。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Retarget {
+    /// 换身份的这个页签改用新身份。`close` 是要顺手关掉的同身份旧页签的下标(没撞上就是
+    /// `None`),`active` 是换完之后的活动页
+    Take {
+        close: Option<usize>,
+        active: WorkbenchPage,
+    },
+    /// 撞上的同身份页签正是活动页:它留着、活动页不动,换身份的这个(后台)页签关掉
+    Yield,
+}
+
+/// diff 页签换了身份(单文件 diff 里换了文件)之后页签区该怎么收拾。
+///
+/// 换到的目标恰好已有另一个页签时,页签条上只留一个,留哪个看用户眼前是谁:
+///
+/// - 撞上的那个**正是活动页** → [`Retarget::Yield`]:留下活动页,关掉换身份的这个。换身份的
+///   这时只可能是后台页签(在它里面做了取消暂存 / 丢弃最后一块,操作在途时切走了,列表重载后
+///   它被带到了眼前这一页的目标上),不能把用户正在看的页签连同焦点从眼前换掉;
+/// - 其余情况 → [`Retarget::Take`]:**换身份的这个接管目标、旧的那个关掉**。用户正在这个
+///   页签里按 Alt+←/→ 往下看,它手上的文件序列(连同更改列表的回调)才是要接着用的;旧页签
+///   多半是早先点开、内容已经过时的同一份 diff。活动页原本指着换身份的这个页签的,跟着新身份走。
+fn retarget_plan(
+    keys: &[TabKey],
+    active: &WorkbenchPage,
+    index: usize,
+    new_key: &TabKey,
+) -> Retarget {
+    let Some(old_key) = keys.get(index) else {
+        return Retarget::Take {
+            close: None,
+            active: active.clone(),
+        };
+    };
+    let duplicate = keys
+        .iter()
+        .enumerate()
+        .find(|(i, key)| *i != index && *key == new_key)
+        .map(|(i, _)| i);
+    if duplicate.is_some() && matches!(active, WorkbenchPage::Tab(key) if key == new_key) {
+        return Retarget::Yield;
+    }
+    let active = match active {
+        WorkbenchPage::Tab(key) if key == old_key => WorkbenchPage::Tab(new_key.clone()),
+        _ => active.clone(),
+    };
+    Retarget::Take {
+        close: duplicate,
+        active,
+    }
+}
+
+fn next_document_after_close(remaining: &[TabKey], removed_index: usize) -> Option<TabKey> {
     remaining
         .get(removed_index)
         .or_else(|| {
@@ -146,8 +293,8 @@ fn next_document_after_close(
 
 /// 页签右键菜单里的批量关闭范围，锚点是被右键的那一页。
 ///
-/// 三档都**只覆盖文档页签**：常驻的终端页不是文档，既不在 `tabs` 里，也就
-/// 永远不会被「关闭其他」带走 —— 它是关不掉的（见 [`WorkbenchPage`]）。
+/// 三档都**只覆盖页签区里的页签**(文件页签与 diff 页签一视同仁)：常驻的终端页不在
+/// `tabs` 里，也就永远不会被「关闭其他」带走 —— 它是关不掉的（见 [`WorkbenchPage`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CloseScope {
     Others,
@@ -156,11 +303,7 @@ enum CloseScope {
 }
 
 /// 按范围挑出要关的页签（不含锚点自己）。顺序与页签条一致，便于逐个 `close`。
-fn documents_in_scope(
-    keys: &[DocumentKey],
-    anchor_index: usize,
-    scope: CloseScope,
-) -> Vec<DocumentKey> {
+fn documents_in_scope(keys: &[TabKey], anchor_index: usize, scope: CloseScope) -> Vec<TabKey> {
     keys.iter()
         .enumerate()
         .filter(|(index, _)| match scope {
@@ -186,10 +329,7 @@ fn global(cx: &App) -> Option<Entity<WorkbenchArea>> {
 }
 
 fn project_documents_are_dirty(project: &ProjectDocuments, cx: &App) -> bool {
-    project
-        .tabs
-        .iter()
-        .any(|tab| tab.document.read(cx).is_dirty())
+    project.tabs.iter().any(|tab| tab.content.is_dirty(cx))
 }
 
 /// 项目移除、worktree 清理等生命周期操作的统一防丢失闸。
@@ -217,7 +357,7 @@ pub fn dirty_document_names(cx: &App) -> Vec<String> {
             .map(|project| project.name.as_str())
             .unwrap_or(project_id);
         for tab in &documents.tabs {
-            if tab.document.read(cx).is_dirty() {
+            if tab.content.is_dirty(cx) {
                 names.push(format!("{project_name}: {}", tab.title));
             }
         }
@@ -294,9 +434,95 @@ pub fn close_document_source(source: DocumentSource, window: &mut Window, cx: &m
         return;
     };
     let project_id = source.project_id().to_string();
-    let key = DocumentKey::from_source(&source);
+    let key = TabKey::Document(DocumentKey::from_source(&source));
     area.update(cx, |area, cx| {
         area.request_close_document(project_id, key, window, cx)
+    });
+}
+
+/// 某个文档的身份(diff 页签的「磁盘对比」按它认是哪个文档)。
+pub fn document_key(source: &DocumentSource) -> DocumentKey {
+    DocumentKey::from_source(source)
+}
+
+// ─── diff 页签 ───────────────────────────────────────────────
+//
+// diff 页签的打开流程在 `git_diff::tab`(先按身份找、找到就复用,否则建一个),这里只管
+// 「放进页签区 / 切过去 / 关掉 / 问现在是不是它」。
+
+/// 身份为 `key` 的 diff 页签(没开就是 `None`)。
+pub fn find_diff_tab(key: &DiffKey, cx: &App) -> Option<Entity<DiffTab>> {
+    let area = global(cx)?;
+    let area = area.read(cx);
+    let project = area.projects.get(key.project_id())?;
+    let index = project.index_of(&TabKey::Diff(key.clone()))?;
+    match &project.tabs[index].content {
+        TabContent::Diff(diff) => Some(diff.clone()),
+        TabContent::File(_) => None,
+    }
+}
+
+/// 把 diff 页签放进它所属项目的页签区(已经在就不再放一次)并切过去、交焦点。
+///
+/// 调用方要保证此刻没有借着任何实体(`git_diff::tab` 的打开流程都延到 `window.defer`
+/// 里才调这里):这里会回读页签实体的身份与标题。
+pub fn show_diff_tab(diff: Entity<DiffTab>, window: &mut Window, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| area.show_diff_tab(diff, window, cx));
+}
+
+/// 把 diff 页签放进它所属项目的页签区,**不切过去**:那个项目已经不是活动项目了(提交 /
+/// 合并变更在后台取文件列表期间切走了)。活动页、焦点都不动,回到那个项目时它在页签条上。
+/// 已经在了就什么都不做。调用方的约束同 [`show_diff_tab`]。
+pub fn add_diff_tab(diff: Entity<DiffTab>, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| {
+        area.insert_diff_tab(&diff, cx);
+    });
+}
+
+/// 这个 diff 页签是不是用户眼前那一页(活动项目的活动页)。后台页签的迟到结果只更新
+/// 自己,不抢焦点;仓库变了也只有眼前那一页当场重取(其余等切回来再取)。
+pub fn is_diff_tab_active(key: &DiffKey, cx: &App) -> bool {
+    let Some(area) = global(cx) else {
+        return false;
+    };
+    let area = area.read(cx);
+    area.store.read(cx).active_project_id.as_deref() == Some(key.project_id())
+        && area
+            .projects
+            .get(key.project_id())
+            .is_some_and(|project| project.active == WorkbenchPage::Tab(TabKey::Diff(key.clone())))
+}
+
+/// 全部打开着的 diff 页签(各项目的都算)。仓库变了时逐个问一遍要不要重取。
+pub fn diff_tabs(cx: &App) -> Vec<Entity<DiffTab>> {
+    let Some(area) = global(cx) else {
+        return Vec::new();
+    };
+    area.read(cx)
+        .projects
+        .values()
+        .flat_map(|project| project.tabs.iter())
+        .filter_map(|tab| match &tab.content {
+            TabContent::Diff(diff) => Some(diff.clone()),
+            TabContent::File(_) => None,
+        })
+        .collect()
+}
+
+/// diff 页签里的 Ctrl/Cmd+W。diff 页签没有未保存状态,直接关。
+pub fn close_diff_tab(key: DiffKey, window: &mut Window, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    let project_id = key.project_id().to_string();
+    area.update(cx, |area, cx| {
+        area.request_close_document(project_id, TabKey::Diff(key), window, cx)
     });
 }
 
@@ -326,7 +552,46 @@ pub fn is_document_active(source: &DocumentSource, cx: &App) -> bool {
         && area
             .projects
             .get(&active_project_id)
-            .is_some_and(|project| project.active == WorkbenchPage::Document(key))
+            .is_some_and(|project| project.active == WorkbenchPage::Tab(TabKey::Document(key)))
+}
+
+/// 该项目「最近打开」的本地文件,新的在前(见 [`ProjectDocuments::recent`])。
+/// 快速打开(`quick_open`)用它排序。
+pub fn recent_files(project_id: &str, cx: &App) -> Vec<PathBuf> {
+    global(cx)
+        .and_then(|area| {
+            area.read(cx)
+                .projects
+                .get(project_id)
+                .map(|project| project.recent.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// 该项目当前停在哪个本地文件页上;停在终端页、或活动页签是远程文件时为 `None`。
+///
+/// 快速打开用它做两件事:空查询时把它排除出「最近打开」(第一条就是上一个文件,
+/// 打开面板直接回车即可切回),以及只输 `:行号` 时在它里面跳行。
+pub fn active_document_path(project_id: &str, cx: &App) -> Option<PathBuf> {
+    let area = global(cx)?;
+    let area = area.read(cx);
+    let project = area.projects.get(project_id)?;
+    let WorkbenchPage::Tab(key) = &project.active else {
+        return None;
+    };
+    let index = project.index_of(key)?;
+    project.tabs[index].local_path.clone()
+}
+
+/// 把 `path` 放到 `recent` 最前面(已在表里就挪上来),只留前 `cap` 条。
+///
+/// 比较按 [`normalize_local_document_path`] 的口径:Windows 上大小写不同的两种写法是同一个
+/// 文件,页签去重也是这么认的。
+fn push_recent(recent: &mut Vec<PathBuf>, path: &Path, cap: usize) {
+    let normalized = normalize_local_document_path(path);
+    recent.retain(|existing| normalize_local_document_path(existing) != normalized);
+    recent.insert(0, path.to_path_buf());
+    recent.truncate(cap);
 }
 
 /// Restore focus after a modal overlay closes without capturing the document
@@ -389,8 +654,9 @@ impl WorkbenchArea {
             });
             for project in this.projects.values() {
                 for tab in &project.tabs {
-                    tab.document
-                        .update(cx, |document, cx| document.validate_remote_source(cx));
+                    if let TabContent::File(document) = &tab.content {
+                        document.update(cx, |document, cx| document.validate_remote_source(cx));
+                    }
                 }
             }
             cx.notify();
@@ -462,17 +728,23 @@ impl WorkbenchArea {
         cx: &mut Context<Self>,
     ) {
         let project_id = source.project_id().to_string();
-        let key = DocumentKey::from_source(&source);
+        let key = TabKey::Document(DocumentKey::from_source(&source));
+        let local_path = match &source {
+            DocumentSource::Local { path, .. } => Some(path.clone()),
+            DocumentSource::Remote { .. } => None,
+        };
         let project = self.projects.entry(project_id).or_default();
+        project.note_recent(local_path.as_deref());
         if let Some(index) = project.index_of(&key) {
-            let document = project.tabs[index].document.clone();
-            project.active = WorkbenchPage::Document(key);
-            window.defer(cx, move |window, cx| {
-                document.update(cx, |document, cx| {
-                    document.reveal_line(highlight, window, cx);
-                    document.on_activated(window, cx);
+            project.active = WorkbenchPage::Tab(key);
+            if let TabContent::File(document) = project.tabs[index].content.clone() {
+                window.defer(cx, move |window, cx| {
+                    document.update(cx, |document, cx| {
+                        document.reveal_line(highlight, window, cx);
+                        document.on_activated(window, cx);
+                    });
                 });
-            });
+            }
             cx.notify();
             return;
         }
@@ -481,16 +753,137 @@ impl WorkbenchArea {
         let document = cx.new(|cx| FileViewer::new_document(source, highlight, window, cx));
         cx.observe(&document, |_this, _document, cx| cx.notify())
             .detach();
+        let content = TabContent::File(document);
         project.tabs.push(DocumentTab {
             key: key.clone(),
             title,
-            document: document.clone(),
+            tip: None,
+            content: content.clone(),
+            local_path,
         });
-        project.active = WorkbenchPage::Document(key);
-        window.defer(cx, move |window, cx| {
-            document.update(cx, |document, cx| document.on_activated(window, cx));
-        });
+        project.active = WorkbenchPage::Tab(key);
+        content.activate_later(window, cx);
         cx.notify();
+    }
+
+    /// 把 diff 页签放进它所属项目的页签区并切过去(见模块函数 [`show_diff_tab`])。
+    ///
+    /// 同一个实体已经在页签区里 → 只是切过去;同身份的另一个页签已经开着(两次打开在后台
+    /// 取数时撞上了)→ 切到开着的那个,新建的这个丢掉。新放进来的页签订阅它的
+    /// [`DiffTabEvent`](换文件时身份 / 标题跟着变)。
+    fn show_diff_tab(
+        &mut self,
+        diff: Entity<DiffTab>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (project_id, key) = self.insert_diff_tab(&diff, cx);
+        self.activate_document(&project_id, &key, window, cx);
+    }
+
+    /// 把 diff 页签放进它所属项目的页签区,不切换活动页;同一个实体或同身份的页签已经在了
+    /// 就不放。返回所属项目与页签身份。
+    fn insert_diff_tab(
+        &mut self,
+        diff: &Entity<DiffTab>,
+        cx: &mut Context<Self>,
+    ) -> (String, TabKey) {
+        let (key, title, tip) = {
+            let tab = diff.read(cx);
+            (
+                tab.key().clone(),
+                tab.title().to_string(),
+                tab.tip().to_string(),
+            )
+        };
+        let project_id = key.project_id().to_string();
+        let key = TabKey::Diff(key);
+        let project = self.projects.entry(project_id.clone()).or_default();
+        if project.index_of_diff(diff).is_none() && project.index_of(&key).is_none() {
+            cx.subscribe(diff, Self::on_diff_tab_event).detach();
+            project.tabs.push(DocumentTab {
+                key: key.clone(),
+                title,
+                tip: Some(tip),
+                content: TabContent::Diff(diff.clone()),
+                local_path: None,
+            });
+            cx.notify();
+        }
+        (project_id, key)
+    }
+
+    fn on_diff_tab_event(
+        &mut self,
+        diff: Entity<DiffTab>,
+        event: &DiffTabEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            DiffTabEvent::Retarget => self.retarget_diff_tab(&diff, cx),
+        }
+    }
+
+    /// diff 页签换了身份 / 标题(单文件 diff 里 Alt+←/→ 换了文件,或块操作后换到了组里的
+    /// 下一个):页签区跟着改,撞上同身份的页签时按 [`retarget_plan`] 关掉其中一个。页签
+    /// 已经被关掉(后台任务晚到)就什么都不做。
+    fn retarget_diff_tab(&mut self, diff: &Entity<DiffTab>, cx: &mut Context<Self>) {
+        let (key, title, tip) = {
+            let tab = diff.read(cx);
+            (
+                tab.key().clone(),
+                tab.title().to_string(),
+                tab.tip().to_string(),
+            )
+        };
+        let new_key = TabKey::Diff(key);
+        for (project_id, project) in self.projects.iter_mut() {
+            let Some(index) = project.index_of_diff(diff) else {
+                continue;
+            };
+            let keys = project
+                .tabs
+                .iter()
+                .map(|tab| tab.key.clone())
+                .collect::<Vec<_>>();
+            // 上一帧画的是这个项目的哪一页(画的不是这个项目就是 `None`);下面两处都按换身份
+            // 之前的样子比
+            let rendered = if self.last_rendered_project.as_deref() == Some(project_id.as_str()) {
+                self.last_rendered_page.clone()
+            } else {
+                None
+            };
+            let closed = match retarget_plan(&keys, &project.active, index, &new_key) {
+                Retarget::Yield => {
+                    // 活动页不动;换身份的这个后台页签连同它的实体一起回收
+                    project.tabs.remove(index);
+                    Some(keys[index].clone())
+                }
+                Retarget::Take { close, active } => {
+                    project.tabs[index].key = new_key.clone();
+                    project.tabs[index].title = title;
+                    project.tabs[index].tip = Some(tip);
+                    if let Some(close) = close {
+                        project.tabs.remove(close);
+                    }
+                    // 还是同一页,别让 render 把它当成「切过来了」再交一次焦点、再刷一次
+                    if rendered == Some(WorkbenchPage::Tab(keys[index].clone())) {
+                        self.last_rendered_page = Some(active.clone());
+                    }
+                    project.active = active;
+                    close.map(|close| keys[close].clone())
+                }
+            };
+            // 兜底:关掉的正是上一帧画着的那一页(它的实体随之释放,焦点还挂在上面)→ 让
+            // render 当成「切过来了」,给眼下的活动页重新交一次焦点
+            if let Some(closed) = closed
+                && rendered == Some(WorkbenchPage::Tab(closed))
+            {
+                self.last_rendered_page = None;
+            }
+            cx.notify();
+            return;
+        }
     }
 
     pub fn activate_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -510,7 +903,7 @@ impl WorkbenchArea {
     fn activate_document(
         &mut self,
         project_id: &str,
-        key: &DocumentKey,
+        key: &TabKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -520,13 +913,12 @@ impl WorkbenchArea {
         let Some(index) = project.index_of(key) else {
             return;
         };
-        let document = project.tabs[index].document.clone();
-        project.active = WorkbenchPage::Document(key.clone());
-        window.defer(cx, move |window, cx| {
-            document.update(cx, |document, cx| {
-                document.on_activated(window, cx);
-            });
-        });
+        let content = project.tabs[index].content.clone();
+        // 点页签切过去也算「最近打开」(与 VS Code 的快速打开同口径;diff 页签不记)
+        let local_path = project.tabs[index].local_path.clone();
+        project.note_recent(local_path.as_deref());
+        project.active = WorkbenchPage::Tab(key.clone());
+        content.activate_later(window, cx);
         cx.notify();
     }
 
@@ -539,7 +931,7 @@ impl WorkbenchArea {
         if self.store.read(cx).active_project_id.as_deref() != Some(expected_project_id) {
             return;
         }
-        let Some(WorkbenchPage::Document(key)) = self
+        let Some(WorkbenchPage::Tab(key)) = self
             .projects
             .get(expected_project_id)
             .map(|project| project.active.clone())
@@ -549,21 +941,22 @@ impl WorkbenchArea {
         self.activate_document(expected_project_id, &key, window, cx);
     }
 
+    /// Ctrl/Cmd+F 落到文件页:交给当前文档的编辑器查找。diff 页签没有查找,什么都不做。
     pub fn search_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return;
         };
-        let Some(WorkbenchPage::Document(key)) = self
+        let Some(WorkbenchPage::Tab(key)) = self
             .projects
             .get(&project_id)
             .map(|project| project.active.clone())
         else {
             return;
         };
-        let Some(document) = self.projects.get(&project_id).and_then(|project| {
+        let Some(TabContent::File(document)) = self.projects.get(&project_id).and_then(|project| {
             project
                 .index_of(&key)
-                .map(|index| project.tabs[index].document.clone())
+                .map(|index| project.tabs[index].content.clone())
         }) else {
             return;
         };
@@ -573,7 +966,7 @@ impl WorkbenchArea {
     fn request_close_document(
         &mut self,
         project_id: String,
-        key: DocumentKey,
+        key: TabKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -581,7 +974,7 @@ impl WorkbenchArea {
             .projects
             .get(&project_id)
             .and_then(|project| project.index_of(&key).map(|index| &project.tabs[index]))
-            .is_some_and(|tab| tab.document.read(cx).is_dirty());
+            .is_some_and(|tab| tab.content.is_dirty(cx));
         if !dirty {
             self.close_document(&project_id, &key, window, cx);
             return;
@@ -611,7 +1004,7 @@ impl WorkbenchArea {
     fn close_document(
         &mut self,
         project_id: &str,
-        key: &DocumentKey,
+        key: &TabKey,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -626,8 +1019,8 @@ impl WorkbenchArea {
     fn close_documents(
         &mut self,
         project_id: &str,
-        keys: &[DocumentKey],
-        fallback: Option<&DocumentKey>,
+        keys: &[TabKey],
+        fallback: Option<&TabKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -636,18 +1029,18 @@ impl WorkbenchArea {
         };
         let mut closed_active = false;
         for key in keys {
-            closed_active |= project.active == WorkbenchPage::Document(key.clone());
+            closed_active |= project.active == WorkbenchPage::Tab(key.clone());
             let _ = project.close(key);
         }
         if closed_active
             && let Some(anchor) = fallback
             && project.index_of(anchor).is_some()
         {
-            project.active = WorkbenchPage::Document(anchor.clone());
+            project.active = WorkbenchPage::Tab(anchor.clone());
         }
         // 批量关闭后剩下的页签会左移，滚动偏移原地不动就会停在一段空白上；
         // 把留下的锚点重新拉进视野（活动页没被动过时也一样成立）。
-        // 滚动区里**只有文档页签**，序号即 tabs 下标（终端页固定在滚动区外）
+        // 滚动区里**只有页签区的页签**，序号即 tabs 下标（终端页固定在滚动区外）
         if let Some(anchor) = fallback
             && let Some(index) = project.index_of(anchor)
         {
@@ -661,18 +1054,13 @@ impl WorkbenchArea {
         }
         match project.active.clone() {
             WorkbenchPage::Terminal => self.activate_terminal(window, cx),
-            WorkbenchPage::Document(next) => self.activate_document(project_id, &next, window, cx),
+            WorkbenchPage::Tab(next) => self.activate_document(project_id, &next, window, cx),
         }
         cx.notify();
     }
 
     /// 右键菜单的三档批量关闭要关掉哪些页签。菜单同时用它判断该不该置灰。
-    fn scope_targets(
-        &self,
-        project_id: &str,
-        anchor: &DocumentKey,
-        scope: CloseScope,
-    ) -> Vec<DocumentKey> {
+    fn scope_targets(&self, project_id: &str, anchor: &TabKey, scope: CloseScope) -> Vec<TabKey> {
         let Some(project) = self.projects.get(project_id) else {
             return Vec::new();
         };
@@ -687,11 +1075,11 @@ impl WorkbenchArea {
         documents_in_scope(&keys, anchor_index, scope)
     }
 
-    /// 文档页签右键的三档批量关闭。
+    /// 页签右键的三档批量关闭。
     fn request_close_scope(
         &mut self,
         project_id: String,
-        anchor: DocumentKey,
+        anchor: TabKey,
         scope: CloseScope,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -700,7 +1088,7 @@ impl WorkbenchArea {
         self.request_close_batch(project_id, targets, Some(anchor), window, cx);
     }
 
-    /// 终端页右键的「关闭所有」：关掉该项目全部文档页签。
+    /// 终端页右键的「关闭所有」：关掉该项目全部页签(文件与 diff)。
     fn request_close_all(
         &mut self,
         project_id: String,
@@ -725,8 +1113,8 @@ impl WorkbenchArea {
     fn request_close_batch(
         &mut self,
         project_id: String,
-        targets: Vec<DocumentKey>,
-        fallback: Option<DocumentKey>,
+        targets: Vec<TabKey>,
+        fallback: Option<TabKey>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -740,7 +1128,7 @@ impl WorkbenchArea {
                 project
                     .tabs
                     .iter()
-                    .filter(|tab| targets.contains(&tab.key) && tab.document.read(cx).is_dirty())
+                    .filter(|tab| targets.contains(&tab.key) && tab.content.is_dirty(cx))
                     .map(|tab| tab.title.clone())
                     .collect::<Vec<_>>()
             })
@@ -773,8 +1161,8 @@ impl WorkbenchArea {
         );
     }
 
-    /// 常驻终端页的右键菜单。终端页自己关不掉，这里只管清空文档页签；
-    /// 页签条只在有文档时才画，所以这一项不会没得可关。
+    /// 常驻终端页的右键菜单。终端页自己关不掉，这里只管清空页签区；
+    /// 页签条只在有页签时才画，所以这一项不会没得可关。
     fn terminal_tab_menu(&self, project_id: &str, cx: &Context<Self>) -> Vec<MenuEntry> {
         let area = cx.entity();
         let project_id = project_id.to_string();
@@ -789,21 +1177,21 @@ impl WorkbenchArea {
         )]
     }
 
-    /// 文档页签的右键菜单。
+    /// 页签区页签(文件 / diff)的右键菜单。
     ///
     /// 终端页有自己那份（[`Self::terminal_tab_menu`]），也不出现在这里任何一档的
     /// 关闭范围里 —— 它是常驻页，关不掉（[`CloseScope`]）。
     fn document_tab_menu(
         &self,
         project_id: &str,
-        key: &DocumentKey,
+        key: &TabKey,
         cx: &Context<Self>,
     ) -> Vec<MenuEntry> {
         let area = cx.entity();
         let close = {
             let (area, project_id, key) = (area.clone(), project_id.to_string(), key.clone());
             MenuItem::new(t("fileViewer", "closeTab"))
-                // 键位见 file_viewer/mod.rs 的 on_key_down(Ctrl/Cmd+W)
+                // 键位见 file_viewer/mod.rs 与 git_diff/tab.rs 的 on_key_down(Ctrl/Cmd+W)
                 .shortcut(menu::hotkey_label(true, false, false, "W"))
                 .on_click(move |window, cx| {
                     let (project_id, key) = (project_id.clone(), key.clone());
@@ -847,7 +1235,12 @@ impl WorkbenchArea {
                 project
                     .tabs
                     .iter()
-                    .map(|tab| (tab.key.clone(), tab.title.clone(), tab.document.clone()))
+                    .map(|tab| TabSnapshot {
+                        key: tab.key.clone(),
+                        title: tab.title.clone(),
+                        tip: tab.tip.clone(),
+                        content: tab.content.clone(),
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -888,37 +1281,30 @@ impl Render for WorkbenchArea {
                         }
                     });
                 }
-                WorkbenchPage::Document(key) => {
-                    if let Some((_, _, document)) =
-                        tabs.iter().find(|(candidate, _, _)| candidate == key)
-                    {
-                        let document = document.clone();
-                        window.defer(cx, move |window, cx| {
-                            document.update(cx, |document, cx| {
-                                document.on_activated(window, cx);
-                            });
-                        });
+                WorkbenchPage::Tab(key) => {
+                    if let Some(tab) = tabs.iter().find(|tab| &tab.key == key) {
+                        tab.content.activate_later(window, cx);
                     }
                 }
             }
             // 页签多到溢出时，刚激活的那一页可能整个在视野之外(尤其是新打开的
-            // 文件排在最右)。滚动区里只有文档页签，序号即 tabs 下标；切回终端页
+            // 文件排在最右)。滚动区里只有页签区的页签，序号即 tabs 下标；切回终端页
             // 不必动偏移 —— 那一颗常驻在滚动区左侧、任何偏移下都在视野里。
-            if let WorkbenchPage::Document(key) = &active
-                && let Some(index) = tabs.iter().position(|(candidate, _, _)| candidate == key)
+            if let WorkbenchPage::Tab(key) = &active
+                && let Some(index) = tabs.iter().position(|tab| &tab.key == key)
             {
                 self.tab_scroll.scroll_to_item(index);
             }
         }
 
-        // 尚未打开文件时保持原终端区的尺寸与结构，一旦有文档才出现工作区页签条。
+        // 尚未打开页签时保持原终端区的尺寸与结构，一旦有页签才出现工作区页签条。
         if tabs.is_empty() {
             return div().size_full().child(self.terminal_area.clone());
         }
 
         let terminal_active = active == WorkbenchPage::Terminal;
         let terminal_menu_project = project_id.clone();
-        // 常驻终端页**钉在最左**,不进滚动区 —— 它是回终端的唯一入口,被文件页签
+        // 常驻终端页**钉在最左**,不进滚动区 —— 它是回终端的唯一入口,被文件 / diff 页签
         // 挤出视野后要先横向滚回去才点得到。
         let terminal_tab = div()
             .id("workbench-tab-terminal")
@@ -948,7 +1334,7 @@ impl Render for WorkbenchArea {
             })
             .child(t("terminalArea", "terminal"))
             .on_click(cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)))
-            // 右键菜单:关闭所有文档页签
+            // 右键菜单:关闭所有页签(文件与 diff)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -958,7 +1344,7 @@ impl Render for WorkbenchArea {
                 }),
             );
 
-        // 文档页签横向滚动区(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
+        // 页签横向滚动区(与终端 tab 栏同一套):页签**不压缩**,溢出即可横向滚。
         //
         // 垂直滚轮不必自己映射 —— gpui 只在 `overflow.x == Scroll && overflow.y
         // != Scroll` 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y`
@@ -980,14 +1366,32 @@ impl Render for WorkbenchArea {
                 }
             }));
 
-        for (key, title, document) in &tabs {
-            let selected = active == WorkbenchPage::Document(key.clone());
-            let dirty = document.read(cx).is_dirty();
+        for tab in &tabs {
+            let TabSnapshot {
+                key,
+                title,
+                tip,
+                content,
+            } = tab;
+            let selected = active == WorkbenchPage::Tab(key.clone());
+            let dirty = content.is_dirty(cx);
+            // 文件页签按文件类型上色的图标;diff 页签一律 accent 色的 Git 图标(diff / 提交 /
+            // 合并 / 历史四种形状),一眼分得开
+            let icon: AnyElement = match key {
+                TabKey::Document(_) => FileIcon::new(title, false, false)
+                    .size(px(14.0))
+                    .into_any_element(),
+                TabKey::Diff(diff) => {
+                    git_ui::icon(diff.icon(), 14.0, ui::accent()).into_any_element()
+                }
+            };
             let tab_key = key.clone();
             let close_key = key.clone();
+            let middle_key = key.clone();
             let menu_key = key.clone();
             let click_project = project_id.clone();
             let close_project = project_id.clone();
+            let middle_project = project_id.clone();
             let menu_project = project_id.clone();
             doc_tabs = doc_tabs.child(
                 div()
@@ -1021,7 +1425,7 @@ impl Render for WorkbenchArea {
                                 ..ui::accent()
                             })
                     })
-                    .child(FileIcon::new(title, false, false).size(px(14.0)))
+                    .child(icon)
                     .child(
                         div()
                             .min_w(px(0.0))
@@ -1029,6 +1433,8 @@ impl Render for WorkbenchArea {
                             .truncate()
                             .child(title.clone()),
                     )
+                    // diff 页签悬停给完整路径 / 提交信息(标题只放得下文件名与短哈希)
+                    .when_some(tip.clone(), |el, tip| el.tip(tip))
                     .when(dirty, |el| {
                         el.child(
                             div()
@@ -1073,6 +1479,19 @@ impl Render for WorkbenchArea {
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.activate_document(&click_project, &tab_key, window, cx)
                     }))
+                    // 中键关闭(浏览器 / IDE 的惯例,松开时关;与 × 同一条路,脏页签照样确认)
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _event: &MouseUpEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.request_close_document(
+                                middle_project.clone(),
+                                middle_key.clone(),
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     // 页签右键菜单:关闭 / 关闭其他 / 关闭右边 / 关闭左边。
                     // 常驻的终端页有自己那份(terminal_tab_menu) —— 它关不掉
                     .on_mouse_down(
@@ -1161,10 +1580,10 @@ impl Render for WorkbenchArea {
 
         let body = match &active {
             WorkbenchPage::Terminal => self.terminal_area.clone().into_any_element(),
-            WorkbenchPage::Document(key) => tabs
+            WorkbenchPage::Tab(key) => tabs
                 .iter()
-                .find(|(candidate, _, _)| candidate == key)
-                .map(|(_, _, document)| document.clone().into_any_element())
+                .find(|tab| &tab.key == key)
+                .map(|tab| tab.content.view())
                 .unwrap_or_else(|| self.terminal_area.clone().into_any_element()),
         };
 
@@ -1261,7 +1680,7 @@ fn dirty_preview(names: &[String]) -> Vec<String> {
     lines
 }
 
-fn stable_hash(key: &DocumentKey) -> u64 {
+fn stable_hash(key: &TabKey) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
@@ -1271,12 +1690,93 @@ fn stable_hash(key: &DocumentKey) -> u64 {
 mod tests {
     use super::*;
 
-    fn key(path: &str) -> DocumentKey {
-        DocumentKey {
+    fn key(path: &str) -> TabKey {
+        TabKey::Document(DocumentKey {
             project_id: "p".into(),
             backend: DocumentBackendKey::Local,
             normalized_path: path.into(),
-        }
+        })
+    }
+
+    fn page(path: &str) -> WorkbenchPage {
+        WorkbenchPage::Tab(key(path))
+    }
+
+    fn take(close: Option<usize>, active: WorkbenchPage) -> Retarget {
+        Retarget::Take { close, active }
+    }
+
+    /// diff 页签换了身份:没有撞上别的页签时只是活动页跟着新身份走(原本停在它上面的话)。
+    #[test]
+    fn 换身份时活动页跟着走() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            retarget_plan(&keys, &page("b"), 1, &key("x")),
+            take(None, page("x"))
+        );
+        // 活动页是别的页签 / 终端页:不动
+        assert_eq!(
+            retarget_plan(&keys, &page("a"), 1, &key("x")),
+            take(None, page("a"))
+        );
+        assert_eq!(
+            retarget_plan(&keys, &WorkbenchPage::Terminal, 1, &key("x")),
+            take(None, WorkbenchPage::Terminal)
+        );
+        // 身份没变(只是标题刷新):什么都不关
+        assert_eq!(
+            retarget_plan(&keys, &page("b"), 1, &key("b")),
+            take(None, page("b"))
+        );
+    }
+
+    /// 换到的目标已经有另一个页签、那个页签不是活动页:换身份的这个接管,旧的那个要关掉。
+    /// 活动页是换身份的这个时跟着新身份走;是别的页签 / 终端页时不动。
+    #[test]
+    fn 换到已开着的目标时关掉旧页签() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            retarget_plan(&keys, &page("b"), 1, &key("c")),
+            take(Some(2), page("c"))
+        );
+        assert_eq!(
+            retarget_plan(&keys, &page("b"), 1, &key("a")),
+            take(Some(0), page("a"))
+        );
+        // 换身份的是后台页签、撞上的也不在眼前:照样接管,活动页不动
+        assert_eq!(
+            retarget_plan(&keys, &page("a"), 1, &key("c")),
+            take(Some(2), page("a"))
+        );
+        assert_eq!(
+            retarget_plan(&keys, &WorkbenchPage::Terminal, 1, &key("c")),
+            take(Some(2), WorkbenchPage::Terminal)
+        );
+        // 下标越界(不该出现,防御):什么都不动
+        assert_eq!(
+            retarget_plan(&keys, &page("b"), 9, &key("a")),
+            take(None, page("b"))
+        );
+    }
+
+    /// 后台页签被换到了眼前这一页的目标上(在 b 里做块操作、在途时切到 c,列表重载后 b 被带到
+    /// c 的文件上):留下眼前的 c,关掉换身份的 b —— 不把用户正在看的页签连同焦点换掉。
+    #[test]
+    fn 撞上的同身份页签是活动页时关掉换身份的后台页签() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            retarget_plan(&keys, &page("c"), 1, &key("c")),
+            Retarget::Yield
+        );
+        assert_eq!(
+            retarget_plan(&keys, &page("a"), 2, &key("a")),
+            Retarget::Yield
+        );
+        // 没撞上任何页签时,活动页的身份恰好等于新身份也谈不上让(不会出现,防御)
+        assert_eq!(
+            retarget_plan(&[key("a"), key("b")], &page("x"), 1, &key("x")),
+            take(None, page("x"))
+        );
     }
 
     #[test]
@@ -1431,5 +1931,30 @@ mod tests {
             Some(key("b"))
         );
         assert_eq!(next_document_after_close(&[], 0), None);
+    }
+
+    /// 最近打开:新的在前、重复的挪到最前而不是再记一条、封顶;Windows 上只差大小写算同一个。
+    #[test]
+    fn 最近打开去重挪前并封顶() {
+        let mut recent = Vec::new();
+        push_recent(&mut recent, Path::new("/p/a.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/b.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/a.rs"), 3);
+        assert_eq!(recent, [PathBuf::from("/p/a.rs"), PathBuf::from("/p/b.rs")]);
+        push_recent(&mut recent, Path::new("/p/c.rs"), 3);
+        push_recent(&mut recent, Path::new("/p/d.rs"), 3);
+        assert_eq!(
+            recent,
+            [
+                PathBuf::from("/p/d.rs"),
+                PathBuf::from("/p/c.rs"),
+                PathBuf::from("/p/a.rs")
+            ]
+        );
+        if cfg!(windows) {
+            push_recent(&mut recent, Path::new(r"\P\A.RS"), 3);
+            assert_eq!(recent.len(), 3, "只差大小写与分隔符的是同一个文件");
+            assert_eq!(recent[0], PathBuf::from(r"\P\A.RS"));
+        }
     }
 }

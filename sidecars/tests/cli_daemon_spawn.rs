@@ -153,7 +153,10 @@ fn process_image(process: &OwnedHandle) -> Option<PathBuf> {
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    match (
+        mt_core::path::canonicalize(a),
+        mt_core::path::canonicalize(b),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => a
             .to_string_lossy()

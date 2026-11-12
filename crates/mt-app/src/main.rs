@@ -70,6 +70,7 @@ mod frost;
 mod fs_ops;
 mod git_branches;
 mod git_changes;
+mod git_conflict;
 mod git_diff;
 mod git_dir_watch;
 mod git_file_history;
@@ -106,6 +107,7 @@ mod project_switcher;
 mod project_tree;
 mod prompt;
 mod pty_slot;
+mod quick_open;
 mod redraw;
 mod remote_directory_picker;
 mod remote_notify;
@@ -209,6 +211,8 @@ actions!(
         TerminalSearch,
         /// 全局搜索(Ctrl+Shift+F,toggle)
         GlobalSearch,
+        /// 快速打开文件(Ctrl+Shift+O,toggle)
+        QuickOpenFile,
         /// 项目快速切换器(Ctrl+Shift+P)
         SwitchProject,
         /// 跳到上一个 AI 任务标记(Ctrl+Shift+↑)
@@ -320,6 +324,31 @@ struct DrawerDrag {
 const GIT_DETAIL_TERMINAL_ROOM: f32 = 200.0;
 /// 窗口再窄,详情栏也不窄于这个宽(宁可压住终端左段,也别挤成一条缝)。
 const GIT_DETAIL_FLOOR_W: f32 = 260.0;
+/// 抽屉挤占页签区时,页签区至少留这么宽;窗口太窄、抽屉连同详情栏放不下时,多出来的
+/// 那截照旧盖在页签区上(与详情栏「宁可压住,也别挤成一条缝」同一取舍)。
+const SQUEEZE_MIN_DOC_W: f32 = 320.0;
+
+/// 提交详情栏的宽:想要的宽(拖过 / 落盘的)先给窗口左侧留出 [`GIT_DETAIL_TERMINAL_ROOM`],
+/// 但不窄于 [`GIT_DETAIL_FLOOR_W`]。
+fn detail_layer_width(wanted: f32, viewport_w: f32, drawer_w: f32) -> f32 {
+    wanted
+        .min(viewport_w - drawer_w - GIT_DETAIL_TERMINAL_ROOM)
+        .max(GIT_DETAIL_FLOOR_W)
+}
+
+/// 右抽屉(连同 Git 抽屉左侧的提交详情栏)从页签区右侧挤占多宽。
+///
+/// - 停在**终端页**、或抽屉没开着(含退场动画驻留的那 400ms)→ 0:抽屉照旧悬浮,
+///   终端宽度一像素不动(每次宽度变化都是一次 PTY resize,见 `terminal_area` 模块注释);
+/// - 停在**文件 / diff 页签**上 → 抽屉占多宽就让出多宽(`occupied` = 抽屉宽 + 详情栏宽),
+///   页签区跟着变窄,可以边看 diff 边在更改列表里点;但页签区至少留 [`SQUEEZE_MIN_DOC_W`]
+///   (`panel_w` 是页签区所在那一栏的宽),放不下的那截照旧盖在上面。
+fn drawer_squeeze(terminal_page: bool, drawer_open: bool, occupied: f32, panel_w: f32) -> f32 {
+    if terminal_page || !drawer_open {
+        return 0.0;
+    }
+    occupied.min(panel_w - SQUEEZE_MIN_DOC_W).max(0.0)
+}
 
 /// 上次退出时的窗口几何 → 本次开窗参数。
 ///
@@ -1154,6 +1183,27 @@ impl Workspace {
         search_modal::toggle(self.store.clone(), window, cx);
     }
 
+    /// Ctrl+Shift+O:开合快速打开文件。
+    ///
+    /// 两道闸只加覆盖物那一道:
+    ///
+    /// - **不看**「焦点在输入框里」([`yields_to_typing`]):文件页的代码编辑器就是输入框,
+    ///   看着代码想跳到另一个文件正是最常用的场合,让路就等于这个键在文件页里废了;
+    ///   Ctrl+Shift+O 在输入框里也没有别的含义;
+    /// - **看**覆盖物栈:设置之类的弹窗压着时不在它上面再叠一层(从那里打开的文件落在弹窗
+    ///   底下看不见)。
+    ///
+    /// toggle 的「关」排在让路之前:面板开着时它自己就在覆盖物栈里(同命令库那条)。
+    fn on_quick_open(&mut self, _: &QuickOpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        if prompt::close_guarded(overlay::kind::QUICK_OPEN, window, cx) {
+            return;
+        }
+        if !overlay::allows(overlay::Yield::ToOverlay) {
+            return;
+        }
+        quick_open::open(self.store.clone(), window, cx);
+    }
+
     /// Ctrl+Shift+↑:跳到上一个 AI 任务标记。首次按跳**最新一条**,
     /// 之后每按一次往上一格,到顶停住(非环形,见 [`markers::next_index`])。
     ///
@@ -1178,31 +1228,39 @@ impl Workspace {
         self.store.update(cx, |store, cx| store.step_marker(1, cx));
     }
 
+    /// 提交详情栏此刻的宽:拖拽中按拖的,否则按落盘的;窗口窄时让一让(见
+    /// [`detail_layer_width`])。
+    fn detail_width(&self, drawer_width: f32, window: &Window, cx: &App) -> f32 {
+        let wanted = self
+            .detail_drag
+            .map(|d| d.width)
+            .unwrap_or_else(|| self.store.read(cx).git_detail_width()) as f32;
+        detail_layer_width(
+            wanted,
+            f32::from(window.viewport_size().width),
+            drawer_width,
+        )
+    }
+
     /// Git 抽屉左侧的「提交详情」栏(内容与开合口径见 `git_history::detail` 模块注释)。
     ///
     /// 挂在抽屉层里当子节点、`right` = 抽屉宽:紧贴抽屉左缘往左排,随抽屉一起滑进滑出、
-    /// 随抽屉拖宽一起左移;同样盖在终端之上、不改终端尺寸(PTY 不 resize)。
+    /// 随抽屉拖宽一起左移;停在终端页时同样盖在终端之上、不改终端尺寸(PTY 不 resize),
+    /// 停在文件 / diff 页签上时连同抽屉一起挤窄页签区(见 [`drawer_squeeze`])。
     ///
     /// 进场从抽屉左缘**滑出来**:外壳按栏宽裁剪,里层的 `left` 从栏宽补到 0 —— 方向性
     /// 位移、零尺寸变化;与抽屉进场同一条时长与缓动,同样不过减弱动效的闸。外壳 `id`
     /// 不变,换选中的提交不重播,只有栏从无到有(单击打开、抽屉重新打开)才播。
     ///
-    /// 宽度落 layout.db(左缘拖拽,松手落盘);窗口窄时先给终端留出
-    /// [`GIT_DETAIL_TERMINAL_ROOM`],但不窄于 [`GIT_DETAIL_FLOOR_W`]。
+    /// 宽度(`width`,由 [`Self::detail_width`] 算好传进来 —— 挤占页签区也按它)落
+    /// layout.db(左缘拖拽,松手落盘)。
     fn render_commit_detail_layer(
         &self,
         pane: Entity<git_history::CommitDetailPane>,
         drawer_width: f32,
-        window: &Window,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let wanted = self
-            .detail_drag
-            .map(|d| d.width)
-            .unwrap_or_else(|| self.store.read(cx).git_detail_width()) as f32;
-        let room =
-            f32::from(window.viewport_size().width) - drawer_width - GIT_DETAIL_TERMINAL_ROOM;
-        let width = wanted.min(room).max(GIT_DETAIL_FLOOR_W);
         div()
             .id("git-detail-layer")
             .absolute()
@@ -1625,6 +1683,36 @@ impl Render for Workspace {
         // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)
         let drawer_width = self.drawer_drag.map(|d| d.width).unwrap_or(drawer_width);
 
+        // 抽屉里正画着哪一块(退场动画驻留期间是刚收起的那块),以及 Git 抽屉左侧的提交详情栏
+        // 有多宽 —— 画抽屉层与挤占页签区共用这一份
+        let exiting = self.drawer_exit.as_ref().map(|e| e.panel);
+        let drawer_panel = self.right_drawer.or(exiting);
+        let detail_pane = match drawer_panel {
+            Some(DrawerPanel::Git) => self.git_panel.read(cx).detail_pane(cx),
+            _ => None,
+        };
+        let detail_width = detail_pane
+            .as_ref()
+            .map(|_| self.detail_width(drawer_width as f32, window, cx));
+        // 停在文件 / diff 页签上时,开着的抽屉(连同详情栏)挤窄页签区而不是盖在上面;
+        // 终端页照旧悬浮(见 [`drawer_squeeze`])。只看 `right_drawer`:收起那一刻就把
+        // 页签区放回原宽,退场动画里的抽屉照旧从页签区上方滑走。页签区所在那一栏的宽按
+        // 视口减边条与中栏估(中栏宽是落盘的那份,拖分隔条时差几像素无妨 —— 只拿来兜
+        // 「至少留多宽」那条底)
+        let doc_panel_width = f32::from(window.viewport_size().width)
+            - activity_bar::WIDTH
+            - if middle_visible {
+                columns[0] as f32
+            } else {
+                0.0
+            };
+        let squeeze = drawer_squeeze(
+            terminal_page_active,
+            self.right_drawer.is_some(),
+            drawer_width as f32 + detail_width.unwrap_or(0.0),
+            doc_panel_width,
+        );
+
         // 中间栏是**上下**结构:ProjectList 在上、FileTree 在下(`App.tsx:501-512`
         // 的 `<Allotment vertical>`,minSize 100/120、无上限,高度落 middleColumnSizes)
         //
@@ -1674,6 +1762,11 @@ impl Render for Workspace {
             // 的分栏账),与 VS Code 终端面板右侧的列表同位。开合会改终端宽度
             // 并触发一次 PTY resize —— 停靠面板的正常代价,与折叠中间栏同档;
             // 悬浮的右抽屉(Sessions/Git)另有考量,见下方 drawer_layer 注释。
+            //
+            // 停在文件 / diff 页签上时,抽屉挤占的那一截是这一栏**里面**最右的一块占位
+            // (`squeeze`),而不是缩这一栏本身:三栏的 `ResizableState` 一见容器变宽变窄
+            // 就按比例重摊各栏(见 `reseed_resizables_on_viewport_change`),中栏会跟着
+            // 抽屉开合伸缩。终端页时竖条在、占位不在,文件页时反过来,两者不同时出现。
             .child(
                 resizable_panel().child(
                     div()
@@ -1700,6 +1793,9 @@ impl Render for Workspace {
                                     .h_full()
                                     .flex_none(),
                             ))
+                        })
+                        .when(squeeze > 0.0, |el| {
+                            el.child(div().flex_none().w(px(squeeze)).h_full())
                         }),
                 ),
             )
@@ -1926,6 +2022,13 @@ impl Render for Workspace {
         // 宽度、连带触发一次 PTY resize**(刷屏进程正在跑时肉眼可见地重排)。
         // 改成悬浮层之后终端尺寸不动,PTY 也就不再收到 SIGWINCH。
         //
+        // **停在文件 / diff 页签上时改为挤占**:抽屉本身仍是同一个悬浮层(位置、动画、
+        // 拖宽一概不变),只是页签区那一栏里垫了一块等宽的占位(上面的 `squeeze`),
+        // 页签区变窄、抽屉落在让出来的那一截里,不再盖住 diff。终端页照旧悬浮 ——
+        // 终端区与页签页不同时渲染,切页时终端拿到的始终是整栏宽,开合抽屉不会让它重排。
+        // 进场时占位一步到位、抽屉照旧从右缘滑进那一截;收起那一刻占位就撤掉,抽屉在
+        // 退场驻留的 400ms 里从页签区上方滑走;拖抽屉 / 详情栏左缘时占位逐帧跟着变。
+        //
         // 层级对照:原版 `z-45` 压过 allotment 分隔条(35)、低于弹窗(50)——
         // 这里 `.children(...)` 的顺序等价:抽屉排在三栏之后、弹窗/菜单层之前。
         // 抽屉**不进 [`overlay`] 栈**(原版 `RightDrawer` 同样没压栈),
@@ -1941,8 +2044,7 @@ impl Render for Workspace {
         //
         // ⚠️ 这三条在原版被**显式豁免** `prefers-reduced-motion`
         // (`styles.css:424-451`),所以 GPUI 侧不加任何减弱动效判定,始终播放。
-        let exiting = self.drawer_exit.as_ref().map(|e| e.panel);
-        let drawer_layer = self.right_drawer.or(exiting).map(|panel| {
+        let drawer_layer = drawer_panel.map(|panel| {
             let leaving = self.right_drawer.is_none();
             let width = drawer_width as f32;
             // ⚠️ 抽屉里这两块**不套** [`cached_panel`](Git 面板里的「更改」「提交历史」
@@ -1961,11 +2063,10 @@ impl Render for Workspace {
                 DrawerPanel::Git => self.git_panel.clone().into_any_element(),
             };
             // Git 面板选中提交时,抽屉左侧再挂一栏「提交详情」
-            let detail_layer = match panel {
-                DrawerPanel::Git => self.git_panel.read(cx).detail_pane(cx),
-                DrawerPanel::Sessions => None,
-            }
-            .map(|pane| self.render_commit_detail_layer(pane, width, window, cx));
+            let detail_layer = detail_pane
+                .clone()
+                .zip(detail_width)
+                .map(|(pane, detail)| self.render_commit_detail_layer(pane, width, detail, cx));
             div()
                 .absolute()
                 .top_0()
@@ -2249,6 +2350,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_focus_down))
             .on_action(cx.listener(Self::on_terminal_search))
             .on_action(cx.listener(Self::on_global_search))
+            .on_action(cx.listener(Self::on_quick_open))
             .on_action(cx.listener(Self::on_switch_project))
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))
@@ -2564,6 +2666,7 @@ fn main() {
         // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
         // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
         i18n::install(locale.as_deref());
+        i18n::install_encoding_region();
 
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
         // 走 mt_config::app_data_dir(),端口文件与装机版落在同一处。
@@ -2768,5 +2871,55 @@ mod tests {
             "min_w(0) 不能省"
         );
         assert_eq!(style.flex_grow, Some(1.0), "仍然吃满 body 的剩余宽度");
+    }
+
+    /// 抽屉挤不挤页签区:终端页、抽屉没开(含退场驻留)一律 0 —— 终端宽度一像素不动;
+    /// 文件 / diff 页上让出抽屉连同详情栏的宽。
+    #[test]
+    fn 只在文件页上挤占页签区() {
+        assert_eq!(
+            drawer_squeeze(true, true, 360.0, 1200.0),
+            0.0,
+            "终端页照旧悬浮"
+        );
+        assert_eq!(
+            drawer_squeeze(false, false, 360.0, 1200.0),
+            0.0,
+            "抽屉收着 / 正在退场"
+        );
+        assert_eq!(drawer_squeeze(true, false, 360.0, 1200.0), 0.0);
+        assert_eq!(drawer_squeeze(false, true, 360.0, 1200.0), 360.0);
+        // 抽屉 + 详情栏一起让
+        assert_eq!(drawer_squeeze(false, true, 360.0 + 420.0, 1600.0), 780.0);
+    }
+
+    /// 页签区至少留 [`SQUEEZE_MIN_DOC_W`]:放不下时只让到那条底,多出来的照旧盖着;
+    /// 那一栏本身比底还窄时不让(整栏都被盖住,与挤占前一样),绝不出负数。
+    #[test]
+    fn 挤占给页签区留底() {
+        let panel = 900.0;
+        assert_eq!(
+            drawer_squeeze(false, true, 780.0, panel),
+            panel - SQUEEZE_MIN_DOC_W
+        );
+        assert_eq!(
+            drawer_squeeze(false, true, 360.0, panel),
+            360.0,
+            "放得下就全让"
+        );
+        assert_eq!(drawer_squeeze(false, true, 360.0, 200.0), 0.0);
+        assert_eq!(drawer_squeeze(false, true, 0.0, 1200.0), 0.0);
+    }
+
+    /// 提交详情栏的宽:想要多宽给多宽,窗口窄时先给左侧留出 [`GIT_DETAIL_TERMINAL_ROOM`],
+    /// 但不窄于 [`GIT_DETAIL_FLOOR_W`](宁可压住一截,也别挤成一条缝)。挤占页签区也按这个宽。
+    #[test]
+    fn 详情栏宽度让一让但有底() {
+        assert_eq!(detail_layer_width(420.0, 1920.0, 360.0), 420.0);
+        assert_eq!(
+            detail_layer_width(900.0, 1280.0, 360.0),
+            1280.0 - 360.0 - GIT_DETAIL_TERMINAL_ROOM
+        );
+        assert_eq!(detail_layer_width(420.0, 700.0, 360.0), GIT_DETAIL_FLOOR_W);
     }
 }
