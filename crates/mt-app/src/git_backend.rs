@@ -1,8 +1,10 @@
 //! Capture Git execution identity on the UI thread before asynchronous work.
 //! Helper consent is project-scoped and bound to the displayed execution target.
+//! Consent separates the project/SSH target, repository path and helper cache path.
 use crate::i18n::t;
 use crate::store::AppStore;
-use gpui::{App, Entity, Window};
+use crate::ui;
+use gpui::{App, ClickEvent, Entity, FontWeight, ParentElement, Styled, Window, div, px};
 use mt_config::{AppConfig, ProjectConfig};
 use mt_remote::GitContext;
 
@@ -55,7 +57,7 @@ pub(crate) fn sync_remote_git_permissions(config: &AppConfig) {
 }
 
 /// Includes the process-local credential identity without persisting a password hash.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct EnableTarget {
     project_id: String,
     connection_fingerprint: u64,
@@ -98,46 +100,133 @@ pub fn request_enable(
     else {
         return;
     };
-    let detail = vec![
-        format!("{} · {}", project.name, connection.name),
-        format!(
-            "{}@{}:{}",
-            connection.user, connection.host, connection.port
-        ),
-        project.path.clone(),
-        "~/.cache/mini-term/git-helper/<sha256>/mt-git-helper".to_string(),
-        t("gitHistory", "enableBoundary").to_string(),
-    ];
-    crate::prompt::Confirm::new(
-        t("gitHistory", "enableTitle"),
-        t("gitHistory", "enableProjectMessage"),
-    )
-    .detail(detail)
-    .ok_text(t("gitHistory", "enableAction"))
-    .open(
-        move |window, cx| {
-            let state = store.read(cx);
-            let current = state
-                .project(&project_id)
-                .and_then(|project| EnableTarget::capture(project, state.config()));
-            if current.as_ref() != Some(&target) {
-                // Defer until the confirmation has been removed from the dialog stack.
-                window.defer(cx, |window, cx| {
-                    crate::prompt::show_alert(
-                        t("gitHistory", "enableTitle"),
-                        t("gitHistory", "enableTargetChanged"),
-                        window,
-                        cx,
-                    );
-                });
-                return;
-            }
-            store.update(cx, |store, cx| {
-                store.set_project_remote_git_enabled(&project_id, true, cx);
-            });
-        },
+    let project_name = project.name.clone();
+    let connection_name = connection.name.clone();
+    let endpoint = format!(
+        "{}@{}:{}",
+        connection.user, connection.host, connection.port
+    );
+    let project_path = project.path.clone();
+    crate::prompt::open_guarded(
+        crate::prompt::kind::CONFIRM,
         window,
         cx,
+        move |dialog, window, _cx| {
+            let field = |label: &'static str, value: &str| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(ui::font_px(11.0))
+                            .text_color(ui::text_secondary())
+                            .child(t("gitHistory", label)),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::font_px(13.0))
+                            .text_color(ui::text_primary())
+                            .whitespace_normal()
+                            .child(value.to_string()),
+                    )
+            };
+            let content = div()
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .child(crate::prompt::body(
+                    t("gitHistory", "enableProjectMessage"),
+                    &[],
+                ))
+                .child(
+                    ui::settings_card()
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(field("enableProjectLabel", &project_name))
+                        .child(
+                            field("enableConnectionLabel", &connection_name).child(
+                                div()
+                                    .text_size(ui::font_px(12.0))
+                                    .text_color(ui::text_secondary())
+                                    .child(endpoint.clone()),
+                            ),
+                        ),
+                )
+                .child(
+                    ui::settings_card()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(field("enableProjectPathLabel", &project_path)),
+                )
+                .child(
+                    ui::settings_card()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(field(
+                            "enableHelperPathLabel",
+                            "~/.cache/mini-term/git-helper/<sha256>/mt-git-helper",
+                        ))
+                        .child(
+                            div()
+                                .text_size(ui::font_px(11.0))
+                                .text_color(ui::text_secondary())
+                                .child(t("gitHistory", "enableHelperPathHint")),
+                        ),
+                )
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(ui::border_subtle())
+                        .pt(px(10.0))
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_secondary())
+                        .child(t("gitHistory", "enableBoundary")),
+                );
+            dialog
+                .title(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t("gitHistory", "enableTitle")),
+                )
+                .w(ui::clamp_dialog_width(px(500.0), window.viewport_size()))
+                .overlay_closable(true)
+                .footer(crate::prompt::confirm_footer(
+                    t("gitHistory", "enableAction"),
+                    Some(t("prompt", "cancel")),
+                ))
+                .child(content)
+                .on_ok({
+                    let store = store.clone();
+                    let project_id = project_id.clone();
+                    let target = target.clone();
+                    move |_: &ClickEvent, window, cx| {
+                        let state = store.read(cx);
+                        let current = state
+                            .project(&project_id)
+                            .and_then(|project| EnableTarget::capture(project, state.config()));
+                        if current.as_ref() != Some(&target) {
+                            // Show the changed-target notice after this confirmation closes.
+                            window.defer(cx, |window, cx| {
+                                crate::prompt::show_alert(
+                                    t("gitHistory", "enableTitle"),
+                                    t("gitHistory", "enableTargetChanged"),
+                                    window,
+                                    cx,
+                                );
+                            });
+                            return true;
+                        }
+                        store.update(cx, |store, cx| {
+                            store.set_project_remote_git_enabled(&project_id, true, cx);
+                        });
+                        true
+                    }
+                })
+        },
     );
 }
 

@@ -198,8 +198,9 @@ use mt_i18n::{
 /// 1548 → 1549：分支弹窗行右键「复制分支名」（`gitBranch.menuCopyName`）。
 /// 1549 → 1577：远端 Git 部署授权、服务错误与跨仓库操作反馈。
 /// 1577 → 1592：项目级远端 Git 授权、显式写结果核对、来源保护与草稿恢复反馈。
+/// 1592 → 1597：远端 Git 授权框区分项目、连接、项目路径及 helper 缓存路径。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1592;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1597;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1592;
+pub const ZH_ENTRY_COUNT: usize = 1597;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1592;
+pub const EN_ENTRY_COUNT: usize = 1597;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1203,8 +1203,13 @@ static GIT_HISTORY_ZH: &[(&str, &str)] = &[
     ("deploymentFailed", "部署远端 Git helper 失败，请检查服务器平台、缓存目录权限和随包资源。"),
     ("enableAction", "允许并启用"),
     ("enableBoundary", "服务器需要 Git 和可执行的用户缓存目录；无需 root，不新增监听端口。可在项目右键菜单撤销；撤销不会取消已发出的写操作。"),
+    ("enableConnectionLabel", "SSH 连接"),
     ("enableEntry", "启用远端 Git"),
-    ("enableProjectMessage", "是否允许为当前项目上传并运行 Git helper？授权仅适用于下面的 SSH 连接和项目目录。"),
+    ("enableHelperPathHint", "helper 与项目文件分开存放；~ 代表远端登录用户的主目录，<sha256> 为随包 helper 的版本校验值。"),
+    ("enableHelperPathLabel", "Git helper 安装路径（服务器缓存目录）"),
+    ("enableProjectLabel", "授权项目"),
+    ("enableProjectMessage", "将上传并运行 Git helper，以便在此服务器上查看和操作当前项目的 Git 仓库。授权仅对下方项目生效。"),
+    ("enableProjectPathLabel", "项目路径（远端仓库所在目录）"),
     ("enableTargetChanged", "确认期间项目、SSH 连接、凭据或目录已改变，未启用任何授权，请重新确认。"),
     ("enableTitle", "允许部署远端 Git helper？"),
     ("invalidReply", "远端 Git 响应无效，未能确认仓库状态。"),
@@ -1244,8 +1249,13 @@ static GIT_HISTORY_EN: &[(&str, &str)] = &[
     ("deploymentFailed", "Could not deploy the Git helper. Check the server platform, cache permissions and bundled resources."),
     ("enableAction", "Allow and enable"),
     ("enableBoundary", "The server needs Git and an executable user cache. No root access or listening port is required. Revoke from the project menu; revocation does not cancel writes already sent."),
+    ("enableConnectionLabel", "SSH connection"),
     ("enableEntry", "Enable remote Git"),
-    ("enableProjectMessage", "Allow uploading and running the Git helper for this project on the SSH connection and project directory shown below? Permission applies only to this project target."),
+    ("enableHelperPathHint", "Stored separately from project files. ~ is the remote user's home directory; <sha256> identifies the bundled helper build."),
+    ("enableHelperPathLabel", "Git helper installation path (server cache)"),
+    ("enableProjectLabel", "Authorized project"),
+    ("enableProjectMessage", "Upload and run the Git helper to view and operate on this project's Git repositories on the server. Permission applies only to the project below."),
+    ("enableProjectPathLabel", "Project path (remote repository directory)"),
     ("enableTargetChanged", "The project, SSH connection, credentials or directory changed while confirmation was open. Nothing was enabled. Confirm the new target again."),
     ("enableTitle", "Allow remote Git helper deployment?"),
     ("invalidReply", "The remote Git response is invalid; repository state could not be verified."),
