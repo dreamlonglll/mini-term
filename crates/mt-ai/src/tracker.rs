@@ -503,6 +503,9 @@ impl SessionTracker {
                     continue;
                 }
                 match ch {
+                    // Emacs 行首 / 行尾,也覆盖 macOS ⌘← / ⌘→ 的终端映射(issue #98)。
+                    '\x01' => state.move_home(),
+                    '\x05' => state.move_end(),
                     '\x03' => {
                         state.clear_line();
                         if in_ai {
@@ -1095,6 +1098,46 @@ mod tests {
         assert_eq!(submits.len(), 1);
         assert_eq!(submits[0].line, "fix the bug");
         assert!(submits[0].ts > 0);
+    }
+
+    #[test]
+    fn ctrl_a_e_preserve_edited_submit_text() {
+        let mgr = SessionTracker::new();
+        mgr.mark_ai_session(1, "omp");
+        for input in ["你好abcd", "\x01", "L", "\x05", "R", "\r"] {
+            mgr.track_input(1, input);
+        }
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "L你好abcdR");
+        assert!(!submits[0].from_snapshot);
+    }
+
+    #[test]
+    fn ctrl_a_e_preserve_edited_ai_command_detection() {
+        let mgr = SessionTracker::new();
+        for input in ["laud", "\x01", "c", "\x05", "e", "\r"] {
+            mgr.track_input(1, input);
+        }
+        assert_eq!(mgr.ai_session_agent(1).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn ctrl_a_e_inside_bracketed_paste_do_not_move_cursor() {
+        let mgr = SessionTracker::new();
+        mgr.mark_ai_session(1, "omp");
+        for input in [
+            "abcd",
+            "\x1b[D",
+            "\x1b[D",
+            "\x1b[200~\x01L\x05R\x1b[201~",
+            "\r",
+        ] {
+            mgr.track_input(1, input);
+        }
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "abLRcd");
     }
 
     /// Codex / OMP 的 Shift+Enter 与 AI 会话里的 Ctrl+J 都是插入换行,不能清空已输入内容。
