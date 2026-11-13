@@ -431,17 +431,21 @@ fn conflict_statuses(repo: &Path, infos: &[git::ConflictInfo]) -> Result<Vec<git
     // Core does not follow the final component: a conflicted symlink is an
     // Unreadable blocker, not a batch RPC failure. Parent containment remains
     // mandatory, so no metadata/content read can escape through a directory.
-    for info in infos {
-        validate_path(repo, &info.path, false)?;
-        validate_file_repository(repo, &info.path)?;
-    }
     let actual = git::list_conflicts(repo)?;
+    let actual: std::collections::HashMap<_, _> = actual
+        .iter()
+        .map(|info| (info.path.as_str(), info))
+        .collect();
     Ok(infos
         .iter()
         .map(|info| {
+            if validate_path(repo, &info.path, false).is_err()
+                || validate_file_repository(repo, &info.path).is_err()
+            {
+                return git::SegmentStatus::Blocked(git::SegmentBlocker::Unreadable);
+            }
             actual
-                .iter()
-                .find(|entry| entry.path == info.path)
+                .get(info.path.as_str())
                 .map(|entry| git::conflict_segment_status(repo, entry))
                 .unwrap_or(git::SegmentStatus::Blocked(
                     git::SegmentBlocker::NotConflicted,

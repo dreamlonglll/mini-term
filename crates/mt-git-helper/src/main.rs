@@ -21,5 +21,9 @@ fn run() -> anyhow::Result<()> {
         args.next().is_none(),
         "usage: mt-git-helper --root <absolute-directory>"
     );
+    // The desktop owns the hint; never infer a different encoding from the remote locale.
+    if let Ok(region) = std::env::var("MINI_TERM_ENCODING_REGION") {
+        mt_project::encoding::set_region_hint(&region);
+    }
     mt_git_helper::serve(&root, std::io::stdin().lock(), std::io::stdout().lock())
 }

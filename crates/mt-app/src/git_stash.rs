@@ -1783,7 +1783,14 @@ fn open_save_with(repo_path: GitContext, on_saved: OnSaved, window: &mut Window,
     let form = cx.new(|_| Form::new());
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitStash", "save.placeholder")));
-    let repo_name = git_ui::repo_label(&repo_path);
+    let repo_name = if repo_path.local_path().is_some() {
+        std::path::Path::new(repo_path.path())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo_path.path().to_owned())
+    } else {
+        git_ui::repo_label(&repo_path)
+    };
     let focus_input = input.clone();
 
     open_guarded(

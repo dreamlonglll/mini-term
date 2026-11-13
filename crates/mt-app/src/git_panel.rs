@@ -1052,9 +1052,12 @@ impl GitPanel {
                     }
                     Err(err) => {
                         eprintln!("[git] 发现仓库失败: {err:#}");
-                        this.load_error = Some(git_ui::error_text(&err));
-                        this.repos.clear();
-                        this.selected_repo.clear();
+                        if !this.local_project() {
+                            this.load_error =
+                                Some(git_ui::error_text_for_store(&err, &this.store, cx));
+                            this.repos.clear();
+                            this.selected_repo.clear();
+                        }
                     }
                 }
                 if before != this.selected_repo {
@@ -1165,9 +1168,11 @@ impl GitPanel {
                     }
                     Err(err) => {
                         eprintln!("[git] 取分支失败: {err:#}");
-                        let error = git_ui::error_text(&err);
-                        changed |= this.load_error.as_ref() != Some(&error);
-                        this.load_error = Some(error);
+                        if !this.local_project() {
+                            let error = git_ui::error_text_for_store(&err, &this.store, cx);
+                            changed |= this.load_error.as_ref() != Some(&error);
+                            this.load_error = Some(error);
+                        }
                     }
                 }
                 this.push_repo_down(cx);
@@ -1347,7 +1352,7 @@ impl GitPanel {
             Err(error) => {
                 git_ui::show_git_error(
                     t("gitHistory", "abandonTitle"),
-                    git_ui::error_text(&error),
+                    git_ui::error_text_for_store(&error, &self.store, cx),
                     window,
                     cx,
                 );
@@ -1355,6 +1360,7 @@ impl GitPanel {
             }
         };
         let panel = cx.entity().downgrade();
+        let store = self.store.clone();
         Confirm::new(
             t("gitHistory", "abandonTitle"),
             t("gitHistory", "abandonWarning"),
@@ -1382,7 +1388,7 @@ impl GitPanel {
                     }
                     Err(error) => git_ui::show_git_error(
                         t("gitHistory", "abandonTitle"),
-                        git_ui::error_text(&error),
+                        git_ui::error_text_for_store(&error, &store, cx),
                         window,
                         cx,
                     ),
@@ -1490,7 +1496,7 @@ impl GitPanel {
                                                 }
                                                 Err(err) => git_ui::show_git_error(
                                                     t("gitHistory", "verifyWrite"),
-                                                    git_ui::error_text(&err),
+                                                    git_ui::error_text_for_store(&err, &store, cx),
                                                     window,
                                                     cx,
                                                 ),
@@ -1504,7 +1510,7 @@ impl GitPanel {
                     }
                     Err(err) => git_ui::show_git_error(
                         t("gitHistory", "verifyWrite"),
-                        git_ui::error_text(&err),
+                        git_ui::error_text_for_store(&err, &store, cx),
                         window,
                         cx,
                     ),
@@ -1699,13 +1705,13 @@ impl GitPanel {
                         Err(err) => {
                             eprintln!("[git] {}失败: {err:#}", busy.label());
                             git_ui::show_git_error(
+                                tr!("gitBranch", "opFailed", op = busy.label()),
                                 git_ui::repo_text(
                                     &this.store,
                                     &completed_repo,
-                                    tr!("gitBranch", "opFailed", op = busy.label()),
+                                    git_ui::error_text_for_store(&err, &this.store, cx),
                                     cx,
                                 ),
-                                git_ui::error_text_for_store(&err, &this.store, cx),
                                 window,
                                 cx,
                             );

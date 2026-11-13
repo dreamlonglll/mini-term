@@ -57,7 +57,7 @@ struct GitChannel {
 
 impl RemoteGitClient {
     /// Connect using the application's SSH pool and launch an absolute remote helper path.
-    /// Only the two quoted paths enter the remote shell; operations use framed JSON stdin.
+    /// Paths and the desktop encoding-region hint are shell-quoted; operations use framed JSON stdin.
     pub fn connect(
         conn: &SshConnection,
         helper_path: &str,
@@ -85,10 +85,10 @@ impl RemoteGitClient {
     ) -> Result<Self, String> {
         validate_absolute_path(helper_path, "helper")?;
         validate_absolute_path(project_root, "root")?;
-        let command = format!(
-            "exec {} --root {}",
-            quote_posix(helper_path),
-            quote_posix(project_root)
+        let command = helper_command(
+            helper_path,
+            project_root,
+            mt_project::encoding::region_hint(),
         );
         let transport = runtime.block_on(async {
             let session = acquire_session(&pool, conn).await?;
@@ -508,6 +508,17 @@ pub(crate) fn validate_absolute_path(path: &str, label: &str) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+fn helper_command(helper_path: &str, project_root: &str, region: Option<&str>) -> String {
+    // Always override inherited remote state, including when the desktop has no hint.
+    // An environment assignment also keeps the existing --root CLI compatible with old helpers.
+    format!(
+        "MINI_TERM_ENCODING_REGION={} exec {} --root {}",
+        quote_posix(region.unwrap_or_default()),
+        quote_posix(helper_path),
+        quote_posix(project_root),
+    )
 }
 
 pub(crate) fn quote_posix(value: &str) -> String {

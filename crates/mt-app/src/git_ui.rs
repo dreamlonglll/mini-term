@@ -1351,6 +1351,17 @@ pub fn error_text(err: &anyhow::Error) -> String {
     if let Some(failure) = err.downcast_ref::<mt_remote::GitFailure>() {
         let (key, detail) = match failure {
             mt_remote::GitFailure::OutcomeUnknown { message } => ("verifyWriteFailed", message),
+            mt_remote::GitFailure::RepositoryBlocked {
+                repo,
+                owner_project_ids,
+            } => {
+                return crate::i18n::tr!(
+                    "gitHistory",
+                    "repositoryBlocked",
+                    projects = owner_project_ids.join(", "),
+                    repo = repo.as_str()
+                );
+            }
             mt_remote::GitFailure::Service { code, message } => {
                 let key = match code.as_str() {
                     "remote_git_disabled" => "remoteDisabled",

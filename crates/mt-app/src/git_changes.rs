@@ -77,8 +77,8 @@
 //! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
 //! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
 //! 分支都没动就不重取。
-//! 首次勾选 / 恢复 amend 草稿时阻挡提交,之后的周期核验不让按钮闪灰;读不到新 HEAD
-//! 元数据仍保留 amend 意图。撤销消息、普通草稿历史、最近提交消息分组共存,恢复消息
+//! 本地勾选 amend 立即允许提交,读取元数据失败自动取消;远程首次勾选 / 恢复草稿时
+//! 阻挡提交并在失败时保留意图。之后的周期核验不让按钮闪灰。撤销消息、普通草稿历史、最近提交消息分组共存,恢复消息
 //! 保存被替换草稿而不把它重新放回待恢复队列,菜单以稳定身份消费原仓库的条目。
 //! 异步提交失败同时核对 store 活动项目与已选仓库,隐藏抽屉保留的旧 context 不能吞掉错误。
 //!
@@ -932,7 +932,8 @@ impl GitChanges {
         let Some(token) = self.amend_flight.begin(Instant::now()) else {
             return;
         };
-        self.amend_verifying = self.amend_info.is_none();
+        self.amend_verifying =
+            self.context.as_ref().is_some_and(GitContext::is_remote) && self.amend_info.is_none();
         let req = self.amend_request;
         let Some(repo) = self.context.clone() else {
             return;
@@ -955,6 +956,10 @@ impl GitChanges {
                 {
                     this.amend_key = info.as_ref().and(key);
                     if info.is_none() {
+                        if !this.context.as_ref().is_some_and(GitContext::is_remote) {
+                            this.amend = false;
+                            this.amend_prefill = None;
+                        }
                         this.commit_error =
                             Some(t("gitChanges", "metadataUnavailable").to_string());
                         cx.notify();
@@ -1861,7 +1866,10 @@ impl GitChanges {
         {
             return Some(t("gitChanges", "metadataUnavailable").to_string());
         }
-        if self.amend && (self.amend_info.is_none() || self.amend_verifying) {
+        if self.amend
+            && self.context.as_ref().is_some_and(GitContext::is_remote)
+            && (self.amend_info.is_none() || self.amend_verifying)
+        {
             return Some(t("gitChanges", "metadataUnavailable").to_string());
         }
         if self.committing {
@@ -2226,7 +2234,8 @@ impl GitChanges {
         self.amend = !self.amend;
         self.amend_request += 1;
         self.amend_flight.reset();
-        self.amend_verifying = self.amend;
+        self.amend_verifying =
+            self.amend && self.context.as_ref().is_some_and(GitContext::is_remote);
         if !self.amend {
             // 预填的消息一个字没动过 —— 那是 HEAD 的旧消息,不是用户写的,收起时带走
             let current = self.commit_input.read(cx).value().to_string();
@@ -2286,9 +2295,19 @@ impl GitChanges {
                     // 空仓库:没有上次提交可改
                     Ok(None) => {
                         this.has_head = false;
+                        if !context.is_remote() {
+                            this.amend = false;
+                            this.amend_info = None;
+                            this.amend_key = None;
+                        }
                     }
                     Err(err) => {
                         eprintln!("[git] 读取上次提交失败: {err:#}");
+                        if !context.is_remote() {
+                            this.amend = false;
+                            this.amend_info = None;
+                            this.amend_key = None;
+                        }
                         this.commit_error = Some(tr!(
                             "gitCommit",
                             "amendInfoFailed",
@@ -2597,7 +2616,7 @@ fn load_snapshot(repo: &GitContext) -> anyhow::Result<Snapshot> {
     snapshot_with_metadata(
         changes,
         || repo.list_conflicts(),
-        |info| repo.conflict_segment_status(info),
+        |infos| repo.conflict_segment_statuses(infos),
         || repo.repo_operation_state().map(|state| state.kind),
         || repo.commit_target(),
         || repo.head_exists(),
@@ -2608,7 +2627,7 @@ fn load_snapshot(repo: &GitContext) -> anyhow::Result<Snapshot> {
 fn snapshot_with_metadata(
     changes: Vec<ChangeFileStatus>,
     conflicts: impl FnOnce() -> anyhow::Result<Vec<ConflictInfo>>,
-    mut segment: impl FnMut(&ConflictInfo) -> anyhow::Result<SegmentStatus>,
+    segments: impl FnOnce(&[ConflictInfo]) -> anyhow::Result<Vec<SegmentStatus>>,
     operation: impl FnOnce() -> anyhow::Result<Option<RepoOpKind>>,
     target: impl FnOnce() -> anyhow::Result<CommitTarget>,
     head: impl FnOnce() -> bool,
@@ -2625,15 +2644,18 @@ fn snapshot_with_metadata(
     } else {
         Vec::new()
     };
-    let segments = conflicts
-        .iter()
-        .map(&mut segment)
-        .collect::<anyhow::Result<Vec<_>>>();
-    let segments = match segments {
-        Ok(segments) => segments,
-        Err(err) => {
-            warnings.push(git_ui::error_text(&err));
-            Vec::new()
+    let segments = if conflicts.is_empty() {
+        Vec::new()
+    } else {
+        match segments(&conflicts) {
+            Ok(segments) => segments,
+            Err(err) => {
+                warnings.push(git_ui::error_text(&err));
+                vec![
+                    SegmentStatus::Blocked(mt_project::git::SegmentBlocker::Unreadable);
+                    conflicts.len()
+                ]
+            }
         }
     };
     let op_kind = match operation() {
@@ -3916,6 +3938,76 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn local_amend_toggle_is_immediate_and_failure_cancels_it(cx: &mut gpui::TestAppContext) {
+        cx.skip_drawing();
+        cx.background_executor.allow_parking();
+        cx.update(gpui_component::init);
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let changes = cx
+            .update_window(window.into(), |_, window, cx| {
+                let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+                changes.update(cx, |this, cx| {
+                    this.context = Some(GitContext::local("/consumer-amend-missing"));
+                    this.sync_input(window, cx);
+                    this.loaded_once = true;
+                    this.has_head = true;
+                    this.commit_input.update(cx, |input, cx| {
+                        input.set_value("keep user draft", window, cx)
+                    });
+                    this.toggle_amend(window, cx);
+                    assert!(this.amend);
+                    assert!(this.amend_info.is_none());
+                    assert!(!this.amend_verifying);
+                    assert!(this.commit_blocker(false, cx).is_none());
+                });
+                changes
+            })
+            .unwrap();
+        cx.condition(&changes, |this, _| this.commit_error.is_some())
+            .await;
+        cx.update_window(window.into(), |_, window, cx| {
+            changes.update(cx, |this, cx| {
+                assert!(!this.amend);
+                assert_eq!(
+                    this.commit_input.read(cx).value().as_ref(),
+                    "keep user draft"
+                );
+                let connection = serde_json::from_value(serde_json::json!({
+                    "id": "amend-guard", "name": "test", "host": "invalid.test",
+                    "port": 22, "user": "tester"
+                }))
+                .unwrap();
+                this.context = Some(GitContext::remote(
+                    "remote".into(),
+                    connection,
+                    "/repo".into(),
+                ));
+                this.sync_input(window, cx);
+                this.commit_input
+                    .update(cx, |input, cx| input.set_value("remote draft", window, cx));
+                this.amend = true;
+                let model = this.model(cx);
+                assert!(this.commit_blocker_with(false, false, &model, cx).is_some());
+                this.amend_info = Some(AmendInfo {
+                    message: "verified".into(),
+                    pushed: false,
+                });
+                this.amend_verifying = true;
+                assert!(this.commit_blocker_with(false, false, &model, cx).is_some());
+                this.amend_verifying = false;
+                assert!(this.commit_blocker_with(false, false, &model, cx).is_none());
+            });
+        })
+        .unwrap();
+        drop(changes);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn parent_commits_selected_child_repo_but_switching_blocks_submission(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4249,7 +4341,10 @@ mod tests {
                         "amend must never become ordinary submit on return"
                     );
                     assert!(this.amend_info.is_none());
-                    assert!(this.amend_verifying);
+                    assert!(
+                        !this.amend_verifying,
+                        "local draft restoration is nonblocking"
+                    );
                     this.loaded_once = true;
                     this.has_head = true;
                     this.amend_info = Some(AmendInfo {
@@ -4257,35 +4352,36 @@ mod tests {
                         pushed: false,
                     });
                     assert!(
-                        this.commit_blocker(false, cx).is_some(),
-                        "verification alone blocks amend"
+                        this.commit_blocker(false, cx).is_none(),
+                        "local amend does not wait for metadata"
                     );
                     this.amend_verifying = false;
                     assert!(
                         this.commit_blocker(false, cx).is_none(),
                         "all other amend requirements met"
                     );
-                    this.amend_verifying = true;
                     this.amend_info = None;
                     (a_input, b_input, b_revision, blank)
                 });
                 (changes, a_input, b_input, b_revision, blank)
             })
             .unwrap();
-        cx.condition(&changes, |this, _| !this.amend_verifying)
+        cx.condition(&changes, |this, _| this.commit_error.is_some())
             .await;
         cx.run_until_parked();
         cx.update_window(window.into(), |_, window, cx| {
             changes.update(cx, |this, cx| {
                 assert!(
-                    this.amend,
-                    "failed metadata verification must retain amend intent"
+                    !this.amend,
+                    "failed local metadata verification cancels amend"
                 );
                 assert!(
                     this.amend_info.is_none(),
                     "missing fixture repository cannot verify HEAD"
                 );
-                assert!(this.commit_blocker(false, cx).is_some());
+                this.amend = true;
+                this.amend_prefill = Some("old HEAD message".into());
+                assert!(this.commit_blocker(false, cx).is_none());
                 this.amend_info = Some(AmendInfo {
                     message: "new HEAD message".into(),
                     pushed: false,
@@ -4420,6 +4516,88 @@ mod tests {
             assert!(warning.contains(detail));
         }
         assert!(load_snapshot(&GitContext::broken("status unavailable")).is_err());
+    }
+
+    #[gpui::test]
+    fn conflict_status_batch_blocks_only_the_unreadable_file(cx: &mut gpui::TestAppContext) {
+        use mt_project::git::SegmentBlocker;
+        cx.skip_drawing();
+        cx.update(gpui_component::init);
+        let infos = vec![
+            ConflictInfo {
+                path: "unreadable".into(),
+                ours: true,
+                theirs: true,
+            },
+            ConflictInfo {
+                path: "ready".into(),
+                ours: true,
+                theirs: true,
+            },
+        ];
+        let files = infos
+            .iter()
+            .map(|info| {
+                change(
+                    &info.path,
+                    Some(GitStatus::Conflicted),
+                    Some(GitStatus::Conflicted),
+                )
+            })
+            .collect::<Vec<_>>();
+        let calls = Cell::new(0);
+        let snap = snapshot_with_metadata(
+            files.clone(),
+            || Ok(infos.clone()),
+            |batch| {
+                calls.set(calls.get() + 1);
+                assert_eq!(batch.len(), 2);
+                assert_eq!(batch[0].path, "unreadable");
+                assert_eq!(batch[1].path, "ready");
+                Ok(vec![
+                    SegmentStatus::Blocked(SegmentBlocker::Unreadable),
+                    SegmentStatus::Ready { blocks: 1 },
+                ])
+            },
+            || Ok(None),
+            || Ok(CommitTarget::Branch("main".into())),
+            || true,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 1, "all conflicts share one status request");
+        assert!(
+            snap.metadata_warning.is_none(),
+            "file blockers must not disable the group"
+        );
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let changes = cx.new(|cx| GitChanges::new(store, window, cx));
+            changes.update(cx, |this, cx| {
+                this.apply_snapshot(Ok(snap), false, cx);
+                assert!(this.segment_availability("unreadable").is_err());
+                assert_eq!(this.segment_availability("ready"), Ok(1));
+                assert!(this.metadata_warning.is_none());
+            });
+        })
+        .unwrap();
+        let snap = snapshot_with_metadata(
+            files,
+            || Ok(infos),
+            |_| anyhow::bail!("conflict index unavailable"),
+            || Ok(None),
+            || Ok(CommitTarget::Branch("main".into())),
+            || true,
+        )
+        .unwrap();
+        assert!(snap.metadata_warning.is_some());
+        assert_eq!(
+            snap.segments,
+            vec![SegmentStatus::Blocked(SegmentBlocker::Unreadable); 2]
+        );
     }
 
     #[test]

@@ -11,6 +11,34 @@ use tokio::sync::Notify;
 
 static UNIQUE: AtomicUsize = AtomicUsize::new(0);
 
+#[test]
+fn helper_launch_quotes_paths_and_overrides_remote_encoding_region() {
+    use std::process::Command;
+
+    let helper = "/helper dir/quo'te;$(false)";
+    let root = "/repo dir/quo'te;$(false)";
+    for region in [None, Some("cn"), Some("tw"), Some("'; exit 17; #$(false)")] {
+        let command = helper_command(helper, root, region);
+        // Keep exec and inspect its inherited environment and argv in a child shell.
+        let probe = command.replacen(
+            " exec ",
+            " exec sh -c 'printf \"%s\\n\" \"$MINI_TERM_ENCODING_REGION\" \"$@\"' sh ",
+            1,
+        );
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(probe)
+            .env("MINI_TERM_ENCODING_REGION", "remote-locale-must-not-win")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n{helper}\n--root\n{root}\n", region.unwrap_or_default(),),
+        );
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 enum Startup {
     #[default]

@@ -105,7 +105,8 @@ fn helper_command(root: &Path) -> Command {
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_EDITOR", "true");
+        .env("GIT_EDITOR", "true")
+        .env_remove("MINI_TERM_ENCODING_REGION");
     for key in [
         "GIT_DIR",
         "GIT_COMMON_DIR",
@@ -128,7 +129,11 @@ struct Helper {
 
 impl Helper {
     fn start(root: &Path) -> Self {
-        let mut child = helper_command(root)
+        Self::start_command(helper_command(root))
+    }
+
+    fn start_command(mut command: Command) -> Self {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -2185,6 +2190,50 @@ fn atomic_multi_hunk_and_line_rpcs_match_real_index_and_worktree() {
 }
 
 #[test]
+fn helper_uses_desktop_encoding_region_without_remote_locale_or_byte_changes() {
+    use mt_project::encoding::{Decoded, decode_in};
+
+    let fixture = Fixture::new("desktop-encoding-region");
+    let repo = fixture.repo("repo");
+    std::fs::write(repo.join("file"), "base\n").unwrap();
+    git(&repo, &["add", "file"]);
+    fixed_time_commit(&repo, "base");
+    let bytes = b"needle \xC4\xE3\xBA\xC3\n";
+    std::fs::write(repo.join("file"), bytes).unwrap();
+
+    for (region, expected_hint) in [
+        (None, None),
+        (Some(""), None),
+        (Some("cn"), Some("cn")),
+        (Some("TW"), Some("tw")),
+        (Some("jp"), Some("jp")),
+        (Some("kr"), Some("kr")),
+        (Some("zh-CN"), None),
+        (Some("'; exit 17; #"), None),
+    ] {
+        let mut command = helper_command(&repo);
+        command
+            .env("LANG", "ja_JP.UTF-8")
+            .env("LC_ALL", "ja_JP.UTF-8");
+        if let Some(region) = region {
+            command.env("MINI_TERM_ENCODING_REGION", region);
+        }
+        let mut helper = Helper::start_command(command);
+        let Reply::Diff { diff: result } = helper.success(diff(&repo, "file", DiffSide::Unstaged))
+        else {
+            panic!("expected text diff");
+        };
+        let Decoded::Text { text, encoding } = decode_in(bytes.to_vec(), expected_hint) else {
+            panic!("expected legacy text");
+        };
+        assert_eq!(result.new_content, text, "region {region:?}");
+        assert_eq!(result.encoding, (!encoding.is_utf8()).then_some(encoding));
+        assert_eq!(std::fs::read(repo.join("file")).unwrap(), bytes);
+        helper.finish();
+    }
+}
+
+#[test]
 fn forged_utf8_hunk_metadata_cannot_rewrite_non_utf8_files() {
     use mt_project::{encoding::TextEncoding, git::HunkPick};
     let fixture = Fixture::new("forged-encoding");
@@ -2486,7 +2535,7 @@ fn conflicted_leaf_symlink_is_one_blocker_without_hiding_regular_segments() {
         .success(Operation::Query {
             repo: path(&repo),
             query: Q::ConflictSegmentStatuses {
-                infos: vec![normal, link.clone()],
+                infos: vec![normal.clone(), link.clone()],
             },
         })
         .decode()
@@ -2511,16 +2560,37 @@ fn conflicted_leaf_symlink_is_one_blocker_without_hiding_regular_segments() {
         ours: true,
         theirs: true,
     };
-    let error = helper
-        .request(Operation::Query {
+    let statuses: Vec<SegmentStatus> = helper
+        .success(Operation::Query {
             repo: path(&repo),
             query: Q::ConflictSegmentStatuses {
-                infos: vec![escaped],
+                infos: vec![
+                    escaped,
+                    normal,
+                    ConflictInfo {
+                        path: "../outside/target".into(),
+                        ours: true,
+                        theirs: true,
+                    },
+                    ConflictInfo {
+                        path: "not-conflicted".into(),
+                        ours: true,
+                        theirs: true,
+                    },
+                ],
             },
         })
-        .result
-        .unwrap_err();
-    assert!(error.to_string().contains("escapes repository"), "{error}");
+        .decode()
+        .unwrap();
+    assert_eq!(
+        statuses,
+        [
+            SegmentStatus::Blocked(SegmentBlocker::Unreadable),
+            SegmentStatus::Ready { blocks: 1 },
+            SegmentStatus::Blocked(SegmentBlocker::Unreadable),
+            SegmentStatus::Blocked(SegmentBlocker::NotConflicted),
+        ]
+    );
     assert_eq!(
         std::fs::read_to_string(outside.join("target")).unwrap(),
         "must not read or change\n"

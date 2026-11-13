@@ -133,6 +133,85 @@ fn write() -> Operation {
         repo: "/repo".into(),
     }
 }
+
+#[test]
+fn write_metadata_preserves_repository_and_operation_identity() {
+    for (operation, expected) in [
+        (write(), RemoteGitOperationKind::StageAll),
+        (
+            Operation::CommitWith {
+                repo: "/repo".into(),
+                message: "message".into(),
+                amend: false,
+            },
+            RemoteGitOperationKind::Commit,
+        ),
+        (
+            Operation::CommitWith {
+                repo: "/repo".into(),
+                message: "message".into(),
+                amend: true,
+            },
+            RemoteGitOperationKind::Amend,
+        ),
+        (
+            Operation::ApplyStash {
+                repo: "/repo".into(),
+                index: 0,
+                hash: "stash-hash".into(),
+                pop: false,
+                reinstate: false,
+            },
+            RemoteGitOperationKind::ApplyStash,
+        ),
+        (
+            Operation::ApplyStash {
+                repo: "/repo".into(),
+                index: 0,
+                hash: "stash-hash".into(),
+                pop: true,
+                reinstate: false,
+            },
+            RemoteGitOperationKind::PopStash,
+        ),
+        (
+            Operation::Mutate {
+                repo: "/repo".into(),
+                mutation: mt_git_helper::GitMutation::StashClear,
+            },
+            RemoteGitOperationKind::ClearStashes,
+        ),
+    ] {
+        assert!(operation.is_write());
+        assert_eq!(operation_repo(&operation), Some("/repo"));
+        assert_eq!(operation_kind(&operation), Some(expected));
+    }
+}
+
+#[test]
+fn read_operations_have_no_write_metadata() {
+    for operation in [
+        Operation::Discover,
+        Operation::Barrier { completed_id: 1 },
+        Operation::Status {
+            repo: "/repo".into(),
+        },
+        Operation::Query {
+            repo: "/repo".into(),
+            query: GitQuery::RepoSignature,
+        },
+        Operation::ChangesSnapshot {
+            repo: "/repo".into(),
+        },
+        Operation::ListStashes {
+            repo: "/repo".into(),
+        },
+    ] {
+        assert!(!operation.is_write());
+        assert_eq!(operation_repo(&operation), None);
+        assert_eq!(operation_kind(&operation), None);
+    }
+}
 fn assert_code(error: GitFailure, expected: &str) {
     assert!(matches!(error, GitFailure::Service { code, .. } if code == expected));
 }

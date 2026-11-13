@@ -874,41 +874,44 @@ fn dispatch(slot: &mut WorkspaceClient, request: &mut QueuedRequest) -> Result<R
                 return Err(service_error("remote_git_disabled"));
             }
             let write = operation.is_write();
-            let repo = write.then(|| operation_repo(&operation)).flatten();
-            if write && repo.is_none() {
-                return Err(service_error("remote_git_missing_repository"));
-            }
-            if write && let Some(blocker) = write_blocker(lease, repo.expect("write repository")) {
-                return Err(blocker);
-            }
+            let metadata = if write {
+                let repo = operation_repo(&operation)
+                    .ok_or_else(|| service_error("remote_git_missing_repository"))?;
+                let kind = operation_kind(&operation)
+                    .ok_or_else(|| service_error("remote_git_missing_operation_kind"))?;
+                if let Some(blocker) = write_blocker(lease, repo) {
+                    return Err(blocker);
+                }
+                Some((repo, kind))
+            } else {
+                None
+            };
             if !write && lock(&lease.inner.unknown).is_some() {
                 return read(slot, lease, operation, decoder);
             }
             // A read-only liveness round trip on a reused channel precedes a write. Only
             // this probe can be retried; once write data starts, failures are never replayed.
-            if write && slot.client.is_some() {
-                let repo = operation_repo(&operation)
-                    .ok_or_else(|| service_error("remote_git_missing_repository"))?;
-                let probe = slot.client.as_mut().expect("present").probe_idle(repo);
-                if probe.is_err() {
-                    slot.client.take();
-                }
+            if let Some((repo, _)) = metadata
+                && let Some(client) = slot.client.as_mut()
+                && client.probe_idle(repo).is_err()
+            {
+                slot.client.take();
             }
             if slot.client.is_none() {
                 slot.client = Some((lease.inner.factory)(lease)?);
             }
             // Prepare metadata outside the source lifecycle critical section.
-            let identity = write.then(|| RemoteGitUnknownWrite {
+            let identity = metadata.map(|(repo, operation)| RemoteGitUnknownWrite {
                 generation: SEQUENCE.fetch_add(1, Ordering::AcqRel),
-                repo: repo.expect("write repository checked above").to_owned(),
-                operation: operation_kind(&operation).expect("write operation kind"),
+                repo: repo.to_owned(),
+                operation,
                 occurred: SystemTime::now(),
             });
             {
                 let _source = remote_git_source_change_guard();
                 lease.check()?;
-                if write {
-                    if let Some(blocker) = write_blocker(lease, repo.expect("write repository")) {
+                if let Some((repo, _)) = metadata {
+                    if let Some(blocker) = write_blocker(lease, repo) {
                         return Err(blocker);
                     }
                     lease.inner.running.store(true, Ordering::Release);
@@ -1005,7 +1008,19 @@ fn operation_kind(operation: &Operation) -> Option<RemoteGitOperationKind> {
             mt_git_helper::GitMutation::RemoveWorktree { .. } => K::RemoveWorktree,
             mt_git_helper::GitMutation::PruneWorktrees => K::PruneWorktrees,
         },
-        _ => return None,
+        Operation::Discover
+        | Operation::Barrier { .. }
+        | Operation::Status { .. }
+        | Operation::Diff { .. }
+        | Operation::Query { .. }
+        | Operation::PanelSnapshot { .. }
+        | Operation::ChangesSnapshot { .. }
+        | Operation::Log { .. }
+        | Operation::CommitDetail { .. }
+        | Operation::CommitFiles { .. }
+        | Operation::CommitDiff { .. }
+        | Operation::PushPreview { .. }
+        | Operation::ListStashes { .. } => return None,
     })
 }
 
@@ -1040,7 +1055,19 @@ fn operation_repo(operation: &Operation) -> Option<&str> {
         | Operation::OperationAbort { repo, .. }
         | Operation::ResolveConflict { repo, .. }
         | Operation::MarkResolved { repo, .. } => Some(repo),
-        _ => None,
+        Operation::Discover
+        | Operation::Barrier { .. }
+        | Operation::Status { .. }
+        | Operation::Diff { .. }
+        | Operation::Query { .. }
+        | Operation::PanelSnapshot { .. }
+        | Operation::ChangesSnapshot { .. }
+        | Operation::Log { .. }
+        | Operation::CommitDetail { .. }
+        | Operation::CommitFiles { .. }
+        | Operation::CommitDiff { .. }
+        | Operation::PushPreview { .. }
+        | Operation::ListStashes { .. } => None,
     }
 }
 fn decode_reply(
