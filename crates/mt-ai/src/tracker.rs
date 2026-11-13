@@ -1126,7 +1126,13 @@ mod tests {
     fn ctrl_a_e_inside_bracketed_paste_do_not_move_cursor() {
         let mgr = SessionTracker::new();
         mgr.mark_ai_session(1, "omp");
-        for input in ["abcd", "\x1b[D", "\x1b[D", "\x1b[200~\x01L\x05R\x1b[201~", "\r"] {
+        for input in [
+            "abcd",
+            "\x1b[D",
+            "\x1b[D",
+            "\x1b[200~\x01L\x05R\x1b[201~",
+            "\r",
+        ] {
             mgr.track_input(1, input);
         }
         let submits = mgr.drain_submits(1);

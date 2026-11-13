@@ -76,13 +76,7 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     }
     // macOS 的 ⌘← / ⌘→ 对应 Emacs 行首 / 行尾。不能直接换成 Home / End:
     // 干净的 zsh Emacs keymap 没有绑定那些 CSI / SS3 序列(issue #98)。
-    if cfg!(target_os = "macos")
-        && m.platform
-        && !m.control
-        && !m.alt
-        && !m.shift
-        && !m.function
-    {
+    if cfg!(target_os = "macos") && m.platform && !m.control && !m.alt && !m.shift && !m.function {
         match key {
             "left" => return control_code("a"),
             "right" => return control_code("e"),
@@ -429,9 +423,19 @@ mod tests {
     fn command_左右箭头仅在_macos_发送行首行尾控制码() {
         for mode in [TermMode::empty(), TermMode::APP_CURSOR] {
             for (name, byte) in [("left", 0x01), ("right", 0x05)] {
-                let k = key(name, Modifiers { platform: true, ..Default::default() });
+                let k = key(
+                    name,
+                    Modifiers {
+                        platform: true,
+                        ..Default::default()
+                    },
+                );
                 assert!(!is_text_input_key(&k));
-                let expected = if cfg!(target_os = "macos") { Some(vec![byte]) } else { None };
+                let expected = if cfg!(target_os = "macos") {
+                    Some(vec![byte])
+                } else {
+                    None
+                };
                 assert_eq!(keystroke_to_bytes(&k, mode), expected, "{name} {mode:?}");
             }
         }
@@ -449,8 +453,11 @@ mod tests {
             };
             for name in ["left", "right"] {
                 for mode in [TermMode::empty(), TermMode::APP_CURSOR] {
-                    assert_eq!(keystroke_to_bytes(&key(name, modifiers), mode), None,
-                        "{name} modifiers={modifiers:?} {mode:?}");
+                    assert_eq!(
+                        keystroke_to_bytes(&key(name, modifiers), mode),
+                        None,
+                        "{name} modifiers={modifiers:?} {mode:?}"
+                    );
                 }
             }
         }
@@ -458,8 +465,16 @@ mod tests {
 
     #[test]
     fn command_其他按键仍留给应用层() {
-        for name in ["up", "down", "home", "end", "a", "e", "c", "v", "t", "tab", "enter"] {
-            let k = key(name, Modifiers { platform: true, ..Default::default() });
+        for name in [
+            "up", "down", "home", "end", "a", "e", "c", "v", "t", "tab", "enter",
+        ] {
+            let k = key(
+                name,
+                Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+            );
             assert_eq!(keystroke_to_bytes(&k, TermMode::empty()), None, "{name}");
         }
     }
