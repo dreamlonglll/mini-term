@@ -6,7 +6,7 @@
 //! 「另一个 git 进程正在运行」,或者把前一条截在半路。这里给它们一道共用的闸:**同一个
 //! 仓库同一时刻只放一个写操作进去**。
 //!
-//! - 键由 `GitContext::repository_key()` 生成,包含物理后端与对应主机的路径语义;
+//! - 键由 `GitContext::key()` 生成,包含后端身份与对应主机的路径语义;
 //!   同一仓库不同写法共闸,不同服务器的同名路径互不干扰;
 //! - [`try_acquire_key`] 占闸,拿到的 [`WriteGuard`] 一 drop 就放闸 —— 成功、失败、超时、
 //!   提前返回、panic 展开、任务被取消(持有它的 future 被丢弃)都一样;
@@ -86,17 +86,13 @@ mod tests {
     #[test]
     fn 后端身份与路径按上下文区分() {
         use mt_remote::GitContext;
-        let key = GitContext::local("/tmp/gate-c/").repository_key();
+        let key = GitContext::local("/tmp/gate-c/").key();
         let _guard = try_acquire_key(&key).unwrap();
-        assert!(is_busy_key(
-            &GitContext::local("/tmp/gate-c").repository_key()
-        ));
+        assert!(is_busy_key(&GitContext::local("/tmp/gate-c").key()));
         if cfg!(windows) {
-            let key = GitContext::local(r"D:\Git\Gate").repository_key();
+            let key = GitContext::local(r"D:\Git\Gate").key();
             let _win = try_acquire_key(&key).unwrap();
-            assert!(is_busy_key(
-                &GitContext::local("d:/git/gate/").repository_key()
-            ));
+            assert!(is_busy_key(&GitContext::local("d:/git/gate/").key()));
         }
         assert!(try_acquire_key("").is_none() && !is_busy_key(""));
     }
