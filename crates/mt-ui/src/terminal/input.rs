@@ -74,7 +74,22 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     if m.control && m.shift {
         return None;
     }
-    // Win/Cmd 键组合同理。
+    // macOS 的 ⌘← / ⌘→ 对应 Emacs 行首 / 行尾。不能直接换成 Home / End:
+    // 干净的 zsh Emacs keymap 没有绑定那些 CSI / SS3 序列(issue #98)。
+    if cfg!(target_os = "macos")
+        && m.platform
+        && !m.control
+        && !m.alt
+        && !m.shift
+        && !m.function
+    {
+        match key {
+            "left" => return control_code("a"),
+            "right" => return control_code("e"),
+            _ => {}
+        }
+    }
+    // 其他 Win/Cmd 组合留给应用层快捷键。
     if m.platform {
         return None;
     }
@@ -408,6 +423,45 @@ mod tests {
             },
         );
         assert!(keystroke_to_bytes(&k, TermMode::empty()).is_none());
+    }
+
+    #[test]
+    fn command_左右箭头仅在_macos_发送行首行尾控制码() {
+        for mode in [TermMode::empty(), TermMode::APP_CURSOR] {
+            for (name, byte) in [("left", 0x01), ("right", 0x05)] {
+                let k = key(name, Modifiers { platform: true, ..Default::default() });
+                assert!(!is_text_input_key(&k));
+                let expected = if cfg!(target_os = "macos") { Some(vec![byte]) } else { None };
+                assert_eq!(keystroke_to_bytes(&k, mode), expected, "{name} {mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn command_左右箭头带额外修饰键不触发行首行尾() {
+        for bits in 1..16 {
+            let modifiers = Modifiers {
+                platform: true,
+                control: bits & 1 != 0,
+                alt: bits & 2 != 0,
+                shift: bits & 4 != 0,
+                function: bits & 8 != 0,
+            };
+            for name in ["left", "right"] {
+                for mode in [TermMode::empty(), TermMode::APP_CURSOR] {
+                    assert_eq!(keystroke_to_bytes(&key(name, modifiers), mode), None,
+                        "{name} modifiers={modifiers:?} {mode:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_其他按键仍留给应用层() {
+        for name in ["up", "down", "home", "end", "a", "e", "c", "v", "t", "tab", "enter"] {
+            let k = key(name, Modifiers { platform: true, ..Default::default() });
+            assert_eq!(keystroke_to_bytes(&k, TermMode::empty()), None, "{name}");
+        }
     }
 
     #[test]
