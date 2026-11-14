@@ -27,7 +27,8 @@ use super::stash::stash_entries;
 use super::{NO_EDITOR, WORKTREE_OP_TIMEOUT, failure_text, run_git_output_env};
 
 /// 进行中的操作种类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum RepoOpKind {
     Merge,
     Rebase,
@@ -48,7 +49,8 @@ impl RepoOpKind {
 }
 
 /// 仓库此刻的「进行中操作」快照。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoOpState {
     /// `None` = 干净(没有进行中的合并 / 变基 / 拣选 / 还原)。
     pub kind: Option<RepoOpKind>,
@@ -292,7 +294,8 @@ pub fn is_relevant_git_change(layout: &GitDirLayout, path: &Path) -> bool {
 ///   (终端里 `git add`、解决了一个冲突)只需重取「更改」区与冲突数,历史不必重载。
 ///
 /// 两半都没变 = 面板没什么可刷的。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoSignature {
     pub refs: u64,
     pub index: u64,

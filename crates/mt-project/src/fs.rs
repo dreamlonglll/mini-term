@@ -1190,13 +1190,19 @@ mod tests {
     }
 
     fn make_test_project() -> (PathBuf, PathBuf) {
-        let ts = std::time::SystemTime::now()
+        // Clock resolution is not an identity: parallel tests can observe the
+        // same timestamp and otherwise overwrite or remove each other's files.
+        static NEXT_PROJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_PROJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mini-term-fs-test-{ts}"));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-fs-test-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
         // 规范成长路径:被测函数返回 canonicalize 过的路径,而 GitHub Windows runner 的
         // 临时目录是 8.3 短路径(`C:\Users\RUNNER~1\...`),直接拿 `root.join(..)` 比会对不上
         let root = mt_core::path::canonicalize(&root).unwrap();

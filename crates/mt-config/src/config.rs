@@ -567,6 +567,22 @@ pub struct ProjectEnvVar {
     pub enabled: bool,
 }
 
+/// Persisted helper consent, bound to a project rather than shared by SSH hosts.
+/// Credentials are not copied here; changing them through AppStore revokes consent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteGitPermission {
+    project_id: String,
+    connection_id: String,
+    host: String,
+    port: u16,
+    user: String,
+    identity_file: Option<String>,
+    root: String,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
 /// 一个项目(`projects[]` 的元素)。
 ///
 /// `Default` 是「刚添加的本地项目」:没有描述、没关联 SSH、不挂父项目、类型自动探测,
@@ -620,6 +636,10 @@ pub struct ProjectConfig {
     /// 引用为单一来源、不内嵌连接快照——连接被删除时项目进入「断链」错误态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_id: Option<String>,
+    /// Explicit consent for this project and its exact remote execution target.
+    /// A missing or mismatched grant never authorizes helper deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_git_permission: Option<RemoteGitPermission>,
     /// 子项目(worktree「设为项目」):有值 = 挂在该项目 id 下渲染,不在 projectTree 里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_project_id: Option<String>,
@@ -646,6 +666,40 @@ impl ProjectConfig {
             path: path.into(),
             ..Default::default()
         }
+    }
+    /// Whether saved consent still matches this project's current target.
+    pub fn remote_git_enabled(&self, connection: &SshConnection) -> bool {
+        self.remote_git_permission.as_ref().is_some_and(|grant| {
+            grant.project_id == self.id
+                && self.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+                && grant.connection_id == connection.id
+                && grant.host == connection.host
+                && grant.port == connection.port
+                && grant.user == connection.user
+                && grant.identity_file == connection.identity_file
+                && grant.root == self.path
+        })
+    }
+
+    /// Record or revoke consent. New worktree projects use `new`, never this grant.
+    pub fn set_remote_git_enabled(&mut self, connection: Option<&SshConnection>, enabled: bool) {
+        if enabled && connection.is_some_and(|connection| self.remote_git_enabled(connection)) {
+            return;
+        }
+        self.remote_git_permission = connection
+            .filter(|connection| {
+                enabled && self.ssh_connection_id.as_deref() == Some(connection.id.as_str())
+            })
+            .map(|connection| RemoteGitPermission {
+                project_id: self.id.clone(),
+                connection_id: connection.id.clone(),
+                host: connection.host.clone(),
+                port: connection.port,
+                user: connection.user.clone(),
+                identity_file: connection.identity_file.clone(),
+                root: self.path.clone(),
+                extra: Default::default(),
+            });
     }
 
     /// 该项目此刻实际可见的连接 id:显式列表 ∪ 整组关联分组里**此刻**的成员。
@@ -761,6 +815,30 @@ fn resolve_download_dir_with(
 }
 
 impl AppConfig {
+    /// Revoke only projects using the changed/removed SSH connection.
+    pub fn revoke_remote_git_permissions_for_connection(&mut self, connection_id: &str) {
+        for project in &mut self.projects {
+            if project.ssh_connection_id.as_deref() == Some(connection_id) {
+                project.remote_git_permission = None;
+            }
+        }
+    }
+
+    /// Discard stale consent before it can be restored into the runtime registry.
+    /// This also covers target changes made by generic configuration edits.
+    pub fn clear_invalid_remote_git_permissions(&mut self) {
+        for project in &mut self.projects {
+            if project.remote_git_permission.is_some()
+                && !self
+                    .ssh_connections
+                    .iter()
+                    .any(|connection| project.remote_git_enabled(connection))
+            {
+                project.remote_git_permission = None;
+            }
+        }
+    }
+
     /// 解析系统默认下载目录，不读取用户覆盖值。
     pub fn system_download_dir() -> Result<PathBuf> {
         resolve_download_dir_with(None, dirs::download_dir(), dirs::home_dir())
@@ -1023,6 +1101,8 @@ pub fn dedupe_project_ids_in_tree(tree: &mut Vec<ProjectTreeItem>) {
 /// 逐代累积的 config 迁移。每次从磁盘读出来都要过一遍(含 `AppConfig::default()`,
 /// 首启用户也得拿到预置的移动端启动器)。
 pub fn migrate_config(mut config: AppConfig) -> AppConfig {
+    config.clear_invalid_remote_git_permissions();
+
     // 迁移 vscodePath → editors
     if config.editors.is_empty()
         && let Some(path) = config.vscode_path.as_ref()
@@ -1769,6 +1849,138 @@ use mt_core::atomic_write;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_permission_connection() -> SshConnection {
+        SshConnection {
+            id: "ssh".into(),
+            name: "Server".into(),
+            host: "example.test".into(),
+            port: 22,
+            user: "user".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn project_git_permission_cannot_cross_project_connection_endpoint_or_root() {
+        let connection = git_permission_connection();
+        let mut project = ProjectConfig::new("a", "A", "/srv/repo");
+        project.ssh_connection_id = Some(connection.id.clone());
+        project.set_remote_git_enabled(Some(&connection), true);
+        assert!(project.remote_git_enabled(&connection));
+        let mutations: [fn(&mut ProjectConfig, &mut SshConnection); 8] = [
+            |project, _| project.id = "b".into(),
+            |project, _| project.path = "/srv/other".into(),
+            |project, _| project.ssh_connection_id = Some("other".into()),
+            |_, connection| connection.id = "other".into(),
+            |_, connection| connection.host = "other.test".into(),
+            |_, connection| connection.port = 2222,
+            |_, connection| connection.user = "other".into(),
+            |_, connection| connection.identity_file = Some("/other/key".into()),
+        ];
+        for mutate in mutations {
+            let mut changed_project = project.clone();
+            let mut changed_connection = connection.clone();
+            mutate(&mut changed_project, &mut changed_connection);
+            assert!(!changed_project.remote_git_enabled(&changed_connection));
+        }
+        let mut renamed_connection = connection.clone();
+        renamed_connection.name = "Renamed".into();
+        renamed_connection.group = Some("Other group".into());
+        project.name = "Renamed project".into();
+        assert!(project.remote_git_enabled(&renamed_connection));
+        let mut worktree = ProjectConfig::new("worktree", "Worktree", "/srv/repo-worktree");
+        worktree.ssh_connection_id = Some(connection.id.clone());
+        worktree.parent_project_id = Some(project.id.clone());
+        assert!(!worktree.remote_git_enabled(&connection));
+    }
+
+    #[test]
+    fn connection_credential_revocation_only_removes_matching_project_grants() {
+        let connection = git_permission_connection();
+        let mut other = connection.clone();
+        other.id = "other".into();
+        let mut config = AppConfig {
+            ssh_connections: vec![connection.clone(), other.clone()],
+            ..Default::default()
+        };
+        for (id, connection) in [("a", &connection), ("b", &connection), ("c", &other)] {
+            let mut project = ProjectConfig::new(id, id, "/srv/repo");
+            project.ssh_connection_id = Some(connection.id.clone());
+            project.set_remote_git_enabled(Some(connection), true);
+            config.projects.push(project);
+        }
+        config.revoke_remote_git_permissions_for_connection("ssh");
+        assert!(!config.projects[0].remote_git_enabled(&connection));
+        assert!(!config.projects[1].remote_git_enabled(&connection));
+        assert!(config.projects[2].remote_git_enabled(&other));
+        config.ssh_connections[0].password = Some("replacement".into());
+        config.clear_invalid_remote_git_permissions();
+        assert!(config.projects[0].remote_git_permission.is_none());
+        assert!(config.projects[1].remote_git_permission.is_none());
+        assert!(config.projects[2].remote_git_enabled(&other));
+    }
+
+    #[test]
+    fn target_change_clears_consent_permanently_and_preserves_other_projects() {
+        let connection = git_permission_connection();
+        let mut config = AppConfig::default();
+        config.ssh_connections.push(connection.clone());
+        for id in ["a", "b"] {
+            let mut project = ProjectConfig::new(id, id, "/srv/repo");
+            project.ssh_connection_id = Some(connection.id.clone());
+            project.set_remote_git_enabled(Some(&connection), true);
+            config.projects.push(project);
+        }
+        config.projects[0].path = "/srv/changed".into();
+        config.clear_invalid_remote_git_permissions();
+        config.projects[0].path = "/srv/repo".into();
+        assert!(!config.projects[0].remote_git_enabled(&connection));
+        assert!(config.projects[1].remote_git_enabled(&connection));
+        config.ssh_connections[0].host = "changed.test".into();
+        config.clear_invalid_remote_git_permissions();
+        config.ssh_connections[0] = connection.clone();
+        assert!(
+            config
+                .projects
+                .iter()
+                .all(|project| !project.remote_git_enabled(&connection))
+        );
+        config.projects[0].set_remote_git_enabled(Some(&connection), true);
+        config.ssh_connections.clear();
+        config.clear_invalid_remote_git_permissions();
+        assert!(config.projects[0].remote_git_permission.is_none());
+    }
+
+    #[test]
+    fn project_git_grant_unknown_fields_survive_schema_roundtrip() {
+        let connection = git_permission_connection();
+        let mut project = ProjectConfig::new("a", "A", "/srv/repo");
+        project.ssh_connection_id = Some(connection.id.clone());
+        project.set_remote_git_enabled(Some(&connection), true);
+        let mut json = serde_json::to_value(&project).unwrap();
+        json["remoteGitPermission"]["futureGrantField"] = serde_json::json!({"values": [1, 2]});
+        json["futureProjectField"] = serde_json::json!({"enabled": true});
+        let mut parsed: ProjectConfig = serde_json::from_value(json.clone()).unwrap();
+        assert!(parsed.remote_git_enabled(&connection));
+        parsed.set_remote_git_enabled(Some(&connection), true);
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json);
+        let legacy: AppConfig = serde_json::from_value(serde_json::json!({
+            "projects": [{"id": "a", "name": "A", "path": "/srv/repo", "sshConnectionId": "ssh"}],
+            "defaultShell": "sh", "availableShells": [], "remoteGitHelperEnabled": true,
+        }))
+        .unwrap();
+        assert!(!legacy.projects[0].remote_git_enabled(&connection));
+        assert!(
+            serde_json::to_value(legacy)
+                .unwrap()
+                .get("remoteGitHelperEnabled")
+                .is_none()
+        );
+    }
 
     #[test]
     fn default_config_has_shells() {

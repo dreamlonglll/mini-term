@@ -14,7 +14,8 @@ use super::log_ops::remotes_contain;
 use super::{LOCAL_OP_TIMEOUT, run_git_command_labeled};
 
 /// 一次成功提交的结果(给「已提交 abc1234:标题」那条 toast 用)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommitOutcome {
     pub short_hash: String,
     pub summary: String,
@@ -57,7 +58,8 @@ fn short_hash(oid: Oid) -> String {
 }
 
 /// 勾选「修改上次提交」时要的 HEAD 信息。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AmendInfo {
     /// HEAD 的完整提交消息(输入框为空时预填)
     pub message: String,
@@ -108,7 +110,8 @@ pub fn head_exists(repo_path: &Path) -> bool {
 }
 
 /// 提交框占位符里的「提交到 xxx」。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum CommitTarget {
     /// 在某个分支上(含还没有任何提交的新分支)
     Branch(String),
@@ -131,7 +134,7 @@ pub fn commit_target(repo_path: &Path) -> Result<CommitTarget> {
 }
 
 /// 提交消息历史里的一条。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitMessageEntry {
     /// 完整消息(选中后整段填进输入框)
     pub message: String,

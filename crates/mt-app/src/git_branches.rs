@@ -40,7 +40,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
 use std::rc::Rc;
 
 use gpui::{
@@ -56,6 +55,7 @@ use mt_project::git::{
     BranchInfo, BranchNameIssue, BranchTracking, DeleteOutcome, MergeOutcome, RebaseOutcome,
     RemoteCheckout, split_remote_branch, validate_branch_name,
 };
+use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -392,6 +392,7 @@ fn name_issue(mode: &NameMode, value: &str, existing: &[String]) -> Option<&'sta
 
 pub struct BranchPopup {
     panel: Entity<GitPanel>,
+    snapshot: RefCell<BranchSnapshot>,
     query: Entity<InputState>,
     /// 高亮到第几行(跨分组连续计数)。
     cursor: usize,
@@ -448,8 +449,10 @@ impl BranchPopup {
         )];
         // 分支列表 / 忙碌态在面板上变了(Fetch 回来、后台刷新)跟着重画
         subs.push(cx.observe(&panel, |_, _, cx| cx.notify()));
+        let snapshot = RefCell::new(panel.read(cx).branch_snapshot());
         Self {
             panel,
+            snapshot,
             query,
             cursor: 0,
             scroll: VirtualListScrollHandle::new(),
@@ -458,9 +461,21 @@ impl BranchPopup {
         }
     }
 
+    fn snapshot(&self, cx: &App) -> BranchSnapshot {
+        let current = self.panel.read(cx).branch_snapshot();
+        let mut snapshot = self.snapshot.borrow_mut();
+        if snapshot.context == current.context {
+            *snapshot = current;
+        } else {
+            snapshot.busy = None;
+            snapshot.gated = git_ui::gate::is_busy_key(&snapshot.context.repository_key());
+        }
+        snapshot.clone()
+    }
+
     /// 眼下这份快照、这个搜索词排出来的行(缓存着,见 [`RowsModel`])。
     fn model(&self, cx: &App) -> Rc<RowsModel> {
-        let snap = self.panel.read(cx).branch_snapshot();
+        let snap = self.snapshot(cx);
         self.model_for(&snap, cx)
     }
 
@@ -504,14 +519,15 @@ impl BranchPopup {
         else {
             return;
         };
-        if row.is_head || !self.panel.read(cx).branch_snapshot().writable() {
+        if row.is_head || !self.snapshot(cx).writable() {
             return;
         }
         let panel = self.panel.clone();
+        let snap = self.snapshot(cx);
         // 关窗排到本轮 effect 之后:这会儿本实体正被 Dialog 的 builder 持有着
         window.defer(cx, move |window, cx| {
             close_guarded(kind::GIT_BRANCHES, window, cx);
-            checkout(&panel, &row, window, cx);
+            checkout(&panel, &row, &snap, window, cx);
         });
     }
 
@@ -541,7 +557,7 @@ impl BranchPopup {
                 ))
             })
             .unwrap_or_else(|| window.mouse_position());
-        let snap = self.panel.read(cx).branch_snapshot();
+        let snap = self.snapshot(cx);
         let entries = row_menu(&self.panel, &row, &snap);
         menu::show(position, entries, window, cx);
     }
@@ -678,7 +694,7 @@ fn group_label(group: &Group) -> String {
 
 impl Render for BranchPopup {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snap = self.panel.read(cx).branch_snapshot();
+        let snap = self.snapshot(cx);
         let query = self.query.read(cx).value().trim().to_string();
         let model = self.model_for(&snap, cx);
         let rows = &model.rows;
@@ -700,6 +716,8 @@ impl Render for BranchPopup {
 
         let panel_for_new = self.panel.clone();
         let panel_for_fetch = self.panel.clone();
+        let new_snapshot = snap.clone();
+        let fetch_context = snap.context.clone();
         let actions = div()
             .flex()
             .items_center()
@@ -719,9 +737,13 @@ impl Render for BranchPopup {
                 // 置灰时说明原因(推送在后台跑着之类);忙闲会变,提示现读
                 .tip_live({
                     let panel = self.panel.downgrade();
+                    let context = snap.context.clone();
                     move |cx| {
-                        let snap = panel.upgrade().map(|p| p.read(cx).branch_snapshot());
-                        if snap.is_some_and(|s| !s.writable()) {
+                        let busy = panel.upgrade().is_some_and(|p| {
+                            let snap = p.read(cx).branch_snapshot();
+                            snap.context == context && !snap.writable()
+                        }) || git_ui::gate::is_busy_key(&context.repository_key());
+                        if busy {
                             git_ui::gate_busy_text().into()
                         } else {
                             t("gitBranch", "newBranchTip").into()
@@ -731,9 +753,10 @@ impl Render for BranchPopup {
                 .when(writable && !snap.repo.is_empty(), |el| {
                     el.on_click(move |_: &ClickEvent, window, cx| {
                         close_guarded(kind::GIT_BRANCHES, window, cx);
-                        open_name_dialog(
+                        open_name_dialog_on(
                             panel_for_new.clone(),
                             NameMode::Create { start: None },
+                            new_snapshot.clone(),
                             window,
                             cx,
                         );
@@ -756,10 +779,14 @@ impl Render for BranchPopup {
                 // `TooltipExt::tip_live`)。Fetch 自己在跑时标签已写「Fetch 中…」
                 .tip_live({
                     let panel = self.panel.downgrade();
+                    let context = snap.context.clone();
                     move |cx| {
-                        let snap = panel.upgrade().map(|p| p.read(cx).branch_snapshot());
-                        let waiting =
-                            snap.is_some_and(|s| !s.writable() && s.busy != Some(GitBusy::Fetch));
+                        let waiting = panel.upgrade().is_some_and(|p| {
+                            let snap = p.read(cx).branch_snapshot();
+                            snap.context == context
+                                && !snap.writable()
+                                && snap.busy != Some(GitBusy::Fetch)
+                        }) || git_ui::gate::is_busy_key(&context.repository_key());
                         if waiting {
                             git_ui::gate_busy_text().into()
                         } else {
@@ -770,7 +797,23 @@ impl Render for BranchPopup {
                 .when(writable, |el| {
                     // Fetch 不收弹窗:回来之后列表就地更新
                     el.on_click(move |_: &ClickEvent, window, cx| {
-                        panel_for_fetch.update(cx, |p, cx| p.fetch(window, cx));
+                        panel_for_fetch.update(cx, |p, cx| {
+                            p.run_write_op_on(
+                                &fetch_context,
+                                GitBusy::Fetch,
+                                GitContext::git_fetch_all,
+                                |p, outcome, _window, cx| {
+                                    let message = if outcome.updated_refs == 0 {
+                                        t("gitBranch", "fetchUpToDate").to_string()
+                                    } else {
+                                        tr!("gitBranch", "fetched", count = outcome.updated_refs)
+                                    };
+                                    p.notify_result(message, Tone::Info, cx);
+                                },
+                                window,
+                                cx,
+                            );
+                        });
                     })
                 }),
             );
@@ -926,20 +969,21 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
     let busy = !snap.writable();
     let current = snap.head.clone();
     // 每个动作:先收弹窗,再交给面板
-    let action = |label: String, f: fn(&Entity<GitPanel>, &Row, &mut Window, &mut App)| {
-        let (panel, row) = (panel.clone(), row.clone());
-        let item = MenuItem::new(label)
-            .disabled(busy)
-            .on_click(move |window, cx| {
-                close_guarded(kind::GIT_BRANCHES, window, cx);
-                f(&panel, &row, window, cx);
-            });
-        if busy {
-            item.detail(git_ui::gate_busy_text())
-        } else {
-            item
-        }
-    };
+    let action =
+        |label: String, f: fn(&Entity<GitPanel>, &Row, &BranchSnapshot, &mut Window, &mut App)| {
+            let (panel, row, snap) = (panel.clone(), row.clone(), snap.clone());
+            let item = MenuItem::new(label)
+                .disabled(busy)
+                .on_click(move |window, cx| {
+                    close_guarded(kind::GIT_BRANCHES, window, cx);
+                    f(&panel, &row, &snap, window, cx);
+                });
+            if busy {
+                item.detail(git_ui::gate_busy_text())
+            } else {
+                item
+            }
+        };
 
     let mut entries: Vec<MenuEntry> = vec![MenuEntry::Header(row.name.clone().into())];
     if !row.is_head {
@@ -952,12 +996,13 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
     entries.push(
         action(
             tr!("gitBranch", "menuNewFrom", name = row.label.as_str()),
-            |panel, row, window, cx| {
-                open_name_dialog(
+            |panel, row, snap, window, cx| {
+                open_name_dialog_on(
                     panel.clone(),
                     NameMode::Create {
                         start: Some(row.name.clone()),
                     },
+                    snap.clone(),
                     window,
                     cx,
                 )
@@ -979,12 +1024,17 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
     entries.push(menu::separator());
     {
         let (panel, name) = (panel.clone(), row.name.clone());
+        let context = snap.context.clone();
         entries.push(
             MenuItem::new(t("gitBranch", "menuViewHistory"))
                 .on_click(move |window, cx| {
                     close_guarded(kind::GIT_BRANCHES, window, cx);
                     let name = name.clone();
-                    panel.update(cx, |p, cx| p.set_view_branch(Some(name), cx));
+                    panel.update(cx, |p, cx| {
+                        if p.repo_context().as_ref() == Some(&context) {
+                            p.set_view_branch(Some(name), cx);
+                        }
+                    });
                 })
                 .into(),
         );
@@ -1006,12 +1056,13 @@ fn row_menu(panel: &Entity<GitPanel>, row: &Row, snap: &BranchSnapshot) -> Vec<M
         entries.push(
             action(
                 t("gitBranch", "menuRename").to_string(),
-                |panel, row, window, cx| {
-                    open_name_dialog(
+                |panel, row, snap, window, cx| {
+                    open_name_dialog_on(
                         panel.clone(),
                         NameMode::Rename {
                             old: row.name.clone(),
                         },
+                        snap.clone(),
                         window,
                         cx,
                     )
@@ -1055,11 +1106,15 @@ enum CheckoutStep {
 
 /// 检出本地分支 `branch` 会被哪些本地改动挡住(后台跑)。预检只是提示性的:读失败就当
 /// 没挡住,照常交给 git —— 真挡住时它自己会拒绝并给出原文。
-fn blocking_changes(repo: &Path, branch: &str) -> Vec<String> {
-    mt_project::git::local_changes_conflict_with(repo, branch).unwrap_or_else(|err| {
-        eprintln!("[git] 检出前预检失败(照常检出): {err:#}");
-        Vec::new()
-    })
+fn blocking_changes(repo: &GitContext, branch: &str) -> Vec<String> {
+    repo.local_changes_conflict_with(branch)
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "[git] {}: 检出前预检失败(照常检出): {err:#}",
+                git_ui::repo_label(repo)
+            );
+            Vec::new()
+        })
 }
 
 /// 检出(本地直接检出;远程:本地无同名则建跟踪分支,有则检出本地那个并提示)。
@@ -1069,12 +1124,17 @@ fn blocking_changes(repo: &Path, branch: &str) -> Vec<String> {
 /// 确认框(`git_stash::open_smart_checkout`)。预检与检出在同一个后台任务里,忙碌态 /
 /// 防重入沿用 [`GitPanel::run_write_op`]。本地没有同名分支的远程行不预检,直接
 /// `checkout_remote_branch`(它新建跟踪分支;被本地改动挡住时报 git 原文)。
-fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
+fn checkout(
+    panel: &Entity<GitPanel>,
+    row: &Row,
+    snap: &BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let name = row.name.clone();
     let remote = row.is_remote;
     // 要预检的本地分支:本地行就是它自己;远程行在本地已有同名分支时,检出的其实是那个
     let local = if remote {
-        let snap = panel.read(cx).branch_snapshot();
         split_remote_branch(&snap.data.remotes, &name)
             .map(|(_, local)| local)
             .filter(|local| {
@@ -1086,9 +1146,11 @@ fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut A
     } else {
         Some(name.clone())
     };
+    let checkout_context = snap.context.clone();
     panel.update(cx, |p, cx| {
         let shown = name.clone();
-        p.run_write_op(
+        p.run_write_op_on(
+            &snap.context,
             GitBusy::Checkout,
             move |repo| {
                 if let Some(local) = local {
@@ -1101,21 +1163,24 @@ fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut A
                     }
                 }
                 if remote {
-                    mt_project::git::checkout_remote_branch(repo, &name)
+                    repo.checkout_remote_branch(&name)
                         .map(|outcome| CheckoutStep::Done(Some(outcome)))
                 } else {
-                    mt_project::git::checkout_branch(repo, &name).map(|()| CheckoutStep::Done(None))
+                    repo.checkout_branch(&name)
+                        .map(|()| CheckoutStep::Done(None))
                 }
             },
             move |p, step, window, cx| {
                 let outcome = match step {
                     CheckoutStep::Done(outcome) => outcome,
                     CheckoutStep::Blocked { branch, conflicts } => {
-                        p.open_smart_checkout(branch, conflicts, window, cx);
+                        p.open_smart_checkout_on(&checkout_context, branch, conflicts, window, cx);
                         return;
                     }
                 };
-                p.set_view_branch(None, cx);
+                if p.repo_context().as_ref() == Some(&checkout_context) {
+                    p.set_view_branch(None, cx);
+                }
                 // 本地行:检出的分支名;远程行:那条远程分支的全名
                 let shown = shown.as_str();
                 let (message, tone) = match outcome {
@@ -1148,14 +1213,21 @@ fn checkout(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut A
 }
 
 /// 把 `row` 合并到当前分支。
-fn merge(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
+fn merge(
+    panel: &Entity<GitPanel>,
+    row: &Row,
+    snap: &BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let name = row.name.clone();
-    let current = panel.read(cx).branch_snapshot().head.unwrap_or_default();
+    let current = snap.head.clone().unwrap_or_default();
     panel.update(cx, |p, cx| {
         let shown = name.clone();
-        p.run_write_op(
+        p.run_write_op_on(
+            &snap.context,
             GitBusy::Merge,
-            move |repo| mt_project::git::merge_branch(repo, &name),
+            move |repo| repo.merge_branch(&name),
             move |p, outcome, _window, cx| {
                 let name = shown.as_str();
                 let (message, tone) = match outcome {
@@ -1194,8 +1266,15 @@ fn merge(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App)
 }
 
 /// 把当前分支变基到 `row`:改写当前分支上独有的提交,先确认。
-fn confirm_rebase(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
-    let current = panel.read(cx).branch_snapshot().head.unwrap_or_default();
+fn confirm_rebase(
+    panel: &Entity<GitPanel>,
+    row: &Row,
+    snap: &BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let current = snap.head.clone().unwrap_or_default();
+    let context = snap.context.clone();
     let (panel, name) = (panel.clone(), row.name.clone());
     Confirm::new(
         t("gitBranch", "rebaseConfirmTitle"),
@@ -1212,9 +1291,10 @@ fn confirm_rebase(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
             let (name, current) = (name.clone(), current.clone());
             panel.update(cx, |p, cx| {
                 let shown = name.clone();
-                p.run_write_op(
+                p.run_write_op_on(
+                    &context,
                     GitBusy::Rebase,
-                    move |repo| mt_project::git::rebase_onto(repo, &name),
+                    move |repo| repo.rebase_onto(&name),
                     move |p, outcome, _window, cx| {
                         let name = shown.as_str();
                         let (message, tone) = match outcome {
@@ -1255,16 +1335,28 @@ fn confirm_rebase(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
 
 /// 推送本地分支:打开推送对话框并预选这一行的分支(当前分支即「当前」),先看清待推送的
 /// 提交、推送目标(可勾强推)再确认 —— 与仓库栏推送按钮同一个对话框。
-fn push_branch(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
+fn push_branch(
+    panel: &Entity<GitPanel>,
+    row: &Row,
+    snap: &BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let branch = (!row.is_head).then(|| row.name.clone());
-    panel.update(cx, |p, cx| p.open_push_dialog(branch, window, cx));
+    crate::git_push::open(panel.clone(), snap.context.clone(), branch, window, cx);
 }
 
 /// 删除:本地先 `-d`,未合并时二次确认 `-D`;远程删除是危险操作,确认文案说清后果。
-fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mut App) {
+fn confirm_delete(
+    panel: &Entity<GitPanel>,
+    row: &Row,
+    snap: &BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let context = snap.context.clone();
     let (panel, name) = (panel.clone(), row.name.clone());
     if row.is_remote {
-        let snap = panel.read(cx).branch_snapshot();
         let (remote, branch) = split_remote_branch(&snap.data.remotes, &name)
             .unwrap_or_else(|| (String::new(), name.clone()));
         Confirm::new(
@@ -1283,9 +1375,10 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
                 let name = name.clone();
                 panel.update(cx, |p, cx| {
                     let shown = name.clone();
-                    p.run_write_op(
+                    p.run_write_op_on(
+                        &context,
                         GitBusy::Delete,
-                        move |repo| mt_project::git::delete_remote_branch(repo, &name),
+                        move |repo| repo.delete_remote_branch(&name),
                         move |p, (), _window, cx| {
                             p.notify_result(
                                 tr!("gitBranch", "deletedRemote", name = shown),
@@ -1310,7 +1403,7 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
     .ok_text(t("gitBranch", "deleteOk"))
     .danger()
     .open(
-        move |window, cx| delete_local(&panel, name.clone(), false, window, cx),
+        move |window, cx| delete_local(&panel, context.clone(), name.clone(), false, window, cx),
         window,
         cx,
     );
@@ -1318,17 +1411,20 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
 
 fn delete_local(
     panel: &Entity<GitPanel>,
+    context: GitContext,
     name: String,
     force: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let panel_for_retry = panel.clone();
+    let retry_context = context.clone();
     panel.update(cx, |p, cx| {
         let shown = name.clone();
-        p.run_write_op(
+        p.run_write_op_on(
+            &context,
             GitBusy::Delete,
-            move |repo| mt_project::git::delete_branch(repo, &name, force),
+            move |repo| repo.delete_branch(&name, force),
             move |p, outcome, window, cx| match outcome {
                 DeleteOutcome::Deleted => {
                     p.notify_result(
@@ -1348,7 +1444,16 @@ fn delete_local(
                     .ok_text(t("gitBranch", "forceDeleteOk"))
                     .danger()
                     .open(
-                        move |window, cx| delete_local(&panel, name.clone(), true, window, cx),
+                        move |window, cx| {
+                            delete_local(
+                                &panel,
+                                retry_context.clone(),
+                                name.clone(),
+                                true,
+                                window,
+                                cx,
+                            )
+                        },
                         window,
                         cx,
                     );
@@ -1376,6 +1481,7 @@ pub(crate) enum NameMode {
 
 struct NameForm {
     panel: Entity<GitPanel>,
+    context: GitContext,
     mode: NameMode,
     input: Entity<InputState>,
     /// 「创建后检出」,默认勾上。
@@ -1396,18 +1502,16 @@ impl Render for NameForm {
     }
 }
 
-/// 打开新建 / 重命名分支的名称弹窗:打开即聚焦输入框(重命名时全选旧名),
-/// 名称即时校验就地显示,Enter 提交、Esc 取消。
-pub(crate) fn open_name_dialog(
+fn open_name_dialog_on(
     panel: Entity<GitPanel>,
     mode: NameMode,
+    snap: BranchSnapshot,
     window: &mut Window,
     cx: &mut App,
 ) {
     if prompt::is_open(kind::GIT_BRANCH_NAME) {
         return;
     }
-    let snap = panel.read(cx).branch_snapshot();
     if snap.repo.is_empty() {
         return;
     }
@@ -1438,6 +1542,7 @@ pub(crate) fn open_name_dialog(
         });
         NameForm {
             panel,
+            context: snap.context.clone(),
             mode,
             input: input.clone(),
             checkout: true,
@@ -1594,7 +1699,7 @@ fn snap_is_local(existing: &[String], name: &str) -> bool {
 
 /// 名称弹窗的「创建 / 重命名」。返回 `false` = 先不关窗(结果回来再说)。
 fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bool {
-    let (busy, invalid, value, panel, mode, checkout) = {
+    let (busy, invalid, value, panel, mode, checkout, repo) = {
         let f = form.read(cx);
         let value = f.input.read(cx).value().trim().to_string();
         (
@@ -1604,6 +1709,7 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
             f.panel.clone(),
             f.mode.clone(),
             f.checkout,
+            f.context.clone(),
         )
     };
     if busy {
@@ -1616,23 +1722,19 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
         });
         return false;
     }
-    let repo = panel.read(cx).repo_path().to_string();
-    if repo.is_empty() {
-        return true;
-    }
     form.update(cx, |f, cx| {
         f.op.begin();
         cx.notify();
     });
     let (name, mode_for_task) = (value.clone(), mode.clone());
     let done_form = form.clone();
+    let context = repo.clone();
+    let store = panel.read(cx).store().clone();
     let started = git_ui::spawn_gated(
         &repo,
         move |repo| match &mode_for_task {
-            NameMode::Create { start } => {
-                mt_project::git::create_branch(repo, &name, start.as_deref(), checkout)
-            }
-            NameMode::Rename { old } => mt_project::git::rename_branch(repo, old, &name),
+            NameMode::Create { start } => repo.create_branch(&name, start.as_deref(), checkout),
+            NameMode::Rename { old } => repo.rename_branch(old, &name),
         },
         move |result, window, cx| match result {
             Ok(()) => {
@@ -1652,16 +1754,24 @@ fn submit_name(form: &Entity<NameForm>, window: &mut Window, cx: &mut App) -> bo
                         new = value.as_str()
                     ),
                 };
+                git_ui::toast_for_repo(&store, &context, message.clone(), Tone::Info, cx);
                 panel.update(cx, |p, cx| {
+                    if p.repo_context().as_ref() != Some(&context) {
+                        return;
+                    }
                     if checkout || matches!(mode, NameMode::Rename { .. }) {
                         p.set_view_branch(None, cx);
                     }
-                    p.notify_result(message, Tone::Info, cx);
                     p.refresh_after_write(cx);
                 });
             }
             Err(err) => {
-                let message = git_ui::error_text(&err);
+                let message = git_ui::repo_text(
+                    &store,
+                    &context,
+                    git_ui::error_text_for_store(&err, &store, cx),
+                    cx,
+                );
                 done_form.update(cx, |f, cx| {
                     f.op.fail(message.clone());
                     cx.notify();
@@ -1718,6 +1828,7 @@ mod tests {
     ) -> BranchSnapshot {
         BranchSnapshot {
             repo: "/r".into(),
+            context: GitContext::local("/r"),
             data: Rc::new(BranchData {
                 generation: 0,
                 branches,

@@ -174,6 +174,11 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 
 ### Git Integration
 
+- **Remote Git** — SSH projects reuse the original Git panel and interactions for status, three-side diffs, hunk staging, commits, history/details, branches, synchronization, stash and worktrees. Each project starts unauthorized: opening Git for the first time asks for permission to upload and run the helper. Only after consent does Mini-Term deploy the bundled server-platform-matched helper over SFTP and verify SHA-256. Enable or revoke permission from the project's context menu; there is no global Settings toggle. Cancellation does not trigger repeated automatic prompts. Permission is bound to the project's SSH endpoint and remote root; changing either requires fresh confirmation. A newly created worktree project starts unauthorized, even when its parent project is authorized. Remote polling runs while visible and preserves stable snapshots; local projects retain file watching.
+- **Remote Git safety and cleanup** — The server needs Git and an executable user cache, but no Rust, root access or new listening port. Helpers are cached under `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`. Use trusted servers and repositories only: authentication, hooks, filters and signing follow server configuration, with no new credential UI; the project root and repository discovery scope are not an operating-system sandbox. Revoking permission stops that project's new operations, not writes already started. Before cleanup, stop remote Git operations and revoke permission for every project using the cache, confirm that all Git operations and related child processes have finished, then delete only the helper cache, never project directories. A recovery acknowledgement is not evidence that those processes have exited. [Usage details](../README.en.md#remote-git-helper).
+- **Unknown write outcomes and recovery** — Disconnected or timed-out writes are never replayed automatically; further writes stay blocked while the result is unknown. If the original channel remains usable, its barrier proof supports safe inspection; if that channel is lost, inspection uses a new read-only channel. Recovery shows the current HEAD, index, operation state and working-tree status. In both cases, inspect the snapshot and explicitly acknowledge that you have checked it before lifting the write restriction; viewing the snapshot alone does not unlock writes. Confirmation checks the snapshot again and rejects stale evidence, including repository, session or permission changes. Without the original channel's proof, acknowledgement does not prove that the old process or its children have ended. Neither path repeats the original write.
+- **Keep recovery reachable** — While a remote write is running or unknown, its source project, connection and target stay protected. If the server is unreachable, explicit risk-confirmed abandonment removes only the local guard, not remote work or its risk. It neither replays the write nor restores permission. Recovery remains visible after revocation; fixed read-only inspection requires separate one-time consent, including possible helper upload/start. Credential changes alone do not clear an unknown outcome.
+- **Remote Git connection usage** — Read-only channels are reused while a write outcome is unknown, rather than opening a fresh connection for each refresh. Local and remote Git have separate execution limits so slow SSH work does not use up local Git capacity; idle remote Git sessions are reclaimed.
 - **File status** — The file tree shows Git status colors (modified / added / deleted / conflict).
 - **Changes / history in one view** — The Git panel stacks two collapsible sections: Changes on top and commit history below, with a draggable divider (clamped 15%–85%) and animated collapse / expand, remembering fold state and ratio for the session. The repo bar at the top has two halves — on the left the repo dropdown (worktree entries marked ⎇), the current-branch pill and ↑ to-push / ↓ to-pull counts; on the right five icon buttons for Fetch / Pull / Push / Stash / Refresh (the stash button shows how many stashes exist) — and when space runs out the left half truncates first so the buttons never get squeezed out; right-clicking the repo name opens it in a terminal or enters worktree management. Icons, pills, section headers, empty / loading states and selection styling are one shared set across the whole panel (28px rows, four type sizes, contrast tuned separately for the light theme).
 - **Auto refresh** — The repo's `.git` directory is watched (HEAD / index / refs / merge and rebase state / stash), refreshing after a 500ms debounce and skipping the refresh when the repo signature hasn't changed; git run inside AI terminals or commits made by external tools show up immediately (previously only a few keywords in plain-terminal output were recognised).
@@ -292,21 +297,34 @@ cargo build --release -p mt-app
 
 > Hook reporting and the portable ConPTY locate sidecars and resources **next to the exe** — the release bundles ship them all. For the full experience when running from source, run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
 
+#### Building the remote Git helper from source
+
+Build the helper for the **server**, not the desktop. Linux x86_64/aarch64 use static musl targets to avoid depending on the server's glibc version; macOS uses its native x86_64/arm64 targets. These targets are not a claim of real-machine verification, and missing matching assets never fall back to local Git. On a matching native Linux host, install `musl-tools`, `build-essential`, `binutils`, `perl`, `pkg-config` and the Rust musl target, then use the shared CI/release script to select static executable linking. For Linux x86_64:
+
+```bash
+bash scripts/build-git-helper-musl.sh x86_64-unknown-linux-musl
+node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary target/x86_64-unknown-linux-musl/release/mt-git-helper --output target/release/remote-git-helpers
+```
+
+Stage the helper beside the desktop executable under `remote-git-helpers/<platform>/mt-git-helper`. The staging script accepts `linux-x86_64`, `linux-aarch64`, `macos-x86_64` and `macos-aarch64`; development builds can use its default output, `target/debug/remote-git-helpers`. Building from source does not bypass the project's deployment confirmation.
+
 ## Project Structure
 
 ```
 mini-term/
-├── crates/                       # Main workspace (12 crates)
+├── crates/                       # Main workspace
 │   ├── mt-app/                   # GPUI app shell: Workspace component tree, AppStore global state, SplitNode layout tree, panels / dialogs / tray / title bar
 │   ├── mt-ui/                    # GPUI rendering layer: terminal view / element, theme bridge (no business logic)
 │   ├── mt-terminal/              # VT state machine + grid model (alacritty_terminal wrapper, gpui-free)
 │   ├── mt-pty/                   # PTY lifecycle (spawn / read / write / resize / kill) + portable ConPTY preload
 │   ├── mt-ai/                    # AI awareness: hook server (authoritative), hook registration, input-detection fallback, status verdicts, session record reading
 │   ├── mt-project/               # File tree, directory watching, search, Git (git2), external editors, WSL distro enumeration
+│   ├── mt-git-helper/            # Remote Git helper: shared Git core over SSH stdio, no GPUI
 │   ├── mt-config/                # Config persistence & theme packs (gpui-free)
 │   ├── mt-i18n/                  # Bilingual copy layer (dictionary source in locales/*.ts; dict.rs is generated)
 │   ├── mt-relay/                 # Mobile relay, desktop side: outbound WSS link, pairing, project snapshots / deltas, conversation mirror, command write-through
 │   ├── mt-ssh/                   # Shared SSH layer (persistent russh session pool + SFTP primitives, used by both the app and sidecars)
+│   ├── mt-remote/                # Remote project services and managed Git: project-scoped permission, helper deployment, SSH Git sessions and recovery
 │   ├── mt-usage/                 # Usage stats: session turn parsing / SQLite ledger / aggregation / pricing
 │   └── mt-core/                  # Leaf shared library (WSL UNC parsing / SSH prompt scanning / atomic writes, etc.)
 ├── sidecars/                     # Standalone workspace for the sidecar binaries (independently versioned, not released with the app)
@@ -320,6 +338,7 @@ mini-term/
 ├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands / start / rename)
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds the sidecars and stages them (plus the portable ConPTY) next to the app exe
+│   ├── stage-git-helpers.mjs     # Stages a server-platform-matched helper beside the desktop executable
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
 ├── tests/                        # Node-side tests (2 files: ConPTY bundling / vendored-openssl guard)
 └── docs/                         # Documentation (feature list / relay deployment / theme pack example, etc.)

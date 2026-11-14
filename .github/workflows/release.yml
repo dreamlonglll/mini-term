@@ -18,6 +18,10 @@ name: Build & Release
 #   deb 的 Depends 由 dpkg-shlibdeps 在构建时按二进制实际链接的库算出)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
 #   该目录收集 —— 目录布局即最终包布局
+# - 每个桌面安装包都带齐 Linux x64/arm64 与 macOS x64/arm64 四种远端 Git helper;
+#   remote-git-helpers 全平台成功后 build-gpui 才组装,stage-git-helpers --verify-all
+#   拒绝缺失或动态链接的 Linux helper。手动补建即使只选一个桌面平台也不缩减 helper
+#   矩阵;任一 helper 构建 / 兼容性冒烟失败同样阻止打包与 publish。
 # - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
 #   各平台只向其上传产物,避免并行抢建 release;全部平台构建成功后 publish 作业
 #   算出 SHA256SUMS.txt 一并上传,再把 draft 转正。匿名请求看不到 draft ——
@@ -143,11 +147,89 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
         run: node .github/scripts/release_matrix.mjs
 
+  # Linux assets are static musl helpers, built natively without a GPUI target.
+  # Asset directory names remain the remote deployment target-map keys.
+  remote-git-helpers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: linux-x86_64
+            rust-target: x86_64-unknown-linux-musl
+          - platform: ubuntu-24.04-arm
+            target: linux-aarch64
+            rust-target: aarch64-unknown-linux-musl
+          - platform: macos-latest
+            target: macos-aarch64
+            rust-target: aarch64-apple-darwin
+          - platform: macos-15-intel
+            target: macos-x86_64
+            rust-target: x86_64-apple-darwin
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Install native musl build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools build-essential binutils perl pkg-config
+      - name: Setup Rust
+        shell: bash
+        env:
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$HELPER_RUST_TARGET"
+      - name: Build remote Git helper
+        shell: bash
+        env:
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            bash scripts/build-git-helper-musl.sh "$HELPER_RUST_TARGET"
+          else
+            cargo build --locked --release --target "$HELPER_RUST_TARGET" --package mt-git-helper
+          fi
+      - name: Validate binary and stage target asset
+        shell: bash
+        env:
+          HELPER_TARGET: ${{ matrix.target }}
+          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+        run: |
+          node scripts/stage-git-helpers.mjs --target "$HELPER_TARGET" \
+            --binary "target/$HELPER_RUST_TARGET/release/mt-git-helper" --output helper-assets
+      - name: Framed discover/status with system Git on glibc 2.31 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          HELPER_TARGET: ${{ matrix.target }}
+        # Pin the Ubuntu 20.04 multiarch index shared with CI, not a mutable tag
+        # or one architecture's manifest. Docker selects native x86_64/aarch64;
+        # Python also asserts glibc < 2.34.
+        run: |
+          sudo docker run --rm -v "$PWD:/workspace:ro" -w /workspace \
+            -e HELPER_TARGET="$HELPER_TARGET" \
+            ubuntu:focal-20250404@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends git python3 ca-certificates
+              python3 scripts/smoke-git-helper-old-glibc.py \
+                "/workspace/helper-assets/$HELPER_TARGET/mt-git-helper"
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: remote-git-helper-${{ matrix.target }}
+          path: helper-assets/
+          if-no-files-found: error
+
   build-gpui:
-    needs: [create-release, plan]
+    needs: [create-release, plan, remote-git-helpers]
     # 手动补建时 create-release 是 skipped,默认隐含的 success() 会把本作业一起
     # 跳掉;显式写状态函数(!cancelled())才能覆盖那个默认,再自己放行 skipped
-    if: needs.plan.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    if: needs.plan.result == 'success' && needs.remote-git-helpers.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -215,11 +297,24 @@ jobs:
             . -> target
             sidecars -> target
 
+      - name: Download remote Git helper assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: remote-git-helper-*
+          path: target/release/remote-git-helpers
+          merge-multiple: true
+
       - name: Build & stage sidecars (+ portable ConPTY on Windows)
         run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
       - name: Build GPUI app
         run: cargo build --locked --release --package mt-app
+
+      # Required for every desktop matrix row, including Windows. The validator
+      # reads binary headers itself (no host file/readelf dependency), rejects
+      # dynamic Linux helpers and fails if any of the four assets is missing.
+      - name: Require all remote Git helper resources before packaging
+        run: node scripts/stage-git-helpers.mjs --verify-all --output target/release/remote-git-helpers
 
       - name: Build NSIS installer (Windows)
         if: matrix.platform == 'windows-latest'
@@ -314,6 +409,7 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$APP/Contents/MacOS/"
           done
+          cp -R target/release/remote-git-helpers "$APP/Contents/MacOS/"
           mkdir -p icon.iconset
           for size in 16 32 128 256 512; do
             sips -z "$size" "$size" docs/icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
@@ -376,6 +472,7 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$STAGE/"
           done
+          cp -R target/release/remote-git-helpers "$STAGE/"
           # ⚠️ 打包目录仍叫 `mini-term`(解压出来就是可执行文件名),只有**资产名**
           # 用 `Mini-Term_…` —— Linux 大小写敏感,上传的 glob 抓不到这个暂存目录
           tar -C dist -czf "dist/Mini-Term_${VERSION}_amd64.tar.gz" mini-term
@@ -387,6 +484,7 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$PKG/usr/lib/mini-term/"
           done
+          cp -R target/release/remote-git-helpers "$PKG/usr/lib/mini-term/"
           # ── 运行时依赖(Depends)──
           # 由 dpkg-shlibdeps(build-essential 带的 dpkg-dev)按四个二进制实际链接的 .so
           # (ELF NEEDED)反查所属包与最低版本算出,不手写死一份会过期的列表:哪天多链 / 少链

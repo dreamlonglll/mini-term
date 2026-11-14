@@ -144,6 +144,20 @@ cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 
 > The app locates its sidecars and the portable ConPTY runtime **next to the exe**. The release bundles ship them all; when running from source, run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
 
+### Remote Git helper
+
+SSH projects can use the existing Git panel for changes, diffs, commit history, branches, stash and worktrees. **Remote Git starts unauthorized for each SSH project.** Opening Git for the first time asks for confirmation; use that project's context menu to enable or revoke permission, not a global Settings toggle. Only after consent does Mini-Term upload and start the bundled helper matched to the server platform. It uploads over SFTP to the SSH user's `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`, verifies the content, and runs it over the existing SSH connection. After cancellation, enable it again from the project's context menu without repeated automatic prompts. Permission is bound to that project's SSH endpoint and remote root; changing either requires confirmation again, and newly created worktree projects do not inherit permission.
+
+The server needs Git and permission to execute programs in its user cache; no Rust, root access or new listening port is required. Linux helpers use static musl builds to avoid depending on the server's glibc version. Target platforms are Linux x86_64/aarch64 and macOS x86_64/arm64; **this does not mean every platform or server environment has been verified on real machines**. Missing matching assets or unsupported platforms produce an explicit error, never a fallback to local Git.
+
+**Use trusted servers and repositories only.** Git hooks, filters, signing, commit identity and push/pull credentials follow server configuration; there is no new interactive credential UI. The project root and repository discovery scope are **not an operating-system sandbox**. Disconnected or timed-out writes are never replayed automatically. An unknown outcome blocks further writes, but status reads and recovery inspection remain available. Inspect the remote snapshot and explicitly acknowledge that you have checked it before resuming writes. If the original channel is lost, inspection uses a new channel; acknowledgement does not prove the old process has ended or replay the original operation.
+
+If the server is unreachable, the Git panel offers explicit risk-confirmed abandonment. This only removes the local guard; remote work may continue. It does not stop processes, replay requests or restore project permission. Recovery remains available after revocation; online inspection asks for one-time read-only verification consent (which may upload and start the helper), not ordinary Git permission.
+
+When projects share a remote repository, an unknown operation blocks further writes to that repository. Errors identify the source projects, and the Git panel can navigate to the owner for verification. Related nested-repository records remain visible after revocation; another project never gains the owner's recovery authority.
+
+Revoking a project's permission stops new remote Git operations for that project; **it does not cancel writes already started**, and Git or related child processes may continue. To clean up the cache, first stop remote Git operations and revoke permission for every project using it. Confirm that all Git operations and related child processes have finished, and only then delete the server's `~/.cache/mini-term/git-helper/` cache. Do not delete project directories. See the [full feature list](docs/features.md#building-the-remote-git-helper-from-source) for source-build and staging instructions.
+
 ---
 
 ## More

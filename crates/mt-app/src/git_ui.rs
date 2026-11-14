@@ -51,8 +51,6 @@ mod icons;
 pub use change_tree::*;
 pub use icons::*;
 
-use std::path::{Path, PathBuf};
-
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, ElementId, Entity, FontWeight, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
@@ -63,6 +61,7 @@ use gpui_component::button::ButtonVariants as _;
 use gpui_component::dialog::{Cancel, Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::GitStatus;
+use mt_remote::GitContext;
 use mt_ui::icons::{FileIcon, Shape};
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -1318,9 +1317,78 @@ pub fn error_text_box(state: &Entity<TextareaState>) -> AnyElement {
         .into_any_element()
 }
 
+/// Resolve local project labels only at the UI boundary; backend failures retain IDs.
+pub fn error_text_for_store(err: &anyhow::Error, store: &Entity<AppStore>, cx: &App) -> String {
+    if let Some(mt_remote::GitFailure::RepositoryBlocked {
+        repo,
+        owner_project_ids,
+    }) = err.downcast_ref::<mt_remote::GitFailure>()
+    {
+        let state = store.read(cx);
+        let projects = owner_project_ids
+            .iter()
+            .map(|id| {
+                state
+                    .project(id)
+                    .map(|project| project.name.as_str())
+                    .unwrap_or(id.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return crate::i18n::tr!(
+            "gitHistory",
+            "repositoryBlocked",
+            projects = projects,
+            repo = repo.as_str()
+        );
+    }
+    error_text(err)
+}
+
 /// 失败的可展示原因:错误链原文收掉首尾空白;空的(git 没吭声就非零退出)给句兜底。
 /// Git 界面里唯一的一份(历史区、贮藏弹窗、更改区都用它)。
 pub fn error_text(err: &anyhow::Error) -> String {
+    if let Some(failure) = err.downcast_ref::<mt_remote::GitFailure>() {
+        let (key, detail) = match failure {
+            mt_remote::GitFailure::OutcomeUnknown { message } => ("verifyWriteFailed", message),
+            mt_remote::GitFailure::RepositoryBlocked {
+                repo,
+                owner_project_ids,
+            } => {
+                return crate::i18n::tr!(
+                    "gitHistory",
+                    "repositoryBlocked",
+                    projects = owner_project_ids.join(", "),
+                    repo = repo.as_str()
+                );
+            }
+            mt_remote::GitFailure::Service { code, message } => {
+                let key = match code.as_str() {
+                    "remote_git_disabled" => "remoteDisabled",
+                    "remote_git_queue_full" => "serviceBusy",
+                    "remote_git_connection_changed" => "connectionChanged",
+                    "remote_git_permission_changed" => "permissionChanged",
+                    "remote_git_request_cancelled" => "requestCancelled",
+                    "remote_git_recovery_stale" => "recoveryStale",
+                    "remote_git_recovery_changed" => "recoveryChanged",
+                    "remote_git_no_unknown_write" => "noUnknownWrite",
+                    "remote_git_write_running" => "writeRunning",
+                    "remote_git_invalid_root" => "invalidRoot",
+                    "remote_git_deployment_failed" => "deploymentFailed",
+                    "remote_git_connection_failed" => "connectionFailed",
+                    "remote_git_protocol_mismatch" => "protocolMismatch",
+                    "remote_git_request_failed" => "requestFailed",
+                    "remote_git_reply_decode_failed"
+                    | "remote_git_recovery_decode_failed"
+                    | "remote_git_recovery_invalid_status" => "invalidReply",
+                    _ => "serviceUnavailable",
+                };
+                (key, message)
+            }
+            _ => return format!("{failure}"),
+        };
+        return format!("{}\n\n{}", t("gitHistory", key), detail.trim());
+    }
     let text = format!("{err:#}");
     match text.trim() {
         "" => t("gitBranch", "errorNoOutput").to_string(),
@@ -1337,27 +1405,33 @@ pub fn gate_busy_text() -> &'static str {
 /// 写操作的公共骨架(见模块注释):占 `repo` 的写操作闸 → 后台执行 `op` → 放闸 → 回 UI
 /// 线程把结果交给 `done`。闸被占时什么都不做、返回 `false`,由调用方就地提示。
 ///
-/// 占闸与放闸后各请求一次整窗重画:别的区按 [`gate::is_busy`] 画的禁用态要跟着变。
+/// 占闸与放闸后各请求一次整窗重画:别的区按 [`gate::is_busy_key`] 画的禁用态要跟着变。
 /// 窗口在等待期间关掉的话 `done` 不再调,闸照样随任务结束放掉。
 pub fn spawn_gated<T: Send + 'static>(
-    repo: &str,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    repo: &GitContext,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     done: impl FnOnce(anyhow::Result<T>, &mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let Some(guard) = gate::try_acquire(repo) else {
+    let Some(guard) = gate::try_acquire_key(&repo.repository_key()) else {
         return false;
     };
     cx.refresh_windows();
-    let path = PathBuf::from(repo);
+    let context = repo.clone();
+    let identity = repo_label(repo);
     window
         .spawn(cx, async move |cx| {
             // ⚠️ 全是阻塞调用(git CLI 最多 120s),必须后台执行器
-            let result = cx
-                .background_executor()
-                .spawn(async move { op(&path) })
-                .await;
+            let result = mt_remote::run_git_on(&context.clone(), move || {
+                let result = op(&context);
+                match &result {
+                    Ok(_) => {}
+                    Err(err) => eprintln!("[git] {identity}: operation failed: {err:#}"),
+                }
+                result
+            })
+            .await;
             drop(guard);
             let _ = cx.update(|window, cx| {
                 cx.refresh_windows();
@@ -1501,9 +1575,328 @@ pub fn toast(store: &Entity<AppStore>, message: String, tone: Tone, cx: &mut App
     crate::toast::push_message(kind, project_id, project_name, message, cx);
 }
 
+/// Captured backend identity, never the project selected when an operation finishes.
+pub fn repo_label(repo: &GitContext) -> String {
+    match repo.connection() {
+        Some(connection) => format!("{} · {}", connection.name, repo.path()),
+        None => repo.path().to_string(),
+    }
+}
+
+pub fn repo_text(
+    store: &Entity<AppStore>,
+    repo: &GitContext,
+    message: impl AsRef<str>,
+    cx: &App,
+) -> String {
+    if needs_repo_label(store, repo, cx) {
+        format!("{}\n{}", repo_label(repo), message.as_ref())
+    } else {
+        message.as_ref().to_string()
+    }
+}
+
+fn local_path_key(path: &str) -> String {
+    let path = mt_core::path_key::strip_verbatim_prefix(path);
+    if cfg!(windows) {
+        mt_core::path_key::windows_eq_key(&path)
+    } else {
+        mt_core::path_key::posix_trim_trailing(&path).to_string()
+    }
+}
+
+fn local_project_for_repo<'a>(
+    store: &'a AppStore,
+    repo: &str,
+) -> Option<&'a mt_config::ProjectConfig> {
+    let repo = local_path_key(repo);
+    store
+        .projects()
+        .iter()
+        .filter(|project| project.ssh_connection_id.is_none())
+        .filter_map(|project| {
+            let root = local_path_key(&project.path);
+            let contained = repo == root
+                || repo
+                    .strip_prefix(&root)
+                    .is_some_and(|rest| rest.starts_with('/') || root == "/");
+            contained.then_some((project, root.len()))
+        })
+        .max_by_key(|(_, length)| *length)
+        .map(|(project, _)| project)
+}
+
+/// Captured sources win over display-path ownership. Path inference exists only
+/// for uncaptured local entrypoints, including projects rooted inside a repository.
+fn source_project<'a>(
+    store: &'a AppStore,
+    repo: &GitContext,
+) -> Option<&'a mt_config::ProjectConfig> {
+    if let Some(id) = repo.project_id() {
+        return store.project(id);
+    }
+    repo.local_path()?;
+    local_project_for_repo(store, repo.path()).or_else(|| {
+        let project = store
+            .active_project()
+            .filter(|project| project.ssh_connection_id.is_none())?;
+        let root = local_path_key(&project.path);
+        let repository = local_path_key(repo.path());
+        root.strip_prefix(&repository)
+            .is_some_and(|rest| rest.starts_with('/') || repository == "/")
+            .then_some(project)
+    })
+}
+
+pub fn repo_is_current(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> bool {
+    let state = store.read(cx);
+    let Some(active) = state.active_project() else {
+        return false;
+    };
+    let source = repo_project_id(store, repo, cx);
+    if source.as_deref() != Some(active.id.as_str()) {
+        return false;
+    }
+    if repo.project_id().is_some()
+        && crate::git_backend::project_context(state, &active.id).with_path(repo.path()) != *repo
+    {
+        return false;
+    }
+    crate::git_panel::current_repo_for_project(state, &active.id)
+        .is_none_or(|selected| selected.repository_key() == repo.repository_key())
+}
+
+fn needs_repo_label(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> bool {
+    repo.is_remote()
+        || !repo_is_current(store, repo, cx)
+        || crate::git_panel::project_has_multiple_repos(
+            store.read(cx),
+            repo_project_id(store, repo, cx).as_deref(),
+        )
+}
+
+pub fn repo_project_id(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> Option<String> {
+    repo.project_id()
+        .map(str::to_string)
+        .or_else(|| source_project(store.read(cx), repo).map(|project| project.id.clone()))
+}
+
+pub fn toast_for_repo(
+    store: &Entity<AppStore>,
+    repo: &GitContext,
+    message: String,
+    tone: Tone,
+    cx: &mut App,
+) {
+    let kind = match tone {
+        Tone::Info => ToastKind::Info,
+        Tone::Attention => ToastKind::Error,
+    };
+    let (project_id, title) = repo_attribution(store, repo, cx);
+    let message = repo_text(store, repo, message, cx);
+    crate::toast::push_message(kind, project_id, title, message, cx);
+}
+
+fn repo_attribution(store: &Entity<AppStore>, repo: &GitContext, cx: &App) -> (String, String) {
+    let store = store.read(cx);
+    let project = source_project(store, repo);
+    let project_id = project
+        .map(|project| project.id.clone())
+        .or_else(|| repo.project_id().map(str::to_string))
+        .unwrap_or_default();
+    let project_name = project
+        .map(|project| project.name.as_str())
+        .unwrap_or(repo.path());
+    let title = match repo.connection() {
+        Some(connection) => format!("{project_name} · {}", connection.name),
+        None => project_name.to_string(),
+    };
+    (project_id, title)
+}
+
+pub fn repo_title(store: &Entity<AppStore>, repo: &GitContext, action: &str, cx: &App) -> String {
+    if needs_repo_label(store, repo, cx) {
+        let (_, title) = repo_attribution(store, repo, cx);
+        format!("{action} — {title} · {}", repo.path())
+    } else {
+        action.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn repository_blocked_error_uses_all_source_project_names(cx: &mut gpui::TestAppContext) {
+        let config = mt_config::AppConfig {
+            projects: vec![
+                mt_config::ProjectConfig::new("owner-a", "Source A", "/a"),
+                mt_config::ProjectConfig::new("owner-b", "Source B", "/b"),
+            ],
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let error = mt_remote::GitFailure::RepositoryBlocked {
+            repo: "/shared/repo".into(),
+            owner_project_ids: vec!["owner-a".into(), "owner-b".into(), "removed-owner".into()],
+        }
+        .into_error();
+        cx.update(|cx| {
+            assert_eq!(
+                error_text_for_store(&error, &store, cx),
+                crate::i18n::tr!(
+                    "gitHistory",
+                    "repositoryBlocked",
+                    projects = "Source A, Source B, removed-owner",
+                    repo = "/shared/repo"
+                )
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn attribution_uses_source_project_and_connection_names(cx: &mut gpui::TestAppContext) {
+        let connection: mt_config::SshConnection = serde_json::from_value(serde_json::json!({
+            "id": "internal-connection-id", "name": "Production SSH", "host": "invalid.test",
+            "port": 22, "user": "developer"
+        }))
+        .unwrap();
+        let mut config = mt_config::AppConfig::default();
+        let mut source =
+            mt_config::ProjectConfig::new("source-project", "Source project", "/srv/project");
+        source.ssh_connection_id = Some(connection.id.clone());
+        config.projects.push(source);
+        config.last_active_project_id = Some("different-project".into());
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let repo = GitContext::remote("source-project".into(), connection, "/srv/project".into())
+            .with_path("/srv/project/nested-repo");
+        cx.update(|cx| {
+            let (id, title) = repo_attribution(&store, &repo, cx);
+            assert_eq!(id, "source-project");
+            assert_eq!(title, "Source project · Production SSH");
+            let title = repo_title(&store, &repo, "Push commits", cx);
+            assert!(title.contains("Source project"));
+            assert!(title.contains("Production SSH"));
+            assert!(title.contains("/srv/project/nested-repo"));
+            assert!(!title.contains("internal-connection-id"));
+        });
+    }
+
+    #[gpui::test]
+    fn local_feedback_uses_specific_project_and_keeps_single_repo_plain(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = mt_config::AppConfig {
+            projects: vec![
+                mt_config::ProjectConfig::new("parent", "Parent", "/work"),
+                mt_config::ProjectConfig::new("child", "Child", "/work/repo"),
+            ],
+            last_active_project_id: Some("child".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let repo = GitContext::local("/work/repo");
+        cx.update(|cx| {
+            assert_eq!(
+                repo_attribution(&store, &repo, cx),
+                ("child".into(), "Child".into())
+            );
+            assert_eq!(
+                repo_text(&store, &repo, "hook rejected", cx),
+                "hook rejected"
+            );
+            assert_eq!(
+                repo_title(&store, &repo, "Push commits", cx),
+                "Push commits"
+            );
+            assert_eq!(
+                repo_project_id(&store, &GitContext::local("/work/repo/deep"), cx).as_deref(),
+                Some("child")
+            );
+            assert_eq!(
+                repo_project_id(&store, &GitContext::local("/work/repository"), cx).as_deref(),
+                Some("parent")
+            );
+            store.update(cx, |state, cx| state.set_active_project("parent", cx));
+            assert_eq!(
+                repo_text(&store, &repo, "hook rejected", cx),
+                "/work/repo\nhook rejected"
+            );
+            assert_eq!(repo_attribution(&store, &repo, cx).0, "child");
+        });
+    }
+
+    #[gpui::test]
+    fn captured_local_source_wins_over_longest_display_owner(cx: &mut gpui::TestAppContext) {
+        let config = mt_config::AppConfig {
+            projects: vec![
+                mt_config::ProjectConfig::new("parent", "Parent", "/work"),
+                mt_config::ProjectConfig::new("child", "Child", "/work/repo"),
+            ],
+            last_active_project_id: Some("parent".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        cx.update(|cx| {
+            let repo = crate::git_backend::project_context(store.read(cx), "parent")
+                .with_path("/work/repo");
+            assert!(repo_is_current(&store, &repo, cx));
+            assert_eq!(
+                repo_project_id(&store, &repo, cx).as_deref(),
+                Some("parent")
+            );
+            assert_eq!(
+                repo_attribution(&store, &repo, cx),
+                ("parent".into(), "Parent".into())
+            );
+            let child = crate::git_backend::project_context(store.read(cx), "child");
+            let guard = gate::try_acquire_key(&repo.repository_key()).unwrap();
+            assert!(gate::is_busy_key(&child.repository_key()));
+            assert!(gate::try_acquire_key(&child.repository_key()).is_none());
+            drop(guard);
+            store.update(cx, |state, cx| state.set_active_project("child", cx));
+            assert!(!repo_is_current(&store, &repo, cx));
+            assert_eq!(
+                repo_attribution(&store, &repo, cx),
+                ("parent".into(), "Parent".into())
+            );
+            assert!(repo_title(&store, &repo, "Commit", cx).contains("Parent"));
+        });
+    }
+
+    #[gpui::test]
+    fn local_subdirectory_project_attributes_repository_root_consistently(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let config = mt_config::AppConfig {
+            projects: vec![mt_config::ProjectConfig::new("pkg", "Package", "/repo/pkg")],
+            last_active_project_id: Some("pkg".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        cx.update(|cx| {
+            let raw = GitContext::local("/repo");
+            let captured =
+                crate::git_backend::project_context(store.read(cx), "pkg").with_path("/repo");
+            for repo in [&raw, &captured] {
+                assert_eq!(repo_project_id(&store, repo, cx).as_deref(), Some("pkg"));
+                assert_eq!(
+                    repo_attribution(&store, repo, cx),
+                    ("pkg".into(), "Package".into())
+                );
+                assert!(repo_is_current(&store, repo, cx));
+                assert_eq!(repo_title(&store, repo, "Commit", cx), "Commit");
+            }
+            store.update(cx, |state, _| state.active_project_id = None);
+            assert_eq!(
+                repo_attribution(&store, &captured, cx),
+                ("pkg".into(), "Package".into())
+            );
+            assert!(!repo_is_current(&store, &captured, cx));
+            assert!(repo_title(&store, &captured, "Commit", cx).contains("Package"));
+        });
+    }
 
     /// 表单两态:执行中不许再开始;失败复位并记原因;再开始时清掉上次的原因。
     #[test]

@@ -196,7 +196,8 @@ pub fn checkout_branch(repo_path: &Path, name: &str) -> Result<()> {
 }
 
 /// 检出远程分支的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RemoteCheckout {
     /// 本地没有同名分支:新建并跟踪该远程分支。
     Created { local: String },
@@ -282,7 +283,8 @@ pub fn rename_branch(repo_path: &Path, old: &str, new: &str) -> Result<()> {
 }
 
 /// 删除本地分支的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum DeleteOutcome {
     Deleted,
     /// `-d` 被拒:分支上有既没合进 HEAD、也没合进上游的提交。UI 二次确认后带
@@ -359,7 +361,7 @@ pub fn delete_remote_branch(repo_path: &Path, remote_branch: &str) -> Result<()>
 // ---------------------------------------------------------------------------
 
 /// 合并的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MergeOutcome {
     /// 目标已被当前分支包含,什么都没变。
     UpToDate,
@@ -408,7 +410,7 @@ pub fn merge_branch(repo_path: &Path, name: &str) -> Result<MergeOutcome> {
 }
 
 /// 变基的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RebaseOutcome {
     /// 当前分支已经在目标之上,什么都没变。
     UpToDate,
@@ -501,7 +503,8 @@ fn recent_branches_in(repo: &Repository, limit: usize) -> Vec<String> {
 }
 
 /// 本地分支相对上游的领先 / 落后。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BranchTracking {
     pub branch: String,
     /// 上游短名(`origin/main`)。
@@ -696,7 +699,8 @@ fn ahead_behind_in(
 
 /// Git 面板一次分支快照要的全部只读数据(仓库栏、分支弹窗、横幅、推拉按钮),
 /// 由 [`repo_panel_snapshot`] 一次开库取齐。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RepoPanelSnapshot {
     /// 读这份快照**之前**的仓库签名(见 [`repo_panel_snapshot`] 为什么要最先算)。
     pub signature: Option<RepoSignature>,

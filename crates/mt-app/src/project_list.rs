@@ -557,9 +557,9 @@ struct ExternalDrag {
 ///
 /// # 远程项目 gate(原版 `isRemote ? [] : [...]`)
 ///
-/// 本地专属入口一律隐藏:**资源管理器打开 / 关联 SSH / 环境变量 / Worktree 管理
-/// / 项目类型**。理由照抄原版注释:agent 已在远程机、envVars 不注入远程 shell
-/// (二期)、路径也不是本机可打开的位置、远程项目领位固定 SSH 图标。
+/// 本地专属入口一律隐藏:**资源管理器打开 / 关联 SSH / 环境变量 / 项目类型**。
+/// 远程 Worktree 管理与本地共用入口，由授权确认拦住尚未启用的 helper；
+/// 路径始终按所属 backend 解释，不拿远端路径打开本机位置。
 /// 保留的是重命名 / 编辑描述 / 复制绝对路径(远程 POSIX)/ 分组操作 / 移除。
 ///
 /// **分组那一段不在这张表里**:它是条件段(有没有分组、是不是子项目各不相同),
@@ -579,6 +579,7 @@ enum ProjectMenuAction {
     EnvVars,
     /// Worktree 管理弹窗(V 批建好的 `git_worktree::open`)。
     Worktrees,
+    ToggleRemoteGit,
     /// 「项目类型」子菜单。
     ProjectKind,
     /// 分组段的位标,见类型注释。
@@ -599,6 +600,11 @@ fn project_menu_actions(is_remote: bool) -> Vec<Option<ProjectMenuAction>> {
         out.push(Some(EnvVars));
         out.push(Some(Worktrees));
         out.push(Some(ProjectKind));
+    }
+    if is_remote {
+        out.push(None);
+        out.push(Some(ToggleRemoteGit));
+        out.push(Some(Worktrees));
     }
     out.push(Some(GroupSection));
     out.push(None);
@@ -801,6 +807,7 @@ fn project_menu(
     store: &Entity<AppStore>,
     row: &Row,
     tree: &[ProjectTreeItem],
+    cx: &App,
 ) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for action in project_menu_actions(row.remote.is_some()) {
@@ -821,11 +828,22 @@ fn project_menu(
                 })
             }
             ProjectMenuAction::Worktrees => {
-                let path = row.path.clone();
                 let id = row.id.clone();
+                let source_store = store.clone();
                 menu::item(t("projectList", "menu.worktrees"), move |window, cx| {
+                    if source_store.read(cx).is_remote_project(&id)
+                        && !crate::git_backend::remote_git_enabled(source_store.read(cx), &id)
+                    {
+                        crate::git_backend::request_enable(
+                            source_store.clone(),
+                            id.clone(),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
                     crate::git_worktree::open(
-                        path.clone(),
+                        crate::git_backend::project_context(source_store.read(cx), &id),
                         // 项目里可能挂着多个仓库,与原版的项目级入口同口径
                         true,
                         Some(id.clone()),
@@ -836,6 +854,41 @@ fn project_menu(
                         cx,
                     );
                 })
+            }
+            ProjectMenuAction::ToggleRemoteGit => {
+                let id = row.id.clone();
+                let source_store = store.clone();
+                let enabled = crate::git_backend::remote_git_enabled(store.read(cx), &id);
+                let broken = store.read(cx).remote_connection_of(&id).is_none();
+                MenuItem::new(t(
+                    "projectList",
+                    if enabled {
+                        "menu.disableRemoteGit"
+                    } else {
+                        "menu.enableRemoteGit"
+                    },
+                ))
+                .disabled(broken)
+                .detail(if broken {
+                    t("gitHistory", "connectionRemoved")
+                } else {
+                    ""
+                })
+                .on_click(move |window, cx| {
+                    if enabled {
+                        source_store.update(cx, |store, cx| {
+                            store.set_project_remote_git_enabled(&id, false, cx)
+                        });
+                    } else {
+                        crate::git_backend::request_enable(
+                            source_store.clone(),
+                            id.clone(),
+                            window,
+                            cx,
+                        );
+                    }
+                })
+                .into()
             }
             ProjectMenuAction::EditDescription => {
                 let store = store.clone();
@@ -2695,12 +2748,8 @@ impl ProjectList {
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     this.close_preview(cx);
-                    let entries = project_menu(
-                        &cx.entity(),
-                        &this.store,
-                        &row_for_menu,
-                        &tree_for_menu,
-                    );
+                    let entries =
+                        project_menu(&cx.entity(), &this.store, &row_for_menu, &tree_for_menu, cx);
                     menu::show(event.position, entries, window, cx);
                 }),
             )
@@ -2839,18 +2888,12 @@ mod tests {
         });
     }
 
-    /// 菜单项序照抄原版。
-    ///
-    /// ⚠️ 逐批同步的那条断言(V/Y 批口径):Y 批接上「Worktree 管理」;
-    /// BB-b 接上「关联 SSH / 环境变量」,并把分组段从 `ProjectKind` 的实现里
-    /// 提成显式位标 `GroupSection`(远程项目没有项目类型那一项,分组段得另有
-    /// 落点)。仍未建的只剩「WSL 会话」子菜单,不占位。
+    /// Project menu sequence and grouping are user-visible navigation contracts.
     #[test]
     fn 右键菜单项序与原版一致() {
         use ProjectMenuAction::*;
-        let actions = project_menu_actions(false);
         assert_eq!(
-            actions,
+            project_menu_actions(false),
             vec![
                 Some(Rename),
                 Some(EditDescription),
@@ -2866,34 +2909,25 @@ mod tests {
                 Some(Remove),
             ]
         );
-        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
     }
 
-    /// 远程项目的 gate(原版 `isRemote ? [] : [...]`):本地专属入口一律隐藏,
-    /// 保留重命名 / 编辑描述 / 复制绝对路径 / 分组段 / 移除。
     #[test]
     fn 远程项目隐藏本地专属菜单项() {
         use ProjectMenuAction::*;
-        let actions = project_menu_actions(true);
         assert_eq!(
-            actions,
+            project_menu_actions(true),
             vec![
                 Some(Rename),
                 Some(EditDescription),
                 Some(CopyAbsolutePath),
+                None,
+                Some(ToggleRemoteGit),
+                Some(Worktrees),
                 Some(GroupSection),
                 None,
                 Some(Remove),
             ]
         );
-        for hidden in [OpenInFolder, AssociateSsh, EnvVars, Worktrees, ProjectKind] {
-            assert!(
-                !actions.contains(&Some(hidden)),
-                "远程项目不该出现 {hidden:?}"
-            );
-        }
-        // 「复制绝对路径」必须留着 —— 远程 POSIX 路径照样要能复制走
-        assert!(actions.contains(&Some(CopyAbsolutePath)));
     }
 
     /// 远程徽章:本地项目没有;远程项目取连接名 + 摘要;连接被删 = 断链态。

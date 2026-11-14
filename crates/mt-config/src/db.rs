@@ -63,6 +63,9 @@
 //!
 //! sidecar 读的 `config.json` 投影不受影响:投影只写本版本已知的字段(见
 //! `config.rs` 的 `ssh_projection`),未知字段只活在库里。
+//!
+//! The unpublished `remoteGitHelperEnabled` experiment is deliberately not retired:
+//! it is an unknown, preserved setting and never participates in project consent.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -763,6 +766,93 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mt-config-db-{label}-{ts}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn project_git_consent_persists_isolation_revocation_and_unknown_fields() {
+        let dir = temp_dir("project-git-permission");
+        let db = ConfigDb::open_at(&dir).unwrap();
+        let connection = conn("ssh");
+        let mut config = AppConfig::default();
+        config.ssh_connections.push(connection.clone());
+        for id in ["a", "b"] {
+            let mut project = ProjectConfig::new(id, id, "/srv/repo");
+            project.ssh_connection_id = Some(connection.id.clone());
+            config.projects.push(project);
+        }
+        db.save(&config).unwrap();
+        assert!(
+            db.load()
+                .unwrap()
+                .unwrap()
+                .projects
+                .iter()
+                .all(|project| !project.remote_git_enabled(&connection))
+        );
+        config.projects[0].set_remote_git_enabled(Some(&connection), true);
+        config.projects[0].extra.insert(
+            "futureProjectField".into(),
+            serde_json::json!({"nested": [1, 2]}),
+        );
+        db.save(&config).unwrap();
+        let mut loaded = db.load().unwrap().unwrap();
+        assert!(loaded.projects[0].remote_git_enabled(&connection));
+        assert!(!loaded.projects[1].remote_git_enabled(&connection));
+        assert_eq!(
+            loaded.projects[0].extra["futureProjectField"],
+            serde_json::json!({"nested": [1, 2]})
+        );
+        loaded.projects[0].set_remote_git_enabled(None, false);
+        db.save(&loaded).unwrap();
+        let loaded = db.load().unwrap().unwrap();
+        assert!(
+            loaded
+                .projects
+                .iter()
+                .all(|project| project.remote_git_permission.is_none())
+        );
+        assert_eq!(
+            loaded.projects[0].extra["futureProjectField"],
+            serde_json::json!({"nested": [1, 2]})
+        );
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_global_consent_is_preserved_but_never_grants_a_project() {
+        let dir = temp_dir("legacy-git-permission");
+        let db = ConfigDb::open_at(&dir).unwrap();
+        let connection = conn("ssh");
+        let mut config = AppConfig::default();
+        let mut project = ProjectConfig::new("a", "A", "/srv/repo");
+        project.ssh_connection_id = Some(connection.id.clone());
+        config.ssh_connections.push(connection.clone());
+        config.projects.push(project);
+        db.save(&config).unwrap();
+        put_raw(
+            &db,
+            "INSERT INTO settings(key,value) VALUES (?1,?2)",
+            &["remoteGitHelperEnabled", "true"],
+        );
+        let loaded = db.load().unwrap().unwrap();
+        assert!(!loaded.projects[0].remote_git_enabled(&connection));
+        assert!(!known_setting_keys().contains("remoteGitHelperEnabled"));
+        assert!(!RETIRED_KEYS.contains(&"remoteGitHelperEnabled"));
+        db.save(&loaded).unwrap();
+        let preserved: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='remoteGitHelperEnabled'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, "true");
+        drop(db);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn project(id: &str, name: &str) -> ProjectConfig {

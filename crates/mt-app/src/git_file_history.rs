@@ -3,8 +3,8 @@
 //! 历史页签)见 `git_diff::tab`。
 //!
 //! - 入口:文件树右键「Git 历史」、更改列表右键;对外只有 [`open`],别处要接入时直接调它;
-//! - 数据:[`mt_project::git::get_file_log`](判定 = 相对第一个父提交改动了该路径,
-//!   **不跟随重命名**),分页游标由后端交回;后端每批最多扫 `SCAN_BUDGET` 个提交,
+//! - 数据:捕获的 `GitContext::get_file_log`(相对第一个父提交改动了该路径,
+//!   **不跟随重命名**);本地与 SSH 统一通过 `run_git_on` 调用,分页游标由后端交回;
 //!   没凑满一页就接着要;
 //! - 右栏复用 `git_diff` 的渲染([`git_diff::CommitFileDiffPane`]),并排 / 行内、
 //!   改动跳转与提交 diff 页签完全一致;双击 / 右键「在完整提交 diff 中查看」另开一个
@@ -14,7 +14,6 @@
 //!   取数落地时比一次 HEAD([`HistoryPage::check_head`]),变了才重拉 —— 历史只随提交变,
 //!   不必像单文件 diff 那样每次都重取。
 
-use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle,
@@ -23,6 +22,7 @@ use gpui::{
     UniformListScrollHandle, Window, div, px, uniform_list,
 };
 use mt_project::git::{FileLogEntry, GitLogCursor};
+use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_diff::{self, CommitFileDiffPane, ToolbarTail};
@@ -55,10 +55,10 @@ const LIST_WIDTH: f32 = 320.0;
 
 struct FileHistory {
     store: Entity<AppStore>,
-    project_root: PathBuf,
+    project_root: GitContext,
     file_rel: String,
     /// 后端换算出来的「仓库根 + 仓库内路径」(取 diff 用)。首页回来之前是 `None`。
-    repo_root: Option<String>,
+    repo_root: Option<GitContext>,
     path_in_repo: Option<String>,
     entries: Vec<FileLogEntry>,
     cursor: Option<GitLogCursor>,
@@ -102,10 +102,10 @@ impl Render for FileHistory {
 }
 
 /// 打开某个文件的 Git 历史页签(已开着就切过去)。`project_root` 可以是仓库里的子目录,
-/// `file_rel` 是相对它的路径(`/` 或 `\` 分隔都行);所属仓库由后端就近发现。
+/// `file_rel` 是相对它的路径;SSH 保留 POSIX 文件名中的反斜杠。所属仓库由后端就近发现。
 pub fn open(
     store: Entity<AppStore>,
-    project_root: PathBuf,
+    project_root: GitContext,
     file_rel: String,
     window: &mut Window,
     cx: &mut App,
@@ -122,16 +122,21 @@ impl HistoryPage {
     /// 建页并拉首页。`focus` 是页签的焦点句柄(左栏点行时要回来)。
     pub(crate) fn new(
         store: Entity<AppStore>,
-        project_root: PathBuf,
+        project_root: GitContext,
         file_rel: String,
         focus: FocusHandle,
         cx: &mut App,
     ) -> Self {
         let diff = CommitFileDiffPane::new(&store, cx);
+        let file_rel = if project_root.is_remote() {
+            file_rel
+        } else {
+            file_rel.replace('\\', "/")
+        };
         let state = cx.new(|_| FileHistory {
             store,
             project_root,
-            file_rel: file_rel.replace('\\', "/"),
+            file_rel,
             repo_root: None,
             path_in_repo: None,
             entries: Vec::new(),
@@ -162,26 +167,28 @@ impl HistoryPage {
     /// 页签切回来 / 仓库变了:后台比一次 HEAD,与首页那一刻的不一样(别处提交了、切了分支)
     /// 才整张重拉。还没拉到首页、正在拉、或已经在比的时候什么都不做。
     pub(crate) fn check_head(&self, cx: &mut App) {
-        let Some((root, rel, known)) = self.state.update(cx, |s, _| {
+        let Some((root, rel, known, request)) = self.state.update(cx, |s, _| {
             if s.loading || s.checking {
                 return None;
             }
             let root = s.repo_root.clone()?;
             let rel = s.path_in_repo.clone()?;
             s.checking = true;
-            Some((root, rel, s.head.clone()))
+            Some((root, rel, s.head.clone(), s.request))
         }) else {
             return;
         };
         let state = self.state.clone();
         cx.spawn(async move |cx| {
-            let signature = cx
-                .background_executor()
-                .spawn(async move { mt_project::git::head_signature(Path::new(&root), &rel) })
-                .await;
+            let executor = root.clone();
+            let signature =
+                mt_remote::run_git_on(&executor, move || root.head_signature(&rel)).await;
             cx.update(|cx| {
                 // 读不到(仓库被删 / 正被别的 git 进程改写)就等下一次
                 let changed = state.update(cx, |s, _| {
+                    if s.request != request {
+                        return false;
+                    }
                     s.checking = false;
                     signature.is_ok_and(|signature| signature.head != known)
                 });
@@ -232,6 +239,7 @@ fn reload(state: &Entity<FileHistory>, cx: &mut App) {
         s.scanned = 0;
         s.selected = None;
         s.head = None;
+        s.checking = false;
         cx.notify();
     });
     load_page(state, cx);
@@ -258,20 +266,20 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
     let first_page = after.is_none();
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                let page = mt_project::git::get_file_log(&root, &rel, after, PAGE_SIZE)?;
-                let head = if first_page {
-                    mt_project::git::head_signature(&page.repo_root, &page.path_in_repo)
-                        .ok()
-                        .and_then(|signature| signature.head)
-                } else {
-                    None
-                };
-                anyhow::Ok((page, head))
-            })
-            .await;
+        let executor = root.clone();
+        let result = mt_remote::run_git_on(&executor, move || {
+            let page = root.get_file_log(&rel, after, PAGE_SIZE)?;
+            let head = if first_page {
+                root.with_path(page.repo_root.to_string_lossy().into_owned())
+                    .head_signature(&page.path_in_repo)
+                    .ok()
+                    .and_then(|signature| signature.head)
+            } else {
+                None
+            };
+            anyhow::Ok((page, head))
+        })
+        .await;
         cx.update(|cx| {
             let landed = state.update(cx, |s, cx| {
                 if s.request != req {
@@ -280,7 +288,10 @@ fn load_page(state: &Entity<FileHistory>, cx: &mut App) {
                 s.loading = false;
                 match result {
                     Ok((page, head)) => {
-                        s.repo_root = Some(page.repo_root.to_string_lossy().to_string());
+                        s.repo_root = Some(
+                            s.project_root
+                                .with_path(page.repo_root.to_string_lossy().into_owned()),
+                        );
                         s.path_in_repo = Some(page.path_in_repo);
                         if first_page {
                             s.head = head;

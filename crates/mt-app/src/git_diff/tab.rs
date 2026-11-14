@@ -14,12 +14,9 @@
 //! | 单文件历史 | 文件(项目根 + 相对路径拼成的绝对路径) | 只是切过去 |
 //! | 磁盘对比 | 那个文档(文件页签的身份) | 换上新取的两侧内容与发起的文件页签 |
 //!
-//! 路径一律规范化后再比(分隔符统一成 `/`、去掉末尾的 `/`,Windows 上不分大小写 —— 与文件
-//! 页签同口径),「仓库 + 路径」拼成绝对路径再比:文件树按项目根传、更改列表与文件页 gutter
-//! 按仓库根传的同一个文件认得出是同一个(撞上时连仓库一起换,见 `FilePage::adopt`)。页签归
-//! 打开那一刻的**活动项目**(Git 面板的仓库属于它,项目里的子仓库 / worktree 也一样;远程
-//! 项目没有 Git 面板)。提交 / 合并变更要先在后台取文件列表,归属在发起时就记下:取数期间
-//! 切了项目,页签只放进原项目、不切过去(见 [`Home`])。
+//! 本地路径按文件页签口径规范化;SSH 路径始终按 POSIX 大小写与反斜杠语义比较。
+//! 身份包含捕获的后端、授权根与项目,同名路径不跨本地/SSH连接或授权源复用。
+//! 页签归属在入口同步捕获;提交/合并变更取数期间切项目,结果只加入原项目、不抢焦点。
 //!
 //! 单文件 diff 里 Alt+← / Alt+→ 换文件(或块操作后当前文件离开了分组、换到下一个)时**在
 //! 当前页签里换**,身份与标题跟着变([`DiffTabEvent::Retarget`]);换到的目标恰好已有另一个
@@ -54,13 +51,12 @@
 //! - 眼前这一页还接更改列表的取数落地([`notify_repo_changed`]):在 Git 抽屉里暂存 / 丢弃 /
 //!   提交、终端里跑 git 命令之后,挤在旁边的那页 diff 当场跟上;不在眼前的页签等切回来再取。
 
-use std::path::PathBuf;
-
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
     IntoElement, KeyDownEvent, Render, Styled as _, Subscription, Task, WeakEntity, Window,
 };
 use gpui_component::WindowExt as _;
+use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 
 use super::pages::{FilePage, FilesPage, TextPage};
@@ -108,31 +104,51 @@ enum DiffTarget {
 }
 
 impl DiffTarget {
-    fn file(repo: &str, path: &str, side: DiffSide) -> Self {
+    fn file_on(repo: &GitContext, path: &str, side: DiffSide) -> Self {
         DiffTarget::File {
-            file: join_path(repo, path),
+            file: join_path_on(repo, path),
             side: side.into(),
         }
     }
 
-    fn commit(repo: &str, hash: &str) -> Self {
+    fn commit_on(repo: &GitContext, hash: &str) -> Self {
         DiffTarget::Commit {
-            repo: norm_path(repo),
+            repo: norm_path_on(repo, repo.path()),
             hash: hash.to_string(),
         }
     }
 
-    fn combined(repo: &str, hashes: &[String]) -> Self {
+    fn combined_on(repo: &GitContext, hashes: &[String]) -> Self {
         DiffTarget::Combined {
-            repo: norm_path(repo),
+            repo: norm_path_on(repo, repo.path()),
             hashes: hashes.to_vec(),
         }
     }
 
-    fn history(project_root: &str, rel: &str) -> Self {
+    fn history_on(repo: &GitContext, path: &str) -> Self {
         DiffTarget::History {
-            file: join_path(project_root, rel),
+            file: join_path_on(repo, path),
         }
+    }
+
+    #[cfg(test)]
+    fn file(repo: &str, path: &str, side: DiffSide) -> Self {
+        Self::file_on(&GitContext::local(repo), path, side)
+    }
+
+    #[cfg(test)]
+    fn commit(repo: &str, hash: &str) -> Self {
+        Self::commit_on(&GitContext::local(repo), hash)
+    }
+
+    #[cfg(test)]
+    fn combined(repo: &str, hashes: &[String]) -> Self {
+        Self::combined_on(&GitContext::local(repo), hashes)
+    }
+
+    #[cfg(test)]
+    fn history(project_root: &str, rel: &str) -> Self {
+        Self::history_on(&GitContext::local(project_root), rel)
     }
 
     /// 这个目标落不落在仓库 `repo`(规范化过的)里:仓库变了时据此挑要跟上的页签。
@@ -141,7 +157,7 @@ impl DiffTarget {
         match self {
             DiffTarget::File { file, .. } | DiffTarget::History { file } => file
                 .strip_prefix(repo)
-                .is_some_and(|rest| rest.starts_with('/')),
+                .is_some_and(|rest| rest.starts_with('/') || repo == "/"),
             DiffTarget::Commit { .. } | DiffTarget::Combined { .. } | DiffTarget::Disk(_) => false,
         }
     }
@@ -151,6 +167,7 @@ impl DiffTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DiffKey {
     project_id: String,
+    backend: String,
     target: DiffTarget,
 }
 
@@ -159,6 +176,11 @@ impl DiffKey {
         &self.project_id
     }
 
+    fn follows_repo(&self, repo: &GitContext) -> bool {
+        self.backend == backend_key(repo)
+            && repo.project_id().is_none_or(|id| id == self.project_id)
+            && self.target.in_repo(&norm_path_on(repo, repo.path()))
+    }
     /// 页签条上的图标形状(与文件页签按类型上色的文件图标分得开)。
     pub fn icon(&self) -> &'static [Shape] {
         match self.target {
@@ -167,6 +189,32 @@ impl DiffKey {
             DiffTarget::Combined { .. } => ICON_MERGE,
             DiffTarget::History { .. } => ICON_HISTORY,
         }
+    }
+}
+
+fn backend_key(context: &GitContext) -> String {
+    context.with_path("").key()
+}
+
+fn norm_path_on(context: &GitContext, path: &str) -> String {
+    if context.is_remote() {
+        mt_core::path_key::posix_trim_trailing(path).to_string()
+    } else {
+        norm_path(path)
+    }
+}
+
+fn join_path_on(context: &GitContext, rel: &str) -> String {
+    let root = norm_path_on(context, context.path());
+    let rel = norm_path_on(context, rel);
+    let rel = rel
+        .strip_prefix("./")
+        .unwrap_or(&rel)
+        .trim_start_matches('/');
+    if rel.is_empty() {
+        root
+    } else {
+        format!("{}/{rel}", root.trim_end_matches('/'))
     }
 }
 
@@ -188,6 +236,7 @@ fn norm_path(path: &str) -> String {
 }
 
 /// 根目录 + 相对路径 → 规范化的绝对路径(相对路径开头的 `./`、`/` 去掉)。
+#[cfg(test)]
 fn join_path(root: &str, rel: &str) -> String {
     let root = norm_path(root);
     let rel = norm_path(rel);
@@ -252,6 +301,32 @@ fn file_tab_title(path: &str, side: DiffSide) -> String {
 /// 单文件 diff 的悬停提示:完整路径 + 比的是哪两侧。
 fn file_tab_tip(repo: &str, path: &str, side: DiffSide) -> String {
     format!("{}\n{}", display_path(repo, path), side_label(side))
+}
+
+fn file_tab_tip_on(repo: &GitContext, path: &str, side: DiffSide) -> String {
+    if repo.is_remote() {
+        format!(
+            "{}/{}\n{}",
+            repo.path().trim_end_matches('/'),
+            path,
+            side_label(side)
+        )
+    } else {
+        file_tab_tip(repo.path(), path, side)
+    }
+}
+
+fn file_tab_title_on(repo: &GitContext, path: &str, side: DiffSide) -> String {
+    if repo.is_remote() {
+        tr!(
+            "diffModal",
+            "tabTitle",
+            name = path.rsplit('/').next().unwrap_or(path),
+            side = side_tab_label(side)
+        )
+    } else {
+        file_tab_title(path, side)
+    }
 }
 
 /// 提交 diff:「提交 abc1234 修复登录页」。
@@ -384,8 +459,8 @@ impl DiffTab {
 
     /// 仓库 `repo`(规范化过的)里有东西变了:眼前这一页在那个仓库里就当场跟上,其余等切
     /// 回来时再取(切回来本来就会静默重取)。
-    fn on_repo_changed(&mut self, repo: &str, cx: &mut Context<Self>) {
-        if !self.key.target.in_repo(repo) || !workbench_area::is_diff_tab_active(&self.key, cx) {
+    fn on_repo_changed(&mut self, repo: &GitContext, cx: &mut Context<Self>) {
+        if !self.key.follows_repo(repo) || !workbench_area::is_diff_tab_active(&self.key, cx) {
             return;
         }
         match &self.page {
@@ -401,11 +476,11 @@ impl DiffTab {
             return;
         };
         let (repo, file) = page.current(cx);
-        let target = DiffTarget::file(&repo, &file.path, file.side);
-        let title = file_tab_title(&file.path, file.side);
+        let target = DiffTarget::file_on(&repo, &file.path, file.side);
+        let title = file_tab_title_on(&repo, &file.path, file.side);
         // 再次打开时可能只换了仓库的写法(文件树按项目根、gutter 按仓库根,见
         // `FilePage::adopt`):身份与标题不变,提示里的完整路径也跟上
-        let tip = file_tab_tip(&repo, &file.path, file.side);
+        let tip = file_tab_tip_on(&repo, &file.path, file.side);
         if target == self.key.target && title == self.title && tip == self.tip {
             return;
         }
@@ -451,28 +526,26 @@ impl Render for DiffTab {
 
 // ─── 打开 ─────────────────────────────────────────────────────
 
-/// diff 页签归哪个项目。
+/// 页签的来源在入口同步捕获,迟到结果不重新解释活动项目。
 enum Home {
-    /// 打开那一刻的活动项目(当场就开的入口)
-    Active,
-    /// 发起时记下的项目:提交 / 合并变更先在后台取文件列表,回来时活动项目可能已经换了
+    Missing,
     Project(String),
 }
 
-/// 打开(或切到)一个归活动项目的 diff 页签(当场就开的入口),见 [`open_tab_in`]。
-fn open_tab(
-    target: DiffTarget,
-    window: &mut Window,
-    cx: &mut App,
-    open: impl FnOnce(
-        Option<&Entity<DiffTab>>,
-        DiffKey,
-        &mut Window,
-        &mut App,
-    ) -> Option<Entity<DiffTab>>
-    + 'static,
-) {
-    open_tab_in(Home::Active, target, window, cx, open);
+impl Home {
+    fn capture(store: &Entity<AppStore>, context: &GitContext, cx: &App) -> Self {
+        match git_ui::repo_project_id(store, context, cx) {
+            Some(id) => Self::Project(id),
+            None => Self::Missing,
+        }
+    }
+
+    fn project_id(&self) -> Option<&str> {
+        match self {
+            Self::Project(id) => Some(id),
+            Self::Missing => None,
+        }
+    }
 }
 
 /// 打开(或切到)一个 diff 页签:延到这一轮更新之后,按 `home` 定下的项目 + `target` 找
@@ -483,6 +556,7 @@ fn open_tab(
 /// 不切项目、不切页、不抢焦点,回到那个项目时它在页签条上。
 fn open_tab_in(
     home: Home,
+    backend: String,
     target: DiffTarget,
     window: &mut Window,
     cx: &mut App,
@@ -500,10 +574,7 @@ fn open_tab_in(
             let store = store.read(cx);
             let active = store.active_project_id.as_deref();
             match home {
-                Home::Active => match active {
-                    Some(id) => (id.to_string(), true),
-                    None => return,
-                },
+                Home::Missing => return,
                 Home::Project(id) => {
                     if store.project(&id).is_none() {
                         return;
@@ -513,7 +584,11 @@ fn open_tab_in(
                 }
             }
         };
-        let key = DiffKey { project_id, target };
+        let key = DiffKey {
+            project_id,
+            backend,
+            target,
+        };
         let tab = match workbench_area::find_diff_tab(&key, cx) {
             Some(tab) => {
                 open(Some(&tab), key, window, cx);
@@ -539,7 +614,7 @@ fn open_tab_in(
 /// (更改列表传自己的重载,文件树传 `None`)。
 pub fn open_file_diff(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     on_changed: Option<OnChanged>,
@@ -558,33 +633,41 @@ pub fn open_file_diff(
 /// [`ReloadFiles`](super::ReloadFiles))。回调里拿更改列表一律用弱引用,列表没了静默忽略。
 pub fn open_file_diff_with(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     hooks: FileDiffHooks,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() || files.is_empty() {
+    if repo_path.path().is_empty() || files.is_empty() {
         return;
     }
     let current = current.min(files.len() - 1);
-    let target = DiffTarget::file(&repo_path, &files[current].path, files[current].side);
-    open_tab(target, window, cx, move |existing, key, _window, cx| {
-        if let Some(tab) = existing {
-            tab.update(cx, |tab, cx| {
-                if let Page::File(page) = &tab.page {
-                    page.adopt(repo_path, files, current, hooks, cx);
-                }
-            });
-            return None;
-        }
-        let file = files[current].clone();
-        let title = file_tab_title(&file.path, file.side);
-        let tip = file_tab_tip(&repo_path, &file.path, file.side);
-        let page = FilePage::new(&store, repo_path, files, current, hooks, cx);
-        Some(new_tab(key, title, tip, Page::File(page), cx))
-    });
+    let target = DiffTarget::file_on(&repo_path, &files[current].path, files[current].side);
+    let home = Home::capture(&store, &repo_path, cx);
+    open_tab_in(
+        home,
+        backend_key(&repo_path),
+        target,
+        window,
+        cx,
+        move |existing, key, _window, cx| {
+            if let Some(tab) = existing {
+                tab.update(cx, |tab, cx| {
+                    if let Page::File(page) = &tab.page {
+                        page.adopt(repo_path, files, current, hooks, cx);
+                    }
+                });
+                return None;
+            }
+            let file = files[current].clone();
+            let title = file_tab_title_on(&repo_path, &file.path, file.side);
+            let tip = file_tab_tip_on(&repo_path, &file.path, file.side);
+            let page = FilePage::new(&store, repo_path, files, current, hooks, cx);
+            Some(new_tab(key, title, tip, Page::File(page), cx))
+        },
+    );
 }
 
 /// 后台取某个提交的改动文件,回来再打开它的多文件 diff 页签(`initial` = 先选中哪个文件)。
@@ -598,25 +681,26 @@ pub fn open_file_diff_with(
 /// 其余直接 `detach`。
 pub fn open_commit_diff_loading(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     commit_hash: String,
     commit_message: String,
     initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> Task<()> {
-    let target = DiffTarget::commit(&repo_path, &commit_hash);
+    let target = DiffTarget::commit_on(&repo_path, &commit_hash);
+    let home = Home::capture(&store, &repo_path, cx);
+    let backend = backend_key(&repo_path);
     window.spawn(cx, async move |cx| {
-        let started =
-            cx.update(|window, cx| begin_files_tab(&target, initial.as_deref(), window, cx));
+        let started = cx.update(|window, cx| {
+            begin_files_tab(&home, &backend, &target, initial.as_deref(), window, cx)
+        });
         let Ok(Some(project_id)) = started else {
             return;
         };
-        let (task_repo, task_hash) = (PathBuf::from(&repo_path), commit_hash.clone());
-        let files = cx
-            .background_executor()
-            .spawn(async move { mt_project::git::get_commit_files(&task_repo, &task_hash) })
-            .await;
+        let (task_repo, task_hash) = (repo_path.clone(), commit_hash.clone());
+        let files =
+            mt_remote::run_git_on(&repo_path, move || task_repo.get_commit_files(&task_hash)).await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => {
                 let title = commit_tab_title(&commit_hash, &commit_message);
@@ -628,6 +712,7 @@ pub fn open_commit_diff_loading(
                     .collect();
                 open_files_tab(
                     Home::Project(project_id),
+                    backend,
                     target,
                     FilesSpec {
                         store,
@@ -646,7 +731,7 @@ pub fn open_commit_diff_loading(
                 eprintln!("[git] 取提交 {commit_hash} 的文件失败: {err:#}");
                 git_ui::show_git_error(
                     t("gitBranch", "viewCommitFailed"),
-                    git_ui::error_text(&err),
+                    git_ui::repo_text(&store, &repo_path, git_ui::error_text(&err), cx),
                     window,
                     cx,
                 );
@@ -660,36 +745,37 @@ pub fn open_commit_diff_loading(
 /// 已开着就直接切过去;失败口径同 [`open_commit_diff_loading`]。
 pub fn open_combined_diff_loading(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     hashes: Vec<String>,
     initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> Task<()> {
-    let target = DiffTarget::combined(&repo_path, &hashes);
+    let target = DiffTarget::combined_on(&repo_path, &hashes);
+    let home = Home::capture(&store, &repo_path, cx);
+    let backend = backend_key(&repo_path);
     window.spawn(cx, async move |cx| {
-        let started =
-            cx.update(|window, cx| begin_files_tab(&target, initial.as_deref(), window, cx));
+        let started = cx.update(|window, cx| {
+            begin_files_tab(&home, &backend, &target, initial.as_deref(), window, cx)
+        });
         let Ok(Some(project_id)) = started else {
             return;
         };
-        let (task_repo, task_hashes) = (PathBuf::from(&repo_path), hashes.clone());
-        let files = cx
-            .background_executor()
-            .spawn(
-                async move { mt_project::git::get_combined_commit_files(&task_repo, &task_hashes) },
-            )
-            .await;
+        let (task_repo, task_hashes) = (repo_path.clone(), hashes.clone());
+        let files = mt_remote::run_git_on(&repo_path, move || {
+            task_repo.get_combined_commit_files(&task_hashes)
+        })
+        .await;
         let _ = cx.update(|window, cx| match files {
             Ok(files) => {
                 let spec = combined_spec(store, repo_path, &hashes, files, initial);
-                open_files_tab(Home::Project(project_id), target, spec, window, cx);
+                open_files_tab(Home::Project(project_id), backend, target, spec, window, cx);
             }
             Err(err) => {
                 eprintln!("[git] 合并 {} 个提交的改动失败: {err:#}", hashes.len());
                 git_ui::show_git_error(
                     t("gitLog", "multi.viewFailed"),
-                    git_ui::error_text(&err),
+                    git_ui::repo_text(&store, &repo_path, git_ui::error_text(&err), cx),
                     window,
                     cx,
                 );
@@ -701,22 +787,24 @@ pub fn open_combined_diff_loading(
 /// 拿着已合并好的文件打开合并变更页签(历史区详情已经合并过同一组提交时直接用)。
 pub fn open_combined_diff(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     hashes: Vec<String>,
     files: Vec<mt_project::git::CombinedFileChange>,
     initial: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let target = DiffTarget::combined(&repo_path, &hashes);
+    let target = DiffTarget::combined_on(&repo_path, &hashes);
+    let home = Home::capture(&store, &repo_path, cx);
+    let backend = backend_key(&repo_path);
     let spec = combined_spec(store, repo_path, &hashes, files, initial);
-    open_files_tab(Home::Active, target, spec, window, cx);
+    open_files_tab(home, backend, target, spec, window, cx);
 }
 
 /// 合并变更页签要的东西。
 fn combined_spec(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     hashes: &[String],
     files: Vec<mt_project::git::CombinedFileChange>,
     initial: Option<String>,
@@ -735,7 +823,7 @@ fn combined_spec(
 /// 提交 / 合并变更页签要的全部东西(文件列表已经取好)。
 struct FilesSpec {
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     heading: super::ModalHeading,
     files: Vec<ModalFile>,
     initial: Option<String>,
@@ -745,45 +833,57 @@ struct FilesSpec {
 
 fn open_files_tab(
     home: Home,
+    backend: String,
     target: DiffTarget,
     spec: FilesSpec,
     window: &mut Window,
     cx: &mut App,
 ) {
-    open_tab_in(home, target, window, cx, move |existing, key, _, cx| {
-        if let Some(tab) = existing {
-            // 后台取文件列表的这段时间里同一目标已经开好了(连点两下):在它身上选中初始文件
-            if let Some(path) = spec.initial.as_deref() {
-                tab.update(cx, |tab, cx| tab.select_path(path, cx));
+    open_tab_in(
+        home,
+        backend,
+        target,
+        window,
+        cx,
+        move |existing, key, _, cx| {
+            if let Some(tab) = existing {
+                // 后台取文件列表的这段时间里同一目标已经开好了(连点两下):在它身上选中初始文件
+                if let Some(path) = spec.initial.as_deref() {
+                    tab.update(cx, |tab, cx| tab.select_path(path, cx));
+                }
+                return None;
             }
-            return None;
-        }
-        let FilesSpec {
-            store,
-            repo_path,
-            heading,
-            files,
-            initial,
-            title,
-            tip,
-        } = spec;
-        let page = FilesPage::new(store, repo_path, heading, files, initial, cx);
-        Some(new_tab(key, title, tip, Page::Files(page), cx))
-    });
+            let FilesSpec {
+                store,
+                repo_path,
+                heading,
+                files,
+                initial,
+                title,
+                tip,
+            } = spec;
+            let page = FilesPage::new(store, repo_path, heading, files, initial, cx);
+            Some(new_tab(key, title, tip, Page::Files(page), cx))
+        },
+    );
 }
 
 /// 提交 / 合并变更起步:记下页签归属的项目(发起这一刻的活动项目,见 [`Home`])。这个目标
 /// 在那个项目里已经开着就切过去(带着 `initial` 的在左栏选中它)、返回 `None`;没开着返回
 /// 记下的项目,调用方接着去后台取文件列表。没有活动项目也就没有页签区,返回 `None`,别去取了。
 fn begin_files_tab(
+    home: &Home,
+    backend: &str,
     target: &DiffTarget,
     initial: Option<&str>,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<String> {
-    let project_id = AppStore::global(cx).read(cx).active_project_id.clone()?;
+    let project_id = home.project_id()?.to_string();
+    AppStore::global(cx).read(cx).project(&project_id)?;
     let key = DiffKey {
         project_id,
+        backend: backend.to_string(),
         target: target.clone(),
     };
     let Some(tab) = workbench_area::find_diff_tab(&key, cx) else {
@@ -792,33 +892,56 @@ fn begin_files_tab(
     if let Some(path) = initial {
         tab.update(cx, |tab, cx| tab.select_path(path, cx));
     }
-    workbench_area::show_diff_tab(tab, window, cx);
+    if AppStore::global(cx).read(cx).active_project_id.as_deref() == Some(key.project_id()) {
+        workbench_area::show_diff_tab(tab, window, cx);
+    }
     None
 }
 
 /// 打开某个文件的单文件历史页签。`project_root` 可以是仓库里的子目录,`file_rel` 是
-/// 相对它的路径(`/` 或 `\` 分隔都行);所属仓库由后端就近发现。已开着就切过去。
+/// 相对它的路径(SSH 使用 POSIX 语义);所属仓库由后端就近发现。已开着就切过去。
 pub(crate) fn open_file_history(
     store: Entity<AppStore>,
-    project_root: PathBuf,
+    project_root: GitContext,
     file_rel: String,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let rel = file_rel.replace('\\', "/");
-    let root = project_root.to_string_lossy().to_string();
-    let target = DiffTarget::history(&root, &rel);
-    open_tab(target, window, cx, move |existing, key, _window, cx| {
-        if existing.is_some() {
-            return None;
-        }
-        let title = tr!("gitLog", "fileHistory.tabTitle", name = file_name_of(&rel));
-        let tip = display_path(&root, &rel);
-        // 历史页的行点击要把焦点要回来(之后 ↑/↓ 才有人接),与页签用同一个焦点句柄
-        let focus = cx.focus_handle();
-        let page = HistoryPage::new(store, project_root, rel, focus.clone(), cx);
-        Some(cx.new(|cx| DiffTab::new(key, title, tip, Page::History(page), focus, cx)))
-    });
+    let rel = if project_root.is_remote() {
+        file_rel
+    } else {
+        file_rel.replace('\\', "/")
+    };
+    let root = project_root.path().to_string();
+    let target = DiffTarget::history_on(&project_root, &rel);
+    let home = Home::capture(&store, &project_root, cx);
+    open_tab_in(
+        home,
+        backend_key(&project_root),
+        target,
+        window,
+        cx,
+        move |existing, key, _window, cx| {
+            if existing.is_some() {
+                return None;
+            }
+            let name = if project_root.is_remote() {
+                rel.rsplit('/').next().unwrap_or(&rel)
+            } else {
+                file_name_of(&rel)
+            };
+            let title = tr!("gitLog", "fileHistory.tabTitle", name = name);
+            let tip = if project_root.is_remote() {
+                format!("{}/{}", root.trim_end_matches('/'), rel)
+            } else {
+                display_path(&root, &rel)
+            };
+            // 历史页的行点击要把焦点要回来(之后 ↑/↓ 才有人接),与页签用同一个焦点句柄
+            let focus = cx.focus_handle();
+            let page = HistoryPage::new(store, project_root, rel, focus.clone(), cx);
+            Some(cx.new(|cx| DiffTab::new(key, title, tip, Page::History(page), focus, cx)))
+        },
+    );
 }
 
 /// 磁盘对比页签要的东西(文件页外部改动提示条的「对比」)。
@@ -840,33 +963,41 @@ pub struct TextDiffSpec {
 /// 对比页签就换上这次的两侧内容、切过去。
 pub fn open_text_diff(spec: TextDiffSpec, window: &mut Window, cx: &mut App) {
     let target = DiffTarget::Disk(workbench_area::document_key(&spec.source));
-    open_tab(target, window, cx, move |existing, key, _window, cx| {
-        let TextDiffSpec {
-            name,
-            source,
-            viewer,
-            disk,
-            mine,
-        } = spec;
-        if let Some(tab) = existing {
-            tab.update(cx, |tab, cx| {
-                if let Page::Text(page) = &mut tab.page {
-                    page.set_texts(viewer, disk, mine, cx);
-                }
-            });
-            return None;
-        }
-        let title = tr!("fileViewer", "compareTabTitle", name = name.as_str());
-        let tip = format!(
-            "{}\n{} → {}",
-            source.path().display(),
-            t("fileViewer", "compareSideDisk"),
-            t("fileViewer", "compareSideUnsaved")
-        );
-        let store = AppStore::global(cx);
-        let page = TextPage::new(&store, &name, viewer, disk, mine, cx);
-        Some(new_tab(key, title, tip, Page::Text(page), cx))
-    });
+    let home = Home::Project(spec.source.project_id().to_string());
+    open_tab_in(
+        home,
+        String::new(),
+        target,
+        window,
+        cx,
+        move |existing, key, _window, cx| {
+            let TextDiffSpec {
+                name,
+                source,
+                viewer,
+                disk,
+                mine,
+            } = spec;
+            if let Some(tab) = existing {
+                tab.update(cx, |tab, cx| {
+                    if let Page::Text(page) = &mut tab.page {
+                        page.set_texts(viewer, disk, mine, cx);
+                    }
+                });
+                return None;
+            }
+            let title = tr!("fileViewer", "compareTabTitle", name = name.as_str());
+            let tip = format!(
+                "{}\n{} → {}",
+                source.path().display(),
+                t("fileViewer", "compareSideDisk"),
+                t("fileViewer", "compareSideUnsaved")
+            );
+            let store = AppStore::global(cx);
+            let page = TextPage::new(&store, &name, viewer, disk, mine, cx);
+            Some(new_tab(key, title, tip, Page::Text(page), cx))
+        },
+    );
 }
 
 fn new_tab(key: DiffKey, title: String, tip: String, page: Page, cx: &mut App) -> Entity<DiffTab> {
@@ -888,13 +1019,12 @@ impl DiffTab {
 /// 仓库 `repo` 里有东西变了(更改列表的取数落地了:Git 抽屉里暂存 / 丢弃 / 提交、监听到
 /// 工作区或 `.git` 变化、终端里跑了 git 命令)。眼前那一页 diff 在这个仓库里就当场静默重取,
 /// 其余等切回来再取。调用方要保证此刻没借着任何 diff 页签(更改列表是延到更新之后调的)。
-pub fn notify_repo_changed(repo: &str, cx: &mut App) {
-    if repo.is_empty() {
+pub fn notify_repo_changed(repo: &GitContext, cx: &mut App) {
+    if repo.path().is_empty() {
         return;
     }
-    let repo = norm_path(repo);
     for tab in workbench_area::diff_tabs(cx) {
-        tab.update(cx, |tab, cx| tab.on_repo_changed(&repo, cx));
+        tab.update(cx, |tab, cx| tab.on_repo_changed(repo, cx));
     }
 }
 
@@ -903,6 +1033,128 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[gpui::test]
+    fn deferred_open_uses_source_project_not_current_project(cx: &mut gpui::TestAppContext) {
+        cx.skip_drawing();
+        cx.update(gpui_component::init);
+        let config = mt_config::AppConfig {
+            projects: vec![
+                mt_config::ProjectConfig::new("a", "a", "/source-a"),
+                mt_config::ProjectConfig::new("b", "b", "/source-b"),
+            ],
+            last_active_project_id: Some("a".into()),
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        cx.update(|cx| AppStore::set_global(store.clone(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        let landed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update_window(window.into(), |_, window, cx| {
+            let repo = crate::git_backend::project_context(store.read(cx), "a");
+            let home = Home::capture(&store, &repo, cx);
+            let done = landed.clone();
+            open_tab_in(
+                home,
+                backend_key(&repo),
+                DiffTarget::file_on(&repo, "file", DiffSide::Unstaged),
+                window,
+                cx,
+                move |_, key, _, _| {
+                    *done.borrow_mut() = Some(key);
+                    None
+                },
+            );
+            store.update(cx, |store, _| store.active_project_id = Some("b".into()));
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(landed.borrow().as_ref().unwrap().project_id(), "a");
+        assert_eq!(
+            cx.update(|cx| store.read(cx).active_project_id.clone())
+                .as_deref(),
+            Some("b")
+        );
+    }
+
+    fn remote(host: &str) -> GitContext {
+        GitContext::remote(
+            "p".into(),
+            mt_config::SshConnection {
+                id: "diff-consumer".into(),
+                name: "test".into(),
+                host: host.into(),
+                port: 22,
+                user: "test".into(),
+                password: None,
+                identity_file: None,
+                group: None,
+                extra: Default::default(),
+            },
+            "/Repo".into(),
+        )
+    }
+
+    #[test]
+    fn remote_tabs_and_refresh_keep_backend_and_posix_identity() {
+        let a = remote("one.invalid");
+        let b = remote("two.invalid");
+        let key = |repo: &GitContext, path: &str| DiffKey {
+            project_id: "p".into(),
+            backend: backend_key(repo),
+            target: DiffTarget::file_on(repo, path, DiffSide::Unstaged),
+        };
+        let ka = key(&a, "src/A\\B.rs");
+        assert_ne!(ka, key(&b, "src/A\\B.rs"));
+        assert_ne!(ka, key(&GitContext::local("/Repo"), "src/A\\B.rs"));
+        assert_ne!(ka, key(&a, "src/a\\B.rs"));
+        assert_ne!(ka, key(&a, "src/A/B.rs"));
+        assert_eq!(ka, key(&a.with_path("/Repo/"), "./src/A\\B.rs"));
+        assert!(ka.follows_repo(&a));
+        assert!(!ka.follows_repo(&b));
+        assert!(!ka.follows_repo(&a.with_path("/Repo2")));
+        let other_project = GitContext::remote(
+            "other".into(),
+            a.connection().unwrap().clone(),
+            "/Repo".into(),
+        );
+        assert!(!ka.follows_repo(&other_project));
+        assert_eq!(backend_key(&a), backend_key(&a.with_path("/Repo/sub")));
+        let history = DiffKey {
+            target: DiffTarget::history_on(&a.with_path("/Repo/sub"), "A\\B.rs"),
+            ..ka.clone()
+        };
+        assert!(history.follows_repo(&a));
+        assert!(!history.follows_repo(&b));
+        let tip = file_tab_tip_on(&a, "A\\B.rs", DiffSide::Unstaged);
+        assert!(tip.starts_with("/Repo/A\\B.rs\n"), "{tip}");
+        assert!(file_tab_title_on(&a, "A\\B.rs", DiffSide::Unstaged).contains("A\\B.rs"));
+    }
+
+    #[test]
+    fn local_tabs_keep_captured_source_separate_from_repository_identity() {
+        let parent = GitContext::local_for_project("parent", "/work");
+        let repo = parent.with_path("/work/repo");
+        let child = GitContext::local_for_project("child", "/work/repo");
+        let key = DiffKey {
+            project_id: "parent".into(),
+            backend: backend_key(&repo),
+            target: DiffTarget::file_on(&repo, "file", DiffSide::Unstaged),
+        };
+        assert_eq!(repo.repository_key(), child.repository_key());
+        assert_eq!(backend_key(&parent), backend_key(&repo));
+        assert_ne!(backend_key(&repo), backend_key(&child));
+        assert_ne!(
+            backend_key(&repo),
+            backend_key(&GitContext::local("/work/repo"))
+        );
+        assert!(key.follows_repo(&repo));
+        assert!(!key.follows_repo(&child));
+        assert!(!key.follows_repo(&GitContext::local("/work/repo")));
+    }
 
     /// 同一个文件,文件树按项目根(子目录)传、更改列表 / gutter 按仓库根传,拼出来是同一个
     /// 身份;分隔符、末尾的 `/`、相对路径开头的 `./` 都不影响。
@@ -939,10 +1191,12 @@ mod tests {
         assert_ne!(
             DiffKey {
                 project_id: "p1".into(),
+                backend: "local".into(),
                 target: staged.clone(),
             },
             DiffKey {
                 project_id: "p2".into(),
+                backend: "local".into(),
                 target: staged,
             }
         );
@@ -1024,6 +1278,7 @@ mod tests {
     fn 图标按目标分() {
         let key = |target| DiffKey {
             project_id: "p".into(),
+            backend: "local".into(),
             target,
         };
         // const 切片每次用到都可能落在不同地址,不能比指针;Shape 没有 PartialEq,按 Debug 比内容。

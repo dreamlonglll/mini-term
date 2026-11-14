@@ -65,7 +65,8 @@ fn count_between(repo: &Repository, tip: Oid, hide: &[Oid], cap: usize) -> usize
 // ---------------------------------------------------------------------------
 
 /// 一次 Fetch 的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FetchOutcome {
     /// 有变化的远程跟踪引用条数。0 = 已是最新。
     pub updated_refs: usize,
@@ -92,7 +93,8 @@ pub fn git_fetch_all(repo_path: &Path) -> Result<FetchOutcome> {
 // ---------------------------------------------------------------------------
 
 /// 拉取方式(用户在面板里**手选**的那种;没手选时走 [`git_pull_by_config`])。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum PullMode {
     /// 合并(`--no-rebase`)。
     #[default]
@@ -120,7 +122,8 @@ impl PullMode {
 
 /// 用户 git 配置里写的拉取方式。**只用于显示**(「跟随配置:变基」):真正拉取时
 /// [`git_pull_by_config`] 不带方式参数,`interactive`、`merges` 这些细节全交给 git 自己读。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PullConfig {
     pub mode: PullMode,
     /// `rebase=merges`:变基时保留本地的合并提交(`--rebase=merges`)。
@@ -192,7 +195,8 @@ fn config_pull_args(config: &PullConfig) -> &'static [&'static str] {
 const PULL_NO_EDITOR: &[(&str, &str)] = &[("GIT_EDITOR", "true"), ("GIT_SEQUENCE_EDITOR", "true")];
 
 /// 一次 Pull 的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PullOutcome {
     UpToDate,
     /// 拉下来 `commits` 个新提交(上游有、拉取前本地没有的)。
@@ -261,7 +265,8 @@ fn pull_run(repo_path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<Pu
 // ---------------------------------------------------------------------------
 
 /// 推送目标。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushTarget {
     /// 要推的本地分支。
     pub branch: String,
@@ -296,7 +301,8 @@ impl PushTarget {
 }
 
 /// 能不能推、推到哪。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PushPlan {
     /// 分离 HEAD:没有分支可推。
     Detached,
@@ -425,7 +431,8 @@ fn plan_for(repo: &Repository, branch: String) -> Result<PushPlan> {
 }
 
 /// 待推送的提交。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutgoingCommits {
     /// 新的在前。
     pub commits: Vec<GitCommitInfo>,
@@ -489,7 +496,8 @@ pub fn outgoing_commits(
 }
 
 /// 推送选项。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushOptions {
     /// `None` = 当前分支。
     pub branch: Option<String>,
@@ -502,7 +510,8 @@ pub struct PushOptions {
 }
 
 /// 一次推送的结果。网络 / 认证这类失败是 `Err`。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PushOutcome {
     Pushed(PushTarget),
     /// 被远端以「不是快进」拒绝(`[rejected]`:non-fast-forward / fetch first /

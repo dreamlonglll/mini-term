@@ -153,6 +153,7 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
 ] }
 
 [dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 # 语言包单测要亲手 `Query::new` 把每份高亮查询编一遍:组件库那条路编不过只会
 # `tracing::warn` 后静默退成纯文本,编译期与测试期都无感。已在树里,零新增。
 tree-sitter = "0.26"

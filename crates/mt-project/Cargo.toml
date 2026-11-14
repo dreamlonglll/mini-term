@@ -28,6 +28,8 @@ pathdiff = "0.2"
 encoding_rs = "0.8.41"
 # 猜编码(Firefox 同款检测器),取舍见 `encoding` 模块注释。
 chardetng = "0.1"
+# Compact, bounded conflict-file snapshots preserve the full 8 MiB read limit.
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 # WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。

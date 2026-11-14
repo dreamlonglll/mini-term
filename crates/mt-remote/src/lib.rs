@@ -20,6 +20,12 @@
 //! | `ssh_remote_ai_sessions` | [`ai_sessions`] |
 //! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
 //!
+//! [`RemoteGitWorkspace`] manages lazy packaged-helper deployment and persistent Git channels.
+//! Managed Git IO runs through [`run_git_on`] or the workspace's bounded async request queue;
+//! GPUI executor threads only await and never wait on a blocking service mutex.
+//! [`set_project_git_permission`] controls default-denied, project/endpoint/root scoped grants.
+//! Explicit-path [`RemoteGitClient`] remains a synchronous transport independent of that gate.
+//!
 //! # 线程口径(与 Tauri 版的唯一结构性差异)
 //!
 //! 原版是 `#[tauri::command(async)]`,跑在 Tauri 自带的全局 tokio runtime 上。
@@ -28,12 +34,10 @@
 //! - **本模块自持一个小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`),
 //!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
 //!   工作线程、进程内唯一;
-//! - **公开入口全是同步阻塞函数**,内部 `block_on`。调用方(mt-app 的视图层)
-//!   **必须**把它们丢进 `cx.background_executor().spawn(...)`,与 `mt_project::git`
-//!   / mt-app 的 `pricing::fetch_models_dev` 同一条纪律。主线程直接调 = 卡界面。
-//!   为什么不做成 `async fn` 让 gpui 的执行器 await:那样整条链路要一个
-//!   tokio-compat 的反应堆(russh 的 IO 依赖 tokio driver),不如把 tokio 的边界
-//!   收在本模块内部一层。
+//! - Existing synchronous SSH APIs retain their blocking boundary. Git UI callers use
+//!   `run_git_on(&context, move || captured.some_git_method()).await`, which admits closures
+//!   asynchronously onto the service-owned executor. Managed synchronous requests reject
+//!   calls outside that executor; local core methods remain direct synchronous calls.
 //!
 //! # 池 / 缓存的归属
 //!
@@ -54,6 +58,27 @@
 //! 主线程的 `AppStore` 里,后台任务读不到,于是**调用方在主线程取好
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
+//!
+//! Managed workspaces bind permission and UI identity to project/configuration/root. Repository
+//! mutation gates share host/port/user/path identity independent of saved credentials. A
+//! credential-only successor retains the originating project's unknown operation and routes
+//! recovery through its original actor using the newly granted credentials. Running writes
+//! are distinct from uncertain
+//! outcomes; neither is replayed. Recovery snapshots retain the original repository, attempt the
+//! old helper's barrier, and observe HEAD/index/operation/status through a reusable read channel.
+//! Lost barriers require explicit risk acknowledgement; revoked projects may instead give a
+//! single-use recovery-only consent (fixed observation/ack, never a normal grant). Offline
+//! abandonment consumes an owner/generation/source-bound confirmation without waiting for
+//! the actor or network, deploying, connecting, or issuing Git requests. Existing channels
+//! still receive normal bounded asynchronous EOF/close cleanup; this is not cancellation
+//! or proof that the original remote write has finished.
+//! Shared repository write rejections preserve the actual unknown repository and all
+//! owner project IDs in [`GitFailure::RepositoryBlocked`], not an unknown outcome for
+//! the rejected caller. Workspace recovery metadata can list the configured root and
+//! nested repositories without discovery or a grant; metadata never grants recovery.
+//! Source configuration mutations hold [`remote_git_source_change_guard`] across their
+//! pending check, mutation and grant synchronization; dispatch atomically publishes Running
+//! under the same guard before releasing it for network IO.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -69,6 +94,9 @@ use mt_ssh::{CachedSession, SftpHandle, SshPool};
 mod delete;
 mod dirs;
 mod files;
+mod git;
+mod git_context;
+mod git_service;
 mod paths;
 mod session_delete;
 mod sessions;
@@ -77,6 +105,14 @@ mod transfer;
 pub use delete::*;
 pub use dirs::*;
 pub use files::*;
+pub use git::RemoteGitClient;
+pub use git_context::GitContext;
+pub use git_service::{
+    RemoteGitOfflineAbandonConfirmation, RemoteGitOperationKind, RemoteGitRecoveryBlocker,
+    RemoteGitRecoveryConsent, RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace,
+    remote_git_source_change_guard, run_git, run_git_on, set_project_git_permission,
+};
+pub use mt_git_helper::GitFailure;
 pub use paths::*;
 pub use session_delete::*;
 pub use sessions::*;
@@ -271,6 +307,7 @@ pub fn state() -> &'static RemoteSshState {
 
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。
 pub fn shutdown_on_exit() {
+    git_service::shutdown_workspaces();
     state().shutdown_pool_blocking();
 }
 
@@ -278,6 +315,7 @@ pub fn shutdown_on_exit() {
 /// [`RemoteSshState::invalidate_connection`])。**由 `AppStore` 的写入侧调用**,
 /// 主线程直接调即可,不阻塞。
 pub fn invalidate_connection(conn_id: &str) {
+    git_service::invalidate_workspaces(conn_id);
     state().invalidate_connection(conn_id);
 }
 

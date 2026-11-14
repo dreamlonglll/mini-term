@@ -43,6 +43,8 @@ use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 use super::{ConflictInfo, list_conflicts, mark_conflict_resolved};
 use crate::encoding::{Decoded, TextEncoding};
@@ -104,7 +106,7 @@ impl ConflictBlock {
 }
 
 /// 解决一段冲突时选哪边。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ConflictPick {
     /// 只要当前这一侧(stage 2;变基时是变基目标)。
     Ours,
@@ -332,7 +334,7 @@ pub fn apply_conflict_picks(
 
 /// 不能逐段解决的原因。单独一个类型:UI `downcast_ref` 出来换成本地化文案(菜单项的
 /// 禁用说明、弹窗里的就地提示),不把后端的中文原文直接摆出来。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentBlocker {
     /// 删除 / 修改冲突(一侧或两侧是删除):文件里没有冲突标记,只能整文件采用一侧。
     DeleteModify,
@@ -380,7 +382,7 @@ impl fmt::Display for StaleConflictFile {
 impl std::error::Error for StaleConflictFile {}
 
 /// 一个冲突文件能不能逐段解决(更改列表随列表一起取,菜单项按它启用 / 写明原因)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SegmentStatus {
     /// 能:文件里有 `blocks` 段成对的冲突。
     Ready {
@@ -404,7 +406,164 @@ pub struct ConflictFile {
     original: Vec<u8>,
 }
 
+/// A write sends only this stale-file proof, never client encoding or offsets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConflictSnapshot {
+    pub path: String,
+    pub digest: String,
+}
+
+// Base64 guarantees the entire 8 MiB raw file fits in the 16 MiB frame,
+// including files whose text consists entirely of JSON escape characters.
+impl Serialize for ConflictFile {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ConflictFile", 3)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("encoding", &self.encoding)?;
+        state.serialize_field(
+            "original",
+            &base64::engine::general_purpose::STANDARD.encode(&self.original),
+        )?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ConflictFile {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            path: String,
+            encoding: TextEncoding,
+            #[serde(deserialize_with = "deserialize_original")]
+            original: Vec<u8>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        parsed_conflict_with_encoding(wire.path, wire.original, wire.encoding)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn deserialize_original<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<u8>, D::Error> {
+    struct Original;
+    impl serde::de::Visitor<'_> for Original {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("base64 conflict bytes up to 8 MiB")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Vec<u8>, E> {
+            let padding = value
+                .as_bytes()
+                .iter()
+                .rev()
+                .take_while(|&&b| b == b'=')
+                .count();
+            if !value.len().is_multiple_of(4)
+                || padding > 2
+                || value.len() > (MAX_SEGMENT_FILE_BYTES as usize).div_ceil(3) * 4
+                || value.len() / 4 * 3 - padding > MAX_SEGMENT_FILE_BYTES as usize
+            {
+                return Err(E::custom("conflict snapshot exceeds 8 MiB"));
+            }
+            base64::engine::general_purpose::STANDARD
+                .decode(value)
+                .map_err(E::custom)
+        }
+    }
+    deserializer.deserialize_str(Original)
+}
+
+fn parsed_conflict(path: String, original: Vec<u8>) -> Result<ConflictFile> {
+    if original.len() as u64 > MAX_SEGMENT_FILE_BYTES {
+        return Err(SegmentBlocker::TooLarge.into());
+    }
+    let (text, encoding) = match crate::encoding::decode(original.clone()) {
+        Decoded::Binary => return Err(SegmentBlocker::Binary.into()),
+        Decoded::Text {
+            encoding: TextEncoding::Lossy,
+            ..
+        } => return Err(SegmentBlocker::Lossy.into()),
+        Decoded::Text { text, encoding } => (text, encoding),
+    };
+    let blocks = find_conflict_blocks(&text);
+    if blocks.is_empty() {
+        return Err(SegmentBlocker::NoMarkers.into());
+    }
+    Ok(ConflictFile {
+        path,
+        encoding,
+        text,
+        blocks,
+        original,
+    })
+}
+
+/// The helper has already identified the codec. Reconstruct its display model
+/// without guessing again under the desktop's potentially different REGION.
+fn parsed_conflict_with_encoding(
+    path: String,
+    original: Vec<u8>,
+    encoding: TextEncoding,
+) -> Result<ConflictFile> {
+    if original.len() as u64 > MAX_SEGMENT_FILE_BYTES {
+        return Err(SegmentBlocker::TooLarge.into());
+    }
+    let text = match encoding {
+        TextEncoding::Utf8 => std::str::from_utf8(&original).ok().map(str::to_owned),
+        TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
+            let (bom, codec): (&[u8], &'static crate::encoding::encoding_rs::Encoding) =
+                if encoding == TextEncoding::Utf16Le {
+                    (&[0xff, 0xfe], crate::encoding::encoding_rs::UTF_16LE)
+                } else {
+                    (&[0xfe, 0xff], crate::encoding::encoding_rs::UTF_16BE)
+                };
+            original.strip_prefix(bom).and_then(|bytes| {
+                codec
+                    .decode_without_bom_handling_and_without_replacement(bytes)
+                    .map(|text| text.into_owned())
+            })
+        }
+        TextEncoding::Legacy(codec) => codec
+            .decode_without_bom_handling_and_without_replacement(&original)
+            .map(|text| text.into_owned()),
+        TextEncoding::Lossy => None,
+    }
+    .ok_or(SegmentBlocker::Lossy)?;
+    // Reject an inconsistent/malicious codec, including aliases that would
+    // silently normalize bytes. This model is display-only; writes still use
+    // the helper's independent reload/parse, never these wire fields.
+    if encoding.encode(&text)? != original {
+        return Err(SegmentBlocker::Lossy.into());
+    }
+    let blocks = find_conflict_blocks(&text);
+    if blocks.is_empty() {
+        return Err(SegmentBlocker::NoMarkers.into());
+    }
+    Ok(ConflictFile {
+        path,
+        encoding,
+        text,
+        blocks,
+        original,
+    })
+}
+
 impl ConflictFile {
+    pub fn snapshot(&self) -> Result<ConflictSnapshot> {
+        Ok(ConflictSnapshot {
+            path: self.path.clone(),
+            digest: git2::Oid::hash_object(git2::ObjectType::Blob, &self.original)?.to_string(),
+        })
+    }
     /// 某段当前这一侧的内容。
     pub fn ours_text(&self, block: &ConflictBlock) -> &str {
         &self.text[block.ours.clone()]
@@ -503,6 +662,24 @@ pub fn load_conflict_file(repo_path: &Path, file: &str) -> Result<ConflictFile> 
     })
 }
 
+/// Reload a remote display snapshot without trusting any client-derived text,
+/// encoding or offsets. Check freshness before parsing changed content.
+pub fn reload_conflict_file(repo_path: &Path, snapshot: &ConflictSnapshot) -> Result<ConflictFile> {
+    conflict_entry(repo_path, &snapshot.path)?;
+    let abs = repo_path.join(&snapshot.path);
+    let meta = std::fs::symlink_metadata(&abs).map_err(|_| StaleConflictFile)?;
+    if !meta.is_file() || meta.len() > MAX_SEGMENT_FILE_BYTES {
+        return Err(StaleConflictFile.into());
+    }
+    let original = std::fs::read(&abs).map_err(|_| StaleConflictFile)?;
+    if original.len() as u64 > MAX_SEGMENT_FILE_BYTES
+        || git2::Oid::hash_object(git2::ObjectType::Blob, &original)?.to_string() != snapshot.digest
+    {
+        return Err(StaleConflictFile.into());
+    }
+    parsed_conflict(snapshot.path.clone(), original)
+}
+
 /// 按各段的选择写回工作区文件(口径见模块注释「写回」)。`picks[i]` 对应
 /// `file.blocks[i]`,`None` 的那段原样保留标记。`mark_resolved` = 写完接着标记为已解决
 /// (此时每段都必须选了)。
@@ -520,17 +697,7 @@ pub fn write_conflict_resolution(
     picks: &[Option<ConflictPick>],
     mark_resolved: bool,
 ) -> Result<()> {
-    if picks.len() != file.blocks.len() {
-        bail!("选择与冲突段对不上,请刷新后重试");
-    }
-    if picks.iter().all(Option::is_none) {
-        bail!("还没有选择任何冲突段");
-    }
-    if mark_resolved && picks.iter().any(Option::is_none) {
-        bail!("还有冲突段没有选择,不能标记为已解决");
-    }
     conflict_entry(repo_path, &file.path)?;
-    let bytes = file.encoding.encode(&file.resolve(picks))?;
     let abs = repo_path.join(&file.path);
     // 防陈旧:长度不同不必读完整个文件;读不到(被删了)同样算变了
     let meta = std::fs::symlink_metadata(&abs).map_err(|_| StaleConflictFile)?;
@@ -541,6 +708,19 @@ pub fn write_conflict_resolution(
     if now != file.original {
         return Err(StaleConflictFile.into());
     }
+    // Public display fields can be changed by a consumer. Derive the actual
+    // write model from the verified bytes, just as the remote endpoint does.
+    let trusted = parsed_conflict(file.path.clone(), now)?;
+    if picks.len() != trusted.blocks.len() {
+        bail!("选择与冲突段对不上,请刷新后重试");
+    }
+    if picks.iter().all(Option::is_none) {
+        bail!("还没有选择任何冲突段");
+    }
+    if mark_resolved && picks.iter().any(Option::is_none) {
+        bail!("还有冲突段没有选择,不能标记为已解决");
+    }
+    let bytes = trusted.encoding.encode(&trusted.resolve(picks))?;
     crate::fs::atomic_write(&abs, &bytes)?;
     if mark_resolved {
         mark_conflict_resolved(repo_path, &file.path)?;

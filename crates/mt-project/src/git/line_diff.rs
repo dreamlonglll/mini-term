@@ -305,7 +305,7 @@ fn group_hunks(ops: &[(char, usize, usize)]) -> Vec<LineHunk> {
 // ---------------------------------------------------------------------------
 
 /// HEAD 在这个文件上的「指纹」,轮询它来判断要不要重取 HEAD 版本 / 重跑注解。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeadSignature {
     /// HEAD 指向的提交;仓库还没有任何提交时为 `None`
     pub head: Option<String>,

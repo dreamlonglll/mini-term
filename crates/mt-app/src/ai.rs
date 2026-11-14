@@ -52,6 +52,17 @@ pub struct AiBridge {
 }
 
 impl AiBridge {
+    /// Real perception state without a hook server, polling thread, or data-dir lookup.
+    #[cfg(test)]
+    pub(crate) fn for_git_test(data_dir: PathBuf) -> Self {
+        let (tx, _rx) = mpsc::unbounded();
+        Self {
+            perception: AiPerception::new(Arc::new(ChannelSink { tx })),
+            live_panes: Arc::new(Mutex::new(Vec::new())),
+            data_dir,
+        }
+    }
+
     /// 建桥并把接收端交出去。`hook_enabled` 为真时顺带起 hook server。
     pub fn new(hook_enabled: bool) -> (Self, mpsc::UnboundedReceiver<AiEvent>) {
         let (tx, rx) = mpsc::unbounded();

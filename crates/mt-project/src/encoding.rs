@@ -22,7 +22,7 @@
 use std::fmt;
 use std::sync::OnceLock;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 再导出:[`TextEncoding::Legacy`] 装的就是它的编码常量(`encoding_rs::GB18030` …),
 /// 下游(`mt-remote` 的单测等)不必为几个常量再直接依赖一份。
@@ -138,6 +138,37 @@ impl Serialize for TextEncoding {
     }
 }
 
+/// Only canonical names emitted by this module are accepted. Web encoding aliases
+/// such as replacement/UTF-7 must never silently become a writable codec.
+impl<'de> Deserialize<'de> for TextEncoding {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        let encoding = match name.as_str() {
+            "UTF-8" => Self::Utf8,
+            "UTF-16 LE" => Self::Utf16Le,
+            "UTF-16 BE" => Self::Utf16Be,
+            "lossy" => Self::Lossy,
+            _ => {
+                let codec = encoding_rs::Encoding::for_label(name.as_bytes())
+                    .ok_or_else(|| serde::de::Error::custom("unknown text encoding"))?;
+                if codec == encoding_rs::UTF_8
+                    || codec == encoding_rs::UTF_16LE
+                    || codec == encoding_rs::UTF_16BE
+                    || codec == encoding_rs::REPLACEMENT
+                {
+                    return Err(serde::de::Error::custom("unsafe text encoding alias"));
+                }
+                let value = Self::Legacy(codec);
+                if value.label() != name {
+                    return Err(serde::de::Error::custom("noncanonical text encoding"));
+                }
+                value
+            }
+        };
+        Ok(encoding)
+    }
+}
+
 /// [`TextEncoding::encode`] 拒绝写回的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
@@ -186,6 +217,19 @@ static REGION: OnceLock<String> = OnceLock::new();
 pub fn set_region_from_language(language: &str) {
     if let Some(region) = region_of(language) {
         let _ = REGION.set(region);
+    }
+}
+
+/// 当前已选的编码地区提示;远程 helper 应转交此值,而不是读取远端 locale。
+pub fn region_hint() -> Option<&'static str> {
+    REGION.get().map(String::as_str)
+}
+
+/// 接收另一个进程已选的地区提示(`cn` / `tw` / `jp` 等两字母地区码)。
+/// 与语言初始化一样,只有第一次有效设置生效;空值、非两字母值不设置。
+pub fn set_region_hint(region: &str) {
+    if region.len() == 2 && region.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        let _ = REGION.set(region.to_ascii_lowercase());
     }
 }
 
@@ -238,7 +282,7 @@ pub fn looks_binary(bytes: &[u8]) -> bool {
 
 /// 按打开文件的规则把整份字节解成文字,地区提示取 [`set_region_from_language`] 设的那个。
 pub fn decode(bytes: Vec<u8>) -> Decoded {
-    decode_in(bytes, REGION.get().map(String::as_str))
+    decode_in(bytes, region_hint())
 }
 
 /// 同 [`decode`],地区提示由调用方给(`cn` / `tw` / `jp`)。依次:

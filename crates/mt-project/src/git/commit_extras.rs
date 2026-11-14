@@ -31,7 +31,7 @@ use super::{QUICK_OP_TIMEOUT, first_parent_diff, run_git_command};
 pub const LINE_STATS_MAX_FILES: usize = 2000;
 
 /// 一个文件的增删行数。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileLineStat {
     /// 新路径(与 `CommitFileInfo::path` 同一口径;删除的文件是它原来的路径)。
     pub path: String,
@@ -42,7 +42,7 @@ pub struct FileLineStat {
 }
 
 /// 一个提交相对第一个父的增删行数。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitLineStats {
     /// 与详情的文件列表同序。
     pub files: Vec<FileLineStat>,
@@ -96,7 +96,7 @@ pub fn get_commit_line_stats(repo_path: &Path, hash: &str) -> Result<Option<Comm
 }
 
 /// 包含某个提交的一个分支。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContainingBranch {
     /// 短名:本地 `main`、远程 `origin/main`。
     pub name: String,

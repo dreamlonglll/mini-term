@@ -7,8 +7,6 @@
 //! | Git 面板仓库栏右键「Worktree 管理」 | `false`(单仓库,`repo_path` 就是仓库根) | 刷新仓库列表 |
 //! | 项目列表右键「Worktrees」 | `true`(项目根未必是仓库,向下发现) | 空函数(后端已失效缓存) |
 //!
-//! 本批只接了第一个入口 —— 项目列表的右键菜单是另一批的活。
-//!
 //! # 三处顺序不能调换
 //!
 //! 1. **删除**(`GitWorktreeModal.tsx:435-449`):先关该目录下的终端(Windows 上
@@ -17,20 +15,20 @@
 //!    见 [`panes_inside`])→ 再 `remove_worktree`(自带占用预检:还被别的程序占着就
 //!    一步不做,报原因与下一步)→ **成功了才**删项目(失败时项目还在,终端呈断开态
 //!    可重开);
-//! 2. **清理失效**(`:466-468`):`prune_worktrees` 之后必须用 `filter_directories`
-//!    复核「目录确实已不存在」才删项目 —— `isValid=false` 但目录还在(元数据损坏)
-//!    时项目要保留;
+//! 2. **清理失效**:prune 失败不阻断存在性复核；只有同 backend 的
+//!    `existing_directories` 明确确认 NotFound 才删项目。权限 / 网络错误必须保留项目；
+//!    `isValid=false` 但目录还在(元数据损坏)时项目也要保留。
 //! 3. **归并**(`:145-172`):扫描可能同时发现主仓库与它在项目目录内的 worktree,
 //!    两者的 `list_worktrees` 结果**完全相同**,按 `isMain` 的路径归并才不会重复展示。
 //!
 //! # 阻塞调用
 //!
 //! `add_worktree`(120s)/ `remove_worktree`(60s)/ `prune_worktrees`(30s)
-//! 全是 CLI,一律丢 `cx.background_executor()`。
+//! 全是阻塞 IO，一律走 `mt_remote::run_git_on` 的本地/远程独立配额工作线程。
+//! 创建、删除与清理先在 UI 线程按 `repository_key()` 占写操作闸；分组仍按来源上下文 `key()` 区分。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
@@ -42,6 +40,7 @@ use gpui_component::input::{Input, InputState};
 use mt_config::ProjectConfig;
 use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
+use mt_remote::GitContext;
 
 use crate::git_ui::{self, ButtonKind};
 use crate::i18n::{t, tr};
@@ -52,9 +51,7 @@ use crate::ui;
 
 // ─── 纯逻辑小件 ───────────────────────────────────────────────
 
-// worktree「是否已是项目」与归并的路径比对(`src/utils/projectActions.ts:9-11` 的
-// `normalizePath`:分隔符统一、去尾斜杠、转小写)已收进
-// `mt_core::path_key::windows_eq_key`,口径逐字相同。
+// 本地沿用既有 Windows 兼容路径比较;远端只按 POSIX 分隔符、区分大小写。
 
 /// 分支名 → 目录名片段(`GitWorktreeModal.tsx:45-47`)。
 pub fn sanitize_branch_for_dir(branch: &str) -> String {
@@ -81,15 +78,62 @@ pub fn sanitize_branch_for_dir(branch: &str) -> String {
     }
 }
 
-/// 拼路径时用的分隔符:本机原生。`list_worktrees` 给的路径已是原生形态,建议路径
-/// 跟着它走,不再看入口传来的 `repo_path` 是哪种斜杠 —— 两边不一致时会拼出
-/// `D:\Git\x/x-wt` 这种混合写法。
-const NATIVE_SEP: char = std::path::MAIN_SEPARATOR;
+fn separator(context: &GitContext) -> char {
+    if context.is_remote() {
+        '/'
+    } else {
+        std::path::MAIN_SEPARATOR
+    }
+}
+
+fn path_key(remote: bool, path: &str) -> String {
+    if remote {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            "/".into()
+        } else {
+            path.into()
+        }
+    } else {
+        windows_eq_key(path)
+    }
+}
+
+fn context_parent_dir<'a>(context: &GitContext, path: &'a str) -> &'a str {
+    if !context.is_remote() {
+        return parent_dir(path);
+    }
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => &trimmed[..1],
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    }
+}
+
+fn context_base_name<'a>(context: &GitContext, path: &'a str) -> &'a str {
+    if context.is_remote() {
+        path.trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+    } else {
+        base_name(path)
+    }
+}
 
 /// 拼路径(分隔符由调用方给)。
 pub fn join_path(base: &str, child: &str, sep: char) -> String {
     let base = base.trim_end_matches(['/', '\\']);
     format!("{base}{sep}{child}")
+}
+
+fn context_join_path(context: &GitContext, base: &str, child: &str) -> String {
+    if context.is_remote() {
+        format!("{}/{}", base.trim_end_matches('/'), child)
+    } else {
+        join_path(base, child, separator(context))
+    }
 }
 
 /// 父目录。没有父级时返回原串。
@@ -122,6 +166,21 @@ fn path_within(path: &str, dir: &str) -> bool {
                 .is_some_and(|rest| rest.starts_with('/')))
 }
 
+fn backend_path_within(context: &GitContext, path: &str, dir: &str) -> bool {
+    if !context.is_remote() {
+        return path_within(path, dir);
+    }
+    if dir.is_empty() {
+        return false;
+    }
+    let (path, dir) = (path_key(true, path), path_key(true, dir));
+    path == dir
+        || (dir == "/" && path.starts_with('/'))
+        || path
+            .strip_prefix(&dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// 停在 worktree 里的一个终端(删除前要先关掉的那些)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BusyPane {
@@ -135,13 +194,19 @@ struct BusyPane {
 /// 「在终端打开」开出来的那种)按它算,没有的按所在项目的根算。
 ///
 /// `skip_project`(指向该 worktree 的项目)整个跳过:它的终端另由
-/// `dispose_project_terminals` 关,确认框里也另有一行说明。远程项目跳过 —— 本机删目录
-/// 与远端无关。只看**启动目录**:shell 里后来 `cd` 进去的看不见,那一类占用由
-/// `mt_project::git::remove_worktree` 的预检兜住(报「被占用,未做任何改动」)。
-fn panes_inside(store: &AppStore, dir: &str, skip_project: Option<&str>) -> Vec<BusyPane> {
+/// `dispose_project_terminals` 关,确认框里也另有一行说明。只查同一 backend 的项目;
+/// 只看**启动目录**:shell 里后来 `cd` 进去的占用由后端预检兜住。
+fn panes_inside(
+    store: &AppStore,
+    context: &GitContext,
+    dir: &str,
+    skip_project: Option<&str>,
+) -> Vec<BusyPane> {
     let mut out = Vec::new();
     for project in store.projects() {
-        if project.ssh_connection_id.is_some() || skip_project == Some(project.id.as_str()) {
+        if project.ssh_connection_id.as_deref() != context.connection_id()
+            || skip_project == Some(project.id.as_str())
+        {
             continue;
         }
         let Some(state) = store.project_state(&project.id) else {
@@ -149,7 +214,7 @@ fn panes_inside(store: &AppStore, dir: &str, skip_project: Option<&str>) -> Vec<
         };
         for pane in state.all_panes() {
             let cwd = pane.cwd.as_deref().unwrap_or(&project.path);
-            if path_within(cwd, dir) {
+            if backend_path_within(context, cwd, dir) {
                 out.push(BusyPane {
                     project_id: project.id.clone(),
                     pane_id: pane.id.clone(),
@@ -230,18 +295,22 @@ fn intersect_ordered(groups: &[Vec<&str>]) -> Vec<String> {
 /// 归并后的一组(`GitWorktreeModal.tsx:31-42`)。
 #[derive(Clone)]
 struct RepoGroup {
-    /// `windows_eq_key(主仓库路径)`。
+    /// backend 身份与主仓库路径。
     key: String,
     /// 主仓库目录名(worktree 目录建议名的前缀)。
     name: String,
     /// git 命令的执行路径:worktree 增删必须落在主仓库上。
     main_path: String,
+    context: GitContext,
     worktrees: Vec<WorktreeInfo>,
     error: Option<String>,
 }
 
 /// 把逐仓库的 `list_worktrees` 结果归并成组。
-fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<RepoGroup> {
+fn merge_groups(
+    root: &GitContext,
+    items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>,
+) -> Vec<RepoGroup> {
     let mut out: Vec<RepoGroup> = Vec::new();
     for (path, result) in items {
         match result {
@@ -251,27 +320,31 @@ fn merge_groups(items: Vec<(String, Result<Vec<WorktreeInfo>, String>)>) -> Vec<
                     .find(|w| w.is_main)
                     .map(|w| w.path.clone())
                     .unwrap_or_else(|| path.clone());
-                let key = windows_eq_key(&main_path);
+                let context = root.with_path(main_path.clone());
+                let key = context.key();
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
                 out.push(RepoGroup {
                     key,
-                    name: base_name(&main_path).to_string(),
+                    name: context_base_name(&context, &main_path).to_string(),
                     main_path,
+                    context,
                     worktrees,
                     error: None,
                 });
             }
             Err(err) => {
-                let key = windows_eq_key(&path);
+                let context = root.with_path(path.clone());
+                let key = context.key();
                 if out.iter().any(|g| g.key == key) {
                     continue;
                 }
                 out.push(RepoGroup {
                     key,
-                    name: base_name(&path).to_string(),
+                    name: context_base_name(&context, &path).to_string(),
                     main_path: path,
+                    context,
                     worktrees: Vec::new(),
                     error: Some(err),
                 });
@@ -292,6 +365,7 @@ enum Mode {
 struct WorktreeModal {
     store: Entity<AppStore>,
     repo_path: String,
+    context: GitContext,
     discover_repos: bool,
     project_id: Option<String>,
     /// `None` = 还在加载。共享一份:Dialog 的 builder 每帧重跑,按钮闭包也要拿着它,
@@ -432,20 +506,47 @@ impl Render for WorktreeModal {
 
 /// 打开 worktree 管理弹窗。
 pub fn open(
-    repo_path: String,
+    context: GitContext,
     discover_repos: bool,
     project_id: Option<String>,
     on_changed: impl Fn(&mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() {
+    let store = AppStore::global(cx);
+    let source_project_id = context
+        .project_id()
+        .map(str::to_string)
+        .or_else(|| project_id.clone())
+        .or_else(|| store.read(cx).active_project_id.clone());
+    let remote_project = source_project_id
+        .as_deref()
+        .and_then(|id| store.read(cx).project(id))
+        .is_some_and(crate::ssh_conn::is_remote_project);
+    if context.is_remote() || remote_project {
+        let Some(source_id) = source_project_id.as_deref() else {
+            return;
+        };
+        if !crate::git_backend::remote_git_enabled(store.read(cx), source_id) {
+            crate::git_backend::request_enable(store, source_id.to_string(), window, cx);
+            return;
+        }
+    }
+    if context.path().is_empty() {
         return;
     }
-    let store = AppStore::global(cx);
+    let repo_path = context.path().to_string();
+    let project_id = source_project_id.filter(|id| {
+        store
+            .read(cx)
+            .project(id)
+            .is_some_and(|project| project.ssh_connection_id.as_deref() == context.connection_id())
+    });
+    let root_name = context_base_name(&context, &repo_path).to_string();
     let state = cx.new(|cx| WorktreeModal {
         store,
         repo_path: repo_path.clone(),
+        context,
         discover_repos,
         project_id,
         groups: None,
@@ -473,7 +574,6 @@ pub fn open(
 
     load(&state, cx);
 
-    let root_name = base_name(&repo_path).to_string();
     open_guarded(kind::GIT_WORKTREE, window, cx, move |dialog, window, cx| {
         let body = render_body(&state, window, cx);
         dialog
@@ -489,9 +589,9 @@ pub fn open(
 
 /// 加载分组。
 fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
-    let (repo_path, discover) = {
+    let (context, discover) = {
         let s = state.read(cx);
-        (s.repo_path.clone(), s.discover_repos)
+        (s.context.clone(), s.discover_repos)
     };
     state.update(cx, |s, cx| {
         s.groups = None;
@@ -500,32 +600,31 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
     });
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let repo_for_task = repo_path.clone();
-        let loaded = cx
-            .background_executor()
-            .spawn(async move {
-                let paths: Vec<String> = if discover {
-                    match mt_project::git::discover_git_repos(std::path::Path::new(&repo_for_task))
-                    {
-                        Ok(repos) => repos
-                            .into_iter()
-                            .map(|r| r.path.to_string_lossy().to_string())
-                            .collect(),
-                        Err(err) => return Err(format!("{err:#}")),
-                    }
-                } else {
-                    vec![repo_for_task.clone()]
-                };
-                Ok(paths
-                    .into_iter()
-                    .map(|path| {
-                        let result = mt_project::git::list_worktrees(std::path::Path::new(&path))
-                            .map_err(|err| format!("{err:#}"));
-                        (path, result)
-                    })
-                    .collect::<Vec<_>>())
-            })
-            .await;
+        let repo_for_task = context.clone();
+        let loaded = mt_remote::run_git_on(&context, move || {
+            let paths: Vec<String> = if discover {
+                match repo_for_task.discover_git_repos() {
+                    Ok(repos) => repos
+                        .into_iter()
+                        .map(|r| r.path.to_string_lossy().to_string())
+                        .collect(),
+                    Err(err) => return Err(git_ui::error_text(&err)),
+                }
+            } else {
+                vec![repo_for_task.path().to_string()]
+            };
+            Ok(paths
+                .into_iter()
+                .map(|path| {
+                    let result = repo_for_task
+                        .with_path(path.clone())
+                        .list_worktrees()
+                        .map_err(|err| git_ui::error_text(&err));
+                    (path, result)
+                })
+                .collect::<Vec<_>>())
+        })
+        .await;
 
         state.update(cx, |s: &mut WorktreeModal, cx| {
             match loaded {
@@ -544,7 +643,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
                         cx.notify();
                         return;
                     }
-                    let groups = merge_groups(items);
+                    let groups = merge_groups(&context, items);
                     // 勾选保留:剔除消失的键;只剩一个可用仓库时自动勾上
                     s.selected_keys
                         .retain(|k| groups.iter().any(|g| &g.key == k));
@@ -565,7 +664,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
 
 /// 惰性拉勾选组的分支(失败也落一条空记录,否则会反复重试)。
 fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
-    let pending: Vec<(String, String)> = {
+    let pending: Vec<(String, GitContext)> = {
         let s = state.read(cx);
         let Some(groups) = &s.groups else {
             return Vec::new().into_iter().collect()
@@ -574,28 +673,28 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
             .iter()
             .filter(|g| s.selected_keys.contains(&g.key))
             .filter(|g| !s.branches_by_repo.contains_key(&g.key))
-            .map(|g| (g.key.clone(), g.main_path.clone()))
+            .map(|g| (g.key.clone(), g.context.clone()))
             .collect()
     };
-    for (key, main_path) in pending {
+    for (key, context) in pending {
         let state = state.clone();
         // 先占位,避免同一帧内重复排队
         state.update(cx, |s, _| {
             s.branches_by_repo.insert(key.clone(), Rc::default());
         });
         cx.spawn(async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::git::get_repo_branches(std::path::Path::new(&main_path))
-                })
-                .await;
+            let execution = context.clone();
+            let result =
+                mt_remote::run_git_on(&execution, move || context.get_repo_branches()).await;
             state.update(cx, |s: &mut WorktreeModal, cx| {
                 match result {
                     Ok(list) => {
                         s.branches_by_repo.insert(key, Rc::new(list));
                     }
-                    Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
+                    Err(err) => {
+                        eprintln!("[git] 取分支失败: {err:#}");
+                        s.create_error = Some(git_ui::error_text(&err));
+                    }
                 }
                 cx.notify();
             });
@@ -683,7 +782,10 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
 
     // 「已是项目」:每行都要按路径找项目,先一次建好表(同一路径取最先的那个项目,与逐行
     // `find` 同一口径),不再每行把全部项目扫一遍、每次比较都现算两个归一键
-    let projects = local_project_ids(state.read(cx).store.read(cx).projects());
+    let projects = backend_project_ids(
+        state.read(cx).store.read(cx).projects(),
+        &state.read(cx).context,
+    );
     for index in 0..groups.len() {
         root = root.child(render_group(
             state, &groups, index, multi_repo, &projects, cx,
@@ -731,14 +833,14 @@ fn sync_path_suggestion(
             0 => String::new(),
             1 => {
                 let g = selected[0];
-                let parent = parent_dir(&g.main_path);
+                let parent = context_parent_dir(&g.context, &g.main_path);
                 if parent.is_empty() {
                     return;
                 }
-                join_path(
+                context_join_path(
+                    &g.context,
                     parent,
                     &format!("{}-{}", g.name, sanitize_branch_for_dir(&branch)),
-                    NATIVE_SEP,
                 )
             }
             _ => s.repo_path.clone(),
@@ -760,11 +862,17 @@ fn reset_form_on_selection(s: &mut WorktreeModal) {
     s.create_results.clear();
 }
 
-/// 本地项目:归一路径键(`windows_eq_key`)→ 项目 id,同一路径取最先的那个。
-fn local_project_ids(projects: &[ProjectConfig]) -> HashMap<String, String> {
+/// 同 backend 的项目路径 → 项目 id,同一路径取最先的那个。
+fn backend_project_ids(
+    projects: &[ProjectConfig],
+    context: &GitContext,
+) -> HashMap<String, String> {
     let mut ids = HashMap::new();
-    for project in projects.iter().filter(|p| p.ssh_connection_id.is_none()) {
-        ids.entry(windows_eq_key(&project.path))
+    for project in projects
+        .iter()
+        .filter(|p| p.ssh_connection_id.as_deref() == context.connection_id())
+    {
+        ids.entry(path_key(context.is_remote(), &project.path))
             .or_insert_with(|| project.id.clone());
     }
     ids
@@ -890,7 +998,7 @@ fn render_group(
     block.into_any_element()
 }
 
-/// 第 `group_index` 组的第 `idx` 个 worktree。`projects` 见 [`local_project_ids`]。
+/// 第 `group_index` 组的第 `idx` 个 worktree。项目只匹配同 backend。
 fn render_worktree_row(
     state: &Entity<WorktreeModal>,
     groups: &Rc<Vec<RepoGroup>>,
@@ -903,7 +1011,9 @@ fn render_worktree_row(
     let group = &groups[group_index];
     let wt = &group.worktrees[idx];
     // 「已是项目」:订阅 config.projects,增删项目即时反映(表每帧按眼下的项目建)
-    let existing_project = projects.get(&windows_eq_key(&wt.path)).cloned();
+    let existing_project = projects
+        .get(&path_key(group.context.is_remote(), &wt.path))
+        .cloned();
     let is_project = existing_project.is_some();
 
     // 胶囊全走共用的语义胶囊:分支 = 本地分支色(带分支图标)、失效 = 错误、
@@ -938,10 +1048,8 @@ fn render_worktree_row(
             wt.name.clone(),
             wt.branch.clone(),
         );
-        let project_id = s
-            .project_id
-            .clone()
-            .or_else(|| s.store.read(cx).active_project_id.clone());
+        let project_id = s.project_id.clone();
+        let terminal_context = group.context.clone();
         actions = actions.child(
             git_ui::action_button(
                 SharedString::from(format!("wt-open-{}-{idx}", group.key)),
@@ -956,6 +1064,11 @@ fn render_worktree_row(
                 let title = format!("⎇ {}", branch.clone().unwrap_or_else(|| name.clone()));
                 let path = path.clone();
                 let opened = store.update(cx, |store, cx| {
+                    if !store.project(&project_id).is_some_and(|project| {
+                        project.ssh_connection_id.as_deref() == terminal_context.connection_id()
+                    }) {
+                        return false;
+                    }
                     let pane = store.new_terminal_with_cwd(
                         &project_id,
                         None,
@@ -980,6 +1093,8 @@ fn render_worktree_row(
         let (store, path) = (s.store.clone(), wt.path.clone());
         let main_path = group.main_path.clone();
         let parent_hint = s.project_id.clone();
+        let context = group.context.clone();
+        let project_name = context_base_name(&context, &path).to_string();
         actions = actions.child(
             git_ui::action_button(
                 SharedString::from(format!("wt-project-{}-{idx}", group.key)),
@@ -998,16 +1113,14 @@ fn render_worktree_row(
                         Some(id) => id.clone(),
                         None => {
                             let parent = store
-                                .find_project_by_path(&main_path)
+                                .find_project_by_backend_path(context.connection_id(), &main_path)
                                 .map(|p| p.id.clone())
-                                .or_else(|| {
-                                    parent_hint
-                                        .clone()
-                                        .or_else(|| store.active_project_id.clone())
-                                });
-                            store.add_project_at(
-                                std::path::Path::new(&path),
-                                parent.as_deref(),
+                                .or_else(|| parent_hint.clone());
+                            store.add_git_worktree_project(
+                                project_name.clone(),
+                                path.clone(),
+                                context.connection_id().map(str::to_string),
+                                parent,
                                 cx,
                             )
                         }
@@ -1259,6 +1372,27 @@ fn render_create_section(
                     true,
                 )
                 .on_click(move |_: &ClickEvent, window, cx| {
+                    let s = state_for_browse.read(cx);
+                    if let Some(connection) = s.context.connection().cloned() {
+                        let initial = s.wt_path.read(cx).value().to_string();
+                        let state = state_for_browse.clone();
+                        crate::remote_directory_picker::open(
+                            connection,
+                            initial,
+                            move |path, window, cx| {
+                                state.update(cx, |s, cx| {
+                                    s.path_edited = true;
+                                    s.wt_path.update(cx, |input, cx| {
+                                        input.set_value(path.clone(), window, cx)
+                                    });
+                                    cx.notify();
+                                });
+                            },
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
                     let paths = cx.prompt_for_paths(PathPromptOptions {
                         files: false,
                         directories: true,
@@ -1428,19 +1562,19 @@ fn create(
         if selected.is_empty() {
             return;
         }
-        let targets: Vec<(String, String)> = if selected.len() == 1 {
-            vec![(selected[0].main_path.clone(), raw_path)]
+        let targets: Vec<(GitContext, String)> = if selected.len() == 1 {
+            vec![(selected[0].context.clone(), raw_path)]
         } else {
             // 多选时路径输入框的语义变成「父目录」
             selected
                 .iter()
                 .map(|g| {
                     (
-                        g.main_path.clone(),
-                        join_path(
+                        g.context.clone(),
+                        context_join_path(
+                            &g.context,
                             &raw_path,
                             &format!("{}-{}", g.name, sanitize_branch_for_dir(&branch)),
-                            NATIVE_SEP,
                         ),
                     )
                 })
@@ -1458,6 +1592,18 @@ fn create(
             s.add_as_project,
         )
     };
+    let mut guards = Vec::with_capacity(targets.len());
+    for (context, _) in &targets {
+        let Some(guard) = git_ui::gate::try_acquire_key(&context.repository_key()) else {
+            state.update(cx, |s, cx| {
+                s.create_error = Some(git_ui::gate_busy_text().into());
+                cx.notify();
+            });
+            return;
+        };
+        guards.push(guard);
+    }
+    cx.refresh_windows();
 
     state.update(cx, |s, cx| {
         s.creating = true;
@@ -1469,27 +1615,22 @@ fn create(
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {
-            let mut results: Vec<(String, Result<(), String>)> = Vec::new();
-            for (main_path, target) in targets {
+            let mut results: Vec<(String, anyhow::Result<()>)> = Vec::new();
+            for (context, target) in targets {
                 let (branch, base) = (branch.clone(), base.clone());
                 let target_for_task = target.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        // ⚠️ add_worktree 是 120s 阻塞 CLI
-                        mt_project::git::add_worktree(
-                            std::path::Path::new(&main_path),
-                            &target_for_task,
-                            &branch,
-                            create_branch,
-                            base.as_deref(),
-                        )
-                    })
-                    .await;
-                results.push((target, result.map(|_| ()).map_err(|err| format!("{err:#}"))));
+                let execution = context.clone();
+                let result = mt_remote::run_git_on(&execution, move || {
+                    // ⚠️ add_worktree 是 120s 阻塞 CLI
+                    context.add_worktree(&target_for_task, &branch, create_branch, base.as_deref())
+                })
+                .await;
+                results.push((target, result.map(|_| ())));
             }
+            drop(guards);
 
             let _ = cx.update(|window, cx| {
+                cx.refresh_windows();
                 // 无论成败先通知外面 + 清掉分支缓存(分支集合已变)
                 let on_changed = state.read(cx).on_changed.clone();
                 on_changed(cx);
@@ -1499,9 +1640,17 @@ fn create(
                     cx.notify();
                 });
 
+                let store = state.read(cx).store.clone();
                 let failures: Vec<(String, String)> = results
                     .iter()
-                    .filter_map(|(t, r)| r.as_ref().err().map(|e| (t.clone(), e.clone())))
+                    .filter_map(|(target, result)| {
+                        result.as_ref().err().map(|error| {
+                            (
+                                target.clone(),
+                                git_ui::error_text_for_store(error, &store, cx),
+                            )
+                        })
+                    })
                     .collect();
                 let successes: Vec<String> = results
                     .iter()
@@ -1513,16 +1662,21 @@ fn create(
                 if add_as_project && !successes.is_empty() {
                     let store = state.read(cx).store.clone();
                     let parent_hint = state.read(cx).project_id.clone();
+                    let context = state.read(cx).context.clone();
                     store.update(cx, |store, cx| {
                         for target in &successes {
-                            let parent = parent_hint
-                                .clone()
-                                .or_else(|| store.active_project_id.clone());
-                            let id = store.add_project_at(
-                                std::path::Path::new(target),
-                                parent.as_deref(),
-                                cx,
-                            );
+                            let id = store
+                                .find_project_by_backend_path(context.connection_id(), target)
+                                .map(|p| p.id.clone())
+                                .unwrap_or_else(|| {
+                                    store.add_git_worktree_project(
+                                        context_base_name(&context, target).to_string(),
+                                        target.clone(),
+                                        context.connection_id().map(str::to_string),
+                                        parent_hint.clone(),
+                                        cx,
+                                    )
+                                });
                             if first_new.is_none() {
                                 first_new = Some(id);
                             }
@@ -1574,11 +1728,7 @@ fn open_remove_confirm(
     let store = state.read(cx).store.clone();
     let linked_project = store
         .read(cx)
-        .projects()
-        .iter()
-        .find(|p| {
-            p.ssh_connection_id.is_none() && windows_eq_key(&p.path) == windows_eq_key(&wt.path)
-        })
+        .find_project_by_backend_path(group.context.connection_id(), &wt.path)
         .map(|p| (p.id.clone(), p.name.clone()));
     if linked_project
         .as_ref()
@@ -1617,6 +1767,7 @@ fn open_remove_confirm(
             // 删之前不关掉它们,Windows 上 git 会删到一半(见 `remove_worktree`)
             let busy = panes_inside(
                 store.read(cx),
+                &group.context,
                 &wt.path,
                 linked.as_ref().map(|(id, _)| id.as_str()),
             );
@@ -1741,6 +1892,26 @@ fn remove_worktree(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let project_id = state
+        .read(cx)
+        .store
+        .read(cx)
+        .find_project_by_backend_path(group.context.connection_id(), &wt.path)
+        .map(|project| project.id.clone())
+        .or_else(|| {
+            project_id.filter(|id| {
+                state
+                    .read(cx)
+                    .store
+                    .read(cx)
+                    .project(id)
+                    .is_some_and(|project| {
+                        project.ssh_connection_id.as_deref() == group.context.connection_id()
+                            && path_key(group.context.is_remote(), &project.path)
+                                == path_key(group.context.is_remote(), &wt.path)
+                    })
+            })
+        });
     if project_id
         .as_deref()
         .is_some_and(|id| crate::workbench_area::project_has_dirty_documents(id, cx))
@@ -1760,6 +1931,15 @@ fn remove_worktree(
     }
     let force = form.read(cx).force;
     let store = state.read(cx).store.clone();
+    let Some(guard) = git_ui::gate::try_acquire_key(&group.context.repository_key()) else {
+        form.update(cx, |f, cx| {
+            f.removing = false;
+            f.error = Some(git_ui::gate_busy_text().into());
+            cx.notify();
+        });
+        return;
+    };
+    cx.refresh_windows();
     // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败。
     //    ⚠️ 这一步必须在 remove **之前**:删失败时终端也已关掉(项目还在,pane 呈
     //    断开态、可重开),代价换来的是 Windows 上能删得掉,别为「失败不关终端」调序
@@ -1769,7 +1949,12 @@ fn remove_worktree(
     //    别的项目里停在 worktree 里的终端(worktree「开终端」开在当前项目下的那种)
     //    确认框里已逐个列出,这里整个关掉。shell 进程退出、放掉当前目录要一小会儿,
     //    由 `mt_project::git::remove_worktree` 的占用预检等它
-    let busy = panes_inside(store.read(cx), &wt.path, project_id.as_deref());
+    let busy = panes_inside(
+        store.read(cx),
+        &group.context,
+        &wt.path,
+        project_id.as_deref(),
+    );
     if !busy.is_empty() {
         store.update(cx, |store, cx| {
             for pane in &busy {
@@ -1777,23 +1962,20 @@ fn remove_worktree(
             }
         });
     }
-    let (main_path, wt_path) = (group.main_path.clone(), wt.path.clone());
+    let (context, wt_path) = (group.context.clone(), wt.path.clone());
     let state = state.clone();
     let form = form.clone();
     window
         .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    // ⚠️ 60s 阻塞 CLI
-                    mt_project::git::remove_worktree(
-                        std::path::Path::new(&main_path),
-                        &wt_path,
-                        force,
-                    )
-                })
-                .await;
+            let execution = context.clone();
+            let result = mt_remote::run_git_on(&execution, move || {
+                // ⚠️ 60s 阻塞 CLI
+                context.remove_worktree(&wt_path, force)
+            })
+            .await;
+            drop(guard);
             let _ = cx.update(|window, cx| {
+                cx.refresh_windows();
                 match result {
                     Ok(_) => {
                         // ② 成功之后才删项目(不留断链项目)
@@ -1807,7 +1989,11 @@ fn remove_worktree(
                     }
                     Err(err) => {
                         eprintln!("[git] 删除 worktree 失败: {err:#}");
-                        let message = remove_failure_text(&err);
+                        let message = if err.is::<mt_project::git::WorktreeRemoveError>() {
+                            remove_failure_text(&err)
+                        } else {
+                            git_ui::error_text_for_store(&err, &store, cx)
+                        };
                         // 删到一半、登记已经没了:列表里不会再有这一条,框里再点「删除」
                         // 也无从删起 —— 关框、刷新列表,原因与下一步退到提示框
                         if matches!(
@@ -1845,67 +2031,112 @@ fn remove_worktree(
 /// 删除失败的可展示原因。`run_git_command` 把 git 的 stderr 原样装进错误,
 /// 末尾带换行,这里收掉首尾空白;万一是空的(git 没吭声就非零退出)也别画一行空白。
 fn remove_error_text(err: &anyhow::Error) -> String {
-    let text = format!("{err:#}");
-    match text.trim() {
-        "" => "git worktree remove failed".to_string(),
-        trimmed => trimmed.to_string(),
-    }
+    git_ui::error_text(err)
 }
 
-/// 清理失效条目。**失败静默**(下次打开重试即可)。
+/// A successful probe may omit only explicit NotFound results. Any ambiguous
+/// metadata/network error invalidates the probe and must never authorize removal.
+fn confirmed_missing_paths<'a>(
+    context: &GitContext,
+    candidates: &'a [String],
+    existing: Result<&[String], ()>,
+) -> Vec<&'a String> {
+    let Ok(existing) = existing else {
+        return Vec::new();
+    };
+    let present: HashSet<String> = existing
+        .iter()
+        .map(|path| path_key(context.is_remote(), path))
+        .collect();
+    candidates
+        .iter()
+        .filter(|path| !present.contains(&path_key(context.is_remote(), path)))
+        .collect()
+}
+
+fn prune_and_probe(
+    context: &GitContext,
+    invalid: &[String],
+) -> (anyhow::Result<String>, anyhow::Result<Vec<String>>) {
+    let pruned = context.prune_worktrees();
+    let existing = context.existing_directories(invalid);
+    (pruned, existing)
+}
+
+/// 清理失效条目。只有同 backend 复核目录确实不存在后才删除关联项目。
 fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
-    // 先记下该组 !isValid 的路径集
-    let invalid: Vec<PathBuf> = group
+    let Some(guard) = git_ui::gate::try_acquire_key(&group.context.repository_key()) else {
+        state.update(cx, |s, cx| {
+            s.load_error = Some(git_ui::gate_busy_text().into());
+            cx.notify();
+        });
+        return;
+    };
+    cx.refresh_windows();
+    let invalid: Vec<String> = group
         .worktrees
         .iter()
         .filter(|w| !w.is_valid)
-        .map(|w| PathBuf::from(&w.path))
+        .map(|w| w.path.clone())
         .collect();
     state.update(cx, |s, cx| {
         s.pruning_key = Some(group.key.clone());
         cx.notify();
     });
-    let main_path = group.main_path.clone();
+    let context = group.context.clone();
     let state = state.clone();
     cx.spawn(async move |cx| {
         let invalid_for_task = invalid.clone();
-        let still_there = cx
-            .background_executor()
-            .spawn(async move {
-                let pruned = mt_project::git::prune_worktrees(std::path::Path::new(&main_path));
-                if let Err(err) = pruned {
-                    eprintln!("[git] prune 失败(忽略): {err:#}");
-                }
-                // 以「目录确实已不存在」为准复核 —— isValid=false 但目录还在
-                // (元数据损坏)时项目要保留
-                mt_project::fs::filter_directories(invalid_for_task)
-            })
-            .await;
+        let context_for_task = context.clone();
+        let result = mt_remote::run_git_on(&context, move || {
+            prune_and_probe(&context_for_task, &invalid_for_task)
+        })
+        .await;
+        drop(guard);
 
-        let _ = cx.update(|cx| {
-            let gone: Vec<String> = invalid
-                .iter()
-                .filter(|p| !still_there.contains(p))
-                .map(|p| p.to_string_lossy().to_string())
-                .collect();
-            let store = state.read(cx).store.clone();
-            store.update(cx, |store, cx| {
-                for path in &gone {
-                    let id = store
-                        .find_project_by_path(path)
-                        .map(|p| p.id.clone());
-                    if let Some(id) = id {
-                        store.remove_project(&id, cx);
-                    }
-                }
-            });
+        cx.update(|cx| {
+            cx.refresh_windows();
             state.update(cx, |s, cx| {
                 s.pruning_key = None;
                 cx.notify();
             });
+            let (pruned, existing) = result;
+            match existing {
+                Ok(still_there) => {
+                    let missing = confirmed_missing_paths(&context, &invalid, Ok(&still_there));
+                    let store = state.read(cx).store.clone();
+                    store.update(cx, |store, cx| {
+                        for path in missing {
+                            let id = store
+                                .find_project_by_backend_path(context.connection_id(), path)
+                                .map(|p| p.id.clone());
+                            if let Some(id) = id {
+                                store.remove_project(&id, cx);
+                            }
+                        }
+                    });
+                }
+                Err(err) => {
+                    let store = state.read(cx).store.clone();
+                    let message = git_ui::error_text_for_store(&err, &store, cx);
+                    state.update(cx, |s, cx| {
+                        s.load_error = Some(message);
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
             let on_changed = state.read(cx).on_changed.clone();
             on_changed(cx);
             load(&state, cx);
+            if let Err(err) = pruned {
+                let store = state.read(cx).store.clone();
+                let message = git_ui::error_text_for_store(&err, &store, cx);
+                state.update(cx, |s, cx| {
+                    s.load_error = Some(message);
+                    cx.notify();
+                });
+            }
         });
     })
     .detach();
@@ -1914,6 +2145,150 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune失败仍可确认不存在且保留存在目录() {
+        let root = std::env::temp_dir().join(format!(
+            "mt-worktree-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let kept = root.join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        let missing = root.join("gone");
+        let candidates = vec![
+            kept.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        let context = GitContext::local(root.to_string_lossy().into_owned());
+        // 真实的非仓库路径让 git worktree prune 失败，但不阻断 metadata 核查。
+        let (pruned, existing) = prune_and_probe(&context, &candidates);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(pruned.is_err());
+        let existing = existing.expect("prune 失败不影响目录核查");
+        assert_eq!(
+            confirmed_missing_paths(&context, &candidates, Ok(&existing)),
+            vec![&candidates[1]]
+        );
+    }
+
+    #[test]
+    fn 清理只删除成功核查中明确缺失的目录() {
+        let candidates = vec!["/repo/kept".into(), "/repo/gone".into()];
+        let existing = vec!["/repo/kept".into()];
+        for context in [GitContext::local("/repo"), remote_context("ssh1")] {
+            let missing = confirmed_missing_paths(&context, &candidates, Ok(&existing));
+            assert_eq!(missing, vec![&candidates[1]]);
+            assert!(
+                confirmed_missing_paths(&context, &candidates, Err(())).is_empty(),
+                "权限或网络错误不得授权删除任何项目"
+            );
+            assert!(
+                confirmed_missing_paths(&context, &candidates, Ok(&candidates)).is_empty(),
+                "prune 后仍存在的失效目录必须保留"
+            );
+        }
+    }
+
+    #[test]
+    fn 远程清理存在性比较不混大小写目录() {
+        let candidates = vec!["/repo/Worktree".into(), "/repo/worktree".into()];
+        let existing = vec!["/repo/Worktree/".into()];
+        assert_eq!(
+            confirmed_missing_paths(&remote_context("ssh1"), &candidates, Ok(&existing)),
+            vec![&candidates[1]]
+        );
+    }
+
+    fn remote_context(connection_id: &str) -> GitContext {
+        GitContext::remote(
+            "source-project".into(),
+            mt_config::SshConnection {
+                id: connection_id.into(),
+                name: "test".into(),
+                host: "example.test".into(),
+                port: 22,
+                user: "test".into(),
+                password: None,
+                identity_file: None,
+                group: None,
+                extra: Default::default(),
+            },
+            "/repo".into(),
+        )
+    }
+
+    #[test]
+    fn 同仓库跨项目共用写闸但保留分组来源身份() {
+        let source = remote_context("shared-worktree-gate");
+        let other = GitContext::remote(
+            "other-project".into(),
+            source.connection().unwrap().clone(),
+            "/repo".into(),
+        );
+        assert_ne!(source.key(), other.key());
+        assert_eq!(source.repository_key(), other.repository_key());
+        let guard = git_ui::gate::try_acquire_key(&source.repository_key()).unwrap();
+        assert!(git_ui::gate::try_acquire_key(&other.repository_key()).is_none());
+        assert!(
+            git_ui::gate::try_acquire_key(&source.with_path("/another-repo").repository_key())
+                .is_some()
+        );
+        drop(guard);
+        assert!(git_ui::gate::try_acquire_key(&other.repository_key()).is_some());
+    }
+
+    #[test]
+    fn 远程路径保留大小写和反斜杠() {
+        let context = remote_context("ssh1");
+        assert_eq!(separator(&context), '/');
+        assert_ne!(path_key(true, "/Repo"), path_key(true, "/repo"));
+        assert_ne!(path_key(true, r"/repo\wt"), path_key(true, "/repo/wt"));
+        assert!(backend_path_within(&context, "/repo/wt/src", "/repo/wt/"));
+        assert!(!backend_path_within(&context, "/Repo/wt/src", "/repo/wt"));
+        assert!(!backend_path_within(&context, "/repo/wt-2", "/repo/wt"));
+        assert!(!backend_path_within(&context, r"/repo/wt\src", "/repo/wt"));
+        assert_eq!(context_join_path(&context, r"/repo\", "wt"), r"/repo\/wt");
+        assert_eq!(context_parent_dir(&context, r"/repo/wt\name"), "/repo");
+        assert_eq!(context_base_name(&context, r"/repo/wt\name"), r"wt\name");
+        let groups = merge_groups(
+            &context,
+            vec![
+                ("/Repo".into(), Ok(vec![wt("Repo", "/Repo", true, None)])),
+                ("/repo".into(), Ok(vec![wt("repo", "/repo", true, None)])),
+            ],
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].context.connection_id(), Some("ssh1"));
+        assert_eq!(groups[0].context.path(), "/Repo");
+    }
+
+    #[test]
+    fn 远程项目匹配限制连接且区分大小写() {
+        let context = remote_context("ssh1");
+        let project = |id: &str, path: &str, ssh: Option<&str>| ProjectConfig {
+            id: id.into(),
+            path: path.into(),
+            ssh_connection_id: ssh.map(str::to_string),
+            ..Default::default()
+        };
+        let ids = backend_project_ids(
+            &[
+                project("local", "/repo", None),
+                project("other", "/repo", Some("ssh2")),
+                project("remote", "/repo", Some("ssh1")),
+                project("uppercase", "/Repo", Some("ssh1")),
+            ],
+            &context,
+        );
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids.get("/repo").map(String::as_str), Some("remote"));
+        assert_eq!(ids.get("/Repo").map(String::as_str), Some("uppercase"));
+    }
 
     fn wt(name: &str, path: &str, is_main: bool, branch: Option<&str>) -> WorktreeInfo {
         WorktreeInfo {
@@ -1999,23 +2374,30 @@ mod tests {
 
     /// 归并键:分隔符统一、去尾斜杠、转小写(`windows_eq_key`)。三条都不能少 ——
     /// libgit2 给的主工作区路径(`D:/Git/Repo/`)与用户填的(`d:\git\repo`)要合成一组。
+    #[cfg(windows)]
     #[test]
     fn 归并键容忍分隔符大小写与尾斜杠() {
         let list = vec![wt("Repo", "D:/Git/Repo/", true, Some("main"))];
-        let groups = merge_groups(vec![
-            (r"D:\Git\Repo".into(), Ok(list)),
-            (
-                r"d:\git\repo\".into(),
-                Err("另一条路径扫到的同一个仓库".into()),
-            ),
-        ]);
+        let groups = merge_groups(
+            &GitContext::local("D:/Git/Repo"),
+            vec![
+                (r"D:\Git\Repo".into(), Ok(list)),
+                (
+                    r"d:\git\repo\".into(),
+                    Err("另一条路径扫到的同一个仓库".into()),
+                ),
+            ],
+        );
         assert_eq!(groups.len(), 1, "同一仓库的不同写法只留一组");
         assert_eq!(groups[0].main_path, "D:/Git/Repo/");
         // 不同仓库不许被合并
-        let groups = merge_groups(vec![
-            (r"D:\Git\Repo".into(), Err("x".into())),
-            (r"D:\Git\Repo2".into(), Err("y".into())),
-        ]);
+        let groups = merge_groups(
+            &GitContext::local("D:/Git/Repo"),
+            vec![
+                (r"D:\Git\Repo".into(), Err("x".into())),
+                (r"D:\Git\Repo2".into(), Err("y".into())),
+            ],
+        );
         assert_eq!(groups.len(), 2);
     }
 
@@ -2054,11 +2436,14 @@ mod tests {
             wt("repo", "/a/repo", true, Some("main")),
             wt("wt1", "/a/repo-wt1", false, Some("feat")),
         ];
-        let groups = merge_groups(vec![
-            ("/a/repo".into(), Ok(list.clone())),
-            // 同一份结果(从 worktree 目录扫到的)—— 不该重复展示
-            ("/a/repo-wt1".into(), Ok(list.clone())),
-        ]);
+        let groups = merge_groups(
+            &GitContext::local("/a"),
+            vec![
+                ("/a/repo".into(), Ok(list.clone())),
+                // 同一份结果(从 worktree 目录扫到的)—— 不该重复展示
+                ("/a/repo-wt1".into(), Ok(list.clone())),
+            ],
+        );
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].main_path, "/a/repo");
         assert_eq!(groups[0].name, "repo");
@@ -2068,10 +2453,13 @@ mod tests {
     /// 某个仓库 `list_worktrees` 失败时只让那一组显示错误,别的组照常。
     #[test]
     fn 单组失败不拖垮别的组() {
-        let groups = merge_groups(vec![
-            ("/a/ok".into(), Ok(vec![wt("ok", "/a/ok", true, None)])),
-            ("/a/bad".into(), Err("仓库损坏".into())),
-        ]);
+        let groups = merge_groups(
+            &GitContext::local("/a"),
+            vec![
+                ("/a/ok".into(), Ok(vec![wt("ok", "/a/ok", true, None)])),
+                ("/a/bad".into(), Err("仓库损坏".into())),
+            ],
+        );
         assert_eq!(groups.len(), 2);
         assert!(groups[0].error.is_none());
         assert_eq!(groups[1].error.as_deref(), Some("仓库损坏"));
@@ -2165,10 +2553,13 @@ mod tests {
     /// 下拉选项缓存:同一份分组 / 分支 / 模式命中;勾选、模式、某组分支换了一份都要重算。
     #[test]
     fn 下拉选项缓存按指针认新旧() {
-        let groups = Rc::new(merge_groups(vec![
-            ("/a".into(), Ok(vec![wt("a", "/a", true, Some("main"))])),
-            ("/b".into(), Ok(vec![wt("b", "/b", true, Some("dev"))])),
-        ]));
+        let groups = Rc::new(merge_groups(
+            &GitContext::local("/"),
+            vec![
+                ("/a".into(), Ok(vec![wt("a", "/a", true, Some("main"))])),
+                ("/b".into(), Ok(vec![wt("b", "/b", true, Some("dev"))])),
+            ],
+        ));
         let branches = Rc::new(vec![branch("main", false), branch("dev", false)]);
         let key = |list: &Rc<Vec<BranchInfo>>| -> Vec<(String, Option<Rc<Vec<BranchInfo>>>)> {
             vec![(groups[0].key.clone(), Some(list.clone()))]
@@ -2218,11 +2609,14 @@ mod tests {
             ssh_connection_id: ssh.map(str::to_string),
             ..Default::default()
         };
-        let ids = local_project_ids(&[
-            project("p1", "D:/Git/Repo", None),
-            project("p2", "d:\\git\\repo\\", None),
-            project("p3", "D:/Git/Other", Some("ssh1")),
-        ]);
+        let ids = backend_project_ids(
+            &[
+                project("p1", "D:/Git/Repo", None),
+                project("p2", "d:\\git\\repo\\", None),
+                project("p3", "D:/Git/Other", Some("ssh1")),
+            ],
+            &GitContext::local("D:/Git/Repo"),
+        );
         assert_eq!(
             ids.get(&windows_eq_key("D:\\Git\\Repo"))
                 .map(String::as_str),

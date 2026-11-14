@@ -42,7 +42,8 @@ use super::{
 // ---------------------------------------------------------------------------
 
 /// 一条贮藏。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StashInfo {
     /// `stash@{n}` 里的 n(0 = 最新)。
     pub index: usize,
@@ -183,7 +184,8 @@ fn ensure_no_conflicts(repo_path: &Path) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// 新建贮藏的选项。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StashSaveOptions {
     /// 贮藏消息;`None` 或只有空白 = 用 git 的默认消息(`WIP on <分支>: …`)。
     pub message: Option<String>,
@@ -194,7 +196,8 @@ pub struct StashSaveOptions {
 }
 
 /// 新建贮藏的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum StashSaveOutcome {
     /// 生成了新贮藏(新贮藏永远是 `stash@{0}`)。
     Saved { reference: String },
@@ -258,7 +261,8 @@ pub fn stash_save(repo_path: &Path, options: &StashSaveOptions) -> Result<StashS
 
 /// 应用 / 弹出 / 从贮藏建分支的结果。冲突**不是错误**:改动已部分落到工作区,
 /// 冲突文件在「更改」区里等用户解决。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum StashApplyOutcome {
     Applied,
     /// 出现冲突。**贮藏一律保留**:`apply` 本来就不删,`pop` / `stash branch` 遇到冲突
@@ -389,7 +393,7 @@ pub fn stash_branch(
 // ---------------------------------------------------------------------------
 
 /// 贮藏里的一个文件。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StashFileInfo {
     pub file: CommitFileInfo,
     /// 来自第三个父提交的未跟踪文件(状态恒为 `added`)。
@@ -457,7 +461,7 @@ pub fn stash_file_diff(repo_path: &Path, file: &StashFileInfo) -> Result<GitDiff
 
 /// 「贮藏后检出」的结果。除 [`SmartCheckoutOutcome::CheckoutCancelled`] 外,只要返回
 /// `Ok`,HEAD 就已经在目标分支上了。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SmartCheckoutOutcome {
     /// 没有需要贮藏的本地改动(或本来就在该分支上),直接检出了。
     CheckedOut,

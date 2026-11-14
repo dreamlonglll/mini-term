@@ -15,7 +15,8 @@ use git2::Repository;
 use super::{QUICK_OP_TIMEOUT, run_git_command, run_literal_paths};
 
 /// 冲突里取哪一侧。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ConflictSide {
     /// stage 2(合并时是当前分支;**变基时是上游** —— git 自己的口径)
     Ours,
@@ -24,7 +25,8 @@ pub enum ConflictSide {
 }
 
 /// 一个冲突文件在暂存区里的三方条目在不在(删除 / 修改冲突时有一侧缺席)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConflictInfo {
     pub path: String,
     pub ours: bool,

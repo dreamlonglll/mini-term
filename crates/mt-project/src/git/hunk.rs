@@ -174,7 +174,7 @@ fn advance(next: &mut Option<usize>, first: &mut Option<usize>, ix: usize) -> Re
 pub type LinePick = BTreeSet<usize>;
 
 /// 一次按块 / 按行操作里的一块:第几块 + 块里哪些行生效(`None` = 整块)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HunkPick {
     pub hunk: usize,
     pub lines: Option<LinePick>,

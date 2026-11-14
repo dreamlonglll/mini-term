@@ -544,3 +544,84 @@ fn 按原编码写回() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn compact_snapshot_rebuilds_fields_and_rejects_forgery() {
+    for encoding in [
+        TextEncoding::Utf8,
+        TextEncoding::Utf16Le,
+        TextEncoding::Utf16Be,
+        TextEncoding::Legacy(crate::encoding::encoding_rs::GB18030),
+    ] {
+        let file = parsed_conflict("a.txt".into(), encoding.encode(TEXT).unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&file).unwrap();
+        let rebuilt: ConflictFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(rebuilt.text, file.text);
+        assert_eq!(rebuilt.encoding, file.encoding);
+        assert_eq!(rebuilt.blocks, file.blocks);
+        assert_eq!(rebuilt.snapshot().unwrap(), file.snapshot().unwrap());
+        let mut forged = serde_json::to_value(&file).unwrap();
+        forged["blocks"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ConflictFile>(forged).is_err());
+    }
+    let mut original = TEXT.as_bytes().to_vec();
+    original.resize(MAX_SEGMENT_FILE_BYTES as usize, b'\\');
+    let file = parsed_conflict("large".into(), original).unwrap();
+    let bytes = serde_json::to_vec(&file).unwrap();
+    assert!(bytes.len() < 16 * 1024 * 1024);
+    let rebuilt: ConflictFile = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rebuilt.original.len(), MAX_SEGMENT_FILE_BYTES as usize);
+    let oversized = serde_json::json!({"path":"a", "encoding":"UTF-8", "original":base64::engine::general_purpose::STANDARD.encode(vec![b'a'; MAX_SEGMENT_FILE_BYTES as usize + 1])});
+    assert!(serde_json::from_value::<ConflictFile>(oversized).is_err());
+    for invalid in ["=", "====", "a===", "!!!!"] {
+        let wire = serde_json::json!({"path":"a", "encoding":"UTF-8", "original":invalid});
+        assert!(serde_json::from_value::<ConflictFile>(wire).is_err());
+    }
+}
+
+#[test]
+fn verified_bytes_not_mutable_display_fields_control_resolution() {
+    let root = conflicted_repo("segments-forged-display", "merge");
+    let sample = "头\r\n<<<<<<< HEAD\r\n甲\r\n=======\r\n乙\r\n>>>>>>> other\r\n尾";
+    let encoding = TextEncoding::Utf16Le;
+    std::fs::write(root.join("a.txt"), encoding.encode(sample).unwrap()).unwrap();
+    let mut file = load_conflict_file(&root, "a.txt").unwrap();
+    file.encoding = TextEncoding::Utf8;
+    file.text = "forged".into();
+    file.blocks.clear();
+    write_conflict_resolution(&root, &file, &[Some(ConflictPick::Theirs)], true).unwrap();
+    assert_eq!(
+        std::fs::read(root.join("a.txt")).unwrap(),
+        encoding.encode("头\r\n乙\r\n尾").unwrap()
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn compact_snapshot_keeps_sender_codec_instead_of_region_guessing() {
+    // A4 A4 is valid and roundtrippable in both codecs, but denotes different
+    // characters. The receiver must retain the sender's chosen interpretation.
+    let mut original = b"<<<<<<< ours\n".to_vec();
+    original.extend_from_slice(&[0xa4, 0xa4]);
+    original.extend_from_slice(b"\n=======\nx\n>>>>>>> theirs\n");
+    let mut texts = Vec::new();
+    for codec in [
+        crate::encoding::encoding_rs::GB18030,
+        crate::encoding::encoding_rs::BIG5,
+    ] {
+        let encoding = TextEncoding::Legacy(codec);
+        let file = parsed_conflict_with_encoding("a".into(), original.clone(), encoding).unwrap();
+        let rebuilt: ConflictFile =
+            serde_json::from_slice(&serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(rebuilt.encoding, encoding);
+        assert_eq!(rebuilt.text, file.text);
+        assert_eq!(rebuilt.blocks, file.blocks);
+        texts.push(rebuilt.text);
+        let mut forged = serde_json::to_value(&file).unwrap();
+        for unsafe_encoding in ["UTF-8", "UTF-16 LE", "lossy", "replacement", "UTF-7"] {
+            forged["encoding"] = unsafe_encoding.into();
+            assert!(serde_json::from_value::<ConflictFile>(forged.clone()).is_err());
+        }
+    }
+    assert_ne!(texts[0], texts[1]);
+}

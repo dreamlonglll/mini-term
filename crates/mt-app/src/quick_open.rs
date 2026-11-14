@@ -1198,7 +1198,7 @@ mod tests {
     /// `project_switcher` 的同名测试)。
     #[test]
     fn 方向键绑定压过输入框自带的() {
-        gpui::actions!(test_only, [InputMoveUp]);
+        gpui::actions!(quick_open_test, [InputMoveUp]);
         let predicate = format!("{CONTEXT} > Input");
         let keymap = Keymap::new(vec![
             // 组件库先注册(gpui_component::init)

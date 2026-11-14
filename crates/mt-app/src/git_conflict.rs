@@ -5,7 +5,7 @@
 //! 随列表一起判好([`mt_project::git::conflict_segment_status`]):删除 / 修改冲突、文件里
 //! 没有成对标记、二进制、编码认不出(只读)、过大时菜单项禁用并写明原因([`blocker_key`])。
 //! 标记规则、防陈旧、编码与原子写的口径见 `mt_project::git::conflict_blocks` 的模块注释。
-//! 远程(SSH)项目没有 Git 面板(`git_panel` 显示「暂不支持」),这里也只管本地仓库。
+//! 本地与 SSH 共用捕获的 `GitContext`,后台读写不改变来源项目或连接身份。
 //!
 //! # 方向文案
 //!
@@ -43,9 +43,9 @@
 //! 写入 —— 改工作区文件的动作只认明确的点击。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, Entity, FocusHandle, FontWeight,
@@ -55,8 +55,9 @@ use gpui::{
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::encoding::TextEncoding;
 use mt_project::git::{
-    self, ConflictBlock, ConflictFile, ConflictPick, RepoOpKind, SegmentBlocker, StaleConflictFile,
+    ConflictBlock, ConflictFile, ConflictPick, RepoOpKind, SegmentBlocker, StaleConflictFile,
 };
+use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_diff;
@@ -221,7 +222,7 @@ enum Notice {
 
 struct SegmentDialog {
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     /// 仓库内相对路径
     path: String,
     rebasing: bool,
@@ -270,7 +271,7 @@ impl SegmentDialog {
 /// `path` 是暂存区里的相对路径,`op` 是进行中的合并 / 变基…(方向文案随它翻转)。
 pub fn open(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     path: String,
     op: Option<RepoOpKind>,
     on_written: OnWritten,
@@ -278,7 +279,7 @@ pub fn open(
     cx: &mut App,
 ) {
     // 守卫要在建实体之前判:已经开着一个的话,下面的读取与聚焦都是白干
-    if repo_path.is_empty() || is_open(kind::GIT_CONFLICT_SEGMENTS) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_CONFLICT_SEGMENTS) {
         return;
     }
     let state = cx.new(|cx| SegmentDialog {
@@ -326,15 +327,14 @@ fn reload(state: &Entity<SegmentDialog>, window: &mut Window, cx: &mut App) {
         s.request += 1;
         s.loading = true;
         cx.notify();
-        (PathBuf::from(&s.repo_path), s.path.clone(), s.request)
+        (s.repo_path.clone(), s.path.clone(), s.request)
     });
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { git::load_conflict_file(&repo, &path) })
-                .await;
+            let executor = repo.clone();
+            let result =
+                mt_remote::run_git_on(&executor, move || repo.load_conflict_file(&path)).await;
             let _ = cx.update(|window, cx| apply_load(&state, request, result, window, cx));
         })
         .detach();
@@ -485,9 +485,20 @@ fn write(state: &Entity<SegmentDialog>, mark: bool, window: &mut Window, cx: &mu
     let started = git_ui::spawn_gated(
         &repo,
         move |repo| {
-            let result = git::write_conflict_resolution(repo, &file, &picks, mark);
-            // 写完当场读一份签名(成败都读:标记已解决失败时文件已经写了),面板拿它当「已知」
-            Ok((result, RepoObservation::read(repo)))
+            let result = repo.write_conflict_resolution(&file, &picks, mark);
+            if let Err(err) = &result {
+                eprintln!(
+                    "[git] {}: conflict resolution failed: {err:#}",
+                    git_ui::repo_label(repo)
+                );
+            }
+            // 标记失败也可能已写回文件,无论结果都读取原仓库的观察值。
+            let observed = RepoObservation {
+                at: Instant::now(),
+                signature: repo.repo_signature().ok(),
+                op: repo.repo_operation_state().ok(),
+            };
+            Ok((result, observed))
         },
         move |outcome, window, cx| {
             finish_write(&done_state, mark, &path, remaining, outcome, window, cx);
@@ -521,9 +532,9 @@ fn finish_write(
         Err(err) => (Err(err), None),
     };
     let open = is_open(kind::GIT_CONFLICT_SEGMENTS);
-    let (store, on_written) = {
+    let (store, repo, on_written) = {
         let s = state.read(cx);
-        (s.store.clone(), s.on_written.clone())
+        (s.store.clone(), s.repo_path.clone(), s.on_written.clone())
     };
     match result {
         Ok(()) => {
@@ -549,10 +560,15 @@ fn finish_write(
                 tr!("gitCommit", "segments.writtenAll", path = path)
             };
             // 弹窗已经关了,toast 看得见
-            git_ui::toast(&store, message, Tone::Info, cx);
+            git_ui::toast_for_repo(&store, &repo, message, Tone::Info, cx);
         }
         Err(err) => {
-            let detail = git_ui::error_text(&err);
+            let detail = git_ui::repo_text(
+                &store,
+                &repo,
+                git_ui::error_text_for_store(&err, &store, cx),
+                cx,
+            );
             eprintln!("[git] 逐段解决 {path} 失败: {detail}");
             let notice = if err.is::<StaleConflictFile>() {
                 Notice::Stale
@@ -1263,7 +1279,9 @@ mod tests {
         assert!(!run(&["-c", "merge.conflictStyle=merge", "merge", "other"]));
         // 冲突在暂存区里;工作区内容换成要测的文本
         std::fs::write(root.join("f.txt"), text).unwrap();
-        let file = git::load_conflict_file(&root, "f.txt").unwrap();
+        let file = GitContext::local(root.to_string_lossy())
+            .load_conflict_file("f.txt")
+            .unwrap();
         std::fs::remove_dir_all(&root).ok();
         file
     }

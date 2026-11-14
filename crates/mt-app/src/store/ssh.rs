@@ -24,6 +24,20 @@ use super::{AppStore, ConfigSection, ProjectState, SshAssocOutcome, StoreEvent};
 // BB-b 已把消费方全部接上(三个弹窗 + 远程项目 UI + 断线遮罩 + 文件树/会话
 // 面板的远程分流),BB-a 留的 `allow(dead_code)` 随之删除 —— 从此这里多一个
 // 没人调的函数就会在 `cargo check` 里红。
+/// Whether a connection edit was rejected before any save, or saved without its password.
+pub enum SshSaveError {
+    NotSaved(String),
+    PasswordUnavailable(String),
+}
+
+impl SshSaveError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotSaved(message) | Self::PasswordUnavailable(message) => message,
+        }
+    }
+}
+
 impl AppStore {
     /// 已保存的 SSH 连接(`config.sshConnections`)。
     pub fn ssh_connections(&self) -> &[SshConnection] {
@@ -50,11 +64,24 @@ impl AppStore {
     /// (没改的沿用旧信封,判据见 [`crate::secrets::stored_password`])。封存失败就
     /// **不存密码**(其余字段照存)并把原因交给调用方提示 —— 宁可让用户再填一次,
     /// 也不把明文写进库。
+    /// Errors are display-ready: blocked target changes save nothing; sealing failures
+    /// preserve the connection without its password and explain that distinction.
     pub fn upsert_ssh_connection(
         &mut self,
         conn: SshConnection,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SshSaveError> {
+        let source_change = mt_remote::remote_git_source_change_guard();
+        if self.config.ssh_connections.iter().any(|existing| {
+            existing.id == conn.id && super::projects::remote_git_endpoint_changed(existing, &conn)
+        }) && self.config.projects.iter().any(|project| {
+            project.ssh_connection_id.as_deref() == Some(conn.id.as_str())
+                && self.remote_git_source_pending(project)
+        }) {
+            return Err(SshSaveError::NotSaved(
+                crate::i18n::t("gitHistory", "recoverySourceBlocked").to_string(),
+            ));
+        }
         let mut conn = conn;
         let id = conn.id.clone();
         let mut seal_error = None;
@@ -90,11 +117,20 @@ impl AppStore {
         }
         if identity_changed {
             mt_remote::invalidate_connection(&id);
+            self.config
+                .revoke_remote_git_permissions_for_connection(&id);
         }
+        self.config.clear_invalid_remote_git_permissions();
+        crate::git_backend::sync_remote_git_permissions(&self.config);
+        drop(source_change);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
         match seal_error {
-            Some(err) => Err(err),
+            Some(err) => Err(SshSaveError::PasswordUnavailable(crate::i18n::tr!(
+                "sshModal",
+                "passwordSealFailed",
+                error = err
+            ))),
             None => Ok(()),
         }
     }
@@ -108,12 +144,23 @@ impl AppStore {
     /// 长连(以及 home / gitignore 缓存)没有任何道理,且新建一条同 id 的连接
     /// (id 由调用方生成,理论上可复用)会直接命中旧机器的 session。
     pub fn remove_ssh_connection(&mut self, id: &str, cx: &mut Context<Self>) {
+        let source_change = mt_remote::remote_git_source_change_guard();
+        if let Some(source) = self.config.projects.iter().find(|project| {
+            project.ssh_connection_id.as_deref() == Some(id)
+                && self.remote_git_source_pending(project)
+        }) {
+            self.notify_remote_git_source_blocked(&source.id, cx);
+            return;
+        }
         let before = self.config.ssh_connections.len();
         self.config.ssh_connections.retain(|c| c.id != id);
         if self.config.ssh_connections.len() == before {
             return;
         }
         mt_remote::invalidate_connection(id);
+        self.config.revoke_remote_git_permissions_for_connection(id);
+        crate::git_backend::sync_remote_git_permissions(&self.config);
+        drop(source_change);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }

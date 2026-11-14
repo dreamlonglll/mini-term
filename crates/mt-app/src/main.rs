@@ -68,6 +68,7 @@ mod focus_nav;
 mod frame_profiler;
 mod frost;
 mod fs_ops;
+mod git_backend;
 mod git_branches;
 mod git_changes;
 mod git_conflict;

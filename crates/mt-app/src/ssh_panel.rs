@@ -959,17 +959,16 @@ fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
         conn.id = crate::tree::gen_unique_id("ssh", |id| existing.iter().any(|c| c.id == id));
     }
     let sealed = state.update(cx, |panel, cx| {
-        panel.form = None;
-        // 明文只活到这一步:store 落库前把它封成信封。封存失败时连接照存、密码不存,
-        // 在面板顶部提示用户再填一次(见 `AppStore::upsert_ssh_connection`;不走
-        // toast 的理由见 [`ConnForm::password_unreadable`])。
         let saved = panel
             .store
             .update(cx, |store, cx| store.upsert_ssh_connection(conn, cx));
         let sealed = saved.is_ok();
+        if !matches!(&saved, Err(crate::store::SshSaveError::NotSaved(_))) {
+            panel.form = None;
+        }
         panel.notice = saved
             .err()
-            .map(|err| SharedString::from(tr!("sshModal", "passwordSealFailed", error = err)));
+            .map(|error| SharedString::from(error.message().to_owned()));
         cx.notify();
         sealed
     });

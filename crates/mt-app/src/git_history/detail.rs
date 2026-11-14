@@ -54,7 +54,6 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui::{
@@ -408,7 +407,7 @@ impl GitHistoryContent {
     /// 详情栏眼下该不该画:有仓库、有选中、没被关上。其余条件(「提交历史」区收着、
     /// 面板在空态)归容器判,见 `GitPanel::detail_pane`。
     pub fn detail_shown(&self) -> bool {
-        !self.repo_path.is_empty() && !self.selection.is_empty() && self.detail.open
+        self.context.is_some() && !self.selection.is_empty() && self.detail.open
     }
 
     /// 关上详情栏(选择照留,再单击一行才重新打开)。
@@ -420,24 +419,27 @@ impl GitHistoryContent {
     }
 
     pub(super) fn load_detail(&mut self, hash: String, cx: &mut Context<Self>) {
-        if self.repo_path.is_empty() {
+        let Some(repo) = self.context.clone() else {
             return;
-        }
+        };
         self.detail.request += 1;
         let req = self.detail.request;
         self.detail.loading = true;
         self.load_containing(hash.clone(), cx);
-        let repo = PathBuf::from(&self.repo_path);
         cx.spawn(async move |this, cx| {
             // 详情与行数一起开跑,详情先回来先画
             let (detail_repo, detail_hash) = (repo.clone(), hash.clone());
-            let detail_task = cx.background_executor().spawn(async move {
-                mt_project::git::get_commit_detail(&detail_repo, &detail_hash)
+            let detail_context = detail_repo.clone();
+            let detail_task = mt_remote::run_git_on(&detail_context, move || {
+                detail_repo.get_commit_detail(&detail_hash)
             });
             let stats_hash = hash.clone();
-            let stats_task = cx
-                .background_executor()
-                .spawn(async move { mt_project::git::get_commit_line_stats(&repo, &stats_hash) });
+            let stats_task = cx.background_executor().spawn(async move {
+                mt_remote::run_git_on(&repo.clone(), move || {
+                    repo.get_commit_line_stats(&stats_hash)
+                })
+                .await
+            });
 
             let result = detail_task.await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -484,18 +486,17 @@ impl GitHistoryContent {
 
     /// 后台查包含这个提交的分支。
     fn load_containing(&mut self, hash: String, cx: &mut Context<Self>) {
-        if self.repo_path.is_empty() {
+        let Some(repo) = self.context.clone() else {
             return;
-        }
+        };
         self.detail.containing_request += 1;
         let req = self.detail.containing_request;
-        let repo = PathBuf::from(&self.repo_path);
         cx.spawn(async move |this, cx| {
             let task_hash = hash.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { mt_project::git::get_branches_containing(&repo, &task_hash) })
-                .await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || {
+                repo.get_branches_containing(&task_hash)
+            })
+            .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.detail.containing_request != req {
                     return;
@@ -520,21 +521,18 @@ impl GitHistoryContent {
 
     /// 多选态:后台合并这组提交的改动文件。
     pub(super) fn load_multi_detail(&mut self, hashes: Vec<String>, cx: &mut Context<Self>) {
-        if self.repo_path.is_empty() {
+        let Some(repo) = self.context.clone() else {
             return;
-        }
+        };
         self.detail.request += 1;
         let req = self.detail.request;
         self.detail.loading = true;
-        let repo = PathBuf::from(&self.repo_path);
         cx.spawn(async move |this, cx| {
             let task_hashes = hashes.clone();
-            let result = cx
-                .background_executor()
-                .spawn(
-                    async move { mt_project::git::get_combined_commit_files(&repo, &task_hashes) },
-                )
-                .await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || {
+                repo.get_combined_commit_files(&task_hashes)
+            })
+            .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 if this.detail.request != req {
                     return;

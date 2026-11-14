@@ -74,6 +74,7 @@ use config_writer::ConfigWriter;
 
 pub use events::{ConfigSection, StoreEvent};
 pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH};
+pub use ssh::SshSaveError;
 
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,
 // `crate::store::Xxx` 这条对外路径一字不变(全仓其它文件零改动的前提)。
@@ -603,6 +604,17 @@ impl AppStore {
         ai: AiBridge,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::assemble(config_store, loaded, ai, open_layout_store, cx)
+    }
+
+    /// Keep initialization identical while allowing tests to exclude user persistence.
+    fn assemble(
+        config_store: Arc<ConfigStore>,
+        loaded: anyhow::Result<LoadedConfig>,
+        ai: AiBridge,
+        open_layout: impl FnOnce(&AppConfig, bool) -> Result<Arc<mt_layout::LayoutStore>, String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (mut config, token, config_error) = match loaded {
             Ok(loaded) => (loaded.config, loaded.token, None),
             Err(err) => {
@@ -613,6 +625,8 @@ impl AppStore {
                 (AppConfig::default(), 0, Some(format!("{err:#}")))
             }
         };
+        config.clear_invalid_remote_git_permissions();
+        crate::git_backend::sync_remote_git_permissions(&config);
 
         // 布局库:开库 →(首次)从 config.json 灌一次 → 把库里的值覆盖回
         // `config` 的对应字段。**覆盖这一步是整个改造的支点** —— 各处 getter
@@ -620,7 +634,7 @@ impl AppStore {
         // 配置加载失败(token=0)时不迁移、也不对账删行:那份 config 是空默认值,
         // 灌进去等于拿一份伪造的空布局把用户真实的布局盖掉(对账同理,见
         // `apply_layout_db`)。
-        let (layout_store, layout_error) = match open_layout_store(&config, token != 0) {
+        let (layout_store, layout_error) = match open_layout(&config, token != 0) {
             Ok(store) => (Some(store), None),
             Err(err) => (None, Some(err)),
         };
@@ -729,6 +743,27 @@ impl AppStore {
             save_generation: 0,
             _save_task: None,
         }
+    }
+
+    /// Real UI model with inert AI and no user filesystem, network, or PTY startup.
+    /// Token zero disables writes and backups; the isolated paths are never created.
+    #[cfg(test)]
+    pub(crate) fn git_test_store(config: AppConfig, cx: &mut Context<Self>) -> Self {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data_dir = std::env::temp_dir().join(format!(
+            "mini-term-git-ui-test-{}-{sequence}",
+            std::process::id(),
+        ));
+        let config_store = Arc::new(ConfigStore::at(data_dir.join("config.json")));
+        let ai = AiBridge::for_git_test(data_dir);
+        Self::assemble(
+            config_store,
+            Ok(LoadedConfig { config, token: 0 }),
+            ai,
+            |_, _| Err("Git UI test fixture disables layout persistence".into()),
+            cx,
+        )
     }
 
     // === 全局取用 ===

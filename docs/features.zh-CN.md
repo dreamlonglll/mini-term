@@ -174,6 +174,11 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### Git 集成
 
+- **远端 Git** — SSH 项目复用原 Git 面板与交互，涵盖状态、三侧 diff、分块暂存、提交、历史与详情、分支、拉推、贮藏及 Worktree。每个项目默认未授权；首次打开 Git 时先确认上传与运行 helper，同意后才经 SFTP 部署匹配服务器平台的随包 helper 并校验 SHA-256。通过项目右键菜单启用或撤销授权，没有设置页全局开关；取消后不反复自动弹窗。授权绑定项目的 SSH 端点与远端根目录，任一变化都须重新确认；从已授权项目新建的 Worktree 项目也默认未授权。远端在面板可见时轮询，静默刷新保留快照；本地继续文件监听。
+- **远端 Git 安全与清理** — 服务器需 Git 和可执行的用户缓存目录，无需 Rust、root 或新监听端口；helper 缓存在 `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`。只连接可信服务器和仓库：拉推认证、hooks、过滤器与签名沿用服务器配置，无新增凭据 UI；项目根与仓库发现范围不是操作系统沙箱。撤销授权只停止该项目的新操作，不取消已经开始的写操作。清理前先停止所有使用此缓存的项目的远端 Git 操作并撤销授权，确认所有 Git 操作及相关子进程均已结束后，只删除 helper 缓存，不碰项目目录；恢复时的「已核对」不代表这些进程已退出。[使用说明](../README.md#远端-git-helper)。
+- **写结果未知与恢复** — 写请求断线或超时不自动重放；结果未知期间暂停后续写入。若原通道仍可用，可通过其 barrier 完成证明（proof）安全核对；若原通道丢失，则用新的只读通道核对。恢复界面展示当前 HEAD、暂存区、操作状态及工作区状态。两种情况均须用户检查快照并明确确认「已核对」后才解除写入限制，只查看快照不会解锁；确认时重新核对，仓库、会话或授权等状态已变化的旧快照不能用于恢复。没有原通道证明时，该确认不证明旧进程或其子进程已结束；两种恢复均不会重放原写请求。
+- **保留恢复入口** — 远端写操作进行中或结果未知时，来源项目、连接及目标仍受保护。服务器无法连接时，可阅读风险说明后离线「放弃核对」，只移除本机保护，不代表远端结束，不重放、不恢复授权。撤权后入口仍可见，联网的固定只读核对需单独同意，并明确提示可能上传、启动 helper。只修改凭据不会清除未知结果。
+- **远端 Git 连接使用** — 写结果未知期间复用只读通道，不随每次刷新另开连接。本地与远端 Git 分别限流，缓慢 SSH 操作不占满本地 Git 的执行名额；空闲的远端 Git 会话会回收。
 - **文件状态** — 文件树显示 Git 状态颜色（修改 / 新增 / 删除 / 冲突）
 - **变更 / 历史同屏** — Git 面板为上下两个可折叠区块：更改在上、提交历史在下，中缝可拖拽调节比例（钳 15%~85%），折叠 / 展开带动画且会话内记住折叠态与比例；面板顶部仓库栏分左右两段——左段是仓库下拉（worktree 条目标 ⎇）、当前分支胶囊与 ↑ 待推送 / ↓ 待拉取计数，右段是 Fetch / 拉取 / 推送 / 贮藏 / 刷新五枚图标按钮（贮藏按钮旁显示贮藏数），窄宽度时左段先截断、按钮组不被挤掉；右键仓库名可在终端打开或进入 Worktree 管理。图标、胶囊、区块标题、空态 / 加载态、选中样式全面板一套（行高 28px、字号四档，浅色主题单独调过对比度）
 - **自动刷新** — 监听仓库 `.git` 目录（HEAD / 暂存区 / refs / 合并与变基现场 / 贮藏），去抖 500ms 刷新，仓库签名不变就不刷；AI 终端里跑的 git、外部工具的提交都能即时反映（此前只认普通终端输出里的几个关键词）
@@ -292,21 +297,34 @@ cargo build --release -p mt-app
 
 > hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布包已带齐；源码运行要完整体验，先跑一次 `stage-sidecars.mjs`（release 构建对应 `--release`，就位到 `target/release/`）。
 
+#### 远端 Git helper：源码构建
+
+helper 必须匹配**服务器**而非桌面平台。Linux x86_64/aarch64 使用 musl 静态目标以避免服务器的 glibc 版本依赖；macOS 对应 x86_64/arm64 原生目标。这些目标不代表均已真机验证，缺少匹配资源时不会回落本机 Git。在同架构的原生 Linux 上安装 `musl-tools`、`build-essential`、`binutils`、`perl`、`pkg-config` 与 Rust musl target，再运行 CI/发布共用脚本以固定静态可执行文件链接模式。例如 Linux x86_64：
+
+```bash
+bash scripts/build-git-helper-musl.sh x86_64-unknown-linux-musl
+node scripts/stage-git-helpers.mjs --target linux-x86_64 --binary target/x86_64-unknown-linux-musl/release/mt-git-helper --output target/release/remote-git-helpers
+```
+
+helper 就位到桌面 exe 旁的 `remote-git-helpers/<平台>/mt-git-helper`。就位脚本接受 `linux-x86_64`、`linux-aarch64`、`macos-x86_64`、`macos-aarch64`；开发构建可用默认输出 `target/debug/remote-git-helpers`。源码构建不绕过该项目的部署确认。
+
 ## 项目结构
 
 ```
 mini-term/
-├── crates/                       # 主工作区（12 个 crate）
+├── crates/                       # 主工作区
 │   ├── mt-app/                   # GPUI 应用壳：Workspace 组件树、AppStore 全局状态、SplitNode 布局树、各面板 / 弹窗 / 托盘 / 标题栏
 │   ├── mt-ui/                    # GPUI 渲染层：终端 view / element、主题桥（不含业务逻辑）
 │   ├── mt-terminal/              # VT 状态机 + grid 模型（alacritty_terminal 封装，不依赖 gpui）
 │   ├── mt-pty/                   # PTY 生命周期（spawn / read / write / resize / kill）+ 便携 ConPTY 预载
 │   ├── mt-ai/                    # AI 感知：hook server（权威）、hook 注册、输入检测降级、状态判定、会话记录读取
 │   ├── mt-project/               # 文件树、目录监听、搜索、Git（git2）、外部编辑器、WSL 发行版枚举
+│   ├── mt-git-helper/            # 远端 Git helper：经 SSH stdio 调用共享 Git 核心，无 GPUI
 │   ├── mt-config/                # 配置持久化与主题包（不依赖 gpui）
 │   ├── mt-i18n/                  # 双语文案层（字典源头 locales/*.ts，dict.rs 由生成器产出）
 │   ├── mt-relay/                 # 移动端中转桌面侧：出站 WSS 长连、配对、项目快照 / 增量、对话镜像、指令写穿
 │   ├── mt-ssh/                   # 共享 SSH 通信层（russh 持久会话池 + SFTP 原语，主程序与 sidecar 共用）
+│   ├── mt-remote/                # 远程项目服务与托管 Git：项目级授权、helper 部署、SSH Git 会话与恢复
 │   ├── mt-usage/                 # 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价
 │   └── mt-core/                  # 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）
 ├── sidecars/                     # sidecar 二进制独立工作区（版本号自成语义，不跟随主程序发版）
@@ -320,6 +338,7 @@ mini-term/
 ├── mobile/                       # 移动端 PWA（React + TS + Vite，配对 / 列表 / 镜像 / 指令 / 发起会话 / 改名）
 ├── scripts/
 │   ├── stage-sidecars.mjs        # 构建 sidecar 并连同便携 ConPTY 就位到主程序 exe 同目录
+│   ├── stage-git-helpers.mjs     # 将匹配服务器平台的 helper 就位到桌面 exe 旁
 │   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
 ├── tests/                        # Node 侧测试（2 个文件：ConPTY 打包 / vendored-openssl 守卫）
 └── docs/                         # 文档（功能清单 / 中转部署 / 主题包示例等）

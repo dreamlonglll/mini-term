@@ -11,9 +11,10 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Div, Entity, FocusHandle, InteractiveElement,
-    IntoElement, ParentElement, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    IntoElement, ParentElement, ScrollStrategy, StatefulInteractiveElement, Styled,
     UniformListScrollHandle, WeakEntity, div, prelude::FluentBuilder as _, px, uniform_list,
 };
+use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
 use super::{
@@ -78,7 +79,7 @@ pub(super) struct FilePage {
 impl FilePage {
     pub(super) fn new(
         store: &Entity<AppStore>,
-        repo_path: String,
+        repo_path: GitContext,
         files: Vec<DiffFile>,
         current: usize,
         hooks: FileDiffHooks,
@@ -87,7 +88,7 @@ impl FilePage {
         let font_size = store.read(cx).config().terminal_font_size as f32;
         let state = cx.new(|_| DiffState::new(font_size));
         let ctl = cx.new(|_| FileDiff {
-            repo_path,
+            context: repo_path,
             files,
             current,
             on_changed: hooks.on_changed,
@@ -103,9 +104,9 @@ impl FilePage {
     }
 
     /// 当前文件(页签的身份与标题按它算)与所在仓库。
-    pub(super) fn current(&self, cx: &App) -> (String, DiffFile) {
+    pub(super) fn current(&self, cx: &App) -> (GitContext, DiffFile) {
         let c = self.ctl.read(cx);
-        (c.repo_path.clone(), c.file().clone())
+        (c.context.clone(), c.file().clone())
     }
 
     /// 已开着的页签被再次打开(更改列表里又双击了同一个文件):换上新的仓库、文件序列与回调
@@ -117,7 +118,7 @@ impl FilePage {
     /// 就是显示成另一个文件。块操作在途时不换 —— 序列与回调留到它收尾再说。
     pub(super) fn adopt(
         &self,
-        repo_path: String,
+        repo_path: GitContext,
         files: Vec<DiffFile>,
         current: usize,
         hooks: FileDiffHooks,
@@ -127,9 +128,9 @@ impl FilePage {
             if c.busy.is_some() || files.is_empty() {
                 return None;
             }
-            let same_repo = c.repo_path == repo_path;
+            let same_repo = c.context == repo_path;
             let before = c.file().path.clone();
-            c.repo_path = repo_path;
+            c.context = repo_path;
             c.current = current.min(files.len() - 1);
             c.files = files;
             c.on_changed = hooks.on_changed;
@@ -261,7 +262,7 @@ pub(super) struct FilesPage {
     state: Entity<DiffState>,
     pick: Entity<CommitPick>,
     files: Rc<Vec<ModalFile>>,
-    repo: SharedString,
+    repo: GitContext,
     heading: ModalHeading,
     /// 左栏的滚动(先选中的文件可能排在很后面,要滚到它那一行)
     file_scroll: UniformListScrollHandle,
@@ -272,7 +273,7 @@ impl FilesPage {
     /// 先选中路径为 `initial` 的文件,`None` 或找不到时选第一个。
     pub(super) fn new(
         store: Entity<AppStore>,
-        repo_path: String,
+        repo_path: GitContext,
         heading: ModalHeading,
         files: Vec<ModalFile>,
         initial: Option<String>,
@@ -305,7 +306,7 @@ impl FilesPage {
             state,
             pick,
             files: Rc::new(files),
-            repo: SharedString::from(repo_path),
+            repo: repo_path,
             heading,
             file_scroll,
             store,
@@ -599,7 +600,7 @@ impl TextPage {
         let Some(input) = viewer.read(cx).disk_compare_input(cx) else {
             return;
         };
-        load_diff_with(&self.state, Fetch::Refresh, cx, move || {
+        load_diff_with(&self.state, None, Fetch::Refresh, cx, move || {
             let disk =
                 read_compare_disk(&input.project_root, &input.path).map_err(anyhow::Error::msg)?;
             Ok(mt_project::git::diff_two_texts(disk, input.mine))

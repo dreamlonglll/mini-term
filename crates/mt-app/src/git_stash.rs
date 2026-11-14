@@ -37,7 +37,6 @@
 //! 列表弹窗:↑/↓ 换贮藏、Enter 应用(Dialog 的 Confirm)、Delete 删除(先确认)、Esc 关闭;
 //! 没有贮藏时 Enter = 贮藏当前改动。其余弹窗 Enter 确认 / Esc 取消。
 
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
@@ -52,6 +51,7 @@ use mt_project::git::{
     self, BranchNameIssue, GitStatus, SmartCheckoutOutcome, StashApplyOutcome, StashFileInfo,
     StashInfo, StashSaveOptions, StashSaveOutcome,
 };
+use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -59,7 +59,7 @@ use crate::git_diff::{self, CommitFileDiffPane};
 use crate::git_history::{format_absolute_time, format_relative_time};
 use crate::git_ui::{
     self, ButtonKind, FormOp, ICON_ALERT, ICON_CHECK, ICON_CLEAN, ICON_PLUS, ICON_REFRESH,
-    ICON_STASH, ICON_TRASH, SectionHeader, Tone, error_text, mono,
+    ICON_STASH, ICON_TRASH, SectionHeader, Tone, mono,
 };
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -146,7 +146,7 @@ enum Notice {
 
 struct StashDialog {
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: OnChanged,
     stashes: Vec<StashInfo>,
     list_loading: bool,
@@ -187,7 +187,7 @@ impl StashDialog {
 
     /// 改写类按钮要不要锁住:自己有操作在跑,或别的区占着仓库的写操作闸。
     fn locked(&self) -> bool {
-        self.busy.is_some() || git_ui::gate::is_busy(&self.repo_path)
+        self.busy.is_some() || git_ui::gate::is_busy_key(&self.repo_path.repository_key())
     }
 }
 
@@ -237,12 +237,12 @@ impl Render for Form {
 /// 先在后台把列表读回来再开窗:空列表是个小空态框、非空是大弹窗,开窗后再变尺寸会闪一下。
 pub fn open_list(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH) {
         return;
     }
     let diff = CommitFileDiffPane::new(&store, cx);
@@ -270,13 +270,10 @@ pub fn open_list(
         files_scroll: UniformListScrollHandle::new(),
         focus: cx.focus_handle(),
     });
-    let repo = PathBuf::from(repo_path);
+    let repo = repo_path;
     window
         .spawn(cx, async move |cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { git::list_stashes(&repo) })
-                .await;
+            let result = mt_remote::run_git_on(&repo.clone(), move || repo.list_stashes()).await;
             let _ = cx.update(|window, cx| {
                 // 读取期间入口又被点了一次,那一次已经把弹窗开出来了
                 if is_open(kind::GIT_STASH) {
@@ -293,12 +290,13 @@ pub fn open_list(
 /// 没有可贮藏的改动时就地提示、弹窗留着。
 pub fn open_save(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let toast_store = store.clone();
+    let context = repo_path.clone();
     let on_saved = Rc::new(
         move |reference: String, warning: Option<String>, _window: &mut Window, cx: &mut App| {
             // 有文件没清掉:需要留意那一档,别让人以为工作区已经干净了
@@ -307,8 +305,9 @@ pub fn open_save(
             } else {
                 Tone::Info
             };
-            git_ui::toast(
+            git_ui::toast_for_repo(
                 &toast_store,
+                &context,
                 saved_text(&reference, warning.as_deref()),
                 tone,
                 cx,
@@ -327,14 +326,14 @@ pub fn open_save(
 /// 检出本身失败 → 就地红字(贮藏已恢复回去)。每种结局都调 `on_changed`。
 pub fn open_smart_checkout(
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     branch: String,
     conflicts: Vec<String>,
     on_changed: Rc<dyn Fn(&mut App)>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH_CHECKOUT) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH_CHECKOUT) {
         return;
     }
     let form = cx.new(|_| Form::new());
@@ -343,7 +342,12 @@ pub fn open_smart_checkout(
         window,
         cx,
         move |dialog, _window, cx| {
-            let title = tr!("gitStash", "checkout.title", branch = branch.as_str());
+            let title = git_ui::repo_title(
+                &store,
+                &repo_path,
+                &tr!("gitStash", "checkout.title", branch = branch.as_str()),
+                cx,
+            );
             let f = form.read(cx);
             if let Some((text, files, detail)) = f.outcome.clone() {
                 // 终态:已经检出,但恢复不顺 —— 只剩「知道了」
@@ -443,14 +447,11 @@ fn reload(state: &Entity<StashDialog>, cx: &mut App) {
         s.list_request += 1;
         s.list_loading = true;
         cx.notify();
-        (PathBuf::from(&s.repo_path), s.list_request)
+        (s.repo_path.clone(), s.list_request)
     });
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move { git::list_stashes(&repo) })
-            .await;
+        let result = mt_remote::run_git_on(&repo.clone(), move || repo.list_stashes()).await;
         cx.update(|cx| apply_list(&state, request, result, cx));
     })
     .detach();
@@ -524,7 +525,7 @@ fn load_files(state: &Entity<StashDialog>, hash: Option<String>, cx: &mut App) {
         s.files_request += 1;
         s.files_loading = hash.is_some();
         cx.notify();
-        Some((PathBuf::from(&s.repo_path), s.files_request))
+        Some((s.repo_path.clone(), s.files_request))
     }) else {
         return;
     };
@@ -533,10 +534,7 @@ fn load_files(state: &Entity<StashDialog>, hash: Option<String>, cx: &mut App) {
     };
     let state = state.clone();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move { git::stash_files(&repo, &hash) })
-            .await;
+        let result = mt_remote::run_git_on(&repo.clone(), move || repo.stash_files(&hash)).await;
         cx.update(|cx| {
             let any = state.update(cx, |s, cx| {
                 if s.files_request != request {
@@ -632,7 +630,7 @@ fn refocus(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App) {
 fn run_op<T: Send + 'static>(
     state: &Entity<StashDialog>,
     busy: Busy,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     on_ok: impl FnOnce(T) -> Notice + 'static,
     window: &mut Window,
     cx: &mut App,
@@ -645,15 +643,31 @@ fn run_op<T: Send + 'static>(
         return;
     }
     let done_state = state.clone();
+    let context = repo.clone();
+    let source_store = state.read(cx).store.clone();
     let started = git_ui::spawn_gated(
         &repo,
         op,
         move |result, window, cx| {
             let state = done_state;
             let notice = match result {
-                Ok(value) => on_ok(value),
+                Ok(value) => match on_ok(value) {
+                    Notice::Info(text) => {
+                        Notice::Info(git_ui::repo_text(&source_store, &context, text, cx))
+                    }
+                    Notice::Attention { text, files } => Notice::Attention {
+                        text: git_ui::repo_text(&source_store, &context, text, cx),
+                        files,
+                    },
+                    error @ Notice::Error(_) => error,
+                },
                 Err(err) => {
-                    let detail = error_text(&err);
+                    let detail = git_ui::repo_text(
+                        &source_store,
+                        &context,
+                        git_ui::error_text_for_store(&err, &source_store, cx),
+                        cx,
+                    );
                     eprintln!("[git] 贮藏操作 {busy:?} 失败: {detail}");
                     // 等待期间弹窗被关掉了:原因不能丢
                     if !is_open(kind::GIT_STASH) {
@@ -667,12 +681,18 @@ fn run_op<T: Send + 'static>(
                     Notice::Error(git_ui::error_text_state(&detail, 8, window, cx))
                 }
             };
-            // 等待期间弹窗被关掉了:冲突(贮藏已保留)这句不能丢,退到 toast
-            if !is_open(kind::GIT_STASH)
-                && let Notice::Attention { text, .. } = &notice
-            {
+            // A dismissed dialog still owes a result, including plain success.
+            if !is_open(kind::GIT_STASH) {
                 let store = state.read(cx).store.clone();
-                git_ui::toast(&store, text.clone(), Tone::Attention, cx);
+                match &notice {
+                    Notice::Info(text) => {
+                        git_ui::toast_for_repo(&store, &context, text.clone(), Tone::Info, cx)
+                    }
+                    Notice::Attention { text, .. } => {
+                        git_ui::toast_for_repo(&store, &context, text.clone(), Tone::Attention, cx)
+                    }
+                    Notice::Error(_) => {}
+                }
             }
             let on_changed = state.update(cx, |s, cx| {
                 s.busy = None;
@@ -723,9 +743,9 @@ fn apply_selected(state: &Entity<StashDialog>, pop: bool, window: &mut Window, c
         busy,
         move |repo| {
             if pop {
-                git::stash_pop(repo, index, reinstate, Some(&hash))
+                repo.stash_pop(index, reinstate, Some(&hash))
             } else {
-                git::stash_apply(repo, index, reinstate, Some(&hash))
+                repo.stash_apply(index, reinstate, Some(&hash))
             }
         },
         move |outcome| match outcome {
@@ -773,7 +793,7 @@ fn confirm_drop(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App) 
             run_op(
                 &state,
                 Busy::Drop,
-                move |repo| git::stash_drop(repo, index, Some(&hash)),
+                move |repo| repo.stash_drop(index, Some(&hash)),
                 move |()| Notice::Info(tr!("gitStash", "result.dropped", reference = reference)),
                 window,
                 cx,
@@ -804,7 +824,7 @@ fn confirm_clear(state: &Entity<StashDialog>, window: &mut Window, cx: &mut App)
             run_op(
                 &state,
                 Busy::Clear,
-                git::stash_clear,
+                GitContext::stash_clear,
                 |()| Notice::Info(t("gitStash", "result.cleared").to_string()),
                 window,
                 cx,
@@ -1593,7 +1613,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
     let Some(stash) = s.selected_stash().cloned() else {
         return;
     };
-    let repo = PathBuf::from(&s.repo_path);
+    let repo = s.repo_path.clone();
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitBranch", "namePlaceholder")));
     let form = cx.new(|cx| {
@@ -1698,7 +1718,7 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
                         kind::GIT_STASH_BRANCH,
                         "result.failedTitle",
                         repo.clone(),
-                        move |repo| git::stash_branch(repo, &op_name, index, Some(&hash)),
+                        move |repo| repo.stash_branch(&op_name, index, Some(&hash)),
                         move |outcome, _form, window, cx| {
                             close_guarded(kind::GIT_STASH_BRANCH, window, cx);
                             let notice = match outcome {
@@ -1713,6 +1733,29 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
                                     files,
                                 },
                             };
+                            if !is_open(kind::GIT_STASH) {
+                                let (store, repo) = {
+                                    let s = list.read(cx);
+                                    (s.store.clone(), s.repo_path.clone())
+                                };
+                                match &notice {
+                                    Notice::Info(text) => git_ui::toast_for_repo(
+                                        &store,
+                                        &repo,
+                                        text.clone(),
+                                        Tone::Info,
+                                        cx,
+                                    ),
+                                    Notice::Attention { text, .. } => git_ui::toast_for_repo(
+                                        &store,
+                                        &repo,
+                                        text.clone(),
+                                        Tone::Attention,
+                                        cx,
+                                    ),
+                                    Notice::Error(_) => {}
+                                }
+                            }
                             list.update(cx, |s, cx| {
                                 s.notice = Some(notice);
                                 cx.notify();
@@ -1733,17 +1776,21 @@ fn open_branch_dialog(state: &Entity<StashDialog>, window: &mut Window, cx: &mut
 // ─── 新建贮藏 ─────────────────────────────────────────────────
 
 /// [`open_save`] 的本体:成功回调拿得到 `window`(从列表里打开时要把焦点还给列表)。
-fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx: &mut App) {
-    if repo_path.is_empty() || is_open(kind::GIT_STASH_SAVE) {
+fn open_save_with(repo_path: GitContext, on_saved: OnSaved, window: &mut Window, cx: &mut App) {
+    if repo_path.path().is_empty() || is_open(kind::GIT_STASH_SAVE) {
         return;
     }
     let form = cx.new(|_| Form::new());
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("gitStash", "save.placeholder")));
-    let repo_name = Path::new(&repo_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| repo_path.clone());
+    let repo_name = if repo_path.local_path().is_some() {
+        std::path::Path::new(repo_path.path())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo_path.path().to_owned())
+    } else {
+        git_ui::repo_label(&repo_path)
+    };
     let focus_input = input.clone();
 
     open_guarded(
@@ -1759,7 +1806,7 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
             let (form_ok, input_ok, repo, on_saved) = (
                 form.clone(),
                 input.clone(),
-                PathBuf::from(&repo_path),
+                repo_path.clone(),
                 on_saved.clone(),
             );
             dialog
@@ -1848,7 +1895,7 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
                         kind::GIT_STASH_SAVE,
                         "save.failedTitle",
                         repo.clone(),
-                        move |repo| git::stash_save(repo, &options),
+                        move |repo| repo.stash_save(&options),
                         move |outcome, form, window, cx| match outcome {
                             StashSaveOutcome::Saved { reference } => {
                                 close_guarded(kind::GIT_STASH_SAVE, window, cx);
@@ -1882,19 +1929,20 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
 fn submit_smart_checkout(
     form: &Entity<Form>,
     store: Entity<AppStore>,
-    repo_path: String,
+    repo_path: GitContext,
     branch: String,
     on_changed: OnChanged,
     window: &mut Window,
     cx: &mut App,
 ) {
     let target = branch.clone();
+    let context = repo_path.clone();
     run_form_op(
         form,
         kind::GIT_STASH_CHECKOUT,
         "checkout.failedTitle",
-        PathBuf::from(repo_path),
-        move |repo| git::checkout_with_stash(repo, &target),
+        repo_path,
+        move |repo| repo.checkout_with_stash(&target),
         move |outcome, form, window, cx| {
             let branch = branch.as_str();
             // 自动贮藏总在栈顶;恢复不顺时它就留在那儿
@@ -1907,8 +1955,9 @@ fn submit_smart_checkout(
                     } else {
                         "checkout.done"
                     };
-                    git_ui::toast(
+                    git_ui::toast_for_repo(
                         &store,
+                        &context,
                         tr!("gitStash", key, branch = branch),
                         Tone::Info,
                         cx,
@@ -1923,7 +1972,7 @@ fn submit_smart_checkout(
                         reference = reference
                     );
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
-                        git_ui::toast(&store, text, Tone::Attention, cx);
+                        git_ui::toast_for_repo(&store, &context, text, Tone::Attention, cx);
                         return;
                     }
                     form.update(cx, |f, cx| {
@@ -1941,7 +1990,7 @@ fn submit_smart_checkout(
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
                         git_ui::show_git_error(
                             tr!("gitStash", "checkout.title", branch = branch),
-                            format!("{text}\n\n{detail}"),
+                            git_ui::repo_text(&store, &context, format!("{text}\n\n{detail}"), cx),
                             window,
                             cx,
                         );
@@ -1959,7 +2008,7 @@ fn submit_smart_checkout(
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
                         git_ui::show_git_error(
                             tr!("gitStash", "checkout.title", branch = branch),
-                            format!("{text}\n\n{detail}"),
+                            git_ui::repo_text(&store, &context, format!("{text}\n\n{detail}"), cx),
                             window,
                             cx,
                         );
@@ -1991,8 +2040,8 @@ fn run_form_op<T: Send + 'static>(
     form: &Entity<Form>,
     dialog: &'static str,
     failed_title_key: &'static str,
-    repo: PathBuf,
-    op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+    repo: GitContext,
+    op: impl FnOnce(&GitContext) -> anyhow::Result<T> + Send + 'static,
     on_ok: impl FnOnce(T, &Entity<Form>, &mut Window, &mut App) + 'static,
     on_settled: Option<OnChanged>,
     window: &mut Window,
@@ -2010,8 +2059,10 @@ fn run_form_op<T: Send + 'static>(
         return;
     }
     let done_form = form.clone();
+    let context = repo.clone();
+    let source_store = AppStore::global(cx);
     let started = git_ui::spawn_gated(
-        &repo.to_string_lossy(),
+        &repo,
         op,
         move |result, window, cx| {
             let form = done_form;
@@ -2024,7 +2075,12 @@ fn run_form_op<T: Send + 'static>(
                     on_ok(value, &form, window, cx);
                 }
                 Err(err) => {
-                    let detail = error_text(&err);
+                    let detail = git_ui::repo_text(
+                        &source_store,
+                        &context,
+                        git_ui::error_text_for_store(&err, &source_store, cx),
+                        cx,
+                    );
                     eprintln!("[git] {dialog} 失败: {detail}");
                     if is_open(dialog) {
                         let state = git_ui::error_text_state(&detail, 8, window, cx);

@@ -118,6 +118,7 @@ pub use mt_project::git::DiffSide;
 use mt_project::git::{
     CombinedFileChange, CommitFileInfo, DiffHunk, FileRevision, GitDiffResult, HunkPick, StaleDiff,
 };
+use mt_remote::GitContext;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
@@ -2189,7 +2190,7 @@ struct OpTarget {
 /// 与 [`DiffState`] 分开:后者是各种 diff 共用的「diff 内容」,这些是单文件 diff 独有的。
 /// 页签观察它:换了文件(`current` / `files` 变了)就跟着改身份与标题(见 [`tab`])。
 struct FileDiff {
-    repo_path: String,
+    context: GitContext,
     files: Vec<DiffFile>,
     current: usize,
     on_changed: Option<OnChanged>,
@@ -2452,12 +2453,26 @@ fn request_hunk_op(
             .into(),
         ),
     };
+    let source = {
+        let c = ctl.read(cx);
+        (c.context.key(), c.file().path.clone(), c.file().side)
+    };
     let (state, ctl) = (state.clone(), ctl.clone());
     Confirm::new(title, message)
         .ok_text(t("gitChanges", "discardOk"))
         .danger()
         .open(
-            move |_window, cx| run_hunk_op(&state, &ctl, op, target.clone(), cx),
+            move |_window, cx| {
+                let same_source = {
+                    let c = ctl.read(cx);
+                    c.context.key() == source.0
+                        && c.file().path == source.1
+                        && c.file().side == source.2
+                };
+                if same_source {
+                    run_hunk_op(&state, &ctl, op, target.clone(), cx);
+                }
+            },
             window,
             cx,
         );
@@ -2485,10 +2500,10 @@ fn run_hunk_op(
         if c.busy.is_some() {
             return;
         }
-        (c.repo_path.clone(), c.file().path.clone())
+        (c.context.clone(), c.file().path.clone())
     };
     // 按块操作同样写暂存区 / 工作区:与面板上的其它写操作共用一道闸,被占时就地说明
-    let Some(guard) = git_ui::gate::try_acquire(&repo) else {
+    let Some(guard) = git_ui::gate::try_acquire_key(&repo.repository_key()) else {
         ctl.update(cx, |c, cx| {
             c.op_error = Some(git_ui::gate_busy_text().to_string());
             c.stale = false;
@@ -2508,17 +2523,13 @@ fn run_hunk_op(
     let (state, ctl) = (state.clone(), ctl.clone());
     let applied = picks.clone();
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                let repo = std::path::Path::new(&repo);
-                match op {
-                    HunkOp::Stage => mt_project::git::stage_hunks(repo, &path, &diff, &picks),
-                    HunkOp::Unstage => mt_project::git::unstage_hunks(repo, &path, &diff, &picks),
-                    HunkOp::Discard => mt_project::git::discard_hunks(repo, &path, &diff, &picks),
-                }
-            })
-            .await;
+        let executor = repo.clone();
+        let result = mt_remote::run_git_on(&executor, move || match op {
+            HunkOp::Stage => repo.stage_hunks(&path, &diff, &picks),
+            HunkOp::Unstage => repo.unstage_hunks(&path, &diff, &picks),
+            HunkOp::Discard => repo.discard_hunks(&path, &diff, &picks),
+        })
+        .await;
         drop(guard);
         cx.update(|cx| cx.refresh_windows());
         cx.update(|cx| match result {
@@ -2562,7 +2573,15 @@ fn run_hunk_op(
                 c.op_error = Some(if c.stale {
                     t("gitCommit", "hunkStale").to_string()
                 } else {
-                    tr!("gitCommit", "hunkFailed", detail = format!("{err:#}"))
+                    let detail = if matches!(
+                        err.downcast_ref::<mt_remote::GitFailure>(),
+                        Some(mt_remote::GitFailure::RepositoryBlocked { .. })
+                    ) {
+                        git_ui::error_text_for_store(&err, &AppStore::global(cx), cx)
+                    } else {
+                        git_ui::error_text(&err)
+                    };
+                    tr!("gitCommit", "hunkFailed", detail = detail)
                 });
                 cx.notify();
             }),
@@ -2591,7 +2610,7 @@ enum Fetch {
 fn load_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, fetch: Fetch, cx: &mut App) {
     let (repo, file) = {
         let c = ctl.read(cx);
-        (c.repo_path.clone(), c.file().clone())
+        (c.context.clone(), c.file().clone())
     };
     let req = state.update(cx, |s, cx| {
         if !s.begin_fetch(fetch) {
@@ -2607,17 +2626,11 @@ fn load_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, fetch: Fetch, cx
     };
     let (state, ctl) = (state.clone(), ctl.clone());
     cx.spawn(async move |cx| {
-        let result = cx
-            .background_executor()
-            .spawn(async move {
-                mt_project::git::get_git_diff_from(
-                    std::path::Path::new(&repo),
-                    &file.path,
-                    file.old_path.as_deref(),
-                    file.side,
-                )
-            })
-            .await;
+        let executor = repo.clone();
+        let result = mt_remote::run_git_on(&executor, move || {
+            repo.get_git_diff_from(&file.path, file.old_path.as_deref(), file.side)
+        })
+        .await;
         state.update(cx, |s: &mut DiffState, cx| {
             if !s.land_fetch(req, fetch, result) {
                 return;
@@ -3142,7 +3155,7 @@ fn choose_modal_file(
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
     files: &[ModalFile],
-    repo_path: &str,
+    repo_path: &GitContext,
     index: usize,
     cx: &mut App,
 ) {
@@ -3163,7 +3176,7 @@ fn step_modal_file(
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
     files: &[ModalFile],
-    repo_path: &str,
+    repo_path: &GitContext,
     scroll: &UniformListScrollHandle,
     delta: isize,
     cx: &mut App,
@@ -3191,7 +3204,7 @@ fn modal_row(
     files: &Rc<Vec<ModalFile>>,
     pick: &Entity<CommitPick>,
     state: &Entity<DiffState>,
-    repo_path: &SharedString,
+    repo_path: &GitContext,
     selected: usize,
     tree: bool,
 ) -> Option<AnyElement> {
@@ -3258,7 +3271,7 @@ fn modal_row(
 /// 不到旧内容,diff 会显示成「整文件新增」。
 fn load_modal_file(
     state: &Entity<DiffState>,
-    repo_path: &str,
+    repo_path: &GitContext,
     file: &ModalFile,
     fetch: Fetch,
     cx: &mut App,
@@ -3269,13 +3282,9 @@ fn load_modal_file(
             load_commit_file_at(state, repo_path, hash, &file.path, old_path, fetch, cx);
         }
         ModalFileSource::Revisions { base, head } => {
-            let (repo, base, head) = (repo_path.to_string(), base.clone(), head.clone());
-            load_diff_with(state, fetch, cx, move || {
-                mt_project::git::get_revision_file_diff(
-                    std::path::Path::new(&repo),
-                    base.as_ref(),
-                    head.as_ref(),
-                )
+            let (repo, base, head) = (repo_path.clone(), base.clone(), head.clone());
+            load_diff_with(state, Some(repo_path), fetch, cx, move || {
+                repo.get_revision_file_diff(base.as_ref(), head.as_ref())
             });
         }
     }
@@ -3284,25 +3293,16 @@ fn load_modal_file(
 /// 某个提交里一个文件的 diff:旧路径由调用方给(单文件历史没有整份文件列表)。
 fn load_commit_file_at(
     state: &Entity<DiffState>,
-    repo_path: &str,
+    repo_path: &GitContext,
     commit_hash: &str,
     path: &str,
     old_path: Option<String>,
     fetch: Fetch,
     cx: &mut App,
 ) {
-    let (repo, hash, path) = (
-        repo_path.to_string(),
-        commit_hash.to_string(),
-        path.to_string(),
-    );
-    load_diff_with(state, fetch, cx, move || {
-        mt_project::git::get_commit_file_diff(
-            std::path::Path::new(&repo),
-            &hash,
-            &path,
-            old_path.as_deref(),
-        )
+    let (repo, hash, path) = (repo_path.clone(), commit_hash.to_string(), path.to_string());
+    load_diff_with(state, Some(repo_path), fetch, cx, move || {
+        repo.get_commit_file_diff(&hash, &path, old_path.as_deref())
     });
 }
 
@@ -3310,6 +3310,7 @@ fn load_commit_file_at(
 /// (见 [`DiffState::begin_fetch`] / [`DiffState::land_fetch`])。
 fn load_diff_with(
     state: &Entity<DiffState>,
+    context: Option<&GitContext>,
     fetch: Fetch,
     cx: &mut App,
     load: impl FnOnce() -> anyhow::Result<GitDiffResult> + Send + 'static,
@@ -3326,8 +3327,12 @@ fn load_diff_with(
     };
 
     let state = state.clone();
+    let context = context.cloned();
     cx.spawn(async move |cx| {
-        let result = cx.background_executor().spawn(async move { load() }).await;
+        let result = match context {
+            Some(context) => mt_remote::run_git_on(&context, load).await,
+            None => cx.background_executor().spawn(async move { load() }).await,
+        };
         state.update(cx, |s: &mut DiffState, cx| {
             if s.land_fetch(req, fetch, result) {
                 cx.notify();
@@ -3363,7 +3368,7 @@ impl CommitFileDiffPane {
     /// 换成另一个(提交, 文件)。重命名过的文件要给 `old_path`,否则父树里查不到旧内容。
     pub(crate) fn load(
         &self,
-        repo_path: &str,
+        repo_path: &GitContext,
         commit_hash: &str,
         path: &str,
         old_path: Option<String>,
@@ -3431,6 +3436,118 @@ mod tests {
     use mt_project::git::DiffLine;
 
     use super::*;
+
+    #[gpui::test]
+    async fn last_hunk_reloads_sequence_and_preserves_adopted_hooks(cx: &mut gpui::TestAppContext) {
+        cx.skip_drawing();
+        cx.background_executor.allow_parking();
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-diff-consumer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        git(&["config", "core.autocrlf", "false"]);
+        for path in ["a", "b"] {
+            std::fs::write(root.join(path), "old\n").unwrap();
+        }
+        git(&["add", "a", "b"]);
+        for path in ["a", "b"] {
+            std::fs::write(root.join(path), "new\n").unwrap();
+        }
+        let repo = GitContext::local(root.to_string_lossy().into_owned());
+        let file = |path: &str| DiffFile {
+            path: path.into(),
+            old_path: None,
+            side: DiffSide::Unstaged,
+            status_label: "M".into(),
+            hunk_actions: true,
+        };
+        let stale_hook = Rc::new(std::cell::Cell::new(0));
+        let changed = Rc::new(std::cell::Cell::new(0));
+        let switched = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (state, ctl) = cx.update(|cx| {
+            let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+            let stale = stale_hook.clone();
+            let page = pages::FilePage::new(
+                &store,
+                repo.clone(),
+                vec![file("a"), file("b")],
+                0,
+                FileDiffHooks {
+                    on_changed: Some(Rc::new(move |_| stale.set(stale.get() + 1))),
+                    ..FileDiffHooks::default()
+                },
+                cx,
+            );
+            (page.state.clone(), page.ctl.clone())
+        });
+        cx.condition(&state, |s, _| !s.loading).await;
+        cx.update(|cx| {
+            let page = pages::FilePage {
+                state: state.clone(),
+                ctl: ctl.clone(),
+            };
+            let (new_changed, new_switched) = (changed.clone(), switched.clone());
+            let remaining = file("b");
+            page.adopt(
+                repo.clone(),
+                vec![file("a"), file("b")],
+                0,
+                FileDiffHooks {
+                    on_changed: Some(Rc::new(move |_| new_changed.set(new_changed.get() + 1))),
+                    on_switch: Some(Rc::new(move |file, _| {
+                        new_switched.borrow_mut().push(file.path.clone())
+                    })),
+                    reload_files: Some(Rc::new(move |done, cx| {
+                        done(Some(vec![remaining.clone()]), cx)
+                    })),
+                },
+                cx,
+            );
+            let target = state.read(cx).op_target(OpScope::Hunk(0)).unwrap();
+            run_hunk_op(&state, &ctl, HunkOp::Stage, target, cx);
+            assert!(ctl.read(cx).busy.is_some());
+            page.adopt(
+                GitContext::local("/must-not-adopt-during-write"),
+                vec![file("other")],
+                0,
+                FileDiffHooks::default(),
+                cx,
+            );
+            assert_eq!(ctl.read(cx).context, repo);
+        });
+        cx.condition(&ctl, |c, _| c.busy.is_none()).await;
+        cx.condition(&state, |s, _| !s.loading).await;
+        cx.update(|cx| {
+            assert_eq!(ctl.read(cx).file().path, "b");
+            assert!(state.read(cx).error.is_none());
+            assert_eq!(state.read(cx).result.as_ref().unwrap().new_content, "new\n");
+        });
+        assert_eq!(stale_hook.get(), 0);
+        assert_eq!(changed.get(), 1);
+        assert_eq!(&*switched.borrow(), &["b".to_string()]);
+        assert_eq!(git(&["show", ":a"]), b"new\n");
+        assert_eq!(git(&["show", ":b"]), b"old\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn hunk(lines: Vec<DiffLine>) -> DiffHunk {
         DiffHunk {

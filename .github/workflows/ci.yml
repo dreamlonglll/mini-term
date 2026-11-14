@@ -6,6 +6,8 @@ name: CI
 #   直推 main 为主,每次 push 都跑一遍两平台的全量 check + test 不值。
 # - pull_request:分支保护 `main-ci-gate` 要求 `Rust workspace` 这个 check 过了才能
 #   合(外部 PR 走这条),砍掉它 PR 会永远卡在 "waiting for status"。
+#   Remote Git musl 另行验证静态 helper 与 glibc 2.31;失败会令 CI 失败,但既有
+#   分支保护只要求 Rust workspace,不会自动把新增 check 设为必过。
 # - workflow_dispatch:想在某个分支上手动跑一次时用。
 on:
   push:
@@ -27,6 +29,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 独立于 GPUI 工作区构建;PR / 手动运行 / 发版 tag 都执行,不调用发布流程。
+  remote-git-musl:
+    name: Remote Git musl
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      HELPER_TARGET: linux-x86_64
+      HELPER_RUST_TARGET: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install native musl build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools build-essential binutils perl pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add "$HELPER_RUST_TARGET"
+          rustc -vV
+
+      # 与工作区 CI 共用只读缓存;不为 PR / dispatch 另存一份。
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          save-if: false
+          workspaces: . -> target
+
+      - name: Build static remote Git helper
+        run: bash scripts/build-git-helper-musl.sh "$HELPER_RUST_TARGET"
+
+      - name: Validate static binary and stage target asset
+        run: |
+          node scripts/stage-git-helpers.mjs --target "$HELPER_TARGET" \
+            --binary "target/$HELPER_RUST_TARGET/release/mt-git-helper" --output helper-assets
+
+      - name: Framed discover/status with system Git on glibc 2.31
+        shell: bash
+        # 与 release.yml 同一个 Ubuntu 20.04 multiarch index,由 Docker 选择原生架构。
+        run: |
+          sudo docker run --rm -v "$PWD:/workspace:ro" -w /workspace \
+            -e HELPER_TARGET="$HELPER_TARGET" \
+            ubuntu:focal-20250404@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214 bash -euc '
+              apt-get update
+              apt-get install -y --no-install-recommends git python3 ca-certificates
+              python3 scripts/smoke-git-helper-old-glibc.py \
+                "/workspace/helper-assets/$HELPER_TARGET/mt-git-helper"
+            '
+
   rust:
     name: Rust workspace
     runs-on: ubuntu-22.04
