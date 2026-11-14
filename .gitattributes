@@ -5,3 +5,7 @@ theme/**/*.json text eol=lf
 
 # 内置字体经 include_bytes! 编进 exe,一个字节都不能被换行转换动到
 *.ttf binary
+
+# 逐段解冲突的测试夹具里写着真的冲突标记(7 个字符)。调大这个文件的标记长度,
+# 免得 CI 的 Whitespace check(`git diff --check`)把它们当成合并残留
+crates/mt-project/src/git/conflict_blocks_tests.rs conflict-marker-size=32
