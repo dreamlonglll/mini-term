@@ -1050,15 +1050,7 @@ impl GitPanel {
                             )
                         });
                     }
-                    Err(err) => {
-                        eprintln!("[git] 发现仓库失败: {err:#}");
-                        if !this.local_project() {
-                            this.load_error =
-                                Some(git_ui::error_text_for_store(&err, &this.store, cx));
-                            this.repos.clear();
-                            this.selected_repo.clear();
-                        }
-                    }
+                    Err(err) => this.repo_discovery_failed(&err, cx),
                 }
                 if before != this.selected_repo {
                     let error = this.load_error.take();
@@ -1085,6 +1077,15 @@ impl GitPanel {
             });
         })
         .detach();
+    }
+
+    fn repo_discovery_failed(&mut self, err: &anyhow::Error, cx: &mut Context<Self>) {
+        eprintln!("[git] 发现仓库失败: {err:#}");
+        if !self.local_project() {
+            self.load_error = Some(git_ui::error_text_for_store(err, &self.store, cx));
+        }
+        self.repos.clear();
+        self.selected_repo.clear();
     }
 
     /// 重载分支列表与随它一起的元数据(领先落后、最近分支、进行中操作、签名)。不转圈,
@@ -4040,6 +4041,38 @@ fn repo_detail(repo_path: &str, project_path: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn local_repo_discovery_failure_clears_previous_repositories(cx: &mut gpui::TestAppContext) {
+        cx.skip_drawing();
+        cx.update(gpui_component::init);
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let panel = cx.new(|cx| GitPanel::new(store, window, cx));
+            panel.update(cx, |this, cx| {
+                this.project_context = Some(GitContext::local("/local-project"));
+                this.repos = vec![GitRepoInfo {
+                    name: "old-repo".into(),
+                    path: "/local-project/old-repo".into(),
+                    current_branch: Some("main".into()),
+                    is_worktree: false,
+                }];
+                this.selected_repo = "/local-project/old-repo".into();
+                this.repo_discovery_failed(&anyhow::anyhow!("discovery failed"), cx);
+                this.push_repo_down(cx);
+                assert!(this.repos.is_empty());
+                assert!(this.selected_repo.is_empty());
+                assert!(this.repo_context().is_none());
+                assert!(this.load_error.is_none(), "local discovery remains silent");
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
 
     /// 比例钳在 0.15~0.85。
     #[test]

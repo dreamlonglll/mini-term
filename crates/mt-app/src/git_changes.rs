@@ -77,8 +77,8 @@
 //! 勾着「修改上次提交」时的「已推送」判定另走一趟([`GitChanges::refresh_amend`]),不挡
 //! 列表:它要逐个远程分支做祖先判定,大仓库可达十几秒。按引用签名缓存 —— HEAD 与远程跟踪
 //! 分支都没动就不重取。
-//! 本地勾选 amend 立即允许提交,读取元数据失败自动取消;远程首次勾选 / 恢复草稿时
-//! 阻挡提交并在失败时保留意图。之后的周期核验不让按钮闪灰。撤销消息、普通草稿历史、最近提交消息分组共存,恢复消息
+//! 本地勾选 amend 立即允许提交,仅勾选时读取元数据失败自动取消;周期刷新失败保留原状态。
+//! 远程首次勾选 / 恢复草稿时阻挡提交并在失败时保留意图。之后的周期核验不让按钮闪灰。撤销消息、普通草稿历史、最近提交消息分组共存,恢复消息
 //! 保存被替换草稿而不把它重新放回待恢复队列,菜单以稳定身份消费原仓库的条目。
 //! 异步提交失败同时核对 store 活动项目与已选仓库,隐藏抽屉保留的旧 context 不能吞掉错误。
 //!
@@ -955,11 +955,9 @@ impl GitChanges {
                     && let Some((key, info)) = fetched
                 {
                     this.amend_key = info.as_ref().and(key);
-                    if info.is_none() {
-                        if !this.context.as_ref().is_some_and(GitContext::is_remote) {
-                            this.amend = false;
-                            this.amend_prefill = None;
-                        }
+                    if info.is_none()
+                        && this.context.as_ref().is_some_and(GitContext::is_remote)
+                    {
                         this.commit_error =
                             Some(t("gitChanges", "metadataUnavailable").to_string());
                         cx.notify();
@@ -2591,20 +2589,27 @@ fn amend_stale(known: Option<u64>, now: Option<u64>) -> bool {
     now.is_none() || now != known
 }
 
-/// [`GitChanges::refresh_amend`] 的后台那一趟:键没变返回 `None`(不重取),否则
-/// `Some((新键, 信息))` —— 信息读失败 / 空仓库为 `None`,与原先随列表取时同一口径。
+/// [`GitChanges::refresh_amend`] 的后台那一趟:键没变或本地读取失败返回 `None`(保留原状态)。
+/// 否则返回 `Some((新键, 信息))`;远程读取失败仍清掉元数据,阻止未经核验的 amend。
 fn fetch_amend(repo: &GitContext, known: Option<u64>) -> Option<(Option<u64>, Option<AmendInfo>)> {
     let key = amend_key_of(repo);
-    amend_stale(known, key).then(|| {
-        let info = repo.amend_info().unwrap_or_else(|err| {
+    if !amend_stale(known, key) {
+        return None;
+    }
+    let info = match repo.amend_info() {
+        Ok(info) => info,
+        Err(err) => {
             eprintln!(
                 "[git] {}: amend metadata failed: {err:#}",
                 git_ui::repo_label(repo)
             );
+            if !repo.is_remote() {
+                return None;
+            }
             None
-        });
-        (key, info)
-    })
+        }
+    };
+    Some((key, info))
 }
 
 /// 一次取数:变更列表 + 冲突细节 + 提交区要的 HEAD 信息。全部是只读的 git2 查询。
@@ -4248,6 +4253,32 @@ mod tests {
         .unwrap();
         cx.condition(&changes, |this, _| this.amend_key.is_some())
             .await;
+        // A periodic local metadata failure must preserve the user's amend intent
+        // and the last verified metadata, unlike a failure while first toggling it.
+        std::fs::remove_dir_all(root.join(".git")).unwrap();
+        let landed = Rc::new(Cell::new(false));
+        let signal = landed.clone();
+        let subscription = cx.update(|cx| {
+            cx.observe(&changes, move |_, _| signal.set(true))
+        });
+        cx.update(|cx| {
+            changes.update(cx, |this, cx| {
+                this.amend_prefill = Some("first".into());
+                this.refresh_amend(cx);
+            });
+        });
+        cx.condition(&changes, |_, _| landed.get()).await;
+        cx.update(|cx| {
+            let this = changes.read(cx);
+            assert!(this.amend);
+            assert_eq!(this.amend_prefill.as_deref(), Some("first"));
+            assert_eq!(this.amend_info.as_ref().unwrap().message.trim(), "first");
+            assert!(this.amend_key.is_some());
+            assert!(this.commit_error.is_none());
+            assert_eq!(this.commit_input.read(cx).value().as_ref(), "amended");
+            assert!(this.commit_blocker(false, cx).is_none());
+        });
+        drop(subscription);
         drop(hooks);
         drop(changes);
         cx.run_until_parked();
@@ -4366,20 +4397,25 @@ mod tests {
                 (changes, a_input, b_input, b_revision, blank)
             })
             .unwrap();
-        cx.condition(&changes, |this, _| this.commit_error.is_some())
-            .await;
+        let landed = Rc::new(Cell::new(false));
+        let signal = landed.clone();
+        let subscription = cx.update(|cx| {
+            cx.observe(&changes, move |_, _| signal.set(true))
+        });
+        cx.condition(&changes, |_, _| landed.get()).await;
+        drop(subscription);
         cx.run_until_parked();
         cx.update_window(window.into(), |_, window, cx| {
             changes.update(cx, |this, cx| {
                 assert!(
-                    !this.amend,
-                    "failed local metadata verification cancels amend"
+                    this.amend,
+                    "failed periodic local verification preserves amend"
                 );
                 assert!(
                     this.amend_info.is_none(),
                     "missing fixture repository cannot verify HEAD"
                 );
-                this.amend = true;
+                assert!(this.commit_error.is_none());
                 this.amend_prefill = Some("old HEAD message".into());
                 assert!(this.commit_blocker(false, cx).is_none());
                 this.amend_info = Some(AmendInfo {
