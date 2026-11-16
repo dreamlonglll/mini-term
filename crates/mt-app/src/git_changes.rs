@@ -955,9 +955,7 @@ impl GitChanges {
                     && let Some((key, info)) = fetched
                 {
                     this.amend_key = info.as_ref().and(key);
-                    if info.is_none()
-                        && this.context.as_ref().is_some_and(GitContext::is_remote)
-                    {
+                    if info.is_none() && this.context.as_ref().is_some_and(GitContext::is_remote) {
                         this.commit_error =
                             Some(t("gitChanges", "metadataUnavailable").to_string());
                         cx.notify();
@@ -4258,9 +4256,7 @@ mod tests {
         std::fs::remove_dir_all(root.join(".git")).unwrap();
         let landed = Rc::new(Cell::new(false));
         let signal = landed.clone();
-        let subscription = cx.update(|cx| {
-            cx.observe(&changes, move |_, _| signal.set(true))
-        });
+        let subscription = cx.update(|cx| cx.observe(&changes, move |_, _| signal.set(true)));
         cx.update(|cx| {
             changes.update(cx, |this, cx| {
                 this.amend_prefill = Some("first".into());
@@ -4399,9 +4395,7 @@ mod tests {
             .unwrap();
         let landed = Rc::new(Cell::new(false));
         let signal = landed.clone();
-        let subscription = cx.update(|cx| {
-            cx.observe(&changes, move |_, _| signal.set(true))
-        });
+        let subscription = cx.update(|cx| cx.observe(&changes, move |_, _| signal.set(true)));
         cx.condition(&changes, |_, _| landed.get()).await;
         drop(subscription);
         cx.run_until_parked();
