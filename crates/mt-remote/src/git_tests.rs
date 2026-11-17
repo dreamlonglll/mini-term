@@ -11,6 +11,7 @@ use tokio::sync::Notify;
 
 static UNIQUE: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(unix)]
 #[test]
 fn helper_launch_quotes_paths_and_overrides_remote_encoding_region() {
     use std::process::Command;
