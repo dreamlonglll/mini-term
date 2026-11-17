@@ -3512,14 +3512,21 @@ impl GitPanel {
                 })
                 .tip(tip)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
-                    if this.branches.is_empty() {
-                        this.load_branches(cx);
-                    }
-                    crate::git_branches::open(cx.entity(), window, cx);
+                    this.open_branch_popup(window, cx)
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// 分支徽标的点击:打开分支弹窗。跑在面板自己的 update 里 —— 快照必须在这里取好
+    /// 带过去,弹窗那边再 `panel.read` 会 panic(见 [`crate::git_branches::open`])。
+    fn open_branch_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
+        if self.branches.is_empty() {
+            self.load_branches(cx);
+        }
+        let snapshot = self.branch_snapshot();
+        crate::git_branches::open(cx.entity(), snapshot, window, cx);
     }
 
     /// 右段图标按钮组:Fetch / 拉取 / 推送 / 贮藏 / 刷新。
@@ -4069,6 +4076,30 @@ mod tests {
                 assert!(this.repo_context().is_none());
                 assert!(this.load_error.is_none(), "local discovery remains silent");
             });
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// 分支徽标的点击跑在面板自己的 update 里,这时打开分支弹窗不能再读面板 ——
+    /// v1.13.31 的 `BranchPopup::new` 里 `panel.read` 撞上借用,panic 落在窗口回调里
+    /// 不能展开,点一下徽标进程就 abort。
+    #[gpui::test]
+    fn branch_popup_opens_from_inside_panel_update(cx: &mut gpui::TestAppContext) {
+        use crate::prompt::{close_guarded, is_open, kind};
+
+        cx.skip_drawing();
+        cx.update(gpui_component::init);
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let window = cx.add_window(|window, cx| {
+            let empty = cx.new(|_| gpui::Empty);
+            gpui_component::Root::new(empty, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            let panel = cx.new(|cx| GitPanel::new(store, window, cx));
+            panel.update(cx, |this, cx| this.open_branch_popup(window, cx));
+            assert!(is_open(kind::GIT_BRANCHES));
+            close_guarded(kind::GIT_BRANCHES, window, cx);
         })
         .unwrap();
         cx.run_until_parked();

@@ -403,13 +403,22 @@ pub struct BranchPopup {
 }
 
 /// 打开分支弹窗。已经开着时是空操作。
-pub(crate) fn open(panel: Entity<GitPanel>, window: &mut Window, cx: &mut App) {
+///
+/// `snapshot` 由调用方给(与 `git_push::open` 的 `repo` 同一个理由):调用点在 Git 面板
+/// 自己的 update 里,这时再 `panel.read` 会撞上「实体正被更新」的借用 —— 这个 panic 落在
+/// 窗口消息回调里不能展开,进程直接 abort(v1.13.31 点分支徽标闪退)。
+pub(crate) fn open(
+    panel: Entity<GitPanel>,
+    snapshot: BranchSnapshot,
+    window: &mut Window,
+    cx: &mut App,
+) {
     // 守卫在建视图之前判:拦下来时输入框已建好、聚焦也排上了,焦点会被送进虚空
     // (与 `prompt::show_prompt` 同一个坑)
     if prompt::is_open(kind::GIT_BRANCHES) {
         return;
     }
-    let view = cx.new(|cx| BranchPopup::new(panel, window, cx));
+    let view = cx.new(|cx| BranchPopup::new(panel, snapshot, window, cx));
     let input = view.read(cx).query.clone();
     open_guarded(kind::GIT_BRANCHES, window, cx, {
         let view = view.clone();
@@ -430,7 +439,14 @@ pub(crate) fn open(panel: Entity<GitPanel>, window: &mut Window, cx: &mut App) {
 }
 
 impl BranchPopup {
-    fn new(panel: Entity<GitPanel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// ⚠️ 这里不能 `panel.read`:构造跑在面板自己的 update 里(见 [`open`]),
+    /// 打开那一刻的快照由调用方带进来。
+    fn new(
+        panel: Entity<GitPanel>,
+        snapshot: BranchSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let query = cx
             .new(|cx| InputState::new(window, cx).placeholder(t("gitBranch", "searchPlaceholder")));
         let mut subs = vec![cx.subscribe_in(
@@ -449,10 +465,9 @@ impl BranchPopup {
         )];
         // 分支列表 / 忙碌态在面板上变了(Fetch 回来、后台刷新)跟着重画
         subs.push(cx.observe(&panel, |_, _, cx| cx.notify()));
-        let snapshot = RefCell::new(panel.read(cx).branch_snapshot());
         Self {
             panel,
-            snapshot,
+            snapshot: RefCell::new(snapshot),
             query,
             cursor: 0,
             scroll: VirtualListScrollHandle::new(),
