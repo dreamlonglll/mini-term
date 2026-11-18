@@ -3,6 +3,9 @@
 //! **按屏幕几何找相邻 pane,而不是在树上推方向**:树形结构里「右边」可能跨好几层
 //! split,几何最近邻既简单又与用户所见一致。旧版从 DOM 的 `getBoundingClientRect`
 //! 取矩形,这里从 gpui 的元素 bounds 取 —— 打分公式一字不改。
+//!
+//! 后半是列表行的键盘导航([`row_nav_target`]):文件树与项目列表的 ↑ / ↓ / Home / End,
+//! 外加文件树 ← / → 的「回父行 / 进子行」。只算下标,焦点与滚动由各列表自己落。
 
 /// 几何方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,9 +66,107 @@ pub fn adjacent_pane(rects: &[PaneRect], from_pane_id: &str, dir: Direction) -> 
     best.map(|(id, _)| id.to_string())
 }
 
+// ─── 列表行的键盘导航 ──────────────────────────────────────────
+
+/// 列表 / 树里的行焦点往哪挪。文件树与项目列表共用(两者的行都是 `tab_index(0)` 的
+/// 焦点停靠点,此前只能靠 Tab 逐个走)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowNav {
+    Prev,
+    Next,
+    First,
+    Last,
+    /// 树:回到父行(← 落在已折叠的目录或文件上)。
+    Parent,
+    /// 树:进到第一个子行(→ 落在已展开的目录上)。
+    FirstChild,
+}
+
+/// 两种列表共有的四个键(↑ / ↓ / Home / End)。← / → 在树里另有折叠 / 展开的语义,
+/// 由文件树自己判。
+pub fn row_nav_for_key(key: &str) -> Option<RowNav> {
+    match key {
+        "up" => Some(RowNav::Prev),
+        "down" => Some(RowNav::Next),
+        "home" => Some(RowNav::First),
+        "end" => Some(RowNav::Last),
+        _ => None,
+    }
+}
+
+/// 焦点该挪到第几行。`depths` 是**当前可见行**按序的缩进层级(扁平列表全给 0 也行,
+/// 只有 [`RowNav::Parent`] / [`RowNav::FirstChild`] 看它),`current` 是焦点所在的行。
+///
+/// 到头停住、不循环(资源管理器 / VS Code 的树都是这样);没有父行 / 子行、或者
+/// 目标就是自己时返回 `None`,调用方据此什么都不做。父行按「往上第一个更浅的行」找,
+/// 不要求恰好浅一层 —— 拍平的行序里那一行一定就是它的父目录。
+pub fn row_nav_target(depths: &[usize], current: usize, nav: RowNav) -> Option<usize> {
+    let depth = *depths.get(current)?;
+    let target = match nav {
+        RowNav::Prev => current.checked_sub(1)?,
+        RowNav::Next => current + 1,
+        RowNav::First => 0,
+        RowNav::Last => depths.len() - 1,
+        RowNav::Parent => (0..current).rev().find(|&row| depths[row] < depth)?,
+        RowNav::FirstChild => {
+            let next = current + 1;
+            (*depths.get(next)? > depth).then_some(next)?
+        }
+    };
+    (target < depths.len() && target != current).then_some(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 扁平的四个键:到头停住、不绕圈;目标是自己(已在首行按 Home)也算不动。
+    #[test]
+    fn 列表上下与首尾到头停住() {
+        let flat = [0, 0, 0];
+        assert_eq!(row_nav_target(&flat, 1, RowNav::Prev), Some(0));
+        assert_eq!(row_nav_target(&flat, 1, RowNav::Next), Some(2));
+        assert_eq!(row_nav_target(&flat, 0, RowNav::Prev), None);
+        assert_eq!(row_nav_target(&flat, 2, RowNav::Next), None);
+        assert_eq!(row_nav_target(&flat, 2, RowNav::First), Some(0));
+        assert_eq!(row_nav_target(&flat, 0, RowNav::Last), Some(2));
+        assert_eq!(row_nav_target(&flat, 0, RowNav::First), None);
+        assert_eq!(row_nav_target(&flat, 2, RowNav::Last), None);
+        // 焦点行已不在可见行里(刚被折叠掉):不动
+        assert_eq!(row_nav_target(&flat, 3, RowNav::Prev), None);
+        assert_eq!(row_nav_target(&[], 0, RowNav::First), None);
+    }
+
+    /// 树的 ← / →:回父行跳过中间的兄弟子树,只进「紧跟着的更深一层」。
+    #[test]
+    fn 树里回父行与进首个子行() {
+        // src/            0
+        //   main.rs       1
+        //   lib/          1
+        //     mod.rs      2
+        //   util.rs       1
+        // README.md       0
+        let tree = [0, 1, 1, 2, 1, 0];
+        assert_eq!(row_nav_target(&tree, 4, RowNav::Parent), Some(0));
+        assert_eq!(row_nav_target(&tree, 3, RowNav::Parent), Some(2));
+        assert_eq!(row_nav_target(&tree, 0, RowNav::Parent), None);
+        assert_eq!(row_nav_target(&tree, 5, RowNav::Parent), None);
+        assert_eq!(row_nav_target(&tree, 0, RowNav::FirstChild), Some(1));
+        assert_eq!(row_nav_target(&tree, 2, RowNav::FirstChild), Some(3));
+        // 展开着但是空目录 / 还没列完:下一行不更深,不动
+        assert_eq!(row_nav_target(&tree, 1, RowNav::FirstChild), None);
+        assert_eq!(row_nav_target(&tree, 5, RowNav::FirstChild), None);
+    }
+
+    #[test]
+    fn 只认四个列表键() {
+        assert_eq!(row_nav_for_key("up"), Some(RowNav::Prev));
+        assert_eq!(row_nav_for_key("down"), Some(RowNav::Next));
+        assert_eq!(row_nav_for_key("home"), Some(RowNav::First));
+        assert_eq!(row_nav_for_key("end"), Some(RowNav::Last));
+        assert_eq!(row_nav_for_key("left"), None);
+        assert_eq!(row_nav_for_key("pageup"), None);
+    }
 
     fn rect(id: &str, left: f32, top: f32, w: f32, h: f32) -> PaneRect {
         PaneRect {

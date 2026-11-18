@@ -1059,7 +1059,12 @@ fn remove_path_no_follow(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_entry(project_root: &Path, path: &Path) -> Result<()> {
+/// 删除前的校验,返回校验后的路径(Windows 上已剥 `\\?\`),删除直接对它下手。
+///
+/// 永久删除([`delete_entry`])与「移到回收站」(mt-app 的 `file_tree::recycle`)共用这一把
+/// 尺子,两条路的安全口径不会各说各话:条目必须在项目根内 —— 父目录跟随链接后仍在根内,
+/// **叶子本身不跟随**(删的是链接 / junction 自己,不是它指向的内容);也不能是项目根本身。
+pub fn resolve_deletable_entry(project_root: &Path, path: &Path) -> Result<PathBuf> {
     let target = verify_under_project_root(project_root, path, true)?;
     // 多一道保险:绝不允许删除项目根目录本身
     // 必须与 verify_under_project_root 同样走 mt_core::path::canonicalize(剥掉 `\\?\`),
@@ -1068,7 +1073,86 @@ pub fn delete_entry(project_root: &Path, path: &Path) -> Result<()> {
     if target == root {
         bail!("不能删除项目根目录");
     }
+    Ok(target)
+}
+
+pub fn delete_entry(project_root: &Path, path: &Path) -> Result<()> {
+    let target = resolve_deletable_entry(project_root, path)?;
     remove_path_no_follow(&target)
+}
+
+/// 文件页签「文件已被删除」之后的保存:按原路径把文件重新建出来,再按编码写入 —— 这是
+/// 用户明确选了保存的结果。
+///
+/// 父目录也一起被删了的,在项目根内逐级补建:最近一级还在的祖先跟随链接后必须仍在根内、
+/// 是目录,它下面缺的每一段都只能是普通名字(没有 `..`、根、盘符)。文件已经在了(别处
+/// 先建了回来)就是普通的覆盖写。编码表示不了 / 超限的拒绝都在碰盘之前,与
+/// [`write_file_content_as`] 同一口径;最后那一下写入也走它(跟随链接后再校验一次)。
+pub fn recreate_file_content_as(
+    project_root: &Path,
+    path: &Path,
+    content: &str,
+    encoding: TextEncoding,
+) -> Result<()> {
+    if content.len() as u64 > MAX_FILE_VIEW_SIZE {
+        bail!("内容过大(>1MB),拒绝写入");
+    }
+    let bytes = encoding.encode(content)?;
+    if bytes.len() as u64 > MAX_FILE_VIEW_SIZE {
+        bail!("内容过大(>1MB),拒绝写入");
+    }
+    if !path_entry_exists(path)? {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("无法获取父目录: {}", path.display()))?;
+        // 从父目录往上找最近一级还在的祖先,沿途缺的名字倒着记下
+        let mut existing = parent;
+        let mut missing: Vec<&OsStr> = Vec::new();
+        while !path_entry_exists(existing)? {
+            match existing.components().next_back() {
+                Some(std::path::Component::Normal(name)) => missing.push(name),
+                _ => bail!("无法重建父目录: {}", parent.display()),
+            }
+            existing = existing
+                .parent()
+                .ok_or_else(|| anyhow!("无法重建父目录: {}", parent.display()))?;
+        }
+        let root = mt_core::path::canonicalize(project_root)
+            .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
+        let mut dir = mt_core::path::canonicalize(existing)
+            .map_err(|e| anyhow!("父目录不可访问: {}: {}", existing.display(), e))?;
+        if !dir.starts_with(&root) || !dir.is_dir() {
+            bail!(
+                "路径不在项目根目录内: {} (root={})",
+                dir.display(),
+                root.display()
+            );
+        }
+        for name in missing.iter().rev() {
+            dir.push(name);
+            match fs::create_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("创建目录失败: {}", dir.display()));
+                }
+            }
+        }
+        let leaf = verify_under_project_root(project_root, path, false)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&leaf)
+        {
+            Ok(_) => {}
+            // 这一会儿被别处建了回来:交给下面的普通写入去校验(是不是文件、跟随后在不在根内)
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("创建文件失败: {}", leaf.display()));
+            }
+        }
+    }
+    write_file_content_as(project_root, path, content, encoding)
 }
 
 #[cfg(test)]
@@ -2104,6 +2188,68 @@ mod tests {
         let from_verbatim =
             verify_under_project_root(&verbatim_root, &verbatim_file, true).unwrap();
         assert_eq!(plain, from_verbatim);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 删除前的校验(回收站那条路也走它):根内的条目交回规范化路径,根本身与根外的一律拒。
+    #[test]
+    fn 删除前校验拒绝项目根与根外路径() {
+        let (root, file) = make_test_project();
+        assert_eq!(resolve_deletable_entry(&root, &file).unwrap(), file);
+        assert!(
+            resolve_deletable_entry(&root, &root).is_err(),
+            "不能删项目根"
+        );
+        let outside = root.parent().unwrap().join("not-in-project.txt");
+        assert!(resolve_deletable_entry(&root, &outside).is_err());
+        assert!(resolve_deletable_entry(&root, &root.join("..").join("x")).is_err());
+        assert!(
+            resolve_deletable_entry(&root, &root.join("missing.txt")).is_err(),
+            "已经不在的条目不交回路径"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 「文件已被删除」后的保存:连同被删的父目录一起按原路径建回来,内容按编码写入。
+    #[test]
+    fn 已删除的文件保存时连同父目录重建() {
+        let (root, _) = make_test_project();
+        let file = root.join("a").join("b").join("note.txt");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "old").unwrap();
+        fs::remove_dir_all(root.join("a")).unwrap();
+
+        recreate_file_content_as(&root, &file, "new", TextEncoding::Utf8).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+
+        // 文件已经在了(别处先建了回来)就是普通的覆盖写
+        recreate_file_content_as(&root, &file, "again", TextEncoding::Utf8).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "again");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 重建只在项目根内:根外的路径、带 `..` 的缺失段一律拒绝,而且什么都不建。
+    #[test]
+    fn 重建已删除文件不越出项目根() {
+        let (root, _) = make_test_project();
+        let parent = root.parent().unwrap().to_path_buf();
+        let stray = format!(
+            "mini-term-recreate-outside-{}",
+            root.file_name().unwrap().to_string_lossy()
+        );
+        let outside = parent.join(&stray).join("x.txt");
+        assert!(recreate_file_content_as(&root, &outside, "x", TextEncoding::Utf8).is_err());
+        assert!(!parent.join(&stray).exists(), "根外的目录不该被建出来");
+
+        let dotted = root
+            .join("gone")
+            .join("..")
+            .join("..")
+            .join(&stray)
+            .join("x.txt");
+        assert!(recreate_file_content_as(&root, &dotted, "x", TextEncoding::Utf8).is_err());
+        assert!(!parent.join(&stray).exists());
+        assert!(!root.join("gone").exists(), "被拒的那次不留半截目录");
         fs::remove_dir_all(&root).ok();
     }
 }

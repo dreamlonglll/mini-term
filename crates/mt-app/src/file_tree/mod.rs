@@ -60,6 +60,31 @@
 //! render 是整树拍平重建。observe 回调先比 [`store_render_signature`] —— render
 //! 从 store 读的**全部**东西的指纹(清单在那个函数的注释里),变了才 notify。
 //! ⚠️ render 里新读了 store 的什么,必须同步进那份清单,否则界面会不跟着刷。
+//!
+//! # 当前文件:高亮与定位
+//!
+//! 工作区停在文件页签上时,树里那个文件的行铺一层 `accent_subtle` 底、文件名转 accent 色
+//! (与项目列表的活动项目行同一套;与悬停的中性底、拖放落点那层更实的 accent 底都分得开);
+//! 停在终端页或 diff 页签上不高亮。当前文件不在
+//! store 里而在工作区([`crate::workbench_area::active_file_path`]),所以另挂一条对工作区的
+//! observe([`FileTree::observe_workbench`]):工作区每拍都 notify(编辑器里每敲一个字也算),
+//! 回调只比「当前文件的比较键」变没变,变了才重画 —— 与上面那道 store 闸同一个做法。
+//!
+//! 文件页签右键「在文件树中定位」([`reveal_in_tree`]):中栏收着先展开,再从根往下逐层找
+//! 通向它的那一行、展开它;某一层还没列过就排一趟列目录,列完的回调接着走
+//! ([`FileTree::advance_reveal`]),最后一帧把那一行滚进可视区并交焦点。路径比较走
+//! [`tree_path_key`](Windows 本地不分大小写、`\` 与 `/` 等价,与文件页签去重同一口径),
+//! 搜索 / 快速打开拼出来的 `D:\proj\src/a.rs` 也认得出。不在项目根内、或某一层里找不到
+//! 通向它的行(在不显示的目录里、已被移走)时,列表上方给一行就地提示,几秒后自己收。
+//!
+//! # 键盘
+//!
+//! 行拿到焦点后:Enter / Space 开文件或折叠展开;← / → 先折叠 / 展开,已折叠(或是文件)时
+//! ← 回父目录行、已展开时 → 进第一个子行;↑ / ↓ / Home / End 按可见行序挪焦点并滚进可视区,
+//! 到头停住(下标怎么算见 [`crate::focus_nav::row_nav_target`])。F2 / Delete 与右键菜单的
+//! 「重命名」「删除」同一条路、同一份可用性判断([`menu::row_key_action_available`])。
+//! **F2 不在行上绑**:它是全局 action,由 `main.rs` 按「谁拿着焦点」分流到
+//! [`FileTree::rename_focused_row`](与项目列表同一个做法)。
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -72,8 +97,8 @@ use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, Context, DragMoveEvent, Entity, ExternalPaths, Global, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder,
-    px,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    div, prelude::FluentBuilder, px,
 };
 use mt_config::{AppConfig, ProjectConfig};
 use mt_core::path_key::collapse_separators;
@@ -86,6 +111,7 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::DragFilePath;
 use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
+use crate::focus_nav::{self, RowNav};
 use crate::fs_ops;
 use crate::git_ui::flight::{Flight, Landing};
 use crate::git_watch;
@@ -98,14 +124,18 @@ mod git_refresh;
 mod menu;
 mod move_to;
 mod ops;
+mod recycle;
 #[cfg(test)]
 mod tests;
 
 use git_refresh::{GitRefreshPlan, RepoSigs};
 
-use menu::{background_menu, file_menu, mod_label};
+use menu::{FileMenuAction, background_menu, file_menu, row_key_action_available};
 use move_to::MoveSource;
-use ops::{confirm_move, start_download, start_upload};
+use ops::{
+    EntryTarget, confirm_delete_entry, confirm_move, rename_entry_prompt, start_download,
+    start_upload,
+};
 
 /// 拖拽悬停命中的落点(高亮用)。资源管理器拖进来的上传与树内拖拽移动共用:
 /// 同一时刻只可能有一种拖拽在飞,`hit_id` 是行 / 空白处的标识。
@@ -197,6 +227,51 @@ pub fn download_remote_file(
     start_download(tree, context, vec![path], window, cx);
 }
 
+/// 文件页签右键「在文件树中定位」(见模块注释「当前文件:高亮与定位」)。
+///
+/// 中栏收着时文件树不在元素树里:先把它展开,逐层展开与滚动交给文件树自己走完 ——
+/// 列目录是异步的,滚动与交焦点要等那一行真画出来的那一帧才兑现。
+pub fn reveal_in_tree(project_id: &str, path: PathBuf, cx: &mut App) {
+    let Some(tree) = cx
+        .try_global::<GlobalFileTree>()
+        .map(|global| global.0.clone())
+    else {
+        return;
+    };
+    let store = tree.read(cx).store.clone();
+    if !store.read(cx).config().middle_column_visible {
+        store.update(cx, |store, cx| store.toggle_middle_column(cx));
+    }
+    tree.update(cx, |tree, cx| tree.begin_reveal(project_id, path, cx));
+}
+
+/// 定位还在半路:等某一层目录列完再接着往下走(见 [`FileTree::advance_reveal`])。
+#[derive(Clone, Debug)]
+struct RevealRequest {
+    project_id: String,
+    /// 目标的比较键([`tree_path_key`])。
+    target: String,
+    /// 发起时的 source generation:中途换了项目 / 连接就作废。
+    generation: u64,
+    /// 这次定位里已经重列过的目录:缓存里找不到时每层最多重列一次再认定「没有」。
+    relisted: HashSet<PathBuf>,
+}
+
+/// 定位落地后等着在下一帧滚进可视区、拿焦点的那一行。那一行多半是这一拍才展开出来的,
+/// 焦点句柄也要等 render 补齐,所以不能当场滚、当场聚焦(键盘移动不走这里:行都在眼前)。
+#[derive(Clone, Debug)]
+struct PendingScroll {
+    path: PathBuf,
+    /// 这一帧把焦点交给它。第二帧的复核只滚不再聚焦。
+    focus: bool,
+    /// 下一帧再滚一次。gpui 用**上一帧**的视口矩形算这次滚动,中栏刚展开、列表刚长出
+    /// 新行的那一帧它是旧的(与项目列表「揭示」兑现两帧同一个理由)。
+    recheck: bool,
+}
+
+/// 定位失败的就地提示挂多久。一行灰字,看一眼就够,不必去点掉。
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+
 pub struct FileTree {
     store: Entity<AppStore>,
     /// 已列出的目录 → 子项。
@@ -264,6 +339,21 @@ pub struct FileTree {
     /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点后 Enter/Space
     /// 与 ←→ 才有落点,见 [`Self::on_row_key`]。
     row_focus: HashMap<PathBuf, gpui::FocusHandle>,
+    /// 行列表的滚动句柄:键盘移动与定位靠它把目标行滚进可视区。列表的子元素就是
+    /// 按序铺开的行(最后多一块空白落点),下标即行号。
+    list_scroll: ScrollHandle,
+    /// 走到一半的「在文件树中定位」。
+    reveal: Option<RevealRequest>,
+    /// 等着在下一帧兑现的滚动(与交焦点),见 render 里兑现那一段。
+    pending_scroll: Option<PendingScroll>,
+    /// 定位失败的就地提示(列表上方一行),[`NOTICE_TTL`] 后自己收。
+    notice: Option<SharedString>,
+    /// 收提示的计时。换一条提示时旧的随之作废。
+    _notice_task: Option<Task<()>>,
+    /// 上一帧画的「工作区当前文件」的比较键([`tree_path_key`]);停在终端页 / diff 页签上
+    /// 为 `None`。工作区通知时拿现值与它比,变了才重画(见模块注释「当前文件」)。
+    active_file: Option<String>,
+    _workbench_sub: Option<Subscription>,
     _fs_task: Task<()>,
     _git_task: Task<()>,
 }
@@ -483,6 +573,13 @@ impl FileTree {
             root_error: None,
             remote_broken: false,
             row_focus: HashMap::new(),
+            list_scroll: ScrollHandle::new(),
+            reveal: None,
+            pending_scroll: None,
+            notice: None,
+            _notice_task: None,
+            active_file: None,
+            _workbench_sub: None,
             _fs_task: fs_task,
             _git_task: git_task,
         };
@@ -782,6 +879,10 @@ impl FileTree {
             self.suppressed_subtrees.insert(path.clone());
         }
         self.drop_target = None;
+        // 定位、等着兑现的滚动与提示都说的是上一个项目里的行
+        self.reveal = None;
+        self.pending_scroll = None;
+        self.notice = None;
         self.remote_broken = broken;
         // 授权关闭的远程项目完全不订阅 Git 输出旁路。
         git_watch::set_enabled_for(git_watch::Subscriber::FileTree, git_enabled);
@@ -1050,6 +1151,8 @@ impl FileTree {
                         }
                     }
                 }
+                // 定位停在等这一层列完:接着往下走(没有在走的定位就是空操作)
+                tree.advance_reveal(cx);
                 cx.notify();
             });
         })
@@ -1143,10 +1246,15 @@ impl FileTree {
             .clone()
     }
 
-    /// 行按键。逐条照抄原版:目录 Enter/Space/→ 展开、← 折叠;文件 Enter/Space 开预览。
+    /// 行按键。前三条逐条照抄原版:目录 Enter/Space/→ 展开、← 折叠;文件 Enter/Space 开预览。
     ///
     /// ⚠️ **→ 只在折叠时生效、← 只在展开时生效**(原版那两个 `&& !expanded` /
     /// `&& expanded`),否则方向键会变成 toggle,在展开的目录上按 → 反而折叠。
+    ///
+    /// 其余是树控件的通行语义(原版没有):← 在已折叠的目录 / 文件上回父目录行,→ 在已展开
+    /// 的目录上进第一个子行;↑ / ↓ / Home / End 按可见行序挪焦点;Delete 删除(先确认)。
+    /// 这几条只认不带修饰键的按法 —— Alt+← / → 是全局的「切 pane 焦点」,Shift+↑ 之类留给
+    /// 将来的多选,不在这里抢。
     fn on_row_key(
         &mut self,
         event: &gpui::KeyDownEvent,
@@ -1156,7 +1264,9 @@ impl FileTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str();
+        let plain = !event.keystroke.modifiers.modified();
+        match key {
             "enter" | "space" => {
                 cx.stop_propagation();
                 if is_dir {
@@ -1173,8 +1283,319 @@ impl FileTree {
                 cx.stop_propagation();
                 self.toggle_dir(path.to_path_buf(), cx);
             }
+            "right" if plain && is_dir => {
+                cx.stop_propagation();
+                self.move_row_focus(path, RowNav::FirstChild, window, cx);
+            }
+            "left" if plain => {
+                cx.stop_propagation();
+                self.move_row_focus(path, RowNav::Parent, window, cx);
+            }
+            "delete" if plain => {
+                cx.stop_propagation();
+                self.run_row_key_action(path, FileMenuAction::Delete, window, cx);
+            }
+            _ if plain => {
+                if let Some(nav) = focus_nav::row_nav_for_key(key) {
+                    cx.stop_propagation();
+                    self.move_row_focus(path, nav, window, cx);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// 当前可见的行(与 render 拍平的是同一份)。没有项目时为空。
+    fn visible_rows(&self, cx: &App) -> Vec<Row> {
+        let mut rows = Vec::new();
+        if let (Some(project_id), Some(root)) =
+            (self.current_project.as_deref(), self.project_root(cx))
+        {
+            self.rows(project_id, &root, &root, 0, cx, &mut rows);
+        }
+        rows
+    }
+
+    /// 键盘挪焦点:按可见行序算出目标行([`focus_nav::row_nav_target`]),焦点当场挪过去,
+    /// 滚动排到下一帧(列表套着 view 级缓存,不 notify 的话 prepaint 不跑、滚动没人兑现)。
+    /// 到头 / 没有父行或子行时什么都不做。
+    fn move_row_focus(
+        &mut self,
+        from: &Path,
+        nav: RowNav,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.visible_rows(cx);
+        let Some(current) = rows.iter().position(|row| row.path == from) else {
+            return;
+        };
+        let depths: Vec<usize> = rows.iter().map(|row| row.depth).collect();
+        let Some(target) = focus_nav::row_nav_target(&depths, current, nav) else {
+            return;
+        };
+        let path = rows[target].path.clone();
+        if let Some(focus) = self.row_focus.get(&path) {
+            window.focus(focus, cx);
+        }
+        self.list_scroll.scroll_to_item(target);
+        cx.notify();
+    }
+
+    /// 行上的 F2 / Delete:与右键菜单「重命名」「删除」同一个函数(含确认框与
+    /// `spawn_tree_op`)。菜单里没有这一项的(见 [`row_key_action_available`]),键盘同样不触发;
+    /// 断链的远程项目没有行,也走不到这里。
+    fn run_row_key_action(
+        &mut self,
+        path: &Path,
+        action: FileMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(context) = self.operation_context(cx) else {
+            return;
+        };
+        let remote = match &context.backend {
+            FileBackendIdentity::Local => false,
+            FileBackendIdentity::Remote { .. } => true,
+            FileBackendIdentity::BrokenRemote => return,
+        };
+        let Some(row) = self
+            .visible_rows(cx)
+            .into_iter()
+            .find(|row| row.path == path)
+        else {
+            return;
+        };
+        if !row_key_action_available(row.is_dir, remote, action) {
+            return;
+        }
+        let target = EntryTarget::of_row(&row, &context.root, remote);
+        let connection = self.remote_conn(cx);
+        let tree = cx.entity();
+        match action {
+            FileMenuAction::Rename => {
+                rename_entry_prompt(tree, context, connection, target, window, cx);
+            }
+            FileMenuAction::Delete => {
+                confirm_delete_entry(tree, context, connection, target, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    /// 全局 F2 落到文件树时的分流(与 `ProjectList::rename_focused_row` 同一个做法):
+    /// **有行拿着焦点就改那一行的名字**,返回 `true` 表示这次 F2 由文件树消费掉了(否则
+    /// `main.rs` 接着去改终端页签)。行拿着焦点但重命名不可用时同样返回 `true` —— 焦点在
+    /// 文件树里按 F2,不该落到眼前看不见的终端页签上。
+    pub fn rename_focused_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // 同一时刻最多只有一个句柄是聚焦的,HashMap 的遍历序不影响结果
+        let Some(path) = self
+            .row_focus
+            .iter()
+            .find(|(_, focus)| focus.is_focused(window))
+            .map(|(path, _)| path.clone())
+        else {
+            return false;
+        };
+        self.run_row_key_action(&path, FileMenuAction::Rename, window, cx);
+        true
+    }
+
+    // ─── 当前文件:高亮与定位(见模块注释) ──────────────────────
+
+    /// 订阅工作区:换了活动页签(或切项目 / 关页签)时,当前文件那一行的高亮要跟着变。
+    /// `Workspace` 建完工作区调一次(文件树先建,建它时工作区还不存在)。
+    pub fn observe_workbench(
+        &mut self,
+        area: &Entity<crate::workbench_area::WorkbenchArea>,
+        cx: &mut Context<Self>,
+    ) {
+        self._workbench_sub = Some(cx.observe(area, |this: &mut Self, _, cx| {
+            if this.current_active_file(cx) != this.active_file {
+                cx.notify();
+            }
+        }));
+        cx.notify();
+    }
+
+    /// 工作区眼下停着的文件页签的比较键(活动项目的;终端页 / diff 页签为 `None`)。
+    fn current_active_file(&self, cx: &App) -> Option<String> {
+        let store = self.store.read(cx);
+        let project_id = store.active_project_id.as_deref()?;
+        let remote = store.is_remote_project(project_id);
+        crate::workbench_area::active_file_path(project_id, cx)
+            .map(|path| tree_path_key(&path, remote))
+    }
+
+    /// 开始一次定位。目标不在项目根内的当场就地提示;否则从根往下走,走不动的地方
+    /// 等列目录回来再走(见 [`Self::advance_reveal`])。
+    fn begin_reveal(&mut self, project_id: &str, path: PathBuf, cx: &mut Context<Self>) {
+        self.reveal = None;
+        self.pending_scroll = None;
+        let Some(root) = self.project_root(cx) else {
+            return;
+        };
+        let remote = self.is_remote(cx);
+        let target = tree_path_key(&path, remote);
+        // 文件页签只开在活动项目上,树也只挂活动项目 —— 对不上只可能是这一拍里刚切走
+        if self.current_project.as_deref() != Some(project_id) || self.remote_broken {
+            self.show_notice(t("fileTree", "reveal.notFound"), cx);
+            return;
+        }
+        if !key_is_under(&tree_path_key(&root, remote), &target) {
+            self.show_notice(t("fileTree", "reveal.outsideRoot"), cx);
+            return;
+        }
+        self.reveal = Some(RevealRequest {
+            project_id: project_id.to_string(),
+            target,
+            generation: self.source_generation,
+            relisted: HashSet::new(),
+        });
+        self.advance_reveal(cx);
+    }
+
+    /// 定位往下走:从根开始,每一层找通向目标的那一行([`reveal_step`]),是目录就展开它
+    /// (落盘的展开态,与手点一样)再往里走;找到目标就排一次滚动 + 交焦点。
+    ///
+    /// 某一层还没列过就排一趟列目录、先停下,列完 [`Self::load_dir_with`] 的回调会再叫
+    /// 回来。展开态只给**真画在树上的行**置位(压缩链置的是链尾那一行),不会往落盘的
+    /// 展开表里塞看不见的中间段。
+    ///
+    /// 缓存可能是旧的:折叠着的目录不监听(见 [`Self::toggle_dir`]),刚建的文件 notify 也
+    /// 可能还在路上。所以这里展开一个原本折着的目录时与手点一样重列一趟(顺带重挂监听),
+    /// 某一层里找不到时先看它是不是正在重列、这次定位里重列过没有 —— 拿新结果再找一遍,
+    /// 仍找不到才算真没有。每层最多重列一次([`RevealRequest::relisted`]),绕不成圈。
+    fn advance_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.reveal.clone() else {
+            return;
+        };
+        // 中途换了项目 / 连接:作废,不提示 —— 用户已经在看别处了
+        if self.current_project.as_deref() != Some(request.project_id.as_str())
+            || self.source_generation != request.generation
+        {
+            self.reveal = None;
+            return;
+        }
+        let Some(root) = self.project_root(cx) else {
+            self.reveal = None;
+            return;
+        };
+        let remote = self.is_remote(cx);
+        let mut dir = root.clone();
+        loop {
+            // 正被删 / 改名的子树不列也不挂(`suppressed_subtrees`),在这里等就等不到了
+            if self.path_is_suppressed(&dir) {
+                self.fail_reveal(cx);
+                return;
+            }
+            let Some(entries) = self.entries.get(&dir) else {
+                // 在列就等它;这次定位里已经列过一趟还没有内容(根目录列失败时不往
+                // `entries` 里落空表,见 `load_dir_with`)就到此为止,免得再排、再失败、
+                // 再叫回来绕成死循环
+                if self.loading.contains(&dir) {
+                    return;
+                }
+                if !self.mark_relisted(&dir) {
+                    self.fail_reveal(cx);
+                    return;
+                }
+                self.load_dir(root.clone(), dir, cx);
+                return;
+            };
+            match reveal_step(entries, &request.target, remote) {
+                RevealStep::Found(path) => {
+                    self.reveal = None;
+                    self.pending_scroll = Some(PendingScroll {
+                        path,
+                        focus: true,
+                        recheck: true,
+                    });
+                    cx.notify();
+                    return;
+                }
+                RevealStep::Descend(next) => {
+                    let key = next.to_string_lossy().to_string();
+                    if !self
+                        .store
+                        .read(cx)
+                        .is_dir_expanded(&request.project_id, &key)
+                    {
+                        self.store.update(cx, |store, cx| {
+                            store.set_dir_expanded(&request.project_id, &key, true, cx)
+                        });
+                        // 与 `toggle_dir` 展开时同一步:重列并重挂监听
+                        self.mark_relisted(&next);
+                        self.load_dir(root.clone(), next.clone(), cx);
+                    }
+                    dir = next;
+                }
+                RevealStep::Missing => {
+                    if self.loading.contains(&dir) {
+                        return;
+                    }
+                    if self.mark_relisted(&dir) {
+                        self.load_dir(root.clone(), dir, cx);
+                        return;
+                    }
+                    self.fail_reveal(cx);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// 记下这次定位重列过 `dir`。返回 `true` = 头一回(该去重列),`false` = 已经重列过。
+    fn mark_relisted(&mut self, dir: &Path) -> bool {
+        self.reveal
+            .as_mut()
+            .is_some_and(|reveal| reveal.relisted.insert(dir.to_path_buf()))
+    }
+
+    fn fail_reveal(&mut self, cx: &mut Context<Self>) {
+        self.reveal = None;
+        self.show_notice(t("fileTree", "reveal.notFound"), cx);
+    }
+
+    /// 列表上方的一行就地提示,[`NOTICE_TTL`] 后自己收(不是 toast:定位是在树里发生的事,
+    /// 提示就该出在树上;也不弹框打断)。
+    fn show_notice(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.notice = Some(text.into());
+        // 换掉旧的计时(丢掉句柄即取消),新提示从头计
+        self._notice_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TTL).await;
+            let _ = this.update(cx, |tree: &mut FileTree, cx| {
+                tree.notice = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// 头部「全部折叠」:清掉当前项目的展开态(落盘,见 `AppStore::collapse_all_dirs`),
+    /// 被折掉的目录与逐个折叠一样摘掉监听(压缩链上的照旧留着,理由见 [`Self::toggle_dir`])。
+    /// 列过的内容缓存不清 —— 再展开时 `toggle_dir` 会重列并重挂监听。
+    fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        let Some(project_id) = self.current_project.clone() else {
+            return;
+        };
+        let root = self.project_root(cx);
+        let collapsed = self
+            .store
+            .update(cx, |store, cx| store.collapse_all_dirs(&project_id, cx));
+        for key in collapsed {
+            let path = PathBuf::from(key);
+            if root.as_deref() == Some(path.as_path()) || self.chain_owner.contains_key(&path) {
+                continue;
+            }
+            if self.watched.remove(&path) {
+                self.watcher.unwatch(&path);
+            }
+        }
+        self.reveal = None;
+        self.pending_scroll = None;
+        cx.notify();
     }
 
     fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1414,6 +1835,56 @@ fn vanished_child_dirs(
         }
     }
     out
+}
+
+// ─── 当前文件的路径比较(见模块注释「当前文件:高亮与定位」) ───
+
+/// 树上的行与文件页签的路径拿来比的键。本地按平台语义:Windows 上不分大小写、`\` 与 `/`
+/// 等价(与文件页签去重 `normalize_local_document_path` 同一口径 —— 搜索拼出来的
+/// `D:\proj\src/a.rs` 与树上的 `D:\proj\src\a.rs` 是同一个文件);远程是 POSIX 原文
+/// (文件名里的 `\` 是合法字符,大小写也有意义)。两边都去掉尾随分隔符。
+fn tree_path_key(path: &Path, remote: bool) -> String {
+    let text = path.to_string_lossy();
+    if !remote && cfg!(windows) {
+        mt_core::path_key::windows_eq_key(&text)
+    } else {
+        mt_core::path_key::posix_trim_trailing(&text).to_string()
+    }
+}
+
+/// `key` 在 `ancestor` 之下(严格的后代,不含自身)。两个都是 [`tree_path_key`] 的键,
+/// 分隔符一律是 `/`;按整段比,`/a/bc` 不算 `/a/b` 的后代。
+fn key_is_under(ancestor: &str, key: &str) -> bool {
+    match key.strip_prefix(ancestor) {
+        Some(rest) if ancestor.ends_with('/') => !rest.is_empty(),
+        Some(rest) => rest.len() > 1 && rest.starts_with('/'),
+        None => false,
+    }
+}
+
+/// 定位在某一层目录里的走法(见 [`FileTree::advance_reveal`])。
+#[derive(Debug, PartialEq, Eq)]
+enum RevealStep {
+    /// 这一层里就是它。
+    Found(PathBuf),
+    /// 往这一行里钻(目录;压缩链则是链尾那个真实目录,链上的中间段不算行)。
+    Descend(PathBuf),
+    /// 这一层里没有通向它的行:在不显示的目录里(`ALWAYS_IGNORE`)、已被移走……
+    Missing,
+}
+
+/// 在一层的条目里找通向 `target`(比较键)的那一行。
+fn reveal_step(entries: &[FileEntry], target: &str, remote: bool) -> RevealStep {
+    for entry in entries {
+        let key = tree_path_key(&entry.path, remote);
+        if key == target {
+            return RevealStep::Found(entry.path.clone());
+        }
+        if entry.is_dir && key_is_under(&key, target) {
+            return RevealStep::Descend(entry.path.clone());
+        }
+    }
+    RevealStep::Missing
 }
 
 #[derive(Clone)]
@@ -1756,6 +2227,38 @@ const REFRESH_SHAPES: &[Shape] = &[
     ),
 ];
 
+/// 全部折叠:前后两个方框叠着(后面那个只露出右上一角),前框里一道减号 —— VS Code
+/// 资源管理器「折叠文件夹」那枚的同一个意象。按 16 格画、除以 16 归一,线宽与放大镜一致。
+const COLLAPSE_ALL_SHAPES: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Rect {
+            x: 0.09375,
+            y: 0.28125,
+            w: 0.625,
+            h: 0.625,
+            round: 0.0625,
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[
+            (0.28125, 0.28125),
+            (0.28125, 0.09375),
+            (0.90625, 0.09375),
+            (0.90625, 0.71875),
+            (0.71875, 0.71875),
+        ]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[(0.25, 0.59375), (0.5625, 0.59375)]),
+    ),
+];
+
 /// 编辑器选择器的下拉箭头(原版 8×8 的 `M1.5 3L4 5.5L6.5 3`)。
 const CARET_SHAPES: &[Shape] = &[Shape::line(
     Ink::Current,
@@ -1764,9 +2267,11 @@ const CARET_SHAPES: &[Shape] = &[Shape::line(
 )];
 
 impl Render for FileTree {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 记下这一帧看到的 store(下面各处的读取点都在这份指纹里,见 store_render_signature)
         self.rendered_store_signature = self.store_signature(cx);
+        // 工作区的当前文件同理:画的是哪一份就记哪一份,工作区通知时拿现值来比
+        self.active_file = self.current_active_file(cx);
         if !cx.has_active_drag() {
             self.drop_target = None;
         }
@@ -1829,12 +2334,11 @@ impl Render for FileTree {
                         el.child(
                             // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
                             header_button("file-tree-search")
-                                // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
-                                // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
-                                .tip(mt_i18n::t_args(
+                                // 键位取自键位表此刻生效的那份(用户改键 / 解绑跟着变)
+                                .tip(tr!(
                                     "fileTree",
                                     "header.searchTitle",
-                                    &[("mod", mod_label())],
+                                    shortcut = crate::hotkeys::hotkey_tip("globalSearch")
                                 ))
                                 .on_click(move |_event, window, cx| {
                                     crate::search_modal::open(store_for_search.clone(), window, cx);
@@ -1857,6 +2361,18 @@ impl Render for FileTree {
                                 this.refresh_root(cx);
                             }))
                             .child(VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted())),
+                    )
+                    // 全部折叠:展开态是落盘的,点开过的深层目录越积越多,一键收回到只剩根下一层
+                    .child(
+                        header_button("file-tree-collapse-all")
+                            .tip(t("fileTree", "header.collapseAll"))
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.collapse_all(cx);
+                            }))
+                            .child(
+                                VectorIcon::new(COLLAPSE_ALL_SHAPES, px(13.0))
+                                    .ink(ui::text_muted()),
+                            ),
                     )
                     // 粘贴/新建/上传不放头部:空白处右键菜单(background_menu)已有
                     .when(!is_remote, |el| {
@@ -1927,6 +2443,26 @@ impl Render for FileTree {
                 .collect();
             for path in missing {
                 self.row_focus(&path, cx);
+            }
+        }
+        // 兑现等着的滚动(键盘移动 / 定位落地)。行号就是这一帧铺出去的子元素下标;那一行
+        // 已经不在了(这期间被折叠 / 删掉)就作罢
+        if let Some(pending) = self.pending_scroll.take()
+            && let Some(ix) = rows.iter().position(|row| row.path == pending.path)
+        {
+            self.list_scroll.scroll_to_item(ix);
+            if pending.focus
+                && let Some(focus) = self.row_focus.get(&pending.path)
+            {
+                window.focus(focus, cx);
+            }
+            if pending.recheck {
+                self.pending_scroll = Some(PendingScroll {
+                    focus: false,
+                    recheck: false,
+                    ..pending
+                });
+                window.request_animation_frame();
             }
         }
 
@@ -2007,7 +2543,9 @@ impl Render for FileTree {
             .flex()
             .flex_col()
             .flex_1()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            // 键盘移动与定位靠它把目标行滚进可视区(子元素下标 = 行号)
+            .track_scroll(&self.list_scroll);
         for row in rows {
             list = list.child(self.render_row(row, cx));
         }
@@ -2119,6 +2657,17 @@ impl Render for FileTree {
                         .text_size(ui::font_px(10.5))
                         .text_color(ui::accent())
                         .child(label),
+                )
+            })
+            // 定位没找到的就地提示(几秒后自己收,见 `show_notice`)。可能比栏宽,折行不截断
+            .when_some(self.notice.clone(), |el, notice| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(ui::font_px(10.5))
+                        .text_color(ui::text_secondary())
+                        .child(notice),
                 )
             })
             .child(list)
@@ -2274,6 +2823,13 @@ impl FileTree {
         let key_path = row.path.clone();
         let key_expanded = row.expanded;
         let remote = self.is_remote(cx);
+        // 工作区眼下开着的就是这个文件(见模块注释「当前文件」)。只比文件行,
+        // 没有当前文件时连键都不算
+        let is_active_file = !row.is_dir
+            && self
+                .active_file
+                .as_deref()
+                .is_some_and(|active| active == tree_path_key(&row.path, remote));
         let row_context = self.operation_context(cx);
         let key_context = row_context.clone();
         let click_context = row_context.clone();
@@ -2335,7 +2891,13 @@ impl FileTree {
             .cursor_pointer()
             .text_size(ui::font_px(12.0))
             .text_color(color)
-            .hover(|el| el.bg(ui::bg_overlay()))
+            // 当前文件:`accent_subtle` 底 + accent 字,与项目列表里活动项目那一行同一套
+            // 「当前」语言(上下紧挨着,一眼对得上);悬停时也不换成中性的悬停底(与 Git 面板
+            // 列表的选中行同一口径)。拖放落点那层更实的 accent 底排在后面、照样盖得住它
+            .when(is_active_file, |el| {
+                el.bg(ui::accent_subtle()).text_color(ui::accent())
+            })
+            .when(!is_active_file, |el| el.hover(|el| el.bg(ui::bg_overlay())))
             .when(drop_highlight, |el| {
                 el.bg(ui::with_alpha(ui::accent(), 0.18))
             })
@@ -2442,6 +3004,7 @@ impl FileTree {
                         } else {
                             mt_project::git::is_inside_git_repo(&context.root, &row_for_menu.path)
                         };
+                    let editor = fs_ops::configured_editor(store.read(cx).config());
                     let entries = file_menu(
                         &cx.entity(),
                         &store,
@@ -2450,6 +3013,7 @@ impl FileTree {
                         connection,
                         can_paste,
                         (git_enabled, in_git_repo),
+                        editor,
                     );
                     crate::menu::show(event.position, entries, window, cx);
                 }),

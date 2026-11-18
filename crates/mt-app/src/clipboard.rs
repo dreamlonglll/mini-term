@@ -16,7 +16,7 @@
 //! |---|---|
 //! | 图片,pane 里正跑着 Claude Code | **不落盘**,直接发 `Alt+V` 让它自己取([`agent_takes_clipboard_image`]) |
 //! | 图片 | 落盘临时文件 → 粘带引号的路径([`read_clipboard_image`]);读不出则退 `Alt+V` |
-//! | 长文本(过阈值) | 落盘 `.txt` → 粘带引号的路径 |
+//! | 长文本(过阈值;缺省只在 AI 会话里,见 [`long_paste_wanted`]) | 落盘 `.txt` → 粘带引号的路径 |
 //! | 其余文本 | 原样粘 |
 //!
 //! ~~SSH 远程分支不做~~ ✅ BB-a 批补上:见 [`spawn_remote_paste`]。
@@ -65,6 +65,20 @@ pub fn is_long_text(text: &str, line_threshold: u32, char_threshold: u32) -> boo
         }
     }
     false
+}
+
+/// 这个 pane 这一次粘贴要不要考虑长文本转存(阈值另由 [`is_long_text`] 判)。
+///
+/// 转存本是给 AI 工具用的:躲开超长内容与 bracketed paste 在 TUI 输入框里的坑。往普通
+/// bash / pwsh 里粘一段十几行的脚本,用户要的是脚本本身,不是一条 `"…\paste-*.txt"`
+/// 路径 —— 所以 `ai_only`(`AppConfig::long_paste_ai_only`,缺省开)时只在 AI 会话里转。
+/// 关掉它 = 回到「所有终端都转存」,给 WSL / 远程里 AI 状态认不出来的用户留的退路。
+///
+/// `status` 取 pane **当下**那份(hook 上报优先、输入检测兜底,与图片那条
+/// [`agent_takes_clipboard_image`] 同一口径),AI 会话的判据同 [`is_ai_alive`]。定位不到
+/// pane 时传 `None`,按「不在 AI 会话里」算。本地 / WSL / SSH 上传三个落点同用这一处。
+pub fn long_paste_wanted(enabled: bool, ai_only: bool, status: Option<PaneStatus>) -> bool {
+    enabled && (!ai_only || status.is_some_and(is_ai_alive))
 }
 
 /// 临时文件目录(`std::env::temp_dir()/mini-term-clipboard`)。
@@ -914,6 +928,44 @@ mod tests {
     #[test]
     fn 两个阈值都为零时永不命中() {
         assert!(!is_long_text(&"x\n".repeat(9999), 0, 0));
+    }
+
+    /// 「只在 AI 会话里转存」开着:只认 ai-idle / ai-working,普通 shell、已退出、
+    /// 定位不到 pane 都粘原文。
+    #[test]
+    fn 只在_ai_会话里转存时普通终端粘原文() {
+        use PaneStatus as S;
+        assert!(long_paste_wanted(true, true, Some(S::AiIdle)));
+        assert!(
+            long_paste_wanted(true, true, Some(S::AiWorking)),
+            "AI 思考中也能排队粘"
+        );
+        assert!(!long_paste_wanted(true, true, Some(S::Idle)), "普通 shell");
+        assert!(!long_paste_wanted(true, true, Some(S::Error)), "已退出");
+        assert!(!long_paste_wanted(true, true, None), "定位不到 pane");
+    }
+
+    /// 子开关关掉 = 旧行为:所有终端都转存(WSL / 远程里 AI 状态认不出来时的退路)。
+    #[test]
+    fn 关掉只在_ai_会话后所有终端都转存() {
+        use PaneStatus as S;
+        for status in [Some(S::Idle), Some(S::Error), Some(S::AiIdle), None] {
+            assert!(long_paste_wanted(true, false, status), "{status:?}");
+        }
+    }
+
+    /// 总开关关着时子开关不起作用,AI 会话里也粘原文。
+    #[test]
+    fn 总开关关着时一律不转存() {
+        use PaneStatus as S;
+        for ai_only in [true, false] {
+            for status in [Some(S::Idle), Some(S::AiIdle), Some(S::AiWorking), None] {
+                assert!(
+                    !long_paste_wanted(false, ai_only, status),
+                    "{ai_only} {status:?}"
+                );
+            }
+        }
     }
 
     /// 字符数按 UTF-16 码元:emoji 算 2、中文算 1 —— 与 JS `String.length` 对齐。

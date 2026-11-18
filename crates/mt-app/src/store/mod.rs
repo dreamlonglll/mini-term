@@ -33,6 +33,7 @@
 //!  ├─ ssh.rs      SSH 连接表、远程项目、「关联 SSH」、断线重连
 //!  ├─ layout.rs   项目级终端面板、三栏与抽屉、文件树展开、布局与配置落盘
 //!  ├─ events.rs   类型化变更事件(`StoreEvent`)、改完即发的收口、各观察者的过滤判定
+//!  ├─ reopen.rs   已关闭终端栈与「重新打开已关闭的终端」(纯逻辑与单测同住)
 //!  └─ pure.rs     无 `self` 的纯函数与它们的类型,连同全部单测
 //! ```
 //!
@@ -68,6 +69,7 @@ mod panes;
 mod prefs;
 mod projects;
 mod pure;
+mod reopen;
 mod ssh;
 
 use config_writer::ConfigWriter;
@@ -101,6 +103,15 @@ pub struct ProjectState {
     /// 铺满了」而不是「哪个叶子」—— 同组内切 tab 仍然保持最大化,与原版一致。
     /// 只对活动面板有意义,切面板时清掉。
     pub maximized_pane_id: Option<String>,
+    /// 「重新打开已关闭的终端」的已关闭栈(栈顶在末尾,上限见 [`reopen::CLOSED_PANES_LIMIT`])。
+    ///
+    /// **纯运行时,不落盘**。挂在项目状态上而不是另开一张表:移除项目时整项
+    /// `project_states.remove` 掉,栈跟着没,不必另记一处清理。
+    pub closed_panes: Vec<reopen::ClosedPane>,
+    /// 这个项目上次聚焦的 pane。`AppStore::focused_pane_id` 是全局的一份,切到别的项目
+    /// 再切回来时它指着别处 —— 「当前该操作哪个 pane」靠这一档接住(见
+    /// [`SplitNode::target_pane`])。**纯运行时,不落盘**。
+    pub last_focused_pane_id: Option<String>,
 }
 
 impl ProjectState {
@@ -110,6 +121,8 @@ impl ProjectState {
             active_panel_id: None,
             needs_attention: false,
             maximized_pane_id: None,
+            closed_panes: Vec::new(),
+            last_focused_pane_id: None,
         }
     }
 
@@ -409,9 +422,17 @@ pub struct AppStore {
     _layout_save_task: Option<Task<()>>,
 
     pub active_project_id: Option<String>,
+    /// 项目的最近使用序(最近激活的在前)。项目切换器空查询时按它排,于是
+    /// Ctrl+Shift+P 再回车就在最近两个项目之间来回切。**纯运行时,不落盘**:启动时只有
+    /// 上次的活动项目,没用过的项目不进表,由切换器排在它们后面、保持侧栏顺序。
+    project_mru: Vec<String>,
     project_states: HashMap<String, ProjectState>,
     /// ptyId → 终端视图。pane 只在树里存 id,视图挂这里(旧版 terminalCache)。
     terminals: HashMap<u32, Entity<TerminalPane>>,
+    /// 每个终端的焦点句柄(弱引用,与 `terminals` 同增同删)。「键盘焦点在哪个终端里」靠它
+    /// 判 —— 去 `read` 终端实体不行:关闭入口可能正跑在某个终端自己的 update 里(退出条上的
+    /// 「关闭」),再读它就是 gpui 的二次租借 panic。弱引用:不替已关掉的终端续命焦点句柄。
+    terminal_focus: HashMap<u32, gpui::WeakFocusHandle>,
     /// 每个 pane 的退出订阅,与 terminals 同生命周期。
     pane_subs: HashMap<u32, Subscription>,
     /// 当前拿着键盘焦点的 pane(旧版靠 DOM `activeElement` 推,这里显式维护)。
@@ -719,9 +740,11 @@ impl AppStore {
             layout_globals_dirty: false,
             layout_save_generation: 0,
             _layout_save_task: None,
+            project_mru: active_project_id.iter().cloned().collect(),
             active_project_id,
             project_states,
             terminals: HashMap::new(),
+            terminal_focus: HashMap::new(),
             pane_subs: HashMap::new(),
             focused_pane_id: None,
             mobile_relay_status: None,
@@ -801,6 +824,11 @@ impl AppStore {
 
     pub fn active_project(&self) -> Option<&ProjectConfig> {
         self.active_project_id.as_deref().and_then(|id| self.project(id))
+    }
+
+    /// 项目的最近使用序,最近激活的在前(见字段注释)。只含本次运行里激活过的项目。
+    pub fn recent_projects(&self) -> &[String] {
+        &self.project_mru
     }
 
     pub fn active_layout(&self) -> Option<&SplitNode> {

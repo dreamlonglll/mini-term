@@ -223,8 +223,60 @@ use mt_i18n::{
 /// 那一栏的「空文件」（`gitCommit.emptySide`）。
 /// 1659 → 1768：合入远端 Git 项目授权与第三轮恢复出口、操作摘要及草稿历史文案。
 /// 1768 → 1769：共享仓库写入阻挡错误展示来源项目名。
+/// 1769 → 1782：终端区交互改进 —— 本地 shell 退出后的底部条（非 0 退出码、重新启动 /
+/// Enter 提示 / 关闭：`paneGroup.{shellExitedCode,restart,restartHint,close}`）、回看时的
+/// 「回到底部」浮钮（`terminal.scrollToBottom`）、设置页快捷键表新增「回看与缩放」组
+/// （`settings.shortcuts.{scrollbackZoom,scrollPageUp,scrollPageDown,scrollTop,scrollBottom,
+/// zoomIn,zoomOut,zoomReset}`）；`settings.shortcuts.footer` 改了措辞，条数不变。
+/// 1782 → 1785：长文本转存新增「只在 AI 会话里」子开关
+/// （`settings.clipboard.{longPasteAiOnlyTitle,longPasteAiOnlyDesc}`，`longPasteDesc` 改了措辞）、
+/// 远程项目里右键 SSH 连接没法开新终端时的提示（`terminal.sshNewTerminalRemote`）；
+/// `terminal.sshFooterHint` 补了 Ctrl+↵ 一截，条数不变。
+/// 1785 → 1802：终端右键菜单补项 —— 链接的打开 / 复制（`terminal.{openLink,copyLink,
+/// openFileLink,copyFilePath}`）、全选 / 查找 / 清除缓冲 / 保存缓冲与失败提示
+/// （`terminal.{selectAll,find,clearBuffer,saveBuffer,saveBufferFailed}`）、不按修饰键悬停
+/// 链接的提示（`terminal.linkHoverHint`）；页签右键菜单补项 —— 复制此终端 / 最大化 / 还原 /
+/// 关闭其他 / 关闭右侧与它们的汇总确认文案（`paneGroup.{duplicate,maximize,restore,
+/// closeOthers,closeToRight,closeSomeMessage,closeSomeAiMessage}`）。
+/// 1802 → 1814：页签与分屏的键盘路径 —— 设置页快捷键表新增「标签与分屏」组与九条动作描述
+/// （`settings.shortcuts.{tabsSplits,closeTab,toggleMaximize,reopenClosed,moveTabLeft,
+/// moveTabRight,resizeLeft,resizeRight,resizeUp,resizeDown}`）、重新打开已关闭终端的菜单项与
+/// 说明行（`paneGroup.{reopenClosed,reopenClosedDetail}`）；`settings.shortcuts.{nextPane,
+/// prevPane}` 补了单页签时切分屏的说明、`paneGroup.{maximizePane,restorePane}` 加了快捷键
+/// 占位符，条数不变。
+/// 1814 → 1822：工作区交互一批 —— 未保存关闭的三选一（`fileViewer.{saveAndClose,
+/// saveAllAndClose,dontSave}`）、移除项目确认框的终端说明
+/// （`projectList.removeConfirm.{endsTerminals,endsTerminalsWithAi}`）、添加项目的两种
+/// 路径错误（`projectList.{pathRequired,pathNotDirectory}`）、Ctrl+` 的快捷键描述
+/// （`settings.shortcuts.toggleWorkbenchPage`）。
+/// 1822 → 1826：文件树交互一批 —— 头部「全部折叠」按钮的 tooltip（`fileTree.header.collapseAll`）、
+/// 文件页签右键「在文件树中定位」（`fileViewer.revealInFileTree`）与它定位不到时的两种就地提示
+/// （`fileTree.reveal.{outsideRoot,notFound}`）。
+/// 1826 → 1840：文件区一批 —— 本地删除进回收站的确认框与「无法移到回收站，是否永久删除」
+/// （`fileTree.dialog.{trashFileTitle,trashFolderTitle,trashConfirmFile,trashConfirmFolder,trashOk,
+/// permanentDeleteTitle,permanentDeleteUnsupported,permanentDeleteFailed,permanentDeleteOk}`、
+/// `fileTree.operation.trashing`）；重新打开已关闭的页签与全都不在时的就地提示
+/// （`fileViewer.{reopenClosedTab,reopenAllMissing}`）；页签跟随文件树删除 / 覆盖时的提示条
+/// （`fileViewer.{deletedOnDisk,replacedOnDisk}`）。
+/// 1840 → 1847：面板与引导一批 —— AI 历史面板的过滤框占位、无结果空态与行 tooltip 的右键提示
+/// （`sessionList.{filterPlaceholder,filterEmpty,rowMenuHint}`）；首屏引导的拖放提示与「开启 AI
+/// 状态精确感知」入口（`app.firstRun.{dropHint,enableHook}`）；注册 Hook 的一次性提示
+/// （`app.hookHint.{title,message}`）。
+/// 1847 → 1877：SSH 表单与更新提示一批 —— 连接表单的必填 / 端口就地提示
+/// （`sshModal.{nameRequired,hostRequired,userRequired,portInvalid}`）与「测试连接」的按钮、
+/// 成功 / 各类失败 / 过期说明（`sshModal.test.*` 17 条）；「发现新版本」弹窗
+/// （`app.update.{dialogTitle,noNotes,download,ignore,later,ignoreHint}`）；「关于」页的更新说明
+/// 与「不再忽略」（`settings.about.{releaseNotes,ignoredVersion,unignore}`）。
+/// 1877 → 1899：快捷键自定义 —— 设置页「快捷键」的录制 / 解绑 / 恢复默认 / 冲突与合法性
+/// 提示（`settings.shortcuts.{unbound,modified,resetOne,resetAll,resetAllConfirm,resetAllOk,
+/// clickToChange,recording,recordingHint,readOnly,readOnlyTerminal,readOnlyDigits,
+/// invalidNeedsModifier,invalidSystemKey,invalidReserved,invalidTypesChar,takenReadOnly,
+/// takenInternal,conflict,conflictReplace,terminalWarning}`）与 mac 上终端占用的 ⌘← / ⌘→
+/// （`settings.shortcuts.lineStartEnd`）；`settings.shortcuts.footer` 按实际让位行为改写，
+/// `paneGroup.markerTooltip` / `search.shortcutHint` / `fileTree.header.searchTitle` 的
+/// `{mod}+Shift+…` 改成从键位表取的占位符，条数不变。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1769;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1899;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

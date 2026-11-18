@@ -8,9 +8,10 @@
 //!
 //! 1. **4px 抖动阈值**:不加阈值的话定时器永远在被 `mousemove` 重置,永远等不到;
 //! 2. **一次按压只复制一次**(`copiedThisPress`):不然停住不动会每秒复制一遍;
-//! 3. **松手补一刀**:拖到边缘触发自动滚屏时鼠标可以保持静止,dwell 会在选区还在
-//!    增长时提前复制半截;松手时选区若已变化就再复制一次,让剪贴板与用户最终看到的
-//!    选区一致(**气泡不重弹** —— 「已复制」对最终内容依然成立);
+//! 3. **松手补一刀**:停留复制过一次之后选区还可能接着变(接着拖、拖到边外自动滚屏),
+//!    松手时选区若已变化就再复制一次,让剪贴板与用户最终看到的选区一致(**气泡不重弹**
+//!    —— 「已复制」对最终内容依然成立)。自动滚屏期间鼠标可以一动不动,选区却每一拍都在
+//!    长,所以每滚一拍都要重新计时([`DwellTracker::restart`]),不然会在半截时复制;
 //! 4. **mouseup 挂在 document 上**:拖选常在终端区域外松手。GPUI 侧等价物是
 //!    `window.on_mouse_event` 的全局派发(本来就不判 hover),天然满足。
 //!
@@ -134,6 +135,18 @@ impl DwellTracker {
             return None;
         }
         self.last_pos = pos;
+        self.generation += 1;
+        Some(self.generation)
+    }
+
+    /// 鼠标没动、选区却变了(拖到边外自动滚屏的每一拍):重新计时,返回新代号。
+    ///
+    /// 不碰 `last_pos`(气泡仍按鼠标所在处落点),也不清「已复制」—— 一次按压只复制
+    /// 一次,滚屏期间长出来的那截由松手补刀兜住。
+    pub fn restart(&mut self, cfg: &DwellConfig) -> Option<u64> {
+        if !self.pressed || !cfg.enabled() {
+            return None;
+        }
         self.generation += 1;
         Some(self.generation)
     }
@@ -343,6 +356,28 @@ mod tests {
         assert!(t.needs_reconcile("half and more"));
         // 没变就别白写一次剪贴板
         assert!(!t.needs_reconcile("half"));
+    }
+
+    #[test]
+    fn 自动滚屏每一拍都重新计时() {
+        let cfg = on();
+        let mut t = DwellTracker::default();
+        let g = t.on_press(&cfg, (10.0, 10.0)).unwrap();
+        // 鼠标停在区外不动,选区被滚长了:旧定时器作废
+        let g2 = t.restart(&cfg).unwrap();
+        assert!(
+            !t.on_dwell_elapsed(g, true),
+            "滚屏之前起的表不能在半截时复制"
+        );
+        assert!(t.on_dwell_elapsed(g2, true));
+        // 落点仍按鼠标所在处
+        assert_eq!(t.tip_origin((800.0, 600.0)), gpui::point(px(22.0), px(4.0)));
+        // 松手之后、停留语义关着时都不起表
+        t.on_release(&cfg);
+        assert_eq!(t.restart(&cfg), None);
+        let mut off = DwellTracker::default();
+        off.on_press(&DwellConfig::default(), (0.0, 0.0));
+        assert_eq!(off.restart(&DwellConfig::default()), None);
     }
 
     #[test]

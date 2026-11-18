@@ -22,16 +22,19 @@
 //! 它是两级侧栏 + 11 个分页的独立视图,与这里三个「只给标题和文案」的小弹窗不同形。
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, ClickEvent, Entity, Focusable as _, ParentElement, PathPromptOptions,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::input::{Input, InputState, SelectAll};
+use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 
-use crate::i18n::t;
+use crate::i18n::{t, tr};
+use crate::pane_actions;
 use crate::prompt::{autofocus, confirm_footer, is_open, kind, open_guarded, show_alert};
 use crate::store::AppStore;
+use crate::tree::{PaneState, PaneStatus};
 use crate::ui;
 
 // ─── 重命名 ───────────────────────────────────────────────────
@@ -105,10 +108,47 @@ pub fn open_rename_pane(
 
 // ─── 移除项目确认 ─────────────────────────────────────────────
 
+/// 移除项目会结束几个终端、其中几个是 AI 会话:`(终端数, AI 会话数)`。
+///
+/// 移除会销毁项目里所有终端(`AppStore::remove_project` 逐个 `dispose_terminal`),
+/// 正在跑的 AI 会话一并没了,确认框得把这句说出来。只数**活着的**:PTY 起来了、且没落进
+/// error 终态(退出 / 没起来,见 `store::ai` 的 `on_pty_exit`)—— 已经死掉的终端谈不上
+/// 「结束」。AI 判据复用关窗确认那一份([`pane_actions::counts_for_window_close`]),
+/// 它要求的「PTY 已起」与这里同一口径。
+fn removal_terminal_counts<'a>(panes: impl IntoIterator<Item = &'a PaneState>) -> (usize, usize) {
+    panes
+        .into_iter()
+        .filter(|pane| pane.pty_id.is_some() && pane.status != PaneStatus::Error)
+        .fold((0, 0), |(terminals, ai), pane| {
+            let is_ai = pane_actions::counts_for_window_close(pane);
+            (terminals + 1, ai + usize::from(is_ai))
+        })
+}
+
+/// 确认框里那行灰字:「将结束 N 个终端(其中 M 个 AI 会话)」,M 为 0 时不带后半句;
+/// 一个活着的终端都没有就不出这一行。
+fn removal_terminal_line(counts: (usize, usize)) -> Option<String> {
+    match counts {
+        (0, _) => None,
+        (count, 0) => Some(tr!(
+            "projectList",
+            "removeConfirm.endsTerminals",
+            count = count
+        )),
+        (count, ai) => Some(tr!(
+            "projectList",
+            "removeConfirm.endsTerminalsWithAi",
+            count = count,
+            ai = ai
+        )),
+    }
+}
+
 /// 移除项目前的确认。
 ///
 /// 收编 `project_list` 里那个「点两次才真删」的临时方案:移除是不可逆的
-/// (配置里的布局、展开目录一起没),必须让用户看清楚删的是哪一个。
+/// (配置里的布局、展开目录一起没),必须让用户看清楚删的是哪一个。项目里还有活着的
+/// 终端时多一行灰字说清会结束几个(见 [`removal_terminal_counts`])。
 pub fn open_confirm_remove_project(
     store: Entity<AppStore>,
     project_id: String,
@@ -121,7 +161,13 @@ pub fn open_confirm_remove_project(
         kind::REMOVE_PROJECT,
         window,
         cx,
-        move |dialog, _window, _cx| {
+        move |dialog, _window, cx| {
+            // 每帧现数:框开着时终端退出 / AI 收工,这一行跟着变
+            let ends_terminals = store
+                .read(cx)
+                .project_state(&project_id)
+                .map(|state| removal_terminal_counts(state.all_panes()))
+                .and_then(removal_terminal_line);
             let store = store.clone();
             let project_id = project_id.clone();
             // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句已经把
@@ -132,6 +178,9 @@ pub fn open_confirm_remove_project(
                 project_name,
                 t("projectList", "removeConfirm.messageSuffix"),
             );
+            let detail = std::iter::once(project_path.clone())
+                .chain(ends_terminals)
+                .collect::<Vec<_>>();
             dialog
                 .title(t("projectList", "removeConfirm.title"))
                 // 与三件套(prompt / confirm / alert)同宽同排版:原版的 320px 让中文
@@ -142,10 +191,7 @@ pub fn open_confirm_remove_project(
                     t("projectList", "removeConfirm.confirm"),
                     Some(t("projectList", "removeConfirm.cancel")),
                 ))
-                .child(crate::prompt::body(
-                    &message,
-                    std::slice::from_ref(&project_path),
-                ))
+                .child(crate::prompt::body(&message, &detail))
                 .on_ok(move |_: &ClickEvent, window, cx| {
                     if crate::workbench_area::project_has_dirty_documents(&project_id, cx) {
                         window.defer(cx, |window, cx| {
@@ -166,6 +212,50 @@ pub fn open_confirm_remove_project(
 }
 
 // ─── 添加项目 ─────────────────────────────────────────────────
+
+/// 添加项目时路径不能用的两种情况,各有一行就地红字。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddPathError {
+    /// 什么都没填(或只有空白)。
+    Empty,
+    /// 填了,但不是一个存在的目录(不存在 / 是文件 / 无权访问)。
+    NotDirectory,
+}
+
+impl AddPathError {
+    fn message(self) -> &'static str {
+        match self {
+            AddPathError::Empty => t("projectList", "pathRequired"),
+            AddPathError::NotDirectory => t("projectList", "pathNotDirectory"),
+        }
+    }
+}
+
+/// 校验添加项目的路径(两端空白不算)。`is_dir` 由调用方注入:界面上是
+/// `Path::is_dir`,单测不碰磁盘。
+fn validate_project_path(
+    raw: &str,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, AddPathError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(AddPathError::Empty);
+    }
+    let path = PathBuf::from(raw);
+    if !is_dir(&path) {
+        return Err(AddPathError::NotDirectory);
+    }
+    Ok(path)
+}
+
+/// 用户改了路径:收起上一次的红字。
+fn clear_add_path_error(error: &Entity<Option<AddPathError>>, cx: &mut App) {
+    error.update(cx, |error, cx| {
+        if error.take().is_some() {
+            cx.notify();
+        }
+    });
+}
 
 /// 添加项目:路径输入 + 「浏览…」调平台目录选择框。
 ///
@@ -195,109 +285,203 @@ pub fn open_add_project_into(
         cx.new(|cx| InputState::new(window, cx).placeholder(t("projectList", "pathPlaceholder")));
     // 聚焦排在 `open_guarded` 之后,见 `prompt::autofocus`
     let input_for_focus = input.clone();
+    // 「添加」被拦下的原因(就地红字)。放实体而不是闭包里的变量:builder 每帧重调
+    // (模块注释「状态放在哪」),`notify` 才会让弹窗重画
+    let error = cx.new(|_| None::<AddPathError>);
+    // 一改输入就清掉:留着的话像是在说新打的路径也不对。`set_value`(「浏览…」回填)不发
+    // Change,那条路在回填处自己清
+    cx.subscribe(&input, {
+        let error = error.clone();
+        move |_, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                clear_add_path_error(&error, cx);
+            }
+        }
+    })
+    .detach();
 
-    open_guarded(
-        kind::ADD_PROJECT,
-        window,
-        cx,
-        move |dialog, _window, _cx| {
-            let store = store.clone();
-            let target_group = target_group.clone();
-            let input_for_ok = input.clone();
-            let input_for_browse = input.clone();
-            dialog
-                .title(t("projectList", "menu.addProject"))
-                .w(px(460.0))
-                .footer(confirm_footer(
-                    t("settings", "common.add"),
-                    Some(t("settings", "common.cancel")),
-                ))
-                .child(
-                    div()
-                        .px(px(20.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(6.0))
-                                .child(div().flex_1().child(Input::new(&input)))
-                                .child(
-                                    ui::ghost_button("browse-dir", t("worktree", "browse"))
-                                        .on_click(move |_, window, cx| {
-                                            let paths = cx.prompt_for_paths(PathPromptOptions {
-                                                files: false,
-                                                directories: true,
-                                                multiple: false,
-                                                // 系统目录选择框的标题。原版用的是 Tauri
-                                                // 的默认标题,这条 key 是 M 批新补的
-                                                prompt: Some(
-                                                    t("projectList", "chooseDirDialogTitle").into(),
-                                                ),
-                                            });
-                                            let input = input_for_browse.clone();
-                                            window
-                                                .spawn(cx, async move |cx| {
-                                                    let Ok(Ok(Some(paths))) = paths.await else {
-                                                        return;
-                                                    };
-                                                    let Some(path) = paths.into_iter().next()
-                                                    else {
-                                                        return;
-                                                    };
-                                                    let text = path.to_string_lossy().to_string();
-                                                    let _ = cx.update(|window, cx| {
-                                                        input.update(cx, |state, cx| {
-                                                            state.set_value(text, window, cx)
-                                                        });
+    open_guarded(kind::ADD_PROJECT, window, cx, move |dialog, _window, cx| {
+        let store = store.clone();
+        let target_group = target_group.clone();
+        let input_for_ok = input.clone();
+        let input_for_browse = input.clone();
+        let error_for_ok = error.clone();
+        let error_for_browse = error.clone();
+        // 有错就把灰字说明换成红字原因(同一个位置,弹窗高度不跳)
+        let note = match *error.read(cx) {
+            Some(err) => div()
+                .text_size(ui::font_px(11.0))
+                .text_color(ui::color_error())
+                .child(err.message()),
+            None => div()
+                .text_size(ui::font_px(11.0))
+                .text_color(ui::text_muted())
+                // 见上面手输框的说明,原版没有这条提示。
+                .child(t("projectList", "pathHint")),
+        };
+        dialog
+            .title(t("projectList", "menu.addProject"))
+            .w(px(460.0))
+            .footer(confirm_footer(
+                t("settings", "common.add"),
+                Some(t("settings", "common.cancel")),
+            ))
+            .child(
+                div()
+                    .px(px(20.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(div().flex_1().child(Input::new(&input)))
+                            .child(
+                                ui::ghost_button("browse-dir", t("worktree", "browse")).on_click(
+                                    move |_, window, cx| {
+                                        let paths = cx.prompt_for_paths(PathPromptOptions {
+                                            files: false,
+                                            directories: true,
+                                            multiple: false,
+                                            // 系统目录选择框的标题。原版用的是 Tauri
+                                            // 的默认标题,这条 key 是 M 批新补的
+                                            prompt: Some(
+                                                t("projectList", "chooseDirDialogTitle").into(),
+                                            ),
+                                        });
+                                        let input = input_for_browse.clone();
+                                        let error = error_for_browse.clone();
+                                        window
+                                            .spawn(cx, async move |cx| {
+                                                let Ok(Ok(Some(paths))) = paths.await else {
+                                                    return;
+                                                };
+                                                let Some(path) = paths.into_iter().next() else {
+                                                    return;
+                                                };
+                                                let text = path.to_string_lossy().to_string();
+                                                let _ = cx.update(|window, cx| {
+                                                    input.update(cx, |state, cx| {
+                                                        state.set_value(text, window, cx)
                                                     });
-                                                })
-                                                .detach();
-                                        }),
+                                                    clear_add_path_error(&error, cx);
+                                                });
+                                            })
+                                            .detach();
+                                    },
                                 ),
-                        )
-                        .child(
-                            div()
-                                .text_size(ui::font_px(11.0))
-                                .text_color(ui::text_muted())
-                                // 见上面手输框的说明,原版没有这条提示。
-                                .child(t("projectList", "pathHint")),
-                        ),
-                )
-                .on_ok(move |_: &ClickEvent, window, cx| {
-                    let raw = input_for_ok.read(cx).value().trim().to_string();
-                    let path = std::path::PathBuf::from(&raw);
-                    // 目录不存在就把对话框留着 —— 关掉的话用户刚打的路径就没了
-                    if raw.is_empty() || !path.is_dir() {
+                            ),
+                    )
+                    .child(note),
+            )
+            .on_ok(move |_: &ClickEvent, window, cx| {
+                let raw = input_for_ok.read(cx).value().to_string();
+                // 用不了就把对话框留着(关掉的话用户刚打的路径就没了),原因就地写在
+                // 输入框下面 —— 此前只是静默不关,看不出是没填还是目录不对
+                let path = match validate_project_path(&raw, Path::is_dir) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        error_for_ok.update(cx, |error, cx| {
+                            *error = Some(err);
+                            cx.notify();
+                        });
                         return false;
                     }
-                    // 顶层与分组两条路都走 `add_project_at`(拿 id),最后统一
-                    // `open_added_project`:切过去 + 开首个终端。原版分组版
-                    // `handleAddProject(groupId)` 是不切的,但「添加完还得自己找过去」
-                    // 被用户点名要改,两条路收成同一口径。
-                    store.update(cx, |store, cx| {
-                        let id = store.add_project_at(&path, None, cx);
-                        if let Some(group_id) = target_group.as_deref() {
-                            store.move_item(&id, Some(group_id), None, cx);
-                            if store
-                                .config()
-                                .project_tree
-                                .as_ref()
-                                .and_then(|tree| {
-                                    crate::project_tree::find_group_in_tree(tree, group_id)
-                                })
-                                .is_some_and(|g| g.collapsed)
-                            {
-                                store.toggle_group_collapse(group_id, cx);
-                            }
+                };
+                // 顶层与分组两条路都走 `add_project_at`(拿 id),最后统一
+                // `open_added_project`:切过去 + 开首个终端。原版分组版
+                // `handleAddProject(groupId)` 是不切的,但「添加完还得自己找过去」
+                // 被用户点名要改,两条路收成同一口径。
+                store.update(cx, |store, cx| {
+                    let id = store.add_project_at(&path, None, cx);
+                    if let Some(group_id) = target_group.as_deref() {
+                        store.move_item(&id, Some(group_id), None, cx);
+                        if store
+                            .config()
+                            .project_tree
+                            .as_ref()
+                            .and_then(|tree| {
+                                crate::project_tree::find_group_in_tree(tree, group_id)
+                            })
+                            .is_some_and(|g| g.collapsed)
+                        {
+                            store.toggle_group_collapse(group_id, cx);
                         }
-                        store.open_added_project(&id, window, cx);
-                    });
-                    true
-                })
-        },
-    );
+                    }
+                    store.open_added_project(&id, window, cx);
+                });
+                true
+            })
+    });
 
     autofocus(&input_for_focus, window, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(status: PaneStatus, pty_id: Option<u32>) -> PaneState {
+        let mut pane = PaneState::new("bash");
+        pane.status = status;
+        pane.pty_id = pty_id;
+        pane
+    }
+
+    /// 只数活着的:PTY 没起来的、已经落进 error 终态(退出 / 没起来)的都不算;
+    /// AI 会话按关窗确认那一份判据(ai-working / ai-idle)。
+    #[test]
+    fn 移除项目只数活着的终端与_ai_会话() {
+        let panes = [
+            pane(PaneStatus::Idle, Some(1)),
+            pane(PaneStatus::AiWorking, Some(2)),
+            pane(PaneStatus::AiIdle, Some(3)),
+            pane(PaneStatus::Error, Some(4)),
+            pane(PaneStatus::AiIdle, None),
+            pane(PaneStatus::Idle, None),
+        ];
+        assert_eq!(removal_terminal_counts(&panes), (3, 2));
+        assert_eq!(removal_terminal_counts(&[] as &[PaneState]), (0, 0));
+    }
+
+    /// 没有活着的终端不出这一行;没有 AI 时不带「其中 M 个 AI 会话」那半句。
+    #[test]
+    fn 移除项目的终端说明按有无_ai_分档() {
+        mt_i18n::set_locale(mt_i18n::Locale::Zh);
+        assert_eq!(removal_terminal_line((0, 0)), None);
+        let plain = removal_terminal_line((2, 0)).expect("有终端就该有这一行");
+        assert!(plain.contains('2') && !plain.contains("AI"), "{plain}");
+        let with_ai = removal_terminal_line((3, 1)).expect("有终端就该有这一行");
+        assert!(with_ai.contains('3') && with_ai.contains('1'), "{with_ai}");
+        assert!(with_ai.contains("AI"), "{with_ai}");
+        assert!(!with_ai.contains('{'), "占位符没换干净:{with_ai}");
+    }
+
+    /// 空串 / 纯空白是「请输入路径」,其余不是目录的是「目录不存在或不是文件夹」;
+    /// 两端空白不算进路径。
+    #[test]
+    fn 添加项目路径分两种错误() {
+        let only = |dir: &'static str| move |path: &Path| path == Path::new(dir);
+        assert_eq!(
+            validate_project_path("", only("/p")),
+            Err(AddPathError::Empty)
+        );
+        assert_eq!(
+            validate_project_path("   ", only("/p")),
+            Err(AddPathError::Empty)
+        );
+        assert_eq!(
+            validate_project_path("/nope", only("/p")),
+            Err(AddPathError::NotDirectory)
+        );
+        assert_eq!(
+            validate_project_path("  /p ", only("/p")),
+            Ok(PathBuf::from("/p"))
+        );
+        assert_ne!(
+            AddPathError::Empty.message(),
+            AddPathError::NotDirectory.message()
+        );
+    }
 }

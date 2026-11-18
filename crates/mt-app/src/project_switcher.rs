@@ -11,6 +11,15 @@
 //! 候选只从内存里的布局现算([`terminal_rows`]):不扫盘、不连远程、不起 PTY。起 PTY
 //! 只发生在真的选中之后,那是切到项目 / 面板本来就有的懒创建。
 //!
+//! # 空查询:最近使用序
+//!
+//! 查询为空时项目行按 [`AppStore::recent_projects`] 排([`order_by_recent`]):本次运行里
+//! 激活过的按最近在前,没激活过的跟在后面、保持侧栏顺序。第一条通常就是当前项目,所以游标
+//! 默认落在**第二条**([`default_cursor`])—— Ctrl+Shift+P 再回车就是在最近两个项目之间
+//! 来回切,与 Alt+Tab 同一手感。有查询时照旧按匹配度排、游标回第一条,不看最近使用序。
+//!
+//! [`AppStore::recent_projects`]: crate::store::AppStore::recent_projects
+//!
 //! 匹配口径([`filter_terminals`]):页签主段、Agent、项目名、分组走子串 + 模糊;**OSC
 //! 动态标题只走子串** —— 那是一整条目录路径之类的长串,子序列匹配随便几个字母都能中。
 //! 用的是页签上**看得见**的那段(`pane_title_parts` 的副段,AI 在场时整个收起),
@@ -38,6 +47,11 @@
 //!
 //! `Enter` 不走这条路:单行输入框的 `Enter` 处理器**会** `cx.propagate()` 并且
 //! 无条件 `cx.emit(InputEvent::PressEnter)`,订阅它更直白。
+//!
+//! PageUp / PageDown(按一屏)与 Ctrl+Home / Ctrl+End(首 / 尾)同一个套路:输入框把它们
+//! 绑成了单行里什么都不做、也不 propagate 的 `MovePage*` / `MoveToStart` / `MoveToEnd`,
+//! 谓词同深度才压得过。裸 Home / End 不占 —— 那是输入框里挪光标的键。三个搜索类浮层
+//! (本文件、`quick_open`、`search_modal`)的游标一步怎么走统一在 [`step_cursor_index`]。
 //!
 //! # Esc 与遮罩
 //!
@@ -71,6 +85,14 @@ actions!(
         SwitcherPrev,
         /// 下一个候选(↓)。
         SwitcherNext,
+        /// 往上翻一屏(PageUp)。
+        SwitcherPageUp,
+        /// 往下翻一屏(PageDown)。
+        SwitcherPageDown,
+        /// 第一个候选(Ctrl+Home)。
+        SwitcherFirst,
+        /// 最后一个候选(Ctrl+End)。
+        SwitcherLast,
     ]
 );
 
@@ -221,10 +243,11 @@ impl ProjectSwitcher {
             &query,
             window,
             |this: &mut Self, _, event: &InputEvent, window, cx| match event {
-                // 关键词一变就把游标拉回第一项(原版 onChange 里那句 setCursor(0))
+                // 关键词一变就把游标拉回第一项(原版 onChange 里那句 setCursor(0));
+                // 删回空查询时回到「上一个用过的项目」(见模块注释「空查询」)
                 InputEvent::Change => {
-                    this.cursor = 0;
-                    this.list_scroll.scroll_to_item(0);
+                    this.reset_cursor(cx);
+                    this.list_scroll.scroll_to_item(this.cursor);
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.commit(window, cx),
@@ -233,13 +256,27 @@ impl ProjectSwitcher {
         );
         // 开着的时候 pane 可能被关掉、灯可能在变:候选是渲染时现算的,这里只负责重画
         let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
-        Self {
+        let mut this = Self {
             store,
             query,
             cursor: 0,
             list_scroll: ScrollHandle::new(),
             _subs: vec![sub, store_sub],
-        }
+        };
+        this.reset_cursor(cx);
+        this
+    }
+
+    /// 游标回到当前查询下的默认位置(见 [`default_cursor`])。
+    fn reset_cursor(&mut self, cx: &App) {
+        let rows = self.rows(cx);
+        let query = self.query.read(cx).value();
+        let active = self.store.read(cx).active_project_id.as_deref();
+        let first_is_active = matches!(
+            rows.first(),
+            Some(Candidate::Project(row)) if Some(row.id.as_str()) == active
+        );
+        self.cursor = default_cursor(&query, first_is_active, rows.len());
     }
 
     /// 当前候选集。每帧现算 —— 项目状态(AI 灯/完成标)随时在变,缓存反而要
@@ -266,19 +303,25 @@ impl ProjectSwitcher {
                 })
             })
             .collect();
-        // 空查询连 pane 都不必走一遍:结果里本来就没有终端行
-        let terminals = if query.trim().is_empty() {
-            Vec::new()
+        // 空查询连 pane 都不必走一遍:结果里本来就没有终端行;项目行按最近使用序排
+        // (见模块注释「空查询」)
+        let (projects, terminals) = if query.trim().is_empty() {
+            let recent = store.recent_projects();
+            let ordered = order_by_recent(projects, recent, |row| row.id.as_str());
+            (ordered, Vec::new())
         } else {
-            terminal_rows(store, &flat)
+            (projects, terminal_rows(store, &flat))
         };
 
         build_candidates(projects, terminals, &query)
     }
 
-    fn move_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+    fn move_cursor(&mut self, step: CursorStep, cx: &mut Context<Self>) {
         let len = self.rows(cx).len();
-        self.cursor = next_cursor(self.cursor, len, delta);
+        // 行高按估算值算(终端行与项目行同高),一屏放得下几行就翻几行
+        let viewport = self.list_scroll.bounds().size.height;
+        let page = page_size(f32::from(viewport), ROW_H);
+        self.cursor = step_cursor_index(self.cursor, len, step, page);
         self.list_scroll.scroll_to_item(self.cursor);
         cx.notify();
     }
@@ -585,6 +628,78 @@ pub fn next_cursor(cursor: usize, len: usize, delta: i32) -> usize {
     let len_i = len as i64;
     let next = (cursor as i64 + delta as i64).rem_euclid(len_i);
     next as usize
+}
+
+/// 搜索类浮层(项目切换器 / 快速打开 / 全局搜索)里游标的一步。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CursorStep {
+    /// ↑
+    Prev,
+    /// ↓
+    Next,
+    /// PageUp
+    PageUp,
+    /// PageDown
+    PageDown,
+    /// Ctrl+Home
+    First,
+    /// Ctrl+End
+    Last,
+}
+
+/// 游标走一步之后停在第几条。逐条移动首尾相接(与之前的 ↑↓ 同一手感);翻页到头停住
+/// (`page` 是一页几条,至少按 1 算);首 / 尾直达。越界的游标(候选变少了)先夹回最后一条
+/// 再走。列表为空时钉在 0。
+pub(crate) fn step_cursor_index(cursor: usize, len: usize, step: CursorStep, page: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    let at = cursor.min(last);
+    let page = page.max(1);
+    match step {
+        CursorStep::Prev => next_cursor(at, len, -1),
+        CursorStep::Next => next_cursor(at, len, 1),
+        CursorStep::PageUp => at.saturating_sub(page),
+        CursorStep::PageDown => (at + page).min(last),
+        CursorStep::First => 0,
+        CursorStep::Last => last,
+    }
+}
+
+/// 一页翻几条:可视区放得下几行就翻几条,留一行重叠好接上上下文,至少 1。可视区还没量到
+/// (首帧)时按 10 条算。
+pub(crate) fn page_size(viewport: f32, row: f32) -> usize {
+    if viewport <= 0.0 || row <= 0.0 {
+        return 10;
+    }
+    ((viewport / row).floor() as usize).saturating_sub(1).max(1)
+}
+
+/// 空查询时的项目行顺序:最近使用序里有的按它排在前,其余保持原来(侧栏)的顺序。
+/// 最近使用序里已经不存在的 id 不影响结果。
+fn order_by_recent<T>(items: Vec<T>, recent: &[String], id_of: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut items = items;
+    // 稳定排序:没用过的同档,保持侧栏顺序
+    items.sort_by_key(|item| {
+        recent
+            .iter()
+            .position(|id| id == id_of(item))
+            .unwrap_or(recent.len())
+    });
+    items
+}
+
+/// 打开切换器 / 改完查询时游标默认停在哪。
+///
+/// 空查询且第一条就是当前项目时停在**第二条**(上一个用过的项目,见模块注释「空查询」);
+/// 只有一条、有查询词、或第一条不是当前项目(没有活动项目)时停在第一条。
+fn default_cursor(query: &str, first_is_active: bool, len: usize) -> usize {
+    if query.trim().is_empty() && first_is_active && len >= 2 {
+        1
+    } else {
+        0
+    }
 }
 
 /// 展平 `projectTree`,给每个项目算出它的分组路径。对应
@@ -998,10 +1113,22 @@ impl Render for ProjectSwitcher {
             // `"ProjectSwitcher > Input"` —— 为什么非这么写见模块注释。
             .key_context("ProjectSwitcher")
             .on_action(cx.listener(|this, _: &SwitcherPrev, _window, cx| {
-                this.move_cursor(-1, cx);
+                this.move_cursor(CursorStep::Prev, cx);
             }))
             .on_action(cx.listener(|this, _: &SwitcherNext, _window, cx| {
-                this.move_cursor(1, cx);
+                this.move_cursor(CursorStep::Next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitcherPageUp, _window, cx| {
+                this.move_cursor(CursorStep::PageUp, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitcherPageDown, _window, cx| {
+                this.move_cursor(CursorStep::PageDown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitcherFirst, _window, cx| {
+                this.move_cursor(CursorStep::First, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SwitcherLast, _window, cx| {
+                this.move_cursor(CursorStep::Last, cx);
             }))
             .size_full()
             .flex()
@@ -1369,6 +1496,106 @@ mod tests {
         assert_eq!(next_cursor(0, 3, -1), 2, "到顶折到最后一项");
         assert_eq!(next_cursor(0, 0, 1), 0);
         assert_eq!(next_cursor(5, 3, 1), 0, "越界的游标也要落回合法区间");
+    }
+
+    /// 一步怎么走:↑↓ 首尾相接,翻页到头停住,首 / 尾直达;越界的游标先夹回再走。
+    #[test]
+    fn 游标一步的走法() {
+        use CursorStep::*;
+        assert_eq!(step_cursor_index(0, 5, Next, 2), 1);
+        assert_eq!(step_cursor_index(0, 5, Prev, 2), 4, "上到头绕到尾");
+        assert_eq!(step_cursor_index(4, 5, Next, 2), 0, "下到尾绕回头");
+        assert_eq!(step_cursor_index(0, 5, PageDown, 2), 2);
+        assert_eq!(step_cursor_index(3, 5, PageDown, 9), 4, "翻页停在最后");
+        assert_eq!(step_cursor_index(1, 5, PageUp, 9), 0, "翻页停在第一");
+        assert_eq!(step_cursor_index(3, 5, PageUp, 0), 2, "一页至少 1 条");
+        assert_eq!(step_cursor_index(2, 5, First, 2), 0);
+        assert_eq!(step_cursor_index(2, 5, Last, 2), 4);
+        assert_eq!(step_cursor_index(9, 5, PageUp, 2), 2, "越界先夹回最后一条");
+        for step in [Prev, Next, PageUp, PageDown, First, Last] {
+            assert_eq!(step_cursor_index(3, 0, step, 2), 0, "空列表钉在 0:{step:?}");
+        }
+    }
+
+    #[test]
+    fn 一页的条数按可视区算() {
+        assert_eq!(page_size(200.0, 20.0), 9, "放得下 10 行,留一行重叠");
+        assert_eq!(page_size(30.0, 20.0), 1, "至少 1");
+        assert_eq!(page_size(0.0, 20.0), 10, "还没量到按 10 条");
+    }
+
+    /// 空查询的项目行:最近用过的按最近在前,其余保持侧栏顺序;已不存在的 id 不碍事。
+    #[test]
+    fn 空查询按最近使用序排() {
+        let sidebar = vec![
+            project_row("a", &[]),
+            project_row("b", &[]),
+            project_row("c", &[]),
+            project_row("d", &[]),
+        ];
+        let recent = vec!["c".to_string(), "已删除".to_string(), "a".to_string()];
+        let names: Vec<String> = order_by_recent(sidebar, &recent, |row| row.id.as_str())
+            .into_iter()
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(names, ["c", "a", "b", "d"]);
+
+        // 没有最近使用记录 = 侧栏顺序原样
+        let names: Vec<String> = order_by_recent(
+            vec![project_row("b", &[]), project_row("a", &[])],
+            &[],
+            |row| row.id.as_str(),
+        )
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
+        assert_eq!(names, ["b", "a"]);
+    }
+
+    /// 空查询游标落在第二条(上一个用过的项目);只有一条 / 有查询 / 首条不是当前项目时落在第一条。
+    #[test]
+    fn 空查询游标默认落在上一个项目() {
+        assert_eq!(default_cursor("", true, 3), 1);
+        assert_eq!(default_cursor("   ", true, 2), 1);
+        assert_eq!(default_cursor("", true, 1), 0, "只有一个项目");
+        assert_eq!(default_cursor("", true, 0), 0);
+        assert_eq!(default_cursor("api", true, 3), 0, "有查询照旧回第一条");
+        assert_eq!(
+            default_cursor("", false, 3),
+            0,
+            "首条不是当前项目时不跳过它"
+        );
+    }
+
+    /// PageUp/PageDown 与 Ctrl+Home/Ctrl+End 同样要压过输入框自带的那几条(机制同方向键)。
+    #[test]
+    fn 翻页与首尾键绑定压过输入框自带的() {
+        gpui::actions!(
+            switcher_page_test,
+            [InputPageDown, InputMoveToStart, InputMoveToEnd]
+        );
+        let keymap = Keymap::new(vec![
+            // 组件库先注册(gpui_component::init)
+            KeyBinding::new("pagedown", InputPageDown, Some("Input")),
+            KeyBinding::new("ctrl-home", InputMoveToStart, Some("Input")),
+            KeyBinding::new("ctrl-end", InputMoveToEnd, Some("Input")),
+            // 壳后注册(hotkeys::bind_keys)
+            KeyBinding::new(
+                "pagedown",
+                SwitcherPageDown,
+                Some("ProjectSwitcher > Input"),
+            ),
+            KeyBinding::new("ctrl-home", SwitcherFirst, Some("ProjectSwitcher > Input")),
+            KeyBinding::new("ctrl-end", SwitcherLast, Some("ProjectSwitcher > Input")),
+        ]);
+        let stack = context_stack(&["Workspace", "Dialog", "ProjectSwitcher", "Input"]);
+        let first = |ks: &str| {
+            let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
+            bindings[0].action().boxed_clone()
+        };
+        assert!(first("pagedown").partial_eq(&SwitcherPageDown));
+        assert!(first("ctrl-home").partial_eq(&SwitcherFirst));
+        assert!(first("ctrl-end").partial_eq(&SwitcherLast));
     }
 
     /// 分组路径展平:嵌套组拼成路径,树外项目追加到末尾且路径为空。

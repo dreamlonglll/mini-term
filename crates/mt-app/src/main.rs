@@ -83,6 +83,7 @@ mod git_stash;
 mod git_ui;
 mod git_watch;
 mod git_worktree;
+mod hook_hint;
 mod hotkeys;
 mod i18n;
 mod image_lightbox;
@@ -137,6 +138,7 @@ mod tray;
 mod tree;
 mod ui;
 mod update_check;
+mod update_dialog;
 mod usage_panel;
 mod workbench_area;
 
@@ -186,9 +188,9 @@ actions!(
         SplitDown,
         /// 折叠/展开中间栏(Ctrl+Shift+B)
         ToggleMiddleColumn,
-        /// 叶内切到下一个 tab(Ctrl+Tab)
+        /// 叶内切到下一个 tab(Ctrl+Tab);组内只有一个 tab 时切到下一个分组
         NextPane,
-        /// 叶内切到上一个 tab(Ctrl+Shift+Tab)
+        /// 叶内切到上一个 tab(Ctrl+Shift+Tab);组内只有一个 tab 时切到上一个分组
         PrevPane,
         /// 重命名当前标签(F2)
         RenamePane,
@@ -222,6 +224,26 @@ actions!(
         MarkerNext,
         /// 开合命令库浮层(Ctrl+Shift+K,issue #81)
         ToggleCommandLibrary,
+        /// 终端页 ↔ 最近停过的文件页签来回切(Ctrl+`)
+        ToggleWorkbenchPage,
+        /// 关闭当前**单个**终端页签(Ctrl+Shift+X;整组仍是 Ctrl+Shift+W)
+        CloseTerminalTab,
+        /// 最大化 / 还原当前分组(Ctrl+Shift+M)
+        ToggleMaximizePane,
+        /// 当前页签在组内左移(Ctrl+Shift+PageUp)
+        MoveTabLeft,
+        /// 当前页签在组内右移(Ctrl+Shift+PageDown)
+        MoveTabRight,
+        /// 当前分屏朝左扩(Alt+Shift+←)
+        ResizeSplitLeft,
+        /// 当前分屏朝右扩(Alt+Shift+→)
+        ResizeSplitRight,
+        /// 当前分屏朝上扩(Alt+Shift+↑)
+        ResizeSplitUp,
+        /// 当前分屏朝下扩(Alt+Shift+↓)
+        ResizeSplitDown,
+        /// 重新打开已关闭的终端(Ctrl+Shift+Z)
+        ReopenClosedTerminal,
     ]
 );
 
@@ -246,6 +268,17 @@ fn yields_to_typing(window: &mut Window, cx: &mut App) -> bool {
 
 fn yields_to_overlay(window: &mut Window, cx: &mut App) -> bool {
     yields_to_typing(window, cx) || !overlay::allows(overlay::Yield::ToOverlay)
+}
+
+/// 一条终端 / 导航快捷键此刻落在哪一页(见 [`Workspace::hotkey_page`])。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotkeyPage {
+    /// 让路:覆盖物压着,或焦点在别处的输入框里
+    Yield,
+    /// 停在终端页:走原来那条路
+    Terminal,
+    /// 停在文件 / diff 页签上:交给工作区页签(`workbench_area` 模块注释)
+    Document,
 }
 
 /// 选中叶内第 N 个 tab(Ctrl+1..9,**1-based**;越界不动)。
@@ -450,9 +483,11 @@ struct Workspace {
     frost_task: Option<Task<()>>,
     /// 启动自检发现的新版本(`None` = 没有 / 还没查完 / 查失败)。
     ///
-    /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
-    /// **也没有「忽略此版本」** —— 原版查完就一直亮着那颗按钮,直到升级为止。
-    update_release: Option<crate::update_check::ReleaseInfo>,
+    /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘。
+    /// 边条按钮亮不亮还要过「忽略此版本」那道闸(`update_check::should_announce`,
+    /// 每帧现判 —— 在弹窗里忽略、在「关于」里不再忽略,按钮即刻跟着变)。放 `Arc` 里:
+    /// 带着发布说明正文,每帧交给按钮闭包时不整份复制。
+    update_release: Option<Arc<crate::update_check::ReleaseInfo>>,
     /// 上一次收到关闭快捷键的时刻,判按住不放的连发用
     /// (见 [`pane_actions::swallows_close_hotkey`])。
     last_close_hotkey: Option<std::time::Instant>,
@@ -501,12 +536,24 @@ impl Workspace {
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         file_tree::install(file_tree.clone(), cx);
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
+        // 键盘焦点落空(拿着焦点的终端 / 页签被关掉,弹窗把焦点还给已经关掉的终端)时接回来,
+        // 见 [`Self::restore_lost_focus`]。监听跑在绘制期:那时改焦点不排下一帧、notify 也被
+        // 吞掉(gpui `Window::draw` 焦点阶段),所以挪到本轮绘制之后再动手
+        cx.on_focus_lost(window, |_: &mut Self, window, cx| {
+            let lost = window.focused(cx).map(|handle| handle.downgrade());
+            cx.defer_in(window, move |this, window, cx| {
+                this.restore_lost_focus(lost, window, cx)
+            });
+        })
+        .detach();
         let workbench_area =
             cx.new(|cx| WorkbenchArea::new(store.clone(), terminal_area.clone(), cx));
         workbench_area::install(workbench_area.clone(), cx);
+        // 文件树高亮当前文件页签那一行:工作区换了活动页签要叫它重画(文件树先建,这里补订阅)
+        file_tree.update(cx, |tree, cx| tree.observe_workbench(&workbench_area, cx));
         let terminals_panel =
             cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
-        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
+        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), window, cx));
         let git_panel = cx.new(|cx| git_panel::GitPanel::new(store.clone(), window, cx));
         let columns_state = cx.new(|_| ResizableState::default());
         let middle_state = cx.new(|_| ResizableState::default());
@@ -556,6 +603,8 @@ impl Workspace {
         // 移动端中转:建桥 + 登记全局 + 按配置建连一次。放在这里(而不是 `main`)
         // 是因为泵要 `spawn_in` 拿窗口 —— 移动端发起会话得建 pane、弹 toast。
         let relay = mobile_relay::install(store.clone(), window, cx);
+        // 「注册 Hook 状态更准」的一次性提示:只订阅 store 事件,判据见 `hook_hint`
+        hook_hint::install(store.clone(), cx);
 
         // 系统托盘:图标住在另一条线程上(自己的隐藏窗口 + 消息循环),
         // 交互经 channel 回到这里 —— 与 AI 状态泵同一套路数。
@@ -592,8 +641,8 @@ impl Workspace {
 
         // 启动版本自检(audit #30)。原版在拿到版本号之后立刻 `checkForUpdate(ver)`
         // 并 `.catch(() => {})`(`App.tsx:273-281`)—— 每次启动查一次、失败静默、
-        // 没有开关也没有「忽略此版本」。HTTP 是阻塞的,丢后台执行器,回主线程只
-        // 改一个字段(与 `pricing.rs` 拉价格表同一套路)。
+        // 没有开关(「忽略此版本」是后加的,在渲染端判,见 `update_release`)。HTTP 是
+        // 阻塞的,丢后台执行器,回主线程只改一个字段(与 `pricing.rs` 拉价格表同一套路)。
         let update_check = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -601,7 +650,7 @@ impl Workspace {
                 .await;
             let Some(release) = found else { return };
             let _ = this.update(cx, |workspace: &mut Self, cx| {
-                workspace.update_release = Some(release);
+                workspace.update_release = Some(Arc::new(release));
                 cx.notify();
             });
         });
@@ -819,7 +868,9 @@ impl Workspace {
         toast::push_alert(kind, alert.project_id, alert.project_name, cx);
     }
 
-    /// 当前该操作哪个 pane:焦点 pane,没有就落到布局里第一个激活 pane。
+    /// 当前该操作哪个 pane。键盘焦点在不在终端上(文件树、项目列表里按快捷键)都按同一条
+    /// 回落链取:逻辑焦点 → 这个项目上次聚焦的 → 第一个分组的激活页签
+    /// (`AppStore::active_pane_id`)。
     fn target_pane(&self, cx: &App) -> Option<(String, String)> {
         let store = self.store.read(cx);
         let project_id = store.active_project_id.clone()?;
@@ -831,8 +882,68 @@ impl Workspace {
         self.workbench_area.read(cx).is_terminal_active(cx)
     }
 
+    /// 键盘焦点落空之后接回来:落空时按键从窗口根派发,`Workspace` 这一层的快捷键一个都
+    /// 收不到,打字也丢。去处(活动终端 / 终端区兜底 / 不动)见
+    /// `TerminalArea::restore_lost_focus`。`lost` 是落空那一刻的焦点:推迟到绘制之后这段
+    /// 时间里已经有别人接手(焦点换成了别的句柄)就不再插手。
+    fn restore_lost_focus(
+        &mut self,
+        lost: Option<gpui::WeakFocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = window.focused(cx).map(|handle| handle.downgrade());
+        if now.is_some() && now != lost {
+            return;
+        }
+        let terminal_page = self.terminal_page_active(cx);
+        let overlay_open = !overlay::allows(overlay::Yield::ToOverlay);
+        self.terminal_area.update(cx, |area, cx| {
+            area.restore_lost_focus(terminal_page, overlay_open, window, cx)
+        });
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+` / Ctrl+Shift+T·W·D·E 这一刻落在哪一页。
+    ///
+    /// 终端页照旧走 [`yields_to_overlay`]。文件页的编辑器本身是 `Input`,套那道「焦点在
+    /// 输入框里就让路」的闸,这几个键在文件页上就全废了 —— 改成只在焦点落在**别处**的输入框
+    /// (Git 提交框、文件树改名框……)里时让路,覆盖物照旧让路。
+    fn hotkey_page(&self, window: &mut Window, cx: &mut App) -> HotkeyPage {
+        if self.terminal_page_active(cx) {
+            return if yields_to_overlay(window, cx) {
+                HotkeyPage::Yield
+            } else {
+                HotkeyPage::Terminal
+            };
+        }
+        let typing_elsewhere = window.has_focused_input(cx)
+            && !self
+                .workbench_area
+                .read(cx)
+                .active_tab_contains_focus(window, cx);
+        if typing_elsewhere || !overlay::allows(overlay::Yield::ToOverlay) {
+            HotkeyPage::Yield
+        } else {
+            HotkeyPage::Document
+        }
+    }
+
+    /// Ctrl+Shift+T / D / E 的前半截:停在页签上就先切回终端页,再照常新建 / 分屏。
+    /// 返回 `false` = 这次让路。
+    fn ensure_terminal_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => false,
+            HotkeyPage::Terminal => true,
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.activate_terminal(window, cx));
+                true
+            }
+        }
+    }
+
     fn on_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
@@ -849,36 +960,55 @@ impl Workspace {
     ///
     /// 走 [`pane_actions::close_leaf_of_pane`] 而不是直接调 store:关闭前要盘点
     /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
+    ///
+    /// 停在页签上时关的是**当前页签**(与 × 同一条路,脏的照常先问)。那条路也刷新连发计时:
+    /// 按住不放把页签关光、落回终端页之后,后续连发照样被 [`pane_actions::swallows_close_hotkey`]
+    /// 吞掉,不会顺势把终端一组组关掉。
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         let now = std::time::Instant::now();
-        let last = self.last_close_hotkey.replace(now);
-        if pane_actions::swallows_close_hotkey(self.store.read(cx).config(), last, now) {
-            return;
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.last_close_hotkey = Some(now);
+                self.workbench_area
+                    .update(cx, |area, cx| area.close_active_tab(window, cx));
+                return;
+            }
         }
+        let last = self.last_close_hotkey.replace(now);
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
+        // 目标组全部已退出时偏好开着也免确认,连发闸要跟着管(见 `swallows_close_hotkey`)
+        let store = self.store.read(cx);
+        let dead = pane_actions::leaf_of_pane_is_dead(store, &project_id, &pane_id);
+        if pane_actions::swallows_close_hotkey(store.config(), dead, last, now) {
+            return;
+        }
         pane_actions::close_leaf_of_pane(self.store.clone(), project_id, pane_id, window, cx);
     }
 
     fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         self.cycle_pane(1, window, cx);
     }
 
     fn on_prev_pane(&mut self, _: &PrevPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         self.cycle_pane(-1, window, cx);
     }
 
+    /// 终端页:叶内换 tab;停在页签上:在「终端页 + 各页签」之间循环
+    /// (`WorkbenchArea::cycle_page`)。
     fn cycle_pane(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.cycle_page(delta, window, cx));
+                return;
+            }
+        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
@@ -901,17 +1031,38 @@ impl Workspace {
     }
 
     fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         self.split(SplitDirection::Horizontal, window, cx);
     }
 
     fn on_split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         self.split(SplitDirection::Vertical, window, cx);
+    }
+
+    /// Ctrl+`:停在页签上 → 回终端页并把焦点还给终端;停在终端页 → 回最近停过的那个页签
+    /// (没有页签就什么都不做)。
+    fn on_toggle_workbench_page(
+        &mut self,
+        _: &ToggleWorkbenchPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => {}
+            HotkeyPage::Terminal => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.return_to_last_tab(window, cx));
+            }
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.activate_terminal(window, cx));
+            }
+        }
     }
 
     fn split(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
@@ -935,7 +1086,7 @@ impl Workspace {
         self.store.update(cx, |store, cx| store.toggle_middle_column(cx));
     }
 
-    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表里那三条行级
+    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表与文件树的行级
     /// 按键(Enter/Space、Delete、F2)只有 F2 与全局键位表撞车,所以它不在行上
     /// 另绑一条 action,而是从这里按「有没有列表行拿着焦点」分流。
     ///
@@ -950,6 +1101,13 @@ impl Workspace {
         if self
             .project_list
             .update(cx, |list, cx| list.rename_focused_row(window, cx))
+        {
+            return;
+        }
+        // 文件树的行拿着焦点 → 改那个文件 / 目录的名字(与它右键「重命名」同一条路)
+        if self
+            .file_tree
+            .update(cx, |tree, cx| tree.rename_focused_row(window, cx))
         {
             return;
         }
@@ -1103,12 +1261,21 @@ impl Workspace {
 
     fn focus_adjacent(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
         // 这四条只从快捷键进来,守卫放这一处就够(Alt+方向键在文本输入框里
-        // 还是「按词移动」,让路给弹窗是必须的)
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
+        // 还是「按词移动」,让路给弹窗是必须的)。
+        //
+        // **没挪成就放行**(`propagate`):让路、不在终端页、那个方向没有相邻分屏,按键都
+        // 原样落回焦点所在处 —— fish / zsh 与不少 TUI 拿 Alt+方向键按词移动,单屏时吞掉
+        // 它等于把这组键整个废掉。gpui 先派发 action,处理器 propagate 之后才跑 key 监听
+        // (`Window::dispatch_key_event`:binding 循环里 `propagate_event` 仍为真就落到
+        // `finish_dispatch_key_event`),终端照常把它编码进 PTY。
+        let moved = !yields_to_overlay(window, cx)
+            && self.terminal_page_active(cx)
+            && self
+                .terminal_area
+                .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
+        if !moved {
+            cx.propagate();
         }
-        self.terminal_area
-            .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
     }
 
     /// Ctrl+F:文件页交给当前文档；终端页在**当前焦点 pane** 上开查找条。
@@ -1227,6 +1394,159 @@ impl Workspace {
             return;
         }
         self.store.update(cx, |store, cx| store.step_marker(1, cx));
+    }
+
+    // ─── 页签与分屏的键盘路径 ─────────────────────────────────────
+    //
+    // 让路口径与同类动作一致:弹窗 / 输入框让路(`yields_to_overlay`),只在终端页生效。
+    // 调比例那四条与 Alt+方向键一样,没动成就 `propagate` 把按键还给终端。
+
+    /// Ctrl+Shift+X:关当前**单个**页签,与点页签上的 × 同一个入口
+    /// ([`pane_actions::close_pane`]:AI 感知确认、已退出免确认)。按住不放的连发闸与
+    /// Ctrl+Shift+W 共用一份时刻:两个关闭键交替连按也只算一次。
+    fn on_close_terminal_tab(
+        &mut self,
+        _: &CloseTerminalTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = std::time::Instant::now();
+        // 停在文件 / diff 页签上:关的是当前页签,与 Ctrl+Shift+W 在那一页的分流同一口径
+        // (那一页没有「整组」可言,两个键落到同一个动作上)
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.last_close_hotkey = Some(now);
+                self.workbench_area
+                    .update(cx, |area, cx| area.close_active_tab(window, cx));
+                return;
+            }
+        }
+        let last = self.last_close_hotkey.replace(now);
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        let store = self.store.read(cx);
+        let dead = pane_actions::pane_is_dead(store, &project_id, &pane_id);
+        if pane_actions::swallows_close_hotkey(store.config(), dead, last, now) {
+            return;
+        }
+        pane_actions::close_pane(self.store.clone(), project_id, pane_id, window, cx);
+    }
+
+    /// Ctrl+Shift+M:最大化 / 还原当前分组。与页签栏的按钮、双击页签栏空白处、页签右键
+    /// 同一个动作(单格布局下是空操作,与按钮不画同一判据)。
+    fn on_toggle_maximize_pane(
+        &mut self,
+        _: &ToggleMaximizePane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.toggle_maximized_leaf(&project_id, &pane_id, cx)
+        });
+    }
+
+    fn on_move_tab_left(&mut self, _: &MoveTabLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_tab(-1, window, cx);
+    }
+    fn on_move_tab_right(&mut self, _: &MoveTabRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_tab(1, window, cx);
+    }
+
+    /// Ctrl+Shift+PageUp / PageDown:当前页签在所属分组内挪一格,到头不循环。
+    fn move_tab(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.move_pane_within_leaf(&project_id, &pane_id, delta, cx)
+        });
+    }
+
+    fn on_resize_split_left(
+        &mut self,
+        _: &ResizeSplitLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Left, window, cx);
+    }
+    fn on_resize_split_right(
+        &mut self,
+        _: &ResizeSplitRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Right, window, cx);
+    }
+    fn on_resize_split_up(
+        &mut self,
+        _: &ResizeSplitUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Up, window, cx);
+    }
+    fn on_resize_split_down(
+        &mut self,
+        _: &ResizeSplitDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Down, window, cx);
+    }
+
+    /// Alt+Shift+方向键:把当前 pane 那一侧最近的分隔线朝箭头方向推一步
+    /// ([`TerminalArea::resize_split`])。**没动成就放行**(让路、不在终端页、那个方向
+    /// 没有分隔线、正最大化着),理由与 [`Self::focus_adjacent`] 相同:单屏时这组键归终端。
+    fn resize_split(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let handled = !yields_to_overlay(window, cx)
+            && self.terminal_page_active(cx)
+            && self
+                .terminal_area
+                .update(cx, |area, cx| area.resize_split(dir, window, cx));
+        if !handled {
+            cx.propagate();
+        }
+    }
+
+    /// Ctrl+Shift+Z:重新打开当前项目最近关掉的终端(`store::reopen`)。按**活动项目**取
+    /// 而不是焦点 pane:关光了终端、停在空态页时正是最需要它的时候。栈空时什么也不做。
+    fn on_reopen_closed_terminal(
+        &mut self,
+        _: &ReopenClosedTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 停在文件 / diff 页签上:重开的是最近关掉的**页签**(两处「重新打开已关闭的…」
+        // 共用一个键,落在眼前那一页自己的已关闭栈上)
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.workbench_area.update(cx, |area, cx| {
+                    area.reopen_closed_tab_of_active_project(window, cx)
+                });
+                return;
+            }
+        }
+        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.reopen_closed_pane(&project_id, window, cx);
+        });
     }
 
     /// 提交详情栏此刻的宽:拖拽中按拖的,否则按落盘的;窗口窄时让一让(见
@@ -1620,12 +1940,24 @@ impl Render for Workspace {
             )
         };
         let terminal_page_active = self.workbench_area.read(cx).is_terminal_active(cx);
+        // 边条更新按钮:查到的新版本还要过「忽略此版本」那道闸
+        let update_shown = {
+            let ignored = self
+                .store
+                .read(cx)
+                .config()
+                .ignored_update_version
+                .as_deref();
+            self.update_release.clone().filter(|release| {
+                update_check::should_announce(release, env!("CARGO_PKG_VERSION"), ignored)
+            })
+        };
 
         // 条件按钮可能在鼠标仍停在原坐标时从元素树消失,这时 GPUI 不保证再补一发
         // on_hover(false)。主动按当前可见性对账,避免它的旧计时把会话偷偷热身。
         let conditional_hover_gone = (unread == 0
             && self.activity_bar_hover.leave("jump-attention"))
-            || (self.update_release.is_none() && self.activity_bar_hover.leave("open-update"));
+            || (update_shown.is_none() && self.activity_bar_hover.leave("open-update"));
         if conditional_hover_gone {
             self.activity_bar_hover_task = None;
         }
@@ -1985,19 +2317,19 @@ impl Render for Workspace {
                 })),
             )
             // 「有新版本」按钮。**只在查到更新时才出现**(原版 `updateVersion &&`,
-            // `ActivityBar.tsx:173-182`),点一下外链到那条 release 的页面。
+            // `ActivityBar.tsx:173-182`)。原版点一下直接外链到发布页;这里改成先开
+            // 「发现新版本」弹窗看发布说明,下载 / 忽略此版本 / 稍后在弹窗里选。
             // 位置照原版:排在全部常规按钮之后(下面那颗「跳到已完成」是 GPUI
             // 独有的,继续留在最末)。
-            .children(self.update_release.as_ref().map(|release| {
-                let url = release.url.clone();
+            .children(update_shown.map(|release| {
                 activity_bar::update_button(
                     "open-update",
                     tr!("app", "update.title", version = release.version.as_str()),
                     self.activity_bar_hover.is_visible("open-update"),
                     Self::activity_bar_item_hover_listener("open-update", cx),
                 )
-                .on_click(move |_event, _window, cx: &mut gpui::App| {
-                    cx.open_url(&url);
+                .on_click(move |_event, window, cx: &mut gpui::App| {
+                    update_dialog::open(&release, window, cx);
                 })
             }))
             // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口;
@@ -2356,6 +2688,16 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))
             .on_action(cx.listener(Self::on_toggle_command_library))
+            .on_action(cx.listener(Self::on_toggle_workbench_page))
+            .on_action(cx.listener(Self::on_close_terminal_tab))
+            .on_action(cx.listener(Self::on_toggle_maximize_pane))
+            .on_action(cx.listener(Self::on_move_tab_left))
+            .on_action(cx.listener(Self::on_move_tab_right))
+            .on_action(cx.listener(Self::on_resize_split_left))
+            .on_action(cx.listener(Self::on_resize_split_right))
+            .on_action(cx.listener(Self::on_resize_split_up))
+            .on_action(cx.listener(Self::on_resize_split_down))
+            .on_action(cx.listener(Self::on_reopen_closed_terminal))
             // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
             // —— 等价于原版往 document 上挂 mousemove/mouseup
             .when(self.drawer_drag.is_some(), |el| {
@@ -2680,6 +3022,14 @@ fn main() {
         );
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
+
+        // 用户改过的快捷键压在默认键位之上(默认键位上面 `bind_keys` 已绑好;机制见
+        // `hotkeys::apply_overrides`)。必须赶在窗口开出来之前:首帧的菜单提示、首启引导的
+        // 键帽读的就是此刻生效的那份。读不懂 / 认不出的条目丢弃,只记日志
+        let hotkey_overrides = store.read(cx).config().hotkey_overrides.clone();
+        for issue in hotkeys::apply_overrides(&hotkey_overrides, cx) {
+            eprintln!("[hotkeys] {issue}");
+        }
 
         // 界面字号 / 字族同样要在**任何视图建出来之前**定下来:`ui::font_px` 读的是
         // 进程级快照,晚一步首帧会按默认 13px 画出来再被刷一遍(闪一下)。

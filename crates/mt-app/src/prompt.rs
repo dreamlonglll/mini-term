@@ -88,6 +88,17 @@ pub fn confirm_footer<S: Into<SharedString>>(
 
 /// [`confirm_footer`] 的本体;`danger` = 确认键用危险色(删除 / 丢弃一类)。
 fn footer(ok: SharedString, cancel: Option<SharedString>, danger: bool) -> DialogFooter {
+    footer_with_alt(ok, cancel, None, danger)
+}
+
+/// [`footer`] 再在「取消」左边垫一颗第三选项(见 [`Confirm::alt_action`]):离确认键最远,
+/// 回车照旧落在确认键上。
+fn footer_with_alt(
+    ok: SharedString,
+    cancel: Option<SharedString>,
+    alt: Option<Button>,
+    danger: bool,
+) -> DialogFooter {
     let ok_button = footer_button("ok", ok).on_click(|_, window, cx| {
         window.dispatch_action(
             Box::new(gpui_component::dialog::Confirm { secondary: false }),
@@ -95,6 +106,7 @@ fn footer(ok: SharedString, cancel: Option<SharedString>, danger: bool) -> Dialo
         )
     });
     DialogFooter::new()
+        .children(alt)
         .children(cancel.map(|cancel| {
             footer_button("cancel", cancel)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
@@ -121,7 +133,9 @@ where
     open_guarded_with_close(kind, window, cx, build, |_window, _cx| {});
 }
 
-fn open_guarded_with_close<F, C>(
+/// [`open_guarded`] 再带一个关窗回调:Esc / 点遮罩 / 确定 / 取消关掉时都调(守卫拦下没开成时
+/// 也调一次)。**程序化关闭([`close_guarded`])不调** —— 那条路的调用方自己收尾。
+pub(crate) fn open_guarded_with_close<F, C>(
     kind: &'static str,
     window: &mut Window,
     cx: &mut App,
@@ -367,7 +381,18 @@ pub struct Confirm {
     danger: bool,
     /// 「不再询问」那一行;`None` = 不出(绝大多数确认框)。
     dont_ask_again: Option<DontAskAgain>,
+    /// 确认 / 取消之外的第三颗钮;`None` = 两键确认框(绝大多数)。
+    alt: Option<AltAction>,
 }
+
+/// 确认框的第三颗钮,见 [`Confirm::alt_action`]。
+struct AltAction {
+    label: SharedString,
+    on_click: AltHandler,
+}
+
+/// [`AltAction`] 的回调(builder 每帧重调,要能克隆进按钮的点击闭包)。
+type AltHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// 确认框里的「不再询问」行,见 [`Confirm::dont_ask_again`]。
 struct DontAskAgain {
@@ -387,7 +412,24 @@ impl Confirm {
             cancel_text: t("prompt", "cancel").into(),
             danger: false,
             dont_ask_again: None,
+            alt: None,
         }
+    }
+
+    /// 加第三颗钮(「保存并关闭 / 不保存 / 取消」里的「不保存」这类)。点它先关框、再调
+    /// `on_click`,**不经过 `on_ok`**,所以「不再询问」的勾选对它不算数;回车 / Esc 仍是
+    /// 确认 / 取消。关框走 [`close_guarded`](自己摘覆盖物栈),与
+    /// [`show_file_conflict_choice`] 的三颗钮同一条路。
+    pub fn alt_action(
+        mut self,
+        label: impl Into<SharedString>,
+        on_click: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.alt = Some(AltAction {
+            label: label.into(),
+            on_click: Rc::new(on_click),
+        });
+        self
     }
 
     /// 不可逆操作:确认键换危险色(与 `git_ui::dialog_footer` 的 danger 同一颗)。
@@ -451,14 +493,22 @@ impl Confirm {
                 .as_ref()
                 .map(|row| row.on_opt_out.clone());
             let opted_out = opted_out.clone();
+            let alt_button = self.alt.as_ref().map(|alt| {
+                let on_click = alt.on_click.clone();
+                footer_button("alt", alt.label.clone()).on_click(move |_, window, cx| {
+                    close_guarded(kind::CONFIRM, window, cx);
+                    on_click(window, cx);
+                })
+            });
             dialog
                 .title(self.title.clone())
                 // 三件套(prompt/confirm/alert)统一宽度,见 `DIALOG_W`
                 .w(px(DIALOG_W))
                 .overlay_closable(true)
-                .footer(footer(
+                .footer(footer_with_alt(
                     self.ok_text.clone(),
                     Some(self.cancel_text.clone()),
+                    alt_button,
                     self.danger,
                 ))
                 .child(body(&self.message, &self.detail))

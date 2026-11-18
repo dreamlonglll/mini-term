@@ -48,7 +48,7 @@
 //!
 //! 本模块只留**面板本体**:分页枚举与侧栏分组、[`SettingsView`] 的状态字段、
 //! 草稿行的归一与提交、`open_settings` 与分页路由。十二个分页各自的渲染按主题
-//! 分在六个 `pages_*` 里,共用小件在 `widgets`:
+//! 分在七个 `pages_*` 里,共用小件在 `widgets`:
 //!
 //! | 文件 | 内容 |
 //! |------|------|
@@ -57,7 +57,8 @@
 //! | `pages_appearance` | appearance(语言 / 主题 / 外置皮肤)/ font |
 //! | `pages_ai` | ai-notification / ai-hook |
 //! | `pages_remote_notify` | remote-notify(Bark / Telegram / Webhook 远程通知,发送在 `crate::remote_notify`) |
-//! | `pages_system` | system / editor / shortcuts / about |
+//! | `pages_system` | system / editor / about |
+//! | `pages_shortcuts` | shortcuts(键位表、录制改键、冲突与就地提示;键位逻辑在 `crate::hotkeys`) |
 //! | `widgets` | 页/节骨架、设置行原语与零碎视图件 |
 //!
 //! about 页要用的版本比较与 GitHub 查询**不在这棵树里** —— 它同时被 `main.rs`
@@ -84,12 +85,14 @@ mod pages_ai;
 mod pages_appearance;
 mod pages_env_vars;
 mod pages_remote_notify;
+mod pages_shortcuts;
 mod pages_system;
 mod pages_terminal;
 mod widgets;
 
 use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
 use pages_remote_notify::RemoteNotifyForm;
+use pages_shortcuts::ShortcutsState;
 
 // ─── 分页 ─────────────────────────────────────────────────────
 
@@ -153,8 +156,8 @@ impl SettingsPage {
         }
     }
 
-    /// 深链入口的解析口(`initial_page`)。原版那两处入口都传 `undefined`,
-    /// 这个口子同样先留着。
+    /// 按深链 id 反查分页。眼下的深链入口(首屏引导、Hook 提示 toast)直接传枚举,
+    /// 只有单测在用;留着是给将来从字符串来的入口(移动端、命令行参数)。
     #[allow(dead_code)]
     pub fn from_id(id: &str) -> Option<Self> {
         ALL_PAGES.iter().copied().find(|p| p.id() == id)
@@ -424,6 +427,9 @@ pub struct SettingsView {
     // ── remote-notify 页 ──
     remote: RemoteNotifyForm,
 
+    // ── shortcuts 页:录制改键(见 `pages_shortcuts`)──
+    shortcuts: ShortcutsState,
+
     // ── system 页:本地下载目录 ──
     download_dir_busy: bool,
     download_dir_error: Option<String>,
@@ -432,6 +438,8 @@ pub struct SettingsView {
     // ── about 页 ──
     checking: bool,
     latest: Option<ReleaseInfo>,
+    /// `latest` 的发布说明,清洗过的 Markdown(查到时在后台清洗一次,不每帧重做)。
+    latest_notes: SharedString,
     update_error: Option<String>,
 
     /// 后台任务(hook 动作 / 皮肤导入 / 检查更新)。换一次就丢掉上一次。
@@ -497,7 +505,22 @@ fn render_dialog_header() -> impl IntoElement {
         )
 }
 
-/// 打开设置面板。`initial_page` 是深链入口(原版留的口子,目前恒传 `None`)。
+/// 本次运行里设置面板上次停在哪一页(关面板时记下,见 `SettingsView::new` 的 `on_release`)。
+/// **不落盘**:重启后从第一页开始,与原版一致;只省掉「同一次运行里来回改同一页」的那几下点击。
+struct LastSettingsPage(SettingsPage);
+impl gpui::Global for LastSettingsPage {}
+
+/// 打开时落在哪一页:深链指定的优先,其次是这次运行里上次停留的那页,都没有就第一页。
+fn resolve_initial_page(
+    requested: Option<SettingsPage>,
+    remembered: Option<SettingsPage>,
+) -> SettingsPage {
+    requested.or(remembered).unwrap_or(SettingsPage::Terminal)
+}
+
+/// 打开设置面板。`initial_page` 是深链入口:首屏引导与「注册 Hook」提示直达
+/// [`SettingsPage::AiHook`];快捷键 / 齿轮按钮传 `None`,回到上次停留的那页
+/// (见 [`resolve_initial_page`])。
 pub fn open_settings(
     store: Entity<AppStore>,
     initial_page: Option<SettingsPage>,
@@ -509,7 +532,9 @@ pub fn open_settings(
     if crate::overlay::contains(crate::overlay::key(kind::SETTINGS)) {
         return;
     }
-    let view = cx.new(|cx| SettingsView::new(store, initial_page, window, cx));
+    let remembered = cx.try_global::<LastSettingsPage>().map(|last| last.0);
+    let page = resolve_initial_page(initial_page, remembered);
+    let view = cx.new(|cx| SettingsView::new(store, Some(page), window, cx));
     let focus = view.read(cx).focus.clone();
 
     open_guarded(kind::SETTINGS, window, cx, {
@@ -685,11 +710,13 @@ impl SettingsView {
             snippet_tab: mt_ai::hook_registry::HookAgent::Claude.key(),
             sound_warning: false,
             remote,
+            shortcuts: ShortcutsState::default(),
             download_dir_busy: false,
             download_dir_error: None,
             download_dir_validation_key: None,
             checking: false,
             latest: None,
+            latest_notes: SharedString::default(),
             update_error: None,
             _job: None,
             _download_dir_job: None,
@@ -732,6 +759,8 @@ impl SettingsView {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
             this.commit_drafts(cx);
+            // 下次不指定分页打开时回到这一页(见 [`resolve_initial_page`])
+            cx.set_global(LastSettingsPage(this.page));
         })
         .detach();
 
@@ -889,7 +918,16 @@ impl SettingsView {
     fn move_page(&mut self, delta: i32, cx: &mut Context<Self>) {
         let len = ALL_PAGES.len() as i32;
         let idx = ALL_PAGES.iter().position(|p| *p == self.page).unwrap_or(0) as i32;
-        self.page = ALL_PAGES[(((idx + delta) % len + len) % len) as usize];
+        self.set_page(ALL_PAGES[(((idx + delta) % len + len) % len) as usize], cx);
+    }
+
+    /// 换分页的唯一入口。离开快捷键页时把那一页的录制(App 级的按键拦截器)、待选冲突、
+    /// 就地提醒一并清掉 —— 拦截器绝不能跟着人跑到别的页去。
+    fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if page != self.page {
+            self.leave_shortcuts_page(cx);
+        }
+        self.page = page;
         cx.notify();
     }
 }
@@ -1030,8 +1068,7 @@ impl SettingsView {
                                 .child(t("settings", page.label_key())),
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.page = page;
-                            cx.notify();
+                            this.set_page(page, cx);
                         })),
                 );
             }
@@ -1089,6 +1126,16 @@ mod tests {
             assert_eq!(SettingsPage::from_id(page.id()), Some(*page));
         }
         assert_eq!(SettingsPage::from_id("nope"), None);
+    }
+
+    /// 打开时落在哪页:深链优先,其次本次运行上次停留的那页,都没有才是第一页。
+    #[test]
+    fn 打开时的分页取舍() {
+        use SettingsPage::*;
+        assert_eq!(resolve_initial_page(None, None), Terminal);
+        assert_eq!(resolve_initial_page(None, Some(Font)), Font);
+        assert_eq!(resolve_initial_page(Some(AiHook), Some(Font)), AiHook);
+        assert_eq!(resolve_initial_page(Some(AiHook), None), AiHook);
     }
 
     /// 侧栏分组覆盖全部分页,且顺序与扁平序列一致(↑↓ 导航按后者走)。

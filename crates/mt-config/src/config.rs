@@ -6,6 +6,7 @@
 //! `config.json` 必须原样读得进来。
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -157,6 +158,13 @@ pub struct AppConfig {
     pub git_commit_files_view_mode: String,
     #[serde(default = "default_true")]
     pub long_paste_to_file: bool,
+    /// 长文本转存只在该 pane 处于 AI 会话(ai-idle / ai-working)时生效,普通 shell 里
+    /// 粘原文。缺省开:转存本就是给 AI 工具用的(躲开超长粘贴与 bracketed paste 的坑),
+    /// 往 bash / pwsh 里粘一段脚本却得到一条文件路径是误伤。关掉 = 所有终端都转存 ——
+    /// WSL / 远程里 AI 状态可能认不出来,给这些用户留的退路。总开关
+    /// [`Self::long_paste_to_file`] 关着时它不起作用。
+    #[serde(default = "default_true")]
+    pub long_paste_ai_only: bool,
     #[serde(default = "default_long_paste_line_threshold")]
     pub long_paste_line_threshold: u32,
     #[serde(default = "default_long_paste_char_threshold")]
@@ -186,6 +194,17 @@ pub struct AppConfig {
     pub last_active_project_id: Option<String>,
     #[serde(default)]
     pub hook_enabled: bool,
+    /// 「检测到 AI 会话,注册 Hook 状态更准」那条一次性提示已经给过(或用户本来就注册过
+    /// 某一家的 hook,视为已知晓)。**只会从 false 变 true**:一辈子提示一次,库里没这个键的
+    /// 老用户按没提示过算 —— 老用户多半也没注册过 hook,正是该提示的人。
+    #[serde(default)]
+    pub hook_hint_shown: bool,
+    /// 「发现新版本」弹窗里点了「忽略此版本」的那个版本号(原样存 tag,如 `v1.13.33`)。
+    /// 启动自检查到的最新版**恰好是它**时不亮边条的更新按钮,出现更新的版本照常亮;
+    /// 设置 →「关于」的手动检查不受它影响,并在那里给「不再忽略」的出口。
+    /// `None` = 没忽略过任何版本(不写进库)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_update_version: Option<String>,
     /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
     /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
     /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
@@ -299,6 +318,16 @@ pub struct AppConfig {
     /// 全缺省(总开关关、三个渠道都没配)时序列化跳过。
     #[serde(default, skip_serializing_if = "RemoteNotifyConfig::is_default")]
     pub remote_notify: RemoteNotifyConfig,
+    /// 用户改过的快捷键(设置 →「快捷键」页):键 = mt-app 键位表(`hotkeys::HOTKEYS`)里的
+    /// id,值 = gpui 键位串(如 `ctrl-alt-t`),**空串 = 解绑**。只存与默认不同的项,空表
+    /// 序列化跳过 —— 库里没这个键的老用户读出来是空表,键位与没有这项功能时完全一样。
+    ///
+    /// 这里不校验:id 认不认得、键位串合不合法由 mt-app 在**使用时**判
+    /// (`hotkeys::Overrides::parse`,认不出的丢弃并记日志)。认不出的条目**原样留在表里**、
+    /// 不回写删掉 —— 与 `config.db` 的前向兼容同一口径:新版本加的快捷键 id,旧版本读到
+    /// 不认识,不能顺手抹掉。跨平台不换算:存的就是这台机器上绑的键位串。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hotkey_overrides: BTreeMap<String, String>,
 }
 
 /// 远程通知配置(`remoteNotify`)。
@@ -923,6 +952,7 @@ impl Default for AppConfig {
             git_changes_view_mode: default_git_changes_view_mode(),
             git_commit_files_view_mode: default_git_commit_files_view_mode(),
             long_paste_to_file: true,
+            long_paste_ai_only: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
             remote_paste_dir: default_remote_paste_dir(),
@@ -931,6 +961,8 @@ impl Default for AppConfig {
             right_drawer_width: None,
             last_active_project_id: None,
             hook_enabled: false,
+            hook_hint_shown: false,
+            ignored_update_version: None,
             smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
@@ -958,6 +990,7 @@ impl Default for AppConfig {
             usage_custom_to: None,
             command_library: CommandLibrary::default(),
             remote_notify: RemoteNotifyConfig::default(),
+            hotkey_overrides: BTreeMap::new(),
         }
     }
 }
@@ -2014,6 +2047,79 @@ mod tests {
         assert!(!off.smart_copy_paste, "显式 false 不许被新默认盖掉");
     }
 
+    /// Hook 一次性提示:老库没这个键按「没提示过」读;置位后键名是 `hookHintShown`,能往返。
+    #[test]
+    fn hook_hint_shown_缺省为未提示且能往返() {
+        assert!(!AppConfig::default().hook_hint_shown);
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(!legacy.hook_hint_shown);
+
+        let shown = AppConfig {
+            hook_hint_shown: true,
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["hookHintShown"], serde_json::json!(true));
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(back.hook_hint_shown);
+    }
+
+    /// 忽略的更新版本:老库没这个键按「没忽略」读,`None` 不写进 JSON;
+    /// 置位后键名是 `ignoredUpdateVersion`,能往返。
+    #[test]
+    fn ignored_update_version_缺省为空且能往返() {
+        assert_eq!(AppConfig::default().ignored_update_version, None);
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.ignored_update_version, None);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("ignoredUpdateVersion").is_none(), "None 不写进库");
+
+        let ignored = AppConfig {
+            ignored_update_version: Some("v1.13.33".into()),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&ignored).unwrap();
+        assert_eq!(json["ignoredUpdateVersion"], serde_json::json!("v1.13.33"));
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.ignored_update_version.as_deref(), Some("v1.13.33"));
+    }
+
+    /// 快捷键覆盖表:老库没这个键读出空表(键位与改动前一样),空表不写进 JSON;
+    /// 键名是 `hotkeyOverrides`,解绑用的空串与认不出的 id 都原样往返(前向兼容)。
+    #[test]
+    fn hotkey_overrides_缺省为空且原样往返() {
+        assert!(AppConfig::default().hotkey_overrides.is_empty());
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(legacy.hotkey_overrides.is_empty());
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("hotkeyOverrides").is_none(), "空表不写进库");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("newTerminal".to_string(), "ctrl-alt-t".to_string());
+        overrides.insert("terminalSearch".to_string(), String::new());
+        overrides.insert("someFutureAction".to_string(), "ctrl-alt-q".to_string());
+        let config = AppConfig {
+            hotkey_overrides: overrides.clone(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["hotkeyOverrides"]["terminalSearch"],
+            serde_json::json!("")
+        );
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.hotkey_overrides, overrides);
+    }
+
     /// 页签标题跟随 shell:纯增量字段 —— `None` 时不写进 JSON（不污染存量配置），
     /// 显式 `false` 要能往返，键名是 camelCase 的 `tabTitleFollowsShell`。
     #[test]
@@ -2068,6 +2174,30 @@ mod tests {
             !parsed.confirm_terminal_close,
             "显式 false 不许被默认值盖掉"
         );
+    }
+
+    /// 长文本转存「只在 AI 会话里」默认开:`Default` 与库里没这个键(升级上来的老库)都是
+    /// true;用户关掉后的显式 `false` 要能往返,键名是 camelCase 的 `longPasteAiOnly`。
+    #[test]
+    fn long_paste_ai_only_缺键时默认开且显式关能往返() {
+        assert!(AppConfig::default().long_paste_ai_only);
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(
+            missing.long_paste_ai_only,
+            "老库没这个键 = 按新口径只在 AI 会话里转存"
+        );
+
+        let config = AppConfig {
+            long_paste_ai_only: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""longPasteAiOnly":false"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.long_paste_ai_only, "显式 false 不许被默认值盖掉");
     }
 
     /// Markdown 目录栏开合:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。

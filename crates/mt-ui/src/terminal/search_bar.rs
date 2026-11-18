@@ -77,7 +77,7 @@
 //!             },
 //!         )
 //!     });
-//!     bar.update(cx, |bar, cx| bar.open(window, cx));  // 开引擎 + 聚焦 + 全选
+//!     bar.update(cx, |bar, cx| bar.open(window, cx));  // 选区预填 + 开引擎 + 聚焦 + 全选
 //!     self.search_bar = Some(bar);
 //!     cx.notify();
 //! }
@@ -147,7 +147,7 @@ use mt_terminal::TerminalEmulator;
 
 use crate::tooltip::TooltipExt as _;
 
-use super::search::{SearchDirection, SearchOptions, TerminalSearch};
+use super::search::{SearchDirection, SearchOptions, TerminalSearch, escape_literal};
 
 /// 查找条上的全部文案。由宿主经 [`TerminalSearchBar::new`] 的文案来源注入
 /// (mt-app 取 mt-i18n 的 `terminalSearch` 命名空间)。
@@ -258,17 +258,36 @@ impl TerminalSearchBar {
         (self.labels)()
     }
 
-    /// 打开:开引擎、把输入框里的关键词推给引擎搜一遍、聚焦并全选。
+    /// 打开(Ctrl+F;查找条已经开着时宿主再调一次也走这里):终端里有单行、非空白的选区
+    /// 就拿它换掉输入框里的词([`search_prefill`]),没有就留着上次的词;再把关键词推给
+    /// 引擎搜一遍、聚焦输入框并全选。
     ///
-    /// 全选是为了「接着改关键词」—— 与旧版 `el.focus(); el.select();` 同款。
+    /// 全选是为了「直接打字就覆盖」—— 与旧版 `el.focus(); el.select();` 同款。
+    ///
+    /// 已经开着、关键词也没变时不重搜也不滚动:用户可能正翻着回看看别处,再按一次 Ctrl+F
+    /// 只是想回到输入框,视口不该被拽回当前命中。
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        {
+        let selection = self.emulator.with_term(|term| term.selection_to_string());
+        let regex = self.search.borrow().options().regex;
+        if let Some(seed) = search_prefill(selection.as_deref(), regex) {
+            // `set_value` 不发 `InputEvent::Change`,关键词在下面直接推给引擎
+            self.input
+                .update(cx, |state, cx| state.set_value(seed, window, cx));
+        }
+        let changed = {
             let mut engine = self.search.borrow_mut();
+            let reopened = !engine.enabled();
             engine.set_enabled(true);
             let query = self.input.read(cx).value().to_string();
-            engine.set_query(query);
-            engine.refresh(&self.emulator);
-            engine.scroll_to_current(&self.emulator);
+            let changed = engine.set_query(query);
+            if reopened || changed {
+                engine.refresh(&self.emulator);
+                engine.scroll_to_current(&self.emulator);
+            }
+            changed
+        };
+        if changed {
+            cx.emit(SearchBarEvent::QueryChanged);
         }
         self.focus_input(window, cx);
         cx.notify();
@@ -276,13 +295,13 @@ impl TerminalSearchBar {
 
     /// 聚焦输入框并全选。
     ///
-    /// 全选走 `SelectAll` action 而不是直接调 `InputState` —— 那个方法是
-    /// `pub(super)` 的。action 要等输入框进了 dispatch 树才有人接,
-    /// 所以推迟到下一帧发。
+    /// 直接调 `InputState::select_all`(gpui-component 0.6.2 起是公开方法)。此前走的是
+    /// 推迟一拍再派发 `SelectAll` action:刚建出来的查找条那一刻还没进 dispatch 树,
+    /// action 没人接,第一次打开时全选就这么静默落空了。直接改状态不看 dispatch 树。
     pub fn focus_input(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.focus_handle(cx).focus(window, cx);
-        window.defer(cx, |window, cx| {
-            window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        self.input.update(cx, |state, cx| {
+            state.focus(window, cx);
+            state.select_all(window, cx);
         });
     }
 
@@ -378,6 +397,30 @@ impl Focusable for TerminalSearchBar {
     }
 }
 
+/// 打开查找条时拿终端选区预填什么。`None` = 不预填,输入框留着上次的词。
+///
+/// - 只认**单行**选区:跨行的选区多半是「选了一段输出想复制」,拿来当关键词也搜不着
+///   什么(查找是按行匹配的)。三击整行选出来的串末尾带一个换行(alacritty 的行选区
+///   就这么拼),那一个不算跨行;软折行的长行选出来本就不带换行,算一行;
+/// - 全是空白不算(只会把上次的词冲掉);
+/// - 正则开关开着时把选区**转义成字面量**:选中的是 `a.b(c)` 就该找 `a.b(c)` 本身,
+///   不能让 `.` 和括号按正则解释(VS Code 同一手)。
+pub fn search_prefill(selection: Option<&str>, regex: bool) -> Option<String> {
+    let text = selection?;
+    let text = text
+        .strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(text);
+    if text.contains(['\n', '\r']) || text.trim().is_empty() {
+        return None;
+    }
+    Some(if regex {
+        escape_literal(text)
+    } else {
+        text.to_string()
+    })
+}
+
 /// 「n/总数」那一格的文案。抽成自由函数是为了能单测 —— 三种状态(没搜过 /
 /// 没结果 / 有结果)在旧版是一串三元表达式,最容易写错的就是它。
 pub fn counter_text(active: bool, index: usize, count: usize, no_results: &str) -> String {
@@ -421,6 +464,15 @@ impl Render for TerminalSearchBar {
             .id("terminal-search-bar")
             .key_context("TerminalSearch")
             .on_key_down(cx.listener(Self::on_key_down))
+            // 焦点在输入框里时 Ctrl+F(macOS Cmd+F)落在输入框自己的 `Search` 绑定上(比
+            // 宿主的全局绑定深),非 searchable 的单行框把它放行、冒到这里:只重新全选。
+            // 不再拿终端选区预填 —— 焦点一直在输入框里,终端选区只可能是打开查找条时就
+            // 在的那一段(点终端会把焦点拿走),再填一遍会冲掉用户刚改过的词
+            .on_action(
+                cx.listener(|this, _: &gpui_component::input::Search, window, cx| {
+                    this.focus_input(window, cx);
+                }),
+            )
             .items_center()
             .gap_1()
             .px_2()
@@ -536,5 +588,68 @@ mod tests {
         // 有命中:1-based
         assert_eq!(counter_text(true, 1, 12, "无结果"), "1/12");
         assert_eq!(counter_text(true, 12, 12, "无结果"), "12/12");
+    }
+
+    /// 单行非空白选区原样预填(前后空白也留着:用户选的就是那一截)。
+    #[test]
+    fn 单行选区原样预填() {
+        assert_eq!(
+            search_prefill(Some("error"), false).as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            search_prefill(Some("  foo bar "), false).as_deref(),
+            Some("  foo bar ")
+        );
+        assert_eq!(
+            search_prefill(Some("中文 关键词"), false).as_deref(),
+            Some("中文 关键词")
+        );
+    }
+
+    /// 没选区 / 空串 / 全空白:不预填,输入框留着上次的词。
+    #[test]
+    fn 没有选区或全是空白时不预填() {
+        assert_eq!(search_prefill(None, false), None);
+        assert_eq!(search_prefill(Some(""), false), None);
+        assert_eq!(search_prefill(Some("   \t "), false), None);
+        assert_eq!(search_prefill(Some("\n"), false), None, "空行的行选区");
+    }
+
+    /// 跨行选区不预填;三击整行选出来的末尾那一个换行不算跨行(CRLF 也认)。
+    #[test]
+    fn 跨行选区不预填但行选区末尾换行不算() {
+        assert_eq!(search_prefill(Some("a\nb"), false), None);
+        assert_eq!(search_prefill(Some("a\r\nb"), false), None);
+        assert_eq!(
+            search_prefill(Some("a\n\n"), false),
+            None,
+            "末尾两个换行就是两行"
+        );
+        assert_eq!(
+            search_prefill(Some("cargo build\n"), false).as_deref(),
+            Some("cargo build")
+        );
+        assert_eq!(
+            search_prefill(Some("cargo build\r\n"), false).as_deref(),
+            Some("cargo build")
+        );
+    }
+
+    /// 正则开关开着:选区转义成字面量,搜的就是选中的那串字本身。
+    #[test]
+    fn 正则模式下选区按字面量转义() {
+        assert_eq!(
+            search_prefill(Some("a.b(c)"), false).as_deref(),
+            Some("a.b(c)")
+        );
+        assert_eq!(
+            search_prefill(Some("a.b(c)"), true).as_deref(),
+            Some(r"a\.b\(c\)")
+        );
+        assert_eq!(
+            search_prefill(Some("plain"), true).as_deref(),
+            Some("plain")
+        );
     }
 }

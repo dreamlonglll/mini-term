@@ -33,6 +33,24 @@
 //! 换范围或清范围必定走 [`SearchModal::rerun`]:[`SearchModal::reset`] 丢掉结果泵,旧
 //! 请求连同它攒在 channel 里没消费的结果一起作废(模块开头那条「整个换掉前台任务」),
 //! 不靠比对请求号。结果路径仍相对项目根,打开文件那条路一行没动。
+//!
+//! # 键盘
+//!
+//! 结果区有一个游标([`SearchModal::cursor`]),记的是**结果下标**而不是行号:内容模式按文件
+//! 分组,流式到达的命中会插进前面的分组里,按行号记的话游标底下的东西会被换掉。分组头与
+//! 截断条不停游标([`selectable_order`])。
+//!
+//! - ↑ / ↓ 逐条(首尾相接),PageUp / PageDown 按可视区翻页(到头停住),Ctrl+Home /
+//!   Ctrl+End 跳到第一 / 最后一条,游标跟着滚进可视区。键位绑在 `"SearchModal > Input"` 上
+//!   —— 与项目切换器同一个理由,谓词要与 `Input` 同深度才压得过输入框自带的方向键 / 翻页键 /
+//!   首尾键(机制见 `project_switcher` 模块注释);
+//! - Enter:输入框里的词 / 模式 / 正则 / 范围与上次发起的那次不同(或还没搜过、没有结果)就
+//!   重搜,否则打开游标所在的结果并收起浮层([`enter_action`]);
+//! - Ctrl+Enter(macOS 另有 Cmd+Enter)与 Ctrl+单击:打开但**留着浮层**,接着看下一条。
+//!   这时工作区已切到文件页,浮层之后再被关掉(Esc / ✕ / 再按 Ctrl+Shift+F)时焦点要交回那个
+//!   文件页 —— Dialog 只会把焦点还给打开浮层前的元素(多半是此刻被盖住的终端),见
+//!   [`refocus_after_close`];
+//! - 切「文件名 / 内容」或开关正则时,查询词非空就立即重搜。
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -42,9 +60,11 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext, ClipboardItem, Context, Entity, Global, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px, size,
+    IntoElement, ParentElement, Pixels, Render, ScrollStrategy, SharedString, Size,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, div,
+    prelude::FluentBuilder, px, size,
 };
+use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::search::{
@@ -57,9 +77,33 @@ use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;
 use crate::overlay::kind;
-use crate::prompt::{autofocus, close_guarded, open_guarded};
+use crate::project_switcher::{CursorStep, page_size, step_cursor_index};
+use crate::prompt::{autofocus, close_guarded, open_guarded_with_close};
 use crate::store::{AppStore, StoreEvent};
 use crate::ui;
+
+actions!(
+    mini_term,
+    [
+        /// 全局搜索:游标移到上一条结果(↑)。绑在 `"SearchModal > Input"` 上,见模块注释「键盘」。
+        SearchCursorPrev,
+        /// 游标移到下一条结果(↓)。
+        SearchCursorNext,
+        /// 游标往上翻一页(PageUp)。
+        SearchCursorPageUp,
+        /// 游标往下翻一页(PageDown)。
+        SearchCursorPageDown,
+        /// 游标跳到第一条结果(Ctrl+Home)。
+        SearchCursorFirst,
+        /// 游标跳到最后一条结果(Ctrl+End)。
+        SearchCursorLast,
+        /// 打开游标所在的结果,浮层留着(Ctrl/Cmd+Enter)。
+        SearchOpenKeep,
+    ]
+);
+
+/// 浮层的 key context(键位谓词是 `"SearchModal > Input"`,见 `hotkeys.rs`)。
+pub const CONTEXT: &str = "SearchModal";
 
 /// 结果上限。与原版 `SearchModal.tsx` 里那两个字面量 1000 同一个数
 /// (超出后只显示前 1000 条并挂一条提示)。直接取后端的同名常量:后端收满这个数
@@ -137,7 +181,24 @@ pub struct SearchModal {
     /// offset 为准、不再读元素自己的跨帧状态(`elements/div.rs:2267`)——
     /// 每帧新建一个句柄等于每帧把滚动位置清零。
     results_scroll: VirtualListScrollHandle,
+    /// 结果游标:停在哪条结果上(`results` 的下标,不是行号,见模块注释「键盘」)。
+    /// 第一批结果一到就落在第一条;[`Self::reset`] 清掉。
+    cursor: Option<usize>,
+    /// 上一次发起搜索时的条件,Enter 拿它判「重搜还是打开」(见 [`enter_action`])。
+    last_run: Option<RunKey>,
+    /// 浮层开着时用 Ctrl+Enter / Ctrl+单击打开过文件的项目:工作区已切到它的文件页,
+    /// 浮层关掉时要把焦点交回去(见 [`refocus_after_close`])。每次打开浮层清掉。
+    refocus_on_close: Option<String>,
     _subs: Vec<Subscription>,
+}
+
+/// 一次搜索的条件(查询词已 trim)。Enter 拿当前的与上次发起的比,见 [`enter_action`]。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunKey {
+    query: String,
+    mode: SearchMode,
+    use_regex: bool,
+    scope: Option<PathBuf>,
 }
 
 impl Drop for SearchModal {
@@ -156,9 +217,29 @@ fn overlay_open() -> bool {
 /// Ctrl+Shift+F:开着就关、关着就开(原版 `setSearchModalOpen(!open)`)。
 pub fn toggle(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     if close_guarded(kind::GLOBAL_SEARCH, window, cx) {
+        refocus_after_close(window, cx);
         return;
     }
     open(store, window, cx);
+}
+
+/// 浮层关掉之后:开着时用 Ctrl+Enter / Ctrl+单击打开过文件的话,把焦点交给工作区眼下那个
+/// 文件页。Dialog 自己只会把焦点还给**打开浮层前**的元素,那时停在终端页的话,焦点就落进
+/// 了此刻被文件页盖住的终端,敲的字全进了看不见的 shell。
+///
+/// 关窗有两类路径都要过这里:Dialog 自己关的(Esc / 点遮罩,走 `open_guarded_with_close` 的
+/// 回调)与程序化关的(✕ / 再按 Ctrl+Shift+F,`close_guarded` 不调回调,调用方自己补这一句)。
+fn refocus_after_close(window: &mut Window, cx: &mut App) {
+    let Some(view) = cx
+        .try_global::<GlobalSearchModal>()
+        .map(|global| global.0.clone())
+    else {
+        return;
+    };
+    let Some(project_id) = view.update(cx, |view, _| view.refocus_on_close.take()) else {
+        return;
+    };
+    crate::workbench_area::reactivate_active_document(&project_id, window, cx);
 }
 
 /// 打开搜索框。已经开着(且上面压着别的弹窗)时是空操作 —— 防叠开在
@@ -213,6 +294,7 @@ fn open_with(store: Entity<AppStore>, dir: Option<PathBuf>, window: &mut Window,
     };
     view.update(cx, |view, cx| {
         view.cancel_pending_close();
+        view.refocus_on_close = None;
         match dir {
             Some(dir) => view.set_scope(dir, window, cx),
             None => view.clear_scope(cx),
@@ -220,9 +302,9 @@ fn open_with(store: Entity<AppStore>, dir: Option<PathBuf>, window: &mut Window,
     });
     let input = view.read(cx).query.clone();
 
-    open_guarded(kind::GLOBAL_SEARCH, window, cx, {
+    let build = {
         let view = view.clone();
-        move |dialog, window, _cx| {
+        move |dialog: Dialog, window: &mut Window, _cx: &mut App| {
             let viewport = window.viewport_size();
             // 原版 `w-[80vw] h-[70vh] max-w-[900px]` + `align="center"`
             let width = (viewport.width * 0.8).min(px(900.0));
@@ -241,7 +323,9 @@ fn open_with(store: Entity<AppStore>, dir: Option<PathBuf>, window: &mut Window,
                 .margin_top(viewport.height * 0.15)
                 .child(div().h(height).child(view.clone()))
         }
-    });
+    };
+    // Esc 关掉时要把焦点交回 Ctrl+Enter 打开过的文件页(见 [`refocus_after_close`])
+    open_guarded_with_close(kind::GLOBAL_SEARCH, window, cx, build, refocus_after_close);
 
     // Dialog 打开时会把焦点抢到自己面板上,聚焦输入框必须排在它后面
     // (判据全文见 `prompt::autofocus`)
@@ -253,11 +337,21 @@ impl SearchModal {
         let query = cx.new(|cx| {
             InputState::new(window, cx).placeholder(placeholder_key(SearchMode::FileName))
         });
-        let sub = cx.subscribe(&query, |this: &mut Self, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                this.run(cx);
-            }
-        });
+        // Ctrl/Cmd+Enter 正常落在 `SearchOpenKeep` 上(谓词与 `Input` 同深度,先派发且不
+        // propagate,输入框的 secondary-enter 轮不到);这里的 `secondary` 分支只是兜底
+        let sub = cx.subscribe_in(
+            &query,
+            window,
+            |this: &mut Self, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { secondary, .. } = event {
+                    if *secondary {
+                        this.open_cursor(true, window, cx);
+                    } else {
+                        this.on_enter(window, cx);
+                    }
+                }
+            },
+        );
         // 活动项目换了 / 被删了 / 变成远程的,旧结果就作废。只在活动项目可能变了时
         // 比对(`StoreEvent::touches_active_project`)。与改造前一样只在作废时 notify
         // (render 里「搜索钮可不可点」那一处读取随根视图重画,不靠这里)
@@ -299,6 +393,9 @@ impl SearchModal {
             _close_task: None,
             close_generation: 0,
             results_scroll: VirtualListScrollHandle::new(),
+            cursor: None,
+            last_run: None,
+            refocus_on_close: None,
             _subs: vec![sub, project_sub],
         }
     }
@@ -321,10 +418,23 @@ impl SearchModal {
         }
     }
 
-    /// 换搜索模式:取消在跑的那次、清空结果(原版那个 `useEffect([mode])`)。
+    /// 点「文件名 / 内容」:换模式,查询词非空就按新模式立即重搜(空词时 [`Self::run`]
+    /// 什么都不做,与原版只清空结果一致)。
     fn set_mode(&mut self, mode: SearchMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apply_mode(mode, window, cx) {
+            self.run(cx);
+        }
+    }
+
+    /// 换搜索模式:取消在跑的那次、清空结果(原版那个 `useEffect([mode])`)。返回模式变了没有。
+    fn apply_mode(
+        &mut self,
+        mode: SearchMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.mode == mode {
-            return;
+            return false;
         }
         self.mode = mode;
         self.reset(cx);
@@ -332,6 +442,17 @@ impl SearchModal {
             state.set_placeholder(placeholder_key(mode), window, cx);
         });
         cx.notify();
+        true
+    }
+
+    /// 开关正则:查询词非空就立即重搜;空词时只翻开关,留着的旧结果不动。
+    fn toggle_regex(&mut self, cx: &mut Context<Self>) {
+        self.use_regex = !self.use_regex;
+        if self.query.read(cx).value().trim().is_empty() {
+            cx.notify();
+        } else {
+            self.rerun(cx);
+        }
     }
 
     /// 限定到 `dir` 并切到内容模式。输入框里留着的关键词立刻按新范围重搜:这是用户
@@ -346,7 +467,7 @@ impl SearchModal {
             path: dir,
             label,
         });
-        self.set_mode(SearchMode::FileContent, window, cx);
+        self.apply_mode(SearchMode::FileContent, window, cx);
         self.rerun(cx);
     }
 
@@ -378,6 +499,98 @@ impl SearchModal {
         self.status = Status::Idle;
         self.search_project = None;
         self.scope_error = None;
+        self.cursor = None;
+        self.last_run = None;
+    }
+
+    /// 输入框里此刻的搜索条件(与 [`Self::run`] 发起时记下的同一口径)。
+    fn run_key(&self, cx: &App) -> RunKey {
+        RunKey {
+            query: self.query.read(cx).value().trim().to_string(),
+            mode: self.mode,
+            use_regex: self.use_regex,
+            scope: self.scope.as_ref().map(|scope| scope.path.clone()),
+        }
+    }
+
+    /// Enter:条件变了(或还没搜过 / 没有结果)就重搜,否则打开游标所在的结果并收起浮层。
+    fn on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.run_key(cx);
+        match enter_action(self.last_run.as_ref(), &current, !self.results.is_empty()) {
+            EnterAction::Search => self.run(cx),
+            EnterAction::Open => self.open_cursor(false, window, cx),
+        }
+    }
+
+    /// 游标移动(↑↓ / PageUp / PageDown),跟着滚进可视区。
+    fn move_cursor(&mut self, step: CursorStep, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = result_rows(&self.results, self.mode, MAX_RESULTS);
+        let order = selectable_order(&rows);
+        let metrics = RowMetrics::measure(window);
+        let row_h = match self.mode {
+            SearchMode::FileName => metrics.file,
+            SearchMode::FileContent => metrics.hit,
+        };
+        let viewport = self.results_scroll.bounds().size.height;
+        let page = page_size(f32::from(viewport), f32::from(row_h));
+        let Some(next) = step_cursor(&order, self.cursor, step, page) else {
+            return;
+        };
+        self.cursor = Some(next);
+        let upward = matches!(
+            step,
+            CursorStep::Prev | CursorStep::PageUp | CursorStep::First
+        );
+        if let Some(row) = scroll_row(&rows, next, upward) {
+            self.results_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
+    /// 打开游标所在的结果(Enter / Ctrl+Enter):在工作区打开并定位到命中行。`keep` = 浮层
+    /// 留着接着看下一条,否则当场收起并把焦点交给打开的文件页。游标还没落定时取第一条。
+    fn open_cursor(&mut self, keep: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self
+            .cursor
+            .or_else(|| (!self.results.is_empty()).then_some(0));
+        let Some(item) = index.and_then(|index| self.results.get(index).cloned()) else {
+            return;
+        };
+        let Some(expected_project) = self.open_in_workbench(&item, window, cx) else {
+            return;
+        };
+        self.cancel_pending_close();
+        if keep {
+            self.refocus_on_close = Some(expected_project.0);
+            return;
+        }
+        self.refocus_on_close = None;
+        // 先打开再关:关窗那一刻 Dialog 把焦点还给打开浮层前的元素,文件页的聚焦排在它后面
+        // (与单击后延迟关窗那条路同一个收尾)
+        if close_guarded(kind::GLOBAL_SEARCH, window, cx) {
+            crate::workbench_area::reactivate_active_document(&expected_project.0, window, cx);
+        }
+    }
+
+    /// 在工作区打开一条结果、定位到命中行(文件名搜索没有行号)。返回发起这次搜索的项目;
+    /// 结果已经过期(项目换了)就不开,返回 `None`。
+    fn open_in_workbench(
+        &mut self,
+        item: &SearchResultItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(String, PathBuf)> {
+        let root = self.current_search_root(cx)?;
+        let expected_project = self.search_project.clone()?;
+        crate::workbench_area::open_active_file(
+            self.store.clone(),
+            root.join(&item.file_path),
+            item.line_number.map(crate::file_viewer::LineTarget::line),
+            window,
+            cx,
+        );
+        Some(expected_project)
     }
 
     fn cancel_pending_close(&mut self) {
@@ -438,6 +651,7 @@ impl SearchModal {
             self.scope = None;
         }
         self.search_project = Some((project_id, root.clone()));
+        self.last_run = Some(self.run_key(cx));
 
         let (tx, mut rx) = mpsc::unbounded::<SearchEvent>();
         let request = SearchRequest {
@@ -482,7 +696,14 @@ impl SearchModal {
 
     fn apply(&mut self, event: SearchEvent) {
         match event {
-            SearchEvent::Results(items) => append_capped(&mut self.results, items, MAX_RESULTS),
+            SearchEvent::Results(items) => {
+                append_capped(&mut self.results, items, MAX_RESULTS);
+                // 第一批到了就落在第一条:两种模式下显示顺序的第一条都是 0 号结果
+                // (内容模式的分组按首次出现排,0 号所在的组排第一、它又是组里的第一条)
+                if self.cursor.is_none() && !self.results.is_empty() {
+                    self.cursor = Some(0);
+                }
+            }
             SearchEvent::ScopeRejected(err) => self.scope_error = Some(err),
             SearchEvent::Complete {
                 total_count,
@@ -496,38 +717,55 @@ impl SearchModal {
         }
     }
 
-    /// 点一条结果：单击先在工作区打开并延迟收起，双击取消延迟并交给外部编辑器。
+    /// 点一条结果：单击先在工作区打开并延迟收起，双击取消延迟并交给外部编辑器；
+    /// Ctrl(macOS 上 Cmd)+单击打开但留着浮层。点到哪条游标就挪到哪条。
     fn open_result(
         &mut self,
-        item: &SearchResultItem,
+        index: usize,
         click_count: usize,
+        keep_open: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(item) = self.results.get(index).cloned() else {
+            return;
+        };
         let Some(root) = self.current_search_root(cx) else {
             return;
         };
-        let Some(expected_project) = self.search_project.clone() else {
+        if self.search_project.is_none() {
             return;
-        };
+        }
+        self.cursor = Some(index);
+        cx.notify();
         let path = root.join(&item.file_path);
-        match result_action(click_count) {
+        match result_action(click_count, keep_open) {
             ResultAction::Preview => {
-                crate::workbench_area::open_active_file(
-                    self.store.clone(),
-                    path,
-                    // 内容搜索给命中行,文件名搜索没有行号
-                    item.line_number.map(crate::file_viewer::LineTarget::line),
-                    window,
-                    cx,
-                );
-                self.schedule_overlay_close(expected_project, window, cx);
+                if let Some(expected_project) = self.open_in_workbench(&item, window, cx) {
+                    self.refocus_on_close = None;
+                    self.schedule_overlay_close(expected_project, window, cx);
+                }
+            }
+            ResultAction::PreviewKeep => {
+                if let Some(expected_project) = self.open_in_workbench(&item, window, cx) {
+                    // 前一下普通单击排上的延迟关窗也撤掉:这一下要的就是留着
+                    self.cancel_pending_close();
+                    self.refocus_on_close = Some(expected_project.0);
+                }
             }
             ResultAction::ExternalEditor => {
                 self.cancel_pending_close();
                 let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
+                // 内容搜索的命中带上行号(认得出跳行参数的编辑器才用得上);文件名搜索没有行号
+                let how = match item.line_number {
+                    Some(line) => crate::fs_ops::ExternalOpen::EditorAt(
+                        editor,
+                        mt_project::editor::EditorPosition::line(line),
+                    ),
+                    None => crate::fs_ops::ExternalOpen::Editor(editor),
+                };
                 // 弹窗随即关掉,失败的 toast 不会被遮罩挡住
-                crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::Editor(editor), path, cx);
+                crate::fs_ops::open_external(how, path, cx);
                 close_guarded(kind::GLOBAL_SEARCH, window, cx);
             }
         }
@@ -551,17 +789,84 @@ impl SearchModal {
 pub enum ResultAction {
     /// 单击：在内置文件工作区打开。
     Preview,
+    /// Ctrl(macOS 上 Cmd)+单击:在工作区打开,浮层留着。
+    PreviewKeep,
     /// 双击及以上：交给配置的外部编辑器。
     ExternalEditor,
 }
 
-/// 把 GPUI 的连续点击次数映射为搜索结果动作。
-pub fn result_action(click_count: usize) -> ResultAction {
-    if click_count >= 2 {
+/// 把 GPUI 的连续点击次数映射为搜索结果动作。按着 Ctrl / Cmd(`keep_open`)时一律是
+/// 「打开但留着浮层」:Ctrl+连点两下要的是逐条看,不是跳去外部编辑器。
+pub fn result_action(click_count: usize, keep_open: bool) -> ResultAction {
+    if keep_open {
+        ResultAction::PreviewKeep
+    } else if click_count >= 2 {
         ResultAction::ExternalEditor
     } else {
         ResultAction::Preview
     }
+}
+
+/// Enter 该做什么,见 [`enter_action`]。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EnterAction {
+    /// 按输入框里的条件重新搜。
+    Search,
+    /// 打开游标所在的结果。
+    Open,
+}
+
+/// Enter:还没搜过、没有结果、或条件(查询词 / 模式 / 正则 / 范围)与上次发起的不同 → 重搜;
+/// 否则打开游标所在的结果。搜索途中(结果已经在流进来)条件没变也是打开,不重起一遍。
+fn enter_action(last_run: Option<&RunKey>, current: &RunKey, has_results: bool) -> EnterAction {
+    if has_results && last_run == Some(current) {
+        EnterAction::Open
+    } else {
+        EnterAction::Search
+    }
+}
+
+/// 结果行表里停得了游标的行(文件名行 / 命中行),按显示顺序给出它们的结果下标。
+/// 分组头与截断条不算。
+fn selectable_order(rows: &[ResultRow]) -> Vec<usize> {
+    rows.iter()
+        .filter_map(|row| match row {
+            ResultRow::File(index) | ResultRow::Hit(index) => Some(*index),
+            ResultRow::Group { .. } | ResultRow::Truncated => None,
+        })
+        .collect()
+}
+
+/// 游标走一步之后停在哪条结果上。`order` 见 [`selectable_order`],`page` 是一页几条。
+/// 怎么走与快速打开、项目切换器共用一份([`step_cursor_index`]:逐条首尾相接、翻页到头停住、
+/// 首尾直达);游标还没落定(或停着的那条已不在表里)时,除了「跳到最后」都先落到第一条。
+fn step_cursor(
+    order: &[usize],
+    cursor: Option<usize>,
+    step: CursorStep,
+    page: usize,
+) -> Option<usize> {
+    let first = *order.first()?;
+    let at = cursor.and_then(|cursor| order.iter().position(|&index| index == cursor));
+    let next = match (at, step) {
+        (_, CursorStep::Last) => order.len() - 1,
+        (None, _) => return Some(first),
+        (Some(at), step) => step_cursor_index(at, order.len(), step, page),
+    };
+    Some(order[next])
+}
+
+/// 游标停在 `cursor` 号结果上时该把哪一行滚进可视区。往上走时它若是分组里的第一条,连上面
+/// 的分组头一起露出来(否则一路按 ↑ 只看得见命中行,看不出换了文件);往下走直接滚到它
+/// —— 滚分组头的话命中行会落在可视区下沿之外。
+fn scroll_row(rows: &[ResultRow], cursor: usize, upward: bool) -> Option<usize> {
+    let row = rows.iter().position(
+        |row| matches!(row, ResultRow::File(index) | ResultRow::Hit(index) if *index == cursor),
+    )?;
+    let header_above = row
+        .checked_sub(1)
+        .is_some_and(|above| matches!(rows[above], ResultRow::Group { .. }));
+    Some(if upward && header_above { row - 1 } else { row })
 }
 
 /// 范围还算不算数:活动项目还是发起时那个。活动项目没了 / 变成远程的(`None`)也不算。
@@ -729,17 +1034,18 @@ fn status_text(
             SearchMode::FileName => tr!("search", "foundFiles", count = total),
             SearchMode::FileContent => tr!("search", "foundMatches", count = total),
         },
-        // 平台修饰键名。原版是 `MOD_LABEL`(mac 上 ⌘,其余 Ctrl)。
-        //
-        // 这条走 `t_args` 而不是 `tr!`:占位符名就叫 `mod`,而 `tr!` 的参数位是
-        // `$name:ident`,`mod` 是 Rust 关键字塞不进去(写 `r#mod` 会被
-        // `stringify!` 原样打成 "r#mod",对不上字典里的 `{mod}`)。
-        Status::Idle => mt_i18n::t_args("search", "shortcutHint", &[("mod", mod_label())]),
+        // 「Ctrl+Shift+F 打开搜索」:键位取自键位表此刻生效的那份(原版是 `MOD_LABEL` 拼
+        // 死的 `{mod}+Shift+F`,用户改键 / 解绑之后就对不上了)。解绑了就不提示 ——
+        // 没有键可按,这一句也就没有意义
+        Status::Idle => {
+            let shortcut = crate::hotkeys::hotkey_label("globalSearch");
+            if shortcut.is_empty() {
+                String::new()
+            } else {
+                tr!("search", "shortcutHint", shortcut = shortcut)
+            }
+        }
     }
-}
-
-fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
 }
 
 fn placeholder_key(mode: SearchMode) -> &'static str {
@@ -861,7 +1167,9 @@ impl SearchModal {
                     .hover(|el| el.text_color(ui::text_primary()))
                     .on_click(cx.listener(|_this, _event, window, cx| {
                         window.defer(cx, |window, cx| {
-                            close_guarded(kind::GLOBAL_SEARCH, window, cx);
+                            if close_guarded(kind::GLOBAL_SEARCH, window, cx) {
+                                refocus_after_close(window, cx);
+                            }
                         });
                     }))
                     .child("✕"),
@@ -905,8 +1213,7 @@ impl SearchModal {
                     })
                     .tip(t("search", "regexTitle"))
                     .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.use_regex = !this.use_regex;
-                        cx.notify();
+                        this.toggle_regex(cx);
                     }))
                     .child(".*"),
             )
@@ -1029,6 +1336,7 @@ impl SearchModal {
         let line_no = item.line_number.map(|n| n.to_string()).unwrap_or_default();
         let content = item.line_content.clone().unwrap_or_default();
         let ranges = item.match_ranges.clone();
+        let is_cursor = self.cursor == Some(index);
 
         div()
             .id(SharedString::from(format!("search-row-{index}")))
@@ -1039,13 +1347,13 @@ impl SearchModal {
             .h(h)
             .px(px(16.0))
             .cursor_pointer()
-            .hover(|el| el.bg(ui::border_subtle()))
+            // 游标行与快速打开同一个底色;悬停只在别的行上提示
+            .when(is_cursor, |el| el.bg(ui::accent_subtle()))
+            .when(!is_cursor, |el| el.hover(|el| el.bg(ui::border_subtle())))
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    let Some(item) = this.results.get(index).cloned() else {
-                        return;
-                    };
-                    this.open_result(&item, event.click_count(), window, cx);
+                    let keep_open = event.modifiers().secondary();
+                    this.open_result(index, event.click_count(), keep_open, window, cx);
                 }),
             )
             .on_mouse_down(
@@ -1082,6 +1390,7 @@ impl SearchModal {
         } else {
             (item.match_ranges.clone(), Vec::new())
         };
+        let is_cursor = self.cursor == Some(index);
 
         div()
             .id(SharedString::from(format!("search-file-{index}")))
@@ -1092,13 +1401,12 @@ impl SearchModal {
             .h(h)
             .px(px(16.0))
             .cursor_pointer()
-            .hover(|el| el.bg(ui::border_subtle()))
+            .when(is_cursor, |el| el.bg(ui::accent_subtle()))
+            .when(!is_cursor, |el| el.hover(|el| el.bg(ui::border_subtle())))
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    let Some(item) = this.results.get(index).cloned() else {
-                        return;
-                    };
-                    this.open_result(&item, event.click_count(), window, cx);
+                    let keep_open = event.modifiers().secondary();
+                    this.open_result(index, event.click_count(), keep_open, window, cx);
                 }),
             )
             .on_mouse_down(
@@ -1258,6 +1566,29 @@ impl Render for SearchModal {
             .child(self.render_results(window, cx));
 
         div()
+            // 键位谓词 `"SearchModal > Input"` 的锚点(见模块注释「键盘」)
+            .key_context(CONTEXT)
+            .on_action(cx.listener(|this, _: &SearchCursorPrev, window, cx| {
+                this.move_cursor(CursorStep::Prev, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorNext, window, cx| {
+                this.move_cursor(CursorStep::Next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorPageUp, window, cx| {
+                this.move_cursor(CursorStep::PageUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorPageDown, window, cx| {
+                this.move_cursor(CursorStep::PageDown, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorFirst, window, cx| {
+                this.move_cursor(CursorStep::First, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorLast, window, cx| {
+                this.move_cursor(CursorStep::Last, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchOpenKeep, window, cx| {
+                this.open_cursor(true, window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -1305,10 +1636,186 @@ mod tests {
 
     #[test]
     fn 单击预览双击及以上打开外部编辑器() {
-        assert_eq!(result_action(0), ResultAction::Preview);
-        assert_eq!(result_action(1), ResultAction::Preview);
-        assert_eq!(result_action(2), ResultAction::ExternalEditor);
-        assert_eq!(result_action(3), ResultAction::ExternalEditor);
+        assert_eq!(result_action(0, false), ResultAction::Preview);
+        assert_eq!(result_action(1, false), ResultAction::Preview);
+        assert_eq!(result_action(2, false), ResultAction::ExternalEditor);
+        assert_eq!(result_action(3, false), ResultAction::ExternalEditor);
+    }
+
+    /// 按着 Ctrl / Cmd 点:不论点几下都是「打开但留着浮层」,不跳外部编辑器。
+    #[test]
+    fn 按住修饰键单击留着浮层() {
+        assert_eq!(result_action(1, true), ResultAction::PreviewKeep);
+        assert_eq!(result_action(2, true), ResultAction::PreviewKeep);
+    }
+
+    fn key(query: &str, mode: SearchMode) -> RunKey {
+        RunKey {
+            query: query.into(),
+            mode,
+            use_regex: false,
+            scope: None,
+        }
+    }
+
+    /// Enter:条件没变且有结果才是打开;还没搜过、没有结果、词 / 模式 / 正则 / 范围变了都是重搜。
+    #[test]
+    fn 回车按条件变化决定重搜还是打开() {
+        let last = key("foo", SearchMode::FileContent);
+        assert_eq!(enter_action(Some(&last), &last, true), EnterAction::Open);
+        assert_eq!(
+            enter_action(None, &last, true),
+            EnterAction::Search,
+            "还没搜过"
+        );
+        assert_eq!(
+            enter_action(Some(&last), &last, false),
+            EnterAction::Search,
+            "没有结果"
+        );
+        assert_eq!(
+            enter_action(Some(&last), &key("bar", SearchMode::FileContent), true),
+            EnterAction::Search,
+            "词变了"
+        );
+        assert_eq!(
+            enter_action(Some(&last), &key("foo", SearchMode::FileName), true),
+            EnterAction::Search,
+            "模式变了"
+        );
+        let regex = RunKey {
+            use_regex: true,
+            ..last.clone()
+        };
+        assert_eq!(enter_action(Some(&last), &regex, true), EnterAction::Search);
+        let scoped = RunKey {
+            scope: Some(PathBuf::from("/p/src")),
+            ..last.clone()
+        };
+        assert_eq!(
+            enter_action(Some(&last), &scoped, true),
+            EnterAction::Search
+        );
+    }
+
+    /// 游标只停在文件名行 / 命中行上,分组头与截断条跳过,顺序按显示顺序(不是结果下标序)。
+    #[test]
+    fn 可选行跳过分组头与截断条() {
+        let results = vec![
+            item("src/a.rs", 1),
+            item("src/b.rs", 7),
+            item("src/a.rs", 9),
+        ];
+        let rows = result_rows(&results, SearchMode::FileContent, 3);
+        assert_eq!(selectable_order(&rows), vec![0, 2, 1]);
+        let rows = result_rows(&results, SearchMode::FileName, 3);
+        assert_eq!(selectable_order(&rows), vec![0, 1, 2]);
+    }
+
+    /// ↑↓ 首尾相接,翻页到头停住;游标没落定或已不在表里时先落到第一条;空表没有游标。
+    #[test]
+    fn 游标逐条循环翻页到头停住() {
+        let order = [0, 2, 1, 3, 4];
+        assert_eq!(step_cursor(&order, Some(0), CursorStep::Next, 2), Some(2));
+        assert_eq!(step_cursor(&order, Some(2), CursorStep::Prev, 2), Some(0));
+        assert_eq!(
+            step_cursor(&order, Some(0), CursorStep::Prev, 2),
+            Some(4),
+            "上到头绕到尾"
+        );
+        assert_eq!(
+            step_cursor(&order, Some(4), CursorStep::Next, 2),
+            Some(0),
+            "下到尾绕回头"
+        );
+        assert_eq!(
+            step_cursor(&order, Some(0), CursorStep::PageDown, 2),
+            Some(1)
+        );
+        assert_eq!(
+            step_cursor(&order, Some(3), CursorStep::PageDown, 9),
+            Some(4),
+            "停在最后"
+        );
+        assert_eq!(
+            step_cursor(&order, Some(1), CursorStep::PageUp, 9),
+            Some(0),
+            "停在第一"
+        );
+        assert_eq!(
+            step_cursor(&order, Some(1), CursorStep::PageUp, 0),
+            Some(2),
+            "一页至少 1 条"
+        );
+        assert_eq!(step_cursor(&order, None, CursorStep::Prev, 2), Some(0));
+        assert_eq!(step_cursor(&order, Some(99), CursorStep::Next, 2), Some(0));
+        assert_eq!(step_cursor(&[], Some(0), CursorStep::Next, 2), None);
+        // Ctrl+Home / Ctrl+End:按显示顺序的首尾,不是结果下标的首尾
+        assert_eq!(step_cursor(&order, Some(1), CursorStep::First, 2), Some(0));
+        assert_eq!(step_cursor(&order, Some(2), CursorStep::Last, 2), Some(4));
+        assert_eq!(
+            step_cursor(&order, None, CursorStep::Last, 2),
+            Some(4),
+            "游标没落定时跳尾也直接到最后"
+        );
+        assert_eq!(step_cursor(&order, None, CursorStep::First, 2), Some(0));
+        assert_eq!(step_cursor(&[], None, CursorStep::Last, 2), None);
+    }
+
+    /// 往上走到分组的第一条时连分组头一起露出来;往下走、或不是组里第一条时只滚到它自己。
+    #[test]
+    fn 游标往上走到组首时带上分组头() {
+        let results = vec![item("src/a.rs", 1), item("src/b.rs", 7)];
+        // 行表:[头 a, 命中 0, 头 b, 命中 1]
+        let rows = result_rows(&results, SearchMode::FileContent, MAX_RESULTS);
+        assert_eq!(scroll_row(&rows, 1, true), Some(2));
+        assert_eq!(scroll_row(&rows, 1, false), Some(3));
+        assert_eq!(scroll_row(&rows, 0, true), Some(0));
+        assert_eq!(scroll_row(&rows, 9, true), None);
+        let rows = result_rows(&results, SearchMode::FileName, MAX_RESULTS);
+        assert_eq!(scroll_row(&rows, 1, true), Some(1), "文件名模式没有分组头");
+    }
+
+    /// 键位要先落到浮层自己的动作上,压过输入框自带的 MoveUp / MovePageDown / secondary-enter
+    /// (机制见 `project_switcher` 的同名测试)。
+    #[test]
+    fn 键位绑定压过输入框自带的() {
+        use gpui::{KeyBinding, KeyContext, Keymap, Keystroke};
+        gpui::actions!(
+            search_modal_test,
+            [InputMoveUp, InputPageDown, InputEnter, InputMoveToStart]
+        );
+        let predicate = format!("{CONTEXT} > Input");
+        let keymap = Keymap::new(vec![
+            // 组件库先注册(gpui_component::init)
+            KeyBinding::new("up", InputMoveUp, Some("Input")),
+            KeyBinding::new("pagedown", InputPageDown, Some("Input")),
+            KeyBinding::new("secondary-enter", InputEnter, Some("Input")),
+            KeyBinding::new("ctrl-home", InputMoveToStart, Some("Input")),
+            // 壳后注册(hotkeys::bind_keys)
+            KeyBinding::new("up", SearchCursorPrev, Some(predicate.as_str())),
+            KeyBinding::new("pagedown", SearchCursorPageDown, Some(predicate.as_str())),
+            KeyBinding::new("ctrl-home", SearchCursorFirst, Some(predicate.as_str())),
+            KeyBinding::new("ctrl-enter", SearchOpenKeep, Some(predicate.as_str())),
+            KeyBinding::new("cmd-enter", SearchOpenKeep, Some(predicate.as_str())),
+        ]);
+        let stack: Vec<KeyContext> = ["Workspace", "Dialog", CONTEXT, "Input"]
+            .iter()
+            .map(|c| KeyContext::parse(c).unwrap())
+            .collect();
+        let first = |ks: &str| {
+            let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
+            bindings[0].action().boxed_clone()
+        };
+        assert!(first("up").partial_eq(&SearchCursorPrev));
+        assert!(first("pagedown").partial_eq(&SearchCursorPageDown));
+        assert!(first("ctrl-home").partial_eq(&SearchCursorFirst));
+        let secondary = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
+        assert!(first(secondary).partial_eq(&SearchOpenKeep));
     }
 
     #[test]
@@ -1479,7 +1986,10 @@ mod tests {
         assert!(capped.contains("1000+"), "{capped}");
 
         let idle = status_text(Status::Idle, SearchMode::FileName, 0, 0, false);
-        assert!(idle.contains(mod_label()), "{idle}");
+        assert!(
+            idle.contains(&crate::hotkeys::hotkey_label("globalSearch")),
+            "空闲提示里的键位取自键位表:{idle}"
+        );
         assert!(!idle.contains('{'), "占位符没换干净:{idle}");
     }
 

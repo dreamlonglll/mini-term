@@ -28,6 +28,10 @@
 //! - ↑ / ↓ 走 action(`SshQuickPrev/Next`,谓词 `"SshQuickConnect > Input"`,
 //!   为什么必须与 `Input` 同深度见 `project_switcher` 模块注释);
 //! - ↵ 订阅 `InputEvent::PressEnter`;
+//! - Ctrl+↵(macOS 另认 Cmd+↵)走 action `SshQuickConnectInNewTerminal`(同一谓词),
+//!   与 Ctrl+单击一样**一律在新终端里连**。普通 ↵ / 单击也不会往正跑着 AI 或全屏程序的
+//!   终端里敲字,判据见 [`crate::pane::ssh_connect_target`];
+//!   这一对是给判不出来的程序(python REPL、`tail -f`)留的手动档;
 //! - Esc 由单行输入框以 `cx.propagate()` 冒到菜单容器,整个菜单关闭、焦点还给终端;
 //! - 菜单容器在焦点被借走期间**只认 Esc**,本面板收起(悬停到别的菜单项)时由菜单
 //!   把焦点收回 —— 这两条在 `menu.rs` 里(`owns_focus` / `reclaim_focus`)。
@@ -42,8 +46,9 @@ use std::cell::RefCell;
 
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div, prelude::FluentBuilder as _, px,
+    IntoElement, Modifiers, ParentElement, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Window, actions, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
@@ -63,6 +68,8 @@ actions!(
         SshQuickPrev,
         /// 下一条连接(↓)。
         SshQuickNext,
+        /// 在新终端里连游标那一条(Ctrl+↵,macOS 另认 Cmd+↵),不管当前终端在跑什么。
+        SshQuickConnectInNewTerminal,
     ]
 );
 
@@ -355,6 +362,16 @@ pub fn shows_group_headers(connections: &[SshConnection]) -> bool {
     connections.iter().any(|c| group_of(c).is_some())
 }
 
+/// 点一行时按着的修饰键要不要「一律在新终端里连」:Ctrl(各平台都认),macOS 另认 Cmd
+/// (`secondary` 在 macOS 上就是 Cmd,别处就是 Ctrl)—— 与 Ctrl+↵ / Cmd+↵ 两个键位对齐。
+fn modifiers_force_new(modifiers: Modifiers) -> bool {
+    modifiers.control || modifiers.secondary()
+}
+
+fn click_forces_new(event: &ClickEvent) -> bool {
+    modifiers_force_new(event.modifiers())
+}
+
 /// 行尾的认证小签,私钥在前。
 pub fn auth_badges(conn: &SshConnection) -> Vec<AuthBadge> {
     let mut badges = Vec::new();
@@ -408,7 +425,10 @@ impl SshQuickPanel {
                     this.reveal_cursor = true;
                     cx.notify();
                 }
-                InputEvent::PressEnter { .. } => this.commit(window, cx),
+                // `secondary` = 输入框自带的 secondary-enter(Win/Linux 的 Ctrl+↵、macOS
+                // 的 Cmd+↵)。正常情况下这两个键先被本面板的 action 截走、走不到这里;
+                // 万一绑定优先级变了,落到这里也是同一个结果
+                InputEvent::PressEnter { secondary, .. } => this.commit(*secondary, window, cx),
                 _ => {}
             },
         );
@@ -494,25 +514,33 @@ impl SshQuickPanel {
         cx.notify();
     }
 
-    /// 连游标所在那一条。
-    fn commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 连游标所在那一条。`force_new` = Ctrl+↵:一律在新终端里连。
+    fn commit(&mut self, force_new: bool, window: &mut Window, cx: &mut Context<Self>) {
         let rows: Vec<QuickRow> = self.buckets(cx).into_iter().flat_map(|b| b.rows).collect();
         let cursor = self.cursor.min(rows.len().saturating_sub(1));
         let Some(row) = rows.into_iter().nth(cursor) else {
             return;
         };
-        self.connect(row.conn, window, cx);
+        self.connect(row.conn, force_new, window, cx);
     }
 
-    /// 在目标终端里连这条 SSH。
+    /// 连这条 SSH:敲进右键的那个终端,还是开新终端再连,由
+    /// [`crate::pane::connect_ssh_from_menu`] 定(`force_new` = Ctrl+↵ / Ctrl+单击)。
     ///
     /// 顺序与 `branch_family` 的节点点击同一条理由:**先收菜单**(把焦点还给终端),
     /// 动作 defer 出去 —— 收菜单会连带 drop 本面板(实体被菜单项的闭包持有),
-    /// 在自己的 listener 里同步跑后续动作等于站在正在塌的楼上。
-    fn connect(&mut self, conn: SshConnection, window: &mut Window, cx: &mut Context<Self>) {
+    /// 在自己的 listener 里同步跑后续动作等于站在正在塌的楼上。开新终端那一支要抢焦点,
+    /// 排在收菜单之后也正好不被菜单的焦点还原盖掉。
+    fn connect(
+        &mut self,
+        conn: SshConnection,
+        force_new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let pty_id = self.pty_id;
         window.defer(cx, move |window, cx| {
-            crate::pane::connect_ssh(pty_id, conn, window, cx);
+            crate::pane::connect_ssh_from_menu(pty_id, conn, force_new, window, cx);
         });
         menu::close(window, cx);
     }
@@ -661,9 +689,9 @@ impl SshQuickPanel {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 cx.stop_propagation();
-                this.connect(conn.clone(), window, cx);
+                this.connect(conn.clone(), click_forces_new(event), window, cx);
             }))
             .child(
                 div()
@@ -763,7 +791,10 @@ impl SshQuickPanel {
                     .pr(px(6.0))
                     .text_size(ui::font_px(10.5))
                     .text_color(ui::text_muted())
-                    .whitespace_nowrap()
+                    // 提示补了「Ctrl+↵ 新终端」一截之后与两颗按钮并排已经不宽裕:放不下时收成
+                    // 省略号,不许顶出面板
+                    .min_w_0()
+                    .truncate()
                     .child(t("terminal", "sshFooterHint")),
             )
     }
@@ -851,6 +882,11 @@ impl Render for SshQuickPanel {
             .on_action(cx.listener(|this, _: &SshQuickNext, _window, cx| {
                 this.move_cursor(1, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &SshQuickConnectInNewTerminal, window, cx| {
+                    this.commit(true, window, cx);
+                }),
+            )
             .w(ui::font_px(PANEL_WIDTH))
             .flex()
             .flex_col()
@@ -1117,6 +1153,32 @@ mod tests {
         let mut collapsed = vec!["内网".to_string()];
         toggle_collapsed(&mut collapsed, "其它", &spaced);
         assert_eq!(collapsed, vec!["内网".to_string(), "其它".to_string()]);
+    }
+
+    /// Ctrl+单击各平台都算「新终端里连」;Cmd+单击只在 macOS 算(别处 `platform` 是 Win 键)。
+    /// Shift / Alt 不算,裸点更不算。
+    #[test]
+    fn ctrl_单击才强制新终端() {
+        let mods = |control, shift, alt, platform| Modifiers {
+            control,
+            shift,
+            alt,
+            platform,
+            ..Default::default()
+        };
+        assert!(!modifiers_force_new(mods(false, false, false, false)));
+        assert!(modifiers_force_new(mods(true, false, false, false)));
+        assert!(
+            modifiers_force_new(mods(true, true, false, false)),
+            "Ctrl+Shift 也算"
+        );
+        assert!(!modifiers_force_new(mods(false, true, false, false)));
+        assert!(!modifiers_force_new(mods(false, false, true, false)));
+        assert_eq!(
+            modifiers_force_new(mods(false, false, false, true)),
+            cfg!(target_os = "macos"),
+            "Cmd+单击只在 macOS 算"
+        );
     }
 
     /// 认证小签:私钥在前、密码在后;空白路径 / 空密码不算配了。

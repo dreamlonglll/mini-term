@@ -19,6 +19,16 @@
 //! 第二颗按钮「添加 SSH 远程项目」由 BB-b 补上,走
 //! [`crate::remote_project::open`] —— 与项目列表底部那颗 `SSH` 钮同一种覆盖物,
 //! 两处入口不会各开一个。
+//!
+//! # GPUI 版多出来的三样
+//!
+//! - 两颗按钮下面一个次要入口「开启 AI 状态精确感知」:AI 状态的权威来源是 hook
+//!   (AGENTS.md「AI 状态判定」),而 `hookEnabled` 缺省关着,不说的话用户一直用的是
+//!   输入检测的降级路径。点了直达「设置 → Hook 事件」页注册。做成文字链接而不是第三颗
+//!   按钮:它不是开始使用的前提,别和「添加项目」抢主次;
+//! - 一句拖放提示:项目列表接受从资源管理器拖进来的文件夹(`project_list` 的
+//!   `on_external_drop`),首屏不说就没人知道;
+//! - 键位提示从三条补到五条,加上快速打开与全局搜索。
 
 use gpui::{
     App, ClickEvent, Div, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
@@ -28,15 +38,23 @@ use gpui::{
 use crate::hotkeys;
 use crate::i18n::t;
 use crate::modal;
+use crate::settings::SettingsPage;
 use crate::store::AppStore;
 use crate::ui;
 
-/// 键位提示那三条的 id(`FirstRunGuide.tsx:36-40` 逐条照抄,顺序也一样)。
+/// 键位提示那几条的 id。前三条照抄 `FirstRunGuide.tsx:36-40`(顺序也一样),后两条
+/// (快速打开、全局搜索)是 GPUI 版补的 —— 找文件、找内容是进了项目之后最先要用的两件事。
 ///
 /// 只存 id,显示串与描述都从 [`crate::hotkeys`] 那张唯一事实来源里取 ——
 /// 原版这里是手写 `hotkeyLabel('newTerminal')` + `t('settings.shortcuts.newTerminal')`
 /// 两处各写一遍,改键位时漏掉一处就漂移。
-pub const HINT_IDS: [&str; 3] = ["newTerminal", "switchProject", "terminalSearch"];
+pub const HINT_IDS: [&str; 5] = [
+    "newTerminal",
+    "switchProject",
+    "terminalSearch",
+    "quickOpen",
+    "globalSearch",
+];
 
 /// 首屏本体。挂在终端栏(`bg-terminal` 底色),整块垂直居中。
 ///
@@ -77,13 +95,44 @@ pub fn guide(store: Entity<AppStore>) -> Div {
         .child(
             div()
                 .flex()
+                .flex_col()
                 .items_center()
-                .justify_center()
-                .gap(px(8.0))
-                .child(add_local_button(store.clone()))
-                .child(add_remote_button(store)),
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.0))
+                        .child(add_local_button(store.clone()))
+                        .child(add_remote_button(store.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .child(t("app", "firstRun.dropHint")),
+                )
+                .child(enable_hook_link(store)),
         )
         .child(hints())
+}
+
+/// 次要入口:直达「设置 → Hook 事件」(见模块注释「GPUI 版多出来的三样」)。
+fn enable_hook_link(store: Entity<AppStore>) -> impl IntoElement {
+    div()
+        .id("first-run-enable-hook")
+        .px(px(8.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .text_size(ui::font_px(12.0))
+        .text_color(ui::accent())
+        .cursor_pointer()
+        .hover(|el| el.bg(ui::accent_subtle()))
+        .child(format!("{} ›", t("app", "firstRun.enableHook")))
+        .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            crate::settings::open_settings(store.clone(), Some(SettingsPage::AiHook), window, cx);
+        })
 }
 
 /// 主按钮:accent 描边 + `--accent-subtle` 底,hover 转 `--accent-muted`
@@ -148,13 +197,18 @@ fn hints() -> Div {
         let Some(desc_key) = hotkeys::hotkey_desc_key(id) else {
             continue;
         };
+        // 键帽取此刻生效的键位;用户把它解绑了就整行不出(一颗空键帽只会让人困惑)
+        let keys = hotkeys::hotkey_label(id);
+        if keys.is_empty() {
+            continue;
+        }
         block = block.child(
             div()
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(ui::kbd(hotkeys::hotkey_label(id)))
+                .child(ui::kbd(keys))
                 .child(div().child(t("settings", desc_key))),
         );
     }
@@ -165,10 +219,10 @@ fn hints() -> Div {
 mod tests {
     use super::*;
 
-    /// 三条提示的 id 必须都在键位表里 —— 不在的话那颗键帽会画成空白,
+    /// 每条提示的 id 必须都在键位表里 —— 不在的话那颗键帽会画成空白,
     /// 而这种「写着有快捷键、其实取不到」正是 `hotkeys.rs` 整张表要防的事。
     #[test]
-    fn 三条键位提示都取得到() {
+    fn 键位提示都取得到() {
         for id in HINT_IDS {
             assert!(
                 !hotkeys::hotkey_label(id).is_empty(),
@@ -181,9 +235,19 @@ mod tests {
         }
     }
 
-    /// 顺序与原版 `FirstRunGuide.tsx:36-40` 一致:新建终端 / 切换项目 / 终端查找。
+    /// 前三条与原版 `FirstRunGuide.tsx:36-40` 一致(新建终端 / 切换项目 / 终端查找),
+    /// GPUI 版补的快速打开与全局搜索排在后面。
     #[test]
-    fn 提示顺序照抄原版() {
-        assert_eq!(HINT_IDS, ["newTerminal", "switchProject", "terminalSearch"]);
+    fn 提示顺序前三条照抄原版() {
+        assert_eq!(
+            HINT_IDS,
+            [
+                "newTerminal",
+                "switchProject",
+                "terminalSearch",
+                "quickOpen",
+                "globalSearch"
+            ]
+        );
     }
 }

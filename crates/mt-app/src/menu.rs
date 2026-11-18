@@ -194,8 +194,11 @@ impl MenuItem {
         self
     }
 
+    /// 右侧的快捷键列。**空串 = 不画**:键位表里被用户解绑的动作,
+    /// `hotkeys::hotkey_label` 取到的就是空串,菜单项照常列、只是不再标键位。
     pub fn shortcut(mut self, label: impl Into<SharedString>) -> Self {
-        self.shortcut = Some(label.into());
+        let label = label.into();
+        self.shortcut = (!label.is_empty()).then_some(label);
         self
     }
 
@@ -268,11 +271,15 @@ pub fn separator() -> MenuEntry {
     MenuEntry::Separator
 }
 
-/// 快捷键提示串。照抄 `src/utils/hotkeys.ts::comboLabel`:
-/// 非 mac 是 `Ctrl+Shift+D`,mac 是 `⌘⇧D`(符号直接拼、不加分隔符)。
+/// **不进键位表**的那些键的提示串(弹窗 / 面板内部键位:提交框的 Ctrl+Enter、diff 页签的
+/// Alt+← 之类)。照抄 `src/utils/hotkeys.ts::comboLabel`:非 mac 是 `Ctrl+Shift+D`,
+/// mac 是 `⌘⇧D`(符号直接拼、不加分隔符)。`with_mod` 在 mac 上画 ⌘,所以只用于 Ctrl 与
+/// Cmd **两种都绑了**的键(`hotkeys::internal_bindings` 里那些 `ctrl-enter` / `cmd-enter`
+/// 成对的)。
 ///
-/// 键位表的事实来源仍是 `main.rs` 里那串 `KeyBinding`,这里只负责**显示**;
-/// 两处对不上不会有编译错误,改键位时记得一起改(与原版同一风险)。
+/// ⚠️ 键位表里的动作(新建终端、分屏……)一律走 `hotkeys::hotkey_label(id)`:那边取的是
+/// 此刻真正绑着的键位,用户改键 / 解绑、mac 的换算都跟着走;在这里手写一份就又会与
+/// 实际绑定对不上。
 pub fn hotkey_label(with_mod: bool, shift: bool, alt: bool, key: &str) -> String {
     let mac = cfg!(target_os = "macos");
     let mut parts: Vec<&str> = Vec::new();

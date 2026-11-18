@@ -314,6 +314,7 @@ impl SettingsView {
         let config = self.store.read(cx).config();
         let smart = config.smart_copy_paste;
         let long_paste = config.long_paste_to_file;
+        let long_paste_ai_only = config.long_paste_ai_only;
 
         page_root()
             .child(
@@ -353,8 +354,21 @@ impl SettingsView {
                         },
                         cx,
                     ))
-                    // 总开关关掉时下面两行**置灰**(与 system 页的托盘子项不同,
+                    // 总开关关掉时下面三行**置灰**(与 system 页的托盘子项不同,
                     // 那边是整个不渲染)
+                    .child(toggle_row(
+                        "clip-long-paste-ai-only",
+                        "clipboard.longPasteAiOnlyTitle",
+                        "clipboard.longPasteAiOnlyDesc",
+                        long_paste_ai_only,
+                        !long_paste,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.long_paste_ai_only = next, cx)
+                            });
+                        },
+                        cx,
+                    ))
                     .child(number_row(
                         "clipboard.lineThreshold",
                         "clipboard.lineThresholdDesc",

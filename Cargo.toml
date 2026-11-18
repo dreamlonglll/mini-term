@@ -99,6 +99,15 @@ dirs = "6"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+# 文件树本地删除进系统回收站(mt-app `file_tree::recycle`)。Windows 上用的 `windows` 0.62
+# 与 gpui 同一份,不引第二套 windows 家族。⚠️ 只给 mt-app 用,**不要**加进 mt-project:
+# 后者被服务器端的 `mt-git-helper`(Linux musl 静态构建)链接,不能拖进桌面依赖。
+# 默认 feature 不砍:其中的时间库只在 Linux 上编,给 .trashinfo 写 `DeletionDate`(freedesktop
+# 回收站规范里是必填项);Windows 上是 COM 单线程套间(调用方在一条新线程上调,见
+# `file_tree::recycle` 模块注释)。
+# ⚠️ 钉死 =5.3.0:5.4.0 与它的唯一差别是把这个时间库从 chrono(树里已有)换成了刚发布的
+# jiff 1.x(连带 jiff-core 1.x 两个新 crate),Windows / macOS 两支的代码一字未改。
+trash = "=5.3.0"
 # 移动端配对二维码(U 批)。default-features=false 砍掉 image 输出后端 ——
 # 只要 QrCode 的位矩阵，渲染由 mt-app 自绘(静区 1 模块 / EC level M)。
 qrcode = { version = "0.14", default-features = false }

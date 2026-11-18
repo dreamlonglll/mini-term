@@ -22,6 +22,9 @@ export const sessionList = {
     remoteBadgeTitle: "远程会话 · {name}",
     viewFlat: "切到平铺视图",
     viewTree: "切到分支树视图",
+    filterPlaceholder: "按标题或 AI 名过滤",
+    filterEmpty: "没有匹配「{query}」的会话",
+    rowMenuHint: "右键查看更多操作",
     branchTree: {
       runningIn: "正在「{project}」运行，点击跳转",
       clickToResume: "点击在新终端恢复此会话",
@@ -76,6 +79,9 @@ export const sessionList = {
     remoteBadgeTitle: "Remote session · {name}",
     viewFlat: "Switch to flat view",
     viewTree: "Switch to branch tree view",
+    filterPlaceholder: "Filter by title or AI name",
+    filterEmpty: "No sessions match \"{query}\"",
+    rowMenuHint: "Right-click for more actions",
     branchTree: {
       runningIn: "Running in \"{project}\", click to jump",
       clickToResume: "Click to resume in a new terminal",

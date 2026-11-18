@@ -715,3 +715,94 @@ fn 会话_外部改动_回声窗口内不理_脏或保存中挂提示_干净重�
         FsChange::Reload
     );
 }
+
+/// 文件树改路径(先打招呼、改完改指向)之后 ECHO_WINDOW 内的监听事件是自己的回声:
+/// 干净的不重载(光标不丢),脏的不挂外部改动;改指向时把途中挂上的提示收掉。
+#[test]
+fn 会话_路径改动_回声窗口内不理_改指向收掉外部改动() {
+    let mut doc = loaded_local("a");
+    let at = Instant::now();
+    doc.expect_path_change(at);
+    assert_eq!(
+        doc.on_fs_change(at + Duration::from_millis(500), || panic!(
+            "回声窗口内不该取草稿"
+        )),
+        FsChange::Ignore
+    );
+    assert_eq!(
+        doc.on_fs_change(at + ECHO_WINDOW, || Some("a".into())),
+        FsChange::Reload,
+        "过了窗口照常判"
+    );
+
+    // 招呼没打到(事件抢在前头):脏的已挂上提示,改指向时收掉
+    let mut doc = loaded_local("a");
+    doc.on_edit("a!");
+    assert_eq!(
+        doc.on_fs_change(Instant::now(), || Some("a!".into())),
+        FsChange::Flagged
+    );
+    let moved_at = Instant::now();
+    doc.on_path_moved(moved_at);
+    assert!(!doc.ext_changed());
+    assert!(doc.is_dirty(), "草稿原样留着");
+    assert_eq!(
+        doc.on_fs_change(moved_at, || Some("a!".into())),
+        FsChange::Ignore
+    );
+}
+
+/// 孤儿(文件被删 / 被顶掉):提示条换成孤儿那一条,之后的监听事件不另挂外部改动;
+/// 已删除的保存「草稿没变也照存」(建回来);保存成功或重新落基线都清掉标记。
+#[test]
+fn 会话_孤儿_删除与顶掉的标记与保存口径() {
+    let mut doc = loaded_local("a");
+    doc.on_edit("a!");
+    doc.on_fs_change(Instant::now(), || Some("a!".into()));
+    assert!(doc.ext_changed());
+    let at = Instant::now();
+    doc.mark_orphan(Orphan::Deleted, at);
+    assert_eq!(doc.orphan(), Some(Orphan::Deleted));
+    assert!(!doc.ext_changed(), "两条提示只留孤儿那一条");
+    assert_eq!(
+        doc.on_fs_change(at + ECHO_WINDOW, || Some("a!".into())),
+        FsChange::Ignore
+    );
+    // 撤销回干净:被删的文件照样能「保存 = 建回来」
+    doc.on_edit("a");
+    assert!(doc.prepare_save("a"));
+    let save = doc.begin_save("a").unwrap();
+    assert!(doc.settle_save(save.generation));
+    doc.on_local_save_result("a".into(), Ok(()), Instant::now(), || Some("a".into()));
+    assert_eq!(doc.orphan(), None, "建回来了就不再是孤儿");
+
+    // 被顶掉的:草稿与基线相同就不存(覆盖成同样的内容没有意义);重新加载清掉标记
+    let mut doc = loaded_local("a");
+    doc.mark_orphan(Orphan::Replaced, Instant::now());
+    assert!(!doc.prepare_save("a"));
+    doc.apply_local_content(text("b"));
+    assert_eq!(doc.orphan(), None);
+
+    // 所在目录后来又被改名 / 移动:跟着换了路径,但删掉的照旧是删掉的,孤儿标记留着
+    let mut doc = loaded_local("a");
+    doc.mark_orphan(Orphan::Deleted, Instant::now());
+    doc.on_path_moved(Instant::now());
+    assert_eq!(doc.orphan(), Some(Orphan::Deleted));
+}
+
+/// 远程重读基线按 `saved` 的口径比(归一行尾**再展开 Tab**):Tab 缩进的文件内容没变
+/// 就只换基线,脏草稿也不挂冲突(页签跟着远程改名 / 移动时就靠这一条换上新路径的基线)。
+#[test]
+fn 会话_激活刷新_tab_缩进的文件内容没变只换基线() {
+    let mut doc = loaded_remote("fn a() {\n\tb();\n}\n", 1);
+    doc.on_edit("changed");
+    let generation = doc.begin_remote_refresh();
+    assert!(doc.settle_remote_refresh(generation));
+    assert_eq!(
+        doc.on_refresh_loaded(remote("fn a() {\n\tb();\n}\n", 2), true),
+        RefreshLoaded::Unchanged
+    );
+    assert_eq!(doc.remote_baseline(), Some(&2));
+    assert!(doc.is_dirty(), "草稿原样留着");
+    assert!(!doc.has_remote_conflict());
+}

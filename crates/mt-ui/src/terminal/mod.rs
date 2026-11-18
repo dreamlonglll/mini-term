@@ -9,6 +9,7 @@
 
 pub mod colors;
 pub mod damage;
+mod drag_select;
 mod element;
 mod images;
 pub mod ime;
@@ -26,12 +27,17 @@ mod view;
 
 pub use damage::{CellSignature, DamageStats, FrameKey, RowCache, row_signature};
 pub use element::{
-    FlashLine, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, PreeditText,
+    FlashLine, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, OnZoom, PreeditText,
     PreparedFrame, TerminalElement,
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
-pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
-pub use links::{FileLink, FileLinks, OpenFileLink, OpenUrlLink, ResolveFileLink};
+pub use input::{
+    ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
+};
+pub use links::{
+    FileLink, FileLinks, LINK_HINT_DELAY, LinkHintLabel, OpenFileLink, OpenUrlLink,
+    ResolveFileLink, TerminalLink,
+};
 pub use mini::{
     MINI_REFRESH_MS, MiniCell, MiniGeometry, MiniRun, MiniTerminalElement, build_row_runs,
     mini_geometry,

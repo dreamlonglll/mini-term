@@ -1,6 +1,6 @@
 //! 偏好与配置写入相关的 `AppStore` 方法:AI 历史面板视图、用量面板偏好、主题、
 //! shell 列表、全局终端环境变量、通用配置补丁、终端渲染参数、终端重绘帧率、
-//! 界面字号/字族、AI 感知取数口、界面语言、pane 重命名、移动端中转、远程通知。
+//! 界面字号/字族、AI 感知取数口、快捷键覆盖表、界面语言、pane 重命名、移动端中转、远程通知。
 //!
 //! 从 `store.rs` 原样搬来的一串段落,段注释随代码走,逻辑一行未改。
 
@@ -14,7 +14,10 @@ use crate::pane::TerminalPane;
 use crate::shell_ops::ShellList;
 
 use super::events::StoreChanged;
-use super::pure::{find_pane_of_pty, rename_pane_in_states, resolve_scrollback};
+use super::pure::{
+    TerminalZoom, find_pane_of_pty, rename_pane_in_states, resolve_scrollback,
+    zoomed_terminal_font_size,
+};
 use super::{AppStore, ConfigSection, StoreEvent, UsagePrefs};
 
 impl AppStore {
@@ -273,6 +276,14 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }
 
+    /// 终端字号快捷缩放(Ctrl+= / Ctrl+- / Ctrl+0 与 Ctrl+滚轮)。走上面同一个 setter:
+    /// 全部终端即时生效 + 防抖落盘,设置页滑杆跟着动;到头了值不变,setter 自己短路。
+    /// 步长与范围见 [`zoomed_terminal_font_size`]。
+    pub fn zoom_terminal_font(&mut self, zoom: TerminalZoom, cx: &mut Context<Self>) {
+        let next = zoomed_terminal_font_size(self.config.terminal_font_size, zoom);
+        self.set_terminal_font_size(next, cx);
+    }
+
     /// 终端字族。空串 = 回落默认(写 `None`,不落空串)。
     ///
     /// 用户自选字体也会**自动补 CJK 回退**,与原版 `resolveTerminalFontFamily`
@@ -445,6 +456,73 @@ impl AppStore {
     /// AI 桥的一份克隆(hook 服务器开关 / 状态查询)。
     pub fn ai(&self) -> AiBridge {
         self.ai.clone()
+    }
+
+    /// 记下「注册 Hook 的一次性提示」已经给过(或用户本来就注册过,视为已知晓)。
+    /// 只会从 false 变 true,判据与弹提示都在 `crate::hook_hint`。
+    pub fn mark_hook_hint_shown(&mut self, cx: &mut Context<Self>) {
+        if self.config.hook_hint_shown {
+            return;
+        }
+        self.config.hook_hint_shown = true;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
+    // === 更新提示 ===
+
+    /// 「忽略此版本」(`Some(版本号)`)/「不再忽略」(`None`)。边条更新按钮亮不亮的判据在
+    /// `crate::update_check::should_announce`;Workspace 观察着 store,这里一变按钮即刻跟着变。
+    pub fn set_ignored_update_version(&mut self, version: Option<String>, cx: &mut Context<Self>) {
+        let next = version
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if self.config.ignored_update_version == next {
+            return;
+        }
+        self.config.ignored_update_version = next;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
+    // === 快捷键(设置 →「快捷键」页)===
+
+    /// 改一组快捷键:`Some(键位串)` = 改成它,`None` = 解绑;与默认键位相同的从覆盖表里删掉
+    /// (只存与默认不同的项)。「替换」= 一次传两条(对方解绑 + 自己改),keymap 只追加一批。
+    /// 认不认得、合不合法由设置页录制时判过,这里不重判(`write_override` 只认表里可改的 id)。
+    pub fn set_hotkeys(&mut self, changes: &[(&str, Option<String>)], cx: &mut Context<Self>) {
+        let platform = crate::hotkeys::Platform::current();
+        let mut next = self.config.hotkey_overrides.clone();
+        for (id, keystroke) in changes {
+            crate::hotkeys::write_override(&mut next, id, keystroke.as_deref(), platform);
+        }
+        self.commit_hotkey_overrides(next, cx);
+    }
+
+    /// 恢复默认:`Some(id)` 只恢复那一条,`None` 恢复全部(只清本版本认得的条目,
+    /// 新版本留下的原样保留,见 `hotkeys::reset_overrides`)。
+    pub fn reset_hotkeys(&mut self, id: Option<&str>, cx: &mut Context<Self>) {
+        let mut next = self.config.hotkey_overrides.clone();
+        crate::hotkeys::reset_overrides(&mut next, id);
+        self.commit_hotkey_overrides(next, cx);
+    }
+
+    /// 覆盖表换成 `next`:**先改 keymap 再落盘** —— 改键即时生效,不等 500ms 防抖
+    /// (机制见 `hotkeys::apply_overrides`)。
+    fn commit_hotkey_overrides(
+        &mut self,
+        next: std::collections::BTreeMap<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if next == self.config.hotkey_overrides {
+            return;
+        }
+        self.config.hotkey_overrides = next;
+        // 丢弃说明不再打:这里写进去的都过了设置页的校验,剩下的只会是启动时已经记过一次的
+        // (新版本留下的认不出的 id 原样留在表里,每改一次键都喊一遍只是噪音)
+        let _ = crate::hotkeys::apply_overrides(&self.config.hotkey_overrides, cx);
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 
     // === 界面语言 ===

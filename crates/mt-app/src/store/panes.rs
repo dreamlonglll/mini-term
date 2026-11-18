@@ -4,7 +4,7 @@
 //! 从 `store.rs` 原样搬来的几段(`// === 终端 ===` / `// === pane 拖拽移动 ===` /
 //! `// === 双击最大化 ===`),段注释随代码走,逻辑一行未改。
 
-use gpui::{AppContext, Context, Window};
+use gpui::{App, AppContext, Context, Focusable, Window};
 use mt_config::{AiLauncher, ProjectConfig, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::{DwellConfig, TerminalStyle};
@@ -137,7 +137,8 @@ impl AppStore {
         let pane = self.spawn_pane(&project, &shell, cwd, window, cx)?;
         let pane_id = pane.id.clone();
 
-        let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
+        // 缺省锚点与快捷键取目标同一条回落链(`active_pane_id`)
+        let anchor = anchor_pane_id.or_else(|| self.active_pane_id(project_id));
         let state = self.project_states.get_mut(project_id)?;
         if state.panels.is_empty() {
             let panel = ProjectPanel::new(SplitNode::leaf(pane));
@@ -190,18 +191,8 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let source_cwd = cwd.or_else(|| {
-            self.project_states
-                .get(project_id)
-                .and_then(|s| s.pane(pane_id))
-                .and_then(|p| p.cwd.clone())
-        });
-        let shell_name = self
-            .project_states
-            .get(project_id)
-            .and_then(|s| s.pane(pane_id))
-            .map(|p| p.shell_name.clone());
-        let shell = self.resolve_shell(shell_name.as_deref())?;
+        let (shell, inherited_cwd) = self.inherited_launch(project_id, pane_id)?;
+        let source_cwd = cwd.or(inherited_cwd);
 
         let pane = self.spawn_pane(&project, &shell, source_cwd, window, cx)?;
         let new_pane_id = pane.id.clone();
@@ -234,6 +225,47 @@ impl AppStore {
         self.after_layout_change(project_id, cx);
         self.focus_pane(project_id, &new_pane_id, window, cx);
         Some(new_pane_id)
+    }
+
+    /// 从源 pane 继承什么来起新终端:它的 shell(按名字回查,已被删掉就退回默认)与它的
+    /// cwd 覆盖(worktree 终端分出来 / 复制出来的理应还在 worktree 里)。
+    ///
+    /// 分屏与「复制此终端」**共用这一处**,两个入口对「新终端像谁」不会有两套看法。
+    /// 源 pane 已经不在了返回 `None`:没有可继承的东西,也就不该起 PTY。
+    fn inherited_launch(
+        &self,
+        project_id: &str,
+        pane_id: &str,
+    ) -> Option<(ShellConfig, Option<String>)> {
+        let source = self.project_states.get(project_id)?.pane(pane_id)?;
+        let cwd = source.cwd.clone();
+        let shell = self.resolve_shell(Some(&source.shell_name))?;
+        Some((shell, cwd))
+    }
+
+    /// 「复制此终端」(页签右键):在源 pane 所在的那一组里新开一个页签,shell 与 cwd 的
+    /// 继承口径与分屏相同([`Self::inherited_launch`]),落点则与 tab 栏的「+」相同
+    /// ([`Self::new_terminal_with_cwd`],锚点是源 pane)。
+    ///
+    /// **只继承「同一个 shell、同一个目录」**:不带 AI 会话身份、不带自定义名、不往新终端
+    /// 里写任何命令。远程项目照常走 `start_pty` 的 ssh 分支,与「+」开出来的远程终端同一条路。
+    ///
+    /// 新页签落在源 pane 那一组,而这一组可能此刻看不见(终端列表竖条里右键的别的面板、
+    /// 铺满时缩在折叠条里的组),所以收尾走 [`Self::jump_to_pane`]:切面板、让那一组接管铺满、
+    /// 激活 —— 开出来的终端一定在眼前。
+    pub fn duplicate_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (shell, cwd) = self.inherited_launch(project_id, pane_id)?;
+        let anchor = Some(pane_id.to_string());
+        let new_pane =
+            self.new_terminal_with_cwd(project_id, Some(shell), anchor, cwd, window, cx)?;
+        self.jump_to_pane(project_id, &new_pane, window, cx);
+        Some(new_pane)
     }
 
     // === pane 拖拽移动 / 合并 / 重排(v0.14.0)===
@@ -377,12 +409,23 @@ impl AppStore {
 
     /// 关闭一个 pane:回收 PTY,再把它从所在面板的树里摘掉
     /// (面板随最后一个 pane 一起消失;面板全没了 = 项目回到空态)。
+    ///
+    /// 关掉的是逻辑焦点所在的 pane 时,逻辑焦点交给接手的那个
+    /// ([`SplitNode::takeover_after_removal`]:同组眼前那个 tab,整组没了就是相邻那一组)。
+    /// 这里只改**逻辑**焦点 —— 手上没有 `Window`;键盘焦点的交接在关闭入口
+    /// (`pane_actions::close_after_prompt`)与 Workspace 的「焦点落空」兜底里做。
     pub fn close_pane(&mut self, project_id: &str, pane_id: &str, cx: &mut Context<Self>) {
         let pty_id = self
             .project_states
             .get(project_id)
             .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id);
+        // 接手的要在**摘之前**的树上算(摘完就不知道它原来挨着谁了)
+        let takeover = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout_of_pane(pane_id))
+            .and_then(|l| l.takeover_after_removal(pane_id));
         if let Some(pty_id) = pty_id {
             self.dispose_terminal(pty_id, cx);
         }
@@ -390,13 +433,19 @@ impl AppStore {
             return;
         };
         state.remove_pane(pane_id);
+        // 接手的不在活动面板上(关掉的是活动面板的最后一个 pane,活动指针挪到了邻位面板;
+        // 或者关的是后台面板里的)时,改由活动面板自己的回落链定
+        let next = takeover
+            .filter(|id| state.active_layout().is_some_and(|l| l.pane(id).is_some()))
+            .or_else(|| {
+                let remembered = state.last_focused_pane_id.as_deref();
+                state.active_layout()?.target_pane(None, remembered)
+            });
+        if state.last_focused_pane_id.as_deref() == Some(pane_id) {
+            state.last_focused_pane_id = next.clone();
+        }
         if self.focused_pane_id.as_deref() == Some(pane_id) {
-            self.focused_pane_id = self
-                .project_states
-                .get(project_id)
-                .and_then(|s| s.active_layout())
-                .and_then(|l| l.first_active_pane())
-                .map(|p| p.id.clone());
+            self.focused_pane_id = next;
             // notify 由下面的 `after_layout_change` 统一收尾
             cx.emit(StoreEvent::FocusedPaneChanged);
         }
@@ -504,7 +553,12 @@ impl AppStore {
         self.activate_pane(project_id, pane_id, window, cx);
     }
 
-    /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。只有一个 tab 时什么也不做。
+    /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。
+    ///
+    /// 组里只有这一个 tab 时改为**切到相邻分组**(布局树 DFS 序循环,见
+    /// [`SplitNode::adjacent_leaf_pane`]):每组一个 tab 的分屏布局里,叶内循环永远原地
+    /// 不动,按了没反应。落点走 [`Self::jump_to_pane`] —— 别的组正铺满时目标缩在折叠条里,
+    /// 只激活的话焦点会落在看不见的那一格。只有一组时照旧什么也不做。
     pub fn cycle_pane(
         &mut self,
         project_id: &str,
@@ -513,13 +567,45 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = self
+        let Some(layout) = self
             .project_states
             .get(project_id)
             .and_then(|s| s.layout_of_pane(from_pane_id))
-            .and_then(|l| l.cycle_target(from_pane_id, delta));
-        if let Some(target) = target {
+        else {
+            return;
+        };
+        if let Some(target) = layout.cycle_target(from_pane_id, delta) {
             self.activate_pane(project_id, &target, window, cx);
+            return;
+        }
+        let single_tab = matches!(
+            layout.leaf_of_pane(from_pane_id),
+            Some(SplitNode::Leaf { panes, .. }) if panes.len() == 1
+        );
+        let neighbour = single_tab
+            .then(|| layout.adjacent_leaf_pane(from_pane_id, delta))
+            .flatten();
+        if let Some(target) = neighbour {
+            self.jump_to_pane(project_id, &target, window, cx);
+        }
+    }
+
+    /// 把 pane 在自己那一组的 tab 栏里左移 / 右移一格(Ctrl+Shift+PageUp / PageDown)。
+    /// 到头不循环;激活 tab 与焦点都不动,只是换位,随布局落盘。
+    pub fn move_pane_within_leaf(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let moved = self
+            .project_states
+            .get_mut(project_id)
+            .and_then(|s| s.layout_of_pane_mut(pane_id))
+            .is_some_and(|layout| layout.move_pane_by(pane_id, delta));
+        if moved {
+            self.after_layout_change(project_id, cx);
         }
     }
 
@@ -565,6 +651,9 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) {
         self.focused_pane_id = Some(pane_id.to_string());
+        if let Some(state) = self.project_states.get_mut(project_id) {
+            state.last_focused_pane_id = Some(pane_id.to_string());
+        }
         // 焦点给到它 = 用户看到它了:页签上「做完了还没看」的绿点就此熄灭。窗口不在
         // 前台时(启动时还原焦点等)人并没有在看,不算。绿点只有渲染在读,变化由下面
         // 这条 `FocusedPaneChanged` 带着重绘,不必另发账本事件
@@ -582,14 +671,32 @@ impl AppStore {
         cx.changed(StoreEvent::FocusedPaneChanged);
     }
 
-    /// 当前项目里该操作哪个 pane:焦点 pane → 布局里第一个激活 pane
-    /// (旧版 `resolveActivePane`,它以 DOM 焦点为准)。
+    /// 当前项目里该操作哪个 pane —— 全部快捷键动作(Workspace 的 `target_pane`)与
+    /// 键盘焦点落空后的去处共用这一份。回落链见 [`SplitNode::target_pane`]:逻辑焦点 →
+    /// 这个项目上次聚焦的 → 活动面板第一个分组的激活页签。旧版 `resolveActivePane` 以 DOM
+    /// 焦点为准、只有首尾两档;中间那档接住「切项目回来时焦点还指着别的项目」。
     pub fn active_pane_id(&self, project_id: &str) -> Option<String> {
-        let layout = self.project_states.get(project_id)?.active_layout()?;
-        self.focused_pane_id
-            .clone()
-            .filter(|id| layout.pane(id).is_some())
-            .or_else(|| layout.first_active_pane().map(|p| p.id.clone()))
+        let state = self.project_states.get(project_id)?;
+        state.active_layout()?.target_pane(
+            self.focused_pane_id.as_deref(),
+            state.last_focused_pane_id.as_deref(),
+        )
+    }
+
+    /// 键盘焦点此刻在哪个终端里(终端视图本身或挂在它下面的元素)。不在任何终端里
+    /// 返回 `None`。关闭入口在关之前拿它记一笔:关掉的是不是正拿着键盘焦点的那个
+    /// (见 `pane_actions::close_after_prompt`)。
+    ///
+    /// 只看焦点句柄表,**不碰终端实体**:退出条上的「关闭」就跑在那个终端自己的 update 里。
+    pub fn focused_terminal(&self, window: &Window, cx: &App) -> Option<u32> {
+        self.terminal_focus
+            .iter()
+            .find(|(_, focus)| {
+                focus
+                    .upgrade()
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+            })
+            .map(|(pty_id, _)| *pty_id)
     }
 
     /// 把一段文本当作用户键入写进某个 pane。
@@ -949,6 +1056,8 @@ impl AppStore {
             TerminalPane::new(
                 pty_id, launch, user_env, style, theme, dwell, scrollback, ai, cx,
             )
+            // 远程 pane 退出后不出本地那条「重新启动」,断线重连归 terminal_area 的遮罩
+            .with_remote(is_remote)
         });
 
         // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);PTY 没起来同样落 error;
@@ -973,6 +1082,9 @@ impl AppStore {
             }
         });
         self.pane_subs.insert(pty_id, sub);
+        // 刚建出来、谁也没在 update 它,此刻读得到(理由见 `terminal_focus` 字段注释)
+        let focus = entity.read(cx).focus_handle(cx).downgrade();
+        self.terminal_focus.insert(pty_id, focus);
         self.terminals.insert(pty_id, entity);
         pty_id
     }
