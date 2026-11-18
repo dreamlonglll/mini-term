@@ -130,7 +130,7 @@ mod tests;
 
 use git_refresh::{GitRefreshPlan, RepoSigs};
 
-use menu::{FileMenuAction, background_menu, file_menu, mod_label, row_key_action_available};
+use menu::{FileMenuAction, background_menu, file_menu, row_key_action_available};
 use move_to::MoveSource;
 use ops::{
     EntryTarget, confirm_delete_entry, confirm_move, rename_entry_prompt, start_download,
@@ -2334,12 +2334,11 @@ impl Render for FileTree {
                         el.child(
                             // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
                             header_button("file-tree-search")
-                                // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
-                                // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
-                                .tip(mt_i18n::t_args(
+                                // 键位取自键位表此刻生效的那份(用户改键 / 解绑跟着变)
+                                .tip(tr!(
                                     "fileTree",
                                     "header.searchTitle",
-                                    &[("mod", mod_label())],
+                                    shortcut = crate::hotkeys::hotkey_tip("globalSearch")
                                 ))
                                 .on_click(move |_event, window, cx| {
                                     crate::search_modal::open(store_for_search.clone(), window, cx);

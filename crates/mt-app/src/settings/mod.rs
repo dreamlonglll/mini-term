@@ -48,7 +48,7 @@
 //!
 //! 本模块只留**面板本体**:分页枚举与侧栏分组、[`SettingsView`] 的状态字段、
 //! 草稿行的归一与提交、`open_settings` 与分页路由。十二个分页各自的渲染按主题
-//! 分在六个 `pages_*` 里,共用小件在 `widgets`:
+//! 分在七个 `pages_*` 里,共用小件在 `widgets`:
 //!
 //! | 文件 | 内容 |
 //! |------|------|
@@ -57,7 +57,8 @@
 //! | `pages_appearance` | appearance(语言 / 主题 / 外置皮肤)/ font |
 //! | `pages_ai` | ai-notification / ai-hook |
 //! | `pages_remote_notify` | remote-notify(Bark / Telegram / Webhook 远程通知,发送在 `crate::remote_notify`) |
-//! | `pages_system` | system / editor / shortcuts / about |
+//! | `pages_system` | system / editor / about |
+//! | `pages_shortcuts` | shortcuts(键位表、录制改键、冲突与就地提示;键位逻辑在 `crate::hotkeys`) |
 //! | `widgets` | 页/节骨架、设置行原语与零碎视图件 |
 //!
 //! about 页要用的版本比较与 GitHub 查询**不在这棵树里** —— 它同时被 `main.rs`
@@ -84,12 +85,14 @@ mod pages_ai;
 mod pages_appearance;
 mod pages_env_vars;
 mod pages_remote_notify;
+mod pages_shortcuts;
 mod pages_system;
 mod pages_terminal;
 mod widgets;
 
 use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
 use pages_remote_notify::RemoteNotifyForm;
+use pages_shortcuts::ShortcutsState;
 
 // ─── 分页 ─────────────────────────────────────────────────────
 
@@ -424,6 +427,9 @@ pub struct SettingsView {
     // ── remote-notify 页 ──
     remote: RemoteNotifyForm,
 
+    // ── shortcuts 页:录制改键(见 `pages_shortcuts`)──
+    shortcuts: ShortcutsState,
+
     // ── system 页:本地下载目录 ──
     download_dir_busy: bool,
     download_dir_error: Option<String>,
@@ -704,6 +710,7 @@ impl SettingsView {
             snippet_tab: mt_ai::hook_registry::HookAgent::Claude.key(),
             sound_warning: false,
             remote,
+            shortcuts: ShortcutsState::default(),
             download_dir_busy: false,
             download_dir_error: None,
             download_dir_validation_key: None,
@@ -911,7 +918,16 @@ impl SettingsView {
     fn move_page(&mut self, delta: i32, cx: &mut Context<Self>) {
         let len = ALL_PAGES.len() as i32;
         let idx = ALL_PAGES.iter().position(|p| *p == self.page).unwrap_or(0) as i32;
-        self.page = ALL_PAGES[(((idx + delta) % len + len) % len) as usize];
+        self.set_page(ALL_PAGES[(((idx + delta) % len + len) % len) as usize], cx);
+    }
+
+    /// 换分页的唯一入口。离开快捷键页时把那一页的录制(App 级的按键拦截器)、待选冲突、
+    /// 就地提醒一并清掉 —— 拦截器绝不能跟着人跑到别的页去。
+    fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if page != self.page {
+            self.leave_shortcuts_page(cx);
+        }
+        self.page = page;
         cx.notify();
     }
 }
@@ -1052,8 +1068,7 @@ impl SettingsView {
                                 .child(t("settings", page.label_key())),
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.page = page;
-                            cx.notify();
+                            this.set_page(page, cx);
                         })),
                 );
             }

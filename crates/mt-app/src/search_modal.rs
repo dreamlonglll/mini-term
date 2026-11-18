@@ -1034,17 +1034,18 @@ fn status_text(
             SearchMode::FileName => tr!("search", "foundFiles", count = total),
             SearchMode::FileContent => tr!("search", "foundMatches", count = total),
         },
-        // 平台修饰键名。原版是 `MOD_LABEL`(mac 上 ⌘,其余 Ctrl)。
-        //
-        // 这条走 `t_args` 而不是 `tr!`:占位符名就叫 `mod`,而 `tr!` 的参数位是
-        // `$name:ident`,`mod` 是 Rust 关键字塞不进去(写 `r#mod` 会被
-        // `stringify!` 原样打成 "r#mod",对不上字典里的 `{mod}`)。
-        Status::Idle => mt_i18n::t_args("search", "shortcutHint", &[("mod", mod_label())]),
+        // 「Ctrl+Shift+F 打开搜索」:键位取自键位表此刻生效的那份(原版是 `MOD_LABEL` 拼
+        // 死的 `{mod}+Shift+F`,用户改键 / 解绑之后就对不上了)。解绑了就不提示 ——
+        // 没有键可按,这一句也就没有意义
+        Status::Idle => {
+            let shortcut = crate::hotkeys::hotkey_label("globalSearch");
+            if shortcut.is_empty() {
+                String::new()
+            } else {
+                tr!("search", "shortcutHint", shortcut = shortcut)
+            }
+        }
     }
-}
-
-fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
 }
 
 fn placeholder_key(mode: SearchMode) -> &'static str {
@@ -1985,7 +1986,10 @@ mod tests {
         assert!(capped.contains("1000+"), "{capped}");
 
         let idle = status_text(Status::Idle, SearchMode::FileName, 0, 0, false);
-        assert!(idle.contains(mod_label()), "{idle}");
+        assert!(
+            idle.contains(&crate::hotkeys::hotkey_label("globalSearch")),
+            "空闲提示里的键位取自键位表:{idle}"
+        );
         assert!(!idle.contains('{'), "占位符没换干净:{idle}");
     }
 

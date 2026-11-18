@@ -3023,6 +3023,14 @@ fn main() {
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
 
+        // 用户改过的快捷键压在默认键位之上(默认键位上面 `bind_keys` 已绑好;机制见
+        // `hotkeys::apply_overrides`)。必须赶在窗口开出来之前:首帧的菜单提示、首启引导的
+        // 键帽读的就是此刻生效的那份。读不懂 / 认不出的条目丢弃,只记日志
+        let hotkey_overrides = store.read(cx).config().hotkey_overrides.clone();
+        for issue in hotkeys::apply_overrides(&hotkey_overrides, cx) {
+            eprintln!("[hotkeys] {issue}");
+        }
+
         // 界面字号 / 字族同样要在**任何视图建出来之前**定下来:`ui::font_px` 读的是
         // 进程级快照,晚一步首帧会按默认 13px 画出来再被刷一遍(闪一下)。
         store.read(cx).apply_ui_font();

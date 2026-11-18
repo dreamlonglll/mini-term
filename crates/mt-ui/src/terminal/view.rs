@@ -777,7 +777,8 @@ impl TerminalView {
         //
         // ⚠️ 必须一并认 `platform`:macOS 把 ⌘ 报在 `platform` 位而不是 `control`,
         // 只判 `control` 的话这个分支在 mac 上永远进不去 —— 而设置页恰恰把这条
-        // 显示成 ⌘⇧V(`hotkeys.rs::combo_label` 在 mac 上渲染 ⌘),显示与实际对不上。
+        // 显示成 ⌘⇧V(mt-app `hotkeys.rs` 里这两条的 mac 默认键位是 `cmd-shift-c/v`,
+        // 那边有单测照抄这一行的判据对照),显示与实际对不上。
         // 判据与 [`smart_key_action`] 保持同一口径(那边本来就是 `control || platform`)。
         //
         // **副作用如实记:Windows 上 Win+Shift+C / Win+Shift+V 也会被这里接管**

@@ -49,7 +49,7 @@ use crate::command_library::{self, CommandPopover, PopoverEvent};
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
 use crate::markers;
-use crate::menu::{self, MenuEntry, MenuItem, hotkey_label};
+use crate::menu::{self, MenuEntry, MenuItem};
 use crate::modal;
 use crate::overlay;
 use crate::pane_actions;
@@ -1050,8 +1050,7 @@ pub(crate) fn tab_menu(
             TabMenuAction::Rename => {
                 let label = label.to_string();
                 MenuItem::new(t("paneGroup", "rename"))
-                    // 键位表见 main.rs 的 KeyBinding(F2 = RenamePane)
-                    .shortcut(hotkey_label(false, false, false, "F2"))
+                    .shortcut(crate::hotkeys::hotkey_label("renamePane"))
                     .on_click(move |window, cx| {
                         // 复用既有的重命名对话框(双击 tab 走的也是它)
                         modal::open_rename_pane(
@@ -1073,7 +1072,7 @@ pub(crate) fn tab_menu(
                 })
             }
             TabMenuAction::SplitRight => MenuItem::new(t("paneGroup", "splitRight"))
-                .shortcut(hotkey_label(true, true, false, "D"))
+                .shortcut(crate::hotkeys::hotkey_label("splitRight"))
                 .on_click(move |window, cx| {
                     store.update(cx, |store, cx| {
                         store.split_pane(&pid, &pane, SplitDirection::Horizontal, window, cx);
@@ -1081,7 +1080,7 @@ pub(crate) fn tab_menu(
                 })
                 .into(),
             TabMenuAction::SplitDown => MenuItem::new(t("paneGroup", "splitDown"))
-                .shortcut(hotkey_label(true, true, false, "E"))
+                .shortcut(crate::hotkeys::hotkey_label("splitDown"))
                 .on_click(move |window, cx| {
                     store.update(cx, |store, cx| {
                         store.split_pane(&pid, &pane, SplitDirection::Vertical, window, cx);
@@ -1149,7 +1148,7 @@ pub(crate) fn tab_menu(
                 .into(),
             TabMenuAction::ClosePane => MenuItem::new(t("paneGroup", "closePane"))
                 .danger()
-                .shortcut(hotkey_label(true, true, false, "W"))
+                .shortcut(crate::hotkeys::hotkey_label("closePane"))
                 .on_click(move |window, cx| {
                     pane_actions::close_leaf_of_pane(
                         store.clone(),
@@ -3080,11 +3079,12 @@ impl TerminalArea {
                 gpui::SharedString::from(format!("term-search-{leaf_id}")),
                 ICON_SEARCH,
             )
-            // 快捷键取自键位表(与设置页 / 首启引导同一份),改键位不必改这里
+            // 快捷键取自键位表此刻生效的那份(与设置页 / 首启引导同一份),用户改键 / 解绑
+            // 跟着变,解绑了括号里写「未设置」
             .tip(tr!(
                 "paneGroup",
                 "searchTooltip",
-                shortcut = crate::hotkeys::hotkey_label("terminalSearch")
+                shortcut = crate::hotkeys::hotkey_tip("terminalSearch")
             ))
             .on_click(cx.listener(move |this, _event, window, cx| {
                 cx.stop_propagation();
@@ -3131,12 +3131,12 @@ impl TerminalArea {
                 .cursor_pointer()
                 .text_color(ui::text_muted())
                 .hover(|el| el.text_color(ui::accent()).bg(ui::border_subtle()))
-                // `{mod}` 的插值不能走 `tr!`:那个宏的参数位是 `$name:ident`,
-                // 而 `mod` 是 Rust 关键字塞不进去(`search_modal.rs:320` 同样的坑)
-                .tip(mt_i18n::t_args(
+                // 两颗键帽取自键位表此刻生效的那份(用户改键 / mac 的 ⌘ 都跟着走)
+                .tip(tr!(
                     "paneGroup",
                     "markerTooltip",
-                    &[("mod", mod_label())],
+                    prev = crate::hotkeys::hotkey_tip("markerPrev"),
+                    next = crate::hotkeys::hotkey_tip("markerNext")
                 ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
@@ -3165,7 +3165,7 @@ impl TerminalArea {
                 } else {
                     "maximizePane"
                 },
-                shortcut = crate::hotkeys::hotkey_label("toggleMaximize")
+                shortcut = crate::hotkeys::hotkey_tip("toggleMaximize")
             ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 cx.stop_propagation();
@@ -3200,7 +3200,7 @@ impl TerminalArea {
                 .tip(tr!(
                     "paneGroup",
                     "splitRightTooltip",
-                    shortcut = crate::hotkeys::hotkey_label("splitRight")
+                    shortcut = crate::hotkeys::hotkey_tip("splitRight")
                 ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
@@ -3223,7 +3223,7 @@ impl TerminalArea {
                 .tip(tr!(
                     "paneGroup",
                     "splitDownTooltip",
-                    shortcut = crate::hotkeys::hotkey_label("splitDown")
+                    shortcut = crate::hotkeys::hotkey_tip("splitDown")
                 ))
                 .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
@@ -3260,7 +3260,7 @@ impl TerminalArea {
                     .tip(tr!(
                         "paneGroup",
                         "closePaneTooltip",
-                        shortcut = crate::hotkeys::hotkey_label("closePane")
+                        shortcut = crate::hotkeys::hotkey_tip("closePane")
                     ))
                     // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                     .on_click(cx.listener(move |this, _event, window, cx| {
@@ -4109,12 +4109,6 @@ fn zone_overlay(zone: DropZone) -> AnyElement {
     .into_any_element()
 }
 
-/// `paneGroup.markerTooltip` 里 `{mod}` 的取值。与 `search_modal.rs:324-326`
-/// 那一份同源(那边是私有的,不为一行去开放它)。
-fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
-}
-
 /// 标记浮层还该开着吗:那个 pane 得还在布局里、pty 没换,而且**仍是所在叶子的
 /// 激活 tab**。
 ///
@@ -4375,17 +4369,22 @@ impl Render for TerminalArea {
                         .child(format!("+ {}", t("terminalArea", "newTerminal"))),
                 )
                 // 键位提示是**独立一行**(原版 `TerminalArea.tsx:85-88`):
-                // 「也可以按」+ 一颗键帽,不是塞进按钮文字里的括号。串从键位表取,
-                // 改键位不会漏这里(与首启引导同一条路)。
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::text_muted())
-                        .child(t("terminalArea", "emptyHint"))
-                        .child(ui::kbd(crate::hotkeys::hotkey_label("newTerminal"))),
+                // 「也可以按」+ 一颗键帽,不是塞进按钮文字里的括号。串从键位表取此刻生效的
+                // 那份,改键位不会漏这里(与首启引导同一条路);用户把它解绑了,这一行就不画
+                .when_some(
+                    Some(crate::hotkeys::hotkey_label("newTerminal")).filter(|k| !k.is_empty()),
+                    |el, keys| {
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(ui::font_px(11.0))
+                                .text_color(ui::text_muted())
+                                .child(t("terminalArea", "emptyHint"))
+                                .child(ui::kbd(keys)),
+                        )
+                    },
                 )
                 // 关光了终端停在这一页:键盘焦点落在这里,新建终端 / 重开已关闭的终端这些
                 // 快捷键照样响应
@@ -5238,20 +5237,9 @@ mod tests {
         assert_eq!(branch_menu_segment(None, None), BranchMenuSegment::None);
     }
 
-    /// 快捷键标签与 `main.rs` 里绑的键位一致(改键位时这条会提醒改标签)。
-    #[test]
-    fn tab_菜单快捷键标签() {
-        if cfg!(target_os = "macos") {
-            return;
-        }
-        assert_eq!(hotkey_label(false, false, false, "F2"), "F2");
-        assert_eq!(hotkey_label(true, true, false, "D"), "Ctrl+Shift+D");
-        assert_eq!(hotkey_label(true, true, false, "E"), "Ctrl+Shift+E");
-        assert_eq!(hotkey_label(true, true, false, "W"), "Ctrl+Shift+W");
-    }
-
-    /// 控制条四颗按钮的悬停提示按 id 取键位表:id 写错会静默变成空串(提示里只剩
-    /// 一对空括号),这里逐个钉住,并确认与 tab 右键菜单显示的是同一组键。
+    /// 页签右键菜单与控制条提示里的快捷键一律按 id 取键位表(此刻生效的那份):id 写错会
+    /// 静默变成空串(菜单不标键位、提示里只剩「未设置」),这里逐个钉住都取得到,
+    /// 并确认 tab 菜单与控制条显示的是同一组键。
     #[test]
     fn 控制条提示里的快捷键取得到() {
         for id in [
@@ -5259,43 +5247,54 @@ mod tests {
             "splitRight",
             "splitDown",
             "closePane",
+            "renamePane",
             // 最大化钮的提示、页签右键「关闭此终端 / 最大化 / 重新打开」的快捷键列
             "toggleMaximize",
             "closeTab",
             "reopenClosed",
+            // 标记按钮的提示
+            "markerPrev",
+            "markerNext",
         ] {
             assert!(
                 !crate::hotkeys::hotkey_label(id).is_empty(),
                 "键位表里没有 {id}"
             );
+            assert_eq!(
+                crate::hotkeys::hotkey_tip(id),
+                crate::hotkeys::hotkey_label(id),
+                "{id} 没解绑时提示与菜单同一串"
+            );
         }
-        assert_eq!(
-            crate::hotkeys::hotkey_label("splitRight"),
-            hotkey_label(true, true, false, "D")
-        );
-        assert_eq!(
-            crate::hotkeys::hotkey_label("splitDown"),
-            hotkey_label(true, true, false, "E")
-        );
-        assert_eq!(
-            crate::hotkeys::hotkey_label("closePane"),
-            hotkey_label(true, true, false, "W")
-        );
+        if cfg!(not(target_os = "macos")) {
+            assert_eq!(crate::hotkeys::hotkey_label("renamePane"), "F2");
+            assert_eq!(crate::hotkeys::hotkey_label("splitRight"), "Ctrl+Shift+D");
+            assert_eq!(crate::hotkeys::hotkey_label("splitDown"), "Ctrl+Shift+E");
+            assert_eq!(crate::hotkeys::hotkey_label("closePane"), "Ctrl+Shift+W");
+        }
         let tip = tr!(
             "paneGroup",
             "splitRightTooltip",
-            shortcut = crate::hotkeys::hotkey_label("splitRight")
+            shortcut = crate::hotkeys::hotkey_tip("splitRight")
         );
         assert!(!tip.contains('{'), "占位符没换干净: {tip}");
         for key in ["maximizePane", "restorePane"] {
             let tip = tr!(
                 "paneGroup",
                 key,
-                shortcut = crate::hotkeys::hotkey_label("toggleMaximize")
+                shortcut = crate::hotkeys::hotkey_tip("toggleMaximize")
             );
             assert!(!tip.contains('{'), "占位符没换干净: {tip}");
             assert!(tip.contains(&crate::hotkeys::hotkey_label("toggleMaximize")));
         }
+        let tip = tr!(
+            "paneGroup",
+            "markerTooltip",
+            prev = crate::hotkeys::hotkey_tip("markerPrev"),
+            next = crate::hotkeys::hotkey_tip("markerNext")
+        );
+        assert!(!tip.contains('{'), "占位符没换干净: {tip}");
+        assert!(tip.contains(&crate::hotkeys::hotkey_label("markerNext")));
     }
 
     /// marker 按钮的锚点由控件簇的布局常量算出(原版是量 DOM 矩形)。

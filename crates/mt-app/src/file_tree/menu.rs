@@ -545,12 +545,3 @@ pub(super) fn background_menu(
     ]);
     entries
 }
-
-/// 快捷键提示里的修饰键名(与 `search_modal` 那份同规则)。
-pub(super) fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘"
-    } else {
-        "Ctrl"
-    }
-}

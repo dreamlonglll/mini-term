@@ -62,7 +62,7 @@ export const fileTree = {
       openExternalFailedTitle: "打开失败",
     },
     header: {
-      searchTitle: "搜索文件 ({mod}+Shift+F)",
+      searchTitle: "搜索文件 ({shortcut})",
       refresh: "刷新",
       collapseAll: "全部折叠",
       editorFallback: "编辑器",
@@ -187,7 +187,7 @@ export const fileTree = {
       openExternalFailedTitle: "Failed to Open",
     },
     header: {
-      searchTitle: "Search Files ({mod}+Shift+F)",
+      searchTitle: "Search Files ({shortcut})",
       refresh: "Refresh",
       collapseAll: "Collapse All",
       editorFallback: "Editor",

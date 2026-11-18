@@ -143,22 +143,6 @@ pub(super) fn choice_group() -> gpui::Div {
     div().flex().gap(px(8.0))
 }
 
-/// 快捷键页的一行:左描述、右键帽。
-pub(super) fn shortcut_row(desc: &'static str, keys: String) -> gpui::Div {
-    ui::settings_card()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(16.0))
-        .child(
-            div()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_primary())
-                .child(desc),
-        )
-        .child(ui::kbd(keys))
-}
-
 /// 一条带色描边的提示条(错误 / 成功 / 警告共用)。
 pub(super) fn banner(text: String, color: Hsla) -> gpui::Div {
     div()

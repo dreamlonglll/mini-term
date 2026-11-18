@@ -2413,7 +2413,7 @@ impl TerminalPane {
             .tip(tr!(
                 "terminal",
                 "scrollToBottom",
-                shortcut = crate::hotkeys::hotkey_label("scrollBottom")
+                shortcut = crate::hotkeys::hotkey_tip("scrollBottom")
             ))
             .on_click(cx.listener(|this, _event, window, cx| this.scroll_to_bottom(window, cx)))
             .child("↓")

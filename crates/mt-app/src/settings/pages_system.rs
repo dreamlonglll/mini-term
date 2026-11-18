@@ -1,5 +1,5 @@
-//! 设置面板的 system(托盘 / 启动)、editor(外部编辑器)、shortcuts(快捷键)
-//! 与 about(版本)四页。
+//! 设置面板的 system(托盘 / 启动)、editor(外部编辑器)与 about(版本)三页。
+//! shortcuts(快捷键)页在 `pages_shortcuts`。
 //!
 //! about 页的版本比较与 GitHub 查询在 [`crate::update_check`],这里只有那颗
 //! 「检查更新」按钮的后台任务与结果渲染。
@@ -14,15 +14,13 @@ use gpui_component::input::Input;
 use gpui_component::text::{TextView, TextViewStyle};
 use mt_config::{AppConfig, EditorConfig};
 
-use crate::hotkeys;
 use crate::i18n::{t, tr};
 use crate::prompt::show_alert;
 use crate::ui;
 use crate::update_check::{compare_versions, fetch_latest_release, format_published_at};
 
 use super::widgets::{
-    banner, dashed_button, form_card, number_row, page_root, radio_dot, section, shortcut_row,
-    toggle_row,
+    banner, dashed_button, form_card, number_row, page_root, radio_dot, section, toggle_row,
 };
 use super::{SettingsView, tray_children_visible};
 
@@ -668,55 +666,6 @@ impl SettingsView {
         });
         self.editor_editing = None;
         cx.notify();
-    }
-
-    // ── shortcuts 页 ──
-
-    pub(super) fn render_shortcuts_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let smart = self.store.read(cx).config().smart_copy_paste;
-        let mut root = page_root();
-
-        for (group_key, items) in hotkeys::groups() {
-            let mut rows = div().flex().flex_col().gap(px(4.0));
-            for def in items {
-                rows = rows.child(shortcut_row(
-                    t("settings", def.desc_key),
-                    hotkeys::combo_label(&def.combo),
-                ));
-            }
-            // 智能 Ctrl+C/V 开启时才存在,附在「复制粘贴」组末尾
-            if smart && group_key == "shortcuts.clipboard" {
-                let modifier = hotkeys::combo_label(&hotkeys::Combo {
-                    modifier: true,
-                    shift: false,
-                    alt: false,
-                    key: "C",
-                });
-                let paste = hotkeys::combo_label(&hotkeys::Combo {
-                    modifier: true,
-                    shift: false,
-                    alt: false,
-                    key: "V",
-                });
-                rows = rows
-                    .child(shortcut_row(t("settings", "shortcuts.copyDesc"), modifier))
-                    .child(shortcut_row(
-                        t("settings", "shortcuts.pasteToTerminal"),
-                        paste,
-                    ));
-            }
-            root = root.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(ui::settings_section_title(t("settings", group_key)))
-                    .child(rows),
-            );
-        }
-
-        root.child(ui::hint(t("settings", "shortcuts.footer")))
-            .into_any_element()
     }
 
     // ── about 页 ──

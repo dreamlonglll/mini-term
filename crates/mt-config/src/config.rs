@@ -6,6 +6,7 @@
 //! `config.json` 必须原样读得进来。
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -317,6 +318,16 @@ pub struct AppConfig {
     /// 全缺省(总开关关、三个渠道都没配)时序列化跳过。
     #[serde(default, skip_serializing_if = "RemoteNotifyConfig::is_default")]
     pub remote_notify: RemoteNotifyConfig,
+    /// 用户改过的快捷键(设置 →「快捷键」页):键 = mt-app 键位表(`hotkeys::HOTKEYS`)里的
+    /// id,值 = gpui 键位串(如 `ctrl-alt-t`),**空串 = 解绑**。只存与默认不同的项,空表
+    /// 序列化跳过 —— 库里没这个键的老用户读出来是空表,键位与没有这项功能时完全一样。
+    ///
+    /// 这里不校验:id 认不认得、键位串合不合法由 mt-app 在**使用时**判
+    /// (`hotkeys::Overrides::parse`,认不出的丢弃并记日志)。认不出的条目**原样留在表里**、
+    /// 不回写删掉 —— 与 `config.db` 的前向兼容同一口径:新版本加的快捷键 id,旧版本读到
+    /// 不认识,不能顺手抹掉。跨平台不换算:存的就是这台机器上绑的键位串。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hotkey_overrides: BTreeMap<String, String>,
 }
 
 /// 远程通知配置(`remoteNotify`)。
@@ -979,6 +990,7 @@ impl Default for AppConfig {
             usage_custom_to: None,
             command_library: CommandLibrary::default(),
             remote_notify: RemoteNotifyConfig::default(),
+            hotkey_overrides: BTreeMap::new(),
         }
     }
 }
@@ -2074,6 +2086,36 @@ mod tests {
         assert_eq!(json["ignoredUpdateVersion"], serde_json::json!("v1.13.33"));
         let back: AppConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back.ignored_update_version.as_deref(), Some("v1.13.33"));
+    }
+
+    /// 快捷键覆盖表:老库没这个键读出空表(键位与改动前一样),空表不写进 JSON;
+    /// 键名是 `hotkeyOverrides`,解绑用的空串与认不出的 id 都原样往返(前向兼容)。
+    #[test]
+    fn hotkey_overrides_缺省为空且原样往返() {
+        assert!(AppConfig::default().hotkey_overrides.is_empty());
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(legacy.hotkey_overrides.is_empty());
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("hotkeyOverrides").is_none(), "空表不写进库");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("newTerminal".to_string(), "ctrl-alt-t".to_string());
+        overrides.insert("terminalSearch".to_string(), String::new());
+        overrides.insert("someFutureAction".to_string(), "ctrl-alt-q".to_string());
+        let config = AppConfig {
+            hotkey_overrides: overrides.clone(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json["hotkeyOverrides"]["terminalSearch"],
+            serde_json::json!("")
+        );
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.hotkey_overrides, overrides);
     }
 
     /// 页签标题跟随 shell:纯增量字段 —— `None` 时不写进 JSON（不污染存量配置），

@@ -197,13 +197,18 @@ fn hints() -> Div {
         let Some(desc_key) = hotkeys::hotkey_desc_key(id) else {
             continue;
         };
+        // 键帽取此刻生效的键位;用户把它解绑了就整行不出(一颗空键帽只会让人困惑)
+        let keys = hotkeys::hotkey_label(id);
+        if keys.is_empty() {
+            continue;
+        }
         block = block.child(
             div()
                 .flex()
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(ui::kbd(hotkeys::hotkey_label(id)))
+                .child(ui::kbd(keys))
                 .child(div().child(t("settings", desc_key))),
         );
     }
