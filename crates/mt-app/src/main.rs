@@ -855,12 +855,15 @@ impl Workspace {
         }
         let now = std::time::Instant::now();
         let last = self.last_close_hotkey.replace(now);
-        if pane_actions::swallows_close_hotkey(self.store.read(cx).config(), last, now) {
-            return;
-        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
+        // 目标组全部已退出时偏好开着也免确认,连发闸要跟着管(见 `swallows_close_hotkey`)
+        let store = self.store.read(cx);
+        let dead = pane_actions::leaf_of_pane_is_dead(store, &project_id, &pane_id);
+        if pane_actions::swallows_close_hotkey(store.config(), dead, last, now) {
+            return;
+        }
         pane_actions::close_leaf_of_pane(self.store.clone(), project_id, pane_id, window, cx);
     }
 
@@ -1103,12 +1106,21 @@ impl Workspace {
 
     fn focus_adjacent(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
         // 这四条只从快捷键进来,守卫放这一处就够(Alt+方向键在文本输入框里
-        // 还是「按词移动」,让路给弹窗是必须的)
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
+        // 还是「按词移动」,让路给弹窗是必须的)。
+        //
+        // **没挪成就放行**(`propagate`):让路、不在终端页、那个方向没有相邻分屏,按键都
+        // 原样落回焦点所在处 —— fish / zsh 与不少 TUI 拿 Alt+方向键按词移动,单屏时吞掉
+        // 它等于把这组键整个废掉。gpui 先派发 action,处理器 propagate 之后才跑 key 监听
+        // (`Window::dispatch_key_event`:binding 循环里 `propagate_event` 仍为真就落到
+        // `finish_dispatch_key_event`),终端照常把它编码进 PTY。
+        let moved = !yields_to_overlay(window, cx)
+            && self.terminal_page_active(cx)
+            && self
+                .terminal_area
+                .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
+        if !moved {
+            cx.propagate();
         }
-        self.terminal_area
-            .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
     }
 
     /// Ctrl+F:文件页交给当前文档；终端页在**当前焦点 pane** 上开查找条。

@@ -199,6 +199,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::term::TermMode;
 use gpui::{
     App, Bounds, ClipboardItem, Context, ElementId, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent,
@@ -209,10 +210,13 @@ use mt_terminal::{TermSize, TerminalEmulator};
 
 use super::damage::DamageStats;
 use super::element::{
-    FlashLine, FrameGeometry, OnGridResize, OnInput, PreeditText, TerminalElement,
+    FlashLine, FrameGeometry, OnGridResize, OnInput, OnZoom, PreeditText, TerminalElement,
 };
 use super::ime::{ImeState, commit_to_bytes};
-use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes, win32_input_bytes};
+use super::input::{
+    ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
+    win32_input_bytes,
+};
 use super::links::{FileLink, FileLinks};
 use super::scrollbar::ScrollbarStyle;
 use super::search::TerminalSearch;
@@ -233,6 +237,8 @@ pub struct TerminalView {
     damage: Rc<StdCell<DamageStats>>,
     on_input: Option<OnInput>,
     on_grid_resize: Option<OnGridResize>,
+    /// Ctrl+滚轮缩放。见 [`TerminalView::on_zoom`]。
+    on_zoom: Option<OnZoom>,
     scrollbar: ScrollbarStyle,
     dwell: DwellConfig,
     on_selection_copied: Option<OnSelectionCopied>,
@@ -356,6 +362,7 @@ impl TerminalView {
             damage: Rc::new(StdCell::new(DamageStats::default())),
             on_input: None,
             on_grid_resize: None,
+            on_zoom: None,
             scrollbar: ScrollbarStyle::default(),
             dwell: DwellConfig::default(),
             on_selection_copied: None,
@@ -524,6 +531,16 @@ impl TerminalView {
         self
     }
 
+    /// Ctrl+滚轮缩放字号:`+1` 放大一档、`-1` 缩小一档。字号是宿主的全局配置,
+    /// 视图只报方向。不接 = Ctrl+滚轮按普通滚轮处理。
+    ///
+    /// 回调在元素的鼠标监听里调用,**没有**借着这个视图 —— 宿主可以直接去 update
+    /// 别的实体(改配置会回头 `set_style` 这个视图,那时它已不在借用中)。
+    pub fn on_zoom(mut self, f: impl Fn(i32, &mut Window, &mut App) + 'static) -> Self {
+        self.on_zoom = Some(Rc::new(f));
+        self
+    }
+
     pub fn emulator(&self) -> &Arc<TerminalEmulator> {
         &self.emulator
     }
@@ -661,6 +678,18 @@ impl TerminalView {
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
     }
 
+    /// 键盘回看(Shift+PgUp/PgDn、Ctrl+Shift+Home/End)。只动回看位置,一个字节都不进 PTY。
+    fn scroll_scrollback(&self, key: ScrollbackKey) {
+        let scroll = match key {
+            ScrollbackKey::PageUp => Scroll::PageUp,
+            ScrollbackKey::PageDown => Scroll::PageDown,
+            ScrollbackKey::Top => Scroll::Top,
+            ScrollbackKey::Bottom => Scroll::Bottom,
+        };
+        self.emulator
+            .with_term_mut(|term| term.scroll_display(scroll));
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let mods = &keystroke.modifiers;
@@ -668,6 +697,19 @@ impl TerminalView {
         // 组合中平台本不该派发到这里(它会先问 marked_text_range)。
         // 万一某个平台没做这一步,这里兜住:一律让给 IME,绝不写进 PTY。
         if self.ime.is_composing() {
+            return;
+        }
+
+        // 本地回看键:**排在一切编码之前**(win32-input-mode 那条路同样先到这里),
+        // 否则 Shift+PgUp 会被编成 `CSI 5;2~` 送走。只在主屏拦 —— alt screen 没有回看
+        // 缓冲,vim / less 这类全屏程序自己认这些键,照旧往下走、发给程序。
+        // Ctrl+Shift+Home/End 也必须排在下面那条 Ctrl+Shift 分支前面,否则会被它冒泡走。
+        if let Some(key) = scrollback_key(keystroke)
+            && !self.emulator.mode().contains(TermMode::ALT_SCREEN)
+        {
+            self.scroll_scrollback(key);
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
 
@@ -836,6 +878,9 @@ impl Render for TerminalView {
         }
         if let Some(cb) = self.on_input.clone() {
             element = element.on_input(move |bytes, window, cx| cb(bytes, window, cx));
+        }
+        if let Some(cb) = self.on_zoom.clone() {
+            element = element.on_zoom(move |step, window, cx| cb(step, window, cx));
         }
         if let Some(cb) = self.on_selection_copied.clone() {
             element = element

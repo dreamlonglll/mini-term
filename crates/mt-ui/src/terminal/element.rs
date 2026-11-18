@@ -127,6 +127,9 @@ pub type InstallInputHandler = Rc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App)>
 /// 元素要往 PTY 写字节时的出口(alt screen 下的滚轮、鼠标上报)。
 /// 元素不持有 PTY,这条只能交回宿主。
 pub type OnInput = Rc<dyn Fn(&[u8], &mut Window, &mut App)>;
+/// Ctrl+滚轮缩放字号的出口:`+1` 放大一档、`-1` 缩小一档。字号是宿主的全局配置
+/// (所有终端一起变、要落盘),元素只报方向。
+pub type OnZoom = Rc<dyn Fn(i32, &mut Window, &mut App)>;
 
 /// 要浮在光标处显示的预编辑串(IME 组合中)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -194,6 +197,7 @@ pub struct TerminalElement {
     on_grid_resize: Option<OnGridResize>,
     install_input_handler: Option<InstallInputHandler>,
     on_input: Option<OnInput>,
+    on_zoom: Option<OnZoom>,
     preedit: Option<PreeditText>,
     geometry_sink: Option<Rc<StdCell<FrameGeometry>>>,
     damage_sink: Option<Rc<StdCell<DamageStats>>>,
@@ -282,6 +286,7 @@ impl TerminalElement {
             on_grid_resize: None,
             install_input_handler: None,
             on_input: None,
+            on_zoom: None,
             preedit: None,
             geometry_sink: None,
             damage_sink: None,
@@ -381,6 +386,12 @@ impl TerminalElement {
     /// 见 [`OnInput`]。
     pub fn on_input(mut self, f: impl Fn(&[u8], &mut Window, &mut App) + 'static) -> Self {
         self.on_input = Some(Rc::new(f));
+        self
+    }
+
+    /// 见 [`OnZoom`]。不接 = Ctrl+滚轮照旧按普通滚轮处理。
+    pub fn on_zoom(mut self, f: impl Fn(i32, &mut Window, &mut App) + 'static) -> Self {
+        self.on_zoom = Some(Rc::new(f));
         self
     }
 
@@ -1061,14 +1072,16 @@ impl TerminalElement {
 
         // ── 滚轮
         //
-        //  优先级:鼠标上报 > alt screen 方向键 > 本地回看。
+        //  优先级:Ctrl+滚轮缩放 > 鼠标上报 > alt screen 方向键 > 本地回看。
         //  上报优先是因为开了上报的 TUI(htop / lazygit / fzf)自己有滚动语义,
-        //  我们代劳只会让它收到一堆无意义的方向键。
+        //  我们代劳只会让它收到一堆无意义的方向键。Ctrl+滚轮排在最前,与 Windows
+        //  Terminal / VS Code 终端同一手感:不管里面跑着什么,按住 Ctrl 滚就是缩放。
         {
             let emulator = self.emulator.clone();
             let hitbox = hitbox.clone();
             let remainder = state.scroll_remainder.clone();
             let on_input = self.on_input.clone();
+            let on_zoom = self.on_zoom.clone();
             let touched = state.scrollbar_touched.clone();
             let app_cursor = mode.contains(TermMode::APP_CURSOR);
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
@@ -1083,6 +1096,14 @@ impl TerminalElement {
                 let whole = total.trunc();
                 remainder.set(total - whole);
                 if whole == 0.0 {
+                    return;
+                }
+                // 一次滚轮事件只走一档(一格滚轮常报 3 行,按行数走会一下跳三档);
+                // 触控板的像素增量照样先攒够一行才算一档
+                if event.modifiers.control
+                    && let Some(on_zoom) = on_zoom.as_ref()
+                {
+                    on_zoom(if whole > 0.0 { 1 } else { -1 }, window, cx);
                     return;
                 }
                 let mods = modifiers_of(&event.modifiers);

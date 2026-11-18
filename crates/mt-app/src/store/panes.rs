@@ -949,6 +949,8 @@ impl AppStore {
             TerminalPane::new(
                 pty_id, launch, user_env, style, theme, dwell, scrollback, ai, cx,
             )
+            // 远程 pane 退出后不出本地那条「重新启动」,断线重连归 terminal_area 的遮罩
+            .with_remote(is_remote)
         });
 
         // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);PTY 没起来同样落 error;

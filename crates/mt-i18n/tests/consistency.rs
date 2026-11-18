@@ -223,8 +223,13 @@ use mt_i18n::{
 /// 那一栏的「空文件」（`gitCommit.emptySide`）。
 /// 1659 → 1768：合入远端 Git 项目授权与第三轮恢复出口、操作摘要及草稿历史文案。
 /// 1768 → 1769：共享仓库写入阻挡错误展示来源项目名。
+/// 1769 → 1782：终端区交互改进 —— 本地 shell 退出后的底部条（非 0 退出码、重新启动 /
+/// Enter 提示 / 关闭：`paneGroup.{shellExitedCode,restart,restartHint,close}`）、回看时的
+/// 「回到底部」浮钮（`terminal.scrollToBottom`）、设置页快捷键表新增「回看与缩放」组
+/// （`settings.shortcuts.{scrollbackZoom,scrollPageUp,scrollPageDown,scrollTop,scrollBottom,
+/// zoomIn,zoomOut,zoomReset}`）；`settings.shortcuts.footer` 改了措辞，条数不变。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1769;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1782;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

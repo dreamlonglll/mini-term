@@ -613,7 +613,8 @@ impl AppStore {
     ///
     /// 返回新 PTY 编号;项目/pane 不在了返回 `None`。
     /// **本地 pane 同样适用** —— 原版覆盖层只画在远程 pane 上,但动作本身与
-    /// 「远程」无关,判定留给调用方(BB-b 的覆盖层)。
+    /// 「远程」无关,判定留给调用方:远程走 `terminal_area` 的断线覆盖层,本地 shell
+    /// 退出 / 起不来走 pane 底部那条「重新启动」(`pane::TerminalPane::request_restart`)。
     pub fn reset_pane_for_reconnect(
         &mut self,
         project_id: &str,
@@ -647,6 +648,8 @@ impl AppStore {
         pane.pty_id = Some(new_pty);
         pane.status = PaneStatus::Idle;
         pane.attention = false;
+        // 上一条 PTY 的退出码随它一起作废(见 `PaneState::clean_exit`)
+        pane.clean_exit = false;
         // 旧 shell 报的标题属于上一条会话,新 shell 起来会自己重报;留着的话,
         // 不设标题的 shell 会一直顶着上一条连接的目录名
         pane.osc_title = None;

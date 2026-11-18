@@ -263,10 +263,19 @@ impl AppStore {
         if let Some((_, pane_id)) = find_pane_of_pty(&self.project_states, pty_id) {
             self.done.forget(&pane_id);
         }
+        // 退出码 0 = 用户自己收的工(`exit` / Ctrl+D):状态照旧落 error(终态与协议口径
+        // 都不动),只记一位让界面按 idle 画灰灯,见 `PaneState::clean_exit`
+        let clean = code == Some(0);
         let touched = self.project_states.values_mut().any(|state| {
-            state
-                .layouts_mut()
-                .any(|layout| layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None))
+            state.layouts_mut().any(|layout| {
+                if !layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None) {
+                    return false;
+                }
+                if let Some(pane) = layout.pane_by_pty_mut(pty_id) {
+                    pane.clean_exit = clean;
+                }
+                true
+            })
         });
         if touched {
             cx.changed(StoreEvent::PaneStatusChanged);
@@ -292,6 +301,8 @@ impl AppStore {
             if let Some(pane) = state.pane_by_pty_mut(pty_id) {
                 pane.status = PaneStatus::Error;
                 pane.attention = false;
+                // 起不来永远是红灯(不是「正常收工」)
+                pane.clean_exit = false;
                 dead = Some(pane.id.clone());
                 break;
             }
@@ -535,7 +546,9 @@ impl AppStore {
                 state.all_panes().into_iter().map(move |p| PaneRef {
                     project_id: pid.as_str(),
                     pane_id: p.id.as_str(),
-                    status: p.status,
+                    // 三处消费方都是界面(挑待办 / 按项目聚合 / 标题栏灯):干净退出的
+                    // shell 不该被当成「异常待处理」,与状态灯同一口径
+                    status: p.display_status(),
                     attention: p.attention,
                 })
             })

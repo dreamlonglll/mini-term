@@ -850,10 +850,11 @@ impl TerminalArea {
     }
 
     /// 这次点 × 要不要当连点吞掉。吞掉的点击也要记时刻,连点才只算一次。
-    fn swallows_close_click(&mut self, cx: &App) -> bool {
+    /// `target_dead`:点的终端(整组则组内全部)已退出,见 [`pane_actions::swallows_close_click`]。
+    fn swallows_close_click(&mut self, target_dead: bool, cx: &App) -> bool {
         let now = std::time::Instant::now();
         let last = self.last_close_click.replace(now);
-        pane_actions::swallows_close_click(self.store.read(cx).config(), last, now)
+        pane_actions::swallows_close_click(self.store.read(cx).config(), target_dead, last, now)
     }
 
     // ─── 非激活 tab 的悬停缩略图(`PaneGroup.tsx:234-277`) ─────
@@ -1166,18 +1167,26 @@ impl TerminalArea {
     }
 
     /// 把键盘焦点移到相邻分屏(`focusAdjacentPane`)。
-    pub fn focus_adjacent(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// 返回「真的挪了没有」:那个方向没有相邻分屏时是 `false`,调用方据此把 Alt+方向键
+    /// 放行给终端(见 `main.rs::Workspace::focus_adjacent`)。
+    pub fn focus_adjacent(
+        &mut self,
+        dir: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
-            return;
+            return false;
         };
         let Some(from) = self.store.read(cx).active_pane_id(&project_id) else {
-            return;
+            return false;
         };
         // 只在当前项目的 pane 里挑:别的项目的矩形是上一次渲染留下的残影
         let live: Vec<PaneRect> = {
             let store = self.store.read(cx);
             let Some(layout) = store.active_layout() else {
-                return;
+                return false;
             };
             layout
                 .panes()
@@ -1186,11 +1195,12 @@ impl TerminalArea {
                 .collect()
         };
         let Some(target) = focus_nav::adjacent_pane(&live, &from, dir) else {
-            return;
+            return false;
         };
         self.store.update(cx, |store, cx| {
             store.activate_pane(&project_id, &target, window, cx)
         });
+        true
     }
 
     /// AI 任务标记浮层。`None` = 没开 / 那个 pane 已经不在了。
@@ -2294,7 +2304,12 @@ impl TerminalArea {
                             // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
                             .on_click(cx.listener(move |this, _event, window, cx| {
                                 cx.stop_propagation();
-                                if this.swallows_close_click(cx) {
+                                let dead = pane_actions::pane_is_dead(
+                                    this.store.read(cx),
+                                    &pid_close,
+                                    &pane_id_close,
+                                );
+                                if this.swallows_close_click(dead, cx) {
                                     return;
                                 }
                                 pane_actions::close_pane(
@@ -2632,7 +2647,12 @@ impl TerminalArea {
                     // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         cx.stop_propagation();
-                        if this.swallows_close_click(cx) {
+                        let dead = pane_actions::leaf_is_dead(
+                            this.store.read(cx),
+                            &pid_close_leaf,
+                            &leaf_for_close,
+                        );
+                        if this.swallows_close_click(dead, cx) {
                             return;
                         }
                         pane_actions::close_leaf(
@@ -2829,8 +2849,9 @@ impl TerminalArea {
         });
         // 远程 pane 的断线覆盖层(`PaneGroup.tsx:329-333` 的 `showReconnect`):
         // 判据是「项目是 SSH 远程项目 **且** 这条 PTY 已登记退出」。
-        // ⚠️ **本地 pane 不进这条路** —— 本地退出仍走既有的 error 状态 + 右下角
-        // 「shell 已退出」角标(原版 `remote &&` 那一半就是这个闸)。
+        // ⚠️ **本地 pane 不进这条路**(原版 `remote &&` 那一半就是这个闸)—— 本地退出
+        // 走 pane 自己底部那条「重新启动 / 关闭」(`pane.rs::render_exit_bar`):不遮
+        // 回滚,退出前的输出照样能回看。整屏遮罩只留给远程断线。
         // 断链(连接被删)照样算远程项目,遮罩照出:重连会再失败一次并把明确的
         // 断链错误画进 pane,比静默什么都不发生强。
         let show_reconnect = store.is_remote_project(project_id)

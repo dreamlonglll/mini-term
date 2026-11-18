@@ -26,11 +26,13 @@ mod view;
 
 pub use damage::{CellSignature, DamageStats, FrameKey, RowCache, row_signature};
 pub use element::{
-    FlashLine, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, PreeditText,
+    FlashLine, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, OnZoom, PreeditText,
     PreparedFrame, TerminalElement,
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
-pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+pub use input::{
+    ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
+};
 pub use links::{FileLink, FileLinks, OpenFileLink, OpenUrlLink, ResolveFileLink};
 pub use mini::{
     MINI_REFRESH_MS, MiniCell, MiniGeometry, MiniRun, MiniTerminalElement, build_row_runs,

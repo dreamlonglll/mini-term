@@ -14,7 +14,10 @@ use crate::pane::TerminalPane;
 use crate::shell_ops::ShellList;
 
 use super::events::StoreChanged;
-use super::pure::{find_pane_of_pty, rename_pane_in_states, resolve_scrollback};
+use super::pure::{
+    TerminalZoom, find_pane_of_pty, rename_pane_in_states, resolve_scrollback,
+    zoomed_terminal_font_size,
+};
 use super::{AppStore, ConfigSection, StoreEvent, UsagePrefs};
 
 impl AppStore {
@@ -271,6 +274,14 @@ impl AppStore {
         self.apply_terminal_style(cx);
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Terminal));
+    }
+
+    /// 终端字号快捷缩放(Ctrl+= / Ctrl+- / Ctrl+0 与 Ctrl+滚轮)。走上面同一个 setter:
+    /// 全部终端即时生效 + 防抖落盘,设置页滑杆跟着动;到头了值不变,setter 自己短路。
+    /// 步长与范围见 [`zoomed_terminal_font_size`]。
+    pub fn zoom_terminal_font(&mut self, zoom: TerminalZoom, cx: &mut Context<Self>) {
+        let next = zoomed_terminal_font_size(self.config.terminal_font_size, zoom);
+        self.set_terminal_font_size(next, cx);
     }
 
     /// 终端字族。空串 = 回落默认(写 `None`,不落空串)。

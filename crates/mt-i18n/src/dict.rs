@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1769;
+pub const ZH_ENTRY_COUNT: usize = 1782;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1769;
+pub const EN_ENTRY_COUNT: usize = 1782;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2248,6 +2248,7 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
 static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("branchPopover.current", "← 当前"),
     ("branchPopover.empty", "该会话没有分支记录"),
+    ("close", "关闭"),
     ("closeAiTitle", "关闭 AI 对话"),
     ("closeDontAskAgain", "不再询问"),
     ("closeDontAskHint", "之后可在「设置 → Shell → 终端行为」中重新开启"),
@@ -2269,10 +2270,13 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("remoteDisconnected", "连接已断开"),
     ("rename", "重命名"),
     ("renameTerminal", "重命名终端"),
+    ("restart", "重新启动"),
+    ("restartHint", "按 Enter 重新启动"),
     ("restorePane", "还原分屏布局"),
     ("retry", "重试"),
     ("searchTooltip", "在终端中查找（{shortcut}）"),
     ("shellExited", "shell 已退出"),
+    ("shellExitedCode", "shell 已退出（退出码 {code}）"),
     ("splitDown", "向下分屏"),
     ("splitDownTooltip", "向下分屏（{shortcut}）"),
     ("splitRight", "向右分屏"),
@@ -2286,6 +2290,7 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
 static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("branchPopover.current", "← current"),
     ("branchPopover.empty", "No branch records for this session"),
+    ("close", "Close"),
     ("closeAiTitle", "Close AI Session"),
     ("closeDontAskAgain", "Don't ask again"),
     ("closeDontAskHint", "You can turn this back on in Settings → Shell → Terminal behavior"),
@@ -2307,10 +2312,13 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("remoteDisconnected", "Connection lost"),
     ("rename", "Rename"),
     ("renameTerminal", "Rename Terminal"),
+    ("restart", "Restart"),
+    ("restartHint", "Press Enter to restart"),
     ("restorePane", "Restore split layout"),
     ("retry", "Retry"),
     ("searchTooltip", "Find in terminal ({shortcut})"),
     ("shellExited", "shell exited"),
+    ("shellExitedCode", "shell exited (code {code})"),
     ("splitDown", "Split down"),
     ("splitDownTooltip", "Split down ({shortcut})"),
     ("splitRight", "Split right"),
@@ -2979,7 +2987,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.focusLeft", "焦点移到左侧分屏"),
     ("shortcuts.focusRight", "焦点移到右侧分屏"),
     ("shortcuts.focusUp", "焦点移到上方分屏"),
-    ("shortcuts.footer", "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」仅在终端内生效"),
+    ("shortcuts.footer", "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」「回看与缩放」仅在终端内生效"),
     ("shortcuts.global", "全局"),
     ("shortcuts.jumpAttention", "跳到下一件待办"),
     ("shortcuts.jumpNextAi", "跳转到下一个 AI 任务提交"),
@@ -2992,6 +3000,11 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.prevPane", "切到上一个终端标签"),
     ("shortcuts.quickOpen", "快速打开文件"),
     ("shortcuts.renamePane", "重命名当前终端"),
+    ("shortcuts.scrollBottom", "回到底部"),
+    ("shortcuts.scrollPageDown", "向下翻一页"),
+    ("shortcuts.scrollPageUp", "向上翻一页回看"),
+    ("shortcuts.scrollTop", "翻到回看最顶部"),
+    ("shortcuts.scrollbackZoom", "回看与缩放"),
     ("shortcuts.selectPaneN", "切到第 N 个终端标签"),
     ("shortcuts.splitDown", "向下分屏"),
     ("shortcuts.splitRight", "向右分屏"),
@@ -3002,6 +3015,9 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.toggleSessions", "开合 AI 会话面板"),
     ("shortcuts.toggleSidebar", "折叠/展开侧栏"),
     ("shortcuts.toggleUsage", "开合用量统计面板"),
+    ("shortcuts.zoomIn", "放大终端字号（也可 Ctrl+向上滚轮）"),
+    ("shortcuts.zoomOut", "缩小终端字号（也可 Ctrl+向下滚轮）"),
+    ("shortcuts.zoomReset", "恢复默认终端字号"),
     ("system.aiAutoResumeDesc", "恢复上次布局后，自动在终端里执行 claude --resume / codex resume 续接退出前的会话；关闭后终端照常恢复，只是不自动跑续接命令（仍可在「会话」面板手动恢复）"),
     ("system.aiAutoResumeTitle", "启动时自动续接 AI 会话"),
     ("system.downloadDirectoryChoose", "选择…"),
@@ -3243,7 +3259,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.focusLeft", "Focus pane to the left"),
     ("shortcuts.focusRight", "Focus pane to the right"),
     ("shortcuts.focusUp", "Focus pane above"),
-    ("shortcuts.footer", "App shortcuts yield to text fields while typing; \"Copy & paste\" applies inside the terminal only"),
+    ("shortcuts.footer", "App shortcuts yield to text fields while typing; \"Copy & paste\" and \"Scrollback & zoom\" apply inside the terminal only"),
     ("shortcuts.global", "Global"),
     ("shortcuts.jumpAttention", "Jump to the next pending task"),
     ("shortcuts.jumpNextAi", "Jump to next AI task commit"),
@@ -3256,6 +3272,11 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.prevPane", "Previous terminal tab"),
     ("shortcuts.quickOpen", "Quick open file"),
     ("shortcuts.renamePane", "Rename current terminal"),
+    ("shortcuts.scrollBottom", "Scroll to bottom"),
+    ("shortcuts.scrollPageDown", "Scroll forward one page"),
+    ("shortcuts.scrollPageUp", "Scroll back one page"),
+    ("shortcuts.scrollTop", "Scroll to the top of the scrollback"),
+    ("shortcuts.scrollbackZoom", "Scrollback & zoom"),
     ("shortcuts.selectPaneN", "Go to Nth terminal tab"),
     ("shortcuts.splitDown", "Split down"),
     ("shortcuts.splitRight", "Split right"),
@@ -3266,6 +3287,9 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.toggleSessions", "Toggle the AI session panel"),
     ("shortcuts.toggleSidebar", "Toggle sidebar"),
     ("shortcuts.toggleUsage", "Toggle the usage stats panel"),
+    ("shortcuts.zoomIn", "Increase terminal font size (or Ctrl+wheel up)"),
+    ("shortcuts.zoomOut", "Decrease terminal font size (or Ctrl+wheel down)"),
+    ("shortcuts.zoomReset", "Reset terminal font size"),
     ("system.aiAutoResumeDesc", "After the previous layout is restored, run claude --resume / codex resume in the terminal to continue the session you left off. Turn off and terminals still come back — they just don't run the resume command (you can still resume manually from the Sessions panel)"),
     ("system.aiAutoResumeTitle", "Auto-resume AI session on startup"),
     ("system.downloadDirectoryChoose", "Choose…"),
@@ -3480,6 +3504,7 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("paste", "粘贴"),
     ("pasteImageNoRemote", "远程连接不可用，剪贴板图片未粘贴"),
     ("pasteUploadFailed", "粘贴内容上传到远程失败：{detail}"),
+    ("scrollToBottom", "回到底部（{shortcut}）"),
     ("sshAuthKey", "密钥"),
     ("sshAuthPassword", "密码"),
     ("sshConnect", "SSH 连接"),
@@ -3500,6 +3525,7 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("paste", "Paste"),
     ("pasteImageNoRemote", "Remote connection unavailable; the clipboard image was not pasted"),
     ("pasteUploadFailed", "Failed to upload pasted content to the remote host: {detail}"),
+    ("scrollToBottom", "Scroll to bottom ({shortcut})"),
     ("sshAuthKey", "Key"),
     ("sshAuthPassword", "Password"),
     ("sshConnect", "SSH Connection"),

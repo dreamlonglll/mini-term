@@ -258,6 +258,7 @@ export const settings = {
       global: "全局",
       aiTaskMarks: "AI 任务标记",
       clipboard: "复制粘贴",
+      scrollbackZoom: "回看与缩放",
       // 动作描述
       newTerminal: "新建终端标签",
       closePane: "关闭当前分屏区域",
@@ -286,7 +287,14 @@ export const settings = {
       toggleUsage: "开合用量统计面板",
       jumpAttention: "跳到下一件待办",
       commandLibrary: "打开命令库",
-      footer: "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」仅在终端内生效",
+      scrollPageUp: "向上翻一页回看",
+      scrollPageDown: "向下翻一页",
+      scrollTop: "翻到回看最顶部",
+      scrollBottom: "回到底部",
+      zoomIn: "放大终端字号（也可 Ctrl+向上滚轮）",
+      zoomOut: "缩小终端字号（也可 Ctrl+向下滚轮）",
+      zoomReset: "恢复默认终端字号",
+      footer: "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」「回看与缩放」仅在终端内生效",
     },
     menu: {
       // 分组标题
@@ -569,6 +577,7 @@ export const settings = {
       global: "Global",
       aiTaskMarks: "AI task markers",
       clipboard: "Copy & paste",
+      scrollbackZoom: "Scrollback & zoom",
       // Action descriptions
       newTerminal: "New terminal tab",
       closePane: "Close current pane",
@@ -597,7 +606,14 @@ export const settings = {
       toggleUsage: "Toggle the usage stats panel",
       jumpAttention: "Jump to the next pending task",
       commandLibrary: "Open the command library",
-      footer: "App shortcuts yield to text fields while typing; \"Copy & paste\" applies inside the terminal only",
+      scrollPageUp: "Scroll back one page",
+      scrollPageDown: "Scroll forward one page",
+      scrollTop: "Scroll to the top of the scrollback",
+      scrollBottom: "Scroll to bottom",
+      zoomIn: "Increase terminal font size (or Ctrl+wheel up)",
+      zoomOut: "Decrease terminal font size (or Ctrl+wheel down)",
+      zoomReset: "Reset terminal font size",
+      footer: "App shortcuts yield to text fields while typing; \"Copy & paste\" and \"Scrollback & zoom\" apply inside the terminal only",
     },
     menu: {
       // Group headings

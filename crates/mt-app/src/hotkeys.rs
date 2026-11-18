@@ -25,9 +25,15 @@
 //! 2. 剪贴板那两条(`Ctrl+Shift+C/V`)在原版是「xterm 的 customKeyEventHandler 消费,
 //!    表里只为设置页展示」,GPUI 侧同样如此 —— 由 `mt_ui::TerminalView::on_key_down`
 //!    自己吃掉,这里 `keystroke = None`,**不绑 action**(绑了就轮不到终端)。
+//!    回看四条(Shift+PgUp/PgDn、Ctrl+Shift+Home/End)同一种登记法。
+//!
+//! 终端字号缩放(Ctrl+= / Ctrl+- / Ctrl+0)是第三种:绑成 action,但挂在 `Terminal`
+//! context 上([`Scope::TerminalAction`]),只在终端有焦点时命中 —— 文件查看器等别处的
+//! 同一组键不受影响。
 
 use gpui::{App, KeyBinding, NoAction};
 
+use crate::pane::{TerminalZoomIn, TerminalZoomOut, TerminalZoomReset};
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane,
@@ -49,6 +55,9 @@ pub enum Scope {
     Global,
     /// 终端内:由 `mt_ui::TerminalView` 自己消费,这里只为设置页展示。
     Terminal,
+    /// 终端内、但绑成 gpui action(挂 `Terminal` context):只在终端有焦点时命中,
+    /// 命中了终端同样看不到这个键。终端字号缩放走这一档。
+    TerminalAction,
 }
 
 /// 按键组合的**显示**形态。`key` 已经是给人看的那一段(`T` / `Tab` / `↑` / `1…9`)。
@@ -84,6 +93,7 @@ const G_NAV: &str = "shortcuts.navigation";
 const G_GLOBAL: &str = "shortcuts.global";
 const G_MARKER: &str = "shortcuts.aiTaskMarks";
 const G_CLIPBOARD: &str = "shortcuts.clipboard";
+const G_VIEW: &str = "shortcuts.scrollbackZoom";
 
 /// 便捷构造:大多数条目只差修饰键与键名。
 const fn def(
@@ -182,6 +192,8 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         G_NAV,
         "shortcuts.selectPaneN",
     ),
+    // Alt+方向键:那个方向没有相邻分屏时处理器 `propagate`,按键落回终端(fish / zsh 与
+    // 不少 TUI 拿它按词移动),见 `main.rs::Workspace::focus_adjacent`
     def(
         "focusLeft",
         Some("alt-left"),
@@ -339,6 +351,69 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Terminal,
         G_CLIPBOARD,
         "shortcuts.pasteToTerminal",
+    ),
+    // ── 回看与缩放(终端内)──
+    //
+    // 回看四条由 `mt_ui::TerminalView` 自己消费(判据 `mt_ui::terminal::scrollback_key`,
+    // 只在主屏拦,alt screen 照旧发给程序),与剪贴板那两条同一种登记法。
+    // 不占 Shift+Home / Shift+End:PSReadLine 拿它们选到行首 / 行尾。
+    def(
+        "scrollPageUp",
+        None,
+        combo(false, true, false, "PgUp"),
+        Scope::Terminal,
+        G_VIEW,
+        "shortcuts.scrollPageUp",
+    ),
+    def(
+        "scrollPageDown",
+        None,
+        combo(false, true, false, "PgDn"),
+        Scope::Terminal,
+        G_VIEW,
+        "shortcuts.scrollPageDown",
+    ),
+    def(
+        "scrollTop",
+        None,
+        combo(true, true, false, "Home"),
+        Scope::Terminal,
+        G_VIEW,
+        "shortcuts.scrollTop",
+    ),
+    def(
+        "scrollBottom",
+        None,
+        combo(true, true, false, "End"),
+        Scope::Terminal,
+        G_VIEW,
+        "shortcuts.scrollBottom",
+    ),
+    // 缩放三条:action 挂在 `Terminal` context 上(见模块注释),落点在
+    // `pane::zoom_terminal_font`,改的是全局终端字号。Ctrl+滚轮同效,写在描述里
+    def(
+        "zoomIn",
+        Some("ctrl-="),
+        combo(true, false, false, "="),
+        Scope::TerminalAction,
+        G_VIEW,
+        "shortcuts.zoomIn",
+    ),
+    def(
+        "zoomOut",
+        Some("ctrl--"),
+        combo(true, false, false, "-"),
+        Scope::TerminalAction,
+        G_VIEW,
+        "shortcuts.zoomOut",
+    ),
+    def(
+        "zoomReset",
+        Some("ctrl-0"),
+        combo(true, false, false, "0"),
+        Scope::TerminalAction,
+        G_VIEW,
+        "shortcuts.zoomReset",
     ),
 ];
 
@@ -798,6 +873,10 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "commandLibrary" => KeyBinding::new(keystroke, ToggleCommandLibrary, Some(WORKSPACE)),
         "markerPrev" => KeyBinding::new(keystroke, MarkerPrev, Some(WORKSPACE)),
         "markerNext" => KeyBinding::new(keystroke, MarkerNext, Some(WORKSPACE)),
+        // 挂 `Terminal`:只在终端有焦点时命中(见 [`Scope::TerminalAction`])
+        "zoomIn" => KeyBinding::new(keystroke, TerminalZoomIn, Some(TERMINAL)),
+        "zoomOut" => KeyBinding::new(keystroke, TerminalZoomOut, Some(TERMINAL)),
+        "zoomReset" => KeyBinding::new(keystroke, TerminalZoomReset, Some(TERMINAL)),
         _ => return None,
     })
 }
@@ -857,7 +936,7 @@ mod tests {
     fn 全局条目都绑得上_action() {
         for def in HOTKEYS {
             match def.scope {
-                Scope::Global => {
+                Scope::Global | Scope::TerminalAction => {
                     let Some(ks) = def.keystroke else {
                         // 唯一允许没有键位串的全局条目是 Ctrl+1..9(bind_keys 单独展开)
                         assert_eq!(def.id, "selectPaneN");
@@ -873,15 +952,74 @@ mod tests {
 
     /// 分组保持声明顺序、组内保持表内顺序(设置页照这个顺序画)。
     ///
-    /// 组序与原版 `hotkeys.ts:42-46` 一致:终端 / 导航 / 全局 / AI 任务标记 / 剪贴板。
+    /// 组序与原版 `hotkeys.ts:42-46` 一致:终端 / 导航 / 全局 / AI 任务标记 / 剪贴板;
+    /// GPUI 侧补的「回看与缩放」排在最后。
     #[test]
     fn 分组保持声明顺序() {
         let groups = groups();
         let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec![G_TERMINAL, G_NAV, G_GLOBAL, G_MARKER, G_CLIPBOARD]);
+        assert_eq!(
+            keys,
+            vec![G_TERMINAL, G_NAV, G_GLOBAL, G_MARKER, G_CLIPBOARD, G_VIEW]
+        );
         assert_eq!(groups[0].1[0].id, "newTerminal");
         assert_eq!(groups[3].1.len(), 2, "AI 任务标记组两条");
         assert_eq!(groups[4].1.len(), 2, "剪贴板组两条");
+        assert_eq!(groups[5].1.len(), 7, "回看四条 + 缩放三条");
+    }
+
+    /// 回看四条登记的组合与 mt-ui 真正拦下的键位是同一组 —— 设置页写着 Shift+PgUp,
+    /// 按下去就得是本地翻页。键位串只在这里用来造 `Keystroke`,不绑 action。
+    #[test]
+    fn 回看键与终端实际拦截的键位一致() {
+        use mt_ui::terminal::{ScrollbackKey, scrollback_key};
+        for (id, ks, expect) in [
+            ("scrollPageUp", "shift-pageup", ScrollbackKey::PageUp),
+            ("scrollPageDown", "shift-pagedown", ScrollbackKey::PageDown),
+            ("scrollTop", "ctrl-shift-home", ScrollbackKey::Top),
+            ("scrollBottom", "ctrl-shift-end", ScrollbackKey::Bottom),
+        ] {
+            let def = HOTKEYS.iter().find(|d| d.id == id).unwrap();
+            assert_eq!(def.scope, Scope::Terminal, "{id} 由终端自己消费");
+            assert!(def.keystroke.is_none(), "{id} 不许绑 action");
+            let parsed = gpui::Keystroke::parse(ks).unwrap();
+            assert_eq!(scrollback_key(&parsed), Some(expect), "{id}");
+            assert_eq!(parsed.modifiers.control, def.combo.modifier, "{id} 的 Ctrl");
+            assert_eq!(parsed.modifiers.shift, def.combo.shift, "{id} 的 Shift");
+            assert!(!def.combo.alt, "{id} 不带 Alt");
+        }
+    }
+
+    /// 缩放三条只在终端里命中:焦点在终端时匹配得到 action,焦点在终端之外(文件查看器 /
+    /// 面板,context 栈里没有 `Terminal`)一条都匹配不到,按键照常归那里。
+    #[test]
+    fn 缩放键只在终端里生效() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+
+        let bindings: Vec<KeyBinding> = HOTKEYS
+            .iter()
+            .filter(|d| d.scope == Scope::TerminalAction)
+            .filter_map(|d| binding_for(d.id, d.keystroke?))
+            .collect();
+        assert_eq!(bindings.len(), 3);
+        let keymap = Keymap::new(bindings);
+
+        let in_terminal = [
+            KeyContext::parse("Root").unwrap(),
+            KeyContext::parse(WORKSPACE).unwrap(),
+            KeyContext::parse(TERMINAL).unwrap(),
+        ];
+        let outside = [
+            KeyContext::parse("Root").unwrap(),
+            KeyContext::parse(WORKSPACE).unwrap(),
+        ];
+        for ks in ["ctrl-=", "ctrl--", "ctrl-0"] {
+            let input = [Keystroke::parse(ks).unwrap()];
+            let (hit, _) = keymap.bindings_for_input(&input, &in_terminal);
+            assert_eq!(hit.len(), 1, "{ks} 在终端里该命中");
+            let (miss, _) = keymap.bindings_for_input(&input, &outside);
+            assert!(miss.is_empty(), "{ks} 在终端之外不该命中");
+        }
     }
 
     // 组件库 `Root` 那两条绑定的替身:它的 action 类型(`gpui_component::root::Tab`)

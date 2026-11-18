@@ -801,8 +801,9 @@ impl SettingsView {
                         "terminal-font-size",
                         t("settings", "font.terminalFontSize"),
                         term_size,
-                        10,
-                        24,
+                        // 与 Ctrl+= / Ctrl+- 快捷缩放同一把尺子
+                        crate::store::TERMINAL_FONT_SIZE_MIN as i32,
+                        crate::store::TERMINAL_FONT_SIZE_MAX as i32,
                         move |value, _window, cx| {
                             store_term.update(cx, |store, cx| {
                                 store.set_terminal_font_size(value as f64, cx);

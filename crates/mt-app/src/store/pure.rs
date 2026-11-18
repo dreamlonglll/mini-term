@@ -332,6 +332,38 @@ pub fn resolve_scrollback(raw: f64) -> u32 {
     (raw.round() as u64).min(MAX_SCROLLBACK as u64) as u32
 }
 
+/// 终端字号的可调范围:设置页「终端字号」滑杆与快捷缩放(Ctrl+= / Ctrl+- / Ctrl+滚轮)
+/// **同一把尺子** —— 滑杆两端读的就是这两个常量。setter 自己另有一道 8..=32 的宽钳,
+/// 那是给手改配置兜底的,快捷缩放不越过滑杆的范围。
+pub const TERMINAL_FONT_SIZE_MIN: f64 = 10.0;
+pub const TERMINAL_FONT_SIZE_MAX: f64 = 24.0;
+/// 默认终端字号(Ctrl+0 回到这里)。`mt_config` 里 `terminalFontSize` 的缺省值是私有函数,
+/// 两边同值由单测对账。
+pub const DEFAULT_TERMINAL_FONT_SIZE: f64 = 14.0;
+
+/// 终端字号快捷缩放的三个方向。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalZoom {
+    In,
+    Out,
+    Reset,
+}
+
+/// 缩放之后的字号。一档 = 1px,结果取整并钳在滑杆范围里 —— 滑杆只认整数,缩出一个
+/// 13.5 会让设置页显示的与实际对不上。
+///
+/// 手改配置落在范围外时只许往回走:30 号字按「放大」不能反而被钳回 24。
+pub fn zoomed_terminal_font_size(current: f64, zoom: TerminalZoom) -> f64 {
+    let (min, max) = (TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX);
+    match zoom {
+        TerminalZoom::Reset => DEFAULT_TERMINAL_FONT_SIZE,
+        TerminalZoom::In if current >= max => current,
+        TerminalZoom::Out if current <= min => current,
+        TerminalZoom::In => (current.round() + 1.0).clamp(min, max),
+        TerminalZoom::Out => (current.round() - 1.0).clamp(min, max),
+    }
+}
+
 /// CSS 通用族名。gpui 的字体解析不认它们,留在回退串里等于占一个查不到的位置。
 const GENERIC_FAMILIES: [&str; 5] = ["monospace", "sans-serif", "serif", "system-ui", "ui-monospace"];
 
@@ -837,6 +869,32 @@ mod tests {
 
     fn project(id: &str, name: &str) -> ProjectConfig {
         ProjectConfig::new(id, name, format!("/tmp/{id}"))
+    }
+
+    /// 快捷缩放一档 1px、取整、钳在设置页滑杆的范围里;Ctrl+0 回到配置的缺省字号。
+    #[test]
+    fn 终端字号快捷缩放() {
+        use TerminalZoom::*;
+        assert_eq!(zoomed_terminal_font_size(14.0, In), 15.0);
+        assert_eq!(zoomed_terminal_font_size(14.0, Out), 13.0);
+        // 小数字号(手改配置)先取整再走一档,滑杆显示的与实际对得上
+        assert_eq!(zoomed_terminal_font_size(13.6, In), 15.0);
+        // 到头不动
+        assert_eq!(zoomed_terminal_font_size(TERMINAL_FONT_SIZE_MAX, In), 24.0);
+        assert_eq!(zoomed_terminal_font_size(TERMINAL_FONT_SIZE_MIN, Out), 10.0);
+        // 范围外只许往回走:放大不能反而变小,缩小一档先回到范围里
+        assert_eq!(zoomed_terminal_font_size(30.0, In), 30.0);
+        assert_eq!(zoomed_terminal_font_size(30.0, Out), 24.0);
+        assert_eq!(zoomed_terminal_font_size(8.0, In), 10.0);
+        assert_eq!(
+            zoomed_terminal_font_size(22.0, Reset),
+            DEFAULT_TERMINAL_FONT_SIZE
+        );
+        // 缺省字号与 mt-config 的 serde 缺省值对账(那边是私有函数)
+        assert_eq!(
+            mt_config::AppConfig::default().terminal_font_size,
+            DEFAULT_TERMINAL_FONT_SIZE
+        );
     }
 
     fn pane<'a>(project_id: &'a str, pane_id: &'a str, status: PaneStatus, attention: bool) -> PaneRef<'a> {

@@ -196,6 +196,17 @@ pub struct PaneState {
     /// `None` = 还没报过 / 收到了 `ResetTitle`。写入口唯一:
     /// [`AppStore::set_pane_osc_title`](crate::store::AppStore::set_pane_osc_title)。
     pub osc_title: Option<String>,
+    /// 这条 PTY 是**干净退出**的(退出码 0:用户自己 `exit` / Ctrl+D 收的工)。
+    /// 只在 `status == Error` 时有意义。
+    ///
+    /// **只影响显示层**:[`PaneStatus`] 四态是后端与移动端的协议口径,不为它加值;error
+    /// 照旧是这条 PTY 的终态 —— 迟到事件的闸、撤出轮询、清完成记录一样不少。界面上的灯
+    /// 经 [`Self::display_status`] / [`Self::light`] 统一推导:干净退出按 idle 画灰灯,
+    /// 非 0 退出与起不来仍是红灯。否则一个正常收工的终端挂着红点,与「出错了」分不开。
+    ///
+    /// **运行时派生,不进磁盘格式**(与 `osc_title` 同一口径)。`AppStore::on_pty_exit`
+    /// 置位,重连 / 起不来时清掉。
+    pub clean_exit: bool,
 }
 
 impl PaneState {
@@ -212,6 +223,7 @@ impl PaneState {
             detected_agent: None,
             attention: false,
             osc_title: None,
+            clean_exit: false,
         }
     }
 
@@ -253,9 +265,26 @@ impl PaneState {
             .or(self.detected_agent.as_deref())
     }
 
+    /// 显示层的四态:干净退出的 pane 按 idle 算(见 [`Self::clean_exit`])。
+    ///
+    /// 界面上「按状态画灯 / 聚合 / 挑待办」的地方都从这里(或 [`Self::light`])取;
+    /// **协议上报与状态机判定不许用它** —— 那些认的是 `status` 本身(error 终态的闸、
+    /// 移动端快照的状态串)。
+    pub fn display_status(&self) -> PaneStatus {
+        if self.status == PaneStatus::Error && self.clean_exit {
+            PaneStatus::Idle
+        } else {
+            self.status
+        }
+    }
+
     /// 状态灯画哪一档(四态 + attention,见 [`StatusLight`])。
+    ///
+    /// 页签、折叠标题条、悬停预览、项目行、切换器、终端列表竖条、边条徽标全从这里取
+    /// (聚合走 [`SplitNode::highest_light_by`],同样逐 pane 调它),干净退出在这一处
+    /// 压成灰灯,各处同一口径。
     pub fn light(&self) -> StatusLight {
-        StatusLight::of(self.status, self.attention)
+        StatusLight::of(self.display_status(), self.attention)
     }
 }
 
@@ -1019,6 +1048,38 @@ mod tests {
             StatusLight::Attention.error_as_idle(),
             StatusLight::Attention
         );
+    }
+
+    /// 退出码 0 的终端按灰灯画:状态本身仍是 error(协议口径与终态闸不动),
+    /// 只有显示层(单 pane 的灯与跨层聚合)压成 idle;非 0 退出 / 起不来照旧红灯。
+    #[test]
+    fn 干净退出的终端按灰灯画() {
+        let mut root = leaf("a", 1);
+        let target = root.panes()[0].id.clone();
+        assert!(root.insert_split(&target, SplitDirection::Horizontal, leaf("b", 2)));
+
+        let exited = root.pane_by_pty_mut(2).unwrap();
+        exited.status = PaneStatus::Error;
+        exited.clean_exit = true;
+        assert_eq!(exited.status, PaneStatus::Error, "状态本身不改");
+        assert_eq!(exited.display_status(), PaneStatus::Idle);
+        assert_eq!(exited.light(), StatusLight::Idle);
+        assert_eq!(root.highest_light(), StatusLight::Idle, "聚合同一口径");
+
+        // 另一格在跑 AI:聚合照旧取它
+        root.pane_by_pty_mut(1).unwrap().status = PaneStatus::AiWorking;
+        assert_eq!(root.highest_light(), StatusLight::AiWorking);
+
+        // 非 0 退出 / 起不来:红灯照旧压过一切
+        root.pane_by_pty_mut(2).unwrap().clean_exit = false;
+        assert_eq!(root.pane_by_pty_mut(2).unwrap().light(), StatusLight::Error);
+        assert_eq!(root.highest_light(), StatusLight::Error);
+
+        // `clean_exit` 只在 error 上生效:活着的 pane 残留这一位也不影响显示
+        let mut alive = PaneState::new("pwsh");
+        alive.status = PaneStatus::AiIdle;
+        alive.clean_exit = true;
+        assert_eq!(alive.display_status(), PaneStatus::AiIdle);
     }
 
     /// insertSplit:命中叶子变成 split,原叶子在第一格,新叶子在第二格,50/50。

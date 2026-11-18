@@ -58,8 +58,22 @@
 //! 所以唤醒循环看到有同步块在攒就排一个**一次性**定时器(见
 //! [`TerminalPane::arm_sync_release`]):不用常驻轮询,也不依赖下一次输出、不依赖有没有
 //! 在画帧 —— 前台任务不看窗口脸色,后台与最小化时照样到点释放,重绘请求由节拍器攒着。
+//!
+//! # 本地 shell 退出 / 起不来之后
+//!
+//! pane 不自动关(画面留着可回看),底部另起一行「shell 已退出(退出码 N)· Enter 重新启动
+//! [重新启动] [关闭]」([`TerminalPane::render_exit_bar`])。这一行**占自己的位置**、不盖在
+//! 终端上 —— 整屏遮罩会挡住退出前的最后几行输出,而用户多半正要看那几行。重新启动复用
+//! 远程重连那条 `AppStore::reset_pane_for_reconnect`(同一 shell 与 cwd,就地换一条新 PTY);
+//! 远程 pane 不走这里,断线由 `terminal_area` 的整屏重连遮罩负责,行为不变。
+//!
+//! # 回看浮钮
+//!
+//! `display_offset > 0` 时终端右下角出一颗「↓」([`TerminalPane::render_scroll_bottom_button`]),
+//! 回看期间来过新输出就点一颗小圆点。回看位置在 render 里现读:滚轮 / 翻页键是终端视图
+//! 自己 `notify`,gpui 会把祖先 view(本 pane)一并标脏重画;新输出走节拍器 notify 本 pane。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,9 +81,10 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, Styled, Task, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Task,
+    Window, div, prelude::FluentBuilder, px,
 };
 use mt_config::SshConnection;
 use mt_pty::{PtySession, PtySpawn};
@@ -78,6 +93,7 @@ use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{SyncRelease, TermSize, TerminalEmulator};
 use mt_ui::terminal::{MouseMods, prefers_local_handling};
+use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::{
     CopiedTip, DwellConfig, FlashLine, PasteAction, TerminalSearch, TerminalSearchBar,
     TerminalStyle, TerminalTheme, TerminalView,
@@ -92,8 +108,21 @@ use crate::notify::ToastKind;
 use crate::overlay;
 use crate::pty_slot::{PtyPhase, PtySlot};
 use crate::redraw;
-use crate::store::AppStore;
+use crate::store::{AppStore, TerminalZoom};
 use crate::toast;
+
+gpui::actions!(
+    mini_term,
+    [
+        /// 终端字号放大一档(Ctrl+=)。绑在 `Terminal` context 上(见 `hotkeys.rs`),
+        /// 只在终端有焦点时命中;落点见 [`zoom_terminal_font`]。
+        TerminalZoomIn,
+        /// 终端字号缩小一档(Ctrl+-)。
+        TerminalZoomOut,
+        /// 终端字号恢复默认(Ctrl+0)。
+        TerminalZoomReset,
+    ]
+);
 
 /// pane 发给上层的事件。
 pub enum PaneEvent {
@@ -161,8 +190,23 @@ pub struct TerminalPane {
     style: TerminalStyle,
     theme: TerminalTheme,
     ai: AiBridge,
+    /// SSH 远程项目的 pane(见 [`Self::with_remote`])。退出 / 起不来之后的「重新启动」
+    /// 只给本地 pane:远程断线有 `terminal_area` 的整屏重连遮罩,不叠第二套入口。
+    remote: bool,
     /// 子进程已退出。
     exited: bool,
+    /// 子进程的退出码(取不到为 `None`)。退出条上非 0 才显示。
+    exit_code: Option<u32>,
+    /// PTY 死掉(退出 / 起不来)的时刻;`None` = 还活着或还在起。
+    /// 「Enter 重新启动」据此挡掉 [`RESTART_ENTER_GRACE`] 之内的回车。
+    dead_since: Option<Instant>,
+    /// 已经排过一次重新启动。重启要 defer 到本轮 effect 之后才做,这之前连按的 Enter /
+    /// 连点的按钮不许再排第二次。
+    restart_requested: bool,
+    /// 上一帧在回看(`display_offset > 0`)。render 里刷新,唤醒循环据此判「回看期间有新输出」。
+    scrolled_back: bool,
+    /// 回看期间来过新输出 —— 「回到底部」浮钮上那颗小圆点。回到底部即清。
+    unseen_output: bool,
     /// PTY 起不来时的错误文本(直接显示给用户,不吞)。后台起完之前是 `None` ——
     /// 「还在起」与「起失败」要看 [`Self::spawn_settled`],不能拿它当判据。
     spawn_error: Option<String>,
@@ -259,6 +303,70 @@ const OSC_TITLE_PERIOD: Duration = Duration::from_millis(250);
 /// ConPTY 的重排与路径有关,一步缩一大截会让 PSReadLine 的提示行错位,见
 /// `mt_pty` 的 `resize_path`。连发在一瞬间完成,TUI 仍只按最终尺寸重画一次。
 const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(120);
+
+/// 退出 / 起不来之后多久之内的 Enter 不算「重新启动」。
+///
+/// 防的是 `exit⏎⏎` 这种连按:第一下回车送走 `exit`,shell 退得比第二下回车快,不挡的话
+/// 第二下就把刚退出的终端又拉起来了。500ms 盖得住手快的连按,又短到看见退出条之后再按
+/// 不会觉得「没反应」。
+const RESTART_ENTER_GRACE: Duration = Duration::from_millis(500);
+
+/// 「回到底部」浮钮离终端本体右缘的距离:pane 内边距 8 + 滚动条 6 + 滚动条留白 1,
+/// 再空出 9 —— 浮钮不压在滚动条那一竖条上(滑块拖到底时正好在这个高度)。
+const SCROLL_BUTTON_RIGHT: f32 = 24.0;
+/// 离终端本体下缘的距离:让开 pane 内边距 8,再空 8。
+const SCROLL_BUTTON_BOTTOM: f32 = 16.0;
+
+thread_local! {
+    /// 退出条「关闭」上一次被点的时刻,连点闸用(见 [`TerminalPane::request_close`])。
+    static LAST_EXIT_BAR_CLOSE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// 这次写入是不是「Enter 重新启动」:PTY 已死、过了 [`RESTART_ENTER_GRACE`]、
+/// 写的正好是一个回车。
+///
+/// 只认单独一个 `\r`(Enter 在传统编码与 win32-input-mode 下都是它;Shift+Enter /
+/// Ctrl+J 另有编码,不算)。粘贴、IME 上屏、别的键都照旧往 PTY 写。
+fn enter_restarts(bytes: &[u8], dead_since: Option<Instant>, now: Instant) -> bool {
+    bytes == b"\r"
+        && dead_since.is_some_and(|at| now.saturating_duration_since(at) >= RESTART_ENTER_GRACE)
+}
+
+/// 退出码的显示形态。Windows 的崩溃码是 NTSTATUS(`0xC0000005` 访问违例、`0xC000013A`
+/// 关窗 / Ctrl+Break),十进制是一串看不出名堂的十位数,大于 0xFFFF 的一并给出十六进制。
+fn format_exit_code(code: u32) -> String {
+    if code > 0xFFFF {
+        format!("{code} (0x{code:08X})")
+    } else {
+        code.to_string()
+    }
+}
+
+/// 退出条上的提示:退出码 0 / 取不到是「shell 已退出」,非 0 带上退出码。
+fn exit_message(code: Option<u32>) -> String {
+    match code {
+        Some(code) if code != 0 => {
+            tr!(
+                "paneGroup",
+                "shellExitedCode",
+                code = format_exit_code(code)
+            )
+        }
+        _ => t("paneGroup", "shellExited").to_string(),
+    }
+}
+
+/// 终端字号缩放(Ctrl+= / Ctrl+- / Ctrl+0 与 Ctrl+滚轮的共同落点)。
+///
+/// 改的是**全局**终端字号 —— 与设置页那条滑杆同一个 setter(全部终端即时生效 + 防抖落盘),
+/// 范围同一把尺子(`store::TERMINAL_FONT_SIZE_MIN / MAX`)。
+///
+/// 两个入口都不借着本 pane:键位走元素的 `on_action`(普通闭包,不是 `cx.listener`),
+/// 滚轮走视图的 `on_zoom`(元素的鼠标监听里调)。setter 会回头 `set_style` 每一个终端
+/// —— 包括这一个,所以落点不能在本 pane 的监听器里,否则就是同一实体的嵌套 update。
+fn zoom_terminal_font(zoom: TerminalZoom, cx: &mut App) {
+    AppStore::global(cx).update(cx, |store, cx| store.zoom_terminal_font(zoom, cx));
+}
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -414,20 +522,25 @@ impl TerminalPane {
         let wake = cx.spawn(async move |this, cx| {
             while let Some(signal) = rx.next().await {
                 let mut exit: Option<Option<u32>> = None;
+                let mut output = false;
                 match signal {
-                    PaneSignal::Output => {}
+                    PaneSignal::Output => output = true,
                     PaneSignal::Exit(code) => exit = Some(code),
                 }
                 // 把已经排队的信号一次抽干,避免一次读一个信号地重绘。
                 while let Ok(extra) = rx.try_recv() {
-                    if let PaneSignal::Exit(code) = extra {
-                        exit = Some(code);
+                    match extra {
+                        PaneSignal::Output => output = true,
+                        PaneSignal::Exit(code) => exit = Some(code),
                     }
                 }
                 if this
                     .update(cx, |pane, cx| {
                         pane.drain_term_events(cx);
                         pane.arm_sync_release(cx);
+                        if output {
+                            pane.note_output();
+                        }
                         // 子进程快到回填之前就退了:先挂着,回填完成后再报
                         // (`PtySlot::note_exit`)—— 退出永远排在回填之后
                         if let Some(code) = exit.and_then(|code| pane.pty.note_exit(code)) {
@@ -483,11 +596,26 @@ impl TerminalPane {
                 })
                 // **唯一**的写 PTY 通道:键盘 / 粘贴 / IME 提交 / 鼠标上报 /
                 // alt screen 滚轮全走这里,`write()` 里的 AI 感知旁路一处不落。
-                .on_input(move |bytes, _window, cx| {
+                .on_input(move |bytes, window, cx| {
                     let bytes = bytes.to_vec();
                     let _ = this_for_input.update(cx, |pane: &mut TerminalPane, cx| {
+                        // 本地 shell 退出后的 Enter = 重新启动(判据见 `enter_restarts`);
+                        // 别的键照旧往(已死的)PTY 写,与此前一致
+                        if !pane.remote && enter_restarts(&bytes, pane.dead_since, Instant::now()) {
+                            pane.request_restart(window, cx);
+                            return;
+                        }
                         pane.write(&bytes, cx);
                     });
+                })
+                // Ctrl+滚轮缩放全局终端字号(键盘那三条在 render 的 `on_action` 上)
+                .on_zoom(|step, _window, cx| {
+                    let zoom = if step > 0 {
+                        TerminalZoom::In
+                    } else {
+                        TerminalZoom::Out
+                    };
+                    zoom_terminal_font(zoom, cx);
                 })
                 // 拖选停留自动复制(`config.selectionAutoCopySecs`)。剪贴板由
                 // mt-ui 写,宿主只负责那颗「已复制」气泡:origin 是**元素相对**
@@ -542,7 +670,13 @@ impl TerminalPane {
             style,
             theme,
             ai,
+            remote: false,
             exited: false,
+            exit_code: None,
+            dead_since: None,
+            restart_requested: false,
+            scrolled_back: false,
+            unseen_output: false,
             spawn_error: None,
             copied_tip: None,
             _tip_timer: None,
@@ -559,6 +693,14 @@ impl TerminalPane {
             _sync_release_timer: None,
             _wake: wake,
         }
+    }
+
+    /// 标记这是 SSH 远程项目的 pane(store 建 pane 时调,见 `start_pty_with`)。
+    /// 远程 pane 退出后不出底部「重新启动」条、Enter 也不重启 —— 断线重连归
+    /// `terminal_area` 的整屏遮罩,行为与此前一致。
+    pub fn with_remote(mut self, remote: bool) -> Self {
+        self.remote = remote;
+        self
     }
 
     /// 有同步块在攒就排一个到期时刻的定时器(缘由见模块注释「同步输出的超时释放」)。
@@ -645,6 +787,11 @@ impl TerminalPane {
     /// 真正下发 resize。只有**真实下发**的 resize 才开 AI 感知的重绘冷却窗口:
     /// 同尺寸的 resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃。
     fn apply_pty_resize(&mut self, rows: u16, cols: u16) {
+        // 子进程已经退出:PTY 那头没人收 resize。退出条占掉两行时 grid 照改(内容挤进回滚),
+        // 不必再去碰 ConPTY,也不必给已撤出轮询的 pane 开 AI 重绘冷却
+        if self.exited {
+            return;
+        }
         match self.pty.resize(rows, cols) {
             Ok(true) => self.ai.perception().note_resize(self.pty_id),
             Ok(false) => {}
@@ -703,6 +850,7 @@ impl TerminalPane {
                     return;
                 }
                 self.spawn_error = Some(msg);
+                self.dead_since = Some(Instant::now());
                 self.settle_spawn_waiters(false);
                 cx.emit(PaneEvent::SpawnFailed);
                 None
@@ -718,12 +866,98 @@ impl TerminalPane {
         cx.notify();
     }
 
-    /// 子进程退出:角标 + 上报。只从「回填之后」的路径进来(见 `PtySlot::note_exit`)。
+    /// 子进程退出:退出条 + 上报。只从「回填之后」的路径进来(见 `PtySlot::note_exit`)。
     fn emit_exit(&mut self, code: Option<u32>, cx: &mut Context<Self>) {
         self.exited = true;
+        self.exit_code = code;
+        self.dead_since = Some(Instant::now());
         cx.emit(PaneEvent::Exited(code));
         // 退出是一次性事件:不进节拍器,当场画完收工
         cx.notify();
+    }
+
+    /// 唤醒循环收到了新输出。回看中(上一帧 `display_offset > 0`)就给「回到底部」浮钮
+    /// 点上小圆点。不在这里读 grid:上一帧的回看状态够用,省一次抢 term 锁。
+    fn note_output(&mut self) {
+        if self.scrolled_back {
+            self.unseen_output = true;
+        }
+    }
+
+    /// 本帧的回看状态 `(在回看, 回看期间有新输出)`,顺手刷新唤醒循环要看的那一位。
+    ///
+    /// 回看位置在 render 里现读:滚轮 / 翻页键改的是终端视图自己,它 `notify` 时 gpui 会把
+    /// 祖先 view(本 pane)一并标脏重画;新输出由节拍器 notify 本 pane —— 两条路都会走到
+    /// 这里。alt screen 的 grid 没有回看缓冲,`display_offset` 恒 0,浮钮自然不出。
+    fn sync_scrollback_state(&mut self) -> (bool, bool) {
+        let offset = self.emulator.with_term(|term| term.grid().display_offset());
+        self.scrolled_back = offset > 0;
+        if !self.scrolled_back {
+            self.unseen_output = false;
+        }
+        (self.scrolled_back, self.unseen_output)
+    }
+
+    /// 「回到底部」浮钮:滚回底部、熄掉小圆点、把键盘还给终端(点浮钮不该让人再去点一下
+    /// 终端才能接着打字)。
+    fn scroll_to_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.emulator
+            .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
+        self.unseen_output = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// 「重新启动」(按钮 / 退出后的 Enter):在**同一个 pane** 上按原 shell 与 cwd 起一条
+    /// 新 PTY。
+    ///
+    /// 动作复用远程重连那一条 [`AppStore::reset_pane_for_reconnect`](它本身不分本地 /
+    /// 远程):回收旧 PTY(连同标记 / 退出登记)、就地起新的、pane 回落 idle。旧回滚随旧
+    /// 终端一起销毁,理由见那边的注释。重启后焦点送进新终端。
+    ///
+    /// 必须 `window.defer`:调用方是本 pane 的监听器 / 输入回调,而
+    /// `reset_pane_for_reconnect` 里的 `dispose_terminal` 要 update 这个 pane ——
+    /// 同一实体的嵌套 update 当场 panic。
+    fn request_restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restart_requested || self.dead_since.is_none() {
+            return;
+        }
+        self.restart_requested = true;
+        let pty_id = self.pty_id;
+        window.defer(cx, move |window, cx| {
+            let store = AppStore::global(cx);
+            let Some((project_id, pane_id)) = store.read(cx).pane_of_pty(pty_id) else {
+                return;
+            };
+            store.update(cx, |store, cx| {
+                if store
+                    .reset_pane_for_reconnect(&project_id, &pane_id, cx)
+                    .is_some()
+                {
+                    store.focus_pane(&project_id, &pane_id, window, cx);
+                }
+            });
+        });
+    }
+
+    /// 退出条上的「关闭」:走关终端的唯一入口 [`crate::pane_actions::close_pane`] ——
+    /// PTY 已死,免确认直接关。
+    ///
+    /// 连点闸:关掉之后补位上来的若也是个已退出的终端,它的「关闭」正好落在同一处,
+    /// 连点的第二下会把它连同回滚一起关掉。这颗按钮不在 `TerminalArea` 里(那边的闸记在
+    /// 它自己身上),所以单记一个进程内的时刻,口径同一个
+    /// [`crate::pane_actions::swallows_close_click`]。
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let last = LAST_EXIT_BAR_CLOSE.with(|at| at.replace(Some(now)));
+        let store = AppStore::global(cx);
+        if crate::pane_actions::swallows_close_click(store.read(cx).config(), true, last, now) {
+            return;
+        }
+        let Some((project_id, pane_id)) = store.read(cx).pane_of_pty(self.pty_id) else {
+            return;
+        };
+        crate::pane_actions::close_pane(store, project_id, pane_id, window, cx);
     }
 
     /// PTY 起没起来,定局后答复(`true` = 起来了)。
@@ -1653,20 +1887,181 @@ fn scroll_delta_to_top(line: i32, display_offset: i32, history: i32) -> i32 {
     (-line).clamp(0, history.max(0)) - display_offset
 }
 
+impl TerminalPane {
+    /// PTY 起不来:正中一行红字(原因不吞)。本地 pane 再给「重新启动 / 关闭」与 Enter;
+    /// 远程 pane 与此前一致只有那行字。
+    fn render_spawn_error(&mut self, err: String, cx: &mut Context<Self>) -> Div {
+        // 不刷底色:着色由 TerminalArea 根容器那层 bg_terminal 承担(单层规则,
+        // 见 terminal_area.rs pane 组容器处的说明)
+        let root = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .text_size(crate::ui::font_px(13.0))
+                    .text_color(crate::ui::color_error())
+                    .child(format!("{}:{err}", t("paneGroup", "startFailed"))),
+            );
+        if self.remote {
+            return root;
+        }
+        // 终端视图这一帧不在树上,焦点句柄改由这个容器认领:点页签 / 切过来时焦点照样
+        // 送到这里,Enter 才有地方落
+        root.track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                if keystroke.key == "enter"
+                    && !keystroke.modifiers.modified()
+                    && enter_restarts(b"\r", this.dead_since, Instant::now())
+                {
+                    this.request_restart(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_size(crate::ui::font_px(12.0))
+                            .text_color(crate::ui::text_muted())
+                            .child(t("paneGroup", "restartHint")),
+                    )
+                    .child(self.render_dead_actions(cx)),
+            )
+    }
+
+    /// 本地 shell 退出后的底部条:「shell 已退出(退出码 N)· Enter 重新启动」+
+    /// 「重新启动 / 关闭」。
+    ///
+    /// **占自己的一行,不盖在终端上**:整屏遮罩(远程断线那种)会挡住退出前的输出,而用户
+    /// 往往正是要回看那几行(报错、最后一屏)。代价是 grid 少两行,挤出去的内容照常进回滚,
+    /// 一行都不丢。不刷底色(单层规则),只用一条上边线和终端隔开。
+    fn render_exit_bar(&mut self, cx: &mut Context<Self>) -> Div {
+        // 与状态灯同一口径:干净退出是灰的,非 0 / 取不到退出码是红的
+        let color = if self.exit_code == Some(0) {
+            crate::ui::text_secondary()
+        } else {
+            crate::ui::color_error()
+        };
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .px(px(12.0))
+            .py(px(6.0))
+            .border_t_1()
+            .border_color(crate::ui::border_subtle())
+            .text_size(crate::ui::font_px(12.0))
+            .child(div().text_color(color).child(exit_message(self.exit_code)))
+            .child(
+                div()
+                    .text_color(crate::ui::text_muted())
+                    .child(t("paneGroup", "restartHint")),
+            )
+            .child(div().flex_1())
+            .child(self.render_dead_actions(cx))
+    }
+
+    /// 「重新启动」「关闭」两颗按钮(退出条与起不来两处共用)。
+    fn render_dead_actions(&mut self, cx: &mut Context<Self>) -> Div {
+        let id = self.pty_id;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                crate::ui::ghost_button(
+                    SharedString::from(format!("pane-restart-{id}")),
+                    t("paneGroup", "restart"),
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.request_restart(window, cx);
+                })),
+            )
+            .child(
+                crate::ui::ghost_button(
+                    SharedString::from(format!("pane-close-{id}")),
+                    t("paneGroup", "close"),
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    this.request_close(window, cx);
+                })),
+            )
+    }
+
+    /// 回看时右下角的「↓」浮钮,回看期间来过新输出就在它右上角点一颗 accent 小圆点。
+    ///
+    /// 位置避让:滚动条在终端本体最右那 7px([`SCROLL_BUTTON_RIGHT`]);查找条在右上角;
+    /// 退出条在本体**下面**另占一行,碰不到。「已复制」气泡跟着选区走、1 秒自撤,
+    /// 画在它上面。
+    fn render_scroll_bottom_button(
+        &mut self,
+        unseen: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("scroll-bottom-{}", self.pty_id)))
+            .absolute()
+            .right(px(SCROLL_BUTTON_RIGHT))
+            .bottom(px(SCROLL_BUTTON_BOTTOM))
+            .w(px(28.0))
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .border_1()
+            .border_color(crate::ui::border_default())
+            .bg(crate::ui::bg_elevated())
+            .text_size(crate::ui::font_px(14.0))
+            .text_color(crate::ui::text_secondary())
+            .cursor_pointer()
+            // 自己吃鼠标:底下终端的按下监听不该把这一下当成起选区 / 鼠标上报
+            .occlude()
+            .hover(|el| {
+                el.border_color(crate::ui::accent())
+                    .text_color(crate::ui::accent())
+            })
+            .tip(tr!(
+                "terminal",
+                "scrollToBottom",
+                shortcut = crate::hotkeys::hotkey_label("scrollBottom")
+            ))
+            .on_click(cx.listener(|this, _event, window, cx| this.scroll_to_bottom(window, cx)))
+            .child("↓")
+            .when(unseen, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(-1.0))
+                        .right(px(-1.0))
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(crate::ui::accent()),
+                )
+            })
+    }
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
-            // 不刷底色:着色由 TerminalArea 根容器那层 bg_terminal 承担(单层规则,
-            // 见 terminal_area.rs pane 组容器处的说明)
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(crate::ui::font_px(13.0))
-                .text_color(crate::ui::color_error())
-                .child(format!("{}:{err}", crate::i18n::t("paneGroup", "startFailed")));
+            return self.render_spawn_error(err, cx).into_any_element();
         }
+
+        let (scrolled_back, unseen) = self.sync_scrollback_state();
+        let scroll_button = scrolled_back.then(|| self.render_scroll_bottom_button(unseen, cx));
+        // 远程 pane 退出后不出这条(上面另有 terminal_area 的整屏重连遮罩),见 `remote`
+        let exit_bar = (self.exited && !self.remote).then(|| self.render_exit_bar(cx));
 
         // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
         // 宿主**不刷底色**:终端区着色只保留 TerminalArea 根容器一层 bg_terminal
@@ -1676,6 +2071,15 @@ impl Render for TerminalPane {
         div()
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
+            // Ctrl+= / Ctrl+- / Ctrl+0:绑在 `Terminal` context 上,终端有焦点才命中、
+            // 一路冒泡到这里。普通闭包而不是 `cx.listener`,理由见 [`zoom_terminal_font`]
+            .on_action(|_: &TerminalZoomIn, _window, cx| zoom_terminal_font(TerminalZoom::In, cx))
+            .on_action(|_: &TerminalZoomOut, _window, cx| zoom_terminal_font(TerminalZoom::Out, cx))
+            .on_action(|_: &TerminalZoomReset, _window, cx| {
+                zoom_terminal_font(TerminalZoom::Reset, cx)
+            })
             // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
             // 「复制 / 粘贴」+ 分支段 + SSH 子菜单段。
             .on_mouse_down(
@@ -1727,11 +2131,21 @@ impl Render for TerminalPane {
                     menu::show(event.position, entries, window, cx);
                 }),
             )
-            // 终端内容内边距:GPUI 的 grid 逐格自绘、顶格铺满 bounds,不垫一层
-            // 会贴着 pane 边缘(原版 xterm 靠字形侧空隙 + 列取整余量,视觉上
-            // 不贴边);8px 与 Windows Terminal 默认同档。padding 挤掉的空间由
-            // resize 链自然吸收(cols/rows 按 view 的实际 bounds 算)。
-            .child(div().size_full().p(px(8.0)).child(self.view.clone()))
+            // 终端本体。底下的退出条占自己的一行(不是盖在终端上的遮罩),
+            // 本体跟着矮一截,退出前的输出一行都不会被挡住
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .relative()
+                    // 终端内容内边距:GPUI 的 grid 逐格自绘、顶格铺满 bounds,不垫一层
+                    // 会贴着 pane 边缘(原版 xterm 靠字形侧空隙 + 列取整余量,视觉上
+                    // 不贴边);8px 与 Windows Terminal 默认同档。padding 挤掉的空间由
+                    // resize 链自然吸收(cols/rows 按 view 的实际 bounds 算)。
+                    .child(div().size_full().p(px(8.0)).child(self.view.clone()))
+                    .children(scroll_button),
+            )
+            .children(exit_bar)
             // 终端内查找条:右上角,距顶 6px、距右 14px —— 与原版
             // `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF 每帧算出来的
             // fixed 坐标,这里由布局白拿)
@@ -1747,8 +2161,9 @@ impl Render for TerminalPane {
                     ),
                 )
             })
-            // 子进程没了但 pane 留着(与旧版一致:画面可回看,不自动关)
-            .when(self.exited, |el| {
+            // 远程 pane 的子进程没了:与此前一致只留右下角一行小字(上面盖着
+            // terminal_area 的整屏重连遮罩)。本地 pane 走上面那条退出条
+            .when(self.exited && self.remote, |el| {
                 el.child(
                     div()
                         .absolute()
@@ -1761,6 +2176,7 @@ impl Render for TerminalPane {
                         .child(crate::i18n::t("paneGroup", "shellExited")),
                 )
             })
+            .into_any_element()
     }
 }
 
@@ -1843,6 +2259,50 @@ mod tests {
     fn 屏幕内的标记也照样滚() {
         assert_eq!(scroll_delta_to_top(5, 0, 500), 0, "已在底部,delta 为零");
         assert_eq!(scroll_delta_to_top(5, 42, 500), -42, "回看态下拉回底部");
+    }
+
+    /// Enter 重新启动:PTY 死了、过了 500ms、写的正好是一个回车,三条缺一不可。
+    #[test]
+    fn 退出后的回车过了宽限期才算重启() {
+        let dead = Instant::now();
+        // 还活着:回车照常进 PTY
+        assert!(!enter_restarts(b"\r", None, dead));
+        // `exit⏎⏎` 连按:第二下回车落在宽限期里,不算
+        assert!(!enter_restarts(b"\r", Some(dead), dead));
+        assert!(!enter_restarts(
+            b"\r",
+            Some(dead),
+            dead + Duration::from_millis(499)
+        ));
+        assert!(enter_restarts(
+            b"\r",
+            Some(dead),
+            dead + RESTART_ENTER_GRACE
+        ));
+        assert!(enter_restarts(
+            b"\r",
+            Some(dead),
+            dead + Duration::from_secs(30)
+        ));
+        // 别的键 / 粘贴进来的多行 / Shift+Enter 的 win32 记录都不算
+        let later = dead + Duration::from_secs(1);
+        assert!(!enter_restarts(b"a", Some(dead), later));
+        assert!(!enter_restarts(b"ls\r", Some(dead), later));
+        assert!(!enter_restarts(b"\x1b[13;28;13;1;16;1_", Some(dead), later));
+        // 时钟往回跳(理论上不该)也不 panic、不误判
+        assert!(!enter_restarts(b"\r", Some(later), dead));
+    }
+
+    /// 退出码:小的照原样,Windows 的 NTSTATUS 崩溃码一并给出十六进制。
+    #[test]
+    fn 退出码的显示形态() {
+        assert_eq!(format_exit_code(1), "1");
+        assert_eq!(format_exit_code(130), "130");
+        assert_eq!(format_exit_code(0xC000_013A), "3221225786 (0xC000013A)");
+        // 非 0 进提示,0 / 取不到不带码
+        assert!(exit_message(Some(2)).contains('2'));
+        assert_eq!(exit_message(Some(0)), t("paneGroup", "shellExited"));
+        assert_eq!(exit_message(None), t("paneGroup", "shellExited"));
     }
 
     /// 目标偏移钳在 `[0, history]`:历史比锚点短(热改小了回滚行数)时不越界。

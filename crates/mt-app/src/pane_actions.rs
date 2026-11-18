@@ -33,6 +33,10 @@
 //! 它手上的事,偏好关着也要问一次,判据见 [`close_needs_prompt`]。这个框不出「不再询问」
 //! —— 它本来就关不掉。
 //!
+//! 反方向的例外是 **PTY 已经死了**([`is_dead`]:退出 / 起不来):关掉它不会终止任何东西,
+//! 偏好开着也直接关。关整组时组内**全部**已死才算 —— 混着一个活的就照常问。免确认之后
+//! 连点闸要跟着管这一下,见 [`swallows_close_click`]。
+//!
 //! 关整组 / 关面板在入口处问一次、之后一次关完,不存在「问了一半」:
 //! `AppStore::close_*` 这一层本来就不弹框。
 //!
@@ -63,6 +67,41 @@ fn is_ai_busy(pane: &PaneState) -> bool {
         pane.light(),
         StatusLight::AiWorking | StatusLight::Attention
     )
+}
+
+/// 这个 pane 的 PTY 已经死了吗(退出 / 起不来,`status == error`)。error 是这条 PTY 的终态,
+/// 只有重连换一条新的才离开,所以关掉它不会终止任何进程 —— 免确认的判据。
+///
+/// 看 `status` 而不是显示层:干净退出(灰灯)与异常退出(红灯)同样是死的。
+fn is_dead(pane: &PaneState) -> bool {
+    pane.status == PaneStatus::Error
+}
+
+/// 一组 pane 是不是**全部**已死。空组不算(没有东西可关,也就谈不上免确认)。
+fn all_dead(panes: &[PaneState]) -> bool {
+    !panes.is_empty() && panes.iter().all(is_dead)
+}
+
+/// 关这个 tab 会不会因为 PTY 已死而免确认 —— 连点闸据此决定要不要管这一下
+/// (见 [`swallows_close_click`])。pane 不在了按「否」算。
+pub fn pane_is_dead(store: &AppStore, project_id: &str, pane_id: &str) -> bool {
+    store
+        .project_state(project_id)
+        .and_then(|s| s.pane(pane_id))
+        .is_some_and(is_dead)
+}
+
+/// [`pane_is_dead`] 的整组版:叶子里全部 pane 都已死。
+pub fn leaf_is_dead(store: &AppStore, project_id: &str, leaf_id: &str) -> bool {
+    all_dead(&leaf_panes(store, project_id, leaf_id))
+}
+
+/// [`leaf_is_dead`] 的「手上只有 pane id」版(Ctrl+Shift+W 关的是焦点 pane 所在的整组)。
+pub fn leaf_of_pane_is_dead(store: &AppStore, project_id: &str, pane_id: &str) -> bool {
+    store
+        .project_state(project_id)
+        .and_then(|s| s.leaf_of_pane(pane_id))
+        .is_some_and(|node| leaf_is_dead(store, project_id, node.id()))
 }
 
 // === 新建终端菜单 ===
@@ -239,8 +278,11 @@ pub fn should_confirm_close(config: &AppConfig) -> bool {
 
 /// 这次关闭要不要弹确认框。偏好开着总是问;选了不再询问后(issue #90)普通终端与
 /// 闲着的 AI(ai-idle 且没亮黄灯)都直接关,只有 AI 手上有事([`is_ai_busy`])时还要问一次。
-fn close_needs_prompt(config: &AppConfig, ai_busy: bool) -> bool {
-    should_confirm_close(config) || ai_busy
+///
+/// 要关的终端 PTY 全都已死(`dead`)时一律不问:没有进程会被终止,问了只是多点一下。
+/// 死掉的 pane 不会是 AI 手上有事(error 不亮黄灯、不转圈),两条例外不打架。
+fn close_needs_prompt(config: &AppConfig, ai_busy: bool, dead: bool) -> bool {
+    !dead && (should_confirm_close(config) || ai_busy)
 }
 
 /// 两次关闭快捷键的间隔短于它,后一次当成按住不放的连发。取值要盖过系统的首次连发
@@ -253,8 +295,17 @@ const CLOSE_HOTKEY_REPEAT_WINDOW: Duration = Duration::from_millis(1100);
 /// 而键盘焦点不在被关的终端上时(文件树、另一个页签……)绑定每次连发都还能命中,
 /// 按久一点就把项目里的终端一组一组全关掉。action 拿不到 `is_held`,只能按间隔判;
 /// `last` 每次连发都刷新,所以按多久都只算一次。
-pub fn swallows_close_hotkey(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
-    swallows_repeat(config, last, now, CLOSE_HOTKEY_REPEAT_WINDOW)
+///
+/// `target_dead`:这一下要关的那组终端全都已退出 —— 偏好开着时它们也免确认(见
+/// [`close_needs_prompt`]),于是同一道闸要管:否则按住不放会把一串已退出的组连同
+/// 它们的回滚一起关掉,直到撞上一个活的才被确认框拦住。
+pub fn swallows_close_hotkey(
+    config: &AppConfig,
+    target_dead: bool,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
+    swallows_repeat(config, target_dead, last, now, CLOSE_HOTKEY_REPEAT_WINDOW)
 }
 
 /// 两次点 × 的间隔短于它,后一次当成连点。要盖住手快的双击(150~300ms),
@@ -267,17 +318,30 @@ const CLOSE_CLICK_REPEAT_WINDOW: Duration = Duration::from_millis(400);
 /// 铺过来,它的 × 也可能落到同一处。连点的第二下就会把相邻终端连同里面的进程关掉。
 /// 确认框开着时第二下落在遮罩上,没有这个问题;不弹框之后才要这道闸。
 /// `last` 每次点击都刷新(吞掉的也算),所以连点多少下都只关一个。
-pub fn swallows_close_click(config: &AppConfig, last: Option<Instant>, now: Instant) -> bool {
-    swallows_repeat(config, last, now, CLOSE_CLICK_REPEAT_WINDOW)
+///
+/// `target_dead`:这一下点的终端(整组 × 则是组内全部)已经退出。已退出的终端偏好开着
+/// 也免确认,连点的第二下要是落在补位过来的另一个已退出终端上,就会无声地把它连同回滚
+/// 一起关掉 —— 那正是用户想回看的东西。所以这时偏好开着也照样吞;第二下落在**活的**
+/// 终端上则放行,由确认框把关(与偏好开着时一贯的口径一致)。
+pub fn swallows_close_click(
+    config: &AppConfig,
+    target_dead: bool,
+    last: Option<Instant>,
+    now: Instant,
+) -> bool {
+    swallows_repeat(config, target_dead, last, now, CLOSE_CLICK_REPEAT_WINDOW)
 }
 
+/// 闸只管「这一下会不弹框直接关」的情形:偏好关着,或目标已退出。
 fn swallows_repeat(
     config: &AppConfig,
+    target_dead: bool,
     last: Option<Instant>,
     now: Instant,
     window: Duration,
 ) -> bool {
-    !should_confirm_close(config) && last.is_some_and(|last| now.duration_since(last) < window)
+    (!should_confirm_close(config) || target_dead)
+        && last.is_some_and(|last| now.duration_since(last) < window)
 }
 
 /// 确认框的文案。不弹框时用不上,但算一份没有代价,不值得为此把入口写成两段。
@@ -289,6 +353,8 @@ struct ClosePrompt {
     detail: Vec<String>,
     /// 要关的终端里有 AI 手上有事,见 [`close_needs_prompt`]。
     ai_busy: bool,
+    /// 要关的终端 PTY 全都已死(关整组时须组内全部),见 [`close_needs_prompt`]。
+    dead: bool,
 }
 
 /// 关一个 tab 的文案:带 pane 名,有活着的 AI 时换成「关闭 AI 对话」那一档。
@@ -310,6 +376,7 @@ fn pane_close_prompt(pane: &PaneState) -> ClosePrompt {
         message,
         detail: Vec::new(),
         ai_busy: is_ai_busy(pane),
+        dead: is_dead(pane),
     }
 }
 
@@ -338,6 +405,7 @@ fn group_close_prompt(panes: &[PaneState]) -> Option<ClosePrompt> {
         message,
         detail,
         ai_busy: panes.iter().any(is_ai_busy),
+        dead: all_dead(panes),
     })
 }
 
@@ -354,7 +422,7 @@ fn close_after_prompt(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if !close_needs_prompt(store.read(cx).config(), prompt.ai_busy) {
+    if !close_needs_prompt(store.read(cx).config(), prompt.ai_busy, prompt.dead) {
         window.defer(cx, move |_window, cx| {
             store.update(cx, |store, cx| do_close(store, cx));
         });
@@ -384,7 +452,7 @@ fn close_after_prompt(
 }
 
 /// 关闭一个终端 tab。偏好开着时**总是**先确认(与原版一致:没有 AI 也要问一句);
-/// 偏好关着时只有 AI 手上有事才问。
+/// 偏好关着时只有 AI 手上有事才问。PTY 已经退出的不问(见 [`close_needs_prompt`])。
 pub fn close_pane(
     store: Entity<AppStore>,
     project_id: String,
@@ -619,12 +687,68 @@ mod tests {
     #[test]
     fn 不再询问后只有_ai_手上有事还要确认() {
         let confirming = AppConfig::default();
-        assert!(close_needs_prompt(&confirming, false));
-        assert!(close_needs_prompt(&confirming, true));
+        assert!(close_needs_prompt(&confirming, false, false));
+        assert!(close_needs_prompt(&confirming, true, false));
 
         let opted_out = opted_out_config();
-        assert!(!close_needs_prompt(&opted_out, false));
-        assert!(close_needs_prompt(&opted_out, true));
+        assert!(!close_needs_prompt(&opted_out, false, false));
+        assert!(close_needs_prompt(&opted_out, true, false));
+    }
+
+    /// PTY 已退出 / 起不来的终端关掉不终止任何东西:偏好开着也直接关。
+    /// 干净退出(灰灯)与异常退出(红灯)一样算死 —— 判据看状态,不看显示层。
+    #[test]
+    fn 已退出的终端关闭免确认() {
+        let confirming = AppConfig::default();
+        assert!(!close_needs_prompt(&confirming, false, true));
+
+        let crashed = pane("pwsh", PaneStatus::Error);
+        let prompt = pane_close_prompt(&crashed);
+        assert!(prompt.dead);
+        assert!(!close_needs_prompt(
+            &confirming,
+            prompt.ai_busy,
+            prompt.dead
+        ));
+
+        let mut clean = pane("pwsh", PaneStatus::Error);
+        clean.clean_exit = true;
+        assert!(pane_close_prompt(&clean).dead, "灰灯也是死的");
+
+        // 活着的照旧问
+        let alive = pane_close_prompt(&pane("pwsh", PaneStatus::Idle));
+        assert!(!alive.dead);
+        assert!(close_needs_prompt(&confirming, alive.ai_busy, alive.dead));
+    }
+
+    /// 关整组:组内**全部**已退出才免确认,混着一个活的就照常问。
+    #[test]
+    fn 整组全部已退出才免确认() {
+        let all = group_close_prompt(&[
+            pane("bash", PaneStatus::Error),
+            pane("cmd", PaneStatus::Error),
+        ])
+        .unwrap();
+        assert!(all.dead);
+        assert!(!close_needs_prompt(
+            &AppConfig::default(),
+            all.ai_busy,
+            all.dead
+        ));
+
+        let mixed = group_close_prompt(&[
+            pane("bash", PaneStatus::Error),
+            pane("pwsh", PaneStatus::Idle),
+        ])
+        .unwrap();
+        assert!(!mixed.dead);
+        assert!(close_needs_prompt(
+            &AppConfig::default(),
+            mixed.ai_busy,
+            mixed.dead
+        ));
+
+        assert!(!all_dead(&[]), "空组不算全部已退出");
     }
 
     fn attention_pane(label: &str, status: PaneStatus) -> PaneState {
@@ -727,22 +851,27 @@ mod tests {
         let config = opted_out_config();
         let start = Instant::now();
         assert!(
-            !swallows_close_hotkey(&config, None, start),
+            !swallows_close_hotkey(&config, false, None, start),
             "第一次按下不吞"
         );
         for ms in [33, 500, 1000] {
             let now = start + Duration::from_millis(ms);
-            assert!(swallows_close_hotkey(&config, Some(start), now), "{ms}ms");
+            assert!(
+                swallows_close_hotkey(&config, false, Some(start), now),
+                "{ms}ms"
+            );
         }
         let later = start + CLOSE_HOTKEY_REPEAT_WINDOW;
-        assert!(!swallows_close_hotkey(&config, Some(start), later));
+        assert!(!swallows_close_hotkey(&config, false, Some(start), later));
 
         let confirming = AppConfig::default();
         let soon = start + Duration::from_millis(33);
         assert!(
-            !swallows_close_hotkey(&confirming, Some(start), soon),
+            !swallows_close_hotkey(&confirming, false, Some(start), soon),
             "确认开着时不归这道闸管"
         );
+        // 目标组全部已退出:偏好开着也免确认,于是按住不放同样只关一组
+        assert!(swallows_close_hotkey(&confirming, true, Some(start), soon));
     }
 
     /// 连点 × 的第二下落在补位过来的相邻 tab 上,要吞掉;隔够了是在挨个关,照常放行。
@@ -752,22 +881,52 @@ mod tests {
         let config = opted_out_config();
         let start = Instant::now();
         assert!(
-            !swallows_close_click(&config, None, start),
+            !swallows_close_click(&config, false, None, start),
             "第一次点击不吞"
         );
         for ms in [150, 200, 399] {
             let now = start + Duration::from_millis(ms);
-            assert!(swallows_close_click(&config, Some(start), now), "{ms}ms");
+            assert!(
+                swallows_close_click(&config, false, Some(start), now),
+                "{ms}ms"
+            );
         }
         let later = start + CLOSE_CLICK_REPEAT_WINDOW;
-        assert!(!swallows_close_click(&config, Some(start), later));
+        assert!(!swallows_close_click(&config, false, Some(start), later));
 
         let confirming = AppConfig::default();
         let soon = start + Duration::from_millis(150);
         assert!(
-            !swallows_close_click(&confirming, Some(start), soon),
+            !swallows_close_click(&confirming, false, Some(start), soon),
             "确认开着时不归这道闸管"
         );
+    }
+
+    /// 已退出的终端偏好开着也免确认:连点的第二下落在补位过来的另一个已退出终端上要吞掉
+    /// (否则它的回滚无声无息就没了);落在活的终端上放行,由确认框把关。
+    #[test]
+    fn 已退出终端免确认时连点同样只算一次() {
+        let confirming = AppConfig::default();
+        let start = Instant::now();
+        let soon = start + Duration::from_millis(150);
+        assert!(swallows_close_click(&confirming, true, Some(start), soon));
+        assert!(
+            !swallows_close_click(&confirming, true, None, start),
+            "第一次点击不吞"
+        );
+        assert!(!swallows_close_click(
+            &confirming,
+            true,
+            Some(start),
+            start + CLOSE_CLICK_REPEAT_WINDOW
+        ));
+        // 偏好关着时本来就吞,目标死活不影响
+        assert!(swallows_close_click(
+            &opted_out_config(),
+            true,
+            Some(start),
+            soon
+        ));
     }
 
     /// 「活着的 AI」只认两个状态 —— idle 与 error 都不算。

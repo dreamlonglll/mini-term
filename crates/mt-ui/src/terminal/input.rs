@@ -324,6 +324,39 @@ pub fn arrow_bytes(dir: Arrow, app_cursor: bool) -> Vec<u8> {
     cursor_key_bytes(final_byte, app_cursor)
 }
 
+/// 本地回看键:不进 PTY,只动回看位置(`display_offset`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbackKey {
+    /// Shift+PageUp:往回翻一页。
+    PageUp,
+    /// Shift+PageDown:往下翻一页。
+    PageDown,
+    /// Ctrl+Shift+Home:翻到回看缓冲最顶。
+    Top,
+    /// Ctrl+Shift+End:回到底部。
+    Bottom,
+}
+
+/// 这次按键是不是本地回看键。**只认键位,不看屏幕**:alt screen 下要不要拦由调用方判
+/// (`TerminalView::on_key_down` 只在主屏拦,TUI 里照旧发给程序)。
+///
+/// 键位取各家终端的公约数(xterm / Windows Terminal / GNOME Terminal 的 Shift+PgUp/PgDn,
+/// Windows Terminal 的 Ctrl+Shift+Home/End)。**不占 Shift+Home / Shift+End**:PSReadLine
+/// 拿它们选到行首 / 行尾。带 Alt / Win / Fn 的一律不算,留给程序。
+pub fn scrollback_key(keystroke: &Keystroke) -> Option<ScrollbackKey> {
+    let m = &keystroke.modifiers;
+    if m.alt || m.platform || m.function || !m.shift {
+        return None;
+    }
+    match (keystroke.key.as_str(), m.control) {
+        ("pageup", false) => Some(ScrollbackKey::PageUp),
+        ("pagedown", false) => Some(ScrollbackKey::PageDown),
+        ("home", true) => Some(ScrollbackKey::Top),
+        ("end", true) => Some(ScrollbackKey::Bottom),
+        _ => None,
+    }
+}
+
 /// 粘贴文本 → PTY 字节。开了 bracketed paste 就包上 `ESC[200~ … ESC[201~`。
 ///
 /// 无论哪种模式都要先把 `\r\n` / `\n` 归一成 `\r`:PTY 那头把 `\n` 当作
@@ -398,6 +431,65 @@ mod tests {
                 "alt_screen 下滚 (app_cursor={app_cursor})"
             );
         }
+    }
+
+    /// 回看键四条认得出;Shift+Home / Shift+End 留给 PSReadLine 选到行首 / 行尾,
+    /// 裸 PgUp / PgDn 与带 Alt / Ctrl 的翻页照旧发给程序。
+    #[test]
+    fn 回看键只认四个组合() {
+        let shift = Modifiers::shift();
+        let ctrl_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            scrollback_key(&key("pageup", shift)),
+            Some(ScrollbackKey::PageUp)
+        );
+        assert_eq!(
+            scrollback_key(&key("pagedown", shift)),
+            Some(ScrollbackKey::PageDown)
+        );
+        assert_eq!(
+            scrollback_key(&key("home", ctrl_shift)),
+            Some(ScrollbackKey::Top)
+        );
+        assert_eq!(
+            scrollback_key(&key("end", ctrl_shift)),
+            Some(ScrollbackKey::Bottom)
+        );
+
+        assert_eq!(
+            scrollback_key(&key("home", shift)),
+            None,
+            "PSReadLine 选到行首"
+        );
+        assert_eq!(
+            scrollback_key(&key("end", shift)),
+            None,
+            "PSReadLine 选到行尾"
+        );
+        assert_eq!(scrollback_key(&key("pageup", Modifiers::default())), None);
+        assert_eq!(scrollback_key(&key("pageup", ctrl_shift)), None);
+        let alt_shift = Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(scrollback_key(&key("pagedown", alt_shift)), None);
+        assert_eq!(scrollback_key(&key("home", Modifiers::control())), None);
+    }
+
+    /// 回看键不拦的时候(alt screen)照旧编码进 PTY —— 这条钉住「拦不拦」与「怎么编」
+    /// 是两件事:`keystroke_to_bytes` 对 Shift+PgUp 给出的仍是 `CSI 5;2~`。
+    #[test]
+    fn 回看键在不拦时照旧有字节() {
+        let k = key("pageup", Modifiers::shift());
+        assert_eq!(
+            keystroke_to_bytes(&k, TermMode::ALT_SCREEN).unwrap(),
+            b"\x1b[5;2~".to_vec()
+        );
     }
 
     #[test]
