@@ -1407,10 +1407,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         let now = std::time::Instant::now();
+        // 停在文件 / diff 页签上:关的是当前页签,与 Ctrl+Shift+W 在那一页的分流同一口径
+        // (那一页没有「整组」可言,两个键落到同一个动作上)
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.last_close_hotkey = Some(now);
+                self.workbench_area
+                    .update(cx, |area, cx| area.close_active_tab(window, cx));
+                return;
+            }
+        }
         let last = self.last_close_hotkey.replace(now);
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
@@ -1517,8 +1526,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
+        // 停在文件 / diff 页签上:重开的是最近关掉的**页签**(两处「重新打开已关闭的…」
+        // 共用一个键,落在眼前那一页自己的已关闭栈上)
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.workbench_area.update(cx, |area, cx| {
+                    area.reopen_closed_tab_of_active_project(window, cx)
+                });
+                return;
+            }
         }
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return;

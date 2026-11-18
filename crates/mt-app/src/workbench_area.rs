@@ -1266,6 +1266,19 @@ impl WorkbenchArea {
         self.request_close_document(project_id, key, window, cx);
     }
 
+    /// 页签页上的 Ctrl+Shift+Z:重新打开当前项目最近关掉的页签,与页签右键那一项同一条路。
+    /// 终端页上同一个键是「重新打开已关闭的终端」,分流在 `main.rs`。
+    pub fn reopen_closed_tab_of_active_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
+            return;
+        };
+        self.reopen_closed_tab(project_id, window, cx);
+    }
+
     /// 键盘焦点在不在当前页签里。文件页的编辑器也是 `Input`,全局快捷键靠它区分「在编辑器
     /// 里按的」(照常生效)与「在别处的输入框里按的」(让路给输入)。diff 页签里没有输入框,
     /// 焦点在输入框里就一定不在它里面,一律 `false`。
