@@ -682,7 +682,7 @@ impl FileViewer {
     /// 轮询醒了一次。本页签不是当前文档就停表(见模块注释「数据流」),返回 `false`;
     /// 再被激活时 [`Self::git_on_activated`] 补查一次并重新起表。
     fn git_poll_tick(&mut self, cx: &mut Context<Self>) -> bool {
-        if !crate::workbench_area::is_document_active(&self.source, cx) {
+        if !crate::workbench_area::is_viewer_active(cx.entity_id(), cx) {
             self.gutter.poll_task = None;
             return false;
         }
@@ -716,7 +716,7 @@ impl FileViewer {
         let Some(repo) = self.gutter.repo.clone() else {
             return;
         };
-        if !force && !crate::workbench_area::is_document_active(&self.source, cx) {
+        if !force && !crate::workbench_area::is_viewer_active(cx.entity_id(), cx) {
             return;
         }
         self.gutter.poll_inflight = true;

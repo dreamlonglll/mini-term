@@ -153,8 +153,8 @@ impl SettingsPage {
         }
     }
 
-    /// 深链入口的解析口(`initial_page`)。原版那两处入口都传 `undefined`,
-    /// 这个口子同样先留着。
+    /// 按深链 id 反查分页。眼下的深链入口(首屏引导、Hook 提示 toast)直接传枚举,
+    /// 只有单测在用;留着是给将来从字符串来的入口(移动端、命令行参数)。
     #[allow(dead_code)]
     pub fn from_id(id: &str) -> Option<Self> {
         ALL_PAGES.iter().copied().find(|p| p.id() == id)
@@ -497,7 +497,22 @@ fn render_dialog_header() -> impl IntoElement {
         )
 }
 
-/// 打开设置面板。`initial_page` 是深链入口(原版留的口子,目前恒传 `None`)。
+/// 本次运行里设置面板上次停在哪一页(关面板时记下,见 `SettingsView::new` 的 `on_release`)。
+/// **不落盘**:重启后从第一页开始,与原版一致;只省掉「同一次运行里来回改同一页」的那几下点击。
+struct LastSettingsPage(SettingsPage);
+impl gpui::Global for LastSettingsPage {}
+
+/// 打开时落在哪一页:深链指定的优先,其次是这次运行里上次停留的那页,都没有就第一页。
+fn resolve_initial_page(
+    requested: Option<SettingsPage>,
+    remembered: Option<SettingsPage>,
+) -> SettingsPage {
+    requested.or(remembered).unwrap_or(SettingsPage::Terminal)
+}
+
+/// 打开设置面板。`initial_page` 是深链入口:首屏引导与「注册 Hook」提示直达
+/// [`SettingsPage::AiHook`];快捷键 / 齿轮按钮传 `None`,回到上次停留的那页
+/// (见 [`resolve_initial_page`])。
 pub fn open_settings(
     store: Entity<AppStore>,
     initial_page: Option<SettingsPage>,
@@ -509,7 +524,9 @@ pub fn open_settings(
     if crate::overlay::contains(crate::overlay::key(kind::SETTINGS)) {
         return;
     }
-    let view = cx.new(|cx| SettingsView::new(store, initial_page, window, cx));
+    let remembered = cx.try_global::<LastSettingsPage>().map(|last| last.0);
+    let page = resolve_initial_page(initial_page, remembered);
+    let view = cx.new(|cx| SettingsView::new(store, Some(page), window, cx));
     let focus = view.read(cx).focus.clone();
 
     open_guarded(kind::SETTINGS, window, cx, {
@@ -732,6 +749,8 @@ impl SettingsView {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
             this.commit_drafts(cx);
+            // 下次不指定分页打开时回到这一页(见 [`resolve_initial_page`])
+            cx.set_global(LastSettingsPage(this.page));
         })
         .detach();
 
@@ -1089,6 +1108,16 @@ mod tests {
             assert_eq!(SettingsPage::from_id(page.id()), Some(*page));
         }
         assert_eq!(SettingsPage::from_id("nope"), None);
+    }
+
+    /// 打开时落在哪页:深链优先,其次本次运行上次停留的那页,都没有才是第一页。
+    #[test]
+    fn 打开时的分页取舍() {
+        use SettingsPage::*;
+        assert_eq!(resolve_initial_page(None, None), Terminal);
+        assert_eq!(resolve_initial_page(None, Some(Font)), Font);
+        assert_eq!(resolve_initial_page(Some(AiHook), Some(Font)), AiHook);
+        assert_eq!(resolve_initial_page(Some(AiHook), None), AiHook);
     }
 
     /// 侧栏分组覆盖全部分页,且顺序与扁平序列一致(↑↓ 导航按后者走)。

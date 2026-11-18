@@ -52,9 +52,10 @@
 //!
 //! # 键盘
 //!
-//! ↑ / ↓ 绑在 `"QuickOpen > Input"` 上(与项目切换器同一个理由:谓词与 `Input` 同深度才压得过
-//! 输入框自带的方向键,见 `project_switcher` 模块注释);Enter 订阅输入框的 `PressEnter`;Esc 与
-//! 点遮罩是 Dialog 自带的。打开文件**先关窗再打开**:`close_dialog` 会把焦点还给打开面板之前的
+//! ↑ / ↓、PageUp / PageDown(按一屏)、Ctrl+Home / Ctrl+End(首 / 尾)绑在 `"QuickOpen > Input"`
+//! 上(与项目切换器同一个理由:谓词与 `Input` 同深度才压得过输入框自带的那几条,见
+//! `project_switcher` 模块注释;一步怎么走共用 `project_switcher::step_cursor_index`);Enter
+//! 订阅输入框的 `PressEnter`;Esc 与点遮罩是 Dialog 自带的。打开文件**先关窗再打开**:`close_dialog` 会把焦点还给打开面板之前的
 //! 那个元素,文件页的聚焦排在它后面才落得到编辑器上。
 //!
 //! 列号目前只解析不定位:文件页的定位([`LineTarget`])只到行。跳到的行滚到视口正中
@@ -85,7 +86,7 @@ use mt_ui::icons::FileIcon;
 use crate::file_viewer::LineTarget;
 use crate::i18n::{t, tr};
 use crate::overlay::kind;
-use crate::project_switcher::hint;
+use crate::project_switcher::{CursorStep, hint, page_size, step_cursor_index};
 use crate::prompt::{autofocus, close_guarded, open_guarded};
 use crate::store::{AppStore, StoreEvent};
 use crate::ui;
@@ -97,6 +98,14 @@ actions!(
         QuickOpenPrev,
         /// 快速打开:下一个候选(↓)。
         QuickOpenNext,
+        /// 快速打开:往上翻一屏(PageUp)。
+        QuickOpenPageUp,
+        /// 快速打开:往下翻一屏(PageDown)。
+        QuickOpenPageDown,
+        /// 快速打开:第一个候选(Ctrl+Home)。
+        QuickOpenFirst,
+        /// 快速打开:最后一个候选(Ctrl+End)。
+        QuickOpenLast,
     ]
 );
 
@@ -604,9 +613,11 @@ impl QuickOpenPanel {
         shown.index.path(hit).map(str::to_string)
     }
 
-    fn move_cursor(&mut self, delta: i32, cx: &mut Context<Self>) {
+    fn move_cursor(&mut self, step: CursorStep, window: &Window, cx: &mut Context<Self>) {
         let len = self.shown.as_ref().map_or(0, |shown| shown.hits.len());
-        self.cursor = crate::project_switcher::next_cursor(self.cursor, len, delta);
+        let viewport = self.scroll.bounds().size.height;
+        let page = page_size(f32::from(viewport), f32::from(row_height(window)));
+        self.cursor = step_cursor_index(self.cursor, len, step, page);
         self.scroll
             .scroll_to_item(self.cursor, ScrollStrategy::Nearest);
         cx.notify();
@@ -1032,11 +1043,23 @@ impl Render for QuickOpenPanel {
         div()
             // 方向键的上下文锚点,谓词是 `"QuickOpen > Input"`(见模块注释「键盘」)
             .key_context(CONTEXT)
-            .on_action(cx.listener(|this, _: &QuickOpenPrev, _window, cx| {
-                this.move_cursor(-1, cx);
+            .on_action(cx.listener(|this, _: &QuickOpenPrev, window, cx| {
+                this.move_cursor(CursorStep::Prev, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &QuickOpenNext, _window, cx| {
-                this.move_cursor(1, cx);
+            .on_action(cx.listener(|this, _: &QuickOpenNext, window, cx| {
+                this.move_cursor(CursorStep::Next, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpenPageUp, window, cx| {
+                this.move_cursor(CursorStep::PageUp, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpenPageDown, window, cx| {
+                this.move_cursor(CursorStep::PageDown, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpenFirst, window, cx| {
+                this.move_cursor(CursorStep::First, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpenLast, window, cx| {
+                this.move_cursor(CursorStep::Last, window, cx);
             }))
             .size_full()
             .flex()
@@ -1217,5 +1240,28 @@ mod tests {
             "第一个派发的必须是快速打开的动作,实际是 {:?}",
             bindings[0].action()
         );
+    }
+
+    /// 翻页与首尾键同理:输入框把它们绑成了单行里什么都不做的 `MovePage*` / `MoveTo*`。
+    #[test]
+    fn 翻页与首尾键绑定压过输入框自带的() {
+        gpui::actions!(quick_open_page_test, [InputPageUp, InputMoveToEnd]);
+        let predicate = format!("{CONTEXT} > Input");
+        let keymap = Keymap::new(vec![
+            KeyBinding::new("pageup", InputPageUp, Some("Input")),
+            KeyBinding::new("ctrl-end", InputMoveToEnd, Some("Input")),
+            KeyBinding::new("pageup", QuickOpenPageUp, Some(predicate.as_str())),
+            KeyBinding::new("ctrl-end", QuickOpenLast, Some(predicate.as_str())),
+        ]);
+        let stack: Vec<KeyContext> = ["Workspace", "Dialog", CONTEXT, "Input"]
+            .iter()
+            .map(|c| KeyContext::parse(c).unwrap())
+            .collect();
+        let first = |ks: &str| {
+            let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
+            bindings[0].action().boxed_clone()
+        };
+        assert!(first("pageup").partial_eq(&QuickOpenPageUp));
+        assert!(first("ctrl-end").partial_eq(&QuickOpenLast));
     }
 }

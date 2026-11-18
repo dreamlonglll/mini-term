@@ -83,6 +83,7 @@ mod git_stash;
 mod git_ui;
 mod git_watch;
 mod git_worktree;
+mod hook_hint;
 mod hotkeys;
 mod i18n;
 mod image_lightbox;
@@ -222,6 +223,8 @@ actions!(
         MarkerNext,
         /// 开合命令库浮层(Ctrl+Shift+K,issue #81)
         ToggleCommandLibrary,
+        /// 终端页 ↔ 最近停过的文件页签来回切(Ctrl+`)
+        ToggleWorkbenchPage,
         /// 关闭当前**单个**终端页签(Ctrl+Shift+X;整组仍是 Ctrl+Shift+W)
         CloseTerminalTab,
         /// 最大化 / 还原当前分组(Ctrl+Shift+M)
@@ -264,6 +267,17 @@ fn yields_to_typing(window: &mut Window, cx: &mut App) -> bool {
 
 fn yields_to_overlay(window: &mut Window, cx: &mut App) -> bool {
     yields_to_typing(window, cx) || !overlay::allows(overlay::Yield::ToOverlay)
+}
+
+/// 一条终端 / 导航快捷键此刻落在哪一页(见 [`Workspace::hotkey_page`])。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HotkeyPage {
+    /// 让路:覆盖物压着,或焦点在别处的输入框里
+    Yield,
+    /// 停在终端页:走原来那条路
+    Terminal,
+    /// 停在文件 / diff 页签上:交给工作区页签(`workbench_area` 模块注释)
+    Document,
 }
 
 /// 选中叶内第 N 个 tab(Ctrl+1..9,**1-based**;越界不动)。
@@ -532,9 +546,11 @@ impl Workspace {
         let workbench_area =
             cx.new(|cx| WorkbenchArea::new(store.clone(), terminal_area.clone(), cx));
         workbench_area::install(workbench_area.clone(), cx);
+        // 文件树高亮当前文件页签那一行:工作区换了活动页签要叫它重画(文件树先建,这里补订阅)
+        file_tree.update(cx, |tree, cx| tree.observe_workbench(&workbench_area, cx));
         let terminals_panel =
             cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
-        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
+        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), window, cx));
         let git_panel = cx.new(|cx| git_panel::GitPanel::new(store.clone(), window, cx));
         let columns_state = cx.new(|_| ResizableState::default());
         let middle_state = cx.new(|_| ResizableState::default());
@@ -584,6 +600,8 @@ impl Workspace {
         // 移动端中转:建桥 + 登记全局 + 按配置建连一次。放在这里(而不是 `main`)
         // 是因为泵要 `spawn_in` 拿窗口 —— 移动端发起会话得建 pane、弹 toast。
         let relay = mobile_relay::install(store.clone(), window, cx);
+        // 「注册 Hook 状态更准」的一次性提示:只订阅 store 事件,判据见 `hook_hint`
+        hook_hint::install(store.clone(), cx);
 
         // 系统托盘:图标住在另一条线程上(自己的隐藏窗口 + 消息循环),
         // 交互经 channel 回到这里 —— 与 AI 状态泵同一套路数。
@@ -882,8 +900,47 @@ impl Workspace {
         });
     }
 
+    /// Ctrl+Tab / Ctrl+Shift+Tab / Ctrl+` / Ctrl+Shift+T·W·D·E 这一刻落在哪一页。
+    ///
+    /// 终端页照旧走 [`yields_to_overlay`]。文件页的编辑器本身是 `Input`,套那道「焦点在
+    /// 输入框里就让路」的闸,这几个键在文件页上就全废了 —— 改成只在焦点落在**别处**的输入框
+    /// (Git 提交框、文件树改名框……)里时让路,覆盖物照旧让路。
+    fn hotkey_page(&self, window: &mut Window, cx: &mut App) -> HotkeyPage {
+        if self.terminal_page_active(cx) {
+            return if yields_to_overlay(window, cx) {
+                HotkeyPage::Yield
+            } else {
+                HotkeyPage::Terminal
+            };
+        }
+        let typing_elsewhere = window.has_focused_input(cx)
+            && !self
+                .workbench_area
+                .read(cx)
+                .active_tab_contains_focus(window, cx);
+        if typing_elsewhere || !overlay::allows(overlay::Yield::ToOverlay) {
+            HotkeyPage::Yield
+        } else {
+            HotkeyPage::Document
+        }
+    }
+
+    /// Ctrl+Shift+T / D / E 的前半截:停在页签上就先切回终端页,再照常新建 / 分屏。
+    /// 返回 `false` = 这次让路。
+    fn ensure_terminal_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => false,
+            HotkeyPage::Terminal => true,
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.activate_terminal(window, cx));
+                true
+            }
+        }
+    }
+
     fn on_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
@@ -900,11 +957,22 @@ impl Workspace {
     ///
     /// 走 [`pane_actions::close_leaf_of_pane`] 而不是直接调 store:关闭前要盘点
     /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
+    ///
+    /// 停在页签上时关的是**当前页签**(与 × 同一条路,脏的照常先问)。那条路也刷新连发计时:
+    /// 按住不放把页签关光、落回终端页之后,后续连发照样被 [`pane_actions::swallows_close_hotkey`]
+    /// 吞掉,不会顺势把终端一组组关掉。
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         let now = std::time::Instant::now();
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.last_close_hotkey = Some(now);
+                self.workbench_area
+                    .update(cx, |area, cx| area.close_active_tab(window, cx));
+                return;
+            }
+        }
         let last = self.last_close_hotkey.replace(now);
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
@@ -919,20 +987,25 @@ impl Workspace {
     }
 
     fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         self.cycle_pane(1, window, cx);
     }
 
     fn on_prev_pane(&mut self, _: &PrevPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
-            return;
-        }
         self.cycle_pane(-1, window, cx);
     }
 
+    /// 终端页:叶内换 tab;停在页签上:在「终端页 + 各页签」之间循环
+    /// (`WorkbenchArea::cycle_page`)。
     fn cycle_pane(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => return,
+            HotkeyPage::Terminal => {}
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.cycle_page(delta, window, cx));
+                return;
+            }
+        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
@@ -955,17 +1028,38 @@ impl Workspace {
     }
 
     fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         self.split(SplitDirection::Horizontal, window, cx);
     }
 
     fn on_split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+        if !self.ensure_terminal_page(window, cx) {
             return;
         }
         self.split(SplitDirection::Vertical, window, cx);
+    }
+
+    /// Ctrl+`:停在页签上 → 回终端页并把焦点还给终端;停在终端页 → 回最近停过的那个页签
+    /// (没有页签就什么都不做)。
+    fn on_toggle_workbench_page(
+        &mut self,
+        _: &ToggleWorkbenchPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.hotkey_page(window, cx) {
+            HotkeyPage::Yield => {}
+            HotkeyPage::Terminal => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.return_to_last_tab(window, cx));
+            }
+            HotkeyPage::Document => {
+                self.workbench_area
+                    .update(cx, |area, cx| area.activate_terminal(window, cx));
+            }
+        }
     }
 
     fn split(&mut self, direction: SplitDirection, window: &mut Window, cx: &mut Context<Self>) {
@@ -989,7 +1083,7 @@ impl Workspace {
         self.store.update(cx, |store, cx| store.toggle_middle_column(cx));
     }
 
-    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表里那三条行级
+    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表与文件树的行级
     /// 按键(Enter/Space、Delete、F2)只有 F2 与全局键位表撞车,所以它不在行上
     /// 另绑一条 action,而是从这里按「有没有列表行拿着焦点」分流。
     ///
@@ -1004,6 +1098,13 @@ impl Workspace {
         if self
             .project_list
             .update(cx, |list, cx| list.rename_focused_row(window, cx))
+        {
+            return;
+        }
+        // 文件树的行拿着焦点 → 改那个文件 / 目录的名字(与它右键「重命名」同一条路)
+        if self
+            .file_tree
+            .update(cx, |tree, cx| tree.rename_focused_row(window, cx))
         {
             return;
         }
@@ -2554,6 +2655,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))
             .on_action(cx.listener(Self::on_toggle_command_library))
+            .on_action(cx.listener(Self::on_toggle_workbench_page))
             .on_action(cx.listener(Self::on_close_terminal_tab))
             .on_action(cx.listener(Self::on_toggle_maximize_pane))
             .on_action(cx.listener(Self::on_move_tab_left))

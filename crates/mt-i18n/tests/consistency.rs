@@ -244,8 +244,26 @@ use mt_i18n::{
 /// 说明行（`paneGroup.{reopenClosed,reopenClosedDetail}`）；`settings.shortcuts.{nextPane,
 /// prevPane}` 补了单页签时切分屏的说明、`paneGroup.{maximizePane,restorePane}` 加了快捷键
 /// 占位符，条数不变。
+/// 1814 → 1822：工作区交互一批 —— 未保存关闭的三选一（`fileViewer.{saveAndClose,
+/// saveAllAndClose,dontSave}`）、移除项目确认框的终端说明
+/// （`projectList.removeConfirm.{endsTerminals,endsTerminalsWithAi}`）、添加项目的两种
+/// 路径错误（`projectList.{pathRequired,pathNotDirectory}`）、Ctrl+` 的快捷键描述
+/// （`settings.shortcuts.toggleWorkbenchPage`）。
+/// 1822 → 1826：文件树交互一批 —— 头部「全部折叠」按钮的 tooltip（`fileTree.header.collapseAll`）、
+/// 文件页签右键「在文件树中定位」（`fileViewer.revealInFileTree`）与它定位不到时的两种就地提示
+/// （`fileTree.reveal.{outsideRoot,notFound}`）。
+/// 1826 → 1840：文件区一批 —— 本地删除进回收站的确认框与「无法移到回收站，是否永久删除」
+/// （`fileTree.dialog.{trashFileTitle,trashFolderTitle,trashConfirmFile,trashConfirmFolder,trashOk,
+/// permanentDeleteTitle,permanentDeleteUnsupported,permanentDeleteFailed,permanentDeleteOk}`、
+/// `fileTree.operation.trashing`）；重新打开已关闭的页签与全都不在时的就地提示
+/// （`fileViewer.{reopenClosedTab,reopenAllMissing}`）；页签跟随文件树删除 / 覆盖时的提示条
+/// （`fileViewer.{deletedOnDisk,replacedOnDisk}`）。
+/// 1840 → 1847：面板与引导一批 —— AI 历史面板的过滤框占位、无结果空态与行 tooltip 的右键提示
+/// （`sessionList.{filterPlaceholder,filterEmpty,rowMenuHint}`）；首屏引导的拖放提示与「开启 AI
+/// 状态精确感知」入口（`app.firstRun.{dropHint,enableHook}`）；注册 Hook 的一次性提示
+/// （`app.hookHint.{title,message}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1814;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1847;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

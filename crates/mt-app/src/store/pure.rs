@@ -860,6 +860,19 @@ pub fn join_title_parts(primary: &str, subtitle: Option<&str>) -> String {
     }
 }
 
+// ─── 项目的最近使用序(项目切换器空查询的排序) ─────────────────
+
+/// 激活一个项目:把它提到最近使用序的最前(已在表里就挪上来,不重复)。
+pub fn touch_recent_project(recent: &mut Vec<String>, id: &str) {
+    recent.retain(|existing| existing != id);
+    recent.insert(0, id.to_string());
+}
+
+/// 项目被移除:从最近使用序里摘掉,其余次序不动。
+pub fn forget_recent_project(recent: &mut Vec<String>, id: &str) {
+    recent.retain(|existing| existing != id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2256,5 +2269,24 @@ mod tests {
 
         drop(layouts);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 最近使用序:激活即提到最前、不重复;移除只摘自己,其余次序不动。
+    #[test]
+    fn 项目最近使用序的维护() {
+        let mut recent = vec!["a".to_string()];
+        touch_recent_project(&mut recent, "b");
+        touch_recent_project(&mut recent, "c");
+        assert_eq!(recent, ["c", "b", "a"]);
+        // 已在表里的挪到最前,不留第二份
+        touch_recent_project(&mut recent, "a");
+        assert_eq!(recent, ["a", "c", "b"]);
+        touch_recent_project(&mut recent, "a");
+        assert_eq!(recent, ["a", "c", "b"], "已在最前时原样");
+
+        forget_recent_project(&mut recent, "c");
+        assert_eq!(recent, ["a", "b"]);
+        forget_recent_project(&mut recent, "不存在");
+        assert_eq!(recent, ["a", "b"]);
     }
 }

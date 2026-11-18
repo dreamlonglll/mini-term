@@ -193,6 +193,11 @@ pub struct AppConfig {
     pub last_active_project_id: Option<String>,
     #[serde(default)]
     pub hook_enabled: bool,
+    /// 「检测到 AI 会话,注册 Hook 状态更准」那条一次性提示已经给过(或用户本来就注册过
+    /// 某一家的 hook,视为已知晓)。**只会从 false 变 true**:一辈子提示一次,库里没这个键的
+    /// 老用户按没提示过算 —— 老用户多半也没注册过 hook,正是该提示的人。
+    #[serde(default)]
+    pub hook_hint_shown: bool,
     /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
     /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
     /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
@@ -939,6 +944,7 @@ impl Default for AppConfig {
             right_drawer_width: None,
             last_active_project_id: None,
             hook_enabled: false,
+            hook_hint_shown: false,
             smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
@@ -2020,6 +2026,24 @@ mod tests {
         )
         .unwrap();
         assert!(!off.smart_copy_paste, "显式 false 不许被新默认盖掉");
+    }
+
+    /// Hook 一次性提示:老库没这个键按「没提示过」读;置位后键名是 `hookHintShown`,能往返。
+    #[test]
+    fn hook_hint_shown_缺省为未提示且能往返() {
+        assert!(!AppConfig::default().hook_hint_shown);
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(!legacy.hook_hint_shown);
+
+        let mut shown = AppConfig::default();
+        shown.hook_hint_shown = true;
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["hookHintShown"], serde_json::json!(true));
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert!(back.hook_hint_shown);
     }
 
     /// 页签标题跟随 shell:纯增量字段 —— `None` 时不写进 JSON（不污染存量配置），

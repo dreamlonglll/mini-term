@@ -13,7 +13,8 @@
 //! # 键盘与悬停(清尾批)
 //!
 //! - 每行 `track_focus` + `tab_index`(原版的 `tabIndex={0}`),Enter/Space 打开、
-//!   Delete 移除(带确认)、F2 重命名。**F2 不在行上绑** —— 它与全局键位表
+//!   Delete 移除(带确认)、F2 重命名;↑ / ↓ / Home / End 按可见行序(分组行与项目行
+//!   混排)挪焦点并滚进可视区,到头停住。**F2 不在行上绑** —— 它与全局键位表
 //!   (`renamePane`)同一条绑定,由 `main.rs` 按焦点分流,见
 //!   [`ProjectList::rename_focused_row`];
 //! - 悬停 250ms 弹 pane 缩略图([`crate::pane_preview`]),开闸条件是「这个项目
@@ -72,6 +73,7 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::dnd::{
     self, DragProjectItem, DropPosition, ExternalDropKind, PreviewIcon,
 };
+use crate::focus_nav::{self, RowNav};
 use crate::fs_ops;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -1148,6 +1150,13 @@ fn reveal_row_index(ordered: &[OrderedItem], project_id: &str) -> Option<usize> 
         .position(|item| matches!(item, OrderedItem::Project { id, .. } if id == project_id))
 }
 
+/// 展平表里一行的 id(分组行与项目行各在各的名字空间,不会撞)。
+fn ordered_item_id(item: &OrderedItem) -> &str {
+    match item {
+        OrderedItem::Group { id, .. } | OrderedItem::Project { id, .. } => id,
+    }
+}
+
 // ─── 视图 ─────────────────────────────────────────────────────
 
 /// 行内重命名的编辑态(项目行与分组行共用一份 —— 同时只可能编辑一行)。
@@ -1481,21 +1490,85 @@ impl ProjectList {
                     cx,
                 );
             }
-            _ => {}
+            key => self.on_row_nav_key(event, key, id, window, cx),
         }
     }
 
     /// 分组行按键(原版只有 Enter/Space 折叠 + F2 改名,**没有 Delete**——
     /// 删组是不可逆的结构变更,只留在右键菜单里并带确认)。
-    fn on_group_key(&mut self, event: &KeyDownEvent, id: &str, cx: &mut Context<Self>) {
+    fn on_group_key(
+        &mut self,
+        event: &KeyDownEvent,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.editing.is_some() {
             return;
         }
-        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-            cx.stop_propagation();
-            self.store
-                .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
+        match event.keystroke.key.as_str() {
+            "enter" | "space" => {
+                cx.stop_propagation();
+                self.store
+                    .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
+            }
+            key => self.on_row_nav_key(event, key, id, window, cx),
         }
+    }
+
+    /// 项目行 / 分组行共用的 ↑ / ↓ / Home / End(原版没有,只能 Tab 逐个走)。只认不带
+    /// 修饰键的按法,其余键原样放行。
+    fn on_row_nav_key(
+        &mut self,
+        event: &KeyDownEvent,
+        key: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        if let Some(nav) = focus_nav::row_nav_for_key(key) {
+            cx.stop_propagation();
+            self.move_row_focus(id, nav, window, cx);
+        }
+    }
+
+    /// 按**可见行序**(分组行与项目行混排,折叠分组里的不算 —— 与 `render_rows` 铺开的是
+    /// 同一张展平表)把焦点挪到目标行,并把它滚进可视区。到头停住、不循环。
+    ///
+    /// 行号就是滚动容器的子元素下标(理由见 [`reveal_row_index`])。悬停缩略图的锚点随滚动
+    /// 失效,顺手收掉(与滚轮那条同一个理由)。
+    fn move_row_focus(
+        &mut self,
+        from_id: &str,
+        nav: RowNav,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ordered = project_tree::get_ordered_tree(self.store.read(cx).config());
+        let ids: Vec<&str> = ordered.iter().map(ordered_item_id).collect();
+        let depths: Vec<usize> = ordered
+            .iter()
+            .map(|item| match item {
+                OrderedItem::Group { depth, .. } | OrderedItem::Project { depth, .. } => *depth,
+            })
+            .collect();
+        let Some(current) = ids.iter().position(|id| *id == from_id) else {
+            return;
+        };
+        let Some(target) = focus_nav::row_nav_target(&depths, current, nav) else {
+            return;
+        };
+        let Some(focus) = self.row_focus.get(ids[target]).cloned() else {
+            return;
+        };
+        self.close_preview(cx);
+        window.focus(&focus, cx);
+        self.rows_scroll.scroll_to_item(target);
+        // 本视图套着 view 级缓存:不 notify 的话 prepaint 不跑,滚动请求没人兑现
+        cx.notify();
     }
 
     /// 全局 F2 落到项目列表时的分流:**有行拿着焦点就改那一行的名字**,
@@ -2110,8 +2183,8 @@ impl ProjectList {
                     .id(SharedString::from(format!("group-{id}")))
                     // 分组行同样可 Tab 可聚焦(原版 `tabIndex={0}` + `role=treeitem`)
                     .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
-                        this.on_group_key(event, &id_key, cx);
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        this.on_group_key(event, &id_key, window, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Left,

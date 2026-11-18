@@ -163,7 +163,7 @@ pub fn terminal_search_labels() -> mt_ui::SearchBarLabels {
 /// `git_changes::take_side_key`,
 /// `gitCommit.segments.{ours,theirs,pick*,blocked*}` 这几组来自
 /// `git_conflict::{side_key,pick_key,blocker_key}`,
-/// 首启引导那三条键位说明来自 `hotkeys::hotkey_desc_key`(值是 `hotkeys.rs`
+/// 首启引导那几条键位说明来自 `hotkeys::hotkey_desc_key`(值是 `hotkeys.rs`
 /// 表里的 `shortcuts.*` 字面量,已在下面的 settings 段里),
 /// `terminalSearch.*` 来自 [`terminal_search_labels`](逐 key 经闭包查)。
 #[cfg(test)]
@@ -190,9 +190,13 @@ const USED_KEYS: &[&str] = &[
     "app.emptyState",
     "app.firstRun.addLocal",
     "app.firstRun.addRemote",
+    "app.firstRun.dropHint",
+    "app.firstRun.enableHook",
     "app.firstRun.hintsTitle",
     "app.firstRun.subtitle",
     "app.firstRun.title",
+    "app.hookHint.message",
+    "app.hookHint.title",
     "app.layoutLoadFailed",
     "app.mobileStartSession",
     "app.storageIssueTitle",
@@ -1257,6 +1261,8 @@ const USED_KEYS: &[&str] = &[
     "sessionList.deleteSession.unidentifiedAi",
     "sessionList.deleteSession.usageKept",
     "sessionList.empty",
+    "sessionList.filterEmpty",
+    "sessionList.filterPlaceholder",
     "sessionList.loadMore",
     "sessionList.loading",
     "sessionList.refresh",
@@ -1264,6 +1270,7 @@ const USED_KEYS: &[&str] = &[
     "sessionList.remoteLoading",
     "sessionList.resumeHere",
     "sessionList.resumeInNewTab",
+    "sessionList.rowMenuHint",
     "sessionList.selectProject",
     "sessionList.time.daysAgo",
     "sessionList.time.hoursAgo",

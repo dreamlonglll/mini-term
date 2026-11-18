@@ -8,7 +8,10 @@
 //!   后者只认一个具体的 [`Editor`] —— 本 crate 因此不必依赖 `mt-config`。
 //! - `open_path_with_default_app` 原本走 `tauri-plugin-opener`。没了 Tauri 就直接
 //!   spawn 平台自带的打开器(Windows `explorer.exe` / macOS `open` / Linux `xdg-open`)。
+//! - 带行号打开([`open_in_editor_at`])是 GPUI 版补的:按编辑器命令的可执行文件名认出
+//!   家族([`editor_family`]),用各家自己的跳行参数([`editor_args`]);认不出来的只传文件。
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
@@ -37,8 +40,128 @@ pub fn select_editor<'a>(
     }
 }
 
+/// 外部编辑器要跳到的位置:行从 1 数;列可选,同样从 1 数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorPosition {
+    pub line: u32,
+    pub column: Option<u32>,
+}
+
+impl EditorPosition {
+    /// 只定到行。
+    pub fn line(line: u32) -> Self {
+        Self { line, column: None }
+    }
+}
+
+/// 按可执行文件名认出来的编辑器家族 —— 它决定「打开并跳到第几行」的参数怎么写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorFamily {
+    /// VS Code 与它的分支(Cursor / Windsurf / VSCodium / Trae……):`-g 文件:行[:列]`
+    VsCode,
+    /// JetBrains 全家:`--line 行 [--column 列] 文件`
+    JetBrains,
+    /// Sublime Text(`subl`)与 Zed:位置直接拼在文件后面,`文件:行[:列]`
+    PathSuffix,
+    /// Notepad++:`-n行 [-c列] 文件`
+    NotepadPlusPlus,
+    /// gVim / nvim-qt:`+行 文件`(列不传)
+    VimGui,
+    /// 认不出来:只传文件,不猜参数 —— 猜错了,编辑器会把 `-g` 之类当成一个文件名去开
+    Unknown,
+}
+
+/// 编辑器命令 → 家族。按可执行文件名认(不分大小写、去掉目录与扩展名),所以装在哪、
+/// 配的是 `Code.exe` 还是 `bin\code.cmd` 都一样。
+pub fn editor_family(command: &str) -> EditorFamily {
+    match executable_stem(command).as_str() {
+        "code" | "code-insiders" | "code - insiders" | "code-oss" | "codium" | "vscodium"
+        | "cursor" | "windsurf" | "trae" | "trae cn" | "kiro" | "positron" => EditorFamily::VsCode,
+        "idea" | "idea64" | "webstorm" | "webstorm64" | "pycharm" | "pycharm64" | "goland"
+        | "goland64" | "rider" | "rider64" | "clion" | "clion64" | "rustrover" | "rustrover64"
+        | "phpstorm" | "phpstorm64" | "rubymine" | "rubymine64" | "datagrip" | "datagrip64"
+        | "dataspell" | "dataspell64" | "studio" | "studio64" => EditorFamily::JetBrains,
+        "subl" | "sublime_text" | "zed" => EditorFamily::PathSuffix,
+        "notepad++" => EditorFamily::NotepadPlusPlus,
+        "gvim" | "nvim-qt" => EditorFamily::VimGui,
+        _ => EditorFamily::Unknown,
+    }
+}
+
+/// 命令里的可执行文件名:去掉引号、目录与最后一段扩展名,转小写。`/` 与 `\` 都当目录
+/// 分隔符(配置里是 Windows 路径,而这段逻辑要在各平台上一样);盘符里的 `:` 落在目录那段,
+/// 不影响。`Code - Insiders.exe` → `code - insiders`。
+fn executable_stem(command: &str) -> String {
+    let command = command.trim().trim_matches('"');
+    let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let stem = match file.rfind('.') {
+        Some(dot) if dot > 0 => &file[..dot],
+        _ => file,
+    };
+    stem.to_lowercase()
+}
+
+/// 启动参数(不含可执行文件本身)。没有位置、或认不出来的编辑器只传文件。
+///
+/// 每个参数都是**一整个** `OsString`:带空格的路径不会被拆开(交给 `Command::args`,
+/// 由它按平台规则加引号);`C:\a.rs` 里盘符的 `:` 原样留着,行号只追加在末尾 ——
+/// 这几家编辑器都是从末尾往前认 `:行[:列]`。
+pub fn editor_args(
+    family: EditorFamily,
+    path: &Path,
+    position: Option<EditorPosition>,
+) -> Vec<OsString> {
+    let Some(position) = position.filter(|position| position.line > 0) else {
+        return vec![path.as_os_str().to_owned()];
+    };
+    let column = position.column.filter(|column| *column > 0);
+    let with_suffix = || {
+        let mut arg = path.as_os_str().to_owned();
+        arg.push(format!(":{}", position.line));
+        if let Some(column) = column {
+            arg.push(format!(":{column}"));
+        }
+        arg
+    };
+    match family {
+        EditorFamily::VsCode => vec!["-g".into(), with_suffix()],
+        EditorFamily::JetBrains => {
+            let mut args: Vec<OsString> = vec!["--line".into(), position.line.to_string().into()];
+            if let Some(column) = column {
+                args.push("--column".into());
+                args.push(column.to_string().into());
+            }
+            args.push(path.as_os_str().to_owned());
+            args
+        }
+        EditorFamily::PathSuffix => vec![with_suffix()],
+        EditorFamily::NotepadPlusPlus => {
+            let mut args: Vec<OsString> = vec![format!("-n{}", position.line).into()];
+            if let Some(column) = column {
+                args.push(format!("-c{column}").into());
+            }
+            args.push(path.as_os_str().to_owned());
+            args
+        }
+        EditorFamily::VimGui => vec![
+            format!("+{}", position.line).into(),
+            path.as_os_str().to_owned(),
+        ],
+        EditorFamily::Unknown => vec![path.as_os_str().to_owned()],
+    }
+}
+
 /// 用指定编辑器打开路径。编辑器为 `None`(没配过 / 名字没匹配上)时给出可操作的提示。
 pub fn open_in_editor(editor: Option<&Editor>, path: &Path) -> Result<()> {
+    open_in_editor_at(editor, path, None)
+}
+
+/// 用指定编辑器打开文件并跳到 `position`(认得出跳行参数的编辑器才带,见 [`editor_args`])。
+pub fn open_in_editor_at(
+    editor: Option<&Editor>,
+    path: &Path,
+    position: Option<EditorPosition>,
+) -> Result<()> {
     let editor = editor.ok_or_else(|| {
         anyhow!("尚未配置外部编辑器,请在『设置 → 系统设置 → 外部编辑器』中添加。")
     })?;
@@ -54,7 +177,7 @@ pub fn open_in_editor(editor: Option<&Editor>, path: &Path) -> Result<()> {
     }
 
     let mut cmd = Command::new(exe_path);
-    cmd.arg(path);
+    cmd.args(editor_args(editor_family(exe), path, position));
     hide_console_window(&mut cmd);
 
     cmd.spawn()
@@ -371,6 +494,137 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("路径不存在"));
+    }
+
+    /// 家族按可执行文件名认:不分大小写、去目录去扩展名,`/` 与 `\` 都当分隔符,盘符的冒号
+    /// 与目录里的点不碍事。
+    #[test]
+    fn 按可执行文件名认编辑器家族() {
+        use EditorFamily::*;
+        for (command, family) in [
+            (r"C:\Program Files\Microsoft VS Code\Code.exe", VsCode),
+            (
+                r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd",
+                VsCode,
+            ),
+            (r"D:\VS Code Insiders\Code - Insiders.exe", VsCode),
+            ("/usr/bin/code-insiders", VsCode),
+            (
+                r"C:\Users\u\AppData\Local\Programs\cursor\Cursor.exe",
+                VsCode,
+            ),
+            ("/opt/Windsurf/windsurf", VsCode),
+            (r"C:\Program Files\VSCodium\VSCodium.exe", VsCode),
+            ("/usr/bin/codium", VsCode),
+            (r"D:\Trae\Trae.exe", VsCode),
+            (
+                r"C:\Program Files\JetBrains\IntelliJ IDEA 2025.2\bin\idea64.exe",
+                JetBrains,
+            ),
+            ("/opt/idea/bin/idea.sh", JetBrains),
+            (r"D:\JetBrains\WebStorm\bin\webstorm64.exe", JetBrains),
+            ("pycharm", JetBrains),
+            ("goland64.exe", JetBrains),
+            ("rider64.exe", JetBrains),
+            ("CLion64.EXE", JetBrains),
+            ("rustrover64.exe", JetBrains),
+            (r"C:\Program Files\Sublime Text\subl.exe", PathSuffix),
+            (
+                r"C:\Program Files\Sublime Text\sublime_text.exe",
+                PathSuffix,
+            ),
+            (r"C:\Users\u\AppData\Local\Programs\Zed\zed.exe", PathSuffix),
+            (r"D:\tools\npp.8.6\notepad++.exe", NotepadPlusPlus),
+            (r"C:\Program Files\Vim\vim91\gvim.exe", VimGui),
+            ("/usr/bin/nvim-qt", VimGui),
+            (r#""C:\Program Files\Microsoft VS Code\Code.exe""#, VsCode),
+            (r"C:\Windows\notepad.exe", Unknown),
+            ("/usr/bin/emacs", Unknown),
+            ("", Unknown),
+        ] {
+            assert_eq!(editor_family(command), family, "{command}");
+        }
+    }
+
+    fn args(family: EditorFamily, path: &str, position: Option<EditorPosition>) -> Vec<String> {
+        editor_args(family, Path::new(path), position)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// 各家的跳行写法;带空格的路径始终是**一个**参数,盘符的冒号原样留着、行号只追加在末尾。
+    #[test]
+    fn 各家编辑器的跳行参数() {
+        use EditorFamily::*;
+        let path = r"C:\My Project\src\main.rs";
+        let at = Some(EditorPosition::line(12));
+        let at_col = Some(EditorPosition {
+            line: 12,
+            column: Some(5),
+        });
+        assert_eq!(
+            args(VsCode, path, at),
+            ["-g", r"C:\My Project\src\main.rs:12"]
+        );
+        assert_eq!(
+            args(VsCode, path, at_col),
+            ["-g", r"C:\My Project\src\main.rs:12:5"]
+        );
+        assert_eq!(args(JetBrains, path, at), ["--line", "12", path]);
+        assert_eq!(
+            args(JetBrains, path, at_col),
+            ["--line", "12", "--column", "5", path]
+        );
+        assert_eq!(
+            args(PathSuffix, path, at),
+            [r"C:\My Project\src\main.rs:12"]
+        );
+        assert_eq!(
+            args(PathSuffix, path, at_col),
+            [r"C:\My Project\src\main.rs:12:5"]
+        );
+        assert_eq!(args(NotepadPlusPlus, path, at), ["-n12", path]);
+        assert_eq!(args(NotepadPlusPlus, path, at_col), ["-n12", "-c5", path]);
+        assert_eq!(args(VimGui, path, at_col), ["+12", path]);
+        // 认不出来的编辑器不猜参数
+        assert_eq!(args(Unknown, path, at_col), [path]);
+        // POSIX 路径同一套
+        assert_eq!(
+            args(VsCode, "/home/u/my proj/a.ts", at),
+            ["-g", "/home/u/my proj/a.ts:12"]
+        );
+    }
+
+    /// 没有位置(或行号是 0 这种无效值)时只传文件:盘符 `C:` 不会被当成「文件:行」。
+    #[test]
+    fn 没有行号时只传文件() {
+        for family in [
+            EditorFamily::VsCode,
+            EditorFamily::JetBrains,
+            EditorFamily::PathSuffix,
+            EditorFamily::NotepadPlusPlus,
+            EditorFamily::VimGui,
+            EditorFamily::Unknown,
+        ] {
+            assert_eq!(args(family, r"C:\a b\x.rs", None), [r"C:\a b\x.rs"]);
+            assert_eq!(
+                args(family, r"C:\a b\x.rs", Some(EditorPosition::line(0))),
+                [r"C:\a b\x.rs"]
+            );
+        }
+        // 列号 0 视同没给
+        assert_eq!(
+            args(
+                EditorFamily::VsCode,
+                "/a.rs",
+                Some(EditorPosition {
+                    line: 3,
+                    column: Some(0)
+                })
+            ),
+            ["-g", "/a.rs:3"]
+        );
     }
 
     #[test]

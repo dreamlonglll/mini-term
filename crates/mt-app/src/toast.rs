@@ -51,6 +51,14 @@
 //!   `pushNotification` 里无条件 `armNotificationTimer`);
 //! - 悬停 → 丢弃定时器句柄(暂停);移开 → **重新计满 5s**,不是续剩余;
 //! - 已经消失的 toast 移开鼠标不会把它复活(`pause` 先查在不在队里)。
+//!
+//! # 点击之后做什么
+//!
+//! 默认按 kind 走([`ToastKind::jumps_to_project`]:AI 提醒跳到项目,其余只关闭)。个别提示
+//! 另带一个 [`ToastAction`] 覆盖它 —— 眼下只有「注册 Hook」的一次性提示
+//! ([`push_settings_hint`]),点了打开设置并直达某一页。设置窗口是弹窗,toast 画在它的
+//! 遮罩底下,所以点击时**先收掉这条**再开设置;它也比别的提示多留一会儿
+//! ([`SETTINGS_HINT_TTL`]),一辈子只弹一次的东西 5 秒就没了太容易错过。
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -64,11 +72,14 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::notify::ToastKind;
+use crate::settings::SettingsPage;
 use crate::store::AppStore;
 use crate::ui;
 
 /// 自动消失时长(`store.ts:592` 的 `NOTIFICATION_TTL_MS`)。
 const TTL: Duration = Duration::from_millis(5000);
+/// 「点击打开设置」那种提示的停留时长(理由见模块注释「点击之后做什么」)。悬停照样暂停。
+const SETTINGS_HINT_TTL: Duration = Duration::from_secs(15);
 /// 最多同时**渲染**几条;超出的排队等补位,**不丢**(`ToastContainer.tsx:12`)。
 const MAX_VISIBLE: usize = 5;
 /// 卡片宽度(`styles.css:551`)。
@@ -84,6 +95,40 @@ pub const WSL_INFO_PROJECT: &str = "__wsl_info__";
 const CONFIG_SAVE_PROJECT: &str = "__config_save__";
 /// 调外部程序失败那条用的占位项目 id(同上)。
 const OPEN_EXTERNAL_PROJECT: &str = "__open_external__";
+/// 「点击打开设置」那种提示用的占位项目 id(同上:不跳项目、不随关项目清理)。
+const SETTINGS_HINT_PROJECT: &str = "__settings_hint__";
+
+/// 点一条 toast 要做的事。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToastAction {
+    /// 按 kind 的老规矩:AI 提醒跳到项目,其余只关闭([`ToastKind::jumps_to_project`])。
+    #[default]
+    ByKind,
+    /// 打开设置并直达这一页。
+    OpenSettings(SettingsPage),
+}
+
+/// 点下去之后的去向(由 [`click_target`] 算出,`activate` 照着执行)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickTarget {
+    /// 只关闭。
+    Dismiss,
+    /// 关闭并跳到这个项目。
+    JumpToProject(String),
+    /// 关闭并打开设置。
+    OpenSettings(SettingsPage),
+}
+
+/// 一条 toast 点下去去哪:带了 [`ToastAction`] 的照它,否则按 kind。
+fn click_target(item: &ToastItem) -> ClickTarget {
+    match item.action {
+        ToastAction::OpenSettings(page) => ClickTarget::OpenSettings(page),
+        ToastAction::ByKind if item.kind.jumps_to_project() => {
+            ClickTarget::JumpToProject(item.project_id.clone())
+        }
+        ToastAction::ByKind => ClickTarget::Dismiss,
+    }
+}
 
 /// 队列里的一条。字段与 `types.ts:306-319` 的 `AiCompletionNotification` 对齐
 /// (`timestamp` 没搬:原版留着它也只是排序用,而这里本来就是插入序)。
@@ -95,6 +140,18 @@ pub struct ToastItem {
     pub kind: ToastKind,
     /// 自定义正文;`None` = 按 kind 取固定文案(见 [`ToastKind::uses_message`])。
     pub message: Option<String>,
+    /// 点击之后做什么(见模块注释「点击之后做什么」)。
+    pub action: ToastAction,
+}
+
+impl ToastItem {
+    /// 自动消失前停留多久。
+    fn ttl(&self) -> Duration {
+        match self.action {
+            ToastAction::OpenSettings(_) => SETTINGS_HINT_TTL,
+            ToastAction::ByKind => TTL,
+        }
+    }
 }
 
 // ─── 纯队列(可测) ──────────────────────────────────────────
@@ -156,6 +213,14 @@ impl ToastQueue {
         self.items.iter().any(|n| n.id == id)
     }
 
+    /// 这条该停留多久(已不在队里时按默认时长,反正到点 `dismiss` 是空转)。
+    fn ttl_of(&self, id: u64) -> Duration {
+        self.items
+            .iter()
+            .find(|n| n.id == id)
+            .map_or(TTL, ToastItem::ttl)
+    }
+
     /// 关项目时把它的 toast 一并清掉(`store.ts:859`)。返回被清掉的 id。
     pub fn retain_other_projects(&mut self, project_id: &str) -> Vec<u64> {
         let dropped: Vec<u64> = self
@@ -215,6 +280,7 @@ pub fn push_alert(kind: ToastKind, project_id: String, project_name: String, cx:
             project_name,
             kind,
             message: None,
+            action: ToastAction::ByKind,
         },
         true,
         cx,
@@ -236,6 +302,24 @@ pub fn push_message(
             project_name,
             kind,
             message: Some(message),
+            action: ToastAction::ByKind,
+        },
+        false,
+        cx,
+    );
+}
+
+/// 推一条「点击打开设置并直达 `page`」的信息提示(`i` 图标)。不属于任何项目,不去重 ——
+/// 调用方自己保证只推一次(眼下唯一的调用方是 `crate::hook_hint`,一辈子一次)。
+pub fn push_settings_hint(title: String, message: String, page: SettingsPage, cx: &mut App) {
+    push_item(
+        ToastItem {
+            id: 0,
+            project_id: SETTINGS_HINT_PROJECT.to_string(),
+            project_name: title,
+            kind: ToastKind::Info,
+            message: Some(message),
+            action: ToastAction::OpenSettings(page),
         },
         false,
         cx,
@@ -257,6 +341,7 @@ pub fn push_message_deduped(
         project_name,
         kind,
         message: Some(message),
+        action: ToastAction::ByKind,
     };
     layer(cx).update(cx, |layer, cx| {
         let message = item.message.as_deref().unwrap_or_default();
@@ -338,10 +423,12 @@ fn push_item(item: ToastItem, dedupe: bool, cx: &mut App) {
 }
 
 impl ToastLayer {
-    /// 给某条挂一个满 5s 的自撤定时器(已有的那个随句柄被覆盖而取消)。
+    /// 给某条挂一个满时长的自撤定时器(已有的那个随句柄被覆盖而取消)。时长一般是 5s,
+    /// 个别提示更长(见 [`ToastItem::ttl`])。
     fn arm(&mut self, id: u64, cx: &mut Context<Self>) {
+        let ttl = self.queue.ttl_of(id);
         let task = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TTL).await;
+            cx.background_executor().timer(ttl).await;
             let _ = this.update(cx, |this: &mut Self, cx| this.dismiss(id, cx));
         });
         self.timers.insert(id, task);
@@ -364,20 +451,22 @@ impl ToastLayer {
         }
     }
 
-    /// 点卡片:该跳的跳,一律关掉自己。
+    /// 点卡片:该跳的跳 / 该开设置的开设置,一律先关掉自己。
     fn activate(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self
-            .queue
-            .visible()
-            .find(|n| n.id == id)
-            .map(|n| (n.kind, n.project_id.clone()));
+        let target = self.queue.visible().find(|n| n.id == id).map(click_target);
         self.dismiss(id, cx);
 
-        let Some(project_id) = target
-            .filter(|(kind, _)| kind.jumps_to_project())
-            .map(|(_, project_id)| project_id)
-        else {
-            return;
+        let project_id = match target {
+            Some(ClickTarget::JumpToProject(project_id)) => project_id,
+            Some(ClickTarget::OpenSettings(page)) => {
+                // 同样 defer:设置面板建一堆输入框、开弹窗,不该挤在本实体的 update 里
+                window.defer(cx, move |window, cx| {
+                    let store = AppStore::global(cx);
+                    crate::settings::open_settings(store, Some(page), window, cx);
+                });
+                return;
+            }
+            Some(ClickTarget::Dismiss) | None => return,
         };
 
         // ⚠️ **必须 defer**:切项目会 `hydrate_project` → 起 PTY,而起 PTY 有一条
@@ -757,7 +846,66 @@ mod tests {
             project_name: format!("项目 {project}"),
             kind,
             message: None,
+            action: ToastAction::ByKind,
         }
+    }
+
+    /// 点击去向:默认按 kind(AI 提醒跳项目、其余只关闭);带了「打开设置」的照它走,
+    /// 哪怕 kind 本身会跳项目。别的种类一条不受影响。
+    #[test]
+    fn 点击去向按动作优先其次按_kind() {
+        assert_eq!(
+            click_target(&item("p1", ToastKind::Completion)),
+            ClickTarget::JumpToProject("p1".into())
+        );
+        assert_eq!(
+            click_target(&item("p1", ToastKind::Attention)),
+            ClickTarget::JumpToProject("p1".into())
+        );
+        for kind in [ToastKind::Info, ToastKind::PasteError, ToastKind::WslInfo] {
+            assert_eq!(
+                click_target(&item("p1", kind)),
+                ClickTarget::Dismiss,
+                "{kind:?}"
+            );
+        }
+        let mut hint = item(SETTINGS_HINT_PROJECT, ToastKind::Info);
+        hint.action = ToastAction::OpenSettings(SettingsPage::AiHook);
+        assert_eq!(
+            click_target(&hint),
+            ClickTarget::OpenSettings(SettingsPage::AiHook)
+        );
+        hint.kind = ToastKind::Completion;
+        assert_eq!(
+            click_target(&hint),
+            ClickTarget::OpenSettings(SettingsPage::AiHook),
+            "动作压过 kind"
+        );
+    }
+
+    /// 「打开设置」那种提示多留一会儿,其余照旧 5 秒;不在队里的按默认时长。
+    #[test]
+    fn 打开设置的提示停留更久() {
+        let mut q = ToastQueue::default();
+        let plain = q.push(item("p1", ToastKind::Info), false).unwrap();
+        let mut hint = item(SETTINGS_HINT_PROJECT, ToastKind::Info);
+        hint.action = ToastAction::OpenSettings(SettingsPage::AiHook);
+        let hint = q.push(hint, false).unwrap();
+        assert_eq!(q.ttl_of(plain), TTL);
+        assert_eq!(q.ttl_of(hint), SETTINGS_HINT_TTL);
+        assert!(SETTINGS_HINT_TTL > TTL);
+        assert_eq!(q.ttl_of(999), TTL);
+    }
+
+    /// 设置提示挂的是占位项目 id,关任何真实项目都不会把它清掉。
+    #[test]
+    fn 设置提示不随项目关闭消失() {
+        let mut q = ToastQueue::default();
+        let mut hint = item(SETTINGS_HINT_PROJECT, ToastKind::Info);
+        hint.action = ToastAction::OpenSettings(SettingsPage::AiHook);
+        let hint = q.push(hint, false).unwrap();
+        q.retain_other_projects("p1");
+        assert!(q.contains(hint));
     }
 
     /// TTL 与上限是照抄来的常量,别在重构里悄悄漂了

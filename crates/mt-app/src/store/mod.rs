@@ -422,6 +422,10 @@ pub struct AppStore {
     _layout_save_task: Option<Task<()>>,
 
     pub active_project_id: Option<String>,
+    /// 项目的最近使用序(最近激活的在前)。项目切换器空查询时按它排,于是
+    /// Ctrl+Shift+P 再回车就在最近两个项目之间来回切。**纯运行时,不落盘**:启动时只有
+    /// 上次的活动项目,没用过的项目不进表,由切换器排在它们后面、保持侧栏顺序。
+    project_mru: Vec<String>,
     project_states: HashMap<String, ProjectState>,
     /// ptyId → 终端视图。pane 只在树里存 id,视图挂这里(旧版 terminalCache)。
     terminals: HashMap<u32, Entity<TerminalPane>>,
@@ -736,6 +740,7 @@ impl AppStore {
             layout_globals_dirty: false,
             layout_save_generation: 0,
             _layout_save_task: None,
+            project_mru: active_project_id.iter().cloned().collect(),
             active_project_id,
             project_states,
             terminals: HashMap::new(),
@@ -819,6 +824,11 @@ impl AppStore {
 
     pub fn active_project(&self) -> Option<&ProjectConfig> {
         self.active_project_id.as_deref().and_then(|id| self.project(id))
+    }
+
+    /// 项目的最近使用序,最近激活的在前(见字段注释)。只含本次运行里激活过的项目。
+    pub fn recent_projects(&self) -> &[String] {
+        &self.project_mru
     }
 
     pub fn active_layout(&self) -> Option<&SplitNode> {

@@ -8,7 +8,17 @@
 //!                     ↓ 各自回主线程 setState,按时间戳降序混排
 //! 右键一行 ─→ 查看 / 在当前终端恢复 / 新标签恢复 / 复制命令 / 删除
 //! 树模式点一行 ─→ 已在跑就跳过去,没在跑就新终端 resume
+//! 平铺模式点一行 ─→ 查看(与右键菜单第一项同一个动作)
 //! ```
+//!
+//! # 过滤与分页
+//!
+//! 头部的过滤框按会话标题(树模式下连分支标题)子串与 agent 名(`claude` 或「Claude Code」)
+//! 过滤,不分大小写([`session_matches_filter`])。三路来源本来就是**整表**拉进内存的,
+//! 「每页 20 条」([`PAGE_SIZE`])只限制铺出去多少行 —— 所以过滤作用在全部已加载的会话上,
+//! 结果照旧分页渲染。树模式下命中的子会话连同祖先链留下([`prune_session_tree`]),没命中
+//! 的祖先画淡一档:树形不散,分支标题与连线前缀都与不过滤时同一套算法。过滤框里 Esc 先清空,
+//! 已空则把焦点还给工作区;切项目时清空(另一个项目的会话里搜同一个词多半不是本意)。
 //!
 //! **三个慢函数必须丢后台**(看板技术债清单明示):`get_ai_session_content`、
 //! `get_wsl_ai_sessions` 与 `scan_session_lineage` 原本靠 Tauri 命令层挪出主线程;
@@ -57,11 +67,13 @@
 //! 「加载更多」翻出来的页数全丢掉。缓存由 `execute` 作废,重开面板读到的是新的。
 
 use gpui::{
-    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::ActiveTheme as _;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::text::{TextView, TextViewStyle};
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge, SessionDeleteError};
 use mt_config::SshConnection;
@@ -72,7 +84,9 @@ use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;
 use crate::prompt::{Confirm, show_alert};
-use crate::session_branch::{build_session_tree, flatten_session_tree, merge_lineage_edges};
+use crate::session_branch::{
+    TreeNode, build_session_tree, flatten_session_tree, merge_lineage_edges, prune_session_tree,
+};
 use crate::store::{AppStore, StoreEvent};
 use crate::toast;
 use crate::tree::{AiSessionRef, StatusLight};
@@ -211,6 +225,28 @@ fn has_wsl_source(path: &str, distro: Option<&str>) -> bool {
     }
     let lower = path.to_ascii_lowercase().replace('/', "\\");
     lower.starts_with("\\\\wsl$\\") || lower.starts_with("\\\\wsl.localhost\\")
+}
+
+/// 过滤框里的词规整成匹配用的形态:去首尾空白、转小写;空 = 不过滤。
+fn filter_needle(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_lowercase())
+}
+
+/// 一条会话过不过得了过滤(`needle` 已经过 [`filter_needle`] 小写化):标题、树模式下的
+/// 分支标题、agent 名任一含有过滤词就算命中。agent 认规范标识(`claude`)与展示名
+/// (`Claude Code`)两种写法 —— 行上画的是品牌图标,用户记得的多半是展示名。
+fn session_matches_filter(
+    needle: &str,
+    title: &str,
+    branch_title: Option<&str>,
+    session_type: &str,
+) -> bool {
+    let contains = |text: &str| text.to_lowercase().contains(needle);
+    if contains(title) || branch_title.is_some_and(contains) || contains(session_type) {
+        return true;
+    }
+    mt_ai::AgentKind::parse(session_type).is_some_and(|kind| contains(kind.spec().label))
 }
 
 /// ISO 8601 → 「刚刚 / n 分钟前 / n 小时前 / n 天前 / 月-日」。
@@ -517,10 +553,23 @@ impl ViewMode {
     }
 }
 
+/// 列表里的一行。**两模式共用同一套行渲染**,见 [`SessionPanel::rows`]。
+struct ListRow {
+    session: AiSession,
+    /// 树连线前缀;平铺为空串。
+    prefix: String,
+    /// 显示标题:树模式下的分支取分支标题,其余是会话标题。
+    title: String,
+    /// 过滤时为了保住树形才留下的祖先(自己没命中),画淡一档。
+    context_only: bool,
+}
+
 pub struct SessionPanel {
     store: Entity<AppStore>,
     /// 上次拉取用的项目路径 —— 项目切换时据此重拉。
     project_path: Option<String>,
+    /// 头部的过滤框(见模块注释「过滤与分页」)。
+    filter: Entity<InputState>,
     host: Vec<AiSession>,
     wsl: Vec<AiSession>,
     /// 磁盘扫描出来的分支边。树视图的数据面,平铺不消费。
@@ -557,31 +606,50 @@ pub struct SessionPanel {
     delete_busy: bool,
     /// 不放 `_tasks`:那边刷新时整个清掉,用户点过确定的删除不能被一次刷新取消。
     _delete_task: Option<Task<()>>,
+    _subs: Vec<Subscription>,
 }
 
 impl SessionPanel {
-    pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 别的 store 变化(状态灯之类)只重画
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        // 项目切了才重拉。比对只在活动项目可能变了时做
-        // (`StoreEvent::touches_active_project`),不再被 OSC 标题 / AI 状态叫醒
-        cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
-            if !event.touches_active_project() {
-                return;
-            }
-            let path = this.store.read(cx).active_project().map(|p| p.path.clone());
-            if path != this.project_path {
-                if this.visible {
-                    this.refresh(false, cx);
-                } else {
-                    // 收着的时候不去扫:WSL 那一路要冷启动整台 VM,不该由「切了个
-                    // 项目」触发(旧版收起时组件根本没挂载)
-                    this.stale = true;
-                }
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t("sessionList", "filterPlaceholder"))
+        });
+        // 过滤词一变,分页从头算(上一个词「加载更多」翻出来的页数对新结果没有意义)
+        let filter_sub = cx.subscribe(&filter, |this: &mut Self, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.display_count = PAGE_SIZE;
                 cx.notify();
             }
-        })
-        .detach();
+        });
+        // 项目切了才重拉。比对只在活动项目可能变了时做
+        // (`StoreEvent::touches_active_project`),不再被 OSC 标题 / AI 状态叫醒。
+        // 走 `subscribe_in`:切项目时要清空过滤框,`set_value` 要 `&mut Window`
+        let store_sub = cx.subscribe_in(
+            &store,
+            window,
+            |this: &mut Self, _, event: &StoreEvent, window, cx| {
+                if !event.touches_active_project() {
+                    return;
+                }
+                let path = this.store.read(cx).active_project().map(|p| p.path.clone());
+                if path != this.project_path {
+                    if !this.filter.read(cx).value().is_empty() {
+                        this.filter
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                    if this.visible {
+                        this.refresh(false, cx);
+                    } else {
+                        // 收着的时候不去扫:WSL 那一路要冷启动整台 VM,不该由「切了个
+                        // 项目」触发(旧版收起时组件根本没挂载)
+                        this.stale = true;
+                    }
+                    cx.notify();
+                }
+            },
+        );
         let view = match store.read(cx).session_list_view() {
             "tree" => ViewMode::Tree,
             _ => ViewMode::Flat,
@@ -589,6 +657,7 @@ impl SessionPanel {
         Self {
             store,
             project_path: None,
+            filter,
             host: Vec::new(),
             wsl: Vec::new(),
             lineage: Vec::new(),
@@ -607,6 +676,22 @@ impl SessionPanel {
             _tasks: Vec::new(),
             delete_busy: false,
             _delete_task: None,
+            _subs: vec![filter_sub, store_sub],
+        }
+    }
+
+    /// 过滤框当前的匹配词;空 = 不过滤。
+    fn filter_needle(&self, cx: &App) -> Option<String> {
+        filter_needle(&self.filter.read(cx).value())
+    }
+
+    /// 过滤框里的 Esc:有词先清空(清空会发 `Change`,分页随之复位),已空则把焦点还给
+    /// 工作区当前那一页 —— 焦点不该停在一个没有下文的输入框上。
+    fn on_filter_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter.read(cx).value().is_empty() {
+            crate::workbench_area::refocus_current_page(window, cx);
+        } else {
+            self.filter.update(cx, |state, cx| state.clean(window, cx));
         }
     }
 
@@ -809,21 +894,35 @@ impl SessionPanel {
         all
     }
 
-    /// 渲染用的行:`(会话, 连线前缀, 显示标题)`。
+    /// 这一页要渲染的行,连同过滤之后一共有多少行(「加载更多」据此算剩几条)。
     ///
     /// **两模式共用同一套行渲染** —— 平铺模式 `prefix` 为空串、标题就是会话标题,
-    /// 树只是列表长出了结构。
+    /// 树只是列表长出了结构。`needle` 是过滤词([`filter_needle`]),`None` = 不过滤。
     ///
     /// ⚠️ 树模式的分页 `take(display_count)` 在**拍平之后**做 —— 反过来会把父
-    /// 截掉、子全变成孤儿根。
-    fn rows(&self) -> Vec<(AiSession, String, String)> {
+    /// 截掉、子全变成孤儿根。过滤的剪枝同理排在建树之后、拍平之前。
+    fn rows(&self, needle: Option<&str>) -> (Vec<ListRow>, usize) {
         let all = self.merged();
         if self.view == ViewMode::Flat {
-            return all
+            let matched: Vec<&AiSession> = all
+                .into_iter()
+                .filter(|s| {
+                    needle
+                        .is_none_or(|n| session_matches_filter(n, &s.title, None, &s.session_type))
+                })
+                .collect();
+            let total = matched.len();
+            let rows = matched
                 .into_iter()
                 .take(self.display_count)
-                .map(|s| (s.clone(), String::new(), s.title.clone()))
+                .map(|s| ListRow {
+                    session: s.clone(),
+                    prefix: String::new(),
+                    title: s.title.clone(),
+                    context_only: false,
+                })
                 .collect();
+            return (rows, total);
         }
         // 磁盘边 + 自记账边(**磁盘优先**)。自记账那份在扫描时已被 mt-ai 补过
         // 标题并入返回值,这里再合一次是为了兜住「扫描整个失败但自记账还在」的窗口
@@ -832,21 +931,41 @@ impl SessionPanel {
         let ids: Vec<String> = all.iter().map(|s| s.id.clone()).collect();
         let timestamps: Vec<String> = all.iter().map(|s| s.timestamp.clone()).collect();
         let roots = build_session_tree(&ids, &timestamps, &edges);
-        flatten_session_tree(&roots)
+        // fork 是**整份复制**,标题字段连同首条消息一起继承自根会话,
+        // 分支之间全同名 —— 真正区分一条分支的是它岔开后干了什么
+        let branch_title = |edge: Option<usize>| {
+            edge.and_then(|i| edges.get(i))
+                .and_then(|e| e.branch_title.as_deref())
+        };
+        let hit = |index: usize, edge: Option<usize>| match needle {
+            None => true,
+            Some(needle) => all.get(index).is_some_and(|s| {
+                session_matches_filter(needle, &s.title, branch_title(edge), &s.session_type)
+            }),
+        };
+        let roots = match needle {
+            Some(_) => prune_session_tree(roots, &|node: &TreeNode| hit(node.index, node.edge)),
+            None => roots,
+        };
+        let flat = flatten_session_tree(&roots);
+        let total = flat.len();
+        let rows = flat
             .into_iter()
             .take(self.display_count)
             .filter_map(|row| {
                 let session = all.get(row.index)?;
-                // fork 是**整份复制**,标题字段连同首条消息一起继承自根会话,
-                // 分支之间全同名 —— 真正区分一条分支的是它岔开后干了什么
-                let title = row
-                    .edge
-                    .and_then(|i| edges.get(i))
-                    .and_then(|e| e.branch_title.clone())
+                let title = branch_title(row.edge)
+                    .map(str::to_string)
                     .unwrap_or_else(|| session.title.clone());
-                Some(((*session).clone(), row.prefix, title))
+                Some(ListRow {
+                    session: (*session).clone(),
+                    context_only: !hit(row.index, row.edge),
+                    prefix: row.prefix,
+                    title,
+                })
             })
-            .collect()
+            .collect();
+        (rows, total)
     }
 
     /// 在当前活动 pane 里恢复会话。没有终端时退化成「开一个新的再恢复」。
@@ -1464,9 +1583,11 @@ impl Render for SessionPanel {
             return container.child(body);
         }
 
-        let rows = self.rows();
-        let sessions: Vec<AiSession> = rows.iter().map(|(s, _, _)| s.clone()).collect();
-        let total = self.host.len() + self.wsl.len();
+        let needle = self.filter_needle(cx);
+        let filtering = needle.is_some();
+        let (rows, total) = self.rows(needle.as_deref());
+        let sessions: Vec<AiSession> = rows.iter().map(|row| row.session.clone()).collect();
+        let has_sessions = !self.host.is_empty() || !self.wsl.is_empty();
         let has_more = self.display_count < total;
         let loading = self.loading;
         let wsl_loading = self.wsl_loading;
@@ -1540,6 +1661,16 @@ impl Render for SessionPanel {
                     .text_color(ui::text_muted())
                     .child(t("sessionList", "loading")),
             );
+        } else if sessions.is_empty() && filtering && has_sessions {
+            // 有会话、只是一条都没过滤中:别说「暂无会话记录」,那会让人以为列表丢了
+            let query = self.filter.read(cx).value().trim().to_string();
+            list = list.child(
+                div()
+                    .py(px(12.0))
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(tr!("sessionList", "filterEmpty", query = query)),
+            );
         } else if sessions.is_empty() {
             list = list.child(
                 div()
@@ -1554,7 +1685,13 @@ impl Render for SessionPanel {
             );
         }
 
-        for (i, (session, prefix, display_title)) in rows.into_iter().enumerate() {
+        for (i, row) in rows.into_iter().enumerate() {
+            let ListRow {
+                session,
+                prefix,
+                title: display_title,
+                context_only,
+            } = row;
             let key = format!(
                 "{}-{}-{}",
                 session.session_type,
@@ -1582,21 +1719,24 @@ impl Render for SessionPanel {
             let live_project = live
                 .as_ref()
                 .map(|(project_id, _)| project_name_of(project_id));
-            // tooltip:树模式区分 live / 非 live,平铺恒是会话标题
-            let tip: SharedString = if tree {
+            // tooltip:树模式区分 live / 非 live,平铺是会话标题;末尾一律补一句右键菜单的
+            // 提示 —— 恢复 / 复制命令 / 删除都只在右键里,不说的话没人知道
+            let tip = if tree {
                 match &live_project {
-                    Some(name) => {
-                        tr!("sessionList", "branchTree.runningIn", project = name.clone()).into()
-                    }
+                    Some(name) => tr!(
+                        "sessionList",
+                        "branchTree.runningIn",
+                        project = name.clone()
+                    ),
                     None => format!(
                         "{display_title}\n{}",
                         t("sessionList", "branchTree.clickToResume")
-                    )
-                    .into(),
+                    ),
                 }
             } else {
-                session.title.clone().into()
+                session.title.clone()
             };
+            let tip: SharedString = format!("{tip}\n{}", t("sessionList", "rowMenuHint")).into();
             let session_for_menu = session.clone();
             let session_for_click = session.clone();
 
@@ -1611,16 +1751,18 @@ impl Render for SessionPanel {
                     .rounded(px(4.0))
                     .text_size(ui::font_px(12.0))
                     .hover(|el| el.bg(ui::border_subtle()))
-                    // 树模式整行可点(跳转 / 恢复),平铺不可点
-                    .when(tree, |el| el.cursor_pointer())
+                    .cursor_pointer()
                     .tip(tip)
-                    .when(tree, |el| {
-                        el.on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                    // 整行可点:树模式跳转 / 恢复,平铺模式「查看」(右键菜单第一项)
+                    .on_click(cx.listener(move |this: &mut Self, _, window, cx| {
+                        if tree {
                             let task =
                                 jump_to_session(&this.store, session_for_click.clone(), window, cx);
                             this._tasks.push(task);
-                        }))
-                    })
+                        } else {
+                            this.open_preview(&session_for_click, cx);
+                        }
+                    }))
                     // 四项右键菜单(N 批的 `menu.rs` 已就位,行内按钮随之收回)
                     .on_mouse_down(
                         MouseButton::Right,
@@ -1681,7 +1823,12 @@ impl Render for SessionPanel {
                                             .flex_1()
                                             .min_w(px(0.0))
                                             .truncate()
-                                            .text_color(ui::text_secondary())
+                                            // 过滤时只为保住树形留下的祖先淡一档
+                                            .text_color(if context_only {
+                                                ui::text_muted()
+                                            } else {
+                                                ui::text_secondary()
+                                            })
                                             .child(display_title.clone()),
                                     ),
                             )
@@ -1707,7 +1854,7 @@ impl Render for SessionPanel {
         }
 
         if has_more {
-            let remaining = total - self.display_count;
+            let remaining = total.saturating_sub(self.display_count);
             list = list.child(
                 div()
                     .id("session-load-more")
@@ -1824,6 +1971,27 @@ impl Render for SessionPanel {
                             ),
                     ),
             )
+            // 过滤框(见模块注释「过滤与分页」)。断链的远程项目没有可过滤的东西,不画
+            .when(has_project && !remote_broken, |el| {
+                el.child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        // 输入框自己不吃 Esc(`clean_on_escape` 没开,它 `cx.propagate()`),
+                        // 在承载它的这一层收(与项目列表重命名框同一个做法)
+                        .on_key_down(cx.listener(
+                            |this: &mut Self, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key == "escape" {
+                                    cx.stop_propagation();
+                                    this.on_filter_escape(window, cx);
+                                }
+                            },
+                        ))
+                        .child(Input::new(&self.filter).cleanable(true)),
+                )
+            })
             .child(list)
     }
 }
@@ -1901,6 +2069,39 @@ mod tests {
         }
         assert!(session_resume_command(&ai_session("claude", &"a".repeat(129))).is_none());
         assert!(session_resume_command(&ai_session("claude", &"a".repeat(128))).is_some());
+    }
+
+    /// 过滤词:去首尾空白、转小写,空白串等于不过滤。
+    #[test]
+    fn 过滤词规整() {
+        assert_eq!(filter_needle(""), None);
+        assert_eq!(filter_needle("   "), None);
+        assert_eq!(filter_needle("  Fix Bug "), Some("fix bug".to_string()));
+        assert_eq!(filter_needle("重构"), Some("重构".to_string()));
+    }
+
+    /// 过滤匹配:标题子串不分大小写;分支标题也算;agent 认规范标识与展示名两种写法。
+    #[test]
+    fn 过滤按标题与_agent_匹配() {
+        let hit = |needle: &str, title: &str, branch: Option<&str>, agent: &str| {
+            session_matches_filter(&filter_needle(needle).unwrap(), title, branch, agent)
+        };
+        assert!(hit("bug", "Fix the BUG in parser", None, "codex"));
+        assert!(hit("解析器", "修一下解析器", None, "claude"));
+        assert!(!hit("deploy", "Fix the bug", None, "codex"));
+        // 树模式:分支标题命中也算(分支继承根会话的标题,真正区分它的是分支标题)
+        assert!(hit(
+            "rewrite",
+            "同一个根标题",
+            Some("rewrite in rust"),
+            "claude"
+        ));
+        assert!(!hit("rewrite", "同一个根标题", None, "claude"));
+        // agent:标识与展示名都认
+        assert!(hit("CODEX", "随便", None, "codex"));
+        assert!(hit("claude code", "随便", None, "claude"));
+        assert!(hit("oh-my", "随便", None, "omp"));
+        assert!(!hit("grok", "随便", None, "claude"));
     }
 
     #[test]

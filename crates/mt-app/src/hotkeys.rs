@@ -16,7 +16,7 @@
 //! (bash transpose-chars)、`Ctrl+W`(删除前一个词)、`Ctrl+P`(上一条历史)都有
 //! 既定语义,因此应用级动作统一走 `Ctrl+Shift+*`(Windows Terminal / VS Code
 //! 终端的惯例),只有确实不与行编辑冲突的才用裸 `Ctrl`
-//! (`Ctrl+Tab`、`Ctrl+1..9`、`Ctrl+,`)。
+//! (`Ctrl+Tab`、`Ctrl+1..9`、`Ctrl+,`、`` Ctrl+` ``)。
 //!
 //! # 与原版表的两处差异(都有意)
 //!
@@ -40,8 +40,9 @@ use crate::{
     OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane, ReopenClosedTerminal,
     ResizeSplitDown, ResizeSplitLeft, ResizeSplitRight, ResizeSplitUp, SelectPane, SplitDown,
     SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMaximizePane,
-    ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_conflict,
-    git_diff, git_file_history, git_history, git_stash, project_switcher, quick_open,
+    ToggleMiddleColumn, ToggleSessions, ToggleUsage, ToggleWorkbenchPage, command_library,
+    git_changes, git_conflict, git_diff, git_file_history, git_history, git_stash,
+    project_switcher, quick_open, search_modal,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -259,6 +260,16 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Global,
         G_NAV,
         "shortcuts.focusDown",
+    ),
+    // 终端页 ↔ 文件页(VS Code 开合终端面板的那个键)。裸 Ctrl 也不吃 shell 的键:终端的编码
+    // 表里 Ctrl+` 本来就不发任何字节(`mt_ui::terminal::input::control_code` 不认 `` ` ``)
+    def(
+        "toggleWorkbenchPage",
+        Some("ctrl-`"),
+        combo(true, false, false, "`"),
+        Scope::Global,
+        G_NAV,
+        "shortcuts.toggleWorkbenchPage",
     ),
     // ── 页签与分屏 ──
     //
@@ -604,6 +615,27 @@ pub fn bind_keys(cx: &mut App) {
         project_switcher::SwitcherNext,
         Some("ProjectSwitcher > Input"),
     ));
+    // 翻页与首尾(三个搜索类浮层同一组键)。裸 home / end 不占:那是输入框里挪光标的键
+    bindings.push(KeyBinding::new(
+        "pageup",
+        project_switcher::SwitcherPageUp,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "pagedown",
+        project_switcher::SwitcherPageDown,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        project_switcher::SwitcherFirst,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        project_switcher::SwitcherLast,
+        Some("ProjectSwitcher > Input"),
+    ));
 
     // 快速打开的方向键。与项目切换器同一套理由:弹窗内部键位不进表,谓词要与 `Input`
     // 同深度才压得过它自带的 up/down(机制见 project_switcher 模块注释)
@@ -619,6 +651,69 @@ pub fn bind_keys(cx: &mut App) {
         quick_open::QuickOpenNext,
         quick_open_input,
     ));
+    bindings.push(KeyBinding::new(
+        "pageup",
+        quick_open::QuickOpenPageUp,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "pagedown",
+        quick_open::QuickOpenPageDown,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        quick_open::QuickOpenFirst,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        quick_open::QuickOpenLast,
+        quick_open_input,
+    ));
+
+    // 全局搜索的结果游标:↑/↓ 逐条、PageUp/PageDown 翻页、Ctrl/Cmd+Enter 打开但留着浮层。
+    // 同一套理由:弹窗内部键位不进表,谓词与 `Input` 同深度才压得过它自带的那几条
+    // (输入框把 pageup/pagedown 绑成了单行里什么都不做、也不 propagate 的 MovePage*)
+    let search_input = format!("{} > Input", search_modal::CONTEXT);
+    let search_input = Some(search_input.as_str());
+    bindings.push(KeyBinding::new(
+        "up",
+        search_modal::SearchCursorPrev,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        search_modal::SearchCursorNext,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "pageup",
+        search_modal::SearchCursorPageUp,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "pagedown",
+        search_modal::SearchCursorPageDown,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        search_modal::SearchCursorFirst,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        search_modal::SearchCursorLast,
+        search_input,
+    ));
+    for keystroke in ["ctrl-enter", "cmd-enter"] {
+        bindings.push(KeyBinding::new(
+            keystroke,
+            search_modal::SearchOpenKeep,
+            search_input,
+        ));
+    }
 
     // 命令库浮层的方向键 / Ctrl+↵(issue #81)。与项目切换器同一套理由:
     // 弹窗内部键位不进表,谓词要与 `Input` 同深度才压得过它自带的 up/down。
@@ -961,6 +1056,7 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "focusRight" => KeyBinding::new(keystroke, FocusRight, Some(WORKSPACE)),
         "focusUp" => KeyBinding::new(keystroke, FocusUp, Some(WORKSPACE)),
         "focusDown" => KeyBinding::new(keystroke, FocusDown, Some(WORKSPACE)),
+        "toggleWorkbenchPage" => KeyBinding::new(keystroke, ToggleWorkbenchPage, Some(WORKSPACE)),
         "moveTabLeft" => KeyBinding::new(keystroke, MoveTabLeft, Some(WORKSPACE)),
         "moveTabRight" => KeyBinding::new(keystroke, MoveTabRight, Some(WORKSPACE)),
         "resizeLeft" => KeyBinding::new(keystroke, ResizeSplitLeft, Some(WORKSPACE)),
