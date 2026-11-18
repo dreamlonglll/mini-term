@@ -47,6 +47,15 @@
 //! [`crate::overlay::kind::SSH_PANEL`]。删除连接的确认框是**另一种类**
 //! (`CONFIRM`),照样叠得上去,Esc 只关它 —— 与原版 `overlayStack` 同语义。
 //!
+//! # 表单:就地校验与「测试连接」
+//!
+//! 保存 / 测试前先过 [`form_issues`]:缺名称 / 主机 / 用户名、端口不是 1–65535 的整数
+//! (留空仍是默认 22)时,原因画在各自输入框下方,焦点移到第一个有问题的字段;那一格一改,
+//! 红字即消。「测试连接」用表单**当前**的值(不必先保存)真连一次、认证完即断开,走
+//! [`mt_remote::start_connection_test`] —— 与正式连接同一套建连 / 认证 / known_hosts 代码,
+//! 但不碰会话池(不复用、不入池、不记认证冷却)。结果就地画在按钮行上方,表单改过就标成过期;
+//! 关表单即放弃这次测试(见 `ConnForm::_test_task`)。两样都**不走 toast**(画在遮罩之下)。
+//!
 //! # 从「添加远程项目」跳进来新建(issue #83)
 //!
 //! [`open_adding`]:本面板叠在 [`crate::remote_project`] 之上、直接开新建表单,新连接
@@ -59,7 +68,7 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use mt_config::SshConnection;
 
 use crate::dnd::{self, DropPosition};
@@ -502,17 +511,65 @@ pub(crate) fn render_conn_buckets<T: BucketCollapse>(
 
 // ─── 表单纯逻辑 ───────────────────────────────────────────────
 
-/// 端口解析。原版:`parseInt` 出来的值不是有限数 / ≤0 / >65535 一律回落 22。
-pub(crate) fn parse_port(raw: &str) -> u16 {
-    match raw.trim().parse::<u32>() {
-        Ok(p) if p > 0 && p <= 65535 => p as u16,
-        _ => 22,
+/// 端口解析:留空(trim 后)= 默认 22;否则必须是 1–65535 的整数,不是就 `None`。
+///
+/// 原版是 `parseInt` 不合法一律**静默**回落 22 —— 填了 `2222x` 存下去连的却是 22 端口,
+/// 到连不上才发现。现在填了不合法的值就地提示、不保存(见 [`form_issues`]),只有「留空」
+/// 还回落默认值。
+pub(crate) fn parse_port(raw: &str) -> Option<u16> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Some(22);
+    }
+    raw.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+/// 表单里要校验的字段,按界面自上而下的顺序 ——「焦点移到第一个有问题的字段」按它走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FormField {
+    Name,
+    Host,
+    Port,
+    User,
+}
+
+impl FormField {
+    /// 就地红字的文案 key(`sshModal.*`)。前三个是必填,端口是格式。
+    fn message_key(self) -> &'static str {
+        match self {
+            FormField::Name => "nameRequired",
+            FormField::Host => "hostRequired",
+            FormField::Port => "portInvalid",
+            FormField::User => "userRequired",
+        }
     }
 }
 
-/// 「保存」按钮亮不亮(原版 `canSave = !!(name && host && user)`,全都 trim 后判)。
-pub(crate) fn form_valid(name: &str, host: &str, user: &str) -> bool {
-    !name.trim().is_empty() && !host.trim().is_empty() && !user.trim().is_empty()
+/// 表单校验(保存与「测试连接」共用):按界面顺序列出没过的字段。名称 / 主机 / 用户名
+/// trim 后不能为空(原版 `canSave = !!(name && host && user)`);端口见 [`parse_port`]。
+pub(crate) fn form_issues(name: &str, host: &str, port: &str, user: &str) -> Vec<FormField> {
+    let mut issues = Vec::new();
+    if name.trim().is_empty() {
+        issues.push(FormField::Name);
+    }
+    if host.trim().is_empty() {
+        issues.push(FormField::Host);
+    }
+    if parse_port(port).is_none() {
+        issues.push(FormField::Port);
+    }
+    if user.trim().is_empty() {
+        issues.push(FormField::User);
+    }
+    issues
+}
+
+/// 就地红字还显不显示:点保存 / 测试那一刻记下了字段的值,现在的值与它不同就说明用户动过
+/// 这一格 —— 改动即消,不必等下一次点保存。
+fn issue_visible(issues: &[(FormField, String)], field: FormField, current: &str) -> bool {
+    issues
+        .iter()
+        .any(|(f, value)| *f == field && value == current)
 }
 
 /// 空串归一成 `None`(原版 `value.trim() || undefined` 与 `normalizeGroup`)。
@@ -525,37 +582,128 @@ fn opt(value: &str) -> Option<String> {
     }
 }
 
-/// 表单值 → 一条连接。`id` 为空串时由调用方补新 id。
+/// 表单此刻的原始值(未 trim)。保存与「测试连接」都从这一份出发。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct FormValues {
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub password: String,
+    pub identity: String,
+    pub group: String,
+}
+
+impl FormValues {
+    /// 被校验字段此刻的值(就地红字「改动即消」靠它比对)。
+    fn field(&self, field: FormField) -> &str {
+        match field {
+            FormField::Name => &self.name,
+            FormField::Host => &self.host,
+            FormField::Port => &self.port,
+            FormField::User => &self.user,
+        }
+    }
+
+    /// 校验通过时组装成一条连接,否则交回没过的字段(见 [`form_issues`])。`id` 为空串时由
+    /// 调用方补新 id。
+    ///
+    /// ⚠️ **密码不 trim**(原版 `password ? password : undefined`):前后空格是合法
+    /// 口令字符,替用户裁掉会让人对着「密码明明没填错」发呆。
+    ///
+    /// 表单只认识本版本的字段,`extra` 留空:编辑既有连接时,新版本写的未知字段由
+    /// `AppStore::upsert_ssh_connection` 从旧条目上接过来。
+    pub(crate) fn to_connection(&self, id: String) -> Result<SshConnection, Vec<FormField>> {
+        let issues = form_issues(&self.name, &self.host, &self.port, &self.user);
+        let port = match parse_port(&self.port) {
+            Some(port) if issues.is_empty() => port,
+            _ => return Err(issues),
+        };
+        Ok(SshConnection {
+            id,
+            name: self.name.trim().to_string(),
+            host: self.host.trim().to_string(),
+            port,
+            user: self.user.trim().to_string(),
+            password: (!self.password.is_empty()).then(|| self.password.clone()),
+            identity_file: opt(&self.identity),
+            group: opt(&self.group),
+            extra: Default::default(),
+        })
+    }
+}
+
+/// 表单值的指纹:测试结果「过期了没有」靠它比(发起测试时记一份,与当前值对不上即过期)。
+/// 用进程内随机密钥的哈希 —— 里面有密码,不留一个跨进程稳定、可离线比对的值
+/// (与 `mt_remote::connection_fingerprint` 同一考虑)。
+fn form_fingerprint(values: &FormValues) -> u64 {
+    static HASHER: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    std::hash::BuildHasher::hash_one(HASHER.get_or_init(Default::default), values)
+}
+
+/// 「测试连接」交给池的密码字段:与保存走**同一个**封存函数
+/// ([`crate::secrets::stored_password`])—— 没改就是已存信封原样(于是与已保存的那条连接
+/// 是同一身份,池里那条认证冷却照样作数),改了就是新封的信封。信封只活在这次测试里,池在
+/// 认证那一刻解开(`mt-ssh` 唯一的解封点)。明文不落盘、不进日志。
 ///
-/// ⚠️ **密码不 trim**(原版 `password ? password : undefined`):前后空格是合法
-/// 口令字符,替用户裁掉会让人对着「密码明明没填错」发呆。
-///
-/// 表单只认识本版本的字段,`extra` 留空:编辑既有连接时,新版本写的未知字段由
-/// `AppStore::upsert_ssh_connection` 从旧条目上接过来。
-pub(crate) fn build_connection(
-    id: String,
-    name: &str,
-    host: &str,
-    port_raw: &str,
-    user: &str,
-    password: &str,
-    identity: &str,
-    group: &str,
-) -> SshConnection {
-    SshConnection {
-        id,
-        name: name.trim().to_string(),
-        host: host.trim().to_string(),
-        port: parse_port(port_raw),
-        user: user.trim().to_string(),
-        password: if password.is_empty() {
-            None
-        } else {
-            Some(password.to_string())
-        },
-        identity_file: opt(identity),
-        group: opt(group),
-        extra: Default::default(),
+/// 凭据库不可用、封存失败时退回明文本身:池的解封对不带信封前缀的值原样放行
+/// (升级窗口期的遗留明文就是这么走的),测试照常进行。
+fn test_password(plain: &str, stored: Option<&str>) -> Option<String> {
+    if plain.is_empty() {
+        return None;
+    }
+    Some(crate::secrets::stored_password(plain, stored).unwrap_or_else(|_| plain.to_string()))
+}
+
+/// 测试失败那句标题的文案 key(`sshModal.test.*`)。
+fn failure_headline_key(kind: mt_remote::ConnectionTestFailureKind) -> &'static str {
+    use mt_remote::ConnectionTestFailureKind as Kind;
+    match kind {
+        Kind::Auth => "test.failedAuth",
+        Kind::HostKey => "test.failedHostKey",
+        Kind::Network => "test.failedNetwork",
+        Kind::Timeout => "test.failedTimeout",
+        Kind::Cooldown => "test.failedCooldown",
+        Kind::Config => "test.failedConfig",
+        Kind::Other => "test.failedOther",
+    }
+}
+
+/// 失败原文框里的内容。认证失败且认得出格式时,逐方法一条一行(首行写登录目标与服务器
+/// 允许的方法);其余原样。已存密码解不开、用户又没重填(`password_unreadable`)时,末尾补
+/// 一句「请重新填写密码」—— 这次测试是不带密码跑的。
+fn failure_detail(failure: &mt_remote::ConnectionTestFailure, password_unreadable: bool) -> String {
+    let mut text = match &failure.auth {
+        Some(report) => {
+            let allows = tr!(
+                "sshModal",
+                "test.serverAllows",
+                methods = report.server_methods.as_str()
+            );
+            let mut lines = vec![format!("{} · {allows}", report.target)];
+            lines.extend(report.attempts.iter().map(|attempt| format!("• {attempt}")));
+            lines.join("\n")
+        }
+        None => failure.message.clone(),
+    };
+    if password_unreadable {
+        text.push_str("\n\n");
+        text.push_str(t("sshModal", "passwordUnreadable"));
+    }
+    text
+}
+
+/// 成功结果里「认证方式」的说法。
+fn auth_method_label(method: &mt_remote::AuthMethodUsed) -> String {
+    match method {
+        mt_remote::AuthMethodUsed::None => t("sshModal", "test.methodNone").to_string(),
+        mt_remote::AuthMethodUsed::PublicKey { key } => {
+            tr!("sshModal", "test.methodPublicKey", key = key.as_str())
+        }
+        mt_remote::AuthMethodUsed::Password => t("sshModal", "test.methodPassword").to_string(),
+        mt_remote::AuthMethodUsed::KeyboardInteractive => {
+            t("sshModal", "test.methodKeyboardInteractive").to_string()
+        }
     }
 }
 
@@ -613,6 +761,71 @@ struct ConnForm {
     password_unreadable: bool,
     identity: Entity<InputState>,
     group: Entity<InputState>,
+    /// 上次点「保存」/「测试连接」时没过校验的字段,连同当时的值(见 [`issue_visible`])。
+    /// 画在各自输入框下方,**不走 toast**(理由同 `password_unreadable`)。
+    issues: Vec<(FormField, String)>,
+    /// 「测试连接」的状态。
+    test: ConnTest,
+    /// 第几次测试:只有与 [`ConnTest::Running`] 对得上号的结果才回填。
+    test_seq: u64,
+    /// 测试任务。**drop 即放弃这次测试**:gpui 任务取消 → 它手里的
+    /// `mt_remote::ConnectionTest` 随之 drop → 运行时上的建连被 abort、连接掐断。关表单
+    /// (含「取消」)/ 换一条连接编辑 / 关面板都会 drop 整张表单,结果不再回填。
+    /// 测完不清(任务在自己的回调里把自己丢掉不稳妥,与 `_copied_timer` 同一手法),
+    /// 下一次测试或表单关闭时才放。
+    _test_task: Option<gpui::Task<()>>,
+}
+
+impl ConnForm {
+    fn values(&self, cx: &App) -> FormValues {
+        let read = |input: &Entity<InputState>| input.read(cx).value().to_string();
+        FormValues {
+            name: read(&self.name),
+            host: read(&self.host),
+            port: read(&self.port),
+            user: read(&self.user),
+            password: read(&self.password),
+            identity: read(&self.identity),
+            group: read(&self.group),
+        }
+    }
+
+    fn input(&self, field: FormField) -> &Entity<InputState> {
+        match field {
+            FormField::Name => &self.name,
+            FormField::Host => &self.host,
+            FormField::Port => &self.port,
+            FormField::User => &self.user,
+        }
+    }
+}
+
+/// 「测试连接」的状态。
+#[derive(Clone, Default)]
+enum ConnTest {
+    #[default]
+    Idle,
+    /// 正在测:按钮显示「测试中…」且点不动。
+    Running { seq: u64 },
+    /// 测完了。`fingerprint` 是发起测试时表单值的指纹([`form_fingerprint`]),与当前值对不上
+    /// 就把结果标成过期 —— 测试期间改了表单,结果一回来就是过期的。
+    Done {
+        outcome: ConnTestOutcome,
+        fingerprint: u64,
+    },
+}
+
+#[derive(Clone)]
+enum ConnTestOutcome {
+    Succeeded {
+        target: String,
+        method: Option<mt_remote::AuthMethodUsed>,
+    },
+    /// 一句标题(文案 key)+ 可选中复制、能折行的原文框(认证失败时逐方法一条一行)。
+    Failed {
+        headline: &'static str,
+        detail: Entity<TextareaState>,
+    },
 }
 
 pub struct SshPanel {
@@ -889,6 +1102,10 @@ fn new_form(
             window,
             cx,
         ),
+        issues: Vec::new(),
+        test: ConnTest::Idle,
+        test_seq: 0,
+        _test_task: None,
     }
 }
 
@@ -933,25 +1150,44 @@ fn toggle_password_reveal(
     }
 }
 
+/// 校验没过:把原因记到各字段下方,焦点移到第一个有问题的字段。
+fn flag_issues(
+    state: &Entity<SshPanel>,
+    values: &FormValues,
+    issues: Vec<FormField>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let first = state.update(cx, |panel, cx| {
+        let form = panel.form.as_mut()?;
+        form.issues = issues
+            .iter()
+            .map(|field| (*field, values.field(*field).to_string()))
+            .collect();
+        cx.notify();
+        issues.first().map(|field| form.input(*field).clone())
+    });
+    if let Some(input) = first {
+        input.update(cx, |input, cx| input.focus(window, cx));
+    }
+}
+
 fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
-    let Some(conn) = state.read(cx).form.as_ref().map(|f| {
-        build_connection(
-            f.id.clone(),
-            &f.name.read(cx).value().to_string(),
-            &f.host.read(cx).value().to_string(),
-            &f.port.read(cx).value().to_string(),
-            &f.user.read(cx).value().to_string(),
-            &f.password.read(cx).value().to_string(),
-            &f.identity.read(cx).value().to_string(),
-            &f.group.read(cx).value().to_string(),
-        )
-    }) else {
+    let Some((id, values)) = state
+        .read(cx)
+        .form
+        .as_ref()
+        .map(|f| (f.id.clone(), f.values(cx)))
+    else {
         return;
     };
-    if !form_valid(&conn.name, &conn.host, &conn.user) {
-        return;
-    }
-    let mut conn = conn;
+    let mut conn = match values.to_connection(id) {
+        Ok(conn) => conn,
+        Err(issues) => {
+            flag_issues(state, &values, issues, window, cx);
+            return;
+        }
+    };
     let is_new = conn.id.is_empty();
     if is_new {
         // 对既有连接去重:`upsert_ssh_connection` 按 id 覆盖,撞上就是顶掉一条老连接
@@ -963,7 +1199,12 @@ fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
             .store
             .update(cx, |store, cx| store.upsert_ssh_connection(conn, cx));
         let sealed = saved.is_ok();
-        if !matches!(&saved, Err(crate::store::SshSaveError::NotSaved(_))) {
+        if matches!(&saved, Err(crate::store::SshSaveError::NotSaved(_))) {
+            // 表单留着让用户看顶部红字;校验是过了的,字段下的红字清掉
+            if let Some(form) = panel.form.as_mut() {
+                form.issues.clear();
+            }
+        } else {
             panel.form = None;
         }
         panel.notice = saved
@@ -977,6 +1218,140 @@ fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
     if is_new && sealed && state.read(cx).return_after_add {
         close_guarded(kind::SSH_PANEL, window, cx);
     }
+}
+
+/// 「测试连接」:用表单**当前**的值(不必先保存)真连一次,认证完即断开,不执行命令。
+///
+/// 建连 / 认证 / known_hosts / 超时预算与正式连接同一套代码,但不碰会话池(见
+/// [`mt_remote::start_connection_test`])。必填项不全时与保存走同一套就地提示。结果就地画在
+/// 按钮行上方(弹窗里看不见 toast)。
+fn test_connection(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
+    let Some((id, values, running, password_unreadable)) = state.read(cx).form.as_ref().map(|f| {
+        (
+            f.id.clone(),
+            f.values(cx),
+            matches!(f.test, ConnTest::Running { .. }),
+            f.password_unreadable,
+        )
+    }) else {
+        return;
+    };
+    if running {
+        return;
+    }
+    let mut conn = match values.to_connection(id) {
+        Ok(conn) => conn,
+        Err(issues) => {
+            flag_issues(state, &values, issues, window, cx);
+            return;
+        }
+    };
+    let stored = (!conn.id.is_empty())
+        .then(|| {
+            let store = state.read(cx).store.read(cx);
+            store
+                .ssh_connections()
+                .iter()
+                .find(|c| c.id == conn.id)
+                .and_then(|c| c.password.clone())
+        })
+        .flatten();
+    conn.password = test_password(&values.password, stored.as_deref());
+    let fingerprint = form_fingerprint(&values);
+    // 已存密码解不开、用户也没重填:这次是不带密码测的,失败时提醒重新填写
+    let unreadable_hint = password_unreadable && values.password.is_empty();
+    let Some(seq) = state.update(cx, |panel, cx| {
+        let form = panel.form.as_mut()?;
+        form.issues.clear();
+        form.test_seq += 1;
+        form.test = ConnTest::Running { seq: form.test_seq };
+        cx.notify();
+        Some(form.test_seq)
+    }) else {
+        return;
+    };
+    let test = match mt_remote::start_connection_test(conn) {
+        Ok(test) => test,
+        Err(failure) => {
+            finish_test(
+                state,
+                seq,
+                Err(failure),
+                fingerprint,
+                unreadable_hint,
+                window,
+                cx,
+            );
+            return;
+        }
+    };
+    // 任务只拿弱引用:它要存进面板自己的表单里,强引用就成环了
+    let weak = state.downgrade();
+    let task = window.spawn(cx, async move |cx| {
+        let outcome = test.outcome().await;
+        let _ = cx.update(|window, cx| {
+            if let Some(state) = weak.upgrade() {
+                finish_test(
+                    &state,
+                    seq,
+                    outcome,
+                    fingerprint,
+                    unreadable_hint,
+                    window,
+                    cx,
+                );
+            }
+        });
+    });
+    state.update(cx, |panel, _cx| {
+        if let Some(form) = panel.form.as_mut() {
+            form._test_task = Some(task);
+        }
+    });
+}
+
+/// 测试结果回填。表单已经换过(关了又开、改去编辑别的连接)或这不是最近一次测试时什么都不做
+/// —— 正常情况下那些路径已经把任务连同表单一起 drop 了,这里只是兜底。
+fn finish_test(
+    state: &Entity<SshPanel>,
+    seq: u64,
+    outcome: Result<mt_remote::ProbeSuccess, mt_remote::ConnectionTestFailure>,
+    fingerprint: u64,
+    unreadable_hint: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let current =
+        state.read(cx).form.as_ref().is_some_and(
+            |f| matches!(f.test, ConnTest::Running { seq: running } if running == seq),
+        );
+    if !current {
+        return;
+    }
+    let outcome = match outcome {
+        Ok(success) => ConnTestOutcome::Succeeded {
+            target: success.target,
+            method: success.method,
+        },
+        Err(failure) => {
+            // 原文不含密码与私钥内容(mt-ssh 的报错口径),可以进日志
+            eprintln!("[ssh-panel] 测试连接失败: {}", failure.message);
+            let detail = failure_detail(&failure, unreadable_hint);
+            ConnTestOutcome::Failed {
+                headline: failure_headline_key(failure.kind),
+                detail: crate::git_ui::error_text_state(&detail, 10, window, cx),
+            }
+        }
+    };
+    state.update(cx, |panel, cx| {
+        if let Some(form) = panel.form.as_mut() {
+            form.test = ConnTest::Done {
+                outcome,
+                fingerprint,
+            };
+            cx.notify();
+        }
+    });
 }
 
 /// 删除一条连接。**不可撤销**(密码/私钥路径一并丢失)且会静默收窄已关联项目的
@@ -1763,6 +2138,9 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
         password_unreadable,
         identity,
         group,
+        values,
+        issues,
+        test,
     )) = state.read(cx).form.as_ref().map(|f| {
         (
             f.name.clone(),
@@ -1774,6 +2152,9 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
             f.password_unreadable,
             f.identity.clone(),
             f.group.clone(),
+            f.values(cx),
+            f.issues.clone(),
+            f.test.clone(),
         )
     })
     else {
@@ -1781,12 +2162,14 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
     };
     // 「解不开」的红字只在用户还没重新填之前显示;一开始输入就换回常规灰字提示
     // (弹窗每帧重建,这里读输入框的值是活的)
-    let show_unreadable = password_unreadable && password.read(cx).value().is_empty();
-    let can_save = form_valid(
-        &name.read(cx).value().to_string(),
-        &host.read(cx).value().to_string(),
-        &user.read(cx).value().to_string(),
-    );
+    let show_unreadable = password_unreadable && values.password.is_empty();
+    // 字段下的就地红字:点保存 / 测试时记下的,这一格改过就不再显示
+    let issue = |field: FormField| {
+        issue_visible(&issues, field, values.field(field))
+            .then(|| t("sshModal", field.message_key()))
+    };
+    let testing = matches!(test, ConnTest::Running { .. });
+    let test_result = render_test_result(&test, form_fingerprint(&values));
     // 分组下拉的候选:已有的具名分组
     let options: Vec<String> = {
         let panel = state.read(cx);
@@ -1804,24 +2187,41 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
         .border_1()
         .border_dashed()
         .border_color(ui::accent())
-        .child(field(t("sshModal", "nameLabel"), None, Input::new(&name)))
+        .child(field(
+            t("sshModal", "nameLabel"),
+            None,
+            with_issue(Input::new(&name), issue(FormField::Name)),
+        ))
         .child(
             div()
                 .flex()
-                .gap(px(8.0))
+                .flex_col()
+                .gap(px(4.0))
                 .child(
                     div()
-                        .flex_1()
-                        .child(field(t("sshModal", "hostLabel"), None, Input::new(&host))),
+                        .flex()
+                        .gap(px(8.0))
+                        .child(div().flex_1().child(field(
+                            t("sshModal", "hostLabel"),
+                            None,
+                            with_issue(Input::new(&host), issue(FormField::Host)),
+                        )))
+                        .child(div().w(px(96.0)).flex_none().child(field(
+                            t("sshModal", "portLabel"),
+                            None,
+                            Input::new(&port),
+                        ))),
                 )
-                .child(
-                    div()
-                        .w(px(96.0))
-                        .flex_none()
-                        .child(field(t("sshModal", "portLabel"), None, Input::new(&port))),
-                ),
+                // 端口那一栏只有 96px 宽,原因画在整行下面,不在窄栏里折成好几行
+                .when_some(issue(FormField::Port), |el, message| {
+                    el.child(issue_line(message))
+                }),
         )
-        .child(field(t("sshModal", "userLabel"), None, Input::new(&user)))
+        .child(field(
+            t("sshModal", "userLabel"),
+            None,
+            with_issue(Input::new(&user), issue(FormField::User)),
+        ))
         .child(field(
             t("sshModal", "passwordLabel"),
             if show_unreadable {
@@ -1930,6 +2330,7 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                     }
                 })),
         ))
+        .children(test_result)
         .child(
             div()
                 .flex()
@@ -1937,6 +2338,27 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                 .gap(px(8.0))
                 .pt(px(2.0))
                 .child(
+                    ui::ghost_button(
+                        "ssh-form-test",
+                        if testing {
+                            t("sshModal", "test.running")
+                        } else {
+                            t("sshModal", "test.button")
+                        },
+                    )
+                    // 测试中点不动(只是不挂点击;按钮的 hover 样式只能设一次,见 `ui`)
+                    .when(testing, |el| el.opacity(0.6).cursor_default())
+                    .when(!testing, |el| {
+                        el.on_click({
+                            let state = state.clone();
+                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                test_connection(&state, window, cx)
+                            }
+                        })
+                    }),
+                )
+                .child(
+                    // 关表单 = 放弃正在跑的测试(任务随表单 drop,见 `ConnForm::_test_task`)
                     ui::ghost_button("ssh-form-cancel", t("sshModal", "cancel")).on_click({
                         let state = state.clone();
                         move |_: &ClickEvent, _window, cx: &mut App| {
@@ -1948,17 +2370,110 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                     }),
                 )
                 .child(
-                    ui::primary_button("ssh-form-save", t("sshModal", "save"))
-                        .opacity(if can_save { 1.0 } else { 0.4 })
-                        .on_click({
-                            let state = state.clone();
-                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                                save_form(&state, window, cx)
-                            }
-                        }),
+                    // 不再按必填项变淡:点了没反应也不说缺什么,比提示更糟;
+                    // 现在点保存就地标出缺的字段(见 `flag_issues`)
+                    ui::primary_button("ssh-form-save", t("sshModal", "save")).on_click({
+                        let state = state.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            save_form(&state, window, cx)
+                        }
+                    }),
                 ),
         )
         .into_any_element()
+}
+
+/// 输入框 + 下方就地红字(没问题时只有输入框)。
+fn with_issue(control: impl IntoElement, message: Option<&'static str>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(control)
+        .when_some(message, |el, message| el.child(issue_line(message)))
+        .into_any_element()
+}
+
+/// 一行就地红字(校验没过的原因)。
+fn issue_line(message: &'static str) -> gpui::Div {
+    div()
+        .text_size(ui::font_px(11.0))
+        .text_color(ui::color_error())
+        .child(message)
+}
+
+/// 「测试连接」的结果区(按钮行上方)。没测过 / 正在测时不画。
+///
+/// 表单在测试之后改过(当前值的指纹与测试时的不同),结果整块变淡并注明「表单已修改」——
+/// 不直接清掉:用户多半是对着失败原因在改,原因留着还有用。
+fn render_test_result(test: &ConnTest, current_fingerprint: u64) -> Option<AnyElement> {
+    let ConnTest::Done {
+        outcome,
+        fingerprint,
+    } = test
+    else {
+        return None;
+    };
+    let stale = *fingerprint != current_fingerprint;
+    let body = match outcome {
+        ConnTestOutcome::Succeeded { target, method } => div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(10.0))
+            .py(px(8.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(ui::with_alpha(ui::color_success(), 0.35))
+            .bg(ui::with_alpha(ui::color_success(), 0.06))
+            .child(
+                div()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::color_success())
+                    .child(tr!("sshModal", "test.succeeded", target = target.as_str())),
+            )
+            .when_some(method.as_ref(), |el, method| {
+                el.child(
+                    div()
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_secondary())
+                        .child(tr!(
+                            "sshModal",
+                            "test.method",
+                            method = auth_method_label(method)
+                        )),
+                )
+            })
+            .into_any_element(),
+        ConnTestOutcome::Failed { headline, detail } => div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::color_error())
+                    .child(t("sshModal", headline)),
+            )
+            .child(crate::git_ui::error_text_box(detail))
+            .into_any_element(),
+    };
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(div().when(stale, |el| el.opacity(0.5)).child(body))
+            .when(stale, |el| {
+                el.child(
+                    div()
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_muted())
+                        .child(t("sshModal", "test.stale")),
+                )
+            })
+            .into_any_element(),
+    )
 }
 
 /// 一行带标签(+ 可选灰字提示)的表单字段(原版 `Field`)。
@@ -2038,41 +2553,95 @@ mod tests {
         assert!(un[0].group.is_none());
     }
 
-    /// 端口解析:非法一律回落 22(原版 `Number.isFinite && >0 && <=65535`)。
-    #[test]
-    fn 端口非法回落默认值() {
-        assert_eq!(parse_port("2222"), 2222);
-        assert_eq!(parse_port(" 22 "), 22);
-        assert_eq!(parse_port(""), 22);
-        assert_eq!(parse_port("abc"), 22);
-        assert_eq!(parse_port("0"), 22);
-        assert_eq!(parse_port("-1"), 22);
-        assert_eq!(parse_port("65536"), 22);
-        assert_eq!(parse_port("65535"), 65535);
+    fn values(name: &str, host: &str, port: &str, user: &str) -> FormValues {
+        FormValues {
+            name: name.into(),
+            host: host.into(),
+            port: port.into(),
+            user: user.into(),
+            ..FormValues::default()
+        }
     }
 
-    /// 三个必填项全都 trim 后判空。
+    /// 端口解析(口径调整过):**留空**仍回落默认 22;填了不合法的值不再静默回落 22,而是
+    /// `None` —— 保存 / 测试时就地提示「端口须为 1–65535 的整数」、不保存(原版这里一律回落
+    /// 22,填错的端口存下去连的却是 22,到连不上才发现)。
     #[test]
-    fn 表单必填三项() {
-        assert!(form_valid("n", "h", "u"));
-        assert!(!form_valid(" ", "h", "u"));
-        assert!(!form_valid("n", "", "u"));
-        assert!(!form_valid("n", "h", "   "));
+    fn 端口留空为默认值_非法值不再静默回落() {
+        assert_eq!(parse_port("2222"), Some(2222));
+        assert_eq!(parse_port(" 22 "), Some(22));
+        assert_eq!(parse_port(""), Some(22));
+        assert_eq!(parse_port("   "), Some(22));
+        assert_eq!(parse_port("65535"), Some(65535));
+        assert_eq!(parse_port("1"), Some(1));
+        assert_eq!(parse_port("abc"), None);
+        assert_eq!(parse_port("0"), None);
+        assert_eq!(parse_port("-1"), None);
+        assert_eq!(parse_port("65536"), None);
+        assert_eq!(parse_port("22x"), None);
+        assert_eq!(parse_port("2.5"), None);
     }
 
-    /// 建连接:名字/主机/用户/私钥/分组 trim,空串归 `None`;**密码不 trim**。
+    /// 三个必填项 trim 后判空,端口填了就得合法;按界面顺序列出,第一个就是要聚焦的那格。
+    #[test]
+    fn 表单校验按界面顺序列出没过的字段() {
+        assert!(form_issues("n", "h", "", "u").is_empty());
+        assert_eq!(form_issues(" ", "h", "22", "u"), vec![FormField::Name]);
+        assert_eq!(form_issues("n", "", "22", "u"), vec![FormField::Host]);
+        assert_eq!(form_issues("n", "h", "22", "   "), vec![FormField::User]);
+        assert_eq!(form_issues("n", "h", "70000", "u"), vec![FormField::Port]);
+        assert_eq!(
+            form_issues("", "", "x", ""),
+            vec![
+                FormField::Name,
+                FormField::Host,
+                FormField::Port,
+                FormField::User
+            ]
+        );
+        // 没过校验就组装不出连接,交回的是同一份字段清单
+        assert_eq!(
+            values("", "h", "x", "u")
+                .to_connection(String::new())
+                .unwrap_err(),
+            vec![FormField::Name, FormField::Port]
+        );
+    }
+
+    /// 就地红字改动即消:只有字段的值还是点保存那一刻的值时才显示。
+    #[test]
+    fn 字段改动后就地提示不再显示() {
+        let issues = vec![
+            (FormField::Name, String::new()),
+            (FormField::Port, "22x".to_string()),
+        ];
+        assert!(issue_visible(&issues, FormField::Name, ""));
+        assert!(
+            !issue_visible(&issues, FormField::Name, "p"),
+            "改过就不显示"
+        );
+        assert!(issue_visible(&issues, FormField::Port, "22x"));
+        assert!(!issue_visible(&issues, FormField::Port, "22"));
+        assert!(
+            !issue_visible(&issues, FormField::Host, ""),
+            "没记过的字段不显示"
+        );
+    }
+
+    /// 建连接:名字/主机/用户/私钥/分组 trim,空串归 `None`;**密码不 trim**;端口留空即 22。
     #[test]
     fn 建连接时空串归none且密码不裁剪() {
-        let c = build_connection(
-            "id1".into(),
-            "  prod ",
-            " 10.0.0.5 ",
-            "2222",
-            " root ",
-            " pa ss ",
-            "  ",
-            "  内网 ",
-        );
+        let form = FormValues {
+            name: "  prod ".into(),
+            host: " 10.0.0.5 ".into(),
+            port: "2222".into(),
+            user: " root ".into(),
+            password: " pa ss ".into(),
+            identity: "  ".into(),
+            group: "  内网 ".into(),
+        };
+        let c = form.to_connection("id1".into()).unwrap();
+        assert_eq!(c.id, "id1");
         assert_eq!(c.name, "prod");
         assert_eq!(c.host, "10.0.0.5");
         assert_eq!(c.port, 2222);
@@ -2081,10 +2650,106 @@ mod tests {
         assert_eq!(c.identity_file, None);
         assert_eq!(c.group.as_deref(), Some("内网"));
 
-        let empty = build_connection("i".into(), "n", "h", "x", "u", "", "", "");
+        let empty = values("n", "h", "", "u").to_connection("i".into()).unwrap();
         assert_eq!(empty.password, None);
         assert_eq!(empty.group, None);
         assert_eq!(empty.port, 22);
+    }
+
+    /// 测试结果过期判定:任何一格改了指纹就变;改回原值指纹也回来(同一进程内稳定)。
+    #[test]
+    fn 表单改动后测试结果的指纹对不上() {
+        let base = FormValues {
+            password: "pw".into(),
+            ..values("n", "h", "22", "u")
+        };
+        let same = base.clone();
+        assert_eq!(form_fingerprint(&base), form_fingerprint(&same));
+        for edit in [
+            FormValues {
+                host: "h2".into(),
+                ..base.clone()
+            },
+            FormValues {
+                password: "pw2".into(),
+                ..base.clone()
+            },
+            FormValues {
+                group: "g".into(),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(form_fingerprint(&base), form_fingerprint(&edit), "{edit:?}");
+        }
+    }
+
+    /// 测试用的密码与保存同一个封存口径:没改就是已存信封原样(与已保存的连接同一身份),
+    /// 改了是新信封且解得回新明文,留空就是不带密码。
+    #[test]
+    fn 测试连接的密码没改沿用已存信封_改了用新填的() {
+        mt_secret::install(mt_secret::Vault::generate().unwrap());
+        let stored = crate::secrets::stored_password("hunter2", None).unwrap();
+        assert_eq!(test_password("", Some(&stored)), None);
+        assert_eq!(
+            test_password("hunter2", Some(&stored)).as_deref(),
+            Some(stored.as_str()),
+            "没改密码:原样用已存信封"
+        );
+        let changed = test_password("hunter3", Some(&stored)).unwrap();
+        assert_ne!(changed, stored);
+        assert!(!changed.contains("hunter3"), "交给池的是信封,不是明文");
+        assert_eq!(
+            crate::secrets::reveal_password(&changed).unwrap(),
+            "hunter3"
+        );
+        // 新建连接(没有已存信封)同样封存后交出
+        let fresh = test_password("pw", None).unwrap();
+        assert_eq!(crate::secrets::reveal_password(&fresh).unwrap(), "pw");
+    }
+
+    /// 认证失败的原文框:首行是目标与服务器允许的方法,之后每种方法一条一行;
+    /// 认不出格式的原样展示;已存密码解不开时末尾提醒重新填写。
+    #[test]
+    fn 认证失败逐方法一条一行() {
+        let failure = mt_remote::ConnectionTestFailure {
+            kind: mt_remote::ConnectionTestFailureKind::Auth,
+            message: "authentication failed for u@h:22 (server allows: publickey,password): \
+                      identity file ~/.ssh/k (connection setting): file not found; password: \
+                      rejected by server"
+                .into(),
+            auth: Some(mt_remote::AuthFailureReport {
+                target: "u@h:22".into(),
+                server_methods: "publickey,password".into(),
+                attempts: vec![
+                    "identity file ~/.ssh/k (connection setting): file not found".into(),
+                    "password: rejected by server".into(),
+                ],
+            }),
+        };
+        let text = failure_detail(&failure, false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].starts_with("u@h:22 · "), "{text}");
+        assert!(lines[0].contains("publickey,password"), "{text}");
+        assert_eq!(
+            lines[1],
+            "• identity file ~/.ssh/k (connection setting): file not found"
+        );
+        assert_eq!(lines[2], "• password: rejected by server");
+        assert_eq!(failure_headline_key(failure.kind), "test.failedAuth");
+
+        let raw = mt_remote::ConnectionTestFailure {
+            kind: mt_remote::ConnectionTestFailureKind::Network,
+            message: "ssh connect to h:22 failed: refused".into(),
+            auth: None,
+        };
+        assert_eq!(failure_detail(&raw, false), raw.message);
+        let hinted = failure_detail(&raw, true);
+        assert!(hinted.starts_with(&raw.message), "{hinted}");
+        assert!(
+            hinted.ends_with(t("sshModal", "passwordUnreadable")),
+            "{hinted}"
+        );
     }
 
     /// 点名字复制出去的是**连接名原文**,不是底下那行 `user@host:port` 摘要,

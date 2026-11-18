@@ -432,6 +432,8 @@ pub struct SettingsView {
     // ── about 页 ──
     checking: bool,
     latest: Option<ReleaseInfo>,
+    /// `latest` 的发布说明,清洗过的 Markdown(查到时在后台清洗一次,不每帧重做)。
+    latest_notes: SharedString,
     update_error: Option<String>,
 
     /// 后台任务(hook 动作 / 皮肤导入 / 检查更新)。换一次就丢掉上一次。
@@ -707,6 +709,7 @@ impl SettingsView {
             download_dir_validation_key: None,
             checking: false,
             latest: None,
+            latest_notes: SharedString::default(),
             update_error: None,
             _job: None,
             _download_dir_job: None,

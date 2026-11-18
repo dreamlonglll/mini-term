@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use mt_core::SshConnection;
 use mt_ssh::russh;
-use mt_ssh::{AcquireErrorKind, AgentSource, CachedSession, PoolConfig, SshClientEnv, SshPool};
+use mt_ssh::{
+    AcquireErrorKind, AgentSource, AuthMethodUsed, CachedSession, PoolConfig, SshClientEnv, SshPool,
+};
 use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
@@ -1350,6 +1352,189 @@ async fn public_key_identity_file_signs_through_the_agent() {
         !log.iter()
             .any(|l| l.contains(&fingerprint(other.public_key()))),
         "the connection's key goes first: {log:?}"
+    );
+    pool.shutdown().await;
+}
+
+// ============================================================================
+// 「测试连接」:SshPool::probe
+// ============================================================================
+
+/// 与 try_acquire 同一套建连 + 认证(known_hosts 照样 accept-new 追加),成功即断开、不进池,
+/// 并报出用上的认证方式。
+#[tokio::test]
+async fn probe_authenticates_then_disconnects_without_entering_the_pool() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("probe")
+    })
+    .await;
+    let home = TestHome::new("probe");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("probe", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+
+    let ok = pool.probe(&conn).await.expect("probe");
+    assert_eq!(ok.target, format!("u@127.0.0.1:{}", server.port()));
+    assert_eq!(ok.method, Some(AuthMethodUsed::Password));
+    assert!(pool.is_empty().await, "a probe never enters the pool");
+    assert!(
+        server.wait_ended(1, Duration::from_secs(3)).await,
+        "the probe connection is closed right away"
+    );
+    assert!(
+        home.known_hosts()
+            .contains(&format!("[127.0.0.1]:{} ", server.port())),
+        "unknown host keys are recorded exactly like the formal path: {}",
+        home.known_hosts()
+    );
+
+    // 只开 keyboard-interactive 的服务器:报出的是 keyboard-interactive。
+    let kbd = TestServer::start(Behavior {
+        methods: vec![MethodKind::KeyboardInteractive],
+        kbd_password: Some("pw".into()),
+        ..Behavior::new("probe-kbd")
+    })
+    .await;
+    let mut kbd_conn = connection("probe-kbd", "127.0.0.1", kbd.port(), "u");
+    kbd_conn.password = Some("pw".into());
+    let ok = pool.probe(&kbd_conn).await.expect("keyboard-interactive");
+    assert_eq!(ok.method, Some(AuthMethodUsed::KeyboardInteractive));
+    pool.shutdown().await;
+}
+
+/// 测试失败不记冷却(紧接着的测试与正式建连都照样去连);正式建连记下的冷却,同一身份的测试
+/// 同样不去连;换了密码的测试照常去连,且不清掉旧身份那条冷却记录。
+#[tokio::test]
+async fn probe_failures_never_start_or_clear_the_auth_cooldown() {
+    let server = TestServer::start(Behavior {
+        password: Some("right".into()),
+        ..Behavior::new("probe-cooldown")
+    })
+    .await;
+    let home = TestHome::new("probe-cooldown");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut wrong = connection("probe-cooldown", "127.0.0.1", server.port(), "u");
+    wrong.password = Some("wrong".into());
+
+    let err = pool.probe(&wrong).await.expect_err("wrong password");
+    assert_eq!(err.kind, AcquireErrorKind::Auth, "{}", err.message);
+    let report = mt_ssh::parse_auth_failure(&err.message).expect("per-method report");
+    assert_eq!(report.target, format!("u@127.0.0.1:{}", server.port()));
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|a| a == "password: rejected by server"),
+        "{report:?}"
+    );
+    assert!(
+        !err.message.contains("wrong"),
+        "password leaked: {}",
+        err.message
+    );
+
+    let err = pool.probe(&wrong).await.expect_err("still wrong");
+    assert_eq!(
+        err.kind,
+        AcquireErrorKind::Auth,
+        "a probe never starts a cooldown"
+    );
+    let accepted = server.accepted();
+    let err = pool
+        .try_acquire(&wrong)
+        .await
+        .err()
+        .expect("formal attempt");
+    assert_eq!(err.kind, AcquireErrorKind::Auth, "{}", err.message);
+    assert_eq!(
+        server.accepted(),
+        accepted + 1,
+        "the formal path was not held back"
+    );
+
+    // 上面那次正式建连记下了冷却:同一身份的测试同样不去连服务器。
+    let accepted = server.accepted();
+    let err = pool.probe(&wrong).await.expect_err("cooldown");
+    assert_eq!(err.kind, AcquireErrorKind::Cooldown, "{}", err.message);
+    assert_eq!(server.accepted(), accepted, "no TCP connection in cooldown");
+
+    // 表单改了密码再测:新身份照常去连,且不把旧身份那条冷却记录清掉。
+    let mut right = wrong.clone();
+    right.password = Some("right".into());
+    let ok = pool.probe(&right).await.expect("right password");
+    assert_eq!(ok.method, Some(AuthMethodUsed::Password));
+    let err = pool.try_acquire(&wrong).await.err().expect("old identity");
+    assert_eq!(err.kind, AcquireErrorKind::Cooldown, "{}", err.message);
+    pool.shutdown().await;
+}
+
+/// 池里已有同一连接的健康会话:测试另开自己的连接,不复用、不淘汰、不替换池里那条。
+#[tokio::test]
+async fn probe_opens_its_own_connection_and_leaves_pooled_sessions_alone() {
+    let key = ed25519(31);
+    let server = TestServer::start(Behavior {
+        keys: vec![key.public_key().clone()],
+        ..Behavior::new("probe-own")
+    })
+    .await;
+    let home = TestHome::new("probe-own");
+    write_key(&home.ssh("id_probe"), &key);
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("probe-own", "127.0.0.1", server.port(), "u");
+    conn.identity_file = Some("~/.ssh/id_probe".into());
+
+    let pooled = pool.try_acquire(&conn).await.expect("pooled session");
+    let accepted = server.accepted();
+    let ok = pool.probe(&conn).await.expect("probe");
+    assert_eq!(
+        server.accepted(),
+        accepted + 1,
+        "the probe dials its own connection"
+    );
+    assert_eq!(
+        ok.method,
+        Some(AuthMethodUsed::PublicKey {
+            key: "identity file ~/.ssh/id_probe (connection setting)".into()
+        })
+    );
+    assert_eq!(pool.len().await, 1);
+    let again = pool.try_acquire(&conn).await.expect("reuse");
+    assert!(
+        Arc::ptr_eq(&pooled, &again),
+        "the pooled session is untouched"
+    );
+    assert_eq!(exec(&again, "p").await, "probe-own:p");
+    pool.shutdown().await;
+}
+
+/// 主机密钥变更:测试与正式建连一样拒绝,不改写 known_hosts。
+#[tokio::test]
+async fn probe_rejects_changed_host_keys_like_the_formal_path() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("probe-hostkey")
+    })
+    .await;
+    let home = TestHome::new("probe-hostkey");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("probe-hostkey", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+    let stale = ed25519(98).public_key().to_openssh().unwrap();
+    let recorded = format!("[127.0.0.1]:{} {stale}\n", server.port());
+    std::fs::write(home.ssh("known_hosts"), &recorded).unwrap();
+
+    let err = pool.probe(&conn).await.expect_err("mismatch");
+    assert_eq!(err.kind, AcquireErrorKind::HostKey, "{}", err.message);
+    assert!(
+        err.message.contains("host key verification failed"),
+        "{}",
+        err.message
+    );
+    assert_eq!(
+        home.known_hosts(),
+        recorded,
+        "known_hosts is left as it was"
     );
     pool.shutdown().await;
 }

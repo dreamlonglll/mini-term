@@ -427,12 +427,11 @@ pub fn move_entry(
 /// 连接自检:只探到远程 `$HOME` 为止,返回它。
 ///
 /// 原版没有独立的「测试连接」command(SshModal 只做 CRUD),这里把
-/// [`validate_dir`] 的前半段单独暴露,BB-b 若要做「测试」按钮可以直接用 ——
-/// 不新增任何行为,失败文案与真实使用同源。
-/// ⚠️ **有意保留的无调用点代码**(窄作用域 `allow`,不是整模块的那种):
-/// BB-b 逐字复刻 `SshModal.tsx` 时确认原版**没有**「测试连接」按钮,所以没有
-/// 入口接它。删掉的话哪天要加这颗按钮又得把同一段重写一遍,而它与
-/// [`validate_dir`] 共用同一条失败面 —— 留着零成本。
+/// [`validate_dir`] 的前半段单独暴露 —— 不新增任何行为,失败文案与真实使用同源。
+/// ⚠️ **有意保留的无调用点代码**(窄作用域 `allow`,不是整模块的那种)。
+/// 后来加上的「SSH 连接」表单「测试连接」按钮**不走这里**,走
+/// [`crate::start_connection_test`]:这条经池的 `acquire`,会复用池里的会话、把新会话
+/// 放进池、认证失败记冷却,测「还没保存的表单值」时这三样都不该发生。
 #[allow(dead_code)]
 pub fn probe_connection(conn: &SshConnection) -> Result<String, String> {
     validate_dir(conn, "~")

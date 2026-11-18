@@ -11,6 +11,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::Input;
+use gpui_component::text::{TextView, TextViewStyle};
 use mt_config::{AppConfig, EditorConfig};
 
 use crate::hotkeys;
@@ -727,16 +728,27 @@ impl SettingsView {
         self.checking = true;
         self.update_error = None;
         self.latest = None;
+        self.latest_notes = SharedString::default();
         cx.notify();
         self._job = Some(cx.spawn(async move |this, cx| {
+            // 发布说明来自网络:清洗(见 `update_dialog` 模块注释)顺手在后台做掉,只做一次
             let result = cx
                 .background_executor()
-                .spawn(async { fetch_latest_release() })
+                .spawn(async {
+                    fetch_latest_release().map(|release| {
+                        let notes =
+                            crate::file_viewer::sanitize_session_markdown(release.body.trim());
+                        (release, SharedString::from(notes))
+                    })
+                })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 this.checking = false;
                 match result {
-                    Ok(release) => this.latest = Some(release),
+                    Ok((release, notes)) => {
+                        this.latest = Some(release);
+                        this.latest_notes = notes;
+                    }
                     Err(err) => this.update_error = Some(err),
                 }
                 cx.notify();
@@ -747,9 +759,13 @@ impl SettingsView {
     pub(super) fn render_about_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = env!("CARGO_PKG_VERSION");
         let latest = self.latest.clone();
+        // 手动检查**不过**「忽略此版本」那道闸:有新版就如实说有(忽略只管边条按钮)
         let has_update = latest
             .as_ref()
             .is_some_and(|r| compare_versions(&r.version, current).is_gt());
+        let ignored = self.store.read(cx).config().ignored_update_version.clone();
+        let notes_style = crate::update_dialog::notes_style(cx);
+        let notes = self.latest_notes.clone();
 
         page_root()
             .child(ui::settings_section_title(t(
@@ -842,6 +858,7 @@ impl SettingsView {
                                             date = format_published_at(&release.published_at)
                                         )),
                                 )
+                                .child(release_notes(&release.version, notes, notes_style))
                                 .child(
                                     ui::primary_button(
                                         "about-download",
@@ -863,9 +880,83 @@ impl SettingsView {
                         }),
                 )
             })
+            // 正忽略着某一版时给出「不再忽略」:边条按钮的提醒就靠这里恢复
+            .when_some(ignored, |el, version| {
+                el.child(
+                    ui::settings_card()
+                        .px(px(16.0))
+                        .py(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(ui::font_px(12.0))
+                                .text_color(ui::text_secondary())
+                                .child(tr!(
+                                    "settings",
+                                    "about.ignoredVersion",
+                                    version = version.as_str()
+                                )),
+                        )
+                        .child(
+                            ui::ghost_button("about-unignore", t("settings", "about.unignore"))
+                                .flex_none()
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.store.update(cx, |store, cx| {
+                                        store.set_ignored_update_version(None, cx)
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(ui::hint(t("settings", "about.footer")))
             .into_any_element()
     }
+}
+
+/// 手动检查查到新版时那张卡里的发布说明:与「发现新版本」弹窗同一套清洗与排版
+/// (见 [`crate::update_dialog`] 模块注释),卡片里限高、超出在框里滚。`notes` 是清洗过的。
+fn release_notes(version: &str, notes: SharedString, style: TextViewStyle) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(ui::font_px(11.0))
+                .text_color(ui::text_muted())
+                .child(t("settings", "about.releaseNotes")),
+        )
+        .child(
+            div()
+                .id("about-release-notes")
+                .max_h(px(260.0))
+                .overflow_y_scroll()
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .bg(ui::bg_base())
+                .border_1()
+                .border_color(ui::border_subtle())
+                .text_size(ui::font_px(13.0))
+                .text_color(ui::text_secondary())
+                .child(if notes.is_empty() {
+                    div()
+                        .text_color(ui::text_muted())
+                        .child(t("app", "update.noNotes"))
+                        .into_any_element()
+                } else {
+                    TextView::markdown(SharedString::from(format!("about-notes-{version}")), notes)
+                        .style(style)
+                        .selectable(true)
+                        .into_any_element()
+                }),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

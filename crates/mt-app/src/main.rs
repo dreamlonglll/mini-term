@@ -138,6 +138,7 @@ mod tray;
 mod tree;
 mod ui;
 mod update_check;
+mod update_dialog;
 mod usage_panel;
 mod workbench_area;
 
@@ -482,9 +483,11 @@ struct Workspace {
     frost_task: Option<Task<()>>,
     /// 启动自检发现的新版本(`None` = 没有 / 还没查完 / 查失败)。
     ///
-    /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
-    /// **也没有「忽略此版本」** —— 原版查完就一直亮着那颗按钮,直到升级为止。
-    update_release: Option<crate::update_check::ReleaseInfo>,
+    /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘。
+    /// 边条按钮亮不亮还要过「忽略此版本」那道闸(`update_check::should_announce`,
+    /// 每帧现判 —— 在弹窗里忽略、在「关于」里不再忽略,按钮即刻跟着变)。放 `Arc` 里:
+    /// 带着发布说明正文,每帧交给按钮闭包时不整份复制。
+    update_release: Option<Arc<crate::update_check::ReleaseInfo>>,
     /// 上一次收到关闭快捷键的时刻,判按住不放的连发用
     /// (见 [`pane_actions::swallows_close_hotkey`])。
     last_close_hotkey: Option<std::time::Instant>,
@@ -638,8 +641,8 @@ impl Workspace {
 
         // 启动版本自检(audit #30)。原版在拿到版本号之后立刻 `checkForUpdate(ver)`
         // 并 `.catch(() => {})`(`App.tsx:273-281`)—— 每次启动查一次、失败静默、
-        // 没有开关也没有「忽略此版本」。HTTP 是阻塞的,丢后台执行器,回主线程只
-        // 改一个字段(与 `pricing.rs` 拉价格表同一套路)。
+        // 没有开关(「忽略此版本」是后加的,在渲染端判,见 `update_release`)。HTTP 是
+        // 阻塞的,丢后台执行器,回主线程只改一个字段(与 `pricing.rs` 拉价格表同一套路)。
         let update_check = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
@@ -647,7 +650,7 @@ impl Workspace {
                 .await;
             let Some(release) = found else { return };
             let _ = this.update(cx, |workspace: &mut Self, cx| {
-                workspace.update_release = Some(release);
+                workspace.update_release = Some(Arc::new(release));
                 cx.notify();
             });
         });
@@ -1937,12 +1940,24 @@ impl Render for Workspace {
             )
         };
         let terminal_page_active = self.workbench_area.read(cx).is_terminal_active(cx);
+        // 边条更新按钮:查到的新版本还要过「忽略此版本」那道闸
+        let update_shown = {
+            let ignored = self
+                .store
+                .read(cx)
+                .config()
+                .ignored_update_version
+                .as_deref();
+            self.update_release.clone().filter(|release| {
+                update_check::should_announce(release, env!("CARGO_PKG_VERSION"), ignored)
+            })
+        };
 
         // 条件按钮可能在鼠标仍停在原坐标时从元素树消失,这时 GPUI 不保证再补一发
         // on_hover(false)。主动按当前可见性对账,避免它的旧计时把会话偷偷热身。
         let conditional_hover_gone = (unread == 0
             && self.activity_bar_hover.leave("jump-attention"))
-            || (self.update_release.is_none() && self.activity_bar_hover.leave("open-update"));
+            || (update_shown.is_none() && self.activity_bar_hover.leave("open-update"));
         if conditional_hover_gone {
             self.activity_bar_hover_task = None;
         }
@@ -2302,19 +2317,19 @@ impl Render for Workspace {
                 })),
             )
             // 「有新版本」按钮。**只在查到更新时才出现**(原版 `updateVersion &&`,
-            // `ActivityBar.tsx:173-182`),点一下外链到那条 release 的页面。
+            // `ActivityBar.tsx:173-182`)。原版点一下直接外链到发布页;这里改成先开
+            // 「发现新版本」弹窗看发布说明,下载 / 忽略此版本 / 稍后在弹窗里选。
             // 位置照原版:排在全部常规按钮之后(下面那颗「跳到已完成」是 GPUI
             // 独有的,继续留在最末)。
-            .children(self.update_release.as_ref().map(|release| {
-                let url = release.url.clone();
+            .children(update_shown.map(|release| {
                 activity_bar::update_button(
                     "open-update",
                     tr!("app", "update.title", version = release.version.as_str()),
                     self.activity_bar_hover.is_visible("open-update"),
                     Self::activity_bar_item_hover_listener("open-update", cx),
                 )
-                .on_click(move |_event, _window, cx: &mut gpui::App| {
-                    cx.open_url(&url);
+                .on_click(move |_event, window, cx: &mut gpui::App| {
+                    update_dialog::open(&release, window, cx);
                 })
             }))
             // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口;

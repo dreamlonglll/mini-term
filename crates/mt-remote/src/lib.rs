@@ -91,6 +91,7 @@ use mt_config::SshConnection;
 use mt_project::fs::{MAX_FILE_VIEW_SIZE, TextGitignore};
 use mt_ssh::{CachedSession, SftpHandle, SshPool};
 
+mod conn_test;
 mod delete;
 mod dirs;
 mod files;
@@ -102,6 +103,7 @@ mod session_delete;
 mod sessions;
 mod transfer;
 
+pub use conn_test::*;
 pub use delete::*;
 pub use dirs::*;
 pub use files::*;
@@ -113,6 +115,8 @@ pub use git_service::{
     remote_git_source_change_guard, run_git, run_git_on, set_project_git_permission,
 };
 pub use mt_git_helper::GitFailure;
+// 「测试连接」结果里的类型(mt-app 不直接依赖 mt-ssh,经这里取)
+pub use mt_ssh::{AuthFailureReport, AuthMethodUsed, ProbeSuccess};
 pub use paths::*;
 pub use session_delete::*;
 pub use sessions::*;

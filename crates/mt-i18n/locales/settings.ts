@@ -251,6 +251,9 @@ export const settings = {
       publishedAt: "发布于 {date}",
       downloadFromGitHub: "前往 GitHub 下载",
       upToDate: "已是最新版本",
+      releaseNotes: "更新说明",
+      ignoredVersion: "已忽略版本 {version} 的更新提醒",
+      unignore: "不再忽略",
       footer: "点击检查更新从 GitHub 获取最新版本信息",
     },
     shortcuts: {
@@ -583,6 +586,9 @@ export const settings = {
       publishedAt: "Published {date}",
       downloadFromGitHub: "Download from GitHub",
       upToDate: "You are on the latest version",
+      releaseNotes: "Release notes",
+      ignoredVersion: "Update reminders for {version} are skipped",
+      unignore: "Stop skipping",
       footer: "Click Check for updates to fetch the latest version info from GitHub",
     },
     shortcuts: {

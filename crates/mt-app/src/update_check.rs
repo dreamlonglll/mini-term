@@ -114,6 +114,9 @@ pub struct ReleaseInfo {
     pub version: String,
     pub url: String,
     pub published_at: String,
+    /// 发布说明(release 的 `body`,Markdown 原文;没写为空串)。与列表同一次响应带回来,
+    /// 不另发请求。来自网络,渲染前要过一遍清洗(见 `update_dialog` 模块注释)。
+    pub body: String,
 }
 
 /// 拉 release 列表。**整体阻塞**,调用方一律丢 `cx.background_executor()`。
@@ -167,6 +170,8 @@ fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
                         version: field("tag_name"),
                         url: field("html_url"),
                         published_at: field("published_at"),
+                        // 没写说明时 GitHub 给的是 null,`field` 一样落成空串
+                        body: field("body"),
                     }
                 })
                 .collect()
@@ -206,6 +211,17 @@ pub fn pick_newer(release: ReleaseInfo, current: &str) -> Option<ReleaseInfo> {
     compare_versions(&release.version, current)
         .is_gt()
         .then_some(release)
+}
+
+/// 启动自检查到的 `latest` 该不该在边条亮按钮:比当前版本新([`pick_newer`] 同一道闸),
+/// 且不是用户「忽略此版本」记下的那一版。
+///
+/// 只认**恰好**那一版(按 [`compare_versions`] 判等,`v` 前缀与 build metadata 不影响):
+/// 忽略的是「这一版」,出现更新的版本照常提醒 —— 发布一周数版,用户跳过一版不等于不想
+/// 再听到任何更新。设置 →「关于」的手动检查不过这道闸。
+pub fn should_announce(latest: &ReleaseInfo, current: &str, ignored: Option<&str>) -> bool {
+    compare_versions(&latest.version, current).is_gt()
+        && !ignored.is_some_and(|ignored| compare_versions(&latest.version, ignored).is_eq())
 }
 
 /// **启动自检**用的一次性检查,等价于原版 `checkForUpdate(currentVersion)`
@@ -270,6 +286,7 @@ mod tests {
             version: v.to_string(),
             url: "https://example.invalid/r".to_string(),
             published_at: "2026-08-19T00:00:00Z".to_string(),
+            body: String::new(),
         };
         assert!(pick_newer(release("v0.14.0"), "0.13.1").is_some());
         // 带 `v` 前缀的 tag 与不带的当前版本要能对上(GitHub tag 是 `v0.13.1`)
@@ -293,6 +310,7 @@ mod tests {
             version: v.to_string(),
             url: "https://example.invalid/r".to_string(),
             published_at: "2026-08-20T00:00:00Z".to_string(),
+            body: String::new(),
         };
         let all = || {
             vec![
@@ -318,6 +336,51 @@ mod tests {
             Some("v1.0.0".to_string())
         );
         assert!(pick_latest(vec![], "1.0.0-beta").is_none());
+    }
+
+    /// 边条按钮:比当前新才亮;忽略的恰好是这一版时不亮(`v` 前缀不影响判等),
+    /// 出现更新的版本照常亮;没忽略过任何版本时只看新旧。
+    #[test]
+    fn 忽略的版本不亮按钮_更新的版本照常亮() {
+        let release = |v: &str| ReleaseInfo {
+            version: v.to_string(),
+            url: "https://example.invalid/r".to_string(),
+            published_at: "2026-11-18T00:00:00Z".to_string(),
+            body: "- 修复若干问题".to_string(),
+        };
+        let current = "1.13.32";
+        assert!(should_announce(&release("v1.13.33"), current, None));
+        assert!(!should_announce(
+            &release("v1.13.33"),
+            current,
+            Some("v1.13.33")
+        ));
+        assert!(
+            !should_announce(&release("v1.13.33"), current, Some("1.13.33")),
+            "带不带 v 前缀都是同一版"
+        );
+        assert!(
+            should_announce(&release("v1.13.34"), current, Some("v1.13.33")),
+            "忽略的只是那一版,更新的版本照常提醒"
+        );
+        // 不比当前新的,忽不忽略都不亮
+        assert!(!should_announce(&release("v1.13.32"), current, None));
+        assert!(!should_announce(
+            &release("v1.13.31"),
+            current,
+            Some("v1.13.33")
+        ));
+        // 预发布链路同样按 SemVer 判等
+        assert!(!should_announce(
+            &release("v1.14.0-pre.2"),
+            "1.14.0-pre.1",
+            Some("v1.14.0-pre.2")
+        ));
+        assert!(should_announce(
+            &release("v1.14.0-pre.10"),
+            "1.14.0-pre.1",
+            Some("v1.14.0-pre.2")
+        ));
     }
 
     /// 发布日期:ISO → `2026/8/19`(locale 写死,与原版一致)。

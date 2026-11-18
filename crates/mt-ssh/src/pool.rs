@@ -219,6 +219,15 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
+/// [`SshPool::probe`]「测试连接」成功的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSuccess {
+    /// 实际登录的目标 `user@host:port`(端口 0 按 22、用户名为空用本机用户名,与建连同一口径)。
+    pub target: String,
+    /// 认证用上的方法。
+    pub method: Option<crate::auth::AuthMethodUsed>,
+}
+
 /// 池内部状态。`SshPool` 用 `Mutex` 把它包起来,保证 acquire/evict 串行。
 struct PoolInner {
     /// `connection.id` → 缓存的 session。
@@ -943,21 +952,7 @@ impl SshPool {
         conn: &SshConnection,
         identity: &CachedConnectionIdentity,
     ) -> Result<CachedSession, AcquireError> {
-        let host = &identity.target;
-        let target = format!("{}@{}", host.user, host.endpoint());
-        let budget = self.config.connect_timeout;
-        let deadline = tokio::time::Instant::now() + budget;
-        let tracker = StageTracker::default();
-        let connecting = self.connect_target(conn, host, deadline, &tracker, &target);
-        let link = match tokio::time::timeout_at(deadline, connecting).await {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(AcquireError::new(
-                    AcquireErrorKind::Timeout,
-                    tracker.describe_timeout(&target, budget),
-                ));
-            }
-        };
+        let link = self.connect_link(conn, identity).await?;
         Ok(CachedSession {
             connection_identity: identity.clone(),
             handle: Mutex::new(link.handle),
@@ -968,6 +963,75 @@ impl SshPool {
             active_sftp_leases: Arc::new(AtomicUsize::new(0)),
             sftp_open_timeout: self.config.sftp_open_timeout,
         })
+    }
+
+    /// [`Self::build_session`] 与 [`Self::probe`] 共用的那一段:在 `connect_timeout` 预算内
+    /// 建连 + 认证,超时报 `Timeout` 并写明卡在哪个阶段。
+    async fn connect_link(
+        &self,
+        conn: &SshConnection,
+        identity: &CachedConnectionIdentity,
+    ) -> Result<Link, AcquireError> {
+        let host = &identity.target;
+        let target = format!("{}@{}", host.user, host.endpoint());
+        let budget = self.config.connect_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
+        let tracker = StageTracker::default();
+        let connecting = self.connect_target(conn, host, deadline, &tracker, &target);
+        match tokio::time::timeout_at(deadline, connecting).await {
+            Ok(result) => result,
+            Err(_) => Err(AcquireError::new(
+                AcquireErrorKind::Timeout,
+                tracker.describe_timeout(&target, budget),
+            )),
+        }
+    }
+
+    /// 「测试连接」:用这份连接配置走一遍与 [`Self::try_acquire`] 新建会话**同一套**的建连 +
+    /// 认证 —— 目标解析、known_hosts 校验(accept-new:没见过的主机照样追加,变更 / 吊销照样
+    /// 拒绝)、认证顺序、「重连只试密码」那一轮、`connect_timeout` 预算全都一样;认证成功即
+    /// 优雅断开,不开任何 channel、不执行命令。
+    ///
+    /// 与 `try_acquire` 的差别只在池的状态,一律**不写**:
+    /// - 不复用池里的会话,建好的连接也不进池:测的是「这份配置现在连不连得上」,池里那条
+    ///   健康会话可能是改配置之前建的;同一连接在池里的会话也不会因此被淘汰或替换;
+    /// - 不走单飞闸:测试是用户点一次跑一轮,不与正式请求合流;
+    /// - 认证失败**不记**冷却:测试失败若记下冷却,随后保存的正式连接(同一身份)就会被白白挡
+    ///   30 秒;
+    /// - 但同一身份**已经**处在冷却期时照样返回 `Cooldown`、不去连服务器 —— 冷却防的是
+    ///   fail2ban,不因为是测试就失效。这一步只读:不像 `check_auth_cooldown` 那样顺手清掉
+    ///   身份不符的旧记录(表单改了密码再测,不能把已保存配置那条记录抹掉)。
+    pub async fn probe(&self, conn: &SshConnection) -> Result<ProbeSuccess, AcquireError> {
+        let identity = CachedConnectionIdentity::new(conn, self.resolve_target(conn)?);
+        self.peek_auth_cooldown(conn, &identity)?;
+        let link = self.connect_link(conn, &identity).await?;
+        let host = &identity.target;
+        let success = ProbeSuccess {
+            target: format!("{}@{}", host.user, host.endpoint()),
+            method: link.method.clone(),
+        };
+        close_link(link, self.config.shutdown_per_session_timeout).await;
+        Ok(success)
+    }
+
+    /// 只读的冷却判定(给 [`Self::probe`]):同一身份仍在冷却期内时返错,其余一概不动。
+    fn peek_auth_cooldown(
+        &self,
+        conn: &SshConnection,
+        identity: &CachedConnectionIdentity,
+    ) -> Result<(), AcquireError> {
+        let failures = self.auth_failures();
+        let Some(record) = failures.get(&conn.id) else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        match cooldown_remaining(record, identity, now) {
+            Some(remaining) => Err(AcquireError::new(
+                AcquireErrorKind::Cooldown,
+                cooldown_message(record, remaining, now),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// 建连并认证,返回建好的 [`Link`]。任何一步失败,已建好的连接随返回值 drop 而掐断。
@@ -1002,7 +1066,10 @@ impl SshPool {
         let first =
             auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker).await;
         let earlier = match first {
-            Ok(()) => return Ok(link),
+            Ok(()) => {
+                link.method = notes.take_authenticated();
+                return Ok(link);
+            }
             Err(AuthError::RetryWithoutKeys { notes: earlier, .. }) => earlier,
             Err(other) => return Err(auth_error(other)),
         };
@@ -1028,6 +1095,7 @@ impl SshPool {
         auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker)
             .await
             .map_err(auth_error)?;
+        link.method = notes.take_authenticated();
         Ok(link)
     }
 
@@ -1071,7 +1139,12 @@ impl SshPool {
         tracker.enter(label, ConnectStage::Handshake);
         tracker.watch_stream(&kill);
         let handle = self.handshake(kill.wrap(tcp), host, label, &notes).await?;
-        Ok((Link { handle, transport }, notes))
+        let link = Link {
+            handle,
+            transport,
+            method: None,
+        };
+        Ok((link, notes))
     }
 
     /// 在已建立的传输上做 SSH 握手(标识串 + 密钥交换 + 主机密钥校验)。
@@ -1129,10 +1202,23 @@ impl SshPool {
     }
 }
 
-/// 建好的连接:会话 handle + 它底层传输的掐断开关。
+/// 建好的连接:会话 handle + 它底层传输的掐断开关 + 认证用上的方法。
 struct Link {
     handle: Handle<MtClient>,
     transport: KillOnDrop,
+    /// 认证成功用的哪一种(认证完才填)。只有 [`SshPool::probe`] 读它,池里的会话不留。
+    method: Option<auth::AuthMethodUsed>,
+}
+
+/// 优雅断开一条没进池的连接(「测试连接」用完即弃),与 [`CachedSession::close`] 同一口径:
+/// 限时 `timeout` 发 DISCONNECT,到点无论成败都掐断传输。
+async fn close_link(link: Link, timeout: Duration) {
+    let Link {
+        handle, transport, ..
+    } = link;
+    let handle = Mutex::new(handle);
+    let _ = tokio::time::timeout(timeout, disconnect_handle(&handle)).await;
+    transport.kill();
 }
 
 impl Default for SshPool {
