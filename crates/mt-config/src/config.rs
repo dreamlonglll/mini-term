@@ -2057,8 +2057,10 @@ mod tests {
         .unwrap();
         assert!(!legacy.hook_hint_shown);
 
-        let mut shown = AppConfig::default();
-        shown.hook_hint_shown = true;
+        let shown = AppConfig {
+            hook_hint_shown: true,
+            ..AppConfig::default()
+        };
         let json = serde_json::to_value(&shown).unwrap();
         assert_eq!(json["hookHintShown"], serde_json::json!(true));
         let back: AppConfig = serde_json::from_value(json).unwrap();
