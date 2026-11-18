@@ -517,6 +517,8 @@ impl Workspace {
         let workbench_area =
             cx.new(|cx| WorkbenchArea::new(store.clone(), terminal_area.clone(), cx));
         workbench_area::install(workbench_area.clone(), cx);
+        // 文件树高亮当前文件页签那一行:工作区换了活动页签要叫它重画(文件树先建,这里补订阅)
+        file_tree.update(cx, |tree, cx| tree.observe_workbench(&workbench_area, cx));
         let terminals_panel =
             cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
         let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
@@ -1024,7 +1026,7 @@ impl Workspace {
         self.store.update(cx, |store, cx| store.toggle_middle_column(cx));
     }
 
-    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表里那三条行级
+    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表与文件树的行级
     /// 按键(Enter/Space、Delete、F2)只有 F2 与全局键位表撞车,所以它不在行上
     /// 另绑一条 action,而是从这里按「有没有列表行拿着焦点」分流。
     ///
@@ -1039,6 +1041,13 @@ impl Workspace {
         if self
             .project_list
             .update(cx, |list, cx| list.rename_focused_row(window, cx))
+        {
+            return;
+        }
+        // 文件树的行拿着焦点 → 改那个文件 / 目录的名字(与它右键「重命名」同一条路)
+        if self
+            .file_tree
+            .update(cx, |tree, cx| tree.rename_focused_row(window, cx))
         {
             return;
         }

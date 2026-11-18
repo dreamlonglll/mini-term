@@ -308,6 +308,32 @@ impl AppStore {
         cx.changed(StoreEvent::ExpandedDirsChanged);
     }
 
+    /// 文件树头部「全部折叠」:清空这个项目的展开态并落盘,返回清掉之前展开着的那些
+    /// (文件树据此摘掉它们的目录监听,与逐个折叠同一口径)。
+    ///
+    /// 展开态是落盘的(`ProjectConfig::expanded_dirs`),早就看不见的深层目录也一直留在
+    /// 表里 —— 这是唯一能把它们一次清干净的入口。本来就是空的不写盘、不发事件。
+    pub fn collapse_all_dirs(&mut self, project_id: &str, cx: &mut Context<Self>) -> Vec<String> {
+        let collapsed: Vec<String> = self
+            .expanded_dirs
+            .get_mut(project_id)
+            .map(|set| set.drain().collect())
+            .unwrap_or_default();
+        let persisted = self
+            .config
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project_id)
+            .map(|project| std::mem::take(&mut project.expanded_dirs))
+            .unwrap_or_default();
+        if collapsed.is_empty() && persisted.is_empty() {
+            return collapsed;
+        }
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::ExpandedDirsChanged);
+        collapsed
+    }
+
     // === 三栏尺寸 ===
 
     pub fn set_layout_sizes(&mut self, sizes: Vec<f64>, cx: &mut Context<Self>) {
@@ -560,5 +586,40 @@ impl AppStore {
         }
         self.config_writer
             .enqueue(&self.config_store, self.token, self.config.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::AppContext as _;
+    use mt_config::{AppConfig, ProjectConfig};
+
+    use super::AppStore;
+
+    #[gpui::test]
+    fn 全部折叠清空本项目展开态并交回清掉的目录(cx: &mut gpui::TestAppContext) {
+        let mut project = ProjectConfig::new("p", "P", "/repo");
+        project.expanded_dirs = vec!["/repo/src".into(), "/repo/src/deep".into()];
+        let config = AppConfig {
+            projects: vec![project, ProjectConfig::new("q", "Q", "/other")],
+            ..AppConfig::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store.set_dir_expanded("q", "/other/a", true, cx);
+                let mut collapsed = store.collapse_all_dirs("p", cx);
+                collapsed.sort();
+                assert_eq!(collapsed, ["/repo/src", "/repo/src/deep"]);
+                assert!(!store.is_dir_expanded("p", "/repo/src"));
+                assert!(!store.is_dir_expanded("p", "/repo/src/deep"));
+                // 落盘那一份也清了,不然重启后又全展开回来
+                assert!(store.project("p").unwrap().expanded_dirs.is_empty());
+                // 别的项目不受影响
+                assert!(store.is_dir_expanded("q", "/other/a"));
+                // 已经全折着时再按一次是空操作
+                assert!(store.collapse_all_dirs("p", cx).is_empty());
+            })
+        });
     }
 }

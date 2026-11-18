@@ -228,8 +228,11 @@ use mt_i18n::{
 /// （`projectList.removeConfirm.{endsTerminals,endsTerminalsWithAi}`）、添加项目的两种
 /// 路径错误（`projectList.{pathRequired,pathNotDirectory}`）、Ctrl+` 的快捷键描述
 /// （`settings.shortcuts.toggleWorkbenchPage`）。
+/// 1777 → 1781：文件树交互一批 —— 头部「全部折叠」按钮的 tooltip（`fileTree.header.collapseAll`）、
+/// 文件页签右键「在文件树中定位」（`fileViewer.revealInFileTree`）与它定位不到时的两种就地提示
+/// （`fileTree.reveal.{outsideRoot,notFound}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1777;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1781;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

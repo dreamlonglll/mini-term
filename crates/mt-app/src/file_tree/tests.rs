@@ -1225,3 +1225,107 @@ fn 汇总优先级与原版一致() {
     // 认不出的字母不参与汇总(优先级 0)
     assert_eq!(git_priority("X"), 0);
 }
+
+/// 行上的 F2 / Delete 跟着右键菜单的项序走:菜单里有就能按,菜单里没有的键盘也不触发。
+#[test]
+fn 行上的重命名与删除跟着菜单项序走() {
+    for remote in [false, true] {
+        for is_dir in [false, true] {
+            assert!(row_key_action_available(is_dir, remote, Rename));
+            assert!(row_key_action_available(is_dir, remote, Delete));
+        }
+    }
+    // 远程菜单没有「在文件夹中打开」,按菜单判的结果也就没有
+    assert!(!row_key_action_available(false, true, RevealInFolder));
+    assert!(row_key_action_available(false, false, RevealInFolder));
+}
+
+/// 当前文件的比较键:远程是 POSIX 原文(大小写、反斜杠都算数);Windows 本地不分大小写、
+/// `\` 与 `/` 等价 —— 搜索拼出来的 `D:\proj\src/a.rs` 要认得出树上的 `D:\proj\src\a.rs`。
+#[test]
+fn 当前文件比较键按后端区分大小写与分隔符() {
+    assert_ne!(
+        tree_path_key(Path::new("/srv/A.rs"), true),
+        tree_path_key(Path::new("/srv/a.rs"), true)
+    );
+    assert_ne!(
+        tree_path_key(Path::new(r"/srv/a\b.rs"), true),
+        tree_path_key(Path::new("/srv/a/b.rs"), true)
+    );
+    assert_eq!(tree_path_key(Path::new("/srv/dir/"), true), "/srv/dir");
+    if cfg!(windows) {
+        assert_eq!(
+            tree_path_key(Path::new(r"D:\Proj\src/Main.rs"), false),
+            tree_path_key(Path::new(r"d:\proj\src\main.rs"), false)
+        );
+    }
+}
+
+/// 后代判定按整段比:`/a/bc` 不在 `/a/b` 之下,自身也不算自己的后代。
+#[test]
+fn 后代判定按整段比() {
+    assert!(key_is_under("/a/b", "/a/b/c"));
+    assert!(key_is_under("/a/b", "/a/b/c/d.rs"));
+    assert!(!key_is_under("/a/b", "/a/bc"));
+    assert!(!key_is_under("/a/b", "/a/b"));
+    assert!(!key_is_under("/a/b", "/a"));
+    // 远程项目根就是 `/` 的极端情形
+    assert!(key_is_under("/", "/etc"));
+    assert!(!key_is_under("/", "/"));
+    assert!(key_is_under("d:/proj", "d:/proj/x.rs"));
+    assert!(!key_is_under("d:/proj", "d:/project/x.rs"));
+}
+
+/// 定位在一层里的走法:命中就停、在某个目录行之下就往里钻(压缩链钻的是链尾那个真实
+/// 目录)、一行都对不上就是找不到。文件行不当目录钻,同名前缀的兄弟目录不算。
+#[test]
+fn 定位逐层找通向目标的行() {
+    let entries = vec![
+        entry("src/main/java", "/p/src/main/java", true, false),
+        entry("lib", "/p/lib", true, false),
+        entry("logs", "/p/logs", true, true),
+        entry("a.rs", "/p/a.rs", false, false),
+    ];
+    assert_eq!(
+        reveal_step(&entries, "/p/a.rs", true),
+        RevealStep::Found(PathBuf::from("/p/a.rs"))
+    );
+    assert_eq!(
+        reveal_step(&entries, "/p/src/main/java/App.java", true),
+        RevealStep::Descend(PathBuf::from("/p/src/main/java"))
+    );
+    assert_eq!(
+        reveal_step(&entries, "/p/lib/x/y.rs", true),
+        RevealStep::Descend(PathBuf::from("/p/lib"))
+    );
+    // gitignore 掉的目录照样列在树上(灰显),定位照样钻得进去
+    assert_eq!(
+        reveal_step(&entries, "/p/logs/app.log", true),
+        RevealStep::Descend(PathBuf::from("/p/logs"))
+    );
+    // `ALWAYS_IGNORE` 的目录(node_modules / target …)压根不列,定位找不到它
+    assert_eq!(
+        reveal_step(&entries, "/p/node_modules/pkg/index.js", true),
+        RevealStep::Missing
+    );
+    assert_eq!(
+        reveal_step(&entries, "/p/library/z.rs", true),
+        RevealStep::Missing
+    );
+    assert_eq!(
+        reveal_step(&entries, "/p/a.rs/x", true),
+        RevealStep::Missing
+    );
+    assert_eq!(
+        reveal_step(&entries, "/p/.git/config", true),
+        RevealStep::Missing
+    );
+    if cfg!(windows) {
+        let local = vec![entry("src", r"D:\Proj\src", true, false)];
+        let target = tree_path_key(Path::new(r"d:\proj\src/Main.rs"), false);
+        assert_eq!(
+            reveal_step(&local, &target, false),
+            RevealStep::Descend(PathBuf::from(r"D:\Proj\src"))
+        );
+    }
+}

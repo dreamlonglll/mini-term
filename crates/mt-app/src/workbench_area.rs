@@ -635,6 +635,23 @@ pub fn active_document_path(project_id: &str, cx: &App) -> Option<PathBuf> {
     project.tabs[index].local_path.clone()
 }
 
+/// 该项目当前停着的**文件页签**是哪个文件(本地 / 远程都算,打开时的原样路径);停在终端页
+/// 或 diff 页签上时为 `None`。文件树据此高亮当前文件那一行(见 `file_tree` 模块注释
+/// 「当前文件」)。
+pub fn active_file_path(project_id: &str, cx: &App) -> Option<PathBuf> {
+    let area = global(cx)?;
+    let area = area.read(cx);
+    let project = area.projects.get(project_id)?;
+    let WorkbenchPage::Tab(key) = &project.active else {
+        return None;
+    };
+    let index = project.index_of(key)?;
+    match &project.tabs[index].content {
+        TabContent::File(document) => Some(document.read(cx).source().path().to_path_buf()),
+        TabContent::Diff(_) => None,
+    }
+}
+
 /// 把 `path` 放到 `recent` 最前面(已在表里就挪上来),只留前 `cap` 条。
 ///
 /// 比较按 [`normalize_local_document_path`] 的口径:Windows 上大小写不同的两种写法是同一个
@@ -1470,6 +1487,19 @@ impl WorkbenchArea {
                     })
                     .into(),
             );
+        }
+        // 文件页签多一组「在文件树中定位」(VS Code 页签菜单的 Reveal in Explorer View 同位:
+        // 关闭那几项之后另起一组)。diff 页签对的是提交 / 改动,不是树上的一个文件,不给
+        if let Some(TabContent::File(document)) = self.tab_content(project_id, key) {
+            let path = document.read(cx).source().path().to_path_buf();
+            let project_id = project_id.to_string();
+            entries.push(menu::separator());
+            entries.push(menu::item(
+                t("fileViewer", "revealInFileTree"),
+                move |_window, cx| {
+                    crate::file_tree::reveal_in_tree(&project_id, path.clone(), cx);
+                },
+            ));
         }
         entries
     }

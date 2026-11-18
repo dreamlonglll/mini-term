@@ -572,6 +572,12 @@ impl FileViewer {
         file_name_of(&p).to_string()
     }
 
+    /// 打开时的来源(项目 / 后端 / 路径)。工作区靠它告诉文件树「当前文件是哪一个」:
+    /// 高亮那一行、页签右键「在文件树中定位」都按这里的路径找。
+    pub fn source(&self) -> &DocumentSource {
+        &self.source
+    }
+
     fn is_img(&self) -> bool {
         is_image_file(&self.path_str())
     }

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1777;
+pub const ZH_ENTRY_COUNT: usize = 1781;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1777;
+pub const EN_ENTRY_COUNT: usize = 1781;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -364,6 +364,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("empty.refreshFailed", "文件列表刷新失败，已保留缓存"),
     ("empty.retry", "重试"),
     ("empty.selectProject", "选择一个项目"),
+    ("header.collapseAll", "全部折叠"),
     ("header.editorFallback", "编辑器"),
     ("header.openWithEditor", "使用{editor}打开"),
     ("header.refresh", "刷新"),
@@ -412,6 +413,8 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("prompt.renameTitle", "重命名"),
     ("remote.broken", "SSH 连接已被删除，无法加载远程文件树"),
     ("remote.refreshTitle", "刷新（重新读取远程根 .gitignore）"),
+    ("reveal.notFound", "文件树里找不到该文件：它可能在不显示的目录里，或已被移动、删除"),
+    ("reveal.outsideRoot", "该文件不在项目根目录内，文件树里没有它"),
     ("upload.chooseFilesTitle", "选择要上传的文件"),
     ("upload.chooseFolderTitle", "选择要上传的文件夹"),
 ];
@@ -451,6 +454,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("empty.refreshFailed", "Failed to refresh file list, cached version kept"),
     ("empty.retry", "Retry"),
     ("empty.selectProject", "Select a project"),
+    ("header.collapseAll", "Collapse All"),
     ("header.editorFallback", "Editor"),
     ("header.openWithEditor", "Open with {editor}"),
     ("header.refresh", "Refresh"),
@@ -499,6 +503,8 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("prompt.renameTitle", "Rename"),
     ("remote.broken", "The SSH connection was deleted; cannot load the remote file tree"),
     ("remote.refreshTitle", "Refresh (re-reads the remote root .gitignore)"),
+    ("reveal.notFound", "Couldn't find this file in the file tree: it may be in a hidden folder, or it was moved or deleted"),
+    ("reveal.outsideRoot", "This file is outside the project root, so it isn't in the file tree"),
     ("upload.chooseFilesTitle", "Choose Files to Upload"),
     ("upload.chooseFolderTitle", "Choose a Folder to Upload"),
 ];
@@ -555,6 +561,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("remoteImageClickToLoad", "点击加载远程图片"),
     ("remoteReadOnly", "远程文件当前不可编辑"),
     ("remoteRelativeImage", "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片"),
+    ("revealInFileTree", "在文件树中定位"),
     ("save", "保存"),
     ("saveAllAndClose", "全部保存并关闭"),
     ("saveAndClose", "保存并关闭"),
@@ -621,6 +628,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("remoteImageClickToLoad", "Click to load remote image"),
     ("remoteReadOnly", "This remote file is currently read-only"),
     ("remoteRelativeImage", "Remote Markdown can only load absolute HTTP(S) images on demand"),
+    ("revealInFileTree", "Reveal in File Tree"),
     ("save", "Save"),
     ("saveAllAndClose", "Save All and Close"),
     ("saveAndClose", "Save and Close"),

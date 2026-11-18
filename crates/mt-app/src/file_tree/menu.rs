@@ -1,20 +1,18 @@
 //! 文件树的菜单构建(从 `file_tree` 平移):行/背景右键菜单、菜单项序。
 
-use std::path::{Path, PathBuf};
-
 use gpui::{ClipboardItem, Entity};
 
 use crate::file_ops::{FileBackendIdentity, FileOperationContext};
 use crate::fs_ops;
-use crate::i18n::{t, tr};
+use crate::i18n::t;
 use crate::menu::{self, MenuEntry, MenuItem};
-use crate::prompt::{Confirm, show_prompt};
 use crate::store::AppStore;
 
 use super::move_to::{MoveSource, move_to_menu_item};
 use super::ops::{
-    choose_upload_paths, copy_to_file_clipboard, new_entry_prompt, open_entry_in_terminal,
-    paste_file_clipboard, spawn_tree_op, start_download,
+    EntryTarget, choose_upload_paths, confirm_delete_entry, copy_to_file_clipboard,
+    new_entry_prompt, open_entry_in_terminal, paste_file_clipboard, rename_entry_prompt,
+    start_download,
 };
 use super::{FileTree, Row};
 
@@ -100,6 +98,15 @@ pub(super) fn file_menu_actions(
     actions
 }
 
+/// 行上的键盘动作(F2 = 重命名、Delete = 删除)能不能触发:**按右键菜单的项序判**——
+/// 菜单里没有这一项的,键盘同样不触发,两边的可用性不会各说各话。
+///
+/// 后三个 git 相关的入参只决定「查看变更 / Git 历史」那一组,与重命名 / 删除无关,
+/// 这里一律按「没有」传,免得为了判一个键去探仓库归属(本地那一路是同步 stat)。
+pub(super) fn row_key_action_available(is_dir: bool, remote: bool, action: FileMenuAction) -> bool {
+    file_menu_actions(is_dir, false, false, remote, false).contains(&Some(action))
+}
+
 /// 一行(文件/目录)的右键菜单。
 pub(super) fn file_menu(
     tree: &Entity<FileTree>,
@@ -113,6 +120,8 @@ pub(super) fn file_menu(
     let (git_enabled, in_git_repo) = git_capability;
     let root = context.root.clone();
     let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
+    // 父目录:重命名/删除/移动之后要刷的是它;新建时刷的是目录自己
+    let target = EntryTarget::of_row(row, &root, remote);
     let mut entries = Vec::new();
     // 仓库归属由树的后台任务发现；右键构建菜单绝不发 SSH 请求。
     for action in file_menu_actions(
@@ -132,16 +141,7 @@ pub(super) fn file_menu(
         let root = root.clone();
         let context = context.clone();
         let connection = connection.clone();
-        // 父目录:重命名/删除之后要刷的是它;新建时刷的是目录自己
-        let parent = if remote {
-            mt_remote::parent_posix(&path.to_string_lossy())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| root.clone())
-        } else {
-            path.parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| root.clone())
-        };
+        let parent = target.parent.clone();
 
         entries.push(match action {
             FileMenuAction::OpenWithDefault => {
@@ -255,52 +255,15 @@ pub(super) fn file_menu(
                     },
                 )
             }
+            // 重命名 / 删除与行上的 F2 / Delete 走同一个函数(见 `FileTree::run_row_key_action`)
             FileMenuAction::Rename => {
-                let is_dir = row.is_dir;
+                let target = target.clone();
                 menu::item(t("fileTree", "menu.rename"), move |window, cx| {
-                    let (tree, root, path, parent) =
-                        (tree.clone(), root.clone(), path.clone(), parent.clone());
-                    let detach_before = is_dir.then(|| path.clone());
-                    let old_name = name.clone();
-                    let context = context.clone();
-                    let connection = connection.clone();
-                    show_prompt(
-                        t("fileTree", "prompt.renameTitle"),
-                        t("fileTree", "prompt.renameMessage"),
-                        old_name.clone(),
-                        move |value, window, cx| {
-                            let new_name = value.trim().to_string();
-                            // 空名 / 没改都当没点(原版同一条判断)
-                            if new_name.is_empty() || new_name == old_name {
-                                return;
-                            }
-                            let (root, path) = (root.clone(), path.clone());
-                            let detach_before = detach_before.clone();
-                            let context = context.clone();
-                            let connection = connection.clone();
-                            spawn_tree_op(
-                                tree.clone(),
-                                context,
-                                Some(parent.clone()),
-                                false,
-                                detach_before,
-                                t("fileTree", "operation.renaming").into(),
-                                move || match connection {
-                                    Some(conn) => mt_remote::rename_entry(
-                                        &conn,
-                                        &root.to_string_lossy(),
-                                        &path.to_string_lossy(),
-                                        &new_name,
-                                    )
-                                    .map(|_| None),
-                                    None => mt_project::fs::rename_entry(&root, &path, &new_name)
-                                        .map(|_| None)
-                                        .map_err(|e| format!("{e:#}")),
-                                },
-                                window,
-                                cx,
-                            );
-                        },
+                    rename_entry_prompt(
+                        tree.clone(),
+                        context.clone(),
+                        connection.clone(),
+                        target.clone(),
                         window,
                         cx,
                     );
@@ -319,60 +282,18 @@ pub(super) fn file_menu(
                 },
             ),
             FileMenuAction::Delete => {
-                let is_dir = row.is_dir;
+                let target = target.clone();
                 MenuItem::new(t("fileTree", "menu.delete"))
                     .danger()
                     .on_click(move |window, cx| {
-                        let (tree, root, path, parent) =
-                            (tree.clone(), root.clone(), path.clone(), parent.clone());
-                        let context = context.clone();
-                        let connection = connection.clone();
-                        let (title, message) = if is_dir {
-                            (
-                                t("fileTree", "dialog.deleteFolderTitle"),
-                                tr!("fileTree", "dialog.deleteConfirmFolder", name = name),
-                            )
-                        } else {
-                            (
-                                t("fileTree", "dialog.deleteFileTitle"),
-                                tr!("fileTree", "dialog.deleteConfirmFile", name = name),
-                            )
-                        };
-                        Confirm::new(title, message)
-                            .ok_text(t("fileTree", "dialog.deleteOk"))
-                            .cancel_text(t("fileTree", "dialog.deleteCancel"))
-                            .open(
-                                move |window, cx| {
-                                    let (root, path) = (root.clone(), path.clone());
-                                    let connection = connection.clone();
-                                    let operation_path = path.clone();
-                                    spawn_tree_op(
-                                        tree.clone(),
-                                        context.clone(),
-                                        Some(parent.clone()),
-                                        false,
-                                        Some(path.clone()),
-                                        t("fileTree", "operation.deleting").into(),
-                                        move || match connection {
-                                            Some(conn) => mt_remote::delete_entry(
-                                                &conn,
-                                                &root.to_string_lossy(),
-                                                &operation_path.to_string_lossy(),
-                                            )
-                                            .map(|_| None),
-                                            None => {
-                                                mt_project::fs::delete_entry(&root, &operation_path)
-                                                    .map(|_| None)
-                                                    .map_err(|e| format!("{e:#}"))
-                                            }
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                },
-                                window,
-                                cx,
-                            );
+                        confirm_delete_entry(
+                            tree.clone(),
+                            context.clone(),
+                            connection.clone(),
+                            target.clone(),
+                            window,
+                            cx,
+                        );
                     })
                     .into()
             }
