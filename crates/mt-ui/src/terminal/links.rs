@@ -8,7 +8,7 @@
 //! # OSC 8 要亮出真实目标
 //!
 //! OSC 8 的显示文字可以写成任何样子(`https://bank.example` 底下是别的网址),所以悬停时
-//! 元素在链接旁边画一个气泡,原样显示它的目标(`TerminalElement::paint_link_target`)。
+//! 元素在链接旁边画一个气泡,原样显示它的目标(`TerminalElement::paint_link_bubble`)。
 //! 普通文本网址不画:显示的就是要打开的。气泡在 paint 里现画,不走 gpui 的 tooltip ——
 //! 那个要等 1.2s、还挂在 div 上,这里只有一个大 hitbox;悬停态本来也只有 paint 才知道。
 //!
@@ -22,12 +22,34 @@
 //! 要一帧的时机只有三个:按住 Ctrl 跨格移动(元素的 mouse-move)、Ctrl 按下 / 松开
 //! ([`super::TerminalView`] 的 modifiers-changed —— 只有焦点终端收得到,非焦点的
 //! 分屏要动一下鼠标)、本来就有的输出重绘。
+//!
+//! # 不按修饰键的悬停提示
+//!
+//! 不按 Ctrl 时网址与路径看着就是普通文字,没人知道能点。所以鼠标**停**在一格上
+//! [`LINK_HINT_DELAY`] 之后再探一次,底下是链接就给它画一条弱化的下划线、旁边出一个
+//! 「Ctrl+单击打开」的气泡(文案由宿主注入,[`LinkHintLabel`])。光标形状不变 ——
+//! 不按 Ctrl 的单击照旧是起选区,手形光标会让人以为点一下就开。
+//!
+//! 与上面「每帧现算」那条路的差别全在开销上:那条路只在按住 Ctrl 时付,这条路是
+//! 鼠标在终端上**随便晃**都可能触发,所以收得更紧([`LinkHint`] 的状态机):
+//!
+//! - **停留才探**:跨格移动只换计时器,不探、不要帧;到点才在计时器回调里探一次
+//!   (路径验盘就在这一下)。探不到链接什么都不画,也不要帧;
+//! - **只在提示出现 / 消失时要帧**:提示挂着时移动、按下鼠标、离开元素才各要一帧把它
+//!   撤掉;
+//! - **内容变了才重探**:提示挂着期间来了新输出,paint 里按内容代数判断要不要重探
+//!   (走同一份裁决缓存,不再碰盘);探出来已经不是同一个链接 —— 输出把别的文字顶到了
+//!   鼠标底下 —— 就撤掉,不许跳到别的链接上。回看位置变了直接撤(滚动等于移开);
+//! - **TUI 抓着鼠标、正在拖选、按着 Ctrl 时不做**:Ctrl 那条路自己会画,两条路叠在
+//!   一起会出两条下划线;OSC 8 的「真实目标」气泡与提示合成**一个**气泡(目标在上、
+//!   提示在最后一行),不叠两个。
 
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
-use gpui::{App, Bounds, Pixels, Point, Size, Window, point};
+use gpui::{App, Bounds, Pixels, Point, SharedString, Size, Window, point};
 use mt_terminal::TerminalEmulator;
 use mt_terminal::links::{LineCell, LogicalLine, PathCandidate};
 
@@ -106,6 +128,146 @@ impl HoveredLink {
             LinkTarget::Url { url, reveal: true } => Some(url),
             _ => None,
         }
+    }
+}
+
+/// 宿主问「这一格底下是什么链接」时拿到的答案(右键菜单的「打开链接 / 复制链接」)。
+///
+/// 与悬停、Ctrl+单击走的是同一个 [`probe`],识别口径一处。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalLink {
+    /// 宿主裁决过、能在文件页打开的文件。
+    File(FileLink),
+    /// http / https 网址(文本网址或 OSC 8 的真实目标)。
+    Url(String),
+}
+
+impl From<LinkTarget> for TerminalLink {
+    fn from(target: LinkTarget) -> Self {
+        match target {
+            LinkTarget::File(link) => Self::File(link),
+            LinkTarget::Url { url, .. } => Self::Url(url),
+        }
+    }
+}
+
+/// 不按修饰键悬停在链接上多久才出提示。比 gpui 自带 tooltip 的 1.2s 短:这是「这里能点」
+/// 的提示,鼠标划过去时不该出,停下来看的时候要来得及。
+pub const LINK_HINT_DELAY: Duration = Duration::from_millis(500);
+
+/// 悬停提示气泡里那行字(「Ctrl+单击打开」)。宿主注入(mt-ui 不依赖 mt-i18n),
+/// 每次画都现取一次,切语言立刻生效。
+pub type LinkHintLabel = Rc<dyn Fn() -> SharedString>;
+
+/// 提示挂着时探到的链接,连同探的那一刻的回看位置与内容代数。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShownHint {
+    link: HoveredLink,
+    display_offset: usize,
+    content_generation: u64,
+}
+
+/// 鼠标移动一次之后提示该怎么变。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HintMove {
+    /// 要(重新)起停留计时器,带上这一轮的代号。
+    pub rearm: Option<u64>,
+    /// 撤掉计时器(鼠标离开、按下修饰键之类,不再停留)。
+    pub disarm: bool,
+    /// 撤掉了一个挂着的提示 —— 要一帧把它擦掉。
+    pub repaint: bool,
+}
+
+/// 不按修饰键的悬停提示的状态机(口径见模块注释「不按修饰键的悬停提示」)。
+///
+/// 纯数据,不碰 gpui:计时器由元素持有,这里只发代号,到点回来的那一发靠代号认赔。
+#[derive(Default)]
+pub(crate) struct LinkHint {
+    /// 鼠标停着的屏幕格 `(列, 行)`。`None` = 不在停留(不在元素上 / 不该提示)。
+    cell: Option<(usize, usize)>,
+    /// 停留计时的代号。每换一格 / 撤销一次加一,到点回来的计时器拿它对账。
+    generation: u64,
+    /// 停够了、探到了的链接。
+    shown: Option<ShownHint>,
+}
+
+impl LinkHint {
+    /// 鼠标挪到了 `cell`(`None` = 不该提示的位置:离开元素、按着键、在滚动条上……)。
+    ///
+    /// 还在同一格不算移动:计时照走,提示照挂。
+    pub fn on_move(&mut self, cell: Option<(usize, usize)>) -> HintMove {
+        if cell == self.cell {
+            return HintMove::default();
+        }
+        self.cell = cell;
+        self.generation += 1;
+        HintMove {
+            rearm: cell.map(|_| self.generation),
+            disarm: cell.is_none(),
+            repaint: self.shown.take().is_some(),
+        }
+    }
+
+    /// 无条件撤销(按下鼠标、鼠标离开窗口)。返回要不要一帧把挂着的提示擦掉。
+    pub fn cancel(&mut self) -> bool {
+        self.on_move(None).repaint
+    }
+
+    /// 停留计时到点:代号对得上、还没探过,就返回该探的那一格。
+    pub fn elapsed(&self, generation: u64) -> Option<(usize, usize)> {
+        (generation == self.generation && self.shown.is_none())
+            .then_some(self.cell)
+            .flatten()
+    }
+
+    /// 探到了链接,挂上提示。代号已经过期(探的途中鼠标又动了)就不挂。
+    pub fn show(
+        &mut self,
+        generation: u64,
+        link: HoveredLink,
+        display_offset: usize,
+        content_generation: u64,
+    ) -> bool {
+        if generation != self.generation || self.cell.is_none() {
+            return false;
+        }
+        self.shown = Some(ShownHint {
+            link,
+            display_offset,
+            content_generation,
+        });
+        true
+    }
+
+    /// 挂着的提示在**这一帧**还算不算数(paint 里调)。
+    ///
+    /// 回看位置变了直接撤;内容代数变了用 `reprobe` 重探同一格,还是同一个目标才留着
+    /// (段落可能换了行,照新的画),否则撤掉 —— 不许借着输出滚动跳到别的链接上。
+    pub fn current(
+        &mut self,
+        display_offset: usize,
+        content_generation: u64,
+        reprobe: impl FnOnce((usize, usize)) -> Option<HoveredLink>,
+    ) -> Option<HoveredLink> {
+        let shown = self.shown.as_mut()?;
+        if shown.display_offset != display_offset {
+            self.shown = None;
+            return None;
+        }
+        if shown.content_generation != content_generation {
+            let cell = self.cell?;
+            match reprobe(cell) {
+                Some(link) if link.target == shown.link.target => {
+                    shown.link = link;
+                    shown.content_generation = content_generation;
+                }
+                _ => {
+                    self.shown = None;
+                    return None;
+                }
+            }
+        }
+        self.shown.as_ref().map(|shown| shown.link.clone())
     }
 }
 
@@ -406,6 +568,122 @@ mod tests {
         assert_eq!(wrap_link_target("abcdefghij", 5, 1), ["…ghij"]);
         // 窄到荒唐也不死循环、不丢字
         assert_eq!(wrap_link_target("abc", 0, 9).concat(), "abc");
+    }
+
+    fn url_link(url: &str, column: usize) -> HoveredLink {
+        HoveredLink {
+            target: LinkTarget::Url {
+                url: url.into(),
+                reveal: false,
+            },
+            spans: vec![LinkSpan {
+                line: 0,
+                start: column,
+                end: column + 5,
+            }],
+        }
+    }
+
+    /// 停留才探:同一格里晃不重新计时;换格换代号、旧代号到点作废;不该提示的位置撤计时器。
+    #[test]
+    fn 悬停提示停留才探且移动即取消() {
+        let mut hint = LinkHint::default();
+        let first = hint.on_move(Some((3, 1)));
+        let ticket = first.rearm.expect("进了一格就该起计时");
+        assert!(!first.repaint, "什么都没挂着,不要帧");
+        assert_eq!(
+            hint.on_move(Some((3, 1))),
+            HintMove::default(),
+            "同一格不算移动"
+        );
+        assert_eq!(hint.elapsed(ticket), Some((3, 1)));
+
+        // 换了一格:旧计时器回来也认不上
+        let second = hint.on_move(Some((4, 1))).rearm.unwrap();
+        assert_ne!(second, ticket);
+        assert_eq!(hint.elapsed(ticket), None);
+        assert!(
+            !hint.show(ticket, url_link("https://a.com", 4), 0, 1),
+            "过期的探测结果不挂"
+        );
+
+        // 不该提示的位置(离开元素、按住 Ctrl、TUI 抓鼠标……):撤计时器
+        let gone = hint.on_move(None);
+        assert_eq!(gone.rearm, None);
+        assert!(gone.disarm);
+        assert_eq!(hint.elapsed(second), None);
+    }
+
+    /// 只在提示出现 / 消失时要帧:挂着时一动就撤并要一帧,没挂着时随便晃都不要。
+    #[test]
+    fn 悬停提示只在消失时要帧() {
+        let mut hint = LinkHint::default();
+        let ticket = hint.on_move(Some((3, 1))).rearm.unwrap();
+        assert!(hint.show(ticket, url_link("https://a.com", 0), 0, 7));
+        assert_eq!(hint.elapsed(ticket), None, "已经挂上了,不再探第二次");
+        assert!(hint.on_move(Some((4, 1))).repaint);
+        assert!(!hint.on_move(Some((5, 1))).repaint);
+
+        let ticket = hint.on_move(Some((6, 1))).rearm.unwrap();
+        hint.show(ticket, url_link("https://a.com", 0), 0, 7);
+        assert!(hint.cancel(), "按下鼠标撤掉挂着的提示要一帧");
+        assert!(!hint.cancel(), "撤过了就不再要");
+    }
+
+    /// 内容没变不重探;变了重探,还是同一个链接就跟着新位置画,换了链接或回看位置变了就撤。
+    #[test]
+    fn 悬停提示挂着时按内容代数重探() {
+        let mut hint = LinkHint::default();
+        let ticket = hint.on_move(Some((3, 1))).rearm.unwrap();
+        hint.show(ticket, url_link("https://a.com", 0), 0, 7);
+
+        let same = hint.current(0, 7, |_| panic!("内容没变不该重探"));
+        assert_eq!(same, Some(url_link("https://a.com", 0)));
+
+        // 新输出把同一个链接挪了位置:留着,按新的段画
+        let moved = hint.current(0, 8, |cell| {
+            assert_eq!(cell, (3, 1));
+            Some(url_link("https://a.com", 2))
+        });
+        assert_eq!(moved, Some(url_link("https://a.com", 2)));
+        assert_eq!(
+            hint.current(0, 8, |_| None),
+            Some(url_link("https://a.com", 2))
+        );
+
+        // 输出把别的链接顶到了鼠标底下:撤,不许跳过去
+        assert_eq!(
+            hint.current(0, 9, |_| Some(url_link("https://b.com", 2))),
+            None
+        );
+        assert_eq!(hint.current(0, 9, |_| None), None, "撤了就是撤了");
+
+        // 回看位置变了(滚轮):直接撤
+        let ticket = hint.on_move(Some((4, 1))).rearm.unwrap();
+        hint.show(ticket, url_link("https://a.com", 0), 0, 9);
+        assert_eq!(hint.current(3, 9, |_| panic!("滚动不重探")), None);
+    }
+
+    #[test]
+    fn 宿主拿到的链接只留目标() {
+        let url = LinkTarget::Url {
+            url: "https://a.com".into(),
+            reveal: true,
+        };
+        assert_eq!(
+            TerminalLink::from(url),
+            TerminalLink::Url("https://a.com".into())
+        );
+        let file = FileLink {
+            path: PathBuf::from("a.rs"),
+            line: Some(3),
+            end_line: None,
+            column: None,
+        };
+        assert_eq!(
+            TerminalLink::from(LinkTarget::File(file.clone())),
+            TerminalLink::File(file)
+        );
     }
 
     #[test]

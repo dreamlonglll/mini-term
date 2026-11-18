@@ -72,8 +72,24 @@
 //! `display_offset > 0` 时终端右下角出一颗「↓」([`TerminalPane::render_scroll_bottom_button`]),
 //! 回看期间来过新输出就点一颗小圆点。回看位置在 render 里现读:滚轮 / 翻页键是终端视图
 //! 自己 `notify`,gpui 会把祖先 view(本 pane)一并标脏重画;新输出走节拍器 notify 本 pane。
+//!
+//! # 右键「清除缓冲」
+//!
+//! 要的效果是 Windows Terminal 的「清除缓冲区」:回看与当前屏都清掉、提示符重画在顶上。
+//! WT 能干净做到是因为它另调了 `ConptyClearPseudoConsole` 让 conhost 也清掉自己那份
+//! 屏幕 —— 这里没有这条通道,**只在本地清屏的话 conhost 不知道**,它以为屏上还是旧内容,
+//! 之后只补画变了的格子,提示符就再也画不回来。所以分三档([`clear_buffer_plan`]):
+//!
+//! - **普通 shell**(认得出支持 Ctrl+L 的那几家,及远程项目的登录 shell):本地清回看,再给
+//!   shell 发一个 Ctrl+L —— 清屏与重画提示符由 shell 自己做(正在输入的半行命令照样留着),
+//!   conhost 与本地的账就对得上。shell 清屏会把屏上内容推进回看(xterm / alacritty 的 ED2
+//!   语义),所以之后 [`CLEAR_REDRAW_WINDOW`] 之内来的输出再顺手清一次回看;
+//! - **AI 会话 / 全屏程序 / 认不出的 shell(cmd 之类)**:只清回看,**一个字节都不发** ——
+//!   Ctrl+L 在 Claude Code 这类 TUI 里是它自己的快捷键,在 cmd 里会变成命令行里的一个怪字符;
+//! - **程序已经退出**:没人会重画了,本地连屏带回看一起清。
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -86,13 +102,14 @@ use gpui::{
     Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Task,
     Window, div, prelude::FluentBuilder, px,
 };
-use mt_config::SshConnection;
+use mt_config::{ShellConfig, SshConnection};
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{SyncRelease, TermSize, TerminalEmulator};
-use mt_ui::terminal::{MouseMods, prefers_local_handling};
+use mt_ui::icons::ShellKind;
+use mt_ui::terminal::{MouseMods, TerminalLink, prefers_local_handling};
 use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::{
     CopiedTip, DwellConfig, FlashLine, PasteAction, TerminalSearch, TerminalSearchBar,
@@ -207,6 +224,9 @@ pub struct TerminalPane {
     scrolled_back: bool,
     /// 回看期间来过新输出 —— 「回到底部」浮钮上那颗小圆点。回到底部即清。
     unseen_output: bool,
+    /// 右键「清除缓冲」给 shell 发了 Ctrl+L 之后,到这个时刻之前来的输出都要顺手清一次回看
+    /// (shell 清屏会把屏上内容推进回看)。`None` = 没在清。见模块注释「右键「清除缓冲」」。
+    scrollback_purge_until: Option<Instant>,
     /// PTY 起不来时的错误文本(直接显示给用户,不吞)。后台起完之前是 `None` ——
     /// 「还在起」与「起失败」要看 [`Self::spawn_settled`],不能拿它当判据。
     spawn_error: Option<String>,
@@ -310,6 +330,11 @@ const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(120);
 /// 第二下就把刚退出的终端又拉起来了。500ms 盖得住手快的连按,又短到看见退出条之后再按
 /// 不会觉得「没反应」。
 const RESTART_ENTER_GRACE: Duration = Duration::from_millis(500);
+
+/// 「清除缓冲」发出 Ctrl+L 之后,多久之内的输出算 shell 那次清屏重画(见模块注释「右键
+/// 「清除缓冲」」)。要盖住远程 ssh 一来一回的延迟;放得太长则会把用户紧接着跑的命令里
+/// 滚出屏幕的那截一并清掉 —— 闲着的提示符上按下去,这段时间里本来就只有那一次重画。
+const CLEAR_REDRAW_WINDOW: Duration = Duration::from_millis(800);
 
 /// 「回到底部」浮钮离终端本体右缘的距离:pane 内边距 8 + 滚动条 6 + 滚动条留白 1,
 /// 再空出 9 —— 浮钮不压在滚动条那一竖条上(滑块拖到底时正好在这个高度)。
@@ -540,6 +565,7 @@ impl TerminalPane {
                         pane.arm_sync_release(cx);
                         if output {
                             pane.note_output();
+                            pane.purge_cleared_scrollback();
                         }
                         // 子进程快到回填之前就退了:先挂着,回填完成后再报
                         // (`PtySlot::note_exit`)—— 退出永远排在回填之后
@@ -638,6 +664,9 @@ impl TerminalPane {
                     crate::terminal_links::open,
                     crate::terminal_links::open_url,
                 )
+                // 不按修饰键停在链接上:弱化下划线 +「Ctrl+单击打开」(文案由宿主注入,
+                // mt-ui 不依赖 mt-i18n;每次画都现取,切语言立刻生效)
+                .link_hover_hint(|| SharedString::from(link_hover_hint_label()))
                 .selection_dwell(dwell)
                 .on_selection_copied(move |_text, origin, _window, cx| {
                     let _ = this_for_tip.update(cx, |pane: &mut TerminalPane, cx| {
@@ -677,6 +706,7 @@ impl TerminalPane {
             restart_requested: false,
             scrolled_back: false,
             unseen_output: false,
+            scrollback_purge_until: None,
             spawn_error: None,
             copied_tip: None,
             _tip_timer: None,
@@ -882,6 +912,60 @@ impl TerminalPane {
         if self.scrolled_back {
             self.unseen_output = true;
         }
+    }
+
+    /// 「清除缓冲」发出 Ctrl+L 之后的收尾:窗口期里来的输出(shell 的清屏重画)把屏上
+    /// 旧内容推进了回看,再清一次。过了窗口期就收手,之后的输出照常进回看。
+    fn purge_cleared_scrollback(&mut self) {
+        let Some(until) = self.scrollback_purge_until else {
+            return;
+        };
+        if Instant::now() > until {
+            self.scrollback_purge_until = None;
+            return;
+        }
+        self.emulator.clear_scrollback();
+    }
+
+    /// 右键「清除缓冲」。三档口径见模块注释「右键「清除缓冲」」与 [`clear_buffer_plan`]。
+    ///
+    /// AI 会话的判据取 pane **当下**的状态(口径同 [`crate::pane_actions::is_ai_alive`]),
+    /// shell 认的是配置里那条 shell 的可执行文件(认不出再看名字)。
+    fn clear_buffer(&mut self, cx: &mut Context<Self>) {
+        let (ai_alive, shell) = {
+            let store = AppStore::global(cx).read(cx);
+            let pane = store
+                .pane_of_pty(self.pty_id)
+                .and_then(|(pid, pane_id)| store.project_state(&pid)?.pane(&pane_id).cloned());
+            let ai_alive = pane
+                .as_ref()
+                .is_some_and(|p| crate::pane_actions::is_ai_alive(p.status));
+            let shell = pane.map_or(ShellKind::Unknown, |p| {
+                shell_kind_of(&store.config().available_shells, &p.shell_name)
+            });
+            (ai_alive, shell)
+        };
+        let plan = clear_buffer_plan(
+            self.dead_since.is_some(),
+            ai_alive,
+            self.in_alt_screen(),
+            self.remote,
+            shell,
+        );
+        match plan {
+            ClearBufferPlan::LocalAll => self.emulator.clear_all(),
+            ClearBufferPlan::ScrollbackOnly => self.emulator.clear_scrollback(),
+            ClearBufferPlan::ShellRedraw => {
+                self.emulator.clear_scrollback();
+                self.scrollback_purge_until = Some(Instant::now() + CLEAR_REDRAW_WINDOW);
+                // 当作用户按了一下 Ctrl+L:走 `write`,AI 输入旁路照常看得到(它不认这个字节)
+                self.write(b"\x0c", cx);
+            }
+        }
+        // 回看没了,滚动条与「回到底部」浮钮都要跟着变
+        self.unseen_output = false;
+        self.view.update(cx, |_, cx| cx.notify());
+        cx.notify();
     }
 
     /// 本帧的回看状态 `(在回看, 回看期间有新输出)`,顺手刷新唤醒循环要看的那一位。
@@ -1792,6 +1876,189 @@ fn branch_entries_for_pty(pty_id: u32, cx: &mut gpui::App) -> Vec<menu::MenuEntr
     crate::branch_family::branch_menu_entries(&store, &project_id, &pane_id, project_path, &segment)
 }
 
+// ─── 终端右键菜单的其余几项(链接 / 清除缓冲 / 保存缓冲) ───
+
+/// 悬停提示里那行字:「Ctrl+单击打开」,macOS 上是 ⌘。修饰键与 Ctrl+单击那条路认的
+/// `Modifiers::secondary()` 同一口径。
+fn link_hover_hint_label() -> String {
+    let modifier = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl"
+    };
+    tr!("terminal", "linkHoverHint", modifier = modifier)
+}
+
+/// 右键位置命中链接时,菜单最前面那一段(不含分隔线)。
+///
+/// 「打开」与 Ctrl+单击是同一个出口(`terminal_links::open` / `open_url`):文件在文件页
+/// 开页签、网址交给默认浏览器。「复制」:网址复制网址本身(OSC 8 则是真实目标,不是显示
+/// 文字);文件复制宿主解析好的路径(本地是绝对路径,远程项目是远程那边的绝对路径)。
+fn link_menu_entries(link: TerminalLink) -> Vec<menu::MenuEntry> {
+    match link {
+        TerminalLink::Url(url) => {
+            let copied = url.clone();
+            vec![
+                menu::item(t("terminal", "openLink"), move |_window, cx| {
+                    crate::terminal_links::open_url(&url, cx)
+                }),
+                menu::item(t("terminal", "copyLink"), move |_window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()))
+                }),
+            ]
+        }
+        TerminalLink::File(file) => {
+            let path = file.path.to_string_lossy().into_owned();
+            vec![
+                menu::item(t("terminal", "openFileLink"), move |window, cx| {
+                    crate::terminal_links::open(&file, window, cx)
+                }),
+                menu::item(t("terminal", "copyFilePath"), move |_window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()))
+                }),
+            ]
+        }
+    }
+}
+
+/// 「清除缓冲」怎么清,口径见模块注释「右键「清除缓冲」」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClearBufferPlan {
+    /// 程序已经退出:本地连屏带回看清掉。
+    LocalAll,
+    /// 只清回看,一个字节都不发。
+    ScrollbackOnly,
+    /// 清回看 + 给 shell 发 Ctrl+L,让它自己清屏、重画提示符。
+    ShellRedraw,
+}
+
+/// 这一下「清除缓冲」走哪一档。
+///
+/// 发 Ctrl+L 的前提是**确定**收的人是认它的 shell:AI 会话里(Claude Code 等 TUI 自己绑了
+/// Ctrl+L)、全屏程序里(vim 里是重画、less 里是别的意思)一律不发;cmd 与认不出的 shell
+/// 也不发 —— cmd 的行编辑不认 Ctrl+L,发过去只会在命令行里多一个控制字符,下一条命令就
+/// 带着它跑。远程项目的 pane 是 ssh,收的是服务器上的登录 shell(bash / zsh 一类),发。
+fn clear_buffer_plan(
+    dead: bool,
+    ai_alive: bool,
+    alt_screen: bool,
+    remote: bool,
+    shell: ShellKind,
+) -> ClearBufferPlan {
+    if dead {
+        return ClearBufferPlan::LocalAll;
+    }
+    if ai_alive || alt_screen {
+        return ClearBufferPlan::ScrollbackOnly;
+    }
+    let redraws = remote
+        || matches!(
+            shell,
+            ShellKind::Pwsh
+                | ShellKind::WindowsPowerShell
+                | ShellKind::Bash
+                | ShellKind::Zsh
+                | ShellKind::Fish
+                | ShellKind::Nu
+                | ShellKind::Wsl
+        );
+    if redraws {
+        ClearBufferPlan::ShellRedraw
+    } else {
+        ClearBufferPlan::ScrollbackOnly
+    }
+}
+
+/// pane 用的是哪家 shell:先认配置里那条 shell 的可执行文件(`pwsh.exe`、`cmd.exe`……,
+/// 比用户起的名字可靠),认不出再看名字。配置里已经没有这条了也按名字认。
+fn shell_kind_of(shells: &[ShellConfig], shell_name: &str) -> ShellKind {
+    let by_command = shells
+        .iter()
+        .find(|s| s.name == shell_name)
+        .map_or(ShellKind::Unknown, |s| {
+            ShellKind::from_shell_name(&s.command)
+        });
+    if by_command == ShellKind::Unknown {
+        ShellKind::from_shell_name(shell_name)
+    } else {
+        by_command
+    }
+}
+
+/// 「将缓冲保存为文件…」的建议文件名:`mini-term-年月日-时分秒.txt`。不带页签名 ——
+/// 那是用户起的名字,什么字符都可能有,文件名里放不下的还得一个个替换。
+fn buffer_file_name(now: chrono::NaiveDateTime) -> String {
+    format!("mini-term-{}.txt", now.format("%Y%m%d-%H%M%S"))
+}
+
+/// 右键「将缓冲保存为文件…」:回看 + 当前屏的纯文本(口径见 `mt_terminal::buffer`)写到用户
+/// 在系统保存对话框里选的位置。
+///
+/// 文本在**点下去那一刻**取(就是用户眼前这份),对话框开着期间的新输出不算;写盘丢后台。
+/// 对话框的起始目录:本地项目是项目根,远程项目(项目路径在服务器上)交给系统默认。
+/// 失败给 toast;取消什么都不做。
+fn save_buffer_to_file(
+    pty_id: u32,
+    emulator: Arc<TerminalEmulator>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = emulator.buffer_text();
+    let (project_id, project_name, directory) = {
+        let store = AppStore::global(cx).read(cx);
+        let project = store
+            .pane_of_pty(pty_id)
+            .and_then(|(pid, _)| store.project(&pid));
+        let directory = project
+            .filter(|p| p.ssh_connection_id.is_none())
+            .map(|p| p.path.clone())
+            .unwrap_or_default();
+        (
+            project.map(|p| p.id.clone()).unwrap_or_default(),
+            project.map(|p| p.name.clone()).unwrap_or_default(),
+            directory,
+        )
+    };
+    let name = buffer_file_name(chrono::Local::now().naive_local());
+    let prompt = cx.prompt_for_new_path(Path::new(&directory), Some(&name));
+    window
+        .spawn(cx, async move |cx| {
+            let path = match prompt.await {
+                Ok(Ok(Some(path))) => path,
+                // 取消 / 对话框那头没了
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(err)) => {
+                    let detail = format!("{err:#}");
+                    let _ = cx.update(|_window, cx| {
+                        toast_save_failure(project_id, project_name, &detail, cx)
+                    });
+                    return;
+                }
+            };
+            let written = cx
+                .background_executor()
+                .spawn(async move { std::fs::write(&path, text) })
+                .await;
+            if let Err(err) = written {
+                let detail = err.to_string();
+                let _ = cx.update(|_window, cx| {
+                    toast_save_failure(project_id, project_name, &detail, cx)
+                });
+            }
+        })
+        .detach();
+}
+
+fn toast_save_failure(project_id: String, project_name: String, detail: &str, cx: &mut App) {
+    toast::push_message(
+        ToastKind::Error,
+        project_id,
+        project_name,
+        tr!("terminal", "saveBufferFailed", detail = detail),
+        cx,
+    );
+}
+
 // ─── 终端右键「SSH 连接」的连接动作(`TerminalInstance.tsx:60-82`) ───
 //
 // 菜单项本身(悬停展开的快速连接面板)在 [`crate::ssh_quick_connect`]。
@@ -2165,6 +2432,109 @@ impl TerminalPane {
     }
 }
 
+impl TerminalPane {
+    /// 终端右键菜单的全部条目,按段排(段间分隔线):
+    ///
+    /// 1. **链接**(右键位置命中链接时才有):打开 / 复制。命中判定与 Ctrl+悬停是同一套
+    ///    ([`TerminalView::link_at`]);
+    /// 2. 复制 / 粘贴 / 全选;
+    /// 3. 查找…(与 Ctrl+F 同一个 [`Self::open_search`]);
+    /// 4. 清除缓冲 / 将缓冲保存为文件…;
+    /// 5. 会话分支段(有才出)与 SSH 连接(恒在)—— 与此前一致。
+    ///
+    /// 置灰:没有选区时「复制」灰(原版 `disabled: !hasSelection`);缓冲里一个可见字都
+    /// 没有时「全选」「保存」灰。各项动作都在菜单关掉之后跑,不借着本 pane,所以一律经
+    /// 弱引用 / 视图句柄回来,不会撞上同一实体的嵌套 update。
+    fn context_menu_entries(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Vec<menu::MenuEntry> {
+        let has_selection = self.has_selection();
+        let has_content = self.emulator.has_buffer_content();
+        let link = self.view.read(cx).link_at(position, cx);
+        let this = cx.weak_entity();
+        let mut entries = Vec::new();
+
+        if let Some(link) = link {
+            entries.extend(link_menu_entries(link));
+            entries.push(menu::separator());
+        }
+
+        let view_copy = self.view.clone();
+        let view_paste = self.view.clone();
+        let view_select = self.view.clone();
+        let focus_paste = self.focus.clone();
+        let focus_select = self.focus.clone();
+        entries.extend([
+            MenuItem::new(t("terminal", "copy"))
+                // 没有选区时置灰(原版 `disabled: !hasSelection`)
+                .disabled(!has_selection)
+                .on_click(move |_window, cx| {
+                    view_copy.update(cx, |view, cx| {
+                        view.copy_selection(cx);
+                    });
+                })
+                .into(),
+            // 走 `request_paste` 而不是 `paste`:长文本转文件挂在
+            // 宿主钩子上,直接调 `paste` 会绕过它(Ctrl+Shift+V 与
+            // 智能 Ctrl+V 同理,那两条在 mt-ui 侧已经改过来了)
+            menu::item(t("terminal", "paste"), move |window, cx| {
+                view_paste.update(cx, |view, cx| view.request_paste(window, cx));
+                // 粘完把键盘还给终端(原版 `term.focus()`)
+                window.focus(&focus_paste, cx);
+            }),
+            // 回看 + 当前屏整个选上;键盘还给终端,接着按 Ctrl+Shift+C 就能复制
+            MenuItem::new(t("terminal", "selectAll"))
+                .disabled(!has_content)
+                .on_click(move |window, cx| {
+                    view_select.update(cx, |view, cx| view.select_all(cx));
+                    window.focus(&focus_select, cx);
+                })
+                .into(),
+            menu::separator(),
+        ]);
+
+        let this_find = this.clone();
+        entries.push(
+            MenuItem::new(t("terminal", "find"))
+                .shortcut(crate::hotkeys::hotkey_label("terminalSearch"))
+                .on_click(move |window, cx| {
+                    let _ = this_find.update(cx, |pane, cx| pane.open_search(window, cx));
+                })
+                .into(),
+        );
+        entries.push(menu::separator());
+
+        let this_clear = this.clone();
+        let pty_id = self.pty_id;
+        let emulator = self.emulator.clone();
+        entries.extend([
+            menu::item(t("terminal", "clearBuffer"), move |_window, cx| {
+                let _ = this_clear.update(cx, |pane, cx| pane.clear_buffer(cx));
+            }),
+            MenuItem::new(t("terminal", "saveBuffer"))
+                .disabled(!has_content)
+                .on_click(move |window, cx| {
+                    save_buffer_to_file(pty_id, emulator.clone(), window, cx);
+                })
+                .into(),
+        ]);
+
+        // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
+        // 右键都找得到),显隐口径与项的实现都是同一份
+        entries.extend(branch_entries_for_pty(self.pty_id, cx));
+        // SSH 段:**恒在**,悬停展开快速连接面板(一条连接都没有时
+        // 面板是带「新建连接」的空态卡,见 `ssh_quick_connect`)
+        entries.push(menu::separator());
+        entries.push(crate::ssh_quick_connect::menu_entry(
+            AppStore::global(cx),
+            self.pty_id,
+        ));
+        entries
+    }
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
@@ -2193,8 +2563,8 @@ impl Render for TerminalPane {
             .on_action(|_: &TerminalZoomReset, _window, cx| {
                 zoom_terminal_font(TerminalZoom::Reset, cx)
             })
-            // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
-            // 「复制 / 粘贴」+ 分支段 + SSH 子菜单段。
+            // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu 起家),
+            // 条目见 [`TerminalPane::context_menu_entries`]。
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -2208,39 +2578,7 @@ impl Render for TerminalPane {
                         return;
                     }
                     cx.stop_propagation();
-                    let has_selection = this.has_selection();
-                    let view_copy = this.view.clone();
-                    let view_paste = this.view.clone();
-                    let focus = this.focus.clone();
-                    let mut entries = vec![
-                        MenuItem::new(t("terminal", "copy"))
-                            // 没有选区时置灰(原版 `disabled: !hasSelection`)
-                            .disabled(!has_selection)
-                            .on_click(move |_window, cx| {
-                                view_copy.update(cx, |view, cx| {
-                                    view.copy_selection(cx);
-                                });
-                            })
-                            .into(),
-                        // 走 `request_paste` 而不是 `paste`:长文本转文件挂在
-                        // 宿主钩子上,直接调 `paste` 会绕过它(Ctrl+Shift+V 与
-                        // 智能 Ctrl+V 同理,那两条在 mt-ui 侧已经改过来了)
-                        menu::item(t("terminal", "paste"), move |window, cx| {
-                            view_paste.update(cx, |view, cx| view.request_paste(window, cx));
-                            // 粘完把键盘还给终端(原版 `term.focus()`)
-                            window.focus(&focus, cx);
-                        }),
-                    ];
-                    // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
-                    // 右键都找得到),显隐口径与项的实现都是同一份
-                    entries.extend(branch_entries_for_pty(this.pty_id, cx));
-                    // SSH 段:**恒在**,悬停展开快速连接面板(一条连接都没有时
-                    // 面板是带「新建连接」的空态卡,见 `ssh_quick_connect`)
-                    entries.push(menu::separator());
-                    entries.push(crate::ssh_quick_connect::menu_entry(
-                        AppStore::global(cx),
-                        this.pty_id,
-                    ));
+                    let entries = this.context_menu_entries(event.position, cx);
                     menu::show(event.position, entries, window, cx);
                 }),
             )
@@ -2459,6 +2797,108 @@ mod tests {
         assert!(exit_message(Some(2)).contains('2'));
         assert_eq!(exit_message(Some(0)), t("paneGroup", "shellExited"));
         assert_eq!(exit_message(None), t("paneGroup", "shellExited"));
+    }
+
+    /// 「清除缓冲」:程序没了本地全清;AI 会话 / 全屏程序只清回看不发字节;认得出的 shell
+    /// 与远程项目发 Ctrl+L;cmd 与认不出的不发(Ctrl+L 会变成命令行里的怪字符)。
+    #[test]
+    fn 清除缓冲按场合分三档() {
+        use ClearBufferPlan as P;
+        // 已经退出:谁都不会重画了,哪怕退出前在 AI 会话里
+        assert_eq!(
+            clear_buffer_plan(true, true, false, false, ShellKind::Pwsh),
+            P::LocalAll
+        );
+        assert_eq!(
+            clear_buffer_plan(false, true, false, false, ShellKind::Pwsh),
+            P::ScrollbackOnly,
+            "Claude Code 这类 TUI 自己绑了 Ctrl+L"
+        );
+        assert_eq!(
+            clear_buffer_plan(false, false, true, true, ShellKind::Bash),
+            P::ScrollbackOnly,
+            "vim / less 里 Ctrl+L 另有意思,远程也一样"
+        );
+        for shell in [
+            ShellKind::Pwsh,
+            ShellKind::WindowsPowerShell,
+            ShellKind::Bash,
+            ShellKind::Zsh,
+            ShellKind::Fish,
+            ShellKind::Nu,
+            ShellKind::Wsl,
+        ] {
+            assert_eq!(
+                clear_buffer_plan(false, false, false, false, shell),
+                P::ShellRedraw,
+                "{shell:?}"
+            );
+        }
+        for shell in [ShellKind::Cmd, ShellKind::Unknown] {
+            assert_eq!(
+                clear_buffer_plan(false, false, false, false, shell),
+                P::ScrollbackOnly,
+                "{shell:?}"
+            );
+        }
+        assert_eq!(
+            clear_buffer_plan(false, false, false, true, ShellKind::Cmd),
+            P::ShellRedraw,
+            "远程 pane 收的是服务器上的登录 shell,本地配的 shell 名不作数"
+        );
+    }
+
+    /// shell 先按配置里的可执行文件认(名字是用户起的),认不出再按名字。
+    #[test]
+    fn shell_按可执行文件认_认不出再看名字() {
+        let shell = |name: &str, command: &str| ShellConfig {
+            name: name.into(),
+            command: command.into(),
+            args: None,
+        };
+        let shells = [
+            shell("我的终端", r"C:\Windows\System32\cmd.exe"),
+            shell("PS7", r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            shell("bash", "/opt/custom/sh-wrapper"),
+        ];
+        assert_eq!(
+            shell_kind_of(&shells, "我的终端"),
+            ShellKind::Cmd,
+            "名字不像 cmd 也认得出"
+        );
+        assert_eq!(shell_kind_of(&shells, "PS7"), ShellKind::Pwsh);
+        assert_eq!(
+            shell_kind_of(&shells, "bash"),
+            ShellKind::Bash,
+            "可执行文件认不出时看名字"
+        );
+        assert_eq!(
+            shell_kind_of(&shells, "zsh"),
+            ShellKind::Zsh,
+            "配置里已经没有了也按名字认"
+        );
+        assert_eq!(shell_kind_of(&[], "神秘 shell"), ShellKind::Unknown);
+    }
+
+    #[test]
+    fn 保存缓冲的建议文件名() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 11, 8)
+            .unwrap()
+            .and_hms_opt(9, 5, 3)
+            .unwrap();
+        assert_eq!(buffer_file_name(at), "mini-term-20261108-090503.txt");
+    }
+
+    #[test]
+    fn 悬停提示文案带上平台的修饰键() {
+        let label = link_hover_hint_label();
+        let modifier = if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        };
+        assert!(label.starts_with(modifier), "{label}");
+        assert!(!label.contains('{'), "占位符要替换掉: {label}");
     }
 
     /// 目标偏移钳在 `[0, history]`:历史比锚点短(热改小了回滚行数)时不越界。

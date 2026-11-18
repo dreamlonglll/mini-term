@@ -78,16 +78,19 @@ use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Corners, CursorStyle, DispatchPhase, Element,
     ElementId, EntityId, FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
-    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size,
-    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine,
+    SharedString, Size, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point,
+    px, size,
 };
 use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
 use super::input::{Arrow, arrow_bytes};
-use super::links::{self, FileLinks, HoveredLink, LinkCache, LinkTarget};
+use super::links::{
+    self, FileLinks, HoveredLink, LINK_HINT_DELAY, LinkCache, LinkHint, LinkHintLabel, LinkTarget,
+};
 use super::mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, alt_screen_scroll_bytes,
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
@@ -209,9 +212,15 @@ pub struct TerminalElement {
     search_colors: SearchColors,
     flash: Option<FlashLine>,
     file_links: Option<FileLinks>,
+    /// 不按修饰键的悬停提示文案。`None` = 不出提示。见 [`super::links`] 模块注释。
+    link_hint: Option<LinkHintLabel>,
     /// Kitty 图片的纹理缓存,由视图持有。见 [`super::images`]。
     image_cache: Option<Rc<RefCell<super::images::TerminalImageCache>>>,
 }
+
+/// 悬停提示那条下划线的透明度(相对前景色)。Ctrl 悬停那条是满色,这条只是「这里能点」
+/// 的暗示,压到三分之一上下,一眼分得出两种状态。
+const LINK_HINT_UNDERLINE_ALPHA: f32 = 0.35;
 
 /// 一次性的「整行闪一下」。跳到某一行之后给的可见反馈,到期由**宿主**撤掉
 /// (元素不持有计时器 —— 它每帧重建,存不下跨帧状态)。
@@ -299,6 +308,7 @@ impl TerminalElement {
             search_colors: SearchColors::default(),
             flash: None,
             file_links: None,
+            link_hint: None,
             image_cache: None,
         }
     }
@@ -315,6 +325,13 @@ impl TerminalElement {
     /// Ctrl(⌘)+悬停 / 单击文件路径。见 [`super::links`]。
     pub fn file_links(mut self, links: Option<FileLinks>) -> Self {
         self.file_links = links;
+        self
+    }
+
+    /// 不按修饰键悬停在链接上停一会儿,出弱化下划线 +「Ctrl+单击打开」气泡。
+    /// 要先接 [`Self::file_links`] 才有用。见 [`super::links`] 模块注释。
+    pub fn link_hint(mut self, label: Option<LinkHintLabel>) -> Self {
+        self.link_hint = label;
         self
     }
 
@@ -451,6 +468,13 @@ struct TerminalElementState {
     link_pointer: Rc<StdCell<Option<(usize, usize)>>>,
     /// 宿主对路径候选的裁决缓存。
     link_cache: Rc<RefCell<LinkCache>>,
+    /// 不按修饰键的悬停提示(见 [`super::links`] 模块注释)。
+    link_hint: Rc<RefCell<LinkHint>>,
+    /// 悬停提示的停留计时器。**必须留着句柄** —— 换格时覆盖掉旧的就是取消。
+    link_hint_task: Rc<RefCell<Option<gpui::Task<()>>>>,
+    /// 悬停提示自己那份裁决缓存。与 Ctrl 那份分开:那份一松开 Ctrl 就清,而悬停提示
+    /// 根本不按 Ctrl;这份在每次停留到点时清,刚生成的文件下一次停留就认得出。
+    link_hint_cache: Rc<RefCell<LinkCache>>,
 }
 
 impl Default for TerminalElementState {
@@ -470,6 +494,9 @@ impl Default for TerminalElementState {
             dwell_task: Rc::new(RefCell::new(None)),
             link_pointer: Rc::new(StdCell::new(None)),
             link_cache: Rc::new(RefCell::new(LinkCache::default())),
+            link_hint: Rc::new(RefCell::new(LinkHint::default())),
+            link_hint_task: Rc::new(RefCell::new(None)),
+            link_hint_cache: Rc::new(RefCell::new(LinkCache::default())),
         }
     }
 }
@@ -850,13 +877,54 @@ impl TerminalElement {
         )
     }
 
+    /// 这一帧挂着的悬停提示(不按修饰键、停留够了的那条)。**只能在 paint 里调**,
+    /// 理由同 [`Self::hovered_link`]。
+    ///
+    /// 判据与 mouse-move 那边起停留计时的条件同一套。不满足时**不撤状态**:下一次
+    /// 鼠标移动会撤,这里撤了反而要补一帧。内容变了才重探(见 [`LinkHint::current`])。
+    fn hinted_link(
+        &self,
+        prepared: &PreparedFrame,
+        window: &Window,
+        cx: &App,
+    ) -> Option<HoveredLink> {
+        self.link_hint.as_ref()?;
+        let links = self.file_links.as_ref()?;
+        let state = &prepared.state;
+        let position = window.mouse_position();
+        let on_bar = prepared
+            .scrollbar
+            .is_some_and(|bar| bar.hit(position, GRAB_SLACK) != ScrollbarHit::Miss);
+        let eligible = !window.modifiers().secondary()
+            && prepared.hitbox.is_hovered(window)
+            && !on_bar
+            && !state.selecting.get()
+            && state.reported_button.get().is_none()
+            && state.scrollbar.get().grab_offset.is_none()
+            && !mouse_reporting_active(prepared.mode);
+        if !eligible {
+            return None;
+        }
+        let display_offset = prepared.display_offset;
+        let content_generation = self.emulator.generation();
+        let mut cache = state.link_hint_cache.borrow_mut();
+        state
+            .link_hint
+            .borrow_mut()
+            .current(display_offset, content_generation, |(col, row)| {
+                let line = row as i32 - display_offset as i32;
+                links::probe(&self.emulator, links, line, col, &mut cache, cx)
+            })
+    }
+
     /// 链接下划线:每段一条 1px 的线,贴着格子底边往上 2px(与 IME 预编辑串的
-    /// 下划线同一粗细)。颜色取前景色 —— 链接文字本身可能是任何颜色,前景色在
-    /// 默认背景上的对比度由主题保证。
+    /// 下划线同一粗细)。颜色由调用方给,取的都是前景色 —— 链接文字本身可能是任何颜色,
+    /// 前景色在默认背景上的对比度由主题保证;悬停提示那条再压低透明度。
     fn paint_link_underline(
         &self,
         prepared: &PreparedFrame,
         link: &HoveredLink,
+        color: Hsla,
         window: &mut Window,
     ) {
         let cell = prepared.cell_size;
@@ -877,19 +945,24 @@ impl TerminalElement {
                     ),
                     size(cell.width * (end - span.start) as f32, px(1.0)),
                 ),
-                self.theme.foreground,
+                color,
             ));
         }
     }
 
-    /// OSC 8 链接的真实目标:显示的文字可以写成任何样子,悬停时必须看得到实际要打开的
-    /// 是什么(见 [`super::links`] 模块注释)。样式照「已复制」气泡;字体用终端字体,
-    /// 折行才能按列算。
-    fn paint_link_target(
+    /// 链接旁边的气泡:OSC 8 的真实目标(`target`)和 / 或悬停提示那行字(`footer`)。
+    ///
+    /// 目标:显示的文字可以写成任何样子,悬停时必须看得到实际要打开的是什么(见
+    /// [`super::links`] 模块注释),按列折行、留头留尾。提示:不折行,放最后一行;
+    /// 与目标同框时压暗一档,两样东西挤在一个气泡里也分得出主次 —— 不叠两个气泡。
+    /// 样式照「已复制」气泡;字体用终端字体,折行才能按列算。两样都没有就不画。
+    #[allow(clippy::too_many_arguments)]
+    fn paint_link_bubble(
         &self,
         prepared: &PreparedFrame,
         link: &HoveredLink,
-        target: &str,
+        target: Option<&str>,
+        footer: Option<&str>,
         bounds: Bounds<Pixels>,
         window: &mut Window,
         cx: &mut App,
@@ -897,6 +970,12 @@ impl TerminalElement {
         const PAD_X: Pixels = px(8.0);
         const PAD_Y: Pixels = px(4.0);
         const MAX_ROWS: usize = 6;
+        /// 与目标同框时提示行的透明度。
+        const FOOTER_ALPHA: f32 = 0.7;
+
+        if target.is_none() && footer.is_none() {
+            return;
+        }
 
         let cell = prepared.cell_size;
         let screen_row = |line: i32| {
@@ -918,17 +997,34 @@ impl TerminalElement {
             .unwrap_or(first_row);
 
         let columns = (f(bounds.size.width - PAD_X * 2.0) / f(cell.width).max(1.0)) as usize;
-        // 矮窗口里也得整个看得见:高过元素的部分会被裁掉,裁掉的偏偏是留着的尾巴
-        let max_rows = MAX_ROWS.min(prepared.screen_lines.saturating_sub(1));
+        // 矮窗口里也得整个看得见:高过元素的部分会被裁掉,裁掉的偏偏是留着的尾巴。
+        // 提示行占掉一行配额
+        let max_rows = MAX_ROWS
+            .min(prepared.screen_lines.saturating_sub(1))
+            .saturating_sub(usize::from(footer.is_some()))
+            .max(1);
         let (background, foreground) = tip_colors();
+        let footer_color = if target.is_some() {
+            Hsla {
+                a: foreground.a * FOOTER_ALPHA,
+                ..foreground
+            }
+        } else {
+            foreground
+        };
         let font = self.style.font();
-        let lines: Vec<ShapedLine> = links::wrap_link_target(target, columns, max_rows)
+        let rows = target
+            .map(|target| links::wrap_link_target(target, columns, max_rows))
+            .unwrap_or_default()
             .into_iter()
-            .map(|row| {
+            .map(|row| (row, foreground))
+            .chain(footer.map(|footer| (footer.to_string(), footer_color)));
+        let lines: Vec<ShapedLine> = rows
+            .map(|(row, color)| {
                 let run = TextRun {
                     len: row.len(),
                     font: font.clone(),
-                    color: foreground,
+                    color,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -1084,6 +1180,8 @@ impl TerminalElement {
             let on_zoom = self.on_zoom.clone();
             let touched = state.scrollbar_touched.clone();
             let app_cursor = mode.contains(TermMode::APP_CURSOR);
+            let link_hint = state.link_hint.clone();
+            let link_hint_task = state.link_hint_task.clone();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
                     return;
@@ -1097,6 +1195,11 @@ impl TerminalElement {
                 remainder.set(total - whole);
                 if whole == 0.0 {
                     return;
+                }
+                // 滚一下等于移开:鼠标底下换了文字,悬停提示要重新停留才出
+                link_hint_task.borrow_mut().take();
+                if link_hint.borrow_mut().cancel() {
+                    cx.notify(view_id);
                 }
                 // 一次滚轮事件只走一档(一格滚轮常报 3 行,按行数走会一下跳三档);
                 // 触控板的像素增量照样先攒够一行才算一档
@@ -1172,9 +1275,17 @@ impl TerminalElement {
             let on_copied = self.on_selection_copied.clone();
             let file_links = self.file_links.clone();
             let link_cache = state.link_cache.clone();
+            let link_hint = state.link_hint.clone();
+            let link_hint_task = state.link_hint_task.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
+                }
+                // 任何一键按下都撤掉悬停提示(起选区、弹右键菜单、点链接都不该再挂着它);
+                // 要再出得松手后重新停留
+                link_hint_task.borrow_mut().take();
+                if link_hint.borrow_mut().cancel() {
+                    cx.notify(view_id);
                 }
                 let mods = modifiers_of(&event.modifiers);
                 let (col, row, side) =
@@ -1362,6 +1473,11 @@ impl TerminalElement {
             let this_emulator = self.emulator.clone();
             let has_links = self.file_links.is_some();
             let link_pointer = state.link_pointer.clone();
+            // 悬停提示:接了文案和链接能力才做
+            let hint_links = self.link_hint.as_ref().and(self.file_links.clone());
+            let link_hint = state.link_hint.clone();
+            let link_hint_task = state.link_hint_task.clone();
+            let link_hint_cache = state.link_hint_cache.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -1384,6 +1500,50 @@ impl TerminalElement {
                         (col, row)
                     });
                     if link_pointer.replace(cell) != cell {
+                        cx.notify(view_id);
+                    }
+                }
+
+                // ── 不按修饰键的悬停提示:跨格只换停留计时器,不探、不要帧;挂着的
+                //    提示被移开时才要一帧擦掉(口径见 `super::links` 模块注释)。
+                //    TUI 抓着鼠标、正在拖选 / 拖滚动条、按着 Ctrl、悬在滚动条上都不提示
+                if let Some(links) = hint_links.as_ref() {
+                    let on_bar = bar.is_some_and(|layout| {
+                        layout.hit(event.position, GRAB_SLACK) != ScrollbarHit::Miss
+                    });
+                    let cell = (!event.modifiers.secondary()
+                        && event.pressed_button.is_none()
+                        && !selecting.get()
+                        && reported.get().is_none()
+                        && !mouse_reporting_active(mode)
+                        && !on_bar
+                        && hitbox.is_hovered(window))
+                    .then(|| {
+                        let (col, row, _) = Self::hit_cell(
+                            event.position,
+                            origin,
+                            cell_size,
+                            columns,
+                            screen_lines,
+                        );
+                        (col, row)
+                    });
+                    let step = link_hint.borrow_mut().on_move(cell);
+                    if let Some(generation) = step.rearm {
+                        *link_hint_task.borrow_mut() = Some(arm_link_hint(
+                            generation,
+                            link_hint.clone(),
+                            link_hint_cache.clone(),
+                            this_emulator.clone(),
+                            links.clone(),
+                            view_id,
+                            window,
+                            cx,
+                        ));
+                    } else if step.disarm {
+                        link_hint_task.borrow_mut().take();
+                    }
+                    if step.repaint {
                         cx.notify(view_id);
                     }
                 }
@@ -1586,7 +1746,69 @@ impl TerminalElement {
                 }
             });
         }
+
+        // ── 鼠标离开窗口:mouse-move 不会再来,挂着的悬停提示在这里撤
+        if self.link_hint.is_some() {
+            let link_hint = state.link_hint.clone();
+            let link_hint_task = state.link_hint_task.clone();
+            window.on_mouse_event(move |_: &MouseExitEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                link_hint_task.borrow_mut().take();
+                if link_hint.borrow_mut().cancel() {
+                    cx.notify(view_id);
+                }
+            });
+        }
     }
+}
+
+/// 起一个悬停提示的停留计时器(口径见 [`super::links`] 模块注释「不按修饰键的悬停提示」)。
+/// 返回的 `Task` 必须由元素状态持有 —— 换格时覆盖掉旧句柄就是取消。
+///
+/// 到点才探:代号对不上(期间鼠标动过)、TUI 开了鼠标上报、按下了 Ctrl 都作罢;探不到
+/// 链接也作罢 —— **这几条路都不要帧**,只有真挂上提示才 notify 一次。每次到点都先清掉
+/// 裁决缓存再验盘:刚生成的文件这一次就认得出。
+#[allow(clippy::too_many_arguments)]
+fn arm_link_hint(
+    generation: u64,
+    hint: Rc<RefCell<LinkHint>>,
+    cache: Rc<RefCell<LinkCache>>,
+    emulator: Arc<TerminalEmulator>,
+    file_links: FileLinks,
+    view_id: EntityId,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Task<()> {
+    window.spawn(cx, async move |cx| {
+        cx.background_executor().timer(LINK_HINT_DELAY).await;
+        let _ = cx.update(|window, cx| {
+            let Some((col, row)) = hint.borrow().elapsed(generation) else {
+                return;
+            };
+            if window.modifiers().secondary() || mouse_reporting_active(emulator.mode()) {
+                return;
+            }
+            let (display_offset, content_generation) =
+                emulator.with_term(|term| (term.grid().display_offset(), emulator.generation()));
+            let line = row as i32 - display_offset as i32;
+            let link = {
+                let mut cache = cache.borrow_mut();
+                cache.clear();
+                links::probe(&emulator, &file_links, line, col, &mut cache, cx)
+            };
+            let Some(link) = link else {
+                return;
+            };
+            if hint
+                .borrow_mut()
+                .show(generation, link, display_offset, content_generation)
+            {
+                cx.notify(view_id);
+            }
+        });
+    })
 }
 
 /// 起一个 dwell 定时器。返回的 `Task` **必须被宿主持有** —— 一 drop 就取消,
@@ -2183,6 +2405,12 @@ impl Element for TerminalElement {
         // 链接的悬停态:这一帧现算(理由见 `super::links` 模块注释)。
         // 不进行签名、不碰 RowCache —— 下划线是叠在格子上的一层浮标,与整行闪烁同一口径
         let hovered_link = self.hovered_link(prepared, window, cx);
+        // 不按修饰键的悬停提示:Ctrl 那条在画的时候让位(两条下划线不叠)
+        let hinted_link = if hovered_link.is_none() {
+            self.hinted_link(prepared, window, cx)
+        } else {
+            None
+        };
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for (y, render) in prepared.rows.iter() {
                 let delta = point(origin.x, origin.y + *y);
@@ -2291,10 +2519,27 @@ impl Element for TerminalElement {
 
             // ── 链接下划线压在文字之上、预编辑浮层之下(组合串要盖住它底下的一切)
             if let Some(link) = hovered_link.as_ref() {
-                self.paint_link_underline(prepared, link, window);
+                self.paint_link_underline(prepared, link, self.theme.foreground, window);
                 if let Some(target) = link.revealed_target() {
-                    self.paint_link_target(prepared, link, target, bounds, window, cx);
+                    self.paint_link_bubble(prepared, link, Some(target), None, bounds, window, cx);
                 }
+            } else if let Some(link) = hinted_link.as_ref() {
+                // 弱化的下划线 +「Ctrl+单击打开」;OSC 8 的真实目标并进同一个气泡
+                let weak = Hsla {
+                    a: self.theme.foreground.a * LINK_HINT_UNDERLINE_ALPHA,
+                    ..self.theme.foreground
+                };
+                self.paint_link_underline(prepared, link, weak, window);
+                let label = self.link_hint.as_ref().map(|label| label());
+                self.paint_link_bubble(
+                    prepared,
+                    link,
+                    link.revealed_target(),
+                    label.as_deref(),
+                    bounds,
+                    window,
+                    cx,
+                );
             }
 
             // ── IME 预编辑浮层:盖住底下的 grid 内容再画,否则组合串会与残留字符叠糊

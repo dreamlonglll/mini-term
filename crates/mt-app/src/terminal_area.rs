@@ -34,8 +34,9 @@ use std::collections::HashMap;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
+    MouseUpEvent, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, anchored, canvas, deferred, div, point,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, ShellIcon, ShellKind, VectorIcon};
@@ -665,10 +666,14 @@ fn sizes_to_percent(pixels: &[f64]) -> Option<Vec<f64>> {
 
 /// tab 右键菜单的**项序**。`None` = 分隔线。
 ///
-/// 对照 `PaneGroup.tsx:336-383`,逐项照抄(含分支那一段的条件出现)。
+/// 底子对照 `PaneGroup.tsx:336-383`(含分支那一段的条件出现);原版之后补的四项
+/// (复制此终端 / 最大化 / 关闭其他 / 关闭右侧)按常见终端的习惯插进去:
+/// 改名 → 复制 → 分屏 → 分支 → 最大化 → 关闭一族。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabMenuAction {
     Rename,
+    /// 「复制此终端」:同组新页签,继承 shell 与 cwd(`AppStore::duplicate_pane`)。
+    Duplicate,
     SplitRight,
     SplitDown,
     /// 「分支会话到新分屏」。有会话身份 + 该 agent 有 fork 能力位时才出。
@@ -678,7 +683,13 @@ enum TabMenuAction {
     /// 「分支会话(未获会话身份…)」置灰提示。与上面两项**互斥**:
     /// 前者要有身份,它要的恰恰是没身份。
     ForkNeedsIdentity,
+    /// 「最大化 / 还原」,与控制条那颗按钮同一个动作(`toggle_maximized_leaf`)。
+    ToggleMaximize,
     CloseTab,
+    /// 「关闭其他终端」(同组)。
+    CloseOthers,
+    /// 「关闭右侧终端」(同组)。
+    CloseToRight,
     ClosePane,
 }
 
@@ -688,6 +699,7 @@ fn tab_menu_actions(can_fork: bool, identity_missing: bool) -> Vec<Option<TabMen
     use TabMenuAction::*;
     let mut actions = vec![
         Some(Rename),
+        Some(Duplicate),
         None,
         Some(SplitRight),
         Some(SplitDown),
@@ -698,8 +710,39 @@ fn tab_menu_actions(can_fork: bool, identity_missing: bool) -> Vec<Option<TabMen
     if identity_missing {
         actions.extend([None, Some(ForkNeedsIdentity)]);
     }
-    actions.extend([None, Some(CloseTab), Some(ClosePane)]);
+    actions.extend([
+        None,
+        Some(ToggleMaximize),
+        None,
+        Some(CloseTab),
+        Some(CloseOthers),
+        Some(CloseToRight),
+        Some(ClosePane),
+    ]);
     actions
+}
+
+/// 「最大化 / 还原」这一项现在是什么样:`None` = 用不上(置灰,标「最大化」);
+/// `Some(true)` = 它那一组正铺满(标「还原」);`Some(false)` = 可以铺满。
+///
+/// 判据与控制条那颗按钮一致:真分了屏才有意义(`maximized_pane_id` 自带这道闸),
+/// 「正铺满」看**组**不看 pane(铺满后组内切过 tab,记着的还是切换前那个 pane),
+/// 与 [`AppStore::toggle_maximized_leaf`] 的口径同一份。再多一条:pane 得在活动面板的
+/// 布局里 —— 终端列表竖条里右键的可能是别的面板上的 pane,铺满只作用于活动面板。
+fn maximize_menu_state(
+    layout: Option<&SplitNode>,
+    maximized_pane_id: Option<&str>,
+    pane_id: &str,
+) -> Option<bool> {
+    let layout = layout?;
+    if !matches!(layout, SplitNode::Split { .. }) {
+        return None;
+    }
+    let leaf = layout.leaf_of_pane(pane_id)?.id();
+    let maximized_leaf = maximized_pane_id
+        .and_then(|id| layout.leaf_of_pane(id))
+        .map(|node| node.id());
+    Some(maximized_leaf == Some(leaf))
 }
 
 /// 组装一个 tab 的右键菜单。`label` 是它当前的显示名(重命名的默认值)。
@@ -728,6 +771,21 @@ pub(crate) fn tab_menu(
         BranchMenuSegment::Fork { session_id, .. } => session_id.clone(),
         _ => String::new(),
     };
+    let maximize = {
+        let s = store.read(cx);
+        maximize_menu_state(
+            s.project_state(project_id)
+                .and_then(|st| st.active_layout()),
+            s.maximized_pane_id(project_id),
+            pane_id,
+        )
+    };
+    // 没得可关就置灰(而不是抽掉那一项):菜单条目固定,肌肉记忆才稳(文件页签同一口径)
+    let nothing_to_close = |scope| {
+        pane_actions::tab_close_targets(store.read(cx), project_id, pane_id, scope).is_empty()
+    };
+    let no_others = nothing_to_close(pane_actions::TabCloseScope::Others);
+    let no_right = nothing_to_close(pane_actions::TabCloseScope::ToRight);
 
     let mut entries = Vec::new();
     for action in tab_menu_actions(
@@ -760,6 +818,13 @@ pub(crate) fn tab_menu(
                     })
                     .into()
             }
+            TabMenuAction::Duplicate => {
+                menu::item(t("paneGroup", "duplicate"), move |window, cx| {
+                    store.update(cx, |store, cx| {
+                        store.duplicate_pane(&pid, &pane, window, cx);
+                    });
+                })
+            }
             TabMenuAction::SplitRight => MenuItem::new(t("paneGroup", "splitRight"))
                 .shortcut(hotkey_label(true, true, false, "D"))
                 .on_click(move |window, cx| {
@@ -785,11 +850,52 @@ pub(crate) fn tab_menu(
                 fork_session_id.clone(),
             ),
             TabMenuAction::ForkNeedsIdentity => branch_family::needs_identity_menu_item(),
-            // 关闭两项都走 pane_actions —— 与 tab 上的 ×、Ctrl+Shift+W 同一个
-            // AI 感知确认入口
+            TabMenuAction::ToggleMaximize => MenuItem::new(t(
+                "paneGroup",
+                if maximize == Some(true) {
+                    "restore"
+                } else {
+                    "maximize"
+                },
+            ))
+            .disabled(maximize.is_none())
+            .on_click(move |_window, cx| {
+                store.update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &pane, cx));
+            })
+            .into(),
+            // 关闭一族全走 pane_actions —— 与 tab 上的 ×、Ctrl+Shift+W 同一个
+            // AI 感知确认入口;批量的两项只弹一个汇总确认框
             TabMenuAction::CloseTab => MenuItem::new(t("paneGroup", "closeTab"))
                 .on_click(move |window, cx| {
                     pane_actions::close_pane(store.clone(), pid.clone(), pane.clone(), window, cx);
+                })
+                .into(),
+            TabMenuAction::CloseOthers => MenuItem::new(t("paneGroup", "closeOthers"))
+                .disabled(no_others)
+                .on_click(move |window, cx| {
+                    let scope = pane_actions::TabCloseScope::Others;
+                    pane_actions::close_tabs(
+                        store.clone(),
+                        pid.clone(),
+                        pane.clone(),
+                        scope,
+                        window,
+                        cx,
+                    );
+                })
+                .into(),
+            TabMenuAction::CloseToRight => MenuItem::new(t("paneGroup", "closeToRight"))
+                .disabled(no_right)
+                .on_click(move |window, cx| {
+                    let scope = pane_actions::TabCloseScope::ToRight;
+                    pane_actions::close_tabs(
+                        store.clone(),
+                        pid.clone(),
+                        pane.clone(),
+                        scope,
+                        window,
+                        cx,
+                    );
                 })
                 .into(),
             TabMenuAction::ClosePane => MenuItem::new(t("paneGroup", "closePane"))
@@ -2047,6 +2153,8 @@ impl TerminalArea {
             let pid_click = project_id.to_string();
             let pane_id_close = pane.id.clone();
             let pane_id_menu = pane.id.clone();
+            let pane_id_middle = pane.id.clone();
+            let pid_middle = project_id.to_string();
             let pid_close = project_id.to_string();
             let pid_rename = project_id.to_string();
             let pid_menu = project_id.to_string();
@@ -2233,6 +2341,30 @@ impl TerminalArea {
                             let entries =
                                 tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
                             menu::show(event.position, entries, window, cx);
+                        }),
+                    )
+                    // 中键单击 = 关闭(浏览器 / IDE 的惯例,松开时关;文件页签同一手法)。
+                    // 与 × 一字不差:同一道连点闸、同一个 AI 感知确认入口
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _event: &MouseUpEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_preview(cx);
+                            let dead = pane_actions::pane_is_dead(
+                                this.store.read(cx),
+                                &pid_middle,
+                                &pane_id_middle,
+                            );
+                            if this.swallows_close_click(dead, cx) {
+                                return;
+                            }
+                            pane_actions::close_pane(
+                                this.store.clone(),
+                                pid_middle.clone(),
+                                pane_id_middle.clone(),
+                                window,
+                                cx,
+                            );
                         }),
                     )
                     // ── 图标槽(16×16,固定)──────────────────────────
@@ -4430,70 +4562,127 @@ mod tests {
         assert!(sizes_to_percent(&[f64::NAN]).is_none());
     }
 
-    /// tab 右键菜单的项序照抄原版(没有 AI 会话的那一支:分支段整段不出),
-    /// 两条分隔线。
+    /// tab 右键菜单的项序(没有 AI 会话的那一支:分支段整段不出):
+    /// 改名 / 复制 → 分屏 → 最大化 → 关闭一族,三条分隔线。
     #[test]
-    fn tab_右键菜单项序与原版一致() {
+    fn tab_右键菜单项序() {
         use TabMenuAction::*;
         let actions = tab_menu_actions(false, false);
         assert_eq!(
             actions,
             vec![
                 Some(Rename),
+                Some(Duplicate),
                 None,
                 Some(SplitRight),
                 Some(SplitDown),
                 None,
+                Some(ToggleMaximize),
+                None,
                 Some(CloseTab),
+                Some(CloseOthers),
+                Some(CloseToRight),
                 Some(ClosePane),
             ]
         );
-        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
+        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 3);
     }
 
-    /// 分支段的两种形态各自插在**分屏两项之后、关闭段之前**,各带一条前导分隔线
-    /// (逐条对照 `PaneGroup.tsx:354-372`)。
+    /// 分支段的两种形态各自插在**分屏两项之后、最大化之前**,各带一条前导分隔线
+    /// (分支段本身逐条对照 `PaneGroup.tsx:354-372`)。
     #[test]
     fn tab_菜单分支段项序() {
         use TabMenuAction::*;
+        let tail = [
+            None,
+            Some(ToggleMaximize),
+            None,
+            Some(CloseTab),
+            Some(CloseOthers),
+            Some(CloseToRight),
+            Some(ClosePane),
+        ];
         // 有会话身份 + 有 fork 能力位
-        assert_eq!(
-            tab_menu_actions(true, false),
-            vec![
-                Some(Rename),
-                None,
-                Some(SplitRight),
-                Some(SplitDown),
-                None,
-                Some(ForkSession),
-                Some(ViewSessionBranches),
-                None,
-                Some(CloseTab),
-                Some(ClosePane),
-            ]
-        );
+        let mut expected = vec![
+            Some(Rename),
+            Some(Duplicate),
+            None,
+            Some(SplitRight),
+            Some(SplitDown),
+            None,
+            Some(ForkSession),
+            Some(ViewSessionBranches),
+        ];
+        expected.extend(tail);
+        assert_eq!(tab_menu_actions(true, false), expected);
 
         // 输入检测认出 AI 但没拿到 hook 身份 —— 置灰提示占同一个位置
-        assert_eq!(
-            tab_menu_actions(false, true),
-            vec![
-                Some(Rename),
-                None,
-                Some(SplitRight),
-                Some(SplitDown),
-                None,
-                Some(ForkNeedsIdentity),
-                None,
-                Some(CloseTab),
-                Some(ClosePane),
-            ]
-        );
+        let mut expected = vec![
+            Some(Rename),
+            Some(Duplicate),
+            None,
+            Some(SplitRight),
+            Some(SplitDown),
+            None,
+            Some(ForkNeedsIdentity),
+        ];
+        expected.extend(tail);
+        assert_eq!(tab_menu_actions(false, true), expected);
 
         // 两者互斥(有身份就不会缺身份),真同时为真也不该塌成畸形菜单:
         // 段与段之间各自带分隔线,关闭段照旧在最后
         let both = tab_menu_actions(true, true);
         assert_eq!(both.last(), Some(&Some(ClosePane)));
-        assert_eq!(both.iter().filter(|a| a.is_none()).count(), 4);
+        assert_eq!(both.iter().filter(|a| a.is_none()).count(), 5);
+    }
+
+    /// 「最大化 / 还原」与控制条那颗按钮同一判据:单格布局用不上;正铺满按**组**认
+    /// (铺满后组内切过 tab 也算);别的组正铺满时,这一项是「最大化」(接管铺满);
+    /// 不在活动面板布局里的 pane(终端列表里别的面板)用不上。
+    #[test]
+    fn tab_菜单最大化一项的状态() {
+        use crate::tree::{PaneState, gen_id};
+        let a = PaneState::new("a");
+        let a2 = PaneState::new("a2");
+        let b = PaneState::new("b");
+        let (a_id, a2_id, b_id) = (a.id.clone(), a2.id.clone(), b.id.clone());
+        let mut left = SplitNode::leaf(a);
+        left.append_pane(Some(&a_id), a2);
+        let split = SplitNode::Split {
+            id: gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![50.0, 50.0],
+            children: vec![left, SplitNode::leaf(b)],
+        };
+
+        assert_eq!(maximize_menu_state(Some(&split), None, &a_id), Some(false));
+        assert_eq!(
+            maximize_menu_state(Some(&split), Some(&a_id), &a_id),
+            Some(true)
+        );
+        assert_eq!(
+            maximize_menu_state(Some(&split), Some(&a_id), &a2_id),
+            Some(true),
+            "同组另一个 tab:还是「还原」"
+        );
+        assert_eq!(
+            maximize_menu_state(Some(&split), Some(&a_id), &b_id),
+            Some(false),
+            "别的组铺满着:接管"
+        );
+        assert_eq!(
+            maximize_menu_state(Some(&split), None, "别的面板上的"),
+            None
+        );
+
+        let single = SplitNode::leaf(PaneState::new("x"));
+        let x = single.first_active_pane().unwrap().id.clone();
+        assert_eq!(
+            maximize_menu_state(Some(&single), None, &x),
+            None,
+            "单格布局"
+        );
+        assert_eq!(maximize_menu_state(None, None, &x), None);
     }
 
     /// 菜单显隐的判据与 `session_branch` 那份纯逻辑同源 —— 两处漂了就会出现

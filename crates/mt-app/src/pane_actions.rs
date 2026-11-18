@@ -409,6 +409,99 @@ fn group_close_prompt(panes: &[PaneState]) -> Option<ClosePrompt> {
     })
 }
 
+/// 关同一组里的**几个** tab(「关闭其他 / 关闭右侧」)的文案;没有要关的返回 `None`。
+///
+/// 盘点、标题、补充行、两条免确认判据都与关整组同一份([`group_close_prompt`]),
+/// 只有正文换掉:「该区域内所有终端」不对 —— 右键的那个留着。AI 那一档同时给出总数与
+/// AI 个数,一眼看得出「关掉的大半是普通 shell」还是「几乎全是 AI」。
+fn batch_close_prompt(panes: &[PaneState]) -> Option<ClosePrompt> {
+    let mut prompt = group_close_prompt(panes)?;
+    prompt.message = if prompt.detail.is_empty() {
+        tr!("paneGroup", "closeSomeMessage", count = panes.len())
+    } else {
+        tr!(
+            "paneGroup",
+            "closeSomeAiMessage",
+            total = panes.len(),
+            count = prompt.detail.len()
+        )
+    };
+    Some(prompt)
+}
+
+/// 页签右键「关闭其他终端 / 关闭右侧终端」的范围。作用域都是右键那个 tab 所在的**组**。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabCloseScope {
+    /// 同组里除它以外的全部。
+    Others,
+    /// 同组里排在它右边的全部。
+    ToRight,
+}
+
+/// 一组 tab(按 tab 顺序)里,`anchor` 之外该关的那些。`anchor` 不在这组里就一个都不关。
+fn scope_targets(panes: &[PaneState], anchor: &str, scope: TabCloseScope) -> Vec<PaneState> {
+    let Some(at) = panes.iter().position(|p| p.id == anchor) else {
+        return Vec::new();
+    };
+    match scope {
+        TabCloseScope::Others => panes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at)
+            .map(|(_, p)| p.clone())
+            .collect(),
+        TabCloseScope::ToRight => panes[at + 1..].to_vec(),
+    }
+}
+
+/// `pane_id` 所在那一组里,这个范围要关哪些 tab(菜单项置灰与关闭动作共用这一份)。
+pub fn tab_close_targets(
+    store: &AppStore,
+    project_id: &str,
+    pane_id: &str,
+    scope: TabCloseScope,
+) -> Vec<PaneState> {
+    match store
+        .project_state(project_id)
+        .and_then(|s| s.leaf_of_pane(pane_id))
+    {
+        Some(SplitNode::Leaf { panes, .. }) => scope_targets(panes, pane_id, scope),
+        _ => Vec::new(),
+    }
+}
+
+/// 「关闭其他终端 / 关闭右侧终端」:走与关整组同一道闸([`close_after_prompt`]),
+/// 要问就**只问一次**,把要关的几个一起列出来;不逐个弹框。
+///
+/// 关的是**确认那一刻列出来的那几个**(按 id 从最新布局关):确认框开着的时候又新开了
+/// tab 不会被捎带关掉,期间已经被别处关掉的 id 是空操作。右键的那个留着;原先激活的
+/// tab 被关掉时,组内激活位按树的规则落到剩下的最后一个上(关右侧时就是它自己)。
+pub fn close_tabs(
+    store: Entity<AppStore>,
+    project_id: String,
+    pane_id: String,
+    scope: TabCloseScope,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let targets = tab_close_targets(store.read(cx), &project_id, &pane_id, scope);
+    let Some(prompt) = batch_close_prompt(&targets) else {
+        return;
+    };
+    let ids: Vec<String> = targets.into_iter().map(|p| p.id).collect();
+    close_after_prompt(
+        store,
+        prompt,
+        move |store, cx| {
+            for id in &ids {
+                store.close_pane(&project_id, id, cx);
+            }
+        },
+        window,
+        cx,
+    );
+}
+
 /// 关终端的**唯一闸**:按 [`close_needs_prompt`] 弹确认框或直接关,两条路跑同一个 `do_close`。
 ///
 /// 不弹框时也要 `window.defer`:调用方多半是 `cx.listener` 里(tab 的 ×、控制条、
@@ -842,6 +935,85 @@ mod tests {
         assert_eq!(mixed.title, t("paneGroup", "closeAiTitle"));
         assert!(mixed.message.contains('2'));
         assert_eq!(mixed.detail, vec!["pi".to_string(), "codex".to_string()]);
+    }
+
+    fn ids(panes: &[PaneState]) -> Vec<&str> {
+        panes.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    /// 关闭其他 = 组里除它以外全部;关闭右侧 = 排在它右边的全部。顺序保持 tab 顺序;
+    /// 不在这组里、或已经是最右 / 唯一一个时没有可关的(菜单据此置灰)。
+    #[test]
+    fn 关闭其他与关闭右侧的范围() {
+        let panes: Vec<PaneState> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|name| pane(name, PaneStatus::Idle))
+            .collect();
+        let all = ids(&panes);
+        let (a, b, d) = (all[0], all[1], all[3]);
+
+        let others = scope_targets(&panes, b, TabCloseScope::Others);
+        assert_eq!(ids(&others), [all[0], all[2], all[3]]);
+        let right = scope_targets(&panes, b, TabCloseScope::ToRight);
+        assert_eq!(ids(&right), [all[2], all[3]]);
+        assert_eq!(
+            ids(&scope_targets(&panes, a, TabCloseScope::ToRight)),
+            [all[1], all[2], all[3]],
+            "最左那个关右侧 = 其余全部"
+        );
+
+        assert!(
+            scope_targets(&panes, d, TabCloseScope::ToRight).is_empty(),
+            "最右的没有右侧"
+        );
+        assert!(
+            scope_targets(&panes[..1], a, TabCloseScope::Others).is_empty(),
+            "只剩它自己"
+        );
+        assert!(scope_targets(&panes, "不在这组", TabCloseScope::Others).is_empty());
+    }
+
+    /// 批量关闭只弹一个框:标题、AI 名单、两条免确认判据与关整组同一份,正文说的是「这几个」。
+    #[test]
+    fn 批量关闭汇总成一个确认框() {
+        assert_eq!(batch_close_prompt(&[]), None);
+
+        let plain = batch_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            pane("cmd", PaneStatus::Idle),
+        ])
+        .unwrap();
+        assert_eq!(plain.title, t("paneGroup", "closeTerminalTitle"));
+        assert!(plain.message.contains('2'));
+        assert_ne!(
+            plain.message,
+            t("paneGroup", "closeGroupMessage"),
+            "右键那个留着,不是全部"
+        );
+        assert!(plain.detail.is_empty());
+
+        let mixed = batch_close_prompt(&[
+            pane("bash", PaneStatus::Idle),
+            pane("pi", PaneStatus::AiWorking),
+            pane("cmd", PaneStatus::Idle),
+        ])
+        .unwrap();
+        assert_eq!(mixed.title, t("paneGroup", "closeAiTitle"));
+        assert!(mixed.message.contains('3') && mixed.message.contains('1'));
+        assert_eq!(mixed.detail, vec!["pi".to_string()]);
+        assert!(mixed.ai_busy, "AI 正在干活:偏好关着也要问");
+
+        let dead = batch_close_prompt(&[
+            pane("bash", PaneStatus::Error),
+            pane("cmd", PaneStatus::Error),
+        ])
+        .unwrap();
+        assert!(dead.dead, "全部已退出:免确认");
+        assert!(!close_needs_prompt(
+            &AppConfig::default(),
+            dead.ai_busy,
+            dead.dead
+        ));
     }
 
     /// 按住 Ctrl+Shift+W 不放:首次连发隔 500ms~1s 才来、之后几十毫秒一次,一律吞掉;

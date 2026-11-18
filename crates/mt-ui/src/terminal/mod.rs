@@ -33,7 +33,10 @@ pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{
     ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
 };
-pub use links::{FileLink, FileLinks, OpenFileLink, OpenUrlLink, ResolveFileLink};
+pub use links::{
+    FileLink, FileLinks, LINK_HINT_DELAY, LinkHintLabel, OpenFileLink, OpenUrlLink,
+    ResolveFileLink, TerminalLink,
+};
 pub use mini::{
     MINI_REFRESH_MS, MiniCell, MiniGeometry, MiniRun, MiniTerminalElement, build_row_runs,
     mini_geometry,

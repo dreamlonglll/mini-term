@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+pub mod buffer;
 pub mod kitty;
 pub mod links;
 pub mod width;

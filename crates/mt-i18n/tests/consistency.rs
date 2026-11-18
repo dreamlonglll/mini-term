@@ -232,8 +232,14 @@ use mt_i18n::{
 /// （`settings.clipboard.{longPasteAiOnlyTitle,longPasteAiOnlyDesc}`，`longPasteDesc` 改了措辞）、
 /// 远程项目里右键 SSH 连接没法开新终端时的提示（`terminal.sshNewTerminalRemote`）；
 /// `terminal.sshFooterHint` 补了 Ctrl+↵ 一截，条数不变。
+/// 1785 → 1802：终端右键菜单补项 —— 链接的打开 / 复制（`terminal.{openLink,copyLink,
+/// openFileLink,copyFilePath}`）、全选 / 查找 / 清除缓冲 / 保存缓冲与失败提示
+/// （`terminal.{selectAll,find,clearBuffer,saveBuffer,saveBufferFailed}`）、不按修饰键悬停
+/// 链接的提示（`terminal.linkHoverHint`）；页签右键菜单补项 —— 复制此终端 / 最大化 / 还原 /
+/// 关闭其他 / 关闭右侧与它们的汇总确认文案（`paneGroup.{duplicate,maximize,restore,
+/// closeOthers,closeToRight,closeSomeMessage,closeSomeAiMessage}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1785;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1802;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

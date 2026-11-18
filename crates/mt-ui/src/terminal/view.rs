@@ -198,12 +198,15 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions as _, Scroll};
+use alacritty_terminal::index::{Column, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use gpui::{
     App, Bounds, ClipboardItem, Context, ElementId, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent,
-    MouseButton, ParentElement, Pixels, Point, Render, Styled, UTF16Selection, Window, div, size,
+    MouseButton, ParentElement, Pixels, Point, Render, SharedString, Styled, UTF16Selection,
+    Window, div, size,
 };
 use mt_terminal::links::PathCandidate;
 use mt_terminal::{TermSize, TerminalEmulator};
@@ -217,7 +220,7 @@ use super::input::{
     ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
     win32_input_bytes,
 };
-use super::links::{FileLink, FileLinks};
+use super::links::{self, FileLink, FileLinks, LinkCache, LinkHintLabel, TerminalLink};
 use super::scrollbar::ScrollbarStyle;
 use super::search::TerminalSearch;
 use super::selection_dwell::{DwellConfig, OnSelectionCopied};
@@ -254,10 +257,31 @@ pub struct TerminalView {
     smart_copy_paste: Option<SmartCopyPaste>,
     /// Ctrl(⌘)+悬停 / 单击文件路径。见 [`TerminalView::file_links`]。
     file_links: Option<FileLinks>,
+    /// 不按修饰键悬停在链接上的提示文案。见 [`TerminalView::link_hover_hint`]。
+    link_hint: Option<LinkHintLabel>,
     /// 上一次 modifiers-changed 时链接修饰键按着没有 —— 只在它翻转时要一帧。
     link_modifier_held: bool,
     /// Kitty 图片的纹理缓存。挂在视图上的理由见 [`super::images`] 模块注释。
     images: Rc<RefCell<super::images::TerminalImageCache>>,
+}
+
+/// 窗口坐标落在网格的哪一格 `(列, 行)`(行是屏幕行)。不在网格里返回 `None`。
+///
+/// 与元素里的 `hit_cell` 不同,这里**不钳**到边上:右键点在内边距里不该认成最边上那格的
+/// 链接。还没画过一帧(网格是空的)时同样是 `None`。
+fn grid_cell_at(geometry: &FrameGeometry, position: Point<Pixels>) -> Option<(usize, usize)> {
+    let width = f32::from(geometry.cell_size.width);
+    let height = f32::from(geometry.cell_size.height);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let x = f32::from(position.x - geometry.origin.x);
+    let y = f32::from(position.y - geometry.origin.y);
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let (col, row) = ((x / width) as usize, (y / height) as usize);
+    (col < geometry.columns && row < geometry.screen_lines).then_some((col, row))
 }
 
 /// 宿主对一次粘贴的裁决。
@@ -373,6 +397,7 @@ impl TerminalView {
             on_paste: None,
             smart_copy_paste: None,
             file_links: None,
+            link_hint: None,
             link_modifier_held: false,
             images,
         }
@@ -398,6 +423,41 @@ impl TerminalView {
     ) -> Self {
         self.file_links = Some(FileLinks::new(resolve, open, open_url));
         self
+    }
+
+    /// 不按修饰键悬停在链接上停一会儿([`links::LINK_HINT_DELAY`]),给它画一条弱化的
+    /// 下划线、旁边出一行提示(「Ctrl+单击打开」)。`label` 每次画都现取,切语言立刻生效。
+    /// 要先接 [`Self::file_links`];不接这一条 = 不出提示。口径见 [`super::links`] 模块注释。
+    pub fn link_hover_hint(mut self, label: impl Fn() -> SharedString + 'static) -> Self {
+        self.link_hint = Some(Rc::new(label));
+        self
+    }
+
+    /// 窗口坐标 `position` 底下的链接(右键菜单「打开链接 / 复制链接」用)。
+    ///
+    /// 识别与 Ctrl+悬停 / 单击是同一个 [`links::probe`],格子按上一帧画出来的几何换算、
+    /// 回看位置现读。不在网格里、没接链接能力、底下不是链接都返回 `None`。每次现验盘、
+    /// 不借悬停那两份缓存:右键是一次性的动作,不该拿一段时间以前的结论。
+    pub fn link_at(&self, position: Point<Pixels>, cx: &App) -> Option<TerminalLink> {
+        let file_links = self.file_links.as_ref()?;
+        let (col, row) = grid_cell_at(&self.geometry.get(), position)?;
+        let display_offset = self.emulator.with_term(|term| term.grid().display_offset());
+        let line = row as i32 - display_offset as i32;
+        let mut cache = LinkCache::default();
+        links::probe(&self.emulator, file_links, line, col, &mut cache, cx)
+            .map(|hit| hit.target.into())
+    }
+
+    /// 选中整个缓冲(回看 + 当前屏)。alt screen 里活动的那块屏没有回看,就是整屏。
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.emulator.with_term_mut(|term| {
+            let start = AlacPoint::new(term.topmost_line(), Column(0));
+            let end = AlacPoint::new(term.bottommost_line(), term.last_column());
+            let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+        });
+        cx.notify();
     }
 
     /// 宿主接管粘贴。设了之后 Ctrl+Shift+V、智能 Ctrl+V 与
@@ -859,6 +919,7 @@ impl Render for TerminalView {
         .search_colors(self.search_colors)
         .flash(self.flash)
         .file_links(self.file_links.clone())
+        .link_hint(self.link_hint.clone())
         .selection_dwell(self.dwell)
         .background_art(self.background_art.clone())
         .geometry_sink(self.geometry.clone())
@@ -1015,8 +1076,48 @@ impl EntityInputHandler for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{SmartAction, smart_key_action};
-    use gpui::Modifiers;
+    use super::{FrameGeometry, SmartAction, grid_cell_at, smart_key_action};
+    use gpui::{Modifiers, point, px, size};
+
+    /// 右键位置 → 格子:网格内按格取整,内边距 / 网格外一律不认(不钳到边上那格)。
+    #[test]
+    fn 右键位置换算成格子且不钳边() {
+        let geometry = FrameGeometry {
+            origin: point(px(100.0), px(50.0)),
+            cell_size: size(px(8.0), px(16.0)),
+            columns: 80,
+            screen_lines: 24,
+            ..FrameGeometry::default()
+        };
+        assert_eq!(
+            grid_cell_at(&geometry, point(px(100.0), px(50.0))),
+            Some((0, 0))
+        );
+        assert_eq!(
+            grid_cell_at(&geometry, point(px(117.0), px(83.0))),
+            Some((2, 2))
+        );
+        assert_eq!(
+            grid_cell_at(&geometry, point(px(99.0), px(60.0))),
+            None,
+            "左侧内边距"
+        );
+        assert_eq!(
+            grid_cell_at(&geometry, point(px(100.0 + 8.0 * 80.0), px(60.0))),
+            None,
+            "右侧网格外"
+        );
+        assert_eq!(
+            grid_cell_at(&geometry, point(px(120.0), px(50.0 + 16.0 * 24.0))),
+            None,
+            "底下网格外"
+        );
+        assert_eq!(
+            grid_cell_at(&FrameGeometry::default(), point(px(1.0), px(1.0))),
+            None,
+            "还没画过一帧"
+        );
+    }
 
     fn ctrl() -> Modifiers {
         Modifiers {

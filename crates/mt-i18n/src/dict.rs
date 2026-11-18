@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1785;
+pub const ZH_ENTRY_COUNT: usize = 1802;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1785;
+pub const EN_ENTRY_COUNT: usize = 1802;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2254,17 +2254,23 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("closeDontAskHint", "之后可在「设置 → Shell → 终端行为」中重新开启"),
     ("closeGroupAiMessage", "该区域内有 {count} 个终端正在运行 AI 对话，关闭后对话将被终止，确定继续吗？"),
     ("closeGroupMessage", "确定要关闭该区域内所有终端吗？"),
+    ("closeOthers", "关闭其他终端"),
     ("closePane", "关闭整个区域"),
     ("closePaneTooltip", "关闭整个区域（{shortcut}）"),
+    ("closeSomeAiMessage", "要关闭的 {total} 个终端中有 {count} 个正在运行 AI 对话，关闭后对话将被终止，确定继续吗？"),
+    ("closeSomeMessage", "确定要关闭这 {count} 个终端吗？"),
     ("closeTab", "关闭此终端"),
     ("closeTabAiMessage", "终端「{label}」正在运行 AI 对话，关闭后对话将被终止，确定继续吗？"),
     ("closeTabLabel", "关闭终端「{label}」"),
     ("closeTabMessage", "确定要关闭终端「{label}」吗？"),
     ("closeTerminalTitle", "关闭终端"),
+    ("closeToRight", "关闭右侧终端"),
     ("collapsedHint", "点击铺满此区域"),
+    ("duplicate", "复制此终端"),
     ("forkNeedsIdentity", "分支会话（未获会话身份，需注册 Hook 事件）"),
     ("forkSession", "分支会话到新分屏"),
     ("markerTooltip", "AI 任务标记 ({mod}+Shift+↑/↓ 跳转)"),
+    ("maximize", "最大化"),
     ("maximizePane", "最大化此区域（双击标签栏空白处）"),
     ("reconnect", "点击重连"),
     ("remoteDisconnected", "连接已断开"),
@@ -2272,6 +2278,7 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("renameTerminal", "重命名终端"),
     ("restart", "重新启动"),
     ("restartHint", "按 Enter 重新启动"),
+    ("restore", "还原"),
     ("restorePane", "还原分屏布局"),
     ("retry", "重试"),
     ("searchTooltip", "在终端中查找（{shortcut}）"),
@@ -2296,17 +2303,23 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("closeDontAskHint", "You can turn this back on in Settings → Shell → Terminal behavior"),
     ("closeGroupAiMessage", "{count} terminal(s) in this area are running AI sessions. Closing will terminate them. Continue?"),
     ("closeGroupMessage", "Close all terminals in this area?"),
+    ("closeOthers", "Close other terminals"),
     ("closePane", "Close whole pane"),
     ("closePaneTooltip", "Close whole pane ({shortcut})"),
+    ("closeSomeAiMessage", "{count} of the {total} terminals to close are running AI sessions. Closing will terminate them. Continue?"),
+    ("closeSomeMessage", "Close these {count} terminals?"),
     ("closeTab", "Close this terminal"),
     ("closeTabAiMessage", "Terminal \"{label}\" is running an AI session. Closing it will terminate the session. Continue?"),
     ("closeTabLabel", "Close terminal \"{label}\""),
     ("closeTabMessage", "Close terminal \"{label}\"?"),
     ("closeTerminalTitle", "Close Terminal"),
+    ("closeToRight", "Close terminals to the right"),
     ("collapsedHint", "Click to maximize this pane"),
+    ("duplicate", "Duplicate terminal"),
     ("forkNeedsIdentity", "Fork session (no session identity — register hook events)"),
     ("forkSession", "Fork session to new split"),
     ("markerTooltip", "AI task markers ({mod}+Shift+↑/↓ to jump)"),
+    ("maximize", "Maximize"),
     ("maximizePane", "Maximize this pane (double-click empty tab bar area)"),
     ("reconnect", "Click to reconnect"),
     ("remoteDisconnected", "Connection lost"),
@@ -2314,6 +2327,7 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("renameTerminal", "Rename Terminal"),
     ("restart", "Restart"),
     ("restartHint", "Press Enter to restart"),
+    ("restore", "Restore"),
     ("restorePane", "Restore split layout"),
     ("retry", "Retry"),
     ("searchTooltip", "Find in terminal ({shortcut})"),
@@ -3502,13 +3516,23 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static TERMINAL_ZH: &[(&str, &str)] = &[
+    ("clearBuffer", "清除缓冲"),
     ("copied", "已复制"),
     ("copy", "复制"),
+    ("copyFilePath", "复制文件路径"),
+    ("copyLink", "复制链接"),
     ("dropToInsertPath", "释放以插入路径"),
+    ("find", "查找…"),
+    ("linkHoverHint", "{modifier}+单击打开"),
+    ("openFileLink", "打开文件"),
+    ("openLink", "打开链接"),
     ("paste", "粘贴"),
     ("pasteImageNoRemote", "远程连接不可用，剪贴板图片未粘贴"),
     ("pasteUploadFailed", "粘贴内容上传到远程失败：{detail}"),
+    ("saveBuffer", "将缓冲保存为文件…"),
+    ("saveBufferFailed", "保存终端缓冲失败：{detail}"),
     ("scrollToBottom", "回到底部（{shortcut}）"),
+    ("selectAll", "全选"),
     ("sshAuthKey", "密钥"),
     ("sshAuthPassword", "密码"),
     ("sshConnect", "SSH 连接"),
@@ -3524,13 +3548,23 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static TERMINAL_EN: &[(&str, &str)] = &[
+    ("clearBuffer", "Clear buffer"),
     ("copied", "Copied"),
     ("copy", "Copy"),
+    ("copyFilePath", "Copy file path"),
+    ("copyLink", "Copy link"),
     ("dropToInsertPath", "Drop to insert path"),
+    ("find", "Find…"),
+    ("linkHoverHint", "{modifier}+Click to open"),
+    ("openFileLink", "Open file"),
+    ("openLink", "Open link"),
     ("paste", "Paste"),
     ("pasteImageNoRemote", "Remote connection unavailable; the clipboard image was not pasted"),
     ("pasteUploadFailed", "Failed to upload pasted content to the remote host: {detail}"),
+    ("saveBuffer", "Save buffer to file…"),
+    ("saveBufferFailed", "Failed to save the terminal buffer: {detail}"),
     ("scrollToBottom", "Scroll to bottom ({shortcut})"),
+    ("selectAll", "Select all"),
     ("sshAuthKey", "Key"),
     ("sshAuthPassword", "Password"),
     ("sshConnect", "SSH Connection"),

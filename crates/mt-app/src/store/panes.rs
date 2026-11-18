@@ -190,18 +190,8 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let source_cwd = cwd.or_else(|| {
-            self.project_states
-                .get(project_id)
-                .and_then(|s| s.pane(pane_id))
-                .and_then(|p| p.cwd.clone())
-        });
-        let shell_name = self
-            .project_states
-            .get(project_id)
-            .and_then(|s| s.pane(pane_id))
-            .map(|p| p.shell_name.clone());
-        let shell = self.resolve_shell(shell_name.as_deref())?;
+        let (shell, inherited_cwd) = self.inherited_launch(project_id, pane_id)?;
+        let source_cwd = cwd.or(inherited_cwd);
 
         let pane = self.spawn_pane(&project, &shell, source_cwd, window, cx)?;
         let new_pane_id = pane.id.clone();
@@ -234,6 +224,47 @@ impl AppStore {
         self.after_layout_change(project_id, cx);
         self.focus_pane(project_id, &new_pane_id, window, cx);
         Some(new_pane_id)
+    }
+
+    /// 从源 pane 继承什么来起新终端:它的 shell(按名字回查,已被删掉就退回默认)与它的
+    /// cwd 覆盖(worktree 终端分出来 / 复制出来的理应还在 worktree 里)。
+    ///
+    /// 分屏与「复制此终端」**共用这一处**,两个入口对「新终端像谁」不会有两套看法。
+    /// 源 pane 已经不在了返回 `None`:没有可继承的东西,也就不该起 PTY。
+    fn inherited_launch(
+        &self,
+        project_id: &str,
+        pane_id: &str,
+    ) -> Option<(ShellConfig, Option<String>)> {
+        let source = self.project_states.get(project_id)?.pane(pane_id)?;
+        let cwd = source.cwd.clone();
+        let shell = self.resolve_shell(Some(&source.shell_name))?;
+        Some((shell, cwd))
+    }
+
+    /// 「复制此终端」(页签右键):在源 pane 所在的那一组里新开一个页签,shell 与 cwd 的
+    /// 继承口径与分屏相同([`Self::inherited_launch`]),落点则与 tab 栏的「+」相同
+    /// ([`Self::new_terminal_with_cwd`],锚点是源 pane)。
+    ///
+    /// **只继承「同一个 shell、同一个目录」**:不带 AI 会话身份、不带自定义名、不往新终端
+    /// 里写任何命令。远程项目照常走 `start_pty` 的 ssh 分支,与「+」开出来的远程终端同一条路。
+    ///
+    /// 新页签落在源 pane 那一组,而这一组可能此刻看不见(终端列表竖条里右键的别的面板、
+    /// 铺满时缩在折叠条里的组),所以收尾走 [`Self::jump_to_pane`]:切面板、让那一组接管铺满、
+    /// 激活 —— 开出来的终端一定在眼前。
+    pub fn duplicate_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (shell, cwd) = self.inherited_launch(project_id, pane_id)?;
+        let anchor = Some(pane_id.to_string());
+        let new_pane =
+            self.new_terminal_with_cwd(project_id, Some(shell), anchor, cwd, window, cx)?;
+        self.jump_to_pane(project_id, &new_pane, window, cx);
+        Some(new_pane)
     }
 
     // === pane 拖拽移动 / 合并 / 重排(v0.14.0)===
