@@ -191,6 +191,12 @@ pub struct AppConfig {
     /// 老用户按没提示过算 —— 老用户多半也没注册过 hook,正是该提示的人。
     #[serde(default)]
     pub hook_hint_shown: bool,
+    /// 「发现新版本」弹窗里点了「忽略此版本」的那个版本号(原样存 tag,如 `v1.13.33`)。
+    /// 启动自检查到的最新版**恰好是它**时不亮边条的更新按钮,出现更新的版本照常亮;
+    /// 设置 →「关于」的手动检查不受它影响,并在那里给「不再忽略」的出口。
+    /// `None` = 没忽略过任何版本(不写进库)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_update_version: Option<String>,
     /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
     /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
     /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
@@ -937,6 +943,7 @@ impl Default for AppConfig {
             last_active_project_id: None,
             hook_enabled: false,
             hook_hint_shown: false,
+            ignored_update_version: None,
             smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
@@ -2036,6 +2043,29 @@ mod tests {
         assert_eq!(json["hookHintShown"], serde_json::json!(true));
         let back: AppConfig = serde_json::from_value(json).unwrap();
         assert!(back.hook_hint_shown);
+    }
+
+    /// 忽略的更新版本:老库没这个键按「没忽略」读,`None` 不写进 JSON;
+    /// 置位后键名是 `ignoredUpdateVersion`,能往返。
+    #[test]
+    fn ignored_update_version_缺省为空且能往返() {
+        assert_eq!(AppConfig::default().ignored_update_version, None);
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.ignored_update_version, None);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("ignoredUpdateVersion").is_none(), "None 不写进库");
+
+        let ignored = AppConfig {
+            ignored_update_version: Some("v1.13.33".into()),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&ignored).unwrap();
+        assert_eq!(json["ignoredUpdateVersion"], serde_json::json!("v1.13.33"));
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.ignored_update_version.as_deref(), Some("v1.13.33"));
     }
 
     /// 页签标题跟随 shell:纯增量字段 —— `None` 时不写进 JSON（不污染存量配置），

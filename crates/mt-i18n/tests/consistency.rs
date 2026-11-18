@@ -241,8 +241,13 @@ use mt_i18n::{
 /// （`sessionList.{filterPlaceholder,filterEmpty,rowMenuHint}`）；首屏引导的拖放提示与「开启 AI
 /// 状态精确感知」入口（`app.firstRun.{dropHint,enableHook}`）；注册 Hook 的一次性提示
 /// （`app.hookHint.{title,message}`）。
+/// 1802 → 1832：SSH 表单与更新提示一批 —— 连接表单的必填 / 端口就地提示
+/// （`sshModal.{nameRequired,hostRequired,userRequired,portInvalid}`）与「测试连接」的按钮、
+/// 成功 / 各类失败 / 过期说明（`sshModal.test.*` 17 条）；「发现新版本」弹窗
+/// （`app.update.{dialogTitle,noNotes,download,ignore,later,ignoreHint}`）；「关于」页的更新说明
+/// 与「不再忽略」（`settings.about.{releaseNotes,ignoredVersion,unignore}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1802;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1832;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -458,6 +458,22 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 
+    // === 更新提示 ===
+
+    /// 「忽略此版本」(`Some(版本号)`)/「不再忽略」(`None`)。边条更新按钮亮不亮的判据在
+    /// `crate::update_check::should_announce`;Workspace 观察着 store,这里一变按钮即刻跟着变。
+    pub fn set_ignored_update_version(&mut self, version: Option<String>, cx: &mut Context<Self>) {
+        let next = version
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if self.config.ignored_update_version == next {
+            return;
+        }
+        self.config.ignored_update_version = next;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
     // === 界面语言 ===
 
     /// 当前界面语言。取自配置,认不出(或没设过)时回落到**进程内实际生效**的那个

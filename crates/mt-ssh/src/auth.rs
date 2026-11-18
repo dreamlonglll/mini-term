@@ -103,6 +103,8 @@ pub(crate) struct ClientNotes {
     pub(crate) rejection: Mutex<Option<String>>,
     /// 会话结束原因。
     pub(crate) ended: Mutex<Option<SessionEnd>>,
+    /// 认证成功时用上的方法,只由 [`authenticate_host`] 在成功返回前写。
+    pub(crate) authenticated: Mutex<Option<AuthMethodUsed>>,
 }
 
 impl ClientNotes {
@@ -112,6 +114,21 @@ impl ClientNotes {
 
     pub(crate) fn ended(&self) -> Option<SessionEnd> {
         self.ended.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// 记下认证成功用的方法。走旁路而不是改 [`authenticate_host`] 的返回值:池的正式建连
+    /// 用不到它,只有「测试连接」([`crate::SshPool::probe`])要报给用户,签名不必为此变。
+    fn note_authenticated(&self, method: AuthMethodUsed) {
+        if let Ok(mut slot) = self.authenticated.lock() {
+            *slot = Some(method);
+        }
+    }
+
+    pub(crate) fn take_authenticated(&self) -> Option<AuthMethodUsed> {
+        self.authenticated
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 }
 
@@ -631,6 +648,80 @@ impl AuthReport {
     }
 }
 
+/// 认证成功时用上的方法(「测试连接」要告诉用户是凭哪一样登进去的)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthMethodUsed {
+    /// 服务器对 `none` 直接放行,没要任何凭据。
+    None,
+    /// 公钥。`key` 与逐方法报错里同一款描述:连接里配的私钥路径,或 ssh-agent 里那把 key
+    /// 的算法与指纹(不含私钥内容)。
+    PublicKey {
+        key: String,
+    },
+    Password,
+    /// keyboard-interactive:每个问询都用配置的密码作答。
+    KeyboardInteractive,
+}
+
+/// 认证失败报错([`AuthReport::render`] 的输出)拆开后的样子。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthFailureReport {
+    /// 登录目标 `user@host:port`。
+    pub target: String,
+    /// 服务器允许的认证方法(逗号分隔;服务器连方法表都没给时是 `unknown`)。
+    pub server_methods: String,
+    /// 逐方法的结果,按尝试顺序,一条一种(与报错同源,不含任何凭据)。
+    pub attempts: Vec<String>,
+}
+
+/// 把认证失败的报错(`AcquireErrorKind::Auth` 的 message)拆成 [`AuthFailureReport`],给界面
+/// 一条一行地列出每种方法的结果。
+///
+/// 只认 [`AuthReport::render`] 那一种格式(`authentication failed for … (server allows: …):
+/// a; b`),认不出返回 `None`,调用方原样显示整条报错即可。格式与解析放在同一个文件里、有往返
+/// 单测钉着,改了一边另一边立刻红。
+///
+/// 逐方法结果之间以 `"; "` 分隔,但单条结果的括号里也可能出现 `"; "`(ssh-agent 连不上时各个
+/// 端点的原因就是这么拼的),所以只在括号外切。
+pub fn parse_auth_failure(message: &str) -> Option<AuthFailureReport> {
+    let rest = message.strip_prefix("authentication failed for ")?;
+    let (target, rest) = rest.split_once(" (server allows: ")?;
+    let (methods, notes) = rest.split_once("): ")?;
+    Some(AuthFailureReport {
+        target: target.to_string(),
+        server_methods: methods.to_string(),
+        attempts: split_outside_parens(notes),
+    })
+}
+
+/// 按括号外的 `"; "` 切开,丢掉空段。`;` 与空格都是 ASCII,按字节找到的切点一定落在字符边界上。
+fn split_outside_parens(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let (mut depth, mut start, mut i) = (0usize, 0usize, 0usize);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 && bytes.get(i + 1) == Some(&b' ') => {
+                parts.push(&text[start..i]);
+                start = i + 2;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn method_names(methods: &MethodSet) -> String {
     let names: Vec<&str> = methods.iter().map(<&str>::from).collect();
     names.join(",")
@@ -948,7 +1039,10 @@ pub(crate) async fn authenticate_host(
         .await
         .map_err(|e| e.to_string());
     let initial_methods = match step_of(none) {
-        Step::Success => return Ok(()),
+        Step::Success => {
+            notes.note_authenticated(AuthMethodUsed::None);
+            return Ok(());
+        }
         Step::Rejected(methods) => methods,
         Step::Ended => {
             let ended = wait_session_end(handle, notes).await;
@@ -1021,7 +1115,12 @@ pub(crate) async fn authenticate_host(
                 })
             );
             match step_of(result) {
-                Step::Success => return Ok(()),
+                Step::Success => {
+                    notes.note_authenticated(AuthMethodUsed::PublicKey {
+                        key: candidate.label.clone(),
+                    });
+                    return Ok(());
+                }
                 Step::Rejected(remaining) => {
                     // 部分成功(这把 key 被接受、还要再验别的)不算被拒。
                     report.rejected_any |= !partial;
@@ -1073,7 +1172,10 @@ pub(crate) async fn authenticate_host(
                     .await
                     .map_err(|e| e.to_string());
                 match step_of(result) {
-                    Step::Success => return Ok(()),
+                    Step::Success => {
+                        notes.note_authenticated(AuthMethodUsed::Password);
+                        return Ok(());
+                    }
                     Step::Rejected(remaining) => {
                         report.rejected_any = true;
                         report.note("password: rejected by server");
@@ -1089,7 +1191,10 @@ pub(crate) async fn authenticate_host(
                 tried = true;
                 tracker.set_detail("waiting for: keyboard-interactive");
                 match keyboard_interactive(handle, user, password).await {
-                    KbdOutcome::Success => return Ok(()),
+                    KbdOutcome::Success => {
+                        notes.note_authenticated(AuthMethodUsed::KeyboardInteractive);
+                        return Ok(());
+                    }
                     KbdOutcome::Rejected => {
                         report.rejected_any = true;
                         report.note("keyboard-interactive: rejected by server");
@@ -1402,6 +1507,41 @@ v9aDxRcrMAaNVKMzZbmEjucR5L+VMM5njNnS4=
             "{empty}"
         );
         assert!(empty.contains("no usable credential"), "{empty}");
+    }
+
+    /// 「测试连接」逐条列出每种方法:解析与 `render` 往返一致,括号里的 `"; "` 不切。
+    #[test]
+    fn auth_failure_report_round_trips_through_render() {
+        let mut report = AuthReport::new("deploy@h:2222");
+        report.server_methods = Some("publickey,password".into());
+        report.note("identity file ~/.ssh/k (connection setting): file not found");
+        report.note(
+            "ssh-agent: not available (\\\\.\\pipe\\openssh-ssh-agent: refused; Pageant: no \
+             response)",
+        );
+        report.note("password: rejected by server");
+        let parsed = parse_auth_failure(&report.render()).expect("render 的格式认得出");
+        assert_eq!(parsed.target, "deploy@h:2222");
+        assert_eq!(parsed.server_methods, "publickey,password");
+        assert_eq!(parsed.attempts, report.notes);
+
+        // 一条凭据都没有:那一句说明自成一条;服务器没给方法表时是 unknown。
+        let empty = parse_auth_failure(&AuthReport::new("u@h:22").render()).unwrap();
+        assert_eq!(empty.server_methods, "unknown");
+        assert_eq!(empty.attempts.len(), 1);
+        assert!(
+            empty.attempts[0].starts_with("no usable credential"),
+            "{:?}",
+            empty.attempts
+        );
+
+        // 别的报错不硬拆(冷却期报错里虽然带着上次的认证失败,但这次根本没去连)。
+        assert!(parse_auth_failure(
+            "authentication cooldown: the last attempt failed. Last error: authentication \
+             failed for u@h:22 (server allows: password): password: rejected by server"
+        )
+        .is_none());
+        assert!(parse_auth_failure("ssh connect to h:22 failed: refused").is_none());
     }
 
     #[test]

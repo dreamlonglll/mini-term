@@ -27,13 +27,15 @@ mod transport;
 /// 统一从 `mt_ssh::russh` 取,避免各消费方自行声明 russh 依赖后版本漂移。
 pub use russh;
 
+pub use auth::{AuthFailureReport, AuthMethodUsed};
 pub use pool::{
     AcquireError, AcquireErrorKind, AgentSource, BoundedExecOutput, BoundedExecState,
-    CachedSession, MtClient, PoolConfig, SftpTransferError, SshClientEnv, SshPool,
+    CachedSession, MtClient, PoolConfig, ProbeSuccess, SftpTransferError, SshClientEnv, SshPool,
 };
 pub use sftp::{SftpDirEntry, SftpHandle, SftpNodeKind};
 
 // 函数单列一组:与类型混在同一个 `{}` 里时,rustfmt 2021 / 2024 两种口径的排序相反。
+pub use auth::parse_auth_failure;
 pub use pool::{
     run_bounded_exec_on_session, run_sftp_download_on_session, run_sftp_upload_on_session,
     run_sftp_upload_until,

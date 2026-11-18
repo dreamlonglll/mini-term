@@ -32,7 +32,13 @@ export const app = {
     },
     update: {
       badge: "新版本 {version}",
-      title: "新版本 {version} 可用，点击前往下载",
+      title: "新版本 {version} 可用，点击查看更新说明",
+      dialogTitle: "发现新版本 {version}",
+      noNotes: "此版本没有附发布说明",
+      download: "前往下载",
+      ignore: "忽略此版本",
+      later: "稍后",
+      ignoreHint: "忽略后这一版不再在左侧边栏提醒，出现更新的版本时照常提醒；可在「设置 → 关于」中取消忽略",
     },
     closeConfirm: {
       titleAi: "有 AI 会话正在运行",
@@ -108,7 +114,13 @@ export const app = {
     },
     update: {
       badge: "New version {version}",
-      title: "New version {version} available, click to download",
+      title: "New version {version} available, click to see what's new",
+      dialogTitle: "New version {version} available",
+      noNotes: "No release notes for this version",
+      download: "Download",
+      ignore: "Skip this version",
+      later: "Later",
+      ignoreHint: "Skipping stops the sidebar reminder for this version only; newer versions are announced as usual. Undo it in Settings → About.",
     },
     closeConfirm: {
       titleAi: "AI sessions still running",

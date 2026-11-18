@@ -146,6 +146,8 @@ pub mod kind {
     /// 冲突文件「逐段解决」弹窗(更改列表冲突行的右键菜单 / 行内按钮)。种类唯一:
     /// 同一时刻只解决一个文件,连点两次不叠开。
     pub const GIT_CONFLICT_SEGMENTS: &str = "git-conflict-segments";
+    /// 「发现新版本」弹窗(边条更新按钮点开的:发布说明 + 前往下载 / 忽略此版本 / 稍后)。
+    pub const UPDATE_NOTES: &str = "update-notes";
 }
 
 /// 栈里的一条。
