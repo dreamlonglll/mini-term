@@ -215,6 +215,7 @@ impl AppStore {
         self.clear_pending_fork(pty_id);
         // 退出登记同理:留着会让复用同一编号的新 PTY 一开就顶着「已断开」遮罩
         self.exited_ptys.remove(&pty_id);
+        self.terminal_focus.remove(&pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)

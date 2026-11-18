@@ -288,6 +288,36 @@ pub struct TerminalArea {
     /// 每个分组页签区的横向滚动状态(key = leaf id)。跨帧保留 —— 句柄一重建,
     /// 用户滚到的位置就丢了;回收与 `split_states` 同一时机(布局变了的那一帧)。
     tab_strips: HashMap<String, TabStripScroll>,
+    /// 键盘焦点的兜底落点:项目里一个终端都不剩时焦点落到这里,不落空。挂在终端区根上一个
+    /// 零尺寸的元素上 —— 点不到(不抢鼠标点击的焦点),但在 Workspace 的派发路径里,
+    /// 全局快捷键照样收得到。见 [`Self::restore_lost_focus`]。
+    focus_sink: FocusHandle,
+}
+
+/// 键盘焦点落空之后交给谁(Workspace 的「焦点落空」兜底转过来)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FocusHandoff {
+    /// 交给这个 pane 的终端:活动项目里该操作的那个(`AppStore::active_pane_id`)。
+    Pane(String),
+    /// 落到终端区的兜底焦点:项目里一个终端都不剩,或接手的 pane 还没有终端实体。
+    Sink,
+    /// 不动:不在终端页(文件页自己管焦点),或有弹窗 / 菜单压着(焦点归它们)。
+    Leave,
+}
+
+/// 焦点落空的去处。`pane`:活动项目里该操作的 pane 以及它有没有终端实体。
+pub fn lost_focus_handoff(
+    terminal_page: bool,
+    overlay_open: bool,
+    pane: Option<(String, bool)>,
+) -> FocusHandoff {
+    if !terminal_page || overlay_open {
+        return FocusHandoff::Leave;
+    }
+    match pane {
+        Some((pane_id, true)) => FocusHandoff::Pane(pane_id),
+        _ => FocusHandoff::Sink,
+    }
 }
 
 /// 一个分组页签区的横向滚动:滚动句柄 + 激活页签的跟随记录。
@@ -1173,7 +1203,51 @@ impl TerminalArea {
             suppress_entity_pane: None,
             last_close_click: None,
             tab_strips: HashMap::new(),
+            focus_sink: cx.focus_handle(),
         }
+    }
+
+    /// 键盘焦点落空(拿着焦点的终端 / 页签被关掉、弹窗把焦点还给了已经关掉的终端)之后接回来。
+    /// Workspace 的 `on_focus_lost` 转过来,终端页与覆盖物两条判据由它带进来,去处见
+    /// [`lost_focus_handoff`]:活动项目里该操作的那个终端,一个都不剩就落到 [`Self::focus_sink`]
+    /// —— 不能落空:落空时按键从窗口根派发,Workspace 那一层的快捷键一个都收不到。
+    pub fn restore_lost_focus(
+        &mut self,
+        terminal_page: bool,
+        overlay_open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (project_id, pane) = {
+            let store = self.store.read(cx);
+            let project_id = store.active_project_id.clone();
+            let pane = project_id.as_deref().and_then(|project_id| {
+                let pane_id = store.active_pane_id(project_id)?;
+                let has_terminal = store
+                    .project_state(project_id)
+                    .and_then(|s| s.pane(&pane_id))
+                    .and_then(|p| p.pty_id)
+                    .is_some_and(|pty_id| store.terminal(pty_id).is_some());
+                Some((pane_id, has_terminal))
+            });
+            (project_id, pane)
+        };
+        match lost_focus_handoff(terminal_page, overlay_open, pane) {
+            FocusHandoff::Pane(pane_id) => {
+                let Some(project_id) = project_id else { return };
+                self.store.update(cx, |store, cx| {
+                    store.focus_pane(&project_id, &pane_id, window, cx)
+                });
+            }
+            FocusHandoff::Sink => window.focus(&self.focus_sink, cx),
+            FocusHandoff::Leave => {}
+        }
+    }
+
+    /// 兜底焦点挂在这个零尺寸元素上(见 [`Self::focus_sink`])。终端区的每条渲染出口都要带上,
+    /// 否则落到兜底上的焦点这一帧不在树上,等于还是落空。
+    fn focus_sink_anchor(&self) -> impl IntoElement + use<> {
+        div().absolute().size_0().track_focus(&self.focus_sink)
     }
 
     /// 这次点 × 要不要当连点吞掉。吞掉的点击也要记时刻,连点才只算一次。
@@ -4203,7 +4277,7 @@ impl Render for TerminalArea {
             // (FirstRunGuide 不显示、每个 TerminalArea 都 display:none),
             // 下面这句是 GPUI 侧原有的兜底提示,保持不动。
             if store.config().projects.is_empty() {
-                return crate::first_run::guide(self.store.clone());
+                return crate::first_run::guide(self.store.clone()).child(self.focus_sink_anchor());
             }
             return div()
                 .size_full()
@@ -4213,7 +4287,8 @@ impl Render for TerminalArea {
                 .justify_center()
                 .text_color(ui::text_muted())
                 .text_size(ui::font_px(13.0))
-                .child(t("app", "emptyState"));
+                .child(t("app", "emptyState"))
+                .child(self.focus_sink_anchor());
         };
         let project_id = project.id.clone();
         let project_name = project.name.clone();
@@ -4311,7 +4386,10 @@ impl Render for TerminalArea {
                         .text_color(ui::text_muted())
                         .child(t("terminalArea", "emptyHint"))
                         .child(ui::kbd(crate::hotkeys::hotkey_label("newTerminal"))),
-                );
+                )
+                // 关光了终端停在这一页:键盘焦点落在这里,新建终端 / 重开已关闭的终端这些
+                // 快捷键照样响应
+                .child(self.focus_sink_anchor());
         };
 
         // 双击最大化(v0.14.0):只渲染目标叶子,整树其余 pane 的**终端主体**
@@ -4605,6 +4683,7 @@ impl Render for TerminalArea {
             .bg(ui::bg_terminal())
             .flex()
             .relative()
+            .child(self.focus_sink_anchor())
             // Esc 中途取消拖拽**不在这里拦**:此前挂在这个根容器上的 `capture_key_down`
             // 只对 pane 拖拽有效(焦点在终端上时它才在派发路径上),从文件树起拖时
             // 焦点在文件树行上、这一层收不到。现已合并到 Workspace 根(`main.rs`),
@@ -4797,6 +4876,36 @@ impl Render for TerminalArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 焦点落空:终端页上没有弹窗压着才接;有接手的终端就给它,一个不剩落到兜底上。
+    #[test]
+    fn 焦点落空交给活动终端否则落到兜底() {
+        let pane = || Some(("pane-a".to_string(), true));
+        assert_eq!(
+            lost_focus_handoff(true, false, pane()),
+            FocusHandoff::Pane("pane-a".into())
+        );
+        assert_eq!(
+            lost_focus_handoff(true, false, None),
+            FocusHandoff::Sink,
+            "项目里一个终端都不剩:落到兜底,不能落空"
+        );
+        assert_eq!(
+            lost_focus_handoff(true, false, Some(("pane-a".into(), false))),
+            FocusHandoff::Sink,
+            "接手的 pane 还没有终端实体:交不出去,也落到兜底"
+        );
+        assert_eq!(
+            lost_focus_handoff(false, false, pane()),
+            FocusHandoff::Leave,
+            "文件页自己管焦点"
+        );
+        assert_eq!(
+            lost_focus_handoff(true, true, pane()),
+            FocusHandoff::Leave,
+            "弹窗 / 菜单压着:不能把键盘抢到底下的终端上"
+        );
+    }
 
     #[test]
     fn 切过来那一下凑成的双击不改名() {

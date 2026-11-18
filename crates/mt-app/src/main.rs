@@ -519,6 +519,16 @@ impl Workspace {
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         file_tree::install(file_tree.clone(), cx);
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
+        // 键盘焦点落空(拿着焦点的终端 / 页签被关掉,弹窗把焦点还给已经关掉的终端)时接回来,
+        // 见 [`Self::restore_lost_focus`]。监听跑在绘制期:那时改焦点不排下一帧、notify 也被
+        // 吞掉(gpui `Window::draw` 焦点阶段),所以挪到本轮绘制之后再动手
+        cx.on_focus_lost(window, |_: &mut Self, window, cx| {
+            let lost = window.focused(cx).map(|handle| handle.downgrade());
+            cx.defer_in(window, move |this, window, cx| {
+                this.restore_lost_focus(lost, window, cx)
+            });
+        })
+        .detach();
         let workbench_area =
             cx.new(|cx| WorkbenchArea::new(store.clone(), terminal_area.clone(), cx));
         workbench_area::install(workbench_area.clone(), cx);
@@ -837,7 +847,9 @@ impl Workspace {
         toast::push_alert(kind, alert.project_id, alert.project_name, cx);
     }
 
-    /// 当前该操作哪个 pane:焦点 pane,没有就落到布局里第一个激活 pane。
+    /// 当前该操作哪个 pane。键盘焦点在不在终端上(文件树、项目列表里按快捷键)都按同一条
+    /// 回落链取:逻辑焦点 → 这个项目上次聚焦的 → 第一个分组的激活页签
+    /// (`AppStore::active_pane_id`)。
     fn target_pane(&self, cx: &App) -> Option<(String, String)> {
         let store = self.store.read(cx);
         let project_id = store.active_project_id.clone()?;
@@ -847,6 +859,27 @@ impl Workspace {
 
     fn terminal_page_active(&self, cx: &App) -> bool {
         self.workbench_area.read(cx).is_terminal_active(cx)
+    }
+
+    /// 键盘焦点落空之后接回来:落空时按键从窗口根派发,`Workspace` 这一层的快捷键一个都
+    /// 收不到,打字也丢。去处(活动终端 / 终端区兜底 / 不动)见
+    /// `TerminalArea::restore_lost_focus`。`lost` 是落空那一刻的焦点:推迟到绘制之后这段
+    /// 时间里已经有别人接手(焦点换成了别的句柄)就不再插手。
+    fn restore_lost_focus(
+        &mut self,
+        lost: Option<gpui::WeakFocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = window.focused(cx).map(|handle| handle.downgrade());
+        if now.is_some() && now != lost {
+            return;
+        }
+        let terminal_page = self.terminal_page_active(cx);
+        let overlay_open = !overlay::allows(overlay::Yield::ToOverlay);
+        self.terminal_area.update(cx, |area, cx| {
+            area.restore_lost_focus(terminal_page, overlay_open, window, cx)
+        });
     }
 
     fn on_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {

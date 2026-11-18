@@ -9,6 +9,7 @@
 
 pub mod colors;
 pub mod damage;
+mod drag_select;
 mod element;
 mod images;
 pub mod ime;

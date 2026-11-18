@@ -544,6 +544,77 @@ impl SplitNode {
         }
     }
 
+    /// 树里**最后**一个叶子当前激活的 pane([`Self::first_active_pane`] 的镜像)。
+    fn last_active_pane(&self) -> Option<&PaneState> {
+        match self {
+            Self::Leaf { .. } => self.first_active_pane(),
+            Self::Split { children, .. } => {
+                children.iter().rev().find_map(|c| c.last_active_pane())
+            }
+        }
+    }
+
+    /// 「当前该操作哪个 pane」:Ctrl+Shift+W / 新建 / 分屏 / 切换 / 最大化 / 关页签……
+    /// 凡是靠 `target_pane` 取目标的动作都走这一条回落链,键盘焦点在不在终端上都一样:
+    ///
+    /// 1. 逻辑焦点 `focused`(上次聚焦的那个 pane)—— 在这棵树里才算;
+    /// 2. 这个项目自己记着的上次聚焦 `remembered`:切项目回来时 `focused` 还指着别的
+    ///    项目,没有这一档就会落到下一档,关掉的是最左那一组而不是眼前那一组;
+    /// 3. 都不在(启动还原、从没聚焦过):第一个分组的激活页签。
+    pub fn target_pane(&self, focused: Option<&str>, remembered: Option<&str>) -> Option<String> {
+        [focused, remembered]
+            .into_iter()
+            .flatten()
+            .find(|id| self.pane(id).is_some())
+            .map(str::to_string)
+            .or_else(|| self.first_active_pane().map(|p| p.id.clone()))
+    }
+
+    /// 关掉 `pane_id` 之后由谁接手(逻辑焦点 —— 也就是键盘焦点 —— 的去处)。在**摘之前**
+    /// 的树上算:
+    ///
+    /// - 同组还有别的 tab:摘完之后这一组的激活 tab。规则与 [`Self::remove_pane`] 一致
+    ///   (关的是激活 tab 就落到剩下的最后一个,否则激活 tab 不变),接手的正是眼前那一个;
+    /// - 这一组随它一起没了:同一个父 split 里紧挨着的那一格接手 —— 优先前一格(左 / 上),
+    ///   它本来就是第一格才取后一格;那一格自己又分了屏时取离它最近的叶子(前一格取最后
+    ///   一片、后一格取第一片)的激活 tab。从前一律回落「第一个分组」,在右边关掉一组焦点
+    ///   就跳回最左边;
+    /// - 整棵树随它一起没了 / pane 不在树里:`None`。
+    pub fn takeover_after_removal(&self, pane_id: &str) -> Option<String> {
+        match self {
+            Self::Leaf {
+                panes,
+                active_pane_id,
+                ..
+            } => {
+                if !panes.iter().any(|p| p.id == pane_id) {
+                    return None;
+                }
+                let rest: Vec<&PaneState> = panes.iter().filter(|p| p.id != pane_id).collect();
+                let next = if active_pane_id == pane_id {
+                    rest.last()
+                } else {
+                    // 激活 id 失配时照渲染的回落取第一个(`first_active_pane` 同一口径)
+                    rest.iter()
+                        .find(|p| &p.id == active_pane_id)
+                        .or_else(|| rest.first())
+                };
+                next.map(|p| p.id.clone())
+            }
+            Self::Split { children, .. } => {
+                let at = children.iter().position(|c| c.pane(pane_id).is_some())?;
+                if let Some(next) = children[at].takeover_after_removal(pane_id) {
+                    return Some(next);
+                }
+                let neighbour = match at.checked_sub(1) {
+                    Some(prev) => children[prev].last_active_pane(),
+                    None => children.get(at + 1)?.first_active_pane(),
+                };
+                neighbour.map(|p| p.id.clone())
+            }
+        }
+    }
+
     /// 在目标 pane 所在叶子处分屏,新叶子放第二格,50/50(`insertSplit`)。
     /// 返回是否命中目标(未命中时新叶子原样丢弃,由调用方负责回收 PTY)。
     pub fn insert_split(
@@ -2054,5 +2125,129 @@ mod tests {
 
         let single = leaf_of(&["s"]);
         assert_eq!(single.boundary_toward(&id_of(&single, "s"), h, true), None);
+    }
+
+    // ===== 关闭后的接手 / 动作目标 =====
+
+    /// 同组还有 tab:关激活 tab 由剩下的最后一个接手(与 `remove_pane` 同一规则),
+    /// 关后台 tab 激活项不动 —— 接手的永远是这一组眼前那个。
+    #[test]
+    fn 同组还有页签时由组内激活页签接手() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a1", "a2", "a3"]), leaf_of(&["b"])],
+        );
+        let (a1, a2, a3) = (id_of(&root, "a1"), id_of(&root, "a2"), id_of(&root, "a3"));
+        // a1 是激活 tab:剩下的最后一个 a3 接手
+        assert_eq!(root.takeover_after_removal(&a1), Some(a3.clone()));
+        // 关的是后台 a2:激活的 a1 不变
+        assert_eq!(root.takeover_after_removal(&a2), Some(a1));
+        let after = root.clone().remove_pane(&id_of(&root, "a1")).unwrap();
+        assert_eq!(
+            active_of(after.leaf_of_pane(&a3).unwrap()),
+            a3,
+            "与摘完后的激活项对得上"
+        );
+    }
+
+    /// 整组没了:同一个 split 里紧挨着的那一格接手,优先前一格;那一格又分了屏时取离得
+    /// 最近的叶子。不再一律跳回最左边那一组。
+    #[test]
+    fn 整组关掉由相邻分组接手() {
+        // [a | b | c]
+        let row = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"]), leaf_of(&["c"])],
+        );
+        let (a, b, c) = (id_of(&row, "a"), id_of(&row, "b"), id_of(&row, "c"));
+        assert_eq!(
+            row.takeover_after_removal(&b),
+            Some(a.clone()),
+            "优先前一格"
+        );
+        assert_eq!(row.takeover_after_removal(&c), Some(b.clone()));
+        assert_eq!(row.takeover_after_removal(&a), Some(b), "第一格取后一格");
+
+        // [[x / y] | z]:关 z,前一格是竖切,离它最近的是最后一片 y
+        let left = split_of(
+            SplitDirection::Vertical,
+            vec![leaf_of(&["x"]), leaf_of(&["y"])],
+        );
+        let root = split_of(SplitDirection::Horizontal, vec![left, leaf_of(&["z"])]);
+        let (x, y, z) = (id_of(&root, "x"), id_of(&root, "y"), id_of(&root, "z"));
+        assert_eq!(root.takeover_after_removal(&z), Some(y.clone()));
+        // 关 x:先在它自己那个竖切里找邻居 y,不跳到外层
+        assert_eq!(root.takeover_after_removal(&x), Some(y));
+
+        // [p | [q / r]]:关 p,后一格是竖切,取第一片 q
+        let right = split_of(
+            SplitDirection::Vertical,
+            vec![leaf_of(&["q"]), leaf_of(&["r"])],
+        );
+        let root = split_of(SplitDirection::Horizontal, vec![leaf_of(&["p"]), right]);
+        let (p, q) = (id_of(&root, "p"), id_of(&root, "q"));
+        assert_eq!(root.takeover_after_removal(&p), Some(q));
+    }
+
+    /// 邻居那一组有多个 tab 时落在它的**激活** tab 上(与点那一组的终端主体同一个落点)。
+    #[test]
+    fn 接手的邻组落在它的激活页签() {
+        let mut b = leaf_of(&["b1", "b2"]);
+        let b2 = id_of(&b, "b2");
+        b.activate_pane(&b2);
+        let root = split_of(SplitDirection::Horizontal, vec![b, leaf_of(&["c"])]);
+        assert_eq!(root.takeover_after_removal(&id_of(&root, "c")), Some(b2));
+    }
+
+    /// 接手的 pane 摘完之后一定还在树上、而且正是某一组眼前那个 tab —— 逐个 pane 对账,
+    /// 免得规则与 `remove_pane` 的塌陷 / 激活规则走偏。
+    #[test]
+    fn 接手的总是摘完后看得见的那个() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![
+                leaf_of(&["a1", "a2"]),
+                split_of(
+                    SplitDirection::Vertical,
+                    vec![leaf_of(&["b"]), leaf_of(&["c1", "c2", "c3"])],
+                ),
+                leaf_of(&["d"]),
+            ],
+        );
+        for name in ["a1", "a2", "b", "c1", "c2", "c3", "d"] {
+            let id = id_of(&root, name);
+            let next = root.takeover_after_removal(&id).expect("还有别的 pane");
+            let after = root.clone().remove_pane(&id).unwrap();
+            assert!(
+                after.visible_panes().iter().any(|p| p.id == next),
+                "关 {name} 后接手的不在眼前"
+            );
+        }
+        // 最后一个 pane / 不在树里:没人接手
+        let single = leaf_of(&["s"]);
+        assert_eq!(single.takeover_after_removal(&id_of(&single, "s")), None);
+        assert_eq!(root.takeover_after_removal("pane-不在树里"), None);
+    }
+
+    /// 动作目标的回落链:逻辑焦点 → 项目自己记着的上次聚焦 → 第一组的激活页签。
+    /// 焦点在文件树 / 项目列表时按 Ctrl+Shift+W,关的是眼前那一组。
+    #[test]
+    fn 动作目标先看逻辑焦点再看项目记忆() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        assert_eq!(root.target_pane(Some(&b), None), Some(b.clone()));
+        // 逻辑焦点指着别的项目(切项目回来):用这个项目自己记着的
+        assert_eq!(
+            root.target_pane(Some("pane-别的项目"), Some(&b)),
+            Some(b.clone())
+        );
+        // 两者都在时逻辑焦点优先
+        assert_eq!(root.target_pane(Some(&a), Some(&b)), Some(a.clone()));
+        // 都不在:第一组的激活页签
+        assert_eq!(root.target_pane(None, Some("pane-已关")), Some(a.clone()));
+        assert_eq!(root.target_pane(None, None), Some(a));
     }
 }

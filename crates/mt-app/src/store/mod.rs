@@ -108,6 +108,10 @@ pub struct ProjectState {
     /// **纯运行时,不落盘**。挂在项目状态上而不是另开一张表:移除项目时整项
     /// `project_states.remove` 掉,栈跟着没,不必另记一处清理。
     pub closed_panes: Vec<reopen::ClosedPane>,
+    /// 这个项目上次聚焦的 pane。`AppStore::focused_pane_id` 是全局的一份,切到别的项目
+    /// 再切回来时它指着别处 —— 「当前该操作哪个 pane」靠这一档接住(见
+    /// [`SplitNode::target_pane`])。**纯运行时,不落盘**。
+    pub last_focused_pane_id: Option<String>,
 }
 
 impl ProjectState {
@@ -118,6 +122,7 @@ impl ProjectState {
             needs_attention: false,
             maximized_pane_id: None,
             closed_panes: Vec::new(),
+            last_focused_pane_id: None,
         }
     }
 
@@ -420,6 +425,10 @@ pub struct AppStore {
     project_states: HashMap<String, ProjectState>,
     /// ptyId → 终端视图。pane 只在树里存 id,视图挂这里(旧版 terminalCache)。
     terminals: HashMap<u32, Entity<TerminalPane>>,
+    /// 每个终端的焦点句柄(弱引用,与 `terminals` 同增同删)。「键盘焦点在哪个终端里」靠它
+    /// 判 —— 去 `read` 终端实体不行:关闭入口可能正跑在某个终端自己的 update 里(退出条上的
+    /// 「关闭」),再读它就是 gpui 的二次租借 panic。弱引用:不替已关掉的终端续命焦点句柄。
+    terminal_focus: HashMap<u32, gpui::WeakFocusHandle>,
     /// 每个 pane 的退出订阅,与 terminals 同生命周期。
     pane_subs: HashMap<u32, Subscription>,
     /// 当前拿着键盘焦点的 pane(旧版靠 DOM `activeElement` 推,这里显式维护)。
@@ -730,6 +739,7 @@ impl AppStore {
             active_project_id,
             project_states,
             terminals: HashMap::new(),
+            terminal_focus: HashMap::new(),
             pane_subs: HashMap::new(),
             focused_pane_id: None,
             mobile_relay_status: None,

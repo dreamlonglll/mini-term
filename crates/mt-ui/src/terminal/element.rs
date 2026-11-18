@@ -87,6 +87,10 @@ use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
+use super::drag_select::{
+    AUTOSCROLL_TICK, LeftPress, ScrollZone, autoscroll_lines, cell_in_selection,
+    classify_left_press, drag_exceeds_cell,
+};
 use super::input::{Arrow, arrow_bytes};
 use super::links::{
     self, FileLinks, HoveredLink, LINK_HINT_DELAY, LinkCache, LinkHint, LinkHintLabel, LinkTarget,
@@ -475,6 +479,42 @@ struct TerminalElementState {
     /// 悬停提示自己那份裁决缓存。与 Ctrl 那份分开:那份一松开 Ctrl 就清,而悬停提示
     /// 根本不按 Ctrl;这份在每次停留到点时清,刚生成的文件下一次停留就认得出。
     link_hint_cache: Rc<RefCell<LinkCache>>,
+    /// ⌥+按下、还没拖过一格的那一下(见 [`AltPress`])。松手时还在 = 定位光标。
+    alt_press: Rc<StdCell<Option<AltPress>>>,
+    /// 拖选自动滚屏与节拍任务共享的那份(见 [`AutoScroll`])。
+    autoscroll: Rc<StdCell<AutoScroll>>,
+    /// 自动滚屏的节拍任务。**必须留着句柄** —— 松手 / 新的按下 / 元素销毁时随之 drop,
+    /// 就是确定能停的那一下。任务的闭包**不许**持有这个格子(那是一个循环引用,元素销毁
+    /// 时任务永远 drop 不掉)。
+    autoscroll_task: Rc<RefCell<Option<gpui::Task<()>>>>,
+}
+
+/// ⌥+按下还没拖过一格:选区先不动,松手时没拖过 = 定位光标,拖过一格 = 从这里开块选。
+#[derive(Clone, Copy, Debug)]
+struct AltPress {
+    /// 按下处(窗口坐标)。拖没拖过一格按它比(见 [`drag_exceeds_cell`])。
+    position: Point<Pixels>,
+    /// 按下那一格的屏幕列与行(定位光标的目标格)。
+    col: usize,
+    row: usize,
+    /// 块选的锚点(grid 坐标)与半格。
+    anchor: AlacPoint,
+    side: Side,
+}
+
+/// 拖选自动滚屏的共享状态。指针停在区外不动时没有 mouse-move 可等,节拍任务只能读这里。
+#[derive(Clone, Copy, Debug, Default)]
+struct AutoScroll {
+    /// 节拍任务在不在跑。由起停两头维护,任务自己判停时也会把它放下。
+    running: bool,
+    /// 最近一次拖动事件的指针位置(窗口坐标)。
+    pointer: Point<Pixels>,
+    /// 最近一帧的网格几何 —— 滚完要按它把活动端落到边行上。每帧 paint 刷新。
+    origin: Point<Pixels>,
+    cell_size: Size<Pixels>,
+    columns: usize,
+    screen_lines: usize,
+    zone: ScrollZone,
 }
 
 impl Default for TerminalElementState {
@@ -497,6 +537,9 @@ impl Default for TerminalElementState {
             link_hint: Rc::new(RefCell::new(LinkHint::default())),
             link_hint_task: Rc::new(RefCell::new(None)),
             link_hint_cache: Rc::new(RefCell::new(LinkCache::default())),
+            alt_press: Rc::new(StdCell::new(None)),
+            autoscroll: Rc::new(StdCell::new(AutoScroll::default())),
+            autoscroll_task: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -1166,6 +1209,35 @@ impl TerminalElement {
             f32::from(prepared.hitbox.bounds.size.height),
         );
 
+        // ── 拖选自动滚屏的几何每帧刷新:指针停在区外不动时节拍任务读的就是这一份
+        //    (拖着的时候窗口被缩放、分屏比例被改也跟得上)。一次 Cell 读写,不分配
+        {
+            let bounds = prepared.hitbox.bounds;
+            let mut shared = state.autoscroll.get();
+            shared.origin = origin;
+            shared.cell_size = cell_size;
+            shared.columns = columns;
+            shared.screen_lines = screen_lines;
+            shared.zone = ScrollZone::new(
+                f(bounds.top()),
+                f(bounds.bottom()),
+                f(window.viewport_size().height),
+            );
+            state.autoscroll.set(shared);
+        }
+        let scroll_ctx = AutoScrollCtx {
+            emulator: self.emulator.clone(),
+            selecting: state.selecting.clone(),
+            shared: state.autoscroll.clone(),
+            touched: state.scrollbar_touched.clone(),
+            dwell: state.dwell.clone(),
+            dwell_task: state.dwell_task.clone(),
+            dwell_cfg: self.dwell,
+            on_copied: self.on_selection_copied.clone(),
+            element_size,
+            view_id,
+        };
+
         // ── 滚轮
         //
         //  优先级:Ctrl+滚轮缩放 > 鼠标上报 > alt screen 方向键 > 本地回看。
@@ -1277,6 +1349,9 @@ impl TerminalElement {
             let link_cache = state.link_cache.clone();
             let link_hint = state.link_hint.clone();
             let link_hint_task = state.link_hint_task.clone();
+            let alt_press = state.alt_press.clone();
+            let autoscroll = state.autoscroll.clone();
+            let autoscroll_task = state.autoscroll_task.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
@@ -1287,6 +1362,10 @@ impl TerminalElement {
                 if link_hint.borrow_mut().cancel() {
                     cx.notify(view_id);
                 }
+                // 上一次拖选的残局一律作废(丢了 MouseUp 的兜底):挂着的 ⌥+单击、还在跑的
+                // 自动滚屏。正常松手时两样早就收干净了,这里是空操作
+                alt_press.set(None);
+                stop_autoscroll(&autoscroll, &autoscroll_task);
                 let mods = modifiers_of(&event.modifiers);
                 let (col, row, side) =
                     Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
@@ -1384,49 +1463,64 @@ impl TerminalElement {
                     return;
                 }
 
-                // 本地:左键开选(双击 = 语义选词,三击 = 选整行)
+                // 本地:左键。这一下是扩选、⌥+单击还是新起选区(单击普通 / 双击选词 /
+                // 三击选行),优先级见 `drag_select` 模块注释
                 if event.button != MouseButton::Left {
                     return;
                 }
                 let display_offset = emulator.with_term(|t| t.grid().display_offset());
-
-                // ⌥+单击:把光标挪到点中的格子。判定与合成见 [`cursor_move_bytes`]。
-                //
-                // **修饰键不能省**:裸左键是拖选区的起手式,两者抢同一个手势。
-                // Terminal.app 同样挂在 ⌥+click 上,这里照它。
-                //
-                // 只在**没滚动回看**时生效:滚上去之后视口行号与光标所在的 grid 行
-                // 不是一回事,差值算出来会把光标带到莫名其妙的地方。
-                if event.modifiers.alt
-                    && event.click_count == 1
-                    && display_offset == 0
-                    && let Some(on_input) = on_input.as_ref()
-                {
-                    let (cur_line, cur_col) = emulator.with_term(|t| {
-                        let p = t.grid().cursor.point;
-                        (p.line.0, p.column.0 as i32)
+                // 「手上有没有看得见的选区」只有按着 Shift 时用得上,别的时候不白拿一次锁
+                let has_selection = event.modifiers.shift
+                    && emulator.with_term(|t| {
+                        t.selection
+                            .as_ref()
+                            .is_some_and(|sel| sel.to_range(t).is_some())
                     });
-                    let payload =
-                        cursor_move_bytes(cur_line, cur_col, row as i32, col as i32, mode);
-                    if !payload.is_empty() {
-                        on_input(&payload, window, cx);
+                // ⌥+单击定位光标只在**没滚动回看**时生效:滚上去之后视口行号与光标所在的
+                // grid 行不是一回事,差值算出来会把光标带到莫名其妙的地方
+                let cursor_move = display_offset == 0 && on_input.is_some();
+                let point = Self::grid_point(col, row, display_offset);
+                match classify_left_press(
+                    event.click_count,
+                    event.modifiers.shift,
+                    event.modifiers.alt,
+                    has_selection,
+                    cursor_move,
+                ) {
+                    // ⌥+单击:把光标挪到点中的格子(判定与合成见 [`cursor_move_bytes`])。
+                    // **修饰键不能省**:裸左键是拖选区的起手式,两者抢同一个手势;
+                    // Terminal.app 同样挂在 ⌥+click 上,这里照它。
+                    //
+                    // 按下时先挂起:⌥+拖动是块选,得等松手才知道这一下是不是单击
+                    // (拖过一格就在 mouse-move 那边转块选)。选区与停留复制这一下都不碰
+                    // —— 与从前的 ⌥+单击一样,已有的选区不被清掉
+                    LeftPress::AltClick => {
+                        alt_press.set(Some(AltPress {
+                            position: event.position,
+                            col,
+                            row,
+                            anchor: point,
+                            side,
+                        }));
+                        return;
                     }
-                    return;
+                    // Shift+单击扩选:锚点与选区类型不动,只把活动端挪过来;接着拖照样延伸
+                    LeftPress::Extend => {
+                        emulator.with_term_mut(|term| {
+                            if let Some(sel) = term.selection.as_mut() {
+                                sel.update(point, side);
+                            }
+                        });
+                        selecting.set(true);
+                    }
+                    LeftPress::Start(ty) => {
+                        emulator.with_term_mut(|term| {
+                            term.selection = Some(Selection::new(ty, point, side));
+                        });
+                        // 双击 / 三击选出的词与行不跟着拖(与从前一致)
+                        selecting.set(event.click_count == 1);
+                    }
                 }
-
-                let ty = match event.click_count {
-                    1 => SelectionType::Simple,
-                    2 => SelectionType::Semantic,
-                    _ => SelectionType::Lines,
-                };
-                emulator.with_term_mut(|term| {
-                    term.selection = Some(Selection::new(
-                        ty,
-                        Self::grid_point(col, row, display_offset),
-                        side,
-                    ));
-                });
-                selecting.set(event.click_count == 1);
 
                 // ── 拖选停留复制:按下就起表(停留语义关掉时 on_press 返回 None)
                 // 存**元素相对**坐标:气泡落点要按元素宽度贴边收拢
@@ -1478,6 +1572,9 @@ impl TerminalElement {
             let link_hint = state.link_hint.clone();
             let link_hint_task = state.link_hint_task.clone();
             let link_hint_cache = state.link_hint_cache.clone();
+            let alt_press = state.alt_press.clone();
+            let autoscroll = state.autoscroll.clone();
+            let autoscroll_task = state.autoscroll_task.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -1602,6 +1699,51 @@ impl TerminalElement {
                     ));
                 }
 
+                // ── ⌥+按下还没转块选:拖满一格才转;没满什么都不做(松手按单击定位光标)
+                if let Some(press) = alt_press.get() {
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        // 丢了 MouseUp:这一下作废,既不定位光标也不开选区
+                        alt_press.set(None);
+                        return;
+                    }
+                    let dx = f(event.position.x - press.position.x);
+                    let dy = f(event.position.y - press.position.y);
+                    if !drag_exceeds_cell(dx, dy, f(cell_size.width), f(cell_size.height)) {
+                        return;
+                    }
+                    alt_press.set(None);
+                    emulator.with_term_mut(|term| {
+                        term.selection = Some(Selection::new(
+                            SelectionType::Block,
+                            press.anchor,
+                            press.side,
+                        ));
+                    });
+                    selecting.set(true);
+                    // 停留复制从转块选这一刻起算:按下那会儿还不知道这一下是不是在选
+                    let generation = dwell_state.borrow_mut().on_press(
+                        &dwell_cfg,
+                        (
+                            f32::from(event.position.x - origin.x),
+                            f32::from(event.position.y - origin.y),
+                        ),
+                    );
+                    if let Some(generation) = generation {
+                        *dwell_task.borrow_mut() = Some(arm_dwell(
+                            generation,
+                            dwell_cfg,
+                            dwell_state.clone(),
+                            this_emulator.clone(),
+                            on_copied.clone(),
+                            element_size,
+                            view_id,
+                            window,
+                            cx,
+                        ));
+                    }
+                    // 接着往下走:把活动端延伸到当前指针
+                }
+
                 let mods = modifiers_of(&event.modifiers);
                 let held = reported.get();
 
@@ -1636,10 +1778,14 @@ impl TerminalElement {
                 }
 
                 if !selecting.get() || event.pressed_button != Some(MouseButton::Left) {
+                    // 没在拖选(或按着的已经不是左键 —— 丢了 MouseUp):自动滚屏一并停掉。
+                    // 没在跑时只是一次 Cell 读
+                    stop_autoscroll(&autoscroll, &autoscroll_task);
                     return;
                 }
                 // 拖出元素外也要继续选,所以这里不判 hover
-                let display_offset = emulator.with_term(|t| t.grid().display_offset());
+                let (display_offset, history) =
+                    emulator.with_term(|t| (t.grid().display_offset(), t.grid().history_size()));
                 let (col, row, side) =
                     Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
                 emulator.with_term_mut(|term| {
@@ -1647,6 +1793,20 @@ impl TerminalElement {
                         sel.update(Self::grid_point(col, row, display_offset), side);
                     }
                 });
+                // ── 拖到可视区上 / 下边外:起自动滚屏;回到区内、滚到头:停。指针停在区外
+                //    不动时没有 mouse-move 可等,节拍任务自己读这里记下的指针
+                let mut shared = autoscroll.get();
+                shared.pointer = event.position;
+                autoscroll.set(shared);
+                // alt screen 没有回看(`history` 恒 0 已经挡住,这里再按模式明说一次)
+                let wants = !alt_screen
+                    && autoscroll_lines(f(event.position.y), shared.zone, display_offset, history)
+                        != 0;
+                if wants {
+                    start_autoscroll(&scroll_ctx, &autoscroll_task, window, cx);
+                } else {
+                    stop_autoscroll(&autoscroll, &autoscroll_task);
+                }
                 // ⚠️ 这是最热的一处:拖选一次 = 每个 mouse-move 一发。
                 // 原来的 refresh 会让三块 cached 面板逐帧重排,改用 notify 之后
                 // 只有这个终端视图重画
@@ -1667,6 +1827,9 @@ impl TerminalElement {
             let dwell_state = state.dwell.clone();
             let dwell_task = state.dwell_task.clone();
             let dwell_cfg = self.dwell;
+            let alt_press = state.alt_press.clone();
+            let autoscroll = state.autoscroll.clone();
+            let autoscroll_task = state.autoscroll_task.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
@@ -1715,6 +1878,32 @@ impl TerminalElement {
                 }
 
                 if event.button != MouseButton::Left {
+                    return;
+                }
+                // 松手 = 拖选结束,自动滚屏当场停(drop 句柄即取消节拍任务)
+                stop_autoscroll(&autoscroll, &autoscroll_task);
+                // ⌥+单击(按下后没拖满一格就松手):把光标挪到按下的那一格。判定在按下时已经
+                // 做完,这里只是把合成推迟到「确定不是拖」之后;按住期间滚过回看的话行号已经
+                // 对不上光标所在行,作罢
+                if let Some(press) = alt_press.take() {
+                    let (display_offset, (cur_line, cur_col)) = emulator.with_term(|t| {
+                        let p = t.grid().cursor.point;
+                        (t.grid().display_offset(), (p.line.0, p.column.0 as i32))
+                    });
+                    if display_offset == 0
+                        && let Some(on_input) = on_input.as_ref()
+                    {
+                        let payload = cursor_move_bytes(
+                            cur_line,
+                            cur_col,
+                            press.row as i32,
+                            press.col as i32,
+                            mode,
+                        );
+                        if !payload.is_empty() {
+                            on_input(&payload, window, cx);
+                        }
+                    }
                     return;
                 }
                 let was_selecting = selecting.replace(false);
@@ -1857,6 +2046,132 @@ fn arm_dwell(
             cx.notify(view_id);
         });
     })
+}
+
+/// 自动滚屏节拍任务要带进去的东西:全是跨帧存活的共享格子,**不含任务句柄本身**
+/// (见 [`TerminalElementState::autoscroll_task`] 那条循环引用的提醒)。
+#[derive(Clone)]
+struct AutoScrollCtx {
+    emulator: Arc<TerminalEmulator>,
+    selecting: Rc<StdCell<bool>>,
+    shared: Rc<StdCell<AutoScroll>>,
+    /// 滚动条的「最近碰过」时刻:滚了就让它亮起来。
+    touched: Rc<StdCell<Option<Instant>>>,
+    dwell: Rc<RefCell<DwellTracker>>,
+    dwell_task: Rc<RefCell<Option<gpui::Task<()>>>>,
+    dwell_cfg: DwellConfig,
+    on_copied: Option<OnSelectionCopied>,
+    element_size: (f32, f32),
+    view_id: EntityId,
+}
+
+/// 起自动滚屏节拍。已经在跑就什么都不做(mouse-move 一个像素一发,不能每发都重起一个)。
+fn start_autoscroll(
+    ctx: &AutoScrollCtx,
+    task: &RefCell<Option<gpui::Task<()>>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut shared = ctx.shared.get();
+    if shared.running {
+        return;
+    }
+    shared.running = true;
+    ctx.shared.set(shared);
+    *task.borrow_mut() = Some(arm_autoscroll(ctx.clone(), window, cx));
+}
+
+/// 停自动滚屏:放下标记、drop 句柄(= 取消节拍任务)。没在跑时只是一次 Cell 读。
+fn stop_autoscroll(shared: &StdCell<AutoScroll>, task: &RefCell<Option<gpui::Task<()>>>) {
+    let mut state = shared.get();
+    if !state.running {
+        return;
+    }
+    state.running = false;
+    shared.set(state);
+    task.borrow_mut().take();
+}
+
+/// 自动滚屏的节拍任务:每 [`AUTOSCROLL_TICK`] 滚一拍,该停时自己退出并放下标记 ——
+/// 退出之后不留任何定时器。返回的 `Task` 必须由元素状态持有(drop = 取消)。
+fn arm_autoscroll(ctx: AutoScrollCtx, window: &mut Window, cx: &mut App) -> gpui::Task<()> {
+    window.spawn(cx, async move |cx| {
+        loop {
+            cx.background_executor().timer(AUTOSCROLL_TICK).await;
+            let keep = cx
+                .update(|window, cx| autoscroll_tick(&ctx, window, cx))
+                .unwrap_or(false);
+            if !keep {
+                let mut shared = ctx.shared.get();
+                shared.running = false;
+                ctx.shared.set(shared);
+                return;
+            }
+        }
+    })
+}
+
+/// 自动滚屏的一拍:朝指针那边滚 [`autoscroll_lines`] 行,把选区活动端落到新露出的边行上,
+/// 停留复制重新计时。返回 `false` = 该停了:松了手 / 选区没了 / alt screen / 窗口不在前台
+/// (焦点被别的窗口抢走时 MouseUp 可能永远不来,不停就一路滚到头)/ 指针回到区内 / 滚到头。
+fn autoscroll_tick(ctx: &AutoScrollCtx, window: &mut Window, cx: &mut App) -> bool {
+    let shared = ctx.shared.get();
+    if !shared.running || !ctx.selecting.get() || !window.is_window_active() {
+        return false;
+    }
+    let moved = ctx.emulator.with_term_mut(|term| {
+        if term.mode().contains(TermMode::ALT_SCREEN) || term.selection.is_none() {
+            return false;
+        }
+        let lines = {
+            let grid = term.grid();
+            autoscroll_lines(
+                f(shared.pointer.y),
+                shared.zone,
+                grid.display_offset(),
+                grid.history_size(),
+            )
+        };
+        if lines == 0 {
+            return false;
+        }
+        term.scroll_display(Scroll::Delta(lines));
+        let display_offset = term.grid().display_offset();
+        // 指针在区外:行号钳到边行,列照指针横坐标走(块选的右边沿跟着手)
+        let (col, row, side) = TerminalElement::hit_cell(
+            shared.pointer,
+            shared.origin,
+            shared.cell_size,
+            shared.columns,
+            shared.screen_lines,
+        );
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(TerminalElement::grid_point(col, row, display_offset), side);
+        }
+        true
+    });
+    if !moved {
+        return false;
+    }
+    // 滚了就把滚动条亮起来(与滚轮同一口径)
+    ctx.touched.set(Some(Instant::now()));
+    // 鼠标没动、选区却在长:停留复制重新计时,别在半截时复制
+    let generation = ctx.dwell.borrow_mut().restart(&ctx.dwell_cfg);
+    if let Some(generation) = generation {
+        *ctx.dwell_task.borrow_mut() = Some(arm_dwell(
+            generation,
+            ctx.dwell_cfg,
+            ctx.dwell.clone(),
+            ctx.emulator.clone(),
+            ctx.on_copied.clone(),
+            ctx.element_size,
+            ctx.view_id,
+            window,
+            cx,
+        ));
+    }
+    cx.notify(ctx.view_id);
+    true
 }
 
 /// 查找的兜底重绘:`delay` 之后 notify 一次本视图,让下一帧的 prepaint 再 sync
@@ -2159,9 +2474,11 @@ impl Element for TerminalElement {
                     fg = bg;
                 }
 
+                // 逐格按 alacritty 的区间判(块选按列区间);宽字符跨在边上时整字一起亮,
+                // 与复制出来的内容对得上(见 [`cell_in_selection`])
                 let selected = selection_range
-                    .map(|r| r.contains(indexed.point))
-                    .unwrap_or(false);
+                    .as_ref()
+                    .is_some_and(|r| cell_in_selection(r, indexed.point, flags));
                 let is_cursor = indexed.point == cursor_point && cursor_shape != CursorShape::Hidden;
                 if is_cursor && focused && cursor_shape == CursorShape::Block {
                     // 块状光标底下的字反白

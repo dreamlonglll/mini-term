@@ -50,6 +50,13 @@
 //! `store::reopen`)。记在 `do_close` 里而不是入口处:确认框被取消就不该入栈,
 //! 而且要按确认那一刻的最新布局记(组里这期间可能又多了 tab)。别处顺手关掉的终端
 //! (删 worktree、移除项目)不经这里,也就不入栈。
+//!
+//! # 关掉之后的键盘焦点
+//!
+//! 关掉的正是拿着键盘焦点的终端时,同一个入口把焦点交给接手的终端
+//! ([`hand_focus_after_close`];接手者由 `AppStore::close_pane` 定)。其余落空的情形 ——
+//! 点 × / 中键时焦点在页签上、确认框把焦点还给已经关掉的终端、项目里一个终端都不剩 ——
+//! 由 Workspace 的「焦点落空」兜底接住(`TerminalArea::restore_lost_focus`)。
 
 use std::time::{Duration, Instant};
 
@@ -511,12 +518,56 @@ pub fn close_tabs(
     );
 }
 
-/// 关终端的**唯一闸**:按 [`close_needs_prompt`] 弹确认框或直接关,两条路跑同一个 `do_close`。
+/// 关掉之后要不要把键盘焦点交给接手的终端:关之前焦点在某个终端里(`focused_before`),
+/// 而那个终端这一关就没了(`still_alive == false`)。
+///
+/// 焦点原本在别处(文件树、项目列表、另一个没被关的终端)一律不动 —— 关的是别的组,
+/// 用户手上的事不该被打断。
+fn focus_follows_close(focused_before: Option<u32>, still_alive: bool) -> bool {
+    focused_before.is_some() && !still_alive
+}
+
+/// 关掉之后把键盘焦点交给接手的终端(见 [`focus_follows_close`])。
+///
+/// 接手的是活动项目里逻辑焦点所在的 pane —— `AppStore::close_pane` 刚把逻辑焦点交到它
+/// 手上(同组眼前那个 tab,整组没了就是相邻那一组)。从前这里什么都不做:被关的终端
+/// 连同它的焦点句柄一起没了,键盘焦点落空,打字直接丢、Workspace 的快捷键全不响应,
+/// 要拿鼠标点一下才回来。项目里一个终端都不剩时这里交不出去,由 Workspace 的「焦点落空」
+/// 兜底接住(落到终端区的兜底焦点上,见 `TerminalArea::restore_lost_focus`)。
+fn hand_focus_after_close(
+    store: &Entity<AppStore>,
+    focused_before: Option<u32>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let alive = focused_before.is_some_and(|pty_id| store.read(cx).terminal(pty_id).is_some());
+    if !focus_follows_close(focused_before, alive) {
+        return;
+    }
+    let target = {
+        let store = store.read(cx);
+        store
+            .active_project_id
+            .clone()
+            .and_then(|project_id| Some((store.active_pane_id(&project_id)?, project_id)))
+    };
+    if let Some((pane_id, project_id)) = target {
+        store.update(cx, |store, cx| {
+            store.focus_pane(&project_id, &pane_id, window, cx)
+        });
+    }
+}
+
+/// 关终端的**唯一闸**:按 [`close_needs_prompt`] 弹确认框或直接关,两条路跑同一个 `do_close`,
+/// 关完同一处交接键盘焦点([`hand_focus_after_close`])。
 ///
 /// 不弹框时也要 `window.defer`:调用方多半是 `cx.listener` 里(tab 的 ×、控制条、
 /// Ctrl+Shift+W),`TerminalArea` / `Workspace` 正被 update 着。确认框那条路的
 /// `do_close` 是在弹窗的 action 里跑的,没有这层租约;这里排到本轮 effect 之后,
 /// 两条路才是真的同一种调用环境,不必去推敲 `AppStore::close_*` 会不会读回它们。
+///
+/// 「焦点在哪个终端里」**在入口处就记下**:弹了确认框之后焦点在框上,等到确认那一刻再看
+/// 就分不清了。确认框取消不走 `do_close`,焦点由弹窗还回原处,这里一下都不碰。
 fn close_after_prompt(
     store: Entity<AppStore>,
     prompt: ClosePrompt,
@@ -524,9 +575,11 @@ fn close_after_prompt(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let focused_before = store.read(cx).focused_terminal(window, cx);
     if !close_needs_prompt(store.read(cx).config(), prompt.ai_busy, prompt.dead) {
-        window.defer(cx, move |_window, cx| {
+        window.defer(cx, move |window, cx| {
             store.update(cx, |store, cx| do_close(store, cx));
+            hand_focus_after_close(&store, focused_before, window, cx);
         });
         return;
     }
@@ -545,8 +598,12 @@ fn close_after_prompt(
         );
     }
     confirm.open(
-        move |_window, cx| {
+        move |window, cx| {
             store.update(cx, |store, cx| do_close(store, cx));
+            // 弹窗随后(关闭动画走完)会把焦点「还」给打开它之前的那个句柄 —— 正是刚关掉
+            // 的终端,还不回去就是一次焦点落空,由 Workspace 的兜底再交回接手的终端。
+            // 这里先交一次,确认之后立刻就能打字
+            hand_focus_after_close(&store, focused_before, window, cx);
         },
         window,
         cx,
@@ -1041,6 +1098,23 @@ mod tests {
             dead.ai_busy,
             dead.dead
         ));
+    }
+
+    /// 关掉的正是拿着键盘焦点的终端才交接;焦点在别处(文件树、没被关的终端)不动。
+    #[test]
+    fn 只有关掉拿着焦点的终端才交接键盘焦点() {
+        assert!(
+            focus_follows_close(Some(3), false),
+            "焦点所在的终端被关了:交给接手的"
+        );
+        assert!(
+            !focus_follows_close(Some(3), true),
+            "焦点所在的终端还在(关的是别的组 / 别的 tab):不动"
+        );
+        assert!(
+            !focus_follows_close(None, false),
+            "焦点原本不在终端里(文件树、项目列表):不抢"
+        );
     }
 
     /// 按住 Ctrl+Shift+W 不放:首次连发隔 500ms~1s 才来、之后几十毫秒一次,一律吞掉;

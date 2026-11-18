@@ -286,7 +286,8 @@ impl AppStore {
         let auto_resume = self.config.ai_auto_resume.unwrap_or(true);
         let pane = reopened_pane(&entry, reopen_resumes(&entry, auto_resume, remote));
         let pane_id = pane.id.clone();
-        let focused = self.focused_pane_id.clone();
+        // 「当前活动分组」与快捷键取目标同一条回落链(切项目回来焦点指着别处也认得出)
+        let focused = self.active_pane_id(project_id);
         let Some(state) = self.project_states.get_mut(project_id) else {
             return;
         };
