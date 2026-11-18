@@ -42,6 +42,14 @@
 //!
 //! 关窗([`crate::title_bar::allow_close`])、移除项目、删 worktree 各有各的确认框,
 //! **不归这个偏好管**:它们一次毁掉的东西更多,语义也不同。
+//!
+//! # 已关闭栈
+//!
+//! 这里的每个关闭动作在真正关之前都把要关的 pane 记进项目的已关闭栈
+//! (`AppStore::remember_closed_panes`,「重新打开已关闭的终端」的数据源,见
+//! `store::reopen`)。记在 `do_close` 里而不是入口处:确认框被取消就不该入栈,
+//! 而且要按确认那一刻的最新布局记(组里这期间可能又多了 tab)。别处顺手关掉的终端
+//! (删 worktree、移除项目)不经这里,也就不入栈。
 
 use std::time::{Duration, Instant};
 
@@ -493,6 +501,7 @@ pub fn close_tabs(
         store,
         prompt,
         move |store, cx| {
+            store.remember_closed_panes(&project_id, &ids);
             for id in &ids {
                 store.close_pane(&project_id, id, cx);
             }
@@ -567,6 +576,7 @@ pub fn close_pane(
         move |store, cx| {
             // 按 id 从**最新**布局关(不是拿确认前那份快照)—— 确认框开着的这段
             // 时间里 pane 可能刚拿到 pty_id,用旧快照会漏掉回收(原版同一条注释)
+            store.remember_closed_panes(&project_id, std::slice::from_ref(&pane_id));
             store.close_pane(&project_id, &pane_id, cx);
         },
         window,
@@ -600,6 +610,8 @@ pub fn close_leaf_of_pane(
         move |store, cx| {
             // 确认之后**按 pane id 重新定位叶子**:这段时间里可能又分了一次屏,
             // 叶子 id 会变(insert_split 把原叶子换成 split 的一个子节点)
+            let ids = store.leaf_pane_ids(&project_id, &pane_id);
+            store.remember_closed_panes(&project_id, &ids);
             store.close_leaf_of_pane(&project_id, &pane_id, cx);
         },
         window,
@@ -622,7 +634,14 @@ pub fn close_leaf(
     close_after_prompt(
         store,
         prompt,
-        move |store, cx| store.close_leaf(&project_id, &leaf_id, cx),
+        move |store, cx| {
+            let ids: Vec<String> = leaf_panes(store, &project_id, &leaf_id)
+                .into_iter()
+                .map(|p| p.id)
+                .collect();
+            store.remember_closed_panes(&project_id, &ids);
+            store.close_leaf(&project_id, &leaf_id, cx);
+        },
         window,
         cx,
     );
@@ -649,7 +668,15 @@ pub fn close_panel(
     close_after_prompt(
         store,
         prompt,
-        move |store, cx| store.close_panel(&project_id, &panel_id, cx),
+        move |store, cx| {
+            let ids: Vec<String> = store
+                .project_state(&project_id)
+                .and_then(|s| s.panels.iter().find(|p| p.id == panel_id))
+                .map(|p| p.layout.panes().into_iter().map(|x| x.id.clone()).collect())
+                .unwrap_or_default();
+            store.remember_closed_panes(&project_id, &ids);
+            store.close_panel(&project_id, &panel_id, cx);
+        },
         window,
         cx,
     );

@@ -30,14 +30,16 @@
 //! 会恢复成 35/65。于是首帧只放量尺的 canvas,下一帧再铺分屏树 —— 代价是一帧空白。
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, anchored, canvas, deferred, div, point,
-    prelude::FluentBuilder, px,
+    MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, SharedString, Size,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, canvas, deferred,
+    div, point, prelude::FluentBuilder, px,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, ShellIcon, ShellKind, VectorIcon};
 use mt_ui::tooltip::TooltipExt as _;
@@ -134,36 +136,51 @@ fn leaf_rect_in(
     w: f32,
     h: f32,
 ) -> Option<RevealFrom> {
-    match node {
-        SplitNode::Leaf { id, .. } => (id == leaf_id).then_some(RevealFrom {
+    node_rect_in(node, leaf_id, x, y, w, h)
+}
+
+/// [`leaf_rect_in`] 的通用版:任意节点(叶子或 split)的矩形。双击分隔条认下标时要
+/// split 自己的起点(见 [`nearest_boundary`])。节点 id 全树唯一,叶子与 split 不会撞。
+fn node_rect_in(
+    node: &SplitNode,
+    node_id: &str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> Option<RevealFrom> {
+    if node.id() == node_id {
+        return Some(RevealFrom {
             left: x,
             top: y,
             width: w,
             height: h,
-        }),
-        SplitNode::Split {
-            direction,
-            children,
-            sizes,
-            ..
-        } => {
-            let fractions = split_fractions(sizes, children.len());
-            let mut off = 0.0f32;
-            for (i, child) in children.iter().enumerate() {
-                let f = fractions.get(i).copied().unwrap_or(0.0) as f32;
-                let found = if *direction == SplitDirection::Horizontal {
-                    leaf_rect_in(child, leaf_id, x + off * w, y, w * f, h)
-                } else {
-                    leaf_rect_in(child, leaf_id, x, y + off * h, w, h * f)
-                };
-                if found.is_some() {
-                    return found;
-                }
-                off += f;
-            }
-            None
-        }
+        });
     }
+    let SplitNode::Split {
+        direction,
+        children,
+        sizes,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    let fractions = split_fractions(sizes, children.len());
+    let mut off = 0.0f32;
+    for (i, child) in children.iter().enumerate() {
+        let f = fractions.get(i).copied().unwrap_or(0.0) as f32;
+        let found = if *direction == SplitDirection::Horizontal {
+            node_rect_in(child, node_id, x + off * w, y, w * f, h)
+        } else {
+            node_rect_in(child, node_id, x, y + off * h, w, h * f)
+        };
+        if found.is_some() {
+            return found;
+        }
+        off += f;
+    }
+    None
 }
 
 pub struct TerminalArea {
@@ -268,6 +285,50 @@ pub struct TerminalArea {
     /// 上一次点 ×(tab 上的与控制条的)的时刻,判连点用
     /// (见 [`pane_actions::swallows_close_click`])。
     last_close_click: Option<std::time::Instant>,
+    /// 每个分组页签区的横向滚动状态(key = leaf id)。跨帧保留 —— 句柄一重建,
+    /// 用户滚到的位置就丢了;回收与 `split_states` 同一时机(布局变了的那一帧)。
+    tab_strips: HashMap<String, TabStripScroll>,
+}
+
+/// 一个分组页签区的横向滚动:滚动句柄 + 激活页签的跟随记录。
+#[derive(Default)]
+struct TabStripScroll {
+    handle: ScrollHandle,
+    follow: TabFollow,
+}
+
+/// 「激活页签滚进视野」的触发判据。
+///
+/// 只在激活页签**变了**(换了一个、或同一个被挪了位置)时滚一次:每帧都滚的话,用户自己
+/// 横向滚动页签区会被立刻拽回去。变化恰好发生在页签区还没排过版的那一帧(刚建出来的
+/// 分组)时先挂着,等排过版再滚 —— gpui 的 `scroll_to_item` 在滚动区头一次排版之前
+/// 还不知道它是横向滚动的,当场滚等于白滚。
+#[derive(Default, Debug, PartialEq)]
+struct TabFollow {
+    /// 上一次见到的激活页签:(pane id, 组内下标)。
+    shown: Option<(String, usize)>,
+    /// 变化已记下、还没滚成。
+    pending: bool,
+}
+
+impl TabFollow {
+    /// 记下这一帧的激活页签;返回这一帧要不要把它滚进视野。
+    /// `laid_out`:页签区至少排过一次版。
+    fn observe(&mut self, active_id: &str, index: usize, laid_out: bool) -> bool {
+        let same = self
+            .shown
+            .as_ref()
+            .is_some_and(|(id, i)| id == active_id && *i == index);
+        if !same {
+            self.shown = Some((active_id.to_string(), index));
+            self.pending = true;
+        }
+        if self.pending && laid_out {
+            self.pending = false;
+            return true;
+        }
+        false
+    }
 }
 
 /// 叶内切 tab 的一次 push 过渡。
@@ -662,6 +723,130 @@ fn sizes_to_percent(pixels: &[f64]) -> Option<Vec<f64>> {
     Some(pixels.iter().map(|p| p / total * 100.0).collect())
 }
 
+// ─── 键盘调比例 / 双击分隔条均分(纯函数)────────────────────────
+//
+// 两条路最后都落到 `ResizableState::resize_panel`(与拖分隔条同一套规则),再把它算出的
+// 像素换回百分比写进 store(与拖完松手同一条 `set_split_sizes` → layout.db 去抖落盘)。
+// 这里只算「分隔线该停在哪」:只在分隔线两侧那两格之间挪,两格都不小于组件库的最小格宽
+// (`PANEL_MIN_SIZE`)—— 挪不动就不挪,不会把更远的格子连带挤小。
+
+/// 键盘调比例一步挪多少:分隔线所在 split 主轴长度的 5%。
+const SPLIT_NUDGE_STEP: f32 = 0.05;
+
+/// 第 `boundary` 条分隔线(`sizes[boundary]` 与 `sizes[boundary + 1]` 之间)朝后一格挪
+/// (`grow = true`,→ / ↓)或朝前一格挪一步之后,`sizes[boundary]` 该是多宽。
+///
+/// 两格都钳在 `min` 以上;挪不动(已经顶到最小、两格合起来都放不下两个最小值、容器还没量出来)
+/// 或挪动不到半像素时返回 `None`。
+fn nudged_panel_size(
+    sizes: &[f32],
+    boundary: usize,
+    container: f32,
+    grow: bool,
+    min: f32,
+) -> Option<f32> {
+    let (a, b) = (*sizes.get(boundary)?, *sizes.get(boundary + 1)?);
+    if !container.is_finite() || container <= 0.0 {
+        return None;
+    }
+    let step = container * SPLIT_NUDGE_STEP;
+    let (lo, hi) = (min, a + b - min);
+    if hi < lo {
+        return None;
+    }
+    let moved = if grow { a + step } else { a - step };
+    let target = moved.clamp(lo, hi);
+    ((target - a).abs() >= 0.5).then_some(target)
+}
+
+/// 双击第 `boundary` 条分隔线:两侧两格均分,返回 `sizes[boundary]` 的新宽度;
+/// 已经等宽(差不到 1px)时返回 `None`。
+fn equalized_panel_size(sizes: &[f32], boundary: usize) -> Option<f32> {
+    let (a, b) = (*sizes.get(boundary)?, *sizes.get(boundary + 1)?);
+    ((a - b).abs() >= 1.0).then_some((a + b) / 2.0)
+}
+
+/// 主轴上离 `pos` 最近的那条分隔线的下标。`start` 是 split 在主轴上的起点,`sizes` 是各格
+/// 实际像素宽(分隔线 i 落在 `start + sizes[0..=i]` 之和处)。少于两格返回 `None`。
+///
+/// 双击分隔条时拿它认「点的是哪一条」:组件库给分隔条外观回调时不告诉下标,
+/// 只好按点击位置反推 —— 两条分隔线之间至少隔一个最小格宽,不会认错。
+fn nearest_boundary(sizes: &[f32], start: f32, pos: f32) -> Option<usize> {
+    let mut edge = start;
+    let mut best: Option<(usize, f32)> = None;
+    for (i, size) in sizes.iter().enumerate().take(sizes.len().saturating_sub(1)) {
+        edge += size;
+        let dist = (pos - edge).abs();
+        if best.is_none_or(|(_, d)| dist < d) {
+            best = Some((i, dist));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// 分隔条拖拽区单侧的宽度,与组件库分隔条的内衬(gpui-base `HANDLE_PADDING`,crate 私有)
+/// 同值:热区要与拖拽区严丝合缝,宽了会抢走旁边格子的点击。
+const SPLIT_HANDLE_PAD: f32 = 4.0;
+
+/// 一条分隔条画什么,外加「双击均分」的热区。
+///
+/// 组件库只把**画什么**交给外观回调(`ResizeHandleRenderer`),热区、光标与拖拽仍归它
+/// 自己;回调一旦接手就得连那条 1px 线一起画,这里照内置样子画(颜色取法同组件库:静止
+/// `border`、拖动中 `drag_border`)。线上挂一块透明热区,铺满分隔条 8px 的拖拽区,只接
+/// 双击、不 `occlude`,拖拽照旧由外层分隔条接。与拖拽不打架:起拖的那一帧 gpui 会清掉
+/// 热区记着的按下(`pending_mouse_down`),拖完松手不会被认成一次点击;没挪动的按下 /
+/// 抬起本来也起不了拖。
+fn split_handle(
+    handle: &gpui_base::ResizeHandleContext,
+    on_double_click: impl Fn(gpui::Point<Pixels>, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let horizontal = matches!(handle.axis(), gpui::Axis::Horizontal);
+    let theme = cx.theme();
+    let color = if handle.is_active() {
+        theme.drag_border
+    } else {
+        theme.border
+    };
+    let hit = div()
+        .id("split-equalize")
+        .absolute()
+        .map(|el| {
+            if horizontal {
+                el.top_0()
+                    .bottom_0()
+                    .left(px(-SPLIT_HANDLE_PAD))
+                    .w(px(2.0 * SPLIT_HANDLE_PAD))
+                    .cursor_col_resize()
+            } else {
+                el.left_0()
+                    .right_0()
+                    .top(px(-SPLIT_HANDLE_PAD))
+                    .h(px(2.0 * SPLIT_HANDLE_PAD))
+                    .cursor_row_resize()
+            }
+        })
+        .on_click(move |event, window, cx| {
+            if click_count(event) < 2 {
+                return;
+            }
+            cx.stop_propagation();
+            on_double_click(click_position(event, window), window, cx);
+        });
+    div()
+        .flex_none()
+        .bg(color)
+        .map(|el| {
+            if horizontal {
+                el.h_full().w(px(1.0))
+            } else {
+                el.w_full().h(px(1.0))
+            }
+        })
+        .child(hit)
+        .into_any_element()
+}
+
 // ─── tab 右键菜单 ─────────────────────────────────────────────
 
 /// tab 右键菜单的**项序**。`None` = 分隔线。
@@ -691,6 +876,8 @@ enum TabMenuAction {
     /// 「关闭右侧终端」(同组)。
     CloseToRight,
     ClosePane,
+    /// 「重新打开已关闭的终端」(项目的已关闭栈,见 `store::reopen`)。栈空时置灰。
+    ReopenClosed,
 }
 
 /// 项序按分支段的两种形态展开。两个入参互斥(有身份就不会缺身份),
@@ -718,8 +905,38 @@ fn tab_menu_actions(can_fork: bool, identity_missing: bool) -> Vec<Option<TabMen
         Some(CloseOthers),
         Some(CloseToRight),
         Some(ClosePane),
+        None,
+        Some(ReopenClosed),
     ]);
     actions
+}
+
+/// 「重新打开已关闭的终端」菜单项:页签右键与页签栏「+」的菜单(连同空态页那颗按钮的)
+/// 共用这一份。栈空时置灰而不是抽掉(菜单条目固定,肌肉记忆才稳);有可重开的时补一行
+/// 说明:要重开的是哪个,以及**原进程回不来** —— 它是新开一个同 shell、同目录的终端,
+/// 不是撤销关闭。
+pub(crate) fn reopen_closed_menu_item(
+    store: &Entity<AppStore>,
+    project_id: &str,
+    cx: &App,
+) -> MenuEntry {
+    let next = store.read(cx).next_closed_label(project_id);
+    let store = store.clone();
+    let pid = project_id.to_string();
+    let item = MenuItem::new(t("paneGroup", "reopenClosed"))
+        .shortcut(crate::hotkeys::hotkey_label("reopenClosed"))
+        .disabled(next.is_none())
+        .on_click(move |window, cx| {
+            store.update(cx, |store, cx| {
+                store.reopen_closed_pane(&pid, window, cx);
+            });
+        });
+    match next {
+        Some(label) => item
+            .detail(tr!("paneGroup", "reopenClosedDetail", label = label))
+            .into(),
+        None => item.into(),
+    }
 }
 
 /// 「最大化 / 还原」这一项现在是什么样:`None` = 用不上(置灰,标「最大化」);
@@ -858,6 +1075,7 @@ pub(crate) fn tab_menu(
                     "maximize"
                 },
             ))
+            .shortcut(crate::hotkeys::hotkey_label("toggleMaximize"))
             .disabled(maximize.is_none())
             .on_click(move |_window, cx| {
                 store.update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &pane, cx));
@@ -866,6 +1084,7 @@ pub(crate) fn tab_menu(
             // 关闭一族全走 pane_actions —— 与 tab 上的 ×、Ctrl+Shift+W 同一个
             // AI 感知确认入口;批量的两项只弹一个汇总确认框
             TabMenuAction::CloseTab => MenuItem::new(t("paneGroup", "closeTab"))
+                .shortcut(crate::hotkeys::hotkey_label("closeTab"))
                 .on_click(move |window, cx| {
                     pane_actions::close_pane(store.clone(), pid.clone(), pane.clone(), window, cx);
                 })
@@ -911,6 +1130,7 @@ pub(crate) fn tab_menu(
                     );
                 })
                 .into(),
+            TabMenuAction::ReopenClosed => reopen_closed_menu_item(&store, &pid, cx),
         });
     }
     entries
@@ -952,6 +1172,7 @@ impl TerminalArea {
             area_origin: gpui::Point::default(),
             suppress_entity_pane: None,
             last_close_click: None,
+            tab_strips: HashMap::new(),
         }
     }
 
@@ -1309,6 +1530,147 @@ impl TerminalArea {
         true
     }
 
+    /// 键盘调分屏比例(Alt+Shift+方向键):把当前 pane 在 `dir` 那一侧最近的分隔线朝 `dir`
+    /// 推一步([`SPLIT_NUDGE_STEP`]),pane 朝那边变大。
+    ///
+    /// 返回「那个方向有没有可调的分隔线」:没有(贴着区域边缘 / 单格布局 / 正最大化着、
+    /// 其余格子都收在折叠条里 / 分隔条状态还没建出来)时是 `false`,调用方据此把按键放行
+    /// 给终端(见 `main.rs::Workspace::resize_split`)。有分隔线但已经顶到最小格宽时照样
+    /// 返回 `true` —— 按键归调比例,只是这一下挪不动。
+    pub fn resize_split(
+        &mut self,
+        dir: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (axis, forward) = match dir {
+            Direction::Left => (SplitDirection::Horizontal, false),
+            Direction::Right => (SplitDirection::Horizontal, true),
+            Direction::Up => (SplitDirection::Vertical, false),
+            Direction::Down => (SplitDirection::Vertical, true),
+        };
+        let found = {
+            let store = self.store.read(cx);
+            store.active_project_id.clone().and_then(|project_id| {
+                if store.maximized_pane_id(&project_id).is_some() {
+                    return None;
+                }
+                let pane_id = store.active_pane_id(&project_id)?;
+                let (node_id, boundary) = store
+                    .active_layout()?
+                    .boundary_toward(&pane_id, axis, forward)?;
+                Some((project_id, node_id, boundary))
+            })
+        };
+        let Some((project_id, node_id, boundary)) = found else {
+            return false;
+        };
+        let Some(state) = self.split_states.get(&node_id).cloned() else {
+            return false;
+        };
+        let (sizes, container) = {
+            let state = state.read(cx);
+            (
+                state
+                    .sizes()
+                    .iter()
+                    .map(|p| f32::from(*p))
+                    .collect::<Vec<_>>(),
+                f32::from(state.container_size()),
+            )
+        };
+        let min = f32::from(gpui_base::PANEL_MIN_SIZE);
+        if let Some(size) = nudged_panel_size(&sizes, boundary, container, forward, min) {
+            self.apply_split_resize(&project_id, &node_id, &state, boundary, size, window, cx);
+        }
+        true
+    }
+
+    /// 双击分隔条:那条分隔线两侧两格均分。`position` 是点击处(窗口坐标),下标按它反推
+    /// (组件库的分隔条外观回调不告诉是第几条,见 [`nearest_boundary`])。
+    fn equalize_split_at(
+        &mut self,
+        node_id: &str,
+        state: &Entity<ResizableState>,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let found = {
+            let store = self.store.read(cx);
+            store.active_project_id.clone().and_then(|project_id| {
+                let layout = store.active_layout()?;
+                let horizontal = matches!(
+                    layout.node(node_id),
+                    Some(SplitNode::Split {
+                        direction: SplitDirection::Horizontal,
+                        ..
+                    })
+                );
+                let rect = node_rect_in(
+                    layout,
+                    node_id,
+                    0.0,
+                    0.0,
+                    f32::from(self.area_size.width),
+                    f32::from(self.area_size.height),
+                )?;
+                Some((project_id, horizontal, rect))
+            })
+        };
+        let Some((project_id, horizontal, rect)) = found else {
+            return;
+        };
+        let (start, pos) = if horizontal {
+            (rect.left, f32::from(position.x - self.area_origin.x))
+        } else {
+            (rect.top, f32::from(position.y - self.area_origin.y))
+        };
+        let sizes: Vec<f32> = state
+            .read(cx)
+            .sizes()
+            .iter()
+            .map(|p| f32::from(*p))
+            .collect();
+        let Some(boundary) = nearest_boundary(&sizes, start, pos) else {
+            return;
+        };
+        if let Some(size) = equalized_panel_size(&sizes, boundary) {
+            self.apply_split_resize(&project_id, node_id, state, boundary, size, window, cx);
+        }
+    }
+
+    /// 让第 `boundary` 条分隔线停到「前一格宽 `size`」处:交给 `ResizableState::resize_panel`
+    /// (与拖分隔条同一套钳位规则),再把它算出的像素换回百分比写进 store —— 与拖完松手的
+    /// `on_resize` 同一条落盘路径(`set_split_sizes` → layout.db 去抖)。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_split_resize(
+        &mut self,
+        project_id: &str,
+        node_id: &str,
+        state: &Entity<ResizableState>,
+        boundary: usize,
+        size: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        state.update(cx, |state, cx| {
+            state.resize_panel(boundary, px(size), window, cx)
+        });
+        let sizes: Vec<f64> = state
+            .read(cx)
+            .sizes()
+            .iter()
+            .map(|p| f32::from(*p) as f64)
+            .collect();
+        if let Some(pct) = sizes_to_percent(&sizes) {
+            self.store.update(cx, |store, cx| {
+                store.set_split_sizes(project_id, node_id, pct, cx)
+            });
+        }
+        cx.notify();
+    }
+
     /// AI 任务标记浮层。`None` = 没开 / 那个 pane 已经不在了。
     ///
     /// 层级照 `menu.rs` 的套路:`deferred(priority 1)` → 全窗透明遮罩(`occlude` +
@@ -1580,12 +1942,31 @@ impl TerminalArea {
                 } else {
                     v_resizable(element_id)
                 };
+                // 分隔条照内置样子画,外加「双击均分」的热区(见 [`split_handle`])
+                let handles: gpui_base::ResizeHandleRenderer = {
+                    let area = cx.weak_entity();
+                    let state = state.clone();
+                    let node_id = id.clone();
+                    Rc::new(move |handle, _window, cx| {
+                        let (area, state, node_id) = (area.clone(), state.clone(), node_id.clone());
+                        Some(split_handle(
+                            handle,
+                            move |position, window, cx| {
+                                let _ = area.update(cx, |area, cx| {
+                                    area.equalize_split_at(&node_id, &state, position, window, cx)
+                                });
+                            },
+                            cx,
+                        ))
+                    })
+                };
 
                 let store = self.store.clone();
                 let node_id = id.clone();
                 let pid = project_id.to_string();
                 group
                     .with_state(&state)
+                    .with_handle_appearance(handles)
                     .children(panels)
                     .on_resize(move |state, _window, cx| {
                         // ResizableState 给的是像素,布局树里存的是百分比(与磁盘
@@ -2096,43 +2477,39 @@ impl TerminalArea {
             })
             .collect();
 
-        // tab 栏横向滚动(E.2):tab **不压缩**(`min_w` 之下就溢出),
-        // 溢出时整条可横向滚。`overflow_x_scroll` 要求元素是 stateful(有 `.id()`)。
+        // 页签区横向滚动(E.2):tab **不压缩**(`min_w` 之下就溢出),溢出时页签区
+        // 自己横向滚。滚动区**只装页签**:「+」与右侧控件簇在它外面、固定在右边 ——
+        // 此前整条 tab 栏一起滚,页签一多「+」与查找 / 分屏 / 关组几颗钮都被滚到视野外。
+        // 页签区 `min_w(0)` + 可收缩:页签少时按内容宽,「+」紧跟在最后一个页签后面;
+        // 放不下时收窄成滚动区,「+」停在右侧。
         //
         // **垂直滚轮不必自己映射**:gpui 只在 `overflow.x == Scroll && overflow.y != Scroll`
         // 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y` 记到 x 上
         // (gpui-0.2.2 `elements/div.rs:2422-2428`,默认值见 `style.rs:741`)——
         // 与原版靠 WebView 免费拿到的那条行为等价。
         //
-        // ⚠️ **这条不刷底色了**(原先是 `bg_elevated()`)。
-        //
-        // 它属于「终端页」,而上面那条工作台页签条里激活的「终端」页签用的是
-        // `bg_terminal` —— 两者同色才连成一片。此前用 elevated,于是从上往下是
-        // 「激活页签 → 更亮的一条带 → 终端内容」,页签与内容之间凭空多出一层,
-        // 「页签连着内容」的隐喻断在这儿。
-        //
-        // 要的颜色正是 `bg_terminal`,但**不能自己刷一遍**:TerminalArea 根容器
-        // 已经刷过一层(见 `render` 尾部那句),背景图主题下 bg_terminal 是半透明
-        // rgba,再刷就是透明度叠乘、这一条会比下面的终端内容暗一块。不刷即可
-        // 透出根容器那层,颜色分毫不差 —— 与 PaneGroup 根「一律不刷底色」同一条
-        // 口径(`styles.css:151` / `themePackManager.ts:294`,见下方 2540 行注释)。
-        // 与终端内容之间仍留 `border_b_1`,那是这一层唯一的分界线。
-        let mut bar = div()
-            .id(gpui::SharedString::from(format!("tabbar-{leaf_id}")))
+        // 激活页签变了(切 tab / Ctrl+1..9 / 跳待办 / 新建落在末尾 / 左右移)时把它滚进
+        // 视野,**只滚这一次**:用户自己横向滚过的位置不会被拽回去(见 [`TabFollow`])。
+        // 不用上游的 Scrollbar 组件:实测它的轨道会吞页签下缘的点击(定稿结论)。
+        let active_idx = panes.iter().position(|p| p.id == active.id).unwrap_or(0);
+        let strip_scroll = self.tab_strips.entry(leaf_id.to_string()).or_default();
+        let laid_out = strip_scroll.handle.bounds().size.width > px(0.0);
+        if strip_scroll
+            .follow
+            .observe(&active.id, active_idx, laid_out)
+        {
+            strip_scroll.handle.scroll_to_item(active_idx);
+        }
+        let scroll_handle = strip_scroll.handle.clone();
+        let mut strip = div()
+            .id(gpui::SharedString::from(format!("tabstrip-{leaf_id}")))
             .flex()
             .items_center()
-            .flex_none()
             .gap(px(4.0))
-            // 只给左内衬:右边缘是 `render_leaf_controls` 那一格,它自带
-            // `px(CTRL_CLUSTER_PAD)`。这里再补一道右内衬会把控件簇整体左推,
-            // 而 marker 浮层的锚点([`MARKER_ANCHOR_INSET`])是按「簇紧贴叶子
-            // 右缘」算出来的常量,推一下就对不上了。
-            .pl(px(6.0))
-            .h(px(TAB_BAR_H))
+            .h_full()
+            .min_w(px(0.0))
             .overflow_x_scroll()
-            .border_b_1()
-            .border_color(ui::border_subtle())
-            .text_size(ui::font_px(12.0));
+            .track_scroll(&scroll_handle);
 
         // tab 焦点句柄先补齐(下面的循环里 `cx` 要交给 listener,腾不出可变借用)
         for pane in panes.iter() {
@@ -2179,7 +2556,7 @@ impl TerminalArea {
             // 悬停态本来就由下面那个 `on_hover` 维护着(它给缩略图预览用),
             // 这里直接读:chip 的悬停底色与「× 现不现身」都看它
             let is_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
-            bar = bar.child(
+            strip = strip.child(
                 div()
                     .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
                     // 量矩形的 canvas 要一个定位上下文;`relative` 对 flex 项
@@ -2467,7 +2844,37 @@ impl TerminalArea {
             );
         }
 
-        // 新建终端
+        // ⚠️ 外层这条**不刷底色**(原先是 `bg_elevated()`)。
+        //
+        // 它属于「终端页」,而上面那条工作台页签条里激活的「终端」页签用的是
+        // `bg_terminal` —— 两者同色才连成一片。此前用 elevated,于是从上往下是
+        // 「激活页签 → 更亮的一条带 → 终端内容」,页签与内容之间凭空多出一层,
+        // 「页签连着内容」的隐喻断在这儿。
+        //
+        // 要的颜色正是 `bg_terminal`,但**不能自己刷一遍**:TerminalArea 根容器
+        // 已经刷过一层(见 `render` 尾部那句),背景图主题下 bg_terminal 是半透明
+        // rgba,再刷就是透明度叠乘、这一条会比下面的终端内容暗一块。不刷即可
+        // 透出根容器那层,颜色分毫不差 —— 与 PaneGroup 根「一律不刷底色」同一条
+        // 口径(`styles.css:151` / `themePackManager.ts:294`,见下方 2540 行注释)。
+        // 与终端内容之间仍留 `border_b_1`,那是这一层唯一的分界线。
+        let mut bar = div()
+            .id(gpui::SharedString::from(format!("tabbar-{leaf_id}")))
+            .flex()
+            .items_center()
+            .flex_none()
+            .gap(px(4.0))
+            // 只给左内衬:右边缘是 `render_leaf_controls` 那一格,它自带
+            // `px(CTRL_CLUSTER_PAD)`。这里再补一道右内衬会把控件簇整体左推,
+            // 而 marker 浮层的锚点([`MARKER_ANCHOR_INSET`])是按「簇紧贴叶子
+            // 右缘」算出来的常量,推一下就对不上了。
+            .pl(px(6.0))
+            .h(px(TAB_BAR_H))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .text_size(ui::font_px(12.0))
+            .child(strip);
+
+        // 新建终端(在滚动区外,页签再多也停在视野里)
         let pid_new = project_id.to_string();
         let anchor_new = active.id.clone();
         bar = bar.child(
@@ -2508,7 +2915,7 @@ impl TerminalArea {
                         });
                         return;
                     }
-                    let entries = pane_actions::new_terminal_menu_entries(
+                    let mut entries = pane_actions::new_terminal_menu_entries(
                         shells,
                         launchers,
                         {
@@ -2538,6 +2945,8 @@ impl TerminalArea {
                             }
                         },
                     );
+                    entries.push(menu::separator());
+                    entries.push(reopen_closed_menu_item(&this.store, &pid_new, cx));
                     menu::show(click_position(event, window), entries, window, cx);
                 }))
                 .child("+"),
@@ -2675,13 +3084,14 @@ impl TerminalArea {
                     ICON_MAXIMIZE
                 },
             )
-            .tip(t(
+            .tip(tr!(
                 "paneGroup",
                 if is_maximized {
                     "restorePane"
                 } else {
                     "maximizePane"
                 },
+                shortcut = crate::hotkeys::hotkey_label("toggleMaximize")
             ))
             .on_click(cx.listener(move |this, _event, _window, cx| {
                 cx.stop_propagation();
@@ -2698,6 +3108,8 @@ impl TerminalArea {
         let leaf_for_close = leaf_id.to_string();
         div()
             .ml_auto()
+            // 页签区放不下时收窄的是它,不是这一簇(marker 浮层的锚点按簇宽算)
+            .flex_none()
             .flex()
             .items_center()
             .gap(px(CTRL_GAP))
@@ -3761,6 +4173,7 @@ impl Render for TerminalArea {
         if layout_changed {
             let live_nodes = self.store.read(cx).live_node_ids();
             self.split_states.retain(|id, _| live_nodes.contains(id));
+            self.tab_strips.retain(|id, _| live_nodes.contains(id));
         }
         // 拖拽结束后借这一帧清掉落点残留(**不 notify**,正在渲染)。
         // 高亮另外还与 `has_active_drag` 与门,见 `render_leaf`。
@@ -3853,7 +4266,7 @@ impl Render for TerminalArea {
                                 });
                                 return;
                             }
-                            let entries = pane_actions::new_terminal_menu_entries(
+                            let mut entries = pane_actions::new_terminal_menu_entries(
                                 shells,
                                 launchers,
                                 {
@@ -3879,6 +4292,9 @@ impl Render for TerminalArea {
                                     }
                                 },
                             );
+                            // 关光了终端才会停在这一页 —— 「误关了最后一个」正好在这里找回
+                            entries.push(menu::separator());
+                            entries.push(reopen_closed_menu_item(&this.store, &pid, cx));
                             menu::show(click_position(event, window), entries, window, cx);
                         }))
                         .child(format!("+ {}", t("terminalArea", "newTerminal"))),
@@ -4563,7 +4979,7 @@ mod tests {
     }
 
     /// tab 右键菜单的项序(没有 AI 会话的那一支:分支段整段不出):
-    /// 改名 / 复制 → 分屏 → 最大化 → 关闭一族,三条分隔线。
+    /// 改名 / 复制 → 分屏 → 最大化 → 关闭一族 → 重新打开已关闭的,四条分隔线。
     #[test]
     fn tab_右键菜单项序() {
         use TabMenuAction::*;
@@ -4583,9 +4999,11 @@ mod tests {
                 Some(CloseOthers),
                 Some(CloseToRight),
                 Some(ClosePane),
+                None,
+                Some(ReopenClosed),
             ]
         );
-        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 3);
+        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 4);
     }
 
     /// 分支段的两种形态各自插在**分屏两项之后、最大化之前**,各带一条前导分隔线
@@ -4601,6 +5019,8 @@ mod tests {
             Some(CloseOthers),
             Some(CloseToRight),
             Some(ClosePane),
+            None,
+            Some(ReopenClosed),
         ];
         // 有会话身份 + 有 fork 能力位
         let mut expected = vec![
@@ -4630,10 +5050,10 @@ mod tests {
         assert_eq!(tab_menu_actions(false, true), expected);
 
         // 两者互斥(有身份就不会缺身份),真同时为真也不该塌成畸形菜单:
-        // 段与段之间各自带分隔线,关闭段照旧在最后
+        // 段与段之间各自带分隔线,关闭段与「重新打开」照旧在最后
         let both = tab_menu_actions(true, true);
-        assert_eq!(both.last(), Some(&Some(ClosePane)));
-        assert_eq!(both.iter().filter(|a| a.is_none()).count(), 5);
+        assert_eq!(both.last(), Some(&Some(ReopenClosed)));
+        assert_eq!(both.iter().filter(|a| a.is_none()).count(), 6);
     }
 
     /// 「最大化 / 还原」与控制条那颗按钮同一判据:单格布局用不上;正铺满按**组**认
@@ -4725,7 +5145,16 @@ mod tests {
     /// 一对空括号),这里逐个钉住,并确认与 tab 右键菜单显示的是同一组键。
     #[test]
     fn 控制条提示里的快捷键取得到() {
-        for id in ["terminalSearch", "splitRight", "splitDown", "closePane"] {
+        for id in [
+            "terminalSearch",
+            "splitRight",
+            "splitDown",
+            "closePane",
+            // 最大化钮的提示、页签右键「关闭此终端 / 最大化 / 重新打开」的快捷键列
+            "toggleMaximize",
+            "closeTab",
+            "reopenClosed",
+        ] {
             assert!(
                 !crate::hotkeys::hotkey_label(id).is_empty(),
                 "键位表里没有 {id}"
@@ -4749,6 +5178,15 @@ mod tests {
             shortcut = crate::hotkeys::hotkey_label("splitRight")
         );
         assert!(!tip.contains('{'), "占位符没换干净: {tip}");
+        for key in ["maximizePane", "restorePane"] {
+            let tip = tr!(
+                "paneGroup",
+                key,
+                shortcut = crate::hotkeys::hotkey_label("toggleMaximize")
+            );
+            assert!(!tip.contains('{'), "占位符没换干净: {tip}");
+            assert!(tip.contains(&crate::hotkeys::hotkey_label("toggleMaximize")));
+        }
     }
 
     /// marker 按钮的锚点由控件簇的布局常量算出(原版是量 DOM 矩形)。
@@ -4843,6 +5281,119 @@ mod tests {
         assert!(!marker_popover_alive(&layout, &second_id, 99));
         // pane 压根不在布局里
         assert!(!marker_popover_alive(&layout, "pane-nonexistent", 7));
+    }
+
+    /// 键盘调比例一步 = 容器主轴的 5%,只在分隔线两侧那两格之间挪,两格都不小于最小格宽;
+    /// 顶到头就不挪(返回 None),容器还没量出来也不挪。
+    #[test]
+    fn 键盘调比例一步与最小格宽() {
+        let sizes = [400.0, 600.0];
+        // 朝后一格挪(→ / ↓):前一格变大 50px(1000 × 5%)
+        assert_eq!(
+            nudged_panel_size(&sizes, 0, 1000.0, true, 100.0),
+            Some(450.0)
+        );
+        assert_eq!(
+            nudged_panel_size(&sizes, 0, 1000.0, false, 100.0),
+            Some(350.0)
+        );
+        // 后一格只剩 120:最多让到 100(最小格宽),不越过
+        assert_eq!(
+            nudged_panel_size(&[880.0, 120.0], 0, 1000.0, true, 100.0),
+            Some(900.0)
+        );
+        assert_eq!(
+            nudged_panel_size(&[900.0, 100.0], 0, 1000.0, true, 100.0),
+            None,
+            "已经顶到最小"
+        );
+        assert_eq!(
+            nudged_panel_size(&[100.0, 900.0], 0, 1000.0, false, 100.0),
+            None
+        );
+        // 三格里挪中间那条:只动第 1、2 格,第 0 格不受牵连(返回的是第 1 格的新宽)
+        assert_eq!(
+            nudged_panel_size(&[300.0, 300.0, 400.0], 1, 1000.0, true, 100.0),
+            Some(350.0)
+        );
+        // 两格合起来都放不下两个最小格 / 容器没量出来 / 下标越界
+        assert_eq!(
+            nudged_panel_size(&[90.0, 90.0], 0, 180.0, true, 100.0),
+            None
+        );
+        assert_eq!(nudged_panel_size(&sizes, 0, 0.0, true, 100.0), None);
+        assert_eq!(nudged_panel_size(&sizes, 1, 1000.0, true, 100.0), None);
+    }
+
+    /// 双击均分:两侧两格各取一半;已经等宽不动。
+    #[test]
+    fn 双击分隔条均分两侧() {
+        assert_eq!(equalized_panel_size(&[300.0, 700.0], 0), Some(500.0));
+        assert_eq!(
+            equalized_panel_size(&[200.0, 300.0, 500.0], 1),
+            Some(400.0),
+            "只均分那条分隔线两侧"
+        );
+        assert_eq!(equalized_panel_size(&[500.0, 500.4], 0), None);
+        assert_eq!(equalized_panel_size(&[500.0], 0), None);
+    }
+
+    /// 点击位置反推分隔线下标:取最近的那条;一格的 split 没有分隔线。
+    #[test]
+    fn 按点击位置认分隔线() {
+        // 起点 100,三格 200/300/500 → 分隔线在 300 与 600
+        let sizes = [200.0, 300.0, 500.0];
+        assert_eq!(nearest_boundary(&sizes, 100.0, 299.0), Some(0));
+        assert_eq!(nearest_boundary(&sizes, 100.0, 303.0), Some(0));
+        assert_eq!(nearest_boundary(&sizes, 100.0, 597.0), Some(1));
+        assert_eq!(nearest_boundary(&sizes, 100.0, 9999.0), Some(1));
+        assert_eq!(nearest_boundary(&[1000.0], 0.0, 10.0), None);
+    }
+
+    /// split 自己的矩形:双击认分隔线时要 split 的起点(嵌套里也要算对)。
+    #[test]
+    fn 分屏节点矩形按比例换算() {
+        use crate::tree::{PaneState, gen_id};
+        let leaf = |name: &str| SplitNode::leaf(PaneState::new(name));
+        let inner_id = gen_id("split");
+        let inner = SplitNode::Split {
+            id: inner_id.clone(),
+            direction: SplitDirection::Vertical,
+            sizes: vec![50.0, 50.0],
+            children: vec![leaf("b"), leaf("c")],
+        };
+        let root = SplitNode::Split {
+            id: gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![30.0, 70.0],
+            children: vec![leaf("a"), inner],
+        };
+        let r = node_rect_in(&root, &inner_id, 0.0, 0.0, 1000.0, 800.0).unwrap();
+        assert_eq!(
+            (r.left, r.top, r.width, r.height),
+            (300.0, 0.0, 700.0, 800.0)
+        );
+        let whole = node_rect_in(&root, root.id(), 0.0, 0.0, 1000.0, 800.0).unwrap();
+        assert_eq!((whole.left, whole.width), (0.0, 1000.0));
+    }
+
+    /// 激活页签跟随:变了才滚、只滚一次;没排过版先挂着,排过版的那一帧补上;
+    /// 同一个页签被挪了位置也算变(要跟过去)。
+    #[test]
+    fn 激活页签只在变化时滚一次() {
+        let mut follow = TabFollow::default();
+        // 刚建出来、还没排过版:先挂着
+        assert!(!follow.observe("p1", 0, false));
+        assert!(follow.observe("p1", 0, true), "排过版的下一帧补滚");
+        // 没变:用户自己滚页签区,不许拽回去
+        assert!(!follow.observe("p1", 0, true));
+        assert!(!follow.observe("p1", 0, true));
+        // 切到别的页签:滚一次
+        assert!(follow.observe("p9", 8, true));
+        assert!(!follow.observe("p9", 8, true));
+        // 同一个页签挪了位置(Ctrl+Shift+PgDn / 左边关掉一个)
+        assert!(follow.observe("p9", 7, true));
+        assert!(!follow.observe("p9", 7, true));
     }
 
     /// 换算一圈回来不变形:百分比 → 像素 → 百分比。

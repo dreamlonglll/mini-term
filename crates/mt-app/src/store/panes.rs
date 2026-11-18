@@ -535,7 +535,12 @@ impl AppStore {
         self.activate_pane(project_id, pane_id, window, cx);
     }
 
-    /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。只有一个 tab 时什么也不做。
+    /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。
+    ///
+    /// 组里只有这一个 tab 时改为**切到相邻分组**(布局树 DFS 序循环,见
+    /// [`SplitNode::adjacent_leaf_pane`]):每组一个 tab 的分屏布局里,叶内循环永远原地
+    /// 不动,按了没反应。落点走 [`Self::jump_to_pane`] —— 别的组正铺满时目标缩在折叠条里,
+    /// 只激活的话焦点会落在看不见的那一格。只有一组时照旧什么也不做。
     pub fn cycle_pane(
         &mut self,
         project_id: &str,
@@ -544,13 +549,45 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = self
+        let Some(layout) = self
             .project_states
             .get(project_id)
             .and_then(|s| s.layout_of_pane(from_pane_id))
-            .and_then(|l| l.cycle_target(from_pane_id, delta));
-        if let Some(target) = target {
+        else {
+            return;
+        };
+        if let Some(target) = layout.cycle_target(from_pane_id, delta) {
             self.activate_pane(project_id, &target, window, cx);
+            return;
+        }
+        let single_tab = matches!(
+            layout.leaf_of_pane(from_pane_id),
+            Some(SplitNode::Leaf { panes, .. }) if panes.len() == 1
+        );
+        let neighbour = single_tab
+            .then(|| layout.adjacent_leaf_pane(from_pane_id, delta))
+            .flatten();
+        if let Some(target) = neighbour {
+            self.jump_to_pane(project_id, &target, window, cx);
+        }
+    }
+
+    /// 把 pane 在自己那一组的 tab 栏里左移 / 右移一格(Ctrl+Shift+PageUp / PageDown)。
+    /// 到头不循环;激活 tab 与焦点都不动,只是换位,随布局落盘。
+    pub fn move_pane_within_leaf(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        delta: i32,
+        cx: &mut Context<Self>,
+    ) {
+        let moved = self
+            .project_states
+            .get_mut(project_id)
+            .and_then(|s| s.layout_of_pane_mut(pane_id))
+            .is_some_and(|layout| layout.move_pane_by(pane_id, delta));
+        if moved {
+            self.after_layout_change(project_id, cx);
         }
     }
 

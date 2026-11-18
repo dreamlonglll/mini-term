@@ -238,8 +238,14 @@ use mt_i18n::{
 /// 链接的提示（`terminal.linkHoverHint`）；页签右键菜单补项 —— 复制此终端 / 最大化 / 还原 /
 /// 关闭其他 / 关闭右侧与它们的汇总确认文案（`paneGroup.{duplicate,maximize,restore,
 /// closeOthers,closeToRight,closeSomeMessage,closeSomeAiMessage}`）。
+/// 1802 → 1814：页签与分屏的键盘路径 —— 设置页快捷键表新增「标签与分屏」组与九条动作描述
+/// （`settings.shortcuts.{tabsSplits,closeTab,toggleMaximize,reopenClosed,moveTabLeft,
+/// moveTabRight,resizeLeft,resizeRight,resizeUp,resizeDown}`）、重新打开已关闭终端的菜单项与
+/// 说明行（`paneGroup.{reopenClosed,reopenClosedDetail}`）；`settings.shortcuts.{nextPane,
+/// prevPane}` 补了单页签时切分屏的说明、`paneGroup.{maximizePane,restorePane}` 加了快捷键
+/// 占位符，条数不变。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1802;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1814;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -33,6 +33,7 @@
 //!  ├─ ssh.rs      SSH 连接表、远程项目、「关联 SSH」、断线重连
 //!  ├─ layout.rs   项目级终端面板、三栏与抽屉、文件树展开、布局与配置落盘
 //!  ├─ events.rs   类型化变更事件(`StoreEvent`)、改完即发的收口、各观察者的过滤判定
+//!  ├─ reopen.rs   已关闭终端栈与「重新打开已关闭的终端」(纯逻辑与单测同住)
 //!  └─ pure.rs     无 `self` 的纯函数与它们的类型,连同全部单测
 //! ```
 //!
@@ -68,6 +69,7 @@ mod panes;
 mod prefs;
 mod projects;
 mod pure;
+mod reopen;
 mod ssh;
 
 use config_writer::ConfigWriter;
@@ -101,6 +103,11 @@ pub struct ProjectState {
     /// 铺满了」而不是「哪个叶子」—— 同组内切 tab 仍然保持最大化,与原版一致。
     /// 只对活动面板有意义,切面板时清掉。
     pub maximized_pane_id: Option<String>,
+    /// 「重新打开已关闭的终端」的已关闭栈(栈顶在末尾,上限见 [`reopen::CLOSED_PANES_LIMIT`])。
+    ///
+    /// **纯运行时,不落盘**。挂在项目状态上而不是另开一张表:移除项目时整项
+    /// `project_states.remove` 掉,栈跟着没,不必另记一处清理。
+    pub closed_panes: Vec<reopen::ClosedPane>,
 }
 
 impl ProjectState {
@@ -110,6 +117,7 @@ impl ProjectState {
             active_panel_id: None,
             needs_attention: false,
             maximized_pane_id: None,
+            closed_panes: Vec::new(),
         }
     }
 

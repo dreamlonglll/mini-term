@@ -35,9 +35,11 @@ use gpui::{App, KeyBinding, NoAction};
 
 use crate::pane::{TerminalZoomIn, TerminalZoomOut, TerminalZoomReset};
 use crate::{
-    ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
-    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane,
-    SelectPane, SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary,
+    ClosePane, CloseTerminalTab, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch,
+    JumpAttention, MarkerNext, MarkerPrev, MoveTabLeft, MoveTabRight, NewTerminal, NextPane,
+    OpenTerminalSettings, PrevPane, QuickOpenFile, RenamePane, ReopenClosedTerminal,
+    ResizeSplitDown, ResizeSplitLeft, ResizeSplitRight, ResizeSplitUp, SelectPane, SplitDown,
+    SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMaximizePane,
     ToggleMiddleColumn, ToggleSessions, ToggleUsage, command_library, git_changes, git_conflict,
     git_diff, git_file_history, git_history, git_stash, project_switcher, quick_open,
 };
@@ -90,6 +92,7 @@ pub struct HotkeyDef {
 
 const G_TERMINAL: &str = "shortcuts.terminalOps";
 const G_NAV: &str = "shortcuts.navigation";
+const G_LAYOUT: &str = "shortcuts.tabsSplits";
 const G_GLOBAL: &str = "shortcuts.global";
 const G_MARKER: &str = "shortcuts.aiTaskMarks";
 const G_CLIPBOARD: &str = "shortcuts.clipboard";
@@ -141,6 +144,17 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         G_TERMINAL,
         "shortcuts.closePane",
     ),
+    // 关**单个**页签(= 点页签上的 ×)。Ctrl+Shift+W 关的是整组(原版语义,不改),
+    // 此前单个页签没有键盘路径。终端里 Ctrl+Shift+X 在传统编码下与 Ctrl+X 同字节,
+    // shell / TUI 要的那个 Ctrl+X 不受影响(与 Ctrl+Shift+O 同一条理由)
+    def(
+        "closeTab",
+        Some("ctrl-shift-x"),
+        combo(true, true, false, "X"),
+        Scope::Global,
+        G_TERMINAL,
+        "shortcuts.closeTab",
+    ),
     def(
         "renamePane",
         Some("f2"),
@@ -164,6 +178,26 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Global,
         G_TERMINAL,
         "shortcuts.splitDown",
+    ),
+    // 与页签栏的最大化钮、页签右键「最大化 / 还原」同一个动作(`toggle_maximized_leaf`)
+    def(
+        "toggleMaximize",
+        Some("ctrl-shift-m"),
+        combo(true, true, false, "M"),
+        Scope::Global,
+        G_TERMINAL,
+        "shortcuts.toggleMaximize",
+    ),
+    // 重新打开已关闭的终端(`store::reopen`)。终端里 Ctrl+Shift+Z 传统编码同 Ctrl+Z,
+    // shell 的挂起作业照旧按 Ctrl+Z;栈空时按了什么也不做,**不放行** —— 放行就是一次
+    // SIGTSTP,比没反应糟
+    def(
+        "reopenClosed",
+        Some("ctrl-shift-z"),
+        combo(true, true, false, "Z"),
+        Scope::Global,
+        G_TERMINAL,
+        "shortcuts.reopenClosed",
     ),
     // ── 导航 ──
     def(
@@ -225,6 +259,61 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         Scope::Global,
         G_NAV,
         "shortcuts.focusDown",
+    ),
+    // ── 页签与分屏 ──
+    //
+    // 页签左右移:只在所属分组内换位,到头不循环(`tree::shifted_index`)。不与回看的
+    // Shift+PgUp/PgDn 相撞:那两条要求不带 Ctrl(`mt_ui::terminal::scrollback_key`)
+    def(
+        "moveTabLeft",
+        Some("ctrl-shift-pageup"),
+        combo(true, true, false, "PgUp"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.moveTabLeft",
+    ),
+    def(
+        "moveTabRight",
+        Some("ctrl-shift-pagedown"),
+        combo(true, true, false, "PgDn"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.moveTabRight",
+    ),
+    // 调分屏比例:把当前 pane 那一侧最近的分隔线朝箭头方向推一步(pane 朝那边变大)。
+    // 那个方向没有分隔线时处理器 `propagate`,按键落回终端 —— 与 Alt+方向键同一做法,
+    // 见 `main.rs::Workspace::resize_split`
+    def(
+        "resizeLeft",
+        Some("alt-shift-left"),
+        combo(false, true, true, "←"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.resizeLeft",
+    ),
+    def(
+        "resizeRight",
+        Some("alt-shift-right"),
+        combo(false, true, true, "→"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.resizeRight",
+    ),
+    def(
+        "resizeUp",
+        Some("alt-shift-up"),
+        combo(false, true, true, "↑"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.resizeUp",
+    ),
+    def(
+        "resizeDown",
+        Some("alt-shift-down"),
+        combo(false, true, true, "↓"),
+        Scope::Global,
+        G_LAYOUT,
+        "shortcuts.resizeDown",
     ),
     // ── 全局 ──
     def(
@@ -860,15 +949,24 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
     Some(match id {
         "newTerminal" => KeyBinding::new(keystroke, NewTerminal, Some(WORKSPACE)),
         "closePane" => KeyBinding::new(keystroke, ClosePane, Some(WORKSPACE)),
+        "closeTab" => KeyBinding::new(keystroke, CloseTerminalTab, Some(WORKSPACE)),
         "renamePane" => KeyBinding::new(keystroke, RenamePane, Some(WORKSPACE)),
         "splitRight" => KeyBinding::new(keystroke, SplitRight, Some(WORKSPACE)),
         "splitDown" => KeyBinding::new(keystroke, SplitDown, Some(WORKSPACE)),
+        "toggleMaximize" => KeyBinding::new(keystroke, ToggleMaximizePane, Some(WORKSPACE)),
+        "reopenClosed" => KeyBinding::new(keystroke, ReopenClosedTerminal, Some(WORKSPACE)),
         "nextPane" => KeyBinding::new(keystroke, NextPane, Some(WORKSPACE)),
         "prevPane" => KeyBinding::new(keystroke, PrevPane, Some(WORKSPACE)),
         "focusLeft" => KeyBinding::new(keystroke, FocusLeft, Some(WORKSPACE)),
         "focusRight" => KeyBinding::new(keystroke, FocusRight, Some(WORKSPACE)),
         "focusUp" => KeyBinding::new(keystroke, FocusUp, Some(WORKSPACE)),
         "focusDown" => KeyBinding::new(keystroke, FocusDown, Some(WORKSPACE)),
+        "moveTabLeft" => KeyBinding::new(keystroke, MoveTabLeft, Some(WORKSPACE)),
+        "moveTabRight" => KeyBinding::new(keystroke, MoveTabRight, Some(WORKSPACE)),
+        "resizeLeft" => KeyBinding::new(keystroke, ResizeSplitLeft, Some(WORKSPACE)),
+        "resizeRight" => KeyBinding::new(keystroke, ResizeSplitRight, Some(WORKSPACE)),
+        "resizeUp" => KeyBinding::new(keystroke, ResizeSplitUp, Some(WORKSPACE)),
+        "resizeDown" => KeyBinding::new(keystroke, ResizeSplitDown, Some(WORKSPACE)),
         "switchProject" => KeyBinding::new(keystroke, SwitchProject, Some(WORKSPACE)),
         "globalSearch" => KeyBinding::new(keystroke, GlobalSearch, Some(WORKSPACE)),
         "quickOpen" => KeyBinding::new(keystroke, QuickOpenFile, Some(WORKSPACE)),
@@ -903,6 +1001,9 @@ pub fn key_label(key: &str) -> String {
         "tab" => "Tab".into(),
         "escape" => "Esc".into(),
         "enter" => "Enter".into(),
+        // 与回看那两条的显示串同一种缩写(`PgUp` / `PgDn`)
+        "pageup" => "PgUp".into(),
+        "pagedown" => "PgDn".into(),
         // 单字符键与 F1..F12 一律大写(`t` → `T`,`f2` → `F2`)
         other => other.to_uppercase(),
     }
@@ -961,19 +1062,75 @@ mod tests {
     /// 分组保持声明顺序、组内保持表内顺序(设置页照这个顺序画)。
     ///
     /// 组序与原版 `hotkeys.ts:42-46` 一致:终端 / 导航 / 全局 / AI 任务标记 / 剪贴板;
-    /// GPUI 侧补的「回看与缩放」排在最后。
+    /// GPUI 侧补的「页签与分屏」紧跟导航,「回看与缩放」排在最后。
     #[test]
     fn 分组保持声明顺序() {
         let groups = groups();
         let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
         assert_eq!(
             keys,
-            vec![G_TERMINAL, G_NAV, G_GLOBAL, G_MARKER, G_CLIPBOARD, G_VIEW]
+            vec![
+                G_TERMINAL,
+                G_NAV,
+                G_LAYOUT,
+                G_GLOBAL,
+                G_MARKER,
+                G_CLIPBOARD,
+                G_VIEW
+            ]
         );
         assert_eq!(groups[0].1[0].id, "newTerminal");
-        assert_eq!(groups[3].1.len(), 2, "AI 任务标记组两条");
-        assert_eq!(groups[4].1.len(), 2, "剪贴板组两条");
-        assert_eq!(groups[5].1.len(), 7, "回看四条 + 缩放三条");
+        assert_eq!(groups[2].1.len(), 6, "页签左右移两条 + 调比例四条");
+        assert_eq!(groups[4].1.len(), 2, "AI 任务标记组两条");
+        assert_eq!(groups[5].1.len(), 2, "剪贴板组两条");
+        assert_eq!(groups[6].1.len(), 7, "回看四条 + 缩放三条");
+    }
+
+    /// 这一批新键位绑在 `Workspace` 上,且一条都不落在终端自己消费的回看键里 ——
+    /// Ctrl+Shift+PgUp/PgDn 与回看的 Shift+PgUp/PgDn 只差一个 Ctrl,对不上就会
+    /// 「按了翻页结果页签跑了」或反过来。
+    #[test]
+    fn 页签与分屏键位绑在工作区且不抢回看键() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+        use mt_ui::terminal::scrollback_key;
+
+        let ids = [
+            "closeTab",
+            "toggleMaximize",
+            "reopenClosed",
+            "moveTabLeft",
+            "moveTabRight",
+            "resizeLeft",
+            "resizeRight",
+            "resizeUp",
+            "resizeDown",
+        ];
+        let bindings: Vec<KeyBinding> = ids
+            .iter()
+            .map(|id| {
+                let def = HOTKEYS.iter().find(|d| d.id == *id).unwrap();
+                assert_eq!(def.scope, Scope::Global, "{id}");
+                binding_for(id, def.keystroke.unwrap()).unwrap()
+            })
+            .collect();
+        let keymap = Keymap::new(bindings);
+        let in_terminal = [
+            KeyContext::parse("Root").unwrap(),
+            KeyContext::parse(WORKSPACE).unwrap(),
+            KeyContext::parse(TERMINAL).unwrap(),
+        ];
+        for id in ids {
+            let ks = HOTKEYS
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap()
+                .keystroke
+                .unwrap();
+            let parsed = Keystroke::parse(ks).unwrap();
+            assert_eq!(scrollback_key(&parsed), None, "{id} 撞上了终端回看键");
+            let (hit, _) = keymap.bindings_for_input(&[parsed], &in_terminal);
+            assert_eq!(hit.len(), 1, "{id} 在终端里该命中");
+        }
     }
 
     /// 回看四条登记的组合与 mt-ui 真正拦下的键位是同一组 —— 设置页写着 Shift+PgUp,
@@ -1131,5 +1288,7 @@ mod tests {
         assert_eq!(combo_label(&combo(false, false, true, "↑")), "Alt+↑");
         assert_eq!(combo_label(&combo(false, false, false, "F2")), "F2");
         assert_eq!(combo_label(&combo(true, false, false, "1…9")), "Ctrl+1…9");
+        assert_eq!(hotkey_label("moveTabRight"), "Ctrl+Shift+PgDn");
+        assert_eq!(hotkey_label("resizeLeft"), "Shift+Alt+←");
     }
 }

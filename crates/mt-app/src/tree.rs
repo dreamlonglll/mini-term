@@ -713,6 +713,88 @@ impl SplitNode {
         panes.get(index.checked_sub(1)?).map(|p| p.id.clone())
     }
 
+    /// 相邻**分组**的激活 pane(Ctrl+Tab 在单页签组里的回落):按 [`Self::leaves`] 的
+    /// DFS 序(与屏幕上左上到右下同序)走 `delta` 步,首尾相接。
+    ///
+    /// 只有一个分组 / pane 不在树里时返回 `None`。目标组取它的激活 tab(与点那一组的
+    /// 终端主体同一个落点),不是第一个 tab。
+    pub fn adjacent_leaf_pane(&self, from_pane_id: &str, delta: i32) -> Option<String> {
+        let leaves = self.leaves();
+        if leaves.len() < 2 {
+            return None;
+        }
+        let from = leaves.iter().position(|leaf| match leaf {
+            Self::Leaf { panes, .. } => panes.iter().any(|p| p.id == from_pane_id),
+            Self::Split { .. } => false,
+        })?;
+        let len = leaves.len() as i32;
+        let next = ((from as i32 + delta) % len + len) % len;
+        match leaves[next as usize] {
+            Self::Leaf {
+                panes,
+                active_pane_id,
+                ..
+            } => panes
+                .iter()
+                .find(|p| &p.id == active_pane_id)
+                .or_else(|| panes.first())
+                .map(|p| p.id.clone()),
+            Self::Split { .. } => None,
+        }
+    }
+
+    /// 把 pane 在自己那一组的 tab 栏里挪 `delta` 格(Ctrl+Shift+PageUp / PageDown)。
+    /// **到头不循环**(挪不动返回 `false`、树不动);激活 tab 不变。
+    pub fn move_pane_by(&mut self, pane_id: &str, delta: i32) -> bool {
+        let Some(SplitNode::Leaf { panes, .. }) = self.leaf_of_pane_mut(pane_id) else {
+            return false;
+        };
+        let Some(from) = panes.iter().position(|p| p.id == pane_id) else {
+            return false;
+        };
+        let Some(to) = shifted_index(from, panes.len(), delta) else {
+            return false;
+        };
+        let pane = panes.remove(from);
+        panes.insert(to, pane);
+        true
+    }
+
+    /// 键盘调分屏比例的落点:从 pane 往上找**最近**的一条、沿 `axis` 切、位于 pane
+    /// `forward` 一侧(→ / ↓ 为 `true`)的分隔线,返回它所在 split 的 id 与分隔线下标
+    /// (第 `i` 条在 `children[i]` 与 `children[i + 1]` 之间)。
+    ///
+    /// 「最近」= 嵌套最深的那层:`[a | [b | c]]` 里 b 往右是 b|c 那条,不是 a|… 那条。
+    /// 那一侧已经贴着区域边缘(最右一格往右)返回 `None`,调用方据此放行按键。
+    pub fn boundary_toward(
+        &self,
+        pane_id: &str,
+        axis: SplitDirection,
+        forward: bool,
+    ) -> Option<(String, usize)> {
+        let Self::Split {
+            id,
+            direction,
+            children,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let at = children.iter().position(|c| c.pane(pane_id).is_some())?;
+        if let Some(inner) = children[at].boundary_toward(pane_id, axis, forward) {
+            return Some(inner);
+        }
+        if *direction != axis {
+            return None;
+        }
+        if forward {
+            (at + 1 < children.len()).then(|| (id.clone(), at))
+        } else {
+            at.checked_sub(1).map(|b| (id.clone(), b))
+        }
+    }
+
     /// 从树里摘掉一个 pane(`removePaneFromLayout`):
     /// - 叶子里还有别的 pane:只摘 pane,必要时把 activePaneId 移到最后一个;
     /// - 叶子空了:从父 split 摘掉;父 split 只剩一个孩子则塌陷成那个孩子;
@@ -952,6 +1034,16 @@ impl SplitNode {
         }
         true
     }
+}
+
+/// 列表里第 `from` 项挪 `delta` 格后的下标。**不循环**:挪出两端、`delta == 0`、`from`
+/// 越界都返回 `None`(调用方据此什么都不做)。
+pub fn shifted_index(from: usize, len: usize, delta: i32) -> Option<usize> {
+    if from >= len || delta == 0 {
+        return None;
+    }
+    let to = from as i64 + delta as i64;
+    (0..len as i64).contains(&to).then_some(to as usize)
 }
 
 #[cfg(test)]
@@ -1808,5 +1900,159 @@ mod tests {
         let mut ids = root.pty_ids();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// Ctrl+Tab 的分组回落:按 DFS 序(左上 → 右下)走,首尾相接;落到目标组的**激活**
+    /// tab;只有一组 / pane 不在树里时不动。
+    #[test]
+    fn 相邻分组按遍历序循环且落在激活页签() {
+        // [a | [b(b1,b2,激活 b2) / c]]
+        let mut b = leaf_of(&["b1", "b2"]);
+        if let SplitNode::Leaf {
+            panes,
+            active_pane_id,
+            ..
+        } = &mut b
+        {
+            *active_pane_id = panes[1].id.clone();
+        }
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![
+                leaf_of(&["a"]),
+                split_of(SplitDirection::Vertical, vec![b, leaf_of(&["c"])]),
+            ],
+        );
+        let (a, b2, c) = (id_of(&root, "a"), id_of(&root, "b2"), id_of(&root, "c"));
+
+        assert_eq!(
+            root.adjacent_leaf_pane(&a, 1),
+            Some(b2.clone()),
+            "落在激活的 b2"
+        );
+        assert_eq!(root.adjacent_leaf_pane(&b2, 1), Some(c.clone()));
+        assert_eq!(
+            root.adjacent_leaf_pane(&c, 1),
+            Some(a.clone()),
+            "最后一组回到第一组"
+        );
+        assert_eq!(
+            root.adjacent_leaf_pane(&a, -1),
+            Some(c.clone()),
+            "第一组往前是最后一组"
+        );
+        assert_eq!(root.adjacent_leaf_pane(&c, -1), Some(b2));
+
+        let single = leaf_of(&["x"]);
+        let x = id_of(&single, "x");
+        assert_eq!(single.adjacent_leaf_pane(&x, 1), None, "只有一组");
+        assert_eq!(root.adjacent_leaf_pane("pane-不在树里", 1), None);
+    }
+
+    /// 下标挪动不循环:两端挪不出去、delta 为 0、越界起点都是 `None`。
+    #[test]
+    fn 页签挪动下标到头不循环() {
+        assert_eq!(shifted_index(0, 3, 1), Some(1));
+        assert_eq!(shifted_index(2, 3, -1), Some(1));
+        assert_eq!(shifted_index(2, 3, 1), None, "最右再往右");
+        assert_eq!(shifted_index(0, 3, -1), None, "最左再往左");
+        assert_eq!(shifted_index(1, 3, 0), None);
+        assert_eq!(shifted_index(3, 3, -1), None, "起点越界");
+        assert_eq!(shifted_index(0, 1, 1), None, "只有一个");
+    }
+
+    /// 页签左右移:只在本组内换位,激活 tab 不变;到头时树不动。
+    #[test]
+    fn 页签在组内左右移() {
+        let mut root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a", "b", "c"]), leaf_of(&["d"])],
+        );
+        let b = id_of(&root, "b");
+        let active_before = root.leaf_of_pane(&b).map(|l| match l {
+            SplitNode::Leaf { active_pane_id, .. } => active_pane_id.clone(),
+            _ => unreachable!(),
+        });
+
+        assert!(root.move_pane_by(&b, 1));
+        assert_eq!(names(&root), vec!["a", "c", "b", "d"]);
+        assert!(!root.move_pane_by(&b, 1), "已在本组最右,不跨到 d 那一组");
+        assert_eq!(names(&root), vec!["a", "c", "b", "d"]);
+        assert!(root.move_pane_by(&b, -1));
+        assert!(root.move_pane_by(&b, -1));
+        assert_eq!(names(&root), vec!["b", "a", "c", "d"]);
+        assert!(!root.move_pane_by(&b, -1), "最左不循环");
+
+        let active_after = root.leaf_of_pane(&b).map(|l| match l {
+            SplitNode::Leaf { active_pane_id, .. } => active_pane_id.clone(),
+            _ => unreachable!(),
+        });
+        assert_eq!(active_before, active_after, "挪页签不换激活 tab");
+        assert!(!root.move_pane_by("pane-不在树里", 1));
+    }
+
+    /// 调比例找的是**最近**一条位于箭头那一侧、方向对得上的分隔线;贴边时没有。
+    #[test]
+    fn 调比例找最近的分隔线() {
+        // [a | [b / c] | d]:外层横切三格,中间那格再竖切
+        let inner = split_of(
+            SplitDirection::Vertical,
+            vec![leaf_of(&["b"]), leaf_of(&["c"])],
+        );
+        let inner_id = inner.id().to_string();
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), inner, leaf_of(&["d"])],
+        );
+        let root_id = root.id().to_string();
+        let (a, b, c, d) = (
+            id_of(&root, "a"),
+            id_of(&root, "b"),
+            id_of(&root, "c"),
+            id_of(&root, "d"),
+        );
+        let (h, v) = (SplitDirection::Horizontal, SplitDirection::Vertical);
+
+        assert_eq!(
+            root.boundary_toward(&a, h, true),
+            Some((root_id.clone(), 0))
+        );
+        assert_eq!(root.boundary_toward(&a, h, false), None, "最左一格往左贴边");
+        assert_eq!(
+            root.boundary_toward(&b, h, false),
+            Some((root_id.clone(), 0))
+        );
+        assert_eq!(
+            root.boundary_toward(&b, h, true),
+            Some((root_id.clone(), 1))
+        );
+        assert_eq!(
+            root.boundary_toward(&d, h, false),
+            Some((root_id.clone(), 1))
+        );
+        assert_eq!(root.boundary_toward(&d, h, true), None);
+        // 竖向:b 往下是 b/c 那条(内层),往上贴边;a 根本不在竖切里
+        assert_eq!(
+            root.boundary_toward(&b, v, true),
+            Some((inner_id.clone(), 0))
+        );
+        assert_eq!(root.boundary_toward(&c, v, false), Some((inner_id, 0)));
+        assert_eq!(root.boundary_toward(&b, v, false), None);
+        assert_eq!(root.boundary_toward(&a, v, true), None);
+
+        // 嵌套同向:[x | [y | z]] 里 y 往右是 y|z(最近那条),不是外层的
+        let nested = split_of(h, vec![leaf_of(&["y"]), leaf_of(&["z"])]);
+        let nested_id = nested.id().to_string();
+        let outer = split_of(h, vec![leaf_of(&["x"]), nested]);
+        let y = id_of(&outer, "y");
+        assert_eq!(outer.boundary_toward(&y, h, true), Some((nested_id, 0)));
+        assert_eq!(
+            outer.boundary_toward(&y, h, false),
+            Some((outer.id().to_string(), 0)),
+            "内层往左贴边,退到外层那条"
+        );
+
+        let single = leaf_of(&["s"]);
+        assert_eq!(single.boundary_toward(&id_of(&single, "s"), h, true), None);
     }
 }

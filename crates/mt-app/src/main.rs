@@ -186,9 +186,9 @@ actions!(
         SplitDown,
         /// 折叠/展开中间栏(Ctrl+Shift+B)
         ToggleMiddleColumn,
-        /// 叶内切到下一个 tab(Ctrl+Tab)
+        /// 叶内切到下一个 tab(Ctrl+Tab);组内只有一个 tab 时切到下一个分组
         NextPane,
-        /// 叶内切到上一个 tab(Ctrl+Shift+Tab)
+        /// 叶内切到上一个 tab(Ctrl+Shift+Tab);组内只有一个 tab 时切到上一个分组
         PrevPane,
         /// 重命名当前标签(F2)
         RenamePane,
@@ -222,6 +222,24 @@ actions!(
         MarkerNext,
         /// 开合命令库浮层(Ctrl+Shift+K,issue #81)
         ToggleCommandLibrary,
+        /// 关闭当前**单个**终端页签(Ctrl+Shift+X;整组仍是 Ctrl+Shift+W)
+        CloseTerminalTab,
+        /// 最大化 / 还原当前分组(Ctrl+Shift+M)
+        ToggleMaximizePane,
+        /// 当前页签在组内左移(Ctrl+Shift+PageUp)
+        MoveTabLeft,
+        /// 当前页签在组内右移(Ctrl+Shift+PageDown)
+        MoveTabRight,
+        /// 当前分屏朝左扩(Alt+Shift+←)
+        ResizeSplitLeft,
+        /// 当前分屏朝右扩(Alt+Shift+→)
+        ResizeSplitRight,
+        /// 当前分屏朝上扩(Alt+Shift+↑)
+        ResizeSplitUp,
+        /// 当前分屏朝下扩(Alt+Shift+↓)
+        ResizeSplitDown,
+        /// 重新打开已关闭的终端(Ctrl+Shift+Z)
+        ReopenClosedTerminal,
     ]
 );
 
@@ -1239,6 +1257,141 @@ impl Workspace {
             return;
         }
         self.store.update(cx, |store, cx| store.step_marker(1, cx));
+    }
+
+    // ─── 页签与分屏的键盘路径 ─────────────────────────────────────
+    //
+    // 让路口径与同类动作一致:弹窗 / 输入框让路(`yields_to_overlay`),只在终端页生效。
+    // 调比例那四条与 Alt+方向键一样,没动成就 `propagate` 把按键还给终端。
+
+    /// Ctrl+Shift+X:关当前**单个**页签,与点页签上的 × 同一个入口
+    /// ([`pane_actions::close_pane`]:AI 感知确认、已退出免确认)。按住不放的连发闸与
+    /// Ctrl+Shift+W 共用一份时刻:两个关闭键交替连按也只算一次。
+    fn on_close_terminal_tab(
+        &mut self,
+        _: &CloseTerminalTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let last = self.last_close_hotkey.replace(now);
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        let store = self.store.read(cx);
+        let dead = pane_actions::pane_is_dead(store, &project_id, &pane_id);
+        if pane_actions::swallows_close_hotkey(store.config(), dead, last, now) {
+            return;
+        }
+        pane_actions::close_pane(self.store.clone(), project_id, pane_id, window, cx);
+    }
+
+    /// Ctrl+Shift+M:最大化 / 还原当前分组。与页签栏的按钮、双击页签栏空白处、页签右键
+    /// 同一个动作(单格布局下是空操作,与按钮不画同一判据)。
+    fn on_toggle_maximize_pane(
+        &mut self,
+        _: &ToggleMaximizePane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.toggle_maximized_leaf(&project_id, &pane_id, cx)
+        });
+    }
+
+    fn on_move_tab_left(&mut self, _: &MoveTabLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_tab(-1, window, cx);
+    }
+    fn on_move_tab_right(&mut self, _: &MoveTabRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_tab(1, window, cx);
+    }
+
+    /// Ctrl+Shift+PageUp / PageDown:当前页签在所属分组内挪一格,到头不循环。
+    fn move_tab(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.move_pane_within_leaf(&project_id, &pane_id, delta, cx)
+        });
+    }
+
+    fn on_resize_split_left(
+        &mut self,
+        _: &ResizeSplitLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Left, window, cx);
+    }
+    fn on_resize_split_right(
+        &mut self,
+        _: &ResizeSplitRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Right, window, cx);
+    }
+    fn on_resize_split_up(
+        &mut self,
+        _: &ResizeSplitUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Up, window, cx);
+    }
+    fn on_resize_split_down(
+        &mut self,
+        _: &ResizeSplitDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_split(Direction::Down, window, cx);
+    }
+
+    /// Alt+Shift+方向键:把当前 pane 那一侧最近的分隔线朝箭头方向推一步
+    /// ([`TerminalArea::resize_split`])。**没动成就放行**(让路、不在终端页、那个方向
+    /// 没有分隔线、正最大化着),理由与 [`Self::focus_adjacent`] 相同:单屏时这组键归终端。
+    fn resize_split(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        let handled = !yields_to_overlay(window, cx)
+            && self.terminal_page_active(cx)
+            && self
+                .terminal_area
+                .update(cx, |area, cx| area.resize_split(dir, window, cx));
+        if !handled {
+            cx.propagate();
+        }
+    }
+
+    /// Ctrl+Shift+Z:重新打开当前项目最近关掉的终端(`store::reopen`)。按**活动项目**取
+    /// 而不是焦点 pane:关光了终端、停在空态页时正是最需要它的时候。栈空时什么也不做。
+    fn on_reopen_closed_terminal(
+        &mut self,
+        _: &ReopenClosedTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
+            return;
+        }
+        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.reopen_closed_pane(&project_id, window, cx);
+        });
     }
 
     /// 提交详情栏此刻的宽:拖拽中按拖的,否则按落盘的;窗口窄时让一让(见
@@ -2368,6 +2521,15 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_marker_prev))
             .on_action(cx.listener(Self::on_marker_next))
             .on_action(cx.listener(Self::on_toggle_command_library))
+            .on_action(cx.listener(Self::on_close_terminal_tab))
+            .on_action(cx.listener(Self::on_toggle_maximize_pane))
+            .on_action(cx.listener(Self::on_move_tab_left))
+            .on_action(cx.listener(Self::on_move_tab_right))
+            .on_action(cx.listener(Self::on_resize_split_left))
+            .on_action(cx.listener(Self::on_resize_split_right))
+            .on_action(cx.listener(Self::on_resize_split_up))
+            .on_action(cx.listener(Self::on_resize_split_down))
+            .on_action(cx.listener(Self::on_reopen_closed_terminal))
             // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
             // —— 等价于原版往 document 上挂 mousemove/mouseup
             .when(self.drawer_drag.is_some(), |el| {
