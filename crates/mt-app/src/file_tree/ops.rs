@@ -4,8 +4,10 @@
 //! 移动(拖拽落点与「移动到」菜单共用)。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{App, Entity, PathPromptOptions, SharedString, Window};
+use parking_lot::Mutex;
 
 use crate::file_ops::{
     FileBackendIdentity, FileClipboardEntry, FileOperationContext, entry_target_directory,
@@ -17,6 +19,7 @@ use crate::prompt::{Confirm, show_alert, show_file_conflict_choice, show_prompt}
 use crate::store::AppStore;
 
 use super::move_to::MoveSource;
+use super::recycle;
 use super::{FileTree, Row, same_file_source};
 
 /// [`spawn_tree_op`] 跑完之后怎么刷树。
@@ -39,10 +42,21 @@ pub(super) struct TreeOpPlan {
     /// 开始时那一个时才跑**:中途切走了项目,旧项目里建出来的文件不该在新项目的页签区
     /// 里冒出来。失败时不跑。
     pub on_success: Option<AfterSuccess>,
+    /// 成功落地之后**一定**要走的一步:已开的文件页签跟上这次改动(重命名 / 移动改指向,
+    /// 删除关掉或标明,见 `workbench_area` 模块注释「页签跟随文件树」)。与
+    /// [`Self::on_success`] 相反,**不看**结束时项目切没切走 —— 文件系统已经变了,页签又是
+    /// 各项目各留各的。先于 `on_success` 跑。
+    pub on_landed: Option<AfterSuccess>,
+    /// 失败时代替通用「文件操作失败」弹窗的处理,返回 `true` 表示接手了(回收站拒收时改问
+    /// 要不要永久删除)。只在这件操作仍归它、项目 / 根 / 后端也没变时才问。
+    pub on_failure: Option<OnFailure>,
 }
 
 /// [`TreeOpPlan::on_success`] 那一步。
 pub(super) type AfterSuccess = Box<dyn FnOnce(&mut Window, &mut App)>;
+
+/// [`TreeOpPlan::on_failure`] 那一步。
+pub(super) type OnFailure = Box<dyn FnOnce(&mut Window, &mut App) -> bool>;
 
 /// 跑一件阻塞文件操作。状态和结果都绑定开始时的项目/连接/generation；切换项目后
 /// 旧结果不会刷新新树。同一 FileTree 同时只接受一件 mutation/transfer。
@@ -146,6 +160,8 @@ pub(super) fn spawn_tree_op(
             collapse_detached: !expand,
             extra_reload: Vec::new(),
             on_success: None,
+            on_landed: None,
+            on_failure: None,
         },
         label,
         op,
@@ -171,6 +187,8 @@ pub(super) fn spawn_tree_op_planned(
         collapse_detached,
         extra_reload,
         on_success,
+        on_landed,
+        on_failure,
     } = plan;
     let suppressed_path = detach_before.clone();
     let start_state = tree.update(cx, |tree, cx| {
@@ -268,6 +286,9 @@ pub(super) fn spawn_tree_op_planned(
                             cx,
                         );
                     }
+                    if let Some(on_landed) = on_landed {
+                        on_landed(window, cx);
+                    }
                     if operation_owned
                         && same_source
                         && let Some(on_success) = on_success
@@ -277,9 +298,9 @@ pub(super) fn spawn_tree_op_planned(
                 }
                 Err(err) => {
                     eprintln!("[files] 操作失败: {err}");
-                    let operation_owned = tree.update(cx, |tree, cx| {
+                    let (operation_owned, same_source) = tree.update(cx, |tree, cx| {
                         if tree.active_operation_context.as_ref() != Some(&context) {
-                            return false;
+                            return (false, false);
                         }
                         let same_source = tree
                             .operation_context(cx)
@@ -304,9 +325,12 @@ pub(super) fn spawn_tree_op_planned(
                             }
                         }
                         cx.notify();
-                        true
+                        (true, same_source)
                     });
-                    if operation_owned {
+                    let handled = operation_owned
+                        && same_source
+                        && on_failure.is_some_and(|on_failure| on_failure(window, cx));
+                    if operation_owned && !handled {
                         show_alert(
                             t("fileTree", "operation.failedTitle"),
                             tr!("fileTree", "operation.failedMessage", error = err),
@@ -836,6 +860,8 @@ pub(super) fn start_move(
     if !source.accepts_target(&target_dir) {
         return;
     }
+    let on_landed = moved_path(&target_dir, &source.path, source.remote)
+        .map(|to| follow_moved_hook(&context, source.path.clone(), to));
     let plan = TreeOpPlan {
         refresh_dir: Some(target_dir.clone()),
         expand: true,
@@ -843,9 +869,12 @@ pub(super) fn start_move(
         collapse_detached: true,
         extra_reload: vec![source.parent.clone()],
         on_success: None,
+        on_landed,
+        on_failure: None,
     };
     let root = context.root.clone();
     let path = source.path.clone();
+    expect_path_change(&context, &path, cx);
     spawn_tree_op_planned(
         tree,
         context,
@@ -988,12 +1017,24 @@ pub(super) fn rename_entry_prompt(
             }
             let (root, path) = (context.root.clone(), path.clone());
             let connection = connection.clone();
-            spawn_tree_op(
+            // 改名后的路径与树上的行同一种拼法(远程 POSIX、本地按父目录自己的分隔符),
+            // 已开的页签按它改指向
+            let renamed = renamed_path(&parent, &new_name, connection.is_some());
+            let plan = TreeOpPlan {
+                refresh_dir: Some(parent.clone()),
+                expand: false,
+                detach_before: detach_before.clone(),
+                collapse_detached: true,
+                extra_reload: Vec::new(),
+                on_success: None,
+                on_landed: Some(follow_moved_hook(&context, path.clone(), renamed)),
+                on_failure: None,
+            };
+            expect_path_change(&context, &path, cx);
+            spawn_tree_op_planned(
                 tree.clone(),
                 context.clone(),
-                Some(parent.clone()),
-                false,
-                detach_before.clone(),
+                plan,
                 t("fileTree", "operation.renaming").into(),
                 move || match connection {
                     Some(conn) => mt_remote::rename_entry(
@@ -1016,8 +1057,28 @@ pub(super) fn rename_entry_prompt(
     );
 }
 
-/// 「删除」:先确认(文件 / 文件夹两套文案),确认后删掉并重列父目录。删除期间脱挂
-/// 目标子树,免得大目录逐文件的监听事件洪泛。
+/// 删除走哪条路。
+#[derive(Clone)]
+enum DeleteMode {
+    /// SSH 远程项目:远端没有回收站,照旧硬删(确认框写明无法撤销)。连接快照三百多字节,
+    /// 装箱免得另外两种也按它的尺寸占位。
+    Remote(Box<mt_config::SshConnection>),
+    /// 本地:移到系统回收站(见 [`recycle`] 模块注释)。
+    Trash,
+    /// 本地永久删除:回收站进不去(WSL / 网络盘 / 回收失败)、用户又点了「永久删除」之后才走。
+    Permanent,
+}
+
+/// 「删除」:先确认,确认后删掉并重列父目录。删除期间脱挂目标子树,免得大目录逐文件的
+/// 监听事件洪泛。
+///
+/// - SSH 远程项目:原样硬删,确认框说「无法撤销」;
+/// - 本地项目:默认**移到回收站**,确认框说的是回收站;位置本来就没有回收站(WSL / UNC /
+///   网络盘,见 [`recycle::recycle_support`])时不先试,直接问「无法移到回收站,是否永久
+///   删除?」;试了被拒([`recycle::TrashFailure::Refused`])同样回到这一问 —— 绝不静默硬删。
+///
+/// 删除成功后已开的文件页签跟上(干净的关掉、有改动的留着并标明,见
+/// `workbench_area::follow_deleted`)。
 pub(super) fn confirm_delete_entry(
     tree: Entity<FileTree>,
     context: FileOperationContext,
@@ -1026,49 +1087,79 @@ pub(super) fn confirm_delete_entry(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let EntryTarget {
-        path,
-        name,
-        is_dir,
-        parent,
-    } = entry;
-    let (title, message) = if is_dir {
+    if let Some(connection) = connection {
+        let (title, message) = if entry.is_dir {
+            (
+                t("fileTree", "dialog.deleteFolderTitle"),
+                tr!(
+                    "fileTree",
+                    "dialog.deleteConfirmFolder",
+                    name = entry.name.clone()
+                ),
+            )
+        } else {
+            (
+                t("fileTree", "dialog.deleteFileTitle"),
+                tr!(
+                    "fileTree",
+                    "dialog.deleteConfirmFile",
+                    name = entry.name.clone()
+                ),
+            )
+        };
+        let mode = DeleteMode::Remote(Box::new(connection));
+        Confirm::new(title, message)
+            .ok_text(t("fileTree", "dialog.deleteOk"))
+            .cancel_text(t("fileTree", "dialog.deleteCancel"))
+            .open(
+                move |window, cx| {
+                    spawn_delete(
+                        tree.clone(),
+                        context.clone(),
+                        entry.clone(),
+                        mode.clone(),
+                        window,
+                        cx,
+                    );
+                },
+                window,
+                cx,
+            );
+        return;
+    }
+    if recycle::recycle_support(&entry.path) == recycle::RecycleSupport::Unsupported {
+        confirm_permanent_delete(tree, context, entry, None, window, cx);
+        return;
+    }
+    let (title, message) = if entry.is_dir {
         (
-            t("fileTree", "dialog.deleteFolderTitle"),
-            tr!("fileTree", "dialog.deleteConfirmFolder", name = name),
+            t("fileTree", "dialog.trashFolderTitle"),
+            tr!(
+                "fileTree",
+                "dialog.trashConfirmFolder",
+                name = entry.name.clone()
+            ),
         )
     } else {
         (
-            t("fileTree", "dialog.deleteFileTitle"),
-            tr!("fileTree", "dialog.deleteConfirmFile", name = name),
+            t("fileTree", "dialog.trashFileTitle"),
+            tr!(
+                "fileTree",
+                "dialog.trashConfirmFile",
+                name = entry.name.clone()
+            ),
         )
     };
     Confirm::new(title, message)
-        .ok_text(t("fileTree", "dialog.deleteOk"))
+        .ok_text(t("fileTree", "dialog.trashOk"))
         .cancel_text(t("fileTree", "dialog.deleteCancel"))
         .open(
             move |window, cx| {
-                let root = context.root.clone();
-                let connection = connection.clone();
-                let operation_path = path.clone();
-                spawn_tree_op(
+                spawn_delete(
                     tree.clone(),
                     context.clone(),
-                    Some(parent.clone()),
-                    false,
-                    Some(path.clone()),
-                    t("fileTree", "operation.deleting").into(),
-                    move || match connection {
-                        Some(conn) => mt_remote::delete_entry(
-                            &conn,
-                            &root.to_string_lossy(),
-                            &operation_path.to_string_lossy(),
-                        )
-                        .map(|_| None),
-                        None => mt_project::fs::delete_entry(&root, &operation_path)
-                            .map(|_| None)
-                            .map_err(|e| format!("{e:#}")),
-                    },
+                    entry.clone(),
+                    DeleteMode::Trash,
                     window,
                     cx,
                 );
@@ -1076,6 +1167,169 @@ pub(super) fn confirm_delete_entry(
             window,
             cx,
         );
+}
+
+/// 「无法移到回收站,是否永久删除?」。`refused` 是回收站拒收的原因(试过了);`None` =
+/// 位置本来就没有回收站(没试)。确认后才走原来的硬删。
+fn confirm_permanent_delete(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    entry: EntryTarget,
+    refused: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let message = match refused {
+        Some(error) => tr!(
+            "fileTree",
+            "dialog.permanentDeleteFailed",
+            name = entry.name.clone(),
+            error = error
+        ),
+        None => tr!(
+            "fileTree",
+            "dialog.permanentDeleteUnsupported",
+            name = entry.name.clone()
+        ),
+    };
+    Confirm::new(t("fileTree", "dialog.permanentDeleteTitle"), message)
+        .ok_text(t("fileTree", "dialog.permanentDeleteOk"))
+        .cancel_text(t("fileTree", "dialog.deleteCancel"))
+        .danger()
+        .open(
+            move |window, cx| {
+                spawn_delete(
+                    tree.clone(),
+                    context.clone(),
+                    entry.clone(),
+                    DeleteMode::Permanent,
+                    window,
+                    cx,
+                );
+            },
+            window,
+            cx,
+        );
+}
+
+/// 真正删:三种 [`DeleteMode`] 共用同一份刷新计划与页签跟随。回收站拒收时由
+/// [`TreeOpPlan::on_failure`] 接手,改问要不要永久删除。
+fn spawn_delete(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    entry: EntryTarget,
+    mode: DeleteMode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let root = context.root.clone();
+    let path = entry.path.clone();
+    // 回收站拒收的原因:后台那一步写、失败回调来取(拿得到 = 是回收站没收,不是校验没过)
+    let refused: Arc<Mutex<Option<String>>> = Arc::default();
+    let on_failure = matches!(mode, DeleteMode::Trash).then(|| {
+        let (tree, context, entry, refused) = (
+            tree.clone(),
+            context.clone(),
+            entry.clone(),
+            refused.clone(),
+        );
+        Box::new(move |window: &mut Window, cx: &mut App| {
+            let Some(error) = refused.lock().take() else {
+                return false;
+            };
+            confirm_permanent_delete(tree, context, entry, Some(error), window, cx);
+            true
+        }) as OnFailure
+    });
+    let label = match mode {
+        DeleteMode::Trash => t("fileTree", "operation.trashing"),
+        DeleteMode::Remote(_) | DeleteMode::Permanent => t("fileTree", "operation.deleting"),
+    };
+    let plan = TreeOpPlan {
+        refresh_dir: Some(entry.parent.clone()),
+        expand: false,
+        detach_before: Some(entry.path.clone()),
+        collapse_detached: true,
+        extra_reload: Vec::new(),
+        on_success: None,
+        on_landed: Some(follow_deleted_hook(&context, entry.path.clone())),
+        on_failure,
+    };
+    expect_path_change(&context, &path, cx);
+    spawn_tree_op_planned(
+        tree,
+        context,
+        plan,
+        label.into(),
+        move || match mode {
+            DeleteMode::Remote(conn) => {
+                mt_remote::delete_entry(&conn, &root.to_string_lossy(), &path.to_string_lossy())
+                    .map(|_| None)
+            }
+            DeleteMode::Trash => match recycle::move_to_trash(&root, &path) {
+                Ok(()) => Ok(None),
+                Err(recycle::TrashFailure::Invalid(error)) => Err(error),
+                Err(recycle::TrashFailure::Refused(error)) => {
+                    *refused.lock() = Some(error.clone());
+                    Err(error)
+                }
+            },
+            DeleteMode::Permanent => mt_project::fs::delete_entry(&root, &path)
+                .map(|_| None)
+                .map_err(|e| format!("{e:#}")),
+        },
+        window,
+        cx,
+    );
+}
+
+// ─── 页签跟随文件树(接线见 `workbench_area` 模块注释「页签跟随文件树」) ────
+
+/// 重命名 / 移动落地后,已开的文件页签改指向新路径。
+fn follow_moved_hook(context: &FileOperationContext, from: PathBuf, to: PathBuf) -> AfterSuccess {
+    let (project_id, backend) = (context.project_id.clone(), context.backend.clone());
+    Box::new(move |window, cx| {
+        crate::workbench_area::follow_moved(&project_id, &backend, &from, &to, window, cx);
+    })
+}
+
+/// 删除落地后,已开的文件页签跟上:干净的关掉,有改动的留着并标明「文件已被删除」。
+fn follow_deleted_hook(context: &FileOperationContext, path: PathBuf) -> AfterSuccess {
+    let (project_id, backend) = (context.project_id.clone(), context.backend.clone());
+    Box::new(move |window, cx| {
+        crate::workbench_area::follow_deleted(&project_id, &backend, &path, window, cx);
+    })
+}
+
+/// 改动马上落地:接下来那一小会儿,受影响页签收到的监听事件是这次操作自己的回声。不先
+/// 打招呼的话,干净的页签会抢在改指向之前按旧路径重载成错误页(光标、滚动全丢),
+/// 有改动的会挂出「已被外部修改」。
+fn expect_path_change(context: &FileOperationContext, path: &Path, cx: &mut App) {
+    crate::workbench_area::expect_path_change(&context.project_id, &context.backend, path, cx);
+}
+
+/// 重命名后的路径:与树上的行同一种拼法 —— 远程按 POSIX,本地按父目录自己的分隔符
+/// (与新建文件同一口径,见 [`new_entry_prompt`])。
+fn renamed_path(parent: &Path, new_name: &str, remote: bool) -> PathBuf {
+    let parent = parent.to_string_lossy();
+    if remote {
+        PathBuf::from(mt_remote::join_posix(&parent, new_name))
+    } else {
+        PathBuf::from(fs_ops::child_path(&parent, new_name))
+    }
+}
+
+/// 移动后的路径:目标目录 + 原名。原名取路径最后一段(远程按 `/` 切,本地按平台),
+/// 不取行上的显示名 —— 压缩链的显示名是 `a/b/c` 一串,移动的只是链尾那一个目录。
+fn moved_path(target_dir: &Path, source: &Path, remote: bool) -> Option<PathBuf> {
+    let name = if remote {
+        let text = source.to_string_lossy();
+        let leaf = text.trim_end_matches('/').rsplit('/').next()?.to_string();
+        (!leaf.is_empty()).then_some(leaf)?
+    } else {
+        source.file_name()?.to_string_lossy().into_owned()
+    };
+    Some(renamed_path(target_dir, &name, remote))
 }
 
 /// 「新建文件 / 新建文件夹」:问名字 → 建 → 展开父目录并重列。
@@ -1149,6 +1403,8 @@ pub(super) fn new_entry_prompt(
                     collapse_detached: false,
                     extra_reload: Vec::new(),
                     on_success,
+                    on_landed: None,
+                    on_failure: None,
                 },
                 t("fileTree", "operation.creating").into(),
                 move || match connection {

@@ -747,8 +747,16 @@ impl SearchModal {
             ResultAction::ExternalEditor => {
                 self.cancel_pending_close();
                 let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
+                // 内容搜索的命中带上行号(认得出跳行参数的编辑器才用得上);文件名搜索没有行号
+                let how = match item.line_number {
+                    Some(line) => crate::fs_ops::ExternalOpen::EditorAt(
+                        editor,
+                        mt_project::editor::EditorPosition::line(line),
+                    ),
+                    None => crate::fs_ops::ExternalOpen::Editor(editor),
+                };
                 // 弹窗随即关掉,失败的 toast 不会被遮罩挡住
-                crate::fs_ops::open_external(crate::fs_ops::ExternalOpen::Editor(editor), path, cx);
+                crate::fs_ops::open_external(how, path, cx);
                 close_guarded(kind::GLOBAL_SEARCH, window, cx);
             }
         }

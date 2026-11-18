@@ -133,6 +133,9 @@ qrcode.workspace = true
 # 价格表缓存信封(model-pricing.json / .cache.json)的 serde 镜像已随归一 / 缓存
 # 逻辑挪进 mt-usage(`models_dev`),本 crate 不再直接依赖 serde。
 serde_json.workspace = true
+# 文件树本地删除进系统回收站(`file_tree::recycle`)。版本与取舍见根 Cargo.toml 那一行;
+# 不放 mt-project 的理由同那里(mt-git-helper 是服务器端程序)。
+trash.workspace = true
 # 用量分桶要 IANA 时区名:mt-usage 按每条记录自身时刻求当地偏移,
 # 只给固定偏移的话 DST 地区的历史记录会错日。
 iana-time-zone = "0.1"
@@ -206,6 +209,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     # PrintWindow 住在打印/XPS 模块里(弹窗毛玻璃快照,见 frost.rs)。
     "Win32_Storage_Xps",
+    # GetDriveTypeW:本地删除前判这个盘有没有回收站(见 file_tree::recycle)。
+    # gpui 的 windows 0.62 已经开着这一项,不多编东西。
+    "Win32_Storage_FileSystem",
 ] }
 # 从 gpui 的 Window 取 HWND。
 raw-window-handle = "0.6"

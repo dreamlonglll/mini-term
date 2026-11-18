@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1781;
+pub const ZH_ENTRY_COUNT: usize = 1795;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1781;
+pub const EN_ENTRY_COUNT: usize = 1795;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -355,8 +355,17 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.noEditorTitle", "未配置外部编辑器"),
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
     ("dialog.openExternalFailedTitle", "打开失败"),
+    ("dialog.permanentDeleteFailed", "无法把 \"{name}\" 移到回收站：{error}\n要永久删除吗？该操作无法撤销。"),
+    ("dialog.permanentDeleteOk", "永久删除"),
+    ("dialog.permanentDeleteTitle", "无法移到回收站"),
+    ("dialog.permanentDeleteUnsupported", "\"{name}\" 所在的位置（WSL、网络位置等）没有回收站，要永久删除吗？\n该操作无法撤销。"),
     ("dialog.renameFailedMessage", "重命名失败：{error}"),
     ("dialog.renameFailedTitle", "重命名失败"),
+    ("dialog.trashConfirmFile", "确定要把文件 \"{name}\" 移到回收站吗？\n之后可以在回收站里还原。"),
+    ("dialog.trashConfirmFolder", "确定要把文件夹 \"{name}\" 及其中的全部内容移到回收站吗？\n之后可以在回收站里还原。"),
+    ("dialog.trashFileTitle", "将文件移到回收站"),
+    ("dialog.trashFolderTitle", "将文件夹移到回收站"),
+    ("dialog.trashOk", "移到回收站"),
     ("download.contextChanged", "下载上下文已变化，请重新打开或刷新文件后再试。"),
     ("download.directoryErrorTitle", "下载目录不可用"),
     ("empty.loadFailed", "文件列表加载失败"),
@@ -404,6 +413,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("operation.moving", "正在移动…"),
     ("operation.renaming", "正在重命名…"),
     ("operation.summary", "完成 {completed} 项，跳过 {skipped} 项，失败 {failed} 项。"),
+    ("operation.trashing", "正在移到回收站…"),
     ("operation.uploading", "正在上传…"),
     ("prompt.newFileMessage", "请输入文件名"),
     ("prompt.newFileTitle", "新建文件"),
@@ -445,8 +455,17 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.noEditorTitle", "No External Editor Configured"),
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
     ("dialog.openExternalFailedTitle", "Failed to Open"),
+    ("dialog.permanentDeleteFailed", "Couldn't move \"{name}\" to the Trash: {error}\nDelete it permanently? This cannot be undone."),
+    ("dialog.permanentDeleteOk", "Delete Permanently"),
+    ("dialog.permanentDeleteTitle", "Can't Move to Trash"),
+    ("dialog.permanentDeleteUnsupported", "\"{name}\" is in a location without a Trash (WSL, network locations, etc.). Delete it permanently?\nThis cannot be undone."),
     ("dialog.renameFailedMessage", "Rename failed: {error}"),
     ("dialog.renameFailedTitle", "Rename Failed"),
+    ("dialog.trashConfirmFile", "Move file \"{name}\" to the Trash?\nYou can restore it from the Trash later."),
+    ("dialog.trashConfirmFolder", "Move folder \"{name}\" and everything inside it to the Trash?\nYou can restore it from the Trash later."),
+    ("dialog.trashFileTitle", "Move File to Trash"),
+    ("dialog.trashFolderTitle", "Move Folder to Trash"),
+    ("dialog.trashOk", "Move to Trash"),
     ("download.contextChanged", "The download context changed. Reopen or refresh the file and try again."),
     ("download.directoryErrorTitle", "Download Directory Unavailable"),
     ("empty.loadFailed", "Failed to load file list"),
@@ -494,6 +513,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("operation.moving", "Moving…"),
     ("operation.renaming", "Renaming…"),
     ("operation.summary", "Completed {completed}, skipped {skipped}, failed {failed}."),
+    ("operation.trashing", "Moving to Trash…"),
     ("operation.uploading", "Uploading…"),
     ("prompt.newFileMessage", "Enter a file name"),
     ("prompt.newFileTitle", "New File"),
@@ -526,6 +546,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ 磁盘"),
     ("compareTitle", "对比：{name}"),
     ("compareUnavailable", "磁盘上的文件已不是可对比的文本（二进制或过大）"),
+    ("deletedOnDisk", "文件已被删除。保存会按原路径重新创建它。"),
     ("dontSave", "不保存"),
     ("encodingTip", "文件编码：{encoding}，保存时按此编码写回"),
     ("externallyChanged", "文件已被外部修改"),
@@ -561,6 +582,9 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("remoteImageClickToLoad", "点击加载远程图片"),
     ("remoteReadOnly", "远程文件当前不可编辑"),
     ("remoteRelativeImage", "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片"),
+    ("reopenAllMissing", "最近关闭的文件都已不在原处"),
+    ("reopenClosedTab", "重新打开已关闭的页签"),
+    ("replacedOnDisk", "原文件已被移动过来的另一个文件替换。保存会用这里的内容覆盖它。"),
     ("revealInFileTree", "在文件树中定位"),
     ("save", "保存"),
     ("saveAllAndClose", "全部保存并关闭"),
@@ -593,6 +617,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ Disk"),
     ("compareTitle", "Compare: {name}"),
     ("compareUnavailable", "The file on disk is no longer comparable text (binary or too large)"),
+    ("deletedOnDisk", "This file was deleted. Saving will recreate it at its original path."),
     ("dontSave", "Don't Save"),
     ("encodingTip", "File encoding: {encoding}; saving writes it back in this encoding"),
     ("externallyChanged", "File was modified externally"),
@@ -628,6 +653,9 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("remoteImageClickToLoad", "Click to load remote image"),
     ("remoteReadOnly", "This remote file is currently read-only"),
     ("remoteRelativeImage", "Remote Markdown can only load absolute HTTP(S) images on demand"),
+    ("reopenAllMissing", "The recently closed files are no longer where they were"),
+    ("reopenClosedTab", "Reopen Closed Tab"),
+    ("replacedOnDisk", "This file was replaced by another file moved here. Saving will overwrite it with this content."),
     ("revealInFileTree", "Reveal in File Tree"),
     ("save", "Save"),
     ("saveAllAndClose", "Save All and Close"),

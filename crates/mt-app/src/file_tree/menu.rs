@@ -1,10 +1,11 @@
 //! 文件树的菜单构建(从 `file_tree` 平移):行/背景右键菜单、菜单项序。
 
 use gpui::{ClipboardItem, Entity};
+use mt_project::editor::Editor;
 
 use crate::file_ops::{FileBackendIdentity, FileOperationContext};
 use crate::fs_ops;
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::store::AppStore;
 
@@ -28,9 +29,12 @@ use super::{FileTree, Row};
 /// 「Git 历史」与「查看变更」同组，只给后台确认属于仓库的文件；不要求有改动。
 /// 「在此目录搜索内容」(`SearchInDirectory`)同样是 GPUI 版补的,只给本地目录:
 /// SSH 项目本来就不支持全局搜索(`search_modal::open` 那道拦截)。
+/// 「用 {编辑器} 打开」(`OpenWithEditor`)也是 GPUI 版补的,紧跟「使用默认工具打开」,
+/// 只给本地 / WSL 的文件;设置里一个外部编辑器都没配时这一项不画(见 [`file_menu`])。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileMenuAction {
     OpenWithDefault,
+    OpenWithEditor,
     CopyEntry,
     Paste,
     Download,
@@ -60,7 +64,7 @@ pub(super) fn file_menu_actions(
     use FileMenuAction::*;
     let mut actions = Vec::new();
     if !remote && !is_dir {
-        actions.push(Some(OpenWithDefault));
+        actions.extend([Some(OpenWithDefault), Some(OpenWithEditor)]);
     }
     actions.push(Some(CopyEntry));
     if is_dir {
@@ -107,7 +111,9 @@ pub(super) fn row_key_action_available(is_dir: bool, remote: bool, action: FileM
     file_menu_actions(is_dir, false, false, remote, false).contains(&Some(action))
 }
 
-/// 一行(文件/目录)的右键菜单。
+/// 一行(文件/目录)的右键菜单。`editor` 是设置里配的外部编辑器(`fs_ops::configured_editor`),
+/// 没配时不画「用 {编辑器} 打开」—— 那样它就只是另一个「使用默认工具打开」。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn file_menu(
     tree: &Entity<FileTree>,
     store: &Entity<AppStore>,
@@ -116,6 +122,7 @@ pub(super) fn file_menu(
     connection: Option<mt_config::SshConnection>,
     can_paste: bool,
     git_capability: (bool, bool),
+    editor: Option<Editor>,
 ) -> Vec<MenuEntry> {
     let (git_enabled, in_git_repo) = git_capability;
     let root = context.root.clone();
@@ -147,6 +154,23 @@ pub(super) fn file_menu(
             FileMenuAction::OpenWithDefault => {
                 menu::item(t("fileTree", "menu.openWithDefault"), move |_window, cx| {
                     fs_ops::open_external(fs_ops::ExternalOpen::DefaultApp, path.clone(), cx);
+                })
+            }
+            FileMenuAction::OpenWithEditor => {
+                let Some(editor) = editor.clone() else {
+                    continue;
+                };
+                let label = tr!(
+                    "fileTree",
+                    "header.openWithEditor",
+                    editor = editor.name.clone()
+                );
+                menu::item(label, move |_window, cx| {
+                    fs_ops::open_external(
+                        fs_ops::ExternalOpen::Editor(Some(editor.clone())),
+                        path.clone(),
+                        cx,
+                    );
                 })
             }
             FileMenuAction::CopyEntry => {

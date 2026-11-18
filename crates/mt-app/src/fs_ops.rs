@@ -27,7 +27,7 @@ use std::process::Command;
 
 use gpui::App;
 use mt_core::path_key::collapse_separators;
-use mt_project::editor::Editor;
+use mt_project::editor::{Editor, EditorPosition};
 
 use crate::i18n::t;
 
@@ -121,6 +121,9 @@ pub fn configured_editor(config: &mt_config::AppConfig) -> Option<Editor> {
 pub enum ExternalOpen {
     /// 外部编辑器;`None` = 没配 → 退到系统默认程序打开,别只给一句报错。
     Editor(Option<Editor>),
+    /// 外部编辑器并跳到某一行(认得出跳行参数的编辑器才带上,见
+    /// `mt_project::editor::editor_args`);`None` 同 [`Self::Editor`],退到系统默认程序、不带行。
+    EditorAt(Option<Editor>, EditorPosition),
     /// 系统默认程序(文件按关联程序开,目录开文件管理器)。
     DefaultApp,
     /// 浏览器(走协议关联,见 `mt_project::editor::open_path_in_browser`)。
@@ -134,7 +137,10 @@ impl ExternalOpen {
     fn run(&self, path: &Path) -> anyhow::Result<()> {
         match self {
             Self::Editor(Some(editor)) => mt_project::editor::open_in_editor(Some(editor), path),
-            Self::Editor(None) | Self::DefaultApp => {
+            Self::EditorAt(Some(editor), position) => {
+                mt_project::editor::open_in_editor_at(Some(editor), path, Some(*position))
+            }
+            Self::Editor(None) | Self::EditorAt(None, _) | Self::DefaultApp => {
                 mt_project::editor::open_path_with_default_app(path)
             }
             Self::Browser => mt_project::editor::open_path_in_browser(path),
@@ -148,11 +154,11 @@ impl ExternalOpen {
     /// 用户要的本来就是「用编辑器打开」,光说「打开失败」没有下一步。
     fn failure_text(&self, detail: String) -> (String, String) {
         match self {
-            Self::Editor(Some(_)) => (
+            Self::Editor(Some(_)) | Self::EditorAt(Some(_), _) => (
                 t("fileTree", "dialog.openEditorFailedTitle").to_string(),
                 detail,
             ),
-            Self::Editor(None) => (
+            Self::Editor(None) | Self::EditorAt(None, _) => (
                 t("fileTree", "dialog.noEditorTitle").to_string(),
                 format!("{}\n{detail}", t("fileTree", "dialog.noEditorMessage")),
             ),

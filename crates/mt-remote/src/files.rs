@@ -210,6 +210,28 @@ pub fn read_file_content(
     })
 }
 
+/// 远程文档还能不能按原路径再打开:叶子过与读写同一套校验(规范化后在项目根内、不是链接、
+/// 是普通文件)。只 stat,不读内容 —— 「重新打开已关闭的页签」先探一次,不在了就跳过。
+///
+/// 连不上 / 项目根本身不可访问报 `Err`,与「文件不在了」(`Ok(false)`)分开:断网时不该把
+/// 已关闭栈里的条目当成全没了丢掉。同步阻塞,调用方丢后台。
+pub fn document_file_exists(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+) -> Result<bool, String> {
+    let st = state();
+    st.block_on(async {
+        let sftp = open_sftp(st, conn).await?;
+        let canonical_root = canonical_remote_document_root(&sftp, project_root).await?;
+        Ok(
+            validate_remote_document_file_against_root(&sftp, &canonical_root, path)
+                .await
+                .is_ok(),
+        )
+    })
+}
+
 /// Safely save one previously loaded remote text document, written back in
 /// the encoding recorded in `expected` (UTF-8 unchanged; a draft the encoding
 /// cannot represent is refused before touching the remote file).

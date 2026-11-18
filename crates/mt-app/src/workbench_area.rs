@@ -30,21 +30,58 @@
 //! 脏的文件页签关闭前三选一:保存并关闭 / 不保存 / 取消(批量关闭同理,一次问完)。
 //! 「保存并关闭」等这一批保存全部收口才关([`WorkbenchArea::save_and_close`]):存成功的
 //! 关掉,存不了 / 存失败的留在页签条上并切过去 —— 原因在它自己的横幅上。
+//!
+//! # 页签跟随文件树
+//!
+//! 文件树里的重命名 / 移动(含拖拽)/ 删除落地后(`file_tree::ops` 的 `on_landed`,本地 /
+//! WSL / 远程同一口径,项目中途切走了也照样跟),这里把受影响的文件页签跟上:
+//!
+//! - **重命名 / 移动**([`follow_moved`]):路径就是旧路径、或在它之下(改名的是目录)的页签
+//!   改指新路径 —— 页签顺序、激活态、身份、标题随之换,[`FileViewer::retarget`] 留着编辑器
+//!   实体(未保存内容、光标、滚动、撤销栈),换掉语法高亮 / 目录监听 / Git 标记;「最近打开」、
+//!   Ctrl+` 记的页签与已关闭栈里的路径一并换。新路径上恰好已开着别的页签(覆盖式移动):
+//!   干净的关掉,有未保存修改的留下、另起身份([`DocumentKey::replaced`])让出路径,并标明
+//!   「文件已被替换」。
+//! - **删除**([`follow_deleted`]):路径在被删路径之下的,干净的直接关掉(不进已关闭栈),
+//!   有未保存修改的留下并标明「文件已被删除」(保存 = 按原路径重建,见 `FileViewer` 的保存)。
+//! - 改动落地**之前**先打一声招呼([`expect_path_change`]):文件自己的目录监听会抢在改指向
+//!   之前收到旧路径的事件,不招呼的话干净的页签会按旧路径重载成错误页(光标全丢)。
+//!
+//! 路径一律按整段比(`foo` 不配 `foobar`),本地在 Windows 上不分大小写、`\` 与 `/` 等价,
+//! 远程按 POSIX 原文(见 [`paths`])。diff 页签不参与。被顶掉留下的页签与顶它的那个同路径,
+//! 所以文件页自己报「关我 / 我是不是当前页」一律按实体认([`close_document_viewer`] /
+//! [`is_viewer_active`]),不按路径。
+//!
+//! # 重新打开已关闭的页签
+//!
+//! 每个项目一份已关闭栈([`closed`],运行时、不落盘、上限 20),记路径 / 来源 / 关闭时的
+//! 光标行与在页签条上的位置。单个关闭、批量关闭(关闭其他 / 右边 / 左边 / 所有)、保存并关闭、
+//! 不保存都入栈;diff 页签不入栈。页签右键与终端页右键「重新打开已关闭的页签」从栈顶往下
+//! 后台探文件还在不在([`closed::pick_reopen`]),不在的跳过,第一条还在的插回原位置、定位到
+//! 关闭时那一行;已经开着的直接切过去。全都不在时页签条右端给一行就地提示,几秒后自己收。
 
-use std::collections::HashMap;
+mod closed;
+mod paths;
+
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
-    prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Context, Entity, EntityId, Focusable as _, Global,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Task,
+    Window, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
+use closed::{ClosedTab, ClosedTabs, ReopenPick};
+use paths::PathSemantics;
+
+use crate::file_ops::FileBackendIdentity;
 use crate::file_viewer::{DocumentSource, FileViewer, LineTarget, SaveForClose};
 use crate::git_diff::{DiffKey, DiffTab, DiffTabEvent};
 use crate::i18n::{t, tr};
@@ -69,6 +106,10 @@ pub struct DocumentKey {
     project_id: String,
     backend: DocumentBackendKey,
     normalized_path: String,
+    /// 被移动 / 改名过来的文件顶掉、又因为有未保存修改留下的页签另起的序号(见模块注释
+    /// 「页签跟随文件树」):路径让给了顶它的那个,同一身份不能有两个页签(`index_of` 只认
+    /// 第一个)。正常页签恒为 0。
+    replaced: u64,
 }
 
 impl DocumentKey {
@@ -92,7 +133,44 @@ impl DocumentKey {
             project_id: source.project_id().to_string(),
             backend,
             normalized_path,
+            replaced: 0,
         }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self.backend, DocumentBackendKey::Remote { .. })
+    }
+
+    /// 同一后端上换了路径的身份(页签跟着改名 / 移动)。
+    fn with_path(&self, path: &Path) -> Self {
+        let normalized_path = if self.is_remote() {
+            normalize_remote_document_path(path)
+        } else {
+            normalize_local_document_path(path)
+        };
+        Self {
+            normalized_path,
+            ..self.clone()
+        }
+    }
+}
+
+/// 文件页签的后端与文件树这次操作的后端是不是同一个(远程还要连接身份一致:换了连接的旧页签
+/// 指的是另一台机器上的文件)。
+fn backend_matches(key: &DocumentBackendKey, backend: &FileBackendIdentity) -> bool {
+    match (key, backend) {
+        (DocumentBackendKey::Local, FileBackendIdentity::Local) => true,
+        (
+            DocumentBackendKey::Remote {
+                connection_id,
+                connection_fingerprint,
+            },
+            FileBackendIdentity::Remote {
+                connection_id: id,
+                connection_fingerprint: fingerprint,
+            },
+        ) => connection_id == id && connection_fingerprint == fingerprint,
+        _ => false,
     }
 }
 
@@ -196,6 +274,8 @@ struct ProjectDocuments {
     /// 上一次从页签切回终端页时停着的页签,Ctrl+` 回去用(见 [`return_target`])。
     /// 那个页签后来被关掉的话就不认,不在这里追着删。
     last_tab: Option<TabKey>,
+    /// 已关闭的文件页签栈(见模块注释「重新打开已关闭的页签」)。
+    closed: ClosedTabs,
 }
 
 impl Default for ProjectDocuments {
@@ -205,6 +285,7 @@ impl Default for ProjectDocuments {
             active: WorkbenchPage::Terminal,
             recent: Vec::new(),
             last_tab: None,
+            closed: ClosedTabs::default(),
         }
     }
 }
@@ -212,6 +293,25 @@ impl Default for ProjectDocuments {
 impl ProjectDocuments {
     fn index_of(&self, key: &TabKey) -> Option<usize> {
         self.tabs.iter().position(|tab| &tab.key == key)
+    }
+
+    /// 某个文件页签实体在第几个(按实体认,不按身份,理由见模块注释「页签跟随文件树」)。
+    fn index_of_viewer(&self, viewer: EntityId) -> Option<usize> {
+        self.tabs.iter().position(
+            |tab| matches!(&tab.content, TabContent::File(entity) if entity.entity_id() == viewer),
+        )
+    }
+
+    /// 页签身份换了(跟着改名 / 移动,或被顶掉另起身份):活动页与 Ctrl+` 记着的是它的话
+    /// 跟着新身份走,否则回不到这个页签。
+    fn rekey(&mut self, index: usize, key: TabKey) {
+        let old = std::mem::replace(&mut self.tabs[index].key, key.clone());
+        if self.active == WorkbenchPage::Tab(old.clone()) {
+            self.active = WorkbenchPage::Tab(key.clone());
+        }
+        if self.last_tab.as_ref() == Some(&old) {
+            self.last_tab = Some(key);
+        }
     }
 
     /// 某个 diff 页签实体在第几个(按实体认,不按身份:换文件时身份会变)。
@@ -479,16 +579,74 @@ pub fn open_document_source(source: DocumentSource, window: &mut Window, cx: &mu
     area.update(cx, |area, cx| area.open_document(source, None, window, cx));
 }
 
-/// 文件页内部的 Ctrl/Cmd+W 入口。延迟执行前先快照来源身份，避免用户在
-/// `window.defer` 落地前切换页签后误关新的活动页。
-pub fn close_document_source(source: DocumentSource, window: &mut Window, cx: &mut App) {
+/// 文件页内部的 Ctrl/Cmd+W 入口。延迟执行前先快照是哪个页签实体，避免用户在
+/// `window.defer` 落地前切换页签后误关新的活动页。按实体认而不按来源路径:页签可能跟着
+/// 改名换过路径,被顶掉留下的页签也与顶它的那个同路径(见模块注释「页签跟随文件树」)。
+pub fn close_document_viewer(viewer: EntityId, window: &mut Window, cx: &mut App) {
     let Some(area) = global(cx) else {
         return;
     };
-    let project_id = source.project_id().to_string();
-    let key = TabKey::Document(DocumentKey::from_source(&source));
     area.update(cx, |area, cx| {
+        let Some((project_id, key)) = area.locate_viewer(viewer) else {
+            return;
+        };
         area.request_close_document(project_id, key, window, cx)
+    });
+}
+
+/// 文件树马上要改 `path`(文件或目录)的路径:受影响的文件页签先打一声招呼,那一下的监听
+/// 事件当回声(见模块注释「页签跟随文件树」)。
+pub fn expect_path_change(
+    project_id: &str,
+    backend: &FileBackendIdentity,
+    path: &Path,
+    cx: &mut App,
+) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    let viewers = area
+        .read(cx)
+        .file_tabs_within(project_id, backend, path, cx)
+        .into_iter()
+        .map(|(_, viewer, _)| viewer)
+        .collect::<Vec<_>>();
+    for viewer in viewers {
+        viewer.update(cx, |viewer, _| viewer.expect_path_change());
+    }
+}
+
+/// 文件树里把 `from`(文件或目录)改名 / 移动成了 `to`:已开的文件页签跟上(见模块注释
+/// 「页签跟随文件树」)。
+pub fn follow_moved(
+    project_id: &str,
+    backend: &FileBackendIdentity,
+    from: &Path,
+    to: &Path,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| {
+        area.follow_moved(project_id, backend, from, to, window, cx)
+    });
+}
+
+/// 文件树里删掉了 `path`(文件或目录):已开的文件页签跟上(见模块注释「页签跟随文件树」)。
+pub fn follow_deleted(
+    project_id: &str,
+    backend: &FileBackendIdentity,
+    path: &Path,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| {
+        area.follow_deleted(project_id, backend, path, window, cx)
     });
 }
 
@@ -591,20 +749,26 @@ pub fn activate_terminal_page(window: &mut Window, cx: &mut App) {
 
 /// 文档异步读盘完成时用来判断是否可以接管焦点。后台页签或其它项目的迟到结果
 /// 只能更新自身内容，不能把键盘焦点从当前终端/文档页抢走。
-pub fn is_document_active(source: &DocumentSource, cx: &App) -> bool {
+///
+/// 按页签实体认(理由同 [`close_document_viewer`]),不回读文件页本身 —— 调用方多半正在
+/// 文件页的 update 里。
+pub fn is_viewer_active(viewer: EntityId, cx: &App) -> bool {
     let Some(area) = global(cx) else {
         return false;
     };
-    let key = DocumentKey::from_source(source);
     let area = area.read(cx);
-    let Some(active_project_id) = area.store.read(cx).active_project_id.clone() else {
+    let Some(active_project_id) = area.store.read(cx).active_project_id.as_deref() else {
         return false;
     };
-    active_project_id == key.project_id
-        && area
-            .projects
-            .get(&active_project_id)
-            .is_some_and(|project| project.active == WorkbenchPage::Tab(TabKey::Document(key)))
+    let Some(project) = area.projects.get(active_project_id) else {
+        return false;
+    };
+    let WorkbenchPage::Tab(key) = &project.active else {
+        return false;
+    };
+    project
+        .index_of(key)
+        .is_some_and(|index| project.index_of_viewer(viewer) == Some(index))
 }
 
 /// 该项目「最近打开」的本地文件,新的在前(见 [`ProjectDocuments::recent`])。
@@ -693,6 +857,13 @@ pub struct WorkbenchArea {
     /// 正在拖页签滚动条：按下那一刻的 (鼠标 x, 滚动偏移 x)。换算见
     /// [`tab_drag_offset`]；拖动期间即使鼠标滑出页签条也保持滚动条可见。
     tab_drag: Option<(gpui::Pixels, gpui::Pixels)>,
+    /// 被顶掉留下的页签另起身份用的序号(见 [`DocumentKey::replaced`])。
+    next_replaced: u64,
+    /// 正在重开已关闭的页签(后台在探文件还在不在):这一趟没回来之前再点不另起一趟。
+    reopening: bool,
+    /// 页签条右端的一行就地提示(哪个项目的, 文案),[`NOTICE_TTL`] 后自己收。
+    notice: Option<(String, SharedString)>,
+    _notice_task: Option<Task<()>>,
 }
 
 impl WorkbenchArea {
@@ -719,7 +890,12 @@ impl WorkbenchArea {
             // 正常移除入口会在 AppStore 层拒绝丢弃脏页签；这里再留一道兜底，
             // 防止配置被其它路径直接改写时观察者静默销毁内存草稿。
             this.projects.retain(|project_id, project| {
-                project_ids.contains(project_id) || project_documents_are_dirty(project, cx)
+                if project_ids.contains(project_id) {
+                    return true;
+                }
+                // 项目已被移除:已关闭栈随它清掉(脏页签兜底留下的那份也不再可重开)
+                project.closed = ClosedTabs::default();
+                project_documents_are_dirty(project, cx)
             });
             for project in this.projects.values() {
                 for tab in &project.tabs {
@@ -740,6 +916,10 @@ impl WorkbenchArea {
             tab_scroll: ScrollHandle::new(),
             tabs_hovered: false,
             tab_drag: None,
+            next_replaced: 0,
+            reopening: false,
+            notice: None,
+            _notice_task: None,
         }
     }
 
@@ -796,6 +976,19 @@ impl WorkbenchArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_document_at(source, highlight, None, window, cx);
+    }
+
+    /// [`Self::open_document`] 的完整版:新建的页签插在页签条第 `insert_at` 个(超出就落在
+    /// 末尾;`None` = 末尾)。重开已关闭的页签用它插回原位置。
+    fn open_document_at(
+        &mut self,
+        source: DocumentSource,
+        highlight: Option<LineTarget>,
+        insert_at: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let project_id = source.project_id().to_string();
         let key = TabKey::Document(DocumentKey::from_source(&source));
         let local_path = match &source {
@@ -823,13 +1016,17 @@ impl WorkbenchArea {
         cx.observe(&document, |_this, _document, cx| cx.notify())
             .detach();
         let content = TabContent::File(document);
-        project.tabs.push(DocumentTab {
-            key: key.clone(),
-            title,
-            tip: None,
-            content: content.clone(),
-            local_path,
-        });
+        let index = insert_at.map_or(project.tabs.len(), |index| index.min(project.tabs.len()));
+        project.tabs.insert(
+            index,
+            DocumentTab {
+                key: key.clone(),
+                title,
+                tip: None,
+                content: content.clone(),
+                local_path,
+            },
+        );
         project.active = WorkbenchPage::Tab(key);
         content.activate_later(window, cx);
         cx.notify();
@@ -1263,6 +1460,8 @@ impl WorkbenchArea {
     /// 在批量语境下会把活动页停在一个马上又要被关掉的页签上。
     ///
     /// 「关闭所有」没有锚点、传 `None`：页签全部关完，`close` 的收敛终点就是终端页。
+    ///
+    /// 关掉的文件页签记进已关闭栈(见模块注释「重新打开已关闭的页签」)。
     fn close_documents(
         &mut self,
         project_id: &str,
@@ -1271,9 +1470,28 @@ impl WorkbenchArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_documents_inner(project_id, keys, fallback, true, window, cx);
+    }
+
+    /// [`Self::close_documents`] 的完整版。`record = false` 的是「文件已经不在原处」的那几种
+    /// 关法(删掉了 / 被顶掉了),它们不进已关闭栈 —— 重开也开不回原来那个文件。
+    fn close_documents_inner(
+        &mut self,
+        project_id: &str,
+        keys: &[TabKey],
+        fallback: Option<&TabKey>,
+        record: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project) = self.projects.get_mut(project_id) else {
             return;
         };
+        if record {
+            project
+                .closed
+                .push_batch(closed_tabs_of(&project.tabs, keys, cx));
+        }
         let mut closed_active = false;
         for key in keys {
             closed_active |= project.active == WorkbenchPage::Tab(key.clone());
@@ -1304,6 +1522,348 @@ impl WorkbenchArea {
             WorkbenchPage::Tab(next) => self.activate_document(project_id, &next, window, cx),
         }
         cx.notify();
+    }
+
+    // ─── 页签跟随文件树(见模块注释) ────────────────────────────
+
+    /// 文件页签实体在哪个项目、眼下是什么身份。
+    fn locate_viewer(&self, viewer: EntityId) -> Option<(String, TabKey)> {
+        self.projects.iter().find_map(|(project_id, project)| {
+            let index = project.index_of_viewer(viewer)?;
+            Some((project_id.clone(), project.tabs[index].key.clone()))
+        })
+    }
+
+    /// 这个项目里、文件树这次操作的后端上、路径就是 `base` 或在它之下的文件页签:
+    /// (身份, 实体, 打开时的原样路径),按页签条顺序。
+    fn file_tabs_within(
+        &self,
+        project_id: &str,
+        backend: &FileBackendIdentity,
+        base: &Path,
+        cx: &App,
+    ) -> Vec<(TabKey, Entity<FileViewer>, PathBuf)> {
+        let Some(project) = self.projects.get(project_id) else {
+            return Vec::new();
+        };
+        let remote = matches!(backend, FileBackendIdentity::Remote { .. });
+        let sem = PathSemantics::for_document(remote);
+        project
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let (TabKey::Document(key), TabContent::File(viewer)) = (&tab.key, &tab.content)
+                else {
+                    return None;
+                };
+                if !backend_matches(&key.backend, backend) {
+                    return None;
+                }
+                let path = viewer.read(cx).source().path().to_path_buf();
+                paths::is_within(&path, base, sem).then(|| (tab.key.clone(), viewer.clone(), path))
+            })
+            .collect()
+    }
+
+    /// 文件树里把 `from` 改名 / 移动成了 `to`(见模块注释「页签跟随文件树」)。
+    fn follow_moved(
+        &mut self,
+        project_id: &str,
+        backend: &FileBackendIdentity,
+        from: &Path,
+        to: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remote = matches!(backend, FileBackendIdentity::Remote { .. });
+        let sem = PathSemantics::for_document(remote);
+        let moving = self
+            .file_tabs_within(project_id, backend, from, cx)
+            .into_iter()
+            .filter_map(|(key, viewer, path)| {
+                let path = paths::rebase(&path, from, to, sem)?;
+                Some((key, viewer, path))
+            })
+            .collect::<Vec<_>>();
+        // 上一帧画的是这个项目的哪一页(画的不是这个项目就是 `None`),按换身份之前的样子比
+        let rendered = if self.last_rendered_project.as_deref() == Some(project_id) {
+            self.last_rendered_page.clone()
+        } else {
+            None
+        };
+        let Some(project) = self.projects.get_mut(project_id) else {
+            return;
+        };
+        // 没有页签开着的路径也要换:「最近打开」与已关闭栈
+        project.closed.rebase(from, to, remote);
+        if !remote {
+            rebase_recent(&mut project.recent, from, to, sem);
+        }
+        let moving_keys = moving
+            .iter()
+            .map(|(key, ..)| key.clone())
+            .collect::<HashSet<_>>();
+        let mut retargets = Vec::new();
+        let mut displaced = Vec::new();
+        let mut closed_rendered = false;
+        for (old_key, viewer, new_path) in moving {
+            let TabKey::Document(old_document) = &old_key else {
+                continue;
+            };
+            let new_key = TabKey::Document(old_document.with_path(&new_path));
+            // 覆盖式移动:新路径上已经开着别的页签(不在这一批里)。干净的关掉(不进已关闭栈:
+            // 那个文件已经被顶掉了);有未保存修改的留下、另起身份让出路径
+            if new_key != old_key
+                && !moving_keys.contains(&new_key)
+                && let Some(other) = project.index_of(&new_key)
+            {
+                if project.tabs[other].content.is_dirty(cx) {
+                    self.next_replaced += 1;
+                    let replaced_key = TabKey::Document(DocumentKey {
+                        replaced: self.next_replaced,
+                        ..old_document.with_path(&new_path)
+                    });
+                    if rendered == Some(WorkbenchPage::Tab(new_key.clone())) {
+                        self.last_rendered_page = Some(WorkbenchPage::Tab(replaced_key.clone()));
+                    }
+                    project.rekey(other, replaced_key);
+                    if let TabContent::File(viewer) = &project.tabs[other].content {
+                        displaced.push(viewer.clone());
+                    }
+                } else {
+                    closed_rendered |= rendered == Some(WorkbenchPage::Tab(new_key.clone()));
+                    let _ = project.close(&new_key);
+                }
+            }
+            let Some(index) = project.index_of(&old_key) else {
+                continue;
+            };
+            // 还是同一页,别让 render 把它当成「切过来了」再交一次焦点、再刷一次
+            if rendered == Some(WorkbenchPage::Tab(old_key.clone())) {
+                self.last_rendered_page = Some(WorkbenchPage::Tab(new_key.clone()));
+            }
+            project.rekey(index, new_key);
+            let tab = &mut project.tabs[index];
+            tab.title = paths::leaf_name(&new_path, sem);
+            if !remote {
+                tab.local_path = Some(new_path.clone());
+            }
+            retargets.push((viewer, new_path));
+        }
+        // 关掉的正是上一帧画着的那一页:让 render 当成「切过来了」,给眼下的活动页交焦点
+        if closed_rendered {
+            self.last_rendered_page = None;
+        }
+        if !retargets.is_empty() || !displaced.is_empty() {
+            // 实体的改动延到这一轮更新收口:改指向要重读 / 换监听,文件页可能回读工作区
+            window.defer(cx, move |window, cx| {
+                for (viewer, path) in retargets {
+                    viewer.update(cx, |viewer, cx| viewer.retarget(path, window, cx));
+                }
+                for viewer in displaced {
+                    viewer.update(cx, |viewer, cx| viewer.mark_replaced(cx));
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// 文件树里删掉了 `path`(见模块注释「页签跟随文件树」):干净的页签关掉(不进已关闭栈),
+    /// 有未保存修改的留着、标明「文件已被删除」。「最近打开」与已关闭栈里在其下的一并摘掉。
+    fn follow_deleted(
+        &mut self,
+        project_id: &str,
+        backend: &FileBackendIdentity,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let remote = matches!(backend, FileBackendIdentity::Remote { .. });
+        let sem = PathSemantics::for_document(remote);
+        let mut close = Vec::new();
+        let mut keep = Vec::new();
+        for (key, viewer, _) in self.file_tabs_within(project_id, backend, path, cx) {
+            if viewer.read(cx).is_dirty() {
+                keep.push(viewer);
+            } else {
+                close.push(key);
+            }
+        }
+        if let Some(project) = self.projects.get_mut(project_id) {
+            project.closed.forget_within(path, remote);
+            if !remote {
+                project
+                    .recent
+                    .retain(|recent| !paths::is_within(recent, path, sem));
+            }
+        }
+        if !keep.is_empty() {
+            window.defer(cx, move |_window, cx| {
+                for viewer in keep {
+                    viewer.update(cx, |viewer, cx| viewer.mark_deleted(cx));
+                }
+            });
+        }
+        if close.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.close_documents_inner(project_id, &close, None, false, window, cx);
+    }
+
+    // ─── 重新打开已关闭的页签(见模块注释) ──────────────────────
+
+    /// 页签右键「重新打开已关闭的页签」。文件还在不在要碰盘 / 走 SFTP,丢后台探
+    /// ([`closed::pick_reopen`]),回来再开。
+    fn reopen_closed_tab(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reopening {
+            return;
+        }
+        let Some(candidates) = self
+            .projects
+            .get(&project_id)
+            .map(|project| project.closed.candidates())
+            .filter(|candidates| !candidates.is_empty())
+        else {
+            return;
+        };
+        // 来源按项目**眼下**的形态建:本地 / 远程变了的条目跳过,远程用当前的连接
+        let (root, remote, connection) = {
+            let store = self.store.read(cx);
+            let Some(project) = store.project(&project_id) else {
+                return;
+            };
+            (
+                project.path.clone(),
+                store.is_remote_project(&project_id),
+                store.remote_connection_of(&project_id),
+            )
+        };
+        if remote && connection.is_none() {
+            self.show_notice(&project_id, t("fileTree", "remote.broken"), cx);
+            return;
+        }
+        self.reopening = true;
+        let (probe_root, probe_connection) = (root.clone(), connection.clone());
+        let task = cx.background_executor().spawn(async move {
+            closed::pick_reopen(candidates, remote, |path| match &probe_connection {
+                Some(connection) => mt_remote::document_file_exists(
+                    connection,
+                    &probe_root,
+                    &path.to_string_lossy(),
+                ),
+                None => Ok(mt_project::fs::is_viewable_file(
+                    Path::new(&probe_root),
+                    path,
+                )),
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let pick = task.await;
+            let _ = this.update_in(cx, |area: &mut WorkbenchArea, window, cx| {
+                area.reopening = false;
+                area.finish_reopen(&project_id, root, connection, pick, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 探完了:用过的条目从栈里摘掉,开第一条还在的那个(插回原位置、定位到关闭时那一行;
+    /// 已经开着的直接切过去,不挪它的光标);一条都开不出来就在页签条右端就地提示。
+    fn finish_reopen(
+        &mut self,
+        project_id: &str,
+        root: String,
+        connection: Option<mt_config::SshConnection>,
+        pick: ReopenPick,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ReopenPick {
+            mut tried,
+            found,
+            error,
+        } = pick;
+        let Some(project) = self.projects.get_mut(project_id) else {
+            return;
+        };
+        tried.extend(found.clone());
+        project.closed.remove(&tried);
+        if let Some(error) = error {
+            self.show_notice(project_id, error, cx);
+            return;
+        }
+        let Some(found) = found else {
+            self.show_notice(project_id, t("fileViewer", "reopenAllMissing"), cx);
+            return;
+        };
+        let source = match connection {
+            Some(connection) => DocumentSource::Remote {
+                project_id: project_id.to_string(),
+                connection: Box::new(connection),
+                project_root: root,
+                path: found.path,
+            },
+            None => DocumentSource::Local {
+                project_id: project_id.to_string(),
+                project_root: PathBuf::from(root),
+                path: found.path,
+            },
+        };
+        let key = TabKey::Document(DocumentKey::from_source(&source));
+        let already_open = self
+            .projects
+            .get(project_id)
+            .is_some_and(|project| project.index_of(&key).is_some());
+        let highlight = if already_open {
+            None
+        } else {
+            found.line.map(LineTarget::line)
+        };
+        self.open_document_at(source, highlight, Some(found.index), window, cx);
+    }
+
+    /// 页签条右端的一行就地提示,[`NOTICE_TTL`] 后自己收(不弹框、不推 toast:重开是在
+    /// 页签条上发生的事)。
+    fn show_notice(
+        &mut self,
+        project_id: &str,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice = Some((project_id.to_string(), text.into()));
+        // 换掉旧的计时(丢掉句柄即取消),新提示从头计
+        self._notice_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TTL).await;
+            let _ = this.update(cx, |area: &mut WorkbenchArea, cx| {
+                area.notice = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// 「重新打开已关闭的页签」那一项。栈空(或这一趟还在探)时置灰,不抽掉:菜单条目固定。
+    fn reopen_menu_item(&self, project_id: &str, cx: &Context<Self>) -> MenuEntry {
+        let empty = self
+            .projects
+            .get(project_id)
+            .is_none_or(|project| project.closed.is_empty());
+        let (area, project_id) = (cx.entity(), project_id.to_string());
+        MenuItem::new(t("fileViewer", "reopenClosedTab"))
+            .disabled(empty || self.reopening)
+            .on_click(move |window, cx| {
+                let project_id = project_id.clone();
+                area.update(cx, |area, cx| {
+                    area.reopen_closed_tab(project_id, window, cx)
+                });
+            })
+            .into()
     }
 
     /// 右键菜单的三档批量关闭要关掉哪些页签。菜单同时用它判断该不该置灰。
@@ -1429,19 +1989,22 @@ impl WorkbenchArea {
     }
 
     /// 常驻终端页的右键菜单。终端页自己关不掉，这里只管清空页签区；
-    /// 页签条只在有页签时才画，所以这一项不会没得可关。
+    /// 页签条只在有页签时才画，所以这一项不会没得可关。另起一组「重新打开已关闭的页签」
+    /// (页签栏空白处没有右键菜单,终端页这一颗就是页签栏上除页签之外唯一的菜单)。
     fn terminal_tab_menu(&self, project_id: &str, cx: &Context<Self>) -> Vec<MenuEntry> {
         let area = cx.entity();
+        let reopen = self.reopen_menu_item(project_id, cx);
         let project_id = project_id.to_string();
-        vec![menu::item(
-            t("fileViewer", "closeAll"),
-            move |window, cx| {
+        vec![
+            menu::item(t("fileViewer", "closeAll"), move |window, cx| {
                 let project_id = project_id.clone();
                 area.update(cx, |area, cx| {
                     area.request_close_all(project_id, window, cx)
                 });
-            },
-        )]
+            }),
+            menu::separator(),
+            reopen,
+        ]
     }
 
     /// 页签区页签(文件 / diff)的右键菜单。
@@ -1488,18 +2051,52 @@ impl WorkbenchArea {
                     .into(),
             );
         }
+        // 「重新打开已关闭的页签」另起一组(VS Code 页签菜单里它也挨着关闭那几项);
+        // 已关闭栈按项目记,diff 页签上右键同样能用
+        entries.push(menu::separator());
+        entries.push(self.reopen_menu_item(project_id, cx));
         // 文件页签多一组「在文件树中定位」(VS Code 页签菜单的 Reveal in Explorer View 同位:
         // 关闭那几项之后另起一组)。diff 页签对的是提交 / 改动,不是树上的一个文件,不给
         if let Some(TabContent::File(document)) = self.tab_content(project_id, key) {
-            let path = document.read(cx).source().path().to_path_buf();
-            let project_id = project_id.to_string();
+            let (path, local, line) = {
+                let document = document.read(cx);
+                (
+                    document.source().path().to_path_buf(),
+                    matches!(document.source(), DocumentSource::Local { .. }),
+                    document.cursor_line(cx),
+                )
+            };
             entries.push(menu::separator());
-            entries.push(menu::item(
-                t("fileViewer", "revealInFileTree"),
-                move |_window, cx| {
-                    crate::file_tree::reveal_in_tree(&project_id, path.clone(), cx);
-                },
-            ));
+            {
+                let (project_id, path) = (project_id.to_string(), path.clone());
+                entries.push(menu::item(
+                    t("fileViewer", "revealInFileTree"),
+                    move |_window, cx| {
+                        crate::file_tree::reveal_in_tree(&project_id, path.clone(), cx);
+                    },
+                ));
+            }
+            // 「用 {编辑器} 打开」:与文件树行菜单同一项,多带上光标所在行。只给本地 / WSL
+            // (SSH 远程的文件不在本机上),设置里没配外部编辑器时不画
+            let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
+            if local && let Some(editor) = editor {
+                let label = tr!(
+                    "fileTree",
+                    "header.openWithEditor",
+                    editor = editor.name.clone()
+                );
+                entries.push(menu::item(label, move |_window, cx| {
+                    let editor = Some(editor.clone());
+                    let how = match line {
+                        Some(line) => crate::fs_ops::ExternalOpen::EditorAt(
+                            editor,
+                            mt_project::editor::EditorPosition::line(line),
+                        ),
+                        None => crate::fs_ops::ExternalOpen::Editor(editor),
+                    };
+                    crate::fs_ops::open_external(how, path.clone(), cx);
+                }));
+            }
         }
         entries
     }
@@ -1856,6 +2453,22 @@ impl Render for WorkbenchArea {
                                 }),
                             )
                     })),
+            )
+            // 就地提示(重开时已关闭的文件都不在了):贴在页签条右端,几秒后自己收
+            .children(
+                self.notice
+                    .as_ref()
+                    .filter(|(notice_project, _)| *notice_project == project_id)
+                    .map(|(_, text)| {
+                        div()
+                            .flex_none()
+                            .max_w(px(360.0))
+                            .px(px(12.0))
+                            .truncate()
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(text.clone())
+                    }),
             );
 
         let body = match &active {
@@ -1966,6 +2579,51 @@ fn stable_hash(key: &TabKey) -> u64 {
     hasher.finish()
 }
 
+/// 页签条就地提示挂多久(与文件树定位失败那行提示同一口径)。
+const NOTICE_TTL: Duration = Duration::from_secs(5);
+
+/// 这一批要关的页签里的文件页签 → 已关闭栈的条目,按页签条从左到右(入栈的次序见
+/// [`ClosedTabs::push_batch`])。diff 页签不记;被顶掉留下的那份也不记 —— 它的路径上已经是
+/// 另一个文件,重开开不回它。
+fn closed_tabs_of(tabs: &[DocumentTab], keys: &[TabKey], cx: &App) -> Vec<ClosedTab> {
+    tabs.iter()
+        .enumerate()
+        .filter(|(_, tab)| keys.contains(&tab.key))
+        .filter_map(|(index, tab)| {
+            let (TabKey::Document(key), TabContent::File(viewer)) = (&tab.key, &tab.content) else {
+                return None;
+            };
+            if key.replaced != 0 {
+                return None;
+            }
+            let viewer = viewer.read(cx);
+            Some(ClosedTab {
+                path: viewer.source().path().to_path_buf(),
+                remote: key.is_remote(),
+                // 停在渲染稿上关的不记行:带行号打开会直接进源码
+                line: if viewer.shows_preview() {
+                    None
+                } else {
+                    viewer.cursor_line(cx)
+                },
+                index,
+            })
+        })
+        .collect()
+}
+
+/// 「最近打开」跟着文件树改名 / 移动:在 `from` 之下的换成 `to` 之下,换完去重(新旧两个
+/// 路径都在表里时留靠前的那条),口径同 [`push_recent`]。
+fn rebase_recent(recent: &mut Vec<PathBuf>, from: &Path, to: &Path, sem: PathSemantics) {
+    for path in recent.iter_mut() {
+        if let Some(rebased) = paths::rebase(path, from, to, sem) {
+            *path = rebased;
+        }
+    }
+    let mut seen = HashSet::new();
+    recent.retain(|path| seen.insert(normalize_local_document_path(path)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1975,6 +2633,7 @@ mod tests {
             project_id: "p".into(),
             backend: DocumentBackendKey::Local,
             normalized_path: path.into(),
+            replaced: 0,
         })
     }
 
@@ -2068,6 +2727,7 @@ mod tests {
                 connection_fingerprint: 1,
             },
             normalized_path: "/work/a.rs".into(),
+            replaced: 0,
         };
         let mut b = a.clone();
         b.backend = DocumentBackendKey::Remote {
@@ -2075,6 +2735,76 @@ mod tests {
             connection_fingerprint: 2,
         };
         assert_ne!(a, b);
+    }
+
+    /// 文件树操作只认同一后端上的页签:本地对本地;远程还要连接 id 与指纹都一致。
+    #[test]
+    fn 页签跟随文件树只认同一后端() {
+        let remote = |id: &str, fingerprint: u64| DocumentBackendKey::Remote {
+            connection_id: id.into(),
+            connection_fingerprint: fingerprint,
+        };
+        let tree_remote = FileBackendIdentity::Remote {
+            connection_id: "ssh".into(),
+            connection_fingerprint: 7,
+        };
+        assert!(backend_matches(
+            &DocumentBackendKey::Local,
+            &FileBackendIdentity::Local
+        ));
+        assert!(!backend_matches(&DocumentBackendKey::Local, &tree_remote));
+        assert!(backend_matches(&remote("ssh", 7), &tree_remote));
+        assert!(
+            !backend_matches(&remote("ssh", 8), &tree_remote),
+            "连接换过的旧页签不跟"
+        );
+        assert!(!backend_matches(&remote("other", 7), &tree_remote));
+        assert!(!backend_matches(
+            &remote("ssh", 7),
+            &FileBackendIdentity::Local
+        ));
+        assert!(!backend_matches(
+            &DocumentBackendKey::Local,
+            &FileBackendIdentity::BrokenRemote
+        ));
+    }
+
+    /// 换路径的身份:同一后端、同一序号,路径按后端的口径规范化。
+    #[test]
+    fn 换路径的身份沿用后端与序号() {
+        let key = DocumentKey {
+            project_id: "p".into(),
+            backend: DocumentBackendKey::Remote {
+                connection_id: "ssh".into(),
+                connection_fingerprint: 1,
+            },
+            normalized_path: "/work/a.rs".into(),
+            replaced: 3,
+        };
+        let moved = key.with_path(Path::new("/work/B.rs"));
+        assert_eq!(moved.normalized_path, "/work/B.rs", "远程路径大小写有意义");
+        assert_eq!(moved.backend, key.backend);
+        assert_eq!(moved.replaced, 3);
+    }
+
+    /// 「最近打开」跟着改名:前缀换掉,换完撞上的去重(留靠前的那条)。
+    #[test]
+    fn 最近打开跟着改名换路径并去重() {
+        let mut recent = vec![
+            PathBuf::from("/p/src/a.rs"),
+            PathBuf::from("/p/lib/a.rs"),
+            PathBuf::from("/p/srcx/b.rs"),
+        ];
+        rebase_recent(
+            &mut recent,
+            Path::new("/p/src"),
+            Path::new("/p/lib"),
+            PathSemantics::Posix,
+        );
+        assert_eq!(
+            recent,
+            [PathBuf::from("/p/lib/a.rs"), PathBuf::from("/p/srcx/b.rs")]
+        );
     }
 
     #[cfg(windows)]

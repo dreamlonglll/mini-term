@@ -231,8 +231,14 @@ use mt_i18n::{
 /// 1777 → 1781：文件树交互一批 —— 头部「全部折叠」按钮的 tooltip（`fileTree.header.collapseAll`）、
 /// 文件页签右键「在文件树中定位」（`fileViewer.revealInFileTree`）与它定位不到时的两种就地提示
 /// （`fileTree.reveal.{outsideRoot,notFound}`）。
+/// 1781 → 1795：文件区一批 —— 本地删除进回收站的确认框与「无法移到回收站，是否永久删除」
+/// （`fileTree.dialog.{trashFileTitle,trashFolderTitle,trashConfirmFile,trashConfirmFolder,trashOk,
+/// permanentDeleteTitle,permanentDeleteUnsupported,permanentDeleteFailed,permanentDeleteOk}`、
+/// `fileTree.operation.trashing`）；重新打开已关闭的页签与全都不在时的就地提示
+/// （`fileViewer.{reopenClosedTab,reopenAllMissing}`）；页签跟随文件树删除 / 覆盖时的提示条
+/// （`fileViewer.{deletedOnDisk,replacedOnDisk}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1781;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1795;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

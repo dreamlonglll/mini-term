@@ -45,10 +45,17 @@
 //! | | 写成功 | 收尾(换新基线,带上清理警告) |
 //! | | 远端已变 | 挂远程冲突 |
 //! | | 失败 | `save_error` |
-//! | 收尾 | — | 按写回文本重算 Tab 映射;`saved = disk = 文本`;记保存时刻;新基线(没有就沿用);清冲突;`save_warning = 清理警告`;按最新草稿重算脏;清外部改动 |
-//! | [`on_fs_change`](DocumentSession::on_fs_change) | 还没内容 / 保存后 [`ECHO_WINDOW`] 内 | 不理 |
+//! | 收尾 | — | 按写回文本重算 Tab 映射;`saved = disk = 文本`;记保存时刻;新基线(没有就沿用);清冲突;`save_warning = 清理警告`;按最新草稿重算脏;清外部改动;清孤儿标记 |
+//! | [`on_fs_change`](DocumentSession::on_fs_change) | 还没内容 / 保存后或路径改动后 [`ECHO_WINDOW`] 内 / 已是孤儿 | 不理 |
 //! | | 草稿与 `saved` 不同,或保存中 | 挂外部改动提示条 |
 //! | | 其余 | 视图静默重载 |
+//! | [`expect_path_change`](DocumentSession::expect_path_change) | — | 记回声时刻(文件树马上要改它的路径) |
+//! | [`on_path_moved`](DocumentSession::on_path_moved) | — | 记回声时刻;清外部改动(孤儿标记留着) |
+//! | [`mark_orphan`](DocumentSession::mark_orphan) | — | 记孤儿(已删除 / 被顶掉)与回声时刻;清外部改动 |
+//!
+//! 「孤儿」= 页签还开着,磁盘上那个路径却已经不是它了(文件树里删掉了,或被移动过来的
+//! 另一个文件顶掉了),只在有未保存修改的页签上出现(干净的直接关掉)。落基线(重新加载)
+//! 与保存成功都会清掉它;已删除的保存由视图按原路径重建文件。
 //!
 //! 看图页签的外部改动不进这里:视图直接走换代去抖
 //! ([`super::FileViewer::schedule_image_reload`]),与文档状态无关。
@@ -236,6 +243,15 @@ pub(super) enum FsChange {
     Reload,
 }
 
+/// 页签还开着、磁盘上那个路径却已经不是它了(见模块注释「孤儿」)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Orphan {
+    /// 文件树里删掉了:保存 = 按原路径重新建出文件。
+    Deleted,
+    /// 被移动 / 改名过来的另一个文件顶掉了:保存 = 用这里的内容覆盖它。
+    Replaced,
+}
+
 /// 一份打开的文档的读写状态。转换规则见模块注释的状态转换表。
 ///
 /// 基线类型参数 `R` 只为单测(理由见 [`RemoteContent`]),视图用的是默认的
@@ -266,6 +282,11 @@ pub(super) struct DocumentSession<R: RemoteContent = RemoteFileReadResult> {
     save_warning: Option<String>,
     ext_changed: bool,
     last_save_at: Option<Instant>,
+    /// 文件树改这个文件路径的时刻(改之前打招呼、改完改指向都记)。之后 [`ECHO_WINDOW`]
+    /// 内的监听事件是那次操作自己的回声:旧路径的「删除」、新路径的「新建」都不算外部改动。
+    path_echo_at: Option<Instant>,
+    /// 见模块注释「孤儿」。
+    orphan: Option<Orphan>,
     /// 远程可编辑文件的加载/上次保存基线。二进制、超限和失败分支为 `None`。
     remote_baseline: Option<R::Baseline>,
     /// 保存前发现远端已变化。保留后端返回的新内容，让“重新加载”无需第二次网络请求。
@@ -293,6 +314,8 @@ impl<R: RemoteContent> DocumentSession<R> {
             save_warning: None,
             ext_changed: false,
             last_save_at: None,
+            path_echo_at: None,
+            orphan: None,
             remote_baseline: None,
             remote_conflict: None,
             remote_source_invalid: false,
@@ -369,6 +392,32 @@ impl<R: RemoteContent> DocumentSession<R> {
     /// 外部改动提示条的「保留我的」:收起提示条、草稿照旧,下次保存覆盖磁盘上的版本
     /// (本地保存不比对基线,本来就是覆盖写)。
     pub(super) fn keep_mine(&mut self) {
+        self.ext_changed = false;
+    }
+
+    // ── 文件树改了路径(重命名 / 移动 / 删除,见模块注释「孤儿」) ──────
+
+    pub(super) fn orphan(&self) -> Option<Orphan> {
+        self.orphan
+    }
+
+    /// 文件树马上要改这个文件的路径:此后 [`ECHO_WINDOW`] 内的监听事件不算外部改动。
+    pub(super) fn expect_path_change(&mut self, now: Instant) {
+        self.path_echo_at = Some(now);
+    }
+
+    /// 页签已跟着改名 / 移动换了路径:改名期间挂上的「外部改动」是自己挪出来的,收掉。
+    /// 孤儿标记**留着**:能跟着挪的孤儿只可能是所在目录被改名 / 移动了,文件照旧是删掉的
+    /// (新路径上同样没有它)/ 被顶掉的(顶它的那个文件也一起挪了过去)。
+    pub(super) fn on_path_moved(&mut self, now: Instant) {
+        self.path_echo_at = Some(now);
+        self.ext_changed = false;
+    }
+
+    /// 文件被删 / 被顶掉,而页签上还有未保存的修改:标成孤儿,提示条换成那一条。
+    pub(super) fn mark_orphan(&mut self, kind: Orphan, now: Instant) {
+        self.orphan = Some(kind);
+        self.path_echo_at = Some(now);
         self.ext_changed = false;
     }
 
@@ -476,6 +525,7 @@ impl<R: RemoteContent> DocumentSession<R> {
         self.disk = text.clone();
         self.dirty = false;
         self.ext_changed = false;
+        self.orphan = None;
         self.save_error = None;
         self.save_warning = None;
         self.refresh_warning = None;
@@ -526,10 +576,13 @@ impl<R: RemoteContent> DocumentSession<R> {
         self.refresh_warning = None;
         let loaded = content.content();
         let editable = has_editor && !loaded.is_binary && !loaded.too_large;
+        // 与 `saved` 同一口径比(归一行尾**再展开 Tab**):只归一不展开的话,Tab 缩进的
+        // 文件每次都算「变了」—— 干净时白白重建编辑器(光标丢),有改动时(页签跟着远程
+        // 改名 / 移动重读基线)平白挂出冲突
         let unchanged = editable
             && loaded.encoding == self.encoding()
             && LineEnding::detect(&loaded.content) == self.line_ending
-            && normalize_to_lf(&loaded.content) == self.saved;
+            && TabExpansion::expand(&normalize_to_lf(&loaded.content), TAB_WIDTH).0 == self.saved;
         if unchanged {
             self.remote_baseline = content.into_parts().1;
             self.remote_conflict = None;
@@ -590,9 +643,13 @@ impl<R: RemoteContent> DocumentSession<R> {
 
     /// 保存第一步:干净或在保存中时不存(Ctrl+S 是肌肉记忆,静默返回);要存就先
     /// 作废在飞的激活刷新。随后视图复核连接身份,再 [`Self::begin_save`]。
+    ///
+    /// 例外:文件已被删除([`Orphan::Deleted`])时草稿与基线相同也照存 —— 这时保存的
+    /// 意思是「按原路径把它建回来」,不存就什么都没发生。
     pub(super) fn prepare_save(&mut self, text: &str) -> bool {
         // 只读(解码有损)的也静默不存:写回会把原文件写坏
-        if self.saving || self.read_only() || text == self.saved {
+        let unchanged = text == self.saved && self.orphan != Some(Orphan::Deleted);
+        if self.saving || self.read_only() || unchanged {
             return false;
         }
         if self.remote_refreshing {
@@ -700,6 +757,8 @@ impl<R: RemoteContent> DocumentSession<R> {
         // 保存期间用户可能又敲了字:按**最新**草稿重新比对。
         self.dirty = self.draft(editor_text()) != text;
         self.ext_changed = false;
+        // 写成功了,这个路径上的文件就是它了(删掉的已建回来 / 顶掉的已被覆盖)
+        self.orphan = None;
     }
 
     // ── 外部改动 ───────────────────────────────────────────
@@ -714,11 +773,16 @@ impl<R: RemoteContent> DocumentSession<R> {
         if self.result.is_none() {
             return FsChange::Ignore;
         }
-        // 自己 write 落盘触发的回声,不算「外部」修改
-        if self
-            .last_save_at
-            .is_some_and(|at| now.saturating_duration_since(at) < ECHO_WINDOW)
-        {
+        // 自己 write 落盘触发的回声,不算「外部」修改;文件树改路径(重命名 / 移动 / 删除)
+        // 的回声同理
+        let within_echo = |at: Option<Instant>| {
+            at.is_some_and(|at| now.saturating_duration_since(at) < ECHO_WINDOW)
+        };
+        if within_echo(self.last_save_at) || within_echo(self.path_echo_at) {
+            return FsChange::Ignore;
+        }
+        // 已是孤儿:提示条说的就是「磁盘上那个已经不是它了」,之后的变化不另挂外部改动
+        if self.orphan.is_some() {
             return FsChange::Ignore;
         }
         if self.draft(editor_text()) != self.saved || self.saving {

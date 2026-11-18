@@ -130,7 +130,7 @@ pub use reveal::LineTarget;
 pub use sanitize::sanitize_session_markdown;
 
 use document::{
-    DocumentSession, FsChange, LoadStart, RefreshLoaded, RemoteRefreshFailurePresentation,
+    DocumentSession, FsChange, LoadStart, Orphan, RefreshLoaded, RemoteRefreshFailurePresentation,
     RemoteSave, SaveStart,
 };
 use file_kind::{
@@ -869,6 +869,109 @@ impl FileViewer {
         }
     }
 
+    // ── 文件树改了路径(接线见 `workbench_area` 模块注释「页签跟随文件树」) ──
+
+    /// 文件树马上要改这个文件(或它所在目录)的路径:那一下的监听事件是自己的回声,
+    /// 不重载、不挂「外部改动」(见 `DocumentSession::expect_path_change`)。
+    pub fn expect_path_change(&mut self) {
+        self.doc.expect_path_change(Instant::now());
+    }
+
+    /// 文件树里把它(或它所在的目录)改名 / 移动到了 `path`:页签改指新路径。
+    ///
+    /// 编辑器实体原样留着 —— 未保存的内容、光标、滚动位置、撤销栈都在它身上。跟着新路径
+    /// 换的:扩展名决定的语法高亮与软换行、目录监听、Git 标记 / 注解(按新路径重取 HEAD)、
+    /// 本地 HTML / PDF 的 WebView(建的时候绑了旧路径,丢掉、下一帧按新路径重建)。
+    /// Markdown 预览的相对资源按路径解析,分块缓存的命中条件里带着目录,自己会失效。
+    ///
+    /// 改名的回声抢在改指向之前到了的话,干净的页签已经按旧路径重载成了错误页(或还在读):
+    /// 那就按新路径重读一次。远程文档按新路径重读一次基线(`refresh_remote`:内容没变只换
+    /// 基线,编辑器与草稿不动),否则下次保存会因为「路径身份已变化」被拒。保存还在途时
+    /// 不重读(会作废那次保存的结果、让保存态悬着),下次保存会给出明确的错误。
+    pub fn retarget(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current_path == path {
+            return;
+        }
+        let old_name = self.file_name();
+        match &mut self.source {
+            DocumentSource::Local { path: current, .. }
+            | DocumentSource::Remote { path: current, .. } => *current = path.clone(),
+        }
+        self.current_path = path;
+        self.doc.on_path_moved(Instant::now());
+        self.compare_error = None;
+        let new_name = self.file_name();
+        if let Some(editor) = self.editor.clone() {
+            let (old_lang, new_lang) = (language_for(&old_name), language_for(&new_name));
+            let (old_wrap, new_wrap) = (should_wrap(&old_name), should_wrap(&new_name));
+            if old_lang != new_lang || old_wrap != new_wrap {
+                editor.update(cx, |state, cx| {
+                    if old_lang != new_lang {
+                        state.set_highlighter(new_lang, cx);
+                    }
+                    if old_wrap != new_wrap {
+                        state.set_soft_wrap(new_wrap, window, cx);
+                    }
+                });
+            }
+        }
+        if matches!(*self.web_preview.borrow(), webview::WebPreview::Ready(_)) {
+            *self.web_preview.borrow_mut() = webview::WebPreview::Idle;
+        }
+        // 目录监听挪到新的父目录(远程文档不挂监听)
+        let _ = self.rewatch();
+        if self.is_media() {
+            // 看图 / PDF 不读成文本:下一帧按新路径取图 / 建 WebView
+            cx.notify();
+            return;
+        }
+        let needs_reload = self.editor.is_none() || self.doc.loading();
+        if self.source.is_remote() {
+            // 保存还在途时不重读(见上:不作废那次保存)
+            if !self.doc.is_saving() {
+                if needs_reload {
+                    self.reload(window, cx);
+                } else {
+                    self.refresh_remote(window, cx);
+                }
+            }
+        } else if needs_reload {
+            self.reload(window, cx);
+        } else {
+            self.git_on_editor_installed(cx);
+        }
+        cx.notify();
+    }
+
+    /// 文件树里把它删了,而页签上还有未保存的修改:留着页签,提示条标明「文件已被删除」,
+    /// 保存 = 按原路径重新建出文件(干净的页签由工作区直接关掉,走不到这里)。
+    pub fn mark_deleted(&mut self, cx: &mut Context<Self>) {
+        self.doc.mark_orphan(Orphan::Deleted, Instant::now());
+        self.compare_error = None;
+        cx.notify();
+    }
+
+    /// 被移动 / 改名过来的另一个文件顶掉了路径,而页签上还有未保存的修改:留着页签,
+    /// 提示条标明「文件已被替换」,保存 = 用这里的内容覆盖它。
+    pub fn mark_replaced(&mut self, cx: &mut Context<Self>) {
+        self.doc.mark_orphan(Orphan::Replaced, Instant::now());
+        self.compare_error = None;
+        cx.notify();
+    }
+
+    /// 编辑器光标所在的行(从 1 数)。没有编辑器(看图 / 二进制 / 还在读)时为 `None`。
+    pub fn cursor_line(&self, cx: &App) -> Option<u32> {
+        self.editor
+            .as_ref()
+            .map(|editor| editor.read(cx).cursor_position().line + 1)
+    }
+
+    /// 眼下画的是 Markdown / HTML 的渲染稿(而不是源码编辑器)。重开已关闭的页签时据此
+    /// 决定要不要带行号:带了行号的打开会直接进源码,在渲染稿里关掉的不该回来变成源码。
+    pub fn shows_preview(&self) -> bool {
+        self.has_preview_toggle() && self.preview
+    }
+
     /// 检查远程页签的连接快照是否仍对应当前项目配置。
     pub fn validate_remote_source(&mut self, cx: &mut Context<Self>) {
         let DocumentSource::Remote {
@@ -1093,6 +1196,8 @@ impl FileViewer {
         };
         cx.notify();
 
+        // 文件已在文件树里被删掉(页签因为有未保存的修改留着):这次保存按原路径把它建回来
+        let recreate = self.doc.orphan() == Some(Orphan::Deleted);
         let path = self.current_path.clone();
         match self.source.clone() {
             DocumentSource::Local { project_root, .. } => {
@@ -1102,13 +1207,25 @@ impl FileViewer {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
-                            mt_project::fs::write_file_content_as(
-                                &probe.0, &probe.1, &probe.2, encoding,
-                            )
+                            if recreate {
+                                mt_project::fs::recreate_file_content_as(
+                                    &probe.0, &probe.1, &probe.2, encoding,
+                                )
+                            } else {
+                                mt_project::fs::write_file_content_as(
+                                    &probe.0, &probe.1, &probe.2, encoding,
+                                )
+                            }
                         })
                         .await;
                     let _ = this.update(cx, |view: &mut FileViewer, cx| {
-                        if view.current_path != path || !view.doc.settle_save(generation) {
+                        if !view.doc.settle_save(generation) {
+                            return;
+                        }
+                        // 保存途中页签跟着改名 / 移动换了路径:写的是旧路径,结论对新路径不成立 ——
+                        // 只收掉保存态(否则一直「保存中」),草稿保持脏,让人按新路径再存一次
+                        if view.current_path != path {
+                            cx.notify();
                             return;
                         }
                         let saved = outcome.is_ok();
@@ -1156,18 +1273,38 @@ impl FileViewer {
                     let outcome = cx
                         .background_executor()
                         .spawn(async move {
+                            if recreate {
+                                // 先按原路径建一个空文件(建不出来 —— 比如别处已经建回来了 ——
+                                // 交给下面的保存去报),再「仍然覆盖」写进去:基线里的旧内容早已
+                                // 不在,照常比对必然不过;路径身份与打开时一致,覆盖那道校验照走
+                                let leaf = remote_path.rsplit('/').next().unwrap_or_default();
+                                if let Some(parent) = mt_remote::parent_posix(&remote_path) {
+                                    let _ = mt_remote::create_entry(
+                                        &connection,
+                                        &project_root,
+                                        &parent,
+                                        leaf,
+                                        false,
+                                    );
+                                }
+                            }
                             mt_remote::save_file_content(
                                 &connection,
                                 &project_root,
                                 &remote_path,
                                 &on_disk,
                                 &baseline,
-                                force,
+                                force || recreate,
                             )
                         })
                         .await;
                     let _ = this.update(cx, |view: &mut FileViewer, cx| {
-                        if view.current_path != path || !view.doc.settle_save(generation) {
+                        if !view.doc.settle_save(generation) {
+                            return;
+                        }
+                        // 同本地那支:保存途中换了路径,只收掉保存态
+                        if view.current_path != path {
+                            cx.notify();
                             return;
                         }
                         view.validate_remote_source(cx);
@@ -1197,9 +1334,10 @@ impl FileViewer {
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Workbench 的关闭检查会回读当前 FileViewer 的 dirty 状态。当前按键
         // listener 仍持有本实体的 update 租约，直接回调会 double-lease。
-        let source = self.source.clone();
+        // 按实体认是哪个页签而不按来源路径:被顶掉留下的页签与顶它的那个路径相同
+        let viewer = cx.entity_id();
         window.defer(cx, move |window, cx| {
-            crate::workbench_area::close_document_source(source, window, cx);
+            crate::workbench_area::close_document_viewer(viewer, window, cx);
         });
     }
 
@@ -1207,7 +1345,7 @@ impl FileViewer {
     /// 否则留在容器上(Ctrl+S / Esc 挂在容器的 `on_key_down` 上,
     /// 焦点不在这条链上就收不到键)。
     fn can_take_async_focus(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        crate::workbench_area::is_document_active(&self.source, cx)
+        crate::workbench_area::is_viewer_active(cx.entity_id(), cx)
             && !window.has_active_dialog(cx)
             && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
     }
@@ -1242,9 +1380,9 @@ impl FileViewer {
         editor.update(cx, |state, cx| state.focus(window, cx));
         let focus = editor.read(cx).focus_handle(cx);
         if was_preview {
-            let source = self.source.clone();
+            let viewer = cx.entity_id();
             window.on_next_frame(move |window, cx| {
-                if crate::workbench_area::is_document_active(&source, cx)
+                if crate::workbench_area::is_viewer_active(viewer, cx)
                     && !window.has_active_dialog(cx)
                     && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
                 {
@@ -1528,6 +1666,41 @@ impl FileViewer {
                         .text_size(ui::font_px(12.0))
                         .text_color(ui::color_warning())
                         .child(t("fileViewer", "remoteConnectionChanged")),
+                )
+            })
+            // 孤儿:文件树里删掉了 / 被移动过来的文件顶掉了,页签因为有未保存的修改留着
+            .when_some(self.doc.orphan(), |el, orphan| {
+                let replaced = orphan == Orphan::Replaced;
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_warning())
+                        .child(match orphan {
+                            Orphan::Deleted => t("fileViewer", "deletedOnDisk"),
+                            Orphan::Replaced => t("fileViewer", "replacedOnDisk"),
+                        })
+                        // 被顶掉的:「重新加载」= 丢掉修改、改看现在占着这个路径的那个文件。
+                        // 被删掉的没有可重新加载的东西
+                        .when(replaced && !self.doc.is_saving(), |el| {
+                            el.child(
+                                div()
+                                    .id("file-viewer-orphan-reload")
+                                    .cursor_pointer()
+                                    .hover(|el| el.text_color(ui::text_primary()))
+                                    .child(t("fileViewer", "reloadDiscard"))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.reload(window, cx);
+                                    })),
+                            )
+                        }),
                 )
             })
             .when_some(self.doc.save_error().map(str::to_owned), |el, err| {

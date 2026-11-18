@@ -124,6 +124,7 @@ mod git_refresh;
 mod menu;
 mod move_to;
 mod ops;
+mod recycle;
 #[cfg(test)]
 mod tests;
 
@@ -3004,6 +3005,7 @@ impl FileTree {
                         } else {
                             mt_project::git::is_inside_git_repo(&context.root, &row_for_menu.path)
                         };
+                    let editor = fs_ops::configured_editor(store.read(cx).config());
                     let entries = file_menu(
                         &cx.entity(),
                         &store,
@@ -3012,6 +3014,7 @@ impl FileTree {
                         connection,
                         can_paste,
                         (git_enabled, in_git_repo),
+                        editor,
                     );
                     crate::menu::show(event.position, entries, window, cx);
                 }),

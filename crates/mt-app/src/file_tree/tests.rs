@@ -74,6 +74,7 @@ fn 文件菜单项序与原版一致() {
         file_menu_actions(false, true, true, false, true),
         vec![
             Some(OpenWithDefault),
+            Some(OpenWithEditor),
             Some(CopyEntry),
             None,
             Some(CopyRelativePath),
@@ -93,6 +94,7 @@ fn 文件菜单项序与原版一致() {
         file_menu_actions(false, false, true, false, true),
         vec![
             Some(OpenWithDefault),
+            Some(OpenWithEditor),
             Some(CopyEntry),
             None,
             Some(CopyRelativePath),
@@ -111,6 +113,7 @@ fn 文件菜单项序与原版一致() {
         file_menu_actions(false, false, false, false, true),
         vec![
             Some(OpenWithDefault),
+            Some(OpenWithEditor),
             Some(CopyEntry),
             None,
             Some(CopyRelativePath),
@@ -128,6 +131,7 @@ fn 文件菜单项序与原版一致() {
         file_menu_actions(false, true, false, false, true),
         vec![
             Some(OpenWithDefault),
+            Some(OpenWithEditor),
             Some(CopyEntry),
             None,
             Some(CopyRelativePath),
@@ -439,6 +443,9 @@ fn 目录与文件的差别只在两处() {
         .collect();
     assert!(file.contains(&OpenWithDefault));
     assert!(!dir.contains(&OpenWithDefault));
+    // 「用 {编辑器} 打开」同样只对文件出现(远程文件也没有,见「远程菜单不暴露本机动作」)
+    assert!(file.contains(&OpenWithEditor));
+    assert!(!dir.contains(&OpenWithEditor));
     assert!(dir.contains(&NewFile) && dir.contains(&NewFolder));
     assert!(!file.contains(&NewFile) && !file.contains(&NewFolder));
     // 「在此目录搜索内容」只给目录
