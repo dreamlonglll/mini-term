@@ -16,22 +16,36 @@
 //! 两种页签共用页签条:单击切换、× 与中键关闭、右键「关闭 / 关闭其他 / 关闭右边 / 关闭左边」,
 //! 终端页右键「关闭所有」;切项目时各项目各留各的页签,移除项目时随项目一起回收。
 //! 「最近打开」与未保存检查只认文件页签。
+//!
+//! # 停在页签上时的全局快捷键
+//!
+//! 终端页上那几条键位(`main.rs` 的 `Workspace::hotkey_page` 分流)在页签页上改落到这里:
+//! Ctrl+Tab / Ctrl+Shift+Tab 在「终端页 + 各页签」之间循环([`page_after`]),
+//! Ctrl+Shift+W 关当前页签,Ctrl+` 在终端页与最近停过的页签之间来回([`return_target`])。
+//! 页签页上的编辑器本身是 `Input`,「焦点在输入框里就让路」那道闸对它不适用,改按焦点在不在
+//! 当前页签里判([`WorkbenchArea::active_tab_contains_focus`])。
+//!
+//! # 未保存的关闭
+//!
+//! 脏的文件页签关闭前三选一:保存并关闭 / 不保存 / 取消(批量关闭同理,一次问完)。
+//! 「保存并关闭」等这一批保存全部收口才关([`WorkbenchArea::save_and_close`]):存成功的
+//! 关掉,存不了 / 存失败的留在页签条上并切过去 —— 原因在它自己的横幅上。
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder,
-    px,
+    AnyElement, App, AppContext, Context, Entity, Focusable as _, Global, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, div, point,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::file_viewer::{DocumentSource, FileViewer, LineTarget};
+use crate::file_viewer::{DocumentSource, FileViewer, LineTarget, SaveForClose};
 use crate::git_diff::{DiffKey, DiffTab, DiffTabEvent};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -179,6 +193,9 @@ struct ProjectDocuments {
     /// 只放内存:关掉页签不删(关掉的文件仍是「最近打开过」),项目被移除时随整个
     /// `ProjectDocuments` 一起回收,重启清空。
     recent: Vec<PathBuf>,
+    /// 上一次从页签切回终端页时停着的页签,Ctrl+` 回去用(见 [`return_target`])。
+    /// 那个页签后来被关掉的话就不认,不在这里追着删。
+    last_tab: Option<TabKey>,
 }
 
 impl Default for ProjectDocuments {
@@ -187,6 +204,7 @@ impl Default for ProjectDocuments {
             tabs: Vec::new(),
             active: WorkbenchPage::Terminal,
             recent: Vec::new(),
+            last_tab: None,
         }
     }
 }
@@ -289,6 +307,40 @@ fn next_document_after_close(remaining: &[TabKey], removed_index: usize) -> Opti
                 .and_then(|index| remaining.get(index))
         })
         .cloned()
+}
+
+/// 页签页上按 Ctrl+Tab(`delta = 1`)/ Ctrl+Shift+Tab(`-1`)该切到哪一页:终端页排最前,
+/// 后面是页签条上的页签,首尾相接循环。活动页已不在页签条上(不该出现)时从终端页算起。
+fn page_after(keys: &[TabKey], active: &WorkbenchPage, delta: i32) -> WorkbenchPage {
+    let len = keys.len() as i64 + 1;
+    let current = match active {
+        WorkbenchPage::Terminal => 0,
+        WorkbenchPage::Tab(key) => keys
+            .iter()
+            .position(|k| k == key)
+            .map_or(0, |index| index as i64 + 1),
+    };
+    match (current + i64::from(delta)).rem_euclid(len) {
+        0 => WorkbenchPage::Terminal,
+        next => WorkbenchPage::Tab(keys[next as usize - 1].clone()),
+    }
+}
+
+/// 终端页上按 Ctrl+` 回哪个页签:上次离开时停着的那个还开着就回它;它已经关了就回页签条
+/// 最右那个(新开的页签排在最右,多半是最近在看的);一个页签都没有就不动。
+fn return_target(keys: &[TabKey], last: Option<&TabKey>) -> Option<TabKey> {
+    last.filter(|&last| keys.contains(last))
+        .or_else(|| keys.last())
+        .cloned()
+}
+
+/// 「保存并关闭」收口后真要关的页签:这一批里除去没存成的,顺序不变。
+fn closable_after_save(targets: &[TabKey], failed: &[TabKey]) -> Vec<TabKey> {
+    targets
+        .iter()
+        .filter(|key| !failed.contains(key))
+        .cloned()
+        .collect()
 }
 
 /// 页签右键菜单里的批量关闭范围，锚点是被右键的那一页。
@@ -863,6 +915,10 @@ impl WorkbenchArea {
                     project.tabs[index].key = new_key.clone();
                     project.tabs[index].title = title;
                     project.tabs[index].tip = Some(tip);
+                    // Ctrl+` 记着的是它的话跟着新身份走,否则回不到这个页签
+                    if project.last_tab.as_ref() == Some(&keys[index]) {
+                        project.last_tab = Some(new_key.clone());
+                    }
                     if let Some(close) = close {
                         project.tabs.remove(close);
                     }
@@ -890,7 +946,12 @@ impl WorkbenchArea {
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return;
         };
-        self.projects.entry(project_id.clone()).or_default().active = WorkbenchPage::Terminal;
+        let project = self.projects.entry(project_id.clone()).or_default();
+        // 从哪个页签离开的记下来,Ctrl+` 回得去(见 [`return_target`])
+        if let WorkbenchPage::Tab(key) = &project.active {
+            project.last_tab = Some(key.clone());
+        }
+        project.active = WorkbenchPage::Terminal;
         let pane_id = self.store.read(cx).active_pane_id(&project_id);
         if let Some(pane_id) = pane_id {
             self.store.update(cx, |store, cx| {
@@ -920,6 +981,79 @@ impl WorkbenchArea {
         project.active = WorkbenchPage::Tab(key.clone());
         content.activate_later(window, cx);
         cx.notify();
+    }
+
+    /// 当前项目停在哪一页、页签条上有哪些页签。没有活动项目时是 `None`。
+    fn active_pages(&self, cx: &App) -> Option<(String, WorkbenchPage, Vec<TabKey>)> {
+        let project_id = self.store.read(cx).active_project_id.clone()?;
+        let (active, keys) = self
+            .projects
+            .get(&project_id)
+            .map(|project| {
+                let keys = project.tabs.iter().map(|tab| tab.key.clone()).collect();
+                (project.active.clone(), keys)
+            })
+            .unwrap_or((WorkbenchPage::Terminal, Vec::new()));
+        Some((project_id, active, keys))
+    }
+
+    /// 页签页上的 Ctrl+Tab / Ctrl+Shift+Tab:按 [`page_after`] 换页,切到谁焦点就给谁
+    /// (终端页交给活动 pane,页签交给它自己的 `on_activated`)。
+    pub fn cycle_page(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, active, keys)) = self.active_pages(cx) else {
+            return;
+        };
+        match page_after(&keys, &active, delta) {
+            WorkbenchPage::Terminal => self.activate_terminal(window, cx),
+            WorkbenchPage::Tab(key) => self.activate_document(&project_id, &key, window, cx),
+        }
+    }
+
+    /// 终端页上的 Ctrl+`:回到最近停过的页签(见 [`return_target`]),一个页签都没有就不动。
+    pub fn return_to_last_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, _, keys)) = self.active_pages(cx) else {
+            return;
+        };
+        let last = self
+            .projects
+            .get(&project_id)
+            .and_then(|project| project.last_tab.as_ref());
+        if let Some(key) = return_target(&keys, last) {
+            self.activate_document(&project_id, &key, window, cx);
+        }
+    }
+
+    /// 页签页上的 Ctrl+Shift+W:关当前页签,与 × 同一条路(脏的文件页签照常先问)。
+    pub fn close_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, WorkbenchPage::Tab(key), _)) = self.active_pages(cx) else {
+            return;
+        };
+        self.request_close_document(project_id, key, window, cx);
+    }
+
+    /// 键盘焦点在不在当前页签里。文件页的编辑器也是 `Input`,全局快捷键靠它区分「在编辑器
+    /// 里按的」(照常生效)与「在别处的输入框里按的」(让路给输入)。diff 页签里没有输入框,
+    /// 焦点在输入框里就一定不在它里面,一律 `false`。
+    pub fn active_tab_contains_focus(&self, window: &Window, cx: &App) -> bool {
+        let Some(project_id) = self.store.read(cx).active_project_id.as_deref() else {
+            return false;
+        };
+        let Some(project) = self.projects.get(project_id) else {
+            return false;
+        };
+        let WorkbenchPage::Tab(key) = &project.active else {
+            return false;
+        };
+        let Some(index) = project.index_of(key) else {
+            return false;
+        };
+        match &project.tabs[index].content {
+            TabContent::File(document) => document
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx),
+            TabContent::Diff(_) => false,
+        }
     }
 
     fn reactivate_active_document(
@@ -981,10 +1115,23 @@ impl WorkbenchArea {
         }
 
         let this = cx.entity();
+        let discard = {
+            let (this, project_id, key) = (this.clone(), project_id.clone(), key.clone());
+            move |window: &mut Window, cx: &mut App| {
+                let (this, project_id, key) = (this.clone(), project_id.clone(), key.clone());
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |area, cx| {
+                        area.close_document(&project_id, &key, window, cx)
+                    });
+                });
+            }
+        };
         Confirm::new(
             t("fileViewer", "unsavedTitle"),
             t("fileViewer", "unsavedMessage"),
         )
+        .ok_text(t("fileViewer", "saveAndClose"))
+        .alt_action(t("fileViewer", "dontSave"), discard)
         .open(
             move |window, cx| {
                 let this = this.clone();
@@ -992,13 +1139,96 @@ impl WorkbenchArea {
                 let key = key.clone();
                 window.defer(cx, move |window, cx| {
                     this.update(cx, |area, cx| {
-                        area.close_document(&project_id, &key, window, cx)
+                        area.save_and_close(project_id, vec![key], None, window, cx)
                     });
                 });
             },
             window,
             cx,
         );
+    }
+
+    /// 页签页里某一页的内容(没有这一页就是 `None`)。
+    fn tab_content(&self, project_id: &str, key: &TabKey) -> Option<TabContent> {
+        let project = self.projects.get(project_id)?;
+        let index = project.index_of(key)?;
+        Some(project.tabs[index].content.clone())
+    }
+
+    /// 「保存并关闭」/「全部保存并关闭」:这一批里有改动的文件页签先存,全部收口后一次关掉
+    /// 存成功的与本来就干净的;存不了 / 存失败的留在页签条上,并切到第一个 —— 原因写在它
+    /// 自己的横幅上(保存错误 / 远程冲突 / 连接身份失效)。`fallback` 同
+    /// [`Self::close_documents`]。
+    ///
+    /// 等保存期间页签可能已被别处关掉、项目也可能已经切走:关的时候按身份找,找不到的跳过;
+    /// 项目不在眼前就不抢活动页。
+    fn save_and_close(
+        &mut self,
+        project_id: String,
+        targets: Vec<TabKey>,
+        fallback: Option<TabKey>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut failed = Vec::new();
+        let mut pending = Vec::new();
+        for key in &targets {
+            let Some(TabContent::File(document)) = self.tab_content(&project_id, key) else {
+                continue;
+            };
+            match document.update(cx, |document, cx| document.save_for_close(cx)) {
+                SaveForClose::Clean => {}
+                SaveForClose::Blocked => failed.push(key.clone()),
+                SaveForClose::Pending(done) => pending.push((key.clone(), done)),
+            }
+        }
+        if pending.is_empty() {
+            self.finish_save_and_close(
+                &project_id,
+                &targets,
+                fallback.as_ref(),
+                &failed,
+                window,
+                cx,
+            );
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            for (key, done) in pending {
+                // 发送端被丢(页签连同文档实体一起没了)按没存成算:不替用户关任何东西
+                if !done.await.unwrap_or(false) {
+                    failed.push(key);
+                }
+            }
+            let _ = this.update_in(cx, |area: &mut WorkbenchArea, window, cx| {
+                area.finish_save_and_close(
+                    &project_id,
+                    &targets,
+                    fallback.as_ref(),
+                    &failed,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn finish_save_and_close(
+        &mut self,
+        project_id: &str,
+        targets: &[TabKey],
+        fallback: Option<&TabKey>,
+        failed: &[TabKey],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let closing = closable_after_save(targets, failed);
+        self.close_documents(project_id, &closing, fallback, window, cx);
+        let visible = self.store.read(cx).active_project_id.as_deref() == Some(project_id);
+        if visible && let Some(first) = failed.first() {
+            self.activate_document(project_id, first, window, cx);
+        }
     }
 
     fn close_document(
@@ -1109,7 +1339,8 @@ impl WorkbenchArea {
         self.request_close_batch(project_id, targets, None, window, cx);
     }
 
-    /// 批量关闭入口。脏页签只弹**一次**确认（列出文件名），取消则一个都不关。
+    /// 批量关闭入口。脏页签只弹**一次**确认（列出文件名）:全部保存并关闭 / 不保存 / 取消,
+    /// 取消则一个都不关。
     fn request_close_batch(
         &mut self,
         project_id: String,
@@ -1139,11 +1370,30 @@ impl WorkbenchArea {
         }
 
         let this = cx.entity();
+        let discard = {
+            let this = this.clone();
+            let project_id = project_id.clone();
+            let fallback = fallback.clone();
+            let targets = targets.clone();
+            move |window: &mut Window, cx: &mut App| {
+                let this = this.clone();
+                let project_id = project_id.clone();
+                let fallback = fallback.clone();
+                let targets = targets.clone();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |area, cx| {
+                        area.close_documents(&project_id, &targets, fallback.as_ref(), window, cx)
+                    });
+                });
+            }
+        };
         Confirm::new(
             t("fileViewer", "unsavedTitle"),
             tr!("fileViewer", "unsavedBatchMessage", count = dirty.len()),
         )
         .detail(dirty_preview(&dirty))
+        .ok_text(t("fileViewer", "saveAllAndClose"))
+        .alt_action(t("fileViewer", "dontSave"), discard)
         .open(
             move |window, cx| {
                 let this = this.clone();
@@ -1152,7 +1402,7 @@ impl WorkbenchArea {
                 let targets = targets.clone();
                 window.defer(cx, move |window, cx| {
                     this.update(cx, |area, cx| {
-                        area.close_documents(&project_id, &targets, fallback.as_ref(), window, cx)
+                        area.save_and_close(project_id, targets, fallback, window, cx)
                     });
                 });
             },
@@ -1918,6 +2168,50 @@ mod tests {
         assert_eq!(lines[..DIRTY_PREVIEW_LIMIT], names[..DIRTY_PREVIEW_LIMIT]);
         assert!(lines[DIRTY_PREVIEW_LIMIT].contains('3'), "剩余 3 项要算准");
         assert_eq!(dirty_preview(&names[..2]), names[..2].to_vec());
+    }
+
+    /// Ctrl+Tab / Ctrl+Shift+Tab:终端页排最前,页签依次在后,首尾相接。
+    #[test]
+    fn 页签页上按页签条顺序循环且终端页排最前() {
+        let keys = [key("a"), key("b")];
+        assert_eq!(page_after(&keys, &page("a"), 1), page("b"));
+        assert_eq!(
+            page_after(&keys, &page("b"), 1),
+            WorkbenchPage::Terminal,
+            "最后一个页签往后是终端页"
+        );
+        assert_eq!(page_after(&keys, &WorkbenchPage::Terminal, 1), page("a"));
+        assert_eq!(page_after(&keys, &page("a"), -1), WorkbenchPage::Terminal);
+        assert_eq!(page_after(&keys, &WorkbenchPage::Terminal, -1), page("b"));
+        // 活动页已不在页签条上(防御):从终端页算起
+        assert_eq!(page_after(&keys, &page("x"), 1), page("a"));
+        // 没有页签:只剩终端页
+        assert_eq!(
+            page_after(&[], &WorkbenchPage::Terminal, 1),
+            WorkbenchPage::Terminal
+        );
+    }
+
+    /// Ctrl+`:回上次离开的页签;它已经关了就回最右那个;一个页签都没有就不动。
+    #[test]
+    fn 回到最近停过的页签() {
+        let keys = [key("a"), key("b"), key("c")];
+        assert_eq!(return_target(&keys, Some(&key("a"))), Some(key("a")));
+        assert_eq!(return_target(&keys, Some(&key("x"))), Some(key("c")));
+        assert_eq!(return_target(&keys, None), Some(key("c")));
+        assert_eq!(return_target(&[], Some(&key("a"))), None);
+    }
+
+    /// 保存并关闭:只关存成功的(连同本来就干净的),顺序不变。
+    #[test]
+    fn 保存并关闭只关存成功的() {
+        let targets = [key("a"), key("b"), key("c")];
+        assert_eq!(
+            closable_after_save(&targets, &[key("b")]),
+            vec![key("a"), key("c")]
+        );
+        assert_eq!(closable_after_save(&targets, &[]), targets.to_vec());
+        assert!(closable_after_save(&targets, &targets).is_empty());
     }
 
     #[test]

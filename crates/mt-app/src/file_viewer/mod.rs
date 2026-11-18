@@ -84,7 +84,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::StreamExt;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Pixels, Render, Resource,
@@ -367,6 +367,16 @@ fn toolbar_outline_button(id: &'static str, label: &'static str) -> gpui::Statef
         .child(label)
 }
 
+/// 「保存并关闭」这一份文档的保存结论,见 [`FileViewer::save_for_close`]。
+pub enum SaveForClose {
+    /// 没有要存的,直接关。
+    Clean,
+    /// 这次存不了(连接身份失效 / 远程没有基线),原因挂在页签横幅上。
+    Blocked,
+    /// 写盘在途;回来的是「落盘成功、此后也没再改」(`true`)才能关。
+    Pending(oneshot::Receiver<bool>),
+}
+
 pub struct FileViewer {
     source: DocumentSource,
     project_root: PathBuf,
@@ -444,6 +454,9 @@ pub struct FileViewer {
     preview: bool,
     /// 外部改动提示条「对比」没能打开(重读磁盘失败 / 盘上变成了二进制)的原因。
     compare_error: Option<String>,
+    /// 「保存并关闭」在等的保存(见 [`Self::save_for_close`]):保存收口时逐个报
+    /// 「现在能不能关」。
+    close_waiters: Vec<oneshot::Sender<bool>>,
 
     watcher: Arc<FsWatcher>,
     watched: Option<PathBuf>,
@@ -528,6 +541,7 @@ impl FileViewer {
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight.is_none(),
             compare_error: None,
+            close_waiters: Vec::new(),
             watcher,
             watched: None,
             focus: cx.focus_handle(),
@@ -1021,6 +1035,42 @@ impl FileViewer {
         self.save_with_mode(false, cx);
     }
 
+    /// 关页签确认框的「保存并关闭」:发起一次保存(已有一次在途就等它),交出这份文档
+    /// 能不能关的结论。存不了 / 存失败时原因都挂在本页签的横幅上(保存错误、远程冲突、
+    /// 连接身份失效),调用方只管「留着页签、切过来让人看见」。
+    pub fn save_for_close(&mut self, cx: &mut Context<Self>) -> SaveForClose {
+        if !self.doc.is_dirty() {
+            return SaveForClose::Clean;
+        }
+        if !self.doc.is_saving() {
+            self.save_with_mode(false, cx);
+            if !self.doc.is_saving() {
+                // 没进保存态:连接身份失效 / 远程没有可比对的基线,横幅上已写明
+                return if self.doc.is_dirty() {
+                    SaveForClose::Blocked
+                } else {
+                    SaveForClose::Clean
+                };
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        self.close_waiters.push(tx);
+        SaveForClose::Pending(rx)
+    }
+
+    /// 一次保存收口了:把「现在能不能关」报给 [`Self::save_for_close`] 的等待者。还有保存
+    /// 在途(这次的结果被作废、更新的那次还没回来)就接着等那一次。保存期间又敲了字的,
+    /// 收口后仍是脏的 —— 报不能关,新敲的字不能跟着页签一起丢。
+    fn settle_close_waiters(&mut self) {
+        if self.doc.is_saving() || self.close_waiters.is_empty() {
+            return;
+        }
+        let closable = !self.doc.is_dirty();
+        for waiter in self.close_waiters.drain(..) {
+            let _ = waiter.send(closable);
+        }
+    }
+
     fn save_with_mode(&mut self, force: bool, cx: &mut Context<Self>) {
         let text = self.draft(cx);
         if !self.doc.prepare_save(&text) {
@@ -1070,6 +1120,8 @@ impl FileViewer {
                         }
                         cx.notify();
                     });
+                    // 结果被作废(上面提前 return)时也要过一遍:等的若是这一次,不能让它悬着
+                    let _ = this.update(cx, |view: &mut FileViewer, _| view.settle_close_waiters());
                 })
                 .detach();
             }
@@ -1125,6 +1177,8 @@ impl FileViewer {
                         );
                         cx.notify();
                     });
+                    // 同本地那支:身份失效 / 结果作废的提前 return 也要报给等待者
+                    let _ = this.update(cx, |view: &mut FileViewer, _| view.settle_close_waiters());
                 })
                 .detach();
             }

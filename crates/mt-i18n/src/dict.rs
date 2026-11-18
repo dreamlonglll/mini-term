@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1769;
+pub const ZH_ENTRY_COUNT: usize = 1777;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1769;
+pub const EN_ENTRY_COUNT: usize = 1777;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -520,6 +520,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ 磁盘"),
     ("compareTitle", "对比：{name}"),
     ("compareUnavailable", "磁盘上的文件已不是可对比的文本（二进制或过大）"),
+    ("dontSave", "不保存"),
     ("encodingTip", "文件编码：{encoding}，保存时按此编码写回"),
     ("externallyChanged", "文件已被外部修改"),
     ("forceSave", "仍然覆盖"),
@@ -555,6 +556,8 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("remoteReadOnly", "远程文件当前不可编辑"),
     ("remoteRelativeImage", "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片"),
     ("save", "保存"),
+    ("saveAllAndClose", "全部保存并关闭"),
+    ("saveAndClose", "保存并关闭"),
     ("saveFailed", "保存失败"),
     ("saveWarning", "已保存，但需要注意"),
     ("saving", "保存中…"),
@@ -562,8 +565,8 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("tooLarge", "文件过大（>1MB），不支持预览"),
     ("unencodable", "第 {line} 行的「{ch}」无法用 {encoding} 编码保存，文件未改动"),
     ("unsaved", "未保存"),
-    ("unsavedBatchMessage", "将要关闭的页签中有 {count} 个文件包含未保存的修改，继续将丢弃这些修改。"),
-    ("unsavedMessage", "当前文件有未保存的修改，继续将丢弃这些修改。"),
+    ("unsavedBatchMessage", "将要关闭的页签中有 {count} 个文件包含未保存的修改，关闭前要保存吗？"),
+    ("unsavedMessage", "当前文件有未保存的修改，关闭前要保存吗？"),
     ("unsavedTitle", "未保存的修改"),
 ];
 #[rustfmt::skip]
@@ -583,6 +586,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ Disk"),
     ("compareTitle", "Compare: {name}"),
     ("compareUnavailable", "The file on disk is no longer comparable text (binary or too large)"),
+    ("dontSave", "Don't Save"),
     ("encodingTip", "File encoding: {encoding}; saving writes it back in this encoding"),
     ("externallyChanged", "File was modified externally"),
     ("forceSave", "Overwrite Anyway"),
@@ -618,6 +622,8 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("remoteReadOnly", "This remote file is currently read-only"),
     ("remoteRelativeImage", "Remote Markdown can only load absolute HTTP(S) images on demand"),
     ("save", "Save"),
+    ("saveAllAndClose", "Save All and Close"),
+    ("saveAndClose", "Save and Close"),
     ("saveFailed", "Save failed"),
     ("saveWarning", "Saved with a warning"),
     ("saving", "Saving…"),
@@ -625,8 +631,8 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("tooLarge", "File too large (>1MB), preview not supported"),
     ("unencodable", "\"{ch}\" on line {line} cannot be saved as {encoding}; the file was not changed"),
     ("unsaved", "Unsaved"),
-    ("unsavedBatchMessage", "{count} of the tabs about to close have unsaved changes. Continuing will discard them."),
-    ("unsavedMessage", "This file has unsaved changes. Continuing will discard them."),
+    ("unsavedBatchMessage", "{count} of the tabs about to close have unsaved changes. Save before closing?"),
+    ("unsavedMessage", "This file has unsaved changes. Save before closing?"),
     ("unsavedTitle", "Unsaved changes"),
 ];
 
@@ -2415,7 +2421,9 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("newSubgroup", "新建子组"),
     ("newSubgroupPlaceholder", "请输入子组名称"),
     ("pathHint", "目录不存在时不会添加。"),
+    ("pathNotDirectory", "目录不存在或不是文件夹。"),
     ("pathPlaceholder", "项目目录，如 D:\\Git\\mini-term"),
+    ("pathRequired", "请输入项目目录的路径。"),
     ("preview.disconnected", "已断开"),
     ("preview.neverOpened", "尚未打开过终端"),
     ("preview.notStarted", "未启动"),
@@ -2424,6 +2432,8 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("remoteBrokenTitle", "SSH 连接已被删除，该远程项目暂不可用（可删除项目，或重新创建同名连接后重试）"),
     ("removeConfirm.cancel", "取消"),
     ("removeConfirm.confirm", "移除"),
+    ("removeConfirm.endsTerminals", "将结束该项目的 {count} 个终端。"),
+    ("removeConfirm.endsTerminalsWithAi", "将结束该项目的 {count} 个终端（其中 {ai} 个 AI 会话）。"),
     ("removeConfirm.messagePrefix", "确定要移除项目「"),
     ("removeConfirm.messageSuffix", "」吗？此操作仅从列表中移除，不会删除文件。"),
     ("removeConfirm.title", "移除项目"),
@@ -2478,7 +2488,9 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("newSubgroup", "New Subgroup"),
     ("newSubgroupPlaceholder", "Enter subgroup name"),
     ("pathHint", "Nothing is added when the directory does not exist."),
+    ("pathNotDirectory", "The directory does not exist or is not a folder."),
     ("pathPlaceholder", "Project directory, e.g. D:\\Git\\mini-term"),
+    ("pathRequired", "Enter the path of the project directory."),
     ("preview.disconnected", "Disconnected"),
     ("preview.neverOpened", "No terminal opened yet"),
     ("preview.notStarted", "Not started"),
@@ -2487,6 +2499,8 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("remoteBrokenTitle", "The SSH connection was deleted; this remote project is unavailable (delete the project, or recreate the connection and retry)"),
     ("removeConfirm.cancel", "Cancel"),
     ("removeConfirm.confirm", "Remove"),
+    ("removeConfirm.endsTerminals", "{count} terminal(s) in this project will be ended."),
+    ("removeConfirm.endsTerminalsWithAi", "{count} terminal(s) in this project will be ended ({ai} of them AI sessions)."),
     ("removeConfirm.messagePrefix", "Remove project “"),
     ("removeConfirm.messageSuffix", "”? This only removes it from the list and won't delete any files."),
     ("removeConfirm.title", "Remove Project"),
@@ -3002,6 +3016,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.toggleSessions", "开合 AI 会话面板"),
     ("shortcuts.toggleSidebar", "折叠/展开侧栏"),
     ("shortcuts.toggleUsage", "开合用量统计面板"),
+    ("shortcuts.toggleWorkbenchPage", "在终端页与文件页之间切换"),
     ("system.aiAutoResumeDesc", "恢复上次布局后，自动在终端里执行 claude --resume / codex resume 续接退出前的会话；关闭后终端照常恢复，只是不自动跑续接命令（仍可在「会话」面板手动恢复）"),
     ("system.aiAutoResumeTitle", "启动时自动续接 AI 会话"),
     ("system.downloadDirectoryChoose", "选择…"),
@@ -3266,6 +3281,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.toggleSessions", "Toggle the AI session panel"),
     ("shortcuts.toggleSidebar", "Toggle sidebar"),
     ("shortcuts.toggleUsage", "Toggle the usage stats panel"),
+    ("shortcuts.toggleWorkbenchPage", "Switch between the terminal page and file tabs"),
     ("system.aiAutoResumeDesc", "After the previous layout is restored, run claude --resume / codex resume in the terminal to continue the session you left off. Turn off and terminals still come back — they just don't run the resume command (you can still resume manually from the Sessions panel)"),
     ("system.aiAutoResumeTitle", "Auto-resume AI session on startup"),
     ("system.downloadDirectoryChoose", "Choose…"),

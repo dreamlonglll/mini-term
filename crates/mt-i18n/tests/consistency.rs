@@ -223,8 +223,13 @@ use mt_i18n::{
 /// 那一栏的「空文件」（`gitCommit.emptySide`）。
 /// 1659 → 1768：合入远端 Git 项目授权与第三轮恢复出口、操作摘要及草稿历史文案。
 /// 1768 → 1769：共享仓库写入阻挡错误展示来源项目名。
+/// 1769 → 1777：工作区交互一批 —— 未保存关闭的三选一（`fileViewer.{saveAndClose,
+/// saveAllAndClose,dontSave}`）、移除项目确认框的终端说明
+/// （`projectList.removeConfirm.{endsTerminals,endsTerminalsWithAi}`）、添加项目的两种
+/// 路径错误（`projectList.{pathRequired,pathNotDirectory}`）、Ctrl+` 的快捷键描述
+/// （`settings.shortcuts.toggleWorkbenchPage`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1769;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1777;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
