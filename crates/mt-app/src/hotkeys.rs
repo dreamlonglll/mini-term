@@ -451,6 +451,27 @@ pub fn bind_keys(cx: &mut App) {
         project_switcher::SwitcherNext,
         Some("ProjectSwitcher > Input"),
     ));
+    // 翻页与首尾(三个搜索类浮层同一组键)。裸 home / end 不占:那是输入框里挪光标的键
+    bindings.push(KeyBinding::new(
+        "pageup",
+        project_switcher::SwitcherPageUp,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "pagedown",
+        project_switcher::SwitcherPageDown,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        project_switcher::SwitcherFirst,
+        Some("ProjectSwitcher > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        project_switcher::SwitcherLast,
+        Some("ProjectSwitcher > Input"),
+    ));
 
     // 快速打开的方向键。与项目切换器同一套理由:弹窗内部键位不进表,谓词要与 `Input`
     // 同深度才压得过它自带的 up/down(机制见 project_switcher 模块注释)
@@ -464,6 +485,26 @@ pub fn bind_keys(cx: &mut App) {
     bindings.push(KeyBinding::new(
         "down",
         quick_open::QuickOpenNext,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "pageup",
+        quick_open::QuickOpenPageUp,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "pagedown",
+        quick_open::QuickOpenPageDown,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        quick_open::QuickOpenFirst,
+        quick_open_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        quick_open::QuickOpenLast,
         quick_open_input,
     ));
 
@@ -490,6 +531,16 @@ pub fn bind_keys(cx: &mut App) {
     bindings.push(KeyBinding::new(
         "pagedown",
         search_modal::SearchCursorPageDown,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-home",
+        search_modal::SearchCursorFirst,
+        search_input,
+    ));
+    bindings.push(KeyBinding::new(
+        "ctrl-end",
+        search_modal::SearchCursorLast,
         search_input,
     ));
     for keystroke in ["ctrl-enter", "cmd-enter"] {

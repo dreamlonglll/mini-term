@@ -40,9 +40,10 @@
 //! 分组,流式到达的命中会插进前面的分组里,按行号记的话游标底下的东西会被换掉。分组头与
 //! 截断条不停游标([`selectable_order`])。
 //!
-//! - ↑ / ↓ 逐条(首尾相接),PageUp / PageDown 按可视区翻页(到头停住),游标跟着滚进
-//!   可视区。键位绑在 `"SearchModal > Input"` 上 —— 与项目切换器同一个理由,谓词要与
-//!   `Input` 同深度才压得过输入框自带的方向键 / 翻页键(机制见 `project_switcher` 模块注释);
+//! - ↑ / ↓ 逐条(首尾相接),PageUp / PageDown 按可视区翻页(到头停住),Ctrl+Home /
+//!   Ctrl+End 跳到第一 / 最后一条,游标跟着滚进可视区。键位绑在 `"SearchModal > Input"` 上
+//!   —— 与项目切换器同一个理由,谓词要与 `Input` 同深度才压得过输入框自带的方向键 / 翻页键 /
+//!   首尾键(机制见 `project_switcher` 模块注释);
 //! - Enter:输入框里的词 / 模式 / 正则 / 范围与上次发起的那次不同(或还没搜过、没有结果)就
 //!   重搜,否则打开游标所在的结果并收起浮层([`enter_action`]);
 //! - Ctrl+Enter(macOS 另有 Cmd+Enter)与 Ctrl+单击:打开但**留着浮层**,接着看下一条。
@@ -76,6 +77,7 @@ use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;
 use crate::overlay::kind;
+use crate::project_switcher::{CursorStep, page_size, step_cursor_index};
 use crate::prompt::{autofocus, close_guarded, open_guarded_with_close};
 use crate::store::{AppStore, StoreEvent};
 use crate::ui;
@@ -91,6 +93,10 @@ actions!(
         SearchCursorPageUp,
         /// 游标往下翻一页(PageDown)。
         SearchCursorPageDown,
+        /// 游标跳到第一条结果(Ctrl+Home)。
+        SearchCursorFirst,
+        /// 游标跳到最后一条结果(Ctrl+End)。
+        SearchCursorLast,
         /// 打开游标所在的结果,浮层留着(Ctrl/Cmd+Enter)。
         SearchOpenKeep,
     ]
@@ -531,7 +537,10 @@ impl SearchModal {
             return;
         };
         self.cursor = Some(next);
-        let upward = matches!(step, CursorStep::Prev | CursorStep::PageUp);
+        let upward = matches!(
+            step,
+            CursorStep::Prev | CursorStep::PageUp | CursorStep::First
+        );
         if let Some(row) = scroll_row(&rows, next, upward) {
             self.results_scroll
                 .scroll_to_item(row, ScrollStrategy::Nearest);
@@ -817,15 +826,6 @@ fn enter_action(last_run: Option<&RunKey>, current: &RunKey, has_results: bool) 
     }
 }
 
-/// 游标的一步。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CursorStep {
-    Prev,
-    Next,
-    PageUp,
-    PageDown,
-}
-
 /// 结果行表里停得了游标的行(文件名行 / 命中行),按显示顺序给出它们的结果下标。
 /// 分组头与截断条不算。
 fn selectable_order(rows: &[ResultRow]) -> Vec<usize> {
@@ -838,8 +838,8 @@ fn selectable_order(rows: &[ResultRow]) -> Vec<usize> {
 }
 
 /// 游标走一步之后停在哪条结果上。`order` 见 [`selectable_order`],`page` 是一页几条。
-/// 逐条移动首尾相接(与快速打开、项目切换器同一手感),翻页到头停住;游标还没落定(或停着的
-/// 那条已不在表里)时不论哪一步都先落到第一条。
+/// 怎么走与快速打开、项目切换器共用一份([`step_cursor_index`]:逐条首尾相接、翻页到头停住、
+/// 首尾直达);游标还没落定(或停着的那条已不在表里)时,除了「跳到最后」都先落到第一条。
 fn step_cursor(
     order: &[usize],
     cursor: Option<usize>,
@@ -847,27 +847,13 @@ fn step_cursor(
     page: usize,
 ) -> Option<usize> {
     let first = *order.first()?;
-    let Some(at) = cursor.and_then(|cursor| order.iter().position(|&index| index == cursor)) else {
-        return Some(first);
-    };
-    let last = order.len() - 1;
-    let page = page.max(1);
-    let next = match step {
-        CursorStep::Prev => crate::project_switcher::next_cursor(at, order.len(), -1),
-        CursorStep::Next => crate::project_switcher::next_cursor(at, order.len(), 1),
-        CursorStep::PageUp => at.saturating_sub(page),
-        CursorStep::PageDown => (at + page).min(last),
+    let at = cursor.and_then(|cursor| order.iter().position(|&index| index == cursor));
+    let next = match (at, step) {
+        (_, CursorStep::Last) => order.len() - 1,
+        (None, _) => return Some(first),
+        (Some(at), step) => step_cursor_index(at, order.len(), step, page),
     };
     Some(order[next])
-}
-
-/// 一页翻几条:可视区放得下几行就翻几条,留一行重叠好接上上下文,至少 1。可视区还没量到
-/// (首帧)时按 10 条算。
-fn page_size(viewport: f32, row: f32) -> usize {
-    if viewport <= 0.0 || row <= 0.0 {
-        return 10;
-    }
-    ((viewport / row).floor() as usize).saturating_sub(1).max(1)
 }
 
 /// 游标停在 `cursor` 号结果上时该把哪一行滚进可视区。往上走时它若是分组里的第一条,连上面
@@ -1593,6 +1579,12 @@ impl Render for SearchModal {
             .on_action(cx.listener(|this, _: &SearchCursorPageDown, window, cx| {
                 this.move_cursor(CursorStep::PageDown, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &SearchCursorFirst, window, cx| {
+                this.move_cursor(CursorStep::First, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SearchCursorLast, window, cx| {
+                this.move_cursor(CursorStep::Last, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SearchOpenKeep, window, cx| {
                 this.open_cursor(true, window, cx);
             }))
@@ -1757,13 +1749,16 @@ mod tests {
         assert_eq!(step_cursor(&order, None, CursorStep::Prev, 2), Some(0));
         assert_eq!(step_cursor(&order, Some(99), CursorStep::Next, 2), Some(0));
         assert_eq!(step_cursor(&[], Some(0), CursorStep::Next, 2), None);
-    }
-
-    #[test]
-    fn 一页的条数按可视区算() {
-        assert_eq!(page_size(200.0, 20.0), 9, "放得下 10 行,留一行重叠");
-        assert_eq!(page_size(30.0, 20.0), 1, "至少 1");
-        assert_eq!(page_size(0.0, 20.0), 10, "还没量到按 10 条");
+        // Ctrl+Home / Ctrl+End:按显示顺序的首尾,不是结果下标的首尾
+        assert_eq!(step_cursor(&order, Some(1), CursorStep::First, 2), Some(0));
+        assert_eq!(step_cursor(&order, Some(2), CursorStep::Last, 2), Some(4));
+        assert_eq!(
+            step_cursor(&order, None, CursorStep::Last, 2),
+            Some(4),
+            "游标没落定时跳尾也直接到最后"
+        );
+        assert_eq!(step_cursor(&order, None, CursorStep::First, 2), Some(0));
+        assert_eq!(step_cursor(&[], None, CursorStep::Last, 2), None);
     }
 
     /// 往上走到分组的第一条时连分组头一起露出来;往下走、或不是组里第一条时只滚到它自己。
@@ -1785,16 +1780,21 @@ mod tests {
     #[test]
     fn 键位绑定压过输入框自带的() {
         use gpui::{KeyBinding, KeyContext, Keymap, Keystroke};
-        gpui::actions!(search_modal_test, [InputMoveUp, InputPageDown, InputEnter]);
+        gpui::actions!(
+            search_modal_test,
+            [InputMoveUp, InputPageDown, InputEnter, InputMoveToStart]
+        );
         let predicate = format!("{CONTEXT} > Input");
         let keymap = Keymap::new(vec![
             // 组件库先注册(gpui_component::init)
             KeyBinding::new("up", InputMoveUp, Some("Input")),
             KeyBinding::new("pagedown", InputPageDown, Some("Input")),
             KeyBinding::new("secondary-enter", InputEnter, Some("Input")),
+            KeyBinding::new("ctrl-home", InputMoveToStart, Some("Input")),
             // 壳后注册(hotkeys::bind_keys)
             KeyBinding::new("up", SearchCursorPrev, Some(predicate.as_str())),
             KeyBinding::new("pagedown", SearchCursorPageDown, Some(predicate.as_str())),
+            KeyBinding::new("ctrl-home", SearchCursorFirst, Some(predicate.as_str())),
             KeyBinding::new("ctrl-enter", SearchOpenKeep, Some(predicate.as_str())),
             KeyBinding::new("cmd-enter", SearchOpenKeep, Some(predicate.as_str())),
         ]);
@@ -1808,6 +1808,7 @@ mod tests {
         };
         assert!(first("up").partial_eq(&SearchCursorPrev));
         assert!(first("pagedown").partial_eq(&SearchCursorPageDown));
+        assert!(first("ctrl-home").partial_eq(&SearchCursorFirst));
         let secondary = if cfg!(target_os = "macos") {
             "cmd-enter"
         } else {

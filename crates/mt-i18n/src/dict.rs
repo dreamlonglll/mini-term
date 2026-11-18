@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1795;
+pub const ZH_ENTRY_COUNT: usize = 1802;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1795;
+pub const EN_ENTRY_COUNT: usize = 1802;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -40,9 +40,13 @@ static APP_ZH: &[(&str, &str)] = &[
     ("emptyState", "请先在中间栏添加项目"),
     ("firstRun.addLocal", "添加本地项目"),
     ("firstRun.addRemote", "添加 SSH 远程项目"),
+    ("firstRun.dropHint", "也可以把文件夹拖进项目列表来添加"),
+    ("firstRun.enableHook", "开启 AI 状态精确感知"),
     ("firstRun.hintsTitle", "常用快捷键"),
     ("firstRun.subtitle", "添加一个目录，就能在里面开终端、跑 AI 会话"),
     ("firstRun.title", "还没有项目"),
+    ("hookHint.message", "检测到 {agent} 会话。注册 Hook 可以让状态与完成提醒更准确，点击前往设置"),
+    ("hookHint.title", "AI 状态精确感知"),
     ("layoutLoadFailed", "界面布局库不可用，本次调整的分屏、栏宽与窗口位置不会保存。\n\n错误：{detail}"),
     ("menu.settings", "设置"),
     ("mobileStartSession", "移动端新建了会话（{launcher}）"),
@@ -93,9 +97,13 @@ static APP_EN: &[(&str, &str)] = &[
     ("emptyState", "Add a project in the middle panel first"),
     ("firstRun.addLocal", "Add local project"),
     ("firstRun.addRemote", "Add SSH remote project"),
+    ("firstRun.dropHint", "You can also drag a folder onto the project list to add it"),
+    ("firstRun.enableHook", "Enable precise AI status tracking"),
     ("firstRun.hintsTitle", "Handy shortcuts"),
     ("firstRun.subtitle", "Add a directory to open terminals and run AI sessions in it"),
     ("firstRun.title", "No projects yet"),
+    ("hookHint.message", "{agent} session detected. Register hooks for more accurate status and completion alerts. Click to open settings"),
+    ("hookHint.title", "Precise AI status"),
     ("layoutLoadFailed", "The layout database is unavailable. Split panes, column widths and window position changed this session won't be saved.\n\nError: {detail}"),
     ("menu.settings", "Settings"),
     ("mobileStartSession", "Mobile started a session ({launcher})"),
@@ -2747,6 +2755,8 @@ static SESSION_LIST_ZH: &[(&str, &str)] = &[
     ("deleteSession.unidentifiedAi", "⚠ 当前项目有 {count} 个 {agent} 终端没有上报会话身份，无法判断是否在用这个会话；如在使用请先退出。"),
     ("deleteSession.usageKept", "已入账的用量会保留，用量账本重建时除外。"),
     ("empty", "暂无会话记录"),
+    ("filterEmpty", "没有匹配「{query}」的会话"),
+    ("filterPlaceholder", "按标题或 AI 名过滤"),
     ("loadMore", "加载更多（还有 {n} 条）"),
     ("loading", "加载中…"),
     ("refresh", "刷新会话列表"),
@@ -2754,6 +2764,7 @@ static SESSION_LIST_ZH: &[(&str, &str)] = &[
     ("remoteLoading", "正在加载远程会话…"),
     ("resumeHere", "在当前终端恢复"),
     ("resumeInNewTab", "在新终端标签恢复"),
+    ("rowMenuHint", "右键查看更多操作"),
     ("selectProject", "请先选择项目"),
     ("time.daysAgo", "{n}天前"),
     ("time.hoursAgo", "{n}小时前"),
@@ -2796,6 +2807,8 @@ static SESSION_LIST_EN: &[(&str, &str)] = &[
     ("deleteSession.unidentifiedAi", "⚠ {count} {agent} terminal(s) in this project haven't reported a session identity, so it can't be told whether they're using this session. Exit them first if they are."),
     ("deleteSession.usageKept", "Usage already recorded is kept, unless the usage ledger gets rebuilt."),
     ("empty", "No session history"),
+    ("filterEmpty", "No sessions match \"{query}\""),
+    ("filterPlaceholder", "Filter by title or AI name"),
     ("loadMore", "Load more ({n} left)"),
     ("loading", "Loading…"),
     ("refresh", "Refresh session list"),
@@ -2803,6 +2816,7 @@ static SESSION_LIST_EN: &[(&str, &str)] = &[
     ("remoteLoading", "Loading remote sessions…"),
     ("resumeHere", "Resume in current terminal"),
     ("resumeInNewTab", "Resume in new terminal tab"),
+    ("rowMenuHint", "Right-click for more actions"),
     ("selectProject", "Select a project first"),
     ("time.daysAgo", "{n} days ago"),
     ("time.hoursAgo", "{n} hr ago"),

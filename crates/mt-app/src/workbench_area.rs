@@ -747,6 +747,27 @@ pub fn activate_terminal_page(window: &mut Window, cx: &mut App) {
     area.update(cx, |area, cx| area.activate_terminal(window, cx));
 }
 
+/// 把键盘焦点还给工作区当前停着的那一页:终端页给活动 pane,文件 / diff 页签给它自己。
+/// 侧栏 / 抽屉里的输入框(如 AI 历史面板的过滤框)按 Esc 退出时用 —— 焦点留在一个没有下文的
+/// 输入框上,接着敲的字就进了它。没有活动项目时只把焦点放掉。
+pub fn refocus_current_page(window: &mut Window, cx: &mut App) {
+    let Some(area) = global(cx) else {
+        window.blur(cx);
+        return;
+    };
+    let Some(project_id) = area.read(cx).store.read(cx).active_project_id.clone() else {
+        window.blur(cx);
+        return;
+    };
+    area.update(cx, |area, cx| {
+        if area.is_terminal_active(cx) {
+            area.activate_terminal(window, cx);
+        } else {
+            area.reactivate_active_document(&project_id, window, cx);
+        }
+    });
+}
+
 /// 文档异步读盘完成时用来判断是否可以接管焦点。后台页签或其它项目的迟到结果
 /// 只能更新自身内容，不能把键盘焦点从当前终端/文档页抢走。
 ///

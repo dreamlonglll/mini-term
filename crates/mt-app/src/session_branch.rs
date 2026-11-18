@@ -204,6 +204,35 @@ pub fn build_session_tree(
         .collect()
 }
 
+/// 过滤用的剪枝:只留「自己命中」或「子树里有命中」的节点,其余整枝剪掉。
+///
+/// 命中的子会话连同它的**祖先链**一起留下 —— 树形不散,连线前缀照常由
+/// [`flatten_session_tree`] 现算;没命中的兄弟枝一律不留。根的相对次序、子的次序都不动。
+/// 命中判据由调用方给(它要看标题、分支标题与 agent,那些不在这一层)。
+pub fn prune_session_tree(roots: Vec<TreeNode>, hit: &dyn Fn(&TreeNode) -> bool) -> Vec<TreeNode> {
+    fn prune(node: TreeNode, hit: &dyn Fn(&TreeNode) -> bool) -> Option<TreeNode> {
+        let own = hit(&node);
+        let TreeNode {
+            index,
+            edge,
+            children,
+        } = node;
+        let children: Vec<TreeNode> = children
+            .into_iter()
+            .filter_map(|child| prune(child, hit))
+            .collect();
+        (own || !children.is_empty()).then_some(TreeNode {
+            index,
+            edge,
+            children,
+        })
+    }
+    roots
+        .into_iter()
+        .filter_map(|root| prune(root, hit))
+        .collect()
+}
+
 /// 取 `target`(输入列表里的下标)所在家族的**根**。找不到返回 `None`。
 ///
 /// 悬停家族面板只画**单支**家族 —— 面板挂在某个 pane 的会话上,画整片森林
@@ -561,5 +590,37 @@ mod tests {
         let rows = flatten_session_tree(&build_session_tree(&ids, &ts, &[]));
         assert_eq!(order(&rows, &ids), vec!["a", "b", "c"]);
         assert_eq!(prefixes(&rows), vec!["", "", ""]);
+    }
+
+    /// 过滤剪枝:命中的孙子连同祖先链留下、没命中的兄弟枝剪掉;连线前缀按剪完的树重算。
+    #[test]
+    fn 剪枝保留命中节点的祖先链() {
+        // r ─┬─ a ── a1
+        //    └─ b
+        // s(独立的根)
+        let ids = strs(&["r", "a", "a1", "b", "s"]);
+        let ts = strs(&["0", "1", "2", "3", "4"]);
+        let edges = vec![edge("a", "r"), edge("a1", "a"), edge("b", "r")];
+        let roots = build_session_tree(&ids, &ts, &edges);
+
+        let hit_a1 = |node: &TreeNode| ids[node.index] == "a1";
+        let rows = flatten_session_tree(&prune_session_tree(roots.clone(), &hit_a1));
+        assert_eq!(order(&rows, &ids), vec!["r", "a", "a1"]);
+        assert_eq!(
+            prefixes(&rows),
+            vec!["", "└─ ", "   └─ "],
+            "b 剪掉后 a 成了末子"
+        );
+
+        // 命中的父不连带没命中的子
+        let hit_r = |node: &TreeNode| ids[node.index] == "r";
+        let rows = flatten_session_tree(&prune_session_tree(roots.clone(), &hit_r));
+        assert_eq!(order(&rows, &ids), vec!["r"]);
+
+        // 根之间的次序不变;一个都不中就是空
+        let hit_s_or_b = |node: &TreeNode| matches!(ids[node.index].as_str(), "s" | "b");
+        let rows = flatten_session_tree(&prune_session_tree(roots.clone(), &hit_s_or_b));
+        assert_eq!(order(&rows, &ids), vec!["r", "b", "s"]);
+        assert!(prune_session_tree(roots, &|_: &TreeNode| false).is_empty());
     }
 }

@@ -14,7 +14,7 @@ use crate::project_tree;
 use crate::tree::gen_unique_id;
 
 use super::events::StoreChanged;
-use super::pure::remove_from_tree;
+use super::pure::{forget_recent_project, remove_from_tree, touch_recent_project};
 use super::{AppStore, ProjectState, StoreEvent};
 
 /// Removing a parent also affects the recovery entry of its nested projects.
@@ -230,6 +230,7 @@ impl AppStore {
             return;
         }
         self.active_project_id = Some(id.to_string());
+        touch_recent_project(&mut self.project_mru, id);
         if let Some(state) = self.project_states.get_mut(id) {
             state.needs_attention = false;
         }
@@ -547,6 +548,7 @@ impl AppStore {
 
         self.project_states.remove(id);
         self.expanded_dirs.remove(id);
+        forget_recent_project(&mut self.project_mru, id);
         self.done.retain_panes(&self.live_pane_ids());
         // 它的 toast 一并撤掉(`store.ts:859`)—— 留着的话点下去会跳向一个
         // 已经不存在的项目
@@ -557,6 +559,9 @@ impl AppStore {
         if self.active_project_id.as_deref() == Some(id) {
             self.active_project_id = self.config.projects.first().map(|p| p.id.clone());
             self.config.last_active_project_id = self.active_project_id.clone();
+            if let Some(next) = self.active_project_id.as_deref() {
+                touch_recent_project(&mut self.project_mru, next);
+            }
             cx.emit(StoreEvent::ActiveProjectChanged);
         }
         // 它在布局库里的那一行一并删掉。`flush_layout_now` 查不到项目时按删行

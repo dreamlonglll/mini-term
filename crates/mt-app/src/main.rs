@@ -83,6 +83,7 @@ mod git_stash;
 mod git_ui;
 mod git_watch;
 mod git_worktree;
+mod hook_hint;
 mod hotkeys;
 mod i18n;
 mod image_lightbox;
@@ -521,7 +522,7 @@ impl Workspace {
         file_tree.update(cx, |tree, cx| tree.observe_workbench(&workbench_area, cx));
         let terminals_panel =
             cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
-        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
+        let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), window, cx));
         let git_panel = cx.new(|cx| git_panel::GitPanel::new(store.clone(), window, cx));
         let columns_state = cx.new(|_| ResizableState::default());
         let middle_state = cx.new(|_| ResizableState::default());
@@ -571,6 +572,8 @@ impl Workspace {
         // 移动端中转:建桥 + 登记全局 + 按配置建连一次。放在这里(而不是 `main`)
         // 是因为泵要 `spawn_in` 拿窗口 —— 移动端发起会话得建 pane、弹 toast。
         let relay = mobile_relay::install(store.clone(), window, cx);
+        // 「注册 Hook 状态更准」的一次性提示:只订阅 store 事件,判据见 `hook_hint`
+        hook_hint::install(store.clone(), cx);
 
         // 系统托盘:图标住在另一条线程上(自己的隐藏窗口 + 消息循环),
         // 交互经 channel 回到这里 —— 与 AI 状态泵同一套路数。

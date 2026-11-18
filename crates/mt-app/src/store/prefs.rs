@@ -447,6 +447,17 @@ impl AppStore {
         self.ai.clone()
     }
 
+    /// 记下「注册 Hook 的一次性提示」已经给过(或用户本来就注册过,视为已知晓)。
+    /// 只会从 false 变 true,判据与弹提示都在 `crate::hook_hint`。
+    pub fn mark_hook_hint_shown(&mut self, cx: &mut Context<Self>) {
+        if self.config.hook_hint_shown {
+            return;
+        }
+        self.config.hook_hint_shown = true;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
     // === 界面语言 ===
 
     /// 当前界面语言。取自配置,认不出(或没设过)时回落到**进程内实际生效**的那个

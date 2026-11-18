@@ -237,8 +237,12 @@ use mt_i18n::{
 /// `fileTree.operation.trashing`）；重新打开已关闭的页签与全都不在时的就地提示
 /// （`fileViewer.{reopenClosedTab,reopenAllMissing}`）；页签跟随文件树删除 / 覆盖时的提示条
 /// （`fileViewer.{deletedOnDisk,replacedOnDisk}`）。
+/// 1795 → 1802：面板与引导一批 —— AI 历史面板的过滤框占位、无结果空态与行 tooltip 的右键提示
+/// （`sessionList.{filterPlaceholder,filterEmpty,rowMenuHint}`）；首屏引导的拖放提示与「开启 AI
+/// 状态精确感知」入口（`app.firstRun.{dropHint,enableHook}`）；注册 Hook 的一次性提示
+/// （`app.hookHint.{title,message}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1795;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1802;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
