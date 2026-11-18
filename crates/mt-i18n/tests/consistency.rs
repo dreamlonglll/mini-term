@@ -228,8 +228,12 @@ use mt_i18n::{
 /// 「回到底部」浮钮（`terminal.scrollToBottom`）、设置页快捷键表新增「回看与缩放」组
 /// （`settings.shortcuts.{scrollbackZoom,scrollPageUp,scrollPageDown,scrollTop,scrollBottom,
 /// zoomIn,zoomOut,zoomReset}`）；`settings.shortcuts.footer` 改了措辞，条数不变。
+/// 1782 → 1785：长文本转存新增「只在 AI 会话里」子开关
+/// （`settings.clipboard.{longPasteAiOnlyTitle,longPasteAiOnlyDesc}`，`longPasteDesc` 改了措辞）、
+/// 远程项目里右键 SSH 连接没法开新终端时的提示（`terminal.sshNewTerminalRemote`）；
+/// `terminal.sshFooterHint` 补了 Ctrl+↵ 一截，条数不变。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1782;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1785;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

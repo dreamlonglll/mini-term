@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1782;
+pub const ZH_ENTRY_COUNT: usize = 1785;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1782;
+pub const EN_ENTRY_COUNT: usize = 1785;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2862,7 +2862,9 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("clipboard.lineThreshold", "行数阈值"),
     ("clipboard.lineThresholdDesc", "粘贴内容行数 ≥ 此值即转存（0 表示不按行数判断）"),
     ("clipboard.longPaste", "长文本粘贴"),
-    ("clipboard.longPasteDesc", "超过下方阈值时，将剪贴板内容保存到临时 .txt 并粘贴带引号的文件路径，避免 AI 工具被超长粘贴卡住"),
+    ("clipboard.longPasteAiOnlyDesc", "终端里正运行 Claude、Codex 等 AI 工具时才转存，普通 shell 里照常粘贴原文（粘进去的脚本能直接执行）。WSL 或远程终端里认不出 AI 会话时可关掉，改为所有终端都转存"),
+    ("clipboard.longPasteAiOnlyTitle", "只在 AI 会话里转存"),
+    ("clipboard.longPasteDesc", "粘贴的文本超过下方阈值时，保存到临时 .txt 并改为粘贴带引号的文件路径，避免 AI 工具被超长粘贴卡住。默认只在 AI 会话里这样做，见下一项"),
     ("clipboard.longPasteFooter", "关闭后超长文本将直接粘贴 · 任一阈值命中即触发转存 · 临时文件保存在系统 temp 目录，24 小时后自动清理"),
     ("clipboard.longPasteTitle", "粘贴时超长文本转临时文件"),
     ("clipboard.remotePaste", "远程粘贴"),
@@ -3134,7 +3136,9 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("clipboard.lineThreshold", "Line threshold"),
     ("clipboard.lineThresholdDesc", "Save when paste lines ≥ this value (0 means ignore line count)"),
     ("clipboard.longPaste", "Long paste"),
-    ("clipboard.longPasteDesc", "When over the threshold below, save clipboard contents to a temp .txt and paste the quoted file path instead, to keep AI tools from choking on huge pastes"),
+    ("clipboard.longPasteAiOnlyDesc", "Save to a file only while an AI tool such as Claude or Codex is running in the terminal; plain shells get the text as-is, so pasted scripts still run. Turn this off to save in every terminal if AI sessions aren't detected (for example in WSL or remote terminals)"),
+    ("clipboard.longPasteAiOnlyTitle", "Only inside AI sessions"),
+    ("clipboard.longPasteDesc", "When pasted text exceeds the thresholds below, save it to a temp .txt and paste the quoted file path instead, so AI tools don't choke on huge pastes. By default this only happens inside AI sessions (see the next option)"),
     ("clipboard.longPasteFooter", "When off, long pastes go through directly · Hitting either threshold triggers saving · Temp files live in the system temp dir and are cleaned up after 24 hours"),
     ("clipboard.longPasteTitle", "Save long pastes to a temp file"),
     ("clipboard.remotePaste", "Remote paste"),
@@ -3510,9 +3514,10 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("sshConnect", "SSH 连接"),
     ("sshEmpty", "还没有 SSH 连接"),
     ("sshEmptyHint", "添加后即可在这里一键连接到当前终端"),
-    ("sshFooterHint", "↑↓ 选择 · ↵ 连接"),
+    ("sshFooterHint", "↑↓ 选择 · ↵ 连接 · Ctrl+↵ 新终端"),
     ("sshManage", "管理连接"),
     ("sshNewConnection", "新建连接"),
+    ("sshNewTerminalRemote", "远程项目里不能在新终端中自动连接：新终端要先登录服务器，预先输入的 ssh 命令会被登录提示吞掉。请在空闲的终端里连接"),
     ("sshNoMatch", "没有匹配的连接"),
     ("sshSearchPlaceholder", "搜索名称、主机或用户…"),
     ("ungrouped", "未分组"),
@@ -3531,9 +3536,10 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("sshConnect", "SSH Connection"),
     ("sshEmpty", "No SSH connections yet"),
     ("sshEmptyHint", "Add one to connect from this terminal in a click"),
-    ("sshFooterHint", "↑↓ Select · ↵ Connect"),
+    ("sshFooterHint", "↑↓ Select · ↵ Connect · Ctrl+↵ New tab"),
     ("sshManage", "Manage"),
     ("sshNewConnection", "New"),
+    ("sshNewTerminalRemote", "Can't connect in a new terminal of a remote project: the new terminal logs in to the server first and its login prompt would swallow the typed ssh command. Connect from an idle terminal instead"),
     ("sshNoMatch", "No matching connections"),
     ("sshSearchPlaceholder", "Search name, host or user…"),
     ("ungrouped", "Ungrouped"),

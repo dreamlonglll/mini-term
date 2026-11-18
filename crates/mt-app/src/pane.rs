@@ -999,7 +999,9 @@ impl TerminalPane {
         &self.theme
     }
 
-    /// Ctrl+F。打开查找条,已经开着就把焦点送回输入框并全选。
+    /// Ctrl+F。打开查找条:终端里有单行、非空白的选区就用它预填并当场按它查找,没有就
+    /// 留着上次的词;输入框全选,直接打字即覆盖。已经开着(焦点在终端上)时同样预填 / 全选,
+    /// 并把焦点送回输入框。预填口径见 [`mt_ui::terminal::search_bar::search_prefill`]。
     ///
     /// # 与原版的两处口径差
     ///
@@ -1010,10 +1012,10 @@ impl TerminalPane {
     ///    一条(各搜各的),原版做不到。
     /// 2. **不是 toggle**。原版 `openTerminalSearch()` 只开不关(再按一次是「回到
     ///    查找条接着改关键词」,焦点在输入框里时那一下压根到不了全局 handler),
-    ///    关闭走 Esc / `✕`。这里照此:第二次按 Ctrl+F = 聚焦 + 全选。
+    ///    关闭走 Esc / `✕`。这里照此:第二次按 Ctrl+F = 选区预填 + 聚焦 + 全选。
     pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(bar) = self.search_bar.clone() {
-            bar.update(cx, |bar, cx| bar.focus_input(window, cx));
+            bar.update(cx, |bar, cx| bar.open(window, cx));
             return;
         }
         // 覆盖物栈里登记一条(按 pty_id 区分)。它**不挡**全局快捷键,
@@ -1035,7 +1037,7 @@ impl TerminalPane {
                 },
             )
         });
-        // 开引擎 + 按已有关键词搜一遍 + 聚焦全选
+        // 选区预填 + 开引擎 + 按关键词搜一遍 + 聚焦全选
         bar.update(cx, |bar, cx| bar.open(window, cx));
         self.search_bar = Some(bar);
         cx.notify();
@@ -1417,6 +1419,12 @@ impl TerminalPane {
         window.focus(&self.focus, cx);
     }
 
+    /// 终端此刻是不是在 alt screen(vim / less / htop / Codex 这类全屏程序)。
+    /// 右键「SSH 连接」据此决定要不要换新终端,见 [`ssh_connect_target`]。
+    pub fn in_alt_screen(&self) -> bool {
+        self.emulator.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后「复制」该是灰的)。
     fn has_selection(&self) -> bool {
         self.emulator
@@ -1522,8 +1530,9 @@ impl Focusable for TerminalPane {
 /// 图片与长文本两条路线都要它,且都在**读到剪贴板之前**就得备好 ——
 /// 所以单独取一次,不跟着某一条分支走。
 struct PasteContext {
-    /// 长文本转文件的总开关。**图片不看它**:终端本来就粘不了图,不转文件
-    /// 就只剩 `Alt+V`(装机版同款口径)。
+    /// 这一次粘贴要不要考虑长文本转文件:总开关 + 「只在 AI 会话里」子开关 + pane 当下
+    /// 状态合成的结论([`clipboard::long_paste_wanted`]),阈值另判。**图片不看它**:终端
+    /// 本来就粘不了图,不转文件就只剩 `Alt+V`(装机版同款口径)。
     enabled: bool,
     line_threshold: u32,
     char_threshold: u32,
@@ -1567,13 +1576,19 @@ fn paste_context(pty_id: u32, cx: &gpui::App) -> PasteContext {
     });
     let target = clipboard::resolve_paste_target(s, pty_id);
     // 状态与 agent 名都取 pane 当下那份:hook 上报优先、输入检测兜底(`ai_agent`),
-    // 与 tab 上品牌图标同一口径。
-    let agent_takes_image = owner
+    // 与 tab 上品牌图标同一口径。长文本转存看的也是这一份状态。
+    let pane = owner
         .as_ref()
-        .and_then(|(pid, pane_id)| s.project_state(pid)?.pane(pane_id))
+        .and_then(|(pid, pane_id)| s.project_state(pid)?.pane(pane_id));
+    let agent_takes_image = pane
         .is_some_and(|p| clipboard::agent_takes_clipboard_image(p.status, p.ai_agent(), target));
+    let enabled = clipboard::long_paste_wanted(
+        cfg.long_paste_to_file,
+        cfg.long_paste_ai_only,
+        pane.map(|p| p.status),
+    );
     PasteContext {
-        enabled: cfg.long_paste_to_file,
+        enabled,
         line_threshold: cfg.long_paste_line_threshold,
         char_threshold: cfg.long_paste_char_threshold,
         target,
@@ -1592,7 +1607,7 @@ fn paste_context(pty_id: u32, cx: &gpui::App) -> PasteContext {
 /// 剪贴板有图 → 落盘 → 写 "{映射后的路径}";远程 pane 交给后台上传
 ///   └─ 有图但读不出 → 发 Alt+V,让终端里的 AI 工具自己读剪贴板
 /// 否则取文本 → 空则什么都不做
-/// 开关开着 && 命中阈值
+/// 开关开着 && (pane 在 AI 会话里 || 关了「只在 AI 会话里」) && 命中阈值
 ///   ├─ 远程 pane 且连接在场 → 交给后台任务(转存 + SFTP 上传 + 写远端路径),
 ///   │                        当场返回 None(语义 = 宿主已接管)
 ///   ├─ 本地/WSL 转存成功    → 写 "{映射后的路径}"(裸写,不走 bracketed paste)
@@ -1800,6 +1815,104 @@ fn build_ssh_command(conn: &SshConnection, identity_path: Option<&str>) -> Strin
     }
     parts.push(format!("{}@{}", conn.user, conn.host));
     parts.join(" ")
+}
+
+/// 右键「SSH 连接」该把 `ssh …` 敲进哪个终端,见 [`ssh_connect_target`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshConnectTarget {
+    /// 右键的那个终端(原行为)。
+    Current,
+    /// 同一分组里新开一个终端页签(项目默认 shell)再连。
+    NewTerminal,
+    /// 该换新终端、但这是远程项目:不连,提示用户换个空闲的终端。
+    Refuse,
+}
+
+/// 右键「SSH 连接」该落在哪个终端。
+///
+/// `ssh …\r` 是当作用户键入写进 PTY 的:终端里正跑着 Claude / Codex(`ai_alive`)时这一行
+/// 会被当成一次提交,vim / less / htop 这类全屏程序(`alt_screen`)会把它当成一串按键 ——
+/// 这两种情况改到新终端里连,其余照旧敲进当前终端。`force_new` 是快速连接面板里的
+/// Ctrl+Enter / Ctrl+单击:python REPL、`tail -f` 这类既不是 AI 也不走 alt screen 的程序
+/// 判不出来,由用户自己说「别动当前这个」。
+///
+/// 远程项目(`remote`)要换新终端时**不连**:那里的新终端是 ssh 启动器,起步时可能停在
+/// 口令 / host key 确认上,预写的命令会被当口令吃掉 —— 与远程项目不出 AI 启动器
+/// ([`crate::pane_actions::project_allows_launchers`])、启动恢复不给远程 pane 预写续接命令
+/// 同一条理由。
+pub(crate) fn ssh_connect_target(
+    force_new: bool,
+    ai_alive: bool,
+    alt_screen: bool,
+    remote: bool,
+) -> SshConnectTarget {
+    if !(force_new || ai_alive || alt_screen) {
+        SshConnectTarget::Current
+    } else if remote {
+        SshConnectTarget::Refuse
+    } else {
+        SshConnectTarget::NewTerminal
+    }
+}
+
+/// 快速连接面板的连接入口:按 [`ssh_connect_target`] 决定敲进当前终端、开新终端再连,
+/// 还是提示后作罢。
+///
+/// AI 会话的判据取 pane **当下**的状态(hook 上报优先、输入检测兜底,口径同
+/// [`crate::pane_actions::is_ai_alive`]);全屏程序看终端此刻是不是 alt screen。
+///
+/// 新终端走 `AppStore::new_terminal`:锚点是右键的那个 pane,于是落在同一分组、被激活并
+/// 拿到焦点,shell 用项目默认的。随后照常 [`connect_ssh`] —— 那边写的是 pane 的写入队列,
+/// PTY 还在后台起时整条 `ssh …\r`(连同密码自动填充的注册)排着,回填时才交给新 PTY;
+/// PTY 起不来就随之丢弃。与 AI 启动器、启动恢复写续接命令同一条时序(见 [`crate::pty_slot`])。
+pub(crate) fn connect_ssh_from_menu(
+    pty_id: u32,
+    conn: SshConnection,
+    force_new: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let store = AppStore::global(cx);
+    let (owner, ai_alive, remote, project_name) = {
+        let s = store.read(cx);
+        let owner = s.pane_of_pty(pty_id);
+        let ai_alive = owner
+            .as_ref()
+            .and_then(|(pid, pane_id)| s.project_state(pid)?.pane(pane_id))
+            .is_some_and(|p| crate::pane_actions::is_ai_alive(p.status));
+        let project = owner.as_ref().and_then(|(pid, _)| s.project(pid));
+        let remote = project.is_some_and(|p| p.ssh_connection_id.is_some());
+        let name = project.map(|p| p.name.clone()).unwrap_or_default();
+        (owner, ai_alive, remote, name)
+    };
+    // 定位不到 pane:照旧交给 `connect_ssh`(终端也不在的话它自己会作罢)
+    let Some((project_id, pane_id)) = owner else {
+        connect_ssh(pty_id, conn, window, cx);
+        return;
+    };
+    let alt_screen = store
+        .read(cx)
+        .terminal(pty_id)
+        .is_some_and(|t| t.read(cx).in_alt_screen());
+    match ssh_connect_target(force_new, ai_alive, alt_screen, remote) {
+        SshConnectTarget::Current => connect_ssh(pty_id, conn, window, cx),
+        SshConnectTarget::NewTerminal => {
+            let new_pty = store.update(cx, |store, cx| {
+                let new_pane = store.new_terminal(&project_id, None, Some(pane_id), window, cx)?;
+                store.project_state(&project_id)?.pane(&new_pane)?.pty_id
+            });
+            if let Some(new_pty) = new_pty {
+                connect_ssh(new_pty, conn, window, cx);
+            }
+        }
+        SshConnectTarget::Refuse => toast::push_message(
+            ToastKind::Info,
+            project_id,
+            project_name,
+            t("terminal", "sshNewTerminalRemote").to_string(),
+            cx,
+        ),
+    }
 }
 
 /// 在指定终端里连 SSH:写入 `ssh` 命令并回车,有密码则**写完再**注册自动填充。
@@ -2216,6 +2329,49 @@ mod tests {
         );
         // 空白私钥路径等于没配
         assert_eq!(build_ssh_command(&c, Some("   ")), "ssh u@h");
+    }
+
+    /// 右键 SSH 连接:终端空着(既不在 AI 会话、也不在 alt screen、没要求新终端)才敲进
+    /// 当前终端,否则开新终端。
+    #[test]
+    fn ssh_连接只在终端空着时敲进当前终端() {
+        use SshConnectTarget as T;
+        assert_eq!(ssh_connect_target(false, false, false, false), T::Current);
+        assert_eq!(
+            ssh_connect_target(false, true, false, false),
+            T::NewTerminal,
+            "Claude / Codex 正活着:敲进去就是一次提交"
+        );
+        assert_eq!(
+            ssh_connect_target(false, false, true, false),
+            T::NewTerminal,
+            "vim / less 这类全屏程序会把它当一串按键"
+        );
+        assert_eq!(
+            ssh_connect_target(true, false, false, false),
+            T::NewTerminal,
+            "Ctrl+Enter / Ctrl+单击:不管当前终端在跑什么"
+        );
+        assert_eq!(ssh_connect_target(true, true, true, false), T::NewTerminal);
+    }
+
+    /// 远程项目里不预写:要换新终端时一律作罢(新终端起步停在登录提示上会吃掉命令);
+    /// 用不着换新终端时照旧敲进当前终端。
+    #[test]
+    fn 远程项目要换新终端时不连() {
+        use SshConnectTarget as T;
+        assert_eq!(ssh_connect_target(false, false, false, true), T::Current);
+        for (force, ai, alt) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                ssh_connect_target(force, ai, alt, true),
+                T::Refuse,
+                "force={force} ai={ai} alt={alt}"
+            );
+        }
     }
 
     /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。

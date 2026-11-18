@@ -157,6 +157,13 @@ pub struct AppConfig {
     pub git_commit_files_view_mode: String,
     #[serde(default = "default_true")]
     pub long_paste_to_file: bool,
+    /// 长文本转存只在该 pane 处于 AI 会话(ai-idle / ai-working)时生效,普通 shell 里
+    /// 粘原文。缺省开:转存本就是给 AI 工具用的(躲开超长粘贴与 bracketed paste 的坑),
+    /// 往 bash / pwsh 里粘一段脚本却得到一条文件路径是误伤。关掉 = 所有终端都转存 ——
+    /// WSL / 远程里 AI 状态可能认不出来,给这些用户留的退路。总开关
+    /// [`Self::long_paste_to_file`] 关着时它不起作用。
+    #[serde(default = "default_true")]
+    pub long_paste_ai_only: bool,
     #[serde(default = "default_long_paste_line_threshold")]
     pub long_paste_line_threshold: u32,
     #[serde(default = "default_long_paste_char_threshold")]
@@ -923,6 +930,7 @@ impl Default for AppConfig {
             git_changes_view_mode: default_git_changes_view_mode(),
             git_commit_files_view_mode: default_git_commit_files_view_mode(),
             long_paste_to_file: true,
+            long_paste_ai_only: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
             remote_paste_dir: default_remote_paste_dir(),
@@ -2068,6 +2076,30 @@ mod tests {
             !parsed.confirm_terminal_close,
             "显式 false 不许被默认值盖掉"
         );
+    }
+
+    /// 长文本转存「只在 AI 会话里」默认开:`Default` 与库里没这个键(升级上来的老库)都是
+    /// true;用户关掉后的显式 `false` 要能往返,键名是 camelCase 的 `longPasteAiOnly`。
+    #[test]
+    fn long_paste_ai_only_缺键时默认开且显式关能往返() {
+        assert!(AppConfig::default().long_paste_ai_only);
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(
+            missing.long_paste_ai_only,
+            "老库没这个键 = 按新口径只在 AI 会话里转存"
+        );
+
+        let config = AppConfig {
+            long_paste_ai_only: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""longPasteAiOnly":false"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.long_paste_ai_only, "显式 false 不许被默认值盖掉");
     }
 
     /// Markdown 目录栏开合:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。

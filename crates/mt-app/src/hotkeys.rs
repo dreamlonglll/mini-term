@@ -566,6 +566,14 @@ pub fn bind_keys(cx: &mut App) {
         crate::ssh_quick_connect::SshQuickNext,
         Some("SshQuickConnect > Input"),
     ));
+    // Ctrl+↵(macOS 另认 Cmd+↵):在新终端里连。与命令库的 Ctrl+↵ 同一写法,两个键各平台都绑
+    for keystroke in ["ctrl-enter", "cmd-enter"] {
+        bindings.push(KeyBinding::new(
+            keystroke,
+            crate::ssh_quick_connect::SshQuickConnectInNewTerminal,
+            Some("SshQuickConnect > Input"),
+        ));
+    }
 
     // Git 分支弹窗:↑↓ 移动高亮、→ 弹出高亮分支的操作菜单。与项目切换器同一套理由
     // (谓词与 `Input` 同深度才压得过它自带的 up/down/right);→ 只在光标位于搜索词
