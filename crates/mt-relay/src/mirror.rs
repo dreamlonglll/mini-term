@@ -793,6 +793,8 @@ pub fn resolve_session_file_by_id(
             claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
         }
         AgentKind::OpenCode => None,
+        // TODO(agy 镜像):transcript 定位与行解析接入前先不绑
+        AgentKind::Agy => None,
     }
 }
 

@@ -32,6 +32,9 @@ pub enum AgentKind {
     Grok,
     /// oh-my-pi(pi 的分支):hook 走进程内 TS 扩展
     Omp,
+    /// Antigravity CLI(Google,命令名 `agy`):shell 命令 hook(`~/.gemini/config/hooks.json`),
+    /// 会话索引是 SQLite、正文是 transcript JSONL(见 `sessions/agy.rs`)
+    Agy,
 }
 
 /// 会话记录怎么按目录分桶 —— 决定续接 / fork 前要不要先找回会话的启动目录。
@@ -190,15 +193,36 @@ const OMP: AgentSpec = AgentSpec {
     permission_request_keeps_working: false,
 };
 
+const AGY: AgentSpec = AgentSpec {
+    kind: AgentKind::Agy,
+    key: "agy",
+    aliases: &["antigravity"],
+    // 三个字母,`contains` 口径会误伤(`agyx` 之类的包装名)
+    loose_match: false,
+    label: "Antigravity CLI",
+    // 会话 id 来自 hook 上报(`conversationId`)或历史面板;`--conversation` 按 id 在
+    // 全局 appDataDir 里找,与启动目录无关
+    resume: Some("agy --conversation {id}"),
+    // 只有 TUI 里的 `/fork` 斜杠命令,没有 CLI 级 fork 参数
+    fork: None,
+    cwd_bucket: CwdBucket::Global,
+    session_log: true,
+    history: true,
+    pastes_clipboard_image: false,
+    // agy 的权限确认框不发任何 hook(实测),无从谈起
+    permission_request_keeps_working: false,
+};
+
 impl AgentKind {
     /// 全部 agent,顺序即输入检测 [`crate::AI_COMMANDS`] 的顺序。
-    pub const ALL: [AgentKind; 6] = [
+    pub const ALL: [AgentKind; 7] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::OpenCode,
         AgentKind::Pi,
         AgentKind::Grok,
         AgentKind::Omp,
+        AgentKind::Agy,
     ];
 
     /// 这一家的知识表。
@@ -210,6 +234,7 @@ impl AgentKind {
             AgentKind::Pi => &PI,
             AgentKind::Grok => &GROK,
             AgentKind::Omp => &OMP,
+            AgentKind::Agy => &AGY,
         }
     }
 
@@ -355,7 +380,7 @@ mod tests {
     fn 命令名表不变() {
         assert_eq!(
             AGENT_COMMANDS,
-            ["claude", "codex", "opencode", "pi", "grok", "omp"]
+            ["claude", "codex", "opencode", "pi", "grok", "omp", "agy"]
         );
     }
 
@@ -376,6 +401,10 @@ mod tests {
             ("opencode", AgentKind::OpenCode),
             ("pi", AgentKind::Pi),
             ("PI", AgentKind::Pi),
+            ("agy", AgentKind::Agy),
+            ("AGY", AgentKind::Agy),
+            ("antigravity", AgentKind::Agy),
+            ("Antigravity", AgentKind::Agy),
         ] {
             assert_eq!(AgentKind::parse(raw), Some(kind), "{raw:?}");
         }
@@ -397,6 +426,8 @@ mod tests {
             "pip",
             "opencode-x",
             "gemini",
+            "agyx",
+            "my-agy",
             "",
             "  ",
             "什么鬼",
@@ -466,6 +497,11 @@ mod tests {
             None,
             "omp 谱系未接,不开 fork"
         );
+        assert_eq!(
+            resume_command(Some("agy"), ID),
+            Some(format!("agy --conversation {ID}"))
+        );
+        assert_eq!(fork_command(Some("agy"), ID), None, "agy 无 CLI 级 fork");
     }
 
     /// 不支持续接的 / 认不出的:一律不产出命令,**不再落到 claude**。
@@ -540,7 +576,8 @@ mod tests {
                 AgentKind::Codex,
                 AgentKind::Pi,
                 AgentKind::Grok,
-                AgentKind::Omp
+                AgentKind::Omp,
+                AgentKind::Agy
             ]
         );
         let with_history: Vec<_> = AgentKind::ALL
@@ -554,7 +591,8 @@ mod tests {
                 AgentKind::Codex,
                 AgentKind::Pi,
                 AgentKind::Grok,
-                AgentKind::Omp
+                AgentKind::Omp,
+                AgentKind::Agy
             ]
         );
         // 能续接的必有会话记录(否则拿不到 id)

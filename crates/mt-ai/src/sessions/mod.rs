@@ -8,6 +8,7 @@
 //! `pub(crate)` 项一律放宽成 `pub` —— 原来的消费者(remote_ssh / usage_stats /
 //! mobile_mirror)迁移后各自成 crate,只能从这里 `pub` 出去。
 
+mod agy;
 mod codex;
 mod delete;
 mod grok;
@@ -17,6 +18,13 @@ mod pi_history;
 mod tool_activity;
 mod tool_path;
 
+pub use agy::{
+    AgyConversation, AgyStep, AgyStepKind, AgyToolCall, agy_app_data_dir, agy_config_dir,
+    agy_summaries_db_path_in, agy_tool_result_text, agy_transcript_path_in,
+    agy_user_request_text, file_uri_to_path, find_agy_transcript, normalize_db_time,
+    parse_agy_step, parse_workspace_uris, read_agy_conversations, read_agy_conversations_from,
+    read_agy_transcript,
+};
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
     codex_question_answer_from_line, codex_question_from_line, codex_user_title_from_line,
