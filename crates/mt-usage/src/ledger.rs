@@ -3,7 +3,9 @@
 //! 原始 JSONL 只在同步时读一次 → 落账本；展示层 `usage_ledger_query` 永远查账本，
 //! 毫秒级返回，任何参数切换都是纯查询。同步按文件粒度增量：`sync_state` 记
 //! (path, mtime, size) 指纹，未变跳过（一次 stat 的成本），变了整会话先删后插
-//! ——重写/compact/回卷/收缩都严格收敛为当前文件的镜像。
+//! ——重写/compact/回卷/收缩都严格收敛为当前文件的镜像。唯一例外是 agy:它的
+//! transcript 压缩时整份重写、被压掉的调用从文件里消失,账本对它只增不删
+//! (按会话内身份 UPSERT,见 `sync_job`)。
 //! 设计合同：docs/plans/2026-08-02-usage-stats-ledger-redesign.md。
 //!
 //! 去 Tauri 化后的两处外部接口（逻辑本身未动）：
@@ -24,8 +26,8 @@ use super::aggregate::{Aggregator, UsageStatsPayload};
 use super::pricing::{ModelPrice, PricingTable};
 use super::turns::{self, ParsedSession, Turn, UsageTotals};
 use super::{
-    collect_claude_jobs, collect_codex_jobs, collect_grok_jobs, AgentFilter, ProviderResolver,
-    SessionJob,
+    collect_agy_jobs, collect_claude_jobs, collect_codex_jobs, collect_grok_jobs, AgentFilter,
+    ProviderResolver, SessionJob,
 };
 
 /// 账本 schema 版本：结构变更时 +1。open 时版本不匹配即删表重建（账本可从
@@ -384,6 +386,7 @@ impl Ledger {
             SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
             SessionJob::Codex { path } => turns::parse_codex_session(path, thread_names),
             SessionJob::Grok { dir } => turns::parse_grok_session(dir),
+            SessionJob::Agy { conv, transcript } => turns::parse_agy_session(conv, transcript),
         };
         // 解析失败（文件消失/无读权限）：不记指纹，下轮枚举到再试
         let Some(s) = parsed else { return Ok(false) };
@@ -401,7 +404,14 @@ impl Ledger {
         // 按会话整删重插：文件收缩（compact/重写变短/子代理转录删除）的残留行
         // 才能收敛——UPSERT 只吸收重复，吸收不了缩短。fork 复制的历史各会话
         // 自己存一份，不会误删别的会话的行
-        tx.execute("DELETE FROM turns WHERE session_id = ?1", params![s.session_id])?;
+        //
+        // agy 例外——只增不删:它的 transcript 在上下文压缩时被整份重写,被压掉的
+        // 步骤从文件里消失了,但那些调用是真花过钱的。账本按「会话内身份」
+        // (`agy:{step_index}@{created_at}`,见 `turns::agy_message_id`)UPSERT:
+        // 还在文件里的步骤原地覆盖、不会记两次;已从文件消失的旧行原样留着
+        if s.agent != "agy" {
+            tx.execute("DELETE FROM turns WHERE session_id = ?1", params![s.session_id])?;
+        }
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO turns(session_id, request_id, message_id, ts_ms, model,
@@ -424,6 +434,9 @@ impl Ledger {
                     // grok 的键是 `prompt_id#model`（一个回合可跨多个模型），
                     // 与 Claude 同理靠它在会话内吸收 fork 复制来的重复回合
                     (Some(id), "grok") => format!("grok:{id}"),
+                    // agy 的 message_id 是跨会话去重键(带模型与用量),主键只取其中
+                    // 的会话内身份——同一步被原地改写时覆盖,而不是多出一行
+                    (Some(id), "agy") => turns::agy_request_id(id).to_string(),
                     (_, "codex") => format!("codex:{i}"),
                     _ => format!("noid:{i}"),
                 };
@@ -489,6 +502,7 @@ impl Ledger {
             AgentFilter::Claude => Some("claude"),
             AgentFilter::Codex => Some("codex"),
             AgentFilter::Grok => Some("grok"),
+            AgentFilter::Agy => Some("agy"),
         };
         let mut stmt = self.conn.prepare_cached(TURNS_IN_WINDOW_SQL)?;
         let mut sessions: Vec<ParsedSession> = Vec::new();
@@ -620,6 +634,12 @@ fn job_fingerprint(job: &SessionJob) -> (PathBuf, i64, i64) {
             let size = size_of(&updates);
             (updates, mtime, size)
         }
+        // 压缩重写可能让文件变短:size 变小同样是指纹变化,照常整份重读
+        SessionJob::Agy { transcript, .. } => (
+            transcript.clone(),
+            turns::mtime_ms(transcript),
+            size_of(transcript),
+        ),
     }
 }
 
@@ -731,6 +751,9 @@ fn sync_round(db_path: &Path, sink: &SyncSink) {
     collect_codex_jobs(&home, &mut jobs);
     if let Some(grok_home) = mt_ai::hook_registry::grok_home() {
         collect_grok_jobs(&grok_home.join("sessions"), &mut jobs);
+    }
+    if let Some(agy_dir) = mt_ai::sessions::agy_app_data_dir() {
+        collect_agy_jobs(&agy_dir, &mut jobs);
     }
     let thread_names = mt_ai::sessions::load_codex_thread_names(&home.join(".codex"));
 
@@ -948,6 +971,7 @@ mod tests {
                 SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
                 SessionJob::Codex { path } => turns::parse_codex_session(path, &names),
                 SessionJob::Grok { dir } => turns::parse_grok_session(dir),
+                SessionJob::Agy { conv, transcript } => turns::parse_agy_session(conv, transcript),
             })
             .collect();
         mem.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -2012,6 +2036,181 @@ mod tests {
             });
         }
         drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── agy:transcript 压缩时整份重写,账本只增不删 ──
+
+    fn agy_plan_line(idx: i64, ts: &str, input: u64, cache: u64, output: u64) -> String {
+        format!(
+            r#"{{"step_index":{idx},"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"{ts}","model":"gemini-3.8-flash-high","input_tokens":{input},"cache_read_tokens":{cache},"output_tokens":{output},"thinking":"思考过程会被压缩掉"}}"#
+        )
+    }
+
+    fn agy_other_line(idx: i64, kind: &str, ts: &str) -> String {
+        format!(
+            r#"{{"step_index":{idx},"source":"USER_EXPLICIT","type":"{kind}","status":"DONE","created_at":"{ts}","content":"<USER_REQUEST>\n做点事\n</USER_REQUEST>"}}"#
+        )
+    }
+
+    fn agy_job(root: &Path, id: &str, parent: Option<&str>) -> SessionJob {
+        let transcript = root
+            .join(id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript_full.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        SessionJob::Agy {
+            conv: mt_ai::sessions::AgyConversation {
+                id: id.into(),
+                title: "压缩测试".into(),
+                preview: String::new(),
+                workspaces: vec!["d:/Git/proj".into()],
+                updated_at: None,
+                last_user_input_at: None,
+                step_count: 0,
+                parent_id: parent.map(str::to_string),
+                nesting_depth: i64::from(parent.is_some()),
+            },
+            transcript,
+        }
+    }
+
+    fn agy_transcript(job: &SessionJob) -> &Path {
+        match job {
+            SessionJob::Agy { transcript, .. } => transcript,
+            _ => unreachable!(),
+        }
+    }
+
+    /// 某会话在账本里的 (行数, input 合计, cache_read 合计, output 合计)。
+    fn agy_totals(ledger: &Ledger, sid: &str) -> (i64, i64, i64, i64) {
+        ledger
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(input),0), COALESCE(SUM(cache_read),0),
+                        COALESCE(SUM(output),0)
+                 FROM turns WHERE session_id = ?1",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// 追加 / 整份重写后变短 / 重写后再追加,外加两种重写变体(同一步原地改写用量、
+    /// 回退后序号被复用):已计入的调用一条不丢,还在文件里的调用一条不重。
+    #[test]
+    fn agy_rewrite_never_loses_or_double_counts() {
+        let root = temp_root("agy-rewrite");
+        let names = HashMap::new();
+        let mut ledger = Ledger::open(&root.join("usage.db")).unwrap();
+        let job = agy_job(&root, "conv-a", None);
+        let path = agy_transcript(&job).to_path_buf();
+        // 每次写都把 mtime 往前推,模拟真实写盘(指纹 = mtime + size)
+        let mut mtime = turns::parse_rfc3339_ms("2026-11-19T14:00:00Z").unwrap();
+        let mut write = |lines: &[String]| {
+            mtime += 1000;
+            write_with_mtime(&path, lines, mtime);
+        };
+
+        // ① 首次:两次模型调用
+        let user0 = agy_other_line(0, "USER_INPUT", "2026-11-19T13:46:08Z");
+        let p1 = agy_plan_line(1, "2026-11-19T13:46:08Z", 100, 0, 10);
+        let g2 = agy_other_line(2, "GENERIC", "2026-11-19T13:46:14Z");
+        let p3 = agy_plan_line(3, "2026-11-19T13:46:14Z", 50, 200, 5);
+        write(&[user0.clone(), p1.clone(), g2.clone(), p3.clone()]);
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (2, 150, 200, 15));
+
+        // ② 追加一次调用
+        let p5 = agy_plan_line(5, "2026-11-19T13:46:30Z", 30, 400, 7);
+        write(&[user0.clone(), p1.clone(), g2.clone(), p3.clone(), p5.clone()]);
+        let before = fs::metadata(&path).unwrap().len();
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (3, 180, 600, 22), "追加只多一行");
+
+        // ③ 上下文压缩:整份重写,前面的步骤被压成一条摘要,只留最后一次调用
+        // (序号不变)。文件变短,但已计入的两次调用不能丢,留下的那次不能重记
+        let summary = agy_other_line(4, "CHECKPOINT", "2026-11-19T13:46:29Z");
+        write(&[summary.clone(), p5.clone()]);
+        assert!(fs::metadata(&path).unwrap().len() < before, "重写后文件确实变短了");
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(
+            agy_totals(&ledger, "conv-a"),
+            (3, 180, 600, 22),
+            "重写变短:历史不丢、留下的那条不重复"
+        );
+
+        // ④ 重写之后接着追加
+        let p7 = agy_plan_line(7, "2026-11-19T13:47:00Z", 20, 500, 3);
+        write(&[summary.clone(), p5.clone(), p7.clone()]);
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (4, 200, 1100, 25), "重写后再追加");
+
+        // 幂等:强制整份重读,数量与合计不变
+        ledger.conn.execute("DELETE FROM sync_state", []).unwrap();
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (4, 200, 1100, 25), "重读幂等");
+
+        // ⑤ 同一步被原地改写(序号、时刻不变,用量变了):覆盖,不多出一行
+        let p7_final = agy_plan_line(7, "2026-11-19T13:47:00Z", 20, 500, 9);
+        write(&[summary.clone(), p5.clone(), p7_final]);
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (4, 200, 1100, 31), "原地改写只覆盖");
+
+        // ⑥ 回退后序号被复用:新的第 7 步时刻不同,是另一次真实调用,旧的第 7 步
+        // 也照样留着(它花过钱)
+        let p7_after_revert = agy_plan_line(7, "2026-11-19T13:50:00Z", 11, 0, 1);
+        write(&[summary, p5, p7_after_revert]);
+        assert!(ledger.sync_job(&job, &names).unwrap());
+        assert_eq!(agy_totals(&ledger, "conv-a"), (5, 211, 1100, 32), "序号复用不覆盖旧调用");
+
+        // 查询口径:agy 筛选只出 agy,会话元信息来自索引
+        let sessions = ledger.query_sessions(AgentFilter::Agy, 0, None).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "agy");
+        assert_eq!(sessions[0].cwd.as_deref(), Some(r"D:\Git\proj"));
+        assert_eq!(sessions[0].title.as_deref(), Some("压缩测试"));
+        assert_eq!(sessions[0].turns.len(), 5);
+        assert!(ledger.query_sessions(AgentFilter::Claude, 0, None).unwrap().is_empty());
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 跨会话去重只吞真正的复制:fork 原样带过来的步骤只计一次;主会话与子代理
+    /// 同一秒各走到第 5 步(实测见过)是两次调用,都要计入。
+    #[test]
+    fn agy_cross_session_dedup_only_swallows_true_copies() {
+        let root = temp_root("agy-dedup");
+        let names = HashMap::new();
+        let mut ledger = Ledger::open(&root.join("usage.db")).unwrap();
+        let p1 = agy_plan_line(1, "2026-11-19T13:47:42Z", 10025, 0, 828);
+        let p3 = agy_plan_line(3, "2026-11-19T13:47:51Z", 3188, 7989, 374);
+        let p5 = agy_plan_line(5, "2026-11-19T13:48:05Z", 2541, 9172, 544);
+        let sub5 = agy_plan_line(5, "2026-11-19T13:48:05Z", 2384, 1788, 32);
+        let fork7 = agy_plan_line(7, "2026-11-19T14:00:00Z", 900, 100, 9);
+        let jobs = [
+            (agy_job(&root, "parent", None), vec![p1.clone(), p3.clone(), p5]),
+            (agy_job(&root, "sub", Some("parent")), vec![sub5]),
+            (agy_job(&root, "fork", None), vec![p1, p3, fork7]),
+        ];
+        for (job, lines) in &jobs {
+            write_with_mtime(agy_transcript(job), lines, 1_795_000_000_000);
+            assert!(ledger.sync_job(job, &names).unwrap());
+        }
+        let sessions = ledger.query_sessions(AgentFilter::All, 0, None).unwrap();
+        let mut agg = Aggregator::new(0, None, -480, Some("Asia/Shanghai"), false);
+        let table = PricingTable::new(HashMap::new());
+        for s in &sessions {
+            agg.add_session(s, &table);
+        }
+        let snap = serde_json::to_value(agg.snapshot()).unwrap();
+        assert_eq!(
+            snap["totalCalls"],
+            serde_json::json!(5),
+            "父 3 + 子代理 1 + fork 新增 1:fork 带过来的两步只计一次"
+        );
+        assert_eq!(snap["sessionCount"], serde_json::json!(3));
         fs::remove_dir_all(&root).ok();
     }
 
