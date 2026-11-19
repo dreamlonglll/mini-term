@@ -570,7 +570,10 @@ mod tests {
     #[test]
     fn agy_needs_both_env_and_conversation_id() {
         let agy = agy_stop_payload();
-        assert_eq!(classify_source(Some("conv-1"), None, Some(&agy)), Source::Agy);
+        assert_eq!(
+            classify_source(Some("conv-1"), None, Some(&agy)),
+            Source::Agy
+        );
         // 只有 payload 没有环境变量(手工 POST / 老版本):不认
         assert_eq!(classify_source(None, None, Some(&agy)), Source::Other);
         // 环境变量是空串:不认
@@ -646,7 +649,10 @@ mod tests {
         let mut body = agy_stop_payload();
         normalize_agy_fields(&mut body, Some("env-conv"));
         alias_camel_case_fields(&mut body);
-        assert_eq!(body["session_id"], "conv-1", "payload 的 conversationId 优先");
+        assert_eq!(
+            body["session_id"], "conv-1",
+            "payload 的 conversationId 优先"
+        );
         assert_eq!(body["termination_reason"], "NO_TOOL_CALL");
         assert_eq!(body["fully_idle"], true);
         assert_eq!(body["has_user_input"], true);

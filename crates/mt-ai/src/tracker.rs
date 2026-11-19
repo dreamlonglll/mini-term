@@ -756,7 +756,10 @@ mod tests {
         mgr.track_input(1, "\x04");
         mgr.track_input(1, "a");
         mgr.track_input(1, "\x04");
-        assert!(mgr.is_ai_session(1), "中间夹了按键,第二次 Ctrl+D 重新算第一次");
+        assert!(
+            mgr.is_ai_session(1),
+            "中间夹了按键,第二次 Ctrl+D 重新算第一次"
+        );
         mgr.track_input(1, "\x04");
         assert!(!mgr.is_ai_session(1));
     }

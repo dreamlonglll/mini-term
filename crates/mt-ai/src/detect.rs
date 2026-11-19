@@ -319,7 +319,11 @@ mod tests {
             "agy --dangerously-skip-permissions",
             "& \"C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe\"",
         ] {
-            assert_eq!(interactive_ai_command_name(cmd), Some("agy"), "{cmd} 应进入 agy 会话");
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                Some("agy"),
+                "{cmd} 应进入 agy 会话"
+            );
         }
         assert_eq!(line_ai_command_name("PS D:\\repo> agy -c"), Some("agy"));
     }
@@ -347,7 +351,11 @@ mod tests {
             "agy --model gemini-x mcp list",
             "agy -- help",
         ] {
-            assert_eq!(interactive_ai_command_name(cmd), None, "{cmd} 不该进入 AI 会话");
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                None,
+                "{cmd} 不该进入 AI 会话"
+            );
         }
         // `--remote-control` 是布尔选项(带远程连接进 TUI),与同名子命令不是一回事
         assert_eq!(
@@ -360,7 +368,10 @@ mod tests {
     /// 不按子命令判(`claude update` 之类保持原口径)。
     #[test]
     fn agy_rules_do_not_leak_to_other_agents() {
-        assert_eq!(interactive_ai_command_name("claude --prompt hi"), Some("claude"));
+        assert_eq!(
+            interactive_ai_command_name("claude --prompt hi"),
+            Some("claude")
+        );
         assert_eq!(interactive_ai_command_name("codex mcp"), Some("codex"));
         assert_eq!(interactive_ai_command_name("grok models"), Some("grok"));
         // 通用的非交互标志照旧

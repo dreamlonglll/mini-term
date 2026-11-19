@@ -1654,7 +1654,10 @@ mod tests {
             status("ai-working", "PermissionRequest")
         );
         let bare = payload(serde_json::json!({}));
-        assert_eq!(route_event("UserPromptSubmit", &bare), status("ai-working", "UserPromptSubmit"));
+        assert_eq!(
+            route_event("UserPromptSubmit", &bare),
+            status("ai-working", "UserPromptSubmit")
+        );
     }
 
     /// 发不发 SessionEnd 查 agent 表;缺省按 Claude,认不出的按「发」(保持原行为)。

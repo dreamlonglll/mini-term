@@ -268,7 +268,11 @@ mod tests {
             let p = t.resolve(&format!("gemini-3.8-flash-{tier}")).unwrap();
             assert_eq!(p.input, 0.75e-6, "{tier}");
         }
-        assert_eq!(t.resolve("Gemini-3.8-Flash-High").unwrap().input, 0.75e-6, "大小写不敏感");
+        assert_eq!(
+            t.resolve("Gemini-3.8-Flash-High").unwrap().input,
+            0.75e-6,
+            "大小写不敏感"
+        );
         assert_eq!(
             t.resolve("gemini-3.8-flash-high-20260101").unwrap().input,
             0.75e-6,
@@ -283,10 +287,17 @@ mod tests {
         // 本体不在表里:锚点均价兜底(表里只有 claude-opus-4-8 一个锚点)
         assert_eq!(t.resolve("gemini-9-ultra-high").unwrap().input, 5e-6);
 
-        assert_eq!(strip_gemini_thinking_tier("gemini-3-8-flash-high"), Some("gemini-3-8-flash"));
+        assert_eq!(
+            strip_gemini_thinking_tier("gemini-3-8-flash-high"),
+            Some("gemini-3-8-flash")
+        );
         assert_eq!(strip_gemini_thinking_tier("gemini-3-8-flash"), None);
         assert_eq!(strip_gemini_thinking_tier("gemini-3-8-flash-lite"), None);
-        assert_eq!(strip_gemini_thinking_tier("o3-mini-high"), None, "只认 gemini");
+        assert_eq!(
+            strip_gemini_thinking_tier("o3-mini-high"),
+            None,
+            "只认 gemini"
+        );
     }
 
     #[test]

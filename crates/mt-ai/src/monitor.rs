@@ -869,9 +869,15 @@ mod tests {
         let (hooks, mgr) = agy_pane_at_idle();
         mgr.track_input(1, "/exit\r");
         mgr.note_output_for_test(1);
-        assert!(!exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED), "输出窗口没过");
+        assert!(
+            !exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED),
+            "输出窗口没过"
+        );
         mgr.expire_output_for_test(1);
-        assert!(!exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED), "状态静置窗口没过");
+        assert!(
+            !exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED),
+            "状态静置窗口没过"
+        );
     }
 
     /// 有 SessionEnd 的几家不走这条(等它们自己的 SessionEnd);没有会话身份的也不插手。
@@ -899,11 +905,20 @@ mod tests {
         hooks.update(1, "ai-working".to_string());
         mgr.track_input(1, "\x04");
         mgr.track_input(1, "\x04");
-        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "ai-working 不归这条管");
+        assert!(
+            !exit_settle_due(&hooks, &mgr, 1, ELAPSED),
+            "ai-working 不归这条管"
+        );
         settle_stalled_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
-        assert!(!hooks.is_hook_enabled(1), "按 SessionEnd 收尾:hook 记录整个清掉");
+        assert!(
+            !hooks.is_hook_enabled(1),
+            "按 SessionEnd 收尾:hook 记录整个清掉"
+        );
         assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
-        assert_eq!(seen.lock().clone(), vec![change("idle", Some(STALL_EXIT_CAUSE))]);
+        assert_eq!(
+            seen.lock().clone(),
+            vec![change("idle", Some(STALL_EXIT_CAUSE))]
+        );
         // 同一轮紧接着的退出兜底不会再发一次
         settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
         assert_eq!(seen.lock().len(), 1);
@@ -935,7 +950,10 @@ mod tests {
         settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
         settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
         assert!(!hooks.is_hook_enabled(1));
-        assert!(hooks.session_of(1).is_none(), "会话身份随之清掉(同 SessionEnd)");
+        assert!(
+            hooks.session_of(1).is_none(),
+            "会话身份随之清掉(同 SessionEnd)"
+        );
         assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "不该反复触发");
         let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1)).collect();
         assert!(polls.iter().all(|s| s == "idle"), "{polls:?}");

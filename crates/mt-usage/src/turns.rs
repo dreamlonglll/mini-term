@@ -905,7 +905,11 @@ fn agy_native_cwd(path: &str) -> String {
     let b = path.as_bytes();
     if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         let rest = path[2..].trim_end_matches(['/', '\\']).replace('/', "\\");
-        let rest = if rest.is_empty() { "\\".to_string() } else { rest };
+        let rest = if rest.is_empty() {
+            "\\".to_string()
+        } else {
+            rest
+        };
         format!("{}:{rest}", b[0].to_ascii_uppercase() as char)
     } else {
         let trimmed = path.trim_end_matches('/');
@@ -1151,8 +1155,16 @@ mod tests {
 
         assert_eq!(s.agent, "agy");
         assert_eq!(s.session_id, "2bada06a");
-        assert_eq!(s.cwd.as_deref(), Some(r"D:\Git\mini-term"), "盘符大写、反斜杠、去尾随分隔符");
-        assert_eq!(s.title.as_deref(), Some("Read hello.txt"), "title 空时回落 preview");
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some(r"D:\Git\mini-term"),
+            "盘符大写、反斜杠、去尾随分隔符"
+        );
+        assert_eq!(
+            s.title.as_deref(),
+            Some("Read hello.txt"),
+            "title 空时回落 preview"
+        );
         assert!(s.provider.is_none());
         assert!(s.tool_uses.is_empty(), "agy 不出工具排行");
         assert_eq!(s.turns.len(), 2, "只有两条带用量的 PLANNER_RESPONSE");

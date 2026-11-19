@@ -1408,8 +1408,8 @@ fn write_agy_hooks(path: &std::path::Path, config: &Value) -> Result<(), String>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
     }
-    let json_str =
-        serde_json::to_string_pretty(config).map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
+    let json_str = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
     crate::util::atomic_write(path, json_str.as_bytes())
         .map_err(|e| format!("写入 hooks.json 失败: {}", e))
 }
@@ -1536,12 +1536,18 @@ pub fn sync_agy_hooks_if_registered() {
     let hook_path = match hook_binary_path() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[hook-registry] agy 补注册跳过（拿不到 hook 二进制路径）: {}", e);
+            eprintln!(
+                "[hook-registry] agy 补注册跳过（拿不到 hook 二进制路径）: {}",
+                e
+            );
             return;
         }
     };
     match sync_agy_hooks_at(&path, &hook_path) {
-        Ok(true) => eprintln!("[hook-registry] agy hooks.json 的 {} 组已刷新", AGY_HOOK_GROUP),
+        Ok(true) => eprintln!(
+            "[hook-registry] agy hooks.json 的 {} 组已刷新",
+            AGY_HOOK_GROUP
+        ),
         Ok(false) => {}
         Err(e) => eprintln!("[hook-registry] agy 补注册失败: {}", e),
     }
@@ -1691,9 +1697,7 @@ impl HookAgent {
             }),
             HookAgent::Omp => OMP_EXTENSION.remove_entries(),
             HookAgent::Pi => PI_EXTENSION.remove_entries(),
-            HookAgent::Agy => {
-                agy_hooks_path().map_or(Ok(0), |path| remove_agy_entries_at(&path))
-            }
+            HookAgent::Agy => agy_hooks_path().map_or(Ok(0), |path| remove_agy_entries_at(&path)),
         }
     }
 }
@@ -1844,8 +1848,8 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
         AGY_HOOK_GROUP.to_string(),
         Value::Object(build_agy_group(&hook_path)),
     );
-    let agy_str = serde_json::to_string_pretty(&Value::Object(agy_config))
-        .map_err(|e| e.to_string())?;
+    let agy_str =
+        serde_json::to_string_pretty(&Value::Object(agy_config)).map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "claude": {
@@ -2672,14 +2676,19 @@ mod tests {
             serde_json::json!({ AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)) })
         );
 
-        let user = serde_json::json!({ "orca-status": orca_group(), "zz-last": { "enabled": false } });
+        let user =
+            serde_json::json!({ "orca-status": orca_group(), "zz-last": { "enabled": false } });
         std::fs::write(&path, serde_json::to_string_pretty(&user).unwrap()).unwrap();
         assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
         let after = read_json(&path);
         assert_eq!(after["orca-status"], orca_group(), "别家的组原样");
         assert_eq!(after["zz-last"], serde_json::json!({ "enabled": false }));
         let keys = top_keys(&after);
-        let foreign: Vec<String> = keys.iter().filter(|k| *k != AGY_HOOK_GROUP).cloned().collect();
+        let foreign: Vec<String> = keys
+            .iter()
+            .filter(|k| *k != AGY_HOOK_GROUP)
+            .cloned()
+            .collect();
         let expected: Vec<String> = top_keys(&user)
             .into_iter()
             .filter(|k| foreign.contains(k))
@@ -2688,7 +2697,10 @@ mod tests {
         assert_eq!(agy_registered_events(&after).len(), AGY_HOOK_EVENTS.len());
 
         let bytes = std::fs::read(&path).unwrap();
-        assert!(!register_agy_hooks_at(&path, AGY_HOOK).unwrap(), "已是最新不写");
+        assert!(
+            !register_agy_hooks_at(&path, AGY_HOOK).unwrap(),
+            "已是最新不写"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2708,8 +2720,14 @@ mod tests {
         assert!(!agy_group_is_current(&config, AGY_HOOK));
         upsert_agy_group(&mut config, AGY_HOOK).unwrap();
         assert!(agy_group_is_current(&config, AGY_HOOK));
-        assert_eq!(config[AGY_HOOK_GROUP]["enabled"], false, "用户的停用开关保留");
-        assert!(config[AGY_HOOK_GROUP].get("SessionStart").is_none(), "旧事件被换掉");
+        assert_eq!(
+            config[AGY_HOOK_GROUP]["enabled"], false,
+            "用户的停用开关保留"
+        );
+        assert!(
+            config[AGY_HOOK_GROUP].get("SessionStart").is_none(),
+            "旧事件被换掉"
+        );
         // preserve_order 下组原位替换;没开时 Map 按键名排序,两种情况相对顺序都不变
         assert_eq!(top_keys(&config), before_keys);
     }
@@ -2836,7 +2854,11 @@ mod tests {
         let raw = r#"{"orca-status":{"PreInvocation":[{"type":"command","command":"x"}]}}"#;
         std::fs::write(&path, raw).unwrap();
         assert_eq!(remove_agy_entries_at(&path).unwrap(), 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw, "紧凑排版原样保留");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            raw,
+            "紧凑排版原样保留"
+        );
 
         std::fs::write(&path, "{broken").unwrap();
         assert_eq!(remove_agy_entries_at(&path).unwrap(), 0);
@@ -2914,7 +2936,8 @@ mod tests {
     /// 从我们的组里抠出登记的二进制路径:两种命令写法都认,别家组 / 没有标识的不算。
     #[test]
     fn agy_registered_hook_path_parses_both_command_forms() {
-        let config = serde_json::json!({ AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)) });
+        let config =
+            serde_json::json!({ AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)) });
         assert_eq!(agy_registered_hook_path(&config).as_deref(), Some(AGY_HOOK));
         let unix = serde_json::json!({ AGY_HOOK_GROUP: {
             "Stop": [ { "type": "command", "command": "/opt/mini term/miniterm-hook Stop" } ]

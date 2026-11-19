@@ -536,7 +536,10 @@ mod tests {
         assert_eq!(p.cache_write, 0.0, "官方没给缓存写价就是 0,不拿聚合商的补");
 
         let priced = crate::PricingTable::new(table).resolve("gemini-3.8-flash-high");
-        assert!((priced.unwrap().input - 0.75e-6).abs() < 1e-15, "带档位的模型名落到本体");
+        assert!(
+            (priced.unwrap().input - 0.75e-6).abs() < 1e-15,
+            "带档位的模型名落到本体"
+        );
 
         // 聚合商目录里带 `google/` 前缀的 id 是次优先,压过不带前缀的聚合商
         assert_eq!(
