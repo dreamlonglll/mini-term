@@ -1,9 +1,8 @@
 //! AI CLI 会话记录读取与谱系扫描（原 `src-tauri/src/ai_sessions.rs`）。
 //!
-//! Claude / Codex / Grok / pi 支持历史面板等完整读取；OMP 目前接入移动镜像所需的
-//! 本机会话定位、消息与 ask 问答解析（pi 与 OMP 的记录同形，定位与行解析共用
-//! `omp.rs`）。opencode 只有状态与移动端指令，镜像必须跳过启发式绑定，否则会把
-//! 同项目其它 agent 的最新记录贴到该 pane。
+//! Claude / Codex / Grok / pi / OMP 支持本地历史列表与正文；pi 和 OMP 共用定位、
+//! 消息解析与桌面历史读取。opencode 只有状态与移动端指令，镜像必须跳过启发式
+//! 绑定，否则会把同项目其它 agent 的最新记录贴到该 pane。
 //!
 //! 原本的 `#[tauri::command]` 全部去掉,函数签名不变;跨模块共享的
 //! `pub(crate)` 项一律放宽成 `pub` —— 原来的消费者(remote_ssh / usage_stats /
@@ -14,7 +13,7 @@ mod delete;
 mod grok;
 mod lineage;
 mod omp;
-mod pi;
+mod pi_history;
 mod tool_activity;
 mod tool_path;
 
@@ -54,7 +53,8 @@ use codex::{
 };
 use grok::{get_grok_sessions, read_grok_session_content};
 use lineage::latest_model_from_file_tail;
-use pi::{get_pi_sessions, read_pi_session_content};
+use omp::PiFlavor;
+use pi_history::{get_pi_family_sessions, read_pi_family_session_content};
 
 use crate::agent::AgentKind;
 use mt_core::path_key::{posix_ci_eq_key, strip_verbatim_prefix, windows_eq_key};
@@ -115,7 +115,7 @@ pub fn invalidate_session_cache() {
 #[serde(rename_all = "camelCase")]
 pub struct AiSession {
     pub id: String,
-    pub session_type: String, // "claude" | "codex" | "grok" | "pi"
+    pub session_type: String, // "claude" | "codex" | "grok" | "pi" | "omp"
     pub title: String,
     pub timestamp: String, // ISO 8601
     /// 会话最新使用的模型（Claude: 尾窗反扫 assistant 行 message.model;
@@ -1103,7 +1103,12 @@ pub fn get_ai_session_content(
         Some(AgentKind::Claude) => read_claude_session_content(&session_id, &project_path),
         Some(AgentKind::Codex) => read_codex_session_content(&session_id, &project_path),
         Some(AgentKind::Grok) => read_grok_session_content(&session_id, &project_path),
-        Some(AgentKind::Pi) => read_pi_session_content(&session_id, &project_path),
+        Some(AgentKind::Pi) => {
+            read_pi_family_session_content(PiFlavor::Pi, &session_id, &project_path)
+        }
+        Some(AgentKind::Omp) => {
+            read_pi_family_session_content(PiFlavor::Omp, &session_id, &project_path)
+        }
         _ => Err(format!("不支持的会话类型: {}", session_type)),
     }
 }
@@ -1111,7 +1116,11 @@ pub fn get_ai_session_content(
 // ─── Tauri Commands ────────────────────────────────────────────
 
 pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
-    let cache_key = windows_eq_key(&project_path);
+    let cache_key = if cfg!(windows) {
+        windows_eq_key(&project_path)
+    } else {
+        mt_core::path_key::posix_trim_trailing(&project_path).to_owned()
+    };
 
     {
         let cache = session_cache()
@@ -1132,7 +1141,8 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     sessions.extend(get_claude_sessions(&project_path));
     sessions.extend(get_codex_sessions(&project_path));
     sessions.extend(get_grok_sessions(&project_path));
-    sessions.extend(get_pi_sessions(&project_path));
+    sessions.extend(get_pi_family_sessions(PiFlavor::Pi, &project_path));
+    sessions.extend(get_pi_family_sessions(PiFlavor::Omp, &project_path));
 
     // 按时间戳降序(最新在前)
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));

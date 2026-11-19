@@ -1,8 +1,8 @@
 //! pi 系(pi 与它的分支 oh-my-pi)的 JSONL 会话记录:定位 + 行解析。
 //!
-//! 两家的行格式相同(首行 `type=session` 头,正文 `type=message` 行,角色与正文在
-//! `message.*`),差在 agent 目录与「cwd → 目录名」的编码,用 [`PiFlavor`] 区分。
-//! 行解析函数沿用 `omp_*` 的名字,pi 直接复用;pi 独有的历史列表 / 正文读取在 `pi.rs`。
+//! 两家都用 `type=session` 头与 `type=message` 行(OMP 另有首行标题槽)；agent 目录
+//! 和「cwd → 目录名」的编码用 [`PiFlavor`] 区分。
+//! 行解析函数沿用 `omp_*` 的名字；两家的桌面历史读取共用 `pi_history.rs`。
 
 use std::collections::HashMap;
 use std::fs;
@@ -31,6 +31,10 @@ pub struct OmpSessionMeta {
 
 pub fn omp_session_meta_from_line(line: &str) -> Option<OmpSessionMeta> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    omp_session_meta(&obj)
+}
+
+fn omp_session_meta(obj: &serde_json::Value) -> Option<OmpSessionMeta> {
     if obj.get("type").and_then(|v| v.as_str()) != Some("session") {
         return None;
     }
@@ -57,7 +61,14 @@ pub(super) enum PiFlavor {
 }
 
 impl PiFlavor {
-    fn agent_dir(self) -> Option<PathBuf> {
+    pub(super) const fn kind(self) -> crate::AgentKind {
+        match self {
+            Self::Pi => crate::AgentKind::Pi,
+            Self::Omp => crate::AgentKind::Omp,
+        }
+    }
+
+    pub(super) fn agent_dir(self) -> Option<PathBuf> {
         match self {
             PiFlavor::Pi => crate::hook_registry::pi_agent_dir(),
             PiFlavor::Omp => crate::hook_registry::omp_agent_dir(),
@@ -75,14 +86,101 @@ impl PiFlavor {
     }
 }
 
-pub(super) fn session_meta(path: &Path) -> Option<OmpSessionMeta> {
-    let file = fs::File::open(path).ok()?;
-    for line in BufReader::new(file).lines().take(5).flatten() {
-        if let Some(meta) = omp_session_meta_from_line(&line) {
-            return Some(meta);
+/// 共享目录有明确的格式差别时才标注 agent；最老的无标记绝对路径记录无法区分。
+fn recorded_flavor(record: &serde_json::Value) -> Option<PiFlavor> {
+    match record.get("type").and_then(|value| value.as_str())? {
+        "title" | "title_change" | "model_usage" => Some(PiFlavor::Omp),
+        "session" if record.get("title").is_some_and(|title| title.is_string()) => {
+            Some(PiFlavor::Omp)
+        }
+        "model_change" if record.get("model").is_some_and(|model| model.is_string()) => {
+            Some(PiFlavor::Omp)
+        }
+        "model_change"
+            if record.get("modelId").is_some_and(|id| id.is_string())
+                && record
+                    .get("provider")
+                    .is_some_and(|provider| provider.is_string()) =>
+        {
+            Some(PiFlavor::Pi)
+        }
+        _ if record
+            .pointer("/runtime/version")
+            .is_some_and(|version| version.is_string()) =>
+        {
+            Some(PiFlavor::Omp)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn shared_sessions_root(flavor: PiFlavor, agent_dir: &Path) -> bool {
+    let other = match flavor {
+        PiFlavor::Pi => PiFlavor::Omp,
+        PiFlavor::Omp => PiFlavor::Pi,
+    };
+    other.agent_dir().is_some_and(|other_dir| {
+        other_dir == agent_dir
+            || mt_core::path::canonicalize(agent_dir.join("sessions"))
+                .ok()
+                .is_some_and(|root| {
+                    mt_core::path::canonicalize(other_dir.join("sessions"))
+                        .is_ok_and(|other| other == root)
+                })
+    })
+}
+
+pub(super) struct SessionHeader {
+    pub(super) meta: OmpSessionMeta,
+    pub(super) lines: Vec<String>,
+    pub(super) header_idx: usize,
+}
+
+/// 列表、正文、镜像和 pi 删除共用 cwd 与共享目录归属检查。
+pub(super) fn read_session_header(
+    reader: &mut impl BufRead,
+    path: &Path,
+    flavor: PiFlavor,
+    project: &SessionProject<'_>,
+    shared: bool,
+) -> Option<SessionHeader> {
+    let mut lines = Vec::new();
+    let mut header = None;
+    let mut recorded = None;
+    for line in reader.lines().take(8).map_while(Result::ok) {
+        let record: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        if header.is_none()
+            && let Some(meta) = omp_session_meta(&record)
+        {
+            if !project.matches(flavor, &meta.cwd) {
+                return None;
+            }
+            header = Some((lines.len(), meta));
+        }
+        if shared
+            && recorded.is_none()
+            && let Some(kind) = recorded_flavor(&record)
+        {
+            recorded = Some(kind);
+        }
+        lines.push(line);
+        if header.is_some() && (!shared || recorded.is_some()) {
+            break;
         }
     }
-    None
+    if shared {
+        let owner =
+            recorded.or_else(|| (!project.is_absolute_bucket(path)).then_some(PiFlavor::Omp));
+        if owner != Some(flavor) {
+            return None;
+        }
+    }
+    let (header_idx, meta) = header?;
+    Some(SessionHeader {
+        meta,
+        lines,
+        header_idx,
+    })
 }
 
 /// OMP 的 legacy absolute 目录编码。只去掉一个前导分隔符,UNC 路径必须保留第二个。
@@ -124,48 +222,102 @@ fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
     }
 }
 
-/// 计算 OMP 默认目录名,同时保留 legacy absolute 名称作为只读发现兜底。
+/// 新版 OMP 优先识别 temp，仍只读查找旧 home 相对桶和绝对路径桶。
 fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<String> {
-    let project_path = strip_verbatim_prefix(project_path);
-    let project_path = project_path.as_ref();
-    let default_name = if let Some(relative) = relative_to(home, project_path) {
-        encoded_relative_dir("-", &relative)
-    } else if let Some(relative) = relative_to(temp_root, project_path) {
-        encoded_relative_dir("-tmp", &relative)
-    } else {
-        encoded_absolute_dir(project_path)
-    };
-    let legacy_name = encoded_absolute_dir(project_path);
-    if default_name == legacy_name {
-        vec![default_name]
-    } else {
-        vec![default_name, legacy_name]
+    let mut names = Vec::with_capacity(3);
+    if let Some(relative) = relative_to(temp_root, project_path) {
+        names.push(encoded_relative_dir("-tmp", &relative));
+    }
+    if let Some(relative) = relative_to(home, project_path) {
+        let name = encoded_relative_dir("-", &relative);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.push(encoded_absolute_dir(project_path));
+    names
+}
+
+pub(super) struct SessionProject<'a> {
+    path: &'a str,
+    canonical: Option<PathBuf>,
+}
+
+impl<'a> SessionProject<'a> {
+    pub(super) fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            canonical: mt_core::path::canonicalize(path).ok(),
+        }
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &str> {
+        self.canonical
+            .as_deref()
+            .and_then(Path::to_str)
+            .filter(|path| *path != self.path)
+            .into_iter()
+            .chain(std::iter::once(self.path))
+    }
+
+    pub(super) fn matches(&self, flavor: PiFlavor, cwd: &str) -> bool {
+        if cwd.is_empty() {
+            return false;
+        }
+        let eq = |a: &str, b: &str| {
+            if cfg!(windows) || flavor == PiFlavor::Pi {
+                windows_eq_key(&strip_verbatim_prefix(a))
+                    == windows_eq_key(&strip_verbatim_prefix(b))
+            } else {
+                mt_core::path_key::posix_trim_trailing(a)
+                    == mt_core::path_key::posix_trim_trailing(b)
+            }
+        };
+        self.paths().any(|path| eq(cwd, path))
+            || self.canonical.as_ref().is_some_and(|project| {
+                Path::new(cwd).is_absolute()
+                    && mt_core::path::canonicalize(cwd).is_ok_and(|cwd| cwd == *project)
+            })
+    }
+
+    pub(super) fn is_absolute_bucket(&self, file: &Path) -> bool {
+        let bucket = file.parent().and_then(Path::file_name);
+        self.paths()
+            .any(|path| bucket == Some(std::ffi::OsStr::new(&encoded_absolute_dir(path))))
     }
 }
 
-pub(super) fn project_session_dirs_in(
+pub(super) fn session_dirs(
     flavor: PiFlavor,
     sessions_root: &Path,
     home: &Path,
     temp_root: &Path,
-    project_path: &str,
+    project: &SessionProject<'_>,
 ) -> Vec<PathBuf> {
     if !sessions_root.is_dir() {
         return Vec::new();
     }
 
-    let mut project_paths = vec![project_path.to_string()];
-    if let Ok(canonical) = mt_core::path::canonicalize(project_path)
-        && canonical.to_string_lossy() != project_path
-    {
-        project_paths.push(canonical.to_string_lossy().into_owned());
-    }
-
-    let home = home.to_string_lossy();
-    let temp_root = temp_root.to_string_lossy();
+    let canonical_home = (flavor == PiFlavor::Omp)
+        .then(|| mt_core::path::canonicalize(home).ok())
+        .flatten();
+    let canonical_temp = (flavor == PiFlavor::Omp)
+        .then(|| mt_core::path::canonicalize(temp_root).ok())
+        .flatten();
+    let fallback = (home.to_string_lossy(), temp_root.to_string_lossy());
+    let preferred = (
+        canonical_home.as_deref().unwrap_or(home).to_string_lossy(),
+        canonical_temp
+            .as_deref()
+            .unwrap_or(temp_root)
+            .to_string_lossy(),
+    );
     let mut names = Vec::new();
-    for project_path in project_paths {
-        for name in flavor.dir_names(&home, &temp_root, &project_path) {
+    for project_path in project.paths() {
+        let candidates = flavor.dir_names(&preferred.0, &preferred.1, project_path);
+        let legacy = (preferred != fallback)
+            .then(|| flavor.dir_names(&fallback.0, &fallback.1, project_path));
+        for name in candidates.into_iter().chain(legacy.into_iter().flatten()) {
             if !names.iter().any(|current| current == &name) {
                 names.push(name);
             }
@@ -179,71 +331,106 @@ pub(super) fn project_session_dirs_in(
         .collect()
 }
 
-pub(super) fn project_session_dirs(flavor: PiFlavor, project_path: &str) -> Vec<PathBuf> {
-    let Some(agent_dir) = flavor.agent_dir() else {
-        return Vec::new();
-    };
+pub(super) fn project_session_dirs(
+    flavor: PiFlavor,
+    agent_dir: &Path,
+    project: &SessionProject<'_>,
+) -> Vec<PathBuf> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
     };
-    project_session_dirs_in(
+    session_dirs(
         flavor,
         &agent_dir.join("sessions"),
         &home,
         &std::env::temp_dir(),
-        project_path,
+        project,
     )
 }
 
-pub(super) fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
-    // 两边都可能是 canonicalize 的 verbatim 形态:先剥 `\\?\` 再取 Windows 比较键
-    let key = |path: &str| windows_eq_key(&strip_verbatim_prefix(path));
-    key(&meta.cwd) == key(project_path)
+pub(super) fn session_filename_matches(path: &Path, session_id: &str) -> bool {
+    !session_id.is_empty()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.strip_suffix(".jsonl")
+                    .and_then(|stem| stem.strip_suffix(session_id))
+                    .is_some_and(|prefix| prefix.ends_with('_'))
+            })
 }
 
-fn find_session_file_in(
-    flavor: PiFlavor,
-    sessions_root: &Path,
-    home: &Path,
-    temp_root: &Path,
-    project_path: &str,
-    session_id: &str,
-) -> Option<PathBuf> {
-    let suffix = format!("_{session_id}.jsonl");
-    for dir in project_session_dirs_in(flavor, sessions_root, home, temp_root, project_path) {
+/// 先按修改时间、再按桶优先级、最后按路径选择；列表与按 ID 查找用同一个顺序。
+/// 定位正文时只 stat 文件名已经命中的副本，不扫整个项目的记录头。
+pub(super) fn ordered_session_files(
+    dirs: &[PathBuf],
+    session_id: Option<&str>,
+    limit: usize,
+) -> impl Iterator<Item = (PathBuf, Option<SystemTime>)> {
+    let mut files = Vec::new();
+    for (bucket, dir) in dirs.iter().enumerate() {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let matches_name = path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .is_some_and(|name| name.ends_with(&suffix));
-            if !matches_name {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+                || session_id.is_some_and(|id| !session_filename_matches(&path, id))
+            {
                 continue;
             }
-            let Some(meta) = session_meta(&path) else {
-                continue;
-            };
-            if meta.id == session_id && meta_matches_project(&meta, project_path) {
-                return Some(path);
+            if let Ok(meta) = path.metadata()
+                && meta.is_file()
+            {
+                files.push((meta.modified().ok(), bucket, path));
             }
+        }
+    }
+    files.sort_unstable_by(|(a_time, a_bucket, a), (b_time, b_bucket, b)| {
+        b_time
+            .cmp(a_time)
+            .then_with(|| a_bucket.cmp(b_bucket))
+            .then_with(|| a.cmp(b))
+    });
+    files
+        .into_iter()
+        .take(limit)
+        .map(|(time, _, path)| (path, time))
+}
+
+pub(super) fn find_session_file_in(
+    flavor: PiFlavor,
+    dirs: &[PathBuf],
+    project: &SessionProject<'_>,
+    session_id: &str,
+    shared: bool,
+) -> Option<PathBuf> {
+    for (path, _) in ordered_session_files(dirs, Some(session_id), usize::MAX) {
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let header = read_session_header(&mut BufReader::new(file), &path, flavor, project, shared);
+        if header.is_some_and(|header| header.meta.id == session_id) {
+            return Some(path);
         }
     }
     None
 }
 
-fn find_session_file(flavor: PiFlavor, project_path: &str, session_id: &str) -> Option<PathBuf> {
+pub(super) fn find_session_file(
+    flavor: PiFlavor,
+    project_path: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
     let agent_dir = flavor.agent_dir()?;
-    let home = dirs::home_dir()?;
+    let project = SessionProject::new(project_path);
+    let dirs = project_session_dirs(flavor, &agent_dir, &project);
     find_session_file_in(
         flavor,
-        &agent_dir.join("sessions"),
-        &home,
-        &std::env::temp_dir(),
-        project_path,
+        &dirs,
+        &project,
         session_id,
+        shared_sessions_root(flavor, &agent_dir),
     )
 }
 
@@ -270,38 +457,21 @@ pub fn newest_pi_session_file(project_path: &str) -> Option<(PathBuf, SystemTime
 /// 无 Hook 时的启发式绑定:先按 mtime 限量,再读取 header 校验 cwd。
 fn newest_session_file(flavor: PiFlavor, project_path: &str) -> Option<(PathBuf, SystemTime)> {
     const MAX_SCAN: usize = 30;
-    let mut newest: Option<(PathBuf, SystemTime)> = None;
-    for dir in project_session_dirs(flavor, project_path) {
-        let Ok(entries) = fs::read_dir(dir) else {
+    let agent_dir = flavor.agent_dir()?;
+    let project = SessionProject::new(project_path);
+    let dirs = project_session_dirs(flavor, &agent_dir, &project);
+    let shared = shared_sessions_root(flavor, &agent_dir);
+    for (path, modified) in ordered_session_files(&dirs, None, MAX_SCAN) {
+        let Some(modified) = modified else { continue };
+        let Ok(file) = fs::File::open(&path) else {
             continue;
         };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
-            .collect();
-        super::sort_newest_session_paths(&mut paths, MAX_SCAN);
-        for path in paths {
-            let Some(meta) = session_meta(&path) else {
-                continue;
-            };
-            if !meta_matches_project(&meta, project_path) {
-                continue;
-            }
-            let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
-                continue;
-            };
-            if newest
-                .as_ref()
-                .is_none_or(|(_, current)| modified > *current)
-            {
-                newest = Some((path, modified));
-            }
-            // paths 已按 mtime 降序,同一目录中首个 cwd 命中就是最新文件。
-            break;
+        if read_session_header(&mut BufReader::new(file), &path, flavor, &project, shared).is_some()
+        {
+            return Some((path, modified));
         }
     }
-    newest
+    None
 }
 
 /// OMP 18.x 的普通消息:外层 `type=message`,角色与正文位于 `message.*`。
@@ -560,6 +730,10 @@ mod tests {
             "-tmp-x"
         );
         assert_eq!(
+            session_dir_names(r"C:\Users\u", r"C:\Users\u\Temp", r"C:\Users\u\Temp\x"),
+            ["-tmp-x", "-Temp-x", "--C--Users-u-Temp-x--"]
+        );
+        assert_eq!(
             session_dir_names(r"C:\Users\u", r"C:\Users\u\Temp", r"D:\Git\proj")[0],
             "--D--Git-proj--"
         );
@@ -618,27 +792,18 @@ mod tests {
         .unwrap();
         // 项目在 root(当 home)之下:omp 的默认名是 home 相对,这里落的是 legacy 绝对名,
         // 照样找得到;pi 只认绝对名,同一份目录也找得到
+        let project = SessionProject::new(project.to_str().unwrap());
         for flavor in [PiFlavor::Omp, PiFlavor::Pi] {
-            let found = find_session_file_in(
+            let dirs = session_dirs(
                 flavor,
                 &agent.join("sessions"),
                 &root,
                 &root.join("Temp"),
-                project.to_str().unwrap(),
-                "session-1",
+                &project,
             );
+            let found = find_session_file_in(flavor, &dirs, &project, "session-1", false);
             assert_eq!(found.as_ref(), Some(&wanted), "{flavor:?}");
-            assert!(
-                find_session_file_in(
-                    flavor,
-                    &agent.join("sessions"),
-                    &root,
-                    &root.join("Temp"),
-                    project.to_str().unwrap(),
-                    "missing",
-                )
-                .is_none()
-            );
+            assert!(find_session_file_in(flavor, &dirs, &project, "missing", false).is_none());
         }
         fs::remove_dir_all(root).unwrap();
     }

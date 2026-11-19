@@ -184,8 +184,8 @@ const OMP: AgentSpec = AgentSpec {
     fork: None,
     cwd_bucket: CwdBucket::PerCwd,
     session_log: true,
-    // AI 历史面板、用量统计与谱系扫描仍未接入(只接了移动镜像)
-    history: false,
+    // 用量统计与谱系扫描仍未接入。
+    history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
 };
@@ -526,8 +526,7 @@ mod tests {
         }
     }
 
-    /// 能力位与 AGENTS.md「有会话记录的是 Claude/Codex/Pi/Grok/OMP」「历史面板接了
-    /// Claude/Codex/Pi/Grok」对账。
+    /// 有本地记录的 agent 都接入移动镜像与历史面板。
     #[test]
     fn 能力位对账() {
         let with_log: Vec<_> = AgentKind::ALL
@@ -554,7 +553,8 @@ mod tests {
                 AgentKind::Claude,
                 AgentKind::Codex,
                 AgentKind::Pi,
-                AgentKind::Grok
+                AgentKind::Grok,
+                AgentKind::Omp
             ]
         );
         // 能续接的必有会话记录(否则拿不到 id)
