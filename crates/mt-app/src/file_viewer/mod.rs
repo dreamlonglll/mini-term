@@ -915,6 +915,9 @@ impl FileViewer {
                 });
             }
         }
+        // 建在旧路径上的 WebView 作废,下一帧按新路径重建;Linux 没有 WebView 预览,
+        // 也就没有 Ready 这一态
+        #[cfg(any(windows, target_os = "macos"))]
         if matches!(*self.web_preview.borrow(), webview::WebPreview::Ready(_)) {
             *self.web_preview.borrow_mut() = webview::WebPreview::Idle;
         }
