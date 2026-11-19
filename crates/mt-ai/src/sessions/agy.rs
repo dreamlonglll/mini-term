@@ -145,7 +145,10 @@ impl AgyConversation {
         }
         self.workspaces.iter().any(|ws| {
             let ws = windows_eq_key(ws);
-            ws == project || ws.strip_prefix(&project).is_some_and(|rest| rest.starts_with('/'))
+            ws == project
+                || ws
+                    .strip_prefix(&project)
+                    .is_some_and(|rest| rest.starts_with('/'))
         })
     }
 }
@@ -228,9 +231,10 @@ pub fn normalize_db_time(raw: &str) -> Option<String> {
         return None;
     }
     let iso = raw.replacen(' ', "T", 1);
-    DateTime::parse_from_rfc3339(&iso)
-        .ok()
-        .map(|t| t.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true))
+    DateTime::parse_from_rfc3339(&iso).ok().map(|t| {
+        t.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    })
 }
 
 /// `workspace_uris` 列(JSON 字符串数组,可能是空串)→ 本地路径列表。
@@ -271,15 +275,15 @@ fn percent_decode(s: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
                 .ok()
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                out.push(b);
-                i += 3;
-                continue;
-            }
+        {
+            out.push(b);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -555,8 +559,14 @@ mod tests {
         assert!(parse_workspace_uris("").is_empty());
         assert!(parse_workspace_uris("null").is_empty());
         // 坏转义原样保留,不 panic
-        assert_eq!(file_uri_to_path("file:///D:/a%2").as_deref(), Some("D:/a%2"));
-        assert_eq!(file_uri_to_path("file:///D:/a%zz").as_deref(), Some("D:/a%zz"));
+        assert_eq!(
+            file_uri_to_path("file:///D:/a%2").as_deref(),
+            Some("D:/a%2")
+        );
+        assert_eq!(
+            file_uri_to_path("file:///D:/a%zz").as_deref(),
+            Some("D:/a%zz")
+        );
     }
 
     fn conv(workspaces: &[&str]) -> AgyConversation {
@@ -579,7 +589,10 @@ mod tests {
         assert!(c.belongs_to(r"D:\Git\mini-term"));
         assert!(c.belongs_to("D:/Git/mini-term/"));
         assert!(!c.belongs_to(r"D:\Git\mini"), "前缀不是目录边界");
-        assert!(!c.belongs_to(r"D:\Git\mini-term\crates"), "项目是会话的子目录不算");
+        assert!(
+            !c.belongs_to(r"D:\Git\mini-term\crates"),
+            "项目是会话的子目录不算"
+        );
         assert!(conv(&["D:/Git/mini-term/crates/mt-ai"]).belongs_to(r"D:\Git\mini-term"));
         assert!(!conv(&[]).belongs_to(r"D:\Git\mini-term"));
         assert!(!c.belongs_to(""));
@@ -639,7 +652,10 @@ mod tests {
         assert_eq!(main.id, "7e54f704-1278");
         assert_eq!(main.display_title(), "One Word Hello Reply");
         assert_eq!(main.updated_at.as_deref(), Some("2026-11-19T13:54:20.694Z"));
-        assert_eq!(main.last_user_input_at.as_deref(), Some("2026-11-19T13:54:17.425Z"));
+        assert_eq!(
+            main.last_user_input_at.as_deref(),
+            Some("2026-11-19T13:54:17.425Z")
+        );
         assert_eq!(main.workspaces, ["C:/ws"]);
         assert!(!main.is_subagent());
         let sub = &rows[1];

@@ -1710,8 +1710,13 @@ impl Render for SessionPanel {
             let vendor = if tree {
                 AiVendor::for_session(&session.session_type, session.model.as_deref())
             } else {
-                // 平铺的缺省是 claude(原版 `TYPE_VENDOR[...] ?? 'claude'`)
+                // 平铺的缺省是 claude(原版 `TYPE_VENDOR[...] ?? 'claude'`)。CLI 图标表里
+                // 还没有的 agent(agy)先按模型推一次:回落成 Claude 图标会让人以为是
+                // claude 的会话
                 AiVendor::from_session_type(&session.session_type)
+                    .or_else(|| {
+                        AiVendor::for_session(&session.session_type, session.model.as_deref())
+                    })
                     .or(Some(AiVendor::Claude))
             };
             let wsl_badge = session.wsl_distro.clone();
@@ -2025,12 +2030,36 @@ mod tests {
                 "01a17c02-730e-74db-ab0c-337bb007000f",
                 "pi --session 01a17c02-730e-74db-ab0c-337bb007000f",
             ),
+            (
+                "agy",
+                "7e54f704-1278-4123-8ad4-11e8f6922c82",
+                "agy --conversation 7e54f704-1278-4123-8ad4-11e8f6922c82",
+            ),
         ] {
             assert_eq!(
                 session_resume_command(&ai_session(session_type, id)).as_deref(),
                 Some(expected)
             );
         }
+    }
+
+    /// agy 有列表、能续接、能复制命令,但右键菜单不出「删除会话」(要动 agy 自己的
+    /// SQLite 索引,见 `mt_ai::sessions::session_delete_supported`);它只有宿主来源,
+    /// 恢复不需要反查启动目录(会话按 id 全局存放)。
+    #[test]
+    fn agy_会话可续接不可删() {
+        let s = ai_session("agy", "7e54f704-1278-4123-8ad4-11e8f6922c82");
+        assert!(session_resume_command(&s).is_some());
+        assert!(!mt_ai::sessions::session_delete_supported(
+            &s.session_type,
+            s.wsl_distro.as_deref(),
+            s.ssh_connection_id.as_deref(),
+        ));
+        assert!(
+            !mt_ai::AgentKind::parse(&s.session_type)
+                .unwrap()
+                .looks_up_session_cwd()
+        );
     }
 
     /// 认不出 / 不支持续接的 agent 不再落到 `claude --resume`(旧口径的 bug:
@@ -2102,6 +2131,10 @@ mod tests {
         assert!(hit("claude code", "随便", None, "claude"));
         assert!(hit("oh-my", "随便", None, "omp"));
         assert!(!hit("grok", "随便", None, "claude"));
+        // agy:命令名与展示名「Antigravity CLI」都认
+        assert!(hit("agy", "随便", None, "agy"));
+        assert!(hit("antigravity", "随便", None, "agy"));
+        assert!(!hit("antigravity", "随便", None, "claude"));
     }
 
     #[test]

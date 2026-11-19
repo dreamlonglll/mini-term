@@ -501,6 +501,11 @@ mod tests {
             "omp 谱系未接,不开 fork"
         );
         assert_eq!(
+            branch_menu_segment(Some(&session(Some("agy"), id)), None),
+            BranchMenuSegment::None,
+            "agy 只有 TUI 里的 /fork,没有 CLI 级 fork"
+        );
+        assert_eq!(
             branch_menu_segment(Some(&session(Some("opencode"), id)), None),
             BranchMenuSegment::None
         );
@@ -532,7 +537,7 @@ mod tests {
             BranchMenuSegment::None,
             "grok 无 fork 位,不提示"
         );
-        for agent in ["opencode", "pi", "omp"] {
+        for agent in ["opencode", "pi", "omp", "agy"] {
             assert_eq!(
                 branch_menu_segment(None, Some(agent)),
                 BranchMenuSegment::None,

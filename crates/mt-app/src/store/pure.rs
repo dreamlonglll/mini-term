@@ -1295,6 +1295,11 @@ mod tests {
             resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
             Some("pi --session 01a17c02-730e-74db-ab0c-337bb007000f")
         );
+        let s = session(Some("agy"), "7e54f704-1278-4123-8ad4-11e8f6922c82");
+        assert_eq!(
+            resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+            Some("agy --conversation 7e54f704-1278-4123-8ad4-11e8f6922c82")
+        );
         for agent in [None, Some(""), Some("claude-code")] {
             let s = session(agent, "abc-123");
             assert_eq!(
@@ -1398,7 +1403,7 @@ mod tests {
             calls.set(calls.get() + 1);
             Some("D:/from-jsonl".to_string())
         };
-        for agent in ["codex", "omp", "pi", "grok", "opencode", "gemini"] {
+        for agent in ["codex", "omp", "pi", "grok", "agy", "opencode", "gemini"] {
             let s = session(Some(agent), "rollout_9");
             assert_eq!(
                 decide_resume_cwd(None, &s, |s| resolve_resume_cwd_with(s, lookup)),

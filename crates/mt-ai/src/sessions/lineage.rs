@@ -394,25 +394,27 @@ fn enrich_bookkept_edges(
         if have.contains(&e.session_id) {
             continue;
         }
-        let branch_title = if AgentKind::parse(&e.agent) == Some(AgentKind::Codex) {
-            codex_dir.as_ref().filter(|d| d.exists()).and_then(|d| {
+        let branch_title = match AgentKind::from_session_agent(Some(&e.agent)) {
+            Some(AgentKind::Codex) => codex_dir.as_ref().filter(|d| d.exists()).and_then(|d| {
                 let child = find_codex_session_file(d, &e.session_id)?;
                 let parent = find_codex_session_file(d, &e.parent_session_id)?;
                 branch_title_from_texts(
                     &codex_user_texts(&parent, 300),
                     &codex_user_texts(&child, 300),
                 )
-            })
-        } else {
-            // claude 系(含 hook 上报的 claude-code)
-            (|| {
+            }),
+            // claude 系(含 hook 上报的 claude-code 与缺省 agent)
+            Some(AgentKind::Claude) => (|| {
                 let child = find_claude_session_file(&claude_dirs, &e.session_id)?;
                 let parent = find_claude_session_file(&claude_dirs, &e.parent_session_id)?;
                 branch_title_from_texts(
                     &claude_user_texts(&parent, 300),
                     &claude_user_texts(&child, 300),
                 )
-            })()
+            })(),
+            // 其余几家(grok / pi / omp / agy)没有谱系解析:边照收、不配分支标题,
+            // 也不拿别家的 id 去 `~/.claude/projects` 里白翻一遍
+            _ => None,
         };
         edges.push(LineageEdge {
             agent: e.agent,
@@ -429,6 +431,34 @@ mod tests {
     use super::*;
 
     // ---- 会话分支链路 ----
+
+    /// 没有谱系解析的 agent(agy 等)的自记账边:原样并入、不配分支标题、不 panic;
+    /// 磁盘边已有的 child 不重复。
+    #[test]
+    fn bookkept_edges_of_unparsed_agents_pass_through() {
+        let bookkept = |agent: &str, child: &str| BookkeptLineageEdge {
+            agent: agent.into(),
+            session_id: child.into(),
+            parent_session_id: "parent-1".into(),
+            fork_point_uuid: None,
+        };
+        let mut edges = vec![LineageEdge {
+            agent: "claude".into(),
+            session_id: "dup".into(),
+            parent_session_id: "p".into(),
+            fork_point_uuid: None,
+            branch_title: None,
+        }];
+        enrich_bookkept_edges(
+            r"D:\mt-test-no-such-project",
+            vec![bookkept("agy", "agy-child"), bookkept("agy", "dup")],
+            &mut edges,
+        );
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[1].agent, "agy");
+        assert_eq!(edges[1].session_id, "agy-child");
+        assert_eq!(edges[1].branch_title, None);
+    }
 
     #[test]
     fn find_claude_session_file_rejects_non_whitelist_id() {

@@ -17,10 +17,11 @@
 //!   预筛只会放过、不会误杀——判别串是 JSON 里必然逐字出现的键值。
 //!
 //! 目标字段核对过本机真实记录的有 Claude / Codex / Grok / pi(见各段注释);OMP 本机
-//! 没有记录,字段名按 oh-my-pi 源码的工具参数 schema 定。
+//! 没有记录,字段名按 oh-my-pi 源码的工具参数 schema 定;agy 见该段注释。
 
 use serde_json::Value;
 
+use super::agy::{AgyStep, AgyStepKind, AgyToolCall, parse_agy_step};
 use super::grok::{grok_acp_update, unix_to_iso};
 use super::line_timestamp;
 use super::tool_path::ToolPathScope;
@@ -473,6 +474,117 @@ fn omp_target(name: &str, args: &Value, paths: &ToolPathScope) -> Option<String>
         "fetch" => &[Field::Text("url")],
         "task" => &[Field::Text("name")],
         _ => return None,
+    };
+    first_target(args, fields, paths)
+}
+
+// ─── Antigravity CLI(agy)────────────────────────────────────────
+//
+// 工具调用是 transcript 里 `PLANNER_RESPONSE` 步的 `tool_calls[{name, args}]`(一步
+// 可带多个,按数组序);结果是随后的 `GENERIC` 步,不带工具名,这里不看。参数键是
+// **PascalCase**。核对过本机真实记录的:`run_command.CommandLine`、`read_file.Path`、
+// `invoke_subagent.Role/TypeName/Prompt`、`send_message.Message`、
+// `ask_question.questions[].question`;其余工具的键取自 agy 1.5.12 二进制里的
+// 「X is required」校验串(`TargetFile` / `AbsolutePath` / `DirectoryPath` /
+// `SearchPath` / `SearchDirectory` / `NotebookPath` / `Query` / `Url` …),工具与键的
+// 对应是按名字推的,所以每个工具都留了后备键,没对上也只是少一行目标。
+//
+// **不排除任何工具**:agy 不出提问卡片(见 mt-relay `parse_agy_line`),`ask_question`
+// 照常算一行工具活动,目标取第一道题的题面。
+
+/// 解析 agy transcript 的一行为工具调用(`PLANNER_RESPONSE.tool_calls`,按数组序)。
+/// 路径类目标按 `paths` 缩短。
+pub fn agy_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
+    if !line.contains("\"tool_calls\"") {
+        return Vec::new();
+    }
+    parse_agy_step(line).map_or_else(Vec::new, |step| agy_tool_calls_from_step(&step, paths))
+}
+
+/// [`agy_tool_calls_from_line`] 的已解析版:镜像那边一行只解析一次,正文与工具都从
+/// 同一个 [`AgyStep`] 取。非 `PLANNER_RESPONSE` 步不产出。
+pub fn agy_tool_calls_from_step(step: &AgyStep, paths: &ToolPathScope) -> Vec<AiToolCall> {
+    if step.kind != AgyStepKind::PlannerResponse {
+        return Vec::new();
+    }
+    let timestamp = step.created_at.clone().unwrap_or_default();
+    step.tool_calls
+        .iter()
+        .filter(|call| !call.name.is_empty())
+        .map(|call| AiToolCall {
+            name: call.name.clone(),
+            target: agy_target(call, paths),
+            timestamp: timestamp.clone(),
+        })
+        .collect()
+}
+
+fn agy_target(call: &AgyToolCall, paths: &ToolPathScope) -> Option<String> {
+    let args = &call.args;
+    let fields: &[Field] = match call.name.as_str() {
+        "run_command" => &[Field::Text("CommandLine")],
+        "send_command_input" => &[Field::Text("Input")],
+        // 文件读写:读用 `Path`(实测)/ `AbsolutePath`,写与改用 `TargetFile`
+        "read_file" | "view_file" => &[
+            Field::Path("Path"),
+            Field::Path("AbsolutePath"),
+            Field::Path("TargetFile"),
+        ],
+        "write_to_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" => &[
+            Field::Path("TargetFile"),
+            Field::Path("AbsolutePath"),
+            Field::Path("Path"),
+        ],
+        "notebook_edit" | "notebook_execution" => {
+            &[Field::Path("NotebookPath"), Field::Path("AbsolutePath")]
+        }
+        "list_dir" => &[Field::Path("DirectoryPath"), Field::Path("Path")],
+        // 搜索:先给搜索词,没有再给搜索范围
+        "grep_search" => &[
+            Field::Text("Query"),
+            Field::Text("Pattern"),
+            Field::Path("SearchPath"),
+        ],
+        "find_by_name" => &[
+            Field::Text("Pattern"),
+            Field::Text("Query"),
+            Field::Path("SearchDirectory"),
+        ],
+        "search_web" => &[Field::Text("Query"), Field::Text("query")],
+        "read_url_content" | "open_browser_url" => &[Field::Text("Url"), Field::Text("URL")],
+        // 子代理:实测 Role 是一句短名(「File Reader」),TypeName 是代理类型,Prompt 是整段任务
+        "invoke_subagent" | "browser_subagent" => &[
+            Field::Text("Role"),
+            Field::Text("TypeName"),
+            Field::Text("Task"),
+            Field::Text("Prompt"),
+        ],
+        "send_message" => &[Field::Text("Message")],
+        "call_mcp_tool" => &[Field::Text("ToolName"), Field::Text("ServerName")],
+        "generate_image" => &[Field::Text("Prompt")],
+        "ask_question" => {
+            return args
+                .get("questions")?
+                .as_array()?
+                .iter()
+                .find_map(|q| q.get("question")?.as_str().and_then(summarize_tool_target));
+        }
+        // 轮询 / 等待 / 权限类:没有能一行概括的对象
+        "command_status" | "wait" | "wait_5_seconds" | "finish" | "list_permissions" => {
+            return None;
+        }
+        // 没见过的工具:按常见目标键的优先级取一个,最后才用模型自己写的 toolSummary
+        _ => &[
+            Field::Text("CommandLine"),
+            Field::Path("TargetFile"),
+            Field::Path("AbsolutePath"),
+            Field::Path("Path"),
+            Field::Path("DirectoryPath"),
+            Field::Text("Query"),
+            Field::Text("Pattern"),
+            Field::Text("Url"),
+            Field::Text("toolSummary"),
+        ],
     };
     first_target(args, fields, paths)
 }
@@ -1256,5 +1368,146 @@ mod tests {
         assert!(got.starts_with(r"segment\segment\"), "{got}");
         assert!(got.ends_with('…'));
         assert_eq!(got.chars().count(), TOOL_TARGET_MAX_CHARS + 1);
+    }
+
+    // ---- agy ----
+
+    /// 行形态取自本机 agy 1.5.12 的真实 transcript(路径换短):一步两个调用,按数组序;
+    /// 路径类缩短、命令原样;时间戳取该步的 created_at。
+    #[test]
+    fn agy_tool_calls_in_array_order() {
+        let line = r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:44:34Z","model":"gemini-3.8-flash-high","input_tokens":8913,"cache_read_tokens":0,"output_tokens":408,"thinking":"…","tool_calls":[{"name":"read_file","args":{"Path":"D:\\proj\\hello.txt"}},{"name":"run_command","args":{"CommandLine":"echo probe-ok\necho 2","WaitMsBeforeAsync":5000,"toolSummary":"Echo probe-ok"}}]}"#;
+        assert_eq!(
+            agy_tool_calls_from_line(line, &proj_paths()),
+            vec![
+                call("read_file", Some("hello.txt"), "2026-11-19T13:44:34Z"),
+                call("run_command", Some("echo probe-ok"), "2026-11-19T13:44:34Z"),
+            ]
+        );
+        // 已解析版与行版同一结果
+        let step = parse_agy_step(line).unwrap();
+        assert_eq!(
+            agy_tool_calls_from_step(&step, &proj_paths()),
+            agy_tool_calls_from_line(line, &proj_paths())
+        );
+    }
+
+    /// ask_question 照出工具行(agy 不出提问卡片),目标是第一道题;子代理取 Role。
+    #[test]
+    fn agy_question_and_subagent_targets() {
+        let ask = r#"{"type":"PLANNER_RESPONSE","created_at":"t","tool_calls":[{"name":"ask_question","args":{"questions":[{"is_multi_select":false,"options":["Red","Blue"],"question":"Which color do you prefer?"}]}}]}"#;
+        assert_eq!(
+            agy_tool_calls_from_line(ask, &no_paths()),
+            vec![call(
+                "ask_question",
+                Some("Which color do you prefer?"),
+                "t"
+            )]
+        );
+        let sub = r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"invoke_subagent","args":{"Prompt":"Please read the file\nand reply","Role":"File Reader","TypeName":"research"}},{"name":"send_message","args":{"Message":"probe file line 1","Recipient":"35f9ab48"}}]}"#;
+        assert_eq!(
+            agy_tool_calls_from_line(sub, &no_paths()),
+            vec![
+                call("invoke_subagent", Some("File Reader"), ""),
+                call("send_message", Some("probe file line 1"), ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn agy_target_per_tool() {
+        let paths = proj_paths();
+        let cases = [
+            (
+                "view_file",
+                r#"{"AbsolutePath":"D:\\proj\\src\\a.rs"}"#,
+                Some(r"src\a.rs"),
+            ),
+            (
+                "write_to_file",
+                r#"{"TargetFile":"D:\\proj\\b.md","CodeContent":"x"}"#,
+                Some("b.md"),
+            ),
+            (
+                "replace_file_content",
+                r#"{"TargetFile":"C:\\Users\\Dev\\x.txt","ReplacementChunks":[]}"#,
+                Some(r"~\x.txt"),
+            ),
+            (
+                "multi_replace_file_content",
+                r#"{"TargetFile":"c.rs"}"#,
+                Some("c.rs"),
+            ),
+            ("list_dir", r#"{"DirectoryPath":"D:\\proj"}"#, Some(".")),
+            (
+                "grep_search",
+                r#"{"Query":"fn main","SearchPath":"D:\\proj"}"#,
+                Some("fn main"),
+            ),
+            (
+                "grep_search",
+                r#"{"SearchPath":"D:\\proj\\src"}"#,
+                Some("src"),
+            ),
+            (
+                "find_by_name",
+                r#"{"Pattern":"*.rs","SearchDirectory":"D:\\proj"}"#,
+                Some("*.rs"),
+            ),
+            ("search_web", r#"{"query":"gpui docs"}"#, Some("gpui docs")),
+            (
+                "read_url_content",
+                r#"{"Url":"https://example.com"}"#,
+                Some("https://example.com"),
+            ),
+            (
+                "call_mcp_tool",
+                r#"{"ServerName":"ctx","ToolName":"query"}"#,
+                Some("query"),
+            ),
+            (
+                "notebook_edit",
+                r#"{"NotebookPath":"D:\\proj\\n.ipynb"}"#,
+                Some("n.ipynb"),
+            ),
+            ("command_status", r#"{"CommandId":"c1"}"#, None),
+            ("wait_5_seconds", r#"{}"#, None),
+            // 没见过的工具:常见键优先,最后用 toolSummary
+            (
+                "brand_new_tool",
+                r#"{"TargetFile":"D:\\proj\\z.rs"}"#,
+                Some("z.rs"),
+            ),
+            (
+                "brand_new_tool",
+                r#"{"toolSummary":"Do a thing"}"#,
+                Some("Do a thing"),
+            ),
+            ("brand_new_tool", r#"{"Other":1}"#, None),
+            // 参数不是对象 / 目标为空:调用照出,目标为 None
+            ("run_command", r#"null"#, None),
+            ("run_command", r#"{"CommandLine":"   "}"#, None),
+        ];
+        for (name, args, expected) in cases {
+            let line = format!(
+                r#"{{"type":"PLANNER_RESPONSE","tool_calls":[{{"name":"{name}","args":{args}}}]}}"#
+            );
+            let calls = agy_tool_calls_from_line(&line, &paths);
+            assert_eq!(calls.len(), 1, "{line}");
+            assert_eq!(calls[0].target.as_deref(), expected, "{line}");
+        }
+    }
+
+    /// 只有 PLANNER_RESPONSE 出工具行:GENERIC 结果正文里出现判别串不算,非 JSON 不算。
+    #[test]
+    fn agy_only_planner_steps_yield_tools() {
+        let generic = r#"{"type":"GENERIC","content":"\"tool_calls\":[{\"name\":\"x\"}]"}"#;
+        assert!(agy_tool_calls_from_line(generic, &no_paths()).is_empty());
+        let user =
+            r#"{"type":"USER_INPUT","content":"tool_calls","tool_calls":[{"name":"x","args":{}}]}"#;
+        assert!(agy_tool_calls_from_line(user, &no_paths()).is_empty());
+        assert!(agy_tool_calls_from_line("garbage \"tool_calls\"", &no_paths()).is_empty());
+        let text_only = r#"{"type":"PLANNER_RESPONSE","content":"hello"}"#;
+        assert!(agy_tool_calls_from_line(text_only, &no_paths()).is_empty());
     }
 }
