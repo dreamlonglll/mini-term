@@ -43,7 +43,9 @@ use crate::agent::AgentKind;
 
 use super::codex::{codex_meta_from_line, collect_codex_session_paths};
 use super::grok::find_grok_cwd_dirs_in;
-use super::omp::{PiFlavor, meta_matches_project, project_session_dirs_in, session_meta};
+use super::omp::{
+    PiFlavor, SessionProject, read_session_header, session_dirs, shared_sessions_root,
+};
 use super::{
     PathStyle, derive_wsl_target, find_claude_project_dirs_in, home_dir, invalidate_session_cache,
     session_id_path_safe, wsl_candidate_homes,
@@ -198,6 +200,7 @@ pub fn plan_session_delete(
                 &std::env::temp_dir(),
                 project_path,
                 session_id,
+                shared_sessions_root(PiFlavor::Pi, &agent_dir),
             )?
         }
         _ => return Err(SessionDeleteError::Unsupported),
@@ -416,9 +419,11 @@ fn pi_targets(
     temp_root: &Path,
     project_path: &str,
     session_id: &str,
+    shared: bool,
 ) -> Result<Vec<SessionDeleteTarget>, SessionDeleteError> {
     let mut targets = Vec::new();
-    for dir in project_session_dirs_in(PiFlavor::Pi, root, home, temp_root, project_path) {
+    let project = SessionProject::new(project_path);
+    for dir in session_dirs(PiFlavor::Pi, root, home, temp_root, &project) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -427,8 +432,15 @@ fn pi_targets(
                 continue;
             }
             // 与列表同口径按头部认,不按文件名:名字对不上的文件列表照样会列出来
-            let is_session = session_meta(&path).is_some_and(|meta| {
-                meta.id == session_id && meta_matches_project(&meta, project_path)
+            let is_session = fs::File::open(&path).ok().is_some_and(|file| {
+                read_session_header(
+                    &mut BufReader::new(file),
+                    &path,
+                    PiFlavor::Pi,
+                    &project,
+                    shared,
+                )
+                .is_some_and(|header| header.meta.id == session_id)
             });
             if is_session {
                 targets.push(checked_target(root, path, false, None)?);
@@ -488,7 +500,7 @@ fn remove_target(target: &SessionDeleteTarget) -> Result<(), SessionDeleteError>
 mod tests {
     use super::super::codex::get_codex_sessions_in;
     use super::super::grok::grok_sessions_in;
-    use super::super::pi::pi_sessions_in;
+    use super::super::pi_history::pi_family_sessions_in;
     use super::super::{get_claude_sessions_in, session_cache, session_cache_epoch};
     use super::*;
 
@@ -596,7 +608,7 @@ mod tests {
     }
 
     fn pi_sessions(dirs: &[PathBuf]) -> Vec<String> {
-        pi_sessions_in(dirs, PROJECT)
+        pi_family_sessions_in(PiFlavor::Pi, dirs, &SessionProject::new(PROJECT), false)
             .into_iter()
             .map(|s| s.id)
             .collect()
@@ -861,16 +873,46 @@ mod tests {
         let collision = bucket.join("collision.jsonl");
         write(&collision, &pi_header(ID, r"D:\pro\j"));
 
-        let dirs = project_session_dirs_in(PiFlavor::Pi, &root, &tmp.0, &tmp.0, PROJECT);
+        let dirs = session_dirs(
+            PiFlavor::Pi,
+            &root,
+            &tmp.0,
+            &tmp.0,
+            &SessionProject::new(PROJECT),
+        );
         assert!(pi_sessions(&dirs).contains(&ID.to_string()));
 
-        let targets = pi_targets(&root, &tmp.0, &tmp.0, PROJECT, ID).unwrap();
+        let targets = pi_targets(&root, &tmp.0, &tmp.0, PROJECT, ID, false).unwrap();
         assert_eq!(targets.len(), 2, "{targets:?}");
         execute_session_delete(&plan_from_targets(targets).unwrap()).unwrap();
 
         assert!(!own.exists() && !renamed.exists());
         assert!(other.exists() && collision.exists());
         assert_eq!(pi_sessions(&dirs), [OTHER]);
+
+        let omp = bucket.join(format!("2026-10-01T00-00-00-002Z_{ID}.jsonl"));
+        write(
+            &omp,
+            &format!(
+                "{}\n{}",
+                r#"{"type":"title","v":1,"title":"OMP"}"#,
+                pi_header(ID, PROJECT)
+            ),
+        );
+        let pi = bucket.join(format!("2026-10-01T00-00-00-003Z_{ID}.jsonl"));
+        write(
+            &pi,
+            &format!(
+                "{}\n{}",
+                pi_header(ID, PROJECT),
+                r#"{"type":"model_change","provider":"x","modelId":"y"}"#
+            ),
+        );
+        let shared = pi_targets(&root, &tmp.0, &tmp.0, PROJECT, ID, true).unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].path.file_name(), pi.file_name());
+        execute_session_delete(&plan_from_targets(shared).unwrap()).unwrap();
+        assert!(omp.exists());
     }
 
     // ---- 路径校验 ----
