@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "晨曦云庭",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1175,
+      "sha256": "0c904740cd4de70166893d3952c029d2885158b6b4d815cc6bf11cf7c7e08198"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 1407825,
+      "sha256": "2ae838783dfe76fc695d301512243160bc95101a3c1cab9aeae942390bd4ae54"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2406,
+      "sha256": "2ee8cc61039ec1138b5392d6551dc396f9f6dee6de342a60325ee292f5ea4edd"
+    }
+  ]
+}

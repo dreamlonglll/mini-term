@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "暮紫鎏金",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1172,
+      "sha256": "860f85ebbed865affb7b8a2ab26624bc5d15f08e3dbe1a6c856a5fabd299353d"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 1068085,
+      "sha256": "08b3d3d4eb5cecb7d64293e014baffd4f742d9729806afdb16ff612cb3d006d6"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2640,
+      "sha256": "e35f802f89864440452128e4b844d31fc15541f513eaaa4f665b8187f7c30f9e"
+    }
+  ]
+}

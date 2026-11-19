@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "银灰机能",
+  "name": "银灰机能",
+  "appearance": "light",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.5,
+    "focusY": 0.45
+  },
+  "colors": {
+    "background": "#f2f4f7",
+    "panel": "#e7ebf0",
+    "panelAlt": "#dce7ef",
+    "accent": "#005477",
+    "accentAlt": "#67421d",
+    "secondary": "#3a4e73",
+    "highlight": "#205347",
+    "text": "#222a35",
+    "muted": "#435166",
+    "line": "#a7b4c5"
+  },
+  "effects": {
+    "surfaceOpacity": 0.92,
+    "backgroundDim": 0.12,
+    "terminalOpacity": 0.88
+  },
+  "terminal": {
+    "foreground": "#222a35",
+    "cursor": "#007298",
+    "cursorAccent": "#f2f4f7",
+    "selectionBackground": "#c0ddea",
+    "selectionForeground": "#222a35",
+    "black": "#1c2530",
+    "red": "#85283f",
+    "green": "#205347",
+    "yellow": "#67421d",
+    "blue": "#2c4d7b",
+    "magenta": "#633478",
+    "cyan": "#00516d",
+    "white": "#435166",
+    "brightBlack": "#49576b",
+    "brightRed": "#8c3048",
+    "brightGreen": "#255d50",
+    "brightYellow": "#714b21",
+    "brightBlue": "#335786",
+    "brightMagenta": "#6e3e89",
+    "brightCyan": "#085d73",
+    "brightWhite": "#222a35"
+  }
+}

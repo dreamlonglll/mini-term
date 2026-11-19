@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "霜蓝听雪",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1173,
+      "sha256": "1d23382efea42c9431921001eb29a7380a7975b937b95cfeac18037266d2be72"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 804446,
+      "sha256": "2b0df9e97da6c013d4a65de56772061a43918415ba6d42ecec59806daa84a60d"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3128,
+      "sha256": "67ba4e7a6a8198481c0801d97c5129ec87715266e8f9a7025f325f7204c5a07a"
+    }
+  ]
+}

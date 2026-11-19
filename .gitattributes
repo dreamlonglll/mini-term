@@ -1,7 +1,10 @@
 # 皮肤库按字节原样分发:每份皮肤的 zip 与同名文件夹要逐字节一致
 # (mt-theme-packs 的测试会对账)。Windows 上 core.autocrlf=true 检出会把
-# 文件夹里的 JSON 换成 CRLF,zip 里仍是 LF,两边就对不上了。
-theme/**/*.json text eol=lf
+# 文件夹里的文本换成 CRLF,zip 里仍是原样,两边就对不上了。有的皮肤的
+# manifest.json 还把 theme.json / README.md 也登记了 bytes + sha256(雨光的文本
+# 本身就是 CRLF),换行一被改写,导入就报「大小不符」。所以皮肤目录里的文件
+# 一律按二进制原样存取,不做任何换行转换(顺带不进 `git diff --check`)
+theme/*/** binary
 
 # 内置字体经 include_bytes! 编进 exe,一个字节都不能被换行转换动到
 *.ttf binary

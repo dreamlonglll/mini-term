@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "霜刃紫焰",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1173,
+      "sha256": "91d0e4529cfcaa028317360ada7d2c0ad540b5a679b88358a1f22829d8f69f0f"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 625371,
+      "sha256": "d68787e3413c7a520e75159e2804de2f4f0e3291dfa0c2979ebc63aea2341f20"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3075,
+      "sha256": "64bd01ef547f4072300abfa99c5570f6240ad99cb94f07af4493f2dc3fe669c5"
+    }
+  ]
+}

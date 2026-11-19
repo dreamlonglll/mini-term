@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "霜刃紫焰",
+  "name": "霜刃紫焰",
+  "appearance": "dark",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.5,
+    "focusY": 0.45
+  },
+  "colors": {
+    "background": "#101827",
+    "panel": "#19263a",
+    "panelAlt": "#23334b",
+    "accent": "#75d9ff",
+    "accentAlt": "#e6bd84",
+    "secondary": "#cbb0f7",
+    "highlight": "#a1d4b6",
+    "text": "#e9f0fb",
+    "muted": "#b9c8df",
+    "line": "#39516f"
+  },
+  "effects": {
+    "surfaceOpacity": 0.86,
+    "backgroundDim": 0.28,
+    "terminalOpacity": 0.74
+  },
+  "terminal": {
+    "foreground": "#e9f0fb",
+    "cursor": "#75d9ff",
+    "cursorAccent": "#101827",
+    "selectionBackground": "#473b68",
+    "selectionForeground": "#f5f8ff",
+    "black": "#101827",
+    "red": "#f3a6b4",
+    "green": "#a1d4b6",
+    "yellow": "#e6bd84",
+    "blue": "#9dbff0",
+    "magenta": "#d5aff2",
+    "cyan": "#8ed8e9",
+    "white": "#d2deef",
+    "brightBlack": "#aabbd3",
+    "brightRed": "#ffc1ca",
+    "brightGreen": "#bce9cc",
+    "brightYellow": "#f5d7a7",
+    "brightBlue": "#c0d5ff",
+    "brightMagenta": "#e9c9ff",
+    "brightCyan": "#b9edfb",
+    "brightWhite": "#f5f8ff"
+  }
+}

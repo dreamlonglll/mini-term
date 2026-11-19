@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "晨曦云庭",
+  "name": "晨曦云庭",
+  "appearance": "light",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.4,
+    "focusY": 0.5
+  },
+  "colors": {
+    "background": "#f1effa",
+    "panel": "#e5e5f3",
+    "panelAlt": "#d9daee",
+    "accent": "#55479f",
+    "accentAlt": "#704817",
+    "secondary": "#345990",
+    "highlight": "#206155",
+    "text": "#202342",
+    "muted": "#4d5576",
+    "line": "#c0c3df"
+  },
+  "effects": {
+    "surfaceOpacity": 0.92,
+    "backgroundDim": 0.18,
+    "terminalOpacity": 0.88
+  },
+  "terminal": {
+    "foreground": "#202342",
+    "cursor": "#55479f",
+    "cursorAccent": "#f1effa",
+    "selectionBackground": "#55479f55",
+    "selectionForeground": "#202342",
+    "black": "#1d2340",
+    "red": "#8f2f49",
+    "green": "#1d6357",
+    "yellow": "#704817",
+    "blue": "#345990",
+    "magenta": "#63327f",
+    "cyan": "#126173",
+    "white": "#535b7d",
+    "brightBlack": "#4d5878",
+    "brightRed": "#97334c",
+    "brightGreen": "#1d6357",
+    "brightYellow": "#79521b",
+    "brightBlue": "#345990",
+    "brightMagenta": "#703e8d",
+    "brightCyan": "#126173",
+    "brightWhite": "#202342"
+  }
+}

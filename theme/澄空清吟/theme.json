@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "澄空清吟",
+  "name": "澄空清吟",
+  "appearance": "light",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.5,
+    "focusY": 0.45
+  },
+  "colors": {
+    "background": "#f0f6fa",
+    "panel": "#e5eef5",
+    "panelAlt": "#d8e5ef",
+    "accent": "#246087",
+    "accentAlt": "#765323",
+    "secondary": "#4d597e",
+    "highlight": "#286251",
+    "text": "#23364b",
+    "muted": "#465b73",
+    "line": "#afc4d6"
+  },
+  "effects": {
+    "surfaceOpacity": 0.92,
+    "backgroundDim": 0.1,
+    "terminalOpacity": 0.84
+  },
+  "terminal": {
+    "foreground": "#23364b",
+    "cursor": "#246c94",
+    "cursorAccent": "#f0f6fa",
+    "selectionBackground": "#c3ddec",
+    "selectionForeground": "#23364b",
+    "black": "#203044",
+    "red": "#943d50",
+    "green": "#2c6555",
+    "yellow": "#765323",
+    "blue": "#2d5c89",
+    "magenta": "#705182",
+    "cyan": "#246379",
+    "white": "#465b73",
+    "brightBlack": "#465d75",
+    "brightRed": "#943f51",
+    "brightGreen": "#2d6657",
+    "brightYellow": "#785326",
+    "brightBlue": "#315f88",
+    "brightMagenta": "#735382",
+    "brightCyan": "#256377",
+    "brightWhite": "#23364b"
+  }
+}

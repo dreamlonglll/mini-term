@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "暮霞云歌",
+  "name": "暮霞云歌",
+  "appearance": "light",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.36,
+    "focusY": 0.5
+  },
+  "colors": {
+    "background": "#faf1ec",
+    "panel": "#f0e4e7",
+    "panelAlt": "#e9dce4",
+    "accent": "#733955",
+    "accentAlt": "#68421d",
+    "secondary": "#334b75",
+    "highlight": "#205341",
+    "text": "#342936",
+    "muted": "#594555",
+    "line": "#c4aaba"
+  },
+  "effects": {
+    "surfaceOpacity": 0.9,
+    "backgroundDim": 0.1,
+    "terminalOpacity": 0.78
+  },
+  "terminal": {
+    "foreground": "#342936",
+    "cursor": "#733955",
+    "cursorAccent": "#faf1ec",
+    "selectionBackground": "#ead4df",
+    "selectionForeground": "#342936",
+    "black": "#2c2531",
+    "red": "#8b3048",
+    "green": "#235a48",
+    "yellow": "#70471f",
+    "blue": "#38517d",
+    "magenta": "#7a3e5d",
+    "cyan": "#235967",
+    "white": "#594555",
+    "brightBlack": "#5f4d5d",
+    "brightRed": "#91334b",
+    "brightGreen": "#245c49",
+    "brightYellow": "#73491f",
+    "brightBlue": "#3a537e",
+    "brightMagenta": "#7c3e5e",
+    "brightCyan": "#235b69",
+    "brightWhite": "#342936"
+  }
+}

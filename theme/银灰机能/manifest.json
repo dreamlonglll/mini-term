@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "银灰机能",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1174,
+      "sha256": "2efee27395c8294ffa9ee444053b48816440385afca29f8384e248c328e792e3"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 625371,
+      "sha256": "d68787e3413c7a520e75159e2804de2f4f0e3291dfa0c2979ebc63aea2341f20"
+    },
+    {
+      "path": "README.md",
+      "bytes": 2780,
+      "sha256": "ed0c7db3bd8b4f714ccdbf69c0cfcb662cfff6ddd59fc69c41aad0efc21684e8"
+    }
+  ]
+}

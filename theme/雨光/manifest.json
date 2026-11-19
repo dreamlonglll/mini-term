@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "雨光",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1213,
+      "sha256": "72f5a74be5ed315104cf1d0d8f6ad10857f8472275bf22d956911e67a2a93cf8"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 839092,
+      "sha256": "1103567a50ea03cf41da3c8aa96cba89fd7fea0d3d3b4efa346ba83aef213384"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1881,
+      "sha256": "8cc6fe0c5dea2c3376fe2d3455b80ecdecf5e89727006b0c383e7622f722554e"
+    }
+  ]
+}

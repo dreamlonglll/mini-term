@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "id": "暮紫鎏金",
+  "name": "暮紫鎏金",
+  "appearance": "dark",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.36,
+    "focusY": 0.5
+  },
+  "colors": {
+    "background": "#211b29",
+    "panel": "#2b2233",
+    "panelAlt": "#35283c",
+    "accent": "#e8c28b",
+    "accentAlt": "#f0b9aa",
+    "secondary": "#b4c6eb",
+    "highlight": "#b1d2b3",
+    "text": "#f4eaf0",
+    "muted": "#d0bbcc",
+    "line": "#72556e"
+  },
+  "effects": {
+    "surfaceOpacity": 0.8,
+    "backgroundDim": 0.26,
+    "terminalOpacity": 0.72
+  },
+  "terminal": {
+    "foreground": "#f4eaf0",
+    "cursor": "#e8c28b",
+    "cursorAccent": "#211b29",
+    "selectionBackground": "#61465c",
+    "selectionForeground": "#f4eaf0",
+    "black": "#211b29",
+    "red": "#f6b1b8",
+    "green": "#b0d0a7",
+    "yellow": "#e8c28b",
+    "blue": "#b4c6eb",
+    "magenta": "#dfb7e5",
+    "cyan": "#a9d2d2",
+    "white": "#e1d3df",
+    "brightBlack": "#ceb8c9",
+    "brightRed": "#ffc7ca",
+    "brightGreen": "#c6e5b7",
+    "brightYellow": "#f6dba9",
+    "brightBlue": "#cbdafb",
+    "brightMagenta": "#efc8f0",
+    "brightCyan": "#b9e4e0",
+    "brightWhite": "#fff3f7"
+  }
+}

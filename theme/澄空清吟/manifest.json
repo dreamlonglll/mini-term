@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "澄空清吟",
+  "files": [
+    {
+      "path": "theme.json",
+      "bytes": 1173,
+      "sha256": "aea9a4ba486d319b211fbc16fb6ecbab4ad5a1425e2ab0ef4012c5d62c6ad8b9"
+    },
+    {
+      "path": "background.jpg",
+      "bytes": 535872,
+      "sha256": "64f0deab598833a47ebeed5e27db14e6420a88976909681cce354d1a91ef70b7"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3039,
+      "sha256": "8bbd09977ddd02cebb91f6c59ecaba7894452343532d95700effa836ff7ccd56"
+    }
+  ]
+}
