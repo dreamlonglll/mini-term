@@ -742,6 +742,7 @@ mod tests {
     fn agent_展示名() {
         assert_eq!(agent_label(Some("claude-code")), "Claude Code");
         assert_eq!(agent_label(Some("omp")), "oh-my-pi");
+        assert_eq!(agent_label(Some("agy")), "Antigravity CLI");
         assert_eq!(agent_label(Some("my-agent")), "my-agent", "认不出原样用");
         assert_eq!(agent_label(None), "AI");
         assert_eq!(agent_label(Some("  ")), "AI");

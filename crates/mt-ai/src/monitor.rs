@@ -203,7 +203,9 @@ impl StatusEmitter {
 /// 也就没有可供误判成"完成"的下降沿。判据（hook 状态是否停在 ai-working）
 /// 本身也随之改变，触发一次就不再满足，这正是与旧兜底的分水岭。
 ///
-/// 退出的唯一权威信号是 SessionEnd hook（hook_server 处理：清状态 + 直推 idle）。
+/// 退出的唯一权威信号是 SessionEnd hook（hook_server 处理：清状态 + 直推 idle）；
+/// 不发 SessionEnd 的 agent（agy）另有一条落盘的退出兜底（`exit_settle_due`），同样
+/// 不在本函数里。
 /// 这里**不能**根据输入检测（is_ai_session）把 hook 状态拆掉降级 idle：
 /// 输入检测会漏判启动（别名/包装脚本）、误判退出（任务运行中双击 Ctrl+C 只是
 /// 打断并不退出），曾经的 "ai-idle && !is_ai_session → idle" 兜底会把这类
@@ -292,6 +294,74 @@ pub(crate) fn stall_settle_target(
     })
 }
 
+/// pane 当前绑定的 agent(hook 上报的会话身份)退出时**不发** SessionEnd(agy)。
+/// 没有身份(从没收到带 session_id 的事件)按「发」算,不插手。
+fn pane_agent_lacks_session_end(hook_state: &HookState, pty_id: u32) -> bool {
+    hook_state
+        .session_of(pty_id)
+        .is_some_and(|s| !crate::hook_server::agent_sends_session_end(s.agent.as_deref()))
+}
+
+/// 「没有 SessionEnd 的 agent 已经退出」兜底的纯判定部分(`timeout` 同
+/// [`stall_settle_target`] 的口径,做成参数便于单测)。
+///
+/// 背景:agy 退出(Ctrl+D 两次 / `/exit`)不发任何 hook,而 hook 一旦启用就是状态的
+/// 绝对权威([`resolve_status`])—— 没有 SessionEnd,pane 会永远顶着最后一次 Stop 落下的
+/// ai-idle。这条兜底与 [`stall_settle_target`] 同一哲学:单看输入检测不可信,「输入检测
+/// 判了退出」叠加「状态与 PTY 输出双双静默满窗口」才算数,且结论**落盘**、触发一次即
+/// 不再满足。
+///
+/// 六道闸,缺一不可:
+/// 1. hook 已启用(没启用的 pane 走轮询降级,那条路本就按输入检测给 idle);
+/// 2. 当前 hook 状态正是 ai-idle(ai-working 时归 [`stall_settle_target`] 管);
+/// 3. pane 绑定的 agent 没有 SessionEnd 能力(有的那几家等它们自己的 SessionEnd);
+/// 4. 输入检测已判定退出(`!is_ai_session`),且此后没有 hook 事件把会话标记扶正;
+/// 5. 状态本身静置满 `timeout`;
+/// 6. PTY 输出静默满 `timeout`。
+///
+/// 误判(agy 其实没退:比如在它的输入框里敲了 `exit` 当提示词)由下一个 hook 事件扶正
+/// —— 那条路径会重新启用 hook、`mark_ai_session` 把会话标记扶回来。
+pub(crate) fn exit_settle_due(
+    hook_state: &HookState,
+    tracker: &SessionTracker,
+    pty_id: u32,
+    timeout: Duration,
+) -> bool {
+    hook_state.is_hook_enabled(pty_id)
+        && hook_state.get_status(pty_id).as_deref() == Some("ai-idle")
+        && pane_agent_lacks_session_end(hook_state, pty_id)
+        && !tracker.is_ai_session(pty_id)
+        && hook_state
+            .status_age(pty_id)
+            .is_some_and(|age| age >= timeout)
+        && !tracker.has_recent_output(pty_id, timeout)
+}
+
+/// 退出兜底的发射侧:视同 SessionEnd —— 清掉该 pane 的 hook 状态(回落轮询,输入检测
+/// 已不在会话里 → idle)并通知上层。清掉之后闸 1 不再成立,不会重复触发。
+/// `timeout` 生产路径恒为 [`AI_STALL_TIMEOUT`],做成参数只为单测能走一遍发射侧。
+fn settle_exited_ai(
+    hook_state: &HookState,
+    tracker: &SessionTracker,
+    emitter: &StatusEmitter,
+    pty_id: u32,
+    timeout: Duration,
+) {
+    if !exit_settle_due(hook_state, tracker, pty_id, timeout) {
+        return;
+    }
+    let agent = hook_state.session_of(pty_id).and_then(|s| s.agent);
+    hook_state.remove(pty_id);
+    emitter.emit_if_changed(pty_id, "idle", Some(STALL_EXIT_CAUSE), None);
+    eprintln!(
+        "[monitor] pty_id={} agent={:?} 已判退出且 ai-idle 静默 {}s -> idle (cause={})",
+        pty_id,
+        agent,
+        timeout.as_secs(),
+        STALL_EXIT_CAUSE
+    );
+}
+
 /// 停摆兜底的发射侧：判定命中就把结论**落盘**到 hook 状态并通知上层。
 ///
 /// 落盘是关键（与 `note_user_interrupt` 同一手法）：`last_hook_status` 被改写后，
@@ -301,23 +371,30 @@ pub(crate) fn stall_settle_target(
 ///
 /// 误判（AI 其实还在跑，只是安静）由下一个 hook 事件立刻纠正回 ai-working，
 /// 那条路径还会顺带 `mark_ai_session` 把会话标记扶正。
+///
+/// `timeout` 生产路径恒为 [`AI_STALL_TIMEOUT`],做成参数只为单测能走一遍发射侧。
 fn settle_stalled_ai(
     hook_state: &HookState,
     tracker: &SessionTracker,
     emitter: &StatusEmitter,
     pty_id: u32,
+    timeout: Duration,
 ) {
     let last_cause = emitter.last_cause(pty_id);
-    let Some(target) = stall_settle_target(
-        hook_state,
-        tracker,
-        last_cause.as_deref(),
-        pty_id,
-        AI_STALL_TIMEOUT,
-    ) else {
+    let Some(target) =
+        stall_settle_target(hook_state, tracker, last_cause.as_deref(), pty_id, timeout)
+    else {
         return;
     };
-    hook_state.update(pty_id, target.to_string());
+    if target == "idle" && pane_agent_lacks_session_end(hook_state, pty_id) {
+        // 判定为已退出,而这家(agy)永远等不来 SessionEnd:直接按 SessionEnd 收尾,
+        // 清掉 hook 状态回落轮询(同 `settle_exited_ai`)。只落一个 "idle" 的话这条
+        // hook 记录会一直留着,同 pane 之后跑没有 hook 的 agent(opencode 等)时
+        // `resolve_status` 仍认它为权威,徽章卡在 idle
+        hook_state.remove(pty_id);
+    } else {
+        hook_state.update(pty_id, target.to_string());
+    }
     let (cause, agent) = if target == "idle" {
         (STALL_EXIT_CAUSE, None)
     } else {
@@ -327,7 +404,7 @@ fn settle_stalled_ai(
     eprintln!(
         "[monitor] pty_id={} ai-working 静默 {}s -> {} (cause={})",
         pty_id,
-        AI_STALL_TIMEOUT.as_secs(),
+        timeout.as_secs(),
         target,
         cause
     );
@@ -377,8 +454,10 @@ fn poll_pane(
     // hook 记录，AI 跑着时把 hook 开关关掉的 pane 照样得能被拉回来。
     // 顺序不能颠倒：收敛命中时下面这次 emit 值已相同，会被去重吞掉，
     // 上层只收到 settle 发出的那条带成因的。
+    // 两条兜底互斥(一条要 ai-working、一条要 ai-idle),同一把锁里先后判即可
     hook_state.with_server_lock(|| {
-        settle_stalled_ai(hook_state, tracker, emitter, pty_id);
+        settle_stalled_ai(hook_state, tracker, emitter, pty_id, AI_STALL_TIMEOUT);
+        settle_exited_ai(hook_state, tracker, emitter, pty_id, AI_STALL_TIMEOUT);
     });
     let status = resolve_status(hook_state, tracker, pty_id);
     let agent = if status.starts_with("ai-") {
@@ -741,6 +820,146 @@ mod tests {
                 cause
             );
         }
+    }
+
+    // ---- 没有 SessionEnd 的 agent 的退出兜底(exit_settle_due)----
+
+    /// agy 跑完一轮停在 ai-idle 的 pane:hook 已启用、会话身份是 agy。
+    fn agy_pane_at_idle() -> (HookState, SessionTracker) {
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "agy\r");
+        hooks.record_session(1, Some("agy".into()), "conv-1".into());
+        hooks.update(1, "ai-idle".to_string()); // Stop(NO_TOOL_CALL)
+        (hooks, mgr)
+    }
+
+    /// 主场景:agy 退出(Ctrl+D 两次)不发任何 hook,输入检测判了退出 + 双静默满窗口
+    /// → 视同 SessionEnd,hook 状态清掉回落 idle。
+    #[test]
+    fn agy_exit_settles_to_idle_after_silence() {
+        for exit in [&["\x04", "\x04"][..], &["/exit\r"], &["/quit\r"]] {
+            let (hooks, mgr) = agy_pane_at_idle();
+            for input in exit {
+                mgr.track_input(1, input);
+            }
+            assert!(!mgr.is_ai_session(1), "{exit:?}");
+            assert!(exit_settle_due(&hooks, &mgr, 1, ELAPSED), "{exit:?}");
+        }
+    }
+
+    /// 单次 Ctrl+D 只是 agy 的提示,不是退出:不动。
+    #[test]
+    fn agy_single_ctrl_d_is_not_an_exit() {
+        let (hooks, mgr) = agy_pane_at_idle();
+        mgr.track_input(1, "\x04");
+        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED));
+    }
+
+    /// 没触发过退出(agy 在等用户):不动 —— 哪怕 agy 空闲时完全不重绘、输出早就静默了。
+    #[test]
+    fn agy_idle_without_exit_trigger_is_left_alone() {
+        let (hooks, mgr) = agy_pane_at_idle();
+        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED));
+    }
+
+    /// 窗口内有输出(或状态刚变过):不动。
+    #[test]
+    fn agy_exit_waits_for_silence() {
+        let (hooks, mgr) = agy_pane_at_idle();
+        mgr.track_input(1, "/exit\r");
+        mgr.note_output_for_test(1);
+        assert!(!exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED), "输出窗口没过");
+        mgr.expire_output_for_test(1);
+        assert!(!exit_settle_due(&hooks, &mgr, 1, NOT_ELAPSED), "状态静置窗口没过");
+    }
+
+    /// 有 SessionEnd 的几家不走这条(等它们自己的 SessionEnd);没有会话身份的也不插手。
+    #[test]
+    fn agents_with_session_end_are_not_settled_by_exit_fallback() {
+        for agent in ["claude-code", "codex", "grok", "omp", "pi"] {
+            let hooks = HookState::new();
+            let mgr = SessionTracker::new();
+            hooks.record_session(1, Some(agent.into()), "sid".into());
+            hooks.update(1, "ai-idle".to_string());
+            assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "{agent}");
+        }
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+        hooks.update(1, "ai-idle".to_string());
+        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "无会话身份");
+    }
+
+    /// ai-working 时归原有的停摆兜底管(这条只认 ai-idle);停摆判出「已退出」时,
+    /// 不发 SessionEnd 的 agent 同样按 SessionEnd 收尾:hook 状态整个清掉。
+    #[test]
+    fn agy_working_exit_goes_through_stall_fallback() {
+        let (emitter, seen) = collecting_emitter();
+        let (hooks, mgr) = agy_pane_at_idle();
+        hooks.update(1, "ai-working".to_string());
+        mgr.track_input(1, "\x04");
+        mgr.track_input(1, "\x04");
+        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "ai-working 不归这条管");
+        settle_stalled_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+        assert!(!hooks.is_hook_enabled(1), "按 SessionEnd 收尾:hook 记录整个清掉");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
+        assert_eq!(seen.lock().clone(), vec![change("idle", Some(STALL_EXIT_CAUSE))]);
+        // 同一轮紧接着的退出兜底不会再发一次
+        settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+        assert_eq!(seen.lock().len(), 1);
+    }
+
+    /// 对照组:有 SessionEnd 的 agent 停摆判出「已退出」时照旧只落一个 idle(等 SessionEnd)。
+    #[test]
+    fn claude_stall_exit_still_only_latches_idle() {
+        let (emitter, _) = collecting_emitter();
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        hooks.record_session(1, Some("claude-code".into()), "sid".into());
+        hooks.update(1, "ai-working".to_string());
+        mgr.track_input(1, "\x04");
+        settle_stalled_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+        assert!(hooks.is_hook_enabled(1));
+        assert_eq!(hooks.get_status(1).as_deref(), Some("idle"));
+    }
+
+    /// 落盘:发射侧清掉 hook 状态后闸 1 不再成立,不会重复触发;误判(agy 其实还活着)
+    /// 由下一个 hook 事件扶正。
+    #[test]
+    fn agy_exit_settle_is_latched_and_correctable() {
+        let (emitter, seen) = collecting_emitter();
+        let (hooks, mgr) = agy_pane_at_idle();
+        mgr.track_input(1, "/exit\r");
+
+        settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+        settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+        assert!(!hooks.is_hook_enabled(1));
+        assert!(hooks.session_of(1).is_none(), "会话身份随之清掉(同 SessionEnd)");
+        assert!(!exit_settle_due(&hooks, &mgr, 1, ELAPSED), "不该反复触发");
+        let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1)).collect();
+        assert!(polls.iter().all(|s| s == "idle"), "{polls:?}");
+        assert_eq!(
+            seen.lock().clone(),
+            vec![change("idle", Some(STALL_EXIT_CAUSE))],
+            "只发一次,且不是完成也不是黄灯"
+        );
+
+        // 误判:agy 其实没退,下一个 PreInvocation 把它扶回来
+        mgr.mark_ai_session(1, "agy");
+        hooks.update(1, "ai-working".to_string());
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-working");
+    }
+
+    /// 生产窗口(10s)没走完时发射侧什么都不做。
+    #[test]
+    fn settle_exited_ai_is_noop_when_not_due() {
+        let (emitter, seen) = collecting_emitter();
+        let (hooks, mgr) = agy_pane_at_idle();
+        mgr.track_input(1, "/exit\r");
+        settle_exited_ai(&hooks, &mgr, &emitter, 1, AI_STALL_TIMEOUT); // 状态刚落
+        assert!(hooks.is_hook_enabled(1));
+        assert!(seen.lock().is_empty());
     }
 
     // ---- StatusSink 注入(替代原 Tauri emit) ----

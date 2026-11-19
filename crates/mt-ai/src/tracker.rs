@@ -13,12 +13,21 @@ use std::time::{Duration, Instant, SystemTime};
 // lock 全部跟着 panic。parking_lot 没有中毒概念,与 mt-pty/mt-terminal 同款。
 use parking_lot::Mutex;
 
+use crate::agent::AgentKind;
 use crate::detect::{
     line_ai_command_name, output_ai_command_name, AI_EXIT_COMMANDS,
 };
 
 /// 连续两次 Ctrl+C 退出的时间窗口
 const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
+
+/// 要连按两次 Ctrl+D 才退出的 agent(`AgentSpec::double_ctrl_d_exit`,即 agy)的判定窗口。
+///
+/// agy 自己的窗口多长没有文档;实测(1.5.12)两次间隔约 1.6 秒照样退出,所以不能沿用
+/// Ctrl+C 那 1 秒。往宽里取:漏判退出没有任何事件来纠正(agy 退出不发 hook,pane 会一直
+/// 挂着 AI 会话标记),误判则由下一个 hook 事件扶正(`mark_ai_session`)。两次之间夹了
+/// 别的输入就不算连按(agy 的提示也随之消失)。
+const DOUBLE_CTRLD_WINDOW: Duration = Duration::from_millis(3000);
 
 /// 按下 Enter 后扫描输出以检测 AI 命令 echo 的时间窗口
 const AI_ENTER_SCAN_WINDOW: Duration = Duration::from_millis(2000);
@@ -240,6 +249,8 @@ pub struct SessionTracker {
     ai_started: Arc<Mutex<HashMap<u32, SystemTime>>>,
     input_states: Arc<Mutex<HashMap<u32, InputState>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// 要连按两次 Ctrl+D 才退出的 agent(agy)上一次 Ctrl+D 的时刻(见 [`DOUBLE_CTRLD_WINDOW`])
+    last_ctrld: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
     pending_submits: Arc<Mutex<HashMap<u32, Vec<UserSubmit>>>>,
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -265,6 +276,7 @@ impl SessionTracker {
             ai_started: Arc::new(Mutex::new(HashMap::new())),
             input_states: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
+            last_ctrld: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
             last_output: Arc::new(Mutex::new(HashMap::new())),
@@ -283,6 +295,7 @@ impl SessionTracker {
         self.ai_started.lock().remove(&pane_id);
         self.input_states.lock().remove(&pane_id);
         self.last_ctrlc.lock().remove(&pane_id);
+        self.last_ctrld.lock().remove(&pane_id);
         self.last_enter.lock().remove(&pane_id);
         self.pending_submits.lock().remove(&pane_id);
         self.last_output.lock().remove(&pane_id);
@@ -360,6 +373,7 @@ impl SessionTracker {
         self.ai_sessions.lock().remove(&pane_id);
         self.ai_started.lock().remove(&pane_id);
         self.last_ctrlc.lock().remove(&pane_id);
+        self.last_ctrld.lock().remove(&pane_id);
         self.last_enter.lock().remove(&pane_id);
         self.turn_armed.lock().remove(&pane_id);
     }
@@ -463,6 +477,15 @@ impl SessionTracker {
     ) {
         let data = self.resolve_wsi_record(pane_id, data);
         let in_ai = self.is_ai_session(pane_id);
+        // 这一家 Ctrl+D 要不要连按两次才退出(agy);两次之间夹了别的输入就不算连按
+        let double_ctrl_d = self
+            .ai_session_agent(pane_id)
+            .and_then(|agent| AgentKind::parse(&agent))
+            .is_some_and(|kind| kind.spec().double_ctrl_d_exit);
+        // (按键一次一写;同一次写入里夹着别的字节的极少见,不细分)
+        if double_ctrl_d && !data.chars().all(|c| c == '\x04') {
+            self.last_ctrld.lock().remove(&pane_id);
+        }
         let mut enter_ai: Option<&'static str> = None;
         let mut exit_ai = false;
         {
@@ -528,7 +551,21 @@ impl SessionTracker {
                     }
                     '\x04' => {
                         state.clear_line();
-                        if in_ai {
+                        if in_ai && double_ctrl_d {
+                            // agy:第一次只提示 `press ctrl+d again to exit`,
+                            // 窗口内的第二次才是退出
+                            let mut last = self.last_ctrld.lock();
+                            let now = Instant::now();
+                            match last.get(&pane_id) {
+                                Some(prev) if now.duration_since(*prev) < DOUBLE_CTRLD_WINDOW => {
+                                    exit_ai = true;
+                                    last.remove(&pane_id);
+                                }
+                                _ => {
+                                    last.insert(pane_id, now);
+                                }
+                            }
+                        } else if in_ai {
                             // Ctrl+D (EOF) → 退出 AI 会话
                             exit_ai = true;
                         }
@@ -689,6 +726,67 @@ mod tests {
         assert!(mgr.is_ai_session(1));
         mgr.track_input(1, "\x04");
         assert!(!mgr.is_ai_session(1));
+    }
+
+    /// agy:第一次 Ctrl+D 只是提示,窗口内的第二次才退出;`/exit` `/quit` 照旧。
+    #[test]
+    fn agy_needs_double_ctrl_d_to_exit() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "agy\r");
+        assert_eq!(mgr.ai_session_agent(1).as_deref(), Some("agy"));
+        mgr.track_input(1, "\x04");
+        assert!(mgr.is_ai_session(1), "单次 Ctrl+D 只是提示,agy 没退");
+        mgr.track_input(1, "\x04");
+        assert!(!mgr.is_ai_session(1), "连按两次才退出");
+
+        for exit in ["/exit\r", "/quit\r"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, "agy\r");
+            mgr.track_input(1, exit);
+            assert!(!mgr.is_ai_session(1), "{exit:?}");
+        }
+    }
+
+    /// 两次 Ctrl+D 之间夹了别的输入就不算连按(agy 的提示也随之消失);hook 扶正的会话
+    /// (没键入过启动命令)同样按 agy 的口径判。
+    #[test]
+    fn agy_ctrl_d_pair_is_broken_by_other_input() {
+        let mgr = SessionTracker::new();
+        mgr.mark_ai_session(1, "agy");
+        mgr.track_input(1, "\x04");
+        mgr.track_input(1, "a");
+        mgr.track_input(1, "\x04");
+        assert!(mgr.is_ai_session(1), "中间夹了按键,第二次 Ctrl+D 重新算第一次");
+        mgr.track_input(1, "\x04");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    /// 窗口过了的第二次 Ctrl+D 重新算第一次。
+    #[test]
+    fn agy_ctrl_d_outside_window_starts_over() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "agy\r");
+        mgr.track_input(1, "\x04");
+        // 把上一次 Ctrl+D 挪到窗口之外
+        let stale = Instant::now()
+            .checked_sub(DOUBLE_CTRLD_WINDOW + Duration::from_millis(10))
+            .expect("单调时钟早于窗口");
+        mgr.last_ctrld.lock().insert(1, stale);
+        mgr.track_input(1, "\x04");
+        assert!(mgr.is_ai_session(1), "超窗的两次不算连按");
+        mgr.track_input(1, "\x04");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    /// 别家的 Ctrl+D 口径不变:单次即退出(pi / omp / grok / codex 同 claude)。
+    #[test]
+    fn single_ctrl_d_still_exits_other_agents() {
+        for agent in ["claude", "codex", "pi", "grok", "omp", "opencode"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, &format!("{agent}\r"));
+            mgr.track_input(1, "\x04");
+            assert!(!mgr.is_ai_session(1), "{agent}");
+        }
     }
 
     #[test]
@@ -1550,6 +1648,7 @@ mod tests {
         mgr.track_input(id, "abc"); // input_states 里留下半行
         mgr.track_input(id, "\x03"); // last_ctrlc
         mgr.track_input(id, "go\r"); // turn_armed
+        mgr.last_ctrld.lock().insert(id, Instant::now()); // agy 的 Ctrl+D 窗口
         mgr.note_output_for_test(id);
         mgr.bump_cooldown(id, RESIZE_COOLDOWN);
         mgr.pending_submits
@@ -1569,6 +1668,7 @@ mod tests {
         assert!(mgr.ai_started.lock().is_empty(), "ai_started 未清");
         assert!(mgr.input_states.lock().is_empty(), "input_states 未清");
         assert!(mgr.last_ctrlc.lock().is_empty(), "last_ctrlc 未清");
+        assert!(mgr.last_ctrld.lock().is_empty(), "last_ctrld 未清");
         assert!(mgr.last_enter.lock().is_empty(), "last_enter 未清");
         assert!(
             mgr.pending_submits.lock().is_empty(),

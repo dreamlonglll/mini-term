@@ -1,7 +1,8 @@
 //! Hook HTTP 服务器模块
 //!
 //! 在后台线程监听 `127.0.0.1` 的 HTTP 请求，接收 Claude Code / Codex / Grok /
-//! oh-my-pi / pi 的 hook 事件上报，并通过注入的 [`StatusEmitter`] 通知上层。
+//! oh-my-pi / pi / Antigravity CLI(agy)的 hook 事件上报，并通过注入的
+//! [`StatusEmitter`] 通知上层。agy 的事件先过一层归一化（`route_agy_event`）。
 //!
 //! **端口 / 协议 / 路由一个字都不能改**:各家 CLI 里已注册在用户机器上的 hook
 //! 命令（与 omp / pi 的进程内扩展）按当前形态 POST 过来,改了等于让存量用户的 AI 感知
@@ -42,7 +43,7 @@ pub struct HookPayload {
     pub pty_id: Option<u32>,
     /// 事件名（如 UserPromptSubmit, PreToolUse 等）
     pub event: Option<String>,
-    /// 来源 agent（claude-code / codex / grok / omp / pi）
+    /// 来源 agent（claude-code / codex / grok / omp / pi / agy）
     pub agent: Option<String>,
     /// 会话 ID
     pub session_id: Option<String>,
@@ -67,6 +68,14 @@ pub struct HookPayload {
     /// hook payload 自带的事件名(Claude Code 公共字段)。sidecar 从 argv 取事件名
     /// 注入 `event`;用户手改配置漏写参数时靠这个兜底,否则整条事件被丢弃。
     pub hook_event_name: Option<String>,
+    /// agy `Stop` 的结束原因(`NO_TOOL_CALL` / `USER_CANCELED` / `ERROR` / …),sidecar 由
+    /// `terminationReason` 改名转发。只有 agy 发,见 `route_agy_event`。
+    pub termination_reason: Option<String>,
+    /// agy `Stop` 的 `fullyIdle`:`false` = 主会话在等子代理,这次 Stop 不是完成。
+    pub fully_idle: Option<bool>,
+    /// agy 事件的 `lastUserInput` 是否非空(正文不经 sidecar 转发,只留这一位)。
+    /// `false` = 子代理会话的事件(实测子代理的 `lastUserInput` 恒为空串)。
+    pub has_user_input: Option<bool>,
 }
 
 /// Hook 状态信息，供 UI 查询
@@ -161,7 +170,12 @@ impl HookState {
     /// 返回身份是否发生变化(新 pane/换会话/agent 修正),变化时调用方通知上层。
     /// agent 也参与比较:codex 的 SessionStart 不带 turn_id 会被 hook 二进制
     /// 误推断为 claude-code,靠后续带 turn_id 的事件在这里纠正并重新通知。
-    fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) -> bool {
+    pub(crate) fn record_session(
+        &self,
+        pty_id: u32,
+        agent: Option<String>,
+        session_id: String,
+    ) -> bool {
         let mut map = self.last_session.lock();
         let changed = map
             .get(&pty_id)
@@ -479,6 +493,123 @@ fn map_event_to_status(
     }
 }
 
+/// 一条 hook 事件落到状态上的去向(纯函数 [`route_event`] 的结果)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventRoute<'a> {
+    /// 整条丢弃:不记会话身份、不改状态(agy 子代理会话的事件)
+    Drop,
+    /// 照常记会话身份,但不改状态。带一句日志用的说明
+    KeepStatus(&'static str),
+    /// 改成 `status`,成因 `cause`(UI 据此判完成 / 黄灯,见 [`event_cause`])
+    Status {
+        status: &'static str,
+        cause: &'a str,
+    },
+}
+
+/// 一条事件该怎么落:agy 先过 [`route_agy_event`],其余各家走既有映射
+/// ([`map_event_to_status`] + 打断 / Notification 的成因归一化)。
+fn route_event<'a>(event: &'a str, payload: &HookPayload) -> EventRoute<'a> {
+    if payload.agent.as_deref().and_then(AgentKind::parse) == Some(AgentKind::Agy) {
+        return route_agy_event(
+            event,
+            payload.termination_reason.as_deref(),
+            payload.fully_idle,
+            payload.has_user_input,
+        );
+    }
+    route_mapped(
+        event,
+        payload.agent.as_deref(),
+        payload.notification_type.as_deref(),
+        payload.message.as_deref(),
+        payload.reason.as_deref(),
+    )
+}
+
+/// 既有映射(Claude / Codex / Grok / omp / pi 的口径,改 agy 时一个字没动)。
+fn route_mapped<'a>(
+    event: &'a str,
+    agent: Option<&str>,
+    notification_type: Option<&str>,
+    message: Option<&str>,
+    reason: Option<&str>,
+) -> EventRoute<'a> {
+    match map_event_to_status(event, agent, notification_type, message, reason) {
+        Some(status) => EventRoute::Status {
+            status,
+            // cause 带归一化后的事件名:Stop/PermissionRequest/Notification 都落 ai-idle,
+            // 但只有 Stop 是「任务做完了」,UI 据此决定播报与托盘黄绿灯
+            cause: if is_user_abort_stop(event, reason) {
+                "Interrupt"
+            } else {
+                event_cause(event, notification_type, message)
+            },
+        },
+        // 未映射事件：新版 Claude Code / Codex 加了事件而这里还没跟上时
+        // 的可见信号（注册列表是白名单，正常不会有陌生事件抵达）
+        None => EventRoute::KeepStatus("无状态映射，已忽略"),
+    }
+}
+
+/// agy(Antigravity CLI)事件的归一化。agy 的事件集与语义都和别家不同(实测 1.5.12,
+/// 见 `hook_registry` 的 agy 段):
+///
+/// - **子代理**(`invoke_subagent`)同样触发全局 hook,带它自己的 conversationId,且
+///   `lastUserInput` 恒为空串 → `has_user_input == Some(false)` 整条丢弃:不记会话身份
+///   (否则 pane 的身份被换成子代理会话,续接 / 镜像全错)、不改状态。
+/// - `PreInvocation`(每次调模型前)是唯一注册的「工作中」事件;`PostInvocation` /
+///   `PostToolUse` 没注册,用户手工加了也一样按工作中算。
+/// - `Stop`:
+///   - `fully_idle == Some(false)`:主会话在等子代理回报,紧接着还会有 `PreInvocation`,
+///     不是完成 → 不改状态;
+///   - `USER_CANCELED` → 走 omp / pi 那条 `reason: "aborted"` 的路(ai-idle,cause=
+///     `Interrupt`,不播报完成)。实测 Esc 打断**不发** Stop,这条是给别的取消路径留的,
+///     Esc 由 `note_user_interrupt` 收;
+///   - `ERROR` / `MAX_INVOCATIONS` / `MAX_FORCED_INVOCATIONS` /
+///     `MAX_TOKEN_BUDGET_EXCEEDED`:回合是被迫停下的 → 按 `StopFailure`(ai-idle + 黄灯,
+///     不播报完成);
+///   - 其余(`NO_TOOL_CALL` 正常完成、`TERMINAL_*`、`INJECTED_RESPONSE`、未知、缺失)→
+///     正常 `Stop`(完成)。
+/// - 其余事件(`SessionStart` 等)走既有映射。
+fn route_agy_event<'a>(
+    event: &'a str,
+    termination_reason: Option<&str>,
+    fully_idle: Option<bool>,
+    has_user_input: Option<bool>,
+) -> EventRoute<'a> {
+    let agy = Some(AgentKind::Agy.key());
+    if has_user_input == Some(false) {
+        return EventRoute::Drop;
+    }
+    match event {
+        "PreInvocation" | "PostInvocation" | "PostToolUse" => EventRoute::Status {
+            status: "ai-working",
+            cause: event,
+        },
+        "Stop" if fully_idle == Some(false) => {
+            EventRoute::KeepStatus("子代理仍在运行(fullyIdle=false),不改状态")
+        }
+        "Stop" => match termination_reason {
+            Some("USER_CANCELED") => route_mapped("Stop", agy, None, None, Some("aborted")),
+            Some(
+                "ERROR"
+                | "MAX_INVOCATIONS"
+                | "MAX_FORCED_INVOCATIONS"
+                | "MAX_TOKEN_BUDGET_EXCEEDED",
+            ) => route_mapped("StopFailure", agy, None, None, None),
+            _ => route_mapped("Stop", agy, None, None, None),
+        },
+        _ => route_mapped(event, agy, None, None, None),
+    }
+}
+
+/// 该 agent 退出时发不发 `SessionEnd`(agent 表的 `session_end_hook`)。缺省 / 空串按
+/// Claude(会话身份的约定);认不出的按「发」算,保持改造前的行为。
+pub(crate) fn agent_sends_session_end(agent: Option<&str>) -> bool {
+    AgentKind::from_session_agent(agent).is_none_or(|kind| kind.spec().session_end_hook)
+}
+
 /// 打断是否应当改写状态（`note_user_interrupt` 的纯判定部分，抽出来是为了可测：
 /// 发射一侧需要 sink，单测里构造不出来）。
 ///
@@ -654,6 +785,16 @@ pub fn start_hook_server(
                 .clone()
                 .or_else(|| payload.hook_event_name.clone());
             if let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) {
+                let route = route_event(event, &payload);
+                if route == EventRoute::Drop {
+                    // agy 子代理会话的事件:它带自己的 conversationId,记下来会把 pane 的
+                    // 会话身份换成子代理的,状态也会被子代理的 Stop 提前收成「完成」
+                    eprintln!(
+                        "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}，忽略",
+                        pty_id, event, payload.session_id
+                    );
+                    continue;
+                }
                 if event == "SessionEnd" {
                     // 只用 payload 自带的 session_id 打墓碑。不要退回 session_of:
                     // 新会话的 SessionStart 若先到,session_of 已是新会话,兜底会
@@ -710,7 +851,13 @@ pub fn start_hook_server(
                     // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
                     // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
                     if let Some(sid) = payload.session_id.clone() {
-                        hook_state.note_session_active(pty_id, &sid);
+                        // 活跃集只服务 SessionEnd 的「是不是最后一个」判定。不发 SessionEnd
+                        // 的 agent(agy)的会话进去了就永远出不来:同一 pane 之后再跑 claude,
+                        // claude 退出时的 SessionEnd 会被这些残留挡成「非最后活跃会话」,
+                        // 状态收不回 idle。所以它们不进
+                        if agent_sends_session_end(payload.agent.as_deref()) {
+                            hook_state.note_session_active(pty_id, &sid);
+                        }
                         if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
                             // hook 端点无鉴权,cwd 是任何本地进程都能塞的字段,而上层会
                             // 把它持久化成「未来某次 PTY 的启动目录」。只放行确实存在的
@@ -730,14 +877,7 @@ pub fn start_hook_server(
                             });
                         }
                     }
-                    let mapped = map_event_to_status(
-                        event,
-                        payload.agent.as_deref(),
-                        payload.notification_type.as_deref(),
-                        payload.message.as_deref(),
-                        payload.reason.as_deref(),
-                    );
-                    if let Some(status) = mapped {
+                    if let EventRoute::Status { status, cause } = route {
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
                         // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
                         // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
@@ -748,18 +888,9 @@ pub fn start_hook_server(
                         hook_state.update(pty_id, status.to_string());
 
                         // 通知上层（与 monitor 共享同一份去重表）。cause 带
-                        // 归一化后的事件名:Stop/PermissionRequest/Notification 都落
-                        // ai-idle,但只有 Stop 是「任务做完了」,UI 据此决定播报与
-                        // 托盘黄绿灯（见 utils/aiCompletion.ts 与 store 的 attention 判定）
-                        let cause = if is_user_abort_stop(event, payload.reason.as_deref()) {
-                            "Interrupt"
-                        } else {
-                            event_cause(
-                                event,
-                                payload.notification_type.as_deref(),
-                                payload.message.as_deref(),
-                            )
-                        };
+                        // 归一化后的事件名(见 route_mapped):Stop/PermissionRequest/
+                        // Notification 都落 ai-idle,但只有 Stop 是「任务做完了」,UI 据此
+                        // 决定播报与托盘黄绿灯（见 notify.rs 与 store 的 attention 判定）
                         emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
 
                         eprintln!(
@@ -775,13 +906,8 @@ pub fn start_hook_server(
                                 .map(|e| format!(" error_type={}", e))
                                 .unwrap_or_default()
                         );
-                    } else {
-                        // 未映射事件：新版 Claude Code / Codex 加了事件而这里还没跟上时
-                        // 的可见信号（注册列表是白名单，正常不会有陌生事件抵达）
-                        eprintln!(
-                            "[hook-server] pty_id={} event={} 无状态映射，已忽略",
-                            pty_id, event
-                        );
+                    } else if let EventRoute::KeepStatus(why) = route {
+                        eprintln!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
                     }
                 }
             }
@@ -1385,6 +1511,170 @@ mod tests {
             Some("ai-working")
         );
         assert!(is_attention_cause(event_cause("StopFailure", None, None)));
+    }
+
+    // ---- Antigravity CLI(agy)特有语义 ----
+
+    fn payload(value: serde_json::Value) -> HookPayload {
+        serde_json::from_value(value).expect("测试 payload 应能反序列化")
+    }
+
+    fn status(status: &'static str, cause: &'static str) -> EventRoute<'static> {
+        EventRoute::Status { status, cause }
+    }
+
+    /// 子代理会话的事件(`lastUserInput` 为空串 → sidecar 转成 `has_user_input: false`)
+    /// 整条丢弃,任何事件都一样 —— 子代理的 Stop 不是主会话的完成,它的 id 也不能顶掉
+    /// pane 的会话身份。
+    #[test]
+    fn agy_subagent_events_are_dropped() {
+        for event in ["SessionStart", "PreInvocation", "PostToolUse", "Stop"] {
+            assert_eq!(
+                route_agy_event(event, Some("NO_TOOL_CALL"), Some(true), Some(false)),
+                EventRoute::Drop,
+                "{event}"
+            );
+        }
+        // 缺这一位(老 sidecar / 手工 POST)不当子代理
+        assert_eq!(
+            route_agy_event("PreInvocation", None, None, None),
+            status("ai-working", "PreInvocation")
+        );
+    }
+
+    /// 每次调模型前的 PreInvocation 是 agy 唯一注册的「工作中」事件;没注册的
+    /// PostInvocation / PostToolUse 被用户手工加上也一样按工作中算。
+    #[test]
+    fn agy_invocation_events_map_to_working() {
+        for event in ["PreInvocation", "PostInvocation", "PostToolUse"] {
+            assert_eq!(
+                route_agy_event(event, None, None, Some(true)),
+                status("ai-working", event)
+            );
+        }
+        // 其余事件走既有映射(SessionStart → ai-idle)
+        assert_eq!(
+            route_agy_event("SessionStart", None, None, Some(true)),
+            status("ai-idle", "SessionStart")
+        );
+        assert_eq!(
+            route_agy_event("SomethingNew", None, None, Some(true)),
+            EventRoute::KeepStatus("无状态映射，已忽略")
+        );
+    }
+
+    /// Stop 的四条分支:等子代理 → 不改;用户取消 → 打断;被迫停下 → StopFailure 黄灯;
+    /// 其余 → 正常完成。
+    #[test]
+    fn agy_stop_routes_by_termination_reason() {
+        // 主会话在等子代理回报:紧接着还有 PreInvocation,不是完成
+        assert!(matches!(
+            route_agy_event("Stop", Some("NO_TOOL_CALL"), Some(false), Some(true)),
+            EventRoute::KeepStatus(_)
+        ));
+        // 用户取消:回合结束但不算完成(与 omp / pi 的 aborted 同一条路)
+        assert_eq!(
+            route_agy_event("Stop", Some("USER_CANCELED"), Some(true), Some(true)),
+            status("ai-idle", "Interrupt")
+        );
+        // 被迫停下:不播报完成,点黄灯提示回来看
+        for reason in [
+            "ERROR",
+            "MAX_INVOCATIONS",
+            "MAX_FORCED_INVOCATIONS",
+            "MAX_TOKEN_BUDGET_EXCEEDED",
+        ] {
+            let route = route_agy_event("Stop", Some(reason), Some(true), Some(true));
+            assert_eq!(route, status("ai-idle", "StopFailure"), "{reason}");
+            assert!(is_attention_cause("StopFailure"));
+        }
+        // 正常完成及其余一切(含未知 / 缺失 / fullyIdle 缺失)
+        for reason in [
+            Some("NO_TOOL_CALL"),
+            Some("TERMINAL_STEP_TYPE"),
+            Some("TERMINAL_CUSTOM_HOOK"),
+            Some("INJECTED_RESPONSE"),
+            Some("SOMETHING_NEW"),
+            None,
+        ] {
+            assert_eq!(
+                route_agy_event("Stop", reason, Some(true), Some(true)),
+                status("ai-idle", "Stop"),
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            route_agy_event("Stop", Some("NO_TOOL_CALL"), None, None),
+            status("ai-idle", "Stop")
+        );
+    }
+
+    /// 只有 agent=agy 才走 agy 的归一化:别家 payload 里出现同名字段也不受影响。
+    #[test]
+    fn agy_routing_is_keyed_on_agent_field() {
+        let agy = payload(serde_json::json!({
+            "agent": "agy", "has_user_input": false
+        }));
+        assert_eq!(route_event("Stop", &agy), EventRoute::Drop);
+
+        let claude = payload(serde_json::json!({
+            "agent": "claude-code", "has_user_input": false, "fully_idle": false,
+            "termination_reason": "ERROR"
+        }));
+        assert_eq!(route_event("Stop", &claude), status("ai-idle", "Stop"));
+        assert_eq!(
+            route_event("PreInvocation", &claude),
+            EventRoute::KeepStatus("无状态映射，已忽略"),
+            "PreInvocation 不是别家的事件"
+        );
+    }
+
+    /// 改造成 `route_event` 后别家的口径逐条不变(打断 / 黄灯归一化 / 收尾 Stop / 未知事件)。
+    #[test]
+    fn route_event_keeps_other_agents_unchanged() {
+        let omp = payload(serde_json::json!({ "agent": "omp", "reason": "aborted" }));
+        assert_eq!(route_event("Stop", &omp), status("ai-idle", "Interrupt"));
+
+        let grok = payload(serde_json::json!({
+            "agent": "grok", "notification_type": "permission_prompt"
+        }));
+        assert_eq!(
+            route_event("Notification", &grok),
+            status("ai-idle", "PermissionRequest")
+        );
+        let grok_teardown = payload(serde_json::json!({ "agent": "grok", "reason": "shutdown" }));
+        assert!(matches!(
+            route_event("Stop", &grok_teardown),
+            EventRoute::KeepStatus(_)
+        ));
+
+        let codex = payload(serde_json::json!({ "agent": "codex" }));
+        assert_eq!(
+            route_event("PermissionRequest", &codex),
+            status("ai-working", "PermissionRequest")
+        );
+        let bare = payload(serde_json::json!({}));
+        assert_eq!(route_event("UserPromptSubmit", &bare), status("ai-working", "UserPromptSubmit"));
+    }
+
+    /// 发不发 SessionEnd 查 agent 表;缺省按 Claude,认不出的按「发」(保持原行为)。
+    #[test]
+    fn session_end_capability_follows_agent_table() {
+        assert!(agent_sends_session_end(None));
+        assert!(agent_sends_session_end(Some("")));
+        assert!(agent_sends_session_end(Some("claude-code")));
+        assert!(agent_sends_session_end(Some("pi")));
+        assert!(agent_sends_session_end(Some("some-wrapper-x")));
+        assert!(!agent_sends_session_end(Some("agy")));
+        assert!(!agent_sends_session_end(Some("opencode")));
+    }
+
+    /// agy 的 pane 同样走得到 Esc 打断收敛(agy 打断不发任何 hook,实测)。
+    #[test]
+    fn agy_interrupt_is_settled_by_input_detection() {
+        let state = HookState::new();
+        state.update(1, "ai-working".to_string());
+        assert!(interrupt_should_settle(&state, 1));
     }
 
     // ---- Grok Build 特有语义 ----

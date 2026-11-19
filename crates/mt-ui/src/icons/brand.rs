@@ -21,6 +21,9 @@
 //! - **Gemini**:原版是同一条 path 叠四层(底色 + 三道线性渐变),这里只画底色层;
 //! - **Qwen**:原版是双色线性渐变,这里取中点纯色 + 同一透明度。
 //!
+//! 另有一枚**自绘**的:Antigravity CLI(agy,GPUI 版新增)手头没有官方 path,按它启动
+//! 横幅里的字标轮廓画了一条单色拱门(见 `AGY` 的注释)。
+//!
 //! 其余各家原版本就是单色填充,几何与颜色都是**逐点等价**。
 //!
 //! # 宿主接线(mt-app)
@@ -56,6 +59,8 @@ pub enum AiVendor {
     Ollama,
     /// oh-my-pi(omp,pi 的分支):GPUI 版新增,原版前端没有这一项
     Omp,
+    /// Antigravity CLI(Google,命令名 `agy`):GPUI 版新增,原版前端没有这一项
+    Agy,
 }
 
 impl AiVendor {
@@ -74,6 +79,7 @@ impl AiVendor {
             Self::Copilot => "copilot",
             Self::Ollama => "ollama",
             Self::Omp => "omp",
+            Self::Agy => "agy",
         }
     }
 
@@ -94,13 +100,14 @@ impl AiVendor {
             "copilot" => Self::Copilot,
             "ollama" => Self::Ollama,
             "omp" => Self::Omp,
+            "agy" => Self::Agy,
             _ => return None,
         })
     }
 
     /// CLI 类型 → 厂商(前端 `inferVendor.ts` 的 `CLI_VENDOR`)。
     ///
-    /// 会话记录能解析的四家,加上 hook 会上报 agent 名的 omp 在表里;其余 CLI
+    /// 会话记录能解析的几家,加上 hook 会上报 agent 名的 omp 在表里;其余 CLI
     /// 返回 `None`,由调用方走 [`Self::infer`] 或回退通用图标。
     pub fn from_session_type(session_type: &str) -> Option<Self> {
         match session_type {
@@ -109,6 +116,7 @@ impl AiVendor {
             "grok" => Some(Self::Grok),
             "pi" => Some(Self::Pi),
             "omp" => Some(Self::Omp),
+            "agy" => Some(Self::Agy),
             _ => None,
         }
     }
@@ -157,6 +165,7 @@ impl AiVendor {
             Self::Copilot => "GitHub Copilot",
             Self::Ollama => "Ollama",
             Self::Omp => "oh-my-pi",
+            Self::Agy => "Antigravity",
         }
     }
 
@@ -174,6 +183,7 @@ impl AiVendor {
             Self::Copilot => COPILOT,
             Self::Ollama => OLLAMA,
             Self::Omp => OMP,
+            Self::Agy => AGY,
         }
     }
 }
@@ -209,6 +219,12 @@ const RULES: &[(AiVendor, &[Needle])] = &[
         &[Needle::Word("omp"), Needle::Word("oh-my-pi")],
     ),
     (AiVendor::Pi, &[Needle::Word("pi")]),
+    // agy 是多模型 harness(默认挂 Gemini,也能挂别家):同 pi 的道理排在各家模型前面,
+    // `agy --model claude-…` 该显示 harness 而不是被代理的模型
+    (
+        AiVendor::Agy,
+        &[Needle::Word("agy"), Needle::Word("antigravity")],
+    ),
     (
         AiVendor::Claude,
         &[Needle::Word("claude"), Needle::Word("anthropic")],
@@ -405,6 +421,21 @@ const OMP: &[Shape] = &[
     ),
 ];
 
+/// Antigravity CLI(agy):**自绘**的单色拱门「A」—— 圆顶实心、下半身开出尖拱、两足外撇,
+/// 对照 agy 启动横幅里那枚方块字标(`▄▀▀▄ / ▀▀▀▀▀▀ / ▄▀▀    ▀▀▄`)的轮廓画。
+///
+/// 官方标识是同一轮廓上的多色渐变,`paint_path` 只吃纯色(同 Gemini 的已知偏差),也没有
+/// 现成的官方 path 可搬,所以按轮廓自绘一条、跟随主题色(与 Grok / OpenCode 同一口径),
+/// 不借 Gemini 的蓝,免得与模型推出来的 Gemini 图标混在一起。
+const AGY: &[Shape] = &[Shape::fill(
+    Ink::Current,
+    Geom::Path {
+        d: "M12 2.5C14.7 2.5 15.9 5.8 17 10C18.1 14.2 19 18.5 22.5 21L17.8 21C16.4 18.5 15.2 12.5 12 12.5C8.8 12.5 7.6 18.5 6.2 21L1.5 21C5 18.5 5.9 14.2 7 10C8.1 5.8 9.3 2.5 12 2.5Z",
+        view: VB24,
+        even_odd: false,
+    },
+)];
+
 /// Gemini:官方 Color 变体的四角星。
 ///
 /// **已知偏差**:原版是同一条 path 叠四层 —— 底色 `#3186FF` 加三道线性渐变
@@ -534,6 +565,7 @@ pub const ALL_VENDORS: &[AiVendor] = &[
     AiVendor::Copilot,
     AiVendor::Ollama,
     AiVendor::Omp,
+    AiVendor::Agy,
 ];
 
 /// 厂商图标。`vendor` 为 `None` 时画通用机器人(与原版回退 lucide `Bot` 同)。
@@ -715,6 +747,41 @@ mod tests {
         assert!(py < ly + lh, "插头顶边压在右腿下端之上");
     }
 
+    /// agy:会话类型直取;命令文本里的 agy / antigravity 认作 harness,压过被代理的模型;
+    /// 短名字只认词边界。
+    #[test]
+    fn agy_的识别与推断() {
+        assert_eq!(AiVendor::from_session_type("agy"), Some(AiVendor::Agy));
+        assert_eq!(AiVendor::for_session("agy", None), Some(AiVendor::Agy));
+        assert_eq!(AiVendor::infer(Some("agy"), None), Some(AiVendor::Agy));
+        assert_eq!(
+            AiVendor::infer(None, Some("agy --model claude-sonnet-5")),
+            Some(AiVendor::Agy)
+        );
+        assert_eq!(
+            AiVendor::infer(None, Some("Antigravity CLI")),
+            Some(AiVendor::Agy)
+        );
+        assert_eq!(AiVendor::infer(None, Some("agyx")), None);
+        assert_eq!(AiVendor::infer(None, Some("magy")), None);
+        // 历史行按模型出图标:agy 默认挂 Gemini,这条是会话面板的既有口径
+        assert_eq!(
+            AiVendor::for_session("agy", Some("gemini-3.8-flash-high")),
+            Some(AiVendor::Gemini)
+        );
+    }
+
+    /// 自绘拱门:圆顶实心、拱洞是空的、两足着地且外撇。
+    #[test]
+    fn agy_拱门的顶是实的_洞是空的() {
+        assert!(covered(AGY, 0.5, 0.25), "圆顶实心");
+        assert!(!covered(AGY, 0.5, 0.75), "拱洞是空的");
+        assert!(covered(AGY, 0.12, 0.85), "左足");
+        assert!(covered(AGY, 0.88, 0.85), "右足");
+        assert!(!covered(AGY, 0.5, 0.05), "顶上留白");
+        assert!(!covered(AGY, 0.05, 0.4), "两肩不出框");
+    }
+
     #[test]
     fn 词边界与_js_的_b_同义() {
         assert!(word_match("run claude now", "claude"));
@@ -761,6 +828,8 @@ mod tests {
             (AiVendor::Zhipu, 22),
             (AiVendor::Copilot, 7),
             (AiVendor::Ollama, 8),
+            // 自绘拱门:一条闭合轮廓
+            (AiVendor::Agy, 1),
         ];
         for (vendor, subpaths) in want {
             let got: Vec<_> = vendor
