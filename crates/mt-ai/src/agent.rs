@@ -82,7 +82,7 @@ pub struct AgentSpec {
     /// 贴到该 pane 上(串台)。
     pub session_log: bool,
     /// 会话记录已接入 AI 历史面板(列表 / 正文读取)。用量统计另有自己的解析器,
-    /// 只接了 claude / codex / grok(`mt_usage::AgentFilter`),不跟这一位走。
+    /// 只接了 claude / codex / grok / agy(`mt_usage::AgentFilter`),不跟这一位走。
     pub history: bool,
     /// agent 自己会从系统剪贴板取图(`Alt+V`)—— 粘图时不落盘,直接发 `ESC v`。
     /// 官方文档把 `Alt+V` 列为 Windows / WSL 下的「Paste image from clipboard」。

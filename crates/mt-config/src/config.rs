@@ -288,7 +288,7 @@ pub struct AppConfig {
     // **全部 Option/宽松类型**:手改坏值不许拖垮整份 config 连带丢掉项目列表。
     // 读取端一律过白名单/正则，认不出就回默认（**不写回、不报错**，与旧版
     // `loadPref` 同）。`skip_serializing_if` 保旧格式互读。
-    /// `"all" | "claude" | "codex" | "grok"`。
+    /// `"all" | "claude" | "codex" | "grok" | "agy"`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
     /// `"today" | "days7" | "days30" | "month" | "months3" | "months6" | "custom"`。
