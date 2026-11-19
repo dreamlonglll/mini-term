@@ -46,6 +46,13 @@ fn main() {
     if agy_should_ack(agy_conversation.as_deref(), early_payload.as_ref()) {
         ack_agy();
     }
+    // agy 的环境变量在场、payload 却没读到(stdin 超时 / 读不懂):多半就是 agy 本身,只是
+    // 判不出它是主会话还是子代理(`lastUserInput`)、Stop 是不是 fullyIdle —— 冒着把子代理
+    // 收尾报成「完成」的风险上报,不如这一条不报;交给后续事件与停摆兜底。别家的 hook
+    // 一定带 payload,不会落进这里
+    if agy_drops_unreadable(agy_conversation.as_deref(), early_payload.as_ref()) {
+        return;
+    }
 
     let source = classify_source(
         agy_conversation.as_deref(),
@@ -180,6 +187,11 @@ fn classify_source(
 fn agy_should_ack(agy_env: Option<&str>, payload: Option<&serde_json::Value>) -> bool {
     agy_env.is_some_and(|s| !s.is_empty())
         && payload.is_none_or(|p| p.get("conversationId").is_some())
+}
+
+/// agy 环境变量在场但 payload 读不到 → 只回 `{}`、不上报(见 `main` 里的说明)。
+fn agy_drops_unreadable(agy_env: Option<&str>, payload: Option<&serde_json::Value>) -> bool {
+    agy_env.is_some_and(|s| !s.is_empty()) && payload.is_none()
 }
 
 /// 往 stdout 交一个空 JSON 对象。写失败（stdout 被关了）也不 panic —— `println!` 会。
@@ -632,6 +644,28 @@ mod tests {
         assert!(!agy_should_ack(None, Some(&agy)));
         assert!(!agy_should_ack(Some(""), None));
         assert!(!agy_should_ack(None, None));
+    }
+
+    /// agy 环境变量在场、payload 没读到:交 `{}` 后整条不报 —— 判不出主会话 / 子代理、
+    /// Stop 是否 fullyIdle,按 claude-code 报上去会把子代理收尾误播成「完成」。
+    /// 别家(有 payload)与不在 agy 里的进程照常上报。
+    #[test]
+    fn agy_unreadable_payload_is_acked_but_not_reported() {
+        assert!(agy_drops_unreadable(Some("conv-1"), None));
+        let claude_inside_agy = serde_json::json!({ "session_id": "s" });
+        assert!(!agy_drops_unreadable(
+            Some("conv-1"),
+            Some(&claude_inside_agy)
+        ));
+        assert!(!agy_drops_unreadable(
+            Some("conv-1"),
+            Some(&agy_stop_payload())
+        ));
+        assert!(
+            !agy_drops_unreadable(None, None),
+            "不在 agy 里:照旧(claude 空 stdin 兜底)"
+        );
+        assert!(!agy_drops_unreadable(Some(""), None));
     }
 
     #[test]

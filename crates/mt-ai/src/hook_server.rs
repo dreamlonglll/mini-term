@@ -32,6 +32,8 @@ const ENDED_SESSIONS_CAP: usize = 8;
 /// 每个 PTY 跟踪的活跃会话数量上限（正常只有 1 个；嵌套非交互实例/事件乱序
 /// 时短暂多个，上限只是防御事件丢失导致的累积）
 const ACTIVE_SESSIONS_CAP: usize = 8;
+/// 每个 pane 记多少个在跑的 agy 子代理会话(正常是个位数;上限只防灌假 id)
+const AGY_SUBAGENTS_CAP: usize = 64;
 /// 单个 hook 请求 body 的字节上限。真实 payload 只有几百字节（三家 CLI 发的都是
 /// 一小段 JSON），1 MiB 已宽出三个数量级；超限直接 413，不进 JSON 解析。
 const MAX_HOOK_BODY_BYTES: usize = 1024 * 1024;
@@ -114,6 +116,12 @@ pub struct HookState {
     /// `codex exec`，继承 MINITERM_PTY_ID）与"退出后立刻重开"的乱序场景下，
     /// pane 上还有别的活跃会话，误销毁会把正在工作的外层会话打回 idle。
     active_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
+    /// agy:pane 上还在跑的子代理会话 id(子代理调模型时记入、它的收尾 Stop 时移出)。
+    /// 只服务「主会话的完成被延后」的判定,见 [`EventRoute::DeferStop`]
+    agy_subagents: Arc<Mutex<HashMap<u32, std::collections::HashSet<String>>>>,
+    /// agy:主会话以 `Stop(fullyIdle=false)` 收尾、正等子代理收尾的 pane → 那次 Stop 的
+    /// terminationReason。主会话再有任何事件即清除
+    agy_deferred_stop: Arc<Mutex<HashMap<u32, Option<String>>>>,
     port: Arc<Mutex<u16>>,
     /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
     server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
@@ -134,6 +142,8 @@ impl HookState {
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ended_sessions: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
+            agy_subagents: Arc::new(Mutex::new(HashMap::new())),
+            agy_deferred_stop: Arc::new(Mutex::new(HashMap::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -200,6 +210,54 @@ impl HookState {
         self.last_hook_time.lock().remove(&pty_id);
         self.last_hook_status.lock().remove(&pty_id);
         self.last_session.lock().remove(&pty_id);
+        self.agy_subagents.lock().remove(&pty_id);
+        self.agy_deferred_stop.lock().remove(&pty_id);
+    }
+
+    /// agy 子代理会话又有动静(调模型):记进该 pane 的在跑集合。容量封顶,防同机
+    /// 进程往无鉴权端口灌假 id 撑内存。
+    pub(crate) fn agy_subagent_active(&self, pty_id: u32, session_id: &str) {
+        let mut map = self.agy_subagents.lock();
+        let set = map.entry(pty_id).or_default();
+        if set.len() < AGY_SUBAGENTS_CAP || set.contains(session_id) {
+            set.insert(session_id.to_string());
+        }
+    }
+
+    /// agy 子代理收尾:移出在跑集合。集合空了、且主会话正以 `fullyIdle=false` 等着时,
+    /// 取走主会话那次 Stop 的 terminationReason(`Some`)—— 主会话的这一回合此刻才算完。
+    pub(crate) fn agy_subagent_settled(
+        &self,
+        pty_id: u32,
+        session_id: &str,
+    ) -> Option<Option<String>> {
+        let all_settled = {
+            let mut map = self.agy_subagents.lock();
+            match map.get_mut(&pty_id) {
+                Some(set) => {
+                    set.remove(session_id);
+                    set.is_empty()
+                }
+                None => true,
+            }
+        };
+        if all_settled {
+            self.agy_deferred_stop.lock().remove(&pty_id)
+        } else {
+            None
+        }
+    }
+
+    /// 主会话以 `Stop(fullyIdle=false)` 收尾:记下,等子代理收尾时再判完成。
+    pub(crate) fn agy_defer_stop(&self, pty_id: u32, termination_reason: Option<String>) {
+        self.agy_deferred_stop
+            .lock()
+            .insert(pty_id, termination_reason);
+    }
+
+    /// 主会话又有动静(继续干活 / 自己发了 fullyIdle=true 的 Stop):延后的完成作废。
+    pub(crate) fn agy_clear_deferred_stop(&self, pty_id: u32) {
+        self.agy_deferred_stop.lock().remove(&pty_id);
     }
 
     /// PTY 关闭时的彻底清理：hook 状态 + 墓碑 + 活跃会话集
@@ -496,8 +554,12 @@ fn map_event_to_status(
 /// 一条 hook 事件落到状态上的去向(纯函数 [`route_event`] 的结果)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventRoute<'a> {
-    /// 整条丢弃:不记会话身份、不改状态(agy 子代理会话的事件)
-    Drop,
+    /// agy 子代理会话的事件:不记会话身份、不改状态,只用来追踪在跑的子代理
+    /// (`settled` = 这是它的收尾 Stop),供 [`EventRoute::DeferStop`] 判主会话何时算完
+    Subagent { settled: bool },
+    /// agy 主会话以 `Stop(fullyIdle=false)` 收尾:照常记会话身份、不改状态,完成延后到
+    /// 它拉起的子代理全部收尾(实测两种时序都有,见 [`route_agy_event`])
+    DeferStop,
     /// 照常记会话身份,但不改状态。带一句日志用的说明
     KeepStatus(&'static str),
     /// 改成 `status`,成因 `cause`(UI 据此判完成 / 黄灯,见 [`event_cause`])
@@ -556,13 +618,18 @@ fn route_mapped<'a>(
 /// 见 `hook_registry` 的 agy 段):
 ///
 /// - **子代理**(`invoke_subagent`)同样触发全局 hook,带它自己的 conversationId,且
-///   `lastUserInput` 恒为空串 → `has_user_input == Some(false)` 整条丢弃:不记会话身份
-///   (否则 pane 的身份被换成子代理会话,续接 / 镜像全错)、不改状态。
+///   `lastUserInput` 恒为空串 → `has_user_input == Some(false)`:不记会话身份(否则 pane
+///   的身份被换成子代理会话,续接 / 镜像全错)、不改状态([`EventRoute::Subagent`]),
+///   只用来追踪「还有哪些子代理在跑」。
 /// - `PreInvocation`(每次调模型前)是唯一注册的「工作中」事件;`PostInvocation` /
 ///   `PostToolUse` 没注册,用户手工加了也一样按工作中算。
 /// - `Stop`:
-///   - `fully_idle == Some(false)`:主会话在等子代理回报,紧接着还会有 `PreInvocation`,
-///     不是完成 → 不改状态;
+///   - `fully_idle == Some(false)`:主会话的回合停了,但它拉起的后台任务(子代理)还在跑
+///     → 先不算完成([`EventRoute::DeferStop`])。实测(1.5.12)两种时序都有:① 主会话
+///     等子代理回报时先停一次,收到回报后接着 `PreInvocation` → … → `Stop(fullyIdle=true)`
+///     —— 这时主会话的新事件把延后作废,以它自己的 Stop 为准;② 主会话收到回报、答完
+///     就停了(`fullyIdle=false`,子代理还在做收尾),之后**再没有**主会话事件,只有子代理
+///     的收尾 Stop —— 这时等子代理全部收尾,才把那次延后的 Stop 补记成完成;
 ///   - `USER_CANCELED` → 走 omp / pi 那条 `reason: "aborted"` 的路(ai-idle,cause=
 ///     `Interrupt`,不播报完成)。实测 Esc 打断**不发** Stop,这条是给别的取消路径留的,
 ///     Esc 由 `note_user_interrupt` 收;
@@ -580,16 +647,16 @@ fn route_agy_event<'a>(
 ) -> EventRoute<'a> {
     let agy = Some(AgentKind::Agy.key());
     if has_user_input == Some(false) {
-        return EventRoute::Drop;
+        return EventRoute::Subagent {
+            settled: event == "Stop" && fully_idle != Some(false),
+        };
     }
     match event {
         "PreInvocation" | "PostInvocation" | "PostToolUse" => EventRoute::Status {
             status: "ai-working",
             cause: event,
         },
-        "Stop" if fully_idle == Some(false) => {
-            EventRoute::KeepStatus("子代理仍在运行(fullyIdle=false),不改状态")
-        }
+        "Stop" if fully_idle == Some(false) => EventRoute::DeferStop,
         "Stop" => match termination_reason {
             Some("USER_CANCELED") => route_mapped("Stop", agy, None, None, Some("aborted")),
             Some(
@@ -601,6 +668,20 @@ fn route_agy_event<'a>(
             _ => route_mapped("Stop", agy, None, None, None),
         },
         _ => route_mapped(event, agy, None, None, None),
+    }
+}
+
+/// 子代理全部收尾时,要不要把主会话延后的完成补记上(纯判定,见 [`EventRoute::DeferStop`])。
+///
+/// 只在主会话「还算在这一回合里」时补记:状态仍是 ai-working,或者只是子代理收尾期间
+/// 输出静默、被停摆兜底悄悄收成了 ai-idle(cause=`Stall`,不是完成,补记上才有完成播报)。
+/// 其余一律作废:被 Esc 打断过(cause=`Interrupt`,打断的回合不算做完)、已退出 / 回落
+/// idle、或别的 ai-idle 成因 —— 宁可少报一次完成,不报假完成。
+fn deferred_stop_applies(status: Option<&str>, last_cause: Option<&str>) -> bool {
+    match status {
+        Some("ai-working") => true,
+        Some("ai-idle") => last_cause == Some(crate::monitor::STALL_CAUSE),
+        _ => false,
     }
 }
 
@@ -786,13 +867,44 @@ pub fn start_hook_server(
                 .or_else(|| payload.hook_event_name.clone());
             if let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) {
                 let route = route_event(event, &payload);
-                if route == EventRoute::Drop {
+                if let EventRoute::Subagent { settled } = route {
                     // agy 子代理会话的事件:它带自己的 conversationId,记下来会把 pane 的
-                    // 会话身份换成子代理的,状态也会被子代理的 Stop 提前收成「完成」
+                    // 会话身份换成子代理的,状态也会被子代理的 Stop 提前收成「完成」。
+                    // 只拿它追踪在跑的子代理:主会话的完成可能正等着它们收尾
+                    let deferred = match payload.session_id.as_deref() {
+                        Some(sid) if settled => hook_state.agy_subagent_settled(pty_id, sid),
+                        Some(sid) => {
+                            hook_state.agy_subagent_active(pty_id, sid);
+                            None
+                        }
+                        None => None,
+                    };
                     eprintln!(
-                        "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}，忽略",
-                        pty_id, event, payload.session_id
+                        "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}(settled={})，不改状态",
+                        pty_id, event, payload.session_id, settled
                     );
+                    let Some(reason) = deferred else { continue };
+                    if !deferred_stop_applies(
+                        hook_state.get_status(pty_id).as_deref(),
+                        emitter.last_cause(pty_id).as_deref(),
+                    ) {
+                        eprintln!(
+                            "[hook-server] pty_id={} 子代理已全部收尾,但主会话已不在工作中(打断/退出),延后的完成作废",
+                            pty_id
+                        );
+                        continue;
+                    }
+                    if let EventRoute::Status { status, cause } =
+                        route_agy_event("Stop", reason.as_deref(), None, None)
+                    {
+                        tracker.mark_ai_session(pty_id, AgentKind::Agy.key());
+                        hook_state.update(pty_id, status.to_string());
+                        emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
+                        eprintln!(
+                            "[hook-server] pty_id={} 子代理已全部收尾,补记主会话延后的完成 -> status={} cause={}",
+                            pty_id, status, cause
+                        );
+                    }
                     continue;
                 }
                 if event == "SessionEnd" {
@@ -877,6 +989,15 @@ pub fn start_hook_server(
                             });
                         }
                     }
+                    // agy 主会话的事件:`Stop(fullyIdle=false)` 记下延后的完成,其余任何事件
+                    // (继续干活 / 自己的 fullyIdle=true 收尾)都让它作废
+                    if payload.agent.as_deref().and_then(AgentKind::parse) == Some(AgentKind::Agy) {
+                        if route == EventRoute::DeferStop {
+                            hook_state.agy_defer_stop(pty_id, payload.termination_reason.clone());
+                        } else {
+                            hook_state.agy_clear_deferred_stop(pty_id);
+                        }
+                    }
                     if let EventRoute::Status { status, cause } = route {
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
                         // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
@@ -908,6 +1029,11 @@ pub fn start_hook_server(
                         );
                     } else if let EventRoute::KeepStatus(why) = route {
                         eprintln!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
+                    } else if route == EventRoute::DeferStop {
+                        eprintln!(
+                            "[hook-server] pty_id={} event={} fullyIdle=false:后台子代理还在跑,完成延后到它们收尾",
+                            pty_id, event
+                        );
                     }
                 }
             }
@@ -1524,17 +1650,30 @@ mod tests {
     }
 
     /// 子代理会话的事件(`lastUserInput` 为空串 → sidecar 转成 `has_user_input: false`)
-    /// 整条丢弃,任何事件都一样 —— 子代理的 Stop 不是主会话的完成,它的 id 也不能顶掉
-    /// pane 的会话身份。
+    /// 一律不改状态、不记身份 —— 子代理的 Stop 不是主会话的完成,它的 id 也不能顶掉
+    /// pane 的会话身份;只有它的收尾 Stop(fullyIdle 不是 false)标成 settled。
     #[test]
-    fn agy_subagent_events_are_dropped() {
-        for event in ["SessionStart", "PreInvocation", "PostToolUse", "Stop"] {
+    fn agy_subagent_events_never_touch_status() {
+        for event in ["SessionStart", "PreInvocation", "PostToolUse"] {
             assert_eq!(
                 route_agy_event(event, Some("NO_TOOL_CALL"), Some(true), Some(false)),
-                EventRoute::Drop,
+                EventRoute::Subagent { settled: false },
                 "{event}"
             );
         }
+        assert_eq!(
+            route_agy_event("Stop", Some("NO_TOOL_CALL"), Some(true), Some(false)),
+            EventRoute::Subagent { settled: true }
+        );
+        assert_eq!(
+            route_agy_event("Stop", Some("NO_TOOL_CALL"), None, Some(false)),
+            EventRoute::Subagent { settled: true }
+        );
+        // 子代理自己也在等孙代理:还没收尾
+        assert_eq!(
+            route_agy_event("Stop", Some("NO_TOOL_CALL"), Some(false), Some(false)),
+            EventRoute::Subagent { settled: false }
+        );
         // 缺这一位(老 sidecar / 手工 POST)不当子代理
         assert_eq!(
             route_agy_event("PreInvocation", None, None, None),
@@ -1567,11 +1706,11 @@ mod tests {
     /// 其余 → 正常完成。
     #[test]
     fn agy_stop_routes_by_termination_reason() {
-        // 主会话在等子代理回报:紧接着还有 PreInvocation,不是完成
-        assert!(matches!(
+        // 后台子代理还在跑:完成延后到它们收尾(或被主会话的新事件作废)
+        assert_eq!(
             route_agy_event("Stop", Some("NO_TOOL_CALL"), Some(false), Some(true)),
-            EventRoute::KeepStatus(_)
-        ));
+            EventRoute::DeferStop
+        );
         // 用户取消:回合结束但不算完成(与 omp / pi 的 aborted 同一条路)
         assert_eq!(
             route_agy_event("Stop", Some("USER_CANCELED"), Some(true), Some(true)),
@@ -1615,7 +1754,10 @@ mod tests {
         let agy = payload(serde_json::json!({
             "agent": "agy", "has_user_input": false
         }));
-        assert_eq!(route_event("Stop", &agy), EventRoute::Drop);
+        assert_eq!(
+            route_event("Stop", &agy),
+            EventRoute::Subagent { settled: true }
+        );
 
         let claude = payload(serde_json::json!({
             "agent": "claude-code", "has_user_input": false, "fully_idle": false,
@@ -1627,6 +1769,62 @@ mod tests {
             EventRoute::KeepStatus("无状态映射，已忽略"),
             "PreInvocation 不是别家的事件"
         );
+    }
+
+    /// 主会话 `Stop(fullyIdle=false)` 之后的两种实测时序(agy 1.5.12):
+    /// ① 主会话收到子代理回报后接着干活 —— 它的新事件作废延后,子代理收尾时不补记;
+    /// ② 主会话答完就停、之后只剩子代理收尾 —— 子代理全部收尾时才补记那次 Stop。
+    /// 多个子代理并行时,要等最后一个收尾。
+    #[test]
+    fn agy_deferred_stop_waits_for_all_subagents() {
+        let hs = HookState::new();
+        // 时序 ②:主会话等着,单个子代理收尾 → 补记(带主会话那次的 reason)
+        hs.agy_subagent_active(1, "sub-a");
+        hs.agy_defer_stop(1, Some("NO_TOOL_CALL".into()));
+        assert_eq!(
+            hs.agy_subagent_settled(1, "sub-a"),
+            Some(Some("NO_TOOL_CALL".to_string()))
+        );
+        assert_eq!(hs.agy_subagent_settled(1, "sub-a"), None, "只补记一次");
+
+        // 时序 ①:主会话延后后又有动静 → 作废,子代理收尾不补记
+        hs.agy_subagent_active(2, "sub-b");
+        hs.agy_defer_stop(2, Some("NO_TOOL_CALL".into()));
+        hs.agy_clear_deferred_stop(2);
+        assert_eq!(hs.agy_subagent_settled(2, "sub-b"), None);
+
+        // 并行两个子代理:第一个收尾时还有一个在跑,不补记;第二个收尾才补记
+        hs.agy_subagent_active(3, "x");
+        hs.agy_subagent_active(3, "y");
+        hs.agy_defer_stop(3, None);
+        assert_eq!(hs.agy_subagent_settled(3, "x"), None);
+        assert_eq!(hs.agy_subagent_settled(3, "y"), Some(None));
+
+        // 没有延后的完成时,子代理收尾什么都不补
+        hs.agy_subagent_active(4, "z");
+        assert_eq!(hs.agy_subagent_settled(4, "z"), None);
+
+        // pane 的 hook 状态被清掉(退出 / SessionEnd 兜底)时,两张表一并清
+        hs.agy_subagent_active(5, "w");
+        hs.agy_defer_stop(5, None);
+        hs.remove(5);
+        assert_eq!(hs.agy_subagent_settled(5, "w"), None);
+    }
+
+    /// 补记只在主会话还算「这一回合里」时生效:工作中,或只是被停摆兜底悄悄收了;
+    /// 打断过、已退出、其余 ai-idle 一律作废(宁可少报一次完成,不报假完成)。
+    #[test]
+    fn deferred_stop_applies_only_while_turn_is_live() {
+        assert!(deferred_stop_applies(
+            Some("ai-working"),
+            Some("PreInvocation")
+        ));
+        assert!(deferred_stop_applies(Some("ai-working"), None));
+        assert!(deferred_stop_applies(Some("ai-idle"), Some("Stall")));
+        assert!(!deferred_stop_applies(Some("ai-idle"), Some("Interrupt")));
+        assert!(!deferred_stop_applies(Some("ai-idle"), Some("Stop")));
+        assert!(!deferred_stop_applies(Some("idle"), Some("StallExit")));
+        assert!(!deferred_stop_applies(None, None));
     }
 
     /// 改造成 `route_event` 后别家的口径逐条不变(打断 / 黄灯归一化 / 收尾 Stop / 未知事件)。

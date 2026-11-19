@@ -56,6 +56,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use mt_core::path_key::windows_eq_key;
 use serde_json::Value;
 
+use super::grok::percent_decode;
+
 /// 索引库里 CLI 会话的 `app_data_dir` 取值
 const CLI_APP_DATA_DIR: &str = "antigravity-cli";
 
@@ -268,27 +270,6 @@ pub fn file_uri_to_path(uri: &str) -> Option<String> {
     } else {
         Some(decoded)
     }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .ok()
-                .and_then(|h| u8::from_str_radix(h, 16).ok())
-        {
-            out.push(b);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ─── transcript_full.jsonl ───────────────────────────────────────

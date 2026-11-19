@@ -1710,13 +1710,8 @@ impl Render for SessionPanel {
             let vendor = if tree {
                 AiVendor::for_session(&session.session_type, session.model.as_deref())
             } else {
-                // 平铺的缺省是 claude(原版 `TYPE_VENDOR[...] ?? 'claude'`)。CLI 图标表里
-                // 还没有的 agent(agy)先按模型推一次:回落成 Claude 图标会让人以为是
-                // claude 的会话
+                // 平铺的缺省是 claude(原版 `TYPE_VENDOR[...] ?? 'claude'`)
                 AiVendor::from_session_type(&session.session_type)
-                    .or_else(|| {
-                        AiVendor::for_session(&session.session_type, session.model.as_deref())
-                    })
                     .or(Some(AiVendor::Claude))
             };
             let wsl_badge = session.wsl_distro.clone();

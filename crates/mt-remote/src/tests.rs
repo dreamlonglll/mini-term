@@ -692,19 +692,6 @@ fn session_id_guard_rejects_traversal_before_touching_network() {
     assert_eq!(err3, "非法会话 id");
 }
 
-#[test]
-fn local_only_agents_are_rejected_before_touching_network() {
-    // 只有本机来源的 agent(agy 等)在远程项目里不会有列表条目;万一有正文请求,
-    // 也在建连之前报「不支持」,不连 SSH(conn 指向的主机不存在,触网会卡住或报连接错)
-    let c = conn("c1");
-    for agent in ["agy", "grok", "pi", "omp", "opencode", ""] {
-        let err = ai_session_content(&c, agent, "7e54f704-1278", "/p", 0).unwrap_err();
-        assert!(err.contains("不支持"), "{agent:?}: {err}");
-    }
-    let err = ai_session_content_all(&c, "agy", "7e54f704-1278", "/p").unwrap_err();
-    assert!(err.contains("不支持"), "{err}");
-}
-
 // --- 会话正文续读循环 ---
 
 fn msg(text: &str) -> AiSessionMessage {

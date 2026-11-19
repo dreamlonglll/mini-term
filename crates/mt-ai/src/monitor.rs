@@ -86,7 +86,9 @@ const AI_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// 停摆兜底改写状态时带的成因。两者都**不是** `Stop`，UI 的 `isAiCompletion`
 /// 认不出，不会播报完成；也都不在 `hook_server::is_attention_cause` 里，
 /// 不点托盘黄灯。纯粹用来把徽章从卡死的 ai-working 上摘下来。
-const STALL_CAUSE: &str = "Stall";
+/// (`pub(crate)`:agy 延后的完成补记时要认出「只是被停摆兜底收了」,见
+/// `hook_server::deferred_stop_applies`)
+pub(crate) const STALL_CAUSE: &str = "Stall";
 /// 停摆 + 此前已触发过退出 → 判定 AI 已经退出，回落 idle（见 `stall_settle_target`）
 const STALL_EXIT_CAUSE: &str = "StallExit";
 /// 降级路径上**不是完成**的下降沿带的成因:这一回合没人提交过(TUI 空闲期的零星

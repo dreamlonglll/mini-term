@@ -527,14 +527,6 @@ pub fn ai_session_content(
     if !session_id_path_safe(session_id) {
         return Err("非法会话 id".to_string());
     }
-    // 远程来源只扫 Claude 与 Codex(grok / pi / omp / agy 只有本机来源,列表里不会出现);
-    // 别家的正文请求在建 SSH 连接之前就拒掉,不白连一趟
-    if !matches!(
-        AgentKind::parse(session_type),
-        Some(AgentKind::Claude | AgentKind::Codex)
-    ) {
-        return Err(format!("不支持的会话类型: {session_type}"));
-    }
     let st = state();
     st.block_on(async move {
         let sftp = open_sftp(st, conn).await?;
