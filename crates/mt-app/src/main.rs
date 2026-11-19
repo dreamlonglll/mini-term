@@ -2937,6 +2937,8 @@ fn main() {
         //           面板判「已注册」只看 hooks.json,界面上没有线索提示用户重点
         //           一次注册;键已是新名字就不落盘
         // - omp / pi:扩展文件与当前模板不同就整份重写(模板随版本演进)
+        // - agy:    `~/.gemini/config/hooks.json` 里我们那一组缺事件、或命令里的 hook
+        //           绝对路径与当前不一致(装机目录变了)时重写那一组;一致就不落盘
         // 每条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
         // 都要读写用户主目录下的文件,故丢后台不挡启动。
         cx.background_executor()
@@ -2946,6 +2948,7 @@ fn main() {
                 mt_ai::hook_registry::sync_codex_hooks_feature_if_registered();
                 mt_ai::hook_registry::sync_omp_hooks_if_registered();
                 mt_ai::hook_registry::sync_pi_hooks_if_registered();
+                mt_ai::hook_registry::sync_agy_hooks_if_registered();
             })
             .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
