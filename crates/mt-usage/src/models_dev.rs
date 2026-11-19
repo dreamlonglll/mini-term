@@ -40,8 +40,10 @@ use crate::pricing::ModelPrice;
 /// 归一后的价格表:canonical 模型名 → $/token。
 pub type PricingMap = HashMap<String, ModelPrice>;
 
-/// 缓存格式版本:**建键规则变更时 +1**。版本不符不当新鲜值(仍可离线兜底)。
-const CACHE_VERSION: u32 = 2;
+/// 缓存格式版本:**建键或择优规则变更时 +1**(缓存里存的是择优后的结果,规则变了
+/// 旧缓存在 24h 内会继续给旧价)。版本不符不当新鲜值(仍可离线兜底)。
+/// v3:一方 provider 加入 `google`。
+const CACHE_VERSION: u32 = 3;
 /// 24h,与 `modelPricing.ts:21` 的 `CACHE_TTL_MS` 同。
 const CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// 用户手放的裸表(`usageStats.pricingLocalHint` 那条文案指的就是它)。
@@ -52,10 +54,13 @@ const CACHE_FILE: &str = "model-pricing.cache.json";
 
 /// 一方 provider:同一模型被多家登记时,官方目录的价格权威。
 /// (grok 同样被几十家聚合商以各自的价登记,不加 `xai` 的话成本会按某个
-/// 随机聚合商的报价算。)
-const FIRST_PARTY_PROVIDERS: [&str; 3] = ["anthropic", "openai", "xai"];
+/// 随机聚合商的报价算。`google` 同理,为 agy 的 Gemini 模型加:2026-11 的
+/// models.dev 里 `gemini-3.8-flash` 有 40 多家登记,不认 Google 时胜出的是一家
+/// 带显式缓存写价的聚合商,输入 / 输出单价比 Google 官方高 10%。`google` 目录里
+/// 只有 Gemini / Gemma 与少量 Google 自家模型,不与别家的键相撞。)
+const FIRST_PARTY_PROVIDERS: [&str; 4] = ["anthropic", "openai", "xai", "google"];
 /// 模型 id 自带一方前缀的次优先(如 `anthropic/claude-opus-5` 来自聚合商目录)。
-const FIRST_PARTY_HINTS: [&str; 3] = ["anthropic", "openai", "xai"];
+const FIRST_PARTY_HINTS: [&str; 4] = ["anthropic", "openai", "xai", "google"];
 
 // ─── 建键与择优(纯函数) ──────────────────────────────────────
 
@@ -506,6 +511,41 @@ mod tests {
         assert_eq!(ta, tb);
         let price = ta.get("claude-opus-5").unwrap();
         assert!((price.input - 5e-6).abs() < 1e-15, "取一方 provider 的价");
+    }
+
+    /// Gemini 取 Google 官方价:照 2026-11 models.dev 的真实碰撞组 —— 聚合商
+    /// `cortecs` 带显式缓存写价(以前靠这一条胜出),官方 `google` 没有缓存写价。
+    /// agy 的 `gemini-3.8-flash-high` 最终要落到这一条上。
+    #[test]
+    fn google_is_first_party_for_gemini() {
+        let api = json!({
+            "cortecs": { "models": { "gemini-3.8-flash": {
+                "cost": { "input": 0.825, "output": 4.125, "cache_read": 0.082, "cache_write": 0.084 }
+            } } },
+            "google": { "models": { "gemini-3.8-flash": {
+                "cost": { "input": 0.75, "output": 3.75, "cache_read": 0.075 }
+            } } },
+            "openrouter": { "models": { "google/gemini-3.8-flash": {
+                "cost": { "input": 0.75, "output": 3.75, "cache_read": 0.075, "cache_write": 0.041667 }
+            } } },
+        });
+        let table = normalize_pricing_table(&api);
+        let p = table.get("gemini-3-8-flash").unwrap();
+        assert!((p.input - 0.75e-6).abs() < 1e-15, "取 Google 官方价: {p:?}");
+        assert!((p.output - 3.75e-6).abs() < 1e-15);
+        assert_eq!(p.cache_write, 0.0, "官方没给缓存写价就是 0,不拿聚合商的补");
+
+        let priced = crate::PricingTable::new(table).resolve("gemini-3.8-flash-high");
+        assert!((priced.unwrap().input - 0.75e-6).abs() < 1e-15, "带档位的模型名落到本体");
+
+        // 聚合商目录里带 `google/` 前缀的 id 是次优先,压过不带前缀的聚合商
+        assert_eq!(
+            compare_pricing_candidates(
+                &candidate("openrouter", "google/gemini-3.8-flash", false, false),
+                &candidate("cortecs", "gemini-3.8-flash", true, true)
+            ),
+            std::cmp::Ordering::Greater
+        );
     }
 
     /// 单位换算:四个值全部 ÷1e6($/1M → $/token)。

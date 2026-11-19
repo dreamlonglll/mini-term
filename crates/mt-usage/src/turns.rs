@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+use mt_ai::sessions::{AgyConversation, AgyStep, AgyStepKind, parse_agy_step};
+
 /// 单次 API 调用的 token 用量（各分量互斥：`input` 不含缓存读写，
 /// `output` 不含 `reasoning`；Codex 侧解析时已换算到该语义）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -137,7 +139,7 @@ fn push_tool_events(
 /// 单个会话解析结果（Claude 主转录 + 子代理转录已合并；Codex 一文件一会话）。
 #[derive(Debug, Clone)]
 pub struct ParsedSession {
-    pub agent: &'static str, // "claude" | "codex" | "grok"
+    pub agent: &'static str, // "claude" | "codex" | "grok" | "agy"
     pub session_id: String,
     pub cwd: Option<String>,
     pub title: Option<String>,
@@ -831,6 +833,134 @@ pub(crate) fn parse_grok_session(session_dir: &Path) -> Option<ParsedSession> {
     })
 }
 
+// ─── Antigravity CLI(agy)会话解析 ─────────────────────────────
+//
+// 一个会话 = 索引库里的一行([`AgyConversation`]:id / 工作区 / 标题)+ 一份
+// `transcript_full.jsonl`。路径、索引与逐行字段解析全在 `mt_ai::sessions::agy`,
+// 这里只把每条 `PLANNER_RESPONSE`(= 一次模型调用)换算成 Turn。
+//
+// transcript 在上下文压缩时会被**整份重写**(旧步骤删掉 / 换掉、文件变短),所以
+// 账本对 agy 是「只增不删」的(见 ledger.rs `sync_job`),本节给出的两层身份键
+// (见 [`agy_message_id`])是那条口径的地基。
+//
+// **不做工具排行**:工具名虽然在 `tool_calls` 里,但账本的工具事件按会话整删重插、
+// 以顺序号为键,压缩重写一次就会把已经数过的工具调用抹掉,与「token 只增不删」
+// 的口径对不上;宁可不出,也不出一个会随压缩缩水的数。
+
+/// `PLANNER_RESPONSE` 的用量 → 互斥语义的 UsageTotals。
+///
+/// agy 的 `input_tokens` **不含**缓存命中(`cache_read_tokens` 另计),与 Claude 的
+/// `input_tokens` / `cache_read_input_tokens` 同形,直接对位;`output_tokens` **已含**
+/// 思考 token、transcript 不单列思考数 —— 与 Claude 一样整个记在 output、reasoning
+/// 记 0(`cost_of` 里两者同价,不会少算也不会双扣)。没有缓存写字段,记 0。
+fn usage_from_agy(step: &AgyStep) -> UsageTotals {
+    UsageTotals {
+        input: step.input_tokens.unwrap_or(0),
+        output: step.output_tokens.unwrap_or(0),
+        reasoning: 0,
+        cache_read: step.cache_read_tokens.unwrap_or(0),
+        cache_write: 0,
+        cache_write_1h: 0,
+    }
+}
+
+/// 一次模型调用的身份,分两层(都以 `agy:` 打头,不与别家的消息 id 相撞):
+///
+/// - **会话内身份** `agy:{step_index}@{created_at}` —— 账本 `turns` 的 request_id
+///   (由 [`agy_request_id`] 从本键截出)。`step_index` 是轨迹里的步序号,压缩重写
+///   transcript 时保留原序号(agy 自带的 swarm_board 插件就按「末行 step_index + 1」
+///   而不是行数来算步数);叠上 `created_at` 是防序号被复用 —— 回退到某一步再往下
+///   走,新步会拿到旧序号,而被回退掉的那些调用也是真花了钱的,不能被新步覆盖。
+///   用量值**不进**这一层:同一步若被原地改写(值变了),账本按主键覆盖,不会一步
+///   记两次。
+/// - **跨会话去重键** = 会话内身份 + `#{模型}#{输入}/{缓存读}/{输出}` —— 存进
+///   `Turn::message_id`,交给聚合层的跨会话去重(复制历史,如 `/fork` 把父会话的
+///   步骤带进新会话时,两边是同一条)。只有序号 + 秒级时间不够唯一:主会话与它的
+///   子代理同一秒各走到第 5 步是实测见过的,再叠上模型与三项用量才算同一次调用。
+pub(crate) fn agy_message_id(step: &AgyStep) -> String {
+    format!(
+        "agy:{}@{}#{}#{}/{}/{}",
+        step.step_index,
+        step.created_at.as_deref().unwrap_or(""),
+        step.model.as_deref().unwrap_or(""),
+        step.input_tokens.unwrap_or(0),
+        step.cache_read_tokens.unwrap_or(0),
+        step.output_tokens.unwrap_or(0),
+    )
+}
+
+/// 跨会话去重键 → 会话内身份(账本主键用,口径见 [`agy_message_id`])。
+pub(crate) fn agy_request_id(message_id: &str) -> &str {
+    message_id
+        .split_once('#')
+        .map_or(message_id, |(head, _)| head)
+}
+
+/// 索引里的工作区是正斜杠形态,盘符大小写还不稳(`d:/Git/x` 与 `D:/Git/x` 都见过)。
+/// 项目排行按 cwd 原串分组,而别家在 Windows 上记的是进程 cwd 原样(`D:\Git\x`)——
+/// 盘符路径转成同一形态(盘符大写、反斜杠、去尾随分隔符),同一项目才不会在排行里
+/// 拆成两行。非盘符路径(Unix)只去尾随 `/`。项目 scope 的匹配走 `windows_eq_key`,
+/// 不受这里影响。
+fn agy_native_cwd(path: &str) -> String {
+    let b = path.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let rest = path[2..].trim_end_matches(['/', '\\']).replace('/', "\\");
+        let rest = if rest.is_empty() { "\\".to_string() } else { rest };
+        format!("{}:{rest}", b[0].to_ascii_uppercase() as char)
+    } else {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() && !path.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+}
+
+/// 解析一个 agy 会话:`conv` 来自索引库(元信息),`transcript` 是它的
+/// `transcript_full.jsonl`(用量)。子代理会话同样走这里,项目归属用它自己的工作区。
+///
+/// 工作区可能有多个,账本的会话行只有一个 cwd 列 —— 取第一个。
+pub(crate) fn parse_agy_session(
+    conv: &AgyConversation,
+    transcript: &Path,
+) -> Option<ParsedSession> {
+    let lines = read_lines(transcript)?;
+    let turns = lines
+        .iter()
+        // 坏行 / 写到一半的末行解析不出来,跳过即可:下一轮文件指纹一变就会重读
+        .filter_map(|line| parse_agy_step(line))
+        .filter(|step| step.kind == AgyStepKind::PlannerResponse)
+        .filter_map(|step| {
+            let usage = usage_from_agy(&step);
+            // 计费门槛与别家相同:全 0 不是一次计费调用
+            if usage.total() == 0 {
+                return None;
+            }
+            Some(Turn {
+                message_id: Some(agy_message_id(&step)),
+                model: step.model.clone().filter(|m| !m.trim().is_empty()),
+                timestamp_ms: step.created_at.as_deref().and_then(parse_rfc3339_ms),
+                usage,
+            })
+        })
+        .collect();
+    let title = Some(conv.display_title())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(100).collect());
+    Some(ParsedSession {
+        agent: "agy",
+        session_id: conv.id.clone(),
+        cwd: conv.workspaces.first().map(|w| agy_native_cwd(w)),
+        title,
+        // 供应商归属由扫描层按 agent 归桶(会话本身不记 baseurl,与 grok 同处境)
+        provider: None,
+        mtime_ms: mtime_ms(transcript),
+        turns,
+        tool_uses: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1091,124 @@ mod tests {
         assert!(parse_grok_session(&empty).is_none());
 
         fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    // ---- Antigravity CLI(agy) ----
+
+    fn agy_conv(id: &str, workspaces: &[&str], parent: Option<&str>) -> AgyConversation {
+        AgyConversation {
+            id: id.into(),
+            title: String::new(),
+            preview: "Read hello.txt".into(),
+            workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
+            updated_at: None,
+            last_user_input_at: None,
+            step_count: 6,
+            parent_id: parent.map(str::to_string),
+            nesting_depth: i64::from(parent.is_some()),
+        }
+    }
+
+    /// 一条 `PLANNER_RESPONSE` 行(字段形态照本机 agy 1.5.12 的真实 transcript)。
+    fn agy_plan(idx: i64, ts: &str, input: u64, cache: u64, output: u64) -> String {
+        format!(
+            r#"{{"step_index":{idx},"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"{ts}","model":"gemini-3.8-flash-high","input_tokens":{input},"cache_read_tokens":{cache},"output_tokens":{output},"thinking":"hmm","tool_calls":[{{"name":"run_command","args":{{"CommandLine":"echo hi"}}}}]}}"#
+        )
+    }
+
+    fn agy_transcript_fixture(tag: &str, lines: &[String]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-agy-usage-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("transcript_full.jsonl");
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    /// 每条 `PLANNER_RESPONSE` 一条 Turn;用量口径与 Claude 对齐(input 不含缓存、
+    /// 思考并在 output、reasoning 0、无缓存写);用户发言 / 工具结果 / 打断报错不计;
+    /// 全 0 用量不计;坏行与写到一半的末行跳过。
+    #[test]
+    fn agy_planner_responses_become_turns_with_claude_like_buckets() {
+        let lines = vec![
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-19T13:46:08Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#.to_string(),
+            agy_plan(1, "2026-11-19T13:46:08Z", 8934, 0, 512),
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-19T13:46:14Z","content":"ok"}"#.to_string(),
+            agy_plan(3, "2026-11-19T13:46:14Z", 2645, 6897, 88),
+            agy_plan(4, "2026-11-19T13:46:20Z", 0, 0, 0),
+            r#"{"step_index":5,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-11-19T13:46:21Z","error":"The stream was interrupted."}"#.to_string(),
+            "not json".to_string(),
+            r#"{"step_index":6,"type":"PLANNER_RESP"#.to_string(),
+        ];
+        let path = agy_transcript_fixture("buckets", &lines);
+        let conv = agy_conv("2bada06a", &["d:/Git/mini-term/"], None);
+        let s = parse_agy_session(&conv, &path).expect("应解析出会话");
+
+        assert_eq!(s.agent, "agy");
+        assert_eq!(s.session_id, "2bada06a");
+        assert_eq!(s.cwd.as_deref(), Some(r"D:\Git\mini-term"), "盘符大写、反斜杠、去尾随分隔符");
+        assert_eq!(s.title.as_deref(), Some("Read hello.txt"), "title 空时回落 preview");
+        assert!(s.provider.is_none());
+        assert!(s.tool_uses.is_empty(), "agy 不出工具排行");
+        assert_eq!(s.turns.len(), 2, "只有两条带用量的 PLANNER_RESPONSE");
+
+        let t = &s.turns[1];
+        assert_eq!(t.model.as_deref(), Some("gemini-3.8-flash-high"));
+        assert_eq!(t.timestamp_ms, parse_rfc3339_ms("2026-11-19T13:46:14Z"));
+        assert_eq!(
+            t.usage,
+            UsageTotals {
+                input: 2645,
+                output: 88,
+                reasoning: 0,
+                cache_read: 6897,
+                cache_write: 0,
+                cache_write_1h: 0,
+            }
+        );
+        assert_eq!(t.usage.total(), 2645 + 6897 + 88);
+        assert_eq!(
+            t.message_id.as_deref(),
+            Some("agy:3@2026-11-19T13:46:14Z#gemini-3.8-flash-high#2645/6897/88")
+        );
+        assert_eq!(
+            agy_request_id(t.message_id.as_deref().unwrap()),
+            "agy:3@2026-11-19T13:46:14Z"
+        );
+        fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// 实测碰撞:主会话 `35f9ab48` 与它的子代理 `a75384f0` 的第 5 步都落在
+    /// 13:48:05。会话内身份相同(账本按会话分开存,互不覆盖),跨会话去重键必须
+    /// 不同,否则聚合层会把子代理那次调用当成复制历史吞掉。
+    #[test]
+    fn agy_parent_and_subagent_same_step_same_second_stay_distinct() {
+        let parent = agy_plan(5, "2026-11-19T13:48:05Z", 2541, 9172, 544);
+        let child = agy_plan(5, "2026-11-19T13:48:05Z", 2384, 1788, 32);
+        let p = parse_agy_step(&parent).unwrap();
+        let c = parse_agy_step(&child).unwrap();
+        assert_eq!(
+            agy_request_id(&agy_message_id(&p)),
+            agy_request_id(&agy_message_id(&c))
+        );
+        assert_ne!(agy_message_id(&p), agy_message_id(&c));
+    }
+
+    #[test]
+    fn agy_cwd_normalization() {
+        assert_eq!(agy_native_cwd("d:/Git/x"), r"D:\Git\x");
+        assert_eq!(agy_native_cwd("D:/"), r"D:\");
+        assert_eq!(agy_native_cwd("C:"), r"C:\");
+        assert_eq!(agy_native_cwd("/home/u/x/"), "/home/u/x");
+        assert_eq!(agy_native_cwd("/"), "/");
+        // 没有 transcript 的会话:返回 None,不 panic
+        let conv = agy_conv("x", &[], None);
+        assert!(parse_agy_session(&conv, Path::new("Z:/definitely/missing.jsonl")).is_none());
     }
 
     #[test]
