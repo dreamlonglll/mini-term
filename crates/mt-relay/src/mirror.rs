@@ -1,6 +1,6 @@
 //! 对话镜像:会话记录(JSONL)的增量解析 → 镜像消息序列。
 //!
-//! 数据源是 Claude/Codex/Grok/OMP/pi 会话记录文件,不是终端原始输出(docs/adr/0001)。
+//! 数据源是 Claude/Codex/Grok/OMP/pi/agy 会话记录文件,不是终端原始输出(docs/adr/0001)。
 //! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
 //! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
 //! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
@@ -13,6 +13,10 @@
 //! AI 启动时刻下限"启发式(此路径保留 v1 限制:多 pane 共同镜像最新会话)。
 //! 两层都保证:本轮会话未落盘时(首条消息前)给空镜像,不错绑别的会话。
 //! v1 限制:仅本机(Windows 宿主)来源的会话记录。
+//!
+//! 增量泵认「文件被换掉」不只看长度:agy 压缩上下文时把 transcript 整份重写,新内容
+//! 可能比旧偏移还长。续读前核对偏移之前那一小段原文([`TailCursor`]),对不上就清
+//! 运行态、下一轮从头换绑。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -24,7 +28,7 @@ use mt_ai::sessions as ai_sessions;
 use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
-/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP / pi 五家)。
+/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP / pi / agy 六家)。
 ///
 /// 判定与其测试随 `ai_sessions.rs` 一起迁进了 mt-ai(那边是会话记录格式的归属方),
 /// 这里 re-export 保留原调用点名字。**红线**:输入检测能认出的 agent 比这宽
@@ -55,6 +59,9 @@ pub enum MirrorAgent {
     Omp,
     /// pi:行形态与 OMP 相同,但没有内建提问工具 → 不出提问卡片
     Pi,
+    /// Antigravity CLI:transcript_full.jsonl 一行一步;同 pi 不出提问卡片
+    /// (理由见 `MirrorParser::parse_agy_line`)
+    Agy,
 }
 
 /// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
@@ -149,6 +156,7 @@ impl MirrorParser {
             MirrorAgent::Grok => self.parse_grok_line(line, out),
             MirrorAgent::Omp => self.parse_omp_line(line, out),
             MirrorAgent::Pi => self.parse_pi_line(line, out),
+            MirrorAgent::Agy => self.parse_agy_line(line, out),
         }
     }
 
@@ -324,6 +332,30 @@ impl MirrorParser {
         self.push_tool_calls(calls, out);
     }
 
+    /// agy 行(一行一步):用户请求 / 模型正文与桌面历史同一口径
+    /// ([`ai_sessions::agy_message_from_step`]),同一步里的 `tool_calls` 随后各出一行
+    /// 工具活动;工具结果、系统注入、断流提示(`ERROR_MESSAGE`)都不出。
+    ///
+    /// **不出提问卡片**(与 pi 同口径),`ask_question` 只算一行工具活动:
+    /// - 结果步(`GENERIC`)不带工具名、也不带调用 id,只能按顺序对上一步的调用,
+    ///   作答正文是 `A1: Red` 这样的纯文本,结构化对账无从做起;
+    /// - 提问框的 TUI 按键序列(选项导航、多选、自由输入)没有实测过,注错按键
+    ///   比不给卡片更糟;
+    /// - 提问框弹出期间 agy 不发任何 hook,桌面端也点不亮「等你处理」,移动端出卡
+    ///   也提示不到人。
+    fn parse_agy_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        // 只解析可能是对话的两种步:GENERIC 装着几 MB 的工具输出,换绑整份重放时不该
+        // 为它们付全量 JSON 解析
+        let Some(step) = ai_sessions::agy_dialogue_step_from_line(line) else {
+            return;
+        };
+        if let Some(raw) = ai_sessions::agy_message_from_step(&step) {
+            out.push(self.next_text_message(raw));
+        }
+        let calls = ai_sessions::agy_tool_calls_from_step(&step, &self.tool_paths);
+        self.push_tool_calls(calls, out);
+    }
+
     /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
     /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
     /// AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
@@ -391,8 +423,9 @@ impl MirrorParser {
             MirrorAgent::Claude => "Other",
             MirrorAgent::Codex => "None of the above",
             MirrorAgent::Grok => "Type your answer here",
-            // pi 不出提问卡片(见 `parse_pi_line`),走不到这里;按 OMP 写只为穷尽
-            MirrorAgent::Omp | MirrorAgent::Pi => "Other (type your own)",
+            // pi / agy 不出提问卡片(见 `parse_pi_line` / `parse_agy_line`),走不到这里;
+            // 按 OMP 写只为穷尽
+            MirrorAgent::Omp | MirrorAgent::Pi | MirrorAgent::Agy => "Other (type your own)",
         };
         for item in &mut question.items {
             // OMP 在追加 Other 前按真实选项范围钳位 recommended。
@@ -709,6 +742,11 @@ pub fn resolve_session_file(
             fresh_since(ai_sessions::newest_pi_session_file(project_path), min_mtime),
             MirrorAgent::Pi,
         ),
+        // 只认主会话:同工作区的子代理 transcript 跑着时比主会话新
+        (
+            fresh_since(ai_sessions::newest_agy_transcript(project_path), min_mtime),
+            MirrorAgent::Agy,
+        ),
     ];
     let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
     for (candidate, agent) in candidates {
@@ -793,6 +831,10 @@ pub fn resolve_session_file_by_id(
             claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
         }
         AgentKind::OpenCode => None,
+        // transcript 在全局 `brain/<id>/` 下,按 id 直达,不按项目找
+        AgentKind::Agy => {
+            ai_sessions::find_agy_transcript(session_id).map(|p| (p, MirrorAgent::Agy))
+        }
     }
 }
 
@@ -808,12 +850,12 @@ const REBIND_CHUNK: usize = 256 * 1024;
 /// 作答对账、grok 的分片状态机也都要从头走一遍才对得上。只读尾部这三样全会走样,
 /// 所以省的是「整份字节同时在内存」,不是「整份都要解析」。
 ///
-/// 返回 (解析出的全部消息, 读到的字节数 = 之后增量泵的起点);打不开 / 读失败
-/// 返回 None(调用方下一轮重试,与原来 `read_from_offset(path, 0)` 失败同处置)。
+/// 返回 (解析出的全部消息, 读到文件尾的游标 = 之后增量泵的起点);打不开 / 读失败
+/// 返回 None(调用方下一轮重试)。
 pub fn parse_whole_file(
     path: &Path,
     parser: &mut MirrorParser,
-) -> Option<(Vec<MirrorMessage>, u64)> {
+) -> Option<(Vec<MirrorMessage>, TailCursor)> {
     parse_whole_file_chunked(path, parser, REBIND_CHUNK)
 }
 
@@ -821,10 +863,10 @@ fn parse_whole_file_chunked(
     path: &Path,
     parser: &mut MirrorParser,
     chunk: usize,
-) -> Option<(Vec<MirrorMessage>, u64)> {
+) -> Option<(Vec<MirrorMessage>, TailCursor)> {
     let mut file = fs::File::open(path).ok()?;
     let mut buf = vec![0u8; chunk.max(1)];
-    let mut offset = 0u64;
+    let mut cursor = TailCursor::default();
     let mut out = Vec::new();
     loop {
         let n = match file.read(&mut buf) {
@@ -833,28 +875,70 @@ fn parse_whole_file_chunked(
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return None,
         };
-        offset += n as u64;
+        cursor.advance(&buf[..n]);
         out.extend(parser.feed(&buf[..n]));
     }
-    Some((out, offset))
+    Some((out, cursor))
 }
 
-/// 从 `offset` 读到文件尾。返回 (新字节, 新 offset);文件比 offset 短(被截断/重写)
-/// 返回 None,调用方应重新绑定。
-pub fn read_from_offset(path: &Path, offset: u64) -> Option<(Vec<u8>, u64)> {
+/// 续读锚的长度。一行 JSON 的尾巴(时间戳、id、收尾括号)几十字节里就有足够的
+/// 区分度;整份重写之后同一偏移前恰好还是原来这些字节,概率可以忽略。
+const TAIL_ANCHOR_LEN: usize = 64;
+
+/// 增量读的游标:读到哪(偏移)+ 偏移之前最后一小段原文(续读锚)。
+///
+/// 只比长度挡不住「整份重写」:agy 压缩上下文时把 transcript 整份重写,新内容可能
+/// 比旧偏移还长,从旧偏移接着读就是半截乱行、前文全对不上。所以续读前先核对锚还在
+/// 原处。追加写的记录(其余几家)前文不变,锚恒等,代价只是每次多读几十字节。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TailCursor {
+    offset: u64,
+    /// 不变量:`anchor.len() <= offset`,且就是文件 `[offset - len, offset)` 的原文
+    anchor: Vec<u8>,
+}
+
+impl TailCursor {
+    /// 已读到的字节数。
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// 吞下紧接着偏移读到的一段:偏移后移,锚换成新的最后 [`TAIL_ANCHOR_LEN`] 字节。
+    fn advance(&mut self, bytes: &[u8]) {
+        self.offset += bytes.len() as u64;
+        if bytes.len() >= TAIL_ANCHOR_LEN {
+            self.anchor.clear();
+            self.anchor
+                .extend_from_slice(&bytes[bytes.len() - TAIL_ANCHOR_LEN..]);
+        } else {
+            self.anchor.extend_from_slice(bytes);
+            let excess = self.anchor.len().saturating_sub(TAIL_ANCHOR_LEN);
+            self.anchor.drain(..excess);
+        }
+    }
+}
+
+/// 从游标处读到文件尾,返回新字节(没有新内容时为空)并推进游标。
+///
+/// 文件比偏移短(被截断)、或偏移之前的原文对不上(被整份重写)返回 None,游标不动
+/// —— 调用方应清掉运行态、从头重新绑定。
+pub fn read_appended(path: &Path, cursor: &mut TailCursor) -> Option<Vec<u8>> {
     let mut file = fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
-    if len < offset {
+    if len < cursor.offset {
         return None;
     }
-    if len == offset {
-        return Some((Vec::new(), offset));
-    }
-    file.seek(SeekFrom::Start(offset)).ok()?;
-    let mut buf = Vec::with_capacity((len - offset) as usize);
+    // 从锚的起点读:锚与新字节一次读回来,省一次 seek
+    let start = cursor.offset - cursor.anchor.len() as u64;
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
     file.read_to_end(&mut buf).ok()?;
-    let new_offset = offset + buf.len() as u64;
-    Some((buf, new_offset))
+    if !buf.starts_with(&cursor.anchor) {
+        return None;
+    }
+    let fresh = buf.split_off(cursor.anchor.len());
+    cursor.advance(&fresh);
+    Some(fresh)
 }
 
 #[cfg(test)]
@@ -1456,6 +1540,63 @@ mod tests {
         assert!(msgs.iter().all(|m| m.kind.as_deref() != Some("question")));
     }
 
+    /// agy:行形态取自本机 agy 1.5.12 的真实 transcript(ask_question 一问一答 + 跑命令 +
+    /// 子代理回信 + Esc 打断,正文截短)。用户请求块、模型正文、工具活动按步序出;
+    /// 工具结果 / 系统注入 / 断流提示不出;ask_question 只出工具行、不出提问卡片。
+    #[test]
+    fn parser_agy_text_and_tools_without_question_cards() {
+        let mut parser = MirrorParser::new(MirrorAgent::Agy, r"D:\ws");
+        let data = [
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-19T13:55:42Z","content":"<USER_REQUEST>\nAsk me: red or blue?\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-19T21:55:42+08:00.\n</ADDITIONAL_METADATA>"}"#,
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:55:42Z","model":"gemini-3.8-flash-high","thinking":"…","tool_calls":[{"name":"ask_question","args":{"questions":[{"is_multi_select":false,"options":["Red","Blue"],"question":"Which color do you prefer?"}]}}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-19T13:55:48Z","content":"Created At: 2026-11-19T21:55:48+08:00\nA1: Red"}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:56:07Z","model":"gemini-3.8-flash-high","content":"You selected **Red**.","tool_calls":[{"name":"run_command","args":{"CommandLine":"echo perm-probe","toolSummary":"Run echo probe"}},{"name":"read_file","args":{"Path":"D:\\ws\\hello.txt"}}]}"#,
+            r#"{"step_index":4,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"2026-11-19T13:56:08Z","content":"<SYSTEM_MESSAGE>\n[Message] sender=a75384f0 content=probe file line 1\n</SYSTEM_MESSAGE>"}"#,
+            r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:54:17Z","content":"1\n2\n3"}"#,
+            r#"{"step_index":6,"source":"SYSTEM","type":"ERROR_MESSAGE","status":"DONE","error":"The stream was interrupted. Please continue the task you were working on.","created_at":"2026-11-19T13:54:20Z","content":"Error: The stream was interrupted. Please continue the task you were working on."}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let msgs = parser.feed(data.as_bytes());
+        let summary: Vec<(&str, Option<&str>, &str)> = msgs
+            .iter()
+            .map(|m| (m.source.as_str(), m.kind.as_deref(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("desktop", None, "Ask me: red or blue?"),
+                (
+                    "assistant",
+                    Some("tool"),
+                    "ask_question Which color do you prefer?"
+                ),
+                ("assistant", None, "You selected **Red**."),
+                ("assistant", Some("tool"), "run_command echo perm-probe"),
+                ("assistant", Some("tool"), "read_file hello.txt"),
+                ("assistant", None, "1\n2\n3"),
+            ]
+        );
+        let seqs: Vec<u64> = msgs.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(msgs[0].timestamp, "2026-11-19T13:55:42Z");
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("ask_question"));
+        assert!(msgs.iter().all(|m| m.kind.as_deref() != Some("question")));
+        assert!(parser.answer_keys(1, "", 0, 0).is_none(), "没有挂起提问");
+    }
+
+    /// agy 按 hook 身份定位:id 过不了白名单不碰盘;本机没有的会话不绑(空镜像)。
+    #[test]
+    fn agy_session_file_by_id_rejects_bad_or_missing_ids() {
+        for bad in ["../x", "a/b", "", "a.b"] {
+            assert!(resolve_session_file_by_id(PROJECT, Some("agy"), bad).is_none());
+        }
+        assert!(
+            resolve_session_file_by_id(PROJECT, Some("agy"), "mt-test-no-such-agy-conversation")
+                .is_none()
+        );
+    }
+
     #[test]
     fn parser_omp_ignores_synthetic_user_without_clearing_question() {
         let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
@@ -1624,35 +1765,70 @@ mod tests {
         assert!(fresh_since(None, Some(start)).is_none());
     }
 
+    fn append_bytes(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
     #[test]
-    fn read_from_offset_detects_truncation() {
-        let dir = std::env::temp_dir().join(format!(
-            "mt-mirror-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
+    fn read_appended_detects_truncation() {
+        let dir = temp_dir("truncate");
         let file = dir.join("s.jsonl");
 
         fs::write(&file, b"hello\n").unwrap();
-        let (bytes, offset) = read_from_offset(&file, 0).unwrap();
-        assert_eq!(bytes, b"hello\n");
-        assert_eq!(offset, 6);
+        let mut cursor = TailCursor::default();
+        assert_eq!(read_appended(&file, &mut cursor).unwrap(), b"hello\n");
+        assert_eq!(cursor.offset(), 6);
+        // 没有新内容:空,游标不动
+        assert!(read_appended(&file, &mut cursor).unwrap().is_empty());
+        assert_eq!(cursor.offset(), 6);
 
-        // 追加后从 offset 续读
-        let mut f = fs::OpenOptions::new().append(true).open(&file).unwrap();
-        use std::io::Write;
-        f.write_all(b"world\n").unwrap();
-        drop(f);
-        let (bytes, offset) = read_from_offset(&file, offset).unwrap();
-        assert_eq!(bytes, b"world\n");
-        assert_eq!(offset, 12);
+        // 追加后从游标续读
+        append_bytes(&file, b"world\n");
+        assert_eq!(read_appended(&file, &mut cursor).unwrap(), b"world\n");
+        assert_eq!(cursor.offset(), 12);
 
-        // 文件被截断(重写):返回 None 提示重新绑定
+        // 文件被截断(重写):返回 None 提示重新绑定,游标不动
         fs::write(&file, b"x\n").unwrap();
-        assert!(read_from_offset(&file, offset).is_none());
+        assert!(read_appended(&file, &mut cursor).is_none());
+        assert_eq!(cursor.offset(), 12);
+        assert!(read_appended(&dir.join("missing"), &mut cursor).is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 整份重写成**更长**的内容(agy 压缩上下文):长度判不出来,靠续读锚认出前文
+    /// 被换掉;锚跨越多次短追加时同样对得上。
+    #[test]
+    fn read_appended_detects_longer_rewrite() {
+        let dir = temp_dir("rewrite");
+        let file = dir.join("s.jsonl");
+        let line = |i: usize| format!("{{\"step_index\":{i},\"type\":\"USER_INPUT\"}}\n");
+
+        fs::write(&file, line(0)).unwrap();
+        let mut cursor = TailCursor::default();
+        read_appended(&file, &mut cursor).unwrap();
+        // 一字节一字节地追加:锚由多段短读拼成,仍与文件对得上
+        for b in line(1).as_bytes() {
+            append_bytes(&file, &[*b]);
+            assert_eq!(read_appended(&file, &mut cursor).unwrap(), [*b]);
+        }
+        let before = cursor.clone();
+
+        // 重写:新内容比旧偏移长,但偏移之前的原文变了
+        let rewritten = format!("{}{}{}", line(7), line(8), line(9));
+        assert!(rewritten.len() as u64 > before.offset());
+        fs::write(&file, &rewritten).unwrap();
+        assert!(read_appended(&file, &mut cursor).is_none());
+        assert_eq!(cursor, before, "认出重写时游标不动");
+
+        // 前文原样、只在后面追加(普通增长)照常续读
+        fs::write(&file, format!("{}{}{}", line(0), line(1), line(2))).unwrap();
+        assert_eq!(
+            read_appended(&file, &mut cursor).unwrap(),
+            line(2).as_bytes()
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1906,13 +2082,15 @@ mod tests {
         let data = format!("{}{head}", claude_transcript());
         fs::write(&file, &data).unwrap();
 
-        let (bytes, read_offset) = read_from_offset(&file, 0).unwrap();
+        let bytes = fs::read(&file).unwrap();
         let expected = MirrorParser::new(MirrorAgent::Claude, PROJECT).feed(&bytes);
+        let mut whole = TailCursor::default();
+        assert_eq!(read_appended(&file, &mut whole).unwrap(), bytes);
         for chunk in [1, 7, 64, REBIND_CHUNK] {
             let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
-            let (msgs, offset) = parse_whole_file_chunked(&file, &mut parser, chunk).unwrap();
+            let (msgs, cursor) = parse_whole_file_chunked(&file, &mut parser, chunk).unwrap();
             assert_eq!(msgs, expected, "块大小 {chunk}");
-            assert_eq!(offset, read_offset, "偏移必须推到文件尾(含半行)");
+            assert_eq!(cursor, whole, "游标(偏移 + 锚)必须推到文件尾(含半行)");
 
             // 半行由之后的增量读补全
             let more = parser.feed(format!("{rest}\n").as_bytes());

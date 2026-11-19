@@ -51,6 +51,22 @@ pub(crate) fn strip_date_suffix(name: &str) -> Option<&str> {
     }
 }
 
+/// Gemini 的思考档位后缀（Gemini API 的 thinking level 取值）。
+const GEMINI_THINKING_TIERS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// 剥 Gemini 模型名尾部的思考档位(`gemini-3-8-flash-high` → `gemini-3-8-flash`)。
+///
+/// agy 的 transcript 把档位拼进模型名(`gemini-3.8-flash-high`),models.dev 只按
+/// 模型登记价格,档位不改单价。只认 `gemini-` 开头的名字:别家的 `-high` 是不是
+/// 档位没有依据,留给后面的通用前缀匹配。
+pub(crate) fn strip_gemini_thinking_tier(name: &str) -> Option<&str> {
+    if !name.starts_with("gemini-") {
+        return None;
+    }
+    let (head, tail) = name.rsplit_once('-')?;
+    GEMINI_THINKING_TIERS.contains(&tail).then_some(head)
+}
+
 /// 同一 canonical 键下的择优序（元组字典序，越大越优先）。
 ///
 /// 只看「来源形态」与「价格是否完整」，不比价格高低——挑贵的或挑便宜的都是在
@@ -130,9 +146,14 @@ impl PricingTable {
         Self { exact, fallback }
     }
 
-    /// 查价链：canonical 精确 → 剥日期后缀 → 最长前缀 → 锚点均价。
+    /// 查价链：canonical 精确 → 剥日期后缀 → 剥 Gemini 思考档位 → 最长前缀 → 锚点均价。
     /// 前缀匹配要求断点落在 `-` 上（`gpt-5-mini` 不塌到 `gpt-5`，因为精确键先命中；
     /// 未知新款 `claude-opus-4-9` 可塌到表内的 `claude-opus-4` 系列键）。
+    ///
+    /// 档位那一步排在精确之后:表里若真有带档位的键(某些聚合商把
+    /// `gemini-3.1-pro-preview-high` 单独登记),精确命中优先。结果上它与最长前缀
+    /// 等价,单列一步是把「档位不是模型名的一部分」写成有单测钉住的显式规则 ——
+    /// 前缀匹配是给未知新款兜底的启发式,日后收紧它时档位映射不该跟着失效。
     pub fn resolve(&self, model: &str) -> Option<ModelPrice> {
         let c = canonical(model);
         if c.is_empty() || c == "<synthetic>" {
@@ -143,6 +164,13 @@ impl PricingTable {
         }
         if let Some(stripped) = strip_date_suffix(&c) {
             if let Some(p) = self.exact.get(stripped) {
+                return Some(*p);
+            }
+        }
+        let undated = strip_date_suffix(&c).unwrap_or(&c);
+        if let Some(base) = strip_gemini_thinking_tier(undated) {
+            let base = strip_date_suffix(base).unwrap_or(base);
+            if let Some(p) = self.exact.get(base) {
                 return Some(*p);
             }
         }
@@ -224,6 +252,52 @@ mod tests {
         assert_eq!(t.resolve("gpt-5-mini-turbo").unwrap().input, 2e-7);
         // 断点不在 `-` 上不算前缀（gpt-52 不该命中 gpt-5）
         assert!(t.resolve("gpt-52").is_none() || t.resolve("gpt-52").unwrap().input != 1e-6);
+    }
+
+    /// agy 的模型名带思考档位(`gemini-3.8-flash-high`):剥档位后按 Gemini 本体计价;
+    /// 表里真有带档位的键时精确命中优先;本体也查不到的走锚点均价(定稿口径不变)。
+    #[test]
+    fn gemini_thinking_tier_maps_to_base_model() {
+        let t = table(&[
+            ("gemini-3.8-flash", 0.75e-6),
+            ("gemini-3.1-pro-preview", 2e-6),
+            ("gemini-3.1-pro-preview-high", 9e-6),
+            ("claude-opus-4-8", 5e-6),
+        ]);
+        for tier in ["minimal", "low", "medium", "high"] {
+            let p = t.resolve(&format!("gemini-3.8-flash-{tier}")).unwrap();
+            assert_eq!(p.input, 0.75e-6, "{tier}");
+        }
+        assert_eq!(
+            t.resolve("Gemini-3.8-Flash-High").unwrap().input,
+            0.75e-6,
+            "大小写不敏感"
+        );
+        assert_eq!(
+            t.resolve("gemini-3.8-flash-high-20260101").unwrap().input,
+            0.75e-6,
+            "档位后挂日期"
+        );
+        assert_eq!(
+            t.resolve("gemini-3.1-pro-preview-high").unwrap().input,
+            9e-6,
+            "表里有带档位的键时精确命中优先"
+        );
+        assert_eq!(t.resolve("gemini-3.1-pro-preview-low").unwrap().input, 2e-6);
+        // 本体不在表里:锚点均价兜底(表里只有 claude-opus-4-8 一个锚点)
+        assert_eq!(t.resolve("gemini-9-ultra-high").unwrap().input, 5e-6);
+
+        assert_eq!(
+            strip_gemini_thinking_tier("gemini-3-8-flash-high"),
+            Some("gemini-3-8-flash")
+        );
+        assert_eq!(strip_gemini_thinking_tier("gemini-3-8-flash"), None);
+        assert_eq!(strip_gemini_thinking_tier("gemini-3-8-flash-lite"), None);
+        assert_eq!(
+            strip_gemini_thinking_tier("o3-mini-high"),
+            None,
+            "只认 gemini"
+        );
     }
 
     #[test]

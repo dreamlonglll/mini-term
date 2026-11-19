@@ -1,7 +1,13 @@
 //! Hook 注册/卸载模块
 //!
-//! 一键把 Claude Code / Codex / Grok / oh-my-pi / pi 各家的 hook 配置写进各自的配置文件，
-//! 并提供配置片段供用户手动粘贴。原本是一组 Tauri command，迁移后是普通函数。
+//! 一键把 Claude Code / Codex / Grok / oh-my-pi / pi / Antigravity CLI 各家的 hook 配置写进
+//! 各自的配置文件，并提供配置片段供用户手动粘贴。原本是一组 Tauri command，迁移后是普通函数。
+//!
+//! # Antigravity CLI（agy）
+//!
+//! 写 `~/.gemini/config/hooks.json` 里 mini-term 自己的组（别家的组原样保留），只注册
+//! `PreInvocation` / `Stop` 两个事件，**绝不注册 `PreToolUse`**（sidecar 对 agy 输出
+//! `{}`，那在 `PreToolUse` 上等于拒绝工具）。细节见 agy 段的注释与 `AGY_HOOK_EVENTS`。
 //!
 //! # oh-my-pi（omp）与 pi 不走 sidecar
 //!
@@ -1195,6 +1201,358 @@ pub fn sync_pi_hooks_if_registered() {
     PI_EXTENSION.sync_if_registered();
 }
 
+// ─── Antigravity CLI(agy)hook 注册/卸载 ───
+//
+// 全局配置 `~/.gemini/config/hooks.json`(`ANTIGRAVITY_GEMINI_DIR` 实测不改它的位置)。
+// 文件是两层:顶层键是**随便起的组名**,值是该组的事件表;事件下挂处理器数组 ——
+// `SessionStart` / `PreInvocation` / `PostInvocation` / `Stop` 是平铺的处理器,
+// `PreToolUse` / `PostToolUse` 是 `{matcher, hooks: [处理器…]}` 分组。组级
+// `"enabled": false` 可整组停用。
+//
+// - 我们只写自己的组 [`AGY_HOOK_GROUP`];用户机器上常见别家的组(比如指向已删脚本的
+//   `orca-status`),别家的组、键序一律原样保留(删键用 `retain`,不用 `Map::remove`
+//   —— 后者在 preserve_order 下是 swap_remove,会打乱用户文件的键序)。
+// - 命令写法实测(1.5.12):Windows 上 agy 交给 `cmd` 执行,`"<绝对路径>" <事件名>` 带空格、
+//   带括号的路径都能跑,外面再包一层引号反而跑不起来 —— 与 Claude 那条同一写法。
+//   hook 进程的工作目录是 hooks.json 所在目录,所以必须写绝对路径。
+// - sidecar 对 agy 的每个事件都往 stdout 打 `{}`(agy 要求输出 JSON 对象)。这对注册
+//   事件集是硬约束:见 [`AGY_HOOK_EVENTS`]。
+// - agy 1.5.x 能读带 UTF-8 BOM 的文件,用户手改过的文件可能带 BOM:读的时候剥掉,
+//   写的时候不带。
+
+/// mini-term 在 agy `hooks.json` 里的组名
+const AGY_HOOK_GROUP: &str = "mini-term";
+
+/// agy 注册的事件:**只要这两个**。
+///
+/// - hook 同步执行、阻塞 agent 循环(官方文档),每多注册一个事件,每次模型调用就多一次
+///   `cmd` + 进程冷启动;
+/// - `SessionStart` 与首个 `PreInvocation` 同时到(懒触发:发第一条消息才有),不带额外信息;
+/// - `PostInvocation` / `PostToolUse` 只覆盖「工具执行完到下一次调模型」那一小段,紧跟着
+///   就是下一个 `PreInvocation`,不值得多一次进程启动;
+/// - ⚠️ **绝不能注册 `PreToolUse`**:sidecar 对 agy 一律输出 `{}`,而 `PreToolUse` 的
+///   `{}`(没有 decision)= **拒绝执行工具**(实测 `tool call denied by pre-tool hook`)。
+const AGY_HOOK_EVENTS: &[&str] = &["PreInvocation", "Stop"];
+
+/// agy hook 处理器的超时(秒)。sidecar POST 完就退,10s 绰绰有余;缺省是 30s,
+/// 而 hook 同步阻塞 agent 循环,万一卡住要尽早放行。
+const AGY_HOOK_TIMEOUT_SECS: u64 = 10;
+
+/// agy 的全局 hook 配置文件 `~/.gemini/config/hooks.json`
+fn agy_hooks_path() -> Option<PathBuf> {
+    crate::sessions::agy_config_dir().map(|d| d.join("hooks.json"))
+}
+
+/// 一个 agy 处理器(平铺形态)。命令写法与 Claude 那条相同,见本段开头。
+fn build_agy_handler(hook_path: &str, event: &str) -> Value {
+    let command = if cfg!(windows) {
+        format!("\"{}\" {}", hook_path, event)
+    } else {
+        format!("{} {}", hook_path, event)
+    };
+    serde_json::json!({
+        "type": "command",
+        "command": command,
+        "timeout": AGY_HOOK_TIMEOUT_SECS
+    })
+}
+
+/// 我们的组应有的内容(不含 `enabled`):每个事件一个处理器。
+fn build_agy_group(hook_path: &str) -> serde_json::Map<String, Value> {
+    AGY_HOOK_EVENTS
+        .iter()
+        .map(|event| {
+            (
+                event.to_string(),
+                serde_json::json!([build_agy_handler(hook_path, event)]),
+            )
+        })
+        .collect()
+}
+
+/// 解析 agy 的 hooks.json:剥 UTF-8 BOM;空文件按 `{}`;顶层不是对象报错。
+fn parse_agy_hooks(content: &str) -> Result<Value, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    if content.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let config: Value =
+        serde_json::from_str(content).map_err(|e| format!("解析 hooks.json 失败: {}", e))?;
+    if !config.is_object() {
+        return Err("hooks.json 顶层不是对象".to_string());
+    }
+    Ok(config)
+}
+
+/// 读 agy 的 hooks.json;文件不在返回 `Ok(None)`,读不了 / 读不懂返回 `Err`。
+fn read_agy_hooks(path: &std::path::Path) -> Result<Option<Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => parse_agy_hooks(&content).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读取 hooks.json 失败: {}", e)),
+    }
+}
+
+/// 处理器(平铺形态的一项,或分组里 `hooks` 的一项)的命令带 miniterm-hook 标识。
+fn agy_handler_is_miniterm(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains(HOOK_MARKER))
+}
+
+/// 已注册事件 = **我们的组里**命令带 miniterm-hook 标识的事件(两种形态都认)。
+fn agy_registered_events(config: &Value) -> std::collections::HashSet<String> {
+    let Some(group) = config.get(AGY_HOOK_GROUP).and_then(|g| g.as_object()) else {
+        return std::collections::HashSet::new();
+    };
+    group
+        .iter()
+        .filter(|(_, items)| {
+            items.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|item| agy_handler_is_miniterm(item) || entry_is_miniterm(item))
+            })
+        })
+        .map(|(event, _)| event.clone())
+        .collect()
+}
+
+/// 我们的组是否已与当前应写的一致(`enabled` 是用户的开关,不参与比较)。装机目录变了
+/// (命令里的绝对路径过期)、事件集变了都算不一致。
+fn agy_group_is_current(config: &Value, hook_path: &str) -> bool {
+    let Some(group) = config.get(AGY_HOOK_GROUP).and_then(|g| g.as_object()) else {
+        return false;
+    };
+    let current: serde_json::Map<String, Value> = group
+        .iter()
+        .filter(|(key, _)| key.as_str() != "enabled")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    current == build_agy_group(hook_path)
+}
+
+/// 把我们的组写成当前应有的内容。组已在 → 原位替换(键序不动),用户在组上设的
+/// `enabled` 保留;不在 → 追加到末尾。别家的组一概不碰。
+fn upsert_agy_group(config: &mut Value, hook_path: &str) -> Result<(), String> {
+    let root = config
+        .as_object_mut()
+        .ok_or_else(|| "hooks.json 顶层不是对象".to_string())?;
+    let mut group = serde_json::Map::new();
+    if let Some(enabled) = root.get(AGY_HOOK_GROUP).and_then(|g| g.get("enabled")) {
+        group.insert("enabled".to_string(), enabled.clone());
+    }
+    group.extend(build_agy_group(hook_path));
+    // 键已在时 insert 原位替换值(preserve_order 下是 IndexMap::insert,不挪位置)
+    root.insert(AGY_HOOK_GROUP.to_string(), Value::Object(group));
+    Ok(())
+}
+
+/// 摘掉**所有组**里的 mini-term 处理器(平铺的看自己的命令,分组的看组里 `hooks`),
+/// 被我们摘空的分组项 / 事件 / 组一并删除,返回摘掉的处理器数。
+///
+/// 只删被**我们**摘空的:用户自己留着的空数组、空组不碰;组里只剩 `enabled` 也算空。
+fn strip_agy_entries(config: &mut Value) -> usize {
+    let Some(root) = config.as_object_mut() else {
+        return 0;
+    };
+    let mut removed = 0;
+    let mut emptied_groups: Vec<String> = Vec::new();
+    for (group_name, group) in root.iter_mut() {
+        let Some(group) = group.as_object_mut() else {
+            continue;
+        };
+        let mut removed_in_group = 0;
+        let mut emptied_events: Vec<String> = Vec::new();
+        for (event, items) in group.iter_mut() {
+            let Some(items) = items.as_array_mut() else {
+                continue;
+            };
+            let mut removed_in_event = 0;
+            items.retain_mut(|item| {
+                if agy_handler_is_miniterm(item) {
+                    removed_in_event += 1;
+                    return false;
+                }
+                if let Some(hooks) = item.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    let before = hooks.len();
+                    hooks.retain(|h| !agy_handler_is_miniterm(h));
+                    let n = before - hooks.len();
+                    removed_in_event += n;
+                    if n > 0 && hooks.is_empty() {
+                        return false;
+                    }
+                }
+                true
+            });
+            if removed_in_event > 0 && items.is_empty() {
+                emptied_events.push(event.clone());
+            }
+            removed_in_group += removed_in_event;
+        }
+        if !emptied_events.is_empty() {
+            group.retain(|event, _| !emptied_events.contains(event));
+        }
+        if removed_in_group > 0 && group.keys().all(|k| k == "enabled") {
+            emptied_groups.push(group_name.clone());
+        }
+        removed += removed_in_group;
+    }
+    if !emptied_groups.is_empty() {
+        root.retain(|name, _| !emptied_groups.contains(name));
+    }
+    removed
+}
+
+fn write_agy_hooks(path: &std::path::Path, config: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let json_str = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
+    crate::util::atomic_write(path, json_str.as_bytes())
+        .map_err(|e| format!("写入 hooks.json 失败: {}", e))
+}
+
+/// 把我们的组写进 `path`,返回是否真的落盘(已是当前内容时一个字节不写)。
+///
+/// 文件读不懂(坏 JSON / 顶层不是对象)→ 报错,**不覆盖**用户文件。
+fn register_agy_hooks_at(path: &std::path::Path, hook_path: &str) -> Result<bool, String> {
+    let mut config = read_agy_hooks(path)?.unwrap_or_else(|| serde_json::json!({}));
+    if agy_group_is_current(&config, hook_path) {
+        return Ok(false);
+    }
+    upsert_agy_group(&mut config, hook_path)?;
+    write_agy_hooks(path, &config)?;
+    Ok(true)
+}
+
+/// 注册 agy hooks 到 ~/.gemini/config/hooks.json
+fn register_agy_hooks(hook_path: &str) -> Result<String, String> {
+    let path = agy_hooks_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let label = AgentKind::Agy.spec().label;
+    Ok(if register_agy_hooks_at(&path, hook_path)? {
+        format!(
+            "{}: hook 已写入组 {} (共 {} 个事件)",
+            label,
+            AGY_HOOK_GROUP,
+            AGY_HOOK_EVENTS.len()
+        )
+    } else {
+        format!(
+            "{}: hook 已是最新 (共 {} 个事件)",
+            label,
+            AGY_HOOK_EVENTS.len()
+        )
+    })
+}
+
+/// 摘掉 `path` 里所有 mini-term 处理器,返回摘掉的条数。文件不在 / 读不懂 / 里面没有
+/// 我们的条目时**一个字节不写**;摘完只剩 `{}` 也照样留着文件(那是 agy 的配置文件,
+/// 不是我们建的专属文件)。
+fn remove_agy_entries_at(path: &std::path::Path) -> Result<usize, String> {
+    let Ok(Some(mut config)) = read_agy_hooks(path) else {
+        return Ok(0);
+    };
+    let removed = strip_agy_entries(&mut config);
+    if removed > 0 {
+        write_agy_hooks(path, &config)?;
+    }
+    Ok(removed)
+}
+
+/// 从 ~/.gemini/config/hooks.json 中卸载 miniterm hooks
+fn unregister_agy_hooks() -> Result<String, String> {
+    let removed = match agy_hooks_path() {
+        Some(path) => remove_agy_entries_at(&path)?,
+        None => 0,
+    };
+    let label = AgentKind::Agy.spec().label;
+    Ok(if removed == 0 {
+        format!("{}: 未发现 mini-term 的 hook 条目，无需卸载", label)
+    } else {
+        format!("{}: 已移除 {} 个 hook 条目", label, removed)
+    })
+}
+
+fn registered_agy_events() -> std::collections::HashSet<String> {
+    agy_hooks_path()
+        .and_then(|path| read_agy_hooks(&path).ok().flatten())
+        .map(|config| agy_registered_events(&config))
+        .unwrap_or_default()
+}
+
+/// 我们的组里登记的 hook 二进制路径(从第一个带标识的处理器命令里抠:Windows 写法
+/// `"<路径>" 事件名` 取引号里的,Unix 写法 `<路径> 事件名` 取最后一个空格前的)。
+fn agy_registered_hook_path(config: &Value) -> Option<String> {
+    let group = config.get(AGY_HOOK_GROUP)?.as_object()?;
+    let command = group
+        .values()
+        .filter_map(|items| items.as_array())
+        .flatten()
+        .filter(|item| agy_handler_is_miniterm(item))
+        .find_map(|item| item.get("command").and_then(|c| c.as_str()))?;
+    let path = match command.strip_prefix('"') {
+        Some(rest) => rest.split_once('"')?.0,
+        None => command.rsplit_once(' ')?.0,
+    };
+    Some(path.to_string())
+}
+
+/// 启动期自愈的文件层:注册过(我们的组里有 miniterm-hook 条目)且组内容与当前应写的
+/// 不一致(缺事件 / 事件集变了 / 命令里的路径过期)时重写我们的组,返回是否落盘。
+/// 没注册过、读不懂、已是最新 → 一个字节不写。
+///
+/// 「路径不一致」只在**登记的那个二进制已经不在了**时才改写:组里其余内容都对、只是指向
+/// 另一份**还在**的 miniterm-hook(dev 实例与装机版并跑),说明是另一个 mini-term 注册
+/// 的,两边每次启动互相改写只会来回翻 —— 不抢。装机目录变了(旧目录随卸载删掉)、
+/// dev 的 target 被删,旧路径都不在了,照样改写。
+fn sync_agy_hooks_at(path: &std::path::Path, hook_path: &str) -> Result<bool, String> {
+    let Ok(Some(config)) = read_agy_hooks(path) else {
+        return Ok(false);
+    };
+    if agy_registered_events(&config).is_empty() || agy_group_is_current(&config, hook_path) {
+        return Ok(false);
+    }
+    let held_by_live_peer = agy_registered_hook_path(&config).is_some_and(|other| {
+        other != hook_path
+            && std::path::Path::new(&other).is_file()
+            && agy_group_is_current(&config, &other)
+    });
+    if held_by_live_peer {
+        return Ok(false);
+    }
+    register_agy_hooks_at(path, hook_path)
+}
+
+/// 已注册用户的启动期自愈:补齐新增事件,以及**命令里的绝对路径过期**时改写 ——
+/// agy 的命令写的是 hook 二进制的绝对路径,装机目录一变(换盘重装)或 dev 的 target
+/// 被删,旧路径就指向不存在的文件,agy 每个事件都白跑一次失败的 `cmd`、状态全丢。
+/// 指向另一份还在的 miniterm-hook 时不抢(口径见 `sync_agy_hooks_at`)。
+pub fn sync_agy_hooks_if_registered() {
+    let Some(path) = agy_hooks_path() else {
+        return;
+    };
+    let hook_path = match hook_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "[hook-registry] agy 补注册跳过（拿不到 hook 二进制路径）: {}",
+                e
+            );
+            return;
+        }
+    };
+    match sync_agy_hooks_at(&path, &hook_path) {
+        Ok(true) => eprintln!(
+            "[hook-registry] agy hooks.json 的 {} 组已刷新",
+            AGY_HOOK_GROUP
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[hook-registry] agy 补注册失败: {}", e),
+    }
+}
+
 // ─── 注册目标 ───
 
 /// 可单独注册/卸载的 CLI。
@@ -1213,6 +1571,8 @@ pub enum HookAgent {
     Omp,
     /// pi（earendil-works/pi，omp 的上游）：同 omp 写 TS 扩展，模板另一份
     Pi,
+    /// Antigravity CLI（agy）：写 `~/.gemini/config/hooks.json` 里我们自己的组
+    Agy,
 }
 
 impl HookAgent {
@@ -1222,6 +1582,7 @@ impl HookAgent {
         HookAgent::Grok,
         HookAgent::Omp,
         HookAgent::Pi,
+        HookAgent::Agy,
     ];
 
     /// 注册目标对应的 agent。标识与展示名都查 [`crate::agent`] 那张表,
@@ -1233,6 +1594,7 @@ impl HookAgent {
             HookAgent::Grok => AgentKind::Grok,
             HookAgent::Omp => AgentKind::Omp,
             HookAgent::Pi => AgentKind::Pi,
+            HookAgent::Agy => AgentKind::Agy,
         }
     }
 
@@ -1258,6 +1620,7 @@ impl HookAgent {
             HookAgent::Grok => GROK_HOOK_EVENTS,
             HookAgent::Omp => OMP_EXTENSION.events,
             HookAgent::Pi => PI_EXTENSION.events,
+            HookAgent::Agy => AGY_HOOK_EVENTS,
         }
     }
 
@@ -1268,6 +1631,7 @@ impl HookAgent {
             HookAgent::Grok => registered_grok_events(),
             HookAgent::Omp => OMP_EXTENSION.registered_events(),
             HookAgent::Pi => PI_EXTENSION.registered_events(),
+            HookAgent::Agy => registered_agy_events(),
         }
     }
 
@@ -1279,6 +1643,7 @@ impl HookAgent {
             HookAgent::Grok => grok_hooks_path(),
             HookAgent::Omp => OMP_EXTENSION.path(),
             HookAgent::Pi => PI_EXTENSION.path(),
+            HookAgent::Agy => agy_hooks_path(),
         };
         let Some(raw) = raw else {
             return String::new();
@@ -1303,6 +1668,7 @@ impl HookAgent {
             // omp / pi 走的是进程内 TS 扩展，用不着 hook 二进制的路径
             HookAgent::Omp => OMP_EXTENSION.register(),
             HookAgent::Pi => PI_EXTENSION.register(),
+            HookAgent::Agy => register_agy_hooks(hook_path),
         }
     }
 
@@ -1313,6 +1679,7 @@ impl HookAgent {
             HookAgent::Grok => unregister_grok_hooks(),
             HookAgent::Omp => OMP_EXTENSION.unregister(),
             HookAgent::Pi => PI_EXTENSION.unregister(),
+            HookAgent::Agy => unregister_agy_hooks(),
         }
     }
 
@@ -1330,6 +1697,7 @@ impl HookAgent {
             }),
             HookAgent::Omp => OMP_EXTENSION.remove_entries(),
             HookAgent::Pi => PI_EXTENSION.remove_entries(),
+            HookAgent::Agy => agy_hooks_path().map_or(Ok(0), |path| remove_agy_entries_at(&path)),
         }
     }
 }
@@ -1396,7 +1764,7 @@ pub fn unregister_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, Str
 }
 
 /// 卸载 mini-term 本体时用(`mini-term.exe --unregister-hooks`,由 NSIS 卸载器调起):
-/// 五家配置里 mini-term 写入的条目全部摘掉,按家返回摘掉的条数。
+/// 各家([`HookAgent::ALL`])配置里 mini-term 写入的条目全部摘掉,按家返回摘掉的条数。
 ///
 /// 与设置页「卸载」同一套摘除逻辑([`HookAgent::remove_entries`]),只认带
 /// `miniterm-hook` 标识的条目 / 文件;没有我们条目的配置文件一个字节不写;单家失败
@@ -1474,6 +1842,15 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
     }
     let grok_str = serde_json::to_string_pretty(&grok_config).map_err(|e| e.to_string())?;
 
+    // agy 配置片段 — 只有我们那一组,合并进 hooks.json 顶层即可
+    let mut agy_config = serde_json::Map::new();
+    agy_config.insert(
+        AGY_HOOK_GROUP.to_string(),
+        Value::Object(build_agy_group(&hook_path)),
+    );
+    let agy_str =
+        serde_json::to_string_pretty(&Value::Object(agy_config)).map_err(|e| e.to_string())?;
+
     Ok(serde_json::json!({
         "claude": {
             "file": "~/.claude/settings.json",
@@ -1525,6 +1902,16 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
                     "file": ts_snippet_file(HookAgent::Pi, "~/.pi/agent"),
                     "note": "整份保存；pi 需重启或执行 /reload",
                     "content": PI_EXTENSION_SOURCE
+                }
+            ]
+        },
+        "agy": {
+            "files": [
+                {
+                    // 与别家的组并列放在顶层;千万别加 PreToolUse(见 AGY_HOOK_EVENTS)
+                    "file": "~/.gemini/config/hooks.json",
+                    "note": format!("合并进顶层对象（组名 {}），别家的组原样保留", AGY_HOOK_GROUP),
+                    "content": agy_str
                 }
             ]
         }
@@ -1690,7 +2077,9 @@ mod tests {
         assert!(serde_json::from_str::<HookAgent>("\"grok\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"omp\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"pi\"").is_ok());
+        assert!(serde_json::from_str::<HookAgent>("\"agy\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"gemini\"").is_err());
+        assert!(serde_json::from_str::<HookAgent>("\"antigravity\"").is_err());
         assert!(serde_json::from_str::<HookAgent>("\"Claude\"").is_err());
     }
 
@@ -1704,7 +2093,7 @@ mod tests {
             assert!(!agent.label().is_empty());
             assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
         }
-        assert_eq!(keys.len(), 5);
+        assert_eq!(keys.len(), 6);
     }
 
     /// key / 展示名改由 agent 表供给后,与改造前逐字相同,且与 serde 名对齐
@@ -1717,6 +2106,7 @@ mod tests {
             (HookAgent::Grok, "grok", "Grok"),
             (HookAgent::Omp, "omp", "oh-my-pi"),
             (HookAgent::Pi, "pi", "pi"),
+            (HookAgent::Agy, "agy", "Antigravity CLI"),
         ];
         assert_eq!(expected.len(), HookAgent::ALL.len());
         for (agent, key, label) in expected {
@@ -2219,6 +2609,362 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Antigravity CLI(agy) ----
+
+    const AGY_HOOK: &str = r"C:\Program Files (x86)\mini term\miniterm-hook.exe";
+
+    /// agy 用户机器上真实存在的别家组(指向已删脚本),用来验「别家的组原样保留」。
+    fn orca_group() -> Value {
+        serde_json::json!({
+            "PreInvocation": [
+                { "type": "command", "command": "node C:/gone/orca-status.js", "timeout": 10 }
+            ]
+        })
+    }
+
+    fn read_json(path: &std::path::Path) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn top_keys(config: &Value) -> Vec<String> {
+        config.as_object().unwrap().keys().cloned().collect()
+    }
+
+    /// 注册集只有 PreInvocation 与 Stop:hook 同步阻塞 agent 循环,越少越好;PreToolUse
+    /// 绝不能注册 —— sidecar 对 agy 输出 `{}`,在 PreToolUse 上等于拒绝执行工具。
+    #[test]
+    fn agy_registration_is_minimal_and_never_gates_tools() {
+        assert_eq!(AGY_HOOK_EVENTS, ["PreInvocation", "Stop"]);
+        let mut seen = std::collections::HashSet::new();
+        for event in AGY_HOOK_EVENTS {
+            assert!(seen.insert(*event), "重复注册事件: {event}");
+        }
+        assert!(!AGY_HOOK_EVENTS.contains(&"PreToolUse"));
+        let group = build_agy_group(AGY_HOOK);
+        assert!(group.get("PreToolUse").is_none());
+        assert_eq!(group.len(), AGY_HOOK_EVENTS.len());
+    }
+
+    /// 处理器形态:平铺、`type: command`、10s 超时、命令是「绝对路径 + 事件名」
+    /// (Windows 带引号,与 Claude 那条同一写法,实测带空格 / 括号的路径都能跑)。
+    #[test]
+    fn agy_handler_shape() {
+        let handler = build_agy_handler(AGY_HOOK, "Stop");
+        assert_eq!(handler["type"], "command");
+        assert_eq!(handler["timeout"], AGY_HOOK_TIMEOUT_SECS);
+        assert!(handler.get("hooks").is_none() && handler.get("matcher").is_none());
+        let command = handler["command"].as_str().unwrap();
+        assert!(command.contains(HOOK_MARKER));
+        assert!(command.ends_with(" Stop"));
+        if cfg!(windows) {
+            assert_eq!(command, format!("\"{AGY_HOOK}\" Stop"));
+        }
+        assert!(agy_handler_is_miniterm(&handler));
+    }
+
+    /// 注册:别家的组原样、键序不动;我们的组追加在后;再注册一次已是最新,一个字节不写。
+    #[test]
+    fn agy_register_keeps_foreign_groups_and_is_idempotent() {
+        let dir = unique_test_dir("agy-register");
+        let path = dir.join("config").join("hooks.json");
+        // 目录不存在也能建
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        assert_eq!(
+            read_json(&path),
+            serde_json::json!({ AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)) })
+        );
+
+        let user =
+            serde_json::json!({ "orca-status": orca_group(), "zz-last": { "enabled": false } });
+        std::fs::write(&path, serde_json::to_string_pretty(&user).unwrap()).unwrap();
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        let after = read_json(&path);
+        assert_eq!(after["orca-status"], orca_group(), "别家的组原样");
+        assert_eq!(after["zz-last"], serde_json::json!({ "enabled": false }));
+        let keys = top_keys(&after);
+        let foreign: Vec<String> = keys
+            .iter()
+            .filter(|k| *k != AGY_HOOK_GROUP)
+            .cloned()
+            .collect();
+        let expected: Vec<String> = top_keys(&user)
+            .into_iter()
+            .filter(|k| foreign.contains(k))
+            .collect();
+        assert_eq!(foreign, expected, "别家的键序不能被打乱");
+        assert_eq!(agy_registered_events(&after).len(), AGY_HOOK_EVENTS.len());
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !register_agy_hooks_at(&path, AGY_HOOK).unwrap(),
+            "已是最新不写"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 我们的组已在(旧路径 / 旧事件集):原位替换,用户在组上设的 `enabled` 保留。
+    #[test]
+    fn agy_register_rewrites_our_group_in_place() {
+        let mut config = serde_json::json!({
+            "a-first": orca_group(),
+            AGY_HOOK_GROUP: {
+                "enabled": false,
+                "SessionStart": [ build_agy_handler(r"D:\old\miniterm-hook.exe", "SessionStart") ]
+            },
+            "z-last": orca_group()
+        });
+        let before_keys = top_keys(&config);
+        assert!(!agy_group_is_current(&config, AGY_HOOK));
+        upsert_agy_group(&mut config, AGY_HOOK).unwrap();
+        assert!(agy_group_is_current(&config, AGY_HOOK));
+        assert_eq!(
+            config[AGY_HOOK_GROUP]["enabled"], false,
+            "用户的停用开关保留"
+        );
+        assert!(
+            config[AGY_HOOK_GROUP].get("SessionStart").is_none(),
+            "旧事件被换掉"
+        );
+        // preserve_order 下组原位替换;没开时 Map 按键名排序,两种情况相对顺序都不变
+        assert_eq!(top_keys(&config), before_keys);
+    }
+
+    /// 读的时候剥 BOM;坏 JSON / 顶层不是对象报错,且**不覆盖**用户文件。
+    #[test]
+    fn agy_register_strips_bom_and_refuses_unreadable_files() {
+        let dir = unique_test_dir("agy-bom");
+        let path = dir.join("hooks.json");
+        let with_bom = format!(
+            "\u{feff}{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "orca-status": orca_group() }))
+                .unwrap()
+        );
+        std::fs::write(&path, &with_bom).unwrap();
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.starts_with('\u{feff}'), "写出去不带 BOM");
+        assert_eq!(read_json(&path)["orca-status"], orca_group());
+
+        // 带 BOM 的已注册文件也认得出(注册现状 / 自愈都靠它)
+        std::fs::write(&path, format!("\u{feff}{written}")).unwrap();
+        let config = read_agy_hooks(&path).unwrap().unwrap();
+        assert_eq!(agy_registered_events(&config).len(), AGY_HOOK_EVENTS.len());
+
+        for broken in ["{broken", "[1, 2]", "\"x\""] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(register_agy_hooks_at(&path, AGY_HOOK).is_err(), "{broken}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "不覆盖");
+        }
+        // 空文件按 {} 处理
+        std::fs::write(&path, "  \n").unwrap();
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「已注册」只认我们组里带标识的事件:别家组里出现 miniterm-hook、我们组里只有别人的
+    /// 命令,都不算。分组形态(`{matcher, hooks}`)的条目也认。
+    #[test]
+    fn agy_registered_events_only_count_our_group() {
+        let config = serde_json::json!({
+            "other": { "Stop": [ build_agy_handler(AGY_HOOK, "Stop") ] },
+            AGY_HOOK_GROUP: {
+                "enabled": true,
+                "PreInvocation": [ build_agy_handler(AGY_HOOK, "PreInvocation") ],
+                "Stop": [ { "type": "command", "command": "notify-send done" } ],
+                "PostToolUse": [
+                    { "matcher": "*", "hooks": [ build_agy_handler(AGY_HOOK, "PostToolUse") ] }
+                ]
+            }
+        });
+        let mut got: Vec<_> = agy_registered_events(&config).into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["PostToolUse", "PreInvocation"]);
+        assert!(agy_registered_events(&serde_json::json!({})).is_empty());
+        assert!(agy_registered_events(&serde_json::json!({ "other": orca_group() })).is_empty());
+    }
+
+    /// 卸载:所有组里的 mini-term 处理器都摘(平铺 / 分组两种形态),被我们摘空的分组项 /
+    /// 事件 / 组一并删除;别家的条目、用户自己的空数组、键序原样;再卸一次字节不变。
+    #[test]
+    fn agy_removal_strips_ours_everywhere_and_keeps_the_rest() {
+        let dir = unique_test_dir("agy-remove");
+        let path = dir.join("hooks.json");
+        let user_handler = serde_json::json!({ "type": "command", "command": "notify-send done" });
+        let config = serde_json::json!({
+            "orca-status": orca_group(),
+            AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)),
+            "mixed": {
+                "enabled": true,
+                "Stop": [ user_handler.clone(), build_agy_handler(AGY_HOOK, "Stop") ],
+                "PostToolUse": [
+                    { "matcher": "*", "hooks": [ build_agy_handler(AGY_HOOK, "PostToolUse") ] },
+                    { "matcher": "run_command", "hooks": [
+                        user_handler.clone(), build_agy_handler(AGY_HOOK, "PostToolUse")
+                    ] }
+                ],
+                "UserEmpty": []
+            },
+            "only-ours": { "enabled": false, "Stop": [ build_agy_handler(AGY_HOOK, "Stop") ] }
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        assert_eq!(remove_agy_entries_at(&path).unwrap(), 6);
+        let after = read_json(&path);
+        assert_eq!(
+            after,
+            serde_json::json!({
+                "orca-status": orca_group(),
+                "mixed": {
+                    "enabled": true,
+                    "Stop": [ user_handler.clone() ],
+                    "PostToolUse": [
+                        { "matcher": "run_command", "hooks": [ user_handler.clone() ] }
+                    ],
+                    "UserEmpty": []
+                }
+            })
+        );
+        let expected: Vec<String> = top_keys(&config)
+            .into_iter()
+            .filter(|k| after.get(k).is_some())
+            .collect();
+        assert_eq!(top_keys(&after), expected, "其余键序不能被打乱");
+
+        // 再卸一次:没有我们的条目,一个字节不写
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(remove_agy_entries_at(&path).unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 文件里只有我们的组:卸完留下 `{}`,文件本身不删(那是 agy 的配置文件)。没有我们
+    /// 条目的、读不懂的、不存在的文件一律不碰。
+    #[test]
+    fn agy_removal_leaves_other_files_untouched() {
+        let dir = unique_test_dir("agy-remove-edge");
+        let path = dir.join("hooks.json");
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        assert_eq!(remove_agy_entries_at(&path).unwrap(), AGY_HOOK_EVENTS.len());
+        assert!(path.exists());
+        assert_eq!(read_json(&path), serde_json::json!({}));
+
+        let raw = r#"{"orca-status":{"PreInvocation":[{"type":"command","command":"x"}]}}"#;
+        std::fs::write(&path, raw).unwrap();
+        assert_eq!(remove_agy_entries_at(&path).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            raw,
+            "紧凑排版原样保留"
+        );
+
+        std::fs::write(&path, "{broken").unwrap();
+        assert_eq!(remove_agy_entries_at(&path).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+
+        let missing = dir.join("absent.json");
+        assert_eq!(remove_agy_entries_at(&missing).unwrap(), 0);
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动期自愈:没注册过 / 已是最新 → 不写;注册过但命令路径过期(装机目录变了)或
+    /// 缺事件 → 重写我们的组,别家的组不动。
+    #[test]
+    fn agy_sync_rewrites_only_stale_registrations() {
+        let dir = unique_test_dir("agy-sync");
+        let path = dir.join("hooks.json");
+
+        // 文件不在 / 没注册过:不写
+        assert!(!sync_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        assert!(!path.exists());
+        let raw = serde_json::to_string_pretty(&serde_json::json!({ "orca-status": orca_group() }))
+            .unwrap();
+        std::fs::write(&path, &raw).unwrap();
+        assert!(!sync_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+
+        // 已是最新:不写
+        assert!(register_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!sync_agy_hooks_at(&path, AGY_HOOK).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        // 装机目录变了(登记的旧二进制已经不在):旧路径的组要被刷成新路径
+        let moved = r"E:\apps\mini-term\miniterm-hook.exe";
+        assert!(!std::path::Path::new(AGY_HOOK).exists());
+        assert!(sync_agy_hooks_at(&path, moved).unwrap());
+        let after = read_json(&path);
+        assert!(agy_group_is_current(&after, moved));
+        assert_eq!(after["orca-status"], orca_group());
+
+        // 登记的是另一份**还在**的 miniterm-hook(dev 实例与装机版并跑):不抢,不来回翻
+        let live_peer = dir.join(hook_binary_name());
+        std::fs::write(&live_peer, b"stub").unwrap();
+        let live_peer = live_peer.to_string_lossy().to_string();
+        assert!(register_agy_hooks_at(&path, &live_peer).unwrap());
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!sync_agy_hooks_at(&path, moved).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // 但它缺事件时照样补齐(补成当前这份)
+        let mut peer_stale = read_json(&path);
+        peer_stale[AGY_HOOK_GROUP]
+            .as_object_mut()
+            .unwrap()
+            .retain(|event, _| event == "Stop");
+        std::fs::write(&path, serde_json::to_string_pretty(&peer_stale).unwrap()).unwrap();
+        assert!(sync_agy_hooks_at(&path, moved).unwrap());
+        assert!(agy_group_is_current(&read_json(&path), moved));
+
+        // 老版本只注册了一个事件:补齐
+        let mut stale = after.clone();
+        stale[AGY_HOOK_GROUP]
+            .as_object_mut()
+            .unwrap()
+            .retain(|event, _| event == "Stop");
+        std::fs::write(&path, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+        assert!(sync_agy_hooks_at(&path, moved).unwrap());
+        assert_eq!(
+            agy_registered_events(&read_json(&path)).len(),
+            AGY_HOOK_EVENTS.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 从我们的组里抠出登记的二进制路径:两种命令写法都认,别家组 / 没有标识的不算。
+    #[test]
+    fn agy_registered_hook_path_parses_both_command_forms() {
+        let config =
+            serde_json::json!({ AGY_HOOK_GROUP: Value::Object(build_agy_group(AGY_HOOK)) });
+        assert_eq!(agy_registered_hook_path(&config).as_deref(), Some(AGY_HOOK));
+        let unix = serde_json::json!({ AGY_HOOK_GROUP: {
+            "Stop": [ { "type": "command", "command": "/opt/mini term/miniterm-hook Stop" } ]
+        } });
+        assert_eq!(
+            agy_registered_hook_path(&unix).as_deref(),
+            Some("/opt/mini term/miniterm-hook")
+        );
+        let foreign = serde_json::json!({
+            "other": { "Stop": [ build_agy_handler(AGY_HOOK, "Stop") ] },
+            AGY_HOOK_GROUP: { "Stop": [ { "type": "command", "command": "notify-send x" } ] }
+        });
+        assert_eq!(agy_registered_hook_path(&foreign), None);
+    }
+
+    /// 手动片段与一键注册写的是同一份组内容,且没有 PreToolUse。
+    #[test]
+    fn agy_manual_snippet_matches_registration() {
+        let snippet = get_hook_config_snippet().expect("应生成 hook 配置片段");
+        let file = &snippet["agy"]["files"][0];
+        assert_eq!(file["file"], "~/.gemini/config/hooks.json");
+        let raw = file["content"].as_str().unwrap();
+        let content: Value = serde_json::from_str(raw).unwrap();
+        let hook_path = hook_binary_path().unwrap();
+        assert!(agy_group_is_current(&content, &hook_path));
+        assert_eq!(top_keys(&content), [AGY_HOOK_GROUP]);
+        assert!(!raw.contains("PreToolUse"));
     }
 
     #[test]

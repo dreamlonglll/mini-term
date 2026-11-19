@@ -38,6 +38,11 @@
 //!   [`hook_registry`] 把自带的扩展整份写进 `~/.omp/agent/extensions/` /
 //!   `~/.pi/agent/extensions/`,扩展在 CLI 进程内 `fetch` 本地 hook 服务器,事件名
 //!   翻译成与 Claude 同名的 PascalCase。两家扩展 API 已分叉,模板各一份。
+//! - **Antigravity CLI(agy)走 sidecar,但口径与别家不同**:只注册 `PreInvocation` /
+//!   `Stop`(绝不注册 `PreToolUse` —— sidecar 对 agy 输出的 `{}` 在那上面等于拒绝工具);
+//!   子代理事件(`lastUserInput` 为空)整条丢弃;退出不发任何 hook,由 monitor 的
+//!   退出兜底(`monitor::exit_settle_due`,同样落盘)收成 idle。见 [`hook_registry`] 的
+//!   agy 段与 `hook_server` 的 `route_agy_event`。
 //! - **hook 接收端原样保留**:端口(23456 起,冲突递增 5 次)、路由(`POST /hook`)、
 //!   payload 形状一个字都没改 —— 各家已注册在用户机器上的 hook 命令还得打得进来。
 //! - **各家 CLI 的知识(识别口径、续接/fork 命令、会话怎么分桶、有无记录……)只住在

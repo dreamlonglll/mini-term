@@ -209,6 +209,23 @@ mod tests {
         assert_eq!(causes, vec![Some("Interrupt".to_string())]);
     }
 
+    /// agy 的 Esc 打断同样不发任何 hook(实测):输入检测这一刀对 agy 的 pane 一样生效,
+    /// 带出去的 agent 是 agy。
+    #[test]
+    fn agy_escape_interrupt_settles_through_input_detection() {
+        let (p, seen) = perception();
+        p.observe_input(1, b"agy\r");
+        p.hooks().update(1, "ai-working".to_string());
+
+        p.observe_input(1, b"\x1b");
+
+        assert_eq!(p.status_of(1), "ai-idle");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].cause.as_deref(), Some("Interrupt"));
+        assert_eq!(seen[0].agent.as_deref(), Some("agy"));
+    }
+
     /// 方向键不是打断键:翻历史不该把「工作中」打灭。
     #[test]
     fn arrow_key_is_not_an_interrupt() {

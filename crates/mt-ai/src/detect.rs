@@ -27,6 +27,12 @@ pub(crate) use mt_core::strip_ansi_codes;
 /// `omp`（oh-my-pi，can1357/oh-my-pi，pi 的分支）的命令名就是 `omp`，Windows 上
 /// 是 `omp.cmd`（basename 归一时剥掉）；一次性提问同样是 `-p`，`--resume` /
 /// `--continue` / `--fork` 都进交互式 TUI。它的 hook 接入见 `hook_registry` 的 omp 段。
+///
+/// `agy`（Google Antigravity CLI）的命令行是 Go 标准库 flag 包的口径，非交互的判定
+/// 比别家多两条，表在 agent 表里（`AgentSpec::print_flags` / `subcommands` /
+/// `value_flags`）：`--prompt` 是 `--print` 的别名；首个位置参数是 `mcp` / `models`
+/// 之类的子命令时不进 TUI。`-i/--prompt-interactive`、`--conversation <id>`、`-c`
+/// 都是交互式。退出要连按两次 Ctrl+D（见 `tracker`），`/exit` `/quit` 在下表里。
 pub const AI_COMMANDS: &[&str] = &crate::agent::AGENT_COMMANDS;
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
@@ -65,10 +71,106 @@ pub fn interactive_ai_command_name(command: &str) -> Option<&'static str> {
         let flag = w.to_lowercase();
         NON_INTERACTIVE_FLAGS.iter().any(|&f| flag == f)
     }) {
-        None
-    } else {
-        Some(agent)
+        return None;
     }
+    // 这一家专属的口径(额外的非交互标志 / 子命令)。表全空的各家直接放行,与改造前一致
+    let spec = crate::agent::AgentKind::parse(agent)?.spec();
+    if spec.print_flags.is_empty() && spec.subcommands.is_empty() {
+        return Some(agent);
+    }
+    go_flag_args_interactive(spec, &shell_words(command)).then_some(agent)
+}
+
+/// 命令行按 shell 的引号口径切词(`"…"` / `'…'` 里的空白不切开,引号本身去掉)。
+///
+/// 只给 [`go_flag_args_interactive`] 用:`agy -i "update the docs"` 按空白硬切会把
+/// `docs"` 当成首个位置参数,带引号的整段才是 `-i` 的值。不处理转义 —— 三家 shell
+/// (cmd / PowerShell / bash)的转义符各不相同,命令行里也几乎碰不到。
+fn shell_words(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for ch in command.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => cur.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                in_word = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            None => {
+                cur.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        out.push(cur);
+    }
+    out
+}
+
+/// `-x` / `--x` / `--x=值` 里的选项名(去掉前导 `-`,`=` 之后另给)。不是选项返回 `None`
+/// (位置参数,以及单独的 `-` —— 惯例是「标准输入」)。
+fn go_flag(word: &str) -> Option<(&str, Option<&str>)> {
+    let name = word.strip_prefix('-')?;
+    let name = name.strip_prefix('-').unwrap_or(name);
+    if name.is_empty() {
+        return None;
+    }
+    Some(match name.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (name, None),
+    })
+}
+
+fn flag_listed(list: &[&str], name: &str) -> bool {
+    list.iter()
+        .any(|f| f.trim_start_matches('-').eq_ignore_ascii_case(name))
+}
+
+/// 按 Go 标准库 flag 包的口径看命令行会不会进 TUI(`words[0]` 是命令本身)。
+///
+/// - 选项里出现 [`AgentSpec::print_flags`](crate::AgentSpec::print_flags) → 非交互;
+/// - flag 包遇到**第一个位置参数**就停止解析选项,它若是
+///   [`AgentSpec::subcommands`](crate::AgentSpec::subcommands) 之一 → 子命令,非交互;
+/// - 带值的选项([`AgentSpec::value_flags`](crate::AgentSpec::value_flags))跳过它的值,
+///   `--` 之后的第一个词按位置参数算。
+fn go_flag_args_interactive(spec: &crate::AgentSpec, words: &[String]) -> bool {
+    let mut args = words.iter().skip_while(|w| *w == "&").skip(1);
+    let mut first_positional = None;
+    while let Some(word) = args.next() {
+        if word == "--" {
+            first_positional = args.next();
+            break;
+        }
+        match go_flag(word) {
+            Some((name, value)) => {
+                if flag_listed(spec.print_flags, name) {
+                    return false;
+                }
+                if value.is_none() && flag_listed(spec.value_flags, name) {
+                    args.next();
+                }
+            }
+            None => {
+                first_positional = Some(word);
+                break;
+            }
+        }
+    }
+    !first_positional.is_some_and(|w| {
+        spec.subcommands
+            .iter()
+            .any(|sub| sub.eq_ignore_ascii_case(w))
+    })
 }
 
 /// 该命令行是否会被识别为"进入交互式 AI 会话"。
@@ -194,6 +296,100 @@ mod tests {
             assert_eq!(interactive_ai_command_name(cmd), Some("pi"), "{cmd}");
         }
         assert_eq!(interactive_ai_command_name("pi -p hi"), None);
+    }
+
+    /// agy 的交互式写法:裸命令 / Windows 的 `agy.exe` / 续接(两种写法)/ 带初始提示
+    /// 进 TUI(`-i` 的值哪怕恰好是子命令名也不算子命令)/ 带模型等选项。
+    #[test]
+    fn agy_interactive_forms() {
+        for cmd in [
+            "agy",
+            "agy.exe",
+            "AGY",
+            "agy --conversation f935f836-8aa7-43dc-aa16-b99e9de3e6dd",
+            "agy --conversation=f935f836-8aa7-43dc-aa16-b99e9de3e6dd",
+            "agy -c",
+            "agy --continue",
+            "agy -i \"update the docs\"",
+            "agy -i update",
+            "agy --prompt-interactive help",
+            "agy --prompt-interactive=\"fix it\"",
+            "agy --model gemini-3.8-flash-high",
+            "agy --model=gemini-3.8-flash-high --mode plan",
+            "agy --dangerously-skip-permissions",
+            "& \"C:\\Users\\me\\AppData\\Local\\agy\\bin\\agy.exe\"",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                Some("agy"),
+                "{cmd} 应进入 agy 会话"
+            );
+        }
+        assert_eq!(line_ai_command_name("PS D:\\repo> agy -c"), Some("agy"));
+    }
+
+    /// agy 的非交互:`-p/--print/--prompt`(含 `=` 写法与 Go 的单横线长选项)、
+    /// 首个位置参数是子命令、帮助。
+    #[test]
+    fn agy_non_interactive_forms() {
+        for cmd in [
+            "agy -p \"hi\"",
+            "agy --print hi",
+            "agy --prompt hi",
+            "agy --prompt=\"hi there\"",
+            "agy -prompt hi",
+            "agy --print=hi",
+            "agy --help",
+            "agy -help",
+            "agy mcp list",
+            "agy models",
+            "agy update",
+            "agy changelog",
+            "agy remote-control status",
+            "agy mic-serve",
+            "agy plugins",
+            "agy --model gemini-x mcp list",
+            "agy -- help",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                None,
+                "{cmd} 不该进入 AI 会话"
+            );
+        }
+        // `--remote-control` 是布尔选项(带远程连接进 TUI),与同名子命令不是一回事
+        assert_eq!(
+            interactive_ai_command_name("agy --remote-control"),
+            Some("agy")
+        );
+    }
+
+    /// agy 专属的口径只对 agy 生效:别家的 `--prompt` 不一定是非交互,首个位置参数也
+    /// 不按子命令判(`claude update` 之类保持原口径)。
+    #[test]
+    fn agy_rules_do_not_leak_to_other_agents() {
+        assert_eq!(
+            interactive_ai_command_name("claude --prompt hi"),
+            Some("claude")
+        );
+        assert_eq!(interactive_ai_command_name("codex mcp"), Some("codex"));
+        assert_eq!(interactive_ai_command_name("grok models"), Some("grok"));
+        // 通用的非交互标志照旧
+        assert_eq!(interactive_ai_command_name("claude -p hi"), None);
+        // 名字近似的不是 agy
+        for cmd in ["agyx", "my-agy", "agy.py"] {
+            assert_eq!(interactive_ai_command_name(cmd), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn shell_words_keeps_quoted_segments_together() {
+        assert_eq!(
+            shell_words("agy -i \"update the docs\" --mode 'plan b'"),
+            ["agy", "-i", "update the docs", "--mode", "plan b"]
+        );
+        assert_eq!(shell_words("  agy   \"\"  "), ["agy", ""]);
+        assert!(shell_words("   ").is_empty());
     }
 
     /// 打断键识别:裸 Esc / Ctrl+C,以及 mini-term 的 WSI Esc 记录。方向键等 CSI

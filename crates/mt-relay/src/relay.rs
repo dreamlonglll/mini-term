@@ -95,13 +95,13 @@ pub struct SyncPane {
     pub needs_attention: bool,
 }
 
-/// 一个镜像绑定的运行态:解析器 + 绑定文件与读取偏移。
+/// 一个镜像绑定的运行态:解析器 + 绑定文件与读取游标(偏移 + 续读锚)。
 /// 三者必须同锁——增量泵的「读文件→喂解析→挪偏移」要原子,拆开就会把同一段
 /// 字节喂两次(消息重复、seq 漂移)。
 struct MirrorRuntime {
     parser: MirrorParser,
     path: PathBuf,
-    offset: u64,
+    cursor: mirror::TailCursor,
 }
 
 /// 决定「这个 pane 该镜像哪个文件」的全部输入。与上一次定位时不同 = 当轮必须
@@ -693,7 +693,8 @@ impl MobileRelayManager {
     /// 增量泵一次镜像:读绑定文件的新字节喂解析器,新消息改标来源、并入缓存并
     /// 推送 MirrorAppend。全程持 runtime 锁——泵有两个调用方(1s 轮询与点选
     /// 作答),「读文件→喂解析→挪偏移」必须原子,否则同一段字节会被喂两次。
-    /// 文件被截断/重写时清空 runtime,下一轮轮询重新绑定。
+    /// 文件被截断/整份重写(偏移之前的原文对不上,见 [`mirror::TailCursor`])时清空
+    /// runtime,下一轮轮询重新绑定。
     fn pump_mirror(
         &self,
         pane_id: &str,
@@ -702,9 +703,8 @@ impl MobileRelayManager {
     ) {
         let mut slot = runtime.lock();
         let Some(rt) = slot.as_mut() else { return };
-        match mirror::read_from_offset(&rt.path, rt.offset) {
-            Some((bytes, new_offset)) => {
-                rt.offset = new_offset;
+        match mirror::read_appended(&rt.path, &mut rt.cursor) {
+            Some(bytes) => {
                 if bytes.is_empty() {
                     return;
                 }
@@ -813,7 +813,7 @@ impl MobileRelayManager {
     /// (只取叶子锁 `recent_mobile_cmds`)。
     fn rebind_mirror(&self, job: &MirrorJob, path: PathBuf, agent: MirrorAgent) -> bool {
         let mut parser = MirrorParser::new(agent, &job.project_path);
-        let Some((mut msgs, offset)) = mirror::parse_whole_file(&path, &mut parser) else {
+        let Some((mut msgs, cursor)) = mirror::parse_whole_file(&path, &mut parser) else {
             return false;
         };
         self.relabel_mobile_sources(&job.pane_id, &mut msgs, RelabelScope::History);
@@ -822,7 +822,7 @@ impl MobileRelayManager {
             *slot = Some(MirrorRuntime {
                 parser,
                 path,
-                offset,
+                cursor,
             });
             let mut m = job.messages.lock();
             *m = msgs;
@@ -2501,6 +2501,44 @@ mod tests {
         assert_eq!(fx.texts(), ["x"]);
     }
 
+    /// 整份重写成**更长**的内容(agy 压缩上下文就是这样):长度判不出,续读锚判出来,
+    /// 泵清运行态、下一轮从头换绑,镜像里是重写后的全量,不是旧消息 + 半截乱行。
+    #[test]
+    fn hook_bound_rebinds_after_longer_rewrite() {
+        let fx = MirrorFixture::new("rewrite");
+        let a = fx.dir.join("a.jsonl");
+        std::fs::write(&a, user_line("a1") + &user_line("a2")).unwrap();
+        let calls = Cell::new(0);
+        let locate = |_: &str, _: &LocateKey| {
+            calls.set(calls.get() + 1);
+            Some((a.clone(), MirrorAgent::Claude))
+        };
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        *fx.host.hook.lock() = hook("sid-a");
+        fx.round(&mut loc, t0, locate);
+        assert_eq!(fx.texts(), ["a1", "a2"]);
+
+        let rewritten = user_line("summary") + &user_line("r1") + &user_line("r2");
+        assert!(rewritten.len() > user_line("a1").len() * 2);
+        std::fs::write(&a, rewritten).unwrap();
+        fx.round(&mut loc, t0 + Duration::from_secs(1), locate);
+        assert_eq!(fx.bound(), None, "重写由泵发现并清运行态");
+        assert_eq!(
+            fx.texts(),
+            ["a1", "a2"],
+            "没有把重写后的半截内容当增量喂进去"
+        );
+        fx.round(&mut loc, t0 + Duration::from_secs(2), locate);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(fx.texts(), ["summary", "r1", "r2"]);
+
+        // 换绑之后照常增量
+        append(&a, "r3");
+        fx.round(&mut loc, t0 + Duration::from_secs(3), locate);
+        assert_eq!(fx.texts(), ["summary", "r1", "r2", "r3"]);
+    }
+
     /// hook 已上报身份、会话文件还没落盘:每轮都再找(移动端在等第一条消息),
     /// 文件一出现当轮绑上。
     #[test]
@@ -2632,6 +2670,26 @@ mod tests {
         fx.round(&mut loc, t0 + HEURISTIC_PENDING_INTERVAL, locate);
         assert_eq!(calls.get(), 2);
         assert!(loc.sent_initial, "定位落空时给过空快照");
+    }
+
+    /// agy 写我们认得的 transcript:没有 hook 身份时照别家走启发式(项目最新的主会话),
+    /// 不落进 NoLog;hook 身份到了就按身份精确定位。
+    #[test]
+    fn agy_without_hook_uses_heuristic_and_with_hook_uses_identity() {
+        let fx = MirrorFixture::new("agy-key");
+        *fx.host.agent.lock() = Some("agy".into());
+        assert!(matches!(
+            fx.manager.mirror_locate_key("pane-1"),
+            LocateKey::Heuristic { agent: Some(ref a), .. } if a == "agy"
+        ));
+        *fx.host.hook.lock() = Some(HookSessionId {
+            agent: Some("agy".into()),
+            session_id: "7e54f704-1278-4123-8ad4-11e8f6922c82".into(),
+        });
+        assert!(matches!(
+            fx.manager.mirror_locate_key("pane-1"),
+            LocateKey::Hook { agent: Some(ref a), .. } if a == "agy"
+        ));
     }
 
     /// 没有会话记录的 agent(opencode):定位输入是 NoLog,生产定位函数

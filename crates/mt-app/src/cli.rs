@@ -2,8 +2,9 @@
 //!
 //! # `--unregister-hooks`
 //!
-//! 卸载 mini-term 时把五家 AI 工具(Claude / Codex / Grok / oh-my-pi / pi)配置里 mini-term
-//! 写入的 hook 注册摘掉([`mt_ai::hook_registry::purge_all_for_uninstall`])。不摘的话
+//! 卸载 mini-term 时把各家 AI 工具(Claude / Codex / Grok / oh-my-pi / pi / Antigravity CLI,
+//! 即 `HookAgent::ALL`,这里不另写名单)配置里 mini-term 写入的 hook 注册摘掉
+//! ([`mt_ai::hook_registry::purge_all_for_uninstall`])。不摘的话
 //! 卸载之后 AI 每来一个事件都要去跑一个已经不存在的 `miniterm-hook.exe`。
 //!
 //! - **为什么是主程序的参数而不是 sidecar 子命令**:摘除逻辑在 mt-ai(带 toml_edit 等),

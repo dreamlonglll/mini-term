@@ -32,6 +32,9 @@ pub enum AgentKind {
     Grok,
     /// oh-my-pi(pi 的分支):hook 走进程内 TS 扩展
     Omp,
+    /// Antigravity CLI(Google,命令名 `agy`):shell 命令 hook(`~/.gemini/config/hooks.json`),
+    /// 会话索引是 SQLite、正文是 transcript JSONL(见 `sessions/agy.rs`)
+    Agy,
 }
 
 /// 会话记录怎么按目录分桶 —— 决定续接 / fork 前要不要先找回会话的启动目录。
@@ -79,7 +82,7 @@ pub struct AgentSpec {
     /// 贴到该 pane 上(串台)。
     pub session_log: bool,
     /// 会话记录已接入 AI 历史面板(列表 / 正文读取)。用量统计另有自己的解析器,
-    /// 只接了 claude / codex / grok(`mt_usage::AgentFilter`),不跟这一位走。
+    /// 只接了 claude / codex / grok / agy(`mt_usage::AgentFilter`),不跟这一位走。
     pub history: bool,
     /// agent 自己会从系统剪贴板取图(`Alt+V`)—— 粘图时不落盘,直接发 `ESC v`。
     /// 官方文档把 `Alt+V` 列为 Windows / WSL 下的「Paste image from clipboard」。
@@ -88,6 +91,25 @@ pub struct AgentSpec {
     /// 直到 `PostToolUse` 之前不再有事件 —— 该事件要映射成 ai-working 而不是
     /// ai-idle,否则批准后整段执行期间状态卡在 ai-idle,还会误报「任务完成」。
     pub permission_request_keeps_working: bool,
+    /// 退出时会发 `SessionEnd` hook(hook server 认它为退出的权威信号)。
+    ///
+    /// 为 `false` 的(agy)退出后 hook 状态会一直停在 ai-idle,由 monitor 的退出兜底
+    /// (`monitor::exit_settle_due`)在「输入检测判了退出 + 双静默」时收成 idle;它们的
+    /// 会话也不进 hook server 的活跃集(那张表只服务 SessionEnd 的「是不是最后一个」)。
+    /// 没有 hook 的 opencode 同记 `false`,反正走不到那两处。
+    pub session_end_hook: bool,
+    /// Ctrl+D 要连按两次才退出(第一次只提示 `press ctrl+d again to exit`,agy 实测)。
+    /// 为 `false` 的按单次 Ctrl+D(EOF)即退出算(见 `tracker` 的 Ctrl+D 分支)。
+    pub double_ctrl_d_exit: bool,
+    /// 这一家**额外**的非交互标志 —— 通用的 `-p/--print/-h/--help/-v/--version` 之外的,
+    /// 以及要认 `--flag=值` 写法的。只在 [`Self::subcommands`] 那套「Go flag 口径」里用:
+    /// 前导的 `-` / `--` 不分(Go 的 flag 包两种都认)。
+    pub print_flags: &'static [&'static str],
+    /// 不进 TUI 的子命令:命令行里**首个位置参数**命中即不算进会话。空 = 不按子命令判。
+    pub subcommands: &'static [&'static str],
+    /// 带值的选项。找「首个位置参数」时跳过它们的值(`agy -i update` 里的 `update` 是
+    /// 提示词不是子命令);写成 `--flag=值` 的不跳。
+    pub value_flags: &'static [&'static str],
 }
 
 const CLAUDE: AgentSpec = AgentSpec {
@@ -103,6 +125,11 @@ const CLAUDE: AgentSpec = AgentSpec {
     history: true,
     pastes_clipboard_image: true,
     permission_request_keeps_working: false,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
 };
 
 const CODEX: AgentSpec = AgentSpec {
@@ -118,6 +145,11 @@ const CODEX: AgentSpec = AgentSpec {
     history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: true,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
 };
 
 const OPENCODE: AgentSpec = AgentSpec {
@@ -134,6 +166,11 @@ const OPENCODE: AgentSpec = AgentSpec {
     history: false,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
+    session_end_hook: false,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
 };
 
 const PI: AgentSpec = AgentSpec {
@@ -152,6 +189,11 @@ const PI: AgentSpec = AgentSpec {
     history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
 };
 
 const GROK: AgentSpec = AgentSpec {
@@ -168,6 +210,11 @@ const GROK: AgentSpec = AgentSpec {
     history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
 };
 
 const OMP: AgentSpec = AgentSpec {
@@ -188,17 +235,84 @@ const OMP: AgentSpec = AgentSpec {
     history: true,
     pastes_clipboard_image: false,
     permission_request_keeps_working: false,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
+};
+
+const AGY: AgentSpec = AgentSpec {
+    kind: AgentKind::Agy,
+    key: "agy",
+    aliases: &["antigravity"],
+    // 三个字母,`contains` 口径会误伤(`agyx` 之类的包装名)
+    loose_match: false,
+    label: "Antigravity CLI",
+    // 会话 id 来自 hook 上报(`conversationId`)或历史面板;`--conversation` 按 id 在
+    // 全局 appDataDir 里找,与启动目录无关
+    resume: Some("agy --conversation {id}"),
+    // 只有 TUI 里的 `/fork` 斜杠命令,没有 CLI 级 fork 参数
+    fork: None,
+    cwd_bucket: CwdBucket::Global,
+    session_log: true,
+    history: true,
+    pastes_clipboard_image: false,
+    // agy 的权限确认框不发任何 hook(实测),无从谈起
+    permission_request_keeps_working: false,
+    // 退出(Ctrl+D 两次 / `/exit` / `/quit`)不发任何 hook,实测 1.5.12
+    session_end_hook: false,
+    // 第一次 Ctrl+D 只在状态栏提示 `press ctrl+d again to exit`
+    double_ctrl_d_exit: true,
+    // `agy --help` 的「Usage of agy.exe」是 Go 标准库 flag 包的输出:`-x` / `--x` 同义、
+    // 支持 `--x=值`、遇到第一个位置参数即停止解析选项。`--prompt` 是 `--print` 的别名
+    // (别家的 `--prompt` 不一定是非交互,所以只挂在这里);`-help` 也是 Go 自带的帮助。
+    print_flags: &["-p", "--print", "--prompt", "-h", "--help"],
+    subcommands: &[
+        "acp",
+        "agent",
+        "agents",
+        "changelog",
+        "help",
+        "install",
+        "mcp",
+        "mic-serve",
+        "models",
+        "plugin",
+        "plugins",
+        "remote-control",
+        "update",
+    ],
+    // `-i` / `--prompt-interactive` 带初始提示**进** TUI;`--conversation <id>` 是续接
+    value_flags: &[
+        "--add-dir",
+        "--agent",
+        "--conversation",
+        "--effort",
+        "-i",
+        "--input-format",
+        "--json-schema",
+        "--log-file",
+        "--mode",
+        "--model",
+        "--output-format",
+        "--print-timeout",
+        "--project",
+        "--prompt-interactive",
+        "--settings",
+    ],
 };
 
 impl AgentKind {
     /// 全部 agent,顺序即输入检测 [`crate::AI_COMMANDS`] 的顺序。
-    pub const ALL: [AgentKind; 6] = [
+    pub const ALL: [AgentKind; 7] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::OpenCode,
         AgentKind::Pi,
         AgentKind::Grok,
         AgentKind::Omp,
+        AgentKind::Agy,
     ];
 
     /// 这一家的知识表。
@@ -210,6 +324,7 @@ impl AgentKind {
             AgentKind::Pi => &PI,
             AgentKind::Grok => &GROK,
             AgentKind::Omp => &OMP,
+            AgentKind::Agy => &AGY,
         }
     }
 
@@ -355,7 +470,7 @@ mod tests {
     fn 命令名表不变() {
         assert_eq!(
             AGENT_COMMANDS,
-            ["claude", "codex", "opencode", "pi", "grok", "omp"]
+            ["claude", "codex", "opencode", "pi", "grok", "omp", "agy"]
         );
     }
 
@@ -376,6 +491,10 @@ mod tests {
             ("opencode", AgentKind::OpenCode),
             ("pi", AgentKind::Pi),
             ("PI", AgentKind::Pi),
+            ("agy", AgentKind::Agy),
+            ("AGY", AgentKind::Agy),
+            ("antigravity", AgentKind::Agy),
+            ("Antigravity", AgentKind::Agy),
         ] {
             assert_eq!(AgentKind::parse(raw), Some(kind), "{raw:?}");
         }
@@ -397,6 +516,8 @@ mod tests {
             "pip",
             "opencode-x",
             "gemini",
+            "agyx",
+            "my-agy",
             "",
             "  ",
             "什么鬼",
@@ -466,6 +587,11 @@ mod tests {
             None,
             "omp 谱系未接,不开 fork"
         );
+        assert_eq!(
+            resume_command(Some("agy"), ID),
+            Some(format!("agy --conversation {ID}"))
+        );
+        assert_eq!(fork_command(Some("agy"), ID), None, "agy 无 CLI 级 fork");
     }
 
     /// 不支持续接的 / 认不出的:一律不产出命令,**不再落到 claude**。
@@ -540,7 +666,8 @@ mod tests {
                 AgentKind::Codex,
                 AgentKind::Pi,
                 AgentKind::Grok,
-                AgentKind::Omp
+                AgentKind::Omp,
+                AgentKind::Agy
             ]
         );
         let with_history: Vec<_> = AgentKind::ALL
@@ -554,9 +681,39 @@ mod tests {
                 AgentKind::Codex,
                 AgentKind::Pi,
                 AgentKind::Grok,
+                AgentKind::Omp,
+                AgentKind::Agy
+            ]
+        );
+        // 退出时发 SessionEnd 的:有 hook 的五家;agy 退出不发任何 hook,opencode 没有 hook
+        let with_session_end: Vec<_> = AgentKind::ALL
+            .into_iter()
+            .filter(|k| k.spec().session_end_hook)
+            .collect();
+        assert_eq!(
+            with_session_end,
+            [
+                AgentKind::Claude,
+                AgentKind::Codex,
+                AgentKind::Pi,
+                AgentKind::Grok,
                 AgentKind::Omp
             ]
         );
+        // Ctrl+D 要连按两次才退出的只有 agy
+        let double_ctrl_d: Vec<_> = AgentKind::ALL
+            .into_iter()
+            .filter(|k| k.spec().double_ctrl_d_exit)
+            .collect();
+        assert_eq!(double_ctrl_d, [AgentKind::Agy]);
+        // 子命令 / 额外非交互标志只有 agy 有;别家表全空 = 输入检测口径与改造前一致
+        for kind in AgentKind::ALL {
+            let spec = kind.spec();
+            let has_cli_shape = !spec.print_flags.is_empty()
+                || !spec.subcommands.is_empty()
+                || !spec.value_flags.is_empty();
+            assert_eq!(has_cli_shape, kind == AgentKind::Agy, "{kind:?}");
+        }
         // 能续接的必有会话记录(否则拿不到 id)
         for kind in AgentKind::ALL {
             if kind.spec().resume.is_some() {

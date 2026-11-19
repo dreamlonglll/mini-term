@@ -188,7 +188,7 @@ mod tests {
         }
     }
 
-    /// 支持 hook 的五家给展示名;opencode 与认不出的不给。
+    /// 支持 hook 的六家给展示名;opencode 与认不出的不给。
     #[test]
     fn 支持_hook_的_agent_才提示() {
         assert_eq!(hook_capable_label("claude"), Some("Claude Code"));
@@ -197,6 +197,7 @@ mod tests {
         assert_eq!(hook_capable_label("grok"), Some("Grok"));
         assert_eq!(hook_capable_label("omp"), Some("oh-my-pi"));
         assert_eq!(hook_capable_label("pi"), Some("pi"));
+        assert_eq!(hook_capable_label("agy"), Some("Antigravity CLI"));
         assert_eq!(hook_capable_label("opencode"), None);
         assert_eq!(hook_capable_label("bash"), None);
         assert_eq!(hook_capable_label(""), None);

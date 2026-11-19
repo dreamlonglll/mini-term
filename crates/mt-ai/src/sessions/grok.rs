@@ -28,8 +28,8 @@ pub(super) fn grok_sessions_dir() -> Option<PathBuf> {
 }
 
 /// 百分号解码(只处理 `%XX`;grok 的 urlencoding 不产出 `+` 代空格)。
-/// 非法转义原样保留,交给调用方的形态校验兜底。
-fn percent_decode(s: &str) -> String {
+/// 非法转义原样保留,交给调用方的形态校验兜底。agy 的 `file:///` 工作区 URI 也走它。
+pub(super) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;

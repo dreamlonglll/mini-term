@@ -159,7 +159,7 @@ impl SettingsView {
         let status = self.store.read(cx).ai().hook_status();
         self.hook_running = status.running;
         self.hook_port = status.port;
-        // 注册现状要读三家的配置文件 —— 丢后台,回主线程再改状态
+        // 注册现状要读各家的配置文件 —— 丢后台,回主线程再改状态
         self._job = Some(cx.spawn(async move |this, cx| {
             let list = cx
                 .background_executor()
@@ -518,14 +518,14 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// 配置片段面板(四个 tab,标签是字面量不走 i18n)。
+    /// 配置片段面板(每家一个 tab,标签是品牌名字面量不走 i18n)。
     fn render_snippet(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let data = self.snippet.as_ref()?;
         let mut tabs = div()
             .flex()
             .border_b_1()
             .border_color(ui::border_subtle());
-        // 四个 tab 即 hook 注入的四家,key / 展示名查 agent 表(与注入结果行同一份)
+        // tab 即 hook 注入的各家(`HookAgent::ALL`),key / 展示名查 agent 表(与注入结果行同一份)
         for (key, label) in HookAgent::ALL.iter().map(|a| (a.key(), a.label())) {
             let active = self.snippet_tab == key;
             tabs = tabs.child(
@@ -561,7 +561,7 @@ impl SettingsView {
             .text_size(ui::font_px(10.0))
             .text_color(ui::text_muted());
         let section_of = |value: &serde_json::Value, name: &str| value.get(name).cloned();
-        // Claude 的片段是单文件(settings.json),其余三家是多文件列表
+        // Claude 的片段是单文件(settings.json),其余各家是多文件列表
         let claude_key = HookAgent::Claude.key();
         if self.snippet_tab == claude_key {
             if let Some(claude) = section_of(data, claude_key) {

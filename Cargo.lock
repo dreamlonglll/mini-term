@@ -5417,6 +5417,7 @@ dependencies = [
  "dirs 6.0.0",
  "mt-core",
  "parking_lot",
+ "rusqlite",
  "serde",
  "serde_json",
  "tiny_http",
