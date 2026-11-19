@@ -2768,6 +2768,14 @@ impl TerminalArea {
                                 store.activate_pane(&pid_click, &pane_id, window, cx)
                             }),
                             SwitchClick::Rename => {
+                                // 先把焦点交给这个(本来就激活的)页签的终端再开改名框:
+                                // tab 可聚焦(上面的 `tab_index`),双击的第二下按下时焦点
+                                // 落在 tab 元素上,弹窗关掉会把焦点还给它 —— 改完名敲的字
+                                // 进不了终端,要再按一下空格把 tab 激活才行。右键菜单那条
+                                // 「重命名」不受影响:菜单收起时已把焦点还回终端
+                                this.store.update(cx, |store, cx| {
+                                    store.focus_pane(&pid_click, &pane_id, window, cx)
+                                });
                                 let (label, store) = (label_rename.clone(), this.store.clone());
                                 modal::open_rename_pane(
                                     store,
@@ -2778,7 +2786,11 @@ impl TerminalArea {
                                     cx,
                                 );
                             }
-                            SwitchClick::Ignore => {}
+                            // 前一下刚把它切过来:第二下按下时焦点又落回 tab 元素(同上),
+                            // 不交回去的话切过去之后敲的字全丢。它此刻已是激活页签
+                            SwitchClick::Ignore => this.store.update(cx, |store, cx| {
+                                store.focus_pane(&pid_click, &pane_id, window, cx)
+                            }),
                         }
                     }))
                     // tab 右键菜单(`PaneGroup.tsx` 的 paneContextMenu)

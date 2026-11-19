@@ -333,7 +333,7 @@ export const settings = {
       conflict: "{keys} 已被「{name}」占用",
       conflictReplace: "替换（那一条解绑）",
       terminalWarning: "这会让终端里的程序收不到 {keys}",
-      footer: "点击键帽录制新组合键，Esc 取消、Backspace 解绑，改动即时生效。焦点在输入框里时多数应用级快捷键让位给输入，例外是全局搜索、快速打开，以及文件页编辑器里的切换、新建、关闭、重新打开、分屏与查找；「复制粘贴」「回看与缩放」仅在终端内生效",
+      footer: "点击键帽录制新组合键，Esc 取消、Backspace 解绑，改动即时生效。焦点在输入框里时多数应用级快捷键让位给输入，例外是全局搜索、快速打开，以及文件页编辑器里的切换、新建、关闭、重新打开、分屏与查找；「复制粘贴」「回看与缩放」仅在终端内生效。Ctrl+Shift 组合键始终留给应用，解绑后也不会送进终端",
     },
     menu: {
       // 分组标题
@@ -691,7 +691,7 @@ export const settings = {
       conflict: "{keys} is already used by \"{name}\"",
       conflictReplace: "Replace (unassign that one)",
       terminalWarning: "Programs in the terminal will no longer receive {keys}",
-      footer: "Click a key cap and press a new combination (Esc cancels, Backspace unassigns); changes apply immediately. While a text field has focus most app shortcuts yield to typing, except global search, quick open and, in the file editor, switching, new, close, reopen, split and find. \"Copy & paste\" and \"Scrollback & zoom\" apply inside the terminal only",
+      footer: "Click a key cap and press a new combination (Esc cancels, Backspace unassigns); changes apply immediately. While a text field has focus most app shortcuts yield to typing, except global search, quick open and, in the file editor, switching, new, close, reopen, split and find. \"Copy & paste\" and \"Scrollback & zoom\" apply inside the terminal only. Ctrl+Shift combinations are always kept for the app and are not sent to the terminal, even when unassigned",
     },
     menu: {
       // Group headings

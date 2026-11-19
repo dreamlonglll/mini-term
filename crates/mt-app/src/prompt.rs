@@ -359,11 +359,28 @@ pub fn show_prompt(
             .on_ok(move |_: &ClickEvent, window, cx| {
                 let value = input_for_ok.read(cx).value().to_string();
                 on_ok(value, window, cx);
-                true
+                close_after_ok(kind::PROMPT, window, cx)
             })
     });
 
     autofocus(&input_for_focus, window, cx);
+}
+
+/// 「确定」(按钮 / 回车)收尾:回调跑完后**当场**关掉本弹窗、把焦点还回去,返回值直接
+/// 交给 `on_ok`(`false` = 已经自己关了)。
+///
+/// 不走 Dialog 默认的确认关闭,是因为那条路是 gpui-component 的 `defer_close_dialog`
+/// (0.6.2 `root.rs:341`):弹窗当场出栈,焦点却要等动画时长(250ms)之后才还给开弹窗
+/// 之前的焦点。回调里异步发起、恰在这 250ms 内落地的焦点交接会被这次迟到的还原整个盖掉:
+/// 新建文件后编辑器刚拿到焦点就被抢回文件树(键入无效);「保存并关闭」后焦点已交给
+/// 相邻页,又被还原到刚关掉那页的编辑器上 —— 落进一个不再画出来的元素,键盘失灵到点
+/// 一下为止。取消 / Esc 本来就是即时关闭(`close_dialog`),第三颗钮
+/// ([`Confirm::alt_action`])也早是先关框再干活;这里让确认与它们同一种还焦点时机。
+///
+/// 回调先跑、框后关,回调执行期间弹窗仍在栈顶(`has_active_dialog` 等判据不变)。回调里
+/// 同步又开了别的弹窗(本弹窗不在栈顶)时关不了,退回默认关闭,与改动前一致。
+fn close_after_ok(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
+    !close_guarded(kind, window, cx)
 }
 
 // ─── confirm ──────────────────────────────────────────────────
@@ -520,7 +537,7 @@ impl Confirm {
                         on_opt_out(cx);
                     }
                     on_ok(window, cx);
-                    true
+                    close_after_ok(kind::CONFIRM, window, cx)
                 })
         });
     }
@@ -572,8 +589,8 @@ pub fn show_alert(
             .child(body(&message, &[]))
             // 「知道了」按钮与回车都派发 `Confirm`,要它关窗就得显式说:
             // `open_guarded` 已把默认 on_ok 垫成「不关」(0.5.1 这条是靠
-            // `has_footer` 分支关的)
-            .on_ok(|_, _, _| true)
+            // `has_footer` 分支关的)。关法与 prompt / confirm 同一条,见 [`close_after_ok`]
+            .on_ok(|_, window, cx| close_after_ok(kind::ALERT, window, cx))
     });
 }
 
@@ -726,6 +743,65 @@ mod tests {
     #[test]
     fn 通用弹窗与_git_小弹窗同宽() {
         assert_eq!(DIALOG_W, crate::git_ui::DIALOG_W_SM);
+    }
+
+    /// 「确定」关框后,回调随后发起的焦点交接(新建文件后编辑器取焦点、「保存并关闭」后交给
+    /// 相邻页)不会被组件库延迟关闭那次迟到 250ms 的焦点还原盖掉,见 [`close_after_ok`]。
+    #[gpui::test]
+    fn 确定关框后的焦点交接不被迟到的还原盖掉(cx: &mut gpui::TestAppContext) {
+        use std::time::Duration;
+
+        /// 只画弹窗层的宿主(`Root` 自己不画,要宿主调 `render_dialog_layer`,同 `main.rs`)。
+        struct DialogHost;
+        impl gpui::Render for DialogHost {
+            fn render(
+                &mut self,
+                window: &mut Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .children(gpui_component::Root::render_dialog_layer(window, cx))
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (_root, cx) = cx.add_window_view(|window, cx| {
+            let host = cx.new(|_| DialogHost);
+            gpui_component::Root::new(host, window, cx)
+        });
+        let before = cx.update(|_, cx| cx.focus_handle());
+        let after = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| {
+            window.focus(&before, cx);
+            let after = after.clone();
+            Confirm::new("title", "message").open(
+                move |window, cx| {
+                    let after = after.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(50))
+                                .await;
+                            let _ = cx.update(|window, cx| window.focus(&after, cx));
+                        })
+                        .detach();
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(is_open(kind::CONFIRM));
+
+        cx.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+
+        assert!(!is_open(kind::CONFIRM));
+        cx.update(|window, _| {
+            assert!(after.is_focused(window), "焦点被还原回开弹窗前的元素");
+        });
     }
 
     #[test]
