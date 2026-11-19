@@ -1,7 +1,8 @@
 //! AI CLI 会话记录读取与谱系扫描（原 `src-tauri/src/ai_sessions.rs`）。
 //!
-//! Claude / Codex / Grok / pi / OMP 支持本地历史列表与正文；pi 和 OMP 共用定位、
-//! 消息解析与桌面历史读取。opencode 只有状态与移动端指令，镜像必须跳过启发式
+//! Claude / Codex / Grok / pi / OMP / agy 支持本地历史列表与正文；pi 和 OMP 共用定位、
+//! 消息解析与桌面历史读取；agy 的存储层在 `agy.rs`、列表 / 正文 / 镜像定位在
+//! `agy_history.rs`。opencode 只有状态与移动端指令，镜像必须跳过启发式
 //! 绑定，否则会把同项目其它 agent 的最新记录贴到该 pane。
 //!
 //! 原本的 `#[tauri::command]` 全部去掉,函数签名不变;跨模块共享的
@@ -9,6 +10,7 @@
 //! mobile_mirror)迁移后各自成 crate,只能从这里 `pub` 出去。
 
 mod agy;
+mod agy_history;
 mod codex;
 mod delete;
 mod grok;
@@ -20,11 +22,11 @@ mod tool_path;
 
 pub use agy::{
     AgyConversation, AgyStep, AgyStepKind, AgyToolCall, agy_app_data_dir, agy_config_dir,
-    agy_summaries_db_path_in, agy_tool_result_text, agy_transcript_path_in,
-    agy_user_request_text, file_uri_to_path, find_agy_transcript, normalize_db_time,
-    parse_agy_step, parse_workspace_uris, read_agy_conversations, read_agy_conversations_from,
-    read_agy_transcript,
+    agy_summaries_db_path_in, agy_tool_result_text, agy_transcript_path_in, agy_user_request_text,
+    file_uri_to_path, find_agy_transcript, normalize_db_time, parse_agy_step, parse_workspace_uris,
+    read_agy_conversations, read_agy_conversations_from, read_agy_transcript,
 };
+pub use agy_history::{agy_dialogue_step_from_line, agy_message_from_step, newest_agy_transcript};
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
     codex_question_answer_from_line, codex_question_from_line, codex_user_title_from_line,
@@ -49,12 +51,13 @@ pub use omp::{
     omp_question_from_line, omp_session_meta_from_line,
 };
 pub use tool_activity::{
-    AiToolCall, TOOL_TARGET_MAX_CHARS, claude_tool_calls_from_line, codex_tool_calls_from_line,
-    grok_tool_calls_from_line, omp_tool_calls_from_line, pi_tool_calls_from_line,
-    summarize_tool_target,
+    AiToolCall, TOOL_TARGET_MAX_CHARS, agy_tool_calls_from_line, agy_tool_calls_from_step,
+    claude_tool_calls_from_line, codex_tool_calls_from_line, grok_tool_calls_from_line,
+    omp_tool_calls_from_line, pi_tool_calls_from_line, summarize_tool_target,
 };
 pub use tool_path::ToolPathScope;
 
+use agy_history::{get_agy_sessions, read_agy_session_content};
 use codex::{
     get_codex_sessions, get_codex_sessions_in, read_codex_session_content,
     read_wsl_codex_session_content,
@@ -123,12 +126,13 @@ pub fn invalidate_session_cache() {
 #[serde(rename_all = "camelCase")]
 pub struct AiSession {
     pub id: String,
-    pub session_type: String, // "claude" | "codex" | "grok" | "pi" | "omp"
+    pub session_type: String, // "claude" | "codex" | "grok" | "pi" | "omp" | "agy"
     pub title: String,
     pub timestamp: String, // ISO 8601
     /// 会话最新使用的模型（Claude: 尾窗反扫 assistant 行 message.model;
     /// Codex: turn_context 的 payload.model; Grok: summary.json 的
-    /// current_model_id）。前端按模型名推厂商图标——CLI ≠ 模型厂商
+    /// current_model_id; agy: transcript 尾窗里最近一步 PLANNER_RESPONSE.model）。
+    /// 前端按模型名推厂商图标——CLI ≠ 模型厂商
     /// （claude CLI 挂 GLM/DeepSeek 中转是常见用法）。None = 识别不出,回落 CLI 图标。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1117,6 +1121,8 @@ pub fn get_ai_session_content(
         Some(AgentKind::Omp) => {
             read_pi_family_session_content(PiFlavor::Omp, &session_id, &project_path)
         }
+        // 会话 id 全局唯一(transcript 在 `brain/<id>/` 下),不按项目定位
+        Some(AgentKind::Agy) => read_agy_session_content(&session_id),
         _ => Err(format!("不支持的会话类型: {}", session_type)),
     }
 }
@@ -1151,6 +1157,7 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     sessions.extend(get_grok_sessions(&project_path));
     sessions.extend(get_pi_family_sessions(PiFlavor::Pi, &project_path));
     sessions.extend(get_pi_family_sessions(PiFlavor::Omp, &project_path));
+    sessions.extend(get_agy_sessions(&project_path));
 
     // 按时间戳降序(最新在前)
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1256,7 +1263,7 @@ mod tests {
 
     // ---- 可解析会话记录的白名单 ----
 
-    /// Claude/Codex/pi/Grok/OMP 有可解析的记录；其余 agent 必须落在白名单外，
+    /// Claude/Codex/pi/Grok/OMP/agy 有可解析的记录；其余 agent 必须落在白名单外，
     /// 否则镜像会退启发式绑到同项目别家的会话文件（串台）。
     #[test]
     fn supported_agents_have_session_logs() {
@@ -1271,6 +1278,9 @@ mod tests {
             "OMP",
             "pi",
             "PI",
+            "agy",
+            "AGY",
+            "antigravity",
         ] {
             assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
         }
@@ -1426,6 +1436,26 @@ mod tests {
             None,
         );
         assert!(r.is_err());
+    }
+
+    /// agy 只有宿主来源:WSL 来源的正文请求(列表里不会有,防御)报不支持而不是去 9P
+    /// 里找;本机找不到的 id 报错而不 panic。
+    #[test]
+    fn agy_content_unsupported_sources_are_errors() {
+        let wsl = get_ai_session_content(
+            "agy".into(),
+            "7e54f704-1278-4123-8ad4-11e8f6922c82".into(),
+            r"\\wsl$\Ubuntu\home\u\p".into(),
+            Some("Ubuntu".into()),
+        );
+        assert!(wsl.unwrap_err().contains("不支持"));
+        let missing = get_ai_session_content(
+            "agy".into(),
+            "mt-test-no-such-agy-conversation".into(),
+            r"D:\nowhere".into(),
+            None,
+        );
+        assert!(missing.is_err());
     }
 
     #[test]

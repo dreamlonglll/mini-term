@@ -80,6 +80,11 @@ pub enum SessionDeleteError {
 
 /// 右键菜单要不要出「删除会话」。与列表的来源口径一一对应:WSL / SSH 远程来源只扫
 /// Claude 与 Codex,Grok / pi 只有宿主来源。
+///
+/// agy 有列表但**不给删**:一条会话散在它自己的 SQLite 索引(`conversation_summaries.db`,
+/// agy 跑着时开着 WAL)、`conversations/<id>.db` 与 `brain/<id>/` 三处,都是 agy 进程
+/// 私有、可能正在写的结构;只删 transcript 条目照样从索引里复活,改索引库又可能和 agy
+/// 抢写。
 pub fn session_delete_supported(
     session_type: &str,
     wsl_distro: Option<&str>,
@@ -90,6 +95,7 @@ pub fn session_delete_supported(
         Some(AgentKind::Grok | AgentKind::Pi) => {
             wsl_distro.is_none() && ssh_connection_id.is_none()
         }
+        Some(AgentKind::Agy) => false,
         _ => false,
     }
 }
@@ -629,7 +635,8 @@ mod tests {
 
     #[test]
     fn 没有列表的来源不提供删除() {
-        for agent in ["omp", "opencode", "whatever", ""] {
+        // agy 有列表也不给删(理由见 session_delete_supported)
+        for agent in ["omp", "opencode", "whatever", "", "agy", "antigravity"] {
             assert!(!session_delete_supported(agent, None, None), "{agent:?}");
             assert_eq!(
                 plan_session_delete(agent, ID, PROJECT, None).unwrap_err(),
