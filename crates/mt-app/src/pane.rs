@@ -125,6 +125,7 @@ use crate::notify::ToastKind;
 use crate::overlay;
 use crate::pty_slot::{PtyPhase, PtySlot};
 use crate::redraw;
+use crate::ssh_activity::SshActivityView;
 use crate::store::{AppStore, TerminalZoom};
 use crate::toast;
 
@@ -270,6 +271,11 @@ pub struct TerminalPane {
     _sync_release_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
+    /// SSH 交互浮层:记录模型 + 内容区右上角的悬浮框(入口按钮在终端组标题栏上,
+    /// `terminal_area::render_leaf_controls` 读它的状态来画)。**恒挂在右上角那一列里**,
+    /// 悬浮框关着时画空,理由见 [`crate::ssh_activity`] 视图模块注释。事件由
+    /// `ssh_activity` 的泵直接投给它,不经本 pane 的 update。
+    ssh_activity: Entity<SshActivityView>,
 }
 
 /// 标记跳转后整行闪烁的底色与时长(`terminalCache.ts:193-194` 的
@@ -688,6 +694,12 @@ impl TerminalPane {
 
         ai.add_pane(pty_id);
 
+        let ssh_activity = {
+            let focus = focus.clone();
+            let mono_font = style.font_family.clone();
+            cx.new(|_| SshActivityView::new(pty_id, focus, mono_font))
+        };
+
         Self {
             pty_id,
             emulator,
@@ -722,7 +734,18 @@ impl TerminalPane {
             sync_release_armed: false,
             _sync_release_timer: None,
             _wake: wake,
+            ssh_activity,
         }
+    }
+
+    /// SSH 交互浮层的视图(`ssh_activity` 的事件泵经它投递)。
+    pub fn ssh_activity(&self) -> &Entity<SshActivityView> {
+        &self.ssh_activity
+    }
+
+    /// 清掉 SSH 交互记录(关 pane / 重启换 PTY,见 `AppStore::dispose_terminal`)。
+    pub fn clear_ssh_activity(&mut self, cx: &mut Context<Self>) {
+        self.ssh_activity.update(cx, |view, cx| view.clear(cx));
     }
 
     /// 标记这是 SSH 远程项目的 pane(store 建 pane 时调,见 `start_pty_with`)。
@@ -1538,7 +1561,11 @@ impl TerminalPane {
             return;
         }
         self.style = style.clone();
+        let mono_font = style.font_family.clone();
         self.view.update(cx, |view, cx| view.set_style(style, cx));
+        // SSH 交互浮层的命令与输出用同一个等宽字族
+        self.ssh_activity
+            .update(cx, |view, cx| view.set_mono_font(mono_font, cx));
         cx.notify();
     }
 
@@ -1576,6 +1603,9 @@ impl TerminalPane {
         }
         self.settle_spawn_waiters(false);
         self.ai.remove_pane(self.pty_id);
+        // SSH 交互浮层的 nonce(store 的 dispose 路径也注销一次;实体直接被丢弃的
+        // 路径 —— 项目移除 / 应用退出 —— 只走到这里)。幂等
+        crate::ssh_activity::forget_pty(self.pty_id);
         self.close_search_state();
     }
 
@@ -2535,6 +2565,24 @@ impl TerminalPane {
     }
 }
 
+/// 把 pane 根容器的窗口坐标报给 SSH 交互视图(悬浮框的宽高按 pane 尺寸定)。
+///
+/// 一层 absolute 全尺寸的 canvas:不插 hitbox、不画东西。pane 套着 view 级缓存,命中缓存时
+/// 不重跑 —— 但 pane 尺寸一变缓存就失效,正好是要重报的时候。报上去的值变了且悬浮框开着,
+/// 就再要一帧让视图按新尺寸重画。
+fn ssh_activity_probe(view: Entity<SshActivityView>) -> impl IntoElement {
+    gpui::canvas(
+        move |bounds, window, cx| {
+            if view.update(cx, |view, _| view.note_pane_bounds(bounds)) {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full()
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
@@ -2545,6 +2593,7 @@ impl Render for TerminalPane {
         let scroll_button = scrolled_back.then(|| self.render_scroll_bottom_button(unseen, cx));
         // 远程 pane 退出后不出这条(上面另有 terminal_area 的整屏重连遮罩),见 `remote`
         let exit_bar = (self.exited && !self.remote).then(|| self.render_exit_bar(cx));
+        let ssh_has_records = self.ssh_activity.read(cx).has_records();
 
         // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
         // 宿主**不刷底色**:终端区着色只保留 TerminalArea 根容器一层 bg_terminal
@@ -2597,11 +2646,25 @@ impl Render for TerminalPane {
                     .children(scroll_button),
             )
             .children(exit_bar)
-            // 终端内查找条:右上角,距顶 6px、距右 14px —— 与原版
-            // `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF 每帧算出来的
-            // fixed 坐标,这里由布局白拿)
-            .when_some(self.search_bar.clone(), |el, bar| {
-                el.child(div().absolute().top(px(6.0)).right(px(14.0)).child(bar))
+            // 右上角一列:终端内查找条 + SSH 交互悬浮框(入口按钮在终端组标题栏上)。距顶 6px、
+            // 距右 14px —— 与原版查找条 `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF
+            // 每帧算出来的 fixed 坐标,这里由布局白拿)。竖排右对齐、间距 6px:查找条开着时
+            // 悬浮框自然落到它下方,两者不重叠。SSH 视图恒挂(关着时画空),理由见它的模块注释
+            .child(
+                div()
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(6.0))
+                    .children(self.search_bar.clone())
+                    .child(self.ssh_activity.clone()),
+            )
+            // 悬浮框的宽高按 pane 尺寸定:有记录时把 pane 根容器的窗口坐标报给 SSH 视图
+            .when(ssh_has_records, |el| {
+                el.child(ssh_activity_probe(self.ssh_activity.clone()))
             })
             // 「已复制」气泡:叠在终端之上,坐标是元素相对值
             .when_some(self.copied_tip, |el, origin| {

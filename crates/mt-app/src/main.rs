@@ -120,6 +120,7 @@ mod session_branch;
 mod session_panel;
 mod settings;
 mod shell_ops;
+mod ssh_activity;
 mod ssh_assoc;
 mod ssh_conn;
 mod ssh_panel;
@@ -3025,6 +3026,11 @@ fn main() {
         );
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
+
+        // SSH 交互浮层的抄送监听(127.0.0.1 随机端口,不看 hook 开关)。要赶在任何 PTY
+        // 起来之前:`MINITERM_SSH_FEED` 是起 PTY 时按 pane 注入的(`store::panes`)。
+        // 事件泵要拿 store,所以排在 `set_global` 之后。绑不上只记日志,功能整体关闭。
+        ssh_activity::start(cx);
 
         // 用户改过的快捷键压在默认键位之上(默认键位上面 `bind_keys` 已绑好;机制见
         // `hotkeys::apply_overrides`)。必须赶在窗口开出来之前:首帧的菜单提示、首启引导的

@@ -275,8 +275,12 @@ use mt_i18n::{
 /// （`settings.shortcuts.lineStartEnd`）；`settings.shortcuts.footer` 按实际让位行为改写，
 /// `paneGroup.markerTooltip` / `search.shortcutHint` / `fileTree.header.searchTitle` 的
 /// `{mod}+Shift+…` 改成从键位表取的占位符，条数不变。
-const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1899;
+/// 1899 → 1920（38 → 39 个命名空间）：SSH 交互浮层新增 `sshActivity` 命名空间 21 条 ——
+/// pane 右上角按钮的 tooltip、悬浮框标题栏（标题 / 复制全部 / 清空 / 关闭）、记录头
+/// （复制命令 / 复制输出 / 已复制 / 上传与下载两行 / cwd / 超时上限）与结尾状态行
+/// （运行中 / 退出码 / 已结束 / 超时 / 连接阶段超时 / 错误 / 已中断 / 传输完成 / 截断说明）。
+const EXPECTED_NAMESPACES: usize = 39;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1920;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -309,6 +313,7 @@ const TS_NAMESPACES: &[&str] = &[
     "sessionList",
     "sessionViewer",
     "settings",
+    "sshActivity",
     "sshAssoc",
     "sshModal",
     "terminal",
