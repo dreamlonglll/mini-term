@@ -103,6 +103,7 @@ mod pane;
 mod pane_actions;
 mod pane_preview;
 mod persist;
+mod popover_reveal;
 mod pricing;
 mod project_list;
 mod project_switcher;

@@ -54,6 +54,7 @@ use crate::modal;
 use crate::overlay;
 use crate::pane_actions;
 use crate::pane_preview;
+use crate::popover_reveal::{Chrome, RevealState, ShadowMode, anchor_probe, reveal_frame};
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::ssh_activity::{ButtonState, SshActivityView};
 use crate::store::AppStore;
@@ -218,6 +219,16 @@ pub struct TerminalArea {
     /// 存活判据与 marker 浮层同一条([`marker_popover_alive`]):切 tab / 关 pane
     /// 就无条件关。
     cmd_open: Option<(String, String, u32)>,
+    /// 命令库浮层**画在**哪个 pane 上:开着,或者收起动画还没播完(`cmd_open` 已经是 `None`)。
+    /// 播完 / pane 没了才清。
+    cmd_shown: Option<(String, String, u32)>,
+    /// 命令库浮层的开合动画(见 [`crate::popover_reveal`])。原点不用它自带的锚点,用
+    /// [`Self::cmd_anchors`] 里目标 pane 那一条。
+    cmd_reveal: RevealState,
+    /// 各叶子「命令库」按钮的窗口坐标,按该叶子 active pane 的 id 索引(探针报来)。
+    /// 浮层开在哪个 pane 上,原点就取那个 pane 所在叶子的按钮 —— 分屏时每个叶子各有一颗,
+    /// 不能共用一个锚点。条目只有几十字节,不按帧回收(与 `pane_enter` 同一档)。
+    cmd_anchors: HashMap<String, Bounds<Pixels>>,
     /// 开命令库浮层前焦点在谁身上(理由同 [`Self::marker_prev_focus`])。
     cmd_prev_focus: Option<FocusHandle>,
     /// 对浮层事件的订阅(Close / Edit / NewGroup / RenameGroup)。
@@ -510,17 +521,7 @@ fn ssh_activity_button(
     view: Entity<SshActivityView>,
     state: ButtonState,
 ) -> gpui::Stateful<gpui::Div> {
-    let probe_view = view.clone();
-    let probe = canvas(
-        move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-            if probe_view.update(cx, |view, _| view.note_anchor_bounds(bounds)) {
-                window.on_next_frame(move |_, cx| probe_view.update(cx, |_, cx| cx.notify()));
-            }
-        },
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .size_full();
+    let probe = anchor_probe(view.clone(), |view, bounds| view.note_anchor_bounds(bounds));
     let group = SharedString::from(format!("ssh-activity-btn-{leaf_id}"));
     let dot = (state.running || state.failed).then(|| {
         div()
@@ -1286,6 +1287,9 @@ impl TerminalArea {
             marker_prev_focus: None,
             cmd_popover: None,
             cmd_open: None,
+            cmd_shown: None,
+            cmd_reveal: RevealState::new(),
+            cmd_anchors: HashMap::new(),
             cmd_prev_focus: None,
             _cmd_sub: None,
             file_drop_pane: None,
@@ -1553,14 +1557,23 @@ impl TerminalArea {
                 popover
             }
         };
-        self.cmd_open = Some((project_id.to_string(), pane_id.to_string(), pty_id));
+        let target = (project_id.to_string(), pane_id.to_string(), pty_id);
+        // 收起动画播到一半又在同一个 pane 上打开:从当前进度往回长;换了 pane 就从头长
+        if self.cmd_shown.as_ref() != Some(&target) {
+            self.cmd_reveal.hide_now();
+        }
+        self.cmd_open = Some(target.clone());
+        self.cmd_shown = Some(target);
         self.cmd_prev_focus = window.focused(cx);
         let (pid, pane) = (project_id.to_string(), pane_id.to_string());
         popover.update(cx, |popover, cx| popover.open_for(pid, pane, window, cx));
+        self.cmd_reveal.show(cx);
         cx.notify();
     }
 
-    /// 收起命令库浮层(幂等),焦点还回去。
+    /// 收起命令库浮层(幂等),播收起动画(播完才卸,见 [`Self::render_command_popover`])。
+    ///
+    /// 焦点**一开始就**还回去:正在收的浮层不再接按键,覆盖物登记也当场摘掉。
     pub fn close_command_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.cmd_open.take().is_none() {
             return;
@@ -1569,15 +1582,37 @@ impl TerminalArea {
         if let Some(prev) = self.cmd_prev_focus.take() {
             window.focus(&prev, cx);
         }
+        self.cmd_reveal.hide(cx);
         cx.notify();
+    }
+
+    /// 直接卸掉命令库浮层,不播动画(它挂的 pane / pty 已经没了,或者整个项目切走了)。
+    fn drop_command_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_command_popover(window, cx);
+        self.cmd_reveal.hide_now();
+        self.cmd_shown = None;
+    }
+
+    /// 「命令库」按钮上的探针报来按钮窗口坐标(`pane_id` = 该叶子的 active pane)。
+    /// 返回「变了、且浮层正画在这个 pane 上」—— 只有那时才要再画一帧。
+    fn note_cmd_anchor(&mut self, pane_id: &str, bounds: Bounds<Pixels>) -> bool {
+        if self.cmd_anchors.get(pane_id) == Some(&bounds) {
+            return false;
+        }
+        self.cmd_anchors.insert(pane_id.to_string(), bounds);
+        self.cmd_shown
+            .as_ref()
+            .is_some_and(|(_, pane, _)| pane == pane_id)
+            && self.cmd_reveal.is_mounted()
     }
 
     /// 浮层要开弹窗时**先关浮层再开**:顺序反了,Dialog 抢到的焦点会被
     /// [`Self::close_command_popover`] 的焦点还原覆盖掉(键落进终端而不是表单)。
     ///
-    /// 「再开」还要**等一帧**:弹窗的毛玻璃背板抓的是 DWM 的上一帧
+    /// 「再开」还要**等浮层从屏幕上消失**:弹窗的毛玻璃背板抓的是 DWM 的上一帧
     /// (`main.rs` 的 frost 段),同一轮里开的话浮层还没从屏幕上消失,会被一起
-    /// 糊进背景 —— 真机截到过一张带浮层残影的编辑弹窗。50ms 够两帧,肉眼无感。
+    /// 糊进背景 —— 真机截到过一张带浮层残影的编辑弹窗。所以等收起动画播完,再等 50ms
+    /// (够两帧,肉眼无感)。
     fn on_command_popover_event(
         &mut self,
         _popover: &Entity<CommandPopover>,
@@ -1591,10 +1626,10 @@ impl TerminalArea {
         }
         let store = self.store.clone();
         let event = event.clone();
+        // 浮层要先从屏幕上消失:收起动画播完再等那两帧(毛玻璃背板抓的是上一帧)
+        let wait = std::time::Duration::from_millis(50) + self.cmd_reveal.hide_remaining();
         cx.spawn_in(window, async move |_this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(50))
-                .await;
+            cx.background_executor().timer(wait).await;
             let _ = cx.update(|window, cx| match event {
                 PopoverEvent::Close => {}
                 PopoverEvent::Edit { existing, group } => {
@@ -1612,17 +1647,32 @@ impl TerminalArea {
     /// 命令库浮层。层级与锚定套路照 [`Self::render_marker_popover`]:
     /// `deferred(priority 1)` → 全窗透明遮罩(按下即关)→ `anchored(按钮下缘)`
     /// → 面板实体。
+    ///
+    /// 开合动画走 [`crate::popover_reveal`]:框体(底色 / 边框 / 阴影)由这里按插值矩形画,面板本体
+    /// 只画内容([`CommandPopover`] 不再自带框体)。收起动画里遮罩不画(点哪儿都不再被它拦),
+    /// 正在收的面板也不接鼠标;播完才卸。
     fn render_command_popover(
         &mut self,
         layout: &SplitNode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (_, pane_id, pty_id) = self.cmd_open.clone()?;
+        let (_, pane_id, pty_id) = self.cmd_shown.clone()?;
         if !marker_popover_alive(layout, &pane_id, pty_id) {
-            self.close_command_popover(window, cx);
+            // 切 tab / 关 pane / pty 换了:浮层挂的地方没了,直接卸,不播动画
+            self.drop_command_popover(window, cx);
             return None;
         }
+        let Some(mut state) = self.cmd_reveal.frame(window) else {
+            // 收起动画播完了
+            self.cmd_shown = None;
+            return None;
+        };
+        state.origin_x = self
+            .cmd_anchors
+            .get(&pane_id)
+            .map(|anchor| anchor.left() + anchor.size.width / 2.0);
+        let open = self.cmd_open.is_some();
         let popover = self.cmd_popover.clone()?;
         let rect = self.pane_rects.get(&pane_id)?;
         let inset = cmd_anchor_inset(matches!(layout, SplitNode::Split { .. }));
@@ -1632,6 +1682,23 @@ impl TerminalArea {
             px(rect.top + 2.0),
         );
 
+        let panel = reveal_frame(
+            popover,
+            state,
+            Some(Chrome {
+                // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+                // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+                bg: ui::bg_overlay(),
+                hover_bg: None,
+                border_color: ui::border_subtle(),
+                border_width: px(1.0),
+                radius: px(6.0).into(),
+                shadow: ShadowMode::Always,
+                // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定
+                occlude: true,
+            }),
+        );
+
         let size = window.viewport_size();
         Some(
             deferred(
@@ -1639,24 +1706,27 @@ impl TerminalArea {
                     div()
                         .w(size.width)
                         .h(size.height)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.close_command_popover(window, cx);
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.close_command_popover(window, cx);
-                            }),
-                        )
+                        // 收起动画里不拦:点哪儿都直接落到下面
+                        .when(open, |el| {
+                            el.occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.close_command_popover(window, cx);
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.close_command_popover(window, cx);
+                                    }),
+                                )
+                        })
                         .child(
                             anchored()
                                 .position(anchor)
                                 .snap_to_window_with_margin(px(4.0))
-                                .child(popover),
+                                .child(panel),
                         ),
                 ),
             )
@@ -3200,10 +3270,16 @@ impl TerminalArea {
         // 终端内查找:与 marker 按钮同一道「有 pty 才画」的闸
         // (原版 `PaneGroup.tsx:504`,`activePane.ptyId !== undefined`)
         let search_btn = active.pty_id.map(|pty_id| {
+            // 查找条开合动画的原点探针:报给这个 pane(查找条由它画),见 `crate::popover_reveal`
+            let probe = store
+                .terminal(pty_id)
+                .cloned()
+                .map(|pane| anchor_probe(pane, |pane, bounds| pane.note_search_anchor(bounds)));
             ctrl_icon(
                 gpui::SharedString::from(format!("term-search-{leaf_id}")),
                 ICON_SEARCH,
             )
+            .relative()
             // 快捷键取自键位表此刻生效的那份(与设置页 / 首启引导同一份),用户改键 / 解绑
             // 跟着变,解绑了括号里写「未设置」
             .tip(tr!(
@@ -3218,6 +3294,7 @@ impl TerminalArea {
                     pane.update(cx, |pane, cx| pane.open_search(window, cx));
                 }
             }))
+            .children(probe)
         });
         // 命令库(issue #81):与查找同一道「有 pty 才画」的闸 —— 没 pty 的 pane
         // 命令写不进去。开着时钮常亮,提示「浮层就是从我这弹出来的」
@@ -3228,16 +3305,24 @@ impl TerminalArea {
         let pid_cmd = project_id.to_string();
         let pane_cmd = active.id.clone();
         let cmd_btn = active.pty_id.map(|_| {
+            // 命令库浮层开合动画的原点探针:报给本视图,按该叶子的 active pane 记(见
+            // [`Self::note_cmd_anchor`])
+            let anchor_pane = active.id.clone();
+            let probe = anchor_probe(cx.entity(), move |area, bounds| {
+                area.note_cmd_anchor(&anchor_pane, bounds)
+            });
             ctrl_icon(
                 gpui::SharedString::from(format!("term-cmds-{leaf_id}")),
                 command_library::ICON_COMMANDS,
             )
+            .relative()
             .when(cmd_open_here, |el| el.opacity(1.0).bg(ui::border_subtle()))
             .tip(t("commandLibrary", "buttonTooltip"))
             .on_click(cx.listener(move |this, _event, window, cx| {
                 cx.stop_propagation();
                 this.toggle_command_popover(&pid_cmd, &pane_cmd, window, cx);
             }))
+            .child(probe)
         });
         // ⚑ N:图标是**文本字符**,不是 SVG(与 menu.rs 的 `✓ ` 同一套理由);
         // 宽度不固定,所以不复用上面那个 22×22 的方钮。
@@ -4392,8 +4477,8 @@ impl Render for TerminalArea {
         if self.marker_open.is_some() && self.store.read(cx).active_layout().is_none() {
             self.close_marker_popover(window, cx);
         }
-        if self.cmd_open.is_some() && self.store.read(cx).active_layout().is_none() {
-            self.close_command_popover(window, cx);
+        if self.cmd_shown.is_some() && self.store.read(cx).active_layout().is_none() {
+            self.drop_command_popover(window, cx);
         }
 
         let store = self.store.read(cx);

@@ -97,11 +97,12 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Task,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Div, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::ActiveTheme as _;
 use mt_config::{ShellConfig, SshConnection};
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
@@ -123,6 +124,7 @@ use crate::markers::{self, MarkerBatch, MarkerSubmit};
 use crate::menu::{self, MenuItem};
 use crate::notify::ToastKind;
 use crate::overlay;
+use crate::popover_reveal::{Chrome, RevealState, ShadowMode, reveal_frame};
 use crate::pty_slot::{PtyPhase, PtySlot};
 use crate::redraw;
 use crate::ssh_activity::SshActivityView;
@@ -244,6 +246,11 @@ pub struct TerminalPane {
     /// 浮动查找条。`None` = 没打开。**逐 pane 一条**(原版是全局单例,见
     /// [`Self::open_search`] 的说明)。
     search_bar: Option<Entity<TerminalSearchBar>>,
+    /// 正在播收起动画的查找条(已经关了,`search_bar` 是 `None`)。播完才丢;动画中途再打开时
+    /// 原样接回来,从当前进度往回长。
+    search_exit: Option<Entity<TerminalSearchBar>>,
+    /// 查找条的开合动画 + 原点(标题栏「查找」按钮,探针报来),见 [`crate::popover_reveal`]。
+    search_reveal: RevealState,
     /// 标记跳转后那 300ms 闪烁的撤销计时器。与 `_tip_timer` 同理必须存句柄:
     /// 连着跳两条时上一个计时器随之被丢弃,否则第一次的到点回调会把第二次刚
     /// 亮起来的那一行提前抹掉。
@@ -724,6 +731,8 @@ impl TerminalPane {
             _tip_timer: None,
             search,
             search_bar: None,
+            search_exit: None,
+            search_reveal: RevealState::new(),
             _flash_timer: None,
             pending_marks: Vec::new(),
             _marks_timer: None,
@@ -1130,24 +1139,38 @@ impl TerminalPane {
         if !overlay::push(overlay::terminal_search(self.pty_id)) {
             return;
         }
-        let search = self.search.clone();
-        let emulator = self.emulator.clone();
-        let this = cx.weak_entity();
-        let bar = cx.new(|cx| {
-            // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效
-            let labels = crate::i18n::terminal_search_labels;
-            TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
-                move |window, cx| {
-                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
-                        pane.dismiss_search(window, cx);
-                    });
-                },
-            )
-        });
+        // 收起动画播到一半又打开:接着用那一条,从当前进度往回长
+        let bar = match self.search_exit.take() {
+            Some(bar) => bar,
+            None => {
+                let search = self.search.clone();
+                let emulator = self.emulator.clone();
+                let this = cx.weak_entity();
+                cx.new(|cx| {
+                    // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效
+                    let labels = crate::i18n::terminal_search_labels;
+                    TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
+                        move |window, cx| {
+                            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                                pane.dismiss_search(window, cx);
+                            });
+                        },
+                    )
+                })
+            }
+        };
         // 选区预填 + 开引擎 + 按关键词搜一遍 + 聚焦全选
         bar.update(cx, |bar, cx| bar.open(window, cx));
         self.search_bar = Some(bar);
+        // 开合动画(点按钮与 Ctrl+F 都走这里)
+        self.search_reveal.show(cx);
         cx.notify();
+    }
+
+    /// 标题栏「查找」按钮上的探针报来按钮窗口坐标(查找条开合动画的原点)。返回「变了、且
+    /// 查找条开着或在动画中」—— 只有那时才要再画一帧。
+    pub fn note_search_anchor(&mut self, bounds: Bounds<Pixels>) -> bool {
+        self.search_reveal.note_anchor(bounds)
     }
 
     /// 收起查找条(Esc / `✕` 都走这里)。
@@ -1155,11 +1178,16 @@ impl TerminalPane {
     /// ⚠️ **焦点必须还给终端**:不还的话焦点停在已卸载的输入框上,用户接着敲的字
     /// 全部落空,还得先用鼠标点一下终端才能继续 —— 原版 `closeTerminalSearch()`
     /// 里那句 `term.focus()` 就是为这个。
+    ///
+    /// 收起播动画:查找条挪进 `search_exit` 留在树上,播完才丢(见 render)。焦点**一开始就**
+    /// 还给终端,正在收的查找条不再接按键,也不再接鼠标(`crate::popover_reveal` 收起时盖住内容)。
     fn dismiss_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.search_bar.take().is_none() {
+        let Some(bar) = self.search_bar.take() else {
             return;
-        }
+        };
         overlay::pop(overlay::terminal_search(self.pty_id));
+        self.search_exit = Some(bar);
+        self.search_reveal.hide(cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1616,6 +1644,9 @@ impl TerminalPane {
         if self.search_bar.take().is_some() {
             overlay::pop(overlay::terminal_search(self.pty_id));
         }
+        // 终端都没了:不播收起动画,直接卸
+        self.search_exit = None;
+        self.search_reveal.hide_now();
     }
 }
 
@@ -2565,6 +2596,48 @@ impl TerminalPane {
     }
 }
 
+impl TerminalPane {
+    /// 右上角那一列里的查找条(开着,或者收起动画还没播完)。
+    ///
+    /// 开合动画走 [`crate::popover_reveal`]。查找条按自己的自然尺寸排版,外壳从第一帧起就占满最终尺寸,
+    /// 下面的 SSH 悬浮框不会跟着动画跳。动画进行中框体(底色 / 边框 / 阴影)由宿主按插值矩形画,
+    /// 取值与 [`TerminalSearchBar`] 自带的那套一致(主题 `popover` 底 / `border` 边 / `rounded_md`
+    /// / `shadow_lg`),查找条本体只露出裁剪窗里的那一块;全开静止时直接画查找条本体,
+    /// 外观与不加动画时一字不差 —— 所以不必改 mt-ui 的查找条。
+    fn render_search_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let bar = self
+            .search_bar
+            .clone()
+            .or_else(|| self.search_exit.clone())?;
+        let Some(state) = self.search_reveal.frame(window) else {
+            if self.search_bar.is_some() {
+                return Some(bar.into_any_element());
+            }
+            // 收起动画播完了
+            self.search_exit = None;
+            return None;
+        };
+        if state.settled {
+            return Some(bar.into_any_element());
+        }
+        let theme = cx.theme();
+        let chrome = Chrome {
+            bg: theme.popover,
+            hover_bg: None,
+            border_color: theme.border,
+            border_width: px(1.0),
+            radius: gpui::rems(0.375).into(),
+            shadow: ShadowMode::Always,
+            occlude: false,
+        };
+        Some(reveal_frame(bar, state, Some(chrome)).into_any_element())
+    }
+}
+
 /// 把 pane 根容器的窗口坐标报给 SSH 交互视图(悬浮框的宽高按 pane 尺寸定)。
 ///
 /// 一层 absolute 全尺寸的 canvas:不插 hitbox、不画东西。pane 套着 view 级缓存,命中缓存时
@@ -2584,7 +2657,7 @@ fn ssh_activity_probe(view: Entity<SshActivityView>) -> impl IntoElement {
 }
 
 impl Render for TerminalPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
             return self.render_spawn_error(err, cx).into_any_element();
         }
@@ -2594,6 +2667,7 @@ impl Render for TerminalPane {
         // 远程 pane 退出后不出这条(上面另有 terminal_area 的整屏重连遮罩),见 `remote`
         let exit_bar = (self.exited && !self.remote).then(|| self.render_exit_bar(cx));
         let ssh_has_records = self.ssh_activity.read(cx).has_records();
+        let search_bar = self.render_search_bar(window, cx);
 
         // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
         // 宿主**不刷底色**:终端区着色只保留 TerminalArea 根容器一层 bg_terminal
@@ -2659,7 +2733,7 @@ impl Render for TerminalPane {
                     .flex_col()
                     .items_end()
                     .gap(px(6.0))
-                    .children(self.search_bar.clone())
+                    .children(search_bar)
                     .child(self.ssh_activity.clone()),
             )
             // 悬浮框的宽高按 pane 尺寸定:有记录时把 pane 根容器的窗口坐标报给 SSH 视图
