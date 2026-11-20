@@ -6,7 +6,10 @@
 //!
 //! 与 `mt-core` 的分工：mt-core 放跨主程序/sidecar 的纯逻辑（config 读取、
 //! SshConnection 类型），这里放仅 sidecar 需要的业务编排（依赖 mt-ssh 会话池）。
+//!
+//! `activity_feed` 只给 `mt-ssh-cli` 用：把业务调用抄送给所在 mini-term pane 的 SSH 交互浮层。
 
+pub mod activity_feed;
 pub mod daemon;
 pub mod daemon_log;
 pub mod daemon_spawn;

@@ -28,6 +28,11 @@
 //! - list / upload / download 成功:0。
 //!
 //! exec 不转发 stdin:请求发出后立刻给远端 EOF,读 stdin 的命令马上读到 EOF。
+//!
+//! 浮层抄送(0.4.13 起,spec `ssh-activity-overlay-v1.md`):pane 环境里有 `MINITERM_SSH_FEED`
+//! 时,exec / upload / download 的请求、服务器输出与结局另抄一份给 mini-term 的 SSH 交互浮层
+//! (见 `mt_sidecars::activity_feed`、[`run_plan`])。只是抄送 —— 上面每一条契约都不变,
+//! list 与运维子命令不抄送。
 
 use clap::{Parser, Subcommand};
 use std::cmp::Ordering;
@@ -35,6 +40,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::time::Duration;
 
+use mt_sidecars::activity_feed::{ActivityFeed, CallOutcome, CallStart, FeedOp};
 use mt_sidecars::daemon;
 use mt_sidecars::daemon_log;
 use mt_sidecars::daemon_spawn;
@@ -450,10 +456,13 @@ fn exec_closing_lines(
         lines.push(format!("mt-ssh-cli: {note}"));
     }
     if outcome.exit_code.is_none() {
-        lines.push("mt-ssh-cli: error: remote exit status unavailable".to_string());
+        lines.push(format!("mt-ssh-cli: error: {EXIT_STATUS_UNAVAILABLE}"));
     }
     lines
 }
+
+/// 远端既没报退出码也没报信号时的错误说明(stderr 收尾行与浮层 end 帧共用)。
+const EXIT_STATUS_UNAVAILABLE: &str = "remote exit status unavailable";
 
 /// exec 结束时的 stderr 收尾行 + 退出码(daemon 路径与 one-shot 共用,
 /// 保证两条路径对 agent 完全一致)。
@@ -632,6 +641,52 @@ impl Plan {
         plan.req.timeout_secs = timeout;
         Ok(plan)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 浮层抄送(spec ssh-activity-overlay-v1):只抄送,不改 CLI 的任何输出、退出码与时序
+// ---------------------------------------------------------------------------
+
+/// 一次业务请求抄送给浮层的 start 内容(纯函数);`None` = 这个 op 不上报 —— list 只读本地
+/// 配置、不碰服务器,status / shutdown 是 daemon 运维。
+fn feed_call_start(req: &Request) -> Option<CallStart> {
+    let op = match req.op? {
+        Op::Exec => FeedOp::Exec,
+        Op::Upload => FeedOp::Upload,
+        Op::Download => FeedOp::Download,
+        Op::List | Op::Status | Op::Shutdown => return None,
+    };
+    let exec = op == FeedOp::Exec;
+    Some(CallStart {
+        op,
+        connection: req.connection.clone().unwrap_or_default(),
+        command: req.command.clone().filter(|_| exec),
+        cwd: req.cwd.clone().filter(|_| exec),
+        timeout_secs: req.timeout_secs,
+        local_path: req.local_path.clone().filter(|_| !exec),
+        remote_path: req.remote_path.clone().filter(|_| !exec),
+    })
+}
+
+/// exec 结局 → 浮层 end 帧的字段(纯函数)。远端既没报退出码也没报信号时 CLI 以错误收尾
+/// (exit 2),end 里同样记成错误;[`finish_exec`] 的收尾说明行本身不镜像(状态由 end 帧表达)。
+fn exec_feed_outcome(outcome: &ssh_service::ExecOutcome) -> CallOutcome {
+    let timed_out = outcome.timed_out;
+    let mut reported = CallOutcome::exec(
+        outcome.exit_code,
+        timed_out,
+        timed_out && outcome.not_started,
+    );
+    if !timed_out && outcome.exit_code.is_none() {
+        reported.error = Some(EXIT_STATUS_UNAVAILABLE.to_string());
+    }
+    reported
+}
+
+/// [`fail`] 的抄送版:错误原文(不带 stderr 前缀)同时记进浮层的 end 帧;没启用浮层时就是 `fail`。
+fn fail_reported(feed: &ActivityFeed, message: &str) -> i32 {
+    feed.record(CallOutcome::error(message));
+    fail(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +1022,10 @@ async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), D
 
 /// 经 daemon 执行一个业务计划。`Err` = daemon 路径不可用(caller 降级 one-shot);
 /// `Ok(code)` = 请求已被 daemon 受理并出了终帧(不再降级 —— 业务错误原样透传)。
-async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
+///
+/// 浮层抄送:stdout / stderr 帧写完终端再抄一份(daemon 在信号终止时补的说明行本来就是
+/// stderr 帧,照常抄);结局与受理之后的错误记进 end 帧。
+async fn run_via_daemon(plan: &Plan, feed: &ActivityFeed) -> Result<i32, DaemonUnavailable> {
     let ep = endpoint();
     let (mut reader, mut writer) = open_daemon_session(&ep).await?;
     write_request(&mut writer, &plan.req).await?;
@@ -979,7 +1037,10 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
             Ok(f) => f,
             // 已受理的请求中途断连:不能盲目重跑(exec 可能有副作用),
             // 按 CLI 错误收尾而非降级。
-            Err(e) => return Ok(fail(&format!("connection to daemon lost mid-request: {e}"))),
+            Err(e) => {
+                let message = format!("connection to daemon lost mid-request: {e}");
+                return Ok(fail_reported(feed, &message));
+            }
         };
         match frame {
             ServerFrame::Stdout { data_b64 } => match ipc::b64_decode(&data_b64) {
@@ -987,18 +1048,20 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
                     let _ = std::io::stdout()
                         .write_all(&data)
                         .and_then(|_| std::io::stdout().flush());
+                    feed.output(StreamKind::Stdout, &data);
                 }
-                Err(e) => return Ok(fail(&e)),
+                Err(e) => return Ok(fail_reported(feed, &e)),
             },
             ServerFrame::Stderr { data_b64 } => match ipc::b64_decode(&data_b64) {
                 Ok(data) => {
                     let _ = std::io::stderr()
                         .write_all(&data)
                         .and_then(|_| std::io::stderr().flush());
+                    feed.output(StreamKind::Stderr, &data);
                 }
-                Err(e) => return Ok(fail(&e)),
+                Err(e) => return Ok(fail_reported(feed, &e)),
             },
-            ServerFrame::Error { message } => return Ok(fail(&message)),
+            ServerFrame::Error { message } => return Ok(fail_reported(feed, &message)),
             ServerFrame::Result {
                 exit_code,
                 timed_out,
@@ -1020,6 +1083,7 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
                             not_started: not_started.unwrap_or(false),
                             signal: None,
                         };
+                        feed.record(exec_feed_outcome(&outcome));
                         finish_exec(
                             &outcome,
                             plan.req.timeout_secs,
@@ -1036,12 +1100,13 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
                                     plan.req.local_path.as_deref().unwrap_or(""),
                                     plan.req.remote_path.as_deref().unwrap_or(""),
                                 );
+                                feed.record(CallOutcome::transferred(n));
                                 0
                             }
-                            None => fail("daemon result missing byte count"),
+                            None => fail_reported(feed, "daemon result missing byte count"),
                         }
                     }
-                    _ => fail("unexpected result frame for this operation"),
+                    _ => fail_reported(feed, "unexpected result frame for this operation"),
                 };
                 return Ok(code);
             }
@@ -1055,8 +1120,9 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
 // one-shot 执行(进程内直连 —— daemon 不可用时的降级路径)
 // ---------------------------------------------------------------------------
 
-/// one-shot 兜底执行一个业务计划(list 直接读 config,其余建临时池)。
-async fn run_one_shot(plan: &Plan) -> i32 {
+/// one-shot 兜底执行一个业务计划(list 直接读 config,其余建临时池)。浮层抄送同
+/// [`run_via_daemon`]:输出写完终端再抄一份,结局与错误记进 end 帧。
+async fn run_one_shot(plan: &Plan, feed: &ActivityFeed) -> i32 {
     let project_token = plan.req.project_token.clone().unwrap_or_default();
     match plan.req.op {
         Some(Op::List) => {
@@ -1069,7 +1135,7 @@ async fn run_one_shot(plan: &Plan) -> i32 {
             let (Some(connection), Some(command)) =
                 (plan.req.connection.clone(), plan.req.command.clone())
             else {
-                return fail("exec requires a connection and a command");
+                return fail_reported(feed, "exec requires a connection and a command");
             };
             let cwd = plan.req.cwd.clone();
             let timeout = plan.req.timeout_secs;
@@ -1096,12 +1162,16 @@ async fn run_one_shot(plan: &Plan) -> i32 {
                                 .write_all(data)
                                 .and_then(|_| std::io::stderr().flush()),
                         };
+                        feed.output(kind, data);
                     },
                 )
                 .await;
                 match result {
-                    Ok(outcome) => finish_exec(&outcome, timeout, &connection),
-                    Err(e) => fail(e.message()),
+                    Ok(outcome) => {
+                        feed.record(exec_feed_outcome(&outcome));
+                        finish_exec(&outcome, timeout, &connection)
+                    }
+                    Err(e) => fail_reported(feed, e.message()),
                 }
             })
             .await
@@ -1113,7 +1183,7 @@ async fn run_one_shot(plan: &Plan) -> i32 {
                 plan.req.local_path.clone(),
                 plan.req.remote_path.clone(),
             ) else {
-                return fail("transfer requires a connection and both paths");
+                return fail_reported(feed, "transfer requires a connection and both paths");
             };
             let timeout = plan.req.timeout_secs;
             run_with_pool(|pool| async move {
@@ -1130,14 +1200,15 @@ async fn run_one_shot(plan: &Plan) -> i32 {
                 {
                     Ok(bytes) => {
                         print_transfer_summary(direction, bytes, &local, &remote);
+                        feed.record(CallOutcome::transferred(bytes));
                         0
                     }
-                    Err(e) => fail(e.message()),
+                    Err(e) => fail_reported(feed, e.message()),
                 }
             })
             .await
         }
-        _ => fail("unsupported operation"),
+        _ => fail_reported(feed, "unsupported operation"),
     }
 }
 
@@ -1156,16 +1227,30 @@ where
 
 /// 业务计划入口:daemon 优先,不可用降级 one-shot(stderr 记一行原因)。提权运行时不碰
 /// daemon(不连、不拉起),直接 one-shot(见 [`daemon_blocked_by_elevation`])。
+///
+/// 浮层抄送在这里开、在这里收:start 在入口发一次(提权直走 one-shot、daemon 不可用降级
+/// one-shot 共用这一份,不会重发),上面两行 stderr 说明不抄送。收尾等后台线程把 end 写完,
+/// 最多 500ms —— 这里跑在 `main` 的 `block_on` 里(主线程,不是 tokio 工作线程),业务输出此刻
+/// 都已写完,同步等待不挡任何任务;`main` 随后 `process::exit`。
 async fn run_plan(plan: Plan) -> i32 {
+    let feed =
+        feed_call_start(&plan.req).map_or_else(ActivityFeed::disabled, ActivityFeed::from_env);
+    let code = dispatch_plan(&plan, &feed).await;
+    feed.finish();
+    code
+}
+
+/// [`run_plan`] 的路由部分:提权 → one-shot;否则 daemon,不可用降级 one-shot。
+async fn dispatch_plan(plan: &Plan, feed: &ActivityFeed) -> i32 {
     if let Some(reason) = daemon_blocked_by_elevation(&ipc::current_process_elevated()) {
         eprintln!("{}", elevated_in_process_notice(&reason));
-        return run_one_shot(&plan).await;
+        return run_one_shot(plan, feed).await;
     }
-    match run_via_daemon(&plan).await {
+    match run_via_daemon(plan, feed).await {
         Ok(code) => code,
         Err(unavailable) => {
             eprintln!("{}", unavailable.fallback_notice());
-            run_one_shot(&plan).await
+            run_one_shot(plan, feed).await
         }
     }
 }
@@ -2150,5 +2235,120 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("another account"), "{message}");
+    }
+
+    // --- 浮层抄送 ---
+
+    #[test]
+    fn feed_reports_only_calls_that_talk_to_the_server() {
+        let mut list = Plan::new(Op::List);
+        list.req.project_token = Some("token-1".into());
+        assert_eq!(feed_call_start(&list.req), None, "list 不上报");
+        for op in [Op::Status, Op::Shutdown] {
+            assert_eq!(feed_call_start(&Plan::new(op).req), None, "{op:?}");
+        }
+        assert_eq!(feed_call_start(&Request::default()), None);
+    }
+
+    #[test]
+    fn feed_start_carries_the_exec_request_verbatim() {
+        let mut plan = Plan::new(Op::Exec);
+        plan.req.project_token = Some("token-1".into());
+        plan.req.connection = Some("prod".into());
+        plan.req.command = Some(join_command(&[
+            "grep".to_string(),
+            "'a b'".to_string(),
+            "/var/log/x".to_string(),
+        ]));
+        plan.req.cwd = Some("~/app".into());
+        let start = feed_call_start(&plan.req).unwrap();
+        assert_eq!(
+            start,
+            CallStart {
+                op: FeedOp::Exec,
+                connection: "prod".into(),
+                command: Some("grep 'a b' /var/log/x".into()),
+                cwd: Some("~/app".into()),
+                timeout_secs: None,
+                local_path: None,
+                remote_path: None,
+            }
+        );
+        plan.req.timeout_secs = Some(5);
+        assert_eq!(feed_call_start(&plan.req).unwrap().timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn feed_start_carries_the_absolutized_local_path_for_transfers() {
+        let plan = Plan::transfer(
+            Op::Download,
+            "token-1".into(),
+            Some(300),
+            "prod".into(),
+            "out.log",
+            "/var/log/app.log".into(),
+        )
+        .unwrap();
+        let start = feed_call_start(&plan.req).unwrap();
+        assert_eq!(start.op, FeedOp::Download);
+        assert_eq!(start.connection, "prod");
+        assert_eq!(start.timeout_secs, Some(300));
+        assert_eq!(start.remote_path.as_deref(), Some("/var/log/app.log"));
+        let local = start.local_path.unwrap();
+        assert!(std::path::Path::new(&local).is_absolute(), "{local}");
+        assert_eq!(Some(local), plan.req.local_path);
+        assert_eq!(start.command, None);
+        assert_eq!(start.cwd, None);
+
+        let upload = Plan::transfer(
+            Op::Upload,
+            "token-1".into(),
+            None,
+            "prod".into(),
+            "in.tar",
+            "/tmp/in.tar".into(),
+        )
+        .unwrap();
+        assert_eq!(feed_call_start(&upload.req).unwrap().op, FeedOp::Upload);
+    }
+
+    #[test]
+    fn feed_end_mirrors_the_exec_exit_code_contract() {
+        assert_eq!(
+            exec_feed_outcome(&outcome(Some(0), false)),
+            CallOutcome::exec(Some(0), false, false)
+        );
+        assert_eq!(
+            exec_feed_outcome(&outcome(Some(137), false)),
+            CallOutcome::exec(Some(137), false, false)
+        );
+        // 运行中超时 / 连接阶段超时。
+        assert_eq!(
+            exec_feed_outcome(&outcome(None, true)),
+            CallOutcome::exec(None, true, false)
+        );
+        let connecting = ExecOutcome {
+            not_started: true,
+            ..outcome(None, true)
+        };
+        assert_eq!(
+            exec_feed_outcome(&connecting),
+            CallOutcome::exec(None, true, true)
+        );
+        // notStarted 只跟着超时出现。
+        let stray = ExecOutcome {
+            not_started: true,
+            ..outcome(Some(1), false)
+        };
+        assert!(!exec_feed_outcome(&stray).not_started);
+        // 远端两样都没报:CLI 按错误收尾(exit 2),end 里记成同一句错误。
+        let missing = exec_feed_outcome(&outcome(None, false));
+        assert_eq!(missing.exit_code, None);
+        assert!(!missing.timed_out);
+        assert_eq!(missing.error.as_deref(), Some(EXIT_STATUS_UNAVAILABLE));
+        assert_eq!(
+            exec_closing_lines(&outcome(None, false), None, "prod"),
+            vec![format!("mt-ssh-cli: error: {EXIT_STATUS_UNAVAILABLE}")]
+        );
     }
 }
