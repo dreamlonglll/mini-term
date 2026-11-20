@@ -1,3 +1,10 @@
+# 全仓文本统一以 LF 入库与检出。工作区里的文件被 Windows 侧工具改写成 CRLF 时,
+# git 先按 LF 归一化再比对,不会再出现「整份文件逐行改了」的万行噪音 diff;
+# 提交进去的也仍是 LF(CI 的 `git diff --check` 会把行尾 CR 当尾随空白拦下)。
+# 必须放在最前面:下面的 binary 等规则写在后面,按 gitattributes 后者覆盖前者的
+# 规则对各自的路径生效,皮肤与字体照旧不做任何换行转换。
+* text=auto eol=lf
+
 # 皮肤库按字节原样分发:每份皮肤的 zip 与同名文件夹要逐字节一致
 # (mt-theme-packs 的测试会对账)。Windows 上 core.autocrlf=true 检出会把
 # 文件夹里的文本换成 CRLF,zip 里仍是原样,两边就对不上了。有的皮肤的
