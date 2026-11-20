@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -80,6 +80,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **进阶能力** — 密钥文件登录（`ssh -i`）、连接分组管理：右键新增 / 重命名 / 解散分组（空分组可持久保存），拖拽连接到分组调整归属，编辑表单分组字段可下拉选择已有分组；右栏连接卡片之间也能拖拽排序——拖到另一条的上 / 下半即插到它前 / 后（2px 指示线提示落点），拖到别的组的卡片上顺带改归属，顺序随配置持久化，左栏分组的先后不受影响；拖到一半按 `Esc` 取消
 - **复制连接** — 连接卡片「编辑 / 复制 / 删除」三键，复制前确认框先亮出新名字：副本命名为「原名 (N)」取第一个空号，复制「x (1)」得「x (2)」而不叠尾巴；副本紧跟在原连接之后，主机、端口、用户、私钥、分组与已存密码（原样沿用加密信封）一并带过去
 - **SSH 工具（CLI + Skill，供 AI agent）** — 让终端里运行的 AI agent（Claude Code / Codex）能操作已保存的 SSH 连接。项目右键菜单「关联 SSH」按项目启用并限定所选连接，左栏分组前的勾选框可**整组关联**——组内后来新增或拖入的连接自动纳入、移出的自动摘掉，分组改名时关联跟着走，解散或并入别组时原成员摊成逐条关联、可见范围不变；启用时生成 Claude / Codex 两份 SKILL.md，内嵌 CLI 绝对路径与随机项目能力令牌，自动追加 `.gitignore` 并迁移清理存量 MCP。`list` / `exec` / `upload` / `download` 每次都必须携带令牌，缺失、纯空白、未知、重复或属于已停用项目的映射一律 fail closed，绝不回退到全部连接，报错说清是哪一类（配置不存在、令牌对不上——比如 SKILL.md 过期或出自开发实例、关联范围里已没有连接……）且不回显令牌；生成示例分别覆盖 Bash、正确转义的 WSL interop 与必须使用 `&` 调用运算符的 PowerShell，远端命令整条作为一个单引号参数传——Git Bash 会把 `/var/log/x` 这类裸 POSIX 路径改写成 Windows 路径，所以 `--cwd` 与上传下载的远端绝对路径写成 `//var/log/x`，CLI 发现疑似被改写的参数会直接报错、不去执行；Claude 版的 `allowed-tools` 只预批 `list` 与 `exec`、写法与示例逐字一致，会读写本地文件的 `upload` / `download` 每次照常弹审批。开发实例（`MT_APP_DATA_DIR`）只把关联存进自己的配置，不写也不删任何 SKILL.md；启动时 mini-term 会把模板、令牌或 CLI 位置已过期的现存 SKILL.md 校正一遍（缺失的不重建）。远程 stdout/stderr 与退出码原样流式透传（124 = 超时，含还在建连时；128+n = 被信号 n 终止；2 = CLI 错误），超时覆盖整个调用（含建连），远端 stdin 立即收到 EOF，`--cwd` 按 POSIX shell 需要加引号，同一连接上的多条命令并发执行、不再互相排队；SFTP 分块传输，认证凭据始终留在本机，每次调用写审计日志（密码、令牌、API Key、`Authorization` 头与 `*_PASSWORD=` 一类赋值都会打码），并硬拒绝传输 mini-term 自己数据目录里的任何文件——经 `\\localhost\C$`、`\\?\` 或 WSL `/mnt/c` 这类别名绕过去也一样。CLI 背后是全机单例 daemon 持久连接池（首调自动拉起、空闲 10 分钟 drain 自退、版本升级自动换代）；Ctrl+C / 客户端断开或请求超时时显式关闭对应 SSH channel，健康 session 继续留池。IPC 仅当前用户可连，安全端点无法建立时 fail closed；CLI 发送任何数据前先核验端点属于当前用户，以管理员身份（提权）运行时不使用也不拉起共享 daemon；daemon 不可用则自动降级为进程内直连。过渡期 `mt-ssh-mcp` MCP sidecar 继续随包发布
+- **SSH 交互浮层（看 AI 对服务器做了什么）** — 本地终端里的 AI 经上面的 CLI 执行 `exec` / `upload` / `download` 后，该终端组标题栏「查找」图标左边出现 SSH 按钮（带调用次数，运行中亮蓝点、最近一次失败亮红点），点开悬浮框按时间列出 AI 发出的命令原文（不脱敏，含 `--cwd`）、服务器原样输出（stderr 另一种颜色）与结局（退出码 / 超时 / 连接阶段超时 / 错误原文 / 中途中断），上传下载显示路径与字节数；`list` 只读本地配置、不出现。悬浮框从按钮下方展开、反向收起，鼠标不在框上时淡底、移入实底，不抢键盘焦点，可复制命令 / 输出 / 全部、清空；记录只在内存里，按 pane 限 500 条 / 4 MiB（单条输出超 1 MiB 截断并注明总字节）。CLI 只把调用抄送给所在 pane（mini-term 为每个本地 pane 注入带随机 nonce 的本机地址 `MINITERM_SSH_FEED`），抄送全程在后台、失败静默，CLI 的输出与退出码不受影响；WSL 与 SSH 远程项目的 pane 不支持
 - **SSH 远程项目** — 把远程服务器上的目录直接添加为项目管理：「添加远程项目」弹窗选择已保存的 SSH 连接并填写远程 POSIX 路径（还没有连接时点弹窗里的「+ 添加 SSH 连接」就地新建，保存后自动退回并选中它），保存前先远程验证目录存在；文件树经 SFTP 懒加载展开（展开行内 loading 反馈，支持手动刷新，根 `.gitignore` 过滤），终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连；Session 块按时间混排远程机器上的 Claude / Codex 会话并支持正文查看；引用的连接被删除时项目显示「断链」态而非静默失效；底层与 SSH 工具 sidecar 共用抽出的 `mt-ssh` crate（russh 持久会话池 + SFTP 原语），远程缓存键掺入连接 id，防止两台服务器的同名路径互相串数据
 - **内置 SSH 客户端** — SSH 工具与远程项目背后的持久会话池只按连接配置本身建连：连接里填的主机就是真正去连的主机，`~/.ssh` 里只读写 `known_hosts`，不读 `~/.ssh/config`（不认别名、`ProxyJump` 跳板）、不碰默认私钥 `~/.ssh/id_*`。认证依次试连接配置的私钥、ssh-agent 里的 key（Windows 为 OpenSSH agent 或 Pageant，其它平台为 `SSH_AUTH_SOCK`）、已存密码（password 或 keyboard-interactive）。私钥加载失败（不存在、格式不支持、带口令）只记原因、继续试别的，已加载进 agent 的带口令私钥交给 agent 签名；公钥尝试有上限，配了密码时密码一定能在服务器的 `MaxAuthTries` 之内轮到。建连（DNS、TCP、握手、认证）整段 20 秒预算，超时报错写明卡在哪个阶段；认证失败时逐条列出每种方法的结果与原因，随后同一连接 30 秒内不再重试，免得 agent 反复重试把本机 IP 送进 fail2ban——改了连接配置可立即重试。known_hosts 支持通配、否定与 `@revoked` 条目，只提供 `ecdh-sha2-nistp*`、`aes128-gcm` 或 SHA-1 MAC 的老服务器也能连上。SFTP 传输约 1 MiB 的请求同时在途（高延迟链路下大文件下载不再慢到超时），也不再占着连接，同一台服务器上的命令与其它传输照常进行；上传原子替换远端文件并保留原有权限与属主（属主保不住时像 `scp` 一样原地覆盖写），目标是软链时写到它最终指向的文件、软链保持软链（共享的 `/tmp` 这类 sticky 目录里别人放的软链会被拒绝），替换失败或替换到一半调用超时都绝不删掉原文件。同一连接上的并发请求共用一次建连，密码错了不会被一波并发反复重试
 
@@ -256,7 +257,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **3749 个 Rust 测试**（43 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **3788 个 Rust 测试**（43 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -411,7 +412,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（43 个测试目标、3749 例）
+# 全工作区 Rust 测试（43 个测试目标、3788 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
