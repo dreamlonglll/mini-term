@@ -1,21 +1,27 @@
-//! pane 右上角的「SSH 交互」按钮 + 悬浮框。
+//! 「SSH 交互」悬浮框(记录模型 + 列表),以及终端组标题栏上那颗按钮要读的状态。
 //!
 //! # 挂在哪
 //!
-//! 每个 [`crate::pane::TerminalPane`] 持有一个本视图实体,恒挂在 pane 根容器右上角那一列
-//! (`top 6px / right 14px`,与 Ctrl+F 查找条同一锚点):列里先是查找条(开着时)、再是本视图,
-//! 竖排、右对齐、间距 6px —— 查找条打开时按钮自然落到它下方,两者不重叠。
+//! - **按钮**在终端组标题栏右侧的控件簇里(「⚑N → SSH → 查找 → 命令库 → …」),由
+//!   `terminal_area::render_leaf_controls` 画,对应该组当前 active pane。它只读本视图的
+//!   [`SshActivityView::button_state`](条数 / 在跑 / 失败 / 开合),点击走
+//!   [`SshActivityView::toggle`]。没有记录时簇里不画它。
+//! - **悬浮框**还在 pane 内容区右上角:每个 [`crate::pane::TerminalPane`] 持有一个本视图实体,
+//!   恒挂在 pane 根容器右上角那一列(`top 6px / right 14px`,与 Ctrl+F 查找条同一锚点):
+//!   列里先是查找条(开着时)、再是本视图,竖排、右对齐、间距 6px —— 查找条打开时悬浮框
+//!   自然落到它下方,两者不重叠。
 //!
-//! 没有记录时本视图画一个空 `div`(零尺寸、没有监听,不挡终端)。**恒挂而不是有记录才挂**:
-//! pane 套着 view 级缓存(`terminal_area::cached_terminal`),子视图 `notify` 时 gpui 沿已渲染
-//! 的视图路径把祖先一并标脏;要是第一条记录到达时本视图还不在树上,这一下 notify 传不到 pane,
-//! 按钮就要等下一次终端输出才冒出来。
+//! 悬浮框关着时本视图画一个空 `div`(零尺寸、没有监听,不挡终端)。**恒挂而不是开着才挂**:
+//! gpui 的 `notify` 沿已渲染的视图路径把祖先一并标脏(pane 的 view 级缓存
+//! `terminal_area::cached_terminal`、再往上的 TerminalArea 都在这条路上)。标题栏按钮就靠这条路
+//! 刷新 —— 本视图得一直在树上,第一条记录到达时这一下 notify 才传得到标题栏。
 //!
 //! # 刷新节流
 //!
 //! 事件到达只改模型,`notify` 走 [`REFRESH_PERIOD`] 的前沿节流(≤ 10Hz):空闲时第一次当场画,
-//! 之后合并到窗口末尾。只 `notify` 本视图 —— 祖先(本 pane)随之重画,别的 pane 的缓存不动。
-//! 悬浮框关着时纯输出事件连 notify 都不发(按钮上的条数 / 圆点没变)。
+//! 之后合并到窗口末尾。只 `notify` 本视图 —— 祖先(本 pane、标题栏所在的 TerminalArea)随之
+//! 重画,别的 pane 的缓存不动。悬浮框关着时只有按钮状态([`ButtonState`])真变了才 notify,
+//! 纯输出事件一个都不发 —— 标题栏不会跟着输出分片重画。
 //!
 //! # 列表
 //!
@@ -30,8 +36,8 @@
 //!
 //! # 焦点
 //!
-//! 按钮点完把键盘焦点还给终端;悬浮框本身不 `track_focus`,点它不抢焦点。点框外不关,
-//! 只有再点按钮或点框内 ✕ 才关。开关是 pane 级运行时态,不持久化。
+//! 标题栏按钮点完把键盘焦点还给该 pane 的终端;悬浮框本身不 `track_focus`,点它不抢焦点。
+//! 点框外不关,只有再点按钮或点框内 ✕ 才关。开关是 pane 级运行时态,不持久化。
 
 use std::time::{Duration, Instant};
 
@@ -57,8 +63,6 @@ pub const IDLE_BG_ALPHA: f32 = 0.30;
 /// 同一 pane 的刷新合并窗口:≤ 10Hz。
 const REFRESH_PERIOD: Duration = Duration::from_millis(100);
 
-/// 按钮高度。
-const BUTTON_H: f32 = 30.0;
 /// 悬浮框宽 = clamp(pane 宽 × 比例, 最小, 最大),pane 太窄时再收到 pane 内。
 const POPOVER_MIN_W: f32 = 360.0;
 const POPOVER_MAX_W: f32 = 720.0;
@@ -318,6 +322,19 @@ pub(super) fn record_text(record: &Record) -> String {
     out
 }
 
+/// 标题栏按钮上看得见的全部状态。只有它变了,悬浮框关着时才需要 notify。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ButtonState {
+    /// 记录条数(≥ 1;没有记录时按钮不画,[`SshActivityView::button_state`] 返回 `None`)。
+    pub count: usize,
+    /// 有调用在跑(accent 小圆点)。
+    pub running: bool,
+    /// 没有在跑、且最近一条的结局是失败(红色小圆点)。
+    pub failed: bool,
+    /// 悬浮框开着(按钮常亮)。
+    pub open: bool,
+}
+
 /// 复制按钮的去向,也用来显示「已复制」。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopyTarget {
@@ -374,9 +391,19 @@ impl SshActivityView {
         }
     }
 
-    /// 至少有一条记录(按钮显示的条件)。
+    /// 至少有一条记录(标题栏按钮显示的条件)。
     pub fn has_records(&self) -> bool {
         !self.activity.is_empty()
+    }
+
+    /// 标题栏按钮的状态;没有记录时 `None`(按钮不画)。
+    pub fn button_state(&self) -> Option<ButtonState> {
+        (!self.activity.is_empty()).then(|| ButtonState {
+            count: self.activity.len(),
+            running: self.activity.any_running(),
+            failed: self.activity.last_failed(),
+            open: self.open,
+        })
     }
 
     /// 终端字族变了(设置页「字体」)。
@@ -401,13 +428,17 @@ impl SshActivityView {
     }
 
     /// 监听线程送来的一批事件(同一 pane)。
+    ///
+    /// 悬浮框关着时只有按钮状态真变了才刷新(标题栏随之重画);开着时列表内容变了也刷新。
     pub fn apply(&mut self, events: Vec<FeedEvent>, cx: &mut Context<Self>) {
         let now = Instant::now();
+        let before = self.button_state();
         let mut applied = Applied::default();
         for event in events {
             applied.merge(self.activity.apply(event, now));
         }
-        if applied.summary || (applied.rows && self.open) {
+        let button_changed = self.button_state() != before;
+        if button_changed || (self.open && (applied.rows || applied.summary)) {
             self.schedule_flush(cx);
         }
     }
@@ -454,24 +485,25 @@ impl SshActivityView {
         cx.notify();
     }
 
-    fn toggle(&mut self, cx: &mut Context<Self>) {
-        if self.open {
-            self.open = false;
-        } else {
-            self.open = true;
+    /// 标题栏按钮的落点:开 / 关悬浮框,然后把键盘焦点还给该 pane 的终端。
+    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_open(!self.open, cx);
+        window.focus(&self.terminal_focus, cx);
+    }
+
+    fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        // 没有记录时没有按钮,也就不该开出一个空框
+        if open == self.open || (open && self.activity.is_empty()) {
+            return;
+        }
+        self.open = open;
+        if open {
             let total = rebuild_rows(&mut self.synced, &mut self.activity);
             self.list.reset(total);
             self.list.set_follow_mode(FollowMode::Tail);
             self.last_box_h = None;
         }
         cx.notify();
-    }
-
-    fn close(&mut self, cx: &mut Context<Self>) {
-        if self.open {
-            self.open = false;
-            cx.notify();
-        }
     }
 
     fn copy(&mut self, target: CopyTarget, cx: &mut Context<Self>) {
@@ -553,65 +585,6 @@ impl SshActivityView {
         height
     }
 
-    fn render_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let running = self.activity.any_running();
-        let failed = self.activity.last_failed();
-        let color = if self.open {
-            ui::accent()
-        } else {
-            ui::text_secondary()
-        };
-        div()
-            .id(SharedString::from(format!(
-                "ssh-activity-button-{}",
-                self.pty_id
-            )))
-            .relative()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(6.0))
-            .h(px(BUTTON_H))
-            .px(px(10.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(if self.open {
-                ui::accent()
-            } else {
-                ui::border_default()
-            })
-            .bg(ui::bg_elevated())
-            .text_size(ui::font_px(13.0))
-            .text_color(color)
-            .cursor_pointer()
-            // 自己吃鼠标:底下终端不该把这一下当成起选区 / 鼠标上报
-            .occlude()
-            .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-            .tip(t("sshActivity", "buttonTip"))
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                this.toggle(cx);
-                window.focus(&this.terminal_focus, cx);
-            }))
-            .child(VectorIcon::new(crate::activity_bar::SSH, px(16.0)).ink(color))
-            .child(self.activity.len().to_string())
-            .when(running || failed, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(-3.0))
-                        .right(px(-3.0))
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded_full()
-                        .bg(if running {
-                            ui::accent()
-                        } else {
-                            ui::color_error()
-                        }),
-                )
-            })
-    }
-
     fn render_title(&self, cx: &mut Context<Self>) -> Div {
         let pty_id = self.pty_id;
         let copied_all = self.copied == Some(CopyTarget::All);
@@ -670,7 +643,9 @@ impl SshActivityView {
                     ui::text_primary(),
                 )
                 .tip(t("sshActivity", "close"))
-                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.close(cx))),
+                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                    this.set_open(false, cx);
+                })),
             )
     }
 
@@ -681,7 +656,7 @@ impl SshActivityView {
             let base = ui::bg_terminal();
             ui::with_alpha(base, base.a * IDLE_BG_ALPHA)
         };
-        // 量悬浮框顶边:最大高要扣掉它上面的查找条 / 按钮,不能伸出 pane 底边
+        // 量悬浮框顶边:最大高要扣掉它上面的查找条,不能伸出 pane 底边
         let this = cx.entity();
         let probe = canvas(
             move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut gpui::App| {
@@ -974,19 +949,12 @@ fn connection_chip(name: &str) -> Div {
 
 impl Render for SshActivityView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.activity.is_empty() {
+        // 按钮在终端组标题栏上(`terminal_area::render_leaf_controls`),这里只画悬浮框;
+        // 关着时画空 div 也要挂着,理由见模块注释「挂在哪」
+        if !self.open || self.activity.is_empty() {
             return div().into_any_element();
         }
-        let button = self.render_button(cx);
-        let popover = self.open.then(|| self.render_popover(window, cx));
-        div()
-            .flex()
-            .flex_col()
-            .items_end()
-            .gap(px(6.0))
-            .child(button)
-            .children(popover)
-            .into_any_element()
+        self.render_popover(window, cx).into_any_element()
     }
 }
 

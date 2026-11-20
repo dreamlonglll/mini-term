@@ -1,11 +1,17 @@
 //! SSH 交互浮层:把 AI 经 mini-term-ssh skill(`mt-ssh-cli`)发给服务器的命令与服务器的
-//! 原样输出,显示在该 pane 右上角的按钮 + 悬浮框里。规格:`docs/specs/ssh-activity-overlay-v1.md`。
+//! 原样输出,显示在悬浮框里。规格:`docs/specs/ssh-activity-overlay-v1.md`。
+//!
+//! 入口按钮在终端组标题栏右侧的控件簇里(「⚑N → SSH → 查找 → …」,对应该组 active pane,
+//! 见 `terminal_area::render_leaf_controls`);悬浮框在 pane 内容区右上角(与 Ctrl+F 查找条
+//! 同一锚点,查找条开着时落在它下方)。用户真机看过后定的位置,与规格初稿不同。
 //!
 //! ```text
 //! AI 的 Bash 工具 → mt-ssh-cli(继承 pane 环境:MINITERM_SSH_FEED=127.0.0.1:<port>/<nonce>)
 //!    └─ 后台线程把 start / out / end 写成 NDJSON → 127.0.0.1:<port>(一次调用一条 TCP 连接)
 //! wire::FeedServer 监听线程 → 按 nonce 认 pane → mpsc → [`start`] 起的 GPUI 任务
-//!    → AppStore::terminal(pty_id) → TerminalPane 的 [`SshActivityView`] → 按钮 + 悬浮框
+//!    → AppStore::terminal(pty_id) → TerminalPane 的 [`SshActivityView`]
+//!    ├─ 悬浮框(pane 内容区右上角)
+//!    └─ 标题栏按钮读 [`SshActivityView::button_state`](TerminalArea 画)
 //! ```
 //!
 //! - **监听**:启动时在 `127.0.0.1:0` 绑随机端口,不依赖 hook 开关;绑不上只记日志、不注入变量,
@@ -29,7 +35,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::App;
 
-pub use view::SshActivityView;
+pub use view::{ButtonState, SshActivityView};
 use wire::{FEED_ENV, FeedEvent, FeedServer};
 
 use crate::store::AppStore;

@@ -55,6 +55,7 @@ use crate::overlay;
 use crate::pane_actions;
 use crate::pane_preview;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
+use crate::ssh_activity::{ButtonState, SshActivityView};
 use crate::store::AppStore;
 use crate::tree::{DropZone, PaneState, SplitDirection, SplitNode, StatusLight};
 use crate::ui;
@@ -435,6 +436,9 @@ enum AreaExitSrc {
 /// marker 浮层要用这个锚点的场景五钮必然齐。
 /// 原版是 `getBoundingClientRect()` 量出来的,这里由布局常量算 ——
 /// 加减控件时**必须同步改这个常量**,有单测钉着组成。
+///
+/// marker 与查找之间还可能夹一颗「SSH 交互」按钮(该 pane 有记录才画),它的宽度随条数的位数变,
+/// 不进这个常量,由 [`ssh_anchor_extra`] 另算、在 `render_marker_popover` 里加上。
 const MARKER_ANCHOR_INSET: f32 =
     CTRL_CLUSTER_PAD + 5.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
 const CTRL_CLUSTER_PAD: f32 = 6.0;
@@ -465,6 +469,91 @@ fn cmd_anchor_inset(has_maximize: bool) -> f32 {
     } else {
         CMD_ANCHOR_INSET
     }
+}
+
+/// 控件簇里「SSH 交互」按钮的左右内边距 / 图标与数字的间距(与 marker 按钮同一套)。
+const SSH_BTN_PAD_X: f32 = 6.0;
+const SSH_BTN_GAP: f32 = 4.0;
+/// 条数每一位数字占的宽(界面 12px 字号下的取值,随界面字号缩放)。
+///
+/// 按钮宽度**按位数定死**而不是由内容撑开:它夹在 marker 与查找之间,marker 浮层的锚点
+/// 是按簇里各钮的宽度算出来的([`marker_anchor_inset`] + [`ssh_anchor_extra`]),宽度得能算。
+const SSH_BTN_DIGIT_W: f32 = 7.5;
+
+/// SSH 按钮的宽:左右内边距 + 图标 + 间距 + 数字位数 × 每位宽。
+fn ssh_button_width(count: usize) -> f32 {
+    let digits = count.max(1).ilog10() as f32 + 1.0;
+    2.0 * SSH_BTN_PAD_X + CTRL_ICON + SSH_BTN_GAP + digits * f32::from(ui::font_px(SSH_BTN_DIGIT_W))
+}
+
+/// SSH 按钮在场(该 pane 有记录)时 marker 锚点要多让出的宽度:按钮宽 + 一个 gap。
+/// 不在场为 0 —— 没有记录时簇里根本不画它,也不留空隙。
+fn ssh_anchor_extra(count: Option<usize>) -> f32 {
+    count.map_or(0.0, |count| ssh_button_width(count) + CTRL_GAP)
+}
+
+/// 标题栏控件簇里的「SSH 交互」按钮:SSH 图标 + 条数,对应该组 active pane 的记录。
+///
+/// 外观与这一簇统一:盒子照 marker 按钮(`px 6` / 圆角 3 / hover `border_subtle` 底),内容照
+/// `ctrl_icon`(常驻 0.6 透明度、hover 全亮并转 accent);悬浮框开着时常亮(同命令库钮的
+/// `cmd_open_here`)。透明度只压在图标与数字那一层,运行中 / 失败两颗小圆点不跟着变淡。
+///
+/// 开合与「点完把键盘焦点还给该 pane 的终端」都在 [`SshActivityView::toggle`] 里;悬浮框本身
+/// 仍画在 pane 内容区右上角(见 `ssh_activity` 模块注释)。
+fn ssh_activity_button(
+    leaf_id: &str,
+    view: Entity<SshActivityView>,
+    state: ButtonState,
+) -> gpui::Stateful<gpui::Div> {
+    let group = SharedString::from(format!("ssh-activity-btn-{leaf_id}"));
+    let dot = (state.running || state.failed).then(|| {
+        div()
+            .absolute()
+            .top(px(1.0))
+            .right(px(1.0))
+            .w(px(6.0))
+            .h(px(6.0))
+            .rounded_full()
+            .bg(if state.running {
+                ui::accent()
+            } else {
+                ui::color_error()
+            })
+    });
+    div()
+        .id(SharedString::from(format!("ssh-activity-{leaf_id}")))
+        .group(group.clone())
+        .relative()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(ssh_button_width(state.count)))
+        .h(px(CTRL_BTN))
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .when(state.open, |el| el.bg(ui::border_subtle()))
+        .hover(|el| el.bg(ui::border_subtle()))
+        .tip(t("sshActivity", "buttonTip"))
+        .on_click(move |_: &ClickEvent, window, cx| {
+            // 别冒到 tab 栏的「双击空白处最大化」上
+            cx.stop_propagation();
+            view.update(cx, |view, cx| view.toggle(window, cx));
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(SSH_BTN_GAP))
+                .text_color(ui::text_muted())
+                .opacity(if state.open { 1.0 } else { 0.6 })
+                .group_hover(group, |el| el.opacity(1.0).text_color(ui::accent()))
+                .child(
+                    VectorIcon::new(crate::activity_bar::SSH, px(CTRL_ICON)).ink(ui::text_muted()),
+                )
+                .child(state.count.to_string()),
+        )
+        .children(dot)
 }
 
 /// tab 栏高度 —— 折叠标题条与它等高(折叠条就是「只剩标题栏的那一格」,
@@ -1744,6 +1833,12 @@ impl TerminalArea {
         cx.notify();
     }
 
+    /// 某个 pane 的「SSH 交互」按钮状态;没有记录(或终端不在了)为 `None`。
+    fn ssh_button_state(&self, pty_id: u32, cx: &App) -> Option<ButtonState> {
+        let pane = self.store.read(cx).terminal(pty_id)?;
+        pane.read(cx).ssh_activity().read(cx).button_state()
+    }
+
     /// AI 任务标记浮层。`None` = 没开 / 那个 pane 已经不在了。
     ///
     /// 层级照 `menu.rs` 的套路:`deferred(priority 1)` → 全窗透明遮罩(`occlude` +
@@ -1767,7 +1862,8 @@ impl TerminalArea {
         let rect = self.pane_rects.get(&pane_id)?;
         // 最大化钮在场与否会让簇宽差一颗 —— 判据与 `render_leaf` 那边同一条
         // (真分了屏才画;最大化态本身就以「分了屏」为前提)
-        let inset = marker_anchor_inset(matches!(layout, SplitNode::Split { .. }));
+        let inset = marker_anchor_inset(matches!(layout, SplitNode::Split { .. }))
+            + ssh_anchor_extra(self.ssh_button_state(pty_id, cx).map(|s| s.count));
         // 面板宽度跟着界面字号缩放,锚点必须用**换算之后**的值,否则字号一调大
         // 面板就从按钮右缘溢出去了
         let panel_width = ui::font_px(MARKER_PANEL_WIDTH);
@@ -3040,7 +3136,7 @@ impl TerminalArea {
         bar
     }
 
-    /// tab 栏右侧的控件簇:⚑N / 查找 / 最大化 / 左右分屏 / 上下分屏 / 关整组。
+    /// tab 栏右侧的控件簇:⚑N / SSH 交互 / 查找 / 命令库 / 最大化 / 左右分屏 / 上下分屏 / 关整组。
     /// 挂在 tab 栏的 `ml_auto` 那一格里(见 [`Self::render_leaf_tab_bar`])。
     fn render_leaf_controls(
         &mut self,
@@ -3157,6 +3253,15 @@ impl TerminalArea {
                 .child("⚑")
                 .child(div().child(marker_count.to_string()))
         });
+        // SSH 交互(该组 active pane 的 AI SSH 调用记录)。没有记录时整个不画 —— 用
+        // `children(Option)` 而不是画一个空占位,簇里不多出一格 gap、别的图标不挪位。
+        // 按钮状态读自 pane 的 `SshActivityView`;它只在条数 / 在跑 / 失败 / 开合变了时
+        // notify(经视图路径把这里标脏),输出分片不惊动这一层,见 `ssh_activity` 模块注释
+        let ssh_btn = active.pty_id.and_then(|pty_id| {
+            let view = store.terminal(pty_id)?.read(cx).ssh_activity().clone();
+            let state = view.read(cx).button_state()?;
+            Some(ssh_activity_button(leaf_id, view, state))
+        });
         // 最大化 / 还原(v0.14.0)。只有真分了屏才画 —— 单格布局下「铺满」是空操作,
         // 常驻一颗按不动的按钮不如不画(原版 `layoutIsSplit || isMaximized` 同款)。
         let pid_max = project_id.to_string();
@@ -3201,6 +3306,7 @@ impl TerminalArea {
             .gap(px(CTRL_GAP))
             .px(px(CTRL_CLUSTER_PAD))
             .children(marker_btn)
+            .children(ssh_btn)
             .children(search_btn)
             .children(cmd_btn)
             .children(maximize_btn)
@@ -5340,6 +5446,21 @@ mod tests {
             MARKER_ANCHOR_INSET - cmd_anchor_inset(false),
             2.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT
         );
+    }
+
+    /// SSH 交互按钮夹在 marker 与查找之间:在场时 marker 锚点多让出「按钮宽 + gap」,
+    /// 按钮宽按条数的位数定死(1~500 条最多三位);不在场一点不让。
+    #[test]
+    fn ssh按钮在场时marker锚点让出它的宽度() {
+        assert_eq!(ssh_anchor_extra(None), 0.0);
+        let one_digit = 2.0 * SSH_BTN_PAD_X + CTRL_ICON + SSH_BTN_GAP + SSH_BTN_DIGIT_W;
+        assert_eq!(ssh_button_width(1), one_digit);
+        assert_eq!(ssh_button_width(9), one_digit);
+        assert_eq!(ssh_button_width(10), one_digit + SSH_BTN_DIGIT_W);
+        assert_eq!(ssh_button_width(500), one_digit + 2.0 * SSH_BTN_DIGIT_W);
+        assert_eq!(ssh_anchor_extra(Some(42)), ssh_button_width(42) + CTRL_GAP);
+        // 命令库钮在 SSH 钮右边,它的锚点与 SSH 钮无关
+        assert_eq!(cmd_anchor_inset(false), CMD_ANCHOR_INSET);
     }
 
     /// 浮层里那些写死的像素尺寸**必须跟着界面字号一起缩放**。

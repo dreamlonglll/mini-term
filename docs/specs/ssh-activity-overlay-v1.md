@@ -9,7 +9,7 @@ AI 通过 mini-term-ssh skill（`mt-ssh-cli`）在服务器上执行命令时，
 
 ## 用户口径（已拍板）
 
-1. **形态**：每个终端 pane 内容区**右上角**一颗悬浮按钮（与 Ctrl+F 查找条同一个角）。该 pane 里第一次用到 mini-term-ssh 时按钮出现；点击后在按钮下方弹出悬浮框。**不放进右侧抽屉**。
+1. **形态**：终端组**标题栏右侧控件簇**里一颗按钮，放在「查找」图标左边（顺序：⚑N → SSH → 查找 → 命令库 → …），对应该组当前 active pane。该 pane 里第一次用到 mini-term-ssh 时按钮出现；点击后在 pane 内容区右上角弹出悬浮框。**不放进右侧抽屉**。（初版放在 pane 内容区右上角，真机看过后改到标题栏。）
 2. **悬浮框底色**：鼠标不在悬浮框上时是**淡底**（约 30% 透明度的终端底色，常量可调），鼠标移入变**实底**，移出恢复。
 3. **内容**：只显示 **AI 与服务器的交互**，全部原文：
    - `exec`：AI 发出的原始命令（不脱敏）、服务器的原样输出（stdout + stderr）、退出码 / 超时 / 错误；
@@ -31,7 +31,7 @@ AI 的 Bash 工具 → mt-ssh-cli（继承 pane 环境：MINITERM_SSH_FEED=127.0
    ├─ 照旧：daemon / one-shot → 远端服务器（stdout/stderr/退出码契约不变）
    └─ 新增：后台线程把 start / out / end 写成 NDJSON → 127.0.0.1:<port>（一次调用一条 TCP 连接）
 mt-app ssh_activity 监听线程 → 按 nonce 认 pane → mpsc → GPUI 任务 → SshActivity 模型
-   → TerminalPane 右上角按钮 + 悬浮框
+   → 终端组标题栏按钮 + TerminalPane 右上角悬浮框
 ```
 
 为什么在 CLI 侧抄送（而不是 daemon / hook server / 审计日志）：
@@ -113,20 +113,20 @@ mt-app ssh_activity 监听线程 → 按 nonce 认 pane → mpsc → GPUI 任务
 
 ## 界面
 
-### 悬浮按钮（`TerminalPane`，`crates/mt-app/src/pane.rs`）
+### 按钮（终端组标题栏，`crates/mt-app/src/terminal_area.rs` 的 `render_leaf_controls`）
 
-- 显示条件：该 pane 至少有一条记录。清空后消失。
-- 位置：pane 根容器内绝对定位，右上角 `top 6px / right 14px`（与查找条同一锚点；右侧 14px 天然避开终端滚动条）。**查找条打开时按钮下移到查找条下方**（间距 6px），两者不重叠。
-- 外观：实底（`bg_elevated` + `border_default`，与右下角「↓」回到底部浮钮同一家族），高度 ≥ 28px，字号 13px 起；内容是 SSH / 服务器类图标（优先用现有图标集，没有就用文字 `SSH`）+ 记录条数。
-  - 有调用在跑：右上角一颗 accent 小圆点。要做呼吸效果只能走 `mt_ui::motion::pulse_phase` 低频泵，**禁止 `with_animation(..).repeat()`**。
+- 显示条件：该组当前 active pane 至少有一条记录。清空后消失；没有记录时控件簇里不留空隙。
+- 位置：标题栏右侧控件簇，「⚑N」之后、「查找」之前。
+- 外观：与控件簇统一（参照 ⚑N 标记按钮：文本色 `text_muted`、hover accent + `border_subtle` 底）；内容是 SSH 图标 + 记录条数。悬浮框开着时按钮常亮。
+  - 有调用在跑：一颗 accent 小圆点。要做呼吸效果只能走 `mt_ui::motion::pulse_phase` 低频泵，**禁止 `with_animation(..).repeat()`**。
   - 没有在跑、且最近一条结局是失败（退出码≠0 / 超时 / 错误 / 已中断）：红色小圆点。
-- `.occlude()`：点按钮不能穿透到终端（不起选区、不发鼠标上报）。
 - tooltip：「AI 的 SSH 交互」一类文案。
-- 点击：切换悬浮框开 / 关；点完把键盘焦点还给终端。
+- 点击：切换悬浮框开 / 关；点完把键盘焦点还给该 pane 的终端。
+- 刷新：只在条数 / 运行中 / 失败 / 开合变化时重画标题栏，输出分片不触发。
 
 ### 悬浮框
 
-- 锚定在按钮正下方、右对齐；宽 `clamp(360px, pane 宽 × 50%, 720px)`，高 ≤ pane 高 × 60%（内容少时按内容收缩，最小约 160px）；pane 太小时随之收缩，不超出 pane。
+- 位置：pane 内容区右上角 `top 6px / right 14px`（与 Ctrl+F 查找条同一锚点，右侧 14px 天然避开终端滚动条）；**查找条打开时落到查找条下方**（间距 6px），两者不重叠。宽 `clamp(360px, pane 宽 × 50%, 720px)`，高 ≤ pane 高 × 60%（内容少时按内容收缩，最小约 160px）；pane 太小时随之收缩，不超出 pane。
 - **底色**：
   - 未悬停：终端底色 × `IDLE_BG_ALPHA`（常量，初值 0.30）+ 细边框，无阴影；
   - 悬停（鼠标在悬浮框内）：实底 `bg_elevated` + 阴影。
@@ -162,9 +162,9 @@ mt-app ssh_activity 监听线程 → 按 nonce 认 pane → mpsc → GPUI 任务
 
 ## 验收标准
 
-1. 本地 pane 里 AI（或手动）调用 `mt-ssh-cli exec/upload/download` 后，该 pane 右上角出现按钮，点开能看到命令原文、服务器原样输出与结局；`list` 不出现。
+1. 本地 pane 里 AI（或手动）调用 `mt-ssh-cli exec/upload/download` 后，该组标题栏「查找」左边出现按钮，点开能看到命令原文、服务器原样输出与结局；`list` 不出现。
 2. CLI 的 stdout / stderr / 退出码与改动前逐字节一致；主程序没开、端口不通、主程序卡住时 CLI 行为不变，额外延迟 ≤ 500ms。
 3. 悬浮框未悬停时为淡底、悬停为实底；滚动、复制、清空、关闭正常；不抢键盘焦点；点框外不关。
-4. Ctrl+F 查找条打开时按钮与查找条不重叠。
+4. Ctrl+F 查找条打开时悬浮框与查找条不重叠。
 5. 大输出（1 MiB+）、多条记录下界面不卡顿，内存受上限约束。
 6. 全工作区测试、sidecars 测试、变更行 rustfmt / clippy 检查通过。

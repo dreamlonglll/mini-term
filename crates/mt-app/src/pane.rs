@@ -271,9 +271,10 @@ pub struct TerminalPane {
     _sync_release_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
-    /// SSH 交互浮层(右上角按钮 + 悬浮框)。**恒挂在右上角那一列里**,没有记录时画空,
-    /// 理由见 [`crate::ssh_activity`] 视图模块注释。事件由 `ssh_activity` 的泵直接投给它,
-    /// 不经本 pane 的 update。
+    /// SSH 交互浮层:记录模型 + 内容区右上角的悬浮框(入口按钮在终端组标题栏上,
+    /// `terminal_area::render_leaf_controls` 读它的状态来画)。**恒挂在右上角那一列里**,
+    /// 悬浮框关着时画空,理由见 [`crate::ssh_activity`] 视图模块注释。事件由
+    /// `ssh_activity` 的泵直接投给它,不经本 pane 的 update。
     ssh_activity: Entity<SshActivityView>,
 }
 
@@ -2645,10 +2646,10 @@ impl Render for TerminalPane {
                     .children(scroll_button),
             )
             .children(exit_bar)
-            // 右上角一列:终端内查找条 + SSH 交互浮层(按钮与悬浮框)。距顶 6px、距右 14px ——
-            // 与原版查找条 `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF 每帧算出来的
-            // fixed 坐标,这里由布局白拿)。竖排右对齐、间距 6px:查找条开着时 SSH 按钮
-            // 自然落到它下方,两者不重叠。SSH 视图恒挂(没有记录时画空),理由见它的模块注释
+            // 右上角一列:终端内查找条 + SSH 交互悬浮框(入口按钮在终端组标题栏上)。距顶 6px、
+            // 距右 14px —— 与原版查找条 `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF
+            // 每帧算出来的 fixed 坐标,这里由布局白拿)。竖排右对齐、间距 6px:查找条开着时
+            // 悬浮框自然落到它下方,两者不重叠。SSH 视图恒挂(关着时画空),理由见它的模块注释
             .child(
                 div()
                     .absolute()
