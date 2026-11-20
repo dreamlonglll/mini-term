@@ -129,6 +129,11 @@ unicode-segmentation.workspace = true
 # 移动端配对二维码(工作区里已 default-features=false，只要位矩阵)。
 # 渲染由 `mobile_relay::qr` 自绘 quad —— 不引 image 后端、不落临时文件。
 qrcode.workspace = true
+# SSH 交互浮层的抄送通道(`ssh_activity`):每个 PTY 一个 128 bit 随机 nonce(ring 的
+# 系统随机源)与 `out` 帧的 base64 解码。两者都已在依赖树里(mt-secret / mt-ssh 带进来的
+# 同一份 ring 0.17 / base64 0.22),净新增 crate = 0。
+ring = "0.17"
+base64 = "0.22"
 # 价格表响应的解析(`pricing::fetch_models_dev`)、布局/设置等处的 JSON 读写。
 # 价格表缓存信封(model-pricing.json / .cache.json)的 serde 镜像已随归一 / 缓存
 # 逻辑挪进 mt-usage(`models_dev`),本 crate 不再直接依赖 serde。

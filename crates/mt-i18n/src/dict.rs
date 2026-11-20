@@ -10,11 +10,11 @@
 use crate::Namespace;
 
 /// 命名空间总数（生成器对账用，测试断言防漂移）
-pub const NAMESPACE_COUNT: usize = 38;
+pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1899;
+pub const ZH_ENTRY_COUNT: usize = 1920;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1899;
+pub const EN_ENTRY_COUNT: usize = 1920;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3515,6 +3515,55 @@ static SETTINGS_EN: &[(&str, &str)] = &[
 ];
 
 #[rustfmt::skip]
+static SSH_ACTIVITY_ZH: &[(&str, &str)] = &[
+    ("buttonTip", "AI 的 SSH 交互"),
+    ("clear", "清空"),
+    ("close", "关闭"),
+    ("copied", "已复制"),
+    ("copyAll", "复制全部"),
+    ("copyCommand", "复制命令"),
+    ("copyOutput", "复制输出"),
+    ("cwd", "cwd: {cwd}"),
+    ("download", "↓ 下载 {remote} → {local}"),
+    ("error", "错误：{message}"),
+    ("exitCode", "退出码 {code} · {elapsed}"),
+    ("finished", "已结束 · {elapsed}"),
+    ("interrupted", "已中断"),
+    ("notStarted", "连接阶段超时，命令未执行"),
+    ("running", "运行中…"),
+    ("timedOut", "超时（{secs}s）"),
+    ("timeoutArg", "超时上限：{secs}s"),
+    ("title", "SSH 交互"),
+    ("transferred", "完成 · {bytes} 字节"),
+    ("truncated", "输出过长，只显示了前 {shown} 字节（共 {total} 字节）"),
+    ("upload", "↑ 上传 {local} → {remote}"),
+];
+#[rustfmt::skip]
+static SSH_ACTIVITY_EN: &[(&str, &str)] = &[
+    ("buttonTip", "AI's SSH activity"),
+    ("clear", "Clear"),
+    ("close", "Close"),
+    ("copied", "Copied"),
+    ("copyAll", "Copy all"),
+    ("copyCommand", "Copy command"),
+    ("copyOutput", "Copy output"),
+    ("cwd", "cwd: {cwd}"),
+    ("download", "↓ Download {remote} → {local}"),
+    ("error", "Error: {message}"),
+    ("exitCode", "Exit code {code} · {elapsed}"),
+    ("finished", "Finished · {elapsed}"),
+    ("interrupted", "Interrupted"),
+    ("notStarted", "Timed out while connecting; the command did not run"),
+    ("running", "Running…"),
+    ("timedOut", "Timed out ({secs}s)"),
+    ("timeoutArg", "Timeout: {secs}s"),
+    ("title", "SSH activity"),
+    ("transferred", "Done · {bytes} bytes"),
+    ("truncated", "Output too long; showing the first {shown} bytes ({total} bytes total)"),
+    ("upload", "↑ Upload {local} → {remote}"),
+];
+
+#[rustfmt::skip]
 static SSH_ASSOC_ZH: &[(&str, &str)] = &[
     ("allConnections", "全部连接"),
     ("cancel", "取消"),
@@ -4221,6 +4270,11 @@ pub static NAMESPACES: &[Namespace] = &[
         name: "settings",
         zh: SETTINGS_ZH,
         en: SETTINGS_EN,
+    },
+    Namespace {
+        name: "sshActivity",
+        zh: SSH_ACTIVITY_ZH,
+        en: SSH_ACTIVITY_EN,
     },
     Namespace {
         name: "sshAssoc",

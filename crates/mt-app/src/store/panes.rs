@@ -955,6 +955,14 @@ impl AppStore {
         if hook_port > 0 {
             env.push(("MINITERM_HOOK_PORT".to_string(), hook_port.to_string()));
         }
+        // SSH 交互浮层的抄送地址(`127.0.0.1:<port>/<nonce>`,每个 PTY 一个 nonce)。只给
+        // 本地 pane:远程 SSH 项目的 pane 里 AI 跑在远端,够不着本机端口。监听没起来时不注入。
+        // nonce 在 PTY 退出 / 关闭 / 重启换 PTY 时注销(`store::ai`)。
+        if project.ssh_connection_id.is_none()
+            && let Some(feed) = crate::ssh_activity::feed_env(pty_id)
+        {
+            env.push(feed);
+        }
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
         // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的远端命令

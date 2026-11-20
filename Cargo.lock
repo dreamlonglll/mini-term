@@ -5430,6 +5430,7 @@ name = "mt-app"
 version = "1.14.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "gpui-base",
@@ -5459,6 +5460,7 @@ dependencies = [
  "parking_lot",
  "qrcode",
  "raw-window-handle",
+ "ring",
  "ropey",
  "serde_json",
  "trash",

@@ -216,11 +216,15 @@ impl AppStore {
         // 退出登记同理:留着会让复用同一编号的新 PTY 一开就顶着「已断开」遮罩
         self.exited_ptys.remove(&pty_id);
         self.terminal_focus.remove(&pty_id);
+        // SSH 交互浮层:nonce 注销(之后用它连上来的一律断开),记录随 pane 一起清掉。
+        // 重启换 PTY 也走这里 —— 新 PTY 拿新 nonce、新视图从空开始
+        crate::ssh_activity::forget_pty(pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)
             entity.update(cx, |pane, cx| {
                 pane.clear_preedit(cx);
+                pane.clear_ssh_activity(cx);
                 pane.shutdown();
             });
         }
@@ -254,6 +258,9 @@ impl AppStore {
         self.clear_pending_fork(pty_id);
         // 原版 `App.tsx:359` 的 `markPtyExited`:与状态落 error 同一时机
         self.exited_ptys.insert(pty_id);
+        // PTY 已经关了:SSH 交互浮层的 nonce 跟着注销。已有的记录留在 pane 上可回看
+        // (与退出后画面留着同一口径),关 pane / 重启时再清
+        crate::ssh_activity::forget_pty(pty_id);
         // 撤出 mt-ai 的 500ms 轮询并清掉这条 PTY 的旁路 / hook 状态。Tauri 版在 reader
         // 断开时就地 `instances.remove` + `purge_pty_state`,monitor 从此看不到它;
         // GPUI 版此前只在关 pane 时才摘(`TerminalPane::shutdown`),退出的 pane 仍被
@@ -295,6 +302,8 @@ impl AppStore {
     ///   会把 pane 里那行起不来的原因盖住。
     pub(super) fn on_pty_spawn_failed(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         self.clear_pending_fork(pty_id);
+        // 起都没起来,不会有人用这个 nonce 了
+        crate::ssh_activity::forget_pty(pty_id);
         // 起都没起来:与退出同理撤出轮询,否则首轮必发的 idle 会把 error 盖掉
         self.ai.remove_pane(pty_id);
         let mut dead: Option<String> = None;
