@@ -34,6 +34,15 @@
 //! 鼠标不在框上:终端底色 × [`IDLE_BG_ALPHA`] + 细边框、无阴影;移入:实底 `bg_elevated` + 阴影。
 //! 文字颜色两态一致。gpui 没有实时 backdrop blur(见 `frost.rs` 模块注释),淡底就是带 alpha 的底色。
 //!
+//! # 开合动画
+//!
+//! 打开:框体从顶边水平居中处的一个小框长到最终尺寸 —— 宽度从中间向两边、高度从上往下
+//! ([`reveal_rect`],[`REVEAL_OPEN`] ease-out);收起完全反向([`REVEAL_CLOSE`] ease-in),
+//! 播完才从树上卸下。动画中途再点按钮从当前进度反向播([`Reveal::retarget`]),不跳变。
+//! 只有位移与尺寸的方向性展开,**不做透明度淡入淡出**;用「裁剪窗」实现,内容按最终尺寸排版、
+//! 不重排不缩放(见 `render_popover`)。只在动画进行中要帧;豁免系统「减少动画」(与其它浮层
+//! 进出场一致),但服从设置里的终端动画总开关 `terminal_animations`(关掉时直接开 / 直接收)。
+//!
 //! # 焦点
 //!
 //! 标题栏按钮点完把键盘焦点还给该 pane 的终端;悬浮框本身不 `track_focus`,点它不抢焦点。
@@ -49,11 +58,13 @@ use gpui::{
 };
 use gpui_component::scroll::Scrollbar;
 use mt_ui::icons::VectorIcon;
+use mt_ui::motion::{Easing, cubic_bezier_at, ease};
 use mt_ui::tooltip::TooltipExt as _;
 
 use super::model::{Activity, Applied, Outcome, Record};
 use super::wire::{FeedEvent, Op, Stream};
 use crate::i18n::{t, tr};
+use crate::store::AppStore;
 use crate::ui;
 
 /// 鼠标不在悬浮框上时,底色取终端底色再乘这个透明度(乘在终端底色自身的 alpha 上,
@@ -76,6 +87,8 @@ const PANE_EDGE: f32 = 14.0;
 const BOTTOM_GAP: f32 = 8.0;
 /// 标题栏高度。
 const TITLE_H: f32 = 40.0;
+/// 悬浮框边框宽。
+const POPOVER_BORDER: f32 = 1.0;
 /// 列表上下内边距。
 const LIST_PAD_Y: f32 = 4.0;
 /// 列表项左右内边距。
@@ -87,6 +100,125 @@ const EST_ROW_H: f32 = 19.0;
 const EST_RECORD_EXTRA: f32 = 44.0;
 /// 「已复制」停留多久。
 const COPIED_FOR: Duration = Duration::from_millis(1200);
+
+/// 悬浮框**打开**动画的全程时长(ease-out)。半路掉头时按剩余路程折算。
+const REVEAL_OPEN: Duration = Duration::from_millis(220);
+/// 悬浮框**收起**动画的全程时长(ease-in)。
+const REVEAL_CLOSE: Duration = Duration::from_millis(155);
+/// 开合动画的起点:顶边水平居中处的一个小框。宽 = 终宽 × 这个比例(从中间向两边展开)。
+const REVEAL_START_W: f32 = 0.10;
+/// 起点高 = 终高 × 这个比例(从上往下展开)。
+const REVEAL_START_H: f32 = 0.0;
+/// 收起用的 ease-in 曲线控制点(CSS 关键字 `ease-in`;`mt_ui::motion::Easing` 里没有这一条)。
+const EASE_IN: (f32, f32, f32, f32) = (0.42, 0.0, 1.0, 1.0);
+
+/// 一个矩形(像素,f32)。开合动画的插值在纯数里做,便于单测。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FrameRect {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// 开合进度 `progress`(0 = 收起,1 = 全开,已缓动)下,可见框体该画成什么矩形。
+///
+/// 起点是终矩形**顶边水平居中**处的一个小框(宽 [`REVEAL_START_W`]、高 [`REVEAL_START_H`]
+/// 的比例):宽度从中间向两边展开,高度从上往下展开 —— 顶边与水平中线始终不动。
+pub(super) fn reveal_rect(progress: f32, target: FrameRect) -> FrameRect {
+    let p = progress.clamp(0.0, 1.0);
+    let width = target.width * (REVEAL_START_W + (1.0 - REVEAL_START_W) * p);
+    let height = target.height * (REVEAL_START_H + (1.0 - REVEAL_START_H) * p);
+    FrameRect {
+        left: target.left + (target.width - width) / 2.0,
+        top: target.top,
+        width,
+        height,
+    }
+}
+
+/// 悬浮框的开合进度(0 = 收起,1 = 全开)。
+///
+/// 不用 `mt_ui::motion::Transition`:它的 `restart` 刻意从头播,而这里要求动画中途再点按钮时
+/// **从当前进度反向播、不许跳变**。于是记「起点值 → 目标值 + 起始时刻 + 时长」,掉头时以
+/// 当前显示值为新起点,时长按剩余路程折算。打开 ease-out、收起 ease-in。
+///
+/// 不过「减少动画」那道闸(与其它浮层进出场一样豁免,`respects_reduce = false` 的口径),
+/// 只服从设置里的终端动画总开关 —— 由调用方在 [`Self::retarget`] 时给 `animate`。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Reveal {
+    from: f32,
+    to: f32,
+    start: Instant,
+    duration: Duration,
+}
+
+impl Reveal {
+    /// 收起且静止。
+    pub(super) fn hidden(now: Instant) -> Self {
+        Self {
+            from: 0.0,
+            to: 0.0,
+            start: now,
+            duration: Duration::ZERO,
+        }
+    }
+
+    /// 这一刻的开合进度(已缓动)。
+    pub(super) fn value_at(&self, now: Instant) -> f32 {
+        let elapsed = now.saturating_duration_since(self.start);
+        if self.duration.is_zero() || elapsed >= self.duration {
+            return self.to;
+        }
+        let t = elapsed.as_secs_f32() / self.duration.as_secs_f32();
+        let eased = if self.to >= self.from {
+            ease(Easing::EaseOut, t)
+        } else {
+            let (x1, y1, x2, y2) = EASE_IN;
+            cubic_bezier_at(x1, y1, x2, y2, t)
+        };
+        self.from + (self.to - self.from) * eased
+    }
+
+    /// 还在动吗(= 还要不要请求下一帧)。到终态之后恒 `false`。
+    pub(super) fn running_at(&self, now: Instant) -> bool {
+        !self.duration.is_zero() && now.saturating_duration_since(self.start) < self.duration
+    }
+
+    /// 还在树上吗:开着、或者收起动画还没播完。
+    pub(super) fn mounted_at(&self, now: Instant) -> bool {
+        self.value_at(now) > 0.0 || self.running_at(now)
+    }
+
+    /// 朝 `target`(0 / 1)走。从**当前显示值**起步,时长按剩余路程折算;
+    /// `animate = false` 时直接到位。
+    pub(super) fn retarget(&mut self, target: f32, now: Instant, animate: bool) {
+        let current = self.value_at(now);
+        let full = if target > current {
+            REVEAL_OPEN
+        } else {
+            REVEAL_CLOSE
+        };
+        self.from = current;
+        self.to = target;
+        self.start = now;
+        self.duration = if animate {
+            full.mul_f32((target - current).abs().min(1.0))
+        } else {
+            Duration::ZERO
+        };
+    }
+}
+
+/// 终端动画总开关(设置页「启用动画」,缺省开)。与 `terminal_area` 的
+/// `animations_enabled` 读同一项配置。
+fn animations_enabled(cx: &gpui::App) -> bool {
+    AppStore::global(cx)
+        .read(cx)
+        .config()
+        .terminal_animations
+        .unwrap_or(true)
+}
 
 /// 列表同步时记下的「每条记录在列表里占哪几项」。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,6 +499,9 @@ pub struct SshActivityView {
     last_box_h: Option<f32>,
     copied: Option<CopyTarget>,
     _copied_timer: Option<Task<()>>,
+    /// 开合动画进度。`open` 是目标(按钮亮不亮看它),这里是画面:收起动画播完之前
+    /// 悬浮框留在树上(与 `main.rs` 右抽屉 `DrawerExit` 的驻留同一个意思)。
+    reveal: Reveal,
 }
 
 impl SshActivityView {
@@ -388,6 +523,7 @@ impl SshActivityView {
             last_box_h: None,
             copied: None,
             _copied_timer: None,
+            reveal: Reveal::hidden(Instant::now()),
         }
     }
 
@@ -424,7 +560,7 @@ impl SshActivityView {
             return false;
         }
         self.pane_bounds = Some(bounds);
-        self.open
+        self.reveal.mounted_at(Instant::now())
     }
 
     /// 监听线程送来的一批事件(同一 pane)。
@@ -443,12 +579,14 @@ impl SshActivityView {
         }
     }
 
-    /// 清掉全部记录(「清空」按钮 / PTY 关闭)。按钮随之消失、悬浮框关闭。
+    /// 清掉全部记录(「清空」按钮 / PTY 关闭)。按钮随之消失、悬浮框直接关闭
+    /// (没有内容可收,不播收起动画)。
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.activity.clear();
         self.synced.clear();
         self.list.reset(0);
         self.open = false;
+        self.reveal = Reveal::hidden(Instant::now());
         self.copied = None;
         self.box_target = None;
         self.last_box_h = None;
@@ -491,18 +629,29 @@ impl SshActivityView {
         window.focus(&self.terminal_focus, cx);
     }
 
+    /// 开 / 关悬浮框,带开合动画(见 [`Reveal`])。
     fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
         // 没有记录时没有按钮,也就不该开出一个空框
         if open == self.open || (open && self.activity.is_empty()) {
             return;
         }
+        let now = Instant::now();
         self.open = open;
         if open {
-            let total = rebuild_rows(&mut self.synced, &mut self.activity);
-            self.list.reset(total);
-            self.list.set_follow_mode(FollowMode::Tail);
-            self.last_box_h = None;
+            if self.reveal.mounted_at(now) {
+                // 收起动画播到一半又点开:框还在树上,列表接着用(滚动位置不动),
+                // 只把关着期间漏掉的变化增量补上
+                sync_rows(&mut self.synced, &mut self.activity, &self.list);
+            } else {
+                let total = rebuild_rows(&mut self.synced, &mut self.activity);
+                self.list.reset(total);
+                self.list.set_follow_mode(FollowMode::Tail);
+                self.last_box_h = None;
+            }
         }
+        let animate = animations_enabled(cx);
+        self.reveal
+            .retarget(if open { 1.0 } else { 0.0 }, now, animate);
         cx.notify();
     }
 
@@ -567,7 +716,7 @@ impl SshActivityView {
     /// 量不出来时沿用上一次的目标,不回落到估算值 —— 高度不会一帧一跳。
     fn box_height(&mut self, max_h: f32, window: &mut Window) -> f32 {
         // 标题栏 + 列表上下内边距 + 上下边框 + 一点余量(让内容恰好装下时不出滚动)
-        let chrome = TITLE_H + 2.0 * LIST_PAD_Y + 2.0 + 4.0;
+        let chrome = TITLE_H + 2.0 * LIST_PAD_Y + 2.0 * POPOVER_BORDER + 4.0;
         let measured = measure_content(&self.list).map(|content| content + chrome);
         let target = measured.or(self.box_target).unwrap_or_else(|| {
             let rows = self.synced.iter().map(SyncedRecord::len).sum::<usize>() as f32;
@@ -649,14 +798,36 @@ impl SshActivityView {
             )
     }
 
-    fn render_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// 画悬浮框。`reveal` 是开合进度(0..1,已缓动)。
+    ///
+    /// # 开合动画用「裁剪窗」做
+    ///
+    /// gpui 的 div 没有缩放变换,于是分三层:
+    /// 1. **外壳**按最终尺寸占位(右上角那一列的布局从头到尾不变;它没有 hitbox,
+    ///    框体还没长到的地方鼠标照常落到终端上);
+    /// 2. **框体**(底色 / 边框 / 阴影 / 拦鼠标)按 [`reveal_rect`] 插值出的矩形画,
+    ///    `overflow_hidden` 当裁剪窗 —— 从顶边中点长到最终尺寸,收起时反向;
+    /// 3. **内容**按最终尺寸排版,相对框体反向偏移、钉在最终矩形上,只被裁剪窗裁掉:
+    ///    文字不重排不缩放,虚拟列表的滚动位置也不受影响。
+    ///
+    /// 整个浮层挂在 pane 内容区的绝对定位列里,终端布局与 PTY 尺寸都不动。
+    fn render_popover(&mut self, reveal: f32, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let (width, max_h) = self.popover_limits();
         let height = self.box_height(max_h, window);
+        let frame = reveal_rect(
+            reveal,
+            FrameRect {
+                left: 0.0,
+                top: 0.0,
+                width,
+                height,
+            },
+        );
         let idle_bg = {
             let base = ui::bg_terminal();
             ui::with_alpha(base, base.a * IDLE_BG_ALPHA)
         };
-        // 量悬浮框顶边:最大高要扣掉它上面的查找条,不能伸出 pane 底边
+        // 量悬浮框顶边(外壳的,开合动画里不动):最大高要扣掉它上面的查找条,不能伸出 pane 底边
         let this = cx.entity();
         let probe = canvas(
             move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut gpui::App| {
@@ -674,24 +845,16 @@ impl SshActivityView {
         .absolute()
         .size_full();
         let pty_id = self.pty_id;
-        div()
-            .id(SharedString::from(format!("ssh-activity-popover-{pty_id}")))
-            .relative()
+        // 内容:最终尺寸(扣掉框体边框),相对框体的内容区反向偏移,窗口坐标始终等于全开时的位置
+        let content = div()
+            .absolute()
+            .left(px(-frame.left))
+            .top(px(-frame.top))
+            .w(px(width - 2.0 * POPOVER_BORDER))
+            .h(px(height - 2.0 * POPOVER_BORDER))
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(width))
-            .h(px(height))
-            .overflow_hidden()
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(ui::border_default())
-            .bg(idle_bg)
-            // 始终拦鼠标:滚轮滚的是框,点击不穿透到终端
-            .occlude()
-            .hover(|el| el.bg(ui::bg_elevated()).shadow_lg())
             .text_color(ui::text_primary())
-            .child(probe)
             .child(self.render_title(cx))
             .child(
                 div()
@@ -715,7 +878,32 @@ impl SshActivityView {
                                 format!("ssh-activity-scrollbar-{pty_id}"),
                             ))),
                     ),
-            )
+            );
+        // 框体 = 裁剪窗
+        let body = div()
+            .id(SharedString::from(format!("ssh-activity-popover-{pty_id}")))
+            .absolute()
+            .left(px(frame.left))
+            .top(px(frame.top))
+            .w(px(frame.width))
+            .h(px(frame.height))
+            .overflow_hidden()
+            .rounded(px(8.0))
+            .border(px(POPOVER_BORDER))
+            .border_color(ui::border_default())
+            .bg(idle_bg)
+            // 始终拦鼠标:滚轮滚的是框,点击不穿透到终端
+            .occlude()
+            .hover(|el| el.bg(ui::bg_elevated()).shadow_lg())
+            .child(content);
+        // 外壳:最终尺寸占位,不拦鼠标
+        div()
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .h(px(height))
+            .child(probe)
+            .child(body)
     }
 
     fn render_row(
@@ -950,11 +1138,17 @@ fn connection_chip(name: &str) -> Div {
 impl Render for SshActivityView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 按钮在终端组标题栏上(`terminal_area::render_leaf_controls`),这里只画悬浮框;
-        // 关着时画空 div 也要挂着,理由见模块注释「挂在哪」
-        if !self.open || self.activity.is_empty() {
+        // 关着时画空 div 也要挂着,理由见模块注释「挂在哪」。收起动画播完之前框还留在树上
+        let now = Instant::now();
+        if self.activity.is_empty() || !self.reveal.mounted_at(now) {
             return div().into_any_element();
         }
-        self.render_popover(window, cx).into_any_element()
+        // 只在开合动画进行中要帧,播完就停(不用 `with_animation(..).repeat()`)
+        if self.reveal.running_at(now) {
+            window.request_animation_frame();
+        }
+        let reveal = self.reveal.value_at(now);
+        self.render_popover(reveal, window, cx).into_any_element()
     }
 }
 
@@ -1106,6 +1300,99 @@ mod tests {
             activity.records_mut().all(|r| r.take_dirty().is_none()),
             "重建顺带清掉脏行"
         );
+    }
+
+    #[test]
+    fn 开合矩形从顶边中点展开() {
+        let target = FrameRect {
+            left: 10.0,
+            top: 20.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        // 起点:顶边水平居中处的小框
+        let start = reveal_rect(0.0, target);
+        assert_eq!(start.width, 400.0 * REVEAL_START_W);
+        assert_eq!(start.height, 300.0 * REVEAL_START_H);
+        assert_eq!(start.top, 20.0);
+        assert_eq!(start.left, 10.0 + (400.0 - start.width) / 2.0);
+        // 终点就是终矩形
+        assert_eq!(reveal_rect(1.0, target), target);
+        // 越界进度钳住
+        assert_eq!(reveal_rect(1.7, target), target);
+        assert_eq!(reveal_rect(-0.3, target), start);
+        // 全程:顶边不动、水平中线不动、宽高单调长大
+        let mut prev = start;
+        for step in 1..=20 {
+            let rect = reveal_rect(step as f32 / 20.0, target);
+            assert_eq!(rect.top, target.top, "高度从上往下展开,顶边不动");
+            let center = rect.left + rect.width / 2.0;
+            assert!((center - 210.0).abs() < 1e-3, "宽度从中间向两边展开");
+            assert!(rect.width > prev.width && rect.height > prev.height);
+            assert!(rect.width <= target.width && rect.height <= target.height);
+            prev = rect;
+        }
+    }
+
+    #[test]
+    fn 开合进度与半路掉头() {
+        let t0 = Instant::now();
+        let mut reveal = Reveal::hidden(t0);
+        assert!(!reveal.mounted_at(t0));
+
+        // 打开:ease-out,从 0 单调走到 1,跑满 REVEAL_OPEN 就停
+        reveal.retarget(1.0, t0, true);
+        assert_eq!(reveal.value_at(t0), 0.0);
+        assert!(reveal.running_at(t0) && reveal.mounted_at(t0));
+        let mut prev = 0.0;
+        for ms in (10..=220).step_by(10) {
+            let v = reveal.value_at(t0 + Duration::from_millis(ms));
+            assert!(v >= prev, "打开过程单调");
+            prev = v;
+        }
+        let opened = t0 + REVEAL_OPEN;
+        assert_eq!(reveal.value_at(opened), 1.0);
+        assert!(!reveal.running_at(opened), "播完就不再要帧");
+
+        // 半路掉头:打开到一半再点,从当前进度反向收,不跳变
+        let mut reveal = Reveal::hidden(t0);
+        reveal.retarget(1.0, t0, true);
+        let mid = t0 + Duration::from_millis(80);
+        let before = reveal.value_at(mid);
+        assert!(before > 0.0 && before < 1.0);
+        reveal.retarget(0.0, mid, true);
+        assert!(
+            (reveal.value_at(mid) - before).abs() < 1e-6,
+            "掉头那一刻不跳变"
+        );
+        // 只走回去那一段:时长按剩余路程折算
+        let back = mid + REVEAL_CLOSE.mul_f32(before);
+        assert!(reveal.running_at(back - Duration::from_millis(1)));
+        assert_eq!(reveal.value_at(back), 0.0);
+        assert!(!reveal.running_at(back));
+        assert!(!reveal.mounted_at(back), "收起播完才从树上卸下");
+
+        // 收起途中再点开:同样从当前进度接着往回长
+        let mut reveal = Reveal::hidden(t0);
+        reveal.retarget(1.0, t0, false);
+        reveal.retarget(0.0, t0, true);
+        let half = t0 + Duration::from_millis(70);
+        let shown = reveal.value_at(half);
+        assert!(shown > 0.0 && shown < 1.0 && reveal.mounted_at(half));
+        reveal.retarget(1.0, half, true);
+        assert!((reveal.value_at(half) - shown).abs() < 1e-6);
+    }
+
+    #[test]
+    fn 动画总开关关掉时直接开合() {
+        let t0 = Instant::now();
+        let mut reveal = Reveal::hidden(t0);
+        reveal.retarget(1.0, t0, false);
+        assert_eq!(reveal.value_at(t0), 1.0);
+        assert!(!reveal.running_at(t0));
+        reveal.retarget(0.0, t0, false);
+        assert_eq!(reveal.value_at(t0), 0.0);
+        assert!(!reveal.mounted_at(t0));
     }
 
     #[test]
