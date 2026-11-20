@@ -36,8 +36,10 @@
 //!
 //! # 开合动画
 //!
-//! 打开:框体从顶边水平居中处的一个小框长到最终尺寸 —— 宽度从中间向两边、高度从上往下
-//! ([`reveal_rect`],[`REVEAL_OPEN`] ease-out);收起完全反向([`REVEAL_CLOSE`] ease-in),
+//! 打开:框体从标题栏 SSH 按钮正下方(框的顶边上)的一个小框长到最终尺寸 —— 左右两边各自
+//! 插值到最终的左、右边(原点不在中间时不对称)、高度从上往下([`reveal_rect`],
+//! [`REVEAL_OPEN`] ease-out)。按钮位置由它身上的探针报来([`SshActivityView::note_anchor_bounds`]),
+//! 还没测到时退回水平中点。收起完全反向([`REVEAL_CLOSE`] ease-in),
 //! 播完才从树上卸下。动画中途再点按钮从当前进度反向播([`Reveal::retarget`]),不跳变。
 //! 只有位移与尺寸的方向性展开,**不做透明度淡入淡出**;用「裁剪窗」实现,内容按最终尺寸排版、
 //! 不重排不缩放(见 `render_popover`)。只在动画进行中要帧;豁免系统「减少动画」(与其它浮层
@@ -105,7 +107,8 @@ const COPIED_FOR: Duration = Duration::from_millis(1200);
 const REVEAL_OPEN: Duration = Duration::from_millis(220);
 /// 悬浮框**收起**动画的全程时长(ease-in)。
 const REVEAL_CLOSE: Duration = Duration::from_millis(155);
-/// 开合动画的起点:顶边水平居中处的一个小框。宽 = 终宽 × 这个比例(从中间向两边展开)。
+/// 开合动画的起点:以原点(标题栏 SSH 按钮正下方、框的顶边上)为中心的一个小框。
+/// 宽 = 终宽 × 这个比例。
 const REVEAL_START_W: f32 = 0.10;
 /// 起点高 = 终高 × 这个比例(从上往下展开)。
 const REVEAL_START_H: f32 = 0.0;
@@ -123,16 +126,27 @@ pub(super) struct FrameRect {
 
 /// 开合进度 `progress`(0 = 收起,1 = 全开,已缓动)下,可见框体该画成什么矩形。
 ///
-/// 起点是终矩形**顶边水平居中**处的一个小框(宽 [`REVEAL_START_W`]、高 [`REVEAL_START_H`]
-/// 的比例):宽度从中间向两边展开,高度从上往下展开 —— 顶边与水平中线始终不动。
-pub(super) fn reveal_rect(progress: f32, target: FrameRect) -> FrameRect {
+/// `origin_x` 是展开原点的横坐标,**相对 `target.left`**(标题栏 SSH 按钮的水平中心换算过来),
+/// 钳在终矩形左右边之间(pane 很窄时按钮可能落在框外);原点的纵坐标就是终矩形顶边。
+///
+/// 起点是以原点为中心的一个小框(宽 [`REVEAL_START_W`]、高 [`REVEAL_START_H`] 的比例);
+/// 左右两边各自从小框的边**线性插值**到终矩形的左、右边(原点不在中间时两边走的路程不同),
+/// 高度从顶边往下长 —— 顶边始终不动。
+pub(super) fn reveal_rect(progress: f32, target: FrameRect, origin_x: f32) -> FrameRect {
     let p = progress.clamp(0.0, 1.0);
-    let width = target.width * (REVEAL_START_W + (1.0 - REVEAL_START_W) * p);
+    if p >= 1.0 {
+        // 全开时就是终矩形本身(免得浮点误差让框体差出零点几像素)
+        return target;
+    }
+    let origin = origin_x.clamp(0.0, target.width.max(0.0));
+    let half = target.width * REVEAL_START_W / 2.0;
+    let left = (origin - half) * (1.0 - p);
+    let right = (origin + half) + (target.width - (origin + half)) * p;
     let height = target.height * (REVEAL_START_H + (1.0 - REVEAL_START_H) * p);
     FrameRect {
-        left: target.left + (target.width - width) / 2.0,
+        left: target.left + left,
         top: target.top,
-        width,
+        width: right - left,
         height,
     }
 }
@@ -494,6 +508,9 @@ pub struct SshActivityView {
     pane_bounds: Option<Bounds<Pixels>>,
     /// 悬浮框顶边的窗口坐标(悬浮框自己的探针报上来)。
     popover_top: Option<Pixels>,
+    /// 标题栏 SSH 按钮的窗口坐标(按钮上的探针报上来,`terminal_area::ssh_activity_button`)。
+    /// 开合动画的原点取它的水平中心。
+    anchor: Option<Bounds<Pixels>>,
     /// 上一次定下的「按内容」目标高度;量不出来时沿用它,免得高度一帧一跳。
     box_target: Option<f32>,
     last_box_h: Option<f32>,
@@ -519,6 +536,7 @@ impl SshActivityView {
             _flush_timer: None,
             pane_bounds: None,
             popover_top: None,
+            anchor: None,
             box_target: None,
             last_box_h: None,
             copied: None,
@@ -561,6 +579,33 @@ impl SshActivityView {
         }
         self.pane_bounds = Some(bounds);
         self.reveal.mounted_at(Instant::now())
+    }
+
+    /// 标题栏 SSH 按钮上的探针报上来的按钮窗口坐标。返回「变了、且悬浮框开着或在动画中」——
+    /// 只有那时才需要再要一帧重画;平时按钮挪了只记下来,不惊动任何视图。
+    pub fn note_anchor_bounds(&mut self, bounds: Bounds<Pixels>) -> bool {
+        if self.anchor == Some(bounds) {
+            return false;
+        }
+        self.anchor = Some(bounds);
+        self.reveal.mounted_at(Instant::now())
+    }
+
+    /// 开合动画原点的横坐标,相对悬浮框最终矩形的左边。
+    ///
+    /// 最终矩形的左边按布局推:右上角那一列贴 pane 右缘内缩 [`PANE_EDGE`](与 `pane.rs` 里
+    /// 那一列的 `right(14)` 同值)、右对齐,所以左边 = pane 右缘 − 14 − 框宽。不读外壳的探针
+    /// —— 那要等外壳画过一帧,第一次打开的头一帧原点会从中点跳到按钮下。
+    /// 按钮或 pane 位置还没测到时退回水平中点;钳到框内由 [`reveal_rect`] 做。
+    fn reveal_origin(&self, width: f32) -> f32 {
+        match (self.anchor, self.pane_bounds) {
+            (Some(anchor), Some(pane)) => {
+                let center = f32::from(anchor.left()) + f32::from(anchor.size.width) / 2.0;
+                let frame_left = f32::from(pane.right()) - PANE_EDGE - width;
+                center - frame_left
+            }
+            _ => width / 2.0,
+        }
     }
 
     /// 监听线程送来的一批事件(同一 pane)。
@@ -806,7 +851,8 @@ impl SshActivityView {
     /// 1. **外壳**按最终尺寸占位(右上角那一列的布局从头到尾不变;它没有 hitbox,
     ///    框体还没长到的地方鼠标照常落到终端上);
     /// 2. **框体**(底色 / 边框 / 阴影 / 拦鼠标)按 [`reveal_rect`] 插值出的矩形画,
-    ///    `overflow_hidden` 当裁剪窗 —— 从顶边中点长到最终尺寸,收起时反向;
+    ///    `overflow_hidden` 当裁剪窗 —— 从标题栏 SSH 按钮正下方(顶边上)的一点长到最终尺寸,
+    ///    收起时反向收回那一点([`Self::reveal_origin`]);
     /// 3. **内容**按最终尺寸排版,相对框体反向偏移、钉在最终矩形上,只被裁剪窗裁掉:
     ///    文字不重排不缩放,虚拟列表的滚动位置也不受影响。
     ///
@@ -822,6 +868,7 @@ impl SshActivityView {
                 width,
                 height,
             },
+            self.reveal_origin(width),
         );
         let idle_bg = {
             let base = ui::bg_terminal();
@@ -1303,35 +1350,56 @@ mod tests {
     }
 
     #[test]
-    fn 开合矩形从顶边中点展开() {
+    fn 开合矩形从原点展开() {
         let target = FrameRect {
             left: 10.0,
             top: 20.0,
             width: 400.0,
             height: 300.0,
         };
-        // 起点:顶边水平居中处的小框
-        let start = reveal_rect(0.0, target);
-        assert_eq!(start.width, 400.0 * REVEAL_START_W);
-        assert_eq!(start.height, 300.0 * REVEAL_START_H);
-        assert_eq!(start.top, 20.0);
-        assert_eq!(start.left, 10.0 + (400.0 - start.width) / 2.0);
-        // 终点就是终矩形
-        assert_eq!(reveal_rect(1.0, target), target);
-        // 越界进度钳住
-        assert_eq!(reveal_rect(1.7, target), target);
-        assert_eq!(reveal_rect(-0.3, target), start);
-        // 全程:顶边不动、水平中线不动、宽高单调长大
-        let mut prev = start;
-        for step in 1..=20 {
-            let rect = reveal_rect(step as f32 / 20.0, target);
-            assert_eq!(rect.top, target.top, "高度从上往下展开,顶边不动");
-            let center = rect.left + rect.width / 2.0;
-            assert!((center - 210.0).abs() < 1e-3, "宽度从中间向两边展开");
-            assert!(rect.width > prev.width && rect.height > prev.height);
-            assert!(rect.width <= target.width && rect.height <= target.height);
-            prev = rect;
+        let half = 400.0 * REVEAL_START_W / 2.0;
+        // 原点在左侧 / 正中 / 右侧(相对终矩形左边)
+        for origin in [60.0_f32, 200.0, 360.0] {
+            // 起点:以原点为中心的小框,顶边就是终矩形顶边
+            let start = reveal_rect(0.0, target, origin);
+            assert_eq!(start.top, 20.0);
+            assert_eq!(start.height, 300.0 * REVEAL_START_H);
+            assert!((start.width - 2.0 * half).abs() < 1e-3);
+            let center = start.left + start.width / 2.0;
+            assert!(
+                (center - (10.0 + origin)).abs() < 1e-3,
+                "起点小框以原点为中心"
+            );
+            // 终点就是终矩形;越界进度钳住
+            assert_eq!(reveal_rect(1.0, target, origin), target);
+            assert_eq!(reveal_rect(1.7, target, origin), target);
+            assert_eq!(reveal_rect(-0.3, target, origin), start);
+            // 全程:顶边不动,左右两边各自单调走向终矩形的左、右边,宽高单调长大
+            let mut prev = start;
+            for step in 1..=20 {
+                let rect = reveal_rect(step as f32 / 20.0, target, origin);
+                assert_eq!(rect.top, target.top, "高度从上往下展开,顶边不动");
+                assert!(rect.left <= prev.left, "左边只往左走");
+                assert!(
+                    rect.left + rect.width >= prev.left + prev.width,
+                    "右边只往右走"
+                );
+                assert!(rect.width > prev.width && rect.height > prev.height);
+                assert!(rect.width <= target.width && rect.height <= target.height);
+                prev = rect;
+            }
         }
+        // 原点不在中间时两边走的路程不同(不对称):原点偏左,半程时左边离终点更近
+        let mid = reveal_rect(0.5, target, 60.0);
+        let left_gap = mid.left - target.left;
+        let right_gap = (target.left + target.width) - (mid.left + mid.width);
+        assert!(left_gap < right_gap);
+        // 原点落在框外(pane 很窄、按钮跑到框左 / 右边去了):钳到框的左右边
+        let clamped_left = reveal_rect(0.0, target, -80.0);
+        assert!((clamped_left.left + clamped_left.width / 2.0 - 10.0).abs() < 1e-3);
+        let clamped_right = reveal_rect(0.0, target, 900.0);
+        assert!((clamped_right.left + clamped_right.width / 2.0 - 410.0).abs() < 1e-3);
+        assert_eq!(reveal_rect(1.0, target, -80.0), target);
     }
 
     #[test]

@@ -500,11 +500,27 @@ fn ssh_anchor_extra(count: Option<usize>) -> f32 {
 ///
 /// 开合与「点完把键盘焦点还给该 pane 的终端」都在 [`SshActivityView::toggle`] 里;悬浮框本身
 /// 仍画在 pane 内容区右上角(见 `ssh_activity` 模块注释)。
+///
+/// 按钮身上挂一个探针(不画东西、不插 hitbox 的 canvas),把按钮的窗口坐标报给视图 ——
+/// 悬浮框的开合动画以它的水平中心为原点。只有坐标变了、且悬浮框开着或在动画中时才给
+/// **那个视图**要一帧(下一帧直接 notify 它):pane 套着 view 级缓存,标脏 TerminalArea
+/// 重画不到悬浮框,而按钮平时挪位也不该惊动任何人。
 fn ssh_activity_button(
     leaf_id: &str,
     view: Entity<SshActivityView>,
     state: ButtonState,
 ) -> gpui::Stateful<gpui::Div> {
+    let probe_view = view.clone();
+    let probe = canvas(
+        move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+            if probe_view.update(cx, |view, _| view.note_anchor_bounds(bounds)) {
+                window.on_next_frame(move |_, cx| probe_view.update(cx, |_, cx| cx.notify()));
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full();
     let group = SharedString::from(format!("ssh-activity-btn-{leaf_id}"));
     let dot = (state.running || state.failed).then(|| {
         div()
@@ -554,6 +570,7 @@ fn ssh_activity_button(
                 .child(state.count.to_string()),
         )
         .children(dot)
+        .child(probe)
 }
 
 /// tab 栏高度 —— 折叠标题条与它等高(折叠条就是「只剩标题栏的那一格」,
