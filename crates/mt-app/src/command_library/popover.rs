@@ -1,7 +1,8 @@
 //! 命令库浮层本体:搜索框 + 分组列表 + 底部两颗按钮。
 //!
 //! 宿主是 `terminal_area`:它负责「从哪颗按钮弹、遮罩、点外面关、焦点还原」
-//! (与 AI 标记浮层同一套),本实体只画面板、管键盘游标与行内状态。**跨次打开
+//! (与 AI 标记浮层同一套),以及框体(底色 / 边框 / 阴影)与开合动画(`crate::popover_reveal`);
+//! 本实体只画面板内容、管键盘游标与行内状态。**跨次打开
 //! 常驻**(宿主懒建一次、反复 [`CommandPopover::open_for`]),所以分组折叠态
 //! 能在同一次会话里记住;搜索词每次打开清空。
 //!
@@ -713,15 +714,10 @@ impl Render for CommandPopover {
             .w(ui::font_px(PANEL_WIDTH))
             .flex()
             .flex_col()
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(ui::border_subtle())
-            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
-            // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
-            .bg(ui::bg_overlay())
-            .shadow_lg()
-            // 面板内的按下不算「点外」—— 宿主遮罩的 on_mouse_down 靠 hitbox 判定
-            .occlude()
+            // 框体(圆角 / 边框 / `bg_overlay` 底色 / 阴影)与拦鼠标都由宿主画
+            // (`terminal_area::render_command_popover`,开合动画要按插值矩形画它);
+            // 这里只让出边框那 1px,内容位置与框体自带时一致
+            .p(px(1.0))
             .child(
                 div()
                     .px(px(8.0))
