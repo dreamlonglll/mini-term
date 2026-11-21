@@ -45,11 +45,16 @@ use std::time::SystemTime;
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use super::agy::{
-    AgyConversation, AgyStep, AgyStepKind, agy_app_data_dir, agy_transcript_path_in,
-    find_agy_transcript, parse_agy_step, read_agy_conversations,
+    AgyConversation, AgyStep, AgyStepKind, agy_app_data_dir, agy_summaries_db_path_in,
+    agy_transcript_path_in, find_agy_transcript, parse_agy_step, read_agy_conversations,
+    read_agy_conversations_via_snapshot,
 };
-use super::{AiSession, AiSessionMessage, MAX_SESSIONS_PER_SOURCE};
+use super::{AiSession, AiSessionMessage, MAX_SESSIONS_PER_SOURCE, wsl_candidate_homes};
 use crate::agent::AgentKind;
+
+/// WSL 9P 经 `\\wsl$` 逐个探测 transcript 文件的上限(先按索引时间排序再探测,
+/// 避免有数百条已删 transcript 残留在索引里时产生过多 9P 往返)。
+const MAX_WSL_AGY_SESSIONS_TO_PROBE: usize = 160;
 
 const TITLE_MAX_CHARS: usize = 100;
 const UNTITLED: &str = "Untitled";
@@ -107,6 +112,84 @@ pub(super) fn agy_sessions_in(
         .collect()
 }
 
+/// 扫描指定 WSL 发行版 home 下的 agy 会话。
+///
+/// 经本地临时快照读 `conversation_summaries.db`(+ `-wal`),不跨 9P 对 Linux 侧
+/// WAL 数据库加锁;项目归属走 POSIX 语义([`AgyConversation::belongs_to_posix`])。
+pub(super) fn get_wsl_agy_sessions_in(home: &Path, unix_cwd: &str, distro: &str) -> Vec<AiSession> {
+    let app_data_dir = home.join(".gemini").join("antigravity-cli");
+    let db = agy_summaries_db_path_in(&app_data_dir);
+    if !db.is_file() {
+        return Vec::new();
+    }
+    let conversations = match read_agy_conversations_via_snapshot(&db) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("[agy-sessions] 读 WSL({distro}) 会话索引失败: {e}");
+            return Vec::new();
+        }
+    };
+    if conversations.is_empty() {
+        return Vec::new();
+    }
+    wsl_agy_sessions_in(&app_data_dir, &conversations, unix_cwd, distro)
+}
+
+/// [`get_wsl_agy_sessions_in`] 的可测部分:先按索引时间倒序过滤,再探测 transcript 存在性,
+/// 凑够 [`MAX_SESSIONS_PER_SOURCE`] 即停,控制 9P 往返次数。
+pub(super) fn wsl_agy_sessions_in(
+    app_data_dir: &Path,
+    conversations: &[AgyConversation],
+    unix_cwd: &str,
+    distro: &str,
+) -> Vec<AiSession> {
+    let mut candidates: Vec<&AgyConversation> = conversations
+        .iter()
+        .filter(|c| !c.is_subagent() && c.step_count > 0 && c.belongs_to_posix(unix_cwd))
+        .collect();
+    // 先按索引时间倒序排好再逐条探测 transcript(9P 上每次 stat 都是一次跨 VM 往返)
+    candidates.sort_by(|a, b| {
+        let ta = a
+            .updated_at
+            .as_deref()
+            .or(a.last_user_input_at.as_deref())
+            .unwrap_or("");
+        let tb = b
+            .updated_at
+            .as_deref()
+            .or(b.last_user_input_at.as_deref())
+            .unwrap_or("");
+        tb.cmp(ta)
+    });
+
+    let mut rows: Vec<(&AgyConversation, PathBuf, String)> = Vec::new();
+    for c in candidates.into_iter().take(MAX_WSL_AGY_SESSIONS_TO_PROBE) {
+        if rows.len() >= MAX_SESSIONS_PER_SOURCE {
+            break;
+        }
+        let Some(path) = agy_transcript_path_in(app_data_dir, &c.id) else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let timestamp = conversation_time(c, &path);
+        rows.push((c, path, timestamp));
+    }
+    rows.sort_by(|(_, _, a), (_, _, b)| b.cmp(a));
+    rows.into_iter()
+        .map(|(c, path, timestamp)| AiSession {
+            id: c.id.clone(),
+            session_type: AgentKind::Agy.key().to_string(),
+            title: session_title(c, &path),
+            timestamp,
+            model: latest_agy_model(&path),
+            wsl_distro: Some(distro.to_string()),
+            ssh_connection_id: None,
+        })
+        .collect()
+}
+
 /// 列表时间:索引的最后修改时间 → 最后一次用户输入时间 → transcript 的修改时间。
 fn conversation_time(c: &AgyConversation, transcript: &Path) -> String {
     c.updated_at
@@ -123,6 +206,27 @@ fn file_mtime_rfc3339(path: &Path) -> Option<String> {
 
 fn truncate_title(text: &str) -> String {
     text.trim().chars().take(TITLE_MAX_CHARS).collect()
+}
+
+/// 从 transcript 头部文本提取首条用户发言(供本地与 SSH 远程 SFTP 读头部共用)。
+pub fn agy_first_user_text_from_str(head: &str) -> Option<String> {
+    head.lines()
+        .take(TITLE_HEAD_LINES)
+        .filter_map(parse_agy_step)
+        .find_map(|step| step.user_text())
+}
+
+/// 索引标题 → transcript 头部首条用户发言 → `Untitled`(供本地与 SSH 远程共用)。
+pub fn agy_session_title_from_head(c: &AgyConversation, transcript_head: Option<&str>) -> String {
+    let indexed = c.display_title();
+    if !indexed.is_empty() {
+        return truncate_title(indexed);
+    }
+    transcript_head
+        .and_then(agy_first_user_text_from_str)
+        .map(|text| truncate_title(&text))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| UNTITLED.to_string())
 }
 
 /// 索引标题 → transcript 首条用户发言 → `Untitled`。
@@ -218,6 +322,31 @@ pub fn agy_message_from_step(step: &AgyStep) -> Option<AiSessionMessage> {
 pub(super) fn read_agy_session_content(session_id: &str) -> Result<Vec<AiSessionMessage>, String> {
     let path = find_agy_transcript(session_id).ok_or_else(|| "未找到 agy 会话文件".to_string())?;
     read_agy_messages(&path)
+}
+
+/// 读取 WSL 发行版内的 agy 会话正文:逐 candidate home 定位 `brain/<id>/…/transcript_full.jsonl`。
+pub(super) fn read_wsl_agy_session_content(
+    distro: &str,
+    session_id: &str,
+) -> Result<Vec<AiSessionMessage>, String> {
+    let homes = wsl_candidate_homes(distro);
+    read_agy_session_content_in_homes(&homes, session_id)
+}
+
+/// [`read_wsl_agy_session_content`] 的可测核心。
+pub(super) fn read_agy_session_content_in_homes(
+    homes: &[PathBuf],
+    session_id: &str,
+) -> Result<Vec<AiSessionMessage>, String> {
+    for home in homes {
+        let app_data_dir = home.join(".gemini").join("antigravity-cli");
+        if let Some(path) = agy_transcript_path_in(&app_data_dir, session_id)
+            && path.is_file()
+        {
+            return read_agy_messages(&path);
+        }
+    }
+    Err("未找到 agy 会话文件".to_string())
 }
 
 fn read_agy_messages(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
@@ -490,5 +619,73 @@ mod tests {
             Some(new)
         );
         assert_eq!(newest_agy_transcript_in(&root.0, &all, r"D:\none"), None);
+    }
+
+    /// WSL 列表:走 POSIX 归属(含子目录与 `/mnt/*` 大小写)、滤子代理与空会话、
+    /// 标上 `wsl_distro`、标题与模型照常提取。
+    #[test]
+    fn wsl_列表按_posix_匹配并标出来源() {
+        let root = TempRoot::new("wsl-list");
+        let mut exact = conv("wsl-1", "/mnt/d/Git/proj");
+        exact.title = "WSL Exact".into();
+        exact.updated_at = Some("2026-11-19T14:00:00.000Z".into());
+        root.transcript("wsl-1", &[USER, REPLY]);
+
+        // 项目子目录里起的 agy,且索引无标题 → 走 transcript 首条用户发言
+        let mut sub_dir = conv("wsl-2", "/mnt/d/git/proj/crates/mt-ai");
+        sub_dir.updated_at = Some("2026-11-19T15:00:00.000Z".into());
+        root.transcript("wsl-2", &[USER, TOOLS_ONLY]);
+
+        let mut subagent = conv("wsl-sub", "/mnt/d/git/proj");
+        subagent.parent_id = Some("wsl-1".into());
+        root.transcript("wsl-sub", &[SYSTEM, REPLY]);
+
+        let mut other = conv("wsl-other", "/mnt/d/git/proj-2");
+        other.updated_at = Some("2026-11-19T16:00:00.000Z".into());
+        root.transcript("wsl-other", &[USER, REPLY]);
+
+        let all = [exact, sub_dir, subagent, other];
+        let sessions = wsl_agy_sessions_in(&root.0, &all, "/mnt/d/git/proj", "Ubuntu");
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["wsl-2", "wsl-1"]);
+        assert_eq!(sessions[0].wsl_distro.as_deref(), Some("Ubuntu"));
+        assert_eq!(sessions[0].ssh_connection_id, None);
+        assert_eq!(sessions[0].title, "Reply with exactly one word: hello");
+        assert_eq!(sessions[0].model.as_deref(), Some("gemini-3.8-pro"));
+        assert_eq!(sessions[1].title, "WSL Exact");
+        assert_eq!(sessions[1].model.as_deref(), Some("gemini-3.8-flash-high"));
+    }
+
+    /// WSL 多用户 home 正文定位:命中第二个 home 的 transcript;非法 id 拒绝;缺失报错。
+    #[test]
+    fn wsl_多_home_正文读取与_head_标题兜底() {
+        let root = TempRoot::new("wsl-content");
+        let home_a = root.0.join("home-a");
+        let home_b = root.0.join("home-b");
+        fs::create_dir_all(&home_a).unwrap();
+        let app_b = home_b.join(".gemini").join("antigravity-cli");
+        let path = agy_transcript_path_in(&app_b, "conv-wsl").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{USER}\n{REPLY}\n{RESULT}\n")).unwrap();
+
+        let homes = vec![home_a, home_b];
+        let msgs = read_agy_session_content_in_homes(&homes, "conv-wsl").unwrap();
+        assert_eq!(
+            texts(&msgs),
+            [
+                ("user", "Reply with exactly one word: hello"),
+                ("assistant", "hello"),
+            ]
+        );
+        assert!(read_agy_session_content_in_homes(&homes, "missing").is_err());
+        assert!(read_agy_session_content_in_homes(&homes, "../evil").is_err());
+
+        // 供远程复用的 head 标题提取
+        let bare = conv("bare", "/home/u/p");
+        assert_eq!(
+            agy_session_title_from_head(&bare, Some(&format!("{USER}\n{REPLY}\n"))),
+            "Reply with exactly one word: hello"
+        );
+        assert_eq!(agy_session_title_from_head(&bare, None), UNTITLED);
     }
 }

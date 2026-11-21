@@ -3,19 +3,23 @@ use std::time::Instant;
 
 use mt_ai::AgentKind;
 use mt_ai::sessions::{
-    AiSession, AiSessionMessage, CachedSessions, MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
-    claude_message_from_line, claude_session_info_from_lines, codex_message_from_line,
-    codex_meta_from_line, codex_user_title_from_line, encode_project_path, is_encoded_variant,
-    session_cache, session_cache_epoch, session_id_path_safe,
+    AGY_INDEX_SNAPSHOT_MAX_BYTES, AgyConversation, AiSession, AiSessionMessage, CachedSessions,
+    MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS, agy_dialogue_step_from_line,
+    agy_message_from_step, agy_session_title_from_head, claude_message_from_line,
+    claude_session_info_from_lines, codex_message_from_line, codex_meta_from_line,
+    codex_user_title_from_line, encode_project_path, is_encoded_variant,
+    read_agy_conversations_from_snapshot, session_cache, session_cache_epoch, session_id_path_safe,
 };
 use mt_config::SshConnection;
 use mt_core::path_key::posix_ci_eq_key;
-use mt_ssh::SftpHandle;
+use mt_ssh::sftp::SftpBoundedFileRead;
+use mt_ssh::{SftpHandle, SftpNodeKind};
 
 use super::{
-    CLAUDE_TITLE_HEAD_BYTES, CODEX_META_HEAD_BYTES, CONTENT_CHUNK_MAX_BYTES, CWD_PROBE_HEAD_BYTES,
-    REMOTE_CLAUDE_SCAN_LIMIT, REMOTE_CODEX_SCAN_LIMIT, REMOTE_SESSION_CACHE_TTL, RemoteSshState,
-    SESSION_INDEX_MAX_BYTES, join_posix, lock, open_sftp, remote_home, state,
+    AGY_TITLE_HEAD_BYTES, CLAUDE_TITLE_HEAD_BYTES, CODEX_META_HEAD_BYTES, CONTENT_CHUNK_MAX_BYTES,
+    CWD_PROBE_HEAD_BYTES, REMOTE_AGY_SCAN_LIMIT, REMOTE_CLAUDE_SCAN_LIMIT, REMOTE_CODEX_SCAN_LIMIT,
+    REMOTE_SESSION_CACHE_TTL, RemoteSshState, SESSION_INDEX_MAX_BYTES, join_posix, lock, open_sftp,
+    remote_home, state,
 };
 
 /// UNIX 秒 → ISO 8601 UTC 字符串(`YYYY-MM-DDTHH:MM:SSZ`)。
@@ -106,7 +110,7 @@ pub(super) fn parse_codex_thread_names(content: &str) -> HashMap<String, String>
 // 入口 4:远程 AI 会话列表
 // ---------------------------------------------------------------------------
 
-/// 扫描远程机器上该项目的 claude/codex 历史会话。
+/// 扫描远程机器上该项目的 claude/codex/agy 历史会话。
 /// - 会话带 `sshConnectionId` 来源标识(对齐 WSL 会话的 `wslDistro`);
 /// - 结果缓存 10s(key 掺 connection id),`force=true` 绕过(手动刷新);
 /// - 远程不可达 / 目录缺失等一切失败:静默降级返回空列表。
@@ -169,6 +173,7 @@ fn scan_remote_sessions(
             let mut sessions = Vec::new();
             sessions.extend(scan_remote_claude(st, &sftp, &home, &conn.id, project_path).await);
             sessions.extend(scan_remote_codex(st, &sftp, &home, &conn.id, project_path).await);
+            sessions.extend(scan_remote_agy(st, &sftp, &home, &conn.id, project_path).await);
             sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             sessions.truncate(MAX_TOTAL_SESSIONS);
             Ok(sessions)
@@ -435,6 +440,168 @@ async fn scan_remote_codex(
     sessions
 }
 
+/// 远端 agy 会话 transcript 的 POSIX 绝对路径(`~/.gemini/antigravity-cli/brain/<id>/…`)。
+/// `session_id` 过不了白名单返回 `None`。
+pub(super) fn remote_agy_transcript_path(app_data_dir: &str, session_id: &str) -> Option<String> {
+    session_id_path_safe(session_id).then(|| {
+        join_posix(
+            app_data_dir,
+            &format!("brain/{session_id}/.system_generated/logs/transcript_full.jsonl"),
+        )
+    })
+}
+
+/// 从远端索引快照筛出属于本项目的 agy 主会话候选,按索引时间降序排好并截断到 `limit`。
+pub(super) fn select_remote_agy_candidates(
+    conversations: Vec<AgyConversation>,
+    project_path: &str,
+    limit: usize,
+) -> Vec<AgyConversation> {
+    let mut matched: Vec<AgyConversation> = conversations
+        .into_iter()
+        .filter(|c| !c.is_subagent() && c.step_count > 0 && c.belongs_to_posix(project_path))
+        .collect();
+    matched.sort_by(|a, b| {
+        let ta = a
+            .updated_at
+            .as_deref()
+            .or(a.last_user_input_at.as_deref())
+            .unwrap_or("");
+        let tb = b
+            .updated_at
+            .as_deref()
+            .or(b.last_user_input_at.as_deref())
+            .unwrap_or("");
+        tb.cmp(ta)
+    });
+    matched.truncate(limit);
+    matched
+}
+
+/// 解析远程会话一段完整行文本为消息列表(供 [`ai_session_content`] 与离线单测共用)。
+pub(super) fn parse_remote_session_lines(
+    session_type: &str,
+    text: &str,
+) -> Result<Vec<AiSessionMessage>, String> {
+    match AgentKind::parse(session_type) {
+        Some(AgentKind::Claude) => Ok(text.lines().filter_map(claude_message_from_line).collect()),
+        Some(AgentKind::Codex) => Ok(text.lines().filter_map(codex_message_from_line).collect()),
+        Some(AgentKind::Agy) => Ok(text
+            .lines()
+            .filter_map(agy_dialogue_step_from_line)
+            .filter_map(|step| agy_message_from_step(&step))
+            .collect()),
+        _ => Err(format!("不支持的会话类型: {session_type}")),
+    }
+}
+
+/// 扫描远程机器上该项目的 agy 会话。
+///
+/// 先 lstat `conversation_summaries.db`(未装 agy 的服务器 1 次往返直接退出);
+/// 存在则按字节上限拉取主库 + 可选 `-wal` 并在本机临时目录只读解析,再验证候选
+/// transcript 存在性(不跟随 symlink)。一切 IO / 解析错误静默降级返回空列表。
+async fn scan_remote_agy(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    home: &str,
+    conn_id: &str,
+    project_path: &str,
+) -> Vec<AiSession> {
+    let app_data_dir = join_posix(&join_posix(home, ".gemini"), "antigravity-cli");
+    let db_path = join_posix(&app_data_dir, "conversation_summaries.db");
+
+    match sftp.try_node_kind(&db_path).await {
+        Ok(Some(SftpNodeKind::File)) => {}
+        _ => return vec![],
+    }
+
+    let db_bytes = match sftp
+        .read_file_bounded(&db_path, AGY_INDEX_SNAPSHOT_MAX_BYTES)
+        .await
+    {
+        Ok(SftpBoundedFileRead::Complete(bytes)) => bytes,
+        Ok(SftpBoundedFileRead::TooLarge) => {
+            eprintln!(
+                "[remote-ssh] agy index exceeds snapshot limit ({AGY_INDEX_SNAPSHOT_MAX_BYTES} bytes), skipping"
+            );
+            return vec![];
+        }
+        Err(e) => {
+            eprintln!(
+                "[remote-ssh] failed to read agy index (degrading to empty): {}",
+                e.message()
+            );
+            return vec![];
+        }
+    };
+
+    let wal_path = format!("{db_path}-wal");
+    let wal_bytes = match sftp.try_node_kind(&wal_path).await {
+        Ok(Some(SftpNodeKind::File)) => match sftp
+            .read_file_bounded(&wal_path, AGY_INDEX_SNAPSHOT_MAX_BYTES)
+            .await
+        {
+            Ok(SftpBoundedFileRead::Complete(bytes)) => Some(bytes),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let conversations = match read_agy_conversations_from_snapshot(&db_bytes, wal_bytes.as_deref())
+    {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("[remote-ssh] failed to parse agy index (degrading to empty): {e}");
+            return vec![];
+        }
+    };
+
+    let candidates =
+        select_remote_agy_candidates(conversations, project_path, REMOTE_AGY_SCAN_LIMIT);
+    let mut sessions = Vec::new();
+    for conv in candidates {
+        if sessions.len() >= MAX_SESSIONS_PER_SOURCE {
+            break;
+        }
+        let Some(transcript_path) = remote_agy_transcript_path(&app_data_dir, &conv.id) else {
+            continue;
+        };
+        if !matches!(
+            sftp.try_node_kind(&transcript_path).await,
+            Ok(Some(SftpNodeKind::File))
+        ) {
+            continue;
+        }
+        let title = if !conv.display_title().is_empty() {
+            agy_session_title_from_head(&conv, None)
+        } else {
+            let head = sftp
+                .read_head(&transcript_path, AGY_TITLE_HEAD_BYTES)
+                .await
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).into_owned());
+            agy_session_title_from_head(&conv, head.as_deref())
+        };
+        let timestamp = conv
+            .updated_at
+            .clone()
+            .or_else(|| conv.last_user_input_at.clone())
+            .unwrap_or_default();
+        remember_session_path(st, conn_id, &conv.id, &transcript_path);
+        sessions.push(AiSession {
+            id: conv.id,
+            session_type: AgentKind::Agy.key().to_string(),
+            title,
+            timestamp,
+            // 远程文件尾窗反扫要再走一趟 SFTP,不值当;与远程 Claude/Codex 同口径回落 CLI 图标
+            model: None,
+            wsl_distro: None,
+            ssh_connection_id: Some(conn_id.to_string()),
+        });
+    }
+    sessions
+}
+
 // ---------------------------------------------------------------------------
 // 入口 5:远程会话正文(支持增量 offset)
 // ---------------------------------------------------------------------------
@@ -548,15 +715,7 @@ pub fn ai_session_content(
             // 拦腰截断,逐段 from_utf8_lossy 与一次性读全量等价
             let (consumed, complete) = split_complete_lines(&bytes);
             let text = String::from_utf8_lossy(complete);
-            let messages: Vec<AiSessionMessage> = match AgentKind::parse(session_type) {
-                Some(AgentKind::Claude) => {
-                    text.lines().filter_map(claude_message_from_line).collect()
-                }
-                Some(AgentKind::Codex) => {
-                    text.lines().filter_map(codex_message_from_line).collect()
-                }
-                _ => return Err(format!("不支持的会话类型: {session_type}")),
-            };
+            let messages = parse_remote_session_lines(session_type, &text)?;
             Ok(RemoteSessionContent {
                 messages,
                 next_offset: offset + consumed as u64,
@@ -628,6 +787,20 @@ async fn locate_remote_session_file(
                 }
             }
             Err("未找到 Codex 会话文件,请刷新会话列表后重试".into())
+        }
+        Some(AgentKind::Agy) => {
+            let app_data_dir = join_posix(&join_posix(&home, ".gemini"), "antigravity-cli");
+            let path = remote_agy_transcript_path(&app_data_dir, session_id)
+                .ok_or_else(|| "非法会话 id".to_string())?;
+            if matches!(
+                sftp.try_node_kind(&path).await,
+                Ok(Some(SftpNodeKind::File))
+            ) {
+                remember_session_path(st, conn_id, session_id, &path);
+                Ok(path)
+            } else {
+                Err("未找到 agy 会话文件".into())
+            }
         }
         _ => Err(format!("不支持的会话类型: {session_type}")),
     }

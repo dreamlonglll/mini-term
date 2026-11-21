@@ -151,11 +151,14 @@ const REMOTE_SESSION_CACHE_TTL: Duration = Duration::from_secs(10);
 /// 远程扫描上限:SFTP 逐文件网络往返,全量扫描不可接受(对齐 WSL 侧下调值)。
 const REMOTE_CLAUDE_SCAN_LIMIT: usize = 100;
 const REMOTE_CODEX_SCAN_LIMIT: usize = 200;
+const REMOTE_AGY_SCAN_LIMIT: usize = 100;
 /// Claude 会话标题提取:读文件头部的字节上限(首条 user 消息几乎总在最前面,
 /// 但个别文件首行是巨大的 file-history-snapshot,给足余量)。
 const CLAUDE_TITLE_HEAD_BYTES: usize = 256 * 1024;
 /// Codex 会话 meta + 标题提取:session_meta 在第 1 行,64KB 覆盖含长 instructions 的情况。
 const CODEX_META_HEAD_BYTES: usize = 64 * 1024;
+/// agy 会话标题兜底(仅当索引中 title/preview 均为空时):读 transcript 头部的字节上限。
+const AGY_TITLE_HEAD_BYTES: usize = 64 * 1024;
 /// codex session_index.jsonl(thread_name 映射)读取上限。
 const SESSION_INDEX_MAX_BYTES: usize = 1024 * 1024;
 /// 会话正文单次增量读取上限;更多内容由调用方带 next_offset 再次调用。
