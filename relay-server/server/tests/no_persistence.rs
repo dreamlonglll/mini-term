@@ -122,6 +122,8 @@ async fn relay_process_leaves_no_files_behind() {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: "no-persist-key".into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;

@@ -49,6 +49,8 @@ async fn send_hello_with_key(ws: &mut WsClient, version: u32, key: &str) {
     let hello = DesktopToRelay::Hello {
         protocol_version: version,
         desktop_key: key.into(),
+        desktop_id: None,
+        desktop_name: None,
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -81,7 +83,8 @@ async fn handshake_success_returns_ack_then_pairing_state() {
     assert_eq!(
         ack,
         RelayToDesktop::HelloAck {
-            protocol_version: PROTOCOL_VERSION
+            protocol_version: PROTOCOL_VERSION,
+            supports_multi_desktop: true,
         }
     );
     // 握手成功后立即收到当前配对状态(未配对)

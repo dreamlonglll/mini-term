@@ -72,9 +72,9 @@ pub use mirror::{
     MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, agent_has_session_log, history_slice,
 };
 pub use relay::{
-    MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, ResumeSessionPayload,
-    StartSessionPayload, SyncPane, SyncProject, can_start_session, check_launcher_command,
-    relay_url_needs_tls_warning,
+    DesktopIdentity, MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload,
+    ResumeSessionPayload, StartSessionPayload, SyncPane, SyncProject, can_start_session,
+    check_launcher_command, default_desktop_name, relay_url_needs_tls_warning,
 };
 
 /// 发起会话失败的**闭集**原因(协议类型)。

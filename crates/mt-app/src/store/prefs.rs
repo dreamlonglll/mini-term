@@ -672,11 +672,29 @@ impl AppStore {
             .unwrap_or_else(|| MobileRelayConfig {
                 relay_url: String::new(),
                 desktop_key: String::new(),
+                desktop_id: String::new(),
+                desktop_name: String::new(),
                 launchers: Vec::new(),
             })
     }
 
-    /// 写中转地址 + 桌面端密钥,**其余字段(启动器)一个不动**。
+    /// 确保本机已分配稳定的中转 `desktop_id`(32 位十六进制随机串)。
+    /// 旧配置升级后首次启动或首次配置中转时自动补齐并立即落盘,此后重启不变。
+    pub fn ensure_mobile_relay_desktop_id(&mut self, cx: &mut Context<Self>) -> String {
+        let mut relay = self.mobile_relay_for_patch();
+        let existing = relay.desktop_id.trim();
+        if !existing.is_empty() {
+            return existing.to_string();
+        }
+        let id = generate_desktop_id();
+        relay.desktop_id = id.clone();
+        self.config.mobile_relay = Some(relay);
+        self.save_config_now();
+        cx.changed(StoreEvent::Config(ConfigSection::MobileRelay));
+        id
+    }
+
+    /// 写中转地址 + 桌面端密钥 + 设备展示名,**其余字段(启动器 / desktop_id)不动**。
     ///
     /// 立即落盘而不是 500ms 防抖(坑 8):原版是 `await saveConfigToDisk` 之后
     /// 才 `apply`,用户点完「保存并连接」立刻关掉应用,地址不该丢。
@@ -689,10 +707,15 @@ impl AppStore {
         &mut self,
         url: &str,
         key: &str,
+        desktop_name: &str,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         let mut relay = self.mobile_relay_for_patch();
         relay.relay_url = url.to_string();
+        relay.desktop_name = desktop_name.trim().to_string();
+        if !url.trim().is_empty() && relay.desktop_id.trim().is_empty() {
+            relay.desktop_id = generate_desktop_id();
+        }
         let sealed = crate::secrets::stored_relay_key(key, &relay.desktop_key);
         relay.desktop_key = sealed.clone().unwrap_or_default();
         self.config.mobile_relay = Some(relay);
@@ -711,7 +734,7 @@ impl AppStore {
     }
 
     /// 手机端(PWA)链接:配了中转地址才有。`pane_id` 给了就带 `#pane=` 深链,
-    /// 点开直接进那个会话的对话镜像(PWA 侧认法见 `mobile/src/relay.ts`)。
+    /// 同时附带 `?desktop=` 指向本机,点开直接切到这台电脑并进该会话的对话镜像。
     ///
     /// 只看地址不看配对状态:手机还没配对时点开是「去桌面端扫码」那一屏,
     /// 本身就是正确的指引。
@@ -721,8 +744,10 @@ impl AppStore {
             return None;
         }
         Some(match pane_id {
-            Some(pane_id) => crate::mobile_relay::pane_url(&relay.relay_url, pane_id),
-            None => crate::mobile_relay::relay_http_base(&relay.relay_url),
+            Some(pane_id) => {
+                crate::mobile_relay::pane_url(&relay.relay_url, &relay.desktop_id, pane_id)
+            }
+            None => crate::mobile_relay::relay_desktop_url(&relay.relay_url, &relay.desktop_id),
         })
     }
 
@@ -767,4 +792,27 @@ impl AppStore {
         }
         sealed.map(|_| ())
     }
+}
+
+/// 生成本机在中转上的稳定唯一标识(32 位小写十六进制,128 bit 系统随机数)。
+/// 与 `ssh_activity` 同一随机源(`ring::rand::SystemRandom`),不额外拉 uuid 依赖;
+/// 系统随机源极罕见失败时退到纳秒时间戳 + 进程号,绝不 panic。
+fn generate_desktop_id() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    use std::fmt::Write as _;
+
+    let mut bytes = [0u8; 16];
+    if SystemRandom::new().fill(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = u128::from(std::process::id());
+        bytes = (nanos ^ (pid << 96)).to_le_bytes();
+    }
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }

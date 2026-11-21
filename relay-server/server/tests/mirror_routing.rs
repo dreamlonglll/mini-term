@@ -70,6 +70,8 @@ async fn paired_pair(addr: SocketAddr) -> (WsClient, WsClient) {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: DESKTOP_KEY.into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;
@@ -335,7 +337,8 @@ async fn unsubscribe_stops_mirror_flow() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 }
@@ -385,7 +388,8 @@ async fn pane_closed_routed_and_clears_subscription() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 }

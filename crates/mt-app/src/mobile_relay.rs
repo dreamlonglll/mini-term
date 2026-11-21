@@ -50,8 +50,8 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, WeakEnt
 use mt_config::{AiLauncher, AppConfig, ProjectConfig};
 use mt_relay::host::{HookSessionId, RelayEvents, RelayHost, RelayProject};
 use mt_relay::{
-    MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, ResumeSessionPayload,
-    StartSessionFailReason, StartSessionPayload, SyncPane, SyncProject,
+    DesktopIdentity, MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload,
+    ResumeSessionPayload, StartSessionFailReason, StartSessionPayload, SyncPane, SyncProject,
 };
 use mt_terminal::TerminalEmulator;
 use mt_terminal::alacritty_terminal::term::TermMode;
@@ -477,15 +477,48 @@ pub fn relay_http_base(relay_url: &str) -> String {
     format!("https://{trimmed}")
 }
 
-/// 配对链接(`MobileRelayModal.tsx:89`)。
-pub fn pair_url(relay_url: &str, code: &str) -> String {
-    format!("{}/#pair={code}", relay_http_base(relay_url))
+/// 带上目标桌面端标识的移动端网页地址(无 `desktop_id` 时回落根地址)。
+pub fn relay_desktop_url(relay_url: &str, desktop_id: &str) -> String {
+    let base = relay_http_base(relay_url);
+    let desktop_id = desktop_id.trim();
+    if desktop_id.is_empty() {
+        base
+    } else {
+        format!("{base}/?desktop={desktop_id}")
+    }
 }
 
-/// 直达某个会话的深链(远程通知里附的那条):PWA 连上后在快照里找到这个 pane
-/// 就直接进它的对话镜像,找不到(会话已结束)停在列表页。
-pub fn pane_url(relay_url: &str, pane_id: &str) -> String {
-    format!("{}/#pane={pane_id}", relay_http_base(relay_url))
+/// 配对链接:携带 `?desktop=`(供过期配对链接书签精准回退到本机凭证)与 `#pair=`。
+pub fn pair_url(relay_url: &str, desktop_id: &str, code: &str) -> String {
+    let base = relay_http_base(relay_url);
+    let desktop_id = desktop_id.trim();
+    if desktop_id.is_empty() {
+        format!("{base}/#pair={code}")
+    } else {
+        format!("{base}/?desktop={desktop_id}#pair={code}")
+    }
+}
+
+/// 直达某个会话的深链(远程通知里附的那条):PWA 连上后切到对应桌面端,
+/// 在快照里找到这个 pane 就直接进它的对话镜像,找不到(会话已结束)停在列表页。
+pub fn pane_url(relay_url: &str, desktop_id: &str, pane_id: &str) -> String {
+    let base = relay_http_base(relay_url);
+    let desktop_id = desktop_id.trim();
+    if desktop_id.is_empty() {
+        format!("{base}/#pane={pane_id}")
+    } else {
+        format!("{base}/?desktop={desktop_id}#pane={pane_id}")
+    }
+}
+
+/// 生效的桌面端展示名:优先使用用户自定义值,留空则回落系统主机名。
+pub fn effective_desktop_name(configured: &str) -> Option<String> {
+    let trimmed = configured.trim();
+    if !trimmed.is_empty() {
+        return Some(trimmed.to_string());
+    }
+    let fallback = mt_relay::default_desktop_name();
+    (!fallback.is_empty()).then_some(fallback)
 }
 
 /// 二维码画布边长(原版 `QRCode.toDataURL(.., { width: 260 })`)。
@@ -652,7 +685,7 @@ impl RelayBridge {
         self.panel = panel;
     }
 
-    /// 保存中转地址与密钥并重建连接。
+    /// 保存中转地址、密钥与本机展示名并重建连接。
     ///
     /// 顺序与原版 `applyRelaySettings` 一致:**先落盘再 apply**
     /// (`set_mobile_relay_endpoint` 内部走 `save_config_now`)。
@@ -660,12 +693,27 @@ impl RelayBridge {
     /// `key` 是面板里的明文:落盘前在 store 那边封存,建连用的仍是这份明文。
     /// 封存失败时密钥没存下来,但**这一次照样建连**(用户刚填的值就在手上),
     /// 原因经 `Err` 交回面板就地提示。
-    pub fn apply_settings(&self, url: &str, key: &str, cx: &mut App) -> Result<(), String> {
-        let (url, key) = (url.trim().to_string(), key.trim().to_string());
+    pub fn apply_settings(
+        &self,
+        url: &str,
+        key: &str,
+        desktop_name: &str,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        let (url, key, desktop_name) = (
+            url.trim().to_string(),
+            key.trim().to_string(),
+            desktop_name.trim().to_string(),
+        );
         let saved = self.store.update(cx, |store, cx| {
-            store.set_mobile_relay_endpoint(&url, &key, cx)
+            store.set_mobile_relay_endpoint(&url, &key, &desktop_name, cx)
         });
-        self.manager.apply(&url, &key);
+        let desktop_id = self.store.read(cx).mobile_relay().desktop_id;
+        let identity = DesktopIdentity {
+            id: desktop_id,
+            name: effective_desktop_name(&desktop_name),
+        };
+        self.manager.apply(&url, &key, identity);
         saved
     }
 
@@ -689,10 +737,10 @@ impl RelayBridge {
         let Some(panel) = self.panel.as_ref().and_then(|p| p.upgrade()) else {
             return;
         };
-        // 用**配置里已保存**的地址拼配对链接,不是输入框里的草稿值 ——
+        // 用**配置里已保存**的地址与本机标识拼配对链接,不是输入框里的草稿值 ——
         // 草稿还没 apply 的话中转根本不在那个地址上
-        let relay_url = self.store.read(cx).mobile_relay().relay_url;
-        let url = pair_url(&relay_url, &code);
+        let relay = self.store.read(cx).mobile_relay();
+        let url = pair_url(&relay.relay_url, &relay.desktop_id, &code);
         panel.update(cx, |panel, cx| panel.set_pair_link(url, cx));
     }
 
@@ -1130,6 +1178,8 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
     entity.update(cx, |this, cx| this.sync_now(cx));
     let relay = store.read(cx).mobile_relay();
     if !relay.relay_url.trim().is_empty() {
+        // 确保本机有稳定的 desktop_id(旧配置升级后首次启动在此自动生成并落盘)
+        let desktop_id = store.update(cx, |store, cx| store.ensure_mobile_relay_desktop_id(cx));
         // 库里是信封,建连前在这里解开。解不开(换机器 / 密钥文件丢了)就按
         // 「未填密钥」建连:中转回「密钥不正确」后连接循环停在那个状态上,
         // 不重试不刷屏;面板打开时再就地提示重填(`mobile_panel::open`)。
@@ -1137,7 +1187,11 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
             tracing::warn!("[mobile-relay] 已存桌面密钥无法解密,按未填写处理: {err}");
             String::new()
         });
-        manager.apply(&relay.relay_url, &key);
+        let identity = DesktopIdentity {
+            id: desktop_id,
+            name: effective_desktop_name(&relay.desktop_name),
+        };
+        manager.apply(&relay.relay_url, &key, identity);
     }
     entity
 }
@@ -1217,11 +1271,33 @@ mod tests {
 
     #[test]
     fn 中转地址去掉尾部斜杠且忽略首尾空白() {
-        assert_eq!(relay_http_base("  wss://r.example.com///  "), "https://r.example.com");
-        assert_eq!(pair_url("wss://r.example.com/", "AB12"), "https://r.example.com/#pair=AB12");
         assert_eq!(
-            pane_url("ws://192.168.1.5:8080/", "pane-7"),
+            relay_http_base("  wss://r.example.com///  "),
+            "https://r.example.com"
+        );
+        assert_eq!(
+            pair_url("wss://r.example.com/", "", "AB12"),
+            "https://r.example.com/#pair=AB12"
+        );
+        assert_eq!(
+            pair_url("wss://r.example.com/", "desk-1", "AB12"),
+            "https://r.example.com/?desktop=desk-1#pair=AB12"
+        );
+        assert_eq!(
+            pane_url("ws://192.168.1.5:8080/", "", "pane-7"),
             "http://192.168.1.5:8080/#pane=pane-7"
+        );
+        assert_eq!(
+            pane_url("ws://192.168.1.5:8080/", "desk-1", "pane-7"),
+            "http://192.168.1.5:8080/?desktop=desk-1#pane=pane-7"
+        );
+        assert_eq!(
+            relay_desktop_url("wss://r.example.com/", "desk-1"),
+            "https://r.example.com/?desktop=desk-1"
+        );
+        assert_eq!(
+            relay_desktop_url("wss://r.example.com/", ""),
+            "https://r.example.com"
         );
     }
 
@@ -1248,7 +1324,8 @@ mod tests {
 
     #[test]
     fn 配对链接能编成二维码且位矩阵尺寸自洽() {
-        let qr = encode_qr(&pair_url("wss://relay.example.com", "ABCD1234")).expect("能编码");
+        let qr =
+            encode_qr(&pair_url("wss://relay.example.com", "desk-1", "ABCD1234")).expect("能编码");
         assert_eq!(qr.dark.len(), qr.width * qr.width);
         // 定位图案:左上角第一个模块必然是深色
         assert!(qr.dark[0]);

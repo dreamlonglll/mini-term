@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1921;
+pub const ZH_ENTRY_COUNT: usize = 1926;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1921;
+pub const EN_ENTRY_COUNT: usize = 1926;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2213,6 +2213,9 @@ static MARKER_LIST_EN: &[(&str, &str)] = &[
 static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("apply", "保存并连接"),
     ("clear", "断开并清除"),
+    ("desktopNameHint", "同一中转可接入多台桌面端，用于在手机端区分与切换；留空自动使用当前计算机名。"),
+    ("desktopNameLabel", "本机设备名称（可选）"),
+    ("desktopNamePlaceholder", "例如：家里 PC、公司 Mac（留空使用计算机名）"),
     ("intro", "移动端体系：桌面端与自托管中转服务器保持长连，手机经中转查看活跃 AI 会话并发送指令。填写你的中转服务器地址后连接自动建立。"),
     ("keyHint", "中转只接受携带正确密钥的桌面端。请在中转服务器上设置环境变量 MT_RELAY_DESKTOP_KEY，并在此填入同一个值；中转未设置该变量时会拒绝一切桌面端连接。"),
     ("keyLabel", "桌面端接入密钥"),
@@ -2240,7 +2243,7 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("modal.paired", "已配对"),
     ("modal.pairedLabel", "配对状态"),
     ("modal.pairedUnknown", "未知（等待中转同步）"),
-    ("modal.qrHint", "用手机相机或浏览器扫码打开移动端页面，配对自动完成；手机没有扫码功能时，复制上方链接发到手机，用浏览器打开。二维码与链接一次性有效（10 分钟内），新设备配对会顶替旧设备。"),
+    ("modal.qrHint", "用手机相机或浏览器扫码打开移动端页面，配对自动完成；手机没有扫码功能时，复制上方链接发到手机，用浏览器打开。二维码与链接一次性有效（10 分钟内），新设备配对会顶替这台电脑原绑定的手机，不影响同一中转上的其他电脑。"),
     ("modal.qrWaiting", "正在向中转请求配对码…"),
     ("modal.regenerateQr", "重新生成"),
     ("modal.resetConfirm", "重置后当前已配对的移动端立即失效，需要重新扫码。确定重置吗？"),
@@ -2250,8 +2253,10 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("status.connected", "已连接"),
     ("status.connecting", "连接中…"),
     ("status.disconnected", "未连接"),
+    ("status.invalidDesktopId", "本机桌面端标识格式无效，请检查配置后重试"),
     ("status.keyNotConfigured", "中转未配置 MT_RELAY_DESKTOP_KEY，正在拒绝所有桌面端连接，请先在中转服务器上设置该环境变量"),
     ("status.reconnecting", "重连中…"),
+    ("status.roomLimitReached", "中转接入的桌面端数量已达上限（RELAY_MAX_DESKTOPS），请调大上限或清理未使用的桌面端"),
     ("status.versionMismatch", "协议版本不匹配（桌面端 v{actual}，中转要求 v{expected}），请升级 mini-term 或中转服务器"),
     ("statusLabel", "连接状态"),
     ("urlInsecure", "该地址使用未加密的 ws://：桌面端密钥与发往终端的指令会以明文在网络上传输，建议改用 wss://。"),
@@ -2262,6 +2267,9 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
 static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("apply", "Save & connect"),
     ("clear", "Disconnect & clear"),
+    ("desktopNameHint", "A single relay can host multiple desktops. Shown on your phone to tell them apart and switch between them; leave blank to use this computer's hostname."),
+    ("desktopNameLabel", "Desktop name (optional)"),
+    ("desktopNamePlaceholder", "e.g. Home PC, Work Mac (blank uses hostname)"),
     ("intro", "Mobile client system: the desktop keeps a persistent connection to your self-hosted relay server; your phone connects through the relay to watch active AI sessions and send commands. Fill in your relay address to establish the connection."),
     ("keyHint", "The relay only accepts desktops presenting the correct key. Set the MT_RELAY_DESKTOP_KEY environment variable on your relay server and enter the same value here; a relay without that variable rejects every desktop connection."),
     ("keyLabel", "Desktop access key"),
@@ -2289,7 +2297,7 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("modal.paired", "Paired"),
     ("modal.pairedLabel", "Pairing status"),
     ("modal.pairedUnknown", "Unknown (waiting for relay)"),
-    ("modal.qrHint", "Scan with your phone camera or browser to open the mobile page — pairing completes automatically. No scanner on your phone? Copy the link above, send it to your phone and open it in the browser. The QR code and link are single-use (valid for 10 minutes); pairing a new device replaces the old one."),
+    ("modal.qrHint", "Scan with your phone camera or browser to open the mobile page — pairing completes automatically. No scanner on your phone? Copy the link above, send it to your phone and open it in the browser. The QR code and link are single-use (valid for 10 minutes); pairing a new phone replaces only this desktop's previous phone without affecting other desktops on the same relay."),
     ("modal.qrWaiting", "Requesting pairing code from relay…"),
     ("modal.regenerateQr", "Regenerate"),
     ("modal.resetConfirm", "Resetting immediately invalidates the currently paired mobile device; it will need to re-scan. Reset now?"),
@@ -2299,8 +2307,10 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("status.connected", "Connected"),
     ("status.connecting", "Connecting…"),
     ("status.disconnected", "Disconnected"),
+    ("status.invalidDesktopId", "Invalid desktop identifier — check your configuration and try again"),
     ("status.keyNotConfigured", "The relay has no MT_RELAY_DESKTOP_KEY set and is rejecting every desktop connection — set that environment variable on the relay first"),
     ("status.reconnecting", "Reconnecting…"),
+    ("status.roomLimitReached", "The relay has reached its desktop limit (RELAY_MAX_DESKTOPS) — raise the limit or disconnect unused desktops"),
     ("status.versionMismatch", "Protocol version mismatch (desktop v{actual}, relay expects v{expected}) — please upgrade mini-term or the relay server"),
     ("statusLabel", "Connection status"),
     ("urlInsecure", "This address uses unencrypted ws:// — the desktop key and the commands sent to your terminals travel over the network in plain text. Use wss:// instead."),

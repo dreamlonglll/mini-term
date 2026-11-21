@@ -140,6 +140,8 @@ async fn paired_pair(addr: SocketAddr) -> (WsClient, WsClient) {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: DESKTOP_KEY.into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;
@@ -299,7 +301,8 @@ async fn oversized_desktop_message_disconnects_desktop() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 }

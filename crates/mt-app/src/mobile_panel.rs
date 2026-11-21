@@ -72,6 +72,7 @@ pub struct MobilePanel {
     bridge: Entity<RelayBridge>,
     url: Entity<InputState>,
     key: Entity<InputState>,
+    desktop_name: Entity<InputState>,
     /// 位矩阵 + 配对链接原文。**面板一关就随实体销毁** —— 留着的旧码可能已被
     /// 后续操作作废(原版关闭面板会 `setQrDataUrl(null)`)。
     qr: Option<(QrMatrix, String)>,
@@ -90,7 +91,7 @@ pub struct MobilePanel {
     /// 按钮下的一行红字提示(目前只有「密钥加密失败,本次未保存密钥」)。
     /// 下一次保存成功时清掉,不走 toast 的理由同上。
     notice: Option<SharedString>,
-    /// 地址 / 密钥两个输入框的回车订阅。
+    /// 地址 / 密钥 / 设备名三个输入框的回车订阅。
     _subs: Vec<Subscription>,
 }
 
@@ -142,13 +143,16 @@ impl MobilePanel {
     fn apply_now(&mut self, cx: &mut Context<Self>) {
         let url = self.url.read(cx).value().trim().to_string();
         let key = self.key.read(cx).value().to_string();
+        let desktop_name = self.desktop_name.read(cx).value().to_string();
         if url.is_empty() {
             return;
         }
         // 地址变了旧配对二维码即作废
         self.clear_qr();
         let bridge = self.bridge.clone();
-        let saved = bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+        let saved = bridge.update(cx, |bridge, cx| {
+            bridge.apply_settings(&url, &key, &desktop_name, cx)
+        });
         self.note_key_saved(saved);
         cx.notify();
     }
@@ -203,13 +207,24 @@ pub fn open(window: &mut Window, cx: &mut App) {
             .placeholder(t("mobileRelay", "keyPlaceholder"))
             .default_value(key_value)
     });
+    let default_name = mt_relay::default_desktop_name();
+    let name_placeholder = if default_name.is_empty() {
+        t("mobileRelay", "desktopNamePlaceholder").to_string()
+    } else {
+        default_name
+    };
+    let desktop_name = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(name_placeholder)
+            .default_value(relay.desktop_name.clone())
+    });
 
     // 打开即可直接改中转地址(密钥框是 masked,不该抢焦点)。聚焦排在
     // `open_guarded` 之后,判据见 `prompt::autofocus`
     let url_for_focus = url.clone();
 
     let state = cx.new(|cx| {
-        // 两个输入框里按回车 = 点「保存并连接」(原版 `onKeyDown` 那两处)。
+        // 三个输入框里按回车 = 点「保存并连接」(原版 `onKeyDown` 那两处)。
         // `InputState` 在单行模式下无条件 emit `PressEnter`,订阅它比抢键位直白。
         let on_enter = |this: &mut MobilePanel, _, event: &InputEvent, cx: &mut Context<_>| {
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -219,12 +234,14 @@ pub fn open(window: &mut Window, cx: &mut App) {
         let subs = vec![
             cx.subscribe(&url, on_enter),
             cx.subscribe(&key, on_enter),
+            cx.subscribe(&desktop_name, on_enter),
         ];
         MobilePanel {
             store: store.clone(),
             bridge: bridge.clone(),
             url,
             key,
+            desktop_name,
             qr: None,
             qr_requested: false,
             link_copied: false,
@@ -268,15 +285,23 @@ pub fn open(window: &mut Window, cx: &mut App) {
 
 // ─── 动作 ─────────────────────────────────────────────────────
 
-/// 保存中转地址 + 桌面端密钥并重建连接(原版 `applyRelaySettings`)。
-fn apply_settings(state: &Entity<MobilePanel>, url: String, key: String, cx: &mut App) {
+/// 保存中转地址 + 桌面端密钥 + 设备名称并重建连接(原版 `applyRelaySettings`)。
+fn apply_settings(
+    state: &Entity<MobilePanel>,
+    url: String,
+    key: String,
+    desktop_name: String,
+    cx: &mut App,
+) {
     // 地址变了旧配对二维码即作废,一并清掉
     state.update(cx, |panel, cx| {
         panel.clear_qr();
         cx.notify();
     });
     let bridge = state.read(cx).bridge.clone();
-    let saved = bridge.update(cx, |bridge, cx| bridge.apply_settings(&url, &key, cx));
+    let saved = bridge.update(cx, |bridge, cx| {
+        bridge.apply_settings(&url, &key, &desktop_name, cx)
+    });
     state.update(cx, |panel, cx| {
         panel.note_key_saved(saved);
         cx.notify();
@@ -536,15 +561,19 @@ fn render_body(
     body.child(qr_section.child(buttons)).into_any_element()
 }
 
-/// 地址 / 密钥 / 「保存并连接」/「断开并清除」。
+/// 地址 / 密钥 / 本机设备名 / 「保存并连接」/「断开并清除」。
 fn render_endpoint_section(
     state: &Entity<MobilePanel>,
     frame: &Frame,
     cx: &mut App,
 ) -> impl IntoElement {
-    let (url_input, key_input) = {
+    let (url_input, key_input, name_input) = {
         let panel = state.read(cx);
-        (panel.url.clone(), panel.key.clone())
+        (
+            panel.url.clone(),
+            panel.key.clone(),
+            panel.desktop_name.clone(),
+        )
     };
     let can_apply = !frame.url_value.trim().is_empty();
     // 「断开并清除」在地址框与已存地址都空时才灰掉
@@ -589,6 +618,19 @@ fn render_endpoint_section(
                     t("mobileRelay", "keyHint")
                 }),
         )
+        .child(
+            div()
+                .mt(px(12.0))
+                .child(field_label(t("mobileRelay", "desktopNameLabel"))),
+        )
+        .child(Input::new(&name_input))
+        .child(
+            div()
+                .mt(px(4.0))
+                .text_size(ui::font_px(11.0))
+                .text_color(ui::text_muted())
+                .child(t("mobileRelay", "desktopNameHint")),
+        )
         .when_some(frame.notice.clone(), |el, notice| {
             el.child(
                 div()
@@ -624,17 +666,18 @@ fn render_endpoint_section(
                                 if !can_clear {
                                     return;
                                 }
-                                // 清地址但**保留密钥与启动器** —— 它们与「这次是否
+                                // 清地址但**保留密钥、设备名与启动器** —— 它们与「这次是否
                                 // 建连」无关,别让用户重填
-                                let (key, url_input) = {
+                                let (key, desktop_name, url_input) = {
                                     let panel = state.read(cx);
                                     (
                                         panel.key.read(cx).value().to_string(),
+                                        panel.desktop_name.read(cx).value().to_string(),
                                         panel.url.clone(),
                                     )
                                 };
                                 url_input.update(cx, |input, cx| input.set_value("", window, cx));
-                                apply_settings(&state, String::new(), key, cx);
+                                apply_settings(&state, String::new(), key, desktop_name, cx);
                             }
                         }),
                 ),
@@ -984,7 +1027,8 @@ fn render_status_badge(status: Option<&mt_relay::MobileRelayStatusPayload>) -> i
     let color = match raw {
         "connected" => ui::color_success(),
         "connecting" | "reconnecting" => ui::color_ai_working(),
-        "versionMismatch" | "authFailed" | "keyNotConfigured" => ui::color_error(),
+        "versionMismatch" | "authFailed" | "keyNotConfigured" | "invalidDesktopId"
+        | "roomLimitReached" => ui::color_error(),
         // "disconnected" 与认不出的串一样回落淡色
         _ => ui::text_muted(),
     };
@@ -996,6 +1040,8 @@ fn render_status_badge(status: Option<&mt_relay::MobileRelayStatusPayload>) -> i
         "reconnecting" => t("mobileRelay", "status.reconnecting").into(),
         "authFailed" => t("mobileRelay", "status.authFailed").into(),
         "keyNotConfigured" => t("mobileRelay", "status.keyNotConfigured").into(),
+        "invalidDesktopId" => t("mobileRelay", "status.invalidDesktopId").into(),
+        "roomLimitReached" => t("mobileRelay", "status.roomLimitReached").into(),
         "versionMismatch" => tr!(
             "mobileRelay",
             "status.versionMismatch",

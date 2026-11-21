@@ -5,6 +5,7 @@
 //!   拒绝一切桌面端连接——"能跑起来"不等于"配好了"(见 ADR 0002)。
 //! - `RELAY_MAX_CONNECTIONS`(默认 64)/ `RELAY_MAX_CONNECTIONS_PER_IP`(默认 16):
 //!   并发 WebSocket 连接数的全局 / 单客户端上限,超限在升级前回 503 / 429。
+//! - `RELAY_MAX_DESKTOPS`(默认 64):同时活跃/已配对的桌面端房间数上限。
 //! - `RELAY_CLIENT_IP_HEADER`(默认不设 = 用 TCP 对端地址):按 IP 计数时取客户端地址
 //!   的请求头。**反代后面必须配**(Cloudflare 橙云填 `CF-Connecting-IP`),否则所有
 //!   连接的对端都是反代自己;没有反代改写该头时**不要**配(客户端可自报任意值)。
@@ -89,6 +90,7 @@ async fn main() {
             "RELAY_MAX_CONNECTIONS_PER_IP",
             defaults.max_connections_per_ip,
         ),
+        max_desktops: env_count("RELAY_MAX_DESKTOPS", defaults.max_desktops),
         client_ip_header: env_client_ip_header(),
         ..defaults
     };
@@ -117,13 +119,14 @@ async fn main() {
     }
     let limits = state.limits();
     tracing::info!(
-        "[relay] limits: {} connections total, {} per client ({}), outbound queue {} frames",
+        "[relay] limits: {} connections total, {} per client ({}), {} desktops, outbound queue {} frames",
         limits.max_connections,
         limits.max_connections_per_ip,
         limits.client_ip_header.as_ref().map_or_else(
             || "keyed by peer address".to_string(),
             |h| format!("keyed by {h}")
         ),
+        limits.max_desktops,
         limits.outbound_queue
     );
 

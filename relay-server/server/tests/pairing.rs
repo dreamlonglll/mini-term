@@ -70,6 +70,8 @@ async fn paired_desktop(addr: SocketAddr) -> WsClient {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: DESKTOP_KEY.into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;

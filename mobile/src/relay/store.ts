@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { SavedDesktop } from './auth';
 import type {
   CommandFailReason,
   HistoryFailReason,
@@ -93,6 +94,12 @@ export type HomeTab = 'active' | 'history';
 export interface RelayStore {
   phase: Phase;
   rejectReason: MobileRejectReason | null;
+  /** 当前标签页正在连接/查看的桌面端 id;null = 未选中任何桌面端 */
+  currentDesktopId: string | null;
+  /** 当前桌面端展示名(来自中转或本地缓存;null = 未命名) */
+  currentDesktopName: string | null;
+  /** 本机已配对保存的全部桌面端(供顶栏多设备切换器展示) */
+  savedDesktops: SavedDesktop[];
   /** 桌面端在线状态;null = 尚未收到 presence */
   desktopOnline: boolean | null;
   /** 桌面端是否支持历史会话展示与继续对话(旧桌面端为 false) */
@@ -118,6 +125,9 @@ export interface RelayStore {
 export const useRelayStore = create<RelayStore>(() => ({
   phase: 'idle',
   rejectReason: null,
+  currentDesktopId: null,
+  currentDesktopName: null,
+  savedDesktops: [],
   desktopOnline: null,
   supportsHistory: false,
   homeTab: 'active',
@@ -129,6 +139,22 @@ export const useRelayStore = create<RelayStore>(() => ({
   starting: null,
   startError: null,
 }));
+
+/** 切换桌面端或解除绑定时清空上一台电脑的运行态视图数据。 */
+export function resetDesktopSessionState() {
+  useRelayStore.setState({
+    desktopOnline: null,
+    supportsHistory: false,
+    homeTab: 'active',
+    projects: [],
+    launchers: [],
+    mirror: null,
+    historyList: null,
+    historyPreview: null,
+    starting: null,
+    startError: null,
+  });
+}
 
 export function setPhase(phase: Phase, rejectReason: MobileRejectReason | null = null) {
   useRelayStore.setState({ phase, rejectReason });
