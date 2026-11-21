@@ -45,7 +45,6 @@ use gpui::{
     Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription,
     UniformListScrollHandle, Window, div, prelude::FluentBuilder as _, px, uniform_list,
 };
-use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, InputEvent, InputState, TextareaState};
 use mt_project::git::{
     self, BranchNameIssue, GitStatus, SmartCheckoutOutcome, StashApplyOutcome, StashFileInfo,
@@ -55,6 +54,7 @@ use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
+use crate::dialog_host::Dialog;
 use crate::git_diff::{self, CommitFileDiffPane};
 use crate::git_history::{format_absolute_time, format_relative_time};
 use crate::git_ui::{

@@ -74,7 +74,6 @@ use gpui::{
     ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Task,
     Window, div, point, prelude::FluentBuilder, px,
 };
-use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -2179,7 +2178,7 @@ impl Render for WorkbenchArea {
                     let project_id = project_id.clone();
                     window.defer(cx, move |window, cx| {
                         if !area.read(cx).is_terminal_page_for_project(&project_id, cx)
-                            || window.has_active_dialog(cx)
+                            || crate::dialog_host::has_open(window, cx)
                             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay)
                         {
                             return;

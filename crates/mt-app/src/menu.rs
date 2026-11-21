@@ -31,10 +31,20 @@
 //!          └─ anchored(鼠标点).snap_to_window_with_margin(4px)  ← 贴边自动收拢
 //!              └─ 菜单面板(occlude —— 面板内的点击不算「点外」)
 //!                  └─ 子菜单 absolute left:100%(挂在父项里,跟着父项走)
+//!                      └─ deferred(同优先级) ← 逃出根面板开合动画的裁剪窗
 //! ```
 //!
 //! 贴边翻转由 `snap_to_window_with_margin` 白拿(原版是自己算 `placeInViewport`);
 //! **子菜单不翻转** —— 它挂在父项右缘,窗口右边缘外的那点差别留作已知缺口。
+//!
+//! # 开合动画
+//!
+//! 走 [`crate::overlay_motion::reveal_box`](裁剪窗展开,不做透明度):根面板从**光标点**
+//! 那个角长出来(贴边收拢后光标不在角上时,原点钳进面板 —— 原点跟着换角),子面板从父项
+//! 那一侧**横向**展开。收起反向播完才卸:点菜单项时动作立即执行、菜单自己播退场,退场中
+//! 不接鼠标,焦点在退场开始时就还。悬停换了父项时,刚收起的那层子面板也反向收回去。
+//! 子面板挂在父项里却 `deferred` 出去,是因为根面板的裁剪窗会把挂在它右缘外面的子面板
+//! 整块裁掉;同优先级、后登记,照样画在根面板之上。
 //!
 //! # 高度上限与滚动
 //!
@@ -109,6 +119,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Global, Hsla, InteractiveElement,
@@ -117,8 +128,10 @@ use gpui::{
     div, point, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use mt_ui::motion::{MENU_IN, OVERLAY_OUT};
 
 use crate::overlay;
+use crate::overlay_motion::{Presence, RevealOrigin, chrome_style, reveal_box};
 use crate::ui;
 
 /// 菜单层的 `deferred` 优先级。
@@ -132,6 +145,22 @@ use crate::ui;
 /// 菜单是所有覆盖物里最后开、最先关的那层,永远画在最上面没有反例。
 /// `paint_deferred_draws` 按 priority 稳定排序,与嵌套 deferred 的深度预算无关。
 pub const MENU_PRIORITY: usize = 100;
+
+/// 根面板开合的起点小框(宽, 高占终尺寸的比例):贴在光标那个角上的一小块。
+const ROOT_REVEAL_START: (f32, f32) = (0.2, 0.1);
+/// 子面板开合的起点:宽从 0 起、高一开始就是全高 —— 纯横向从父项那一侧飞出来。
+const SUBMENU_REVEAL_START: (f32, f32) = (0.0, 1.0);
+
+/// 菜单面板的框体(底色 / 边框 / 圆角 / 阴影)。由开合动画按插值矩形画,面板本体只留版式。
+fn panel_chrome() -> gpui::Style {
+    chrome_style(|el| {
+        el.rounded(px(6.0))
+            .border_1()
+            .border_color(ui::border_default())
+            .bg(ui::bg_overlay())
+            .shadow_lg()
+    })
+}
 
 /// 菜单项被点中时跑的动作。
 pub type MenuHandler = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -332,16 +361,21 @@ struct OpenMenu {
     /// 打开菜单前的焦点,关闭时还回去。
     prev_focus: Option<FocusHandle>,
     focus: FocusHandle,
-    /// 根面板进场(`menuPopIn`)。
-    pop_in: mt_ui::motion::Transition,
+    /// 根面板开合(进场 `MENU_IN`,退场 `OVERLAY_OUT`;半路掉头不跳变)。
+    reveal: Presence,
     /// **最深那层**刚展开的子面板的进场。原版每建一个 `.ctx-menu` 元素就播一次,
     /// 这里只有一份状态 —— 够用,因为同一时刻只可能有一层是「刚展开的」。
-    submenu_in: mt_ui::motion::Transition,
+    submenu_in: Presence,
+    /// 刚被收起、还在退场的那一层子面板(它的路径 + 退场进度)。悬停换了父项时它反向
+    /// 收回去,同时新的一层照常展开;又悬停回来就从当前进度接着往回长。
+    submenu_out: Option<(Vec<usize>, Presence)>,
 }
 
 #[derive(Default)]
 pub struct ContextMenu {
     open: Option<OpenMenu>,
+    /// 关掉之后还在播退场的那个菜单(不接鼠标、不吃键盘)。新菜单弹出来时直接撤掉。
+    closing: Option<OpenMenu>,
     /// 每个**配了滚动条**的层的滚动句柄(滚动条要拿它算 thumb)。配不配见
     /// [`wants_scrollbar`] —— 右键菜单不配,那些层这里根本不留条目。
     ///
@@ -399,10 +433,14 @@ pub fn show_with(
         };
         // 换菜单时这一步是空操作(已经在栈里),照调不误 —— 压栈是幂等的
         overlay::push(overlay::key(overlay::kind::MENU));
+        // 上一个菜单还在播退场的话直接撤掉:新菜单要清滚动句柄,两份同时画会互相串
+        menu.closing = None;
         // 上一个菜单的滚动位置不带进这一个(见 `scrolls` 的字段注释)
         menu.scrolls.borrow_mut().clear();
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let mut reveal = Presence::hidden(MENU_IN, OVERLAY_OUT);
+        reveal.show(Instant::now());
         menu.open = Some(OpenMenu {
             position,
             options,
@@ -411,9 +449,10 @@ pub fn show_with(
             active: None,
             prev_focus,
             focus,
-            pop_in: mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
-            // 还没有子面板,建成「已跑完」的:第一次真展开时才 restart
-            submenu_in: mt_ui::motion::Transition::settled(mt_ui::motion::MENU_IN),
+            reveal,
+            // 还没有子面板:第一次真展开时才起播
+            submenu_in: Presence::shown(MENU_IN, OVERLAY_OUT),
+            submenu_out: None,
         });
         cx.notify();
     });
@@ -473,6 +512,15 @@ fn panel_open(open_path: &[usize], ancestors: &[usize]) -> bool {
 /// 重播动画(`closeSubmenusFrom` 只 `remove()` 深层的,浅层元素原地不动)。
 fn opens_new_panel(prev: &[usize], next: &[usize]) -> bool {
     !next.is_empty() && !prev.starts_with(next)
+}
+
+/// 展开路径从 `prev` 变成 `next` 时,被收起的**最浅**那一层面板的路径(要播退场);
+/// 没有面板被收起时 `None`。更深的那几层随它一起走,不另播。
+fn collapsed_panel(prev: &[usize], next: &[usize]) -> Option<Vec<usize>> {
+    (1..=prev.len())
+        .map(|depth| &prev[..depth])
+        .find(|panel| !next.starts_with(panel))
+        .map(<[usize]>::to_vec)
 }
 
 /// 该层里**键盘选得中**的条目下标。
@@ -717,13 +765,19 @@ fn render_label(label: &SharedString, detail: Option<&str>) -> gpui::Div {
 }
 
 impl ContextMenu {
+    /// 关菜单:当场摘覆盖物栈、还焦点,菜单本身播退场(不接鼠标、不吃键盘),播完才卸。
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open) = self.open.take() else {
+        let Some(mut open) = self.open.take() else {
             return;
         };
         overlay::pop(overlay::key(overlay::kind::MENU));
-        if let Some(prev) = open.prev_focus {
+        if let Some(prev) = open.prev_focus.take() {
             window.focus(&prev, cx);
+        }
+        let now = Instant::now();
+        open.reveal.hide(now);
+        if open.reveal.mounted_at(now) {
+            self.closing = Some(open);
         }
         cx.notify();
     }
@@ -745,7 +799,7 @@ impl ContextMenu {
         }
     }
 
-    /// 换展开路径。变了才动;有**新面板**出现时顺带重播子面板进场动画。
+    /// 换展开路径。变了才动;有**新面板**出现时顺带播子面板进场,有面板被收起时播它的退场。
     /// 悬停与 →/← 都走这一条,免得两边对「什么时候算新面板」有两套看法。
     fn set_open_path(&mut self, next: Vec<usize>) -> bool {
         let Some(open) = self.open.as_mut() else {
@@ -754,8 +808,29 @@ impl ContextMenu {
         if open.open_path == next {
             return false;
         }
-        if opens_new_panel(&open.open_path, &next) {
-            open.submenu_in.restart();
+        let now = Instant::now();
+        let prev = std::mem::take(&mut open.open_path);
+        if let Some(collapsed) = collapsed_panel(&prev, &next) {
+            // 收起的正是还在进场的最深那层:从当前进度往回收;更浅的那层早就开着,从全开起收
+            let mut exit = if collapsed == prev {
+                open.submenu_in
+            } else {
+                Presence::shown(MENU_IN, OVERLAY_OUT)
+            };
+            exit.hide(now);
+            open.submenu_out = Some((collapsed, exit));
+        }
+        if opens_new_panel(&prev, &next) {
+            // 新展开的若正是刚收起、还在退场的那层:从当前进度接着往回长,不从零起
+            let mut entrance = match open.submenu_out.take() {
+                Some((path, presence)) if path == next => presence,
+                other => {
+                    open.submenu_out = other;
+                    Presence::hidden(MENU_IN, OVERLAY_OUT)
+                }
+            };
+            entrance.show(now);
+            open.submenu_in = entrance;
         }
         open.open_path = next;
         true
@@ -913,54 +988,36 @@ impl ContextMenu {
         }
     }
 
-    /// 根面板。单独一层是为了让 `self` 的不可变借用不跨到 `render` 的其余部分。
+    /// 一层面板(根面板或某个子面板),连同它的开合动画。
     ///
+    /// `interactive = false`:整个菜单在播退场 —— 不挂任何监听,面板上盖拦鼠标的 hitbox。
     /// `window` 一路透传到项级 —— 自绘子菜单面板([`MenuItem::submenu_element`])
     /// 的构造器要它。
-    fn render_root_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        match self.open.as_ref() {
-            Some(open) => self.render_panel(&open.entries, Vec::new(), window, cx),
-            None => div().into_any_element(),
-        }
-    }
-
     fn render_panel(
         &self,
+        menu: &OpenMenu,
         entries: &[MenuEntry],
         ancestors: Vec<usize>,
+        interactive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open_path = self
-            .open
-            .as_ref()
-            .map(|o| o.open_path.clone())
-            .unwrap_or_default();
-        let active = self.open.as_ref().and_then(|o| o.active.clone());
-        // 刚展开的那一层播进场(`menuPopIn`)。判据是「这一层就是最深的展开层」:
-        // 收起时留下的浅层面板并没有重建,不该跟着重播。根面板走 `pop_in`,
-        // 不在这里。
-        let pop_in = (!ancestors.is_empty() && ancestors == open_path)
-            .then(|| self.open.as_ref().map(|o| o.submenu_in.drive(window)))
-            .flatten()
-            .map(mt_ui::motion::menu_pop_in);
+        let open_path = menu.open_path.clone();
+        let active = menu.active.clone();
+        let is_root = ancestors.is_empty();
+        let (progress, live) = panel_motion(menu, &ancestors, interactive, window);
 
         let panel = div()
             .flex()
             .flex_col()
             .min_w(px(160.0))
             .p(px(4.0))
-            .rounded(px(6.0))
+            // 框体(圆角 / 边框色 / 底色 / 阴影)由开合动画按插值矩形画(`panel_chrome`),
+            // 这里只留版式:边框宽度照占位
             .border_1()
-            .border_color(ui::border_default())
-            .bg(ui::bg_overlay())
-            .shadow_lg()
-            .when_some(pop_in, |el, (opacity, dy)| {
-                el.opacity(opacity).mt(px(dy))
-            })
             // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定,
             // occlude 一挡,遮罩就收不到这一下了
-            .occlude();
+            .when(live, |el| el.occlude());
 
         let mut list = div().flex().flex_col();
         for (index, entry) in entries.iter().enumerate() {
@@ -986,11 +1043,12 @@ impl ContextMenu {
                 }
                 MenuEntry::Item(item) => {
                     list = list.child(self.render_item(
+                        menu,
                         item,
                         &ancestors,
                         index,
-                        &open_path,
-                        active.as_deref(),
+                        (&open_path, active.as_deref()),
+                        live,
                         window,
                         cx,
                     ));
@@ -1002,14 +1060,14 @@ impl ContextMenu {
         // 菜单(用量面板的项目 scope、SSH 连接、分支列表)全走这一支。**能滚 ≠ 配
         // 滚动条**,后者另有一道更窄的判据(见 `wants_scrollbar`)。
         let list = if is_scrollable(entries) {
-            let requested = self.open.as_ref().and_then(|o| o.options.max_height);
-            let is_root = ancestors.is_empty();
+            let requested = menu.options.max_height;
             let max_h = effective_max_height(window.viewport_size().height, requested, is_root);
             let list = list.id(panel_id(&ancestors)).max_h(max_h);
             // 滚动条只给下拉式菜单(判据见 `wants_scrollbar`)。右键菜单走这一支,
             // 与加滚动条之前逐字一致 —— 封高 + 滚轮,不套壳、不留边。
             if !wants_scrollbar(requested, is_root) {
-                return panel.child(list.overflow_y_scroll()).into_any_element();
+                let body = panel.child(list.overflow_y_scroll());
+                return reveal_panel(body, progress, is_root, menu.position, live);
             }
             let handle = self.scroll_handle(&ancestors);
             // 真溢出了才画滚动条、才给它让位:`max_offset` 是**上一帧**量的
@@ -1048,17 +1106,20 @@ impl ContextMenu {
             list.into_any_element()
         };
 
-        panel.child(list).into_any_element()
+        reveal_panel(panel.child(list), progress, is_root, menu.position, live)
     }
 
+    /// 一行菜单项。`(open_path, active)` 是这一帧的展开路径与键盘选中项;
+    /// `interactive = false`(整个菜单在退场 / 这层在收起)时不挂任何监听、不画悬停态。
     #[allow(clippy::too_many_arguments)]
     fn render_item(
         &self,
+        menu: &OpenMenu,
         item: &MenuItem,
         ancestors: &[usize],
         index: usize,
-        open_path: &[usize],
-        active: Option<&[usize]>,
+        (open_path, active): (&[usize], Option<&[usize]>),
+        interactive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1096,7 +1157,7 @@ impl ContextMenu {
             .text_color(text_color)
             // 禁用项:原版是 `opacity: .4` + hover 不变色
             .when(disabled, |el| el.opacity(0.4))
-            .when(!disabled, |el| {
+            .when(!disabled && interactive, |el| {
                 el.cursor_pointer().hover(move |el| {
                     if danger {
                         el.bg(with_alpha(ui::color_error(), 0.15))
@@ -1114,19 +1175,21 @@ impl ContextMenu {
                         .text_color(ui::text_primary())
                 }
             })
-            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
-                // 只认「进入」:子菜单是悬停展开的,移开并不收起(与原版一致 ——
-                // 收起发生在悬停同层的别的项、或整个菜单关闭时)
-                if !*hovered {
-                    return;
-                }
-                let next = next_open_path(&hover_ancestors, index, has_submenu);
-                if this.set_open_path(next) {
-                    // 借焦点的面板可能刚被收起(见模块注释「借焦点的面板」)
-                    this.reclaim_focus(window, cx);
-                    cx.notify();
-                }
-            }))
+            .when(interactive, |el| {
+                el.on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                    // 只认「进入」:子菜单是悬停展开的,移开并不收起(与原版一致 ——
+                    // 收起发生在悬停同层的别的项、或整个菜单关闭时)
+                    if !*hovered {
+                        return;
+                    }
+                    let next = next_open_path(&hover_ancestors, index, has_submenu);
+                    if this.set_open_path(next) {
+                        // 借焦点的面板可能刚被收起(见模块注释「借焦点的面板」)
+                        this.reclaim_focus(window, cx);
+                        cx.notify();
+                    }
+                }))
+            })
             .child(render_label(&item.label, item.detail.as_deref()));
 
         if let Some(shortcut) = item.shortcut.clone() {
@@ -1154,60 +1217,146 @@ impl ContextMenu {
         //
         // 外面再套一层不带 position 的 `anchored`:它默认以**自己的布局位置**为锚点,
         // 于是位置照旧、还白拿了贴边收拢 —— 「项目类型」那 15 项的子菜单在靠近
-        // 屏幕下缘的项目行上展开时,不至于有一半掉到窗口外面去。
-        if submenu_open {
-            let mut child_path = ancestors.to_vec();
-            child_path.push(index);
+        // 屏幕下缘的项目行上展开时,不至于有一半掉到窗口外面去。再外面那层 `deferred`
+        // 让它逃出根面板开合动画的裁剪窗(见模块注释「开合动画」)。
+        //
+        // 刚被收起、还在退场的那一层照样画(不接鼠标),播完才撤。
+        let mut child_path = ancestors.to_vec();
+        child_path.push(index);
+        let collapsing = has_submenu
+            && menu.submenu_out.as_ref().is_some_and(|(path, presence)| {
+                *path == child_path && presence.mounted_at(Instant::now())
+            });
+        if submenu_open || collapsing {
             // 自绘面板优先:两者都给时以它为准(见 `submenu_element` 的字段注释)
             let submenu = match item.submenu_element.as_ref() {
-                Some(render) => render(window, cx),
-                None => self.render_panel(&item.submenu, child_path, window, cx),
+                Some(render) => {
+                    let (progress, live) = panel_motion(menu, &child_path, interactive, window);
+                    // 自绘面板自带框体:只裁剪,不另画
+                    reveal_box(render(window, cx), progress)
+                        .origin(RevealOrigin::Fraction(0.0, 0.5))
+                        .start(SUBMENU_REVEAL_START.0, SUBMENU_REVEAL_START.1)
+                        .interactive(live)
+                        .into_any_element()
+                }
+                None => self.render_panel(menu, &item.submenu, child_path, interactive, window, cx),
             };
             row = row.child(
-                div()
-                    .absolute()
-                    .left(relative(1.0))
-                    .top(px(-4.0))
-                    .child(anchored().snap_to_window_with_margin(px(4.0)).child(submenu)),
+                div().absolute().left(relative(1.0)).top(px(-4.0)).child(
+                    // 同优先级、后登记 → 画在根面板之上(`paint_deferred_draws` 稳定排序)
+                    deferred(
+                        anchored()
+                            .snap_to_window_with_margin(px(4.0))
+                            .child(submenu),
+                    )
+                    .with_priority(MENU_PRIORITY),
+                ),
             );
         }
 
-        match (item.is_actionable(), handler) {
-            (true, Some(handler)) => {
-                row = row.on_click(cx.listener(move |this, _event, window, cx| {
-                    cx.stop_propagation();
-                    // 先收菜单(顺带把焦点还回去)再跑动作 —— 动作可能同步开一个
-                    // 输入弹窗并聚焦输入框,反过来的话还原焦点会把光标从那儿抢走
-                    this.dismiss(window, cx);
-                    handler(window, cx);
-                }));
+        if interactive {
+            match (item.is_actionable(), handler) {
+                (true, Some(handler)) => {
+                    row = row.on_click(cx.listener(move |this, _event, window, cx| {
+                        cx.stop_propagation();
+                        // 先收菜单(顺带把焦点还回去)再跑动作 —— 动作可能同步开一个
+                        // 输入弹窗并聚焦输入框,反过来的话还原焦点会把光标从那儿抢走。
+                        // 动作当场执行,菜单自己播退场
+                        this.dismiss(window, cx);
+                        handler(window, cx);
+                    }));
+                }
+                // 子菜单父项 / 禁用项:点自己不触发动作、也不关菜单
+                _ => row = row.on_click(|_event, _window, cx| cx.stop_propagation()),
             }
-            // 子菜单父项 / 禁用项:点自己不触发动作、也不关菜单
-            _ => row = row.on_click(|_event, _window, cx| cx.stop_propagation()),
         }
 
         row.into_any_element()
     }
 }
 
+/// 某一层面板这一帧的开合进度,以及它接不接鼠标。
+///
+/// 根面板走整个菜单的进出场;最深那层子面板走它自己的进场;刚收起的那层走它的退场
+/// (不接鼠标);其余早就开着。整个菜单在退场时(`interactive = false`)一律跟着收。
+/// 只在动画进行中要帧(`Presence::drive`)。
+fn panel_motion(
+    menu: &OpenMenu,
+    path: &[usize],
+    interactive: bool,
+    window: &Window,
+) -> (f32, bool) {
+    let whole = menu.reveal.drive(window);
+    if path.is_empty() {
+        return (whole, interactive);
+    }
+    let collapsing = menu
+        .submenu_out
+        .as_ref()
+        .filter(|(collapsed, _)| collapsed.as_slice() == path)
+        .map(|(_, presence)| *presence);
+    let own = match collapsing {
+        Some(presence) => presence.drive(window),
+        None if path == menu.open_path.as_slice() => menu.submenu_in.drive(window),
+        None => 1.0,
+    };
+    let progress = if interactive { own } else { own.min(whole) };
+    (progress, interactive && collapsing.is_none())
+}
+
+/// 把一层面板包进开合动画:根面板从光标点那个角长出来,子面板从父项那一侧横向展开。
+fn reveal_panel(
+    panel: impl IntoElement,
+    progress: f32,
+    is_root: bool,
+    position: Point<Pixels>,
+    interactive: bool,
+) -> AnyElement {
+    let (origin, (start_w, start_h)) = if is_root {
+        (RevealOrigin::Window(position), ROOT_REVEAL_START)
+    } else {
+        (RevealOrigin::Fraction(0.0, 0.5), SUBMENU_REVEAL_START)
+    };
+    reveal_box(panel, progress)
+        .origin(origin)
+        .start(start_w, start_h)
+        .chrome(panel_chrome())
+        .interactive(interactive)
+        .into_any_element()
+}
+
 impl Render for ContextMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some((position, focus)) = self
-            .open
+        let now = Instant::now();
+        // 退场播完的菜单 / 子面板撤掉
+        if self
+            .closing
             .as_ref()
-            .map(|open| (open.position, open.focus.clone()))
-        else {
+            .is_some_and(|menu| !menu.reveal.mounted_at(now))
+        {
+            self.closing = None;
+        }
+        for menu in [self.open.as_mut(), self.closing.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if menu
+                .submenu_out
+                .as_ref()
+                .is_some_and(|(_, presence)| !presence.mounted_at(now))
+            {
+                menu.submenu_out = None;
+            }
+        }
+        // 开着的那个照常交互;只剩退场中的那个时,遮罩不拦点击、面板不接鼠标、不收键盘
+        let interactive = self.open.is_some();
+        let Some(menu) = self.open.as_ref().or(self.closing.as_ref()) else {
             return div();
         };
-        // 根面板进场(`.ctx-menu { animation: menuPopIn }`)。**浮层豁免面**:
+        let (position, focus) = (menu.position, menu.focus.clone());
+        // 根面板开合(`overlay_motion::reveal_box`)。**浮层豁免面**:
         // 系统开着「减少动画」照播(见 `mt_ui::motion` 的豁免表)。
-        let (pop_opacity, pop_dy) = mt_ui::motion::menu_pop_in(
-            self.open
-                .as_ref()
-                .map(|open| open.pop_in.drive(window))
-                .unwrap_or(1.0),
-        );
-        let panel = self.render_root_panel(window, cx);
+        let panel = self.render_panel(menu, &menu.entries, Vec::new(), interactive, window, cx);
         let size = window.viewport_size();
 
         div().child(
@@ -1219,42 +1368,47 @@ impl Render for ContextMenu {
                         // 点菜单外任意处关闭(原版挂 document 的 click)。
                         // occlude 让这层吃掉点击 —— 否则关菜单那一下会同时点到
                         // 底下的终端/项目行,成了「关菜单顺便切了个项目」
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.dismiss(window, cx);
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.dismiss(window, cx);
-                            }),
-                        )
+                        .when(interactive, |el| {
+                            el.occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.dismiss(window, cx);
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.dismiss(window, cx);
+                                    }),
+                                )
+                        })
                         .child(
                             anchored()
                                 .position(position)
                                 .snap_to_window_with_margin(px(4.0))
                                 .child(
                                     div()
-                                        .track_focus(&focus)
-                                        .key_context("ContextMenu")
-                                        .opacity(pop_opacity)
-                                        .mt(px(pop_dy))
-                                        .on_key_down(cx.listener(
-                                            |this, event: &KeyDownEvent, window, cx| {
-                                                let key = event.keystroke.key.as_str();
-                                                // 焦点被自绘子面板借走时只认 Esc,其余键
-                                                // 是那个输入框的(见模块注释「借焦点的面板」)
-                                                if key != "escape" && !this.owns_focus(window) {
-                                                    return;
-                                                }
-                                                if this.on_key(key, window, cx) {
-                                                    cx.stop_propagation();
-                                                }
-                                            },
-                                        ))
+                                        .when(interactive, |el| {
+                                            el.track_focus(&focus)
+                                                .key_context("ContextMenu")
+                                                .on_key_down(cx.listener(
+                                                    |this, event: &KeyDownEvent, window, cx| {
+                                                        let key = event.keystroke.key.as_str();
+                                                        // 焦点被自绘子面板借走时只认 Esc,其余键
+                                                        // 是那个输入框的(见模块注释「借焦点的
+                                                        // 面板」)
+                                                        if key != "escape"
+                                                            && !this.owns_focus(window)
+                                                        {
+                                                            return;
+                                                        }
+                                                        if this.on_key(key, window, cx) {
+                                                            cx.stop_propagation();
+                                                        }
+                                                    },
+                                                ))
+                                        })
                                         .child(panel),
                                 ),
                         ),
@@ -1399,6 +1553,23 @@ mod tests {
         assert!(!opens_new_panel(&[2, 1], &[2]), "收起最深一层不算");
         assert!(!opens_new_panel(&[2], &[]), "全收起不算");
         assert!(!opens_new_panel(&[2], &[2]), "没变不算");
+    }
+
+    /// 收起时播退场的是被收掉的**最浅**那一层(更深的随它一起走);
+    /// 只是往深里展开 / 没变时没有面板被收起。
+    #[test]
+    fn 收起的最浅一层播退场() {
+        assert_eq!(collapsed_panel(&[2], &[]), Some(vec![2]), "全收起");
+        assert_eq!(collapsed_panel(&[2], &[3]), Some(vec![2]), "换一个父项");
+        assert_eq!(
+            collapsed_panel(&[2, 1], &[2]),
+            Some(vec![2, 1]),
+            "收起最深一层"
+        );
+        assert_eq!(collapsed_panel(&[2, 1], &[3]), Some(vec![2]), "连根换掉");
+        assert_eq!(collapsed_panel(&[2], &[2, 1]), None, "往深里展开");
+        assert_eq!(collapsed_panel(&[], &[2]), None);
+        assert_eq!(collapsed_panel(&[2], &[2]), None);
     }
 
     /// 选中高亮只认「路径完全相同」的那一项。

@@ -29,11 +29,21 @@
 //! `content_mask_stack`),所以这件挂在抽屉式面板里也不会被抽屉裁掉 —— 宿主只要
 //! 在自己的 render 里把它 `child` 出来即可,不必像 `menu.rs` 那样做成全局层。
 //!
+//! # 开合与翻月
+//!
+//! 面板从触发钮**下方**长出来(`overlay_motion::reveal_box`:裁剪窗从钮下沿那一点往下
+//! 展开,不做透明度),收起反向播完才卸。宿主收到关闭事件就 drop 实体,退场没处播 ——
+//! 所以关闭那一刻先还焦点、摘覆盖物栈登记,再把实体交给离场托管层
+//! (`overlay_motion::linger`)画完最后几帧,最后才发事件。翻月按 ‹ › 的方向左右整幅
+//! push(`motion_kit`,`PANEL_SWAP`)。
+//!
 //! # 网格恒 6 行
 //!
 //! 42 格从「当月 1 号所在周的周日」起排,不足的前后补邻月日期。**行数固定**才不会
 //! 出现「翻个月面板高度跳一下」——2 月正好 28 天且 1 号是周日时只要 4 行,不补
 //! 就会缩掉两行高。邻月格照常可点(点了就跳到那个月),与浏览器原生日历同。
+
+use std::time::Instant;
 
 use chrono::{Datelike, NaiveDate};
 use gpui::{
@@ -43,10 +53,13 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
+use mt_ui::motion::{MENU_IN, OVERLAY_OUT, PANEL_SWAP};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
+use crate::motion_kit::{KeyedSwap, PushAxis, push_pair};
 use crate::overlay;
+use crate::overlay_motion::{self, Presence, RevealOrigin, chrome_style, reveal_box};
 use crate::ui;
 
 // ─── 图标(0..1 单位方框,与 `mt_ui::icons::vector` 同约定)────────
@@ -156,6 +169,9 @@ pub enum DatePickerEvent {
 /// 版式常量。
 const CELL: f32 = 30.0;
 const CELL_H: f32 = 26.0;
+/// 浮层锚点比点击位置往左退多少(见 [`trigger_button`]):面板左缘与输入框右段对齐,
+/// 点击点(触发钮)离面板左缘就是这么远 —— 开合动画的原点由它反推。
+const TRIGGER_BACKOFF: f32 = 24.0;
 
 pub struct DatePicker {
     /// 浮层锚点(窗口坐标),一般给触发钮的左下角。
@@ -170,8 +186,15 @@ pub struct DatePicker {
     /// 打开浮层前的焦点,关闭时还回去(顺序纪律同 `menu.rs`:先还焦点再跑动作)。
     prev_focus: Option<FocusHandle>,
     focus: FocusHandle,
-    /// 进场(与右键菜单同一条 `menuPopIn`,浮层豁免「减少动画」)。
-    pop_in: mt_ui::motion::Transition,
+    /// 开合(进场与右键菜单同一档 `MENU_IN`,退场 `OVERLAY_OUT`;浮层豁免「减少动画」)。
+    reveal: Presence,
+    /// 已经关了、正在播退场(不接鼠标、不收键盘,由离场托管层画完)。
+    closing: bool,
+    /// 覆盖物栈里的登记还在不在。关闭那一刻就摘(退场那几帧不再挡全局快捷键,
+    /// 新开的浮层也能马上登记),drop 时只摘自己还没摘的那份。
+    registered: bool,
+    /// 翻月的左右 push(谁在台上 = 显示的那个月)。
+    month_swap: KeyedSwap<NaiveDate>,
 }
 
 impl EventEmitter<DatePickerEvent> for DatePicker {}
@@ -194,6 +217,8 @@ impl DatePicker {
         let prev_focus = window.focused(cx);
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        let mut reveal = Presence::hidden(MENU_IN, OVERLAY_OUT);
+        reveal.show(Instant::now());
         Self {
             anchor,
             month: month_start(selected.unwrap_or(today)),
@@ -203,7 +228,10 @@ impl DatePicker {
             max: None,
             prev_focus,
             focus,
-            pop_in: mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
+            reveal,
+            closing: false,
+            registered: true,
+            month_swap: KeyedSwap::new(PANEL_SWAP),
         }
     }
 
@@ -226,20 +254,49 @@ impl DatePicker {
         }
     }
 
-    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 摘覆盖物栈登记(幂等)。
+    fn unregister(&mut self) {
+        if std::mem::take(&mut self.registered) {
+            overlay::pop(overlay::key(overlay::kind::DATE_PICKER));
+        }
+    }
+
+    /// 关闭的前半段(三条关闭路共用,**发事件之前**调):还焦点、摘登记、播退场,
+    /// 把实体交给离场托管层多活一个退场时长 —— 宿主收到事件就会 drop 自己那份。
+    fn begin_exit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.closing = true;
         self.restore_focus(window, cx);
+        self.unregister();
+        let now = Instant::now();
+        self.reveal.hide(now);
+        if self.reveal.mounted_at(now) {
+            overlay_motion::linger(cx.entity().into(), OVERLAY_OUT.duration, cx);
+        }
+        cx.notify();
+    }
+
+    fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.begin_exit(window, cx);
         cx.emit(DatePickerEvent::Dismissed);
     }
 
     fn pick(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.in_range(date) {
+        if self.closing || !self.in_range(date) {
             return;
         }
-        self.restore_focus(window, cx);
+        // 收起那几帧里高亮的就是刚选的那天
+        self.selected = Some(date);
+        self.begin_exit(window, cx);
         cx.emit(DatePickerEvent::Picked(date));
     }
 
     fn step_month(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
         self.month = shift_month(self.month, delta);
         cx.notify();
     }
@@ -272,28 +329,9 @@ impl DatePicker {
             .into_any_element()
     }
 
-    fn render_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let (opacity, dy) = mt_ui::motion::menu_pop_in(self.pop_in.drive(window));
-        let month = self.month;
-
-        // 星期表头
-        let mut head = div().flex();
-        for label in weekday_labels() {
-            head = head.child(
-                div()
-                    .w(px(CELL))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .py(px(4.0))
-                    .text_size(ui::font_px(10.0))
-                    .text_color(ui::text_muted())
-                    .child(label),
-            );
-        }
-
-        // 6 行日期
-        let mut grid = div().flex().flex_col();
+    /// 某一个月的 6 行日期。外层 id 带上月份:翻月 push 时新旧两份同帧都在,格子 id 不撞。
+    fn render_grid(&self, month: NaiveDate, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let mut grid = div().id(("cal-grid", month_index(month))).flex().flex_col();
         for (row, week) in month_grid(month).chunks(7).enumerate() {
             let mut line = div().flex();
             for (col, date) in week.iter().enumerate() {
@@ -341,28 +379,71 @@ impl DatePicker {
             }
             grid = grid.child(line);
         }
+        grid
+    }
+
+    /// 面板内容(框体由开合动画画,见 [`Render`] 实现)。`interactive = false`:正在退场,
+    /// 不收键盘、不挡点击(面板上另有一块拦鼠标的 hitbox)。
+    fn render_panel(
+        &mut self,
+        interactive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let month = self.month;
+
+        // 星期表头
+        let mut head = div().flex();
+        for label in weekday_labels() {
+            head = head.child(
+                div()
+                    .w(px(CELL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .py(px(4.0))
+                    .text_size(ui::font_px(10.0))
+                    .text_color(ui::text_muted())
+                    .child(label),
+            );
+        }
+
+        // 6 行日期。翻月按 ‹ › 的方向左右整幅 push:往后翻新月从右边进、旧月向左出
+        self.month_swap
+            .observe(&month, |old, new| if new > old { 1.0 } else { -1.0 });
+        let grid = match self.month_swap.frame(window) {
+            Some((old, progress, dir)) => push_pair(
+                self.render_grid(month, cx),
+                Some(self.render_grid(old, cx).into_any_element()),
+                progress,
+                PushAxis::Horizontal,
+                dir,
+            )
+            .into_any_element(),
+            None => self.render_grid(month, cx).into_any_element(),
+        };
 
         div()
-            .track_focus(&self.focus)
-            .key_context("DatePicker")
-            .on_key_down(cx.listener(|this: &mut Self, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key.as_str() == "escape" {
-                    this.dismiss(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
-            .opacity(opacity)
-            .mt(px(dy))
+            .when(interactive, |el| {
+                el.track_focus(&self.focus)
+                    .key_context("DatePicker")
+                    .on_key_down(cx.listener(
+                        |this: &mut Self, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key.as_str() == "escape" {
+                                this.dismiss(window, cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+            })
             .flex()
             .flex_col()
             .p(px(6.0))
-            .rounded(px(6.0))
+            // 框体(圆角 / 边框色 / 底色 / 阴影)由开合动画按插值矩形画,这里只留版式:
+            // 边框宽度照占位
             .border_1()
-            .border_color(ui::border_default())
-            .bg(ui::bg_overlay())
-            .shadow_lg()
             // 面板内的按下不算「点外」(同 `menu.rs`)
-            .occlude()
+            .when(interactive, |el| el.occlude())
             .child(
                 div()
                     .flex()
@@ -392,24 +473,50 @@ impl DatePicker {
                     )),
             )
             .child(head)
-            .child(grid)
+            // 翻页窗:push 的两层是 absolute 全尺寸,父级要给确定尺寸 —— 恰是 6 行 × 7 格的
+            // 自然尺寸,不翻页时版式与不包这一层相同
+            .child(div().w(px(CELL * 7.0)).h(px(CELL_H * 6.0)).child(grid))
             .into_any_element()
     }
 }
 
-/// 实体被 drop(宿主关掉浮层)时摘掉登记 —— 三条关闭路都是「宿主收事件后 drop」,
-/// 把摘栈放在这里就不会漏(放 `dismiss` 里的话,宿主直接丢弃实体那条路会泄漏)。
+/// 网格外层 id 用的月份序号(年 × 12 + 月)。
+fn month_index(month: NaiveDate) -> usize {
+    month.year().max(0) as usize * 12 + month.month0() as usize
+}
+
+/// 实体被 drop(宿主关掉浮层)时摘掉登记 —— 三条关闭路在关闭那一刻已经摘过
+/// ([`DatePicker::begin_exit`]),这里兜的是宿主不经关闭事件、直接丢弃实体那条路。
 impl Drop for DatePicker {
     fn drop(&mut self) {
-        overlay::pop(overlay::key(overlay::kind::DATE_PICKER));
+        self.unregister();
     }
 }
 
 impl Render for DatePicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let progress = self.reveal.drive(window);
+        if self.closing && !self.reveal.mounted_at(Instant::now()) {
+            // 退场播完了,等离场托管层把实体丢掉
+            return div();
+        }
+        let interactive = !self.closing;
         let size = window.viewport_size();
         let anchor = self.anchor;
-        let panel = self.render_panel(window, cx);
+        let panel = self.render_panel(interactive, window, cx);
+        // 从触发钮下沿那一点往下长(点击点在面板左缘右边 `TRIGGER_BACKOFF` 处;贴边收拢后
+        // 原点钳进面板)
+        let origin = point(anchor.x + px(TRIGGER_BACKOFF), anchor.y);
+        let panel = reveal_box(panel, progress)
+            .origin(RevealOrigin::Window(origin))
+            .chrome(chrome_style(|el| {
+                el.rounded(px(6.0))
+                    .border_1()
+                    .border_color(ui::border_default())
+                    .bg(ui::bg_overlay())
+                    .shadow_lg()
+            }))
+            .interactive(interactive);
 
         div().child(
             deferred(
@@ -418,20 +525,27 @@ impl Render for DatePicker {
                         .w(size.width)
                         .h(size.height)
                         // 点浮层外任意处关闭。occlude 让这层吃掉这一下 ——
-                        // 否则关闭那一下会顺手点到底下的东西(同 `menu.rs`)
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this: &mut Self, _: &MouseDownEvent, window, cx| {
-                                this.dismiss(window, cx);
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this: &mut Self, _: &MouseDownEvent, window, cx| {
-                                this.dismiss(window, cx);
-                            }),
-                        )
+                        // 否则关闭那一下会顺手点到底下的东西(同 `menu.rs`)。
+                        // 退场中不拦:点哪儿都直接落到下面
+                        .when(interactive, |el| {
+                            el.occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                                            this.dismiss(window, cx);
+                                        },
+                                    ),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(
+                                        |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                                            this.dismiss(window, cx);
+                                        },
+                                    ),
+                                )
+                        })
                         .child(
                             anchored()
                                 .position(anchor)
@@ -470,7 +584,11 @@ pub fn trigger_button(
         .tip(tip)
         .on_click(move |event: &gpui::ClickEvent, window, cx| {
             let at = event.position();
-            on_open(point(at.x - px(24.0), at.y + px(14.0)), window, cx);
+            on_open(
+                point(at.x - px(TRIGGER_BACKOFF), at.y + px(14.0)),
+                window,
+                cx,
+            );
         })
         .child(VectorIcon::new(ICON_CALENDAR, px(14.0)).ink(ui::text_muted()))
 }
