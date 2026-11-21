@@ -44,8 +44,23 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.append_pane_background_with_cwd(project_id, shell, custom_title, None, window, cx)
+    }
+
+    /// 移动端发起/恢复会话时挂后台 pane,支持显式指定启动目录(Claude 子目录会话
+    /// `--resume` 需要落在原启动目录)。其余语义与 [`Self::append_pane_background`] 一致:
+    /// 不激活、不抢焦点、不切项目。
+    pub fn append_pane_background_with_cwd(
+        &mut self,
+        project_id: &str,
+        shell: ShellConfig,
+        custom_title: Option<String>,
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let mut pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        let mut pane = self.spawn_pane(&project, &shell, cwd, window, cx)?;
         pane.custom_title = custom_title;
         let pane_id = pane.id.clone();
         let pty_id = pane.pty_id;

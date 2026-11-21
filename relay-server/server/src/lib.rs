@@ -29,8 +29,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Extension, Router};
 use mt_relay_protocol::{
-    CommandFailReason, DesktopRejectReason, DesktopToRelay, MobileRejectReason, MobileToRelay,
-    RelayToDesktop, RelayToMobile, StartSessionFailReason, PROTOCOL_VERSION,
+    CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason, MobileRejectReason,
+    MobileToRelay, RelayToDesktop, RelayToMobile, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
@@ -583,12 +583,14 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
         DesktopToRelay::SessionsSnapshot {
             projects,
             launchers,
+            supports_history,
         } => {
             let inner = state.inner.lock().unwrap();
             if let Some(mobile) = inner.mobile.as_ref() {
                 mobile.send(to_text(&RelayToMobile::SessionsSnapshot {
                     projects,
                     launchers,
+                    supports_history,
                 }));
             }
         }
@@ -671,7 +673,7 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
                 }));
             }
         }
-        // 发起会话回执:原样转发(以 request_id 关联)
+        // 发起/恢复会话回执:原样转发(以 request_id 关联)
         DesktopToRelay::StartSessionReceipt {
             request_id,
             ok,
@@ -684,6 +686,47 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
                     request_id,
                     ok,
                     pane_id,
+                    reason,
+                }));
+            }
+        }
+        // 历史会话列表与正文响应:原样转发给在线移动端,中转不落盘不缓存
+        DesktopToRelay::SessionHistory {
+            request_id,
+            project_id,
+            ok,
+            sessions,
+            reason,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                mobile.send(to_text(&RelayToMobile::SessionHistory {
+                    request_id,
+                    project_id,
+                    ok,
+                    sessions,
+                    reason,
+                }));
+            }
+        }
+        DesktopToRelay::SessionContent {
+            request_id,
+            project_id,
+            session_id,
+            ok,
+            messages,
+            has_more,
+            reason,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                mobile.send(to_text(&RelayToMobile::SessionContent {
+                    request_id,
+                    project_id,
+                    session_id,
+                    ok,
+                    messages,
+                    has_more,
                     reason,
                 }));
             }
@@ -1016,21 +1059,101 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                     launcher_id,
                 })
             } else {
-                eprintln!("[relay] start ai session rejected: desktop offline");
+                reject_start_offline(&inner, "start ai session", request_id);
+                None
+            }
+        }
+        // 拉取历史会话列表:离线即拒,不让移动端空等超时
+        MobileToRelay::RequestSessionHistory {
+            request_id,
+            project_id,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::RequestSessionHistory {
+                    request_id,
+                    project_id,
+                })
+            } else {
+                eprintln!("[relay] request session history rejected: desktop offline");
                 if let Some(mobile) = inner.mobile.as_ref() {
-                    mobile.send(to_text(&RelayToMobile::StartSessionReceipt {
+                    mobile.send(to_text(&RelayToMobile::SessionHistory {
                         request_id,
+                        project_id,
                         ok: false,
-                        pane_id: None,
-                        reason: Some(StartSessionFailReason::DesktopOffline),
+                        sessions: Vec::new(),
+                        reason: Some(HistoryFailReason::DesktopOffline),
                     }));
                 }
+                None
+            }
+        }
+        // 拉取单条历史会话正文:离线即拒
+        MobileToRelay::RequestSessionContent {
+            request_id,
+            project_id,
+            agent,
+            session_id,
+            before_seq,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::RequestSessionContent {
+                    request_id,
+                    project_id,
+                    agent,
+                    session_id,
+                    before_seq,
+                })
+            } else {
+                eprintln!("[relay] request session content rejected: desktop offline");
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    mobile.send(to_text(&RelayToMobile::SessionContent {
+                        request_id,
+                        project_id,
+                        session_id,
+                        ok: false,
+                        messages: Vec::new(),
+                        has_more: false,
+                        reason: Some(HistoryFailReason::DesktopOffline),
+                    }));
+                }
+                None
+            }
+        }
+        // 基于历史会话继续对话:与发起新会话同一回执通道,离线即拒
+        MobileToRelay::ResumeAiSession {
+            request_id,
+            project_id,
+            agent,
+            session_id,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::ResumeAiSession {
+                    request_id,
+                    project_id,
+                    agent,
+                    session_id,
+                })
+            } else {
+                reject_start_offline(&inner, "resume ai session", request_id);
                 None
             }
         }
     };
     if let (Some(msg), Some(desktop)) = (forward, inner.desktop.as_ref()) {
         desktop.send(to_text(&msg));
+    }
+}
+
+/// 发起/恢复会话在桌面端离线时的路由层拒绝:复用 StartSessionReceipt 通道。
+fn reject_start_offline(inner: &Inner, what: &str, request_id: String) {
+    eprintln!("[relay] {what} rejected: desktop offline");
+    if let Some(mobile) = inner.mobile.as_ref() {
+        mobile.send(to_text(&RelayToMobile::StartSessionReceipt {
+            request_id,
+            ok: false,
+            pane_id: None,
+            reason: Some(StartSessionFailReason::DesktopOffline),
+        }));
     }
 }
 

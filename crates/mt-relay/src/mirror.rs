@@ -150,6 +150,26 @@ impl MirrorParser {
         out
     }
 
+    /// 读到静态历史文件末尾时收尾:冲出不以 `\n` 结尾的残行与 grok 分片缓冲区里的最后一条。
+    /// 实时增量镜像不调它(实时流里末尾半行 / 未收尾分片还要等下一批字节)。
+    pub fn finish(&mut self) -> Vec<MirrorMessage> {
+        let mut out = Vec::new();
+        if !self.partial.is_empty() {
+            let tail = std::mem::take(&mut self.partial);
+            self.scanned = 0;
+            let line = String::from_utf8_lossy(&tail);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.is_empty() {
+                self.parse_line(line, &mut out);
+            }
+        }
+        if let Some(raw) = self.grok.as_mut().and_then(ai_sessions::GrokUpdateParser::flush) {
+            let msg = self.next_text_message(raw);
+            out.push(msg);
+        }
+        out
+    }
+
     fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
         match self.agent {
             // 一行可产出多条（说明文字 + 工具活动 + 提问卡片 / 作答标记）。
@@ -857,10 +877,10 @@ pub fn resolve_session_file(
     best.map(|(path, _, agent)| (path, agent))
 }
 
-/// session_id 应为 UUID 形态;拒绝任何可构成路径穿越的字符——hook 端口对
-/// 本机所有进程开放,上报的 session_id 不可未经校验直接拼文件路径。
+/// session_id 白名单;拒绝任何可构成路径穿越或参数注入的字符——hook 端口与
+/// 移动端输入都不可未经校验直接拼文件路径。口径与 `mt_ai::agent::session_id_ok` 对齐。
 fn valid_session_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    mt_ai::agent::session_id_ok(id)
 }
 
 /// 在给定目录列表中定位 `<session_id>.jsonl`(Claude 会话文件名即 session id)。
@@ -931,6 +951,55 @@ pub fn resolve_session_file_by_id(
             ai_sessions::find_agy_transcript(session_id).map(|p| (p, MirrorAgent::Agy))
         }
     }
+}
+
+/// 读取并解析一条本机历史会话的完整镜像消息序列(供移动端只读预览与分页)。
+///
+/// - **pi / OMP**：走 `mt_ai::sessions::get_ai_session_content`，按 `parentId` /
+///   `activeLeafId` 重放当前活动对话分支(避免把历史选枝里的非活动分支或后台记录混入)；
+/// - **Claude / Codex / Grok / agy**：优先复用 [`resolve_session_file_by_id`] +
+///   [`parse_whole_file`] + [`MirrorParser::finish`]，保留工具活动折叠行与提问记录，
+///   找不到或读失败时再回落 `get_ai_session_content`。
+pub fn parse_session_history_messages(
+    project_path: &str,
+    agent: &str,
+    session_id: &str,
+) -> Result<Vec<MirrorMessage>, String> {
+    if !valid_session_id(session_id) {
+        return Err("invalid session id".into());
+    }
+    let kind = AgentKind::parse(agent).ok_or_else(|| format!("unsupported agent: {agent}"))?;
+    if !matches!(kind, AgentKind::Pi | AgentKind::Omp)
+        && let Some((path, mirror_agent)) =
+            resolve_session_file_by_id(project_path, Some(kind.key()), session_id)
+    {
+        let mut parser = MirrorParser::new(mirror_agent, project_path);
+        if let Some((mut msgs, _)) = parse_whole_file(&path, &mut parser) {
+            msgs.extend(parser.finish());
+            return Ok(msgs);
+        }
+    }
+    let raw = ai_sessions::get_ai_session_content(
+        kind.key().to_string(),
+        session_id.to_string(),
+        project_path.to_string(),
+        None,
+    )?;
+    Ok(raw
+        .into_iter()
+        .enumerate()
+        .map(|(seq, m)| MirrorMessage {
+            seq: seq as u64,
+            source: if m.role == "user" {
+                "desktop".into()
+            } else {
+                "assistant".into()
+            },
+            content: m.content,
+            timestamp: m.timestamp,
+            ..Default::default()
+        })
+        .collect())
 }
 
 /// 换绑时整份解析每次读多少字节。
@@ -1126,6 +1195,26 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].content, "split me");
         assert_eq!(out[0].seq, 0);
+    }
+
+    /// 静态历史文件末尾没有 `\n` 或 grok 最后一条未跟边界行时,`finish()` 必须冲出。
+    #[test]
+    fn parser_finish_flushes_trailing_grok_and_partial_line() {
+        let mut grok = MirrorParser::new(MirrorAgent::Grok, PROJECT);
+        let tail = r#"{"timestamp":10,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"final answer"}}}}"#;
+        assert!(grok.feed(tail.as_bytes()).is_empty());
+        let flushed = grok.finish();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].source, "assistant");
+        assert_eq!(flushed[0].content, "final answer");
+        assert_eq!(flushed[0].seq, 0);
+
+        let mut claude = MirrorParser::new(MirrorAgent::Claude, PROJECT);
+        let no_nl = claude_line("user", "last without newline", "2026-11-21T08:00:00Z");
+        assert!(claude.feed(no_nl.as_bytes()).is_empty());
+        let flushed = claude.finish();
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].content, "last without newline");
     }
 
     #[test]

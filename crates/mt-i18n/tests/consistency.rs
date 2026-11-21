@@ -280,7 +280,7 @@ use mt_i18n::{
 /// （复制命令 / 复制输出 / 已复制 / 上传与下载两行 / cwd / 超时上限）与结尾状态行
 /// （运行中 / 退出码 / 已结束 / 超时 / 连接阶段超时 / 错误 / 已中断 / 传输完成 / 截断说明）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1920;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1921;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

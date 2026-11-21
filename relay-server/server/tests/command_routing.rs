@@ -5,8 +5,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use mt_relay_protocol::{
-    CommandFailReason, DesktopToRelay, MobileToRelay, RelayToDesktop, RelayToMobile,
-    StartSessionFailReason, PROTOCOL_VERSION,
+    CommandFailReason, DesktopToRelay, HistoryFailReason, MirrorMessage, MobileHistorySession,
+    MobileToRelay, RelayToDesktop, RelayToMobile, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use mt_relay_server::{app, RelayState};
 use std::future::IntoFuture;
@@ -423,6 +423,228 @@ async fn desktop_offline_rejects_start_ai_session_at_router() {
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::StartSessionReceipt {
             request_id: "req-9".into(),
+            ok: false,
+            pane_id: None,
+            reason: Some(StartSessionFailReason::DesktopOffline),
+        })
+    );
+}
+
+#[tokio::test]
+async fn history_and_resume_route_both_ways_and_reject_offline() {
+    let addr = spawn_relay().await;
+    let mut desktop = desktop_handshake(addr).await;
+    let mut mobile = paired_mobile(addr, &mut desktop).await;
+
+    // 1. 拉取历史列表往返
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestSessionHistory {
+            request_id: "hist-1".into(),
+            project_id: "p1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::RequestSessionHistory {
+            request_id: "hist-1".into(),
+            project_id: "p1".into(),
+        })
+    );
+    let item = MobileHistorySession {
+        session_id: "s1".into(),
+        agent: "claude".into(),
+        agent_label: "Claude Code".into(),
+        title: "修复登录".into(),
+        timestamp: "2026-11-21T08:00:00Z".into(),
+        can_resume: true,
+        live_pane_id: None,
+    };
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::SessionHistory {
+            request_id: "hist-1".into(),
+            project_id: "p1".into(),
+            ok: true,
+            sessions: vec![item.clone()],
+            reason: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::SessionHistory {
+            request_id: "hist-1".into(),
+            project_id: "p1".into(),
+            ok: true,
+            sessions: vec![item],
+            reason: None,
+        })
+    );
+
+    // 2. 拉取历史正文往返
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestSessionContent {
+            request_id: "cnt-1".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+            before_seq: Some(40),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::RequestSessionContent {
+            request_id: "cnt-1".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+            before_seq: Some(40),
+        })
+    );
+    let msg = MirrorMessage {
+        seq: 0,
+        source: "desktop".into(),
+        content: "hello".into(),
+        timestamp: "2026-11-21T08:00:00Z".into(),
+        ..Default::default()
+    };
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::SessionContent {
+            request_id: "cnt-1".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            ok: true,
+            messages: vec![msg.clone()],
+            has_more: true,
+            reason: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::SessionContent {
+            request_id: "cnt-1".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            ok: true,
+            messages: vec![msg],
+            has_more: true,
+            reason: None,
+        })
+    );
+
+    // 3. 恢复历史会话往返(回执复用 StartSessionReceipt)
+    send_json(
+        &mut mobile,
+        &MobileToRelay::ResumeAiSession {
+            request_id: "res-1".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::ResumeAiSession {
+            request_id: "res-1".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+        })
+    );
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::StartSessionReceipt {
+            request_id: "res-1".into(),
+            ok: true,
+            pane_id: Some("pane-8".into()),
+            reason: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::StartSessionReceipt {
+            request_id: "res-1".into(),
+            ok: true,
+            pane_id: Some("pane-8".into()),
+            reason: None,
+        })
+    );
+
+    // 4. 桌面端离线后三条请求均在路由层即拒
+    desktop.close(None).await.unwrap();
+    drop(desktop);
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::Presence {
+            desktop_online: false
+        })
+    );
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestSessionHistory {
+            request_id: "hist-off".into(),
+            project_id: "p1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::SessionHistory {
+            request_id: "hist-off".into(),
+            project_id: "p1".into(),
+            ok: false,
+            sessions: vec![],
+            reason: Some(HistoryFailReason::DesktopOffline),
+        })
+    );
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestSessionContent {
+            request_id: "cnt-off".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+            before_seq: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::SessionContent {
+            request_id: "cnt-off".into(),
+            project_id: "p1".into(),
+            session_id: "s1".into(),
+            ok: false,
+            messages: vec![],
+            has_more: false,
+            reason: Some(HistoryFailReason::DesktopOffline),
+        })
+    );
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::ResumeAiSession {
+            request_id: "res-off".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::StartSessionReceipt {
+            request_id: "res-off".into(),
             ok: false,
             pane_id: None,
             reason: Some(StartSessionFailReason::DesktopOffline),

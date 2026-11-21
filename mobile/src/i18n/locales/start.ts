@@ -20,6 +20,8 @@ export const start = {
       launcherNotFound: "该启动器已被删除",
       notSupported: "该项目不支持远程新建会话",
       spawnFailed: "桌面端创建终端失败",
+      sessionNotFound: "该历史会话已不存在",
+      resumeUnsupported: "该 Agent 暂不支持从移动端恢复对话",
     },
   },
   en: {
@@ -43,6 +45,8 @@ export const start = {
       launcherNotFound: "That launcher has been deleted",
       notSupported: "This project can't start sessions remotely",
       spawnFailed: "The desktop failed to create a terminal",
+      sessionNotFound: "That historical session no longer exists",
+      resumeUnsupported: "Resuming this agent session is not supported",
     },
   },
 } as const;

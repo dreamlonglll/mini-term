@@ -50,8 +50,8 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, WeakEnt
 use mt_config::{AiLauncher, AppConfig, ProjectConfig};
 use mt_relay::host::{HookSessionId, RelayEvents, RelayHost, RelayProject};
 use mt_relay::{
-    MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, StartSessionFailReason,
-    StartSessionPayload, SyncPane, SyncProject,
+    MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, ResumeSessionPayload,
+    StartSessionFailReason, StartSessionPayload, SyncPane, SyncProject,
 };
 use mt_terminal::TerminalEmulator;
 use mt_terminal::alacritty_terminal::term::TermMode;
@@ -60,7 +60,7 @@ use parking_lot::Mutex;
 use crate::ai::AiBridge;
 use crate::i18n::tr;
 use crate::store::{AppStore, StoreEvent};
-use crate::tree::PaneStatus;
+use crate::tree::{AiSessionRef, PaneStatus};
 
 /// 结构同步的去抖(原版 `mobileSessionSync.ts:101` 的 150ms)。
 ///
@@ -85,6 +85,8 @@ pub enum RelaySignal {
     RenamePane(RenamePanePayload),
     /// 移动端发起新 AI 会话(原 `mobile-start-session`),校验已通过。
     StartSession(StartSessionPayload),
+    /// 移动端恢复历史会话:校验与 cwd 反查已通过。
+    ResumeSession(ResumeSessionPayload),
     /// 移动端指令的写穿请求(`RelayHost::write_pty` 的主线程落点)。
     WritePty { pty_id: u32, data: String },
 }
@@ -103,6 +105,12 @@ struct HostMirror {
     /// 活 PTY 的终端模拟器句柄:`bracketed_paste` 拿它**现读** VT 模式位,
     /// 不吃快照的陈旧度(agent 启动那一刻才开 bracketed paste)
     emulators: HashMap<u32, Arc<TerminalEmulator>>,
+    /// 活跃 AI pane 的 `session_id → pane_id`(仅 `{AiWorking, AiIdle}` 且有活 PTY):
+    /// 历史会话列表标「运行中」用
+    live_sessions: HashMap<String, String>,
+    /// 活跃 AI pane 的 `pty_id → ai_session`(回落身份):无 hook 或 Codex resume
+    /// 不重报 SessionStart 时,镜像定位仍能精确绑到目标会话文件
+    pane_sessions: HashMap<u32, HookSessionId>,
 }
 
 /// 该 PTY 的终端此刻开没开 bracketed paste —— 与桌面端粘贴(`paste_to_bytes`)
@@ -111,6 +119,35 @@ struct HostMirror {
 fn bracketed_paste_of(mirror: &Mutex<HostMirror>, pty_id: u32) -> bool {
     let emulator = mirror.lock().emulators.get(&pty_id).cloned();
     emulator.is_some_and(|e| e.mode().contains(TermMode::BRACKETED_PASTE))
+}
+
+/// 从项目的全部 pane 中提取活跃 AI 会话身份映射:
+/// - `live_sessions`: `session_id → pane_id`(历史列表标「运行中」)
+/// - `pane_sessions`: `pty_id → HookSessionId`(无 hook 或 Codex resume 时的镜像精确绑定回落)
+///
+/// 只收「`pty_id` 存在且状态在 `{AiWorking, AiIdle}`」的 pane:AI 退出落回 `Idle`
+/// (身份仅为重启续接保留)或 PTY 死掉落 `Error` 时,必须立即撤出两张表。
+fn collect_active_sessions<'a>(
+    panes: impl IntoIterator<Item = &'a crate::tree::PaneState>,
+    live_sessions: &mut HashMap<String, String>,
+    pane_sessions: &mut HashMap<u32, HookSessionId>,
+) {
+    for pane in panes {
+        if let (Some(pty_id), Some(session)) = (pane.pty_id, pane.ai_session.as_ref())
+            && matches!(pane.status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+        {
+            live_sessions
+                .entry(session.session_id.clone())
+                .or_insert_with(|| pane.id.clone());
+            pane_sessions.insert(
+                pty_id,
+                HookSessionId {
+                    agent: session.agent.clone(),
+                    session_id: session.session_id.clone(),
+                },
+            );
+        }
+    }
 }
 
 /// `mt_config::AiLauncher` → `mt_relay::AiLauncher`。
@@ -199,6 +236,14 @@ impl RelayHost for HostImpl {
     fn ai_session_started_at(&self, pty_id: u32) -> Option<SystemTime> {
         self.ai.perception().tracker().ai_session_started_at(pty_id)
     }
+
+    fn pane_session(&self, pty_id: u32) -> Option<HookSessionId> {
+        self.mirror.lock().pane_sessions.get(&pty_id).cloned()
+    }
+
+    fn live_session_pane(&self, session_id: &str) -> Option<String> {
+        self.mirror.lock().live_sessions.get(session_id).cloned()
+    }
 }
 
 struct EventsImpl {
@@ -217,6 +262,9 @@ impl RelayEvents for EventsImpl {
     }
     fn start_session(&self, payload: StartSessionPayload) {
         let _ = self.tx.unbounded_send(RelaySignal::StartSession(payload));
+    }
+    fn resume_session(&self, payload: ResumeSessionPayload) {
+        let _ = self.tx.unbounded_send(RelaySignal::ResumeSession(payload));
     }
 }
 
@@ -778,6 +826,128 @@ impl RelayBridge {
         Ok((pane_id, spawned))
     }
 
+    /// 移动端基于历史会话继续对话:已在活跃 pane 运行则直接回执复用该 pane;
+    /// 否则在后台建 tab、当场写回会话身份、写入本地模板生成的 resume 命令并等 PTY 定局。
+    fn resume_session(
+        &mut self,
+        payload: ResumeSessionPayload,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let request_id = payload.request_id.clone();
+        // 先检查目标会话是否已在桌面端某个活 AI pane 上运行:
+        // 已在跑就直接复用,不开重复 tab,移动端收到回执后立即进该 pane 的实时镜像
+        if let Some((_, live_pane_id, _)) = self
+            .store
+            .read(cx)
+            .find_live_session_pane(&payload.session_id)
+        {
+            self.manager
+                .start_session_result(request_id, true, Some(live_pane_id), None);
+            return;
+        }
+        match self.try_resume_session(&payload, window, cx) {
+            Ok((pane_id, spawned)) => {
+                let manager = self.manager.clone();
+                let project_id = payload.project_id.clone();
+                let agent_label = payload.agent_label.clone();
+                cx.spawn(async move |_, cx| {
+                    if !spawned.await.unwrap_or(false) {
+                        manager.start_session_result(
+                            request_id,
+                            false,
+                            None,
+                            Some(StartSessionFailReason::SpawnFailed),
+                        );
+                        return;
+                    }
+                    cx.update(|cx| {
+                        let project_name = AppStore::global(cx)
+                            .read(cx)
+                            .project(&project_id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        crate::toast::push_message(
+                            crate::notify::ToastKind::MobileSession,
+                            project_id,
+                            project_name,
+                            tr!("app", "mobileResumeSession", agent = agent_label),
+                            cx,
+                        );
+                    });
+                    manager.start_session_result(request_id, true, Some(pane_id), None);
+                })
+                .detach();
+            }
+            Err(reason) => self
+                .manager
+                .start_session_result(request_id, false, None, Some(reason)),
+        }
+    }
+
+    fn try_resume_session(
+        &mut self,
+        payload: &ResumeSessionPayload,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(String, futures::channel::oneshot::Receiver<bool>), StartSessionFailReason> {
+        let shell = {
+            let store = self.store.read(cx);
+            if store.project(&payload.project_id).is_none() {
+                return Err(StartSessionFailReason::ProjectNotFound);
+            }
+            // 与桌面端会话面板「点击恢复」同口径:用默认 shell(不套可能指向 WSL 的启动器 shell)
+            store
+                .resolve_shell(None)
+                .ok_or(StartSessionFailReason::SpawnFailed)?
+        };
+
+        let pane_id = self
+            .store
+            .update(cx, |store, cx| {
+                store.append_pane_background_with_cwd(
+                    &payload.project_id,
+                    shell,
+                    Some(payload.title.clone()),
+                    payload.cwd.clone(),
+                    window,
+                    cx,
+                )
+            })
+            .ok_or(StartSessionFailReason::SpawnFailed)?;
+
+        let data = format!("{}\r", payload.command);
+        let (written, spawned) = self.store.update(cx, |store, cx| {
+            // 恢复出的会话身份当场写回 pane(与桌面端 `session_panel::jump_to_session` 同口径):
+            // codex resume 不会重报 SessionStart,无 hook 时镜像也靠它精确绑定原会话文件
+            store.set_pane_ai_session(
+                &payload.project_id,
+                &pane_id,
+                AiSessionRef {
+                    agent: Some(payload.agent.clone()),
+                    session_id: payload.session_id.clone(),
+                    cwd: payload.cwd.clone(),
+                },
+                cx,
+            );
+            let written = store.write_to_pane(&payload.project_id, &pane_id, &data, cx);
+            let pty_id = store
+                .project_state(&payload.project_id)
+                .and_then(|s| s.pane(&pane_id))
+                .and_then(|p| p.pty_id);
+            (
+                written,
+                pty_id.map(|pty_id| store.pane_spawn_settled(pty_id, cx)),
+            )
+        });
+        // 立刻刷新镜像切面,让 `pane_sessions` 在移动端订阅镜像之前就可见
+        self.refresh_mirror(cx);
+        let Some(spawned) = spawned.filter(|_| written) else {
+            return Err(StartSessionFailReason::SpawnFailed);
+        };
+        Ok((pane_id, spawned))
+    }
+
     fn apply_signal(&mut self, signal: RelaySignal, window: &mut Window, cx: &mut Context<Self>) {
         match signal {
             RelaySignal::Status(status) => {
@@ -792,6 +962,7 @@ impl RelayBridge {
                 });
             }
             RelaySignal::StartSession(payload) => self.start_session(payload, window, cx),
+            RelaySignal::ResumeSession(payload) => self.resume_session(payload, window, cx),
             RelaySignal::WritePty { pty_id, data } => {
                 let Some((project_id, pane_id)) = self.store.read(cx).pane_of_pty(pty_id) else {
                     // 预检到落地之间 pane 被关掉了。mt-relay 已经回过「已排队」的
@@ -806,7 +977,7 @@ impl RelayBridge {
         }
     }
 
-    /// 刷新 [`RelayHost`] 用的镜像快照(主线程写,tokio 线程读)。
+        /// 刷新 [`RelayHost`] 用的镜像快照(主线程写,tokio 线程读)。
     fn refresh_mirror(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let launchers = store
@@ -817,10 +988,13 @@ impl RelayBridge {
             .collect();
         let mut projects = HashMap::new();
         let mut live_ptys = HashSet::new();
+        let mut live_sessions = HashMap::new();
+        let mut pane_sessions = HashMap::new();
         for project in store.projects() {
             projects.insert(project.id.clone(), to_relay_project(project));
             if let Some(state) = store.project_state(&project.id) {
                 live_ptys.extend(state.pty_ids());
+                collect_active_sessions(state.all_panes(), &mut live_sessions, &mut pane_sessions);
             }
         }
         let emulators = live_ptys
@@ -832,6 +1006,8 @@ impl RelayBridge {
             projects,
             live_ptys,
             emulators,
+            live_sessions,
+            pane_sessions,
         };
     }
 
@@ -1356,6 +1532,45 @@ mod tests {
                 old.insert("a".to_string(), vec![pane("p1", PaneStatus::AiIdle, Some(1))]);
                 build_snapshot(&projects, &old, &mut ids)
             }
+        );
+    }
+
+    #[test]
+    fn 活跃会话身份映射只收活_pty_且处于_ai_状态的_pane() {
+        let make = |id: &str, status: PaneStatus, pty: Option<u32>, sid: Option<&str>| {
+            let mut p = crate::tree::PaneState::new("pwsh");
+            p.id = id.into();
+            p.status = status;
+            p.pty_id = pty;
+            p.ai_session = sid.map(|s| AiSessionRef {
+                agent: Some("codex".into()),
+                session_id: s.into(),
+                cwd: None,
+            });
+            p
+        };
+        let list = [
+            make("p-work", PaneStatus::AiWorking, Some(1), Some("s-work")),
+            make("p-idle-ai", PaneStatus::AiIdle, Some(2), Some("s-idle-ai")),
+            // 退出 AI 后留着备查的身份不该算运行中
+            make("p-shell", PaneStatus::Idle, Some(3), Some("s-exited")),
+            // PTY 挂了的 error pane 也不该算运行中
+            make("p-err", PaneStatus::Error, Some(4), Some("s-err")),
+            // 未补 PTY 的冷布局 pane 不该算运行中
+            make("p-cold", PaneStatus::AiIdle, None, Some("s-cold")),
+        ];
+        let mut live = HashMap::new();
+        let mut by_pty = HashMap::new();
+        collect_active_sessions(list.iter(), &mut live, &mut by_pty);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live.get("s-work").map(String::as_str), Some("p-work"));
+        assert_eq!(live.get("s-idle-ai").map(String::as_str), Some("p-idle-ai"));
+        assert_eq!(by_pty.len(), 2);
+        assert_eq!(by_pty.get(&1).map(|h| h.session_id.as_str()), Some("s-work"));
+        assert_eq!(
+            by_pty.get(&2).map(|h| h.session_id.as_str()),
+            Some("s-idle-ai")
         );
     }
 }

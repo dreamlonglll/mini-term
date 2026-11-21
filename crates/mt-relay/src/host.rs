@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 
 pub use mt_ai::hook_server::HookSessionId;
 
-use crate::relay::{MobileRelayStatusPayload, RenamePanePayload, StartSessionPayload};
+use crate::relay::{
+    MobileRelayStatusPayload, RenamePanePayload, ResumeSessionPayload, StartSessionPayload,
+};
 
 /// 一条具名的"怎么起一个 AI 会话"。
 ///
@@ -79,6 +81,18 @@ pub trait RelayHost: Send + Sync + 'static {
 
     /// 本轮 AI 会话的启动时刻(启发式绑定的 mtime 下限);不在 AI 会话中返回 None。
     fn ai_session_started_at(&self, pty_id: u32) -> Option<SystemTime>;
+
+    /// pane 已知的会话身份(回落):未开 hook 或 Codex resume 不重报 SessionStart 时,
+    /// 从桌面端 `pane.ai_session` 补出精确身份,避免恢复的旧会话进入镜像时空白或串台。
+    fn pane_session(&self, _pty_id: u32) -> Option<HookSessionId> {
+        None
+    }
+
+    /// 按会话 id 查找正在桌面端某个活跃 AI pane 中运行该会话的 `pane_id`。
+    /// 用于历史列表标出「运行中」,以及继续对话时直接复用现成 pane 不重复开 tab。
+    fn live_session_pane(&self, _session_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// 中转体系推给桌面端的状态与动作。
@@ -99,6 +113,11 @@ pub trait RelayEvents: Send + Sync + 'static {
     ///
     /// [`MobileRelayManager::start_session_result`]: crate::MobileRelayManager::start_session_result
     fn start_session(&self, payload: StartSessionPayload);
+
+    /// 移动端基于历史会话继续对话:校验与 cwd 反查已通过,桌面侧若已有活 pane
+    /// 直接复用回执,否则建后台 pane、写回会话身份并写入续接命令,完成后调
+    /// [`MobileRelayManager::start_session_result`] 回执。
+    fn resume_session(&self, _payload: ResumeSessionPayload) {}
 }
 
 /// 什么都不做的宿主实现。
