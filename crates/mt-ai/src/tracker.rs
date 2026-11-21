@@ -4,6 +4,7 @@
 //! 行编辑状态机、Ctrl+C 双击窗口、Enter 后的输出扫描窗口、TUI 重绘冷却、
 //! 最近输出时刻。PTY 只管字节进出,这些全是 AI 感知的私产,随迁移整块搬来。
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -244,8 +245,10 @@ pub struct SessionTracker {
     /// pane → 会话内 AI 命令名("claude"/"codex"/"opencode";hook 扶正时取 hook 的 agent)。
     /// 有键即视为处于 AI 会话,值供前端品牌图标兜底(无 hook 时的唯一 agent 来源)。
     ai_sessions: Arc<Mutex<HashMap<u32, String>>>,
-    /// pane → 本轮 AI 会话的启动时刻(enter_ai 时记录)。对话镜像用它过滤
-    /// 早于本轮会话的旧记录文件,避免新会话未落盘时错绑上一次会话。
+    /// pane → 本轮 AI 会话的启动时刻。凡是把 pane 标进 `ai_sessions` 的路径都要
+    /// 同时记它(enter_ai / 输出回扫补判 / hook 扶正)。对话镜像用它过滤早于本轮会话
+    /// 的旧记录文件,避免新会话未落盘时错绑上一次会话;同项目多个 Codex pane 也靠它
+    /// 分各自的会话(`mt_relay::mirror::CodexPeers`)。
     ai_started: Arc<Mutex<HashMap<u32, SystemTime>>>,
     input_states: Arc<Mutex<HashMap<u32, InputState>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -422,18 +425,25 @@ impl SessionTracker {
         // 基于输出扫描检测 AI 会话（补偿上箭头历史调用 / PSReadLine 补全）：
         // 若在 Enter 后 2 秒内收到包含 AI 命令 echo 的输出，自动标记为 AI 会话
         {
-            let recently_entered = self
+            let entered = self
                 .last_enter
                 .lock()
                 .get(&pane_id)
-                .map(|t| t.elapsed() < AI_ENTER_SCAN_WINDOW)
-                .unwrap_or(false);
-            if recently_entered {
+                .map(|t| t.elapsed())
+                .filter(|since| *since < AI_ENTER_SCAN_WINDOW);
+            if let Some(since) = entered {
                 let mut sessions = self.ai_sessions.lock();
-                if !sessions.contains_key(&pane_id) {
-                    if let Some(agent) = output_ai_command_name(data) {
-                        sessions.insert(pane_id, agent.to_string());
-                    }
+                if let Entry::Vacant(slot) = sessions.entry(pane_id)
+                    && let Some(agent) = output_ai_command_name(data)
+                {
+                    slot.insert(agent.to_string());
+                    // 启动时刻记那次 Enter,不记认出 echo 的这一刻:命令早在 Enter 时
+                    // 就交给 shell 了,AI 建会话可能比 echo 先到。此前这条路径漏记,
+                    // 镜像拿不到下限,会把同项目的旧会话绑上来
+                    let now = SystemTime::now();
+                    self.ai_started
+                        .lock()
+                        .insert(pane_id, now.checked_sub(since).unwrap_or(now));
                 }
             }
         }
@@ -1535,11 +1545,19 @@ mod tests {
     fn output_echo_marks_ai_session_within_enter_window() {
         let mgr = SessionTracker::new();
         mgr.track_input(1, "cla\t"); // 补全把可见行改成 claude,本地缓冲仍是 "cla"
+        let before_enter = SystemTime::now();
         mgr.track_input(1, "\r"); // 无行快照
         assert!(!mgr.is_ai_session(1));
+        assert!(mgr.ai_session_started_at(1).is_none());
         // Enter 打开了扫描窗口(输入非空 → last_enter 已记),输出里出现 echo
+        std::thread::sleep(Duration::from_millis(30));
+        let before_echo = SystemTime::now();
         mgr.note_output(1, "PS D:\\Git\\mini-term> claude\r\n");
         assert!(mgr.is_ai_session(1));
+        // 补判同样要记启动时刻(镜像的下限),记的是 Enter 那一刻而不是认出 echo 的这一刻
+        let started = mgr.ai_session_started_at(1).expect("补判也要记启动时刻");
+        assert!(started >= before_enter - Duration::from_millis(5));
+        assert!(started < before_echo, "启动时刻应回溯到 Enter");
     }
 
     /// 没按过 Enter 的 pane 不开扫描窗口:AI 名字随便出现在某次 `cat` 的输出里

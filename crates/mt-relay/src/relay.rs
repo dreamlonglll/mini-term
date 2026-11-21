@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
+use mt_ai::AgentKind;
+use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{
     CommandFailReason, DesktopRejectReason, DesktopToRelay, MirrorMessage, MobileLauncher,
     MobilePane, MobileProject, RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
@@ -22,7 +24,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::host::{AiLauncher, RelayEvents, RelayHost};
-use crate::mirror::{self, MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, history_slice};
+use crate::mirror::{
+    self, CodexPeers, HeuristicScope, MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, history_slice,
+};
 use crate::util::is_wsl_unc_path;
 
 /// 握手 ack 等待超时。
@@ -121,6 +125,9 @@ enum LocateKey {
         pty_id: Option<u32>,
         agent: Option<String>,
         started: Option<SystemTime>,
+        /// 同项目里其他 Codex pane 划的范围:别的 pane 起停、拿到 hook 身份都会变,
+        /// 变了当轮重新定位
+        codex_peers: CodexPeers,
     },
 }
 
@@ -184,9 +191,19 @@ fn locate_session_file(project_path: &str, key: &LocateKey) -> Option<(PathBuf, 
             agent, session_id, ..
         } => mirror::resolve_session_file_by_id(project_path, agent.as_deref(), session_id),
         LocateKey::NoLog { .. } => None,
-        LocateKey::Heuristic { started, .. } => {
-            mirror::resolve_session_file(project_path, *started)
-        }
+        LocateKey::Heuristic {
+            agent,
+            started,
+            codex_peers,
+            ..
+        } => mirror::resolve_session_file(
+            project_path,
+            &HeuristicScope {
+                agent: agent.as_deref(),
+                started: *started,
+                codex_peers,
+            },
+        ),
     }
 }
 
@@ -727,7 +744,8 @@ impl MobileRelayManager {
     /// 这一轮的定位输入。绑定分两层,每轮重取(PTY 映射、hook 上报都可能后到):
     /// 1. hook 上报过会话身份 → 只认该会话的文件,未落盘就等(空镜像),
     ///    不退启发式——退了就会串到同项目其他 pane 的会话;
-    /// 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式。
+    /// 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式,
+    ///    只找本 pane 那家 agent 的记录;同项目多个 Codex pane 按 [`CodexPeers`] 分。
     ///
     /// 这几问都是查内存表,每轮问一遍没有代价;贵的是拿着答案去扫磁盘,
     /// 那一步由 [`MirrorLocator::needs_locate`] 把关。
@@ -754,11 +772,80 @@ impl MobileRelayManager {
                 agent: agent.to_string(),
             };
         }
+        let started = pty_id.and_then(|id| self.host.ai_session_started_at(id));
+        let codex_peers = self.codex_peers(pane_id, agent.as_deref(), started);
         LocateKey::Heuristic {
             pty_id,
             agent,
-            started: pty_id.and_then(|id| self.host.ai_session_started_at(id)),
+            started,
+            codex_peers,
         }
+    }
+
+    /// 同项目里其他 Codex pane 划给本 pane 的范围(口径见 [`CodexPeers`])。
+    ///
+    /// 只在本 pane 跑的是 Codex、且知道启动时刻时才算:别家的记录不带建会话时刻,
+    /// 分不出来,照旧镜像项目最新的那个。同伴分两种 ——
+    /// - 有 hook 身份的:它的会话是哪个已经确定,记进 `claimed` 不许别人绑;它的启动
+    ///   时刻**不**当区间上界(hook 扶正记的启动时刻可能晚于它建会话,也没必要)。
+    /// - 没有 hook 身份的:按启动时刻排队,晚于本 pane 的最早一个就是上界。
+    ///   同一时刻启动的按 pane id 排,保证两个 pane 不会认领同一段。
+    fn codex_peers(
+        &self,
+        pane_id: &str,
+        agent: Option<&str>,
+        started: Option<SystemTime>,
+    ) -> CodexPeers {
+        let is_codex =
+            |agent: Option<&str>| agent.and_then(AgentKind::parse) == Some(AgentKind::Codex);
+        let mut peers = CodexPeers::default();
+        let Some(started) = started.filter(|_| is_codex(agent)) else {
+            return peers;
+        };
+        let peer_panes: Vec<String> = {
+            let paths = self.pane_paths.lock();
+            let Some(own) = paths.get(pane_id).map(|p| windows_eq_key(p)) else {
+                return peers;
+            };
+            paths
+                .iter()
+                .filter(|(id, path)| id.as_str() != pane_id && windows_eq_key(path) == own)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let peer_ptys: Vec<(String, u32)> = {
+            let ptys = self.pane_ptys.lock();
+            peer_panes
+                .into_iter()
+                .filter_map(|id| ptys.get(&id).map(|pty| (id, *pty)))
+                .collect()
+        };
+        for (peer_id, pty) in peer_ptys {
+            let peer_agent = self.host.ai_session_agent(pty);
+            if let Some(hook) = self.host.hook_session(pty) {
+                // codex 的 SessionStart 会被误推断成 claude-code,输入检测那边认的是 codex 也算
+                if is_codex(hook.agent.as_deref()) || is_codex(peer_agent.as_deref()) {
+                    peers.claimed.push(hook.session_id);
+                }
+                continue;
+            }
+            if !is_codex(peer_agent.as_deref()) {
+                continue;
+            }
+            peers.contested = true;
+            if let Some(peer_started) = self.host.ai_session_started_at(pty)
+                && (peer_started, peer_id.as_str()) > (started, pane_id)
+            {
+                peers.next_start = Some(
+                    peers
+                        .next_start
+                        .map_or(peer_started, |cur| cur.min(peer_started)),
+                );
+            }
+        }
+        peers.claimed.sort();
+        peers.claimed.dedup();
+        peers
     }
 
     /// 镜像轮询的一轮:必要时重新定位,换绑或增量泵。**全是阻塞文件 IO**,
@@ -2340,11 +2427,26 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     /// 可控的宿主:hook 身份 / 输入检测的 agent / AI 启动时刻都由测试随手改。
+    /// `ptys` 里登记过的 pty 按登记的答,其余一律答上面三个字段(单 pane 用例的老口径)。
     #[derive(Default)]
     struct FakeHost {
         hook: Mutex<Option<HookSessionId>>,
         agent: Mutex<Option<String>>,
         started: Mutex<Option<SystemTime>>,
+        ptys: Mutex<HashMap<u32, FakePty>>,
+    }
+
+    #[derive(Default, Clone)]
+    struct FakePty {
+        hook: Option<HookSessionId>,
+        agent: Option<String>,
+        started: Option<SystemTime>,
+    }
+
+    impl FakeHost {
+        fn pty(&self, pty_id: u32) -> Option<FakePty> {
+            self.ptys.lock().get(&pty_id).cloned()
+        }
     }
 
     impl RelayHost for FakeHost {
@@ -2357,14 +2459,23 @@ mod tests {
         fn write_pty(&self, _pty_id: u32, _data: String) -> Result<(), String> {
             Ok(())
         }
-        fn hook_session(&self, _pty_id: u32) -> Option<HookSessionId> {
-            self.hook.lock().clone()
+        fn hook_session(&self, pty_id: u32) -> Option<HookSessionId> {
+            match self.pty(pty_id) {
+                Some(p) => p.hook,
+                None => self.hook.lock().clone(),
+            }
         }
-        fn ai_session_agent(&self, _pty_id: u32) -> Option<String> {
-            self.agent.lock().clone()
+        fn ai_session_agent(&self, pty_id: u32) -> Option<String> {
+            match self.pty(pty_id) {
+                Some(p) => p.agent,
+                None => self.agent.lock().clone(),
+            }
         }
-        fn ai_session_started_at(&self, _pty_id: u32) -> Option<SystemTime> {
-            *self.started.lock()
+        fn ai_session_started_at(&self, pty_id: u32) -> Option<SystemTime> {
+            match self.pty(pty_id) {
+                Some(p) => p.started,
+                None => *self.started.lock(),
+            }
         }
     }
 
@@ -2718,5 +2829,137 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         assert_eq!(fx.bound(), None);
+    }
+
+    fn codex_pty(started: SystemTime) -> FakePty {
+        FakePty {
+            hook: None,
+            agent: Some("codex".into()),
+            started: Some(started),
+        }
+    }
+
+    fn peers_of(fx: &MirrorFixture, pane_id: &str) -> CodexPeers {
+        match fx.manager.mirror_locate_key(pane_id) {
+            LocateKey::Heuristic { codex_peers, .. } => codex_peers,
+            other => panic!("应走启发式: {other:?}"),
+        }
+    }
+
+    fn contested(next_start: Option<SystemTime>) -> CodexPeers {
+        CodexPeers {
+            contested: true,
+            next_start,
+            claimed: vec![],
+        }
+    }
+
+    /// issue #103:同项目的无 hook Codex pane 按启动时刻排开,各自的区间上界是下一个
+    /// 启动的同伴;别的项目、别家 agent 不算同伴;同伴拿到 hook 身份后改记成「已认领」,
+    /// 不再当上界;同一时刻启动的按 pane id 排,不会两个 pane 认领同一段。
+    #[test]
+    fn codex_peers_partition_same_project_panes_by_start() {
+        let fx = MirrorFixture::new("codex-peers");
+        let t = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        {
+            let mut paths = fx.manager.pane_paths.lock();
+            paths.insert("pane-1".into(), r"D:\proj".into());
+            // 同一个项目,写法不同(大小写 / 分隔符 / 尾随分隔符)
+            paths.insert("pane-2".into(), "d:/proj/".into());
+            paths.insert("pane-3".into(), r"D:\other".into());
+            paths.insert("pane-4".into(), r"D:\proj".into());
+        }
+        {
+            let mut ptys = fx.manager.pane_ptys.lock();
+            ptys.insert("pane-2".into(), 8);
+            ptys.insert("pane-3".into(), 9);
+            ptys.insert("pane-4".into(), 10);
+        }
+        {
+            let mut ptys = fx.host.ptys.lock();
+            ptys.insert(7, codex_pty(t(100)));
+            ptys.insert(8, codex_pty(t(200)));
+            // 别的项目里的 Codex
+            ptys.insert(9, codex_pty(t(150)));
+            // 同项目里的 Claude
+            ptys.insert(
+                10,
+                FakePty {
+                    hook: None,
+                    agent: Some("claude".into()),
+                    started: Some(t(120)),
+                },
+            );
+        }
+        let before = fx.manager.mirror_locate_key("pane-1");
+        assert_eq!(peers_of(&fx, "pane-1"), contested(Some(t(200))));
+        assert_eq!(peers_of(&fx, "pane-2"), contested(None));
+        assert_eq!(
+            peers_of(&fx, "pane-4"),
+            CodexPeers::default(),
+            "别家 agent 的 pane 不划区间"
+        );
+
+        // pane-2 拿到 hook 身份(codex 的 SessionStart 会被误推断成 claude-code,
+        // 输入检测认的是 codex 也算):改记成已认领
+        fx.host.ptys.lock().get_mut(&8).unwrap().hook = Some(HookSessionId {
+            agent: Some("claude-code".into()),
+            session_id: "sid-b".into(),
+        });
+        assert_eq!(
+            peers_of(&fx, "pane-1"),
+            CodexPeers {
+                contested: false,
+                next_start: None,
+                claimed: vec!["sid-b".into()],
+            }
+        );
+        assert_ne!(
+            fx.manager.mirror_locate_key("pane-1"),
+            before,
+            "同伴的变化进定位输入,当轮重新定位"
+        );
+
+        // 同一时刻启动:pane id 小的上界就是对方的启动时刻(区间为空),大的拿到全部
+        {
+            let mut ptys = fx.host.ptys.lock();
+            ptys.insert(8, codex_pty(t(100)));
+        }
+        assert_eq!(peers_of(&fx, "pane-1"), contested(Some(t(100))));
+        assert_eq!(peers_of(&fx, "pane-2"), contested(None));
+    }
+
+    /// 本 pane 不是 Codex,或不知道启动时刻:不划区间(照旧镜像项目最新)。
+    #[test]
+    fn codex_peers_empty_without_codex_or_start() {
+        let fx = MirrorFixture::new("codex-peers-none");
+        let t = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        {
+            let mut paths = fx.manager.pane_paths.lock();
+            paths.insert("pane-1".into(), r"D:\proj".into());
+            paths.insert("pane-2".into(), r"D:\proj".into());
+        }
+        fx.manager.pane_ptys.lock().insert("pane-2".into(), 8);
+        fx.host.ptys.lock().insert(8, codex_pty(t(200)));
+
+        fx.host.ptys.lock().insert(
+            7,
+            FakePty {
+                hook: None,
+                agent: Some("codex".into()),
+                started: None,
+            },
+        );
+        assert_eq!(peers_of(&fx, "pane-1"), CodexPeers::default());
+
+        fx.host.ptys.lock().insert(
+            7,
+            FakePty {
+                hook: None,
+                agent: Some("grok".into()),
+                started: Some(t(100)),
+            },
+        );
+        assert_eq!(peers_of(&fx, "pane-1"), CodexPeers::default());
     }
 }
