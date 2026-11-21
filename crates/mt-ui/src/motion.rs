@@ -1163,10 +1163,16 @@ mod tests {
         let p1 = phase_of_ms(clock.advance(t0 + Duration::from_millis(300), true), period);
         assert!((p1 - 0.3).abs() < 1e-4, "{p1}");
         // 同一时刻切到后台:相位不得跳变
-        let p2 = phase_of_ms(clock.advance(t0 + Duration::from_millis(300), false), period);
+        let p2 = phase_of_ms(
+            clock.advance(t0 + Duration::from_millis(300), false),
+            period,
+        );
         assert!((p2 - p1).abs() < 1e-6, "失焦瞬间跳变: {p1} -> {p2}");
         // 后台走 400ms(1/4 流速 = 有效 100ms)→ 相位 0.4
-        let p3 = phase_of_ms(clock.advance(t0 + Duration::from_millis(700), false), period);
+        let p3 = phase_of_ms(
+            clock.advance(t0 + Duration::from_millis(700), false),
+            period,
+        );
         assert!((p3 - 0.4).abs() < 1e-4, "{p3}");
         // 同一时刻切回前台:相位同样连续不跳变
         let p4 = phase_of_ms(clock.advance(t0 + Duration::from_millis(700), true), period);
@@ -1445,12 +1451,15 @@ mod tests {
 
     #[test]
     fn 侧栏推拉规格豁免减弱动效且端点单调() {
-        assert!(!SIDEBAR_TOGGLE.respects_reduce);
+        const { assert!(!SIDEBAR_TOGGLE.respects_reduce) };
         assert_eq!(SIDEBAR_TOGGLE.duration, Duration::from_millis(220));
         assert_eq!(SIDEBAR_TOGGLE.progress_at(Duration::ZERO, true), 0.0);
         let mid = SIDEBAR_TOGGLE.progress_at(Duration::from_millis(110), true);
         assert!(mid > 0.7 && mid < 0.96, "中段应舒展推进且不过早发呆: {mid}");
-        assert_eq!(SIDEBAR_TOGGLE.progress_at(SIDEBAR_TOGGLE.duration, true), 1.0);
+        assert_eq!(
+            SIDEBAR_TOGGLE.progress_at(SIDEBAR_TOGGLE.duration, true),
+            1.0
+        );
         assert_eq!(
             SIDEBAR_TOGGLE.progress_with(Duration::from_millis(50), false, false),
             1.0,

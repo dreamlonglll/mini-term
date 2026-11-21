@@ -1022,8 +1022,9 @@ impl Render for SettingsView {
         // 切页:先报这一帧谁在台上,再取出场信息(见模块注释「切页动画」)
         let page = self.page;
         let explicit_dir = self.pending_page_dir.take();
-        self.page_swap
-            .observe(&page, |old, new| explicit_dir.unwrap_or_else(|| page_order(*old, *new)));
+        self.page_swap.observe(&page, |old, new| {
+            explicit_dir.unwrap_or_else(|| page_order(*old, *new))
+        });
         let swap = self.page_swap.frame(window);
         // 先对账再画:换走了外观页 / 皮肤列表变了,缩略图在这一帧放掉(外观页正作为出场层
         // 滑走时还在画,不放)

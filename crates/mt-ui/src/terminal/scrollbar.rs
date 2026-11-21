@@ -446,8 +446,12 @@ mod tests {
         let early = alpha(&s, Duration::from_millis(900 + 100), false, false);
         let mid = alpha(&s, Duration::from_millis(900 + 225), false, false);
         let late = alpha(&s, Duration::from_millis(900 + 350), false, false);
-        assert!(early > mid && mid > late && late > 0.5, "{early} {mid} {late}");
-        let expected_mid = 0.5 + 0.5 * (1.0 - crate::motion::ease(crate::motion::Easing::EaseOut, 0.5));
+        assert!(
+            early > mid && mid > late && late > 0.5,
+            "{early} {mid} {late}"
+        );
+        let expected_mid =
+            0.5 + 0.5 * (1.0 - crate::motion::ease(crate::motion::Easing::EaseOut, 0.5));
         assert!((mid - expected_mid).abs() < 0.01, "实际 {mid}");
         // 在底部彻底消失,不在底部留一半 —— 「我还在回看」要一直看得见
         assert_eq!(alpha(&s, Duration::from_secs(5), false, true), 0.0);
@@ -484,7 +488,11 @@ mod tests {
             fade_schedule(&g, Duration::from_millis(500), false),
             FadeSchedule::Wait(Duration::from_millis(400))
         );
-        assert!(!needs_animation_frame(&g, Duration::from_millis(500), false));
+        assert!(!needs_animation_frame(
+            &g,
+            Duration::from_millis(500),
+            false
+        ));
         // 过了延迟直接落到静息值(没有中间帧)
         assert_eq!(
             alpha(&g, Duration::from_millis(901), false, false),

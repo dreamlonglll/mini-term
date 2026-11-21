@@ -522,9 +522,7 @@ mod tests {
     /// 调色板 8 色循环:第 9 次分配回到第 0 色。
     #[test]
     fn 调色板八色循环() {
-        let commits: Vec<_> = (0..9)
-            .map(|i| test_commit(&format!("t{i}"), &[]))
-            .collect();
+        let commits: Vec<_> = (0..9).map(|i| test_commit(&format!("t{i}"), &[])).collect();
         let layout = compute(&commits);
         let colors: Vec<u8> = layout.rows.iter().map(|r| r.color).collect();
         assert_eq!(colors, vec![0, 1, 2, 3, 4, 5, 6, 7, 0]);
@@ -535,7 +533,9 @@ mod tests {
     fn 宽度封顶在八条_lane() {
         // 12 个互不相干的尖端(都是根提交,画完即释放 lane)——
         // 每行都只占 lane 0,宽度应当停在 1 条 lane
-        let roots: Vec<_> = (0..12).map(|i| test_commit(&format!("r{i}"), &[])).collect();
+        let roots: Vec<_> = (0..12)
+            .map(|i| test_commit(&format!("r{i}"), &[]))
+            .collect();
         assert_eq!(compute(&roots).width, GRAPH_LANE_WIDTH + 4.0);
 
         // 12 条同时活着的线:第一行开 12 条 lane,宽度按 8 封顶
@@ -546,7 +546,9 @@ mod tests {
             ],
         )];
         for i in 0..12 {
-            let name = ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "pa", "pb"][i];
+            let name = [
+                "p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "pa", "pb",
+            ][i];
             commits.push(test_commit(name, &[]));
         }
         let layout = compute(&commits);

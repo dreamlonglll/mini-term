@@ -63,7 +63,9 @@ use gpui_base::{ElementExt as _, FocusTrapElement as _, TextSelection, TextSelec
 use gpui_component::dialog::{Cancel, Confirm, DialogTitle};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{ActiveTheme as _, StyledExt as _, TITLE_BAR_HEIGHT, v_flex, window_paddings};
-use mt_ui::motion::{OVERLAY_IN, OVERLAY_OUT, SHEET_IN, SHEET_OUT, TransitionSpec, animations_enabled};
+use mt_ui::motion::{
+    OVERLAY_IN, OVERLAY_OUT, SHEET_IN, SHEET_OUT, TransitionSpec, animations_enabled,
+};
 
 use crate::overlay_motion::{Presence, chrome_style, reveal_box, slide_down_box};
 
@@ -1502,7 +1504,13 @@ mod tests {
             assert_eq!(motion, DialogMotion::SlideFromTop, "{kind}");
             assert_eq!(motion.specs(), (SHEET_IN, SHEET_OUT));
         }
-        for kind in [k::CONFIRM, k::ALERT, k::PROMPT, k::ADD_PROJECT, k::RENAME_PANE] {
+        for kind in [
+            k::CONFIRM,
+            k::ALERT,
+            k::PROMPT,
+            k::ADD_PROJECT,
+            k::RENAME_PANE,
+        ] {
             let motion = DialogMotion::for_kind(kind);
             assert_eq!(motion, DialogMotion::Reveal, "{kind}");
             assert_eq!(motion.specs(), (OVERLAY_IN, OVERLAY_OUT));

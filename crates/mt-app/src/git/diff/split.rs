@@ -44,8 +44,8 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, Entity, HitboxBehavior, Hsla, IntoElement,
-    ListHorizontalSizingBehavior, ParentElement, Pixels, Point, ScrollHandle, ScrollEvent,
-    Size, Styled, canvas, div, fill, point, prelude::FluentBuilder as _, px, size, uniform_list,
+    ListHorizontalSizingBehavior, ParentElement, Pixels, Point, ScrollEvent, ScrollHandle, Size,
+    Styled, canvas, div, fill, point, prelude::FluentBuilder as _, px, size, uniform_list,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 

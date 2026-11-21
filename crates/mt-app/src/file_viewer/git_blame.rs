@@ -23,9 +23,9 @@ use chrono::{DateTime, Datelike, TimeZone};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DispatchPhase, Font, Hitbox,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    Pixels, Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task,
-    TextAlign, TextRun, WeakEntity, Window, anchored, deferred, div, fill, point,
-    prelude::FluentBuilder as _, px, size,
+    Pixels, Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task, TextAlign,
+    TextRun, WeakEntity, Window, anchored, deferred, div, fill, point, prelude::FluentBuilder as _,
+    px, size,
 };
 use mt_project::git::{BLAME_MAX_LINES, BlameResult, RepoFile};
 use mt_ui::icons::VectorIcon;

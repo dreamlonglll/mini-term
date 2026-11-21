@@ -432,7 +432,7 @@ pub fn reveal_frame(
 
 impl RevealFrame {
     /// 改为从底边往上展开(默认从顶边往下)。
-    pub fn from_bottom(mut self, from_bottom: bool) -> Self {
+    pub fn anchor_bottom(mut self, from_bottom: bool) -> Self {
         self.from_bottom = from_bottom;
         self
     }

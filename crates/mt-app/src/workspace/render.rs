@@ -163,7 +163,9 @@ impl Workspace {
                         .h_full()
                         .child(middle_group)
                         // 退场途中拦住点击与拖拽
-                        .when(!entering, |el| el.child(div().absolute().inset_0().occlude())),
+                        .when(!entering, |el| {
+                            el.child(div().absolute().inset_0().occlude())
+                        }),
                 )
                 // 与静止态 `h_resizable` 的 1px handle 同色同位,交接帧零闪烁
                 .when(cur_w >= 1.0, |el| {
@@ -182,7 +184,12 @@ impl Workspace {
         }
 
         let occupied = if middle_visible { target_w } else { 0.0 };
-        (middle_visible, middle_group.into_any_element(), None, occupied)
+        (
+            middle_visible,
+            middle_group.into_any_element(),
+            None,
+            occupied,
+        )
     }
 
     /// 左侧窄边条(ActivityBar)。
@@ -555,13 +562,13 @@ impl Workspace {
                         el.child(native_view::input_blocker())
                             .child(native_view::occluder())
                             .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(|this, _event, window, cx| {
-                                if this.usage_open {
-                                    this.toggle_usage(window, cx);
-                                }
-                            }),
-                        )
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _event, window, cx| {
+                                    if this.usage_open {
+                                        this.toggle_usage(window, cx);
+                                    }
+                                }),
+                            )
                     })
                     .child(
                         overlay_motion::slide_down_box(

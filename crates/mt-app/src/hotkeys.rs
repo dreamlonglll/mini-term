@@ -1326,11 +1326,7 @@ fn load_binding<A: gpui::Action>(
 }
 
 #[cfg(test)]
-fn test_binding<A: gpui::Action>(
-    keystroke: &str,
-    action: A,
-    context: Option<&str>,
-) -> KeyBinding {
+fn test_binding<A: gpui::Action>(keystroke: &str, action: A, context: Option<&str>) -> KeyBinding {
     KeyBinding::new(
         Box::leak(keystroke.to_owned().into_boxed_str()),
         action,
@@ -1379,9 +1375,7 @@ fn table_bindings_with(platform: Platform, cx: Option<&App>) -> Vec<KeyBinding> 
             }
             continue;
         }
-        if let Some(binding) =
-            binding_for_with(def.id, &default_keystroke_for(def, platform), cx)
-        {
+        if let Some(binding) = binding_for_with(def.id, &default_keystroke_for(def, platform), cx) {
             bindings.push(binding);
         }
     }

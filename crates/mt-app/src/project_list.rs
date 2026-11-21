@@ -58,11 +58,10 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
-    ExternalPaths, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, anchored, canvas, deferred, div,
-    prelude::FluentBuilder, px,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollEvent,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, canvas,
+    deferred, div, prelude::FluentBuilder, px,
 };
 use gpui::{Global, ScrollHandle};
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};

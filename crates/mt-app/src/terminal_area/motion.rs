@@ -132,10 +132,7 @@ impl gpui::Element for ClipReveal {
                     bounds.origin.x + px(self.clip.left),
                     bounds.origin.y + px(self.clip.top),
                 ),
-                gpui::size(
-                    px(self.clip.width.max(0.0)),
-                    px(self.clip.height.max(0.0)),
-                ),
+                gpui::size(px(self.clip.width.max(0.0)), px(self.clip.height.max(0.0))),
             ),
         };
         let offset = point(px(self.clip.left), px(self.clip.top));

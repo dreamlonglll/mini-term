@@ -51,9 +51,9 @@ use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, CursorStyle,
     DispatchPhase, Entity, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels,
-    Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity,
-    Window, actions, anchored, canvas, deferred, div, fill, point, prelude::FluentBuilder as _, px,
-    size, uniform_list,
+    Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity, Window,
+    actions, anchored, canvas, deferred, div, fill, point, prelude::FluentBuilder as _, px, size,
+    uniform_list,
 };
 use gpui_component::input::{Editor, EditorState, Position, RopeExt as _};
 use mt_project::git::{DiffSide, HeadFile, LineChangeKind, LineHunk, RepoFile};

@@ -69,9 +69,10 @@ impl TerminalArea {
                 .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
                 .await;
             let any_visible = cx.update(|cx| {
-                cx.windows()
-                    .iter()
-                    .any(|w| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false))
+                cx.windows().iter().any(|w| {
+                    w.update(cx, |_, window, _| window.is_visible())
+                        .unwrap_or(false)
+                })
             });
             let alive = this
                 .update(cx, |this: &mut TerminalArea, cx| {
@@ -152,7 +153,7 @@ impl TerminalArea {
             state,
             Some(pane_preview::card_chrome()),
         )
-        .from_bottom(flip_up);
+        .anchor_bottom(flip_up);
         Some(
             deferred(
                 anchored()

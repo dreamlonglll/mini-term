@@ -14,7 +14,6 @@
 //!   取数落地时比一次 HEAD([`HistoryPage::check_head`]),变了才重拉 —— 历史只随提交变,
 //!   不必像单文件 diff 那样每次都重取。
 
-
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, FocusHandle,
     FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,

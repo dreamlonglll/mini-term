@@ -54,8 +54,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::term::cell::Flags;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, GlobalElementId, Hsla, InspectorElementId,
-    LayoutId, Pixels, Point, ShapedLine, SharedString, Style, TextRun, Window, fill,
-    point, px,
+    LayoutId, Pixels, Point, ShapedLine, SharedString, Style, TextRun, Window, fill, point, px,
 };
 use mt_terminal::TerminalEmulator;
 

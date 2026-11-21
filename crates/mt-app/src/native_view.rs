@@ -342,9 +342,8 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
             let views: Vec<_> = s.views.iter().filter_map(|view| view.upgrade()).collect();
             (views, s.occluders.clone(), s.block_input)
         });
-        let modal = block_input
-            || dialog_open
-            || !crate::overlay::allows(crate::overlay::Yield::ToOverlay);
+        let modal =
+            block_input || dialog_open || !crate::overlay::allows(crate::overlay::Yield::ToOverlay);
         for view in views {
             if view.stamped() == frame {
                 any_shown = true;
@@ -402,8 +401,8 @@ mod hosted {
     use std::rc::Rc;
 
     use gpui::{
-        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-        LayoutId, MouseDownEvent, Pixels, Size, Style, Window,
+        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, LayoutId,
+        MouseDownEvent, Pixels, Size, Style, Window,
     };
 
     use super::{STATE, bump_sync, current_frame, frame_open, punch, subscribe};

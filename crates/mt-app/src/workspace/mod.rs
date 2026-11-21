@@ -8,8 +8,8 @@ use gpui::{
     Styled, Subscription, Task, Window, WindowBounds, div, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::WindowExt as _;
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::file_tree::FileTree;
@@ -523,7 +523,10 @@ impl Workspace {
         });
 
         let ai_status_dot = cx.new(|_| {
-            activity_bar::CornerDotView::new(ui::status_color(crate::tree::StatusLight::Idle), false)
+            activity_bar::CornerDotView::new(
+                ui::status_color(crate::tree::StatusLight::Idle),
+                false,
+            )
         });
         let update_dot = cx.new(|_| activity_bar::CornerDotView::new(ui::accent(), false));
 

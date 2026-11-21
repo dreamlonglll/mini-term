@@ -541,10 +541,7 @@ mod tests {
             " 2 files changed, 5 deletions(-)",
             " 2 files changed, 1 deletion(-)",
         ] {
-            assert!(
-                matches_git_refresh(sample.as_bytes()),
-                "应当命中: {sample}"
-            );
+            assert!(matches_git_refresh(sample.as_bytes()), "应当命中: {sample}");
         }
         for sample in [
             "",

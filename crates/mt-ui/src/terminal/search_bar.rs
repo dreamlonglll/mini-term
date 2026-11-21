@@ -496,96 +496,95 @@ impl Render for TerminalSearchBar {
                 .border_color(cx.theme().border)
                 .shadow_lg();
         }
-        bar
-            .child(
-                Input::new(&self.input)
-                    .small()
-                    // 旧版是 `w-48` = 12rem = 192px
-                    .w(px(192.))
-                    .cleanable(false)
-                    .shadow_none(),
-            )
-            .child(
-                div()
-                    .min_w(px(56.))
-                    .text_xs()
-                    .text_center()
-                    // 正则写错时把计数染红:旧版没有这一档,但 GPUI 侧没有浏览器
-                    // 控制台可看,不给提示用户只会看到「无结果」而查不出原因
-                    .text_color(if has_error { danger } else { muted })
-                    .child(counter),
-            )
-            .child(with_tip(
-                "case-sensitive-tip",
-                labels.case_sensitive.clone(),
-                Button::new("case-sensitive")
-                    .label("Aa")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .selected(options.case_sensitive)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.toggle_option(|o| o.case_sensitive = !o.case_sensitive, cx);
-                    })),
-            ))
-            .child(with_tip(
-                "whole-word-tip",
-                labels.whole_word.clone(),
-                Button::new("whole-word")
-                    .label("ab")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .selected(options.whole_word)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.toggle_option(|o| o.whole_word = !o.whole_word, cx);
-                    })),
-            ))
-            .child(with_tip(
-                "regex-tip",
-                labels.regex.clone(),
-                Button::new("regex")
-                    .label(".*")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .selected(options.regex)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.toggle_option(|o| o.regex = !o.regex, cx);
-                    })),
-            ))
-            .child(with_tip(
-                "previous-tip",
-                labels.previous.clone(),
-                Button::new("previous")
-                    .label("↑")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .disabled(!has_query)
-                    .on_click(cx.listener(|this, _, _window, cx| this.find_previous(cx))),
-            ))
-            .child(with_tip(
-                "next-tip",
-                labels.next.clone(),
-                Button::new("next")
-                    .label("↓")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .disabled(!has_query)
-                    .on_click(cx.listener(|this, _, _window, cx| this.find_next(cx))),
-            ))
-            .child(with_tip(
-                "close-tip",
-                labels.close.clone(),
-                Button::new("close")
-                    .label("✕")
-                    .xsmall()
-                    .compact()
-                    .ghost()
-                    .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-            ))
+        bar.child(
+            Input::new(&self.input)
+                .small()
+                // 旧版是 `w-48` = 12rem = 192px
+                .w(px(192.))
+                .cleanable(false)
+                .shadow_none(),
+        )
+        .child(
+            div()
+                .min_w(px(56.))
+                .text_xs()
+                .text_center()
+                // 正则写错时把计数染红:旧版没有这一档,但 GPUI 侧没有浏览器
+                // 控制台可看,不给提示用户只会看到「无结果」而查不出原因
+                .text_color(if has_error { danger } else { muted })
+                .child(counter),
+        )
+        .child(with_tip(
+            "case-sensitive-tip",
+            labels.case_sensitive.clone(),
+            Button::new("case-sensitive")
+                .label("Aa")
+                .xsmall()
+                .compact()
+                .ghost()
+                .selected(options.case_sensitive)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.toggle_option(|o| o.case_sensitive = !o.case_sensitive, cx);
+                })),
+        ))
+        .child(with_tip(
+            "whole-word-tip",
+            labels.whole_word.clone(),
+            Button::new("whole-word")
+                .label("ab")
+                .xsmall()
+                .compact()
+                .ghost()
+                .selected(options.whole_word)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.toggle_option(|o| o.whole_word = !o.whole_word, cx);
+                })),
+        ))
+        .child(with_tip(
+            "regex-tip",
+            labels.regex.clone(),
+            Button::new("regex")
+                .label(".*")
+                .xsmall()
+                .compact()
+                .ghost()
+                .selected(options.regex)
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.toggle_option(|o| o.regex = !o.regex, cx);
+                })),
+        ))
+        .child(with_tip(
+            "previous-tip",
+            labels.previous.clone(),
+            Button::new("previous")
+                .label("↑")
+                .xsmall()
+                .compact()
+                .ghost()
+                .disabled(!has_query)
+                .on_click(cx.listener(|this, _, _window, cx| this.find_previous(cx))),
+        ))
+        .child(with_tip(
+            "next-tip",
+            labels.next.clone(),
+            Button::new("next")
+                .label("↓")
+                .xsmall()
+                .compact()
+                .ghost()
+                .disabled(!has_query)
+                .on_click(cx.listener(|this, _, _window, cx| this.find_next(cx))),
+        ))
+        .child(with_tip(
+            "close-tip",
+            labels.close.clone(),
+            Button::new("close")
+                .label("✕")
+                .xsmall()
+                .compact()
+                .ghost()
+                .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+        ))
     }
 }
 

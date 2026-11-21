@@ -800,11 +800,20 @@ fn 最大化裁剪窗矩形插值端点精确且越界钳住() {
 
     // 展开:from → full
     let start = reveal_clip_rect(from, full, 0.0);
-    assert_eq!((start.left, start.top, start.width, start.height), (320.0, 180.0, 480.0, 360.0));
+    assert_eq!(
+        (start.left, start.top, start.width, start.height),
+        (320.0, 180.0, 480.0, 360.0)
+    );
     let mid = reveal_clip_rect(from, full, 0.5);
-    assert_eq!((mid.left, mid.top, mid.width, mid.height), (160.0, 90.0, 740.0, 530.0));
+    assert_eq!(
+        (mid.left, mid.top, mid.width, mid.height),
+        (160.0, 90.0, 740.0, 530.0)
+    );
     let end = reveal_clip_rect(from, full, 1.0);
-    assert_eq!((end.left, end.top, end.width, end.height), (0.0, 0.0, 1000.0, 700.0));
+    assert_eq!(
+        (end.left, end.top, end.width, end.height),
+        (0.0, 0.0, 1000.0, 700.0)
+    );
 
     // 越界输入被钳在 [0, 1]
     let under = reveal_clip_rect(from, full, -0.5);
@@ -814,5 +823,8 @@ fn 最大化裁剪窗矩形插值端点精确且越界钳住() {
 
     // 还原:full → from
     let back_end = reveal_clip_rect(full, from, 1.0);
-    assert_eq!((back_end.left, back_end.top, back_end.width, back_end.height), (320.0, 180.0, 480.0, 360.0));
+    assert_eq!(
+        (back_end.left, back_end.top, back_end.width, back_end.height),
+        (320.0, 180.0, 480.0, 360.0)
+    );
 }

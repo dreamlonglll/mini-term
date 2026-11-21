@@ -464,6 +464,9 @@ impl TerminalElement {
     }
 }
 
+/// 滚动条停留期单发定时唤醒句柄的类型别名(避免 clippy `type_complexity`)。
+type ScrollbarFadeTask = Rc<RefCell<Option<(Instant, gpui::Task<()>)>>>;
+
 /// 跨帧保留的交互状态与缓存。元素每帧重建,这些必须挂在 `GlobalElementId` 上。
 #[derive(Clone)]
 struct TerminalElementState {
@@ -494,7 +497,7 @@ struct TerminalElementState {
     scrollbar_touched: Rc<StdCell<Option<Instant>>>,
     /// `fade_delay` 保持期的单发定时唤醒句柄(记录对应的 `touched` 时刻,防止同一次
     /// 停留重复建任务;再次滚动或进入淡出/静息时覆写/清空自动取消旧定时器)。
-    scrollbar_fade_task: Rc<RefCell<Option<(Instant, gpui::Task<()>)>>>,
+    scrollbar_fade_task: ScrollbarFadeTask,
     /// 上一帧的 display_offset。变了就说明滚过,滚动条要重新亮起。
     last_offset: Rc<StdCell<usize>>,
     /// 拖选停留复制的状态机。

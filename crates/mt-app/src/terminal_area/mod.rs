@@ -716,15 +716,15 @@ impl Render for TerminalArea {
             let prev = self.last_area_key.replace(area_key.clone());
             // 首帧加载、切项目或切面板时,目标布局里本来就存在的全部叶子都记为 settled:
             // 它们是既有的窗格而不是刚分屏出来的新窗格,避免首次切进已有项目时整排窗格横移 14px。
-            let switched_context = prev
-                .as_ref()
-                .is_none_or(|(p_proj, p_panel, _)| p_proj != &project_id || p_panel != &active_panel_id);
+            let switched_context = prev.as_ref().is_none_or(|(p_proj, p_panel, _)| {
+                p_proj != &project_id || p_panel != &active_panel_id
+            });
             if switched_context {
                 for leaf in layout.leaves() {
                     let key = format!("{project_id}\u{1}{}", leaf.id());
-                    self.pane_enter
-                        .entry(key)
-                        .or_insert_with(|| mt_ui::motion::Transition::settled(mt_ui::motion::PANE_ENTER));
+                    self.pane_enter.entry(key).or_insert_with(|| {
+                        mt_ui::motion::Transition::settled(mt_ui::motion::PANE_ENTER)
+                    });
                 }
             }
             // 项目一换只记不播:旧面板属于别的项目,出场层无从画起,

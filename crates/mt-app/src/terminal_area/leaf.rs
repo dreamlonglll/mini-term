@@ -126,7 +126,8 @@ impl TerminalArea {
                     return el;
                 }
                 let animate = self.animations_enabled(cx);
-                let el = self.wrap_pane_enter(&leaf_id, project_id, enter_axis, el, animate, window);
+                let el =
+                    self.wrap_pane_enter(&leaf_id, project_id, enter_axis, el, animate, window);
                 // 关掉相邻分屏后,这一格从旧格子的裁剪窗长到新格子(见 [`fx`]);
                 // 平时只记一下本帧的矩形,不裁剪、不挪
                 fx::leaf_slot(el, self.fx.clone(), leaf_id).into_any_element()

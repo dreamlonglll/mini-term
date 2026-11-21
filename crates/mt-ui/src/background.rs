@@ -48,8 +48,8 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ContentMask, Corners, DevicePixels, Element, GlobalElementId, ImageAssetLoader,
-    InspectorElementId, LayoutId, Pixels, RenderImage, Resource, Size, Style, Window,
-    fill, point, px, size,
+    InspectorElementId, LayoutId, Pixels, RenderImage, Resource, Size, Style, Window, fill, point,
+    px, size,
 };
 
 use crate::theme_bridge::BackgroundArt;

@@ -58,8 +58,8 @@ pub fn sanitize_branch_for_dir(branch: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
     for c in branch.chars() {
-        let bad = matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-            || c.is_whitespace();
+        let bad =
+            matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_whitespace();
         if bad {
             if !last_dash {
                 out.push('-');
@@ -650,9 +650,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
                     // 勾选保留:剔除消失的键;只剩一个可用仓库时自动勾上
                     s.selected_keys
                         .retain(|k| groups.iter().any(|g| &g.key == k));
-                    if s.selected_keys.is_empty()
-                        && groups.len() == 1
-                        && groups[0].error.is_none()
+                    if s.selected_keys.is_empty() && groups.len() == 1 && groups[0].error.is_none()
                     {
                         s.selected_keys = vec![groups[0].key.clone()];
                     }
@@ -670,7 +668,7 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
     let pending: Vec<(String, GitContext)> = {
         let s = state.read(cx);
         let Some(groups) = &s.groups else {
-            return Vec::new().into_iter().collect()
+            return Vec::new().into_iter().collect();
         };
         groups
             .iter()
@@ -1549,12 +1547,7 @@ fn dropdown(
 
 // ─── 创建 / 删除 / 清理 ───────────────────────────────────────
 
-fn create(
-    state: &Entity<WorktreeModal>,
-    groups: &[RepoGroup],
-    window: &mut Window,
-    cx: &mut App,
-) {
+fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Window, cx: &mut App) {
     let (branch, targets, create_branch, base, add_as_project) = {
         let s = state.read(cx);
         let branch = match s.mode {

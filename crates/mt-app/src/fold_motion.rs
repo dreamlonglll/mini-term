@@ -41,8 +41,8 @@ use std::f32::consts::TAU;
 use std::time::Instant;
 
 use gpui::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, LayoutId,
-    PathBuilder, Pixels, Point, Style, Window, point, px,
+    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, LayoutId, PathBuilder,
+    Pixels, Point, Style, Window, point, px,
 };
 use mt_ui::motion::{TransitionSpec, ValueTween};
 
