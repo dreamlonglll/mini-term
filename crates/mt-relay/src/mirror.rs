@@ -10,7 +10,9 @@
 //!
 //! 绑定策略分两层:hook 上报过会话身份(pty→session_id)时精确绑定该会话的
 //! 文件,同项目多个 AI pane 各绑各的会话;未启用 hook 时退回"项目最新文件 +
-//! AI 启动时刻下限"启发式(此路径保留 v1 限制:多 pane 共同镜像最新会话)。
+//! AI 启动时刻下限"启发式,只在 pane 自己那家 agent 的记录里找。启发式里同项目
+//! 多个 Codex pane 按建会话时刻分([`CodexPeers`]);其余几家的记录不带建会话时刻,
+//! 同项目同一家多个 pane 仍共同镜像最新会话(v1 限制,开 hook 即解)。
 //! 两层都保证:本轮会话未落盘时(首条消息前)给空镜像,不错绑别的会话。
 //! v1 限制:仅本机(Windows 宿主)来源的会话记录。
 //!
@@ -639,39 +641,95 @@ fn newest_claude_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     newest
 }
 
-/// 项目的最新 Codex 会话文件:按 mtime 从新到旧检查头部 session_meta 的 cwd,
-/// 命中即返回(限扫描量,避免历史膨胀拖慢轮询)。
-fn newest_codex_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
-    const MAX_SCAN: usize = 30;
-    let home = dirs::home_dir()?;
-    let sessions_dir = home.join(".codex").join("sessions");
+/// 按 mtime 从新到旧最多读多少个 Codex 会话文件的头(避免历史膨胀拖慢轮询)。
+const CODEX_MAX_SCAN: usize = 30;
+
+/// 读 Codex 会话文件头部的 session_meta(只看前 5 行,取第一条)。
+fn read_codex_meta(path: &Path) -> Option<ai_sessions::CodexSessionMeta> {
+    use std::io::BufRead;
+    let file = fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .lines()
+        .take(5)
+        .filter_map(Result::ok)
+        .find_map(|line| ai_sessions::codex_meta_from_line(&line))
+}
+
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(SystemTime::from)
+}
+
+/// 同项目里其他 Codex pane 划给本 pane 的范围(启发式绑定用,见 [`resolve_session_file`])。
+///
+/// 没有 hook 时只知道每个 pane 什么时候敲下了 `codex`,不知道它写的是哪个会话文件。
+/// Codex 记录头 `session_meta.payload.timestamp` 是**建会话**的时刻:进程一起来就建,
+/// 文件却等首条消息才落盘(Windows 上新版 Codex 追加写还不刷新 mtime,本机实测
+/// 0.146~0.152,文件 mtime 一直停在首次写入)。建会话一定晚于所在 pane 那次 Enter,
+/// 所以把同项目的无 hook Codex pane 按启动时刻排开,建会话时刻落在
+/// [本 pane 启动, 下一个 pane 启动) 里的会话归本 pane,取其中最新的(`/new` 换出来的)。
+/// 与各 pane 谁先发首条消息无关(issue #103:此前一律镜像「项目最新」,两个 pane
+/// 看到的是同一个会话)。
+///
+/// 已知限制:先启动的 pane 在后一个 pane 启动之后 `/new`,新会话会算到后一个 pane
+/// 头上;`codex resume` 恢复的旧会话建会话时刻早于启动,在这种多 pane 场景下不绑
+/// (空镜像)。要精确就开 hook。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexPeers {
+    /// 同项目里还有别的**没有 hook 身份**的 Codex pane:按启动区间分配;
+    /// 否则沿用「项目里最新的那个」
+    pub contested: bool,
+    /// 那些 pane 里比本 pane 晚启动的最早一个的启动时刻 = 区间上界;`None` = 本 pane 最晚
+    pub next_start: Option<SystemTime>,
+    /// 有 hook 身份的 Codex pane 已认领的会话 id(升序去重):这些会话一律不绑
+    pub claimed: Vec<String>,
+}
+
+/// 启发式下本 pane 该镜像的 Codex 会话文件,返回 (路径, 比新用的时刻)。
+fn codex_candidate(
+    project_path: &str,
+    started: Option<SystemTime>,
+    peers: &CodexPeers,
+) -> Option<(PathBuf, SystemTime)> {
+    let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
+    codex_candidate_in(&sessions_dir, project_path, started, peers)
+}
+
+fn codex_candidate_in(
+    sessions_dir: &Path,
+    project_path: &str,
+    started: Option<SystemTime>,
+    peers: &CodexPeers,
+) -> Option<(PathBuf, SystemTime)> {
     if !sessions_dir.exists() {
         return None;
     }
     let mut paths = Vec::new();
-    ai_sessions::collect_codex_session_paths(&sessions_dir, &mut paths);
-    ai_sessions::sort_newest_session_paths(&mut paths, MAX_SCAN);
+    ai_sessions::collect_codex_session_paths(sessions_dir, &mut paths);
+    ai_sessions::sort_newest_session_paths(&mut paths, CODEX_MAX_SCAN);
 
     let normalized = windows_eq_key(project_path);
-    for path in paths {
-        let Ok(content) = fs::File::open(&path) else {
-            continue;
-        };
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(content);
-        for line in reader.lines().take(5) {
-            let Ok(line) = line else { continue };
-            if let Some(meta) = ai_sessions::codex_meta_from_line(&line) {
-                if windows_eq_key(&meta.cwd) == normalized
-                    && let Some(t) = mtime(&path)
-                {
-                    return Some((path, t));
-                }
-                break;
-            }
+    let mut ours = paths.into_iter().filter_map(|path| {
+        let meta = read_codex_meta(&path)?;
+        (windows_eq_key(&meta.cwd) == normalized && !peers.claimed.contains(&meta.id))
+            .then_some((path, meta))
+    });
+    match (peers.contested, started) {
+        // 同项目还有别的无 hook Codex pane:按建会话时刻认领,时刻读不出的分不了,不要
+        (true, Some(start)) => ours
+            .filter_map(|(path, meta)| {
+                let created = parse_rfc3339(&meta.timestamp)?;
+                let mine = created >= start && peers.next_start.is_none_or(|end| created < end);
+                mine.then_some((path, created))
+            })
+            .max_by_key(|(_, created)| *created),
+        // 只有本 pane 在跑 Codex:项目里 mtime 最新的那个(原行为),早于本轮启动的不要
+        _ => {
+            let (path, _) = ours.next()?;
+            fresh_since(mtime(&path).map(|t| (path, t)), started)
         }
     }
-    None
 }
 
 /// 丢弃早于 `min_mtime` 的候选:候选取的是项目内 mtime 最大者,它若早于锚点,
@@ -711,51 +769,91 @@ fn newest_grok_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     newest
 }
 
-/// 解析 pane 所属项目当前应镜像的会话记录:各家里最新修改的那个。
-/// `min_mtime` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
+/// 启发式绑定(pane 没有 hook 会话身份)的全部输入。
+#[derive(Debug, Clone, Copy)]
+pub struct HeuristicScope<'a> {
+    /// 输入检测认出的 agent 名(`ai_session_agent`)
+    pub agent: Option<&'a str>,
+    /// 本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑
+    pub started: Option<SystemTime>,
+    /// 同项目里其他 Codex pane 划给本 pane 的范围;只在本 pane 跑 Codex 时有内容
+    pub codex_peers: &'a CodexPeers,
+}
+
+/// 启发式在哪几家的记录里找。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentFilter {
+    /// 认不出 agent:各家里最新的那个(原行为)
+    Any,
+    /// 认得出:只找这一家 —— 各家比新会把同项目里别家 pane 的对话贴到这个 pane 上
+    Only(MirrorAgent),
+    /// 认得出但没有可解析的记录(opencode):一家都不找。调用方本该已经走了
+    /// NoLog,这里再守一道
+    Nothing,
+}
+
+fn agent_filter(agent: Option<&str>) -> AgentFilter {
+    let Some(kind) = agent.and_then(AgentKind::parse) else {
+        return AgentFilter::Any;
+    };
+    match kind {
+        AgentKind::Claude => AgentFilter::Only(MirrorAgent::Claude),
+        AgentKind::Codex => AgentFilter::Only(MirrorAgent::Codex),
+        AgentKind::Grok => AgentFilter::Only(MirrorAgent::Grok),
+        AgentKind::Omp => AgentFilter::Only(MirrorAgent::Omp),
+        AgentKind::Pi => AgentFilter::Only(MirrorAgent::Pi),
+        AgentKind::Agy => AgentFilter::Only(MirrorAgent::Agy),
+        AgentKind::OpenCode => AgentFilter::Nothing,
+    }
+}
+
+/// 解析 pane 所属项目当前应镜像的会话记录(没有 hook 身份时的启发式):
+/// pane 的 agent 认得出就只看这一家,否则各家比新;一家之内取项目里最新的那个,
+/// Codex 在同项目有多个 pane 时按 [`CodexPeers`] 分。
+/// `scope.started` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
 /// 宁可先给空镜像等新会话落盘(代价:`--resume` 恢复的旧记录在下一条消息前不显示)。
 pub fn resolve_session_file(
     project_path: &str,
-    min_mtime: Option<SystemTime>,
+    scope: &HeuristicScope,
 ) -> Option<(PathBuf, MirrorAgent)> {
-    let candidates = [
-        (
-            fresh_since(newest_claude_file(project_path), min_mtime),
-            MirrorAgent::Claude,
-        ),
-        (
-            fresh_since(newest_codex_file(project_path), min_mtime),
-            MirrorAgent::Codex,
-        ),
-        (
-            fresh_since(newest_grok_file(project_path), min_mtime),
-            MirrorAgent::Grok,
-        ),
-        (
-            fresh_since(
-                ai_sessions::newest_omp_session_file(project_path),
-                min_mtime,
-            ),
-            MirrorAgent::Omp,
-        ),
-        (
-            fresh_since(ai_sessions::newest_pi_session_file(project_path), min_mtime),
-            MirrorAgent::Pi,
-        ),
-        // 只认主会话:同工作区的子代理 transcript 跑着时比主会话新
-        (
-            fresh_since(ai_sessions::newest_agy_transcript(project_path), min_mtime),
-            MirrorAgent::Agy,
-        ),
-    ];
+    let filter = agent_filter(scope.agent);
+    if filter == AgentFilter::Nothing {
+        return None;
+    }
+    let min_mtime = scope.started;
     let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
-    for (candidate, agent) in candidates {
-        let Some((path, t)) = candidate else { continue };
-        // 严格大于:同刻并列时保留先出现的(Claude > Codex > Grok)
+    // 只对要找的那家做 IO;严格大于:同刻并列时保留先出现的(Claude > Codex > Grok)
+    let mut consider = |agent: MirrorAgent, find: &dyn Fn() -> Option<(PathBuf, SystemTime)>| {
+        if matches!(filter, AgentFilter::Only(only) if only != agent) {
+            return;
+        }
+        let Some((path, t)) = find() else { return };
         if best.as_ref().is_none_or(|(_, cur, _)| t > *cur) {
             best = Some((path, t, agent));
         }
-    }
+    };
+    consider(MirrorAgent::Claude, &|| {
+        fresh_since(newest_claude_file(project_path), min_mtime)
+    });
+    consider(MirrorAgent::Codex, &|| {
+        codex_candidate(project_path, min_mtime, scope.codex_peers)
+    });
+    consider(MirrorAgent::Grok, &|| {
+        fresh_since(newest_grok_file(project_path), min_mtime)
+    });
+    consider(MirrorAgent::Omp, &|| {
+        fresh_since(
+            ai_sessions::newest_omp_session_file(project_path),
+            min_mtime,
+        )
+    });
+    consider(MirrorAgent::Pi, &|| {
+        fresh_since(ai_sessions::newest_pi_session_file(project_path), min_mtime)
+    });
+    // 只认主会话:同工作区的子代理 transcript 跑着时比主会话新
+    consider(MirrorAgent::Agy, &|| {
+        fresh_since(ai_sessions::newest_agy_transcript(project_path), min_mtime)
+    });
     best.map(|(path, _, agent)| (path, agent))
 }
 
@@ -772,33 +870,30 @@ fn claude_session_file_in(dirs: &[PathBuf], session_id: &str) -> Option<PathBuf>
         .find(|p| p.is_file())
 }
 
-/// 在 Codex sessions 目录中按头部 session_meta 的 id 定位会话文件
-/// (文件名不含 session id,须读 meta;限扫描量同 newest_codex_file)。
+/// 在 Codex sessions 目录中按头部 session_meta 的 id 定位会话文件。
+///
+/// 文件名 `rollout-<时刻>-<id>.jsonl` 本身带着 id:先按名字找、读头核对,不受
+/// 「最新 [`CODEX_MAX_SCAN`] 个」的限制 —— Windows 上新版 Codex 追加写不刷新 mtime,
+/// `codex resume` 恢复的旧会话按 mtime 排不进前 30。名字对不上(旧版命名、改过名)
+/// 再退回按 mtime 读最新那批的头。
 fn codex_session_file_in(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    const MAX_SCAN: usize = 30;
     if !sessions_dir.exists() {
         return None;
     }
     let mut paths = Vec::new();
     ai_sessions::collect_codex_session_paths(sessions_dir, &mut paths);
-    ai_sessions::sort_newest_session_paths(&mut paths, MAX_SCAN);
-    for path in paths {
-        let Ok(file) = fs::File::open(&path) else {
-            continue;
-        };
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines().take(5) {
-            let Ok(line) = line else { continue };
-            if let Some(meta) = ai_sessions::codex_meta_from_line(&line) {
-                if meta.id == session_id {
-                    return Some(path);
-                }
-                break;
-            }
-        }
+    let has_id = |path: &Path| read_codex_meta(path).is_some_and(|meta| meta.id == session_id);
+    let suffix = format!("-{session_id}.jsonl");
+    if let Some(path) = paths.iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&suffix))
+            && has_id(path)
+    }) {
+        return Some(path.clone());
     }
-    None
+    ai_sessions::sort_newest_session_paths(&mut paths, CODEX_MAX_SCAN);
+    paths.into_iter().find(|path| has_id(path))
 }
 
 /// 按 hook 上报的会话身份精确定位记录文件——同项目多个 AI pane 各绑各的
@@ -1745,6 +1840,196 @@ mod tests {
         assert!(codex_session_file_in(&root, "sid-missing").is_none());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// 真实 Codex 记录头:`payload.timestamp` 是建会话时刻(早于首条消息落盘)。
+    fn codex_meta_at(id: &str, cwd: &str, created: &str) -> String {
+        let cwd = cwd.replace('\\', "\\\\");
+        format!(
+            "{{\"timestamp\":\"{created}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"{created}\",\"cwd\":\"{cwd}\"}}}}\n"
+        )
+    }
+
+    fn set_mtime(path: &Path, t: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    fn ts(s: &str) -> SystemTime {
+        parse_rfc3339(s).unwrap()
+    }
+
+    /// 按 id 定位先认文件名:恢复的旧会话 mtime 排不进最新 30 个也找得到;
+    /// 名字对得上但头里的 id 对不上的不算。
+    #[test]
+    fn codex_session_file_found_by_name_beyond_scan_limit() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let root = temp_dir("codex-by-name");
+        let old_day = root.join("2026").join("01").join("01");
+        let new_day = root.join("2026").join("11").join("21");
+        let fake_day = root.join("2026").join("11").join("20");
+        for d in [&old_day, &new_day, &fake_day] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let id = "01a0b285-5d07-72d3-b684-3e5a3c9a3d47";
+        let target = old_day.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+        fs::write(
+            &target,
+            codex_meta_at(id, r"D:\proj", "2026-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        set_mtime(&target, UNIX_EPOCH + Duration::from_secs(1_000));
+        // 名字冒充、头里不是这个 id
+        let impostor = fake_day.join(format!("rollout-2026-11-20T00-00-00-{id}.jsonl"));
+        fs::write(
+            &impostor,
+            codex_meta_at("someone-else", r"D:\proj", "2026-11-20T00:00:00Z"),
+        )
+        .unwrap();
+        for i in 0..(CODEX_MAX_SCAN + 2) {
+            let p = new_day.join(format!("rollout-2026-11-21T00-00-{i:02}-other-{i}.jsonl"));
+            fs::write(
+                &p,
+                codex_meta_at(&format!("other-{i}"), r"D:\proj", "2026-11-21T00:00:00Z"),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(codex_session_file_in(&root, id), Some(target));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// issue #103:同项目两个无 hook 的 Codex pane 各绑各的会话,与谁先发首条消息无关。
+    #[test]
+    fn codex_candidate_partitions_sessions_by_pane_start() {
+        let root = temp_dir("codex-peers");
+        let day = root.join("2026").join("11").join("21");
+        fs::create_dir_all(&day).unwrap();
+        let write = |name: &str, id: &str, cwd: &str, created: &str, first_write: &str| {
+            let p = day.join(name);
+            fs::write(&p, codex_meta_at(id, cwd, created)).unwrap();
+            // 新版 Codex 在 Windows 上 mtime 停在首条消息落盘那一刻
+            set_mtime(&p, ts(first_write));
+            p
+        };
+        let t1 = ts("2026-11-21T03:00:00Z");
+        let t2 = ts("2026-11-21T03:00:30Z");
+        // 旧会话:早于两个 pane 启动
+        write(
+            "r-old.jsonl",
+            "sid-old",
+            r"D:\proj",
+            "2026-11-21T02:00:00Z",
+            "2026-11-21T02:00:10Z",
+        );
+        // pane-1 的会话:先建、但首条消息最晚才发 → mtime 全项目最新(原实现两个 pane 都绑它)
+        let a = write(
+            "r-a.jsonl",
+            "sid-a",
+            r"D:\proj",
+            "2026-11-21T03:00:02Z",
+            "2026-11-21T03:05:00Z",
+        );
+        let b = write(
+            "r-b.jsonl",
+            "sid-b",
+            r"D:\proj",
+            "2026-11-21T03:00:33Z",
+            "2026-11-21T03:01:00Z",
+        );
+        // 别的项目同一时段的会话:不归任何一个
+        write(
+            "r-x.jsonl",
+            "sid-x",
+            r"D:\other",
+            "2026-11-21T03:00:40Z",
+            "2026-11-21T03:06:00Z",
+        );
+
+        let pane1 = CodexPeers {
+            contested: true,
+            next_start: Some(t2),
+            claimed: vec![],
+        };
+        let pane2 = CodexPeers {
+            contested: true,
+            next_start: None,
+            claimed: vec![],
+        };
+        let pick = |started, peers: &CodexPeers| {
+            codex_candidate_in(&root, r"d:/proj/", Some(started), peers).map(|(p, _)| p)
+        };
+        assert_eq!(pick(t1, &pane1), Some(a.clone()));
+        assert_eq!(pick(t2, &pane2), Some(b.clone()));
+
+        // pane-2 里 /new 出的新会话归 pane-2(区间里取最新),pane-1 不受影响
+        let b2 = write(
+            "r-b2.jsonl",
+            "sid-b2",
+            r"D:\proj",
+            "2026-11-21T03:02:00Z",
+            "2026-11-21T03:02:05Z",
+        );
+        assert_eq!(pick(t2, &pane2), Some(b2.clone()));
+        assert_eq!(pick(t1, &pane1), Some(a.clone()));
+
+        // 被有 hook 身份的同伴认领的会话不绑
+        let claimed = CodexPeers {
+            claimed: vec!["sid-b2".into()],
+            ..pane2.clone()
+        };
+        assert_eq!(pick(t2, &claimed), Some(b.clone()));
+
+        // pane-1 的会话还没建:区间里没有就是空镜像,不去绑 pane-2 的
+        let early = CodexPeers {
+            next_start: Some(ts("2026-11-21T03:00:01Z")),
+            ..pane1.clone()
+        };
+        assert_eq!(pick(t1, &early), None);
+
+        // 只有一个 Codex pane:照旧取项目里 mtime 最新的,早于启动的不要
+        let alone = CodexPeers::default();
+        assert_eq!(pick(t1, &alone), Some(a.clone()));
+        assert_eq!(pick(ts("2026-11-21T04:00:00Z"), &alone), None);
+        // 独自一个也不绑别人认领的
+        let alone_claimed = CodexPeers {
+            claimed: vec!["sid-a".into()],
+            ..CodexPeers::default()
+        };
+        assert_eq!(pick(t1, &alone_claimed), Some(b2));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 启发式只找 pane 那家 agent 的记录;认不出才各家比新;opencode 一家都不找。
+    #[test]
+    fn agent_filter_follows_detected_agent() {
+        assert_eq!(agent_filter(None), AgentFilter::Any);
+        assert_eq!(agent_filter(Some("")), AgentFilter::Any);
+        assert_eq!(
+            agent_filter(Some("codex")),
+            AgentFilter::Only(MirrorAgent::Codex)
+        );
+        assert_eq!(
+            agent_filter(Some("claude-code")),
+            AgentFilter::Only(MirrorAgent::Claude)
+        );
+        assert_eq!(
+            agent_filter(Some("agy")),
+            AgentFilter::Only(MirrorAgent::Agy)
+        );
+        assert_eq!(agent_filter(Some("opencode")), AgentFilter::Nothing);
+        let peers = CodexPeers::default();
+        let scope = HeuristicScope {
+            agent: Some("opencode"),
+            started: None,
+            codex_peers: &peers,
+        };
+        assert_eq!(resolve_session_file(PROJECT, &scope), None);
     }
 
     #[test]
