@@ -1214,7 +1214,9 @@ impl FileViewer {
                     .into_any_element()
             }
             // 收起途中:正文已铺满,出场层叠在正文左侧滑走。目录栏本身不刷底色(着色归
-            // 容器层),出场层得自己垫一层页面底色,否则底下正文的字会透上来;不接鼠标
+            // 容器层),出场层得自己垫一层页面底色,否则底下正文的字会透上来;不接鼠标 ——
+            // 拦鼠标的是**最后一个子元素**那张透明罩:`occlude` 挂在容器上只挡先于它插入的
+            // 命中框,目录项是后插入的、在它之上,照样点得到(同 `motion_kit::push_pair`)
             Some(outline) if available && openness > 0.0 => div()
                 .size_full()
                 .relative()
@@ -1235,8 +1237,8 @@ impl FileViewer {
                                 .w(px(MD_OUTLINE_WIDTH))
                                 .h_full()
                                 .bg(ui::bg_document())
-                                .occlude()
-                                .child(self.render_md_outline(&outline, cx)),
+                                .child(self.render_md_outline(&outline, cx))
+                                .child(div().absolute().inset_0().occlude()),
                         ),
                 )
                 .into_any_element(),

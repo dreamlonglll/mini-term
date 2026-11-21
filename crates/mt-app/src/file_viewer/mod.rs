@@ -1713,7 +1713,11 @@ impl FileViewer {
                         },
                         |_, _, _, _| {},
                     )
+                    // 钉住 inset:段是 block 带 padding、探针排在字后面,不写会按静态位置
+                    // 落到字的下方、右移一个 padding(两段同偏、相减抵掉,但别靠它)
                     .absolute()
+                    .top_0()
+                    .left_0()
                     .size_full(),
                 )
         };

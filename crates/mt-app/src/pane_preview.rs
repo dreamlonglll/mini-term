@@ -580,6 +580,17 @@ impl<K: Clone + PartialEq> HoverCard<K> {
         self.is_warm() && self.shown.as_ref().is_some_and(|shown| shown.key == *key)
     }
 
+    /// 卡正显示 `key` 时它记着的锚点矩形(见 [`Self::is_on`]),否则 `None`。
+    ///
+    /// 收起途中悬停回原目标时拿它重开:调用方手上的「最近一次量到的矩形」若只有一格
+    /// (项目列表的量尺只挂在被悬停的那一行上),此刻可能已被中间悬停过的那一行盖掉。
+    pub fn anchor_of(&self, key: &K) -> Option<Bounds<Pixels>> {
+        self.shown
+            .as_ref()
+            .filter(|_| self.is_on(key))
+            .map(|shown| shown.anchor)
+    }
+
     /// 弹出 / 换到 `key`。`place` 把锚点矩形换成卡的落点(与渲染处同一个函数),
     /// 换卡位移按两个落点之差算。
     ///
@@ -810,5 +821,31 @@ mod tests {
         let at = tab_anchor(tab);
         assert_eq!(f32::from(at.x), 50.0);
         assert_eq!(f32::from(at.y), 62.0);
+    }
+
+    /// 项目 A 的卡弹出 → 移到没有 AI 的 B(B 的量尺把那一格矩形量成了 B 的,卡开始收)
+    /// → 收起途中移回 A:重开要用卡上记着的 A 的锚点,不能贴到 B 那一行旁边。
+    #[gpui::test]
+    fn 收起途中回到原目标_锚点沿用卡上记着的(cx: &mut gpui::TestAppContext) {
+        let row = |y: f32| Bounds {
+            origin: gpui::point(px(0.0), px(y)),
+            size: size(px(240.0), px(28.0)),
+        };
+        cx.update(|cx| {
+            let mut card: HoverCard<&'static str> = HoverCard::default();
+            card.open("a", row(100.0), project_anchor, cx);
+            assert_eq!(card.anchor_of(&"a"), Some(row(100.0)));
+            assert_eq!(card.anchor_of(&"b"), None, "卡上显示的不是 b");
+            assert!(card.close(cx));
+            if mt_ui::motion::animations_enabled() {
+                // 收起途中仍在屏幕上:A 的锚点还在,拿它重开就回到 A 的那一行
+                let anchor = card.anchor_of(&"a");
+                assert_eq!(anchor, Some(row(100.0)));
+                card.open("a", anchor.unwrap(), project_anchor, cx);
+                assert_eq!(card.anchor_of(&"a"), Some(row(100.0)));
+            }
+            card.close_now();
+            assert_eq!(card.anchor_of(&"a"), None, "卸掉之后没有锚点");
+        });
     }
 }

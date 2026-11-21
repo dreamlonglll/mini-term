@@ -1212,8 +1212,21 @@ impl Render for UsagePanel {
 
         let header = self.render_header(cx);
         // 量主体区的可视高度(上推入场的起点,见 [`entry_offset`])。量完不 notify:
-        // 只有入场那 350ms 用得上,那时本来每帧都在画
+        // 只有入场那 350ms 用得上,那时本来每帧都在画。
+        //
+        // ⚠️ 探针挂在滚动容器**外面**那层外壳上:滚动容器按直接子元素的包围盒算内容尺寸,
+        // 一块 `h_full` 的探针挂进去,内容恒 ≥ 可视高、再加上下 padding —— 内容很短时
+        // 滚轮也能把主体上推 28px 露出空白
         let body_height = self.body_height.clone();
+        let height_probe = gpui::canvas(
+            move |bounds, _window, _cx| body_height.set(f32::from(bounds.size.height)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(0.0))
+        .h_full();
         let mut body = div()
             .id("usage-body")
             .relative()
@@ -1223,18 +1236,7 @@ impl Render for UsagePanel {
             .py(px(14.0))
             .flex()
             .flex_col()
-            .gap(px(14.0))
-            .child(
-                gpui::canvas(
-                    move |bounds, _window, _cx| body_height.set(f32::from(bounds.size.height)),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .w(px(0.0))
-                .h_full(),
-            );
+            .gap(px(14.0));
 
         // 副标题 + backfill 进度(原版 `:474-487`)
         body = body.child(
@@ -1329,7 +1331,17 @@ impl Render for UsagePanel {
             .flex_col()
             .bg(ui::bg_surface())
             .child(header)
-            .child(body)
+            // 主体区外壳:量高探针 + 滚动容器(见上)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .child(height_probe)
+                    .child(body),
+            )
             // 日期浮层。挂在这一层是安全的:它自己是 `deferred`,而 gpui 的
             // `DeferredDraw` 不带祖先的 ContentMask —— 抽屉裁不到它
             .when_some(self.calendar.clone(), |el, picker| el.child(picker))
@@ -1963,18 +1975,15 @@ impl UsagePanel {
         self.rank_bars.drive(window);
 
         // 入场(原版 `usageFadeIn` 是 opacity 0→1 + 下移 6px):不淡入,整块从主体区
-        // 底边上推入位 —— `relative` + `top` 偏移只挪绘制位置、不改布局(滚动范围不跟着
-        // 变),主体区自己是裁剪窗。跑完直接不挂包装层
+        // 底边上推入位 —— [`crate::motion_kit::shifted`] 只挪绘制位置、不改排版(滚动范围
+        // 不跟着变;`relative` + `top` 改的是排版位置,入场那 350ms 里滚动范围会临时变大),
+        // 主体区自己是裁剪窗。跑完直接不挂包装层
         let p = self.fade_in.drive(window);
         let offset = entry_offset(self.body_height.get(), p);
         body.child(if offset <= 0.0 {
             main.into_any_element()
         } else {
-            div()
-                .relative()
-                .top(px(offset))
-                .child(main)
-                .into_any_element()
+            crate::motion_kit::shifted(main, 0.0, offset).into_any_element()
         })
     }
 

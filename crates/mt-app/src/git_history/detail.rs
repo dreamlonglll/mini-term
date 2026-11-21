@@ -124,6 +124,10 @@ pub(super) struct DetailState {
     target: Option<DetailTarget>,
     /// 眼下画出来的是哪一份(换了一份才回顶、展开全部目录)。
     shown: Option<DetailTarget>,
+    /// 选择刚清空 / 换了仓库([`Self::retire`])时台上那一份要的是什么。详情栏这时只可能
+    /// 还画在退场层上,照它的形态画、内容原样留着,不当场变成「加载中…」再滑走;下一次
+    /// 选中([`Self::retarget`])先整份清掉。
+    retired: Option<DetailTarget>,
     /// 请求令牌:连着换选中时,迟到的详情丢弃。单选 / 多选共用。
     request: u64,
     /// 只读正文(可选中复制)。
@@ -179,6 +183,7 @@ impl DetailState {
             containing_request: 0,
             target: None,
             shown: None,
+            retired: None,
             request: 0,
             body: cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, BODY_MAX_ROWS)),
             pending_body: None,
@@ -202,10 +207,23 @@ impl DetailState {
         self.containing = None;
         self.target = None;
         self.shown = None;
+        self.retired = None;
         self.pending_body = None;
         self.collapsed.clear();
         self.files_changed();
         self.containing_changed();
+    }
+
+    /// 换仓库 / 选择清空:在途的请求作废,**台上的内容先留着** —— 详情栏这时正从抽屉
+    /// 左缘滑走(退场层画的就是这个实体),当场清空的话滑走的是一栏「加载中…」。下一次
+    /// 选中时 [`Self::retarget`] 再整份清掉(与原先 [`Self::clear`] 之后再选中同一结果)。
+    pub(super) fn retire(&mut self) {
+        self.request += 1;
+        self.containing_request += 1;
+        self.loading = false;
+        if let Some(target) = self.target.take() {
+            self.retired = Some(target);
+        }
     }
 
     /// 文件列表 / 行数统计 / 收起的目录变了:文件区的派生行作废,下一帧重算。
@@ -314,6 +332,11 @@ impl DetailState {
     pub(super) fn retarget(&mut self, target: Option<DetailTarget>) -> bool {
         if self.target == target {
             return false;
+        }
+        // 退场留下的那一份([`Self::retire`])到此为止:再选中时与原先「清空后再选中」
+        // 一样从白纸开始(回顶、展开全部目录、不露上一份的内容)
+        if target.is_some() && self.retired.is_some() {
+            self.clear();
         }
         let was_multi = matches!(self.target, Some(DetailTarget::Multi(_)));
         let was_single = matches!(self.target, Some(DetailTarget::Single(_)));
@@ -674,6 +697,18 @@ fn file_stat_label(stat: &FileLineStat) -> Option<AnyElement> {
     line_counts(stat.additions, stat.deletions).map(IntoElement::into_any_element)
 }
 
+/// 详情栏这一帧按多选态画吗。
+///
+/// 平时看选中数;选中集为空时详情栏只可能还在退场层上(主层要求有选中,见
+/// [`GitHistoryContent::detail_shown`]),照清空前那一份([`DetailState::retire`])的形态画
+/// —— 否则多选刚清空的那一栏会当场换成单提交那一支(旧单选详情 / 「加载中…」)再滑走。
+fn pane_is_multi(selected: usize, retired: Option<&DetailTarget>) -> bool {
+    match selected {
+        0 => matches!(retired, Some(DetailTarget::Multi(_))),
+        n => n >= 2,
+    }
+}
+
 /// 详情栏:标题条 + 可滚动的内容。由 [`CommitDetailPane`] 借历史区实体调。
 fn render_pane(
     this: &mut GitHistoryContent,
@@ -684,7 +719,7 @@ fn render_pane(
     this.detail.flush_body(window, cx);
     this.detail.chevrons.drive(window);
     let this = &*this;
-    let multi = this.selection.len() >= 2;
+    let multi = pane_is_multi(this.selection.len(), this.detail.retired.as_ref());
 
     let mut body = div()
         .id("git-log-detail-body")
@@ -1128,7 +1163,12 @@ fn render_multi(
     mut body: gpui::Stateful<gpui::Div>,
     cx: &mut Context<GitHistoryContent>,
 ) -> gpui::Stateful<gpui::Div> {
-    let total = this.selection.len();
+    // 选中集刚清空(退场层,见 [`pane_is_multi`]):列的是清空前要合并的那一组
+    let retired = match this.detail.retired.as_ref() {
+        Some(DetailTarget::Multi(hashes)) if this.selection.is_empty() => Some(hashes),
+        _ => None,
+    };
+    let total = retired.map_or(this.selection.len(), Vec::len);
     let now = chrono::Utc::now().timestamp();
     body = body.child(
         div()
@@ -1139,7 +1179,10 @@ fn render_multi(
     );
 
     // 选中提交的小列表:短哈希 + 标题 + 作者 + 相对时间,完整信息挂 tooltip
-    let picked = picked_rows(&this.selection, &this.log);
+    let picked = match retired {
+        Some(hashes) => rows_of(hashes.iter().map(String::as_str), &this.log),
+        None => picked_rows(&this.selection, &this.log),
+    };
     let mut list = div().flex().flex_col().gap(px(2.0));
     let view = cx.entity().downgrade();
     for commit in picked
@@ -1259,10 +1302,12 @@ fn render_multi(
 /// 选中的提交在列表里的行号,按列表顺序(与 `CommitSelection::ordered` 同一结果)。按常驻
 /// 索引查位置,只做与选中数成正比的活 —— 多选态这一栏每帧都画,不能每帧扫整份已加载列表。
 fn picked_rows(selection: &CommitSelection, log: &LoadedLog) -> Vec<usize> {
-    let mut rows: Vec<usize> = selection
-        .hashes()
-        .filter_map(|hash| log.position(hash))
-        .collect();
+    rows_of(selection.hashes(), log)
+}
+
+/// 一组提交在列表里的行号,按列表顺序(不在已加载列表里的跳过)。
+fn rows_of<'a>(hashes: impl Iterator<Item = &'a str>, log: &LoadedLog) -> Vec<usize> {
+    let mut rows: Vec<usize> = hashes.filter_map(|hash| log.position(hash)).collect();
     rows.sort_unstable();
     rows
 }
@@ -1539,6 +1584,27 @@ mod tests {
             .map(|i| commits[i].hash.as_str())
             .collect();
         assert_eq!(got, want);
+        // 选中集清空后退场层按留下的那组哈希列(顺序无关),与清空前列的一模一样
+        let mut retired: Vec<String> = sel.hashes().map(str::to_string).collect();
+        retired.reverse();
+        let from_retired = rows_of(retired.iter().map(String::as_str), &log);
+        assert_eq!(from_retired, picked_rows(&sel, &log));
+    }
+
+    /// 详情栏按多选态画吗:平时看选中数;选中集清空(只剩退场层在画)时照清空前那一份
+    /// 的形态,不当场换成单提交那一支。
+    #[test]
+    fn 选择清空后退场层照清空前的形态画() {
+        let single = DetailTarget::Single("a".into());
+        let multi = DetailTarget::Multi(vec!["a".into(), "b".into()]);
+        assert!(!pane_is_multi(1, None));
+        assert!(pane_is_multi(2, None));
+        assert!(pane_is_multi(5, Some(&single)), "有选中时只看选中数");
+        assert!(!pane_is_multi(1, Some(&multi)));
+        // 选中集为空:按退场留下的那一份
+        assert!(pane_is_multi(0, Some(&multi)));
+        assert!(!pane_is_multi(0, Some(&single)));
+        assert!(!pane_is_multi(0, None));
     }
 
     #[test]

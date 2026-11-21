@@ -299,10 +299,13 @@ pub struct TerminalArea {
     tab_swaps: HashMap<String, TabSwap>,
     /// 整块(面板切换 / 最大化开合)的换场记录。
     area_swap: Option<AreaSwap>,
-    /// 上一帧「每个叶子的激活 pane + 它在组里的下标」—— 检测切 tab 用;下标给
-    /// 「关掉激活 tab 后新激活的从哪一侧推入」定方向。**不按帧回收**
-    /// (与 `pane_enter` 同理:切面板再回来不该被误判成一次切换)。
-    last_leaf_active: HashMap<String, (String, usize)>,
+    /// 上一次画到「每个叶子」时的激活 pane + 它在组里的下标 + 那一轮 render 的代次 ——
+    /// 检测切 tab 用;下标给「关掉激活 tab 后新激活的从哪一侧推入」定方向。**不按帧回收**
+    /// (与 `pane_enter` 同理:切面板再回来不该被误判成一次切换);隔了几轮才再画到的
+    /// 叶子只对齐不起过渡(见 [`leaf_drawn_recently`])。
+    last_leaf_active: HashMap<String, LeafActive>,
+    /// render 的代次(每次 `render` 加一)。[`LeafActive::drawn_gen`] 拿它判「上一轮画没画到」。
+    render_gen: u64,
     /// 上一帧的整块内容键:(项目, 面板, 最大化叶)。项目一换只记不播。
     last_area_key: Option<(String, String, Option<String>)>,
     /// 换场动画序号:同一处连续快速切换时,上一场动画的 id 必须让位。
@@ -413,6 +416,25 @@ fn tab_swap_plan(old_idx: Option<usize>, old_prev_idx: usize, new_idx: usize) ->
     }
 }
 
+/// 上一次以展开态画到某个叶子时它的激活 pane(见 [`TerminalArea::last_leaf_active`])。
+struct LeafActive {
+    pane_id: String,
+    /// 激活 pane 当时在组里的下标。
+    index: usize,
+    /// 记下它的那一轮 render 的代次([`TerminalArea::render_gen`])。
+    drawn_gen: u64,
+}
+
+/// 记录是不是**上一轮(或这一轮)**render 画到这一叶时留下的。
+///
+/// 不是 = 这一叶有一阵子没以展开态画过:缩在最大化的折叠条里(折叠条不走 `render_leaf`)、
+/// 在别的面板 / 项目里。那期间激活项的变化(折叠条上右键关掉激活 tab、从终端列表跳过去)
+/// 不是「刚刚发生」的,再画到时只对齐记录、不起过渡 —— 否则还原 / 切回来的同时
+/// 这一叶又横推一次。
+fn leaf_drawn_recently(drawn_gen: u64, current_gen: u64) -> bool {
+    drawn_gen.saturating_add(1) >= current_gen
+}
+
 /// 叶内切 tab 的一次 push 过渡。
 struct TabSwap {
     seq: u64,
@@ -479,7 +501,8 @@ enum AreaExitSrc {
     /// resize、画面跳一下 —— 早先这里只画终端主体、漏了铺满组自己那条 `TAB_BAR_H`
     /// 的 tab 栏,终端凭空高出 30px。现在整组照 `render_leaf` 画,底下的整树把这组
     /// 挖空(见 [`AreaMotion::RevealBack`]),tab 栏只在飞行层上挂一份。
-    /// `bar_count` 是铺满时折叠条的条数(= 叶子数 − 1)。
+    /// `bar_count` 是铺满时折叠条的条数(= **还原前那一帧**的叶子数 − 1,
+    /// 见 [`restore_bar_count`])。
     MaxLeaf { leaf_id: String, bar_count: usize },
 }
 
@@ -743,6 +766,16 @@ fn collapsed_zone_max(area_h: f32) -> f32 {
 /// 还原飞行层按它占位 —— 差一点,飞行层里的终端就比铺满态高 / 矮,多一次 PTY resize。
 fn collapsed_zone_height(area_h: f32, bars: usize) -> f32 {
     collapsed_zone_max(area_h).min(bars as f32 * TAB_BAR_H)
+}
+
+/// 还原飞行层的折叠条条数:按**还原开始前那一帧**(铺满态真正画出来的)的布局数,
+/// 不按变更之后的。
+///
+/// 最大化状态下分屏(`split_pane_with_cwd`、拖到终端区边缘)会先 `clear_maximized`,
+/// 同一帧叶子数 +1 并开始还原 —— 按新布局数,飞行层的折叠区比铺满态多一条、终端主体
+/// 矮 `TAB_BAR_H`,还原第一帧多一次 PTY resize。上一帧快照缺席(理论走不到)才退回现布局。
+fn restore_bar_count(prev: Option<&SplitNode>, now: &SplitNode) -> usize {
+    prev.unwrap_or(now).leaves().len().saturating_sub(1)
 }
 
 // ─── 控件簇的描边图标(照抄 `PaneGroup.tsx:40-62` 的 SVG,viewBox 16 归一化;
@@ -1366,6 +1399,7 @@ impl TerminalArea {
             tab_swaps: HashMap::new(),
             area_swap: None,
             last_leaf_active: HashMap::new(),
+            render_gen: 0,
             last_area_key: None,
             swap_seq: 0,
             area_origin: gpui::Point::default(),
@@ -1523,7 +1557,7 @@ impl TerminalArea {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let frame = self.tab_card.frame(window)?;
+        let mut frame = self.tab_card.frame(window)?;
         let (pane_id, rect) = (frame.key.clone(), frame.anchor);
         let (project_id, still_hidden) = {
             let store = self.store.read(cx);
@@ -1547,8 +1581,12 @@ impl TerminalArea {
             self.tab_card.close_now();
             return None;
         };
-        if !still_hidden {
-            self.tab_card.close(cx);
+        // 被激活了(Ctrl+数字 / Ctrl+Tab / 聚焦 chip 上回车):收起,且**本帧就按收起之后的
+        // 状态画** —— 上面那份是 close 之前取的(全开、不要帧),照它画的话:总开关关着时
+        // close 已直达收起、再没人重画,卡一直盖着;开着时收起动画第一帧没人要。重取一次:
+        // 关着拿到 None、当帧不画;开着从这一帧起播收起并自己要帧
+        if !still_hidden && self.tab_card.close(cx) {
+            frame = self.tab_card.frame(window)?;
         }
         let store = self.store.read(cx);
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
@@ -2682,7 +2720,11 @@ impl TerminalArea {
                             },
                             |_, _, _, _| {},
                         )
+                        // 钉住 inset:tab 是带 px(10) 的 flex,不写会按静态位置右移 10px,
+                        // 缩略图锚点跟着偏(见 `segment_slider::IndicatorSlider::probe`)
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full()
                     })
                     .text_color(if is_active {
@@ -2813,14 +2855,17 @@ impl TerminalArea {
         cx: &mut Context<Self>,
     ) -> Option<(u64, f32, Option<String>)> {
         let animations_enabled = self.animations_enabled(cx);
+        let now_gen = self.render_gen;
         let new_idx = panes.iter().position(|p| p.id == active_id);
         match self.last_leaf_active.get(leaf_id) {
-            Some((prev, prev_idx)) if prev.as_str() != active_id => {
-                let (old, old_prev_idx) = (prev.clone(), *prev_idx);
+            Some(rec) if rec.pane_id != active_id => {
+                let (old, old_prev_idx) = (rec.pane_id.clone(), rec.index);
+                let recent = leaf_drawn_recently(rec.drawn_gen, now_gen);
                 let old_idx = panes.iter().position(|p| p.id == old);
                 let swap = new_idx.map(|n| tab_swap_plan(old_idx, old_prev_idx, n));
-                if !animations_enabled {
-                    // 开关关着:只对齐记录,不起过渡(也把可能在飞的收掉)
+                if !animations_enabled || !recent {
+                    // 开关关着 / 这一叶隔了几轮才再画到(变化不是刚发生的):只对齐记录,
+                    // 不起过渡(也把可能在飞的收掉)
                     self.tab_swaps.remove(leaf_id);
                 } else if let Some((dir, keeps_old)) = swap {
                     self.swap_seq += 1;
@@ -2851,23 +2896,45 @@ impl TerminalArea {
                 } else {
                     self.tab_swaps.remove(leaf_id);
                 }
-                if let Some(n) = new_idx {
-                    self.last_leaf_active
-                        .insert(leaf_id.to_string(), (active_id.to_string(), n));
+                match new_idx {
+                    Some(n) => {
+                        self.last_leaf_active.insert(
+                            leaf_id.to_string(),
+                            LeafActive {
+                                pane_id: active_id.to_string(),
+                                index: n,
+                                drawn_gen: now_gen,
+                            },
+                        );
+                    }
+                    None => {
+                        if let Some(rec) = self.last_leaf_active.get_mut(leaf_id) {
+                            rec.drawn_gen = now_gen;
+                        }
+                    }
                 }
             }
-            Some((prev, prev_idx)) => {
+            Some(_) => {
                 // 激活项没换,但它在组里的位置可能挪了(拖拽重排 / 关掉它左边的 tab):
-                // 下标跟着记,下次关掉它时才算得出被关的那一侧
-                if let Some(n) = new_idx.filter(|n| n != prev_idx) {
-                    let id = prev.clone();
-                    self.last_leaf_active.insert(leaf_id.to_string(), (id, n));
+                // 下标跟着记,下次关掉它时才算得出被关的那一侧。代次每轮都刷(原地改,
+                // 不分配)
+                if let Some(rec) = self.last_leaf_active.get_mut(leaf_id) {
+                    if let Some(n) = new_idx {
+                        rec.index = n;
+                    }
+                    rec.drawn_gen = now_gen;
                 }
             }
             None => {
                 if let Some(n) = new_idx {
-                    self.last_leaf_active
-                        .insert(leaf_id.to_string(), (active_id.to_string(), n));
+                    self.last_leaf_active.insert(
+                        leaf_id.to_string(),
+                        LeafActive {
+                            pane_id: active_id.to_string(),
+                            index: n,
+                            drawn_gen: now_gen,
+                        },
+                    );
                 }
             }
         }
@@ -3920,6 +3987,8 @@ impl TerminalArea {
         // 这里**故意不 notify**:量尺寸再触发重画就是每帧一个死循环。
         let this = cx.entity();
         let rect_pane_id = active_id.clone();
+        // 关分屏后的扩张中,整格被 LeafSlot 挪着画:量尺减掉那份偏移,记的仍是排版位置
+        let rect_fx = self.fx.clone();
 
         // 终端区落点预览的档位(只画本组自己那一份)
         let body_zone = self
@@ -4039,6 +4108,7 @@ impl TerminalArea {
                     .child(
                         canvas(
                             move |bounds: Bounds<Pixels>, _window, cx| {
+                                let bounds = rect_fx.borrow().unshift(bounds);
                                 this.update(cx, |area: &mut TerminalArea, _cx| {
                                     area.pane_rects.insert(
                                         rect_pane_id.clone(),
@@ -4627,6 +4697,7 @@ impl Render for TerminalArea {
         //
         // 上一帧的那份先留一个引用计数:关分屏后邻居扩张要比对「哪些叶子没了」
         self.fx.borrow_mut().begin_frame();
+        self.render_gen += 1;
         let prev_layout = self.layout_snapshot.clone();
         let layout_changed = {
             let store = self.store.read(cx);
@@ -4874,13 +4945,14 @@ impl Render for TerminalArea {
                     Some((dir, AreaMotion::Push, exit))
                 } else {
                     // 还原飞行层画的旧铺满组(整组 + 折叠区占位)。最大化状态下换
-                    // 铺满组早已改成瞬切,这份取法只剩还原一个用处
+                    // 铺满组早已改成瞬切,这份取法只剩还原一个用处。折叠条条数按
+                    // 上一帧的布局数(见 [`restore_bar_count`])
                     let max_leaf_exit = |old_leaf: &str| -> AreaExitSrc {
                         match layout.node(old_leaf) {
                             Some(SplitNode::Leaf { panes, .. }) if !panes.is_empty() => {
                                 AreaExitSrc::MaxLeaf {
                                     leaf_id: old_leaf.to_string(),
-                                    bar_count: layout.leaves().len().saturating_sub(1),
+                                    bar_count: restore_bar_count(prev_layout.as_deref(), &layout),
                                 }
                             }
                             _ => AreaExitSrc::None,
@@ -4903,8 +4975,14 @@ impl Render for TerminalArea {
                                     .position(|p| &p.id == active_pane_id)
                                     .or_else(|| (!panes.is_empty()).then_some(0));
                                 if let Some(i) = active {
-                                    self.last_leaf_active
-                                        .insert(new_leaf.clone(), (panes[i].id.clone(), i));
+                                    self.last_leaf_active.insert(
+                                        new_leaf.clone(),
+                                        LeafActive {
+                                            pane_id: panes[i].id.clone(),
+                                            index: i,
+                                            drawn_gen: self.render_gen,
+                                        },
+                                    );
                                 }
                             }
                             None
@@ -5479,6 +5557,35 @@ mod tests {
         assert_eq!(collapsed_zone_max(10.0), TAB_BAR_H);
     }
 
+    /// 最大化状态下分屏:`clear_maximized` 与叶子 +1 落在同一帧,还原飞行层的折叠区
+    /// 必须按上一帧(铺满态真正画出来的)条数占位,终端主体才与铺满态等高。
+    #[test]
+    fn 还原同帧叶子数变化时折叠条按上一帧算() {
+        use crate::tree::PaneState;
+        let leaf = |name: &str| SplitNode::leaf(PaneState::new(name));
+        let split = |children: Vec<SplitNode>| SplitNode::Split {
+            id: crate::tree::gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![],
+            children,
+        };
+        let (a, b) = (leaf("a"), leaf("b"));
+        // 铺满 a、底部一条 b 的折叠条;在 a 上分屏 → 同一帧还原且多出一格
+        let before = split(vec![a.clone(), b.clone()]);
+        let after = split(vec![split(vec![a.clone(), leaf("new")]), b.clone()]);
+        assert_eq!(restore_bar_count(Some(&before), &after), 1);
+        // 旧写法按变更后的布局数:多一条
+        assert_eq!(after.leaves().len() - 1, 2);
+        let area_h = 600.0_f32;
+        let zone_in_maximized = (1.0 * TAB_BAR_H).min(collapsed_zone_max(area_h));
+        let bars = restore_bar_count(Some(&before), &after);
+        assert_eq!(collapsed_zone_height(area_h, bars), zone_in_maximized);
+        // 布局没变的还原:两种取法一致
+        assert_eq!(restore_bar_count(Some(&before), &before), 1);
+        // 上一帧快照缺席时退回现布局
+        assert_eq!(restore_bar_count(None, &after), 2);
+    }
+
     /// 切 tab / 关激活 tab 的推移方向与出场层取舍(见 [`tab_swap_plan`])。
     #[test]
     fn 切tab与关激活tab的推移方向() {
@@ -5493,6 +5600,23 @@ mod tests {
         assert_eq!(tab_swap_plan(None, 2, 1), (-1.0, false));
         // 「关闭其他」从最左的 A 发起、激活的 C(下标 2)被关:A 从左推入
         assert_eq!(tab_swap_plan(None, 2, 0), (-1.0, false));
+    }
+
+    /// 叶内切 tab 的过渡只认「上一轮 render 刚画过这一叶」时发生的变化。
+    ///
+    /// 最大化 A、在 B 的折叠条上右键关掉 B 的激活 tab(折叠条不走 `render_leaf`,记录停在
+    /// 最大化之前),还原时 B 再以展开态画到:记录是好几轮之前的,只对齐不横推。
+    #[test]
+    fn 隔了几轮才再画到的叶子不起切tab过渡() {
+        // 上一轮刚画过(普通点 tab / 关 tab):起过渡
+        assert!(leaf_drawn_recently(41, 42));
+        // 这一轮已经画过一次(还原飞行层与整树各画一遍):同样算
+        assert!(leaf_drawn_recently(42, 42));
+        // 中间隔了至少一轮没画到(折叠在最大化里 / 切去了别的面板、项目):只对齐
+        assert!(!leaf_drawn_recently(40, 42));
+        assert!(!leaf_drawn_recently(3, 1_000));
+        // 代次溢出边界不 panic
+        assert!(leaf_drawn_recently(u64::MAX, u64::MAX));
     }
 
     /// 关分屏后邻居扩张只认「叶子只少不多」。

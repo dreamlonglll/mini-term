@@ -176,7 +176,11 @@ impl HeightReveal {
             },
             |_, _, _, _| {},
         )
+        // 钉住 inset:不写的话 taffy 按静态位置把它摆到内容下方(只量高度时数值照样对,
+        // 但探针的矩形整个落在内层之外)
         .absolute()
+        .top_0()
+        .left_0()
         .size_full();
         // 内层不受外壳约束:高度 = 内容自然高度,宽度随外壳
         let inner = div()
