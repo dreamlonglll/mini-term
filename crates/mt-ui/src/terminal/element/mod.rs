@@ -78,10 +78,9 @@ use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     App, Bounds, ClipboardItem, ContentMask, Corners, CursorStyle, DispatchPhase, Element,
     ElementId, EntityId, FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
-    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine,
-    SharedString, Size, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point,
-    px, size,
+    InspectorElementId, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, ShapedLine, SharedString, Size,
+    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 
@@ -625,14 +624,6 @@ pub struct PreparedFrame {
     flash: Option<(Bounds<Pixels>, Hsla)>,
     /// 这一帧看得见的 Kitty 图片。没开图形或没有图时是空的。
     images: Vec<mt_terminal::kitty::VisibleImage>,
-}
-
-impl IntoElement for TerminalElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for TerminalElement {

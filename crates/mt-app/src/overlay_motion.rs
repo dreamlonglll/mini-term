@@ -296,14 +296,6 @@ pub struct RevealBoxPrepaint {
     mask: Option<Bounds<Pixels>>,
 }
 
-impl IntoElement for RevealBox {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for RevealBox {
     type RequestLayoutState = ();
     type PrepaintState = RevealBoxPrepaint;
@@ -383,7 +375,7 @@ impl Element for RevealBox {
             window.insert_hitbox(frame, HitboxBehavior::BlockMouse);
         }
         if self.occlude_native {
-            crate::native_view::occlude_rect(frame);
+            crate::native_view::occlude_rect(frame, cx);
         }
         RevealBoxPrepaint { frame, mask }
     }

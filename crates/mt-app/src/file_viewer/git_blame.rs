@@ -23,7 +23,7 @@ use chrono::{DateTime, Datelike, TimeZone};
 use gpui::{
     AnyElement, App, Bounds, ClickEvent, Context, CursorStyle, DispatchPhase, Font, Hitbox,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    Pixels, Point, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Task,
+    Pixels, Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task,
     TextAlign, TextRun, WeakEntity, Window, anchored, deferred, div, fill, point,
     prelude::FluentBuilder as _, px, size,
 };
@@ -968,7 +968,7 @@ impl AnnotationPaint {
             });
         }
         if current.is_some() {
-            window.on_mouse_event(move |_: &ScrollWheelEvent, phase, _window, cx| {
+            window.on_mouse_event(move |_: &ScrollEvent, phase, _window, cx| {
                 if phase == DispatchPhase::Bubble {
                     let _ = view.update(cx, |view, cx| {
                         view.annotate.clear_hover();

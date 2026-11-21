@@ -805,7 +805,7 @@ impl GitChanges {
             } else {
                 self.select_single(area, index);
             }
-        } else if modifiers.secondary() {
+        } else if modifiers.secondary(cx) {
             if !same_area {
                 self.select_single(area, index);
             } else {

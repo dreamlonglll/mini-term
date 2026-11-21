@@ -2353,12 +2353,12 @@ impl Render for FileViewer {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
                 let mods = &ks.modifiers;
-                if ks.key == "w" && mods.secondary() && !mods.shift && !mods.alt {
+                if ks.key == "w" && mods.secondary(cx) && !mods.shift && !mods.alt {
                     cx.stop_propagation();
                     this.request_close(window, cx);
                     return;
                 }
-                if ks.key == "s" && mods.secondary() && !mods.shift && !mods.alt {
+                if ks.key == "s" && mods.secondary(cx) && !mods.shift && !mods.alt {
                     cx.stop_propagation();
                     this.save(cx);
                     return;

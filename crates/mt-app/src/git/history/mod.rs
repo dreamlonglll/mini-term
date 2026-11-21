@@ -2151,7 +2151,7 @@ impl GitHistoryContent {
             window.focus(&this.focus, cx);
             let modifiers = event.modifiers();
             let mods = ClickMods {
-                toggle: modifiers.secondary(),
+                toggle: modifiers.secondary(cx),
                 range: modifiers.shift,
             };
             // ⚠️ 双击打开 diff(`GitHistoryContent.tsx:105`);单击 = 选中(带修饰键的单击
@@ -2255,13 +2255,6 @@ const GRADIENT_ANGLE: f32 = 180.0;
 const GRAPH_STROKE: f32 = 1.75;
 /// 节点半径。
 const NODE_RADIUS: f32 = 4.5;
-
-impl IntoElement for GraphCell {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
 
 impl Element for GraphCell {
     type RequestLayoutState = ();

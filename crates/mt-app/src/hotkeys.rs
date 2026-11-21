@@ -674,13 +674,26 @@ fn canonical(modifiers: &Modifiers, key: &str) -> String {
     out
 }
 
+fn os_of(platform: Platform) -> gpui::OperatingSystem {
+    match platform {
+        Platform::Mac => gpui::OperatingSystem::Mac,
+        Platform::Other => {
+            if cfg!(target_os = "linux") {
+                gpui::OperatingSystem::Linux
+            } else {
+                gpui::OperatingSystem::Windows
+            }
+        }
+    }
+}
+
 /// 把一个键位串规范化。解析不了、是多键序列(`ctrl-k ctrl-s`)时返回 `None`。
 pub fn normalize_keystroke(keystroke: &str) -> Option<String> {
     let keystroke = keystroke.trim();
     if keystroke.is_empty() || keystroke.split_whitespace().count() != 1 {
         return None;
     }
-    let parsed = Keystroke::parse(keystroke).ok()?;
+    let parsed = Keystroke::parse_with_os(keystroke, os_of(Platform::current())).ok()?;
     Some(canonical(&parsed.modifiers, &parsed.key))
 }
 
@@ -754,7 +767,7 @@ fn modifiers_label(modifiers: &Modifiers, key: &str, platform: Platform) -> Stri
 
 /// 一个 gpui 键位串的显示串。解析不了就原样返回(只会是手改坏的配置,不炸)。
 pub fn keystroke_label_for(keystroke: &str, platform: Platform) -> String {
-    match Keystroke::parse(keystroke) {
+    match Keystroke::parse_with_os(keystroke, os_of(platform)) {
         Ok(parsed) => modifiers_label(&parsed.modifiers, &key_label(&parsed.key), platform),
         Err(_) => keystroke.to_string(),
     }
@@ -770,7 +783,7 @@ fn def_label(def: &HotkeyDef, keystroke: &str, platform: Platform) -> String {
     if def.id != SELECT_PANE_N {
         return keystroke_label_for(keystroke, platform);
     }
-    match Keystroke::parse(keystroke) {
+    match Keystroke::parse_with_os(keystroke, os_of(platform)) {
         Ok(parsed) => modifiers_label(&parsed.modifiers, "1…9", platform),
         Err(_) => keystroke.to_string(),
     }
@@ -854,7 +867,7 @@ fn parse_single(keystroke: &str) -> Option<Keystroke> {
     if keystroke.split_whitespace().count() != 1 {
         return None;
     }
-    Keystroke::parse(keystroke).ok()
+    Keystroke::parse_with_os(keystroke, os_of(Platform::current())).ok()
 }
 
 /// 这一条此刻生效的键位:覆盖优先,否则默认,解绑为 `None`。不可改的条目永远是默认。
@@ -1300,15 +1313,60 @@ pub fn terminal_warning(keystroke: &str) -> bool {
 ///
 /// gpui 的按键派发**先匹配 action 绑定、后跑 key 监听**,所以这里绑上就等于拿到了
 /// 原版 capture 阶段 `consume(e)` 的效果:终端看不到这些键。
+/// 构造一条动态键位绑定:运行期走 `KeyBinding::load`(零泄漏、使用真实键盘映射);
+/// 无 `App` 的纯单测路径经 `make_binding_test` 走 `KeyBinding::new`。
+fn load_binding<A: gpui::Action>(
+    keystroke: &str,
+    action: A,
+    context: Option<&str>,
+    cx: &App,
+) -> KeyBinding {
+    let predicate = context.map(|c| gpui::KeyBindingContextPredicate::parse(c).unwrap().into());
+    KeyBinding::load(keystroke, Box::new(action), predicate, false, None, cx).unwrap()
+}
+
+#[cfg(test)]
+fn test_binding<A: gpui::Action>(
+    keystroke: &str,
+    action: A,
+    context: Option<&str>,
+) -> KeyBinding {
+    KeyBinding::new(
+        Box::leak(keystroke.to_owned().into_boxed_str()),
+        action,
+        context,
+    )
+}
+
+fn make_binding<A: gpui::Action>(
+    keystroke: &str,
+    action: A,
+    context: Option<&str>,
+    cx: Option<&App>,
+) -> KeyBinding {
+    match cx {
+        Some(cx) => load_binding(keystroke, action, context, cx),
+        #[cfg(test)]
+        None => test_binding(keystroke, action, context),
+        #[cfg(not(test))]
+        None => unreachable!("runtime hotkey binding always has App"),
+    }
+}
+
 pub fn bind_keys(cx: &mut App) {
-    let mut bindings = table_bindings(Platform::current());
+    let mut bindings = table_bindings_with(Platform::current(), Some(cx));
     bindings.extend(internal_bindings());
     cx.bind_keys(bindings);
     APPLIED.with(|applied| *applied.borrow_mut() = Overrides::default());
 }
 
 /// 表里那几十条的默认绑定(含 `Ctrl+1..9` 展开的九条)。终端 scope 的不绑。
+#[cfg(test)]
 fn table_bindings(platform: Platform) -> Vec<KeyBinding> {
+    table_bindings_with(platform, None)
+}
+
+fn table_bindings_with(platform: Platform, cx: Option<&App>) -> Vec<KeyBinding> {
     let mut bindings = Vec::new();
     for def in HOTKEYS {
         if def.scope == Scope::Terminal {
@@ -1317,11 +1375,13 @@ fn table_bindings(platform: Platform) -> Vec<KeyBinding> {
         if def.id == SELECT_PANE_N {
             // 选中叶内第 N 个 tab(表里是一条,这里展开成九条)
             for (n, keystroke) in digit_keystrokes(platform) {
-                bindings.push(KeyBinding::new(&keystroke, SelectPane(n), Some(WORKSPACE)));
+                bindings.push(make_binding(&keystroke, SelectPane(n), Some(WORKSPACE), cx));
             }
             continue;
         }
-        if let Some(binding) = binding_for(def.id, &default_keystroke_for(def, platform)) {
+        if let Some(binding) =
+            binding_for_with(def.id, &default_keystroke_for(def, platform), cx)
+        {
             bindings.push(binding);
         }
     }
@@ -1337,7 +1397,7 @@ pub fn apply_overrides(raw: &BTreeMap<String, String>, cx: &mut App) -> Vec<Stri
     let platform = Platform::current();
     let (next, issues) = Overrides::parse(raw, platform);
     let prev = applied_overrides();
-    let bindings = rebind_bindings(&prev, &next, platform);
+    let bindings = rebind_bindings_with(&prev, &next, platform, Some(cx));
     if !bindings.is_empty() {
         cx.bind_keys(bindings);
     }
@@ -1348,7 +1408,17 @@ pub fn apply_overrides(raw: &BTreeMap<String, String>, cx: &mut App) -> Vec<Stri
 /// 从 `prev` 换到 `next` 要追加的绑定:先是所有旧键位上的 `Unbind(动作名)`,再是所有新键位
 /// 上的动作绑定。先解后绑:两条互换键位时,后追加的绑定排在 `Unbind` 前面(同深度后注册的
 /// 优先),不会被自己那批 `Unbind` 误伤 —— 何况 `Unbind` 只认同名动作。
+#[cfg(test)]
 fn rebind_bindings(prev: &Overrides, next: &Overrides, platform: Platform) -> Vec<KeyBinding> {
+    rebind_bindings_with(prev, next, platform, None)
+}
+
+fn rebind_bindings_with(
+    prev: &Overrides,
+    next: &Overrides,
+    platform: Platform,
+    cx: Option<&App>,
+) -> Vec<KeyBinding> {
     let mut unbinds = Vec::new();
     let mut binds = Vec::new();
     for def in HOTKEYS.iter().filter(|def| is_editable(def)) {
@@ -1358,16 +1428,17 @@ fn rebind_bindings(prev: &Overrides, next: &Overrides, platform: Platform) -> Ve
             continue;
         }
         if let Some(keystroke) = before
-            && let Some(binding) = binding_for(def.id, &keystroke)
+            && let Some(binding) = binding_for_with(def.id, &keystroke, cx)
         {
-            unbinds.push(KeyBinding::new(
+            unbinds.push(make_binding(
                 &keystroke,
                 Unbind(binding.action().name().into()),
                 Some(context_of(def)),
+                cx,
             ));
         }
         if let Some(keystroke) = after
-            && let Some(binding) = binding_for(def.id, &keystroke)
+            && let Some(binding) = binding_for_with(def.id, &keystroke, cx)
         {
             binds.push(binding);
         }
@@ -1832,45 +1903,50 @@ fn internal_bindings() -> Vec<KeyBinding> {
 ///
 /// 返回 `None` 只应发生在终端 scope 与 `selectPaneN` 上(前者不绑,后者由
 /// [`table_bindings`] 单独展开)—— 有 [`tests::全局条目都绑得上_action`] 盯着。
+#[cfg(test)]
 fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
+    binding_for_with(id, keystroke, None)
+}
+
+fn binding_for_with(id: &str, keystroke: &str, cx: Option<&App>) -> Option<KeyBinding> {
     Some(match id {
-        "newTerminal" => KeyBinding::new(keystroke, NewTerminal, Some(WORKSPACE)),
-        "closePane" => KeyBinding::new(keystroke, ClosePane, Some(WORKSPACE)),
-        "closeTab" => KeyBinding::new(keystroke, CloseTerminalTab, Some(WORKSPACE)),
-        "renamePane" => KeyBinding::new(keystroke, RenamePane, Some(WORKSPACE)),
-        "splitRight" => KeyBinding::new(keystroke, SplitRight, Some(WORKSPACE)),
-        "splitDown" => KeyBinding::new(keystroke, SplitDown, Some(WORKSPACE)),
-        "toggleMaximize" => KeyBinding::new(keystroke, ToggleMaximizePane, Some(WORKSPACE)),
-        "reopenClosed" => KeyBinding::new(keystroke, ReopenClosedTerminal, Some(WORKSPACE)),
-        "nextPane" => KeyBinding::new(keystroke, NextPane, Some(WORKSPACE)),
-        "prevPane" => KeyBinding::new(keystroke, PrevPane, Some(WORKSPACE)),
-        "focusLeft" => KeyBinding::new(keystroke, FocusLeft, Some(WORKSPACE)),
-        "focusRight" => KeyBinding::new(keystroke, FocusRight, Some(WORKSPACE)),
-        "focusUp" => KeyBinding::new(keystroke, FocusUp, Some(WORKSPACE)),
-        "focusDown" => KeyBinding::new(keystroke, FocusDown, Some(WORKSPACE)),
-        "toggleWorkbenchPage" => KeyBinding::new(keystroke, ToggleWorkbenchPage, Some(WORKSPACE)),
-        "moveTabLeft" => KeyBinding::new(keystroke, MoveTabLeft, Some(WORKSPACE)),
-        "moveTabRight" => KeyBinding::new(keystroke, MoveTabRight, Some(WORKSPACE)),
-        "resizeLeft" => KeyBinding::new(keystroke, ResizeSplitLeft, Some(WORKSPACE)),
-        "resizeRight" => KeyBinding::new(keystroke, ResizeSplitRight, Some(WORKSPACE)),
-        "resizeUp" => KeyBinding::new(keystroke, ResizeSplitUp, Some(WORKSPACE)),
-        "resizeDown" => KeyBinding::new(keystroke, ResizeSplitDown, Some(WORKSPACE)),
-        "switchProject" => KeyBinding::new(keystroke, SwitchProject, Some(WORKSPACE)),
-        "globalSearch" => KeyBinding::new(keystroke, GlobalSearch, Some(WORKSPACE)),
-        "quickOpen" => KeyBinding::new(keystroke, QuickOpenFile, Some(WORKSPACE)),
-        "terminalSearch" => KeyBinding::new(keystroke, TerminalSearch, Some(WORKSPACE)),
-        "openSettings" => KeyBinding::new(keystroke, OpenTerminalSettings, Some(WORKSPACE)),
-        "toggleSidebar" => KeyBinding::new(keystroke, ToggleMiddleColumn, Some(WORKSPACE)),
-        "toggleSessions" => KeyBinding::new(keystroke, ToggleSessions, Some(WORKSPACE)),
-        "toggleUsage" => KeyBinding::new(keystroke, ToggleUsage, Some(WORKSPACE)),
-        "jumpAttention" => KeyBinding::new(keystroke, JumpAttention, Some(WORKSPACE)),
-        "commandLibrary" => KeyBinding::new(keystroke, ToggleCommandLibrary, Some(WORKSPACE)),
-        "markerPrev" => KeyBinding::new(keystroke, MarkerPrev, Some(WORKSPACE)),
-        "markerNext" => KeyBinding::new(keystroke, MarkerNext, Some(WORKSPACE)),
+        "newTerminal" => make_binding(keystroke, NewTerminal, Some(WORKSPACE), cx),
+        "closePane" => make_binding(keystroke, ClosePane, Some(WORKSPACE), cx),
+        "closeTab" => make_binding(keystroke, CloseTerminalTab, Some(WORKSPACE), cx),
+        "renamePane" => make_binding(keystroke, RenamePane, Some(WORKSPACE), cx),
+        "splitRight" => make_binding(keystroke, SplitRight, Some(WORKSPACE), cx),
+        "splitDown" => make_binding(keystroke, SplitDown, Some(WORKSPACE), cx),
+        "toggleMaximize" => make_binding(keystroke, ToggleMaximizePane, Some(WORKSPACE), cx),
+        "reopenClosed" => make_binding(keystroke, ReopenClosedTerminal, Some(WORKSPACE), cx),
+        "nextPane" => make_binding(keystroke, NextPane, Some(WORKSPACE), cx),
+        "prevPane" => make_binding(keystroke, PrevPane, Some(WORKSPACE), cx),
+        "focusLeft" => make_binding(keystroke, FocusLeft, Some(WORKSPACE), cx),
+        "focusRight" => make_binding(keystroke, FocusRight, Some(WORKSPACE), cx),
+        "focusUp" => make_binding(keystroke, FocusUp, Some(WORKSPACE), cx),
+        "focusDown" => make_binding(keystroke, FocusDown, Some(WORKSPACE), cx),
+        "toggleWorkbenchPage" => make_binding(keystroke, ToggleWorkbenchPage, Some(WORKSPACE), cx),
+        "moveTabLeft" => make_binding(keystroke, MoveTabLeft, Some(WORKSPACE), cx),
+        "moveTabRight" => make_binding(keystroke, MoveTabRight, Some(WORKSPACE), cx),
+        "resizeLeft" => make_binding(keystroke, ResizeSplitLeft, Some(WORKSPACE), cx),
+        "resizeRight" => make_binding(keystroke, ResizeSplitRight, Some(WORKSPACE), cx),
+        "resizeUp" => make_binding(keystroke, ResizeSplitUp, Some(WORKSPACE), cx),
+        "resizeDown" => make_binding(keystroke, ResizeSplitDown, Some(WORKSPACE), cx),
+        "switchProject" => make_binding(keystroke, SwitchProject, Some(WORKSPACE), cx),
+        "globalSearch" => make_binding(keystroke, GlobalSearch, Some(WORKSPACE), cx),
+        "quickOpen" => make_binding(keystroke, QuickOpenFile, Some(WORKSPACE), cx),
+        "terminalSearch" => make_binding(keystroke, TerminalSearch, Some(WORKSPACE), cx),
+        "openSettings" => make_binding(keystroke, OpenTerminalSettings, Some(WORKSPACE), cx),
+        "toggleSidebar" => make_binding(keystroke, ToggleMiddleColumn, Some(WORKSPACE), cx),
+        "toggleSessions" => make_binding(keystroke, ToggleSessions, Some(WORKSPACE), cx),
+        "toggleUsage" => make_binding(keystroke, ToggleUsage, Some(WORKSPACE), cx),
+        "jumpAttention" => make_binding(keystroke, JumpAttention, Some(WORKSPACE), cx),
+        "commandLibrary" => make_binding(keystroke, ToggleCommandLibrary, Some(WORKSPACE), cx),
+        "markerPrev" => make_binding(keystroke, MarkerPrev, Some(WORKSPACE), cx),
+        "markerNext" => make_binding(keystroke, MarkerNext, Some(WORKSPACE), cx),
         // 挂 `Terminal`:只在终端有焦点时命中(见 [`Scope::TerminalAction`])
-        "zoomIn" => KeyBinding::new(keystroke, TerminalZoomIn, Some(TERMINAL)),
-        "zoomOut" => KeyBinding::new(keystroke, TerminalZoomOut, Some(TERMINAL)),
-        "zoomReset" => KeyBinding::new(keystroke, TerminalZoomReset, Some(TERMINAL)),
+        "zoomIn" => make_binding(keystroke, TerminalZoomIn, Some(TERMINAL), cx),
+        "zoomOut" => make_binding(keystroke, TerminalZoomOut, Some(TERMINAL), cx),
+        "zoomReset" => make_binding(keystroke, TerminalZoomReset, Some(TERMINAL), cx),
         _ => return None,
     })
 }
@@ -1881,7 +1957,8 @@ mod tests {
     use gpui::{Action, KeyContext, Keymap};
 
     fn ks(keystroke: &str) -> Keystroke {
-        Keystroke::parse(keystroke).unwrap_or_else(|e| panic!("{keystroke} 解析失败: {e}"))
+        Keystroke::parse_with_os(keystroke, os_of(Platform::current()))
+            .unwrap_or_else(|e| panic!("{keystroke} 解析失败: {e}"))
     }
 
     fn contexts(names: &[&str]) -> Vec<KeyContext> {
@@ -2055,7 +2132,7 @@ mod tests {
             KeyBinding::new("ctrl-0", TerminalZoomReset, Some(TERMINAL)),
         ];
         for n in 1..=9usize {
-            expected.push(KeyBinding::new(
+            expected.push(test_binding(
                 &format!("ctrl-{n}"),
                 SelectPane(n),
                 Some(WORKSPACE),
@@ -2077,7 +2154,7 @@ mod tests {
                 1,
                 "{} @ {:?} 与改造前不一致",
                 want.action().name(),
-                want.keystrokes()[0].inner().unparse()
+                want.keystrokes()[0].inner().unparse(os_of(Platform::Other))
             );
         }
     }

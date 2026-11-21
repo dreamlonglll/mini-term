@@ -455,7 +455,8 @@ impl SettingsView {
         cx.stop_propagation();
 
         let platform = Platform::current();
-        let pressed = || hotkeys::keystroke_label_for(&event.keystroke.unparse(), platform);
+        let os = cx.platform_info().os;
+        let pressed = || hotkeys::keystroke_label_for(&event.keystroke.unparse(os), platform);
         match hotkeys::interpret_recorded(&event.keystroke, platform) {
             Recorded::Pending => {}
             Recorded::Cancel => self.finish_hotkey_recording(Some(window), cx),

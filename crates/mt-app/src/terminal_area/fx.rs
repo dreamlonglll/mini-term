@@ -413,14 +413,6 @@ impl FlipSlot {
     }
 }
 
-impl IntoElement for FlipSlot {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for FlipSlot {
     type RequestLayoutState = ();
     type PrepaintState = Option<ContentMask<Pixels>>;
@@ -516,14 +508,6 @@ pub(super) struct LeafSlot {
 
 pub(super) fn leaf_slot(child: AnyElement, fx: SharedFx, leaf: String) -> LeafSlot {
     LeafSlot { child, fx, leaf }
-}
-
-impl IntoElement for LeafSlot {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for LeafSlot {

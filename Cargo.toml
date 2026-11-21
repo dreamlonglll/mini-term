@@ -14,7 +14,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["sidecars", "relay-server", "mobile"]
+exclude = ["sidecars", "relay-server", "mobile", "patches"]
 
 [workspace.package]
 version = "1.14.2"
@@ -43,34 +43,25 @@ license = "MIT"
 #    (issue #82,v1.13.6-pre ~ v1.13.11-pre 的 mac 包全中)。gpui 自己 default 里那个
 #    `font-kit` 管不到 gpui_macos。Windows(DirectWrite)/ Linux 不受影响。
 #    守门:`tests/gpuiMacFontKit.test.cjs`。
-# spike/gpui-pre:底座换成 huacnlee 上传的 Zed 快照 gpui-pre(zed@d89e9c2,2026-09-14)。
-# 0.3.x 把窗口/文字后端拆去了 gpui_platform,应用入口改为 gpui_platform::application()。
-gpui = { package = "gpui-pre", version = "0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit"] }
+# spike/gpui-fast: 底座切到 Longbridge 的 gpui-fast 0.1.17 + gpui-component/gpui-kit 0.10.0。
+# 0.3.x / gpui-fast 把窗口/文字后端拆去了 gpui_platform,应用入口仍是 gpui_platform::application()。
+gpui = { package = "gpui-fast", version = "0.1.17" }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.17", features = ["font-kit"] }
 # 组件库:Resizable(替 Allotment) / Tree(替 FileTree) / TabBar / Modal / Input /
 # Table，以及 JSON 驱动的主题层 + 运行时主题注册表(替自研 theme_packs 的一部分)。
-gpui-component = "0.6.2"
-# 组件库的图标资产(`AssetSource`)。0.6.2 把图标本体从 gpui-component 拆进了这个
-# crate,**它本来就在依赖树里**(gpui-component 的直接依赖),这里只是把传递依赖
-# 提成直接依赖好在 `main.rs` 挂上 —— 版本必须与 gpui-component 拉的那份**完全一致**,
-# 否则依赖树里会出现两份、`IconName` 的路径对不上。
-# `Assets` = 组件库默认用到的 101 枚 Lucide 线条图(约 44 KB);全集 `AllAssets`
-# 是 1830 枚(约 731 KB),本仓用不上。没有它时上游组件画 `IconName::*` 一律是
-# **空白且编译期无感**(svg 走 AssetSource 取,取不到只记一行日志)。
-gpui-kit-assets = "0.6.2"
-# 组件库的底层原语包,同样**本来就在依赖树里**(gpui-component 的直接依赖),
-# 提成直接依赖只为拿窗口级选区的 `TextSelection` —— gpui-component 没重导出它
-# (见 `main.rs` 的 `text_selection_release_guard`)。版本同上,必须与
-# gpui-component 拉的那份完全一致。
-gpui-base = "0.6.2"
-# 本地 HTML 预览的系统 WebView(Windows = WebView2,macOS = WKWebView)。gpui-component
-# 0.6 起把 `webview` feature 拆成了这个独立 crate(gpui-kit 出品,同一份 gpui-pre)。
-# ⚠️ 钉死 =0.6.4:0.6.5 起它把 gpui-pre 钉成 `=0.3.6`,与上面的 0.3.5 冲突(两版源码
-#    一字不差,底座升 0.3.6 时再一起放开)。只挂在 mt-app 的 Windows / macOS 段 ——
-#    wry 在 Linux 上要 webkit2gtk 系统库,CI 的 Linux 构建机没有。
-gpui-wry = "=0.6.4"
-# gpui-wry 用的 wry 分支(longbridge 维护)。建 WebView 要直接用它的 builder,
-# 版本与 gpui-wry 拉的那份一致,依赖树里只有一份。
+gpui-component = { version = "0.10.0", features = ["gpui-fast"] }
+# 组件库的图标资产(`AssetSource`)。版本与 gpui-component 完全一致。
+gpui-kit-assets = { version = "0.10.0", features = ["gpui-fast"] }
+# 组件库的底层原语包(`TextSelection`)。版本与 gpui-component 完全一致。
+gpui-base = { version = "0.10.0", features = ["gpui-fast"] }
+# gpui-webview 0.10 通过 gpui-kit 选择后端;这里只开 gpui-fast 开关(不拉默认组件/资产重复声明)
+# 以满足 gpui-webview 的编译期后端一致断言。
+gpui-kit = { version = "0.10.0", default-features = false, features = ["gpui-fast"] }
+# 本地 HTML 预览与 PDF 页签的系统 WebView(Windows = WebView2,macOS = WKWebView)。
+# 原 gpui-wry 自 0.7 起改名为 gpui-webview,启用 gpui-fast 与主栈保持一致。
+gpui-webview = { version = "0.10.0", features = ["gpui-fast"] }
+# gpui-webview 用的 wry 分支(longbridge 维护)。建 WebView 要直接用它的 builder,
+# 版本与 gpui-webview 拉的那份一致,依赖树里只有一份。
 wry = { package = "lb-wry", version = "0.53.3" }
 
 # ---------------------------------------------------------------------------
@@ -222,3 +213,15 @@ debug = "line-tables-only"
 # 剥符号表(macOS / Linux):装机包小一圈。用 `symbols` 而非 `debuginfo` —— 后者只去
 # 调试信息,符号表还留着。MSVC 上无效(见上一项)。
 strip = "symbols"
+
+# gpui-base / gpui-component / gpui-kit / gpui-kit-assets 0.10.0 开启 `gpui-fast`
+# feature 后在各自 `lib.rs` 中用 `extern crate gpui_fast as gpui;` 完全遮蔽了
+# `gpui-pre`,但 Cargo.toml 仍将 `gpui-pre =0.3.12` / `gpui-pre-platform =0.3.12`
+# 保留为非可选依赖。这里用空壳 stub 替换,只编译唯一一份 `gpui-fast` 引擎,同时
+# 彻底省掉 `gpui-pre-{windows,macos,linux}` 三端平台后端。
+# Windows 的 PerMonitorV2 / SegmentHeap 清单改由宿主 `crates/mt-app/build.rs` 嵌入
+# (`gpui-component 0.10` 已为 `gpui-fast` 开启 `windows-manifest-provided-by-host`)。
+# ⚠️ 升级 gpui-component 时若其钉死的 gpui-pre 版本变了,同步改 `patches/*/Cargo.toml` 的 version。
+[patch.crates-io]
+gpui-pre = { path = "patches/gpui-pre" }
+gpui-pre-platform = { path = "patches/gpui-pre-platform" }

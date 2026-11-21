@@ -44,7 +44,7 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, Bounds, Entity, HitboxBehavior, Hsla, IntoElement,
-    ListHorizontalSizingBehavior, ParentElement, Pixels, Point, ScrollHandle, ScrollWheelEvent,
+    ListHorizontalSizingBehavior, ParentElement, Pixels, Point, ScrollHandle, ScrollEvent,
     Size, Styled, canvas, div, fill, point, prelude::FluentBuilder as _, px, size, uniform_list,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
@@ -865,7 +865,7 @@ fn scroll_layer(
             window.insert_hitbox(bounds, HitboxBehavior::Normal)
         },
         move |_bounds, hitbox, window, _cx| {
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if !phase.capture() || !hitbox.should_handle_scroll(window) {
                     return;
                 }

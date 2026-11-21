@@ -60,7 +60,7 @@ impl TerminalElement {
         let on_bar = prepared
             .scrollbar
             .is_some_and(|bar| bar.hit(position, GRAB_SLACK) != ScrollbarHit::Miss);
-        let active = window.modifiers().secondary()
+        let active = window.modifiers().secondary(cx)
             && prepared.hitbox.is_hovered(window)
             && !on_bar
             && !state.selecting.get()
@@ -106,7 +106,7 @@ impl TerminalElement {
         let on_bar = prepared
             .scrollbar
             .is_some_and(|bar| bar.hit(position, GRAB_SLACK) != ScrollbarHit::Miss);
-        let eligible = !window.modifiers().secondary()
+        let eligible = !window.modifiers().secondary(cx)
             && prepared.hitbox.is_hovered(window)
             && !on_bar
             && !state.selecting.get()

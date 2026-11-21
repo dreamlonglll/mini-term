@@ -412,7 +412,9 @@ fn flush(cx: &mut App) -> bool {
     }
     for pane in pending {
         // pane 已经关了就跳过 —— 弱引用失效是正常生命周期,不是错误
-        let _ = pane.update(cx, |_, cx| cx.notify());
+        // gpui-fast 下子视图 `TerminalView` 默认保留复用,经 `notify_redraw` 直接
+        // 标脏 `TerminalView`(回看浮钮状态变化时顺带标脏外壳 `TerminalPane`)。
+        let _ = pane.update(cx, |pane, cx| pane.notify_redraw(cx));
     }
     true
 }

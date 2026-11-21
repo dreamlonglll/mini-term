@@ -60,19 +60,19 @@ const CLOSURE_BANS = [
   },
   {
     crate: 'mt-terminal',
-    ban: ['gpui-pre'],
+    ban: ['gpui-pre', 'gpui-fast'],
     rule: 'mt-terminal 不许依赖 gpui',
     source: 'AGENTS.md crate 表 mt-terminal 行「不依赖 gpui」',
   },
   {
     crate: 'mt-config',
-    ban: ['gpui-pre'],
+    ban: ['gpui-pre', 'gpui-fast'],
     rule: 'mt-config 不许依赖 gpui',
     source: 'AGENTS.md crate 表 mt-config 行「不依赖 gpui」',
   },
   {
     crate: 'mt-remote',
-    ban: ['gpui-pre'],
+    ban: ['gpui-pre', 'gpui-fast'],
     rule: 'mt-remote 不许依赖 gpui',
     source: 'AGENTS.md crate 表 mt-remote 行「不依赖 gpui」+ crates/mt-remote/Cargo.toml',
   },
@@ -95,7 +95,7 @@ const MEMBER_ALLOWLISTS = [
 const SIDECAR_RULE = {
   root: 'mt-sidecars',
   allowLocal: ['mt-core', 'mt-ssh', 'mt-secret'],
-  ban: ['rusqlite', 'gpui-pre'],
+  ban: ['rusqlite', 'gpui-pre', 'gpui-fast'],
   rule: '三个 sidecar 只许链接 mt-core / mt-ssh(及其下的 mt-secret),不许带进 rusqlite / gpui',
   source: 'AGENTS.md「config.json 为什么还在」一节 + 根 Cargo.toml rusqlite / mt-layout 注释',
 };
@@ -270,7 +270,7 @@ function checkSidecars(graph, r) {
   return out;
 }
 
-/** 整张图里只许有一份 gpui:不许出现 gpui-ce / crates.io 的 gpui,gpui-pre 只许一个版本。 */
+/** 整张图里只许有一份 gpui 引擎:不许出现 gpui-ce / crates.io 的 gpui / 真 gpui-pre,gpui-fast 只许一个版本。 */
 function checkSingleGpui(meta) {
   const out = [];
   const inGraph = new Set(meta.resolve.nodes.map((n) => n.id));
@@ -278,15 +278,28 @@ function checkSingleGpui(meta) {
   for (const p of pkgs) {
     if (p.name === 'gpui-ce' || p.name === 'gpui') {
       out.push(
-        `依赖图里出现了 ${p.name} ${p.version}。违反规则:只许用 gpui-pre 这一份 gpui,` +
-          '混用会出现两个类型不互通的 gpui crate。来源:根 Cargo.toml「不要换成 gpui-ce」',
+        `依赖图里出现了 ${p.name} ${p.version}。违反规则:只许用 gpui-fast 这一份 gpui 引擎,` +
+          '混用会出现两个类型不互通的 gpui crate。来源:根 Cargo.toml GPUI 栈注释',
+      );
+    }
+    if (
+      (p.name === 'gpui-pre' ||
+        p.name === 'gpui-pre-platform' ||
+        p.name === 'gpui-pre-windows' ||
+        p.name === 'gpui-pre-macos' ||
+        p.name === 'gpui-pre-linux') &&
+      p.source !== null
+    ) {
+      out.push(
+        `依赖图里出现了来自 registry 的 ${p.name} ${p.version}。违反规则:只许保留唯一的 gpui-fast 引擎,` +
+          '上游残留的 gpui-pre 必须由 patches/ 空壳 stub 拦截。来源:根 Cargo.toml [patch.crates-io]',
       );
     }
   }
-  const versions = pkgs.filter((p) => p.name === 'gpui-pre').map((p) => p.version);
+  const versions = pkgs.filter((p) => p.name === 'gpui-fast').map((p) => p.version);
   if (versions.length > 1) {
     out.push(
-      `依赖图里有 ${versions.length} 个版本的 gpui-pre(${versions.join(', ')})。` +
+      `依赖图里有 ${versions.length} 个版本的 gpui-fast(${versions.join(', ')})。` +
         '违反规则:只许一份 gpui。来源:根 Cargo.toml GPUI 栈注释',
     );
   }
@@ -386,6 +399,18 @@ test('分层:判定逻辑能抓到构造的违规', () => {
   assert.match(missing[0], /mt-gone 不在工作区成员里/);
 
   assert.equal(checkSingleGpui(meta).length, 1);
+
+  // 来自 crates.io 的真 gpui-pre 必须被拦下,本地 stub(source: null) 放行
+  const withRealPre = {
+    packages: [pkg('gpui-pre', reg), pkg('gpui-fast', reg)],
+    resolve: { nodes: [{ id: 'gpui-pre 0.1.0', deps: [] }, { id: 'gpui-fast 0.1.0', deps: [] }] },
+  };
+  assert.equal(checkSingleGpui(withRealPre).length, 1);
+  const withStubPre = {
+    packages: [pkg('gpui-pre', null), pkg('gpui-fast', reg)],
+    resolve: { nodes: [{ id: 'gpui-pre 0.1.0', deps: [] }, { id: 'gpui-fast 0.1.0', deps: [] }] },
+  };
+  assert.equal(checkSingleGpui(withStubPre).length, 0);
 
   // cfg(windows) 下的 windows-sys 放行
   const ok = buildGraph({

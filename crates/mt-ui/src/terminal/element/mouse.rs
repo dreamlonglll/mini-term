@@ -139,7 +139,7 @@ impl TerminalElement {
             let app_cursor = mode.contains(TermMode::APP_CURSOR);
             let link_hint = state.link_hint.clone();
             let link_hint_task = state.link_hint_task.clone();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
                     return;
                 }
@@ -315,7 +315,7 @@ impl TerminalElement {
                 //    非焦点的分屏按下 Ctrl 收不到 modifiers-changed,没动鼠标就直接点,
                 //    上一帧根本没画过下划线。
                 if event.button == MouseButton::Left
-                    && event.modifiers.secondary()
+                    && event.modifiers.secondary(cx)
                     && let Some(links) = file_links.as_ref()
                 {
                     let display_offset = emulator.with_term(|t| t.grid().display_offset());
@@ -504,7 +504,7 @@ impl TerminalElement {
                 // ── 链接:按住 Ctrl 跨格、松开、移出元素时要一帧(悬停态在 paint 里
                 //    现算)。不按 Ctrl 的移动这里只比一次 `None == None`,不要帧。
                 if has_links {
-                    let cell = (event.modifiers.secondary()
+                    let cell = (event.modifiers.secondary(cx)
                         && event.pressed_button.is_none()
                         && hitbox.is_hovered(window))
                     .then(|| {
@@ -529,7 +529,7 @@ impl TerminalElement {
                     let on_bar = bar.is_some_and(|layout| {
                         layout.hit(event.position, GRAB_SLACK) != ScrollbarHit::Miss
                     });
-                    let cell = (!event.modifiers.secondary()
+                    let cell = (!event.modifiers.secondary(cx)
                         && event.pressed_button.is_none()
                         && !selecting.get()
                         && reported.get().is_none()
@@ -913,7 +913,7 @@ pub(super) fn arm_link_hint(
             let Some((col, row)) = hint.borrow().elapsed(generation) else {
                 return;
             };
-            if window.modifiers().secondary() || mouse_reporting_active(emulator.mode()) {
+            if window.modifiers().secondary(cx) || mouse_reporting_active(emulator.mode()) {
                 return;
             }
             let (display_offset, content_generation) =

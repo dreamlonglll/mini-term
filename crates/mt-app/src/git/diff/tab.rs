@@ -495,7 +495,7 @@ impl DiffTab {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let mods = &keystroke.modifiers;
-        if keystroke.key == "w" && mods.secondary() && !mods.shift && !mods.alt {
+        if keystroke.key == "w" && mods.secondary(cx) && !mods.shift && !mods.alt {
             cx.stop_propagation();
             let key = self.key.clone();
             window.defer(cx, move |window, cx| {

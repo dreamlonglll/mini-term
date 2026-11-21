@@ -43,7 +43,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Element, FillOptions, FillRule, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px, size,
+    LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px, size,
 };
 
 use super::svg_path::SubPath;
@@ -363,14 +363,6 @@ impl VectorIcon {
         }
         color.a *= self.opacity;
         color
-    }
-}
-
-impl IntoElement for VectorIcon {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 

@@ -364,7 +364,7 @@ pub fn shows_group_headers(connections: &[SshConnection]) -> bool {
 /// 点一行时按着的修饰键要不要「一律在新终端里连」:Ctrl(各平台都认),macOS 另认 Cmd
 /// (`secondary` 在 macOS 上就是 Cmd,别处就是 Ctrl)—— 与 Ctrl+↵ / Cmd+↵ 两个键位对齐。
 fn modifiers_force_new(modifiers: Modifiers) -> bool {
-    modifiers.control || modifiers.secondary()
+    modifiers.control || (cfg!(target_os = "macos") && modifiers.platform)
 }
 
 fn click_forces_new(event: &ClickEvent) -> bool {

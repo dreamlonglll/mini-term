@@ -24,5 +24,5 @@ test('macOS ARM Cargo graph enables gpui_macos font-kit text backend', () => {
     { cwd: projectRoot, encoding: 'utf8' },
   );
 
-  assert.match(tree, /gpui-pre-macos feature "font-kit"/);
+  assert.match(tree, /gpui-fast-macos feature "font-kit"/);
 });

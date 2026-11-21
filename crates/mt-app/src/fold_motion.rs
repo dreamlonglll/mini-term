@@ -41,7 +41,7 @@ use std::f32::consts::TAU;
 use std::time::Instant;
 
 use gpui::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, LayoutId,
     PathBuilder, Pixels, Point, Style, Window, point, px,
 };
 use mt_ui::motion::{TransitionSpec, ValueTween};
@@ -166,14 +166,6 @@ pub fn fold_glyph(turns: f32) -> FoldGlyph {
 
 pub struct FoldGlyph {
     turns: f32,
-}
-
-impl IntoElement for FoldGlyph {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for FoldGlyph {

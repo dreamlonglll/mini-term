@@ -9,7 +9,7 @@ use gpui::{
     prelude::FluentBuilder, px, size,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use gpui_component::{Root, WindowExt as _};
+use gpui_component::WindowExt as _;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::file_tree::FileTree;
