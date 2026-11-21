@@ -1,15 +1,24 @@
 use super::*;
 
-/// 中栏内容层:滑入从整幅在左推到 0、滑出从 0 推到整幅在左,端点精确(残留零点几会让
-/// 中栏内容永远错位);右抽屉与提交详情栏进出场端点精确,带着详情栏关抽屉整体滑出视口右缘。
+/// 中栏推拉轨道宽度与目标宽度夹紧:展开从 0 长到目标宽、折叠从目标宽收回 0,
+/// 端点精确;右抽屉与提交详情栏进出场端点精确,带着详情栏关抽屉整体滑出视口右缘。
 #[test]
 fn 中栏与详情栏的位移端点精确() {
-    assert_eq!(middle_content_left(true, 0.0), -1.0);
-    assert_eq!(middle_content_left(true, 1.0), 0.0);
-    assert_eq!(middle_content_left(true, 0.25), -0.75);
-    assert_eq!(middle_content_left(false, 0.0), 0.0);
-    assert_eq!(middle_content_left(false, 1.0), -1.0);
-    assert_eq!(middle_content_left(false, 2.0), -1.0, "越界钳住");
+    assert_eq!(middle_visible_width(263.0, true, 0.0), 0.0);
+    assert_eq!(middle_visible_width(263.0, true, 1.0), 263.0);
+    assert!((middle_visible_width(263.0, true, 0.25) - 65.75).abs() < 1e-4);
+    assert_eq!(middle_visible_width(263.0, false, 0.0), 263.0);
+    assert_eq!(middle_visible_width(263.0, false, 1.0), 0.0);
+    assert_eq!(middle_visible_width(263.0, false, 2.0), 0.0, "越界钳住");
+    // 目标宽度夹紧:动画轨道与 h_resizable 共用唯一口径,窄窗时给右侧留出安全余量
+    assert_eq!(middle_target_width(263.0, 1920.0), 263.0);
+    assert_eq!(middle_target_width(90.0, 1920.0), MIDDLE_MIN_WIDTH);
+    assert_eq!(middle_target_width(999.0, 1920.0), MIDDLE_MAX_WIDTH);
+    assert_eq!(
+        middle_target_width(600.0, 500.0),
+        500.0 - activity_bar::WIDTH - MIDDLE_RIGHT_RESERVE,
+        "窗口窄时上限顺应可用宽度"
+    );
     assert_eq!(detail_slide_left(320.0, 1.0), 0.0);
     assert_eq!(detail_slide_left(320.0, 0.5), 160.0);
     assert_eq!(detail_slide_left(320.0, 0.0), 320.0);
@@ -24,20 +33,20 @@ fn 中栏与详情栏的位移端点精确() {
 }
 
 /// 中栏半路掉头不跳:收到一半又展开(或反过来),新一场从 `1 − 进度` 起步,
-/// 内容层此刻的位置与掉头前一模一样(见 [`MiddleMotion`])。
+/// 轨道此刻的宽度与掉头前一模一样(见 [`MiddleMotion`])。
 #[test]
 fn 中栏开合半路掉头从当前位置接着走() {
     for entering in [true, false] {
         for i in 0..=20 {
             let p = i as f32 / 20.0;
-            let before = middle_content_left(entering, p);
-            let after = middle_content_left(!entering, motion_kit::reversed_progress(p));
-            assert!((before - after).abs() < 1e-6, "entering={entering} p={p}");
+            let before = middle_visible_width(320.0, entering, p);
+            let after = middle_visible_width(320.0, !entering, motion_kit::reversed_progress(p));
+            assert!((before - after).abs() < 1e-4, "entering={entering} p={p}");
         }
     }
     // 起步进度由 `resume_band` 接上:建出来那一刻就在起步值上
     let now = std::time::Instant::now();
-    let band = motion_kit::resume_band(0.6, mt_ui::motion::PANEL_SWAP, now);
+    let band = motion_kit::resume_band(0.6, mt_ui::motion::SIDEBAR_TOGGLE, now);
     assert!((band.value_at(now) - 0.6).abs() < 1e-6);
     assert_eq!(band.target(), 1.0);
 }

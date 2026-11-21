@@ -549,6 +549,12 @@ pub enum Easing {
     EaseOutExpo,
     /// `--ease-overlay-out` = `cubic-bezier(0.4, 0, 0.9, 0.6)`。
     EaseOverlayOut,
+    /// 大面板下滑入场 = `cubic-bezier(0.2, 0.88, 0.28, 1.0)`:比 `EaseOutExpo` 起步更舒展
+    /// (前两帧不再猛冲大半屏),中段流畅推进,尾段温柔稳稳刹停。
+    SheetIn,
+    /// 大面板上滑退场 = `cubic-bezier(0.3, 0.08, 0.75, 0.25)`:零迟滞即刻抬升,随后平滑加速
+    /// 收出视口顶边,不发沉也不突兀。
+    SheetOut,
 }
 
 impl Easing {
@@ -559,6 +565,8 @@ impl Easing {
             Easing::EaseOut => Some((0.0, 0.0, 0.58, 1.0)),
             Easing::EaseOutExpo => Some((0.16, 1.0, 0.3, 1.0)),
             Easing::EaseOverlayOut => Some((0.4, 0.0, 0.9, 0.6)),
+            Easing::SheetIn => Some((0.2, 0.88, 0.28, 1.0)),
+            Easing::SheetOut => Some((0.3, 0.08, 0.75, 0.25)),
         }
     }
 }
@@ -697,6 +705,13 @@ pub const OVERLAY_IN: TransitionSpec =
 /// `--motion-overlay-out` 0.14s(豁免)。
 pub const OVERLAY_OUT: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(140), Easing::EaseOverlayOut);
+/// 活动栏大面板(用量统计 / 设置 / SSH / 移动端)从窗口顶边整块滑落入场(豁免)。
+/// 长程位移(700~1000px)配 320ms + [`Easing::SheetIn`],既清晰可见下落轨迹又稳稳刹停。
+pub const SHEET_IN: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(320), Easing::SheetIn);
+/// 活动栏大面板向上收回视口顶边退场(豁免):240ms + [`Easing::SheetOut`],即刻起步、顺滑加速收走。
+pub const SHEET_OUT: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(240), Easing::SheetOut);
 /// `--motion-menu-in` 0.16s(豁免)。
 pub const MENU_IN: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(160), Easing::EaseOutExpo);
@@ -744,6 +759,10 @@ pub const AREA_SWAP: TransitionSpec =
 /// 日期翻月。与 [`TERMINAL_SWAP`] 同档,单列一条是为了两边能各自调。
 pub const PANEL_SWAP: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(200), Easing::EaseOutExpo);
+/// 左侧中栏(项目列表 + 文件树)推拉开合(豁免):220ms + [`Easing::SheetIn`]。
+/// 相比 `EaseOutExpo` 起步更舒展、尾段不长时间发呆,流内同步推开/收回右侧工作区时不顿挫。
+pub const SIDEBAR_TOGGLE: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(220), Easing::SheetIn);
 /// 列表里的条目被挤动后补位(FLIP:tab chip 新建 / 关闭 / 拖拽落位,toast 叠放重排)。
 pub const LIST_REFLOW: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(200), Easing::EaseOutExpo);
@@ -1180,6 +1199,8 @@ mod tests {
             Easing::EaseOut,
             Easing::EaseOutExpo,
             Easing::EaseOverlayOut,
+            Easing::SheetIn,
+            Easing::SheetOut,
         ] {
             assert!(ease(easing, 0.0).abs() < 1e-4, "{easing:?} 起点应为 0");
             assert!((ease(easing, 1.0) - 1.0).abs() < 1e-4, "{easing:?} 终点应为 1");
@@ -1420,5 +1441,20 @@ mod tests {
         map.sweep();
         assert!(map.is_empty());
         assert!(!map.running_at(t0));
+    }
+
+    #[test]
+    fn 侧栏推拉规格豁免减弱动效且端点单调() {
+        assert!(!SIDEBAR_TOGGLE.respects_reduce);
+        assert_eq!(SIDEBAR_TOGGLE.duration, Duration::from_millis(220));
+        assert_eq!(SIDEBAR_TOGGLE.progress_at(Duration::ZERO, true), 0.0);
+        let mid = SIDEBAR_TOGGLE.progress_at(Duration::from_millis(110), true);
+        assert!(mid > 0.7 && mid < 0.96, "中段应舒展推进且不过早发呆: {mid}");
+        assert_eq!(SIDEBAR_TOGGLE.progress_at(SIDEBAR_TOGGLE.duration, true), 1.0);
+        assert_eq!(
+            SIDEBAR_TOGGLE.progress_with(Duration::from_millis(50), false, false),
+            1.0,
+            "总开关关掉时直达终态"
+        );
     }
 }

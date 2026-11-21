@@ -63,9 +63,35 @@ use gpui_base::{ElementExt as _, FocusTrapElement as _, TextSelection, TextSelec
 use gpui_component::dialog::{Cancel, Confirm, DialogTitle};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::{ActiveTheme as _, StyledExt as _, TITLE_BAR_HEIGHT, v_flex, window_paddings};
-use mt_ui::motion::{OVERLAY_IN, OVERLAY_OUT, animations_enabled};
+use mt_ui::motion::{OVERLAY_IN, OVERLAY_OUT, SHEET_IN, SHEET_OUT, TransitionSpec, animations_enabled};
 
-use crate::overlay_motion::{Presence, chrome_style, reveal_box};
+use crate::overlay_motion::{Presence, chrome_style, reveal_box, slide_down_box};
+
+/// 弹窗面板的进出场动画形态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogMotion {
+    /// 默认小弹窗 / 确认框 / 输入框:顶边水平中点裁剪窗展开。
+    Reveal,
+    /// 活动栏大型功能面板(设置 / SSH / 移动端):整块从窗口顶边向下滑落、关闭时向上收回。
+    SlideFromTop,
+}
+
+impl DialogMotion {
+    fn for_kind(kind: &str) -> Self {
+        use crate::overlay::kind as k;
+        match kind {
+            k::SETTINGS | k::SSH_PANEL | k::MOBILE_RELAY => Self::SlideFromTop,
+            _ => Self::Reveal,
+        }
+    }
+
+    fn specs(self) -> (TransitionSpec, TransitionSpec) {
+        match self {
+            Self::Reveal => (OVERLAY_IN, OVERLAY_OUT),
+            Self::SlideFromTop => (SHEET_IN, SHEET_OUT),
+        }
+    }
+}
 
 type Decision = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) -> bool>;
 type Closed = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -216,6 +242,7 @@ struct Layer {
     id: u64,
     /// 覆盖物种类([`crate::overlay::kind`])。程序化关闭按它找层。
     kind: &'static str,
+    motion: DialogMotion,
     focus: FocusHandle,
     /// 打开前的焦点,关闭时还回去。
     prev_focus: Option<WeakFocusHandle>,
@@ -294,11 +321,14 @@ impl HostState {
             .retain(|layer| !(layer.closing && layer.kind == kind));
         self.next_id += 1;
         let slot = self.layers.iter().filter(|layer| !layer.closing).count();
-        let mut presence = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        let motion = DialogMotion::for_kind(kind);
+        let (enter, exit) = motion.specs();
+        let mut presence = Presence::hidden(enter, exit);
         presence.retarget(1.0, now, animate);
         self.layers.push(Layer {
             id: self.next_id,
             kind,
+            motion,
             focus,
             prev_focus,
             builder,
@@ -561,9 +591,22 @@ pub struct ShellFrame {
 
 /// 不走 [`Dialog`] 的自绘模态(用量统计)用同一套外壳的进出场:`open` 是宿主的开关,
 /// 变了就起一场。完全收起后返回 `None`(不画)。只在动画进行中要帧。
+#[allow(dead_code)]
 pub fn shell_frame(
     key: &'static str,
     open: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<ShellFrame> {
+    shell_frame_with(key, open, OVERLAY_IN, OVERLAY_OUT, window, cx)
+}
+
+/// 同 [`shell_frame`],允许调用方指定进出场规格(例如用量统计大面板用 [`SHEET_IN`] / [`SHEET_OUT`])。
+pub fn shell_frame_with(
+    key: &'static str,
+    open: bool,
+    enter: TransitionSpec,
+    exit: TransitionSpec,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<ShellFrame> {
@@ -572,7 +615,7 @@ pub fn shell_frame(
         let presence = host
             .shells
             .entry(key)
-            .or_insert_with(|| Presence::hidden(OVERLAY_IN, OVERLAY_OUT));
+            .or_insert_with(|| Presence::hidden(enter, exit));
         if open != presence.target_open() {
             if open {
                 presence.show(now);
@@ -648,6 +691,7 @@ fn panel_shadows() -> Vec<BoxShadow> {
 /// 渲染时一层要的东西(从栈里拷出来,调 builder 时不借着全局)。
 struct LayerView {
     id: u64,
+    motion: DialogMotion,
     focus: FocusHandle,
     builder: Builder,
     progress: f32,
@@ -672,6 +716,7 @@ pub fn render_layer(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
             .iter()
             .map(|layer| LayerView {
                 id: layer.id,
+                motion: layer.motion,
                 focus: layer.focus.clone(),
                 builder: layer.builder.clone(),
                 progress: layer.presence.value_at(now),
@@ -858,14 +903,29 @@ fn render_one(
         });
     // 开着时每帧量尺寸(退场时钉它);退场中这块登记成 WebView 之上的 occluder ——
     // 遮罩一开始收 WebView 就恢复收鼠标了,正在收的面板那块不能让网页抢走
-    let panel = reveal_box(popup, layer.progress)
-        .chrome(chrome)
-        .interactive(interactive)
-        .occlude_native(!interactive);
-    let panel = if interactive {
-        panel.measure_into(layer.size.clone())
-    } else {
-        panel
+    let panel: AnyElement = match layer.motion {
+        DialogMotion::Reveal => {
+            let panel = reveal_box(popup, layer.progress)
+                .chrome(chrome)
+                .interactive(interactive)
+                .occlude_native(!interactive);
+            if interactive {
+                panel.measure_into(layer.size.clone()).into_any_element()
+            } else {
+                panel.into_any_element()
+            }
+        }
+        DialogMotion::SlideFromTop => {
+            let panel = slide_down_box(popup, layer.progress)
+                .chrome(chrome)
+                .interactive(interactive)
+                .occlude_native(!interactive);
+            if interactive {
+                panel.measure_into(layer.size.clone()).into_any_element()
+            } else {
+                panel.into_any_element()
+            }
+        }
     };
 
     // ── 遮罩:按下即关(左键 + overlay_closable + 最上面那层 + on_cancel 放行);
@@ -1431,5 +1491,21 @@ mod tests {
         host.shells.insert("usage-stats", shell);
         assert!(host.anything_mounted(t1) && !host.is_mounted(t1));
         assert!(!host.anything_mounted(t1 + OVERLAY_OUT.duration));
+    }
+
+    /// 活动栏大型功能面板(设置 / SSH / 移动端)走顶边滑落规格,小确认框/输入框保持裁剪窗展开。
+    #[test]
+    fn 活动栏大面板走顶边滑落_其余弹窗走裁剪窗展开() {
+        use crate::overlay::kind as k;
+        for kind in [k::SETTINGS, k::SSH_PANEL, k::MOBILE_RELAY] {
+            let motion = DialogMotion::for_kind(kind);
+            assert_eq!(motion, DialogMotion::SlideFromTop, "{kind}");
+            assert_eq!(motion.specs(), (SHEET_IN, SHEET_OUT));
+        }
+        for kind in [k::CONFIRM, k::ALERT, k::PROMPT, k::ADD_PROJECT, k::RENAME_PANE] {
+            let motion = DialogMotion::for_kind(kind);
+            assert_eq!(motion, DialogMotion::Reveal, "{kind}");
+            assert_eq!(motion.specs(), (OVERLAY_IN, OVERLAY_OUT));
+        }
     }
 }

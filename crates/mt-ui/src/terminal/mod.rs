@@ -28,7 +28,7 @@ mod view;
 pub use damage::{CellSignature, DamageStats, FrameKey, RowCache, row_signature};
 pub use element::{
     FlashLine, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, OnZoom, PreeditText,
-    PreparedFrame, TerminalElement,
+    PreparedFrame, TerminalElement, is_grid_resize_frozen, set_grid_resize_frozen,
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{

@@ -7,6 +7,7 @@ use gpui::{
     ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
     Styled, Subscription, Task, Window, WindowBounds, div, point, prelude::FluentBuilder, px, size,
 };
+use gpui_component::ActiveTheme as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::WindowExt as _;
 use mt_ui::tooltip::TooltipExt as _;
@@ -96,18 +97,49 @@ impl DrawerPanel {
     }
 }
 
-/// 中栏开合时栏里内容的方向性位移。栏宽照旧一次跳到位(PTY resize 一次是停靠面板的
-/// 正常代价),只有内容在 `overflow_hidden` 的 absolute 层里从左滑入;收起时栏已隐藏,
-/// 另起一层短暂的出场层画旧内容向左滑出(此刻栏里不画它们,不会同帧双挂)。
-/// ⚠️ 项目列表、文件树套着 [`cached_panel`]:动画层只动 `left`,**不许**改 opacity
-/// (缓存会把某一帧的透明度定死,见抽屉层那段注释)。
+/// 中栏开合时的流内同步推拉过渡。
+///
+/// 展开/折叠途中,中栏放进 `body` 的流内定高容器(宽随进度在 `0..=target_w` 平滑变化),
+/// 内层保持定宽 `target_w` 贴右缘(`right_0`)随容器推入/收回 —— 右侧工作区同步丝滑让位/
+/// 填满,全程零白底空洞、零遮盖终端文字、零外置主题包半透明闪色,且落定切回 `h_resizable`
+/// 零像素宽差。期间经 `mt_ui::terminal::set_grid_resize_frozen(true)` 暂停终端逐帧重排,
+/// 动画结束解冻后一次性完成唯一一次 `emulator.resize` 与去抖 PTY resize。
+/// ⚠️ 项目列表、文件树套着 [`cached_panel`]:动画层只改容器裁切宽度,**不许**改 opacity。
 ///
 /// 半路掉头(收到一半又展开、展开到一半又收)从眼下的位置接着走:进度存成
 /// `ValueTween`,新一场从 [`motion_kit::reversed_progress`] 起步(推导见
-/// [`middle_content_left`] 的单测),不从头播。
+/// [`middle_visible_width`] 的单测),不从头播。
 struct MiddleMotion {
     entering: bool,
     progress: mt_ui::motion::ValueTween,
+}
+
+/// 中栏最小/最大宽度,与 `h_resizable` 的 `size_range` 保持唯一真相源。
+const MIDDLE_MIN_WIDTH: f32 = 180.0;
+const MIDDLE_MAX_WIDTH: f32 = 700.0;
+/// 右侧工作区最少留出的安全宽度(与 `gpui-base` `PANEL_MIN_SIZE` 一致)。
+const MIDDLE_RIGHT_RESERVE: f32 = 100.0;
+
+/// 中栏最终目标宽度(像素):流内推拉动画与落定后的 `h_resizable` 第 0 栏共用此值,
+/// 保证动画末帧与静止态严格 0px 宽差。
+fn middle_target_width(saved: f64, viewport_w: f32) -> f32 {
+    let max_fit = (viewport_w - activity_bar::WIDTH - MIDDLE_RIGHT_RESERVE)
+        .clamp(MIDDLE_MIN_WIDTH, MIDDLE_MAX_WIDTH);
+    (saved as f32).clamp(MIDDLE_MIN_WIDTH, max_fit)
+}
+
+/// 中栏流内推拉容器这一帧的可视宽度(像素):展开从 `0` 长到 `target_w`,折叠从 `target_w`
+/// 收回 `0`。**纯函数**,端点精确且半路掉头严格连续。
+fn middle_visible_width(target_w: f32, entering: bool, progress: f32) -> f32 {
+    let w = target_w.max(0.0);
+    let p = progress.clamp(0.0, 1.0);
+    if entering {
+        if p >= 1.0 { w } else { w * p }
+    } else if p >= 1.0 {
+        0.0
+    } else {
+        w * (1.0 - p)
+    }
 }
 
 /// 抽屉段控件的排列次序(会话在左、Git 在右):换面板时往右边那项切,新面板从右进。
@@ -124,19 +156,6 @@ fn drawer_tab_left(panel: DrawerPanel) -> f32 {
     match panel {
         DrawerPanel::Sessions => 0.0,
         DrawerPanel::Git => 0.5,
-    }
-}
-
-/// 中栏内容层这一帧的 `left`(栏宽的分数):滑入从 -1 推到 0,滑出从 0 推到 -1。**纯函数**,
-/// 终点精确(滑入残留零点几会让中栏内容永远错位)。
-fn middle_content_left(entering: bool, progress: f32) -> f32 {
-    let p = progress.clamp(0.0, 1.0);
-    if entering {
-        if p >= 1.0 { 0.0 } else { -(1.0 - p) }
-    } else if p >= 1.0 {
-        -1.0
-    } else {
-        -p
     }
 }
 
@@ -343,6 +362,13 @@ pub(crate) struct Workspace {
     _activation: Subscription,
     /// 窗口大小/位置的观察者 —— 拖动缩放期间每帧回调,由 store 那边的防抖收口。
     _window_bounds: Subscription,
+}
+
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        // 兜底:窗口在侧栏动画中途关闭时解除终端 grid 尺寸冻结闸
+        mt_ui::terminal::set_grid_resize_frozen(false);
+    }
 }
 
 impl Workspace {

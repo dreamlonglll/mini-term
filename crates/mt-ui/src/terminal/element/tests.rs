@@ -277,3 +277,14 @@ fn 光标滚出视口钳到最近边缘() {
     let b = cursor_cell_bounds(origin, cell, 0, 0, 0, 0, 0);
     assert_eq!(b.origin, origin);
 }
+
+#[test]
+fn 布局动画期_grid_resize_冻结闸状态切换() {
+    assert!(!is_grid_resize_frozen());
+    assert!(!set_grid_resize_frozen(false));
+    assert!(set_grid_resize_frozen(true));
+    assert!(is_grid_resize_frozen());
+    assert!(!set_grid_resize_frozen(true));
+    assert!(set_grid_resize_frozen(false));
+    assert!(!is_grid_resize_frozen());
+}

@@ -68,14 +68,23 @@ impl Workspace {
         (frost_wanted, frost_alpha)
     }
 
-    /// 中间栏(项目列表 + 文件树)及其开合滑入/滑出出场层。
+    /// 中间栏(项目列表 + 文件树)及其开合流内推拉轨道。
+    ///
+    /// 返回 `(middle_in_layout, middle_content, middle_track, occupied_middle_w)`:
+    /// - 动画进行中(无论展开还是折叠):`middle_in_layout = false`,中栏放进 `body` 的流内
+    ///   `middle_track`(宽随进度在 `0..=target_w` 平滑变化),内层保持定宽 `target_w` 贴右缘
+    ///   (`right_0`)随轨道同步推入/收回,右侧工作区实时让位/填满 —— 零白底空洞、零遮挡终端
+    ///   文字、零外置主题包半透明闪色,同时冻结终端逐帧 grid 重排;
+    /// - 动画落定那一帧:解除冻结、用同一 `target_w` 干净重建 `columns_state` 并补一次下一帧
+    ///   缓存刷新让终端一次性完成唯一一次 `emulator.resize`,中栏以 0px 宽差无缝交回 `h_resizable`。
     fn render_middle_column(
         &mut self,
         middle: &[f64],
-        columns: &[f64],
+        target_w: f32,
         middle_visible: bool,
         window: &mut Window,
-    ) -> (gpui::AnyElement, Option<gpui::Div>) {
+        cx: &mut Context<Self>,
+    ) -> (bool, gpui::AnyElement, Option<gpui::Div>, f32) {
         let store_for_middle = self.store.clone();
         // 中间栏是**上下**结构:ProjectList 在上、FileTree 在下(`App.tsx:501-512`
         // 的 `<Allotment vertical>`,minSize 100/120、无上限,高度落 middleColumnSizes)
@@ -96,8 +105,7 @@ impl Workspace {
                     .collect();
                 store_for_middle.update(cx, |store, cx| store.set_middle_column_sizes(sizes, cx));
             });
-        // 中栏开合(见 [`MiddleMotion`]):开了 → 栏里内容从左滑入;收了 → 出场层画旧内容
-        // 向左滑出。首帧只记下,不播
+        // 中栏开合(见 [`MiddleMotion`]):开合途中统一走流内同步推拉轨道,首帧只记下不播
         let now = std::time::Instant::now();
         if let Some(was) = self.middle_seen
             && was != middle_visible
@@ -112,7 +120,7 @@ impl Workspace {
                 });
             self.middle_motion = mt_ui::motion::animations_enabled().then(|| MiddleMotion {
                 entering: middle_visible,
-                progress: motion_kit::resume_band(from, mt_ui::motion::PANEL_SWAP, now),
+                progress: motion_kit::resume_band(from, mt_ui::motion::SIDEBAR_TOGGLE, now),
             });
         }
         self.middle_seen = Some(middle_visible);
@@ -122,61 +130,59 @@ impl Workspace {
                 .running_at(now)
                 .then(|| (motion.entering, motion.progress.value_at(now)))
         });
-        match middle_frame {
-            Some(_) => window.request_animation_frame(),
-            None => self.middle_motion = None,
+        let animating = middle_frame.is_some();
+        let freeze_changed = mt_ui::terminal::set_grid_resize_frozen(animating);
+        if animating {
+            window.request_animation_frame();
+        } else {
+            self.middle_motion = None;
+            if freeze_changed {
+                // 动画刚刚落定:用干净的 ResizableState 重新以同一 `target_w` 做种,
+                // 避免动画途中 `columns_host` 宽变化残留任何比例误差;同时在下一帧开画前
+                // 刷新一次缓存,保证所有可见终端(即便与末帧同宽命中了 view 缓存)都补齐
+                // 解冻后的唯一一次 `emulator.resize`。
+                self.columns_state = cx.new(|_| ResizableState::default());
+                window.on_next_frame(|window, _| window.refresh());
+            }
         }
-        let middle_content: gpui::AnyElement = match middle_frame {
-            // 滑入:同尺寸的 absolute 层只动 left,栏本身裁掉露在左边外的部分
-            Some((true, progress)) => div()
-                .size_full()
+        if let Some((entering, progress)) = middle_frame {
+            let cur_w = middle_visible_width(target_w, entering, progress);
+            let divider_color = cx.theme().border;
+            let track = div()
                 .relative()
+                .flex_none()
+                .w(px(cur_w))
+                .h_full()
                 .overflow_hidden()
                 .child(
                     div()
                         .absolute()
                         .top_0()
+                        .right_0()
+                        .w(px(target_w))
                         .h_full()
-                        .w_full()
-                        .left(gpui::relative(middle_content_left(true, progress)))
-                        .child(middle_group),
+                        .child(middle_group)
+                        // 退场途中拦住点击与拖拽
+                        .when(!entering, |el| el.child(div().absolute().inset_0().occlude())),
                 )
-                .into_any_element(),
-            _ => middle_group.into_any_element(),
-        };
-        // 滑出:栏已隐藏(上面那份进的是不可见的 panel,不会被画),出场层里画另一份。
-        // 拦鼠标的是里层末尾那张罩(随内容滑、被外壳裁剪,只罩内容此刻还露着的那块):
-        // 外壳上的 `occlude` 挡不住自己的子元素(滑走中的项目行照样能点、能起拖拽),
-        // 整宽常驻又会在内容滑走后继续吞掉终端区左段的点击
-        let middle_exit = match middle_frame {
-            Some((false, progress)) => {
-                let exit_w = (columns[0] as f32).clamp(180.0, 700.0);
-                Some(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left(px(activity_bar::WIDTH))
-                        .h_full()
-                        .w(px(exit_w))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .h_full()
-                                .w_full()
-                                .left(gpui::relative(middle_content_left(false, progress)))
-                                // 挂在滑动内层:WebView2 抠洞随内容一起向左收,不挡已露出的左侧区域
-                                .child(native_view::occluder())
-                                .child(self.middle_group(middle))
-                                .child(div().absolute().inset_0().occlude()),
-                        ),
-                )
-            }
-            _ => None,
-        };
+                // 与静止态 `h_resizable` 的 1px handle 同色同位,交接帧零闪烁
+                .when(cur_w >= 1.0, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .w(px(1.0))
+                            .h_full()
+                            .bg(divider_color),
+                    )
+                });
+            // 动画途中中栏暂不入 `h_resizable`(占位传空 div,保证内部视图实体不双挂)
+            return (false, div().into_any_element(), Some(track), cur_w);
+        }
 
-        (middle_content, middle_exit)
+        let occupied = if middle_visible { target_w } else { 0.0 };
+        (middle_visible, middle_group.into_any_element(), None, occupied)
     }
 
     /// 左侧窄边条(ActivityBar)。
@@ -511,13 +517,19 @@ impl Workspace {
         // 原版 `w-[80vw] max-h-[85vh]` + 外壳默认 `pt-[10vh]`(`Modal.tsx:162`):
         // 左右各留 10vw,顶 10vh、底 5vh(10vh + 85vh = 95vh)
         let usage_viewport = window.viewport_size();
-        // 进出场与 Dialog 族同一套外壳(`dialog_host::shell_frame`):遮罩压暗渐变,面板按最终
-        // 尺寸排好、从顶边水平中点裁剪窗展开;收起反向播完才卸。退场那几帧遮罩不再拦点击、
-        // 面板不再接鼠标(`toggle_usage` 那一下面板已经被告知不可见,定时器照停)
-        let usage_frame = self
-            .usage_panel
-            .as_ref()
-            .and_then(|_| dialog_host::shell_frame("usage-stats", self.usage_open, window, cx));
+        // 进出场与设置 / SSH / 移动端大面板同一套「从窗口顶边整块向下滑落 / 向上收回」:
+        // 遮罩压暗渐变,面板按最终尺寸排好完整滑入,退场反向收出视口顶边再卸。退场那几帧
+        // 遮罩不再拦点击、面板不再接鼠标(`toggle_usage` 那一下面板已经被告知不可见,定时器照停)
+        let usage_frame = self.usage_panel.as_ref().and_then(|_| {
+            dialog_host::shell_frame_with(
+                "usage-stats",
+                self.usage_open,
+                mt_ui::motion::SHEET_IN,
+                mt_ui::motion::SHEET_OUT,
+                window,
+                cx,
+            )
+        });
         let usage_layer = self
             .usage_panel
             .clone()
@@ -552,7 +564,7 @@ impl Workspace {
                         )
                     })
                     .child(
-                        overlay_motion::reveal_box(
+                        overlay_motion::slide_down_box(
                             div()
                                 .absolute()
                                 .top(usage_viewport.height * 0.10)
@@ -770,29 +782,25 @@ impl Render for Workspace {
         // 页签区放回原宽,退场动画里的抽屉照旧从页签区上方滑走。页签区所在那一栏的宽按
         // 视口减边条与中栏估(中栏宽是落盘的那份,拖分隔条时差几像素无妨 —— 只拿来兜
         // 「至少留多宽」那条底)
-        let doc_panel_width = f32::from(window.viewport_size().width)
-            - activity_bar::WIDTH
-            - if middle_visible {
-                columns[0] as f32
-            } else {
-                0.0
-            };
+        let viewport_w = f32::from(window.viewport_size().width);
+        let middle_target_w = middle_target_width(columns[0], viewport_w);
+        let (middle_in_layout, middle_content, middle_track, occupied_middle_w) =
+            self.render_middle_column(&middle, middle_target_w, middle_visible, window, cx);
+        let doc_panel_width = viewport_w - activity_bar::WIDTH - occupied_middle_w;
         let squeeze = drawer_squeeze(
             terminal_page_active,
             self.right_drawer.is_some(),
             drawer_width as f32 + detail_width.unwrap_or(0.0),
             doc_panel_width,
         );
-
-        let (middle_content, middle_exit) =
-            self.render_middle_column(&middle, &columns, middle_visible, window);
         let columns_group = h_resizable("columns")
             .with_state(&self.columns_state)
             .child(
                 resizable_panel()
-                    .visible(middle_visible)
-                    .size(px(columns[0] as f32))
-                    .size_range(px(180.0)..px(700.0))
+                    .visible(middle_in_layout)
+                    .fixed()
+                    .size(px(middle_target_w))
+                    .size_range(px(MIDDLE_MIN_WIDTH)..px(MIDDLE_MAX_WIDTH))
                     .child(middle_content),
             )
             // 面板切换竖条停靠在终端区**里侧**右缘(固定 44px、不进 resizable
@@ -855,7 +863,7 @@ impl Render for Workspace {
                         .clone()
                         .filter(|s| s.len() == 2)
                         .unwrap_or_else(|| DEFAULT_COLUMNS.to_vec());
-                    if middle_visible && let Some(w) = sizes.first() {
+                    if middle_in_layout && let Some(w) = sizes.first() {
                         columns[0] = *w;
                     }
                     if let Some(w) = sizes.get(1) {
@@ -882,9 +890,9 @@ impl Render for Workspace {
             // Activity Bar 的 flex 占位仍是 44px;视觉条本体在 columns 后面以
             // absolute sibling 画,让右伸的标签不被 columns 覆盖。
             .child(div().flex_none().w(px(activity_bar::WIDTH)).h_full())
+            // 中栏开合途中的流内推拉轨道(与右侧 columns_host 实时联动让位/填满)
+            .children(middle_track)
             .child(columns_host().child(columns_group))
-            // 中栏收起的出场层(盖在终端区左段上滑走,边条画在它之上)
-            .children(middle_exit)
             .child(toggle_strip)
             .children(drawer_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——

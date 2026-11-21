@@ -117,6 +117,26 @@ const MAX_LINES: usize = 512;
 /// 6px 的滚动条精确命中太难点,左右各放宽 3px(与原生滚动条的手感一致)。
 const GRAB_SLACK: Pixels = px(3.0);
 
+thread_local! {
+    /// 布局推拉动画(如中栏开合)进行中暂停终端 grid 重排与 PTY resize 通知。
+    ///
+    /// 动画途中容器宽逐帧变化,终端绘制已有 `ContentMask { bounds }` 裁剪:冻结期间
+    /// 沿用当前 `(columns, screen_lines)` 绘制,行缓存 100% 命中、零逐列重排与
+    /// scrollback 挤压;动画落定解冻后下一帧一次性按最终尺寸完成唯一一次
+    /// `emulator.resize` + PTY 去抖下发。
+    static GRID_RESIZE_FROZEN: StdCell<bool> = const { StdCell::new(false) };
+}
+
+/// 设置终端 grid 尺寸冻结态,返回状态是否发生变化。
+pub fn set_grid_resize_frozen(frozen: bool) -> bool {
+    GRID_RESIZE_FROZEN.with(|flag| flag.replace(frozen) != frozen)
+}
+
+/// 当前是否处于布局动画期的 grid 尺寸冻结态。
+pub fn is_grid_resize_frozen() -> bool {
+    GRID_RESIZE_FROZEN.with(StdCell::get)
+}
+
 /// `Pixels` 的内部字段是 `pub(crate)`,取标量只能走 `From`。写成短名字省得刷屏。
 #[inline]
 fn f(p: Pixels) -> f32 {
@@ -705,18 +725,24 @@ impl Element for TerminalElement {
         // 主字体缺的私用区图标换哪份字体画;`None` = 这一帧不接管(见 [`symbols`])。
         let symbol_font = symbols::symbol_font(&self.style, window);
 
-        // ── grid 尺寸随可用像素走
-        let columns = ((f(bounds.size.width) / f(cell_width).max(1.0)).floor() as usize)
-            .clamp(2, MAX_COLUMNS);
-        let screen_lines = ((f(bounds.size.height) / f(line_height).max(1.0)).floor() as usize)
-            .clamp(1, MAX_LINES);
-        let target = TermSize::new(columns, screen_lines);
-        if self.emulator.term_size() != target {
-            self.emulator.resize(target);
-            if let Some(cb) = self.on_grid_resize.clone() {
-                cb(target, window, cx);
+        // ── grid 尺寸随可用像素走;布局动画期冻结,避免逐帧重排与打穿行缓存
+        let (columns, screen_lines) = if is_grid_resize_frozen() {
+            let cur = self.emulator.term_size();
+            (cur.columns, cur.screen_lines)
+        } else {
+            let columns = ((f(bounds.size.width) / f(cell_width).max(1.0)).floor() as usize)
+                .clamp(2, MAX_COLUMNS);
+            let screen_lines = ((f(bounds.size.height) / f(line_height).max(1.0)).floor() as usize)
+                .clamp(1, MAX_LINES);
+            let target = TermSize::new(columns, screen_lines);
+            if self.emulator.term_size() != target {
+                self.emulator.resize(target);
+                if let Some(cb) = self.on_grid_resize.clone() {
+                    cb(target, window, cx);
+                }
             }
-        }
+            (columns, screen_lines)
+        };
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let focused = self.focus.is_focused(window);

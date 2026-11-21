@@ -421,6 +421,173 @@ impl Element for RevealBox {
     }
 }
 
+/// 大面板整块从顶边滑出时额外多退出的阴影余量(逻辑像素),防止 `progress = 0` 时
+/// 面板底缘投影在窗口顶边露出一道黑边。
+const SLIDE_SHADOW_CLEARANCE: f32 = 24.0;
+
+/// 整块大面板「从上往下滑入 / 从下往上收回」这一帧的纵向位移(逻辑像素,<= 0)。
+///
+/// - `progress = 0.0`:面板底边退到视口顶边之上(含阴影余量),画面里完全不可见;
+/// - `progress = 1.0`:严格归零,落位与未包动画逐像素一致。
+pub fn slide_down_offset(progress: f32, target: FrameRect) -> f32 {
+    let p = progress.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        return 0.0;
+    }
+    let travel = (target.top + target.height).max(0.0) + SLIDE_SHADOW_CLEARANCE;
+    -travel * (1.0 - p)
+}
+
+/// 整块面板「从上往下滑入 / 从下往上滑出」外壳。用 [`slide_down_box`] 构造。
+///
+/// 布局按最终尺寸排好(零重排、内容全程不透明也不横向裁切);`prepaint` 经
+/// `window.with_element_offset` 将整块面板与内部全部交互坐标统一沿 Y 轴平移,
+/// 框体底色 / 边框 / 圆角 / 阴影按平移后的真实矩形绘制。
+pub struct SlideDownBox {
+    child: AnyElement,
+    progress: f32,
+    chrome: Option<Style>,
+    interactive: bool,
+    occlude_native: bool,
+    measure: Option<Rc<Cell<Option<Size<Pixels>>>>>,
+}
+
+/// 把 `child` 包成「从窗口顶边整块向下滑落、关闭时向上收回顶边」的弹窗外壳。
+pub fn slide_down_box(child: impl IntoElement, progress: f32) -> SlideDownBox {
+    SlideDownBox {
+        child: child.into_any_element(),
+        progress,
+        chrome: None,
+        interactive: true,
+        occlude_native: false,
+        measure: None,
+    }
+}
+
+impl SlideDownBox {
+    pub fn chrome(mut self, style: Style) -> Self {
+        self.chrome = Some(style);
+        self
+    }
+
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
+        self
+    }
+
+    pub fn occlude_native(mut self, occlude: bool) -> Self {
+        self.occlude_native = occlude;
+        self
+    }
+
+    pub fn measure_into(mut self, cell: Rc<Cell<Option<Size<Pixels>>>>) -> Self {
+        self.measure = Some(cell);
+        self
+    }
+}
+
+pub struct SlideDownBoxPrepaint {
+    frame: Bounds<Pixels>,
+}
+
+impl Element for SlideDownBox {
+    type RequestLayoutState = ();
+    type PrepaintState = SlideDownBoxPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if let Some(cell) = self.measure.as_ref() {
+            cell.set(Some(bounds.size));
+        }
+        let target = rect_of(bounds);
+        let offset_y = slide_down_offset(self.progress, target);
+        let frame = Bounds::new(
+            point(bounds.origin.x, bounds.origin.y + px(offset_y)),
+            bounds.size,
+        );
+        if self.interactive {
+            window.insert_hitbox(frame, HitboxBehavior::BlockMouse);
+        }
+        if offset_y == 0.0 {
+            self.child.prepaint(window, cx);
+        } else {
+            window.with_element_offset(point(px(0.0), px(offset_y)), |window| {
+                self.child.prepaint(window, cx);
+            });
+        }
+        if !self.interactive {
+            window.insert_hitbox(frame, HitboxBehavior::BlockMouse);
+        }
+        if self.occlude_native {
+            // 仅把落在视口可见区域内(y >= 0)的那一截登记成 WebView 遮挡矩形
+            let top = f32::from(frame.origin.y).max(0.0);
+            let bottom = f32::from(frame.origin.y + frame.size.height);
+            if bottom > top {
+                crate::native_view::occlude_rect(
+                    Bounds::new(
+                        point(frame.origin.x, px(top)),
+                        size(frame.size.width, px(bottom - top)),
+                    ),
+                    cx,
+                );
+            }
+        }
+        SlideDownBoxPrepaint { frame }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        let Some(chrome) = self.chrome.as_ref() else {
+            child.paint(window, cx);
+            return;
+        };
+        let mut style = chrome.clone();
+        // 下滑途中保留克制阴影增强悬浮层次,到位时恢复 100%
+        let p = self.progress.clamp(0.0, 1.0);
+        let strength = if p <= 0.0 { 0.0 } else { 0.35 + 0.65 * p };
+        for shadow in style.box_shadow.iter_mut() {
+            shadow.color.a *= strength;
+        }
+        style.paint(prepaint.frame, window, cx, |window, cx| {
+            child.paint(window, cx);
+        });
+    }
+}
+
 // ─── 离场托管 ────────────────────────────────────────────────
 
 /// 托管期比退场规格多留的一点余量:最后一帧(进度落到 0 的那帧)要真画出来,
@@ -616,5 +783,31 @@ mod tests {
         r.retarget(0.0, t0, false);
         assert!(!r.mounted_at(t0));
         assert_eq!(r.remaining_at(t0), Duration::ZERO);
+    }
+
+    /// 整块从顶边滑落/收回:起点底边彻底藏在视口顶边之外,终点严格归零,全程单调。
+    #[test]
+    fn 顶边整块滑落端点精确且单调() {
+        let t = FrameRect {
+            left: 160.0,
+            top: 90.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let at0 = slide_down_offset(0.0, t);
+        assert!(
+            t.top + at0 + t.height < 0.0,
+            "起点面板底边必须完全藏在视口顶边之上: offset={at0}"
+        );
+        assert_eq!(slide_down_offset(1.0, t), 0.0, "终点严格归零");
+        assert_eq!(slide_down_offset(2.0, t), 0.0, "越界上限钳住");
+        assert_eq!(slide_down_offset(-0.5, t), at0, "越界下限钳住");
+
+        let mut prev = at0;
+        for step in 1..=20 {
+            let cur = slide_down_offset(step as f32 / 20.0, t);
+            assert!(cur >= prev, "下滑必须单调向 0 收敛: {prev} -> {cur}");
+            prev = cur;
+        }
     }
 }
