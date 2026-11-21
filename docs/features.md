@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -242,7 +242,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Truncated text really gets an ellipsis** — on the old gpui 0.2.2 base, `truncate()` only clipped inside a flex item sized to its natural width, drawing no ellipsis, so text looked like it had simply been sliced off; a custom `mt_ui::TruncatedText` element used to truncate in prepaint once the final width was known. gpui-pre 0.3.5 fixed both upstream causes (the poisoned truncation cache and the high-DPI rounding), so these call sites are back on native `truncate()`, with their containers still given `min_w(0)` so they can actually be compressed: file-viewer breadcrumbs and Markdown image placeholders, directory group names and file paths in Git changes / diffs, worktree groups and the current dropdown item, project names / descriptions / ⎇ branch badges / remote-connection badges in the project list, search result paths and group file names, settings tabs and theme-pack names, SSH panel group headers and connection names, and project paths on pane preview cards.
 - **Startup performance** — Native rendering with no web assets: the startup path makes zero network requests, so the offline first frame is unaffected (the price table refreshes daily and falls back to its cache when unreachable); terminals left over from the last session are re-created only after the first frame is presented, so the window is never held back by PTY spawning; PTY writes run on a dedicated thread so typing never blocks the main thread; a unified startup-timeline trace is written to stderr for regression hunting.
 - **Installed-build log file** — When there is no console, stderr / stdout go to `mini-term.log` in the data directory (startup trace, panic reports and every error message end up there), rotated to `.log.1` at startup once it exceeds 2 MB; with a console attached output still goes to the terminal, and `MT_LOG_FILE=1` forces the file anyway.
-- **Interface motion** — Dialogs, context menus, and the side drawer share one enter/exit animation: the backdrop fades in while the panel drops and scales into place; on close it plays the reverse before unmounting (content is frozen meanwhile, so it never goes blank mid-fade or keeps swallowing Esc). Context menus expand from the cursor, and switching terminals or creating a split each get their own transition. When the system turns window animations off these transitions still play — the AI-done toast sliding in from the right and the usage panel's number tweens and chart animations are exempted likewise — only looping animations such as the blinking status dot are stopped. The usage trend chart's area fill is a single true gradient path rather than stacked horizontal bands.
+- **Interface motion** — Every animation is a directional slide or a clip-window reveal; content never fades in from transparent. Dialogs (a custom shell) darken the backdrop while the panel unfolds from the middle of its top edge, with the frosted backdrop fading in alongside and vanishing the moment the dialog closes; context menus unfold from the cursor and submenus open sideways from their parent row; the date picker, the title-bar project switcher, the AI task marker popover, the Git change popup and the tab / project hover cards all grow out of the control that triggered them, and moving between hover targets slides the card across. Every popover plays its reverse before unmounting, stops taking the mouse while leaving, hands focus back as soon as it starts closing, and turns around from its current progress when you reverse mid-way. Tabs push left / right and panels up / down; maximize grows from the original cell and restore retraces it (matching the maximized layout exactly, so no extra resize); closing the active tab pushes the neighbour in from the closed side; closing a split grows the neighbour from its old cell to the new one (a single resize); tab chips slide into place when tabs are created, closed or dropped. Drawer panel switches, settings pages, session drill-down, the file page's Preview / Source toggle and the date picker's month flip are full-width pushes whose direction follows the control's layout. Git sections, the in-progress banner and command-library groups expand by height, fold arrows rotate, segmented controls and the settings nav have sliding indicators, toggles slide, toasts slide in and out on the right and the rest reflow, and the DONE tag expands and retracts horizontally. Settings → Terminal → "Enable animations" now governs every animation — off means everything happens instantly (loading spinners only slow down). When the system turns window animations off these transitions still play; only looping animations such as the blinking status dot are stopped. The usage trend chart's area fill is a single true gradient path rather than stacked horizontal bands.
 - **Hover tips** — Tooltips across the UI wait a uniform 1.2s before showing (the icon-only buttons in the usage panel pop at 0.5s), and the bubble is anchored at the mouse position at the moment it appears, so moving within the same element no longer leaves it pinned halfway; the file tree's nested "Move to ▸" sub-panels are positioned from the current frame's row rect, so the first frame is no longer offset.
 
 ## Tech Stack
@@ -258,7 +258,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **3,788 Rust tests** (43 test targets) + relay-server protocol boundary tests |
+| Tests | **3,889 Rust tests** (43 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -413,7 +413,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (43 test targets, 3,788 cases)
+# Workspace-wide Rust tests (43 test targets, 3,889 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
