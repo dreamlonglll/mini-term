@@ -53,15 +53,16 @@ docker logs mini-term-relay | grep 'desktop key'   # expect "desktop key configu
 | `RELAY_PWA_DIR` | `/srv/pwa` | PWA asset directory (baked into the image; no need to change) |
 | `RELAY_MAX_CONNECTIONS` | `64` | Global cap on concurrent WebSocket connections (including ones still handshaking); over the cap the upgrade is answered with 503 |
 | `RELAY_MAX_CONNECTIONS_PER_IP` | `16` | Cap on concurrent connections per client; over the cap the upgrade is answered with 429 |
+| `RELAY_MAX_DESKTOPS` | `64` | Cap on concurrent desktop rooms (online or paired desktops; empty offline rooms are reclaimed automatically) |
 | `RELAY_CLIENT_IP_HEADER` | unset (TCP peer address) | Request header that carries the client address for the per-client cap. **Required behind a reverse proxy**, see below |
 
-Like the key, the last three go into `relay-server/.env` (`docker-compose.yml` passes them through); leave them out to use the defaults.
+Like the key, the last four go into `relay-server/.env` (`docker-compose.yml` passes them through); leave them out to use the defaults.
 
 The public address (domain/port) is not configured on the relay — which address the desktop and phone connect to is determined by the relay URL you enter in the desktop settings.
 
 ### Connection and Message Limits
 
-The relay is single-tenant and 1×1 (one desktop + one phone), so it normally holds two or three connections; the defaults are far above normal use and rarely need changing. Per-message limits are fixed in code: 16 MiB for the desktop (a mirror page of 50 text messages) and 1 MiB for the phone — the sender of an oversized message is disconnected. A connection whose outbound backlog reaches 256 frames (the peer is too slow) is disconnected too; both ends reconnect automatically and fetch a fresh full snapshot.
+A single relay server can host **multiple desktops** sharing the same `MT_RELAY_DESKTOP_KEY` (each desktop generates its own stable ID and can set a custom display name in the Mobile panel). Each desktop still binds to **at most one phone at a time** — scanning a desktop's QR code with a new phone revokes only that desktop's previous phone without affecting other desktops on the same relay. The defaults are far above personal multi-machine use and rarely need changing. Per-message limits are fixed in code: 16 MiB for the desktop (a mirror page of 50 text messages) and 1 MiB for the phone — the sender of an oversized message is disconnected. A connection whose outbound backlog reaches 256 frames (the peer is too slow) is disconnected too; both ends reconnect automatically and fetch a fresh full snapshot.
 
 The per-client cap needs the real client address. Behind a reverse proxy the TCP peer is always the proxy itself (the bridge gateway under Docker port mapping), so set `RELAY_CLIENT_IP_HEADER` to the header the proxy writes (the last comma-separated value is used):
 
@@ -150,6 +151,6 @@ Things to keep in mind:
 
 - Restarting the relay (including recreating the container on upgrade) loses pairing state, so the phone must scan again.
 - The protocol is versioned: if the desktop and relay versions do not match, the handshake is rejected explicitly with an upgrade prompt rather than failing silently.
-- 1×1 topology: only one desktop and one phone are active at a time; pairing a new device supersedes the old one.
-- Lost phone: desktop "Mobile" panel → reset pairing, and every mobile credential is invalidated immediately.
+- Multi-desktop topology: a single relay instance can serve multiple desktops (no extra containers or domains required). Each desktop is isolated and paired to at most one phone at a time; pairing a new phone supersedes only that desktop's previous phone. On the phone, switch between paired desktops from the top bar or bookmark `/?desktop=<id>` (separate browser tabs can stay connected to different desktops concurrently).
+- Lost phone: desktop "Mobile" panel → reset pairing, and that desktop's mobile credential is invalidated immediately without affecting other desktops.
 - Log spot-check: `docker logs mini-term-relay` should show only connection / auth / pairing metadata, never any conversation content.

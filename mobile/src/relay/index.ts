@@ -10,6 +10,7 @@
  * - `session.ts`: 发起新会话 / 恢复历史会话及自动跳转镜像
  * - `connection.ts`: WebSocket 握手、消息路由、重连、前后台与网络监听
  */
+export { type SavedDesktop } from './auth';
 export {
   type HistoryError,
   type HistoryListState,
@@ -42,4 +43,9 @@ export {
   refreshProjectHistory,
 } from './history';
 export { resumeAiSession, startAiSession } from './session';
-export { refreshSessions, startRelay } from './connection';
+export {
+  refreshSessions,
+  removeSavedDesktop,
+  startRelay,
+  switchDesktop,
+} from './connection';

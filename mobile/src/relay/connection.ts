@@ -1,5 +1,5 @@
 /**
- * 移动端 → 中转的 WebSocket 连接生命周期、握手、重连、消息路由与深链调度。
+ * 移动端 → 中转的 WebSocket 连接生命周期、握手、重连、多桌面切换、消息路由与深链调度。
  */
 import {
   PROTOCOL_VERSION,
@@ -8,23 +8,36 @@ import {
   type RelayToMobile,
 } from '../protocol';
 import {
+  DEFAULT_DESKTOP_ID,
+  DESKTOPS_STORAGE_KEY,
   backoffMs,
-  clearCredential,
   clearHash,
-  consumePairingCode,
-  getCredential,
+  clearLegacyCredential,
+  getActiveDesktopId,
+  getLegacyCredential,
+  getSavedDesktop,
+  listSavedDesktops,
+  readDesktopHash,
+  readDesktopQuery,
+  readPairingCode,
   readPaneLink,
-  saveCredential,
+  removeSavedDesktopEntry,
+  setActiveDesktopId,
+  syncDesktopUrl,
+  updateSavedDesktopName,
+  upsertSavedDesktop,
   wsUrl,
 } from './auth';
 import {
+  clearHistoryListTimer,
+  clearHistoryPreviewTimer,
   failPendingHistoryOffline,
   handleHistoryMessage,
   resyncPendingHistory,
 } from './history';
 import { closeMirror, handleMirrorMessage, openMirror } from './mirror';
 import { finishStart, handleStartSessionReceipt, onProjectsChanged } from './session';
-import { findPane, setPhase, useRelayStore } from './store';
+import { findPane, resetDesktopSessionState, setPhase, useRelayStore } from './store';
 import { registerTransportSender, sendToRelay } from './transport';
 
 /**
@@ -44,8 +57,17 @@ const STALE_AFTER_HIDDEN_MS = 30_000;
 let ws: WebSocket | null = null;
 let reconnectAttempt = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-/** 握手被拒/被吊销后不再自动重连 */
+/** 握手被拒/被吊销/手动停用后不再自动重连 */
 let stopped = false;
+/** 当前连接的中转是否支持多桌面端(helloAck 带 desktopId 即为 true) */
+let relaySupportsMultiDesktop = false;
+
+/**
+ * 本标签页当前绑定的桌面端 id 与凭证(仅活在内存,不随其他标签页切机漂移)。
+ * 多标签页同时分别打开 `?desktop=A` 和 `?desktop=B` 时,各管各的重连。
+ */
+let activeDesktopId: string | null = null;
+let activeCredential: string | null = null;
 
 /**
  * 等着打开的深链 pane。只试一次:收到快照时找得到就进镜像,找不到说明会话已经结束,
@@ -66,6 +88,25 @@ registerTransportSender((msg) => {
   }
 });
 
+function teardownSocket() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+}
+
+function clearInFlightUiState() {
+  clearHistoryListTimer();
+  clearHistoryPreviewTimer();
+  finishStart(null);
+  resetDesktopSessionState();
+}
+
 /** 打开深链指向的 pane;已在看它就不动,在看别的就先退订再进。 */
 function openPaneLink(paneId: string) {
   const { projects, mirror } = useRelayStore.getState();
@@ -76,13 +117,67 @@ function openPaneLink(paneId: string) {
   openMirror(pane.paneId, pane.title);
 }
 
+/** 查找本标签页当前应使用的重连凭证。 */
+function currentReconnectAuth(): { desktopId: string | null; credential: string | null } {
+  if (activeDesktopId) {
+    const saved = getSavedDesktop(activeDesktopId);
+    if (saved) return { desktopId: saved.desktopId, credential: saved.credential };
+  }
+  if (activeCredential) {
+    return { desktopId: activeDesktopId, credential: activeCredential };
+  }
+  return { desktopId: activeDesktopId, credential: null };
+}
+
+/**
+ * 过期配对码书签的回退目标(issue #96 + #106):
+ * - 链接自带 `?desktop=<id>` 时,只回退到该桌面端的本地凭证(绝不误连另一台电脑);
+ * - 旧版链接没有 `?desktop=` 时,仅当本地只有 1 台设备(或旧单键凭证)才回退。
+ */
+function fallbackCredentialForStaleCode(
+  targetDesktopId?: string,
+): { desktopId?: string; credential: string; fromLegacy?: boolean } | null {
+  if (targetDesktopId) {
+    const saved = getSavedDesktop(targetDesktopId);
+    return saved ? { desktopId: saved.desktopId, credential: saved.credential } : null;
+  }
+  const all = listSavedDesktops();
+  if (all.length === 1) {
+    return { desktopId: all[0].desktopId, credential: all[0].credential };
+  }
+  if (all.length === 0) {
+    const legacy = getLegacyCredential();
+    if (legacy) return { credential: legacy, fromLegacy: true };
+  }
+  return null;
+}
+
 /**
  * `staleCode`:这次是配对码被拒后退回凭证的重连(见 `helloReject` 分支),
  * 凭证也不认时按「配对码无效」提示——用户要的是新二维码,不是「凭证已失效」。
  */
-function connect(auth: { pairingCode?: string; credential?: string; staleCode?: boolean }) {
+function connect(auth: {
+  pairingCode?: string;
+  credential?: string;
+  targetDesktopId?: string;
+  staleCode?: boolean;
+  fromLegacy?: boolean;
+}) {
+  teardownSocket();
   stopped = false;
   snapshotReady = false;
+  if (auth.targetDesktopId) {
+    activeDesktopId = auth.targetDesktopId;
+    const saved = getSavedDesktop(auth.targetDesktopId);
+    useRelayStore.setState({
+      currentDesktopId: auth.targetDesktopId,
+      currentDesktopName: saved?.desktopName ?? useRelayStore.getState().currentDesktopName,
+    });
+  }
+  if (auth.credential) {
+    activeCredential = auth.credential;
+  }
+
   if (auth.pairingCode) {
     setPhase('pairing');
   } else {
@@ -108,6 +203,7 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
   };
 
   socket.onmessage = (ev) => {
+    if (ws !== socket) return;
     let msg: RelayToMobile;
     try {
       msg = JSON.parse(String(ev.data)) as RelayToMobile;
@@ -119,7 +215,33 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
         handshakeDone = true;
         clearTimeout(handshakeTimer);
         reconnectAttempt = 0;
-        if (msg.credential) saveCredential(msg.credential);
+        const desktopId = msg.desktopId ?? auth.targetDesktopId ?? DEFAULT_DESKTOP_ID;
+        const credential = msg.credential ?? auth.credential ?? activeCredential;
+        activeDesktopId = desktopId;
+        activeCredential = credential ?? null;
+
+        let savedDesktops = listSavedDesktops();
+        const authoritativeName = msg.desktopId !== undefined;
+        relaySupportsMultiDesktop = authoritativeName;
+        if (credential) {
+          savedDesktops = upsertSavedDesktop({
+            desktopId,
+            desktopName: msg.desktopName,
+            credential,
+            authoritativeName,
+          });
+          if (auth.fromLegacy) clearLegacyCredential();
+        }
+        setActiveDesktopId(desktopId);
+        syncDesktopUrl(desktopId);
+        const saved = savedDesktops.find((d) => d.desktopId === desktopId);
+        useRelayStore.setState({
+          currentDesktopId: desktopId,
+          currentDesktopName: authoritativeName
+            ? (msg.desktopName?.trim() || null)
+            : (msg.desktopName ?? saved?.desktopName ?? null),
+          savedDesktops,
+        });
         setPhase('connected');
         // 断线前在看的镜像不在这里重订阅:桌面端在线时中转会请它回发结构快照,
         // 收到快照再订阅(见 sessionsSnapshot 分支);桌面端不在线时订阅本来就到不了它
@@ -127,14 +249,28 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
       }
       case 'helloReject': {
         stopped = true;
-        if (msg.reason === 'invalidCredential') clearCredential();
-        // 配对码兑换不了(书签里存的是带 #pair= 的配对链接、码过期或已兑换过),本地还留着
-        // 上次配对的凭证:退回凭证重连,别把用户拦在「配对码无效」页上。一个中转只对一台
-        // 桌面端,这把凭证连的就是同一台。凭证重连只会回 invalidCredential,不会再进这里
+        if (msg.reason === 'invalidCredential') {
+          if (auth.fromLegacy) {
+            clearLegacyCredential();
+          }
+          const targetId = auth.targetDesktopId ?? activeDesktopId;
+          if (targetId) {
+            const savedDesktops = removeSavedDesktopEntry(targetId);
+            activeCredential = null;
+            useRelayStore.setState({ savedDesktops });
+          }
+        }
+        // 配对码兑换不了(书签里存的是带 #pair= 的配对链接、码过期或已兑换过):
+        // 若能精确定位到同一台桌面端的已保存凭证,则退回该凭证重连,别拦在错误页上
         if (msg.reason === 'invalidPairingCode') {
-          const cred = getCredential();
-          if (cred) {
-            connect({ credential: cred, staleCode: true });
+          const fallback = fallbackCredentialForStaleCode(auth.targetDesktopId);
+          if (fallback) {
+            connect({
+              credential: fallback.credential,
+              targetDesktopId: fallback.desktopId,
+              fromLegacy: fallback.fromLegacy,
+              staleCode: true,
+            });
             break;
           }
         }
@@ -144,13 +280,27 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
         );
         break;
       }
-      case 'revoked':
+      case 'revoked': {
         stopped = true;
-        clearCredential();
+        activeCredential = null;
+        if (activeDesktopId) {
+          const savedDesktops = removeSavedDesktopEntry(activeDesktopId);
+          useRelayStore.setState({ savedDesktops });
+        }
+        clearInFlightUiState();
         setPhase('revoked');
         break;
+      }
       case 'presence': {
-        useRelayStore.setState({ desktopOnline: msg.desktopOnline });
+        const patch: { desktopOnline: boolean; currentDesktopName?: string | null; savedDesktops?: ReturnType<typeof listSavedDesktops> } = {
+          desktopOnline: msg.desktopOnline,
+        };
+        if ((msg.desktopName !== undefined || relaySupportsMultiDesktop) && activeDesktopId) {
+          const nextName = msg.desktopName?.trim() || null;
+          patch.currentDesktopName = nextName;
+          patch.savedDesktops = updateSavedDesktopName(activeDesktopId, nextName ?? undefined);
+        }
+        useRelayStore.setState(patch);
         // 桌面端在等待期间掉线:在途的发起 / 历史拉取再也不会有下文,立刻给出原因而不是等超时
         if (!msg.desktopOnline) {
           if (useRelayStore.getState().starting) finishStart('desktopOffline');
@@ -226,76 +376,205 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
     if (ws !== socket) return; // 已被新连接取代
     ws = null;
     if (stopped) return;
-    const cred = getCredential();
-    if (!cred) {
-      // 配对失败且没有旧凭证可回退
+    const { desktopId, credential } = currentReconnectAuth();
+    if (!credential) {
+      // 配对失败且没有凭证可回退
       if (!handshakeDone) setPhase('idle');
       return;
     }
     reconnectAttempt += 1;
     setPhase('reconnecting');
-    reconnectTimer = setTimeout(() => connect({ credential: cred }), backoffMs(reconnectAttempt));
+    reconnectTimer = setTimeout(
+      () =>
+        connect({
+          credential,
+          targetDesktopId: desktopId ?? undefined,
+          fromLegacy: auth.fromLegacy,
+        }),
+      backoffMs(reconnectAttempt),
+    );
   };
 }
 
 /**
- * 下拉刷新：主动断开重连。
- *
- * 协议里没有「请求全量快照」这条消息（加一条要同时动 relay-server 的 protocol
- * crate 与桌面端），而握手成功后桌面端本来就会推一份完整 sessionsSnapshot ——
- * 重连即是最直接的「重新对齐」，且复用了已经跑熟的那条路径。
- *
- * 返回 false = 当前没有凭证，刷新无从谈起（未配对）。
+ * 切换到本机已保存的另一台桌面端。
+ * 清空上一台电脑的会话与镜像状态,用目标桌面端凭证重建连接并同步 `?desktop=` URL。
  */
-export function refreshSessions(): boolean {
-  const cred = getCredential();
-  if (!cred) return false;
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
+export function switchDesktop(desktopId: string): boolean {
+  const entry = getSavedDesktop(desktopId);
+  if (!entry) return false;
+  const { phase } = useRelayStore.getState();
+  if (
+    activeDesktopId === desktopId &&
+    (phase === 'connected' || phase === 'connecting' || phase === 'reconnecting')
+  ) {
+    return true;
   }
   reconnectAttempt = 0;
-  // 先摘掉 onclose 再关，免得旧连接的关闭回调把我们刚发起的重连排到退避队列里
-  if (ws) {
-    ws.onclose = null;
-    ws.close();
-    ws = null;
-  }
-  connect({ credential: cred });
+  clearInFlightUiState();
+  activeDesktopId = entry.desktopId;
+  activeCredential = entry.credential;
+  setActiveDesktopId(entry.desktopId);
+  syncDesktopUrl(entry.desktopId);
+  useRelayStore.setState({
+    currentDesktopId: entry.desktopId,
+    currentDesktopName: entry.desktopName ?? null,
+    savedDesktops: listSavedDesktops(),
+  });
+  connect({ credential: entry.credential, targetDesktopId: entry.desktopId });
   return true;
 }
 
-/** 应用启动入口:优先兑换 URL 里的配对码,否则凭本地凭证重连。 */
+/**
+ * 从本机列表移除一台已保存的桌面端(只清本机缓存,不向中转发起重置)。
+ * 若移除的是当前正在查看的桌面端,自动切到剩余的第一台;删光后进入 idle。
+ */
+export function removeSavedDesktop(desktopId: string) {
+  const remaining = removeSavedDesktopEntry(desktopId);
+  useRelayStore.setState({ savedDesktops: remaining });
+  if (activeDesktopId !== desktopId) return;
+
+  teardownSocket();
+  stopped = true;
+  clearInFlightUiState();
+  if (remaining.length > 0) {
+    const next = remaining[0];
+    activeDesktopId = next.desktopId;
+    activeCredential = next.credential;
+    setActiveDesktopId(next.desktopId);
+    syncDesktopUrl(next.desktopId);
+    useRelayStore.setState({
+      currentDesktopId: next.desktopId,
+      currentDesktopName: next.desktopName ?? null,
+    });
+    reconnectAttempt = 0;
+    connect({ credential: next.credential, targetDesktopId: next.desktopId });
+  } else {
+    activeDesktopId = null;
+    activeCredential = null;
+    setActiveDesktopId(null);
+    syncDesktopUrl(null);
+    useRelayStore.setState({ currentDesktopId: null, currentDesktopName: null });
+    setPhase('idle');
+  }
+}
+
+/**
+ * 下拉刷新:主动断开重连。
+ *
+ * 协议里没有「请求全量快照」这条消息,而握手成功后桌面端本来就会推一份完整
+ * sessionsSnapshot —— 重连即是最直接的「重新对齐」,且复用了已经跑熟的那条路径。
+ *
+ * 返回 false = 当前没有凭证,刷新无从谈起(未配对)。
+ */
+export function refreshSessions(): boolean {
+  const { desktopId, credential } = currentReconnectAuth();
+  if (!credential) return false;
+  reconnectAttempt = 0;
+  connect({ credential, targetDesktopId: desktopId ?? undefined });
+  return true;
+}
+
+/** 应用启动入口:优先兑换 URL 里的配对码,否则按 `?desktop=` 或上次活跃桌面重连。 */
 export function startRelay() {
-  // 深链先读(配对码那一步会把整个 hash 清掉);连上后的首个快照里兑现
+  const savedDesktops = listSavedDesktops();
+  useRelayStore.setState({ savedDesktops });
+
+  // 深链与配对码先全部读出来,再统一清 hash
+  const urlDesktopId = readDesktopQuery() ?? readDesktopHash();
   pendingPaneId = readPaneLink();
-  const code = consumePairingCode();
-  if (pendingPaneId && !code) clearHash();
+  const code = readPairingCode();
+  if (code || pendingPaneId) clearHash();
+
   if (code) {
-    // 扫了新码就走新配对(顶替旧凭证),即使本地已有凭证
-    connect({ pairingCode: code });
+    // 扫了新码就走新配对(中转只顶替那一台桌面端原绑定的手机,本机保留其他电脑凭证)
+    connect({ pairingCode: code, targetDesktopId: urlDesktopId ?? undefined });
     return;
   }
-  const cred = getCredential();
-  if (cred) {
-    connect({ credential: cred });
+
+  // 指定了 ?desktop=<id>(书签 / 远程通知深链 / 刷新):精准连那一台,不存在则不误连别台
+  if (urlDesktopId) {
+    const target = getSavedDesktop(urlDesktopId);
+    if (target) {
+      activeDesktopId = target.desktopId;
+      activeCredential = target.credential;
+      useRelayStore.setState({
+        currentDesktopId: target.desktopId,
+        currentDesktopName: target.desktopName ?? null,
+      });
+      connect({ credential: target.credential, targetDesktopId: target.desktopId });
+      return;
+    }
+    useRelayStore.setState({ currentDesktopId: urlDesktopId, currentDesktopName: null });
+    setPhase('idle');
+    return;
+  }
+
+  // 无 ?desktop= 参数(如主屏幕 PWA 图标打开):回落到上次活跃的电脑或列表首台
+  const preferredId = getActiveDesktopId();
+  const target =
+    (preferredId ? getSavedDesktop(preferredId) : null) ?? savedDesktops[0] ?? null;
+  if (target) {
+    activeDesktopId = target.desktopId;
+    activeCredential = target.credential;
+    syncDesktopUrl(target.desktopId);
+    useRelayStore.setState({
+      currentDesktopId: target.desktopId,
+      currentDesktopName: target.desktopName ?? null,
+    });
+    connect({ credential: target.credential, targetDesktopId: target.desktopId });
+    return;
+  }
+
+  // 兼容旧版单桌面 PWA 留下的单键凭证:重连一次拿到 desktopId 后自动迁入多机表
+  const legacy = getLegacyCredential();
+  if (legacy) {
+    connect({ credential: legacy, fromLegacy: true });
   } else {
     setPhase('idle');
   }
 }
 
-// 页面已经开着时再点一条通知:同一文档只换了 hash,不会重新走 startRelay。
-// 这条连接已收到过快照就当场打开;还在连、或连上了但快照没到(桌面端离线),
-// 就记下,等快照到了再兑现 —— 与冷启动走 startRelay 的那条路同一口径。
+// 页面已经开着时再点一条通知或配对链接:同一文档只换了 hash,不会重新走 startRelay。
 window.addEventListener('hashchange', () => {
+  const code = readPairingCode();
   const paneId = readPaneLink();
-  if (!paneId) return;
+  const targetDesktopId = readDesktopQuery() ?? readDesktopHash();
+  if (!code && !paneId) return;
   clearHash();
-  if (useRelayStore.getState().phase === 'connected' && snapshotReady) {
-    openPaneLink(paneId);
-  } else {
+
+  if (code) {
     pendingPaneId = paneId;
+    clearInFlightUiState();
+    reconnectAttempt = 0;
+    connect({ pairingCode: code, targetDesktopId: targetDesktopId ?? undefined });
+    return;
   }
+
+  if (paneId) {
+    if (targetDesktopId && targetDesktopId !== activeDesktopId) {
+      pendingPaneId = paneId;
+      if (switchDesktop(targetDesktopId)) return;
+    }
+    if (useRelayStore.getState().phase === 'connected' && snapshotReady) {
+      openPaneLink(paneId);
+    } else {
+      pendingPaneId = paneId;
+    }
+  }
+});
+
+// 同浏览器多标签页同步设备列表(例如在标签页 B 扫了新电脑,标签页 A 的切换器立刻看到)
+window.addEventListener('storage', (ev) => {
+  if (ev.key !== DESKTOPS_STORAGE_KEY) return;
+  const savedDesktops = listSavedDesktops();
+  const current = activeDesktopId
+    ? savedDesktops.find((d) => d.desktopId === activeDesktopId)
+    : undefined;
+  useRelayStore.setState((prev) => ({
+    savedDesktops,
+    currentDesktopName: current?.desktopName ?? prev.currentDesktopName,
+  }));
 });
 
 /** 页面最近一次转入后台的时刻;null = 在前台。 */
@@ -307,8 +586,10 @@ function reconnectNowIfWaiting() {
   if (phase === 'reconnecting' && !ws) {
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = null;
-    const cred = getCredential();
-    if (cred) connect({ credential: cred });
+    const { desktopId, credential } = currentReconnectAuth();
+    if (credential) {
+      connect({ credential, targetDesktopId: desktopId ?? undefined });
+    }
   }
 }
 

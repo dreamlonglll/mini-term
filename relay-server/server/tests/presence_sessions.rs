@@ -70,6 +70,8 @@ async fn desktop_handshake(addr: SocketAddr) -> WsClient {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: DESKTOP_KEY.into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;
@@ -180,7 +182,8 @@ async fn mobile_hello_receives_current_presence() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: true
+            desktop_online: true,
+            desktop_name: None,
         })
     );
     assert_eq!(
@@ -198,7 +201,8 @@ async fn mobile_hello_receives_current_presence() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile2).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 }
@@ -213,7 +217,8 @@ async fn desktop_going_offline_and_online_pushes_presence() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: true
+            desktop_online: true,
+            desktop_name: None,
         })
     );
     // 消费快照请求
@@ -228,7 +233,8 @@ async fn desktop_going_offline_and_online_pushes_presence() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 
@@ -237,7 +243,8 @@ async fn desktop_going_offline_and_online_pushes_presence() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: true
+            desktop_online: true,
+            desktop_name: None,
         })
     );
 }

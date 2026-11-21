@@ -142,6 +142,10 @@ pub enum DesktopRejectReason {
     InvalidKey,
     /// 中转未配置 `MT_RELAY_DESKTOP_KEY`:fail-closed,拒绝一切桌面连接
     KeyNotConfigured,
+    /// 桌面端标识不合法(超长或含非法字符)
+    InvalidDesktopId,
+    /// 中转活跃桌面端房间数已达上限
+    RoomLimitReached,
 }
 
 /// 对话镜像中的一条消息。seq 在一次镜像绑定内从 0 连续递增,分页取数以此为锚。
@@ -212,9 +216,15 @@ pub struct MirrorQuestionOption {
 pub enum DesktopToRelay {
     /// 握手:桌面端连上 WebSocket 后必须发送的第一条消息。
     /// `desktop_key` 是部署方配置在中转上的共享密钥(v2 起必填,不匹配即拒)。
+    /// `desktop_id` 标识单台中转上的某台桌面端(缺省 = 兼容旧桌面端,归入内置默认槽位)。
+    /// `desktop_name` 为桌面端展示名(如主机名或自定义别名,供移动端区分多台电脑)。
     Hello {
         protocol_version: u32,
         desktop_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_name: Option<String>,
     },
     /// 请求签发一次性配对码(用于桌面端展示二维码)。旧配对码立即作废。
     RequestPairingCode,
@@ -305,7 +315,12 @@ pub enum DesktopToRelay {
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RelayToDesktop {
     /// 握手成功。
-    HelloAck { protocol_version: u32 },
+    HelloAck {
+        protocol_version: u32,
+        /// 中转是否支持同一实例接入多台桌面端(旧中转不发 → 缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_multi_desktop: bool,
+    },
     /// 握手拒绝(版本不匹配 / 密钥不对 / 中转未配置密钥);发送后中转立即关闭连接。
     /// 桌面端据 reason 分别给出"升级"与"配置密钥"的提示,两种都不再自动重连。
     /// 版本字段仅 `VersionMismatch` 时携带。
@@ -460,19 +475,29 @@ pub enum MobileToRelay {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RelayToMobile {
-    /// 握手成功。configured pairing 时携带新签发的长期凭证,重连时为 None。
+    /// 握手成功。首次配对兑换时携带新签发的长期凭证,重连时为 None。
     HelloAck {
         protocol_version: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<String>,
+        /// 当前连接绑定的桌面端标识(支持多桌面端的中转总是下发;旧中转缺省为 None)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_id: Option<String>,
+        /// 桌面端展示名(桌面端握手时上报;未上报时省略)。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_name: Option<String>,
     },
     /// 握手拒绝;发送后中转立即关闭连接。
     HelloReject { reason: MobileRejectReason },
     /// 已建立的连接被吊销(新设备配对顶替 / 桌面端重置配对),随后关闭连接。
     /// 移动端应清除本地凭证并提示重新扫码。
     Revoked,
-    /// 桌面端在线状态(握手成功后立即推一次,此后变化时推送)。
-    Presence { desktop_online: bool },
+    /// 桌面端在线状态(握手成功后立即推一次,此后变化或桌面端改名重连时推送)。
+    Presence {
+        desktop_online: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        desktop_name: Option<String>,
+    },
     /// 结构全量快照(转发自桌面端):全部项目 + 可用 AI 启动器名单。
     SessionsSnapshot {
         projects: Vec<MobileProject>,
@@ -577,27 +602,65 @@ mod tests {
         let msg = DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: "s3cret".into(),
+            desktop_id: None,
+            desktop_name: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
             json.contains(r#""type":"hello""#)
                 && json.contains(r#""protocolVersion":2"#)
-                && json.contains(r#""desktopKey":"s3cret""#),
+                && json.contains(r#""desktopKey":"s3cret""#)
+                && !json.contains("desktopId")
+                && !json.contains("desktopName"),
             "serde camelCase 对齐被破坏: {json}"
         );
         let parsed: DesktopToRelay = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
+
+        // 带多桌面端标识与展示名
+        let named = DesktopToRelay::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            desktop_key: "s3cret".into(),
+            desktop_id: Some("desk-a".into()),
+            desktop_name: Some("家里 PC".into()),
+        };
+        let json = serde_json::to_string(&named).unwrap();
+        assert!(
+            json.contains(r#""desktopId":"desk-a""#) && json.contains(r#""desktopName":"家里 PC""#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(&json).unwrap(),
+            named
+        );
+
+        // 旧桌面端载荷(缺 desktopId / desktopName)必须照常解析
+        let legacy = r#"{"type":"hello","protocolVersion":2,"desktopKey":"s3cret"}"#;
+        assert_eq!(serde_json::from_str::<DesktopToRelay>(legacy).unwrap(), msg);
     }
 
     #[test]
     fn hello_ack_round_trip() {
         let msg = RelayToDesktop::HelloAck {
             protocol_version: PROTOCOL_VERSION,
+            supports_multi_desktop: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"helloAck""#), "{json}");
+        assert!(!json.contains("supportsMultiDesktop"), "{json}");
         let parsed: RelayToDesktop = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
+
+        let multi = RelayToDesktop::HelloAck {
+            protocol_version: PROTOCOL_VERSION,
+            supports_multi_desktop: true,
+        };
+        let json = serde_json::to_string(&multi).unwrap();
+        assert!(json.contains(r#""supportsMultiDesktop":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<RelayToDesktop>(&json).unwrap(),
+            multi
+        );
     }
 
     #[test]
@@ -623,6 +686,8 @@ mod tests {
         for reason in [
             DesktopRejectReason::InvalidKey,
             DesktopRejectReason::KeyNotConfigured,
+            DesktopRejectReason::InvalidDesktopId,
+            DesktopRejectReason::RoomLimitReached,
         ] {
             let msg = RelayToDesktop::HelloReject {
                 reason,
@@ -632,13 +697,23 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             assert!(
                 !json.contains("Version"),
-                "密钥类拒绝不应携带版本字段: {json}"
+                "非版本类拒绝不应携带版本字段: {json}"
             );
             assert_eq!(serde_json::from_str::<RelayToDesktop>(&json).unwrap(), msg);
         }
         // camelCase 枚举值口径(前端手写镜像按此匹配)
-        let json = serde_json::to_string(&DesktopRejectReason::KeyNotConfigured).unwrap();
-        assert_eq!(json, r#""keyNotConfigured""#);
+        assert_eq!(
+            serde_json::to_string(&DesktopRejectReason::KeyNotConfigured).unwrap(),
+            r#""keyNotConfigured""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DesktopRejectReason::InvalidDesktopId).unwrap(),
+            r#""invalidDesktopId""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DesktopRejectReason::RoomLimitReached).unwrap(),
+            r#""roomLimitReached""#
+        );
     }
 
     #[test]
@@ -707,9 +782,28 @@ mod tests {
         let ack = RelayToMobile::HelloAck {
             protocol_version: PROTOCOL_VERSION,
             credential: Some("secret".into()),
+            desktop_id: Some("desk-1".into()),
+            desktop_name: Some("Office Mac".into()),
         };
         let json = serde_json::to_string(&ack).unwrap();
+        assert!(
+            json.contains(r#""desktopId":"desk-1""#)
+                && json.contains(r#""desktopName":"Office Mac""#),
+            "{json}"
+        );
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), ack);
+
+        // 旧中转的 helloAck(无 desktopId/desktopName)照常解析
+        let legacy_ack = r#"{"type":"helloAck","protocolVersion":2,"credential":"secret"}"#;
+        assert_eq!(
+            serde_json::from_str::<RelayToMobile>(legacy_ack).unwrap(),
+            RelayToMobile::HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+                credential: Some("secret".into()),
+                desktop_id: None,
+                desktop_name: None,
+            }
+        );
     }
 
     fn sample_project() -> MobileProject {
@@ -1010,12 +1104,24 @@ mod tests {
 
         let presence = RelayToMobile::Presence {
             desktop_online: true,
+            desktop_name: Some("Home PC".into()),
         };
         let json = serde_json::to_string(&presence).unwrap();
-        assert!(json.contains(r#""desktopOnline":true"#), "{json}");
+        assert!(
+            json.contains(r#""desktopOnline":true"#) && json.contains(r#""desktopName":"Home PC""#),
+            "{json}"
+        );
         assert_eq!(
             serde_json::from_str::<RelayToMobile>(&json).unwrap(),
             presence
+        );
+        let legacy_presence = r#"{"type":"presence","desktopOnline":false}"#;
+        assert_eq!(
+            serde_json::from_str::<RelayToMobile>(legacy_presence).unwrap(),
+            RelayToMobile::Presence {
+                desktop_online: false,
+                desktop_name: None,
+            }
         );
 
         let req = RelayToDesktop::SessionsSnapshotRequest;

@@ -469,6 +469,15 @@ pub struct MobileRelayConfig {
     /// 顶掉用户的手机并往 PTY 写命令。明文只在 mt-app 边界解开后交给 mt-relay。
     #[serde(default)]
     pub desktop_key: String,
+    /// 本机在中转服务器上的稳定唯一标识(32 位十六进制随机串)。
+    /// 单台中转接入多台桌面端时靠此字段隔离各自的房间与手机配对凭证(issue #106);
+    /// 空串表示尚未生成,会在首次配置或建连时自动补齐并落盘。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub desktop_id: String,
+    /// 本机在移动端展示的设备名称(如「家里台式机」「公司 Mac」)。
+    /// 空串 = 未自定义,建连时自动使用本机主机名。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub desktop_name: String,
     /// AI 启动器列表:移动端能发起哪些 agent 由此决定。
     /// 命令与 shell 只存在于桌面端配置里,移动端只见 id 与展示名。
     /// 旧配置缺该字段时填充预置两条(Claude / Codex),开箱即用。
@@ -481,6 +490,8 @@ impl Default for MobileRelayConfig {
         Self {
             relay_url: String::new(),
             desktop_key: String::new(),
+            desktop_id: String::new(),
+            desktop_name: String::new(),
             launchers: default_launchers(),
         }
     }

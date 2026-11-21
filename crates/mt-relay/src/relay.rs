@@ -256,13 +256,47 @@ impl Spawner {
     }
 }
 
+/// 桌面端在中转上的身份信息(单中转接入多桌面端时隔离各自房间与展示名,issue #106)。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DesktopIdentity {
+    /// 本机稳定唯一标识(32 位十六进制);空串 = 缺省槽位(兼容旧中转/旧配置)。
+    pub id: String,
+    /// 移动端展示的设备名;None 或空白 = 未提供。
+    pub name: Option<String>,
+}
+
+/// 探测本机默认设备名(用于移动端展示名留空时的缺省值与面板 placeholder)。
+/// 优先读环境变量(`COMPUTERNAME` / `HOSTNAME` / `HOST`),Unix 再回落 `/etc/hostname`,
+/// 不派生子进程;结果统一经标题收敛。
+pub fn default_desktop_name() -> String {
+    let from_env = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    #[allow(unused_mut)]
+    let mut raw = from_env("COMPUTERNAME")
+        .or_else(|| from_env("HOSTNAME"))
+        .or_else(|| from_env("HOST"));
+    #[cfg(unix)]
+    if raw.is_none() {
+        raw = std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+            .filter(|s| !s.is_empty());
+    }
+    raw.map(|s| sanitize_pane_title(&s)).unwrap_or_default()
+}
+
 /// 连接状态(serde camelCase 与移动端面板的展示模型对齐)。
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileRelayStatusPayload {
     /// "disconnected" | "connecting" | "connected" | "reconnecting" | "versionMismatch"
-    /// | "authFailed"(密钥不匹配)| "keyNotConfigured"(中转未配置密钥)。
-    /// 后三者都是配置问题:停止重连,等用户改配置。
+    /// | "authFailed"(密钥不匹配)| "keyNotConfigured"(中转未配置密钥)
+    /// | "invalidDesktopId"(桌面标识非法)| "roomLimitReached"(中转房间数已满)。
+    /// 后五者都是配置/上限问题:停止重连,等用户调整。
     pub status: String,
     /// versionMismatch 时携带,供 UI 给出明确升级提示
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,6 +306,9 @@ pub struct MobileRelayStatusPayload {
     /// 移动端配对状态(中转 PairingUpdate 推送);None = 尚未知悉(未连上中转)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paired: Option<bool>,
+    /// 中转是否支持单实例接入多台桌面端(来自 HelloAck;未连接时 None)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_multi_desktop: Option<bool>,
 }
 
 impl MobileRelayStatusPayload {
@@ -281,6 +318,7 @@ impl MobileRelayStatusPayload {
             expected_version: None,
             actual_version: None,
             paired: None,
+            supports_multi_desktop: None,
         }
     }
 }
@@ -1004,9 +1042,9 @@ impl MobileRelayManager {
         });
     }
 
-    /// 应用新的中转地址与桌面端密钥:先停旧连接;地址非空则启动新的重连循环。
+    /// 应用新的中转地址、桌面端密钥与桌面身份:先停旧连接;地址非空则启动新的重连循环。
     /// 地址为空字符串 = 断开并停用。
-    pub fn apply(self: &Arc<Self>, relay_url: &str, desktop_key: &str) {
+    pub fn apply(self: &Arc<Self>, relay_url: &str, desktop_key: &str, identity: DesktopIdentity) {
         if let Some(tx) = self.cancel.lock().take() {
             let _ = tx.send(true);
         }
@@ -1026,7 +1064,7 @@ impl MobileRelayManager {
         let desktop_key = desktop_key.to_string();
         let manager = Arc::clone(self);
         let spawned = self.spawn(async move {
-            connection_loop(manager, url, desktop_key, cancel_rx).await;
+            connection_loop(manager, url, desktop_key, identity, cancel_rx).await;
         });
         if !spawned {
             self.set_status(MobileRelayStatusPayload::simple("disconnected"));
@@ -1095,6 +1133,7 @@ async fn connection_loop(
     manager: Arc<MobileRelayManager>,
     url: String,
     desktop_key: String,
+    identity: DesktopIdentity,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
     let mut attempt: u32 = 0;
@@ -1106,7 +1145,7 @@ async fn connection_loop(
         };
         manager.set_status(MobileRelayStatusPayload::simple(status));
 
-        match connect_once(&manager, &url, &desktop_key, &mut cancel_rx).await {
+        match connect_once(&manager, &url, &desktop_key, &identity, &mut cancel_rx).await {
             Attempt::Cancelled => return,
             Attempt::VersionMismatch { expected, actual } => {
                 manager.set_status(MobileRelayStatusPayload {
@@ -1114,6 +1153,7 @@ async fn connection_loop(
                     expected_version: Some(expected),
                     actual_version: Some(actual),
                     paired: None,
+                    supports_multi_desktop: None,
                 });
                 return;
             }
@@ -1134,21 +1174,24 @@ async fn connection_loop(
     }
 }
 
-/// 握手拒绝原因 → 上层状态串(两种密钥问题的修法不同,文案也不同)。
+/// 握手拒绝原因 → 上层状态串(各类配置/上限问题的修法与文案各自独立)。
 fn reject_status(reason: DesktopRejectReason) -> &'static str {
     match reason {
         DesktopRejectReason::InvalidKey => "authFailed",
         DesktopRejectReason::KeyNotConfigured => "keyNotConfigured",
+        DesktopRejectReason::InvalidDesktopId => "invalidDesktopId",
+        DesktopRejectReason::RoomLimitReached => "roomLimitReached",
         // 版本不匹配走 Attempt::VersionMismatch 分支,不会到这里
         DesktopRejectReason::VersionMismatch => "versionMismatch",
     }
 }
 
-/// 单次连接:建连 → hello(带密钥)→ 等 ack → 已连接后挂住直到断线/取消。
+/// 单次连接:建连 → hello(带密钥与桌面身份)→ 等 ack → 已连接后挂住直到断线/取消。
 async fn connect_once(
     manager: &Arc<MobileRelayManager>,
     url: &str,
     desktop_key: &str,
+    identity: &DesktopIdentity,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Attempt {
     let connect = tokio_tungstenite::connect_async(url);
@@ -1163,9 +1206,20 @@ async fn connect_once(
         _ = cancel_rx.changed() => return Attempt::Cancelled,
     };
 
+    let desktop_id = {
+        let trimmed = identity.id.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let desktop_name = identity
+        .name
+        .as_deref()
+        .map(sanitize_pane_title)
+        .filter(|s| !s.is_empty());
     let hello = DesktopToRelay::Hello {
         protocol_version: PROTOCOL_VERSION,
         desktop_key: desktop_key.to_string(),
+        desktop_id,
+        desktop_name,
     };
     if ws
         .send(Message::Text(
@@ -1182,9 +1236,12 @@ async fn connect_once(
         r = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws.next()) => r,
         _ = cancel_rx.changed() => return Attempt::Cancelled,
     };
-    match ack {
+    let supports_multi_desktop = match ack {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<RelayToDesktop>(&text) {
-            Ok(RelayToDesktop::HelloAck { .. }) => {}
+            Ok(RelayToDesktop::HelloAck {
+                supports_multi_desktop,
+                ..
+            }) => supports_multi_desktop,
             Ok(RelayToDesktop::HelloReject {
                 reason,
                 expected_version,
@@ -1202,9 +1259,12 @@ async fn connect_once(
             Ok(_) | Err(_) => return Attempt::Failed,
         },
         _ => return Attempt::Failed,
-    }
+    };
 
-    manager.set_status(MobileRelayStatusPayload::simple("connected"));
+    manager.set_status(MobileRelayStatusPayload {
+        supports_multi_desktop: Some(supports_multi_desktop),
+        ..MobileRelayStatusPayload::simple("connected")
+    });
 
     // 注册出站通道(配对码请求/重置配对/结构快照经此发送)
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<DesktopToRelay>();
@@ -2873,6 +2933,7 @@ mod tests {
             expected_version: Some(1),
             actual_version: Some(2),
             paired: None,
+            supports_multi_desktop: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(
@@ -3312,6 +3373,7 @@ mod tests {
             let _hello = ws.next().await;
             let ack = RelayToDesktop::HelloAck {
                 protocol_version: PROTOCOL_VERSION,
+                supports_multi_desktop: true,
             };
             ws.send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
                 .await
@@ -3353,7 +3415,13 @@ mod tests {
             let started = Instant::now();
             let outcome = tokio::time::timeout(
                 Duration::from_secs(5),
-                connect_once(&manager, &url, "key", &mut cancel_rx),
+                connect_once(
+                    &manager,
+                    &url,
+                    "key",
+                    &DesktopIdentity::default(),
+                    &mut cancel_rx,
+                ),
             )
             .await
             .expect("应在探活超时后自行断开");
@@ -3383,7 +3451,13 @@ mod tests {
             let started = Instant::now();
             let outcome = tokio::time::timeout(
                 Duration::from_secs(5),
-                connect_once(&manager, &url, "key", &mut cancel_rx),
+                connect_once(
+                    &manager,
+                    &url,
+                    "key",
+                    &DesktopIdentity::default(),
+                    &mut cancel_rx,
+                ),
             )
             .await
             .expect("中转关闭后应返回");
@@ -3393,6 +3467,60 @@ mod tests {
                 "一直有 pong 回来,不该在 {:?} 就判死",
                 started.elapsed()
             );
+        });
+    }
+
+    /// 握手时把桌面端 id / name 传给中转,并记录中转返回的 multi-desktop 能力标记。
+    #[test]
+    fn connect_once_sends_desktop_identity_and_records_multi_desktop_cap() {
+        keepalive_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (hello_tx, hello_rx) = oneshot::channel::<DesktopToRelay>();
+            tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                if let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let parsed: DesktopToRelay = serde_json::from_str(&text).unwrap();
+                    let _ = hello_tx.send(parsed);
+                }
+                let ack = RelayToDesktop::HelloAck {
+                    protocol_version: PROTOCOL_VERSION,
+                    supports_multi_desktop: true,
+                };
+                ws.send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                let _ = ws.close(None).await;
+            });
+
+            let manager = keepalive_manager();
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let identity = DesktopIdentity {
+                id: "desk-test-1".into(),
+                name: Some("  Home PC\n".into()),
+            };
+            let url = format!("ws://{addr}/ws/desktop");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_once(&manager, &url, "key-1", &identity, &mut cancel_rx),
+            )
+            .await
+            .expect("连接应正常结束");
+            assert!(matches!(outcome, Attempt::ConnectedThenLost));
+
+            let hello = hello_rx.await.unwrap();
+            assert_eq!(
+                hello,
+                DesktopToRelay::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    desktop_key: "key-1".into(),
+                    desktop_id: Some("desk-test-1".into()),
+                    desktop_name: Some("Home PC".into()),
+                }
+            );
+            assert_eq!(manager.current_status().supports_multi_desktop, Some(true));
         });
     }
 

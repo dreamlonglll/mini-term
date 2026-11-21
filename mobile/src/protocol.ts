@@ -130,6 +130,10 @@ export interface MobileHelloAck {
   protocolVersion: number;
   /** 配对兑换成功时携带新签发的长期凭证;凭证重连时缺省 */
   credential?: string;
+  /** 当前连接绑定的桌面端标识(多桌面端中转总是下发;旧中转缺省) */
+  desktopId?: string;
+  /** 桌面端展示名(桌面端握手时上报;缺省时 UI 回落默认名称) */
+  desktopName?: string;
 }
 
 export interface MobileHelloReject {
@@ -177,10 +181,12 @@ export interface MobileLauncher {
   name: string;
 }
 
-/** 桌面端在线状态(握手成功后立即推一次,此后变化时推送) */
+/** 桌面端在线状态(握手成功后立即推一次,此后变化或桌面端改名重连时推送) */
 export interface MobilePresence {
   type: 'presence';
   desktopOnline: boolean;
+  /** 桌面端最新展示名(改名重连时更新) */
+  desktopName?: string;
 }
 
 export interface MobileSessionsSnapshot {

@@ -69,6 +69,8 @@ async fn desktop_handshake(addr: SocketAddr) -> WsClient {
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
             desktop_key: DESKTOP_KEY.into(),
+            desktop_id: None,
+            desktop_name: None,
         },
     )
     .await;
@@ -203,7 +205,8 @@ async fn answer_question_routes_and_rejects_when_offline() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
     send_json(
@@ -240,7 +243,8 @@ async fn desktop_offline_rejects_command_immediately() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 
@@ -405,7 +409,8 @@ async fn desktop_offline_rejects_start_ai_session_at_router() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 
@@ -584,7 +589,8 @@ async fn history_and_resume_route_both_ways_and_reject_offline() {
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::Presence {
-            desktop_online: false
+            desktop_online: false,
+            desktop_name: None,
         })
     );
 
