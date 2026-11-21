@@ -2133,15 +2133,19 @@ impl Render for Workspace {
         // 不持有它,只按 overlay 栈里有没有它来垫玻璃 —— 它打开的那次 notify 会把
         // 祖先视图一路标脏,这里必定在同一帧里重跑,抓到的仍是没有浮层的上一帧。
         //
-        // 玻璃跟遮罩一起渐入渐出(`dialog_host::frost_alpha`),不「啪」地出现:快照到货
-        // 那一刻起淡入;全关之后随遮罩淡出,播完才丢图。淡出途中又开了弹窗就从当前浓度
-        // 淡回来,**不重抓**(这时抓会把正在收起的弹窗抓进去)。「有弹窗」只认开着的,
-        // 退场中的不算(它收起那一刻玻璃就开始跟着淡出)。
+        // 玻璃进场随遮罩淡入(`dialog_host::frost_alpha`),不「啪」地出现:快照到货那一刻
+        // 起淡入。退场**当场撤**(用户定稿):快照可能是几分钟前抓的,随遮罩淡出就是旧画面
+        // 叠在实时内容上的残影;遮罩压暗照常渐出。「有弹窗」只认开着的,退场中的不算。
+        //
+        // 图却留到外壳全部收完(`frost_keep`):退场途中又开弹窗就从零淡入、沿用这张,
+        // **不重抓** —— 这时抓到的上一帧里有正在收起的那层(抓进去就是一团糊在新弹窗背后)。
         let dialog_open = dialog_host::has_open(window, cx);
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
         let frost_target = dialog_open || self.usage_open || lightbox_open;
         let frost_alpha = dialog_host::frost_alpha(frost_target, self.frost.is_some(), window, cx);
-        let frost_wanted = frost_target || frost_alpha > 0.0;
+        let frost_wanted = frost_alpha > 0.0;
+        let frost_keep =
+            frost_target || dialog_host::is_mounted(window, cx) || overlay_motion::lingering(cx);
         if frost_target {
             if self.frost.is_none()
                 && self.frost_task.is_none()
@@ -2167,8 +2171,8 @@ impl Render for Workspace {
                     });
                 }));
             }
-        } else if !frost_wanted && (self.frost.is_some() || self.frost_task.is_some()) {
-            // 淡出播完了(或还没到货就全关了)才丢。
+        } else if !frost_keep && (self.frost.is_some() || self.frost_task.is_some()) {
+            // 外壳全部收完了(或还没到货就全关了)才丢。
             // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
             // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
             // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
@@ -2763,11 +2767,11 @@ impl Render for Workspace {
                     .inset_0()
                     .when(open, |el| el.occlude())
                     .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5 * frame.progress))
-                    // 自绘模态不进 overlay 栈:开着(含退场那几帧)时 HTML 预览的 WebView
-                    // 不收鼠标,也不盖到正在收起的面板上
-                    .child(native_view::input_blocker())
+                    // 自绘模态不进 overlay 栈:开着时 HTML 预览的 WebView 不收鼠标。退场那几帧
+                    // 遮罩已经不拦点击,WebView 跟着恢复(与 Dialog 族同口径,画面本来就压在
+                    // WebView 之上);正在收的面板那块由 `occlude_native` 让出来
                     .when(open, |el| {
-                        el.on_mouse_down(
+                        el.child(native_view::input_blocker()).on_mouse_down(
                             gpui::MouseButton::Left,
                             cx.listener(|this, _event, window, cx| {
                                 if this.usage_open {
@@ -2854,7 +2858,8 @@ impl Render for Workspace {
                                 .border_1()
                                 .border_color(ui::border_default())
                         }))
-                        .interactive(open),
+                        .interactive(open)
+                        .occlude_native(!open),
                     )
             })
             // 上面压着弹窗时面板里的字不参与选区(见 `dialog_host::confine_background`)
@@ -3046,8 +3051,8 @@ impl Render for Workspace {
             // (含标题栏 —— 原版 Modal 是 `fixed inset-0`,遮罩同样盖住标题栏)。
             // 压暗不在这层:Dialog 走自己的 `cx.theme().overlay`(black/50,
             // theme.rs::apply 钉的),用量面板走 usage_layer 自己的 black/50 ——
-            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。浓度跟着遮罩渐变
-            // (`frost_alpha`),全开静止时是 1。
+            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。浓度随遮罩淡入
+            // (`frost_alpha`),全开静止时是 1;收起那一刻撤掉。
             .children(self.frost.clone().filter(|_| frost_wanted).map(|img| {
                 div()
                     .absolute()

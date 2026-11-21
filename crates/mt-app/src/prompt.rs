@@ -147,12 +147,53 @@ where
     F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     C: Fn(&mut Window, &mut App) + 'static,
 {
+    open_guarded_inner(kind, window, cx, build, on_close, None)
+}
+
+/// [`open_guarded`] 再带一个关窗收尾:**任何一条路**关掉(含程序化 [`close_guarded`])都在
+/// 退场开始那一刻调一次;守卫拦下没开成时不调。
+///
+/// 关窗要收尾(提交草稿、记住停在哪一页)的弹窗走它,别把收尾挂在内容实体的 `on_release`
+/// 上 —— 弹窗外壳有退场动画,实体要等退场播完才释放(判据见 `dialog_host::open_with_dismiss`)。
+pub(crate) fn open_guarded_with_dismiss<F, D>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_dismiss: D,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    D: FnOnce(&mut Window, &mut App) + 'static,
+{
+    open_guarded_inner(
+        kind,
+        window,
+        cx,
+        build,
+        |_window, _cx| {},
+        Some(Box::new(on_dismiss)),
+    )
+}
+
+fn open_guarded_inner<F, C>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_close: C,
+    on_dismiss: Option<dialog_host::Dismiss>,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    C: Fn(&mut Window, &mut App) + 'static,
+{
     if !overlay::push(overlay::key(kind)) {
         on_close(window, cx);
         return false;
     }
     let on_close = Rc::new(on_close);
-    dialog_host::open(kind, window, cx, move |dialog, window, cx| {
+    let build = move |dialog: Dialog, window: &mut Window, cx: &mut App| {
         let on_close = on_close.clone();
         // on_ok 垫在 build **之前**,设了自己 on_ok 的弹窗(prompt / confirm /
         // 重命名…)照常覆盖;没设的(设置 / SSH / 移动端这类面板)回车就什么都
@@ -173,7 +214,8 @@ where
                 overlay::pop(overlay::key(kind));
                 on_close(window, cx);
             })
-    });
+    };
+    dialog_host::open_with_dismiss(kind, window, cx, build, on_dismiss);
     true
 }
 
@@ -260,7 +302,7 @@ pub fn is_open(kind: &'static str) -> bool {
 ///
 /// # 为什么不能在开弹窗之前聚焦
 ///
-/// `dialog_host::open` 里有一句 `focus.focus(window, cx)`(照抄 gpui-component
+/// `dialog_host::open_with_dismiss` 里有一句 `focus.focus(window, cx)`(照抄 gpui-component
 /// `root.rs` 的 `open_dialog`)——**弹窗一开就把焦点抢到自己的面板上**。而 `Window::focus`
 /// 只是把 `window.focus` 改写成新的 id、后来者无条件覆盖前者,所以「先聚焦输入框、
 /// 再开弹窗」等于白聚焦:落地时焦点在 Dialog 面板上。

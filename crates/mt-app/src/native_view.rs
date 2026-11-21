@@ -124,12 +124,16 @@ fn holes() -> Vec<Bounds<Pixels>> {
 /// `relative` / `absolute`)下当子节点,本帧的矩形就从 WebView 的显示与点击
 /// 区域里让出来。用于常驻、不模态的浮层(右侧抽屉、toast 卡片)。
 pub fn occluder() -> impl IntoElement {
-    canvas(
-        |bounds, _, _| STATE.with(|s| s.borrow_mut().occluders.push(bounds)),
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .inset_0()
+    canvas(|bounds, _, _| occlude_rect(bounds), |_, _, _, _| {})
+        .absolute()
+        .inset_0()
+}
+
+/// [`occluder`] 的直登版:本帧把窗口坐标里的 `rect` 登记成画在 WebView 之上的不透明浮层。
+/// **只能在 prepaint 期调**(收尾在根底色的 paint 期)。给矩形不等于布局盒的浮层用 ——
+/// 正在收起的弹窗面板按插值矩形画([`crate::overlay_motion::RevealBox`])。
+pub fn occlude_rect(rect: Bounds<Pixels>) {
+    STATE.with(|s| s.borrow_mut().occluders.push(rect));
 }
 
 /// 标记「本帧有吃整窗点击的透明遮罩」(点外关闭的下拉、自绘模态):WebView
@@ -268,10 +272,11 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
             let views: Vec<_> = s.views.iter().filter_map(|view| view.upgrade()).collect();
             (views, s.occluders.clone(), s.block_input)
         });
-        // 弹窗看「还挂着」(含退场那几帧):收起途中照样让位,否则 WebView 会盖在
-        // 正在收起的弹窗上(见 `dialog_host::is_mounted`)
+        // 弹窗只看「开着」的(退场中的不算):GPUI 的画面本来就压在 WebView 之上(模块注释
+        // 「为什么要挖洞」),这里管的只是输入。弹窗一开始收,遮罩就不再拦点击,网页随即可点;
+        // 正在收的面板那块由它自己登记成 occluder(`RevealBox::occlude_native`),点不穿
         let modal = block_input
-            || crate::dialog_host::is_mounted(window, cx)
+            || crate::dialog_host::has_open(window, cx)
             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay);
         for view in views {
             if view.stamped() == frame {

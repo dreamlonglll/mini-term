@@ -82,10 +82,11 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use mt_ai::hook_registry::HookRegistrationInfo;
 
+use crate::dialog_host::Dialog;
 use crate::env_vars::EnvRow;
 use crate::i18n::t;
 use crate::motion_kit::{KeyedSwap, PushAxis, push_pair};
-use crate::prompt::{kind, open_guarded};
+use crate::prompt::{kind, open_guarded_with_dismiss};
 use crate::segment_slider::IndicatorSlider;
 use crate::store::{AppStore, MAX_SCROLLBACK, resolve_scrollback};
 use crate::ui;
@@ -465,6 +466,9 @@ pub struct SettingsView {
     /// 下载目录选择与校验独立持有，避免覆盖其它设置页正在运行的任务。
     _download_dir_job: Option<Task<()>>,
     _subs: Vec<Subscription>,
+    /// 关面板的收尾做过了没有(见 [`SettingsView::finish`]);`on_release` 只给没走关窗收尾的
+    /// 路兜底。
+    finished: bool,
 }
 
 /// 面板头部高度(含 1px 下边框)。正文高度按它扣,见 [`render_dialog_header`]。
@@ -523,7 +527,7 @@ fn render_dialog_header() -> impl IntoElement {
         )
 }
 
-/// 本次运行里设置面板上次停在哪一页(关面板时记下,见 `SettingsView::new` 的 `on_release`)。
+/// 本次运行里设置面板上次停在哪一页(关面板那一刻记下,见 [`SettingsView::finish`])。
 /// **不落盘**:重启后从第一页开始,与原版一致;只省掉「同一次运行里来回改同一页」的那几下点击。
 struct LastSettingsPage(SettingsPage);
 impl gpui::Global for LastSettingsPage {}
@@ -554,10 +558,18 @@ pub fn open_settings(
     let page = resolve_initial_page(initial_page, remembered);
     let view = cx.new(|cx| SettingsView::new(store, Some(page), window, cx));
     let focus = view.read(cx).focus.clone();
-
-    open_guarded(kind::SETTINGS, window, cx, {
+    // 关窗收尾:关面板那一刻(退场开始时)提交草稿、记页,不等实体释放(见 `SettingsView::finish`)。
+    // defer 出去:收尾哪天从面板自己的 update 里触发(面板里加一颗关闭),也不会重入同一实体
+    let on_dismiss = {
         let view = view.clone();
-        move |dialog, window, _cx| {
+        move |_window: &mut Window, cx: &mut App| {
+            cx.defer(move |cx| view.update(cx, |view, cx| view.finish(cx)));
+        }
+    };
+
+    let build = {
+        let view = view.clone();
+        move |dialog: Dialog, window: &mut Window, _cx: &mut App| {
             // 原版 `w-[680px] max-h-[80vh]`(`SettingsModal.tsx:2099`)。两条都要
             // 按视口现算:`Dialog` 的宽是定值、位置按「视口中心 − 宽/2」推,
             // 窗口比它窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)。
@@ -588,7 +600,8 @@ pub fn open_settings(
                         .child(div().h(body).child(view.clone())),
                 )
         }
-    });
+    };
+    open_guarded_with_dismiss(kind::SETTINGS, window, cx, build, on_dismiss);
 
     // Dialog 打开时会把焦点抢到自己面板上,↑↓ 导航要的焦点必须排在它后面
     window.defer(cx, move |window, cx| {
@@ -743,6 +756,7 @@ impl SettingsView {
             _job: None,
             _download_dir_job: None,
             _subs: Vec::new(),
+            finished: false,
         };
 
         // 草稿行:失焦 / 回车才归一并提交(见模块注释第 2 条)。
@@ -776,13 +790,12 @@ impl SettingsView {
 
         // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
         // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口。
-        // 草稿在这里兜底提交一次:点 ✕ / Esc 关面板不保证输入框先失焦
+        // 草稿提交与记页**不在这里做**:关面板那一刻由关窗收尾做掉(见 [`Self::finish`]),
+        // 这里只给没走那条路的情形兜底
         cx.on_release(|this: &mut Self, cx: &mut App| {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
-            this.commit_drafts(cx);
-            // 下次不指定分页打开时回到这一页(见 [`resolve_initial_page`])
-            cx.set_global(LastSettingsPage(this.page));
+            this.finish(cx);
         })
         .detach();
 
@@ -792,6 +805,20 @@ impl SettingsView {
     }
 
     // ── 提交 ──
+
+    /// 关面板的收尾(只做一次):草稿兜底提交(点 ✕ / Esc 关面板不保证输入框先失焦)、记住停在
+    /// 哪一页(下次不指定分页打开时回到这一页,见 [`resolve_initial_page`])。
+    ///
+    /// 关窗那一刻调(`open_settings` 登记的关窗收尾),**不等实体释放**:弹窗外壳有退场动画,
+    /// 实体要等它播完、层出栈才放,这期间再按 Ctrl+, 的话新面板会先按没提交的旧配置建好
+    /// 输入框、落在上上次的那一页,旧实体随后释放时再提交 —— 新面板显示的是旧值。
+    fn finish(&mut self, cx: &mut App) {
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
+        self.commit_drafts(cx);
+        cx.set_global(LastSettingsPage(self.page));
+    }
 
     /// 数字草稿行。失焦 / 回车的订阅与关面板兜底共用这张表,新增一行两边都有。
     fn number_inputs(&self) -> [(Entity<InputState>, NumField); 7] {
@@ -822,8 +849,9 @@ impl SettingsView {
         ]
     }
 
-    /// 把还没提交的草稿全部落盘。收 `&mut App`:关面板时的兜底在 `on_release` 里,
-    /// 那里只有 `App`,也写不回输入框 —— 面板都关了,不用写。没改的行到 setter 都是空转。
+    /// 把还没提交的草稿全部落盘。收 `&mut App`:关面板时的兜底([`Self::finish`])也会从
+    /// `on_release` 里调,那里只有 `App`,也写不回输入框 —— 面板都关了,不用写。没改的行
+    /// 到 setter 都是空转。
     fn commit_drafts(&mut self, cx: &mut App) {
         for (input, field) in self.number_inputs() {
             self.save_number(field, &input, cx);

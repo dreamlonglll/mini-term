@@ -18,13 +18,15 @@
 //!   焦点在退场开始时就由各浮层自己还回去;
 //! - 只在动画进行中要帧,播完就停。
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, AnyView, App, AppContext, Bounds, ContentMask, Div, Element, ElementId, Entity,
     Global, GlobalElementId, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    ParentElement, Pixels, Point, Refineable as _, Render, Style, Styled, Window, div, point, px,
-    size,
+    ParentElement, Pixels, Point, Refineable as _, Render, Size, Style, Styled, Window, div, point,
+    px, size,
 };
 use mt_ui::motion::{TransitionSpec, animations_enabled, ease};
 
@@ -57,15 +59,6 @@ impl Presence {
             duration: Duration::ZERO,
             enter,
             exit,
-        }
-    }
-
-    /// 全开且静止(早就开着的那一层,收起时从 1 起播)。
-    pub fn shown(enter: TransitionSpec, exit: TransitionSpec) -> Self {
-        Self {
-            from: 1.0,
-            to: 1.0,
-            ..Self::hidden(enter, exit)
         }
     }
 
@@ -235,6 +228,8 @@ pub struct RevealBox {
     start: (f32, f32),
     chrome: Option<Style>,
     interactive: bool,
+    occlude_native: bool,
+    measure: Option<Rc<Cell<Option<Size<Pixels>>>>>,
 }
 
 /// 把 `child` 包成带开合动画的浮层,`progress` 是 [`Presence`] 这一帧的值。默认:原点在顶边
@@ -247,6 +242,8 @@ pub fn reveal_box(child: impl IntoElement, progress: f32) -> RevealBox {
         start: (0.10, 0.0),
         chrome: None,
         interactive: true,
+        occlude_native: false,
+        measure: None,
     }
 }
 
@@ -273,6 +270,21 @@ impl RevealBox {
     /// `false` = 退场中:框体上盖一块拦鼠标的 hitbox,正在收的内容不再接悬停与点击。
     pub fn interactive(mut self, interactive: bool) -> Self {
         self.interactive = interactive;
+        self
+    }
+
+    /// `true` = 这一帧画出来的框体矩形登记成 HTML 预览 WebView 之上的不透明浮层
+    /// ([`crate::native_view::occlude_rect`]):这块从网页的点击区域里让出来。给退场中的
+    /// 模态外壳用 —— 它收起那一刻 WebView 就恢复收鼠标了,正在收的面板那块不能被网页抢走。
+    pub fn occlude_native(mut self, occlude: bool) -> Self {
+        self.occlude_native = occlude;
+        self
+    }
+
+    /// 每帧把内容的最终尺寸(布局盒)写进 `cell`。弹窗外壳拿它在退场时把面板钉在
+    /// 最后一帧开着时的尺寸上(见 `dialog_host::render_one`)。
+    pub fn measure_into(mut self, cell: Rc<Cell<Option<Size<Pixels>>>>) -> Self {
+        self.measure = Some(cell);
         self
     }
 }
@@ -324,6 +336,9 @@ impl Element for RevealBox {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if let Some(cell) = self.measure.as_ref() {
+            cell.set(Some(bounds.size));
+        }
         let target = rect_of(bounds);
         let origin = match self.origin {
             RevealOrigin::Fraction(fx, fy) => (target.width * fx, target.height * fy),
@@ -366,6 +381,9 @@ impl Element for RevealBox {
         if !self.interactive {
             // 盖在内容上面:正在收的浮层不再接任何悬停与点击
             window.insert_hitbox(frame, HitboxBehavior::BlockMouse);
+        }
+        if self.occlude_native {
+            crate::native_view::occlude_rect(frame);
         }
         RevealBoxPrepaint { frame, mask }
     }
@@ -436,6 +454,13 @@ pub fn exit_layer(cx: &mut App) -> Entity<ExitStash> {
     let entity = cx.new(|_| ExitStash::default());
     cx.set_global(GlobalExitStash(entity.clone()));
     entity
+}
+
+/// 托管层里还有没播完的浮层吗(毛玻璃快照的去留看它:退场途中又开浮层就沿用旧图,
+/// 这时重抓会把正在收起的那个抓进去)。
+pub fn lingering(cx: &App) -> bool {
+    cx.try_global::<GlobalExitStash>()
+        .is_some_and(|global| !global.0.read(cx).items.is_empty())
 }
 
 /// 让 `view` 再活 `exit` 这么久(加一点收尾余量),期间由托管层画它。
@@ -578,7 +603,8 @@ mod tests {
         assert!(!p.mounted_at(end), "收起播完才从树上卸下");
 
         // 早就开着的一层收起:从 1 起播,走退场曲线
-        let mut q = Presence::shown(OVERLAY_IN, OVERLAY_OUT);
+        let mut q = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        q.retarget(1.0, t0, false);
         assert!(q.mounted_at(t0) && !q.running_at(t0));
         q.retarget(0.0, t0, true);
         let half = t0 + OVERLAY_OUT.duration / 2;

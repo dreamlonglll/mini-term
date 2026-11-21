@@ -65,7 +65,8 @@
 //! - 进场从右边横向滑入(`TOAST_SLIDE_IN`),不做透明度;排队中超过 [`MAX_VISIBLE`] 的那条
 //!   补上来时同样按进场播;
 //! - 退场向右滑出(`TOAST_SLIDE_OUT`):出队那一刻卡片就离开排版(其余卡片当场补位),
-//!   自己按上一帧量到的位置原地画完滑出,不接点击([`Leaving`]);
+//!   自己按上一帧**画在**哪(补位途中取显示值,不取排版值)原地画完滑出,不接点击
+//!   ([`Leaving`]);
 //! - 剩下的卡片按 id 补纵向位置(FLIP,`LIST_REFLOW`):排版已经是新位置,显示位置从旧位置
 //!   补间过去([`Reflow`] / [`Reflowed`])。位置量的是「离栈底边多远」,拖窗口时整栈跟着
 //!   窗口走,不会误触发补位。
@@ -279,8 +280,19 @@ struct Reflow {
     stack: Option<Bounds<Pixels>>,
     /// 每张卡片离栈底边多远:目标值是这一帧排版排出来的,显示值跟着补间。
     tweens: TweenMap,
-    /// 这一帧量到的离底距离(出队那一刻给退场卡片原地定位)。
-    gaps: HashMap<u64, f32>,
+    /// 这一帧各卡片**画在**离底多远(补间中的显示值,不是排版值):出队那一刻退场卡片
+    /// 就从这里原地滑出 —— 补位途中被关掉的那张不先瞬移到排版位置。
+    shown: HashMap<u64, f32>,
+}
+
+impl Reflow {
+    /// 一张卡片这一帧排版离栈底 `gap`:取补间后的显示值、记下来(给退场定位),返回该整体
+    /// 平移多少(见 [`reflow_offset`])。
+    fn place_at(&mut self, id: u64, gap: f32, now: Instant) -> f32 {
+        let shown = self.tweens.value_at(&id.to_string(), gap, now);
+        self.shown.insert(id, shown);
+        reflow_offset(gap, shown)
+    }
 }
 
 impl Default for Reflow {
@@ -288,7 +300,7 @@ impl Default for Reflow {
         Self {
             stack: None,
             tweens: TweenMap::new(LIST_REFLOW),
-            gaps: HashMap::new(),
+            shown: HashMap::new(),
         }
     }
 }
@@ -296,7 +308,7 @@ impl Default for Reflow {
 /// 一张正在退场的卡片。
 struct Leaving {
     item: ToastItem,
-    /// 出队那一刻离栈底边多远(原地画完滑出)。
+    /// 出队那一刻画在离栈底边多远(上一帧的显示值,原地画完滑出)。
     gap: f32,
     slide: Transition,
 }
@@ -359,12 +371,12 @@ impl Element for Reflowed {
             match book.stack {
                 Some(stack) => {
                     let gap = f32::from(stack.bottom() - bounds.bottom());
-                    book.gaps.insert(self.id, gap);
-                    let shown = book.tweens.value(&self.id.to_string(), gap);
-                    if book.tweens.running_at(Instant::now()) {
+                    let now = Instant::now();
+                    let offset = book.place_at(self.id, gap, now);
+                    if book.tweens.running_at(now) {
                         window.request_animation_frame();
                     }
-                    reflow_offset(gap, shown)
+                    offset
                 }
                 None => 0.0,
             }
@@ -586,12 +598,13 @@ impl ToastLayer {
         }
     }
 
-    /// 刚出队的那张若画着,原地播滑出(位置取上一帧量到的离底距离)。总开关关掉时不播。
+    /// 刚出队的那张若画着,原地播滑出(位置取上一帧画在哪 —— 补位途中也是显示值)。
+    /// 总开关关掉时不播。
     fn start_leaving(&mut self, item: ToastItem) {
         if !mt_ui::motion::animations_enabled() {
             return;
         }
-        let Some(gap) = self.reflow.borrow().gaps.get(&item.id).copied() else {
+        let Some(gap) = self.reflow.borrow().shown.get(&item.id).copied() else {
             return;
         };
         self.leaving.push(Leaving {
@@ -918,7 +931,7 @@ impl Render for ToastLayer {
         {
             let mut book = self.reflow.borrow_mut();
             book.tweens.sweep();
-            book.gaps.clear();
+            book.shown.clear();
             book.stack = None;
         }
         let book = self.reflow.clone();
@@ -1023,6 +1036,31 @@ mod tests {
         let end = t0 + LIST_REFLOW.duration;
         assert_eq!(reflow_offset(10.0, tweens.value_at("1", 10.0, end)), 0.0);
         assert!(!tweens.running_at(end));
+    }
+
+    /// 补位途中被关掉的卡片从**画着的位置**滑出:账本记的是显示值,不是排版值
+    /// (记排版值的话它出队那一刻先瞬移到排版位置再滑)。
+    #[test]
+    fn 补位途中出队的卡片按显示位置定位() {
+        let t0 = Instant::now();
+        let mut book = Reflow::default();
+        assert_eq!(book.place_at(7, 60.0, t0), 0.0, "首次出现落在排版位置");
+        assert_eq!(book.shown.get(&7), Some(&60.0));
+
+        // 下面那张被关掉,这张排版落到离底 10,补间刚走了一段
+        let mid = t0 + LIST_REFLOW.duration / 3;
+        book.place_at(7, 10.0, t0);
+        let offset = book.place_at(7, 10.0, mid);
+        let shown = book.shown[&7];
+        assert!(shown > 10.0 && shown < 60.0, "补间途中:{shown}");
+        assert!(
+            (10.0 - offset - shown).abs() < 1e-4,
+            "记下的就是这一帧画的位置"
+        );
+
+        // 补间播完:显示值与排版值重合
+        book.place_at(7, 10.0, t0 + LIST_REFLOW.duration);
+        assert_eq!(book.shown[&7], 10.0);
     }
 
     /// 路径样的词单独成段(连着全角括号也算),其余并成普通文字;

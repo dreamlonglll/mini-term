@@ -36,10 +36,18 @@
 //! # 退场期间
 //!
 //! - 不接鼠标:遮罩不再拦点击、不再是标题栏拖拽区,面板上盖一块拦鼠标的 hitbox;
+//!   HTML 预览的 WebView 随即恢复收鼠标,正在收的面板那块登记成 occluder 让出来;
 //! - 不吃键盘:焦点在退场开始那一刻就还给打开前的句柄;
-//! - **不算「有弹窗」**([`has_open`]),但**仍算「挂着」**([`is_mounted`]):HTML 预览的
-//!   WebView 让位看后者,否则它会盖在正在收起的弹窗上;抢焦点类的判据看前者。
+//! - **不重排**:builder 照样每帧调(它读到的已经是确定 / 取消执行之后的状态,比如刚移除的
+//!   项目那行「将结束 N 个终端」没了),面板钉在最后一帧开着时的尺寸上,裁剪窗不跟着跳;
+//! - **收尾不等卸载**:要在关窗时收尾的弹窗(设置面板的草稿兜底提交)登记 `on_dismiss`
+//!   ([`open_with_dismiss`]),退场**开始**那一刻调,不靠实体释放 —— 实体要等退场播完、
+//!   层出栈才放,比上游晚一个 `OVERLAY_OUT`;
+//! - **不算「有弹窗」**([`has_open`]),但**仍算「挂着」**([`is_mounted`]):输入让位、
+//!   抢焦点类的判据看前者;毛玻璃快照的去留看后者(退场途中又开弹窗就沿用旧图,
+//!   这时重抓会把正在收起的那层抓进去)。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -47,7 +55,7 @@ use std::time::Instant;
 
 use gpui::{
     AnyElement, App, BoxShadow, ClickEvent, Edges, FocusHandle, Global, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Pixels, Role, StatefulInteractiveElement,
+    IntoElement, MouseButton, ParentElement, Pixels, Role, Size, StatefulInteractiveElement,
     StyleRefinement, Styled, WeakFocusHandle, Window, WindowControlArea, WindowId, anchored,
     deferred, div, hsla, point, prelude::FluentBuilder, px,
 };
@@ -62,6 +70,10 @@ use crate::overlay_motion::{Presence, chrome_style, reveal_box};
 type Decision = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) -> bool>;
 type Closed = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 type Builder = Rc<dyn Fn(Dialog, &mut Window, &mut App) -> Dialog>;
+/// 关窗收尾(见 [`open_with_dismiss`])。
+pub type Dismiss = Box<dyn FnOnce(&mut Window, &mut App)>;
+/// 面板最后一帧开着时的尺寸(退场时钉住,见 [`render_one`])。
+type SizeCell = Rc<Cell<Option<Size<Pixels>>>>;
 
 /// 叠层每层下移多少(上游 `layer_ix * 16`)。
 const LAYER_STEP: f32 = 16.0;
@@ -212,13 +224,18 @@ struct Layer {
     closing: bool,
     /// 位置档(每档下移 16px)。开着的层每帧按「下面还有几层开着」现算,退场中的冻住。
     slot: usize,
+    /// 面板尺寸:开着时每帧量,退场时按它钉住(builder 读到的状态已经变了,不重排)。
+    size: SizeCell,
+    /// 关窗收尾,退场开始那一刻取走调一次。
+    on_dismiss: Option<Dismiss>,
 }
 
-/// 关一层之后宿主外面要补的事(焦点)。
+/// 关一层之后宿主外面要补的事(焦点 / 收尾)。
 struct ClosePlan {
     is_top: bool,
     prev_focus: Option<WeakFocusHandle>,
     own_focus: FocusHandle,
+    on_dismiss: Option<Dismiss>,
 }
 
 #[derive(Default)]
@@ -248,6 +265,11 @@ impl HostState {
             .any(|layer| !layer.closing || layer.presence.mounted_at(now))
     }
 
+    /// 弹窗层或自绘模态还有没有挂着的(开着或退场中)。
+    fn anything_mounted(&self, now: Instant) -> bool {
+        self.is_mounted(now) || self.shells.values().any(|shell| shell.mounted_at(now))
+    }
+
     fn is_layer_open(&self, id: u64) -> bool {
         self.layers
             .iter()
@@ -261,6 +283,7 @@ impl HostState {
         focus: FocusHandle,
         prev_focus: Option<WeakFocusHandle>,
         builder: Builder,
+        on_dismiss: Option<Dismiss>,
         now: Instant,
         animate: bool,
     ) -> u64 {
@@ -282,6 +305,8 @@ impl HostState {
             presence,
             closing: false,
             slot,
+            size: Rc::new(Cell::new(None)),
+            on_dismiss,
         });
         self.next_id
     }
@@ -310,6 +335,7 @@ impl HostState {
             is_top,
             prev_focus: layer.prev_focus.clone(),
             own_focus: layer.focus.clone(),
+            on_dismiss: layer.on_dismiss.take(),
         };
         if !is_top
             && let Some(upper) = self.layers[index + 1..]
@@ -356,16 +382,33 @@ fn read_host<R>(window: &Window, cx: &App, f: impl FnOnce(&HostState) -> R) -> O
 
 // ─── 对外入口 ────────────────────────────────────────────────
 
-/// 开一个弹窗(由 [`crate::prompt::open_guarded_with_close`] 调,别处别直接用 —— 防叠开与覆盖物
-/// 栈登记在那边)。
-///
-/// 与上游 `Root::open_dialog` 同:记下打开前的焦点,弹窗一开就把焦点抢到自己身上(所以输入框
-/// 的聚焦要排在打开之后,见 `prompt::autofocus`),清掉背景里残留的选区。
-pub fn open(
+/// 测试用的简写:不带关窗收尾的 [`open_with_dismiss`]。
+#[cfg(test)]
+fn open(
     kind: &'static str,
     window: &mut Window,
     cx: &mut App,
     build: impl Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+) {
+    open_with_dismiss(kind, window, cx, build, None);
+}
+
+/// 开一个弹窗(由 `crate::prompt` 的 `open_guarded*` 调,别处别直接用 —— 防叠开与覆盖物
+/// 栈登记在那边)。
+///
+/// 与上游 `Root::open_dialog` 同:记下打开前的焦点,弹窗一开就把焦点抢到自己身上(所以输入框
+/// 的聚焦要排在打开之后,见 `prompt::autofocus`),清掉背景里残留的选区。
+///
+/// `on_dismiss` 是关窗收尾:**无论哪条路**关掉(确定 / 取消 / Esc / 点遮罩 / 程序化
+/// [`close`]),都在退场开始那一刻调一次(焦点已经还回去之后)。要在关窗时收尾的弹窗走它,
+/// 别挂在弹窗内容实体的 `on_release` / `Drop` 上:实体要等退场播完、层出栈才释放,比关窗
+/// 晚一个 `OVERLAY_OUT`,这期间重开同种类弹窗会先于收尾建好新内容。
+pub fn open_with_dismiss(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: impl Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    on_dismiss: Option<Dismiss>,
 ) {
     let prev_focus = window.focused(cx).map(|focus| focus.downgrade());
     let focus = cx.focus_handle();
@@ -373,7 +416,15 @@ pub fn open(
     let now = Instant::now();
     let animate = animations_enabled();
     with_host(window, cx, |host| {
-        host.push(kind, focus, prev_focus, Rc::new(build), now, animate);
+        host.push(
+            kind,
+            focus,
+            prev_focus,
+            Rc::new(build),
+            on_dismiss,
+            now,
+            animate,
+        );
     });
     TextSelection::clear(window, cx);
     window.refresh();
@@ -395,7 +446,7 @@ pub fn close(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
     id.is_some_and(|id| close_layer(id, window, cx))
 }
 
-/// 收起一层:开始退场、焦点还给打开前的句柄(最上面那层才还)、清选区。
+/// 收起一层:开始退场、焦点还给打开前的句柄(最上面那层才还)、清选区、调关窗收尾。
 fn close_layer(id: u64, window: &mut Window, cx: &mut App) -> bool {
     let now = Instant::now();
     let animate = animations_enabled();
@@ -420,21 +471,24 @@ fn close_layer(id: u64, window: &mut Window, cx: &mut App) -> bool {
         }
     }
     TextSelection::clear(window, cx);
+    if let Some(on_dismiss) = plan.on_dismiss {
+        on_dismiss(window, cx);
+    }
     window.refresh();
     true
 }
 
-/// 这扇窗口有没有**开着**的弹窗(退场中的不算)。抢焦点类的判据用它:弹窗收起那一刻焦点
-/// 已经还回去了,上游这时弹窗也已出栈。
+/// 这扇窗口有没有**开着**的弹窗(退场中的不算)。抢焦点、WebView 输入让位这类判据用它:
+/// 弹窗收起那一刻焦点已经还回去、遮罩不再拦点击,上游这时弹窗也已出栈。
 pub fn has_open(window: &Window, cx: &App) -> bool {
     read_host(window, cx, HostState::has_open).unwrap_or(false)
 }
 
-/// 这扇窗口有没有**还挂着**的弹窗(含退场中的)。HTML 预览的 WebView 让位用它 —— 退场期间
-/// 照样让,否则 WebView 会盖在正在收起的弹窗上。
+/// 这扇窗口有没有**还挂着**的弹窗外壳(开着或退场中的弹窗层、自绘模态)。毛玻璃快照的去留
+/// 看它:退场途中又开弹窗就沿用旧图 —— 这时重抓,抓到的上一帧里有正在收起的那层。
 pub fn is_mounted(window: &Window, cx: &App) -> bool {
     let now = Instant::now();
-    read_host(window, cx, |host| host.is_mounted(now)).unwrap_or(false)
+    read_host(window, cx, |host| host.anything_mounted(now)).unwrap_or(false)
 }
 
 fn layer_open(id: u64, window: &Window, cx: &App) -> bool {
@@ -469,27 +523,31 @@ where
 /// 毛玻璃快照这一帧的不透明度。`target` = 该不该有玻璃(有弹窗 / 用量面板 / 图片浮层
 /// 开着),`has_image` = 快照到了没有。
 ///
-/// 玻璃跟着遮罩一起渐入渐出,不「啪」地出现:快照晚到(模糊丢在后台跑)的话从到货那一刻起
-/// 淡入;全关时随遮罩淡出,播完调用方才把图丢掉。只在动画进行中要帧。
+/// - 进场随遮罩淡入,不「啪」地出现:快照晚到(模糊丢在后台跑)的话从到货那一刻起淡入;
+/// - 退场**当场撤**(用户定稿):快照可能是几分钟前抓的,终端早滚过了,随遮罩淡出就是旧画面
+///   叠在实时内容上的残影。遮罩压暗照常渐出,只是玻璃不陪它。
+///
+/// 只在淡入进行中要帧。
 pub fn frost_alpha(target: bool, has_image: bool, window: &mut Window, cx: &mut App) -> f32 {
     let now = Instant::now();
     let presence = with_host(window, cx, |host| {
         let frost = host
             .frost
             .get_or_insert_with(|| Presence::hidden(OVERLAY_IN, OVERLAY_OUT));
-        if !has_image {
-            // 没图就没有可淡出的,下次到货从零淡入
-            *frost = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
-        } else if target != frost.target_open() {
-            if target {
-                frost.show(now);
-            } else {
-                frost.hide(now);
-            }
-        }
+        step_frost(frost, target, has_image, now, animations_enabled());
         *frost
     });
     presence.drive(window)
+}
+
+/// [`frost_alpha`] 的状态机一步(纯逻辑,单测钉语义):没图或不该有玻璃 → 当场归零;
+/// 该有且有图、还没在往上走 → 从零淡入。
+fn step_frost(frost: &mut Presence, target: bool, has_image: bool, now: Instant, animate: bool) {
+    if !target || !has_image {
+        *frost = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+    } else if !frost.target_open() {
+        frost.retarget(1.0, now, animate);
+    }
 }
 
 /// 自绘模态这一帧怎么画(见 [`shell_frame`])。
@@ -595,6 +653,7 @@ struct LayerView {
     progress: f32,
     closing: bool,
     slot: usize,
+    size: SizeCell,
 }
 
 /// 弹窗层。由窗口根视图画(`main.rs`,替原来的 `Root::render_dialog_layer`)。
@@ -618,6 +677,7 @@ pub fn render_layer(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
                 progress: layer.presence.value_at(now),
                 closing: layer.closing,
                 slot: layer.slot,
+                size: layer.size.clone(),
             })
             .collect::<Vec<_>>();
         (views, running)
@@ -708,7 +768,14 @@ fn render_one(
         )
     };
     let y = margin_top.unwrap_or(view_size.height / 10.) + px(layer.slot as f32 * LAYER_STEP);
-    let width = width.min((view_size.width - margin * 2.).max(px(0.)));
+    // 退场中钉在最后一帧开着时的尺寸上:builder 这时读到的已经是确定 / 取消执行之后的状态
+    // (刚移除的项目那行「将结束 N 个终端」没了、按钮行换成「执行中」…),照常排版的话面板
+    // 当帧矮一截、裁剪窗跟着跳。内容在钉住的框里照常画,多出来的空着、超出的裁掉
+    let frozen = if interactive { None } else { layer.size.get() };
+    let width = match frozen {
+        Some(size) => size.width,
+        None => width.min((view_size.width - margin * 2.).max(px(0.))),
+    };
     let x = (view_size.width - width) / 2.;
     let max_height = (view_size.height - y - margin).max(px(0.));
 
@@ -758,6 +825,8 @@ fn render_one(
         .top(y)
         .w(width)
         .max_h(max_height)
+        .when_some(frozen, |el, size| el.h(size.height))
+        .debug_selector(|| "mt-dialog-panel".into())
         .child(
             v_flex()
                 .flex_1()
@@ -787,9 +856,17 @@ fn render_one(
         .when_some(footer, |el, footer| {
             el.child(div().pl(paddings.left).pr(paddings.right).child(footer))
         });
+    // 开着时每帧量尺寸(退场时钉它);退场中这块登记成 WebView 之上的 occluder ——
+    // 遮罩一开始收 WebView 就恢复收鼠标了,正在收的面板那块不能让网页抢走
     let panel = reveal_box(popup, layer.progress)
         .chrome(chrome)
-        .interactive(interactive);
+        .interactive(interactive)
+        .occlude_native(!interactive);
+    let panel = if interactive {
+        panel.measure_into(layer.size.clone())
+    } else {
+        panel
+    };
 
     // ── 遮罩:按下即关(左键 + overlay_closable + 最上面那层 + on_cancel 放行);
     // 标题栏高度以内不算点遮罩;整块是标题栏拖拽区(上游同) ──
@@ -946,8 +1023,8 @@ mod tests {
         let (c, _) = handle_pair(cx);
         let t0 = Instant::now();
         let mut host = HostState::default();
-        host.push("a", a, None, builder(), t0, true);
-        let b_id = host.push("b", b, None, builder(), t0, true);
+        host.push("a", a, None, builder(), None, t0, true);
+        let b_id = host.push("b", b, None, builder(), None, t0, true);
         host.assign_slots();
         assert_eq!(
             host.layers.iter().map(|l| l.slot).collect::<Vec<_>>(),
@@ -957,7 +1034,7 @@ mod tests {
         let t1 = t0 + OVERLAY_IN.duration;
         assert!(host.begin_close(b_id, t1, true, |_, _| false).is_some());
         assert!(host.has_open() && host.is_mounted(t1));
-        host.push("c", c, None, builder(), t1, true);
+        host.push("c", c, None, builder(), None, t1, true);
         host.assign_slots();
         assert_eq!(
             host.layers.iter().map(|l| l.slot).collect::<Vec<_>>(),
@@ -976,24 +1053,24 @@ mod tests {
         let (a, b) = handle_pair(cx);
         let t0 = Instant::now();
         let mut host = HostState::default();
-        let id = host.push("k", a, None, builder(), t0, true);
+        let id = host.push("k", a, None, builder(), None, t0, true);
         let t1 = t0 + OVERLAY_IN.duration;
         assert!(host.begin_close(id, t1, true, |_, _| false).is_some());
         assert!(host.begin_close(id, t1, true, |_, _| false).is_none());
         assert!(!host.has_open() && host.is_mounted(t1));
-        host.push("k", b, None, builder(), t1, true);
+        host.push("k", b, None, builder(), None, t1, true);
         assert_eq!(host.layers.len(), 1, "同种类的退场层当场撤掉");
 
         // 刚开那一刻就关:还什么都没露出来,不播退场,直接出栈
         let (d, _) = handle_pair(cx);
         let mut early = HostState::default();
-        let id = early.push("k", d, None, builder(), t0, true);
+        let id = early.push("k", d, None, builder(), None, t0, true);
         assert!(early.begin_close(id, t0, true, |_, _| false).is_some());
         assert!(early.layers.is_empty());
 
         let (c, _) = handle_pair(cx);
         let mut instant = HostState::default();
-        let id = instant.push("k", c, None, builder(), t0, false);
+        let id = instant.push("k", c, None, builder(), None, t0, false);
         assert!(instant.begin_close(id, t0, false, |_, _| false).is_some());
         assert!(instant.layers.is_empty() && !instant.is_mounted(t0));
     }
@@ -1010,10 +1087,19 @@ mod tests {
             lower.clone(),
             Some(before.downgrade()),
             builder(),
+            None,
             t0,
             true,
         );
-        host.push("upper", upper, Some(lower.downgrade()), builder(), t0, true);
+        host.push(
+            "upper",
+            upper,
+            Some(lower.downgrade()),
+            builder(),
+            None,
+            t0,
+            true,
+        );
         let plan = host
             .begin_close(lower_id, t0 + OVERLAY_IN.duration, true, |own, focus| {
                 own == focus
@@ -1208,5 +1294,142 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(closed.get(), 1);
         cx.update(|window, cx| assert!(!has_open(window, cx)));
+    }
+
+    /// 关窗收尾:Esc / 确定 / 程序化关闭每条路都在**退场开始那一刻**调一次(焦点已经还回去),
+    /// 不等退场播完;已经在收的层再关一次不重调。
+    #[gpui::test]
+    fn 关窗收尾每条路都在退场开始时调一次(cx: &mut TestAppContext) {
+        let cx = test_window(cx);
+        let before = cx.update(|_, cx| cx.focus_handle());
+        // (调了几次, 调的那一刻焦点回去了没有)
+        let log = Rc::new(Cell::new((0, false)));
+        let open_logged = |kind: &'static str, cx: &mut gpui::VisualTestContext| {
+            let (log, before) = (log.clone(), before.clone());
+            cx.update(|window, cx| {
+                window.focus(&before, cx);
+                let dismiss: Dismiss = Box::new(move |window, _| {
+                    log.set((log.get().0 + 1, before.is_focused(window)));
+                });
+                open_with_dismiss(
+                    kind,
+                    window,
+                    cx,
+                    |dialog, _, _| {
+                        dialog
+                            .close_button(false)
+                            .child("body")
+                            .on_ok(|_, _, _| true)
+                    },
+                    Some(dismiss),
+                );
+            });
+            cx.run_until_parked();
+        };
+
+        for path in ["cancel", "confirm", "programmatic"] {
+            log.set((0, false));
+            open_logged("k", cx);
+            match path {
+                "cancel" => cx.dispatch_action(Cancel),
+                "confirm" => cx.dispatch_action(Confirm { secondary: false }),
+                _ => cx.update(|window, cx| {
+                    assert!(close("k", window, cx));
+                }),
+            }
+            assert_eq!(log.get(), (1, true), "{path}:当场调一次,焦点已还");
+            cx.update(|window, cx| {
+                assert!(is_mounted(window, cx), "{path}:收尾不等退场播完");
+                assert!(!close("k", window, cx), "已经在收");
+            });
+            assert_eq!(log.get().0, 1, "{path}:不重调");
+            cx.run_until_parked();
+        }
+    }
+
+    /// 退场中 builder 读到的状态变了(内容变矮),面板仍钉在最后一帧开着时的尺寸上。
+    #[gpui::test]
+    fn 退场中面板钉在最后一帧开着时的尺寸(cx: &mut TestAppContext) {
+        let cx = test_window(cx);
+        let tall = Rc::new(Cell::new(true));
+        cx.update(|window, cx| {
+            let tall = tall.clone();
+            open("k", window, cx, move |dialog, _, _| {
+                let h = if tall.get() { 200.0 } else { 20.0 };
+                dialog.close_button(false).child(
+                    div()
+                        .debug_selector(|| "mt-dialog-test-body".into())
+                        .h(px(h)),
+                )
+            });
+        });
+        cx.run_until_parked();
+        let open_panel = cx.debug_bounds("mt-dialog-panel").expect("面板画出来了");
+        // 等进场播完再关:退场按全程播,下一帧肯定还挂着
+        std::thread::sleep(OVERLAY_IN.duration + Duration::from_millis(20));
+
+        tall.set(false);
+        cx.dispatch_action(Cancel);
+        cx.run_until_parked();
+        let body = cx
+            .debug_bounds("mt-dialog-test-body")
+            .expect("退场中照样画");
+        assert_eq!(
+            body.size.height,
+            px(20.0),
+            "这一帧 builder 已按新状态排了正文"
+        );
+        let closing_panel = cx.debug_bounds("mt-dialog-panel").expect("退场中照样画");
+        assert_eq!(closing_panel.size, open_panel.size, "面板不跟着变矮");
+        assert_eq!(closing_panel.origin, open_panel.origin);
+    }
+
+    /// 毛玻璃:快照到货随遮罩从零淡入;淡入途中不重播;全关当场撤(不淡出);
+    /// 退场途中又开从零重新淡入。
+    #[test]
+    fn 毛玻璃进场淡入退场当场撤() {
+        let t0 = Instant::now();
+        let mut frost = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        step_frost(&mut frost, true, false, t0, true);
+        assert!(!frost.target_open(), "快照还没到:不显示");
+        step_frost(&mut frost, true, true, t0, true);
+        assert!(
+            frost.running_at(t0) && frost.value_at(t0) == 0.0,
+            "到货从零淡入"
+        );
+        let mid = t0 + OVERLAY_IN.duration / 3;
+        let before = frost.value_at(mid);
+        step_frost(&mut frost, true, true, mid, true);
+        assert_eq!(frost.value_at(mid), before, "淡入途中不重播");
+        let t1 = t0 + OVERLAY_IN.duration;
+        assert_eq!(frost.value_at(t1), 1.0);
+
+        step_frost(&mut frost, false, true, t1, true);
+        assert_eq!(frost.value_at(t1), 0.0, "全关当场撤");
+        assert!(!frost.running_at(t1), "不淡出、不要帧");
+        step_frost(&mut frost, true, true, t1, true);
+        assert!(
+            frost.running_at(t1) && frost.value_at(t1) == 0.0,
+            "又开:从零淡入"
+        );
+
+        let mut instant = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        step_frost(&mut instant, true, true, t0, false);
+        assert_eq!(instant.value_at(t0), 1.0, "总开关关掉直接到位");
+    }
+
+    /// 「还挂着」含自绘模态(用量统计)的退场:毛玻璃快照的去留看它。
+    #[test]
+    fn 挂着含自绘模态() {
+        let t0 = Instant::now();
+        let mut host = HostState::default();
+        assert!(!host.anything_mounted(t0));
+        let mut shell = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        shell.retarget(1.0, t0, true);
+        let t1 = t0 + OVERLAY_IN.duration;
+        shell.retarget(0.0, t1, true);
+        host.shells.insert("usage-stats", shell);
+        assert!(host.anything_mounted(t1) && !host.is_mounted(t1));
+        assert!(!host.anything_mounted(t1 + OVERLAY_OUT.duration));
     }
 }

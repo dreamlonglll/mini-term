@@ -8,7 +8,7 @@
 //! - **表里有一行报错就整表不提交**:只落盘没报错的行的话,改名途中撞了别行的名
 //!   (两行都报重复)会把那两行一起从配置里抹掉。已保存的仍是上一份合法的表,
 //!   页脚另起一行红字说明;
-//! - 关掉设置面板时兜底再提交一次(见 `SettingsView::new` 的 `on_release`)——
+//! - 关掉设置面板那一刻兜底再提交一次(见 `SettingsView::finish`)——
 //!   直接点 ✕ 关面板不保证输入框先失焦。
 
 use gpui::{
@@ -107,8 +107,8 @@ impl SettingsView {
         (self.store.read(cx).config().terminal_env_vars != vars).then_some(vars)
     }
 
-    /// 收 `&mut App` 而不是 `Context<Self>`:关面板时的兜底提交在 `on_release` 里,
-    /// 那里只有 `App`。
+    /// 收 `&mut App` 而不是 `Context<Self>`:关面板时的兜底提交(`SettingsView::finish`)
+    /// 也会从 `on_release` 里调,那里只有 `App`。
     pub(super) fn commit_env_vars(&mut self, cx: &mut App) {
         if let Some(vars) = self.pending_env_vars(cx) {
             self.store

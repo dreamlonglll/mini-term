@@ -42,7 +42,10 @@
 //! 走 [`crate::overlay_motion::reveal_box`](裁剪窗展开,不做透明度):根面板从**光标点**
 //! 那个角长出来(贴边收拢后光标不在角上时,原点钳进面板 —— 原点跟着换角),子面板从父项
 //! 那一侧**横向**展开。收起反向播完才卸:点菜单项时动作立即执行、菜单自己播退场,退场中
-//! 不接鼠标,焦点在退场开始时就还。悬停换了父项时,刚收起的那层子面板也反向收回去。
+//! 不接鼠标,焦点在退场开始时就还。子面板逐层各有一条在场度([`OpenMenu::panels`]):
+//! 悬停换了父项时,刚收起的那层**连同它里面展开着的更深几层**一起反向收回去;上一层还没
+//! 长全就展开下一层时,上一层照常长完;子面板的父项在另一层子面板里时,它贴着那层的
+//! 裁剪窗右缘走([`submenu_anchor_x`])。
 //! 子面板挂在父项里却 `deferred` 出去,是因为根面板的裁剪窗会把挂在它右缘外面的子面板
 //! 整块裁掉;同优先级、后登记,照样画在根面板之上。
 //!
@@ -363,12 +366,10 @@ struct OpenMenu {
     focus: FocusHandle,
     /// 根面板开合(进场 `MENU_IN`,退场 `OVERLAY_OUT`;半路掉头不跳变)。
     reveal: Presence,
-    /// **最深那层**刚展开的子面板的进场。原版每建一个 `.ctx-menu` 元素就播一次,
-    /// 这里只有一份状态 —— 够用,因为同一时刻只可能有一层是「刚展开的」。
-    submenu_in: Presence,
-    /// 刚被收起、还在退场的那一层子面板(它的路径 + 退场进度)。悬停换了父项时它反向
-    /// 收回去,同时新的一层照常展开;又悬停回来就从当前进度接着往回长。
-    submenu_out: Option<(Vec<usize>, Presence)>,
+    /// 子面板逐层的开合(键是面板路径,根面板不在里面)。展开着的、正在进场的、刚被收起
+    /// 还在退场的都在表里,退场播完由 render 摘掉。每层各管各的:上一层还没长全时又展开
+    /// 下一层,上一层照常长完;收起一层时它里面更深的几层同一刻一起收(见 [`retarget_panels`])。
+    panels: HashMap<Vec<usize>, Presence>,
 }
 
 #[derive(Default)]
@@ -450,9 +451,8 @@ pub fn show_with(
             prev_focus,
             focus,
             reveal,
-            // 还没有子面板:第一次真展开时才起播
-            submenu_in: Presence::shown(MENU_IN, OVERLAY_OUT),
-            submenu_out: None,
+            // 还没有子面板:第一次真展开时才进表、起播
+            panels: HashMap::new(),
         });
         cx.notify();
     });
@@ -506,21 +506,34 @@ fn panel_open(open_path: &[usize], ancestors: &[usize]) -> bool {
     open_path.starts_with(ancestors)
 }
 
-/// 展开路径从 `prev` 变成 `next` 时,是否有**新面板**出现(要播进场动画)。
+/// 展开路径换成 `next` 时,子面板在场度表(见 [`OpenMenu::panels`])怎么变。
 ///
-/// 收起不算:`next` 是 `prev` 的前缀时留下的那些面板并没有重建,原版也不会
-/// 重播动画(`closeSubmenusFrom` 只 `remove()` 深层的,浅层元素原地不动)。
-fn opens_new_panel(prev: &[usize], next: &[usize]) -> bool {
-    !next.is_empty() && !prev.starts_with(next)
-}
-
-/// 展开路径从 `prev` 变成 `next` 时,被收起的**最浅**那一层面板的路径(要播退场);
-/// 没有面板被收起时 `None`。更深的那几层随它一起走,不另播。
-fn collapsed_panel(prev: &[usize], next: &[usize]) -> Option<Vec<usize>> {
-    (1..=prev.len())
-        .map(|depth| &prev[..depth])
-        .find(|panel| !next.starts_with(panel))
-        .map(<[usize]>::to_vec)
+/// - `next` 链上的每一层朝全开走:新出现的从零起播;还在收起的(悬停又回来了)从当前进度
+///   掉头长回去;早就开着 / 正在进场的**不动** —— 收起最深一层时留下的那些面板没有重建,
+///   原版也不重播(`closeSubmenusFrom` 只 `remove()` 深层的);
+/// - 不在 `next` 链上、还朝全开走的一律开始收起:被收掉的那层**连同它里面更深的几层**同一刻
+///   起收(更深的随它一起走,不当帧消失),各自从当前进度起步。
+///
+/// 收完的条目留在表里,由 render 按 `mounted_at` 摘掉。
+fn retarget_panels(
+    panels: &mut HashMap<Vec<usize>, Presence>,
+    next: &[usize],
+    now: Instant,
+    animate: bool,
+) {
+    for depth in 1..=next.len() {
+        let presence = panels
+            .entry(next[..depth].to_vec())
+            .or_insert_with(|| Presence::hidden(MENU_IN, OVERLAY_OUT));
+        if !presence.target_open() {
+            presence.retarget(1.0, now, animate);
+        }
+    }
+    for (path, presence) in panels.iter_mut() {
+        if !next.starts_with(path) && presence.target_open() {
+            presence.retarget(0.0, now, animate);
+        }
+    }
 }
 
 /// 该层里**键盘选得中**的条目下标。
@@ -799,8 +812,9 @@ impl ContextMenu {
         }
     }
 
-    /// 换展开路径。变了才动;有**新面板**出现时顺带播子面板进场,有面板被收起时播它的退场。
-    /// 悬停与 →/← 都走这一条,免得两边对「什么时候算新面板」有两套看法。
+    /// 换展开路径。变了才动;新出现的面板播进场,被收起的面板(连同更深的几层)播退场
+    /// (见 [`retarget_panels`])。悬停与 →/← 都走这一条,免得两边对「什么时候算新面板」
+    /// 有两套看法。
     fn set_open_path(&mut self, next: Vec<usize>) -> bool {
         let Some(open) = self.open.as_mut() else {
             return false;
@@ -808,30 +822,12 @@ impl ContextMenu {
         if open.open_path == next {
             return false;
         }
-        let now = Instant::now();
-        let prev = std::mem::take(&mut open.open_path);
-        if let Some(collapsed) = collapsed_panel(&prev, &next) {
-            // 收起的正是还在进场的最深那层:从当前进度往回收;更浅的那层早就开着,从全开起收
-            let mut exit = if collapsed == prev {
-                open.submenu_in
-            } else {
-                Presence::shown(MENU_IN, OVERLAY_OUT)
-            };
-            exit.hide(now);
-            open.submenu_out = Some((collapsed, exit));
-        }
-        if opens_new_panel(&prev, &next) {
-            // 新展开的若正是刚收起、还在退场的那层:从当前进度接着往回长,不从零起
-            let mut entrance = match open.submenu_out.take() {
-                Some((path, presence)) if path == next => presence,
-                other => {
-                    open.submenu_out = other;
-                    Presence::hidden(MENU_IN, OVERLAY_OUT)
-                }
-            };
-            entrance.show(now);
-            open.submenu_in = entrance;
-        }
+        retarget_panels(
+            &mut open.panels,
+            &next,
+            Instant::now(),
+            mt_ui::motion::animations_enabled(),
+        );
         open.open_path = next;
         true
     }
@@ -1045,10 +1041,9 @@ impl ContextMenu {
                     list = list.child(self.render_item(
                         menu,
                         item,
-                        &ancestors,
-                        index,
+                        (&ancestors, index),
                         (&open_path, active.as_deref()),
-                        live,
+                        (progress, live),
                         window,
                         cx,
                     ));
@@ -1109,17 +1104,17 @@ impl ContextMenu {
         reveal_panel(panel.child(list), progress, is_root, menu.position, live)
     }
 
-    /// 一行菜单项。`(open_path, active)` 是这一帧的展开路径与键盘选中项;
+    /// 一行菜单项:`ancestors` 这一层的第 `index` 项。`(open_path, active)` 是这一帧的展开
+    /// 路径与键盘选中项;`panel_progress` 是所在那层面板这一帧的开合进度;
     /// `interactive = false`(整个菜单在退场 / 这层在收起)时不挂任何监听、不画悬停态。
     #[allow(clippy::too_many_arguments)]
     fn render_item(
         &self,
         menu: &OpenMenu,
         item: &MenuItem,
-        ancestors: &[usize],
-        index: usize,
+        (ancestors, index): (&[usize], usize),
         (open_path, active): (&[usize], Option<&[usize]>),
-        interactive: bool,
+        (panel_progress, interactive): (f32, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1220,14 +1215,16 @@ impl ContextMenu {
         // 屏幕下缘的项目行上展开时,不至于有一半掉到窗口外面去。再外面那层 `deferred`
         // 让它逃出根面板开合动画的裁剪窗(见模块注释「开合动画」)。
         //
-        // 刚被收起、还在退场的那一层照样画(不接鼠标),播完才撤。
+        // 刚被收起、还在退场的那几层(收起的那层连同它里面更深的)照样画(不接鼠标),
+        // 播完才撤 —— 在场度表里还挂着就画。
         let mut child_path = ancestors.to_vec();
         child_path.push(index);
-        let collapsing = has_submenu
-            && menu.submenu_out.as_ref().is_some_and(|(path, presence)| {
-                *path == child_path && presence.mounted_at(Instant::now())
-            });
-        if submenu_open || collapsing {
+        let mounted = has_submenu
+            && menu
+                .panels
+                .get(&child_path)
+                .is_some_and(|presence| presence.mounted_at(Instant::now()));
+        if submenu_open || mounted {
             // 自绘面板优先:两者都给时以它为准(见 `submenu_element` 的字段注释)
             let submenu = match item.submenu_element.as_ref() {
                 Some(render) => {
@@ -1241,16 +1238,22 @@ impl ContextMenu {
                 }
                 None => self.render_panel(menu, &item.submenu, child_path, interactive, window, cx),
             };
+            // 子面板贴在父项右缘。所在那层是子面板(从左缘横向展开 / 收起)且还在动时,
+            // 右缘跟着它的裁剪窗走(见 [`submenu_anchor_x`]),子面板不悬在半空
             row = row.child(
-                div().absolute().left(relative(1.0)).top(px(-4.0)).child(
-                    // 同优先级、后登记 → 画在根面板之上(`paint_deferred_draws` 稳定排序)
-                    deferred(
-                        anchored()
-                            .snap_to_window_with_margin(px(4.0))
-                            .child(submenu),
-                    )
-                    .with_priority(MENU_PRIORITY),
-                ),
+                div()
+                    .absolute()
+                    .left(relative(submenu_anchor_x(ancestors, panel_progress)))
+                    .top(px(-4.0))
+                    .child(
+                        // 同优先级、后登记 → 画在根面板之上(`paint_deferred_draws` 稳定排序)
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(4.0))
+                                .child(submenu),
+                        )
+                        .with_priority(MENU_PRIORITY),
+                    ),
             );
         }
 
@@ -1277,9 +1280,9 @@ impl ContextMenu {
 
 /// 某一层面板这一帧的开合进度,以及它接不接鼠标。
 ///
-/// 根面板走整个菜单的进出场;最深那层子面板走它自己的进场;刚收起的那层走它的退场
-/// (不接鼠标);其余早就开着。整个菜单在退场时(`interactive = false`)一律跟着收。
-/// 只在动画进行中要帧(`Presence::drive`)。
+/// 根面板走整个菜单的进出场;子面板走在场度表里自己那一条,且不比祖先链上任何一层
+/// 更开(祖先先收完的话它跟着没了,不会悬在半空);祖先链上有一层在收起就不接鼠标。
+/// 整个菜单在退场时(`interactive = false`)一律跟着收。只在动画进行中要帧(`Presence::drive`)。
 fn panel_motion(
     menu: &OpenMenu,
     path: &[usize],
@@ -1290,18 +1293,40 @@ fn panel_motion(
     if path.is_empty() {
         return (whole, interactive);
     }
-    let collapsing = menu
-        .submenu_out
-        .as_ref()
-        .filter(|(collapsed, _)| collapsed.as_slice() == path)
-        .map(|(_, presence)| *presence);
-    let own = match collapsing {
-        Some(presence) => presence.drive(window),
-        None if path == menu.open_path.as_slice() => menu.submenu_in.drive(window),
-        None => 1.0,
-    };
+    let (own, live) = chain_motion(&menu.panels, path, |presence| presence.drive(window));
     let progress = if interactive { own } else { own.min(whole) };
-    (progress, interactive && collapsing.is_none())
+    (progress, interactive && live)
+}
+
+/// 子面板 `path` 沿祖先链取的进度(链上各层取最小)与「链上每层都朝全开走」。`value`
+/// 取某一层这一帧的进度。不在表里的层按早就开着算。**纯函数**,单测钉语义。
+fn chain_motion(
+    panels: &HashMap<Vec<usize>, Presence>,
+    path: &[usize],
+    value: impl Fn(&Presence) -> f32,
+) -> (f32, bool) {
+    (1..=path.len())
+        .filter_map(|depth| panels.get(&path[..depth]))
+        .fold((1.0f32, true), |(progress, live), presence| {
+            (
+                progress.min(value(presence)),
+                live && presence.target_open(),
+            )
+        })
+}
+
+/// 子面板容器贴在父项的哪儿(占父项宽度的比例,`left: relative(..)`)。
+///
+/// 父项在根面板里:恒贴右缘(1.0)。父项在子面板里:那层面板从左缘横向展开 / 收起
+/// (起点宽 0、高全高,见 [`SUBMENU_REVEAL_START`]),画出来的右缘在「左缘 + 宽 × 进度」,
+/// 子面板跟着它走 —— 上一层还在长时就展开下一层、或者两层一起收起时,下一层贴着上一层的
+/// 裁剪窗,不悬在半空。全开时(进度 1)就是原来的右缘。
+fn submenu_anchor_x(ancestors: &[usize], panel_progress: f32) -> f32 {
+    if ancestors.is_empty() {
+        1.0
+    } else {
+        panel_progress.clamp(0.0, 1.0)
+    }
 }
 
 /// 把一层面板包进开合动画:根面板从光标点那个角长出来,子面板从父项那一侧横向展开。
@@ -1340,13 +1365,7 @@ impl Render for ContextMenu {
             .into_iter()
             .flatten()
         {
-            if menu
-                .submenu_out
-                .as_ref()
-                .is_some_and(|(_, presence)| !presence.mounted_at(now))
-            {
-                menu.submenu_out = None;
-            }
+            menu.panels.retain(|_, presence| presence.mounted_at(now));
         }
         // 开着的那个照常交互;只剩退场中的那个时,遮罩不拦点击、面板不接鼠标、不收键盘
         let interactive = self.open.is_some();
@@ -1543,33 +1562,122 @@ mod tests {
         assert!(!panel_open(&[], &[2]), "子面板已收起");
     }
 
-    /// 只有**新面板**出现才重播进场:收起(新路径是旧路径的前缀)时留下的
-    /// 面板并没有重建,不能跟着闪一下。
-    #[test]
-    fn 新面板出现才播进场() {
-        assert!(opens_new_panel(&[], &[2]), "根上展开一层");
-        assert!(opens_new_panel(&[2], &[2, 1]), "再深一层");
-        assert!(opens_new_panel(&[2], &[3]), "换一个父项 = 换了个新面板");
-        assert!(!opens_new_panel(&[2, 1], &[2]), "收起最深一层不算");
-        assert!(!opens_new_panel(&[2], &[]), "全收起不算");
-        assert!(!opens_new_panel(&[2], &[2]), "没变不算");
+    /// 在场度表里某层这一刻的值(测试里按显式时刻取,不碰窗口)。
+    fn panel_value(panels: &HashMap<Vec<usize>, Presence>, path: &[usize], now: Instant) -> f32 {
+        panels
+            .get(path)
+            .map_or(0.0, |presence| presence.value_at(now))
     }
 
-    /// 收起时播退场的是被收掉的**最浅**那一层(更深的随它一起走);
-    /// 只是往深里展开 / 没变时没有面板被收起。
+    /// 只有**新面板**出现才起播;收起最深一层时留下的那几层不动(没有重建,不能跟着闪一下)。
     #[test]
-    fn 收起的最浅一层播退场() {
-        assert_eq!(collapsed_panel(&[2], &[]), Some(vec![2]), "全收起");
-        assert_eq!(collapsed_panel(&[2], &[3]), Some(vec![2]), "换一个父项");
+    fn 新面板出现才播进场() {
+        let t0 = Instant::now();
+        let mut panels = HashMap::new();
+        retarget_panels(&mut panels, &[2], t0, true);
+        assert!(panels[&vec![2]].running_at(t0) && panels[&vec![2]].target_open());
+        let t1 = t0 + MENU_IN.duration;
+        retarget_panels(&mut panels, &[2, 1], t1, true);
+        assert!(!panels[&vec![2]].running_at(t1), "再深一层:上一层不重播");
+        assert!(panels[&vec![2, 1]].running_at(t1));
+        let t2 = t1 + MENU_IN.duration;
+        retarget_panels(&mut panels, &[2], t2, true);
         assert_eq!(
-            collapsed_panel(&[2, 1], &[2]),
-            Some(vec![2, 1]),
-            "收起最深一层"
+            panel_value(&panels, &[2], t2),
+            1.0,
+            "收起最深一层:留下的那层不动"
         );
-        assert_eq!(collapsed_panel(&[2, 1], &[3]), Some(vec![2]), "连根换掉");
-        assert_eq!(collapsed_panel(&[2], &[2, 1]), None, "往深里展开");
-        assert_eq!(collapsed_panel(&[], &[2]), None);
-        assert_eq!(collapsed_panel(&[2], &[2]), None);
+        assert!(!panels[&vec![2, 1]].target_open(), "最深那层开始收");
+    }
+
+    /// 收起一层时它里面展开着的更深几层**同一刻一起收**,不当帧消失;换父项时新的一层照常展开。
+    #[test]
+    fn 收起一层时更深的随它一起走() {
+        let t0 = Instant::now();
+        let mut panels = HashMap::new();
+        retarget_panels(&mut panels, &[2], t0, true);
+        retarget_panels(&mut panels, &[2, 1], t0 + MENU_IN.duration, true);
+        let t1 = t0 + MENU_IN.duration * 2;
+        // 悬停根层另一个带子菜单的项:[2] 连同 [2,1] 一起收,[3] 展开
+        retarget_panels(&mut panels, &[3], t1, true);
+        for path in [&[2][..], &[2, 1]] {
+            let presence = &panels[path];
+            assert!(
+                !presence.target_open() && presence.mounted_at(t1),
+                "{path:?} 在收"
+            );
+            assert_eq!(presence.value_at(t1), 1.0, "{path:?} 从全开起收,不跳");
+        }
+        assert!(panels[&vec![3]].target_open());
+        // 两层同一刻起收、同一条规格:一路同步,同时收完
+        let mid = t1 + OVERLAY_OUT.duration / 2;
+        assert_eq!(
+            panel_value(&panels, &[2], mid),
+            panel_value(&panels, &[2, 1], mid)
+        );
+        let end = t1 + OVERLAY_OUT.duration;
+        assert!(!panels[&vec![2]].mounted_at(end) && !panels[&vec![2, 1]].mounted_at(end));
+    }
+
+    /// 上一层还在进场(没长全)时悬停进它里面带子菜单的一项:上一层照常长完,不跳到全开。
+    #[test]
+    fn 上一层进场途中展开下一层不跳变() {
+        let t0 = Instant::now();
+        let mut panels = HashMap::new();
+        retarget_panels(&mut panels, &[2], t0, true);
+        let mid = t0 + MENU_IN.duration / 4;
+        let before = panel_value(&panels, &[2], mid);
+        assert!(before > 0.0 && before < 1.0);
+        retarget_panels(&mut panels, &[2, 1], mid, true);
+        assert_eq!(panel_value(&panels, &[2], mid), before, "上一层不跳");
+        assert!(panels[&vec![2]].running_at(mid), "上一层照常往下播");
+        assert_eq!(panel_value(&panels, &[2, 1], mid), 0.0, "新的一层从零起");
+    }
+
+    /// 收到一半又悬停回来:从当前进度掉头长回去,不从零起。
+    #[test]
+    fn 收起途中悬停回来从当前进度长回去() {
+        let t0 = Instant::now();
+        let mut panels = HashMap::new();
+        retarget_panels(&mut panels, &[2], t0, true);
+        let t1 = t0 + MENU_IN.duration;
+        retarget_panels(&mut panels, &[], t1, true);
+        let mid = t1 + OVERLAY_OUT.duration / 3;
+        let before = panel_value(&panels, &[2], mid);
+        assert!(before > 0.0 && before < 1.0);
+        retarget_panels(&mut panels, &[2], mid, true);
+        assert!(panels[&vec![2]].target_open());
+        assert!(
+            (panel_value(&panels, &[2], mid) - before).abs() < 1e-6,
+            "掉头不跳"
+        );
+    }
+
+    /// 子面板的进度沿祖先链取最小;链上有一层在收就不接鼠标;不在表里的层按全开算。
+    #[test]
+    fn 子面板进度不超过祖先() {
+        let t0 = Instant::now();
+        let mut panels = HashMap::new();
+        retarget_panels(&mut panels, &[2, 1], t0, true);
+        let at = |panels: &HashMap<Vec<usize>, Presence>, path: &[usize], now| {
+            chain_motion(panels, path, |presence| presence.value_at(now))
+        };
+        let t1 = t0 + MENU_IN.duration;
+        assert_eq!(at(&panels, &[2, 1], t1), (1.0, true));
+        retarget_panels(&mut panels, &[], t1, true);
+        let mid = t1 + OVERLAY_OUT.duration / 2;
+        let (progress, live) = at(&panels, &[2, 1], mid);
+        assert!(progress < 1.0 && !live, "跟着收、不接鼠标");
+        assert_eq!(at(&HashMap::new(), &[4], t0), (1.0, true));
+    }
+
+    /// 子面板容器贴父项右缘:父项在根面板里恒为 1;在子面板里跟着那层的进度走。
+    #[test]
+    fn 子面板跟着上一层的右缘走() {
+        assert_eq!(submenu_anchor_x(&[], 0.3), 1.0, "根面板是二维展开,不跟");
+        assert_eq!(submenu_anchor_x(&[2], 1.0), 1.0, "全开时就是右缘");
+        assert_eq!(submenu_anchor_x(&[2], 0.4), 0.4);
+        assert_eq!(submenu_anchor_x(&[2, 1], 1.5), 1.0, "越界钳住");
     }
 
     /// 选中高亮只认「路径完全相同」的那一项。
