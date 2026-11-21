@@ -59,7 +59,7 @@ impl TerminalArea {
     }
 
     /// 卡开着期间按 500ms 节拍重画 —— 缩略图是活的(`MiniTerminalElement` 自己也按
-    /// 这个节拍取数)。卡下了屏幕就停。
+    /// 这个节拍取数)。卡下了屏幕或所有窗口均不可见时自动停泵,避免后台空刷。
     pub(super) async fn keep_tab_preview_alive(
         this: gpui::WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
@@ -68,8 +68,17 @@ impl TerminalArea {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
                 .await;
+            let any_visible = cx.update(|cx| {
+                cx.windows()
+                    .iter()
+                    .any(|w| w.update(cx, |_, window, _| window.is_visible()).unwrap_or(false))
+            });
             let alive = this
                 .update(cx, |this: &mut TerminalArea, cx| {
+                    if !any_visible {
+                        this.tab_card.close_now();
+                        return false;
+                    }
                     let warm = this.tab_card.is_warm();
                     if warm {
                         cx.notify();
@@ -101,7 +110,7 @@ impl TerminalArea {
     ) -> Option<AnyElement> {
         let mut frame = self.tab_card.frame(window)?;
         let (pane_id, rect) = (frame.key.clone(), frame.anchor);
-        let (project_id, still_hidden) = {
+        let (project_id, folded_away, still_hidden) = {
             let store = self.store.read(cx);
             // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
             let project_id = store.active_project_id.clone().unwrap_or_default();
@@ -117,16 +126,12 @@ impl TerminalArea {
                     Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
                     _ => false,
                 };
-            (project_id, still_hidden)
+            (project_id, folded_away, still_hidden)
         };
         let Some(pane) = layout.pane(&pane_id) else {
             self.tab_card.close_now();
             return None;
         };
-        // 被激活了(Ctrl+数字 / Ctrl+Tab / 聚焦 chip 上回车):收起,且**本帧就按收起之后的
-        // 状态画** —— 上面那份是 close 之前取的(全开、不要帧),照它画的话:总开关关着时
-        // close 已直达收起、再没人重画,卡一直盖着;开着时收起动画第一帧没人要。重取一次:
-        // 关着拿到 None、当帧不画;开着从这一帧起播收起并自己要帧
         if !still_hidden && self.tab_card.close(cx) {
             frame = self.tab_card.frame(window)?;
         }
@@ -136,18 +141,22 @@ impl TerminalArea {
         let style = pane_preview::preview_style(store);
         let mut state = frame.reveal;
         state.origin_x = Some(rect.left() + rect.size.width / 2.0);
-        // 卡是纯展示(不拦鼠标):收起途中也别让 reveal_frame 盖拦截层,否则移开 tab 后
-        // 马上点下面的终端,那一下会被正在收的卡吞掉
-        state.open = true;
+        // 底部折叠条或贴近窗口下缘被 `snap_to_window` 向上翻转的预览卡改为从底边往上长,
+        // 紧贴触发 tab 上缘。纯展示层(`occlude: false`)退场期间由 `RevealFrame` 自动放行鼠标。
+        let anchor_pos = pane_preview::tab_anchor(rect) + frame.offset;
+        let flip_up = folded_away
+            || f32::from(anchor_pos.y) + pane_preview::TAB_CARD_HEIGHT + 6.0
+                > f32::from(window.viewport_size().height);
         let card = reveal_frame(
             pane_preview::tab_preview_card(&info, &style),
             state,
             Some(pane_preview::card_chrome()),
-        );
+        )
+        .from_bottom(flip_up);
         Some(
             deferred(
                 anchored()
-                    .position(pane_preview::tab_anchor(rect) + frame.offset)
+                    .position(anchor_pos)
                     // 「底下放不下就翻到 tab 上方」由贴边收拢代劳
                     .snap_to_window_with_margin(px(6.0))
                     .child(card),

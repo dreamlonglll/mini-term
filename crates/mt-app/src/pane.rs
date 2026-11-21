@@ -952,6 +952,8 @@ impl TerminalPane {
         self.exit_code = code;
         self.dead_since = Some(Instant::now());
         cx.emit(PaneEvent::Exited(code));
+        // 同步刷新终端子视图,确保进程退出前同一批输出的最后几行必刷出而不被节拍/缓存吞掉
+        self.view.update(cx, |_, cx| cx.notify());
         // 退出是一次性事件:不进节拍器,当场画完收工
         cx.notify();
     }
@@ -1181,15 +1183,16 @@ impl TerminalPane {
                 let emulator = self.emulator.clone();
                 let this = cx.weak_entity();
                 cx.new(|cx| {
-                    // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效
+                    // 文案由宿主注入(mt-ui 不依赖 mt-i18n):查找条每帧调一次,切语言立刻生效;
+                    // 外框交由 `reveal_frame` 统一绘制,避免动画期间双重阴影与落定骤跳
                     let labels = crate::i18n::terminal_search_labels;
-                    TerminalSearchBar::new(search, emulator, labels, window, cx).on_close(
-                        move |window, cx| {
+                    TerminalSearchBar::new(search, emulator, labels, window, cx)
+                        .framed(false)
+                        .on_close(move |window, cx| {
                             let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
                                 pane.dismiss_search(window, cx);
                             });
-                        },
-                    )
+                        })
                 })
             }
         };
@@ -2671,9 +2674,8 @@ impl TerminalPane {
             self.search_exit = None;
             return None;
         };
-        if state.settled {
-            return Some(bar.into_any_element());
-        }
+        // 全程(含静止态)由 `reveal_frame` 统一绘制单层底色 / 边框 / 阴影并垫底拦鼠标,
+        // 彻底避免动画中双层阴影叠加以及 `settled` 瞬间阴影骤跳
         let theme = cx.theme();
         let chrome = Chrome {
             bg: theme.popover,
@@ -2682,7 +2684,7 @@ impl TerminalPane {
             border_width: px(1.0),
             radius: gpui::rems(0.375).into(),
             shadow: ShadowMode::Always,
-            occlude: false,
+            occlude: true,
         };
         Some(reveal_frame(bar, state, Some(chrome)).into_any_element())
     }
@@ -2692,12 +2694,14 @@ impl TerminalPane {
 ///
 /// 一层 absolute 全尺寸的 canvas:不插 hitbox、不画东西。pane 套着 view 级缓存,命中缓存时
 /// 不重跑 —— 但 pane 尺寸一变缓存就失效,正好是要重报的时候。报上去的值变了且悬浮框开着,
-/// 就再要一帧让视图按新尺寸重画。
+/// 经 `on_next_frame` 显式标脏 `SshActivityView`(同 `popover_reveal::anchor_probe`),确保在
+/// `gpui-fast` 保留模式下生效。
 fn ssh_activity_probe(view: Entity<SshActivityView>) -> impl IntoElement {
     gpui::canvas(
         move |bounds, window, cx| {
             if view.update(cx, |view, _| view.note_pane_bounds(bounds)) {
-                window.request_animation_frame();
+                let target = view.clone();
+                window.on_next_frame(move |_, cx| target.update(cx, |_, cx| cx.notify()));
             }
         },
         |_, _, _, _| {},

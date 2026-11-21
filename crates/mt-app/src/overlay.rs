@@ -244,6 +244,35 @@ thread_local! {
     static CURRENT: RefCell<Stack> = RefCell::new(Stack::default());
 }
 
+/// 给 `gpui-fast` 依赖图与根视图用的覆盖物栈变更世代哨兵。
+///
+/// 栈本体出于 `Drop` 里拿不到 `cx` 的原因留在 `thread_local!`，但在 `gpui-fast`
+/// 视图拼接模式下，子视图（如文档页里的 `ImageLightbox`）改完 `thread_local!` 后只
+/// notify 自己不会标脏根 `Workspace`，导致根层的毛玻璃抓拍/释放漏跑。
+/// 需要根视图响应的覆盖物在开关时调 [`notify_changed`] 推进本全局，根视图经
+/// [`observe_in`] 订阅即可同步重绘（无变化时零开销）。
+struct OverlayRevision(u64);
+impl gpui::Global for OverlayRevision {}
+
+/// 让视图在 [`notify_changed`] 被调用时收到一次 `cx.notify()`。
+pub fn observe_in<V: 'static>(cx: &mut gpui::Context<V>) {
+    cx.observe_global::<OverlayRevision>(|_, cx| cx.notify())
+        .detach();
+}
+
+/// 在渲染里把本视图挂进 `OverlayRevision` 的 `gpui-fast` 依赖图。
+pub fn observe_changes(cx: &gpui::App) {
+    let _ = cx.try_global::<OverlayRevision>();
+}
+
+/// 通知关心覆盖物栈的根视图（如毛玻璃层）同步对账。
+pub fn notify_changed(cx: &mut gpui::App) {
+    let next = cx
+        .try_global::<OverlayRevision>()
+        .map_or(1, |r| r.0.wrapping_add(1));
+    cx.set_global(OverlayRevision(next));
+}
+
 /// 压入一层。返回 `false` = 同一层已经开着(调用方应当直接放弃这次打开)。
 ///
 /// 真压进去了就顺带打断 tooltip(`mt_ui::tooltip::interrupt`):还在等待中的提示

@@ -32,7 +32,6 @@
 //! | `mt_ui::icons::usage_glyphs` | KPI 六枚图标的形状表(几何属渲染层) |
 //! | 本文件 | 相位机 + 面板本体(状态、数据流、render 全家) |
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -186,23 +185,17 @@ const PROJECT_MENU_GAP: gpui::Pixels = px(4.0);
 const PROJECT_MENU_MAX_HEIGHT: gpui::Pixels = px(280.0);
 /// 模型排行前 N,其余合并成一行 Others。
 const TOP_MODELS: usize = 6;
-/// `@keyframes usageFadeIn` 的 `translateY(6px)`。
-/// 主体区还没量到高度时上推的起点(首帧就进 Ready 才会用上)。
-const ENTRY_FALLBACK_SHIFT: f32 = 240.0;
+/// 主体首次加载入场的轻度上浮距离(px)。克制在 18px(不再整屏猛冲),终点精确归零。
+const ENTRY_SHIFT_PX: f32 = 18.0;
 
-/// 主体入场这一帧整块往下偏多少像素:起点是主体区可视高度(整块在底边之外),按进度
-/// `p`(已缓动)推到 0。**纯函数**,终点必须精确归零(残留零点几会让主体永远错位)。
-fn entry_offset(body_height: f32, p: f32) -> f32 {
+/// 主体入场这一帧整块往下偏多少像素:按进度 `p`(已缓动)从 [`ENTRY_SHIFT_PX`] 推到 0。
+/// **纯函数**,终点必须精确归零(残留零点几会让主体永远错位)。
+fn entry_offset(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     if p >= 1.0 {
         return 0.0;
     }
-    let from = if body_height > 0.0 {
-        body_height
-    } else {
-        ENTRY_FALLBACK_SHIFT
-    };
-    from * (1.0 - p)
+    ENTRY_SHIFT_PX * (1.0 - p)
 }
 
 // ─── 趋势图版式(逐条抄 `DailyChart.tsx`)────────────────────
@@ -280,12 +273,9 @@ pub struct UsagePanel {
     /// 抽屉是否展开。实体常驻,定时器必须靠它闸住。
     visible: bool,
     tweens: Tweens,
-    /// 主体入场(原版 `.usage-fade-in`)。**相位切进 Ready 才重播** ——
-    /// 等价原版「那层 div 重新挂载」;自动刷新期间相位不变,于是不闪。
-    /// 2026-11-21 起不再淡入,改成整块从主体区底边**上推**入位(见 [`entry_offset`])。
+    /// 主体入场(原版 `.usage-fade-in`)。只在首次从加载态进 Ready 时播一次轻度上浮,
+    /// 自动刷新或从空范围切回时不再整屏跳动。
     fade_in: mt_ui::motion::Transition,
-    /// 主体区(滚动容器)的可视高度,canvas 量的:上推的起点就是整整这么高。
-    body_height: Rc<Cell<f32>>,
     /// scope / range 两组段控件的滑动选中块(见 `segment_slider`)。
     scope_slider: crate::segment_slider::IndicatorSlider,
     range_slider: crate::segment_slider::IndicatorSlider,
@@ -322,9 +312,6 @@ pub struct UsagePanel {
     /// 自动刷新定时器。**改档位即重建**(60s→5s 时用户要立刻看到效果),
     /// 档位为 0 或面板收起时置 `None`。
     _refresh_task: Option<Task<()>>,
-    /// 数字滚动的重绘泵。五格共用一个,不给每格挂 `with_animation`
-    /// (那是五个独立动画各自持续请求帧)。
-    _tween_task: Option<Task<()>>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -403,7 +390,6 @@ impl UsagePanel {
             // 首帧就是 Skeleton/PricingLoading,建成「已跑完」的,
             // 等真进了 Ready 再 restart
             fade_in: mt_ui::motion::Transition::settled(mt_ui::motion::USAGE_FADE_IN),
-            body_height: Rc::new(Cell::new(0.0)),
             scope_slider: crate::segment_slider::IndicatorSlider::new(),
             range_slider: crate::segment_slider::IndicatorSlider::new(),
             last_phase: None,
@@ -418,7 +404,6 @@ impl UsagePanel {
             _pricing_task: None,
             _preview_task: None,
             _refresh_task: None,
-            _tween_task: None,
             _subs: subs,
         };
         // 打开面板:拉价 → 出账本现值(在 load_pricing 的回调里 query),
@@ -564,7 +549,6 @@ impl UsagePanel {
                 match result {
                     Ok(stats) => {
                         this.tweens.retarget(&stats, Instant::now());
-                        this.start_tween_pump(cx);
                         this.stats = Some(stats);
                         this.error = None;
                     }
@@ -640,30 +624,6 @@ impl UsagePanel {
                     })
                     .unwrap_or(false);
                 if !alive {
-                    return;
-                }
-            }
-        }));
-    }
-
-    /// 数字滚动的单点重绘泵:有任一 tween 没跑完就每 16ms 请一帧。
-    fn start_tween_pump(&mut self, cx: &mut Context<Self>) {
-        if !self.tweens.running(Instant::now()) {
-            self._tween_task = None;
-            return;
-        }
-        self._tween_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
-                let running = this
-                    .update(cx, |this: &mut Self, cx| {
-                        cx.notify();
-                        this.tweens.running(Instant::now())
-                    })
-                    .unwrap_or(false);
-                if !running {
                     return;
                 }
             }
@@ -1211,22 +1171,6 @@ impl Render for UsagePanel {
         }
 
         let header = self.render_header(cx);
-        // 量主体区的可视高度(上推入场的起点,见 [`entry_offset`])。量完不 notify:
-        // 只有入场那 350ms 用得上,那时本来每帧都在画。
-        //
-        // ⚠️ 探针挂在滚动容器**外面**那层外壳上:滚动容器按直接子元素的包围盒算内容尺寸,
-        // 一块 `h_full` 的探针挂进去,内容恒 ≥ 可视高、再加上下 padding —— 内容很短时
-        // 滚轮也能把主体上推 28px 露出空白
-        let body_height = self.body_height.clone();
-        let height_probe = gpui::canvas(
-            move |bounds, _window, _cx| body_height.set(f32::from(bounds.size.height)),
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .w(px(0.0))
-        .h_full();
         let mut body = div()
             .id("usage-body")
             .relative()
@@ -1272,10 +1216,14 @@ impl Render for UsagePanel {
             self.progress.is_some_and(|(_, total)| total > 0),
         );
 
-        // `.usage-fade-in` 是挂在**主体那层 div** 上的一次性动画,只在它被挂载时
-        // 播 —— 相位从别的档切进 Ready 就是「挂载」。停在 Ready 上的自动刷新
-        // (每 5s 一次)不该让整个面板反复淡入。
-        if phase == Phase::Ready && self.last_phase != Some(Phase::Ready) {
+        // 只在首次从加载态(定价加载 / 骨架屏)进入 Ready 时播轻度上浮入场;
+        // 切空范围回来或自动刷新不再整屏弹跳
+        if phase == Phase::Ready
+            && matches!(
+                self.last_phase,
+                None | Some(Phase::PricingLoading | Phase::Skeleton)
+            )
+        {
             self.fade_in.restart();
         }
         self.last_phase = Some(phase);
@@ -1331,17 +1279,7 @@ impl Render for UsagePanel {
             .flex_col()
             .bg(ui::bg_surface())
             .child(header)
-            // 主体区外壳:量高探针 + 滚动容器(见上)
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .child(height_probe)
-                    .child(body),
-            )
+            .child(body)
             // 日期浮层。挂在这一层是安全的:它自己是 `deferred`,而 gpui 的
             // `DeferredDraw` 不带祖先的 ContentMask —— 抽屉裁不到它
             .when_some(self.calendar.clone(), |el, picker| el.child(picker))
@@ -1400,8 +1338,9 @@ impl UsagePanel {
             .unwrap_or_else(|| t("usageStats", "scope.allProjects").to_string());
 
         // 两组段控件的选中底色是滑动的实底块(见 `segment_slider`):各段宽度随文字变,
-        // 先量再滑;反白的字跟着滑块走(盖过一半才反白,见 `IndicatorSlider::coverage`)
+        // 先同步目标再量再滑,保证关动画模式下当帧反白不滞后一拍
         let scope_ix = Scope::ALL.iter().position(|s| *s == scope).unwrap_or(0);
+        self.scope_slider.sync(scope_ix);
         let mut scope_bar = segmented().child(slider_block(&self.scope_slider, scope_ix));
         for (ix, s) in Scope::ALL.into_iter().enumerate() {
             scope_bar = scope_bar.child(
@@ -1420,6 +1359,7 @@ impl UsagePanel {
             .iter()
             .position(|r| *r == range)
             .unwrap_or(0);
+        self.range_slider.sync(range_ix);
         let mut range_bar = segmented().child(slider_block(&self.range_slider, range_ix));
         for (ix, r) in UsageRange::ALL.into_iter().enumerate() {
             range_bar = range_bar.child(
@@ -1494,7 +1434,13 @@ impl UsagePanel {
                     .tooltip(|window, cx| {
                         Tooltip::new(t("usageStats", "refresh")).build(window, cx)
                     })
-                    .child(VectorIcon::new(ICON_REFRESH, px(14.0)).ink(ui::text_muted())),
+                    .child(if syncing {
+                        ui::spinner(px(14.0), ui::text_muted()).into_any_element()
+                    } else {
+                        VectorIcon::new(ICON_REFRESH, px(14.0))
+                            .ink(ui::text_muted())
+                            .into_any_element()
+                    }),
             )
     }
 
@@ -1665,6 +1611,10 @@ impl UsagePanel {
         };
         let mut main = div().flex().flex_col().gap(px(14.0));
         let now = Instant::now();
+        // 数字滚动由显示器节拍按帧驱动,面板收起或窗口不可见时零后台定时器开销
+        if self.tweens.running(now) {
+            window.request_animation_frame();
+        }
         let hit = cache_hit_rate(
             stats.input_tokens,
             stats.cache_read_tokens,
@@ -1974,12 +1924,9 @@ impl UsagePanel {
         self.rank_bars.sweep();
         self.rank_bars.drive(window);
 
-        // 入场(原版 `usageFadeIn` 是 opacity 0→1 + 下移 6px):不淡入,整块从主体区
-        // 底边上推入位 —— [`crate::motion_kit::shifted`] 只挪绘制位置、不改排版(滚动范围
-        // 不跟着变;`relative` + `top` 改的是排版位置,入场那 350ms 里滚动范围会临时变大),
-        // 主体区自己是裁剪窗。跑完直接不挂包装层
+        // 入场:轻度 18px 上浮入位(只挪绘制位置、不改排版与滚动范围),跑完直接不挂包装层
         let p = self.fade_in.drive(window);
-        let offset = entry_offset(self.body_height.get(), p);
+        let offset = entry_offset(p);
         body.child(if offset <= 0.0 {
             main.into_any_element()
         } else {
@@ -2163,7 +2110,7 @@ impl UsagePanel {
     /// Top 会话列表(`TopSessions.tsx`):
     /// 日期(76px 等宽) | 项目名(150px) | 标题(flex-1) | 横条(110px) | 成本 | 调用数。
     fn render_top_sessions(
-        &self,
+        &mut self,
         stats: &UsageStatsPayload,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2181,7 +2128,9 @@ impl UsagePanel {
         );
         let mut rows = div().flex().flex_col();
         for (i, s) in stats.top_sessions.iter().enumerate() {
-            let ratio = ratios.get(i).copied().unwrap_or(0.0);
+            let row_id = format!("top-{}-{}", s.agent, s.session_id);
+            let target_ratio = ratios.get(i).copied().unwrap_or(0.0);
+            let ratio = self.rank_bars.value(&row_id, target_ratio);
             let session = s.clone();
             let title = if s.title.is_empty() {
                 t("usageStats", "untitled").to_string()
@@ -2190,7 +2139,7 @@ impl UsagePanel {
             };
             rows = rows.child(
                 div()
-                    .id(SharedString::from(format!("top-{}-{}", s.agent, s.session_id)))
+                    .id(SharedString::from(row_id))
                     .flex()
                     .items_center()
                     .gap(px(12.0))
@@ -2695,18 +2644,16 @@ mod tests {
         crate::motion::with_reduce(true, || assert!(!mt_ui::motion::blinks()));
     }
 
-    /// 主体入场是整块上推,不淡入:起点整整一个主体区高(整块在底边之外),终点精确归零。
+    /// 主体入场是克制的 18px 轻度上浮,不淡入,终点精确归零。
     #[test]
     fn 主体入场从底边上推入位() {
-        assert_eq!(entry_offset(500.0, 0.0), 500.0);
-        assert_eq!(entry_offset(500.0, 0.5), 250.0);
-        assert_eq!(entry_offset(500.0, 1.0), 0.0, "终点必须精确归零");
-        assert_eq!(entry_offset(500.0, 1.4), 0.0, "越界钳住");
-        // 还没量到主体区高度:按兜底距离推
-        assert_eq!(entry_offset(0.0, 0.0), ENTRY_FALLBACK_SHIFT);
+        assert_eq!(entry_offset(0.0), ENTRY_SHIFT_PX);
+        assert_eq!(entry_offset(0.5), ENTRY_SHIFT_PX * 0.5);
+        assert_eq!(entry_offset(1.0), 0.0, "终点必须精确归零");
+        assert_eq!(entry_offset(1.4), 0.0, "越界钳住");
         let mut prev = f32::INFINITY;
         for i in 0..=20 {
-            let y = entry_offset(500.0, i as f32 / 20.0);
+            let y = entry_offset(i as f32 / 20.0);
             assert!(y <= prev, "上推全程单调");
             prev = y;
         }

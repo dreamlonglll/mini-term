@@ -36,8 +36,11 @@ impl Tween {
         }
     }
 
-    /// 改目标:起点取**当前显示值**(动画中途目标又变时从当前值继续)。
+    /// 改目标:目标值未变时保持既有补间不重起;真变了才从**当前显示值**起步。
     fn retarget(&mut self, to: f64, now: Instant) {
+        if (to - self.to).abs() < 1e-6 {
+            return;
+        }
         let from = self.value(now);
         *self = Self {
             from,
@@ -51,7 +54,8 @@ impl Tween {
         if self.from == self.to || !mt_ui::motion::animations_enabled() {
             return 1.0;
         }
-        (now.duration_since(self.start).as_secs_f32() * 1000.0 / TWEEN_MS).clamp(0.0, 1.0)
+        (now.saturating_duration_since(self.start).as_secs_f32() * 1000.0 / TWEEN_MS)
+            .clamp(0.0, 1.0)
     }
 
     pub(super) fn value(&self, now: Instant) -> f64 {
@@ -144,5 +148,10 @@ mod tests {
         assert!((t.value(later) - 100.0).abs() < 1e-6);
         // 超时之后不许越过目标
         assert!((t.value(now + Duration::from_secs(10)) - 100.0).abs() < 1e-6);
+
+        // 同值重设目标不重起补间(自动刷新返回相同数据时保持静止)
+        t.retarget(100.0, later);
+        assert!(t.done(later));
+        assert!((t.value(later) - 100.0).abs() < 1e-6);
     }
 }

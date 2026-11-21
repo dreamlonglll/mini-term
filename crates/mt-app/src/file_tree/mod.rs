@@ -855,6 +855,7 @@ impl FileTree {
             self.watcher.unwatch(&dir);
         }
         self.entries.clear();
+        self.chevrons.clear();
         self.loading.clear();
         self.dir_request_ids.clear();
         self.pending_reload.clear();

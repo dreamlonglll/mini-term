@@ -69,6 +69,11 @@ impl FlipTweens {
         }
     }
 
+    /// 清空全部在飞记录(切项目 / 换仓库 / 关设置窗时调,免得旧补间残留到新上下文)。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// 记一笔:`key` 刚从 `from` 翻向 `to`。在飞的那条从**当前显示值**掉头,不跳变;
     /// 没在飞的从 `from` 起播。顺手丢掉已经跑完的条目(表只随用户的点击增长)。
     pub fn flip_at(&mut self, key: impl Into<String>, from: f32, to: f32, now: Instant) {

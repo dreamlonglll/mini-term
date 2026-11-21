@@ -3,10 +3,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 use gpui::StyledImage as _;
 use gpui::{
-    AnimationExt as _, AnyView, App, AppContext, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
-    StyleRefinement, Styled, Subscription, Task, Window, WindowBounds, div, point,
-    prelude::FluentBuilder, px, size,
+    AnyView, App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, StyleRefinement,
+    Styled, Subscription, Task, Window, WindowBounds, div, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::WindowExt as _;
@@ -79,10 +78,6 @@ enum HotkeyPage {
 const DEFAULT_COLUMNS: [f64; 2] = [520.0, 1000.0];
 const DEFAULT_MIDDLE: [f64; 2] = [320.0, 380.0];
 
-/// 浮层退场后 DOM 还留多久(`src/hooks/useOverlayMotion.ts:19` 的 `OVERLAY_EXIT_MS`)。
-/// 动画时长本身一律取 `mt_ui::motion` 的规格常量(`OVERLAY_IN` / `OVERLAY_OUT` /
-/// `PANEL_SWAP` / `TAB_INDICATOR`),这里只是驻留时长。
-const OVERLAY_EXIT_MS: u64 = 400;
 /// 右抽屉里当前是哪一块。对应 `store.ts:685` 的
 /// `rightDrawer: 'sessions' | 'git' | null` —— **运行时态,互斥单抽屉,
 /// 不持久化开合**(每次启动收起)。落盘的只有宽度。
@@ -99,23 +94,6 @@ impl DrawerPanel {
             DrawerPanel::Git => "git",
         }
     }
-}
-
-/// 抽屉退场动画的驻留。原版 `useOverlayPresence` + `OVERLAY_EXIT_MS = 400`:
-/// 关闭时 DOM 与**面板内容**都多留 400ms,否则「抽屉在滑出的同时内容先空掉」
-/// (`RightDrawer.tsx:29-30` 原注释)。
-struct DrawerExit {
-    panel: DrawerPanel,
-    _timer: Task<()>,
-}
-
-/// 提交详情栏的退场:取消选中 / 关栏时它向右收回抽屉左缘,播完才卸(与 [`DrawerExit`]
-/// 同一种驻留)。期间画的是同一个实体 —— 栏已从正常位置撤下,不会同帧挂两份。
-struct DetailExit {
-    pane: Entity<git_history::CommitDetailPane>,
-    /// 收起那一刻的栏宽。
-    width: f32,
-    transition: mt_ui::motion::Transition,
 }
 
 /// 中栏开合时栏里内容的方向性位移。栏宽照旧一次跳到位(PTY resize 一次是停靠面板的
@@ -162,9 +140,22 @@ fn middle_content_left(entering: bool, progress: f32) -> f32 {
     }
 }
 
-/// 提交详情栏退场这一帧里层的 `left`(像素):从 0 收到整栏宽(滑进抽屉左缘后面)。
-fn detail_exit_left(width: f32, progress: f32) -> f32 {
-    width * progress.clamp(0.0, 1.0)
+/// 右抽屉(连同左侧展开着的提交详情栏)这一帧的 `right`(像素):
+/// 全开(`progress = 1.0`)严丝合缝贴在右缘 0;全收(`0.0`)把「抽屉 + 当前露出的详情栏」
+/// 整块送出视口右缘,不会在关闭时把详情栏卡在右缘外面。
+fn drawer_slide_right(drawer_width: f32, detail_visible_width: f32, progress: f32) -> f32 {
+    let p = progress.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        0.0
+    } else {
+        -(drawer_width + detail_visible_width.max(0.0)) * (1.0 - p)
+    }
+}
+
+/// 提交详情栏这一帧里层的 `left`(像素):收起(`0.0`)整栏藏在抽屉左缘后面,全开(`1.0`)落到 0。
+fn detail_slide_left(width: f32, progress: f32) -> f32 {
+    let p = progress.clamp(0.0, 1.0);
+    if p >= 1.0 { 0.0 } else { width * (1.0 - p) }
 }
 
 /// 右抽屉(或它左侧的提交详情栏)左缘拖拽的一次会话。
@@ -290,18 +281,24 @@ pub(crate) struct Workspace {
     last_viewport: Size<Pixels>,
     /// 右侧悬浮抽屉现在开着哪一块(运行时态,不持久化 —— 与旧版一致)。
     right_drawer: Option<DrawerPanel>,
-    /// 正在播退场动画的那一块(见 [`DrawerExit`])。
-    drawer_exit: Option<DrawerExit>,
+    /// 右抽屉的开合在场度(进场 `OVERLAY_IN` / 退场 `OVERLAY_OUT`,支持半路掉头与关动画即卸)。
+    drawer_presence: overlay_motion::Presence,
+    /// 最近打开过的那块抽屉面板:退场动画播完前继续渲染它,播完清掉。
+    drawer_last_panel: Option<DrawerPanel>,
     /// 抽屉**换面板**的整幅 push(会话在左、Git 在右,见 [`drawer_panel_order`])。开抽屉
     /// 不播(那有整层滑入),所以由 [`Self::set_drawer`] 显式驱动,不在 render 里比对。
     drawer_swap: motion_kit::KeyedSwap<DrawerPanel>,
     /// 抽屉段控件滑动选中块的位置(容器宽的分数:0 = 会话那一半,0.5 = Git 那一半)。
     /// 只在换面板时补间;开抽屉直接落位(见 [`drawer_tab_left`])。
     drawer_tab: mt_ui::motion::ValueTween,
-    /// 提交详情栏的退场(见 [`DetailExit`])。
-    detail_exit: Option<DetailExit>,
-    /// 上一帧画着的提交详情栏(实体 + 栏宽):这一帧没了就起退场。
-    detail_seen: Option<(Entity<git_history::CommitDetailPane>, f32)>,
+    /// 提交详情栏的开合在场度(进出场统一,支持半路掉头与关动画即卸)。
+    detail_presence: overlay_motion::Presence,
+    /// 当前或正在退场的提交详情栏(实体 + 栏宽),退场播完自动释放。
+    detail_last: Option<(Entity<git_history::CommitDetailPane>, f32)>,
+    /// 左侧边条上独立隔离的 8px 闪烁圆点视图(AI 状态角标 / 更新提示蓝点),
+    /// 避免 `PulsePump` 每 100ms 标脏整棵 `Workspace`。
+    ai_status_dot: Entity<activity_bar::CornerDotView>,
+    update_dot: Entity<activity_bar::CornerDotView>,
     /// 中栏开合的内容滑入 / 滑出(见 [`MiddleMotion`])。
     middle_motion: Option<MiddleMotion>,
     /// 上一帧中栏开着没有(`None` = 还没画过:首帧只记下,不播)。
@@ -358,6 +355,9 @@ impl Workspace {
         // 根视图的 render 直接读 store(三栏比例、徽标、未读数、背景……),
         // 任何变化都照旧重画。
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 子视图挂起的整窗覆盖物(如 Markdown 预览里的 ImageLightbox)改完覆盖物栈后
+        // 推进 OverlayRevision,这里必须收到通知以同步抓拍 / 释放毛玻璃快照。
+        overlay::observe_in(cx);
         // 托盘只在它读的数据变了时才重算快照。**推送时机就这一处** —— 原版在七个
         // 调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 / 关项目 / 改布局 /
         // 清未读 / 焦点变化 / 托盘配置变化 …),对应的正是
@@ -496,6 +496,11 @@ impl Workspace {
             });
         });
 
+        let ai_status_dot = cx.new(|_| {
+            activity_bar::CornerDotView::new(ui::status_color(crate::tree::StatusLight::Idle), false)
+        });
+        let update_dot = cx.new(|_| activity_bar::CornerDotView::new(ui::accent(), false));
+
         let mut workspace = Self {
             store,
             menu_layer: menu::layer(cx),
@@ -513,11 +518,20 @@ impl Workspace {
             middle_state,
             last_viewport: window.viewport_size(),
             right_drawer: None,
-            drawer_exit: None,
+            drawer_presence: overlay_motion::Presence::hidden(
+                mt_ui::motion::OVERLAY_IN,
+                mt_ui::motion::OVERLAY_OUT,
+            ),
+            drawer_last_panel: None,
             drawer_swap: motion_kit::KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
             drawer_tab: mt_ui::motion::ValueTween::settled(0.0, mt_ui::motion::TAB_INDICATOR),
-            detail_exit: None,
-            detail_seen: None,
+            detail_presence: overlay_motion::Presence::hidden(
+                mt_ui::motion::OVERLAY_IN,
+                mt_ui::motion::OVERLAY_OUT,
+            ),
+            detail_last: None,
+            ai_status_dot,
+            update_dot,
             middle_motion: None,
             middle_seen: None,
             drawer_drag: None,
@@ -833,25 +847,22 @@ impl Workspace {
         )
     }
 
-    /// Git 抽屉左侧的「提交详情」栏(内容与开合口径见 `git_history::detail` 模块注释)。
+    /// Git 抽屉左侧的「提交详情」栏(进出场统一由 [`Self::detail_presence`] 驱动,
+    /// 支持半路掉头与关动画即卸)。
     ///
-    /// 挂在抽屉层里当子节点、`right` = 抽屉宽:紧贴抽屉左缘往左排,随抽屉一起滑进滑出、
-    /// 随抽屉拖宽一起左移;停在终端页时同样盖在终端之上、不改终端尺寸(PTY 不 resize),
-    /// 停在文件 / diff 页签上时连同抽屉一起挤窄页签区(见 [`drawer_squeeze`])。
-    ///
-    /// 进场从抽屉左缘**滑出来**:外壳按栏宽裁剪,里层的 `left` 从栏宽补到 0 —— 方向性
-    /// 位移、零尺寸变化;与抽屉进场同一条时长与缓动,同样不过减弱动效的闸。外壳 `id`
-    /// 不变,换选中的提交不重播,只有栏从无到有(单击打开、抽屉重新打开)才播。
-    ///
-    /// 宽度(`width`,由 [`Self::detail_width`] 算好传进来 —— 挤占页签区也按它)落
-    /// layout.db(左缘拖拽,松手落盘)。
-    ///
-    /// 退场(取消选中 / 关栏)见 [`Self::render_detail_exit_layer`]。
+    /// - 进场/退场靠里层 `left = detail_slide_left(width, progress)` 从抽屉左缘滑出/收回,
+    ///   零尺寸变化;
+    /// - 底色用不透明的 `ui::bg_overlay()`(与抽屉本体同档),外置主题包背景图下不透叠影;
+    /// - `native_view::occluder()` 挂在随 `left` 滑动的内层里,只抠当前实际盖住 WebView2 的区域;
+    /// - `interactive = false`(栏自己退场或整个抽屉退场)时不画拖拽手柄,并在里层末尾盖透明
+    ///   `.occlude()` 阻止点击与悬停穿透到旧内容。
     fn render_commit_detail_layer(
         &self,
         pane: Entity<git_history::CommitDetailPane>,
         drawer_width: f32,
         width: f32,
+        progress: f32,
+        interactive: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         div()
@@ -862,102 +873,57 @@ impl Workspace {
             .h_full()
             .w(px(width))
             .overflow_hidden()
-            .occlude()
-            // 盖在文档页上时,这块同样从 HTML 预览 WebView 的显示与点击里让出来
-            .child(native_view::occluder())
             .child(
                 div()
                     .id("git-detail-panel")
                     .absolute()
                     .top_0()
-                    .left_0()
+                    .left(px(detail_slide_left(width, progress)))
                     .h_full()
                     .w(px(width))
+                    .when(interactive, |el| el.occlude())
                     .flex()
                     .flex_col()
-                    .bg(ui::bg_surface())
+                    .bg(ui::bg_overlay())
+                    // 挂在滑动内层里:只把此刻真盖着 WebView2 的区域抠出来
+                    .child(native_view::occluder())
                     .border_l_1()
                     .border_color(ui::border_default())
                     .child(pane)
-                    // 左缘拖拽手柄(同抽屉那条:往左拖 = 变宽)
-                    .child(
-                        div()
-                            .id("git-detail-resize-handle")
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .h_full()
-                            .w(px(6.0))
-                            .cursor_col_resize()
-                            .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
-                            .on_mouse_down(
-                                gpui::MouseButton::Left,
-                                cx.listener(
-                                    move |this: &mut Self,
-                                          event: &gpui::MouseDownEvent,
-                                          _window,
-                                          cx| {
-                                        cx.stop_propagation();
-                                        this.detail_drag = Some(DrawerDrag {
-                                            start_x: event.position.x,
-                                            start_width: width as f64,
-                                            width: width as f64,
-                                        });
-                                    },
+                    .when(interactive, |el| {
+                        // 左缘拖拽手柄(同抽屉那条:往左拖 = 变宽)
+                        el.child(
+                            div()
+                                .id("git-detail-resize-handle")
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .h_full()
+                                .w(px(6.0))
+                                .cursor_col_resize()
+                                .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(
+                                        move |this: &mut Self,
+                                              event: &gpui::MouseDownEvent,
+                                              _window,
+                                              cx| {
+                                            cx.stop_propagation();
+                                            this.detail_drag = Some(DrawerDrag {
+                                                start_x: event.position.x,
+                                                start_width: width as f64,
+                                                width: width as f64,
+                                            });
+                                        },
+                                    ),
                                 ),
-                            ),
-                    )
-                    .with_animation(
-                        "git-detail-slide-in",
-                        mt_ui::motion::OVERLAY_IN.animation(),
-                        move |el, delta| el.left(px(width * (1.0 - delta))),
-                    ),
-            )
-    }
-
-    /// 提交详情栏的退场层:与进场同一个外壳(按栏宽裁剪、贴着抽屉左缘),里层的 `left`
-    /// 从 0 补到栏宽 —— 向右收回抽屉左缘后面,方向与进场相反、零尺寸变化
-    /// ([`mt_ui::motion::OVERLAY_OUT`])。外壳 `id` 与进场那层不同:退场期间进场层不在
-    /// 树上,它的动画状态随之丢掉,再选中一个提交照旧从头滑出来。没有左缘手柄。
-    ///
-    /// 拦鼠标的是**里层末尾**那张透明罩(随内容滑、被外壳裁剪):外壳上的 `occlude` 挡不住
-    /// 自己的子元素(外壳的命中框先于子元素插入,命中从后往前找),退场中的栏照样接
-    /// 「查看变更 / 关闭 / 文件行」的点击;罩在外壳上又会让内容滑走后空出来的那块继续
-    /// 吞掉底下的点击。
-    ///
-    /// 文件页上的挤占(`drawer_squeeze`)在收起那一刻就一帧放回原宽、不补间(逐帧重排
-    /// 文件页不值),这一层照旧盖在页签区上方滑走,两者互不牵扯。
-    fn render_detail_exit_layer(
-        exit: &DetailExit,
-        drawer_width: f32,
-        window: &Window,
-    ) -> impl IntoElement + use<> {
-        let progress = exit.transition.drive(window);
-        let width = exit.width;
-        div()
-            .id("git-detail-exit")
-            .absolute()
-            .top_0()
-            .right(px(drawer_width))
-            .h_full()
-            .w(px(width))
-            .overflow_hidden()
-            .child(native_view::occluder())
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(detail_exit_left(width, progress)))
-                    .h_full()
-                    .w(px(width))
-                    .flex()
-                    .flex_col()
-                    .bg(ui::bg_surface())
-                    .border_l_1()
-                    .border_color(ui::border_default())
-                    .child(exit.pane.clone())
-                    // 退场中的内容不接悬停与点击(见上)
-                    .child(div().absolute().inset_0().occlude()),
+                        )
+                    })
+                    .when(!interactive, |el| {
+                        // 退场中的内容不接悬停与点击
+                        el.child(div().absolute().inset_0().occlude())
+                    }),
             )
     }
 

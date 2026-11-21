@@ -132,6 +132,7 @@ impl ImageLightbox {
         cx: &mut Context<Self>,
     ) -> Self {
         overlay::push(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
+        overlay::notify_changed(cx);
         let prev_focus = window.focused(cx);
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
@@ -273,10 +274,12 @@ impl ImageLightbox {
         self.drag = None;
         self.restore_focus(window, cx);
         self.unregister();
+        overlay::notify_changed(cx);
         let now = Instant::now();
         self.presence.hide(now);
-        if self.presence.mounted_at(now) {
-            overlay_motion::linger(cx.entity().into(), OVERLAY_OUT.duration, cx);
+        let remaining = self.presence.remaining_at(now);
+        if !remaining.is_zero() {
+            overlay_motion::linger(cx.entity().into(), remaining, cx);
         }
         cx.notify();
         cx.emit(ImageLightboxEvent::Dismissed);
@@ -556,6 +559,13 @@ impl Render for ImageLightbox {
         let toolbar = self.render_toolbar(hidden * (8.0 + TOOLBAR_H), cx);
         let hint = self.render_hint(hidden * (10.0 + HINT_H));
 
+        // 阴影随开合进度同步淡入淡出，避免图片缩到 0×0 一点时仍拖着满强度阴影
+        let mut img_shadows = overlay_motion::chrome_style(|el| el.shadow_lg()).box_shadow;
+        let shadow_alpha = progress.clamp(0.0, 1.0);
+        for shadow in img_shadows.iter_mut() {
+            shadow.color.a *= shadow_alpha;
+        }
+
         div().child(
             deferred(
                 anchored().position(point(px(0.0), px(0.0))).child(
@@ -587,7 +597,7 @@ impl Render for ImageLightbox {
                                 .w(px(frame.size.width))
                                 .h(px(frame.size.height))
                                 .rounded(px(6.0))
-                                .shadow_lg()
+                                .shadow(img_shadows)
                                 .object_fit(gpui::ObjectFit::Fill),
                         )
                         .child(toolbar)

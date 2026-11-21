@@ -24,8 +24,8 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Div, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, Context, Div, Entity, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Render, RenderOnce, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::ActiveTheme as _;
@@ -493,6 +493,7 @@ pub fn update_button<F>(
     key: &'static str,
     tip: impl Into<SharedString>,
     label_visible: bool,
+    dot: Entity<CornerDotView>,
     on_hover: F,
 ) -> Stateful<Div>
 where
@@ -514,10 +515,7 @@ where
         .child(VectorIcon::new(UPDATE, px(ICON)).ink(ui::accent()))
         // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
         //  border border-[var(--bg-surface)] animate-blink`
-        .child(CornerDot {
-            color: ui::accent(),
-            blinking: update_dot_blinks(),
-        });
+        .child(corner_dot_slot(dot));
 
     with_hover_label(button, tip.into(), label_visible, on_hover)
 }
@@ -622,6 +620,8 @@ where
 ///
 /// 档位含第五档「等你处理」:颜色走 [`ui::status_color`] 的 attention 色,**不闪** ——
 /// 等人的状态靠颜色说话,与状态灯本体静止的口径一致。
+/// 轻量内联角标（供已具备独立小视图边界的面板如 `TerminalsPanel` 直接挂载；
+/// 顶层 `Workspace` 侧栏按钮请走 [`CornerDotView`] + [`corner_dot_slot`] 隔离刷新）。
 pub fn status_badge(light: StatusLight) -> AnyElement {
     CornerDot {
         color: ui::status_color(light),
@@ -630,12 +630,6 @@ pub fn status_badge(light: StatusLight) -> AnyElement {
     .into_any_element()
 }
 
-/// 按钮右上角那颗 8px 圆点。全局 AI 徽标([`status_badge`])与「有新版本」按钮
-/// ([`update_button`])共用同一颗,差别只有配色与闪不闪。
-///
-/// 闪烁相位来自 `mt_ui::motion::pulse_phase` 的低频泵 —— **不用**
-/// `with_animation(..repeat())`,那条路每帧请求重绘,一颗 8px 的点就能把
-/// 整窗钉在满帧率上。静态档连泵都不挂。
 #[derive(IntoElement)]
 struct CornerDot {
     color: Hsla,
@@ -644,10 +638,71 @@ struct CornerDot {
 
 impl RenderOnce for CornerDot {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let dot = div()
+        let (side, inset, opacity) = if self.blinking {
+            let delta = mt_ui::motion::pulse_phase(BLINK_PERIOD, window, cx);
+            blink_dot_frame(crate::title_bar::blink_phase(delta))
+        } else {
+            (DOT_SIZE, DOT_INSET, 1.0)
+        };
+
+        div()
             .absolute()
-            .top(px(DOT_INSET))
-            .right(px(DOT_INSET))
+            .top(px(inset))
+            .right(px(inset))
+            .w(px(side))
+            .h(px(side))
+            .rounded_full()
+            .border_1()
+            .border_color(ui::bg_surface())
+            .bg(self.color)
+            .opacity(opacity)
+    }
+}
+
+/// 把独立角标视图定位到按钮右上角（8×8 绝对定位壳，不参与按钮内部 flex 居中）。
+pub fn corner_dot_slot(dot: Entity<CornerDotView>) -> AnyElement {
+    div()
+        .absolute()
+        .top(px(DOT_INSET))
+        .right(px(DOT_INSET))
+        .w(px(DOT_SIZE))
+        .h(px(DOT_SIZE))
+        .child(dot)
+        .into_any_element()
+}
+
+/// 按钮右上角那颗 8px 圆点的独立视图实体。
+///
+/// 全局 AI 徽标与「有新版本」按钮共用这一视图。拆成独立 `Entity` 而不是在
+/// `Workspace::render` 里内联 `RenderOnce`，是为了给 `mt_ui::motion::pulse_phase`
+/// 提供一颗 8×8 的最小 `window.current_view()` 刷新边界：AI 思考中或有更新蓝点时，
+/// 保底泵每 100ms（后台 500ms）只标脏这一颗小圆点，不再拖着整棵 `Workspace` 重跑。
+pub struct CornerDotView {
+    color: Hsla,
+    blinking: bool,
+}
+
+impl CornerDotView {
+    pub fn new(color: Hsla, blinking: bool) -> Self {
+        Self { color, blinking }
+    }
+
+    /// 同步配色与闪烁开关；值未变时不发 `notify`，避免在父视图 render 中循环触发。
+    pub fn sync(&mut self, color: Hsla, blinking: bool, cx: &mut Context<Self>) {
+        if self.color != color || self.blinking != blinking {
+            self.color = color;
+            self.blinking = blinking;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for CornerDotView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut dot = div()
+            .absolute()
+            .top_0()
+            .right_0()
             .w(px(DOT_SIZE))
             .h(px(DOT_SIZE))
             .rounded_full()
@@ -655,16 +710,20 @@ impl RenderOnce for CornerDot {
             .border_color(ui::bg_surface())
             .bg(self.color);
 
-        if !self.blinking {
-            return dot;
+        if self.blinking {
+            let delta = mt_ui::motion::pulse_phase(BLINK_PERIOD, window, cx);
+            let (side, inset, opacity) = blink_dot_frame(crate::title_bar::blink_phase(delta));
+            // 外壳已锚在 (DOT_INSET, DOT_INSET)，这里只需补相对壳的半差值即可绕中心缩放
+            let local_inset = inset - DOT_INSET;
+            dot = dot
+                .w(px(side))
+                .h(px(side))
+                .top(px(local_inset))
+                .right(px(local_inset))
+                .opacity(opacity);
         }
-        let delta = mt_ui::motion::pulse_phase(BLINK_PERIOD, window, cx);
-        let (side, inset, opacity) = blink_dot_frame(crate::title_bar::blink_phase(delta));
-        dot.w(px(side))
-            .h(px(side))
-            .top(px(inset))
-            .right(px(inset))
-            .opacity(opacity)
+
+        div().size_full().relative().child(dot)
     }
 }
 

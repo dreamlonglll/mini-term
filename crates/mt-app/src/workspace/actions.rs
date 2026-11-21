@@ -281,24 +281,57 @@ impl Workspace {
         if self.right_drawer == next {
             return;
         }
+        let now = std::time::Instant::now();
         let prev = self.right_drawer;
         self.right_drawer = next;
         // 换面板才播 push / 滑块;从收着打开直接落位(开抽屉本身有整层滑入)
         match (prev, next) {
             (Some(old), Some(new)) => {
+                self.drawer_last_panel = Some(new);
                 self.drawer_swap
                     .observe(&new, |_, _| drawer_panel_order(old, new));
-                self.drawer_tab
-                    .retarget_at(drawer_tab_left(new), std::time::Instant::now());
+                self.drawer_tab.retarget_at(drawer_tab_left(new), now);
             }
             (None, Some(new)) => {
+                self.drawer_last_panel = Some(new);
+                self.drawer_presence.show(now);
                 self.drawer_swap.jump(&new);
                 self.drawer_tab = mt_ui::motion::ValueTween::settled(
                     drawer_tab_left(new),
                     mt_ui::motion::TAB_INDICATOR,
                 );
+                // 重新打开 Git 抽屉时若本来就选着一条提交:随整层抽屉一起滑入即可,
+                // 详情栏一步到位,避免双重滑入叠加。
+                if new == DrawerPanel::Git && self.git_panel.read(cx).detail_pane(cx).is_some() {
+                    self.detail_presence.retarget(1.0, now, false);
+                } else {
+                    self.detail_presence = overlay_motion::Presence::hidden(
+                        mt_ui::motion::OVERLAY_IN,
+                        mt_ui::motion::OVERLAY_OUT,
+                    );
+                    self.detail_last = None;
+                }
             }
-            _ => {}
+            (Some(old), None) => {
+                self.drawer_last_panel = Some(old);
+                self.drawer_presence.hide(now);
+                self.drawer_drag = None;
+                self.detail_drag = None;
+                // 整层抽屉收起时把详情栏当前开合进度定格为刚体,随抽屉一并滑出视口右缘;
+                // 关动画模式立即卸载,零残留。
+                if !self.drawer_presence.mounted_at(now) {
+                    self.drawer_last_panel = None;
+                    self.detail_last = None;
+                    self.detail_presence = overlay_motion::Presence::hidden(
+                        mt_ui::motion::OVERLAY_IN,
+                        mt_ui::motion::OVERLAY_OUT,
+                    );
+                } else if self.detail_last.is_some() {
+                    let frozen = self.detail_presence.value_at(now);
+                    self.detail_presence.retarget(frozen, now, false);
+                }
+            }
+            (None, None) => {}
         }
         self.session_panel.update(cx, |panel, cx| {
             panel.set_visible(next == Some(DrawerPanel::Sessions), cx)
@@ -306,24 +339,6 @@ impl Workspace {
         self.git_panel.update(cx, |panel, cx| {
             panel.set_visible(next == Some(DrawerPanel::Git), cx)
         });
-
-        // 整块收起时留 400ms 给退场动画(面板实体必须还在树上,否则「抽屉在
-        // 滑出的同时内容先空掉」)。换面板不进退场:那是 panel-swap 的活。
-        self.drawer_exit = match (prev, next) {
-            (Some(panel), None) => Some(DrawerExit {
-                panel,
-                _timer: cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(OVERLAY_EXIT_MS))
-                        .await;
-                    let _ = this.update(cx, |this: &mut Self, cx| {
-                        this.drawer_exit = None;
-                        cx.notify();
-                    });
-                }),
-            }),
-            _ => None,
-        };
         cx.notify();
     }
 

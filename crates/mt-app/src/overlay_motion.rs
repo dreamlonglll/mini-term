@@ -92,6 +92,12 @@ impl Presence {
         self.value_at(now) > 0.0 || self.running_at(now)
     }
 
+    /// 从 `now` 起还要动多久(0 = 已静止)。给离场托管 [`linger`] 传真实剩余时长,
+    /// 避免半路折返或关动画模式仍多挂一整段退场定时。
+    pub fn remaining_at(&self, now: Instant) -> Duration {
+        (self.start + self.duration).saturating_duration_since(now)
+    }
+
     /// 朝 `target`(0 / 1)走。从**当前显示值**起步,时长按剩余路程折算;
     /// `animate = false` 时直接到位。
     pub fn retarget(&mut self, target: f32, now: Instant, animate: bool) {
@@ -586,7 +592,7 @@ mod tests {
         p.retarget(0.0, mid, true);
         assert!((p.value_at(mid) - before).abs() < 1e-6, "掉头那一刻不跳变");
         assert_eq!(
-            p.remaining_for_test(mid),
+            p.remaining_at(mid),
             OVERLAY_OUT.duration.mul_f32(before),
             "只走回去那一段"
         );
@@ -609,11 +615,6 @@ mod tests {
         assert_eq!(r.value_at(t0), 1.0);
         r.retarget(0.0, t0, false);
         assert!(!r.mounted_at(t0));
-    }
-
-    impl Presence {
-        fn remaining_for_test(&self, now: Instant) -> Duration {
-            (self.start + self.duration).saturating_duration_since(now)
-        }
+        assert_eq!(r.remaining_at(t0), Duration::ZERO);
     }
 }

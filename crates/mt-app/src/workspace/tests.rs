@@ -1,7 +1,7 @@
 use super::*;
 
 /// 中栏内容层:滑入从整幅在左推到 0、滑出从 0 推到整幅在左,端点精确(残留零点几会让
-/// 中栏内容永远错位);提交详情栏退场从 0 收到整栏宽。
+/// 中栏内容永远错位);右抽屉与提交详情栏进出场端点精确,带着详情栏关抽屉整体滑出视口右缘。
 #[test]
 fn 中栏与详情栏的位移端点精确() {
     assert_eq!(middle_content_left(true, 0.0), -1.0);
@@ -10,9 +10,17 @@ fn 中栏与详情栏的位移端点精确() {
     assert_eq!(middle_content_left(false, 0.0), 0.0);
     assert_eq!(middle_content_left(false, 1.0), -1.0);
     assert_eq!(middle_content_left(false, 2.0), -1.0, "越界钳住");
-    assert_eq!(detail_exit_left(320.0, 0.0), 0.0);
-    assert_eq!(detail_exit_left(320.0, 0.5), 160.0);
-    assert_eq!(detail_exit_left(320.0, 1.5), 320.0);
+    assert_eq!(detail_slide_left(320.0, 1.0), 0.0);
+    assert_eq!(detail_slide_left(320.0, 0.5), 160.0);
+    assert_eq!(detail_slide_left(320.0, 0.0), 320.0);
+    assert_eq!(detail_slide_left(320.0, 1.5), 0.0, "越界钳住");
+    // 单抽屉滑出
+    assert_eq!(drawer_slide_right(360.0, 0.0, 1.0), 0.0);
+    assert_eq!(drawer_slide_right(360.0, 0.0, 0.0), -360.0);
+    // 带着 420px 提交详情栏关闭抽屉:终点必须把 360 + 420 整块送出视口右缘
+    assert_eq!(drawer_slide_right(360.0, 420.0, 1.0), 0.0);
+    assert_eq!(drawer_slide_right(360.0, 420.0, 0.5), -390.0);
+    assert_eq!(drawer_slide_right(360.0, 420.0, 0.0), -780.0);
 }
 
 /// 中栏半路掉头不跳:收到一半又展开(或反过来),新一场从 `1 − 进度` 起步,

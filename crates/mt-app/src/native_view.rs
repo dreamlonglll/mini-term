@@ -1,19 +1,19 @@
-//! 原生子视图(系统 WebView)与 GPUI 画面的合成:**挖洞** + **逐帧对账**。
+//! 原生子视图(系统 WebView)与 GPUI 画面的合成:**挖洞 / 裁区域** + **逐帧对账**。
 //!
-//! # 为什么要挖洞
+//! # 合成层级（gpui-fast 现状）
 //!
-//! gpui-pre 在 Windows 上把整窗画面交给 DirectComposition,目标建成 topmost
-//! (`gpui-pre-windows` `directx_renderer.rs`:`CreateTargetForHwnd(hwnd, true)`),
-//! 窗口还带 `WS_EX_NOREDIRECTIONBITMAP` —— GPUI 的画面**永远盖在子窗口之上**。
-//! WebView2 是子窗口,照常接进来会被整块底色盖住、一个像素都看不见(09-25 探针实测:
-//! 普通子窗口、给容器补 `WS_EX_LAYERED` 都是整块底色)。
+//! 本仓早期在 `gpui-pre-windows` 上采用 topmost DirectComposition
+//! (`CreateTargetForHwnd(hwnd, true)`)，彼时 GPUI 永远盖在子窗口之上、靠挖洞把 WebView2
+//! 透上来。迁至 **`gpui-fast-windows`** 后 DirectComposition 目标改为非 topmost
+//! (`CreateTargetForHwnd(hwnd, false)`)，**WebView2 子窗口叠在 GPUI 画面之上**（macOS
+//! 的 `WKWebView` 同样是叠在 Metal 层之上的子 `NSView`）。
 //!
-//! 做法是反过来:GPUI 在 WebView 那块**什么都不画**,再把清屏色改成透明
-//! (`WindowBackgroundAppearance::Transparent`;`Opaque` 会清成不透明白,见同文件
-//! `render`),子窗口就从洞里透上来。附带的好处是 GPUI 自己的浮层(右键菜单、
-//! 弹窗与遮罩、toast、tooltip)天然画在 WebView **之上**,没有「空域」问题。
-//! macOS 的 WKWebView 是叠在 Metal 层之上的子 NSView,本来就看得见,挖洞只是无害
-//! 的空操作;清屏色只在 Windows 上切。
+//! 因此现在两条腿并行：
+//! - 保留透明清屏与挖洞路径（兼容历史与底层透明底色）；
+//! - **所有叠在文档区之上的 GPUI 浮层**（弹窗、右键菜单、日期选择器、浮层面板、抽屉、
+//!   Toast、预览卡等）都**必须**通过 [`occluder`] / [`occlude_rect`]（或
+//!   `overlay_motion::RevealBox::occlude_native(true)`）把自身当前矩形从 WebView2 的
+//!   窗口区域（`SetWindowRgn`）中抠出，否则会被网页正文直接盖住且吃掉点击。
 //!
 //! # 一帧的时序
 //!

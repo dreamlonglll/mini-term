@@ -33,9 +33,6 @@ use super::*;
 
 /// 分屏进场的滑入偏移(新格子从右滑到位;它没有「旧内容」,不走 push)。
 pub(super) const SWAP_SLIDE_PX: f32 = 14.0;
-/// 面板切换 / 最大化还原的整块换场时长(规格 `mt_ui::motion::AREA_SWAP`;这里的毫秒数
-/// 只给「到点摘除」的计时器用)。
-pub(super) const AREA_SWAP_MS: u64 = mt_ui::motion::AREA_SWAP.duration.as_millis() as u64;
 /// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作;规格 `TERMINAL_SWAP`)。
 pub(super) const TAB_SWAP_MS: u64 = mt_ui::motion::TERMINAL_SWAP.duration.as_millis() as u64;
 
@@ -63,6 +60,107 @@ pub(super) fn push_exit_x(dir: f32, delta: f32) -> f32 {
 pub(super) fn reveal_lerp(from: f32, to: f32, delta: f32) -> f32 {
     let d = delta.clamp(0.0, 1.0);
     from + (to - from) * d
+}
+
+/// 最大化 / 还原裁剪窗矩形的插值(进度已被 easing 处理过)。终点严丝合缝返回 `to`。
+pub(super) fn reveal_clip_rect(from: RevealFrom, to: RevealFrom, delta: f32) -> RevealFrom {
+    let d = delta.clamp(0.0, 1.0);
+    if d >= 1.0 {
+        return to;
+    }
+    RevealFrom {
+        left: reveal_lerp(from.left, to.left, d),
+        top: reveal_lerp(from.top, to.top, d),
+        width: reveal_lerp(from.width, to.width, d),
+        height: reveal_lerp(from.height, to.height, d),
+    }
+}
+
+/// 单时钟驱动的裁剪窗展开 / 收回元素(最大化与还原共用)。
+///
+/// 布局交给全尺寸内容(PTY 零逐帧 resize);prepaint 时将内容左上角通过 `with_element_offset`
+/// 钉在裁剪窗左上角 `(clip.left, clip.top)`,再用 `with_content_mask` 裁出当前裁剪窗:
+/// 1. 裁剪窗与内容偏移出自同一帧同一个 `Transition` 进度,彻底消除双 `with_animation` 的 1px 抖动;
+/// 2. 内容左上角跟随裁剪窗从原位滑到 `(0, 0)`,右/下分屏展开时始终直接展示该终端的 tab 栏与正文,
+///    不再露出纯黑空白区。
+pub(super) struct ClipReveal {
+    child: AnyElement,
+    clip: RevealFrom,
+}
+
+pub(super) fn clip_reveal(child: impl IntoElement, clip: RevealFrom) -> ClipReveal {
+    ClipReveal {
+        child: child.into_any_element(),
+        clip,
+    }
+}
+
+impl gpui::Element for ClipReveal {
+    type RequestLayoutState = ();
+    type PrepaintState = gpui::ContentMask<Pixels>;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let mask = gpui::ContentMask {
+            bounds: Bounds::new(
+                point(
+                    bounds.origin.x + px(self.clip.left),
+                    bounds.origin.y + px(self.clip.top),
+                ),
+                gpui::size(
+                    px(self.clip.width.max(0.0)),
+                    px(self.clip.height.max(0.0)),
+                ),
+            ),
+        };
+        let offset = point(px(self.clip.left), px(self.clip.top));
+        window.with_content_mask(Some(mask), |window| {
+            window.with_element_offset(offset, |window| {
+                self.child.prepaint(window, cx);
+            });
+        });
+        mask
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        mask: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        window.with_content_mask(Some(*mask), |window| {
+            self.child.paint(window, cx);
+        });
+    }
 }
 /// 一个分组页签区的横向滚动:滚动句柄 + 激活页签的跟随记录。
 #[derive(Default)]
@@ -157,13 +255,15 @@ pub(super) struct TabSwap {
 }
 
 /// 整块内容(面板切换 / 最大化开合)的一次换场。折叠条上换铺满组是瞬切,不进这里。
+///
+/// 统一由单一 [`mt_ui::motion::Transition`] 驱动进度并在播完后由 render 自动收掉,
+/// 不再依赖外部定时器与多条独立 `with_animation` 竞速。
 pub(super) struct AreaSwap {
-    pub(super) seq: u64,
     /// Push/Drift 的方向号(`+1` = 从下方推入 / 上浮落位)。Reveal 不用。
     pub(super) dir: f32,
     pub(super) motion: AreaMotion,
     pub(super) exit: AreaExitSrc,
-    pub(super) _timer: Task<()>,
+    pub(super) transition: mt_ui::motion::Transition,
 }
 
 /// 换场的运动形态。

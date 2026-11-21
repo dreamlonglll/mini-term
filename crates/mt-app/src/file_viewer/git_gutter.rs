@@ -896,14 +896,15 @@ impl FileViewer {
             let line = hunk.new_start.min(last) as u32;
             state.set_cursor_position(Position::new(line, 0), window, cx);
         });
-        let width = self
+        // 切换「上一处/下一处变更」时暂留旧锚点直到下一帧更新到新锚点,避免小窗闪烁消失一帧
+        let (anchor, width) = self
             .gutter
             .popup
             .as_ref()
-            .map_or(px(POPUP_MIN_WIDTH), |p| p.width);
+            .map_or((None, px(POPUP_MIN_WIDTH)), |p| (p.anchor, p.width));
         self.gutter.popup = Some(ChangePopup {
             hunk: target,
-            anchor: None,
+            anchor,
             width,
             copied: false,
         });

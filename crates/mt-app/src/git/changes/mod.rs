@@ -479,6 +479,7 @@ impl GitChanges {
         self.segments.clear();
         self.op_kind = None;
         self.collapsed_dirs.clear();
+        self.chevrons.clear();
         self.invalidate_model();
         self.clear_selection();
         self.target = None;

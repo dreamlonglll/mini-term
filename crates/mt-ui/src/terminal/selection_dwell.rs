@@ -165,6 +165,15 @@ impl DwellTracker {
         self.copied_text = Some(text);
     }
 
+    /// 异常中断本次按压(如丢失 `MouseUp` 或窗口失焦):清掉按压状态并作废未到点的定时器,
+    /// 绝不触发复制或松手补刀。
+    pub fn cancel(&mut self) {
+        self.pressed = false;
+        self.copied = false;
+        self.copied_text = None;
+        self.generation += 1;
+    }
+
     /// 左键松开。
     pub fn on_release(&mut self, cfg: &DwellConfig) -> ReleaseAction {
         let was_pressed = self.pressed;

@@ -91,12 +91,25 @@ impl FrameRect {
     }
 }
 
-/// 开合进度 `progress`(0 = 收起,1 = 全开,已缓动)下,可见框体该画成什么矩形。
+/// 开合进度 `progress`(0 = 收起,1 = 全开,已缓动)下,可见框体该画成什么矩形(顶边锚定)。
 ///
 /// `origin_x` 是原点的横坐标,**相对 `target.left`**,钳在终矩形左右边之间(pane 很窄时按钮
 /// 可能落在框外);原点的纵坐标就是终矩形顶边。起点是以原点为中心的小框,左右两边各自线性
 /// 插值到终矩形的左、右边,高度从顶边往下长 —— 顶边始终不动。
+#[cfg(test)]
 pub fn reveal_rect(progress: f32, target: FrameRect, origin_x: f32) -> FrameRect {
+    reveal_rect_aligned(progress, target, origin_x, false)
+}
+
+/// 开合进度 `progress`(0 = 收起,1 = 全开,已缓动)下可见框体的矩形:
+/// `from_bottom = false` 时顶边不动、向下展开;`from_bottom = true` 时底边不动、向上展开
+/// (贴近窗口底边向上翻转的悬停预览卡 / 浮层用)。
+pub fn reveal_rect_aligned(
+    progress: f32,
+    target: FrameRect,
+    origin_x: f32,
+    from_bottom: bool,
+) -> FrameRect {
     let p = progress.clamp(0.0, 1.0);
     if p >= 1.0 {
         // 全开时就是终矩形本身(免得浮点误差让框体差出零点几像素)
@@ -107,9 +120,14 @@ pub fn reveal_rect(progress: f32, target: FrameRect, origin_x: f32) -> FrameRect
     let left = (origin - half) * (1.0 - p);
     let right = (origin + half) + (target.width - (origin + half)) * p;
     let height = target.height * (REVEAL_START_H + (1.0 - REVEAL_START_H) * p);
+    let top = if from_bottom {
+        target.top + (target.height - height)
+    } else {
+        target.top
+    };
     FrameRect {
         left: target.left + left,
-        top: target.top,
+        top,
         width: right - left,
         height,
     }
@@ -394,6 +412,8 @@ pub struct RevealFrame {
     child: AnyElement,
     state: RevealFrameState,
     chrome: Option<Chrome>,
+    /// 底边不动、从底边往上长(贴底向上翻转的浮层)。
+    from_bottom: bool,
 }
 
 /// 把 `child` 包成带开合动画的浮层。`chrome` 为 `None` 时只裁剪、不画框体。
@@ -406,6 +426,15 @@ pub fn reveal_frame(
         child: child.into_any_element(),
         state,
         chrome,
+        from_bottom: false,
+    }
+}
+
+impl RevealFrame {
+    /// 改为从底边往上展开(默认从顶边往下)。
+    pub fn from_bottom(mut self, from_bottom: bool) -> Self {
+        self.from_bottom = from_bottom;
+        self
     }
 }
 
@@ -453,7 +482,7 @@ impl Element for RevealFrame {
             .state
             .origin_x
             .map_or(target.width / 2.0, |x| f32::from(x) - target.left);
-        let rect = reveal_rect(self.state.progress, target, origin);
+        let rect = reveal_rect_aligned(self.state.progress, target, origin, self.from_bottom);
         let border = self
             .chrome
             .as_ref()
@@ -467,7 +496,8 @@ impl Element for RevealFrame {
         let occlude = self.chrome.as_ref().is_some_and(|chrome| chrome.occlude);
         let hover = self.chrome.as_ref().is_some_and(Chrome::hover_dependent);
         // 开着:框体垫在内容底下(内容照常接鼠标,框体挡住下面的终端);
-        // 收起动画里:盖在内容上面,正在收的浮层不再接任何点击
+        // 收起动画里:仅交互型浮层(occlude=true 或无 chrome)盖在内容上面拦点击,
+        // 悬停预览卡这类 occlude=false 的纯提示层退场不抢鼠标。
         let mut hitbox = if self.state.open && (occlude || hover) {
             Some(window.insert_hitbox(
                 frame,
@@ -483,7 +513,7 @@ impl Element for RevealFrame {
         window.with_content_mask(Some(ContentMask { bounds: mask }), |window| {
             self.child.prepaint(window, cx);
         });
-        if !self.state.open {
+        if !self.state.open && (occlude || self.chrome.is_none()) {
             hitbox = Some(window.insert_hitbox(frame, HitboxBehavior::BlockMouse));
         }
         RevealFramePrepaint {
@@ -514,12 +544,16 @@ impl Element for RevealFrame {
             .hitbox
             .as_ref()
             .is_some_and(|hitbox| hitbox.is_hovered(window));
-        // 底色 + 阴影 → 内容(裁剪窗内)→ 边框压在最上面(`Style::paint` 的顺序)
-        chrome
-            .style(hovered)
-            .paint(prepaint.frame, window, cx, |window, cx| {
-                window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
-            });
+        // 底色 + 阴影 → 内容(裁剪窗内)→ 边框压在最上面(`Style::paint` 的顺序);
+        // 阴影随开合进度同步淡入淡出,避免 progress≈0 时一条细缝拖着满强度大阴影
+        let mut style = chrome.style(hovered);
+        let strength = self.state.progress.clamp(0.0, 1.0);
+        for shadow in style.box_shadow.iter_mut() {
+            shadow.color.a *= strength;
+        }
+        style.paint(prepaint.frame, window, cx, |window, cx| {
+            window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
+        });
         // 悬停态变了要重画(与 gpui div 的 hover 样式同一手法)
         if chrome.hover_dependent()
             && let Some(hitbox) = prepaint.hitbox.clone()
@@ -589,6 +623,30 @@ mod tests {
         let clamped_right = reveal_rect(0.0, target, 900.0);
         assert!((clamped_right.left + clamped_right.width / 2.0 - 410.0).abs() < 1e-3);
         assert_eq!(reveal_rect(1.0, target, -80.0), target);
+    }
+
+    #[test]
+    fn 贴底浮层从底边向上展开() {
+        let target = FrameRect {
+            left: 10.0,
+            top: 20.0,
+            width: 300.0,
+            height: 200.0,
+        };
+        let bottom = target.top + target.height;
+        let start = reveal_rect_aligned(0.0, target, 150.0, true);
+        assert_eq!(start.height, 0.0);
+        assert!((start.top - bottom).abs() < 1e-3, "起点贴在终矩形底边");
+        for step in 1..=20 {
+            let r = reveal_rect_aligned(step as f32 / 20.0, target, 150.0, true);
+            assert!(
+                (r.top + r.height - bottom).abs() < 1e-3,
+                "全过程底边不动: top={} height={}",
+                r.top,
+                r.height
+            );
+        }
+        assert_eq!(reveal_rect_aligned(1.0, target, 150.0, true), target);
     }
 
     #[test]

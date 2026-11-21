@@ -208,11 +208,17 @@ impl TerminalElement {
                     return;
                 }
 
-                emulator.with_term_mut(|term| term.scroll_display(Scroll::Delta(whole as i32)));
-                // 滚了就把滚动条亮起来(淡出重新计时)
-                touched.set(Some(Instant::now()));
-                // 变的只有本元素的回看位置与滚动条,不必用 refresh 把别的面板一起作废
-                cx.notify(view_id);
+                let changed = emulator.with_term_mut(|term| {
+                    let before = term.grid().display_offset();
+                    term.scroll_display(Scroll::Delta(whole as i32));
+                    term.grid().display_offset() != before
+                });
+                if changed {
+                    // 确实滚了才把滚动条亮起来(淡出重新计时)并通知视图重绘
+                    touched.set(Some(Instant::now()));
+                    // 变的只有本元素的回看位置与滚动条,不必用 refresh 把别的面板一起作废
+                    cx.notify(view_id);
+                }
             });
         }
     }
@@ -622,26 +628,33 @@ impl TerminalElement {
                     bar_drag.set(ScrollbarDrag::default());
                 }
 
-                // ── 停留复制:越过 4px 阈值才重新计时
-                let rearm = dwell_state.borrow_mut().on_move(
-                    &dwell_cfg,
-                    (
-                        f32::from(event.position.x - origin.x),
-                        f32::from(event.position.y - origin.y),
-                    ),
-                );
-                if let Some(generation) = rearm {
-                    *dwell_task.borrow_mut() = Some(arm_dwell(
-                        generation,
-                        dwell_cfg,
-                        dwell_state.clone(),
-                        this_emulator.clone(),
-                        on_copied.clone(),
-                        element_size,
-                        view_id,
-                        window,
-                        cx,
-                    ));
+                // ── 停留复制:丢了 MouseUp 时先撤表;左键还按着且越过 4px 阈值才重新计时
+                if event.pressed_button != Some(MouseButton::Left) {
+                    if dwell_state.borrow().is_pressed() {
+                        dwell_state.borrow_mut().cancel();
+                        *dwell_task.borrow_mut() = None;
+                    }
+                } else {
+                    let rearm = dwell_state.borrow_mut().on_move(
+                        &dwell_cfg,
+                        (
+                            f32::from(event.position.x - origin.x),
+                            f32::from(event.position.y - origin.y),
+                        ),
+                    );
+                    if let Some(generation) = rearm {
+                        *dwell_task.borrow_mut() = Some(arm_dwell(
+                            generation,
+                            dwell_cfg,
+                            dwell_state.clone(),
+                            this_emulator.clone(),
+                            on_copied.clone(),
+                            element_size,
+                            view_id,
+                            window,
+                            cx,
+                        ));
+                    }
                 }
 
                 // ── ⌥+按下还没转块选:拖满一格才转;没满什么都不做(松手按单击定位光标)
@@ -728,11 +741,15 @@ impl TerminalElement {
                 }
 
                 if !selecting.get() || event.pressed_button != Some(MouseButton::Left) {
-                    // 没在拖选(或按着的已经不是左键 —— 丢了 MouseUp):自动滚屏与拖选锚点一并收干净。
+                    // 没在拖选(或按着的已经不是左键 —— 丢了 MouseUp):自动滚屏、拖选锚点与停留计时一并收干净。
                     // 没在跑时只是一次 Cell 读
                     selecting.set(false);
                     drag_anchor.set(None);
                     stop_autoscroll(&autoscroll, &autoscroll_task);
+                    if dwell_state.borrow().is_pressed() {
+                        dwell_state.borrow_mut().cancel();
+                        *dwell_task.borrow_mut() = None;
+                    }
                     return;
                 }
                 // 拖出元素外也要继续选,所以这里不判 hover
@@ -999,6 +1016,11 @@ pub(super) fn arm_dwell(
     window.spawn(cx, async move |cx| {
         cx.background_executor().timer(delay).await;
         let _ = cx.update(|window, cx| {
+            // 停留期间窗口已经失焦(如 Alt+Tab 切走并丢了 MouseUp):不要在后台静默覆写系统剪贴板
+            if !window.is_window_active() {
+                tracker.borrow_mut().cancel();
+                return;
+            }
             let text = emulator
                 .with_term(|t| t.selection_to_string())
                 .unwrap_or_default();
