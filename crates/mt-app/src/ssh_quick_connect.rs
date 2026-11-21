@@ -162,7 +162,6 @@ const ICON_SEARCH: &[Shape] = &[ring(11.0, 11.0, 8.0), path("m21 21-4.3-4.3")];
 /// 新建(`plus`)。
 const ICON_PLUS: &[Shape] = &[path("M5 12h14"), path("M12 5v14")];
 /// 分组展开 / 折叠(`chevron-down` / `chevron-right`)。
-const ICON_CHEVRON_DOWN: &[Shape] = &[path("m6 9 6 6 6-6")];
 const ICON_CHEVRON_RIGHT: &[Shape] = &[path("m9 18 6-6-6-6")];
 /// 管理(`settings-2`)。
 const ICON_MANAGE: &[Shape] = &[
@@ -401,6 +400,8 @@ pub struct SshQuickPanel {
     /// 本来就在鼠标底下,再滚一次只会让列表在手底下跳。
     reveal_cursor: bool,
     scroll: ScrollHandle,
+    /// 分组标题的折叠箭头:只让刚点的那一组转(见 `fold_motion`)。
+    chevrons: crate::fold_motion::FlipTweens,
     _subs: Vec<Subscription>,
 }
 
@@ -439,6 +440,7 @@ impl SshQuickPanel {
             cursor: 0,
             reveal_cursor: false,
             scroll: ScrollHandle::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             _subs: vec![sub],
         }
     }
@@ -573,11 +575,11 @@ impl SshQuickPanel {
             Some(g) => g.clone().into(),
             None => t("terminal", "ungrouped").into(),
         };
-        let chevron = if bucket.collapsed {
-            ICON_CHEVRON_RIGHT
-        } else {
-            ICON_CHEVRON_DOWN
-        };
+        // 只画一枚右指箭头、按圈转到下指(见 `fold_motion`)
+        let collapsed = bucket.collapsed;
+        let turns = self
+            .chevrons
+            .value_open(&key, !collapsed, crate::fold_motion::OPEN_TURNS);
         div()
             .id(SharedString::from(format!("ssh-quick-grp-{key}")))
             .flex()
@@ -595,6 +597,12 @@ impl SshQuickPanel {
                     .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_secondary()))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
+                        // 点之前折着 = 点完展开
+                        this.chevrons.flip_open(
+                            key.clone(),
+                            collapsed,
+                            crate::fold_motion::OPEN_TURNS,
+                        );
                         this.toggle_group(key.clone(), cx);
                     }))
             })
@@ -604,7 +612,11 @@ impl SshQuickPanel {
                     .w(px(11.0))
                     .h(px(11.0))
                     .when(searching, |el| el.opacity(0.0))
-                    .child(VectorIcon::new(chevron, px(11.0)).ink(ui::text_muted())),
+                    .child(
+                        VectorIcon::new(ICON_CHEVRON_RIGHT, px(11.0))
+                            .ink(ui::text_muted())
+                            .rotation(turns),
+                    ),
             )
             .child(div().flex_1().min_w_0().truncate().child(name))
             .child(div().flex_none().child(bucket.count().to_string()))
@@ -860,7 +872,8 @@ impl SshQuickPanel {
 }
 
 impl Render for SshQuickPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.chevrons.drive(window);
         let store = self.store.read(cx);
         let connections = store.ssh_connections();
         let empty = connections.is_empty();

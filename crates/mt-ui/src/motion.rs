@@ -22,7 +22,7 @@
 //! | `.animate-blink`(状态灯闪烁 / 更新红点 / 中转连接中) | **停** | [`blinks`] |
 //! | `.animate-pulse`(骨架屏) | **停** | [`blinks`] |
 //! | `.animate-glow` | **停** | (GPUI 侧无消费方) |
-//! | `.done-tag` 的 `tagFadeIn` | **停**(压成瞬时) | [`TAG_FADE_IN`] |
+//! | `.done-tag` 的 `tagFadeIn` | 原版**停**(压成瞬时);**2026-11-21 起豁免**,理由见常量注释 | [`TAG_FADE_IN`] |
 //! | `.toast-card` 的 `toastSlideIn` | 原版**停**(压成瞬时);**2026-09-19 起豁免**,理由见常量注释 | [`TOAST_SLIDE_IN`] |
 //! | `.animate-status-spin` / `.animate-spin`(**进行中**指示器) | 继续转,周期放慢到 2.4s | [`spin_period`] |
 //! | 浮层进出场(`.overlay-*` / `.ctx-menu` / `.prompt-*`) | **豁免**,原速播完 | [`OVERLAY_IN`] 等 |
@@ -615,10 +615,12 @@ pub const RANK_BAR: TransitionSpec =
 /// 闪烁全停)同类,而且它 250ms 播完即止、不常驻。
 pub const TOAST_SLIDE_IN: TransitionSpec =
     TransitionSpec::exempt(Duration::from_millis(250), Easing::EaseOut);
-/// `.done-tag` 的 `tagFadeIn 0.3s ease-out`(`styles.css:522`)。原版**没有**
-/// 豁免它 —— 与 toast 同一档,reduce 下由通配规则压成瞬时。
+/// `.done-tag` 的 `tagFadeIn 0.3s ease-out`(`styles.css:522`)。原版**没有**豁免它
+/// (reduce 下由通配规则压成瞬时),**2026-11-21 用户拍板改为豁免**:用户机器上系统动画
+/// 是关的,过闸的结果是这一条从来没播过;它现在是药丸横向展开的方向性形变(不再淡入),
+/// 300ms 播完即止,与 toast 同一条理由。
 pub const TAG_FADE_IN: TransitionSpec =
-    TransitionSpec::new(Duration::from_millis(300), Easing::EaseOut);
+    TransitionSpec::exempt(Duration::from_millis(300), Easing::EaseOut);
 
 // ── 2026-11-21 动画打磨一批补的规格(全部豁免 reduce,全部服从总开关) ──
 //
@@ -1116,14 +1118,12 @@ mod tests {
             TOGGLE_KNOB,
             CHEVRON_ROTATE,
             TOAST_SLIDE_OUT,
+            // 原版不在名单里,2026-11-21 用户拍板加入(此前过闸,用户机器上从来没播过)
+            TAG_FADE_IN,
         ] {
             assert!(!exempt.respects_reduce, "{exempt:?} 应属豁免面");
         }
         assert_eq!(TAG_FADE_IN.duration, Duration::from_millis(300));
-        assert!(
-            TAG_FADE_IN.respects_reduce,
-            "tagFadeIn 在原版 reduce 段没有豁免(注释里被点名当反例),必须过闸"
-        );
     }
 
     /// `menuPopIn`:淡入 + 从上方 6px 落位,终点严丝合缝(残留位移会让菜单

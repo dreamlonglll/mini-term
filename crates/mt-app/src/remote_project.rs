@@ -68,6 +68,8 @@ pub struct AddRemotePanel {
     target_group: Option<String>,
     selected: GroupKey,
     collapsed: HashSet<String>,
+    /// 右栏桶标题的折叠箭头(见 `ssh_panel::BucketCollapse`)。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 输入框里按过回车、还没被消费。**订阅拿不到 `&mut Window`**(提交要起
     /// 后台任务并可能关窗),所以订阅只置这个标志,由下一帧的 Dialog builder
     /// 消费 —— builder 手里两样都有。
@@ -85,6 +87,10 @@ impl Render for AddRemotePanel {
 impl BucketCollapse for AddRemotePanel {
     fn collapsed_set(&mut self) -> &mut HashSet<String> {
         &mut self.collapsed
+    }
+
+    fn chevrons(&mut self) -> &mut crate::fold_motion::FlipTweens {
+        &mut self.chevrons
     }
 }
 
@@ -184,6 +190,7 @@ pub fn open(
             target_group,
             selected: GroupKey::All,
             collapsed: HashSet::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             enter_pressed: false,
             _subs: subs,
             _task: None,
@@ -195,6 +202,8 @@ pub fn open(
         window,
         cx,
         move |dialog, window, cx| {
+            // 桶标题的折叠箭头在转就要下一帧(弹窗正文每帧经这里重建)
+            state.read(cx).chevrons.drive(window);
             // 回车提交要 `&mut Window`(要起后台任务并可能关窗),订阅里拿不到,
             // 于是订阅只置一个标志,下一帧的 builder 里消费掉。
             // **必须 `window.defer`**:builder 跑在 `Root::render` 里,当场
@@ -368,6 +377,7 @@ struct Frame {
     order: Vec<SshGroupBucket>,
     active: GroupKey,
     collapsed: HashSet<String>,
+    chevrons: crate::fold_motion::FlipTweens,
     connection_id: String,
     busy: bool,
     error: String,
@@ -387,6 +397,7 @@ fn read_frame(state: &Entity<AddRemotePanel>, cx: &App) -> Frame {
         order: buckets.display_order(),
         active,
         collapsed: panel.collapsed.clone(),
+        chevrons: panel.chevrons.clone(),
         connection_id: panel.connection_id.clone(),
         busy: panel.busy,
         error: panel.error.clone(),
@@ -533,6 +544,7 @@ fn render_list(state: &Entity<AddRemotePanel>, frame: &Frame) -> AnyElement {
         visible_buckets(&frame.order, &frame.active),
         &frame.active,
         &frame.collapsed,
+        &frame.chevrons,
         has_named,
         "remote-bucket-",
         t("remoteProject", "ungrouped"),

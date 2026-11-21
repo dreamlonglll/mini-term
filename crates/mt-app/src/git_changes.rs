@@ -628,6 +628,8 @@ pub struct GitChanges {
     /// 组件态,**不落盘**(抽屉一关就没,规格 §11 第 25 条)。
     collapsed_dirs: HashSet<String>,
     collapsed_groups: HashSet<Area>,
+    /// 分组标题 / 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`)。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 列表取数的单飞调度(见模块注释「取数调度」);换仓库时作废在途的那份。
     flight: Flight,
     /// 派生模型的缓存(见 [`Self::model`])。改了 `changes` / 两种折叠态的地方都要
@@ -725,6 +727,7 @@ impl GitChanges {
             metadata_warning: None,
             collapsed_dirs: HashSet::new(),
             collapsed_groups: HashSet::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             flight: Flight::default(),
             list_model: RefCell::new(None),
             diff_waiters: Vec::new(),
@@ -2807,6 +2810,7 @@ impl Render for GitChanges {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_input(window, cx);
         self.sync_placeholder(window, cx);
+        self.chevrons.drive(window);
         // 写操作闸每帧只问一次:行内 / 组操作按钮与提交按钮都按它画
         let gated = self.gated();
         let model = self.model(cx);
@@ -3021,9 +3025,15 @@ impl GitChanges {
             Area::Untracked => (t("panels", "untrackedFiles"), ui::text_muted()),
         };
         let key = area.key();
+        let turns = self.chevrons.value_open(
+            &format!("group-{key}"),
+            !collapsed,
+            crate::fold_motion::OPEN_TURNS,
+        );
         let mut header = SectionHeader::new(SharedString::from(format!("git-group-{key}")), title)
             .group()
             .collapsible(!collapsed)
+            .chevron_turns(turns)
             .count(count);
         if area == Area::Conflicts {
             header = header.tone(tone).icon(ICON_ALERT);
@@ -3080,9 +3090,15 @@ impl GitChanges {
         }
 
         let toggle = cx.listener(move |this, _: &ClickEvent, _window, cx| {
-            if !this.collapsed_groups.remove(&area) {
+            let open = this.collapsed_groups.remove(&area);
+            if !open {
                 this.collapsed_groups.insert(area);
             }
+            this.chevrons.flip_open(
+                format!("group-{}", area.key()),
+                open,
+                crate::fold_motion::OPEN_TURNS,
+            );
             this.invalidate_model();
             cx.notify();
         });
@@ -3106,18 +3122,27 @@ impl GitChanges {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key = dir_key(area, &full_path);
+        let turns = self.chevrons.value_open(
+            &format!("dir-{key}"),
+            !collapsed,
+            crate::fold_motion::OPEN_TURNS,
+        );
         git_ui::tree_dir_row(
             SharedString::from(format!("git-dir-{key}")),
             name,
             file_count,
             depth,
             collapsed,
+            turns,
         )
         .w_full()
         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-            if !this.collapsed_dirs.remove(&key) {
+            let open = this.collapsed_dirs.remove(&key);
+            if !open {
                 this.collapsed_dirs.insert(key.clone());
             }
+            this.chevrons
+                .flip_open(format!("dir-{key}"), open, crate::fold_motion::OPEN_TURNS);
             this.invalidate_model();
             cx.notify();
         }))

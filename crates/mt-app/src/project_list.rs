@@ -51,8 +51,10 @@
 //! 「补齐可见」顶一下,看着就是跳动。中栏收起时列表不在元素树里,登记的滚动留到
 //! 下次展开中栏时兑现(届时还是活动项目才滚)。
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
@@ -204,32 +206,122 @@ fn shows_done_tag(needs_attention: bool, is_active: bool) -> bool {
     needs_attention && !is_active
 }
 
+/// 完成标退场:收回去再卸。与浮层退场同一条时长与缓动。
+const DONE_TAG_OUT: mt_ui::motion::TransitionSpec = mt_ui::motion::OVERLAY_OUT;
+
+/// 一枚完成标这一帧的形态:`open` = 药丸露出来的宽度比例(0..1),`scale` = 水平内边距的
+/// 缩放(进场的过冲落在它上面)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DoneTagFrame {
+    open: f32,
+    scale: f32,
+}
+
+/// 进场按 `tagFadeIn` 的关键帧(见 [`mt_ui::motion::tag_fade_in`]):前 60% 药丸从 0 宽
+/// 横向展开到全宽、同时内边距过冲到 1.15,之后内边距回落到 1 —— 原版的「淡入 + 放大过冲」
+/// 换成宽度表达,不做透明度。退场从开始收的那一刻露着的宽度 `from` 线性收回 0。
+fn done_tag_frame(leaving: Option<f32>, progress: f32) -> DoneTagFrame {
+    let p = progress.clamp(0.0, 1.0);
+    match leaving {
+        Some(from) => DoneTagFrame {
+            open: from.clamp(0.0, 1.0) * (1.0 - p),
+            scale: 1.0,
+        },
+        None => {
+            let (open, scale) = mt_ui::motion::tag_fade_in(p);
+            DoneTagFrame { open, scale }
+        }
+    }
+}
+
+/// 一枚完成标的进出场状态(见 [`ProjectList::done_tags`])。
+struct DoneTagAnim {
+    transition: mt_ui::motion::Transition,
+    /// `Some(起收时露着的宽度比例)` = 正在退场。
+    leaving: Option<f32>,
+    /// 「完成」两个字的自然宽(canvas 量的;0 = 还没量过)。
+    text_w: Rc<Cell<f32>>,
+}
+
+impl DoneTagAnim {
+    fn enter() -> Self {
+        Self {
+            transition: mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN),
+            leaving: None,
+            text_w: Rc::new(Cell::new(0.0)),
+        }
+    }
+
+    fn frame(&self) -> DoneTagFrame {
+        done_tag_frame(self.leaving, self.transition.progress())
+    }
+
+    /// 开始退场:从眼下露着的宽度收回去。
+    fn leave(&mut self) {
+        let from = self.frame().open;
+        self.leaving = Some(from);
+        self.transition = mt_ui::motion::Transition::new(DONE_TAG_OUT);
+    }
+
+    /// 退场途中又该出现了:重新进场(从头播,与原版「重新挂载」同语义)。
+    fn reenter(&mut self) {
+        self.leaving = None;
+        self.transition = mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN);
+    }
+
+    /// 退场播完了(可以从表里摘掉)。
+    fn gone(&self) -> bool {
+        self.leaving.is_some() && !self.transition.running()
+    }
+}
+
 /// 完成标(原版的 `<DoneTag/>`,样式在 `styles.css:509-524`)。
 ///
 /// 实心 success 底 + **底色字**(不是白字:浅色主题下白字配浅绿看不见,
 /// 与 StatusDot 的 `contrast` 同一条理由)、圆角 10px、字号 `0.77rem`≈10px、粗体。
 /// 原版还有一层 success 色的外发光,gpui 的 div 没有 box-shadow,省掉。
 ///
-/// # 进场(`tagFadeIn` 0.3s)
+/// # 进出场(`tagFadeIn` 0.3s / 退场 [`DONE_TAG_OUT`])
 ///
-/// `progress` 由调用方喂(状态在 [`ProjectList::done_tags`] 里)。关键帧的
-/// `scale(.6) → 1.15 → 1` 在 gpui 里没有 transform 可用,**只让水平内边距跟着
-/// 缩放**:药丸自己横向呼吸 ±2px,字号与行高一动不动 —— 动它们会让整行在这
-/// 300ms 里抖高度。这一档**不在** reduce 豁免名单里(`TAG_FADE_IN` 过闸),
-/// 用户机器上开着「减少动画」就是直接出现。
-fn done_tag(progress: f32) -> AnyElement {
-    let (opacity, scale) = mt_ui::motion::tag_fade_in(progress);
-    div()
+/// 状态在 [`ProjectList::done_tags`] 里。药丸本身就是裁剪窗:底色与圆角画在外壳上、外壳
+/// 宽度 = 自然宽 × [`DoneTagFrame::open`],字居中排在里面按自然宽度不动 —— 看上去是一枚
+/// 从中间横向长开的药丸,任何一帧两端都是圆的。过冲落在水平内边距上(`scale`),字号与
+/// 行高一动不动(动它们会让整行在这 300ms 里抖高度)。**豁免**系统「减少动画」(2026-11-21
+/// 用户拍板:此前它过闸,用户机器上系统动画关着,这条从来没播过),服从「启用动画」总开关。
+/// 静止时外壳不设宽度,与原来的药丸一模一样;探针一直量着字宽,留给下一次开合当起点。
+fn done_tag(frame: DoneTagFrame, settled: bool, text_w: &Rc<Cell<f32>>) -> AnyElement {
+    let measure = text_w.clone();
+    let probe = canvas(
+        move |bounds, _window, _cx| measure.set(f32::from(bounds.size.width)),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_full();
+    let pad = 8.0 * frame.scale;
+    let label = div()
+        .relative()
+        .flex_none()
+        .whitespace_nowrap()
+        .child(t("panels", "done"))
+        .child(probe);
+    let pill = div()
         .flex_shrink_0()
-        .px(px(8.0 * scale))
+        .flex()
+        .justify_center()
         .py(px(2.0))
         .rounded(px(10.0))
         .bg(ui::color_success())
         .text_size(ui::font_px(10.0))
         .font_weight(FontWeight::BOLD)
-        .text_color(ui::bg_base())
-        .opacity(opacity)
-        .child(t("panels", "done"))
+        .text_color(ui::bg_base());
+    if settled {
+        return pill.px(px(8.0)).child(label).into_any_element();
+    }
+    // 动画中:外壳定宽、裁掉多出的部分;还没量过字宽的那一帧按 0 算(那时 open≈0)
+    let full = text_w.get() + pad * 2.0;
+    pill.w(px(full * frame.open))
+        .overflow_hidden()
+        .child(label)
         .into_any_element()
 }
 
@@ -316,13 +408,23 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
 ///
 /// 灯按显示档位画(含第五档「等你处理」):项目里有 pane 在等授权,行上就是叹号 ——
 /// 标题栏那颗全局灯撤掉之后,跨项目找「谁在等我」主要就看这一列。
+///
+/// 完成标退场期间(`tag` 还在、`show_done_tag` 已经 false)照旧只画标:收回去之后才轮到灯。
 fn row_status_mark(
     show_done_tag: bool,
-    done_tag_in: f32,
+    tag: Option<&DoneTagAnim>,
     light: StatusLight,
 ) -> Option<AnyElement> {
-    if show_done_tag {
-        Some(done_tag(done_tag_in))
+    if let Some(tag) = tag {
+        let settled = tag.leaving.is_none() && !tag.transition.running();
+        Some(done_tag(tag.frame(), settled, &tag.text_w))
+    } else if show_done_tag {
+        // 表由 `render` 前置段维护,理论上不会落到这;万一没赶上按已就位画
+        let frame = DoneTagFrame {
+            open: 1.0,
+            scale: 1.0,
+        };
+        Some(done_tag(frame, true, &Rc::new(Cell::new(0.0))))
     } else if light != StatusLight::Idle {
         Some(ui::status_dot(light).into_any_element())
     } else {
@@ -1214,12 +1316,14 @@ pub struct ProjectList {
     hover_rect: Option<Bounds<Pixels>>,
     /// 刚进编辑态、还等着「默认全选」的那个输入框。见 [`Self::start_rename`]。
     pending_select_all: Option<FocusHandle>,
-    /// 各行完成标的进场(`tagFadeIn`),按项目 id 索引。
+    /// 各行完成标的进出场(`tagFadeIn` / 收回),按项目 id 索引。
     ///
-    /// 生命周期照抄 DOM:**标出现时建、消失时丢** —— 丢掉之后再出现按「新挂载」
-    /// 处理,从头播一遍。表在 `render` 的前置段维护(`render_project` 拿的是
+    /// **标出现时建(从头播进场)、该消失时转退场、收完才丢** —— 丢掉之后再出现按
+    /// 「新挂载」处理,从头播一遍。表在 `render` 的前置段维护(`render_project` 拿的是
     /// `&self`,建不了)。
-    done_tags: HashMap<String, mt_ui::motion::Transition>,
+    done_tags: HashMap<String, DoneTagAnim>,
+    /// 分组行的折叠箭头:只让刚点(或回车 / 空格翻)的那一行转(见 `fold_motion`)。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 行列表那个滚动容器的句柄(滚动偏移也住在这里)。揭示靠它把目标行滚进可视区。
     rows_scroll: ScrollHandle,
     /// 等着滚进可视区的项目,由 [`Self::reveal`] 登记、接下来的 `render` 兑现。
@@ -1276,6 +1380,7 @@ impl ProjectList {
             hover_rect: None,
             pending_select_all: None,
             done_tags: HashMap::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             rows_scroll: ScrollHandle::new(),
             pending_reveal: None,
             };
@@ -1496,10 +1601,13 @@ impl ProjectList {
 
     /// 分组行按键(原版只有 Enter/Space 折叠 + F2 改名,**没有 Delete**——
     /// 删组是不可逆的结构变更,只留在右键菜单里并带确认)。
+    ///
+    /// `collapsed` 是这一行眼下的折叠态(翻过去之后箭头转到哪靠它)。
     fn on_group_key(
         &mut self,
         event: &KeyDownEvent,
         id: &str,
+        collapsed: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1509,6 +1617,8 @@ impl ProjectList {
         match event.keystroke.key.as_str() {
             "enter" | "space" => {
                 cx.stop_propagation();
+                self.chevrons
+                    .flip_open(id, collapsed, crate::fold_motion::OPEN_TURNS);
                 self.store
                     .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
             }
@@ -2101,6 +2211,7 @@ impl Render for ProjectList {
         }
         self.sync_row_focus(&ordered, cx);
         self.sync_done_tags(&ordered, window, cx);
+        self.chevrons.drive(window);
         let preview = self.render_preview(window, cx);
         let list = self.render_rows(ordered, dragging.as_deref(), drag_active, cx);
         let footer = self.render_footer(cx);
@@ -2184,7 +2295,7 @@ impl ProjectList {
                     // 分组行同样可 Tab 可聚焦(原版 `tabIndex={0}` + `role=treeitem`)
                     .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        this.on_group_key(event, &id_key, window, cx);
+                        this.on_group_key(event, &id_key, collapsed, window, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -2248,6 +2359,12 @@ impl ProjectList {
                         if this.editing.is_some() {
                             return;
                         }
+                        // 点之前折着 = 点完展开:箭头从右指转到下指
+                        this.chevrons.flip_open(
+                            id_toggle.clone(),
+                            collapsed,
+                            crate::fold_motion::OPEN_TURNS,
+                        );
                         this.store.update(cx, |store, cx| {
                             store.toggle_group_collapse(&id_toggle, cx)
                         });
@@ -2270,14 +2387,18 @@ impl ProjectList {
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
-                    // 折叠箭头。原版是一个恒定的 ▾ 加 `rotate(-90deg)`,
-                    // gpui 的 div 没有 transform —— 直接换字形,视觉等价
+                    // 折叠箭头。原版是一个恒定的 ▾ 加 `rotate(-90deg)`;这里是同大小同位置的
+                    // 矢量三角(颜色随行的字色),只让刚翻的那一行转过去(见 `fold_motion`)
                     .child(
                         div()
                             .w(px(12.0))
                             .flex_shrink_0()
                             .text_size(ui::font_px(9.75))
-                            .child(if collapsed { "▸" } else { "▾" }),
+                            .child(crate::fold_motion::fold_glyph(self.chevrons.value_open(
+                                &id,
+                                !collapsed,
+                                crate::fold_motion::OPEN_TURNS,
+                            ))),
                     )
                     // 「分组 = 空间」:容器图标,着主题文件夹色
                     .child(
@@ -2329,8 +2450,9 @@ impl ProjectList {
         }
     }
 
-    /// 完成标的进场表:这一帧哪些行挂着标就留哪些(等价于 DOM 的挂载/卸载)。
-    /// 进度在 `render_project` 里读,**请求下一帧只能在这儿**(那边没有 window)。
+    /// 完成标的进出场表:这一帧哪些行该挂标 —— 新出现的建一条进场,不该挂了的转退场,
+    /// 收完的才摘掉(等价于 DOM 的挂载 / 退场驻留 / 卸载)。进度在 `render_project` 里读,
+    /// **请求下一帧只能在这儿**(那边没有 window)。
     fn sync_done_tags(
         &mut self,
         ordered: &[OrderedItem],
@@ -2353,13 +2475,23 @@ impl ProjectList {
                 OrderedItem::Group { .. } => None,
             })
             .collect();
-        self.done_tags.retain(|id, _| showing.contains(id));
+        for (id, tag) in self.done_tags.iter_mut() {
+            if !showing.contains(id) && tag.leaving.is_none() {
+                tag.leave();
+            }
+        }
+        self.done_tags.retain(|_, tag| !tag.gone());
         for id in showing {
             self.done_tags
                 .entry(id)
-                .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN));
+                .and_modify(|tag| {
+                    if tag.leaving.is_some() {
+                        tag.reenter();
+                    }
+                })
+                .or_insert_with(DoneTagAnim::enter);
         }
-        if self.done_tags.values().any(|tr| tr.running()) {
+        if self.done_tags.values().any(|tag| tag.transition.running()) {
             window.request_animation_frame();
         }
     }
@@ -2858,12 +2990,8 @@ impl ProjectList {
         // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
         // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
         let show_done_tag = shows_done_tag(needs_attention, is_active);
-        // 进场进度。表由 `render` 前置段维护;万一没赶上(理论上不会)按已就位画
-        let done_tag_in = self
-            .done_tags
-            .get(id.as_str())
-            .map(|tr| tr.progress())
-            .unwrap_or(1.0);
+        // 进出场状态。表由 `render` 前置段维护(退场期间标还在、`show_done_tag` 已是 false)
+        let done_tag = self.done_tags.get(id.as_str());
         let editing = self
             .editing
             .as_ref()
@@ -2900,7 +3028,7 @@ impl ProjectList {
             // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
             // 完成标 / 状态灯二选一,**idle 时两个都不画**
-            .children(row_status_mark(show_done_tag, done_tag_in, light))
+            .children(row_status_mark(show_done_tag, done_tag, light))
             // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
             .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
 
@@ -2948,17 +3076,46 @@ mod tests {
         assert!(!shows_done_tag(false, true));
     }
 
-    /// 完成标的进场**不在** reduce 豁免名单里(原版 `tagFadeIn` 被通配规则
-    /// 压成瞬时),开着减弱动效时第一帧就是终态。
+    /// 完成标的进出场**豁免**系统「减少动画」(2026-11-21 用户拍板:原版 `tagFadeIn` 被
+    /// 通配规则压成瞬时,用户机器上系统动画关着,这条从来没播过),只服从「启用动画」总开关。
     #[test]
-    fn 完成标进场过减弱动效的闸() {
-        let spec = mt_ui::motion::TAG_FADE_IN;
-        assert!(spec.respects_reduce);
+    fn 完成标进出场豁免减弱动效() {
+        for spec in [mt_ui::motion::TAG_FADE_IN, DONE_TAG_OUT] {
+            assert!(!spec.respects_reduce, "{spec:?}");
+        }
         crate::motion::with_reduce(true, || {
-            let tr = mt_ui::motion::Transition::new(spec);
-            assert_eq!(tr.progress(), 1.0);
-            assert!(!tr.running(), "reduce 下一帧都不该请求");
+            let tr = mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN);
+            if mt_ui::motion::animations_enabled() {
+                assert!(tr.running(), "reduce 下照样播");
+                assert!(tr.progress() < 1.0);
+            }
         });
+    }
+
+    /// 完成标的形态:进场从 0 宽展开、宽度先到顶(60%)、内边距过冲后回落到 1;退场从起收
+    /// 时露着的宽度线性收回 0。端点钉死 —— 残留零点几会让药丸永远缺一截或多一截。
+    #[test]
+    fn 完成标进出场的宽度与过冲() {
+        let start = done_tag_frame(None, 0.0);
+        assert_eq!(start.open, 0.0, "进场从 0 宽起");
+        let peak = done_tag_frame(None, 0.6);
+        assert!((peak.open - 1.0).abs() < 1e-6, "60% 处已全宽");
+        assert!(peak.scale > 1.1, "过冲在内边距上:{}", peak.scale);
+        let end = done_tag_frame(None, 1.0);
+        assert_eq!(end.open, 1.0);
+        assert!((end.scale - 1.0).abs() < 1e-6, "终点回到 1");
+        // 宽度全程不回头
+        let mut prev = -1.0;
+        for i in 0..=20 {
+            let open = done_tag_frame(None, i as f32 / 20.0).open;
+            assert!(open >= prev - 1e-6, "在 {i} 处回头了");
+            prev = open;
+        }
+        // 退场:从起收那一刻的宽度收,不跳到全宽再收
+        assert_eq!(done_tag_frame(Some(0.4), 0.0).open, 0.4);
+        assert!((done_tag_frame(Some(0.4), 0.5).open - 0.2).abs() < 1e-6);
+        assert_eq!(done_tag_frame(Some(1.0), 1.0).open, 0.0);
+        assert_eq!(done_tag_frame(Some(1.0), 0.3).scale, 1.0, "退场不过冲");
     }
 
     /// Project menu sequence and grouping are user-visible navigation contracts.

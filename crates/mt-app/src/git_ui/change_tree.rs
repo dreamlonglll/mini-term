@@ -27,8 +27,8 @@ use gpui::{
 use mt_ui::icons::FileIcon;
 
 use super::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_LIST, ICON_LIST_TREE, ICON_SIZE, ICON_SIZE_SM,
-    ROW_H, commit_file_status, file_label, hover_bg, icon, icon_button, list_row, status_letter,
+    ICON_LIST, ICON_LIST_TREE, ICON_SIZE, ROW_H, chevron, commit_file_status, file_label, hover_bg,
+    icon_button, list_row, status_letter,
 };
 use crate::i18n::{t, tr};
 use crate::ui;
@@ -275,13 +275,15 @@ pub fn dir_file_count_label(count: usize) -> String {
 }
 
 /// 目录行:折叠箭头 + 文件夹图标 + 名称(压缩过的是 `a/b/c`)+ 弱化的文件数。整行可点,
-/// 点击(切换收起 / 展开)由调用方挂。行高、缩进与文件行一致。
+/// 点击(切换收起 / 展开)由调用方挂。行高、缩进与文件行一致。折叠箭头这一帧转 `turns`
+/// 圈(只画一枚、转过去;补间状态在持有列表的视图上,见 [`crate::fold_motion::FlipTweens`])。
 pub fn tree_dir_row(
     id: impl Into<ElementId>,
     name: impl Into<SharedString>,
     file_count: usize,
     depth: usize,
     collapsed: bool,
+    turns: f32,
 ) -> Stateful<Div> {
     div()
         .id(id)
@@ -303,15 +305,7 @@ pub fn tree_dir_row(
                 .w(px(ICON_SIZE))
                 .flex()
                 .justify_center()
-                .child(icon(
-                    if collapsed {
-                        ICON_CHEVRON_RIGHT
-                    } else {
-                        ICON_CHEVRON_DOWN
-                    },
-                    ICON_SIZE_SM,
-                    ui::text_muted(),
-                )),
+                .child(chevron(turns)),
         )
         .child(FileIcon::folder(!collapsed).size(px(ICON_SIZE)))
         .child(div().min_w_0().truncate().child(name.into()))

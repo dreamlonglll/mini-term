@@ -372,18 +372,12 @@ pub const ICON_FOLDER_PLUS: &[Shape] = &[
     ),
 ];
 
-/// 分组标题前的折叠指示:› (折叠着)。
+/// 分组标题前的折叠指示:›。只画这一枚,展开时绕中心顺时针转 90° 成 ˅
+/// (见 `fold_motion`;原先另有一枚 ˅ 两态硬换)。
 pub const ICON_CHEVRON_RIGHT: &[Shape] = &[Shape::line(
     Ink::Current,
     STROKE,
     Geom::Polyline(&[(cu(6.0), cu(4.0)), (cu(10.0), cu(8.0)), (cu(6.0), cu(12.0))]),
-)];
-
-/// ˅(展开着)。
-pub const ICON_CHEVRON_DOWN: &[Shape] = &[Shape::line(
-    Ink::Current,
-    STROKE,
-    Geom::Polyline(&[(cu(4.0), cu(6.0)), (cu(8.0), cu(10.0)), (cu(12.0), cu(6.0))]),
 )];
 
 /// ✕(解散分组)。
@@ -781,7 +775,6 @@ mod tests {
             ("plus", ICON_PLUS),
             ("folder-plus", ICON_FOLDER_PLUS),
             ("chevron-right", ICON_CHEVRON_RIGHT),
-            ("chevron-down", ICON_CHEVRON_DOWN),
             ("close", ICON_CLOSE),
         ] {
             for shape in icon {

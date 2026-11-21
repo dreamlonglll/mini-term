@@ -22,9 +22,10 @@ use crate::prompt::Confirm;
 use crate::ui;
 
 use super::widgets::{
-    banner, choice_group, font_family_input, mini_bar, page_root, section, toggle_row,
+    banner, choice_group, flip_knob, font_family_input, knob_toggle, mini_bar, page_root, section,
+    toggle_row,
 };
-use super::{SettingsPage, SettingsView, choice_value};
+use super::{SettingsView, choice_value};
 
 /// 「更多皮肤」按钮的去处:仓库里的成品皮肤库(`theme/`)。
 ///
@@ -721,11 +722,18 @@ impl SettingsView {
     ///
     /// 渲染途中放是安全的:所有 render / prepaint 都先于本帧任何 paint,这些
     /// 缩略图本帧不会再被画;上一帧的场景画完本帧就被替换,不会再呈现。
-    pub(super) fn release_stale_theme_thumbs(&mut self, window: &mut Window, cx: &mut App) {
+    ///
+    /// `showing` = 这一帧外观页还画不画(当前页是它,或它正作为切页的出场层滑走)。
+    pub(super) fn release_stale_theme_thumbs(
+        &mut self,
+        showing: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         if self.theme_thumbs.is_empty() {
             return;
         }
-        let live: HashSet<ThemeThumbKey> = if self.page == SettingsPage::Appearance {
+        let live: HashSet<ThemeThumbKey> = if showing {
             self.theme_cards
                 .iter()
                 .filter_map(ThemeCard::thumb_key)
@@ -849,8 +857,9 @@ impl SettingsView {
                             .into_any_element(),
                         ),
                         false,
-                        ui::toggle("font-ligatures", ligatures).on_click(cx.listener(
+                        knob_toggle("font-ligatures", ligatures).on_click(cx.listener(
                             move |this, _, _window, cx| {
+                                flip_knob("font-ligatures", !ligatures);
                                 this.store.update(cx, |store, cx| {
                                     store.set_terminal_ligatures(!ligatures, cx);
                                 });
