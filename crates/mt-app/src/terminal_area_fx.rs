@@ -18,8 +18,10 @@
 //!
 //! # 三条约束(评审口径)
 //!
-//! - **偏移不写进 `tab_rects`**:拖拽插入线、方向导航、悬停卡锚点都读它。量矩形由
-//!   [`FlipSlot`] 自己在挪动之前报(`on_bounds`),报的是排版位置;
+//! - **偏移不写进 `tab_rects` / `pane_rects`**:拖拽插入线、方向导航、悬停卡锚点、最大化
+//!   的起点矩形都读它们。量矩形由 [`FlipSlot`] 自己在挪动之前报(`on_bounds`),报的是排版
+//!   位置;祖先 [`LeafSlot`] 在扩张中挪了整格的,两处量尺都减掉它的偏移
+//!   ([`LayoutFx::unshift`]);
 //! - **不和 `scroll_to_item` 打架**:chip 的位置按「相对页签区」算(页签区的
 //!   `ScrollHandle` 在子元素 prepaint 之前就记好了每个子项未滚动的矩形),横向滚动、
 //!   跟随滚动、整条 tab 栏随窗口挪位都不算挪动;
@@ -132,6 +134,29 @@ pub(super) fn grow_clip(from: Rect, to: Rect, progress: f32) -> (Rect, (f32, f32
     (clip, (clip.left - to.left, clip.top - to.top))
 }
 
+/// 新出现的 chip 裁剪展开这一帧的裁剪窗:从 chip 左缘往右长到全宽。
+///
+/// 原点跟着内容的位移走(`offset` = 本帧画在排版位置右侧多少):展开还没播完时又被挤动
+/// (紧接着又新建了一个排在它前面的页签),内容画在「排版位置 + 偏移」上,裁剪窗按排版
+/// 位置放就会错位裁掉一截。
+pub(super) fn reveal_clip(layout: Rect, offset: f32, progress: f32) -> Rect {
+    Rect {
+        left: layout.left + offset,
+        top: layout.top,
+        width: layout.width * progress.clamp(0.0, 1.0),
+        height: layout.height,
+    }
+}
+
+/// 把子树里量到的矩形换回排版位置:减掉祖先 [`LeafSlot`] 这一帧的内容偏移(见
+/// [`LayoutFx::leaf_offset`])。
+pub(super) fn unshift(bounds: Bounds<Pixels>, (dx, dy): (f32, f32)) -> Bounds<Pixels> {
+    Bounds::new(
+        point(bounds.origin.x - px(dx), bounds.origin.y - px(dy)),
+        bounds.size,
+    )
+}
+
 // ─── 状态 ────────────────────────────────────────────────────
 
 /// 一个 chip 的补位记录。
@@ -190,6 +215,12 @@ pub(super) struct LayoutFx {
     growing: HashMap<String, GrowEntry>,
     /// 这一帧刚关掉分屏:剩下的叶子该从上一帧的矩形长到新矩形
     grow_armed: bool,
+    /// 正在 prepaint 的那一格被 [`LeafSlot`] 挪了多少(只在扩张中的叶子子树 prepaint 期间
+    /// 非零)。子树里报排版矩形的几处([`FlipSlot::on_bounds`]、`render_leaf` 的 pane 量尺)
+    /// 拿它减回去([`Self::unshift`]),扩张那 240ms 里 `tab_rects` / `pane_rects` 照样是
+    /// 排版位置 —— 否则此间换卡,卡锚偏到旧格子的左缘并停在那里;双击最大化,Reveal 的
+    /// 起点也取错
+    leaf_offset: (f32, f32),
 }
 
 impl LayoutFx {
@@ -231,6 +262,11 @@ impl LayoutFx {
     /// render 里报:这一帧是不是刚关掉了分屏(同一面板、叶子只少不多)。
     pub fn arm_split_grow(&mut self, armed: bool) {
         self.grow_armed = armed;
+    }
+
+    /// 子树里量到的矩形换回排版位置(见 [`Self::leaf_offset`])。只在 prepaint 里调。
+    pub fn unshift(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        unshift(bounds, self.leaf_offset)
     }
 
     /// [`FlipSlot`] 的 prepaint 里调:`rel_x` 是 chip 本帧相对页签区左缘的排版位置。
@@ -297,13 +333,18 @@ impl LayoutFx {
             // 只认「长大」:关分屏后剩下的格子只会罩住自己原来那一格
             && target.contains(old)
         {
-            self.growing.insert(
-                leaf.to_string(),
-                GrowEntry {
-                    from: *old,
-                    start: now,
-                },
-            );
+            // 起点是**这一刻屏幕上的裁剪窗**:扩张途中又关掉一格(`Split_h[A, Split_v[B, C]]`
+            // 关 C、B 还在往下长时再关 A),上一帧的排版矩形是那一场的终点,从它起步
+            // 裁剪窗会先跳到整格再长
+            let from = match self.growing.get(leaf) {
+                Some(entry) => {
+                    let elapsed = now.saturating_duration_since(entry.start);
+                    grow_clip(entry.from, *old, AREA_SWAP.progress_live(elapsed)).0
+                }
+                None => *old,
+            };
+            self.growing
+                .insert(leaf.to_string(), GrowEntry { from, start: now });
         }
         // 每帧每格都要记一次:有条目就就地改,免得每帧为键分配一次字符串
         match self.leaves.get_mut(leaf) {
@@ -413,7 +454,9 @@ impl Element for FlipSlot {
         cx: &mut App,
     ) -> Self::PrepaintState {
         if let Some(report) = &self.on_bounds {
-            report(bounds, cx);
+            // 祖先 LeafSlot 在扩张中时减掉它的偏移,报的仍是排版位置
+            let layout_bounds = self.fx.borrow().unshift(bounds);
+            report(layout_bounds, cx);
         }
         let strip = self.strip.bounds();
         // 页签区还没排过版(宽 0):不记、不动
@@ -436,12 +479,9 @@ impl Element for FlipSlot {
         if frame.running {
             window.request_animation_frame();
         }
-        // 裁剪展开:从 chip 左缘往右长(chip 自己的终位,不跟着偏移走)
+        // 裁剪展开:从 chip 左缘往右长,原点跟着本帧的位移走(见 [`reveal_clip`])
         let mask = frame.reveal.map(|p| ContentMask {
-            bounds: Bounds::new(
-                bounds.origin,
-                size(bounds.size.width * p.clamp(0.0, 1.0), bounds.size.height),
-            ),
+            bounds: reveal_clip(Rect::from_bounds(bounds), frame.offset, p).to_bounds(),
         });
         window.with_content_mask(mask, |window| {
             window.with_element_offset(point(px(frame.offset), px(0.0)), |window| {
@@ -529,11 +569,15 @@ impl Element for LeafSlot {
         let mask = Some(ContentMask {
             bounds: clip.to_bounds(),
         });
+        // 子树 prepaint 期间登记偏移,子树里报排版矩形的几处据此减回去(见
+        // [`LayoutFx::leaf_offset`]);叶子不嵌套,出来就清零
+        self.fx.borrow_mut().leaf_offset = (dx, dy);
         window.with_content_mask(mask, |window| {
             window.with_element_offset(point(px(dx), px(dy)), |window| {
                 self.child.prepaint(window, cx)
             });
         });
+        self.fx.borrow_mut().leaf_offset = (0.0, 0.0);
         mask
     }
 
@@ -714,5 +758,70 @@ mod tests {
         fx.begin_frame();
         fx.arm_split_grow(true);
         assert!(fx.grow("b", rect(0.0, 0.0, 300.0, 700.0), done).is_none());
+    }
+
+    /// `Split_h[A, Split_v[B, C]]`:关 C(B 往下长),半路再关 A(B 的目标变成整幅)——
+    /// 第二场从**这一刻的裁剪窗**起步,不先跳到右半幅整格再往左长。
+    #[test]
+    fn 扩张途中再关一格_从当前裁剪窗接着长() {
+        if !mt_ui::motion::animations_enabled() {
+            return;
+        }
+        let t0 = Instant::now();
+        let mut fx = LayoutFx::default();
+        let quarter = rect(500.0, 0.0, 500.0, 350.0);
+        let half = rect(500.0, 0.0, 500.0, 700.0);
+        let full = rect(0.0, 0.0, 1000.0, 700.0);
+        fx.begin_frame();
+        assert!(fx.grow("b", quarter, t0).is_none());
+        // 关 C:B 从右上四分之一往下长
+        fx.begin_frame();
+        fx.arm_split_grow(true);
+        assert!(fx.grow("b", half, t0).is_some());
+        // 半路再关 A
+        let mid = t0 + AREA_SWAP.duration / 2;
+        let (on_screen, _) = grow_clip(quarter, half, AREA_SWAP.progress_live(mid - t0));
+        assert!(on_screen.height < half.height, "前提:第一场确实还在半路");
+        fx.begin_frame();
+        fx.arm_split_grow(true);
+        let (clip, (dx, dy)) = fx.grow("b", full, mid).expect("再关一格照样扩张");
+        assert!(
+            !clip.differs(&on_screen),
+            "接着当前裁剪窗长,不跳:{clip:?} vs {on_screen:?}"
+        );
+        // 内容照旧钉在裁剪窗左上角
+        assert!((full.left + dx - clip.left).abs() < 1e-3);
+        assert!((full.top + dy - clip.top).abs() < 1e-3);
+        // 第二场播完精确落到整幅
+        fx.begin_frame();
+        let done = mid + AREA_SWAP.duration + Duration::from_millis(1);
+        assert!(fx.grow("b", full, done).is_none());
+    }
+
+    /// 展开中的新 chip 又被挤动:裁剪窗原点跟着内容的偏移走,宽按进度长。
+    #[test]
+    fn chip_展开中被挤动_裁剪窗跟着内容走() {
+        let layout = rect(200.0, 4.0, 120.0, 26.0);
+        // 没挪:就是排版位置,从左缘往右长
+        assert_eq!(reveal_clip(layout, 0.0, 0.5), rect(200.0, 4.0, 60.0, 26.0));
+        // 内容此刻画在排版位置左边 80px:裁剪窗原点同样左移 80
+        let clip = reveal_clip(layout, -80.0, 0.5);
+        assert_eq!(clip, rect(120.0, 4.0, 60.0, 26.0));
+        // 进度越界钳住
+        assert_eq!(reveal_clip(layout, 0.0, 1.5).width, 120.0);
+        assert_eq!(reveal_clip(layout, 0.0, -1.0).width, 0.0);
+    }
+
+    /// 扩张中整格被挪着画:子树里量到的矩形减掉偏移,还原成排版位置;尺寸不动。
+    #[test]
+    fn 扩张中量到的矩形减掉整格偏移() {
+        let drawn = Bounds::new(point(px(900.0), px(40.0)), size(px(110.0), px(26.0)));
+        let layout = unshift(drawn, (400.0, 0.0));
+        assert_eq!(layout.origin, point(px(500.0), px(40.0)));
+        assert_eq!(layout.size, drawn.size);
+        assert_eq!(unshift(drawn, (0.0, 0.0)), drawn, "不在扩张中原样返回");
+        // 偏移只在扩张中的叶子子树 prepaint 期间登记,平时为零
+        let fx = LayoutFx::default();
+        assert_eq!(fx.unshift(drawn), drawn);
     }
 }

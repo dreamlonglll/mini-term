@@ -234,11 +234,30 @@ fn done_tag_frame(leaving: Option<f32>, progress: f32) -> DoneTagFrame {
     }
 }
 
+/// 退场途中掉头重新进场这一帧的形态:从掉头那一刻露着的宽度 `from` 接着展开到全宽,
+/// 内边距停在 1(过冲只属于头一回出现;从 1 跳回关键帧起点的 0.6 会让药丸宽度当场缩一截)。
+/// **纯函数**,终点精确到全宽。
+fn resumed_tag_frame(from: f32, progress: f32) -> DoneTagFrame {
+    let p = progress.clamp(0.0, 1.0);
+    let from = from.clamp(0.0, 1.0);
+    DoneTagFrame {
+        open: if p >= 1.0 {
+            1.0
+        } else {
+            from + (1.0 - from) * p
+        },
+        scale: 1.0,
+    }
+}
+
 /// 一枚完成标的进出场状态(见 [`ProjectList::done_tags`])。
 struct DoneTagAnim {
     transition: mt_ui::motion::Transition,
     /// `Some(起收时露着的宽度比例)` = 正在退场。
     leaving: Option<f32>,
+    /// `Some(掉头时露着的宽度比例)` = 退场途中又该出现了,正从那里接着展开(见
+    /// [`resumed_tag_frame`]);`None` + 不在退场 = 头一回进场(关键帧)。
+    resumed: Option<f32>,
     /// 「完成」两个字的自然宽(canvas 量的;0 = 还没量过)。
     text_w: Rc<Cell<f32>>,
 }
@@ -248,30 +267,85 @@ impl DoneTagAnim {
         Self {
             transition: mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN),
             leaving: None,
+            resumed: None,
             text_w: Rc::new(Cell::new(0.0)),
         }
     }
 
+    /// 建一枚**已经到位**的(首次出现不播:见 [`ProjectList::sync_done_tags`] 的「隔了一阵
+    /// 才再画」那一支)。
+    fn settled() -> Self {
+        Self {
+            transition: mt_ui::motion::Transition::settled(mt_ui::motion::TAG_FADE_IN),
+            ..Self::enter()
+        }
+    }
+
     fn frame(&self) -> DoneTagFrame {
-        done_tag_frame(self.leaving, self.transition.progress())
+        let p = self.transition.progress();
+        match (self.leaving, self.resumed) {
+            (None, Some(from)) => resumed_tag_frame(from, p),
+            (leaving, _) => done_tag_frame(leaving, p),
+        }
     }
 
     /// 开始退场:从眼下露着的宽度收回去。
     fn leave(&mut self) {
         let from = self.frame().open;
         self.leaving = Some(from);
+        self.resumed = None;
         self.transition = mt_ui::motion::Transition::new(DONE_TAG_OUT);
     }
 
-    /// 退场途中又该出现了:重新进场(从头播,与原版「重新挂载」同语义)。
+    /// 退场途中又该出现了:从眼下露着的宽度掉头接着展开(半路掉头不跳 —— 此前从 0 宽
+    /// 重播,收到一半的药丸会当场缩没再长出来)。
     fn reenter(&mut self) {
+        let from = self.frame().open;
         self.leaving = None;
+        self.resumed = Some(from);
         self.transition = mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN);
     }
 
     /// 退场播完了(可以从表里摘掉)。
     fn gone(&self) -> bool {
         self.leaving.is_some() && !self.transition.running()
+    }
+}
+
+/// 把完成标表对齐到这一帧该挂标的那些行(`showing`):新出现的建一条进场,不该挂了的转
+/// 退场,退场途中又该挂的掉头,收完的摘掉。
+///
+/// `stale` = 隔了一阵才再画(中栏收着时本视图不渲染,那期间切过项目 / AI 跑完过):那些
+/// 变化用户没看见,再展开时不补播 —— 不该挂的直接摘、该挂的直接到位(否则中栏滑入的
+/// 同时,一枚早该没了的标还要当着面收一次)。
+fn sync_tag_table(tags: &mut HashMap<String, DoneTagAnim>, showing: HashSet<String>, stale: bool) {
+    if stale {
+        tags.retain(|id, _| showing.contains(id));
+        for id in showing {
+            tags.entry(id)
+                .and_modify(|tag| {
+                    if tag.leaving.is_some() {
+                        *tag = DoneTagAnim::settled();
+                    }
+                })
+                .or_insert_with(DoneTagAnim::settled);
+        }
+        return;
+    }
+    for (id, tag) in tags.iter_mut() {
+        if !showing.contains(id) && tag.leaving.is_none() {
+            tag.leave();
+        }
+    }
+    tags.retain(|_, tag| !tag.gone());
+    for id in showing {
+        tags.entry(id)
+            .and_modify(|tag| {
+                if tag.leaving.is_some() {
+                    tag.reenter();
+                }
+            })
+            .or_insert_with(DoneTagAnim::enter);
     }
 }
 
@@ -295,7 +369,10 @@ fn done_tag(frame: DoneTagFrame, settled: bool, text_w: &Rc<Cell<f32>>) -> AnyEl
         move |bounds, _window, _cx| measure.set(f32::from(bounds.size.width)),
         |_, _, _, _| {},
     )
+    // 钉住 inset(不写会按静态位置落到字的下方,见 `segment_slider::IndicatorSlider::probe`)
     .absolute()
+    .top_0()
+    .left_0()
     .size_full();
     let pad = 8.0 * frame.scale;
     let label = div()
@@ -1313,6 +1390,9 @@ pub struct ProjectList {
     /// 「新挂载」处理,从头播一遍。表在 `render` 的前置段维护(`render_project` 拿的是
     /// `&self`,建不了)。
     done_tags: HashMap<String, DoneTagAnim>,
+    /// 中栏收着期间 store 变过(本视图那时不渲染,完成标表没跟上)。下一次 `render`
+    /// 按「隔了一阵才再画」对齐完成标表,不补播进出场(见 [`Self::sync_done_tags`])。
+    done_tags_stale: bool,
     /// 分组行的折叠箭头:只让刚点(或回车 / 空格翻)的那一行转(见 `fold_motion`)。
     chevrons: crate::fold_motion::FlipTweens,
     /// 行列表那个滚动容器的句柄(滚动偏移也住在这里)。揭示靠它把目标行滚进可视区。
@@ -1331,8 +1411,15 @@ struct PendingReveal {
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
         // 本视图套了 view 级缓存(`main.rs::cached_panel`),render 读的状态灯 / 名字 /
-        // 完成标全靠这条 notify 重画
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 完成标全靠这条 notify 重画。中栏收着时本视图不渲染(这条照样跑):记一笔,
+        // 再展开时完成标表直接对齐、不补播(见 `sync_done_tags`)
+        cx.observe(&store, |this: &mut Self, store, cx| {
+            if !store.read(cx).config().middle_column_visible {
+                this.done_tags_stale = true;
+            }
+            cx.notify();
+        })
+        .detach();
         // 三道后台探测的闸只在项目表 / 技术栈缓存 / 窗口聚焦变了时过
         // (`StoreEvent::touches_project_probes`),不再被 OSC 标题 / AI 状态叫醒
         cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
@@ -1371,6 +1458,7 @@ impl ProjectList {
             hover_rect: None,
             pending_select_all: None,
             done_tags: HashMap::new(),
+            done_tags_stale: false,
             chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             rows_scroll: ScrollHandle::new(),
             pending_reveal: None,
@@ -1732,9 +1820,11 @@ impl ProjectList {
     /// [`pane_preview::HoverCard`]);这一行没有 AI 会话就让卡照常收起。
     fn schedule_preview(&mut self, project_id: String, cx: &mut Context<Self>) {
         self._preview_task = None;
-        if self.preview.is_on(&project_id) {
-            // 收起途中又悬停回卡正显示的那一行:矩形还是这一行的,当场从当前进度往回长
-            if self.fire_preview(&project_id, cx) {
+        if let Some(anchor) = self.preview.anchor_of(&project_id) {
+            // 收起途中又悬停回卡正显示的那一行:当场从当前进度往回长。锚点沿用卡上记着的
+            // 那一个 —— `hover_rect` 只有一格,中间悬停过的那一行(哪怕没弹卡)已经把它
+            // 量成了自己的矩形,这一行要等下一帧画过才量得回来
+            if self.fire_preview_at(&project_id, Some(anchor), cx) {
                 self._preview_task = Some(cx.spawn(async move |this, cx| {
                     Self::keep_preview_alive(this, cx).await;
                 }));
@@ -1809,10 +1899,20 @@ impl ProjectList {
 
     /// 计时到点:三道闸(还悬着同一行 / 量到过矩形 / 项目里真有 AI 会话)。
     fn fire_preview(&mut self, project_id: &str, cx: &mut Context<Self>) -> bool {
+        self.fire_preview_at(project_id, self.hover_rect, cx)
+    }
+
+    /// 同 [`Self::fire_preview`],锚点矩形由调用方给(`None` = 还没量到,不开)。
+    fn fire_preview_at(
+        &mut self,
+        project_id: &str,
+        anchor: Option<Bounds<Pixels>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.hovered.as_deref() != Some(project_id) {
             return false;
         }
-        let Some(anchor) = self.hover_rect else {
+        let Some(anchor) = anchor else {
             return false;
         };
         let store = self.store.read(cx);
@@ -2536,22 +2636,8 @@ impl ProjectList {
                 OrderedItem::Group { .. } => None,
             })
             .collect();
-        for (id, tag) in self.done_tags.iter_mut() {
-            if !showing.contains(id) && tag.leaving.is_none() {
-                tag.leave();
-            }
-        }
-        self.done_tags.retain(|_, tag| !tag.gone());
-        for id in showing {
-            self.done_tags
-                .entry(id)
-                .and_modify(|tag| {
-                    if tag.leaving.is_some() {
-                        tag.reenter();
-                    }
-                })
-                .or_insert_with(DoneTagAnim::enter);
-        }
+        let stale = std::mem::take(&mut self.done_tags_stale);
+        sync_tag_table(&mut self.done_tags, showing, stale);
         if self.done_tags.values().any(|tag| tag.transition.running()) {
             window.request_animation_frame();
         }
@@ -3177,6 +3263,59 @@ mod tests {
         assert!((done_tag_frame(Some(0.4), 0.5).open - 0.2).abs() < 1e-6);
         assert_eq!(done_tag_frame(Some(1.0), 1.0).open, 0.0);
         assert_eq!(done_tag_frame(Some(1.0), 0.3).scale, 1.0, "退场不过冲");
+    }
+
+    /// 退场途中又该出现:从眼下露着的宽度掉头接着展开,不从 0 宽重播;内边距停在 1。
+    #[test]
+    fn 完成标退场途中掉头从当前宽度接着展开() {
+        // 收到一半(露着 0.5)时掉头
+        let shown = done_tag_frame(Some(1.0), 0.5);
+        let resumed = resumed_tag_frame(shown.open, 0.0);
+        assert!(
+            (resumed.open - shown.open).abs() < 1e-6,
+            "掉头那一刻宽度不变"
+        );
+        assert_eq!(resumed.scale, shown.scale, "内边距也不跳");
+        assert!((resumed_tag_frame(0.5, 0.5).open - 0.75).abs() < 1e-6);
+        assert_eq!(resumed_tag_frame(0.5, 1.0).open, 1.0, "终点精确到全宽");
+        assert_eq!(resumed_tag_frame(0.5, 1.0).scale, 1.0);
+        // 掉头之后再收:从掉头途中露着的宽度收(`leave` 读的是 `frame()`)
+        let mut tag = DoneTagAnim::enter();
+        tag.resumed = Some(0.4);
+        tag.transition = mt_ui::motion::Transition::settled(mt_ui::motion::TAG_FADE_IN);
+        assert_eq!(tag.frame().open, 1.0, "掉头那一场播完就是全宽");
+        tag.leave();
+        assert_eq!(tag.leaving, Some(1.0));
+        assert_eq!(tag.resumed, None);
+    }
+
+    /// 中栏收着期间变的完成标(本视图那时不渲染),再展开时直接对齐,不补播进出场;
+    /// 平时照常播。
+    #[test]
+    fn 中栏收着期间变的完成标再展开时不补播() {
+        let ids = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+        // 平时:新挂的播进场、不该挂的转退场
+        let mut tags = HashMap::new();
+        sync_tag_table(&mut tags, ids(&["a"]), false);
+        assert!(tags.contains_key("a"));
+        if mt_ui::motion::animations_enabled() {
+            assert!(tags["a"].transition.running(), "新挂的播进场");
+            sync_tag_table(&mut tags, ids(&[]), false);
+            assert!(tags["a"].leaving.is_some(), "不该挂的转退场,收完才摘");
+        }
+        // 收着期间:a 不该挂了、b 新挂上 → 再画时 a 直接摘,b 直接到位
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), DoneTagAnim::settled());
+        sync_tag_table(&mut tags, ids(&["b"]), true);
+        assert!(!tags.contains_key("a"), "早该没了的标不当面再收一次");
+        assert!(!tags["b"].transition.running() && tags["b"].leaving.is_none());
+        // 收起之前正在退场、再画时又该挂:直接到位,不接着收、也不掉头补播
+        let mut leaving = DoneTagAnim::settled();
+        leaving.leave();
+        tags.insert("c".to_string(), leaving);
+        sync_tag_table(&mut tags, ids(&["b", "c"]), true);
+        assert!(tags["c"].leaving.is_none() && !tags["c"].transition.running());
+        assert_eq!(tags["c"].frame().open, 1.0);
     }
 
     /// Project menu sequence and grouping are user-visible navigation contracts.

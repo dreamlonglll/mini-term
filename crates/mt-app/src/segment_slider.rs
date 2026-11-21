@@ -187,6 +187,11 @@ impl IndicatorSlider {
     }
 
     /// 量第 `index` 项位置的探针:挂进那一项里(absolute 全尺寸、不画东西、不插 hitbox)。
+    ///
+    /// ⚠️ **必须钉 `top_0().left_0()`**:taffy 对不写 inset 的绝对定位子元素按「静态位置」摆
+    /// —— flex 容器里落在内容盒起点(差一个 padding),block 容器里还会落到前面兄弟的下方
+    /// (`git_diff/split.rs`、`menu.rs` 记过同一个坑)。漏了它,量出来的矩形整体偏右 / 偏下,
+    /// 滑块跟着错位。
     pub fn probe(&self, index: usize) -> impl IntoElement + use<> {
         let state = self.0.clone();
         canvas(
@@ -208,6 +213,8 @@ impl IndicatorSlider {
             |_, _, _, _| {},
         )
         .absolute()
+        .top_0()
+        .left_0()
         .size_full()
     }
 
@@ -415,6 +422,59 @@ mod tests {
         let (rect, running) = s.plan(0, t0 + Duration::from_millis(5)).unwrap();
         assert_eq!(rect, [21.0, 0.0, 50.0, 24.0]);
         assert!(!running, "没换项不补间");
+    }
+
+    /// 探针量到的必须是**段自身**的矩形 —— 段是 flex 带 padding(diff / worktree / 设置导航)
+    /// 还是 block 带 padding、探针排在文字之后(用量统计),都一样。漏写 inset 时 taffy 按
+    /// 静态位置摆:flex 段偏右一个 padding,block 段落到文字下方。
+    #[gpui::test]
+    fn 探针量的是段自身的矩形(cx: &mut gpui::TestAppContext) {
+        use gpui::{AnyWindowHandle, AppContext as _, Context, ParentElement, Render};
+
+        // 探针在 prepaint 里要帧(`request_animation_frame` 认的是「正在画的视图」),
+        // 所以得挂在一个真视图里画,不能走 `VisualTestContext::draw`
+        struct Host(IndicatorSlider);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let s = &self.0;
+                // 外面再包一层:窗口根元素被拉成整窗高,段控件直接当根的话各段会被拉高
+                div().child(
+                    div()
+                        .flex()
+                        .border_1()
+                        .child(s.block(0, |el| el))
+                        // flex 段:24 高、左右 padding 10、内容 30 宽 → 50 × 24
+                        .child(
+                            div()
+                                .h(px(24.0))
+                                .flex()
+                                .items_center()
+                                .px(px(10.0))
+                                .child(div().w(px(30.0)).h(px(12.0)))
+                                .child(s.probe(0)),
+                        )
+                        // block 段:padding 10 / 4、内容 20 × 16 → 40 × 24,探针排在内容之后
+                        .child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .child(div().w(px(20.0)).h(px(16.0)))
+                                .child(s.probe(1)),
+                        ),
+                )
+            }
+        }
+
+        let slider = IndicatorSlider::new();
+        let host = slider.clone();
+        let window = AnyWindowHandle::from(cx.add_window(move |_, _| Host(host)));
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let state = slider.0.borrow();
+        // 参照原点 = 外框内边(1px 边框)
+        assert_eq!(state.origin, Some(point(px(1.0), px(1.0))));
+        assert_eq!(state.rect_of(0), Some([0.0, 0.0, 50.0, 24.0]), "flex 段");
+        assert_eq!(state.rect_of(1), Some([50.0, 0.0, 40.0, 24.0]), "block 段");
     }
 
     #[test]

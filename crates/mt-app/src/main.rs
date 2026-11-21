@@ -361,9 +361,13 @@ struct DetailExit {
 /// 另起一层短暂的出场层画旧内容向左滑出(此刻栏里不画它们,不会同帧双挂)。
 /// ⚠️ 项目列表、文件树套着 [`cached_panel`]:动画层只动 `left`,**不许**改 opacity
 /// (缓存会把某一帧的透明度定死,见抽屉层那段注释)。
+///
+/// 半路掉头(收到一半又展开、展开到一半又收)从眼下的位置接着走:进度存成
+/// `ValueTween`,新一场从 [`motion_kit::reversed_progress`] 起步(推导见
+/// [`middle_content_left`] 的单测),不从头播。
 struct MiddleMotion {
     entering: bool,
-    transition: mt_ui::motion::Transition,
+    progress: mt_ui::motion::ValueTween,
 }
 
 /// 抽屉段控件的排列次序(会话在左、Git 在右):换面板时往右边那项切,新面板从右进。
@@ -1774,8 +1778,12 @@ impl Workspace {
     /// 提交详情栏的退场层:与进场同一个外壳(按栏宽裁剪、贴着抽屉左缘),里层的 `left`
     /// 从 0 补到栏宽 —— 向右收回抽屉左缘后面,方向与进场相反、零尺寸变化
     /// ([`mt_ui::motion::OVERLAY_OUT`])。外壳 `id` 与进场那层不同:退场期间进场层不在
-    /// 树上,它的动画状态随之丢掉,再选中一个提交照旧从头滑出来。整块拦鼠标(退场中的
-    /// 栏不接点击 / 拖拽),没有左缘手柄。
+    /// 树上,它的动画状态随之丢掉,再选中一个提交照旧从头滑出来。没有左缘手柄。
+    ///
+    /// 拦鼠标的是**里层末尾**那张透明罩(随内容滑、被外壳裁剪):外壳上的 `occlude` 挡不住
+    /// 自己的子元素(外壳的命中框先于子元素插入,命中从后往前找),退场中的栏照样接
+    /// 「查看变更 / 关闭 / 文件行」的点击;罩在外壳上又会让内容滑走后空出来的那块继续
+    /// 吞掉底下的点击。
     ///
     /// 文件页上的挤占(`drawer_squeeze`)在收起那一刻就一帧放回原宽、不补间(逐帧重排
     /// 文件页不值),这一层照旧盖在页签区上方滑走,两者互不牵扯。
@@ -1794,7 +1802,6 @@ impl Workspace {
             .h_full()
             .w(px(width))
             .overflow_hidden()
-            .occlude()
             .child(native_view::occluder())
             .child(
                 div()
@@ -1808,7 +1815,9 @@ impl Workspace {
                     .bg(ui::bg_surface())
                     .border_l_1()
                     .border_color(ui::border_default())
-                    .child(exit.pane.clone()),
+                    .child(exit.pane.clone())
+                    // 退场中的内容不接悬停与点击(见上)
+                    .child(div().absolute().inset_0().occlude()),
             )
     }
 
@@ -2262,23 +2271,33 @@ impl Render for Workspace {
             });
         // 中栏开合(见 [`MiddleMotion`]):开了 → 栏里内容从左滑入;收了 → 出场层画旧内容
         // 向左滑出。首帧只记下,不播
+        let now = std::time::Instant::now();
         if let Some(was) = self.middle_seen
             && was != middle_visible
         {
+            // 上一场还在飞就是半路掉头:从眼下的位置接着走(见 [`MiddleMotion`])
+            let from = self
+                .middle_motion
+                .as_ref()
+                .filter(|motion| motion.progress.running_at(now))
+                .map_or(0.0, |motion| {
+                    motion_kit::reversed_progress(motion.progress.value_at(now))
+                });
             self.middle_motion = mt_ui::motion::animations_enabled().then(|| MiddleMotion {
                 entering: middle_visible,
-                transition: mt_ui::motion::Transition::new(mt_ui::motion::PANEL_SWAP),
+                progress: motion_kit::resume_band(from, mt_ui::motion::PANEL_SWAP, now),
             });
         }
         self.middle_seen = Some(middle_visible);
         let middle_frame = self.middle_motion.as_ref().and_then(|motion| {
             motion
-                .transition
-                .running()
-                .then(|| (motion.entering, motion.transition.drive(window)))
+                .progress
+                .running_at(now)
+                .then(|| (motion.entering, motion.progress.value_at(now)))
         });
-        if middle_frame.is_none() {
-            self.middle_motion = None;
+        match middle_frame {
+            Some(_) => window.request_animation_frame(),
+            None => self.middle_motion = None,
         }
         let middle_content: gpui::AnyElement = match middle_frame {
             // 滑入:同尺寸的 absolute 层只动 left,栏本身裁掉露在左边外的部分
@@ -2298,7 +2317,10 @@ impl Render for Workspace {
                 .into_any_element(),
             _ => middle_group.into_any_element(),
         };
-        // 滑出:栏已隐藏(上面那份进的是不可见的 panel,不会被画),出场层里画另一份
+        // 滑出:栏已隐藏(上面那份进的是不可见的 panel,不会被画),出场层里画另一份。
+        // 拦鼠标的是里层末尾那张罩(随内容滑、被外壳裁剪,只罩内容此刻还露着的那块):
+        // 外壳上的 `occlude` 挡不住自己的子元素(滑走中的项目行照样能点、能起拖拽),
+        // 整宽常驻又会在内容滑走后继续吞掉终端区左段的点击
         let middle_exit = match middle_frame {
             Some((false, progress)) => Some(
                 div()
@@ -2308,7 +2330,6 @@ impl Render for Workspace {
                     .h_full()
                     .w(px(columns[0] as f32))
                     .overflow_hidden()
-                    .occlude()
                     .child(native_view::occluder())
                     .child(
                         div()
@@ -2317,7 +2338,8 @@ impl Render for Workspace {
                             .h_full()
                             .w_full()
                             .left(gpui::relative(middle_content_left(false, progress)))
-                            .child(self.middle_group(&middle)),
+                            .child(self.middle_group(&middle))
+                            .child(div().absolute().inset_0().occlude()),
                     ),
             ),
             _ => None,
@@ -3517,6 +3539,25 @@ mod tests {
         assert_eq!(detail_exit_left(320.0, 0.0), 0.0);
         assert_eq!(detail_exit_left(320.0, 0.5), 160.0);
         assert_eq!(detail_exit_left(320.0, 1.5), 320.0);
+    }
+
+    /// 中栏半路掉头不跳:收到一半又展开(或反过来),新一场从 `1 − 进度` 起步,
+    /// 内容层此刻的位置与掉头前一模一样(见 [`MiddleMotion`])。
+    #[test]
+    fn 中栏开合半路掉头从当前位置接着走() {
+        for entering in [true, false] {
+            for i in 0..=20 {
+                let p = i as f32 / 20.0;
+                let before = middle_content_left(entering, p);
+                let after = middle_content_left(!entering, motion_kit::reversed_progress(p));
+                assert!((before - after).abs() < 1e-6, "entering={entering} p={p}");
+            }
+        }
+        // 起步进度由 `resume_band` 接上:建出来那一刻就在起步值上
+        let now = std::time::Instant::now();
+        let band = motion_kit::resume_band(0.6, mt_ui::motion::PANEL_SWAP, now);
+        assert!((band.value_at(now) - 0.6).abs() < 1e-6);
+        assert_eq!(band.target(), 1.0);
     }
 
     /// 抽屉换面板:往段控件右边那项(Git)切新面板从右进,反之从左;滑块停在各自那一半。

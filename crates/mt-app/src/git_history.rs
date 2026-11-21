@@ -596,9 +596,10 @@ impl GitHistoryContent {
             self.filter.email_pending = false;
             self.filter.email = None;
             self.filter.no_email = false;
-            // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查
+            // 换仓库:选中、详情、标签都是上一个仓库的,一并作废;「仅我的」的邮箱重查。
+            // 详情的在途请求作废,台上那一份留给退场层画完(见 `DetailState::retire`)
             self.selection.clear();
-            self.detail.clear();
+            self.detail.retire();
             self.tags.clear();
             self.tags_by_commit.clear();
             if self.filter.only_mine {
@@ -1150,7 +1151,8 @@ impl GitHistoryContent {
             return;
         }
         match target {
-            None => self.detail.clear(),
+            // 选择清空:详情栏随之退场,台上那一份留给退场层画完(见 `DetailState::retire`)
+            None => self.detail.retire(),
             Some(DetailTarget::Single(hash)) => self.load_detail(hash, cx),
             Some(DetailTarget::Multi(hashes)) => self.load_multi_detail(hashes, cx),
         }

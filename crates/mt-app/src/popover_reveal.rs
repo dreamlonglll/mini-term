@@ -315,6 +315,9 @@ impl RevealState {
 ///
 /// 每次按钮所在的视图画到它时,把按钮的窗口坐标交给 `note`(在 `entity` 上调);`note` 返回
 /// `true`(坐标变了且浮层开着 / 在动画中)时下一帧 notify `entity` —— 只惊动持有浮层的那个视图。
+///
+/// ⚠️ 钉了 `top_0().left_0()`:不写 inset 时 taffy 按「静态位置」摆,在带左 padding 的 flex
+/// 按钮里(标题栏项目切换胶囊、⚑ 标记钮)整块右移一个 padding,开合原点跟着偏。
 pub fn anchor_probe<T: 'static>(
     entity: Entity<T>,
     note: impl FnOnce(&mut T, Bounds<Pixels>) -> bool + 'static,
@@ -328,6 +331,8 @@ pub fn anchor_probe<T: 'static>(
         |_, _, _, _| {},
     )
     .absolute()
+    .top_0()
+    .left_0()
     .size_full()
 }
 
