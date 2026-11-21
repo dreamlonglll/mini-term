@@ -59,15 +59,30 @@
 //! ([`push_settings_hint`]),点了打开设置并直达某一页。设置窗口是弹窗,toast 画在它的
 //! 遮罩底下,所以点击时**先收掉这条**再开设置;它也比别的提示多留一会儿
 //! ([`SETTINGS_HINT_TTL`]),一辈子只弹一次的东西 5 秒就没了太容易错过。
+//!
+//! # 进出场与补位
+//!
+//! - 进场从右边横向滑入(`TOAST_SLIDE_IN`),不做透明度;排队中超过 [`MAX_VISIBLE`] 的那条
+//!   补上来时同样按进场播;
+//! - 退场向右滑出(`TOAST_SLIDE_OUT`):出队那一刻卡片就离开排版(其余卡片当场补位),
+//!   自己按上一帧量到的位置原地画完滑出,不接点击([`Leaving`]);
+//! - 剩下的卡片按 id 补纵向位置(FLIP,`LIST_REFLOW`):排版已经是新位置,显示位置从旧位置
+//!   补间过去([`Reflow`] / [`Reflowed`])。位置量的是「离栈底边多远」,拖窗口时整栈跟着
+//!   窗口走,不会误触发补位。
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnimationExt as _, App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, px,
+    AnimationExt as _, AnyElement, App, AppContext, Bounds, Context, Div, Element, ElementId,
+    Entity, Global, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId,
+    ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Task, Window, canvas, div, point, prelude::FluentBuilder as _, px,
 };
 
+use mt_ui::motion::{LIST_REFLOW, TOAST_SLIDE_OUT, Transition, TweenMap};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
@@ -252,6 +267,125 @@ pub struct ToastLayer {
     /// 每条一个自撤定时器。悬停暂停 = **丢句柄**(Task 一 drop 就取消),
     /// 移开 = 重建一个满 5s 的。
     timers: HashMap<u64, Task<()>>,
+    /// 各卡片上一帧排在哪(纵向补位与退场卡片的定位都靠它)。prepaint 里写、render 里读。
+    reflow: Rc<RefCell<Reflow>>,
+    /// 正在向右滑出的卡片(已出队)。
+    leaving: Vec<Leaving>,
+}
+
+/// 纵向补位(FLIP)的账本。见模块注释「进出场与补位」。
+struct Reflow {
+    /// toast 栈这一帧的窗口坐标(栈里第一个子元素量出来,早于各卡片 prepaint)。
+    stack: Option<Bounds<Pixels>>,
+    /// 每张卡片离栈底边多远:目标值是这一帧排版排出来的,显示值跟着补间。
+    tweens: TweenMap,
+    /// 这一帧量到的离底距离(出队那一刻给退场卡片原地定位)。
+    gaps: HashMap<u64, f32>,
+}
+
+impl Default for Reflow {
+    fn default() -> Self {
+        Self {
+            stack: None,
+            tweens: TweenMap::new(LIST_REFLOW),
+            gaps: HashMap::new(),
+        }
+    }
+}
+
+/// 一张正在退场的卡片。
+struct Leaving {
+    item: ToastItem,
+    /// 出队那一刻离栈底边多远(原地画完滑出)。
+    gap: f32,
+    slide: Transition,
+}
+
+/// 显示位置相对排版位置该往下挪多少(负 = 往上):卡片排版离栈底 `gap`,显示值还在
+/// `shown`(补间途中),那就画在 `shown` 那里。**纯函数**,单测钉方向。
+fn reflow_offset(gap: f32, shown: f32) -> f32 {
+    gap - shown
+}
+
+/// 包一张卡片:prepaint 时量它离栈底多远、取补间后的显示值,按差值整体平移(只挪位置,
+/// 不改尺寸、不重排)。补间进行中顺手要下一帧。
+struct Reflowed {
+    id: u64,
+    child: AnyElement,
+    book: Rc<RefCell<Reflow>>,
+}
+
+impl IntoElement for Reflowed {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Reflowed {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let offset = {
+            let mut book = self.book.borrow_mut();
+            match book.stack {
+                Some(stack) => {
+                    let gap = f32::from(stack.bottom() - bounds.bottom());
+                    book.gaps.insert(self.id, gap);
+                    let shown = book.tweens.value(&self.id.to_string(), gap);
+                    if book.tweens.running_at(Instant::now()) {
+                        window.request_animation_frame();
+                    }
+                    reflow_offset(gap, shown)
+                }
+                None => 0.0,
+            }
+        };
+        window.with_element_offset(point(px(0.0), px(offset)), |window| {
+            self.child.prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+    }
 }
 
 struct GlobalToastLayer(Entity<ToastLayer>);
@@ -400,11 +534,20 @@ pub fn push_open_external_failure(title: String, message: String, cx: &mut App) 
     );
 }
 
-/// 关项目 → 它的 toast 一并撤掉(`store.ts:859`)。
+/// 关项目 → 它的 toast 一并撤掉(`store.ts:859`)。画着的那几张照样滑出去。
 pub fn remove_project(project_id: &str, cx: &mut App) {
     layer(cx).update(cx, |layer, cx| {
+        let shown: Vec<ToastItem> = layer
+            .queue
+            .visible()
+            .filter(|n| n.project_id == project_id)
+            .cloned()
+            .collect();
         for id in layer.queue.retain_other_projects(project_id) {
             layer.timers.remove(&id);
+        }
+        for item in shown {
+            layer.start_leaving(item);
         }
         cx.notify();
     });
@@ -434,9 +577,28 @@ impl ToastLayer {
 
     fn dismiss(&mut self, id: u64, cx: &mut Context<Self>) {
         self.timers.remove(&id);
+        let shown = self.queue.visible().find(|n| n.id == id).cloned();
         if self.queue.dismiss(id) {
+            if let Some(item) = shown {
+                self.start_leaving(item);
+            }
             cx.notify();
         }
+    }
+
+    /// 刚出队的那张若画着,原地播滑出(位置取上一帧量到的离底距离)。总开关关掉时不播。
+    fn start_leaving(&mut self, item: ToastItem) {
+        if !mt_ui::motion::animations_enabled() {
+            return;
+        }
+        let Some(gap) = self.reflow.borrow().gaps.get(&item.id).copied() else {
+            return;
+        };
+        self.leaving.push(Leaving {
+            item,
+            gap,
+            slide: Transition::new(TOAST_SLIDE_OUT),
+        });
     }
 
     /// 悬停暂停。5s 硬倒计时会在鼠标正要点它的时候把它抽走。
@@ -612,10 +774,154 @@ fn render_description(desc: SharedString) -> gpui::AnyElement {
     column.into_any_element()
 }
 
+impl ToastLayer {
+    /// 一张卡片。`interactive = false`:退场中 —— 不接点击 / 悬停,不拦鼠标
+    /// (WebView 那块的让位照留,否则滑出途中会被 HTML 预览盖住)。
+    fn card(&self, item: &ToastItem, interactive: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        let id = item.id;
+        let kind = item.kind;
+        let desc = description(item);
+        div()
+            .id(SharedString::from(format!("toast-{id}")))
+            .relative()
+            .w_full()
+            .flex()
+            // ⚠️ 这一层**不能** `items_center`:左侧那条 3px 竖边靠 flex 的
+            // 默认 `stretch` 撑满高度,居中会把它压成 0
+            .rounded(px(6.0))
+            .overflow_hidden()
+            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+            // `surface_opacity`,卡片叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+            .bg(ui::bg_overlay())
+            .border_1()
+            .border_color(ui::border_default())
+            .shadow_lg()
+            .when(interactive, |el| el.cursor_pointer().occlude())
+            // 叠在 HTML 预览上时这块归 GPUI(见 `native_view` 模块注释「输入的空域」)
+            .child(crate::native_view::occluder())
+            // `.toast-card:hover { transform: translateX(-2px) }`
+            .when(interactive, |el| el.hover(|el| el.left(px(-2.0))))
+            .child(
+                // `border-left: 3px solid ...` 的等价物。
+                //
+                // gpui 的 `border_color` 是**四边一个色**,没有 per-side ——
+                // 写成 `border_1().border_color(A).border_l(3).border_color(B)`
+                // 会把整圈边框都染成 B。改画一条 3px 的实心竖条,外层
+                // `overflow_hidden` + `rounded(6)` 顺带把它的两个角切圆。
+                div().w(px(3.0)).flex_none().bg(border_left_color(kind)),
+            )
+            .child(
+                // 卡片正文:`padding: 10px 12px; gap: 10px`(原版的内边距在
+                // 边框之内,所以挪到这一层)
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .child(
+                        // 20px 圆底 + 文本字符(原版就是文本,不是 svg)
+                        div()
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(icon_color(kind))
+                            // `color: var(--bg-base)`;亮色主题那条 `#ffffff` 覆盖与
+                            // 亮色 `--bg-base` 恰好同值,不必分支
+                            .text_color(ui::bg_base())
+                            .text_size(ui::font_px(11.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(kind.icon_char()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                // `.toast-name` 0.92rem / 600 / 单行省略
+                                div()
+                                    .text_size(ui::font_px(12.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(ui::text_primary())
+                                    .truncate()
+                                    .child(SharedString::from(item.project_name.clone())),
+                            )
+                            .child(
+                                // `.toast-desc` 0.77rem,`margin-top: 1px`
+                                div()
+                                    .mt(px(1.0))
+                                    .text_size(ui::font_px(10.0))
+                                    .text_color(ui::text_secondary())
+                                    .child(render_description(desc)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("toast-close-{id}")))
+                            .px(px(4.0))
+                            .flex_none()
+                            .text_size(ui::font_px(14.0))
+                            .text_color(ui::text_muted())
+                            .child("×")
+                            .when(interactive, |el| {
+                                el.cursor_pointer()
+                                    .hover(|el| el.text_color(ui::text_primary()))
+                                    // 原版这颗按钮带 `aria-label` / `title`
+                                    // (`ToastContainer.tsx:69-70`);GPUI 没有无障碍树,
+                                    // tooltip 是它唯一的等价物
+                                    .tip(t("toast", "dismiss"))
+                                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                                        // 关按钮吃掉这次点击 —— 不然会连带触发卡片的「跳项目」
+                                        cx.stop_propagation();
+                                        this.dismiss(id, cx);
+                                    }))
+                            }),
+                    ),
+            )
+            .when(interactive, |el| {
+                el.on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    this.pause(id, *hovered, cx);
+                }))
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    this.activate(id, window, cx);
+                }))
+            })
+    }
+}
+
 impl Render for ToastLayer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 先拍快照:下面每条都要 `cx.listener`,边遍历边借 self 不划算
         let visible: Vec<ToastItem> = self.queue.visible().cloned().collect();
+        // 滑出播完的撤掉;还在滑的取这一帧的进度(顺手要下一帧)
+        self.leaving.retain(|leaving| leaving.slide.running());
+        let leaving: Vec<(ToastItem, f32, f32)> = self
+            .leaving
+            .iter()
+            .map(|leaving| {
+                (
+                    leaving.item.clone(),
+                    leaving.gap,
+                    leaving.slide.drive(window),
+                )
+            })
+            .collect();
+        // 补位账本进入新一帧:上一帧没画到的卡片丢掉(下次出现按「首次出现」不补间)
+        {
+            let mut book = self.reflow.borrow_mut();
+            book.tweens.sweep();
+            book.gaps.clear();
+            book.stack = None;
+        }
+        let book = self.reflow.clone();
 
         // `.toast-stack`:`fixed right:16 bottom:16; flex-col; gap:8`。
         // 容器本身**不 occlude**(原版 `pointer-events:none`),卡片自己收事件。
@@ -627,139 +933,56 @@ impl Render for ToastLayer {
             .flex()
             .flex_col()
             .items_end()
-            .gap(px(8.0));
+            .gap(px(8.0))
+            // 量栈自己的窗口坐标(absolute 铺满、不画东西、不插 hitbox)。排在最前,
+            // prepaint 早于各卡片 —— 卡片量「离栈底多远」要用它
+            .child(
+                canvas(
+                    {
+                        let book = book.clone();
+                        move |bounds, _, _| book.borrow_mut().stack = Some(bounds)
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
 
         for item in visible {
             let id = item.id;
-            let kind = item.kind;
-            let desc = description(&item);
-            let card = div()
-                .id(SharedString::from(format!("toast-{id}")))
-                .relative()
-                .w_full()
-                .flex()
-                // ⚠️ 这一层**不能** `items_center`:左侧那条 3px 竖边靠 flex 的
-                // 默认 `stretch` 撑满高度,居中会把它压成 0
-                .rounded(px(6.0))
-                .overflow_hidden()
-                // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
-                // `surface_opacity`,卡片叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
-                .bg(ui::bg_overlay())
-                .border_1()
-                .border_color(ui::border_default())
-                .shadow_lg()
-                .cursor_pointer()
-                .occlude()
-                // 叠在 HTML 预览上时这块归 GPUI(见 `native_view` 模块注释「输入的空域」)
-                .child(crate::native_view::occluder())
-                // `.toast-card:hover { transform: translateX(-2px) }`
-                .hover(|el| el.left(px(-2.0)))
-                .child(
-                    // `border-left: 3px solid ...` 的等价物。
-                    //
-                    // gpui 的 `border_color` 是**四边一个色**,没有 per-side ——
-                    // 写成 `border_1().border_color(A).border_l(3).border_color(B)`
-                    // 会把整圈边框都染成 B。改画一条 3px 的实心竖条,外层
-                    // `overflow_hidden` + `rounded(6)` 顺带把它的两个角切圆。
-                    div().w(px(3.0)).flex_none().bg(border_left_color(kind)),
-                )
-                .child(
-                    // 卡片正文:`padding: 10px 12px; gap: 10px`(原版的内边距在
-                    // 边框之内,所以挪到这一层)
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .px(px(12.0))
-                        .py(px(10.0))
-                        .child(
-                            // 20px 圆底 + 文本字符(原版就是文本,不是 svg)
-                            div()
-                                .w(px(20.0))
-                                .h(px(20.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(icon_color(kind))
-                                // `color: var(--bg-base)`;亮色主题那条 `#ffffff` 覆盖与
-                                // 亮色 `--bg-base` 恰好同值,不必分支
-                                .text_color(ui::bg_base())
-                                .text_size(ui::font_px(11.0))
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child(kind.icon_char()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    // `.toast-name` 0.92rem / 600 / 单行省略
-                                    div()
-                                        .text_size(ui::font_px(12.0))
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(ui::text_primary())
-                                        .truncate()
-                                        .child(SharedString::from(item.project_name.clone())),
-                                )
-                                .child(
-                                    // `.toast-desc` 0.77rem,`margin-top: 1px`
-                                    div()
-                                        .mt(px(1.0))
-                                        .text_size(ui::font_px(10.0))
-                                        .text_color(ui::text_secondary())
-                                        .child(render_description(desc)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("toast-close-{id}")))
-                                .px(px(4.0))
-                                .flex_none()
-                                .cursor_pointer()
-                                .text_size(ui::font_px(14.0))
-                                .text_color(ui::text_muted())
-                                .hover(|el| el.text_color(ui::text_primary()))
-                                // 原版这颗按钮带 `aria-label` / `title`
-                                // (`ToastContainer.tsx:69-70`);GPUI 没有无障碍树,
-                                // tooltip 是它唯一的等价物
-                                .tip(t("toast", "dismiss"))
-                                .child("×")
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    // 关按钮吃掉这次点击 —— 不然会连带触发卡片的「跳项目」
-                                    cx.stop_propagation();
-                                    this.dismiss(id, cx);
-                                })),
-                        ),
-                )
-                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                    this.pause(id, *hovered, cx);
-                }))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.activate(id, window, cx);
-                }));
-
-            // `toastSlideIn 0.25s ease-out`:opacity 0→1 且 translateX(100%)→0。
-            // gpui 没有 transform,用相对定位的 `left` 补一条等效位移
-            // (容器宽度就是卡片宽度,所以 100% = CARD_WIDTH)。
+            // `toastSlideIn 0.25s ease-out`:translateX(100%)→0。gpui 没有 transform,用相对
+            // 定位的 `left` 补一条等效位移(容器宽度就是卡片宽度,所以 100% = CARD_WIDTH)。
+            // **不做透明度**(原版那条 opacity 0→1 读作「闪一下」,用户口径否掉了)。
             //
             // 减弱动效下**照播**:原版 `.toast-card` 不在 reduce 豁免名单里,曾按
             // 通配规则压成瞬时(此处不挂动画元素);2026-09-19 用户拍板改为豁免
             // (`mt_ui::motion::TOAST_SLIDE_IN` 已是 exempt 规格),口径与浮层进出场
-            // 同类。gpui 自己那道 `App::reduce_motion` 闸由 `motion::install` 钉成
-            // false,所以这里的 `with_animation` 在系统 reduce 下也会真的动。
+            // 同类。gpui 自己那道 `App::reduce_motion` 闸只跟「启用动画」总开关
+            // (`motion::sync_switch`),所以这里的 `with_animation` 在系统 reduce 下也会真的动。
+            let card = self.card(&item, true, cx).with_animation(
+                SharedString::from(format!("toast-slide-{id}")),
+                mt_ui::motion::TOAST_SLIDE_IN.animation(),
+                |el, delta| el.left(px(CARD_WIDTH * (1.0 - delta))),
+            );
+            stack = stack.child(Reflowed {
+                id,
+                child: card.into_any_element(),
+                book: book.clone(),
+            });
+        }
+
+        // 退场中的卡片:已经离开排版(其余卡片当场补位),按出队那一刻的离底距离原地画,
+        // 向右滑出屏外
+        for (item, gap, progress) in leaving {
             stack = stack.child(
-                card.with_animation(
-                    SharedString::from(format!("toast-slide-{id}")),
-                    mt_ui::motion::TOAST_SLIDE_IN.animation(),
-                    |el, delta| el.opacity(delta).left(px(CARD_WIDTH * (1.0 - delta))),
-                )
-                .into_any_element(),
+                div()
+                    .absolute()
+                    .bottom(px(gap))
+                    .right(px(-CARD_WIDTH * progress))
+                    .w_full()
+                    .child(self.card(&item, false, cx)),
             );
         }
         stack
@@ -776,6 +999,30 @@ mod tests {
 
     fn path(s: &str) -> DescSegment {
         DescSegment::Path(s.to_string())
+    }
+
+    /// 纵向补位的方向:卡片原先更高(离底更远)时画得更高,补间收尾时严丝合缝落回排版位置。
+    #[test]
+    fn 补位方向与终点() {
+        // 上面一张被点掉,这张往下掉了 40:显示值还停在原处 → 往上挪 40 画
+        assert_eq!(reflow_offset(10.0, 50.0), -40.0);
+        // 下面新进来一张,这张被顶上去 50:显示值还在低处 → 往下挪 50 画
+        assert_eq!(reflow_offset(60.0, 10.0), 50.0);
+        assert_eq!(reflow_offset(25.0, 25.0), 0.0, "补间到终点就不再挪");
+
+        // 用补间表跑一遍:目标变了才动,跑完就停在新位置
+        let t0 = Instant::now();
+        let mut tweens = TweenMap::new(LIST_REFLOW);
+        assert_eq!(
+            tweens.value_at("1", 50.0, t0),
+            50.0,
+            "首次出现直接落在排版位置"
+        );
+        let first = tweens.value_at("1", 10.0, t0);
+        assert_eq!(reflow_offset(10.0, first), -40.0);
+        let end = t0 + LIST_REFLOW.duration;
+        assert_eq!(reflow_offset(10.0, tweens.value_at("1", 10.0, end)), 0.0);
+        assert!(!tweens.running_at(end));
     }
 
     /// 路径样的词单独成段(连着全角括号也算),其余并成普通文字;

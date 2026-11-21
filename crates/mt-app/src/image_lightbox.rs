@@ -22,8 +22,17 @@
 //! 位图是预览那条路已经栅格好的同一份(mermaid 走 2× 栅格),**不为放大重新
 //! 渲染** —— 一份 4× 的架构图动辄几十 MB 显存(见 GPU 性能档案的「尺寸悬崖」),
 //! 而 2× 在 150% 缩放下放到 1.33× 仍是逐像素的,再往上是 GPU 双线性放大,读图足够。
+//!
+//! # 开合
+//!
+//! 遮罩压暗渐变;图片**不淡入**:从点开它的那一点(打开时的光标位置)放大到位,收起反向
+//! 缩回那一点([`zoom_rect`])。工具栏从顶边滑进、提示行从底边滑进。宿主拿不到预览里那张
+//! 图的原矩形(`ClickEvent` 不带元素 bounds),所以原点只能是点击点。宿主收到关闭事件就
+//! drop 实体,退场没处播 —— 关闭那一刻先还焦点、摘覆盖物栈登记,再交给离场托管层
+//! (`overlay_motion::linger`)画完,最后才发事件。退场中不接鼠标、不收键盘。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
@@ -32,10 +41,12 @@ use gpui::{
     StyledImage as _, Window, anchored, deferred, div, img, point, prelude::FluentBuilder, px,
     size,
 };
+use mt_ui::motion::{OVERLAY_IN, OVERLAY_OUT};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::overlay;
+use crate::overlay_motion::{self, Presence};
 use crate::ui;
 
 /// 图片四周至少留这么多空(逻辑像素),「适应窗口」按扣掉它之后的视口算。
@@ -95,8 +106,14 @@ pub struct ImageLightbox {
     /// 打开前的焦点,关闭时还回去(顺序纪律同 `menu.rs`:先还焦点再发事件)。
     prev_focus: Option<FocusHandle>,
     focus: FocusHandle,
-    /// 进场:遮罩淡入 + 图片从下方 6px 升到位(浮层进出场豁免「减少动画」)。
-    pop_in: mt_ui::motion::Transition,
+    /// 开合(`OVERLAY_IN` / `OVERLAY_OUT`,浮层进出场豁免「减少动画」)。
+    presence: Presence,
+    /// 图片从这一点放大出来、收起时缩回这一点(打开时的光标位置,窗口坐标)。
+    origin: Point<f32>,
+    /// 已经关了、正在播退场(不接鼠标、不收键盘,由离场托管层画完)。
+    closing: bool,
+    /// 覆盖物栈里的登记还在不在(关闭那一刻就摘,drop 时只摘自己还没摘的那份)。
+    registered: bool,
 }
 
 impl EventEmitter<ImageLightboxEvent> for ImageLightbox {}
@@ -120,6 +137,10 @@ impl ImageLightbox {
         window.focus(&focus, cx);
         let viewport = window.viewport_size();
         let natural = size(natural.width.max(1.0), natural.height.max(1.0));
+        // 宿主是在点击回调里建的:此刻的光标就是点图的那一点
+        let at = window.mouse_position();
+        let mut presence = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        presence.show(Instant::now());
         let mut this = Self {
             image,
             natural,
@@ -130,7 +151,10 @@ impl ImageLightbox {
             drag: None,
             prev_focus,
             focus,
-            pop_in: mt_ui::motion::Transition::new(mt_ui::motion::OVERLAY_IN),
+            presence,
+            origin: point(f32::from(at.x), f32::from(at.y)),
+            closing: false,
+            registered: true,
         };
         this.fit();
         this
@@ -231,8 +255,30 @@ impl ImageLightbox {
         }
     }
 
+    /// 摘覆盖物栈登记(幂等)。根层按栈里有没有本浮层垫毛玻璃 —— 关闭那一刻摘,
+    /// 玻璃就与这边的遮罩同步淡出。
+    fn unregister(&mut self) {
+        if std::mem::take(&mut self.registered) {
+            overlay::pop(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
+        }
+    }
+
+    /// 关闭(Esc / × / 点遮罩):还焦点、摘登记、播退场,把实体交给离场托管层多活一个
+    /// 退场时长,最后才发事件(宿主收到就 drop 自己那份)。
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.drag = None;
         self.restore_focus(window, cx);
+        self.unregister();
+        let now = Instant::now();
+        self.presence.hide(now);
+        if self.presence.mounted_at(now) {
+            overlay_motion::linger(cx.entity().into(), OVERLAY_OUT.duration, cx);
+        }
+        cx.notify();
         cx.emit(ImageLightboxEvent::Dismissed);
     }
 
@@ -377,17 +423,22 @@ impl ImageLightbox {
             .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
+                // 退场中不接点击(工具栏正往顶边外滑)
+                if this.closing {
+                    return;
+                }
                 on_click(this, window, cx);
             }))
             .child(label)
             .into_any_element()
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 工具栏。`slide` = 往上收进顶边外的距离(开合动画,全开时 0)。
+    fn render_toolbar(&self, slide: f32, cx: &mut Context<Self>) -> AnyElement {
         let percent = format!("{}%", (self.zoom * 100.0).round() as i32);
         div()
             .absolute()
-            .top(px(8.0))
+            .top(px(8.0 - slide))
             .right(px(12.0))
             .flex()
             .items_center()
@@ -423,6 +474,9 @@ impl ImageLightbox {
                     .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, _window, cx| {
                         cx.stop_propagation();
+                        if this.closing {
+                            return;
+                        }
                         this.fit();
                         cx.notify();
                     }))
@@ -452,10 +506,11 @@ impl ImageLightbox {
             .into_any_element()
     }
 
-    fn render_hint(&self) -> AnyElement {
+    /// 底部提示行。`slide` = 往下收进底边外的距离(开合动画,全开时 0)。
+    fn render_hint(&self, slide: f32) -> AnyElement {
         div()
             .absolute()
-            .bottom(px(10.0))
+            .bottom(px(10.0 - slide))
             .left_0()
             .right_0()
             .flex()
@@ -474,55 +529,63 @@ impl ImageLightbox {
     }
 }
 
-/// 实体被 drop(宿主关掉浮层 / 文档页签关掉)时摘掉登记 —— 放这里不放 `dismiss`,
-/// 宿主直接丢弃实体那条路才不会漏(同 `DatePicker`)。
+/// 实体被 drop(宿主关掉浮层 / 文档页签关掉)时摘掉登记 —— 关闭那一刻已经摘过
+/// ([`ImageLightbox::dismiss`]),这里兜的是宿主不经关闭事件、直接丢弃实体那条路
+/// (同 `DatePicker`)。
 impl Drop for ImageLightbox {
     fn drop(&mut self) {
-        overlay::pop(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
+        self.unregister();
     }
 }
 
 impl Render for ImageLightbox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let progress = self.presence.drive(window);
+        if self.closing && !self.presence.mounted_at(Instant::now()) {
+            // 退场播完了,等离场托管层把实体丢掉
+            return div();
+        }
+        let interactive = !self.closing;
         self.sync_viewport(window.viewport_size());
         let viewport = self.viewport;
-        let (opacity, rise) = mt_ui::motion::menu_pop_in(self.pop_in.drive(window));
-        let display = self.display_size();
-        let offset = self.offset;
-        let dragging = self.drag.is_some_and(|d| d.moved);
-        let pannable = self.pannable();
-        let toolbar = self.render_toolbar(cx);
-        let hint = self.render_hint();
+        let frame = zoom_rect(progress, self.origin, self.image_bounds());
+        let dragging = interactive && self.drag.is_some_and(|d| d.moved);
+        let pannable = interactive && self.pannable();
+        // 工具栏 / 提示行跟着开合从顶边 / 底边滑进滑出(收进窗口外)
+        let hidden = 1.0 - progress.clamp(0.0, 1.0);
+        let toolbar = self.render_toolbar(hidden * (8.0 + TOOLBAR_H), cx);
+        let hint = self.render_hint(hidden * (10.0 + HINT_H));
 
         div().child(
             deferred(
                 anchored().position(point(px(0.0), px(0.0))).child(
                     div()
                         .id("image-lightbox")
-                        .track_focus(&self.focus)
-                        .key_context("ImageLightbox")
                         .w(viewport.width)
                         .h(viewport.height)
-                        .occlude()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
-                        .opacity(opacity)
+                        // 遮罩压暗随开合渐变(不是内容闪现);图片本身不淡入
+                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5 * progress))
+                        // 退场中不拦:点哪儿都直接落到下面,也不再收键盘
+                        .when(interactive, |el| {
+                            el.track_focus(&self.focus)
+                                .key_context("ImageLightbox")
+                                .occlude()
+                                .on_key_down(cx.listener(Self::on_key_down))
+                                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                                .on_pinch(cx.listener(Self::on_pinch))
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                                .on_mouse_move(cx.listener(Self::on_mouse_move))
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                        })
                         .when(pannable && !dragging, |el| el.cursor_grab())
                         .when(dragging, |el| el.cursor_grabbing())
-                        .on_key_down(cx.listener(Self::on_key_down))
-                        .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-                        .on_pinch(cx.listener(Self::on_pinch))
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                        .on_mouse_move(cx.listener(Self::on_mouse_move))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                         .child(
                             img(self.image.clone())
                                 .absolute()
-                                // 进场时图片从下方 6px 升到位(menu_pop_in 给的是负值上移量,
-                                // 这里反过来用:起点在下、终点归零)
-                                .left(px(offset.x))
-                                .top(px(offset.y - rise))
-                                .w(px(display.width))
-                                .h(px(display.height))
+                                .left(px(frame.origin.x))
+                                .top(px(frame.origin.y))
+                                .w(px(frame.size.width))
+                                .h(px(frame.size.height))
                                 .rounded(px(6.0))
                                 .shadow_lg()
                                 .object_fit(gpui::ObjectFit::Fill),
@@ -533,6 +596,24 @@ impl Render for ImageLightbox {
             )
             .with_priority(1),
         )
+    }
+}
+
+/// 开合进度 `progress` 下图片该画在哪:中心从 `origin` 那一点走到终矩形的中心,尺寸从 0
+/// 等比长到终尺寸 —— 从点开它的地方放大到位。起点零尺寸,收起时缩回那一点就是没了,
+/// 不留一块小图「啪」地消失。
+fn zoom_rect(progress: f32, origin: Point<f32>, target: gpui::Bounds<f32>) -> gpui::Bounds<f32> {
+    let p = progress.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        return target;
+    }
+    let lerp = |from: f32, to: f32| from + (to - from) * p;
+    let center_x = lerp(origin.x, target.origin.x + target.size.width / 2.0);
+    let center_y = lerp(origin.y, target.origin.y + target.size.height / 2.0);
+    let (width, height) = (target.size.width * p, target.size.height * p);
+    gpui::Bounds {
+        origin: point(center_x - width / 2.0, center_y - height / 2.0),
+        size: size(width, height),
     }
 }
 
@@ -592,6 +673,28 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4
+    }
+
+    /// 开合:起点是点击点上的零尺寸,终点严丝合缝落在终矩形上;全程等比(宽高比不变)。
+    #[test]
+    fn 从点击处放大到位() {
+        let target = gpui::Bounds {
+            origin: point(100.0, 50.0),
+            size: size(400.0, 200.0),
+        };
+        let click = point(30.0, 600.0);
+        let start = zoom_rect(0.0, click, target);
+        assert_eq!(start.size, size(0.0, 0.0));
+        assert!(close(start.origin.x, click.x) && close(start.origin.y, click.y));
+        assert_eq!(zoom_rect(1.0, click, target), target);
+        assert_eq!(zoom_rect(2.0, click, target), target, "越界钳住");
+        let mid = zoom_rect(0.5, click, target);
+        assert!(close(mid.size.width / mid.size.height, 2.0), "宽高比不变");
+        let center = point(
+            mid.origin.x + mid.size.width / 2.0,
+            mid.origin.y + mid.size.height / 2.0,
+        );
+        assert!(close(center.x, (30.0 + 300.0) / 2.0) && close(center.y, (600.0 + 150.0) / 2.0));
     }
 
     #[test]

@@ -261,7 +261,6 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
 
     #[cfg(any(windows, target_os = "macos"))]
     {
-        use gpui_component::WindowExt as _;
         let frame = current_frame();
         let (views, occluders, block_input) = STATE.with(|s| {
             let mut s = s.borrow_mut();
@@ -269,8 +268,10 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
             let views: Vec<_> = s.views.iter().filter_map(|view| view.upgrade()).collect();
             (views, s.occluders.clone(), s.block_input)
         });
+        // 弹窗看「还挂着」(含退场那几帧):收起途中照样让位,否则 WebView 会盖在
+        // 正在收起的弹窗上(见 `dialog_host::is_mounted`)
         let modal = block_input
-            || window.has_active_dialog(cx)
+            || crate::dialog_host::is_mounted(window, cx)
             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay);
         for view in views {
             if view.stamped() == frame {

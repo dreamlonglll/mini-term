@@ -70,6 +70,9 @@ use mt_ui::rgb8;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
+use crate::popover_reveal::{
+    Chrome, RevealFrameState, RevealState, ShadowMode, anchor_probe, reveal_frame,
+};
 use crate::prompt::Confirm;
 use crate::store::{AiProjectEntry, AiProjectKind, AppStore, TitleBarLight};
 use crate::ui;
@@ -475,6 +478,8 @@ pub struct TitleBar {
     store: Entity<AppStore>,
     /// 项目切换胶囊的下拉是否展开。
     switcher_open: bool,
+    /// 下拉的开合动画(从胶囊水平中心往下长,收起反向播完才卸;原点由胶囊上的探针报)。
+    switcher_reveal: RevealState,
     /// 下拉开着时焦点收在这儿(否则打字会落进终端)。
     focus: FocusHandle,
     /// 打开下拉前的焦点,关闭时**先还回去再跑动作**。
@@ -491,6 +496,7 @@ impl TitleBar {
         Self {
             store,
             switcher_open: false,
+            switcher_reveal: RevealState::new(),
             focus: cx.focus_handle(),
             prev_focus: None,
             hovered_control: None,
@@ -504,15 +510,18 @@ impl TitleBar {
         self.prev_focus = window.focused(cx);
         window.focus(&self.focus, cx);
         self.switcher_open = true;
+        self.switcher_reveal.show(cx);
         cx.notify();
     }
 
-    /// 收起下拉并把焦点还给打开前那个元素(幂等)。
+    /// 收起下拉并把焦点还给打开前那个元素(幂等)。遮罩当场撤(不然收起那几帧会吞点击),
+    /// 面板反向收回胶囊、播完才卸。
     fn dismiss_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.switcher_open {
             return;
         }
         self.switcher_open = false;
+        self.switcher_reveal.hide(cx);
         if let Some(prev) = self.prev_focus.take() {
             window.focus(&prev, cx);
         }
@@ -584,6 +593,9 @@ impl TitleBar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.switcher_open;
+        // 开合进度(收起动画播完前都是 `Some`);箭头的半圈旋转同吃这个进度
+        let reveal = self.switcher_reveal.frame(window);
+        let turned = reveal.map_or(0.0, |state| state.progress);
         // 当前项目自己的 AI 状态色点;没有 AI 会话时压暗,和全局灯一个口径
         let dot_color = active_kind.map(kind_color).unwrap_or_else(ui::text_muted);
         let dot_alpha = if active_kind.is_some() { 1.0 } else { 0.45 };
@@ -613,6 +625,10 @@ impl TitleBar {
                     this.open_switcher(window, cx);
                 }
             }))
+            // 下拉开合的原点:胶囊的水平中心(探针只报坐标,不画东西、不插 hitbox)
+            .child(anchor_probe(cx.entity(), |this: &mut Self, bounds| {
+                this.switcher_reveal.note_anchor(bounds)
+            }))
             .child(
                 div()
                     .w(px(6.0))
@@ -621,23 +637,29 @@ impl TitleBar {
                     .rounded_full()
                     .bg(ui::with_alpha(dot_color, dot_alpha)),
             )
-            .child(div().flex_1().overflow_hidden().child(div().truncate().child(project_name)))
             .child(
                 div()
-                    .flex_none()
-                    .child(
-                        VectorIcon::new(ICON_CHEVRON_DOWN, px(9.0))
-                            .ink(ui::text_muted())
-                            // 展开时 `rotate(180deg)` = 半圈(`VectorIcon::rotation` 的单位是圈)
-                            .rotation(if open { 0.5 } else { 0.0 }),
-                    ),
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(div().truncate().child(project_name)),
+            )
+            .child(
+                div().flex_none().child(
+                    VectorIcon::new(ICON_CHEVRON_DOWN, px(9.0))
+                        .ink(ui::text_muted())
+                        // 展开时 `rotate(180deg)` = 半圈(`VectorIcon::rotation` 的单位是圈),
+                        // 跟着下拉的开合进度转,不瞬翻
+                        .rotation(0.5 * turned),
+                ),
             );
 
         let mut container = div().relative().flex_none().child(button);
+        // 遮罩只在开着时挂:收起那几帧不吞点击
         if open {
-            container = container
-                .child(self.switcher_backdrop(window, cx))
-                .child(self.switcher_panel(entries, active_project_id, cx));
+            container = container.child(self.switcher_backdrop(window, cx));
+        }
+        if let Some(state) = reveal {
+            container = container.child(self.switcher_panel(entries, active_project_id, state, cx));
         }
         container.into_any_element()
     }
@@ -674,10 +696,14 @@ impl TitleBar {
 
     /// 下拉面板本体。**不裁剪、不限条数**(与托盘的 `trayMaxProjects` 不同),
     /// 靠 `max-w` + `truncate` 处理溢出。
+    ///
+    /// 开合走 [`crate::popover_reveal`](与 SSH 浮层同一语言):框体(底色 / 边框 / 阴影)由
+    /// 外壳按插值矩形画,从胶囊水平中心往下长;面板本体只画内容。收起动画里面板不接鼠标。
     fn switcher_panel(
         &self,
         entries: Vec<AiProjectEntry>,
         active_project_id: Option<String>,
+        state: RevealFrameState,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut panel = div()
@@ -689,16 +715,9 @@ impl TitleBar {
             .flex_col()
             .min_w(px(220.0))
             .max_w(px(320.0))
-            .rounded(px(4.0))
+            // 边框宽度照占位,颜色 / 圆角 / 底色 / 阴影归外壳的框体(见下面 `Chrome`)
             .border_1()
-            .border_color(ui::border_default())
-            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
-            // `surface_opacity`,下拉叠在终端上时底下的字会透出来。判据见 `ui::Palette::from_pack`
-            .bg(ui::bg_overlay())
-            .shadow_lg()
-            .overflow_hidden()
-            // 面板内的按下不算「点外」
-            .occlude();
+            .overflow_hidden();
 
         if entries.is_empty() {
             panel = panel.child(
@@ -767,6 +786,23 @@ impl TitleBar {
                     ),
             );
         }
+
+        let panel = reveal_frame(
+            panel,
+            state,
+            Some(Chrome {
+                // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+                // `surface_opacity`,下拉叠在终端上时底下的字会透出来。判据见 `ui::Palette::from_pack`
+                bg: ui::bg_overlay(),
+                hover_bg: None,
+                border_color: ui::border_default(),
+                border_width: px(1.0),
+                radius: px(4.0).into(),
+                shadow: ShadowMode::Always,
+                // 面板内的按下不算「点外」
+                occlude: true,
+            }),
+        );
 
         // `absolute top:100% left:0` 挂在胶囊下方;外面套 `anchored()`(不给
         // position = 以自己的布局位置为锚点)白拿贴边收拢,`deferred` 把它抬到

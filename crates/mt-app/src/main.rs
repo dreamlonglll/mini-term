@@ -25,7 +25,7 @@
 //!      │   └─ panel(可折叠)
 //!      │       └─ SessionPanel                       ← AI 历史(右侧抽屉)
 //!      ├─ UsagePanel(浮层)                           ← 用量统计
-//!      ├─ Root::render_dialog_layer                  ← 各类 Modal
+//!      ├─ dialog_host::render_layer                  ← 各类 Modal(自建弹窗外壳)
 //!      └─ Root::render_notification_layer            ← 完成 / 待确认 toast
 //! ```
 //!
@@ -54,6 +54,7 @@ mod cli;
 mod clipboard;
 mod command_library;
 mod date_picker;
+mod dialog_host;
 mod dnd;
 mod env_vars;
 mod file_ops;
@@ -100,6 +101,7 @@ mod motion_kit;
 mod native_view;
 mod notify;
 mod overlay;
+mod overlay_motion;
 mod pane;
 mod pane_actions;
 mod pane_preview;
@@ -433,7 +435,7 @@ fn current_window_geometry(window: &Window) -> mt_layout::WindowGeometry {
 struct Workspace {
     store: Entity<AppStore>,
     /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
-    /// **画出来**的那个位置 —— 与 `Root::render_dialog_layer` 同一种分工。
+    /// **画出来**的那个位置 —— 与弹窗层(`dialog_host::render_layer`)同一种分工。
     menu_layer: Entity<menu::ContextMenu>,
     /// 自绘标题栏(无边框窗口的拖拽区 + 三键 + 项目胶囊 + 全局状态灯)。
     title_bar: Entity<TitleBar>,
@@ -1962,15 +1964,22 @@ impl Render for Workspace {
         // (那一刻 DWM 的上一帧还没有弹窗),期间沿用,全关即弃 —— 开着时再抓
         // 会把弹窗自己抓进去。抓帧同步(PrintWindow 有窗口线程亲和性,也快),
         // 模糊丢后台 —— 同步跑 debug 构建的模糊会把弹窗首帧拖出「慢半拍」
-        // (用户实测);玻璃晚一两帧淡入,压暗层与弹窗本体零延迟。
+        // (用户实测);玻璃晚一两帧到,压暗层与弹窗本体零延迟。
         //
         // 图片放大浮层(`image_lightbox`)由文档页签自己 `deferred` 画出来,根层
         // 不持有它,只按 overlay 栈里有没有它来垫玻璃 —— 它打开的那次 notify 会把
         // 祖先视图一路标脏,这里必定在同一帧里重跑,抓到的仍是没有浮层的上一帧。
-        let dialog_open = window.has_active_dialog(cx);
+        //
+        // 玻璃跟遮罩一起渐入渐出(`dialog_host::frost_alpha`),不「啪」地出现:快照到货
+        // 那一刻起淡入;全关之后随遮罩淡出,播完才丢图。淡出途中又开了弹窗就从当前浓度
+        // 淡回来,**不重抓**(这时抓会把正在收起的弹窗抓进去)。「有弹窗」只认开着的,
+        // 退场中的不算(它收起那一刻玻璃就开始跟着淡出)。
+        let dialog_open = dialog_host::has_open(window, cx);
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
-        let frost_wanted = dialog_open || self.usage_open || lightbox_open;
-        if frost_wanted {
+        let frost_target = dialog_open || self.usage_open || lightbox_open;
+        let frost_alpha = dialog_host::frost_alpha(frost_target, self.frost.is_some(), window, cx);
+        let frost_wanted = frost_target || frost_alpha > 0.0;
+        if frost_target {
             if self.frost.is_none()
                 && self.frost_task.is_none()
                 && let Some(raw) = frost::capture_raw(window)
@@ -1995,7 +2004,8 @@ impl Render for Workspace {
                     });
                 }));
             }
-        } else if self.frost.is_some() || self.frost_task.is_some() {
+        } else if !frost_wanted && (self.frost.is_some() || self.frost_task.is_some()) {
+            // 淡出播完了(或还没到货就全关了)才丢。
             // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
             // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
             // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
@@ -2478,11 +2488,19 @@ impl Render for Workspace {
         // 原版 `w-[80vw] max-h-[85vh]` + 外壳默认 `pt-[10vh]`(`Modal.tsx:162`):
         // 左右各留 10vw,顶 10vh、底 5vh(10vh + 85vh = 95vh)
         let usage_viewport = window.viewport_size();
+        // 进出场与 Dialog 族同一套外壳(`dialog_host::shell_frame`):遮罩压暗渐变,面板按最终
+        // 尺寸排好、从顶边水平中点裁剪窗展开;收起反向播完才卸。退场那几帧遮罩不再拦点击、
+        // 面板不再接鼠标(`toggle_usage` 那一下面板已经被告知不可见,定时器照停)
+        let usage_frame = self
+            .usage_panel
+            .as_ref()
+            .and_then(|_| dialog_host::shell_frame("usage-stats", self.usage_open, window, cx));
         let usage_layer = self
             .usage_panel
             .clone()
-            .filter(|_| self.usage_open)
-            .map(|panel| {
+            .zip(usage_frame)
+            .map(|(panel, frame)| {
+                let open = frame.open;
                 // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
                 // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
                 // (`Modal.tsx:171`)。毛玻璃由**根层那张共用快照**承担(与 Dialog
@@ -2493,85 +2511,104 @@ impl Render for Workspace {
                 div()
                     .absolute()
                     .inset_0()
-                    .occlude()
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
-                    // 自绘模态不进 overlay 栈:开着时 HTML 预览的 WebView 不收鼠标
+                    .when(open, |el| el.occlude())
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5 * frame.progress))
+                    // 自绘模态不进 overlay 栈:开着(含退场那几帧)时 HTML 预览的 WebView
+                    // 不收鼠标,也不盖到正在收起的面板上
                     .child(native_view::input_blocker())
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _event, window, cx| {
-                            if this.usage_open {
-                                this.toggle_usage(window, cx);
-                            }
-                        }),
-                    )
+                    .when(open, |el| {
+                        el.on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                if this.usage_open {
+                                    this.toggle_usage(window, cx);
+                                }
+                            }),
+                        )
+                    })
                     .child(
-                        div()
-                            .absolute()
-                            .top(usage_viewport.height * 0.10)
-                            .left(usage_viewport.width * 0.10)
-                            .right(usage_viewport.width * 0.10)
-                            .bottom(usage_viewport.height * 0.05)
-                            .occlude()
-                            // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
-                            // stopPropagation 同款),否则点面板空白处也会关窗
-                            .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation();
-                            })
-                            // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
-                            // 背后只剩那层 black/50,终端文字照样一个个看得清。
-                            //
-                            // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
-                            // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
-                            // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
-                            // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
-                            //
-                            // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
-                            // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
-                            // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
-                            // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
-                            // 用的都是它,这里是唯一漏掉的一个。
-                            .bg(ui::bg_overlay())
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(ui::border_default())
-                            .overflow_hidden()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .bg(ui::bg_elevated())
-                                    .child(
-                                        div()
-                                            .text_size(crate::ui::font_px(12.0))
-                                            .text_color(ui::text_primary())
-                                            .child(t("usageStats", "title")),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("usage-close")
-                                            .px(px(6.0))
-                                            .text_color(ui::text_muted())
-                                            .cursor_pointer()
-                                            .hover(|el| el.text_color(ui::color_error()))
-                                            // 走 toggle 而不是直接改标志位 —— 可见性要透给
-                                            // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                if this.usage_open {
-                                                    this.toggle_usage(window, cx);
-                                                }
-                                            }))
-                                            .child("×"),
-                                    ),
-                            )
-                            .child(div().flex_1().overflow_hidden().child(panel)),
+                        overlay_motion::reveal_box(
+                            div()
+                                .absolute()
+                                .top(usage_viewport.height * 0.10)
+                                .left(usage_viewport.width * 0.10)
+                                .right(usage_viewport.width * 0.10)
+                                .bottom(usage_viewport.height * 0.05)
+                                .when(open, |el| {
+                                    el.occlude()
+                                        // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
+                                        // stopPropagation 同款),否则点面板空白处也会关窗
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            |_event, _window, cx| cx.stop_propagation(),
+                                        )
+                                })
+                                // 底色与边框色由外壳框体按插值矩形画(见下面 `chrome`),
+                                // 这里只留版式:边框宽度照占位
+                                .border_1()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .bg(ui::bg_elevated())
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::font_px(12.0))
+                                                .text_color(ui::text_primary())
+                                                .child(t("usageStats", "title")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("usage-close")
+                                                .px(px(6.0))
+                                                .text_color(ui::text_muted())
+                                                .cursor_pointer()
+                                                .hover(|el| el.text_color(ui::color_error()))
+                                                // 走 toggle 而不是直接改标志位 —— 可见性要透给
+                                                // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
+                                                .on_click(cx.listener(
+                                                    |this, _event, window, cx| {
+                                                        if this.usage_open {
+                                                            this.toggle_usage(window, cx);
+                                                        }
+                                                    },
+                                                ))
+                                                .child("×"),
+                                        ),
+                                )
+                                .child(div().flex_1().overflow_hidden().child(panel)),
+                            frame.progress,
+                        )
+                        // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
+                        // 背后只剩那层 black/50,终端文字照样一个个看得清。
+                        //
+                        // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
+                        // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
+                        // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
+                        // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
+                        //
+                        // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
+                        // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
+                        // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
+                        // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
+                        // 用的都是它,这里是唯一漏掉的一个。
+                        .chrome(overlay_motion::chrome_style(|el| {
+                            el.bg(ui::bg_overlay())
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(ui::border_default())
+                        }))
+                        .interactive(open),
                     )
-            });
+            })
+            // 上面压着弹窗时面板里的字不参与选区(见 `dialog_host::confine_background`)
+            .map(|layer| dialog_host::confine_background(layer, window, cx));
 
         // 三栏 + 悬浮抽屉的那一层。标题栏之下的**全部**内容都在这里 ——
         // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉的
@@ -2751,26 +2788,28 @@ impl Render for Workspace {
             // 清空 —— 命中一次缓存,那一帧的窗口拖拽与最小化/最大化/关闭就全没了。
             // 它每帧那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
             .child(self.title_bar.clone())
-            .child(body)
+            // 弹窗开着时背景里的字不参与选区(见 `dialog_host::confine_background`)
+            .child(dialog_host::confine_background(body, window, cx))
             // 弹窗毛玻璃背板:垫在用量面板与 Dialog 层之下、其余一切之上
             // (含标题栏 —— 原版 Modal 是 `fixed inset-0`,遮罩同样盖住标题栏)。
             // 压暗不在这层:Dialog 走自己的 `cx.theme().overlay`(black/50,
             // theme.rs::apply 钉的),用量面板走 usage_layer 自己的 black/50 ——
-            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。
+            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。浓度跟着遮罩渐变
+            // (`frost_alpha`),全开静止时是 1。
             .children(self.frost.clone().filter(|_| frost_wanted).map(|img| {
-                div().absolute().inset_0().child(
-                    gpui::img(img)
-                        .size_full()
-                        .object_fit(gpui::ObjectFit::Fill),
-                )
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(frost_alpha)
+                    .child(gpui::img(img).size_full().object_fit(gpui::ObjectFit::Fill))
             }))
             // 用量统计(自绘 Modal):玻璃之上、Dialog 层之下 —— Dialog 叠开时
             // (如面板里再弹确认框)压在它上面,与原版 Modal 叠 Modal 同序。
             .children(usage_layer)
-            // Modal 由 Root 持有,但要由应用视图**画出来**。
+            // 弹窗层(自建外壳 `dialog_host`,栈按窗口存),由应用视图**画出来**。
             // (它自己走 `anchored()` 定在视口中央,挂哪一层都一样;
             //  通知层不同 —— 见 `body` 那边的注释。)
-            .children(Root::render_dialog_layer(window, cx))
+            .children(dialog_host::render_layer(window, cx))
             // 右键菜单层。零尺寸的绝对定位壳子 —— 菜单自己走 anchored(窗口坐标)
             // + deferred,不参与这里的 flex 布局,收着的时候一个像素都不占。
             .child(
@@ -2780,7 +2819,10 @@ impl Render for Workspace {
                     .left_0()
                     .w_0()
                     .h_0()
-                    .child(self.menu_layer.clone()),
+                    .child(self.menu_layer.clone())
+                    // 离场托管层:宿主已经丢掉、退场还没播完的浮层(日期选择器 / 图片放大)
+                    // 在这里画完最后几帧。它们同样是 deferred + 窗口坐标,零尺寸壳子不碍事
+                    .child(overlay_motion::exit_layer(cx)),
             )
     }
 }

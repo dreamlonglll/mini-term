@@ -55,7 +55,6 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
     IntoElement, KeyDownEvent, Render, Styled as _, Subscription, Task, WeakEntity, Window,
 };
-use gpui_component::WindowExt as _;
 use mt_remote::GitContext;
 use mt_ui::icons::Shape;
 
@@ -443,7 +442,7 @@ impl DiffTab {
     /// 自己会还焦点)。
     fn can_take_focus(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         workbench_area::is_diff_tab_active(&self.key, cx)
-            && !window.has_active_dialog(cx)
+            && !crate::dialog_host::has_open(window, cx)
             && overlay::allows(overlay::Yield::ToOverlay)
     }
 

@@ -91,7 +91,6 @@ use gpui::{
     ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, img,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::WindowExt as _;
 use gpui_component::input::{EditorState, Escape, InputEvent, Search, TabSize};
 use mt_project::encoding::{EncodeError, TextEncoding};
 use mt_project::fs::FileContentResult;
@@ -1349,7 +1348,7 @@ impl FileViewer {
     /// 焦点不在这条链上就收不到键)。
     fn can_take_async_focus(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         crate::workbench_area::is_viewer_active(cx.entity_id(), cx)
-            && !window.has_active_dialog(cx)
+            && !crate::dialog_host::has_open(window, cx)
             && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
     }
 
@@ -1386,7 +1385,7 @@ impl FileViewer {
             let viewer = cx.entity_id();
             window.on_next_frame(move |window, cx| {
                 if crate::workbench_area::is_viewer_active(viewer, cx)
-                    && !window.has_active_dialog(cx)
+                    && !crate::dialog_host::has_open(window, cx)
                     && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
                 {
                     focus.dispatch_action(&Search, window, cx);
