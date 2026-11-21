@@ -217,12 +217,13 @@ pub(crate) fn sidebar_row_with(
         )
 }
 
-/// 右栏桶的可折叠标题(`▸/▾ 组名 (n)`)。
+/// 右栏桶的可折叠标题(`▸/▾ 组名 (n)`)。箭头是同大小同位置的矢量三角,这一帧转
+/// `turns` 圈(见 `fold_motion`)。
 pub(crate) fn bucket_header(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
     count: usize,
-    collapsed: bool,
+    turns: f32,
 ) -> gpui::Stateful<gpui::Div> {
     let label: SharedString = label.into();
     div()
@@ -240,7 +241,7 @@ pub(crate) fn bucket_header(
                 .w(px(12.0))
                 .flex_none()
                 .text_size(ui::font_px(10.0))
-                .child(if collapsed { "▸" } else { "▾" }),
+                .child(crate::fold_motion::fold_glyph(turns)),
         )
         .child(div().min_w(px(0.0)).truncate().child(label))
         .child(div().flex_none().child(format!("({count})")))
@@ -442,9 +443,11 @@ fn conn_text_with_name(name: AnyElement, conn: &SshConnection, suffix: &str) -> 
 }
 
 /// 右栏折叠态住在各自面板结构的 `collapsed` 字段上 —— [`render_conn_buckets`]
-/// 要改的就是这一个字段,三家的其余状态互不相干,所以只抽这一口。
+/// 要改的就是这一个字段,三家的其余状态互不相干,所以只抽这一口。桶标题箭头的补间表
+/// (`fold_motion::FlipTweens`)跟着它住,点的那一刻记一笔。
 pub(crate) trait BucketCollapse: 'static {
     fn collapsed_set(&mut self) -> &mut HashSet<String>;
+    fn chevrons(&mut self) -> &mut crate::fold_motion::FlipTweens;
 }
 
 /// 右栏「分组折叠 + 逐条渲染」的骨架。三个弹窗此前逐字重复三份,差别只有两处:
@@ -457,11 +460,15 @@ pub(crate) trait BucketCollapse: 'static {
 ///   不画 —— 原版 `bucket.group || hasNamedGroup` 那条;
 /// - 返回**一桶一个** `AnyElement`,调用方 `.children(...)` 铺进列表容器 ——
 ///   三家的容器 id / padding / 空态提示各不相同,那一层不并。
+///
+/// `chevrons` 是桶标题箭头补间表的这一帧快照(各家 `Frame` 里那份)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_conn_buckets<T: BucketCollapse>(
     state: &Entity<T>,
     buckets: Vec<SshGroupBucket>,
     active: &GroupKey,
     collapsed: &HashSet<String>,
+    chevrons: &crate::fold_motion::FlipTweens,
     has_named: bool,
     id_prefix: &'static str,
     ungrouped_label: &'static str,
@@ -477,12 +484,13 @@ pub(crate) fn render_conn_buckets<T: BucketCollapse>(
                 Some(g) => g.clone().into(),
                 None => ungrouped_label.into(),
             };
+            let turns = chevrons.value_open(&key, !is_collapsed, crate::fold_motion::OPEN_TURNS);
             section = section.child(
                 bucket_header(
                     SharedString::from(format!("{id_prefix}{key}")),
                     label,
                     bucket.items.len(),
-                    is_collapsed,
+                    turns,
                 )
                 .on_click({
                     let state = state.clone();
@@ -490,9 +498,13 @@ pub(crate) fn render_conn_buckets<T: BucketCollapse>(
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                         let key = key.clone();
                         state.update(cx, |panel, cx| {
-                            if !panel.collapsed_set().remove(&key) {
-                                panel.collapsed_set().insert(key);
+                            let open = panel.collapsed_set().remove(&key);
+                            if !open {
+                                panel.collapsed_set().insert(key.clone());
                             }
+                            panel
+                                .chevrons()
+                                .flip_open(key, open, crate::fold_motion::OPEN_TURNS);
                             cx.notify();
                         });
                     }
@@ -832,6 +844,8 @@ pub struct SshPanel {
     store: Entity<AppStore>,
     selected: GroupKey,
     collapsed: HashSet<String>,
+    /// 右栏桶标题的折叠箭头(见 [`BucketCollapse`])。
+    chevrons: crate::fold_motion::FlipTweens,
     form: Option<ConnForm>,
     /// 分组改名中:`(旧组名, 输入框)`。
     renaming: Option<(String, Entity<InputState>)>,
@@ -868,6 +882,10 @@ impl Render for SshPanel {
 impl BucketCollapse for SshPanel {
     fn collapsed_set(&mut self) -> &mut HashSet<String> {
         &mut self.collapsed
+    }
+
+    fn chevrons(&mut self) -> &mut crate::fold_motion::FlipTweens {
+        &mut self.chevrons
     }
 }
 
@@ -954,6 +972,7 @@ fn open_with(mode: OpenMode, window: &mut Window, cx: &mut App) {
         store,
         selected,
         collapsed: HashSet::new(),
+        chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
         form: None,
         renaming: None,
         creating: None,
@@ -969,6 +988,8 @@ fn open_with(mode: OpenMode, window: &mut Window, cx: &mut App) {
     let state_for_add = state.clone();
 
     open_guarded(kind::SSH_PANEL, window, cx, move |dialog, window, cx| {
+        // 桶标题的折叠箭头在转就要下一帧(弹窗正文每帧经这里重建)
+        state.read(cx).chevrons.drive(window);
         let total = panel_total_h(window.viewport_size());
         let body = render_body(&state, total, cx);
         dialog
@@ -1582,6 +1603,7 @@ struct Frame {
     order: Vec<SshGroupBucket>,
     active: GroupKey,
     collapsed: HashSet<String>,
+    chevrons: crate::fold_motion::FlipTweens,
     editing_id: Option<String>,
     adding: bool,
     renaming: Option<String>,
@@ -1610,6 +1632,7 @@ fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
         order,
         active,
         collapsed: panel.collapsed.clone(),
+        chevrons: panel.chevrons.clone(),
         editing_id: panel
             .form
             .as_ref()
@@ -1913,6 +1936,7 @@ fn render_list(state: &Entity<SshPanel>, frame: &Frame, cx: &mut App) -> AnyElem
         visible_buckets(&frame.order, &frame.active),
         &frame.active,
         &frame.collapsed,
+        &frame.chevrons,
         has_named,
         "ssh-bucket-",
         t("sshModal", "ungrouped"),

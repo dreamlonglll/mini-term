@@ -257,6 +257,11 @@ impl AppStore {
         crate::git_backend::sync_remote_git_permissions(&self.config);
         drop(source_change);
         self.save_config_soon(cx);
+        // 「启用动画」管全部动画:改了就同步两道闸(mt-ui 总开关 + gpui 那道),
+        // 再刷一遍窗口 —— 闪烁类动画的挂 / 摘只发生在 render 里
+        if crate::motion::sync_switch(self.config.terminal_animations.unwrap_or(true), cx) {
+            cx.refresh_windows();
+        }
         cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 

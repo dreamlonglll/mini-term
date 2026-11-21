@@ -64,7 +64,6 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, div,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::dialog::Dialog;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use mt_project::search::{
@@ -73,6 +72,7 @@ use mt_project::search::{
 };
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::dialog_host::Dialog;
 use crate::i18n::{t, tr};
 use crate::menu;
 use crate::notify::ToastKind;

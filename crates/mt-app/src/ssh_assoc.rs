@@ -76,6 +76,8 @@ pub struct SshAssocPanel {
     busy: bool,
     selected: GroupKey,
     collapsed: HashSet<String>,
+    /// 右栏桶标题的折叠箭头(见 `ssh_panel::BucketCollapse`)。
+    chevrons: crate::fold_motion::FlipTweens,
     _task: Option<Task<()>>,
 }
 
@@ -88,6 +90,10 @@ impl Render for SshAssocPanel {
 impl BucketCollapse for SshAssocPanel {
     fn collapsed_set(&mut self) -> &mut HashSet<String> {
         &mut self.collapsed
+    }
+
+    fn chevrons(&mut self) -> &mut crate::fold_motion::FlipTweens {
+        &mut self.chevrons
     }
 }
 
@@ -124,10 +130,13 @@ pub fn open(store: Entity<AppStore>, project_id: &str, window: &mut Window, cx: 
         busy: false,
         selected: GroupKey::All,
         collapsed: HashSet::new(),
+        chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
         _task: None,
     });
 
     open_guarded(kind::SSH_ASSOC, window, cx, move |dialog, window, cx| {
+        // 桶标题的折叠箭头在转就要下一帧(弹窗正文每帧经这里重建)
+        state.read(cx).chevrons.drive(window);
         let busy = state.read(cx).busy;
         let total = panel_total_h(window.viewport_size());
         let body = render_body(&state, total, cx);
@@ -299,6 +308,7 @@ struct Frame {
     order: Vec<SshGroupBucket>,
     active: GroupKey,
     collapsed: HashSet<String>,
+    chevrons: crate::fold_motion::FlipTweens,
     checked: HashSet<String>,
     checked_groups: HashSet<String>,
     /// 被整组关联罩住的连接 id —— 这些行画成已勾、点不动。
@@ -335,6 +345,7 @@ fn read_frame(state: &Entity<SshAssocPanel>, cx: &App) -> Frame {
         order: buckets.display_order(),
         active,
         collapsed: panel.collapsed.clone(),
+        chevrons: panel.chevrons.clone(),
         checked: panel.checked.clone(),
         checked_groups: panel.checked_groups.clone(),
         covered,
@@ -566,6 +577,7 @@ fn render_list(state: &Entity<SshAssocPanel>, frame: &Frame) -> AnyElement {
         buckets,
         &frame.active,
         &frame.collapsed,
+        &frame.chevrons,
         !frame.named.is_empty(),
         "ssh-assoc-bucket-",
         t("sshAssoc", "ungrouped"),

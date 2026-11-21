@@ -792,6 +792,10 @@ impl AppStore {
     // === 全局取用 ===
 
     pub fn set_global(store: Entity<AppStore>, cx: &mut App) {
+        // 配置读出来了:把「启用动画」总开关同步进两道闸(启动时 `motion::install`
+        // 还只按缺省「开」写过一遍)
+        let animations = store.read(cx).config.terminal_animations.unwrap_or(true);
+        crate::motion::sync_switch(animations, cx);
         cx.set_global(GlobalStore(store));
     }
 

@@ -32,6 +32,7 @@
 //! | `mt_ui::icons::usage_glyphs` | KPI 六枚图标的形状表(几何属渲染层) |
 //! | 本文件 | 相位机 + 面板本体(状态、数据流、render 全家) |
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -186,7 +187,23 @@ const PROJECT_MENU_MAX_HEIGHT: gpui::Pixels = px(280.0);
 /// 模型排行前 N,其余合并成一行 Others。
 const TOP_MODELS: usize = 6;
 /// `@keyframes usageFadeIn` 的 `translateY(6px)`。
-const USAGE_FADE_SHIFT: f32 = 6.0;
+/// 主体区还没量到高度时上推的起点(首帧就进 Ready 才会用上)。
+const ENTRY_FALLBACK_SHIFT: f32 = 240.0;
+
+/// 主体入场这一帧整块往下偏多少像素:起点是主体区可视高度(整块在底边之外),按进度
+/// `p`(已缓动)推到 0。**纯函数**,终点必须精确归零(残留零点几会让主体永远错位)。
+fn entry_offset(body_height: f32, p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        return 0.0;
+    }
+    let from = if body_height > 0.0 {
+        body_height
+    } else {
+        ENTRY_FALLBACK_SHIFT
+    };
+    from * (1.0 - p)
+}
 
 // ─── 趋势图版式(逐条抄 `DailyChart.tsx`)────────────────────
 //
@@ -263,9 +280,15 @@ pub struct UsagePanel {
     /// 抽屉是否展开。实体常驻,定时器必须靠它闸住。
     visible: bool,
     tweens: Tweens,
-    /// 主体入场淡入(`.usage-fade-in`)。**相位切进 Ready 才重播** ——
+    /// 主体入场(原版 `.usage-fade-in`)。**相位切进 Ready 才重播** ——
     /// 等价原版「那层 div 重新挂载」;自动刷新期间相位不变,于是不闪。
+    /// 2026-11-21 起不再淡入,改成整块从主体区底边**上推**入位(见 [`entry_offset`])。
     fade_in: mt_ui::motion::Transition,
+    /// 主体区(滚动容器)的可视高度,canvas 量的:上推的起点就是整整这么高。
+    body_height: Rc<Cell<f32>>,
+    /// scope / range 两组段控件的滑动选中块(见 `segment_slider`)。
+    scope_slider: crate::segment_slider::IndicatorSlider,
+    range_slider: crate::segment_slider::IndicatorSlider,
     /// 上一帧的相位。判「刚进 Ready」用,别的地方不要读。
     last_phase: Option<Phase>,
     /// 排行条宽度补间(`.usage-rank-bar` 的 `transition-[width] duration-500
@@ -380,6 +403,9 @@ impl UsagePanel {
             // 首帧就是 Skeleton/PricingLoading,建成「已跑完」的,
             // 等真进了 Ready 再 restart
             fade_in: mt_ui::motion::Transition::settled(mt_ui::motion::USAGE_FADE_IN),
+            body_height: Rc::new(Cell::new(0.0)),
+            scope_slider: crate::segment_slider::IndicatorSlider::new(),
+            range_slider: crate::segment_slider::IndicatorSlider::new(),
             last_phase: None,
             rank_bars: mt_ui::motion::TweenMap::new(mt_ui::motion::RANK_BAR),
             chart_cache: None,
@@ -1185,8 +1211,25 @@ impl Render for UsagePanel {
         }
 
         let header = self.render_header(cx);
+        // 量主体区的可视高度(上推入场的起点,见 [`entry_offset`])。量完不 notify:
+        // 只有入场那 350ms 用得上,那时本来每帧都在画。
+        //
+        // ⚠️ 探针挂在滚动容器**外面**那层外壳上:滚动容器按直接子元素的包围盒算内容尺寸,
+        // 一块 `h_full` 的探针挂进去,内容恒 ≥ 可视高、再加上下 padding —— 内容很短时
+        // 滚轮也能把主体上推 28px 露出空白
+        let body_height = self.body_height.clone();
+        let height_probe = gpui::canvas(
+            move |bounds, _window, _cx| body_height.set(f32::from(bounds.size.height)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(0.0))
+        .h_full();
         let mut body = div()
             .id("usage-body")
+            .relative()
             .flex_1()
             .overflow_y_scroll()
             .px(px(16.0))
@@ -1288,7 +1331,17 @@ impl Render for UsagePanel {
             .flex_col()
             .bg(ui::bg_surface())
             .child(header)
-            .child(body)
+            // 主体区外壳:量高探针 + 滚动容器(见上)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .child(height_probe)
+                    .child(body),
+            )
             // 日期浮层。挂在这一层是安全的:它自己是 `deferred`,而 gpui 的
             // `DeferredDraw` 不带祖先的 ContentMask —— 抽屉裁不到它
             .when_some(self.calendar.clone(), |el, picker| el.child(picker))
@@ -1346,27 +1399,36 @@ impl UsagePanel {
             })
             .unwrap_or_else(|| t("usageStats", "scope.allProjects").to_string());
 
-        let mut scope_bar = segmented();
-        for s in Scope::ALL {
+        // 两组段控件的选中底色是滑动的实底块(见 `segment_slider`):各段宽度随文字变,
+        // 先量再滑;反白的字跟着滑块走(盖过一半才反白,见 `IndicatorSlider::coverage`)
+        let scope_ix = Scope::ALL.iter().position(|s| *s == scope).unwrap_or(0);
+        let mut scope_bar = segmented().child(slider_block(&self.scope_slider, scope_ix));
+        for (ix, s) in Scope::ALL.into_iter().enumerate() {
             scope_bar = scope_bar.child(
                 segment(
                     SharedString::from(format!("usage-scope-{}", s.key())),
                     s.label(),
-                    s == scope,
+                    SegmentPaint::of(&self.scope_slider, ix, scope_ix),
                 )
+                .child(self.scope_slider.probe(ix))
                 .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
                     this.set_scope(s, cx);
                 })),
             );
         }
-        let mut range_bar = segmented();
-        for r in UsageRange::ALL {
+        let range_ix = UsageRange::ALL
+            .iter()
+            .position(|r| *r == range)
+            .unwrap_or(0);
+        let mut range_bar = segmented().child(slider_block(&self.range_slider, range_ix));
+        for (ix, r) in UsageRange::ALL.into_iter().enumerate() {
             range_bar = range_bar.child(
                 segment(
                     SharedString::from(format!("usage-range-{}", r.key())),
                     r.label(),
-                    r == range,
+                    SegmentPaint::of(&self.range_slider, ix, range_ix),
                 )
+                .child(self.range_slider.probe(ix))
                 .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
                     this.set_range(r, cx);
                 })),
@@ -1912,18 +1974,16 @@ impl UsagePanel {
         self.rank_bars.sweep();
         self.rank_bars.drive(window);
 
-        // `@keyframes usageFadeIn`:`opacity 0→1` + `translateY(6px)→0`。
-        // gpui 没有 transform,位移用上外边距等价(与 `main.rs` 的 `panelSwapIn`
-        // 同一套路);跑完直接不挂包装层。
-        let fade = self.fade_in.drive(window);
-        body.child(if fade >= 1.0 {
+        // 入场(原版 `usageFadeIn` 是 opacity 0→1 + 下移 6px):不淡入,整块从主体区
+        // 底边上推入位 —— [`crate::motion_kit::shifted`] 只挪绘制位置、不改排版(滚动范围
+        // 不跟着变;`relative` + `top` 改的是排版位置,入场那 350ms 里滚动范围会临时变大),
+        // 主体区自己是裁剪窗。跑完直接不挂包装层
+        let p = self.fade_in.drive(window);
+        let offset = entry_offset(self.body_height.get(), p);
+        body.child(if offset <= 0.0 {
             main.into_any_element()
         } else {
-            div()
-                .opacity(fade)
-                .mt(px(USAGE_FADE_SHIFT * (1.0 - fade)))
-                .child(main)
-                .into_any_element()
+            crate::motion_kit::shifted(main, 0.0, offset).into_any_element()
         })
     }
 
@@ -2348,7 +2408,45 @@ fn segmented() -> Div {
         .overflow_hidden()
 }
 
-fn segment(id: SharedString, label: &str, active: bool) -> Stateful<Div> {
+/// 一段这一帧怎么画:自己画不画实底(滑块还没量到位置时选中段自己画,见
+/// `segment_slider`)、字反不反白(压在滑块上才反白)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentPaint {
+    own_bg: bool,
+    inverted: bool,
+}
+
+impl SegmentPaint {
+    fn of(slider: &crate::segment_slider::IndicatorSlider, ix: usize, active: usize) -> Self {
+        let ready = slider.ready(active);
+        Self::decide(ix == active, ready, slider.coverage(ix))
+    }
+
+    /// 纯判定:没量到时照旧(选中段实底反白);量到之后底色归滑块,字按滑块此刻盖住
+    /// 这一段的比例定(过半反白)。
+    fn decide(active: bool, ready: bool, coverage: Option<f32>) -> Self {
+        if !ready {
+            return Self {
+                own_bg: active,
+                inverted: active,
+            };
+        }
+        Self {
+            own_bg: false,
+            inverted: coverage.map_or(active, |c| c >= 0.5),
+        }
+    }
+}
+
+/// 段控件的滑动实底块(排在各段之前)。
+fn slider_block(
+    slider: &crate::segment_slider::IndicatorSlider,
+    active: usize,
+) -> crate::segment_slider::SliderBlock {
+    slider.block(active, |el| el.bg(ui::accent()))
+}
+
+fn segment(id: SharedString, label: &str, paint: SegmentPaint) -> Stateful<Div> {
     div()
         .id(id)
         .px(px(10.0))
@@ -2356,8 +2454,9 @@ fn segment(id: SharedString, label: &str, active: bool) -> Stateful<Div> {
         .text_size(ui::font_px(11.0))
         .flex_none()
         .cursor_pointer()
-        .when(active, |el| el.bg(ui::accent()).text_color(ui::bg_base()))
-        .when(!active, |el| {
+        .when(paint.own_bg, |el| el.bg(ui::accent()))
+        .when(paint.inverted, |el| el.text_color(ui::bg_base()))
+        .when(!paint.inverted, |el| {
             el.text_color(ui::text_muted())
                 .hover(|el| el.text_color(ui::text_primary()))
         })
@@ -2594,6 +2693,52 @@ mod tests {
         assert_eq!(mt_ui::motion::RANK_BAR.duration, Duration::from_millis(500));
         // 骨架屏的脉冲相反:`.animate-pulse` 不在豁免名单,reduce 下必须停
         crate::motion::with_reduce(true, || assert!(!mt_ui::motion::blinks()));
+    }
+
+    /// 主体入场是整块上推,不淡入:起点整整一个主体区高(整块在底边之外),终点精确归零。
+    #[test]
+    fn 主体入场从底边上推入位() {
+        assert_eq!(entry_offset(500.0, 0.0), 500.0);
+        assert_eq!(entry_offset(500.0, 0.5), 250.0);
+        assert_eq!(entry_offset(500.0, 1.0), 0.0, "终点必须精确归零");
+        assert_eq!(entry_offset(500.0, 1.4), 0.0, "越界钳住");
+        // 还没量到主体区高度:按兜底距离推
+        assert_eq!(entry_offset(0.0, 0.0), ENTRY_FALLBACK_SHIFT);
+        let mut prev = f32::INFINITY;
+        for i in 0..=20 {
+            let y = entry_offset(500.0, i as f32 / 20.0);
+            assert!(y <= prev, "上推全程单调");
+            prev = y;
+        }
+    }
+
+    /// 段控件:没量到时选中段自己画实底反白(与改动前一模一样);量到之后底色归滑块,
+    /// 字按滑块此刻盖住的比例反白(滑块没到之前新选中的那段不是一行看不见的白字)。
+    #[test]
+    fn 段控件反白跟着滑块走() {
+        let paint = |own_bg, inverted| SegmentPaint { own_bg, inverted };
+        assert_eq!(SegmentPaint::decide(true, false, None), paint(true, true));
+        assert_eq!(
+            SegmentPaint::decide(false, false, None),
+            paint(false, false)
+        );
+        // 量到了:谁都不自己画底
+        assert_eq!(
+            SegmentPaint::decide(true, true, Some(1.0)),
+            paint(false, true)
+        );
+        assert_eq!(
+            SegmentPaint::decide(true, true, Some(0.2)),
+            paint(false, false),
+            "刚点中、滑块还没过来"
+        );
+        assert_eq!(
+            SegmentPaint::decide(false, true, Some(0.7)),
+            paint(false, true),
+            "刚离开、滑块还压着大半"
+        );
+        // 滑块还没画过(量到了但这是第一帧):按选中与否
+        assert_eq!(SegmentPaint::decide(true, true, None), paint(false, true));
     }
 
     /// 排行条:首次出现直接落目标(浏览器同款),数据变了才补间。

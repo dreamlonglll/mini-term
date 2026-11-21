@@ -25,7 +25,7 @@
 //!      │   └─ panel(可折叠)
 //!      │       └─ SessionPanel                       ← AI 历史(右侧抽屉)
 //!      ├─ UsagePanel(浮层)                           ← 用量统计
-//!      ├─ Root::render_dialog_layer                  ← 各类 Modal
+//!      ├─ dialog_host::render_layer                  ← 各类 Modal(自建弹窗外壳)
 //!      └─ Root::render_notification_layer            ← 完成 / 待确认 toast
 //! ```
 //!
@@ -54,6 +54,7 @@ mod cli;
 mod clipboard;
 mod command_library;
 mod date_picker;
+mod dialog_host;
 mod dnd;
 mod env_vars;
 mod file_ops;
@@ -61,6 +62,7 @@ mod file_tree;
 mod file_viewer;
 mod first_run;
 mod focus_nav;
+mod fold_motion;
 // dev-only 度量工具(gpui-pre 内置帧剖析叠层)。默认不编译:整个模块连同
 // `open_window` 之后那唯一一处调用都挂在 `frame-profiler` feature 下,
 // 正式版零代码零依赖。用法见该模块的注释。
@@ -83,6 +85,7 @@ mod git_stash;
 mod git_ui;
 mod git_watch;
 mod git_worktree;
+mod height_reveal;
 mod hook_hint;
 mod hotkeys;
 mod i18n;
@@ -96,9 +99,11 @@ mod mobile_panel;
 mod mobile_relay;
 mod modal;
 mod motion;
+mod motion_kit;
 mod native_view;
 mod notify;
 mod overlay;
+mod overlay_motion;
 mod pane;
 mod pane_actions;
 mod pane_preview;
@@ -117,6 +122,7 @@ mod remote_notify;
 mod remote_project;
 mod search_modal;
 mod secrets;
+mod segment_slider;
 mod session_branch;
 mod session_panel;
 mod settings;
@@ -296,12 +302,9 @@ const DEFAULT_COLUMNS: [f64; 2] = [520.0, 1000.0];
 const DEFAULT_MIDDLE: [f64; 2] = [320.0, 380.0];
 
 /// 浮层退场后 DOM 还留多久(`src/hooks/useOverlayMotion.ts:19` 的 `OVERLAY_EXIT_MS`)。
+/// 动画时长本身一律取 `mt_ui::motion` 的规格常量(`OVERLAY_IN` / `OVERLAY_OUT` /
+/// `PANEL_SWAP` / `TAB_INDICATOR`),这里只是驻留时长。
 const OVERLAY_EXIT_MS: u64 = 400;
-/// `--motion-overlay-in` / `--motion-overlay-out` / `--motion-terminal-swap`
-/// (`styles.css:67-78`)。
-const MOTION_OVERLAY_IN_MS: u64 = 240;
-const MOTION_OVERLAY_OUT_MS: u64 = 140;
-const MOTION_PANEL_SWAP_MS: u64 = 200;
 
 /// 应用数据目录:`config.db`(配置本体)、`layout.db`(界面布局)、
 /// `config.json`(给 sidecar 读的 SSH 投影)、`hook-server.json` 的落点。
@@ -342,6 +345,64 @@ impl DrawerPanel {
 struct DrawerExit {
     panel: DrawerPanel,
     _timer: Task<()>,
+}
+
+/// 提交详情栏的退场:取消选中 / 关栏时它向右收回抽屉左缘,播完才卸(与 [`DrawerExit`]
+/// 同一种驻留)。期间画的是同一个实体 —— 栏已从正常位置撤下,不会同帧挂两份。
+struct DetailExit {
+    pane: Entity<git_history::CommitDetailPane>,
+    /// 收起那一刻的栏宽。
+    width: f32,
+    transition: mt_ui::motion::Transition,
+}
+
+/// 中栏开合时栏里内容的方向性位移。栏宽照旧一次跳到位(PTY resize 一次是停靠面板的
+/// 正常代价),只有内容在 `overflow_hidden` 的 absolute 层里从左滑入;收起时栏已隐藏,
+/// 另起一层短暂的出场层画旧内容向左滑出(此刻栏里不画它们,不会同帧双挂)。
+/// ⚠️ 项目列表、文件树套着 [`cached_panel`]:动画层只动 `left`,**不许**改 opacity
+/// (缓存会把某一帧的透明度定死,见抽屉层那段注释)。
+///
+/// 半路掉头(收到一半又展开、展开到一半又收)从眼下的位置接着走:进度存成
+/// `ValueTween`,新一场从 [`motion_kit::reversed_progress`] 起步(推导见
+/// [`middle_content_left`] 的单测),不从头播。
+struct MiddleMotion {
+    entering: bool,
+    progress: mt_ui::motion::ValueTween,
+}
+
+/// 抽屉段控件的排列次序(会话在左、Git 在右):换面板时往右边那项切,新面板从右进。
+fn drawer_panel_order(old: DrawerPanel, new: DrawerPanel) -> f32 {
+    let index = |panel: DrawerPanel| match panel {
+        DrawerPanel::Sessions => 0,
+        DrawerPanel::Git => 1,
+    };
+    (index(new) - index(old)) as f32
+}
+
+/// 抽屉段控件滑块停在哪(容器宽的分数)。
+fn drawer_tab_left(panel: DrawerPanel) -> f32 {
+    match panel {
+        DrawerPanel::Sessions => 0.0,
+        DrawerPanel::Git => 0.5,
+    }
+}
+
+/// 中栏内容层这一帧的 `left`(栏宽的分数):滑入从 -1 推到 0,滑出从 0 推到 -1。**纯函数**,
+/// 终点精确(滑入残留零点几会让中栏内容永远错位)。
+fn middle_content_left(entering: bool, progress: f32) -> f32 {
+    let p = progress.clamp(0.0, 1.0);
+    if entering {
+        if p >= 1.0 { 0.0 } else { -(1.0 - p) }
+    } else if p >= 1.0 {
+        -1.0
+    } else {
+        -p
+    }
+}
+
+/// 提交详情栏退场这一帧里层的 `left`(像素):从 0 收到整栏宽(滑进抽屉左缘后面)。
+fn detail_exit_left(width: f32, progress: f32) -> f32 {
+    width * progress.clamp(0.0, 1.0)
 }
 
 /// 右抽屉(或它左侧的提交详情栏)左缘拖拽的一次会话。
@@ -435,7 +496,7 @@ fn current_window_geometry(window: &Window) -> mt_layout::WindowGeometry {
 struct Workspace {
     store: Entity<AppStore>,
     /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
-    /// **画出来**的那个位置 —— 与 `Root::render_dialog_layer` 同一种分工。
+    /// **画出来**的那个位置 —— 与弹窗层(`dialog_host::render_layer`)同一种分工。
     menu_layer: Entity<menu::ContextMenu>,
     /// 自绘标题栏(无边框窗口的拖拽区 + 三键 + 项目胶囊 + 全局状态灯)。
     title_bar: Entity<TitleBar>,
@@ -466,6 +527,20 @@ struct Workspace {
     right_drawer: Option<DrawerPanel>,
     /// 正在播退场动画的那一块(见 [`DrawerExit`])。
     drawer_exit: Option<DrawerExit>,
+    /// 抽屉**换面板**的整幅 push(会话在左、Git 在右,见 [`drawer_panel_order`])。开抽屉
+    /// 不播(那有整层滑入),所以由 [`Self::set_drawer`] 显式驱动,不在 render 里比对。
+    drawer_swap: motion_kit::KeyedSwap<DrawerPanel>,
+    /// 抽屉段控件滑动选中块的位置(容器宽的分数:0 = 会话那一半,0.5 = Git 那一半)。
+    /// 只在换面板时补间;开抽屉直接落位(见 [`drawer_tab_left`])。
+    drawer_tab: mt_ui::motion::ValueTween,
+    /// 提交详情栏的退场(见 [`DetailExit`])。
+    detail_exit: Option<DetailExit>,
+    /// 上一帧画着的提交详情栏(实体 + 栏宽):这一帧没了就起退场。
+    detail_seen: Option<(Entity<git_history::CommitDetailPane>, f32)>,
+    /// 中栏开合的内容滑入 / 滑出(见 [`MiddleMotion`])。
+    middle_motion: Option<MiddleMotion>,
+    /// 上一帧中栏开着没有(`None` = 还没画过:首帧只记下,不播)。
+    middle_seen: Option<bool>,
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     /// Git 抽屉左侧「提交详情」栏的左缘正在被拖(同上,松手才落盘)。
@@ -570,7 +645,7 @@ impl Workspace {
             redraw::set_window_active(active, cx);
             // 顺手重探一次「减少动画」:用户多半是切到系统设置里改完再切回来的。
             // 变了才刷窗口(闪烁类动画的挂/摘只发生在 render 里)。
-            if active && motion::refresh() {
+            if active && motion::refresh(cx) {
                 cx.refresh_windows();
             }
         });
@@ -675,6 +750,12 @@ impl Workspace {
             last_viewport: window.viewport_size(),
             right_drawer: None,
             drawer_exit: None,
+            drawer_swap: motion_kit::KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
+            drawer_tab: mt_ui::motion::ValueTween::settled(0.0, mt_ui::motion::TAB_INDICATOR),
+            detail_exit: None,
+            detail_seen: None,
+            middle_motion: None,
+            middle_seen: None,
             drawer_drag: None,
             detail_drag: None,
             usage_open: false,
@@ -1180,6 +1261,23 @@ impl Workspace {
         }
         let prev = self.right_drawer;
         self.right_drawer = next;
+        // 换面板才播 push / 滑块;从收着打开直接落位(开抽屉本身有整层滑入)
+        match (prev, next) {
+            (Some(old), Some(new)) => {
+                self.drawer_swap
+                    .observe(&new, |_, _| drawer_panel_order(old, new));
+                self.drawer_tab
+                    .retarget_at(drawer_tab_left(new), std::time::Instant::now());
+            }
+            (None, Some(new)) => {
+                self.drawer_swap.jump(&new);
+                self.drawer_tab = mt_ui::motion::ValueTween::settled(
+                    drawer_tab_left(new),
+                    mt_ui::motion::TAB_INDICATOR,
+                );
+            }
+            _ => {}
+        }
         self.session_panel.update(cx, |panel, cx| {
             panel.set_visible(next == Some(DrawerPanel::Sessions), cx)
         });
@@ -1551,6 +1649,36 @@ impl Workspace {
         });
     }
 
+    /// 中间栏的上下两块(项目列表 / 文件树)。`on_resize` 由调用方挂 —— 中栏收起的出场层
+    /// 另画一份(那时栏里那份进的是不可见的 panel,不会被画),它不该回写尺寸。
+    ///
+    /// ⚠️ **只给上面那块播种,下面那块留空**(见 render 里那段注释)。
+    fn middle_group(&self, middle: &[f64]) -> gpui_component::resizable::ResizablePanelGroup {
+        v_resizable("middle-column")
+            .with_state(&self.middle_state)
+            .child(
+                resizable_panel()
+                    .size(px(middle[0] as f32))
+                    .size_range(px(100.0)..Pixels::MAX)
+                    // 两块都套 view 级缓存(判据见 [`cached_panel`]):内容全从
+                    // store 来、各自 `cx.observe(&store)`,终端刷屏那一拍不该带着
+                    // 它们重跑 render。占位样式与两者 render 根节点的
+                    // `div().size_full()` 等价
+                    .child(cached_panel(
+                        &self.project_list,
+                        StyleRefinement::default().size_full(),
+                    )),
+            )
+            .child(
+                resizable_panel()
+                    .size_range(px(120.0)..Pixels::MAX)
+                    .child(cached_panel(
+                        &self.file_tree,
+                        StyleRefinement::default().size_full(),
+                    )),
+            )
+    }
+
     /// 提交详情栏此刻的宽:拖拽中按拖的,否则按落盘的;窗口窄时让一让(见
     /// [`detail_layer_width`])。
     fn detail_width(&self, drawer_width: f32, window: &Window, cx: &App) -> f32 {
@@ -1577,6 +1705,8 @@ impl Workspace {
     ///
     /// 宽度(`width`,由 [`Self::detail_width`] 算好传进来 —— 挤占页签区也按它)落
     /// layout.db(左缘拖拽,松手落盘)。
+    ///
+    /// 退场(取消选中 / 关栏)见 [`Self::render_detail_exit_layer`]。
     fn render_commit_detail_layer(
         &self,
         pane: Entity<git_history::CommitDetailPane>,
@@ -1639,12 +1769,55 @@ impl Workspace {
                     )
                     .with_animation(
                         "git-detail-slide-in",
-                        gpui::Animation::new(std::time::Duration::from_millis(
-                            MOTION_OVERLAY_IN_MS,
-                        ))
-                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                        mt_ui::motion::OVERLAY_IN.animation(),
                         move |el, delta| el.left(px(width * (1.0 - delta))),
                     ),
+            )
+    }
+
+    /// 提交详情栏的退场层:与进场同一个外壳(按栏宽裁剪、贴着抽屉左缘),里层的 `left`
+    /// 从 0 补到栏宽 —— 向右收回抽屉左缘后面,方向与进场相反、零尺寸变化
+    /// ([`mt_ui::motion::OVERLAY_OUT`])。外壳 `id` 与进场那层不同:退场期间进场层不在
+    /// 树上,它的动画状态随之丢掉,再选中一个提交照旧从头滑出来。没有左缘手柄。
+    ///
+    /// 拦鼠标的是**里层末尾**那张透明罩(随内容滑、被外壳裁剪):外壳上的 `occlude` 挡不住
+    /// 自己的子元素(外壳的命中框先于子元素插入,命中从后往前找),退场中的栏照样接
+    /// 「查看变更 / 关闭 / 文件行」的点击;罩在外壳上又会让内容滑走后空出来的那块继续
+    /// 吞掉底下的点击。
+    ///
+    /// 文件页上的挤占(`drawer_squeeze`)在收起那一刻就一帧放回原宽、不补间(逐帧重排
+    /// 文件页不值),这一层照旧盖在页签区上方滑走,两者互不牵扯。
+    fn render_detail_exit_layer(
+        exit: &DetailExit,
+        drawer_width: f32,
+        window: &Window,
+    ) -> impl IntoElement + use<> {
+        let progress = exit.transition.drive(window);
+        let width = exit.width;
+        div()
+            .id("git-detail-exit")
+            .absolute()
+            .top_0()
+            .right(px(drawer_width))
+            .h_full()
+            .w(px(width))
+            .overflow_hidden()
+            .child(native_view::occluder())
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(detail_exit_left(width, progress)))
+                    .h_full()
+                    .w(px(width))
+                    .flex()
+                    .flex_col()
+                    .bg(ui::bg_surface())
+                    .border_l_1()
+                    .border_color(ui::border_default())
+                    .child(exit.pane.clone())
+                    // 退场中的内容不接悬停与点击(见上)
+                    .child(div().absolute().inset_0().occlude()),
             )
     }
 
@@ -1652,14 +1825,20 @@ impl Workspace {
     ///
     /// 段控件的选中态底块是一个**滑动的绝对定位块**(`absolute inset-y-0 left-0
     /// w-1/2`,`transform: translateX(0% | 100%)`,`--motion-tab-indicator` 0.22s)。
-    /// gpui 没有 transform,这里用 `left` 百分比 + `with_animation` 做等效补间:
-    /// 换面板时 id 里带目标面板名 → 动画重播,底块从 0% 滑到 50%(或反过来)。
+    /// gpui 没有 transform,这里用 `left` 百分比做等效补间:位置是挂在 Workspace 上的
+    /// [`Self::drawer_tab`],**只在换面板时**补(此前按目标面板名换 id 重播
+    /// `with_animation`,抽屉关上超过驻留时间再打开,底块会从另一半滑过来)。
     fn render_drawer_header(
         &self,
         panel: DrawerPanel,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let to_git = panel == DrawerPanel::Git;
+        let now = std::time::Instant::now();
+        let tab_left = self.drawer_tab.value_at(now);
+        if self.drawer_tab.running_at(now) {
+            window.request_animation_frame();
+        }
         let mut seg = div()
             .relative()
             .flex()
@@ -1672,23 +1851,12 @@ impl Workspace {
             // 滑动选中块
             .child(
                 div()
-                    .id(SharedString::from(format!("drawer-tab-ind-{}", panel.key())))
                     .absolute()
                     .top_0()
                     .bottom_0()
                     .w(gpui::relative(0.5))
-                    .bg(ui::accent_subtle())
-                    .with_animation(
-                        SharedString::from(format!("drawer-tab-slide-{}", panel.key())),
-                        gpui::Animation::new(std::time::Duration::from_millis(220))
-                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
-                        move |el, delta| {
-                            // 起点是另一半,终点是自己那一半
-                            let from = if to_git { 0.0 } else { 0.5 };
-                            let to = if to_git { 0.5 } else { 0.0 };
-                            el.left(gpui::relative(from + (to - from) * delta))
-                        },
-                    ),
+                    .left(gpui::relative(tab_left))
+                    .bg(ui::accent_subtle()),
             );
         for (tab, label) in [
             (DrawerPanel::Sessions, t("panels", "sessions")),
@@ -1968,15 +2136,26 @@ impl Render for Workspace {
         // (那一刻 DWM 的上一帧还没有弹窗),期间沿用,全关即弃 —— 开着时再抓
         // 会把弹窗自己抓进去。抓帧同步(PrintWindow 有窗口线程亲和性,也快),
         // 模糊丢后台 —— 同步跑 debug 构建的模糊会把弹窗首帧拖出「慢半拍」
-        // (用户实测);玻璃晚一两帧淡入,压暗层与弹窗本体零延迟。
+        // (用户实测);玻璃晚一两帧到,压暗层与弹窗本体零延迟。
         //
         // 图片放大浮层(`image_lightbox`)由文档页签自己 `deferred` 画出来,根层
         // 不持有它,只按 overlay 栈里有没有它来垫玻璃 —— 它打开的那次 notify 会把
         // 祖先视图一路标脏,这里必定在同一帧里重跑,抓到的仍是没有浮层的上一帧。
-        let dialog_open = window.has_active_dialog(cx);
+        //
+        // 玻璃进场随遮罩淡入(`dialog_host::frost_alpha`),不「啪」地出现:快照到货那一刻
+        // 起淡入。退场**当场撤**(用户定稿):快照可能是几分钟前抓的,随遮罩淡出就是旧画面
+        // 叠在实时内容上的残影;遮罩压暗照常渐出。「有弹窗」只认开着的,退场中的不算。
+        //
+        // 图却留到外壳全部收完(`frost_keep`):退场途中又开弹窗就从零淡入、沿用这张,
+        // **不重抓** —— 这时抓到的上一帧里有正在收起的那层(抓进去就是一团糊在新弹窗背后)。
+        let dialog_open = dialog_host::has_open(window, cx);
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
-        let frost_wanted = dialog_open || self.usage_open || lightbox_open;
-        if frost_wanted {
+        let frost_target = dialog_open || self.usage_open || lightbox_open;
+        let frost_alpha = dialog_host::frost_alpha(frost_target, self.frost.is_some(), window, cx);
+        let frost_wanted = frost_alpha > 0.0;
+        let frost_keep =
+            frost_target || dialog_host::is_mounted(window, cx) || overlay_motion::lingering(cx);
+        if frost_target {
             if self.frost.is_none()
                 && self.frost_task.is_none()
                 && let Some(raw) = frost::capture_raw(window)
@@ -2001,7 +2180,8 @@ impl Render for Workspace {
                     });
                 }));
             }
-        } else if self.frost.is_some() || self.frost_task.is_some() {
+        } else if !frost_keep && (self.frost.is_some() || self.frost_task.is_some()) {
+            // 外壳全部收完了(或还没到货就全关了)才丢。
             // 快照是 `img(Arc<RenderImage>)` 直接画的,不经资源缓存,但上传进图集的
             // 纹理(约 1/4 窗口大小)只有 `drop_image` 摘得掉 —— 只清字段的话每开
             // 一次弹窗就漏一张。渲染途中必须把当前窗口递进去(它此刻被摘出了
@@ -2029,6 +2209,33 @@ impl Render for Workspace {
         let detail_width = detail_pane
             .as_ref()
             .map(|_| self.detail_width(drawer_width as f32, window, cx));
+        // 提交详情栏刚没了(取消选中 / 关栏 / 换到会话面板)且抽屉还开着:起退场,播完再卸。
+        // 整个抽屉收起时详情栏随抽屉一起滑走,不另播
+        match detail_pane.clone().zip(detail_width) {
+            Some(shown) => {
+                self.detail_exit = None;
+                self.detail_seen = Some(shown);
+            }
+            None => {
+                if let Some((pane, width)) = self.detail_seen.take()
+                    && self.right_drawer.is_some()
+                    && mt_ui::motion::animations_enabled()
+                {
+                    self.detail_exit = Some(DetailExit {
+                        pane,
+                        width,
+                        transition: mt_ui::motion::Transition::new(mt_ui::motion::OVERLAY_OUT),
+                    });
+                }
+                if self
+                    .detail_exit
+                    .as_ref()
+                    .is_some_and(|exit| !exit.transition.running() || self.right_drawer.is_none())
+                {
+                    self.detail_exit = None;
+                }
+            }
+        }
         // 停在文件 / diff 页签上时,开着的抽屉(连同详情栏)挤窄页签区而不是盖在上面;
         // 终端页照旧悬浮(见 [`drawer_squeeze`])。只看 `right_drawer`:收起那一刻就把
         // 页签区放回原宽,退场动画里的抽屉照旧从页签区上方滑走。页签区所在那一栏的宽按
@@ -2056,33 +2263,87 @@ impl Render for Workspace {
         // 会在首帧之后 `adjust_to_container_size()` 把它们**按比例**摊回容器高 ——
         // 存的 300/400 于是被拉成 583/777,「上次拖的高度」永远保不住(实测)。
         // 留空的那块 `initial_size` 是 `None`,自动吸收差额,上面那块就纹丝不动。
-        let middle_group = v_resizable("middle-column")
-            .with_state(&self.middle_state)
-            .child(
-                resizable_panel()
-                    .size(px(middle[0] as f32))
-                    .size_range(px(100.0)..Pixels::MAX)
-                    // 两块都套 view 级缓存(判据见 [`cached_panel`]):内容全从
-                    // store 来、各自 `cx.observe(&store)`,终端刷屏那一拍不该带着
-                    // 它们重跑 render。占位样式与两者 render 根节点的
-                    // `div().size_full()` 等价
-                    .child(cached_panel(
-                        &self.project_list,
-                        StyleRefinement::default().size_full(),
-                    )),
-            )
-            .child(
-                resizable_panel()
-                    .size_range(px(120.0)..Pixels::MAX)
-                    .child(cached_panel(
-                        &self.file_tree,
-                        StyleRefinement::default().size_full(),
-                    )),
-            )
+        let middle_group = self
+            .middle_group(&middle)
             .on_resize(move |state, _window, cx| {
                 let sizes: Vec<f64> = state.read(cx).sizes().iter().map(|p| f32::from(*p) as f64).collect();
                 store_for_middle.update(cx, |store, cx| store.set_middle_column_sizes(sizes, cx));
             });
+        // 中栏开合(见 [`MiddleMotion`]):开了 → 栏里内容从左滑入;收了 → 出场层画旧内容
+        // 向左滑出。首帧只记下,不播
+        let now = std::time::Instant::now();
+        if let Some(was) = self.middle_seen
+            && was != middle_visible
+        {
+            // 上一场还在飞就是半路掉头:从眼下的位置接着走(见 [`MiddleMotion`])
+            let from = self
+                .middle_motion
+                .as_ref()
+                .filter(|motion| motion.progress.running_at(now))
+                .map_or(0.0, |motion| {
+                    motion_kit::reversed_progress(motion.progress.value_at(now))
+                });
+            self.middle_motion = mt_ui::motion::animations_enabled().then(|| MiddleMotion {
+                entering: middle_visible,
+                progress: motion_kit::resume_band(from, mt_ui::motion::PANEL_SWAP, now),
+            });
+        }
+        self.middle_seen = Some(middle_visible);
+        let middle_frame = self.middle_motion.as_ref().and_then(|motion| {
+            motion
+                .progress
+                .running_at(now)
+                .then(|| (motion.entering, motion.progress.value_at(now)))
+        });
+        match middle_frame {
+            Some(_) => window.request_animation_frame(),
+            None => self.middle_motion = None,
+        }
+        let middle_content: gpui::AnyElement = match middle_frame {
+            // 滑入:同尺寸的 absolute 层只动 left,栏本身裁掉露在左边外的部分
+            Some((true, progress)) => div()
+                .size_full()
+                .relative()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .h_full()
+                        .w_full()
+                        .left(gpui::relative(middle_content_left(true, progress)))
+                        .child(middle_group),
+                )
+                .into_any_element(),
+            _ => middle_group.into_any_element(),
+        };
+        // 滑出:栏已隐藏(上面那份进的是不可见的 panel,不会被画),出场层里画另一份。
+        // 拦鼠标的是里层末尾那张罩(随内容滑、被外壳裁剪,只罩内容此刻还露着的那块):
+        // 外壳上的 `occlude` 挡不住自己的子元素(滑走中的项目行照样能点、能起拖拽),
+        // 整宽常驻又会在内容滑走后继续吞掉终端区左段的点击
+        let middle_exit = match middle_frame {
+            Some((false, progress)) => Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(activity_bar::WIDTH))
+                    .h_full()
+                    .w(px(columns[0] as f32))
+                    .overflow_hidden()
+                    .child(native_view::occluder())
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .w_full()
+                            .left(gpui::relative(middle_content_left(false, progress)))
+                            .child(self.middle_group(&middle))
+                            .child(div().absolute().inset_0().occlude()),
+                    ),
+            ),
+            _ => None,
+        };
 
         let columns_group = h_resizable("columns")
             .with_state(&self.columns_state)
@@ -2091,7 +2352,7 @@ impl Render for Workspace {
                     .visible(middle_visible)
                     .size(px(columns[0] as f32))
                     .size_range(px(180.0)..px(700.0))
-                    .child(middle_group),
+                    .child(middle_content),
             )
             // 面板切换竖条停靠在终端区**里侧**右缘(固定 44px、不进 resizable
             // 的分栏账),与 VS Code 终端面板右侧的列表同位。开合会改终端宽度
@@ -2374,17 +2635,21 @@ impl Render for Workspace {
         //   gpui 没有 transform,改成把 `right` 从 `-width` 补到 0(等效);
         // - 退场 `drawerSlideOut` 140ms:反过来,期间**面板实体仍留在树上**
         //   (`drawer_exit` 驻留 400ms),否则内容会先空掉;
-        // - 换面板 `panelSwapIn` 200ms:内容层的 `ElementId` 带面板名,
-        //   换面板即换 id → 动画重播(等价于原版 `key={panel}` 的重建)。
+        // - 换面板 200ms:左右整幅 push(`motion_kit::push_pair`),方向跟段控件次序
+        //   (会话在左、Git 在右);会话 / Git 是两个不同实体,同帧挂两份没问题。**只在
+        //   换面板时播**(`drawer_swap` 由 `set_drawer` 驱动),开抽屉不播 —— 此前内容层的
+        //   id 带面板名,每次开抽屉都是新 id,连同整层滑入一起再淡一遍;原版的
+        //   `panelSwapIn`(opacity 0→1 + 右移 10px)按口径改成不淡入的方向性位移。
         //
         // ⚠️ 这三条在原版被**显式豁免** `prefers-reduced-motion`
         // (`styles.css:424-451`),所以 GPUI 侧不加任何减弱动效判定,始终播放。
+        let drawer_swap = self.drawer_swap.frame(window);
         let drawer_layer = drawer_panel.map(|panel| {
             let leaving = self.right_drawer.is_none();
             let width = drawer_width as f32;
             // ⚠️ 抽屉里这两块**不套** [`cached_panel`](Git 面板里的「更改」「提交历史」
             // 两个子视图也没单独套):
-            // ① 它们身上压着两层 `with_animation`(整层滑入滑出 + 换面板的
+            // ① 它们身上压着整层滑入滑出的 `with_animation`(此前还有换面板的
             //    `panelSwapIn` 改 opacity),而 opacity 是 paint 期烙进图元的、
             //    `reuse_paint` 原样重放 —— 命中缓存就会把某一帧的透明度定死。连带的
             //    `ml(10·(1−δ))` 在末几帧被布局按设备像素取整成 0,缓存键与终态相同,
@@ -2393,15 +2658,37 @@ impl Render for Workspace {
             //    「更改」列表已虚拟化(只建视口里那几行,见 `git_changes` 模块注释),
             //    剩下的开销与改动数无关;提交历史区每行按墙钟现算「x 分钟前」、没有
             //    定时 notify,套缓存会把它冻住。
-            let content: gpui::AnyElement = match panel {
-                DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
-                DrawerPanel::Git => self.git_panel.clone().into_any_element(),
+            let panel_view = |panel: DrawerPanel| -> gpui::AnyElement {
+                match panel {
+                    DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
+                    DrawerPanel::Git => self.git_panel.clone().into_any_element(),
+                }
+            };
+            // 换面板:新旧两个面板实体整幅 push;收起途中不推(整层在滑走)
+            let content = match drawer_swap {
+                Some((old, progress, dir)) if !leaving && old != panel => motion_kit::push_pair(
+                    panel_view(panel),
+                    Some(panel_view(old)),
+                    progress,
+                    motion_kit::PushAxis::Horizontal,
+                    dir,
+                )
+                .into_any_element(),
+                _ => panel_view(panel),
             };
             // Git 面板选中提交时,抽屉左侧再挂一栏「提交详情」
             let detail_layer = detail_pane
                 .clone()
                 .zip(detail_width)
-                .map(|(pane, detail)| self.render_commit_detail_layer(pane, width, detail, cx));
+                .map(|(pane, detail)| {
+                    self.render_commit_detail_layer(pane, width, detail, cx)
+                        .into_any_element()
+                })
+                .or_else(|| {
+                    self.detail_exit.as_ref().map(|exit| {
+                        Self::render_detail_exit_layer(exit, width, window).into_any_element()
+                    })
+                });
             div()
                 .absolute()
                 .top_0()
@@ -2420,24 +2707,14 @@ impl Render for Workspace {
                 // `--shadow-overlay`(`RightDrawer.tsx:67`);gpui 侧用同一档
                 // 阴影,与 `menu.rs` 的浮层一致
                 .shadow_lg()
-                .child(self.render_drawer_header(panel, cx))
+                .child(self.render_drawer_header(panel, window, cx))
                 .child(
                     div()
-                        // `key={panel}` 的对应物:换面板时这层换 id → 重建 → 动画重播
-                        .id(SharedString::from(format!("drawer-body-{}", panel.key())))
+                        .id("drawer-body")
                         .flex_1()
                         .min_h(px(0.0))
                         .overflow_hidden()
-                        .child(content)
-                        .with_animation(
-                            SharedString::from(format!("panel-swap-{}", panel.key())),
-                            gpui::Animation::new(std::time::Duration::from_millis(
-                                MOTION_PANEL_SWAP_MS,
-                            ))
-                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
-                            // `panelSwapIn`:opacity 0→1 且 translateX(10px)→0
-                            |el, delta| el.opacity(delta).ml(px(10.0 * (1.0 - delta))),
-                        ),
+                        .child(content),
                 )
                 // 左缘拖拽手柄:抽屉贴右边缘,把左缘往左拖 = 变宽,
                 // 所以位移取 `start_x - 当前 x`(照抄 `RightDrawer.tsx:48`)
@@ -2472,16 +2749,11 @@ impl Render for Workspace {
                     } else {
                         "drawer-slide-in"
                     }),
-                    gpui::Animation::new(std::time::Duration::from_millis(if leaving {
-                        MOTION_OVERLAY_OUT_MS
+                    if leaving {
+                        mt_ui::motion::OVERLAY_OUT.animation()
                     } else {
-                        MOTION_OVERLAY_IN_MS
-                    }))
-                    .with_easing(if leaving {
-                        ui::cubic_bezier(0.4, 0.0, 0.9, 0.6)
-                    } else {
-                        ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)
-                    }),
+                        mt_ui::motion::OVERLAY_IN.animation()
+                    },
                     move |el, delta| {
                         let offset = if leaving { delta } else { 1.0 - delta };
                         el.right(px(-width * offset))
@@ -2492,11 +2764,19 @@ impl Render for Workspace {
         // 原版 `w-[80vw] max-h-[85vh]` + 外壳默认 `pt-[10vh]`(`Modal.tsx:162`):
         // 左右各留 10vw,顶 10vh、底 5vh(10vh + 85vh = 95vh)
         let usage_viewport = window.viewport_size();
+        // 进出场与 Dialog 族同一套外壳(`dialog_host::shell_frame`):遮罩压暗渐变,面板按最终
+        // 尺寸排好、从顶边水平中点裁剪窗展开;收起反向播完才卸。退场那几帧遮罩不再拦点击、
+        // 面板不再接鼠标(`toggle_usage` 那一下面板已经被告知不可见,定时器照停)
+        let usage_frame = self
+            .usage_panel
+            .as_ref()
+            .and_then(|_| dialog_host::shell_frame("usage-stats", self.usage_open, window, cx));
         let usage_layer = self
             .usage_panel
             .clone()
-            .filter(|_| self.usage_open)
-            .map(|panel| {
+            .zip(usage_frame)
+            .map(|(panel, frame)| {
+                let open = frame.open;
                 // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
                 // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
                 // (`Modal.tsx:171`)。毛玻璃由**根层那张共用快照**承担(与 Dialog
@@ -2507,85 +2787,105 @@ impl Render for Workspace {
                 div()
                     .absolute()
                     .inset_0()
-                    .occlude()
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
-                    // 自绘模态不进 overlay 栈:开着时 HTML 预览的 WebView 不收鼠标
-                    .child(native_view::input_blocker())
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _event, window, cx| {
-                            if this.usage_open {
-                                this.toggle_usage(window, cx);
-                            }
-                        }),
-                    )
+                    .when(open, |el| el.occlude())
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5 * frame.progress))
+                    // 自绘模态不进 overlay 栈:开着时 HTML 预览的 WebView 不收鼠标。退场那几帧
+                    // 遮罩已经不拦点击,WebView 跟着恢复(与 Dialog 族同口径,画面本来就压在
+                    // WebView 之上);正在收的面板那块由 `occlude_native` 让出来
+                    .when(open, |el| {
+                        el.child(native_view::input_blocker()).on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                if this.usage_open {
+                                    this.toggle_usage(window, cx);
+                                }
+                            }),
+                        )
+                    })
                     .child(
-                        div()
-                            .absolute()
-                            .top(usage_viewport.height * 0.10)
-                            .left(usage_viewport.width * 0.10)
-                            .right(usage_viewport.width * 0.10)
-                            .bottom(usage_viewport.height * 0.05)
-                            .occlude()
-                            // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
-                            // stopPropagation 同款),否则点面板空白处也会关窗
-                            .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
-                                cx.stop_propagation();
-                            })
-                            // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
-                            // 背后只剩那层 black/50,终端文字照样一个个看得清。
-                            //
-                            // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
-                            // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
-                            // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
-                            // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
-                            //
-                            // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
-                            // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
-                            // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
-                            // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
-                            // 用的都是它,这里是唯一漏掉的一个。
-                            .bg(ui::bg_overlay())
-                            .rounded(px(6.0))
-                            .border_1()
-                            .border_color(ui::border_default())
-                            .overflow_hidden()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px(px(12.0))
-                                    .py(px(6.0))
-                                    .bg(ui::bg_elevated())
-                                    .child(
-                                        div()
-                                            .text_size(crate::ui::font_px(12.0))
-                                            .text_color(ui::text_primary())
-                                            .child(t("usageStats", "title")),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("usage-close")
-                                            .px(px(6.0))
-                                            .text_color(ui::text_muted())
-                                            .cursor_pointer()
-                                            .hover(|el| el.text_color(ui::color_error()))
-                                            // 走 toggle 而不是直接改标志位 —— 可见性要透给
-                                            // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                if this.usage_open {
-                                                    this.toggle_usage(window, cx);
-                                                }
-                                            }))
-                                            .child("×"),
-                                    ),
-                            )
-                            .child(div().flex_1().overflow_hidden().child(panel)),
+                        overlay_motion::reveal_box(
+                            div()
+                                .absolute()
+                                .top(usage_viewport.height * 0.10)
+                                .left(usage_viewport.width * 0.10)
+                                .right(usage_viewport.width * 0.10)
+                                .bottom(usage_viewport.height * 0.05)
+                                .when(open, |el| {
+                                    el.occlude()
+                                        // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
+                                        // stopPropagation 同款),否则点面板空白处也会关窗
+                                        .on_mouse_down(
+                                            gpui::MouseButton::Left,
+                                            |_event, _window, cx| cx.stop_propagation(),
+                                        )
+                                })
+                                // 底色与边框色由外壳框体按插值矩形画(见下面 `chrome`),
+                                // 这里只留版式:边框宽度照占位
+                                .border_1()
+                                .overflow_hidden()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .px(px(12.0))
+                                        .py(px(6.0))
+                                        .bg(ui::bg_elevated())
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::font_px(12.0))
+                                                .text_color(ui::text_primary())
+                                                .child(t("usageStats", "title")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("usage-close")
+                                                .px(px(6.0))
+                                                .text_color(ui::text_muted())
+                                                .cursor_pointer()
+                                                .hover(|el| el.text_color(ui::color_error()))
+                                                // 走 toggle 而不是直接改标志位 —— 可见性要透给
+                                                // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
+                                                .on_click(cx.listener(
+                                                    |this, _event, window, cx| {
+                                                        if this.usage_open {
+                                                            this.toggle_usage(window, cx);
+                                                        }
+                                                    },
+                                                ))
+                                                .child("×"),
+                                        ),
+                                )
+                                .child(div().flex_1().overflow_hidden().child(panel)),
+                            frame.progress,
+                        )
+                        // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
+                        // 背后只剩那层 black/50,终端文字照样一个个看得清。
+                        //
+                        // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
+                        // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
+                        // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
+                        // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
+                        //
+                        // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
+                        // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
+                        // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
+                        // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
+                        // 用的都是它,这里是唯一漏掉的一个。
+                        .chrome(overlay_motion::chrome_style(|el| {
+                            el.bg(ui::bg_overlay())
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(ui::border_default())
+                        }))
+                        .interactive(open)
+                        .occlude_native(!open),
                     )
-            });
+            })
+            // 上面压着弹窗时面板里的字不参与选区(见 `dialog_host::confine_background`)
+            .map(|layer| dialog_host::confine_background(layer, window, cx));
 
         // 三栏 + 悬浮抽屉的那一层。标题栏之下的**全部**内容都在这里 ——
         // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉的
@@ -2600,6 +2900,8 @@ impl Render for Workspace {
             // absolute sibling 画,让右伸的标签不被 columns 覆盖。
             .child(div().flex_none().w(px(activity_bar::WIDTH)).h_full())
             .child(columns_host().child(columns_group))
+            // 中栏收起的出场层(盖在终端区左段上滑走,边条画在它之上)
+            .children(middle_exit)
             .child(toggle_strip)
             .children(drawer_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
@@ -2765,26 +3067,28 @@ impl Render for Workspace {
             // 清空 —— 命中一次缓存,那一帧的窗口拖拽与最小化/最大化/关闭就全没了。
             // 它每帧那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
             .child(self.title_bar.clone())
-            .child(body)
+            // 弹窗开着时背景里的字不参与选区(见 `dialog_host::confine_background`)
+            .child(dialog_host::confine_background(body, window, cx))
             // 弹窗毛玻璃背板:垫在用量面板与 Dialog 层之下、其余一切之上
             // (含标题栏 —— 原版 Modal 是 `fixed inset-0`,遮罩同样盖住标题栏)。
             // 压暗不在这层:Dialog 走自己的 `cx.theme().overlay`(black/50,
             // theme.rs::apply 钉的),用量面板走 usage_layer 自己的 black/50 ——
-            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。
+            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。浓度随遮罩淡入
+            // (`frost_alpha`),全开静止时是 1;收起那一刻撤掉。
             .children(self.frost.clone().filter(|_| frost_wanted).map(|img| {
-                div().absolute().inset_0().child(
-                    gpui::img(img)
-                        .size_full()
-                        .object_fit(gpui::ObjectFit::Fill),
-                )
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(frost_alpha)
+                    .child(gpui::img(img).size_full().object_fit(gpui::ObjectFit::Fill))
             }))
             // 用量统计(自绘 Modal):玻璃之上、Dialog 层之下 —— Dialog 叠开时
             // (如面板里再弹确认框)压在它上面,与原版 Modal 叠 Modal 同序。
             .children(usage_layer)
-            // Modal 由 Root 持有,但要由应用视图**画出来**。
+            // 弹窗层(自建外壳 `dialog_host`,栈按窗口存),由应用视图**画出来**。
             // (它自己走 `anchored()` 定在视口中央,挂哪一层都一样;
             //  通知层不同 —— 见 `body` 那边的注释。)
-            .children(Root::render_dialog_layer(window, cx))
+            .children(dialog_host::render_layer(window, cx))
             // 右键菜单层。零尺寸的绝对定位壳子 —— 菜单自己走 anchored(窗口坐标)
             // + deferred,不参与这里的 flex 布局,收着的时候一个像素都不占。
             .child(
@@ -2794,7 +3098,10 @@ impl Render for Workspace {
                     .left_0()
                     .w_0()
                     .h_0()
-                    .child(self.menu_layer.clone()),
+                    .child(self.menu_layer.clone())
+                    // 离场托管层:宿主已经丢掉、退场还没播完的浮层(日期选择器 / 图片放大)
+                    // 在这里画完最后几帧。它们同样是 deferred + 窗口坐标,零尺寸壳子不碍事
+                    .child(overlay_motion::exit_layer(cx)),
             )
     }
 }
@@ -3218,6 +3525,50 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 中栏内容层:滑入从整幅在左推到 0、滑出从 0 推到整幅在左,端点精确(残留零点几会让
+    /// 中栏内容永远错位);提交详情栏退场从 0 收到整栏宽。
+    #[test]
+    fn 中栏与详情栏的位移端点精确() {
+        assert_eq!(middle_content_left(true, 0.0), -1.0);
+        assert_eq!(middle_content_left(true, 1.0), 0.0);
+        assert_eq!(middle_content_left(true, 0.25), -0.75);
+        assert_eq!(middle_content_left(false, 0.0), 0.0);
+        assert_eq!(middle_content_left(false, 1.0), -1.0);
+        assert_eq!(middle_content_left(false, 2.0), -1.0, "越界钳住");
+        assert_eq!(detail_exit_left(320.0, 0.0), 0.0);
+        assert_eq!(detail_exit_left(320.0, 0.5), 160.0);
+        assert_eq!(detail_exit_left(320.0, 1.5), 320.0);
+    }
+
+    /// 中栏半路掉头不跳:收到一半又展开(或反过来),新一场从 `1 − 进度` 起步,
+    /// 内容层此刻的位置与掉头前一模一样(见 [`MiddleMotion`])。
+    #[test]
+    fn 中栏开合半路掉头从当前位置接着走() {
+        for entering in [true, false] {
+            for i in 0..=20 {
+                let p = i as f32 / 20.0;
+                let before = middle_content_left(entering, p);
+                let after = middle_content_left(!entering, motion_kit::reversed_progress(p));
+                assert!((before - after).abs() < 1e-6, "entering={entering} p={p}");
+            }
+        }
+        // 起步进度由 `resume_band` 接上:建出来那一刻就在起步值上
+        let now = std::time::Instant::now();
+        let band = motion_kit::resume_band(0.6, mt_ui::motion::PANEL_SWAP, now);
+        assert!((band.value_at(now) - 0.6).abs() < 1e-6);
+        assert_eq!(band.target(), 1.0);
+    }
+
+    /// 抽屉换面板:往段控件右边那项(Git)切新面板从右进,反之从左;滑块停在各自那一半。
+    #[test]
+    fn 抽屉换面板的方向与滑块位置() {
+        assert!(drawer_panel_order(DrawerPanel::Sessions, DrawerPanel::Git) > 0.0);
+        assert!(drawer_panel_order(DrawerPanel::Git, DrawerPanel::Sessions) < 0.0);
+        assert_eq!(drawer_panel_order(DrawerPanel::Git, DrawerPanel::Git), 0.0);
+        assert_eq!(drawer_tab_left(DrawerPanel::Sessions), 0.0);
+        assert_eq!(drawer_tab_left(DrawerPanel::Git), 0.5);
+    }
 
     /// 三栏宿主必须能收缩到内容 min-content 以下,理由与实测数据见 [`columns_host`]。
     /// 布局本身要真窗口才能跑(本 crate 不开 gpui 的 test-support),这里钉的是

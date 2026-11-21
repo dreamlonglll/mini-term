@@ -1329,6 +1329,8 @@ struct DiffState {
     /// 结果一到就算好的派生数据,不在每帧的 uniform_list 回调里重算。
     flat: Flat,
     view: ViewMode,
+    /// 「并排 / 内联」段控件的滑动选中块(见 `segment_slider`)。
+    view_slider: crate::segment_slider::IndicatorSlider,
     font_size: f32,
     /// 请求令牌:换文件时旧响应不许覆盖。
     request: u64,
@@ -1369,6 +1371,7 @@ impl DiffState {
             result: None,
             flat: Flat::default(),
             view: ViewMode::SideBySide,
+            view_slider: crate::segment_slider::IndicatorSlider::new(),
             font_size,
             request: 0,
             refreshing: false,
@@ -2044,12 +2047,21 @@ fn view_toggle(
 ) -> AnyElement {
     let (side_label, inline_label) = (labels.side, labels.inline);
     let jumps = jump_group(state, id_prefix, &labels, cx);
-    let current = state.read(cx).view;
-    let mut seg = git_ui::segmented();
-    for (mode, label) in [
+    let (current, slider) = {
+        let s = state.read(cx);
+        (s.view, s.view_slider.clone())
+    };
+    // 选中底色是一块滑动的绝对定位块(见 `segment_slider`):两段宽度随文字变,先量再滑
+    let active = usize::from(matches!(current, ViewMode::Inline));
+    let own_bg = !slider.ready(active);
+    let mut seg = git_ui::segmented().child(git_ui::segmented_slider(&slider, active));
+    for (ix, (mode, label)) in [
         (ViewMode::SideBySide, side_label),
         (ViewMode::Inline, inline_label),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let state = state.clone();
         seg = seg.child(
             git_ui::segment(
@@ -2063,7 +2075,9 @@ fn view_toggle(
                 )),
                 label,
                 mode == current,
+                own_bg,
             )
+            .child(slider.probe(ix))
             .on_click(move |_: &ClickEvent, _window, cx| {
                 state.update(cx, |s, cx| {
                     // 两个视图的行下标不是一回事:换视图就清掉选区
@@ -3049,6 +3063,8 @@ struct CommitPick {
     collapsed: HashSet<String>,
     /// 左栏拍平后的行(见 [`Self::rows`])。切视图、收起 / 展开目录时作废。
     rows: Option<Rc<Vec<ChangeTreeRow>>>,
+    /// 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`)。
+    chevrons: crate::fold_motion::FlipTweens,
 }
 
 impl CommitPick {
@@ -3068,9 +3084,12 @@ impl CommitPick {
 
     /// 收起 / 展开一个目录。
     fn toggle_dir(&mut self, full_path: &str) {
-        if !self.collapsed.remove(full_path) {
+        let open = self.collapsed.remove(full_path);
+        if !open {
             self.collapsed.insert(full_path.to_string());
         }
+        self.chevrons
+            .flip_open(full_path, open, crate::fold_motion::OPEN_TURNS);
         self.rows = None;
     }
 }
@@ -3198,7 +3217,9 @@ fn modal_file_tip(file: &ModalFile) -> String {
 }
 
 /// 左栏的一行:目录行点击收起 / 展开,文件行点击换右栏的 diff。只给可视区里的行建
-/// (左栏是 uniform_list,行等高 [`git_ui::ROW_H`])。
+/// (左栏是 uniform_list,行等高 [`git_ui::ROW_H`])。`chevrons` 是目录行折叠箭头的
+/// 补间表(在 [`CommitPick`] 上,见 `fold_motion`)。
+#[allow(clippy::too_many_arguments)]
 fn modal_row(
     row: &ChangeTreeRow,
     files: &Rc<Vec<ModalFile>>,
@@ -3207,6 +3228,7 @@ fn modal_row(
     repo_path: &GitContext,
     selected: usize,
     tree: bool,
+    chevrons: &crate::fold_motion::FlipTweens,
 ) -> Option<AnyElement> {
     match row {
         ChangeTreeRow::Dir {
@@ -3218,6 +3240,7 @@ fn modal_row(
         } => {
             let pick = pick.clone();
             let id = SharedString::from(format!("git-commit-dir-{full_path}"));
+            let turns = chevrons.value_open(full_path, !*collapsed, crate::fold_motion::OPEN_TURNS);
             let full_path = full_path.clone();
             let toggle = move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                 pick.update(cx, |p, cx| {
@@ -3226,7 +3249,7 @@ fn modal_row(
                 });
             };
             Some(
-                git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed)
+                git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed, turns)
                     // 列表项按根布局排,不像块容器那样自动撑满:不补 w_full 悬停底只有字那么宽
                     .w_full()
                     .on_click(toggle)
@@ -3659,6 +3682,7 @@ mod tests {
             tree: true,
             collapsed: HashSet::new(),
             rows: None,
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
         };
         let first = pick.rows(&files);
         assert_eq!(*first, modal_rows(&files, true, &HashSet::new()));

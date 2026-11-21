@@ -4,9 +4,15 @@
 //! 才能把点击回调挂到 [`SettingsView`] 上)。通用原语 Toggle / SettingRow /
 //! ChoiceGroup / 滑块 / 键帽自绘在 [`crate::ui`],这里只放「只有设置面板用」
 //! 的那一批。
+//!
+//! 开关滑块的走位补间([`knob_toggle`] / [`flip_knob`])住在本模块的 `thread_local`:
+//! 开关是无状态构建函数、调用点散在十几处,补间表跟着视图走就得给每处多传一个参数。
+//! 只让**刚翻的那一颗**动(`fold_motion::FlipTweens`),设置面板打开时一颗都不播。
+
+use std::cell::RefCell;
 
 use gpui::{
-    Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Context, Entity, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputState};
@@ -15,6 +21,30 @@ use crate::i18n::t;
 use crate::ui;
 
 use super::SettingsView;
+
+thread_local! {
+    /// 开关滑块的补间表(见模块注释)。开关 id 全是静态字面量,设置面板同一时刻只开
+    /// 一个,按 id 索引不会串。
+    static KNOBS: RefCell<crate::fold_motion::FlipTweens> =
+        RefCell::new(crate::fold_motion::FlipTweens::new(mt_ui::motion::TOGGLE_KNOB));
+}
+
+/// 一颗会动的开关:静止时就是 `ui::toggle(id, checked)`,刚被 [`flip_knob`] 翻过的那颗
+/// 滑块横向走位、底色同步过渡([`mt_ui::motion::TOGGLE_KNOB`])。点击回调由调用方挂。
+pub(super) fn knob_toggle(id: &'static str, checked: bool) -> Stateful<gpui::Div> {
+    let travel = KNOBS.with(|knobs| knobs.borrow().value_open(id, checked, 1.0));
+    ui::toggle_at(id, travel)
+}
+
+/// 开关 `id` 刚被翻成 `checked`(点击回调里、改状态之前或之后都行)。
+pub(super) fn flip_knob(id: &str, checked: bool) {
+    KNOBS.with(|knobs| knobs.borrow_mut().flip_open(id, checked, 1.0));
+}
+
+/// 还有滑块在走就要下一帧(设置视图的 render 里调)。
+pub(super) fn drive_knobs(window: &Window) {
+    KNOBS.with(|knobs| knobs.borrow().drive(window));
+}
 
 /// 页根节点:`space-y-6`。
 pub(super) fn page_root() -> gpui::Div {
@@ -40,8 +70,9 @@ pub(super) fn toggle_row(
     on_toggle: impl Fn(&mut SettingsView, bool, &mut Window, &mut Context<SettingsView>) + 'static,
     cx: &mut Context<SettingsView>,
 ) -> gpui::Div {
-    let control = ui::toggle(id, checked).when(!disabled, |el| {
+    let control = knob_toggle(id, checked).when(!disabled, |el| {
         el.on_click(cx.listener(move |this, _, window, cx| {
+            flip_knob(id, !checked);
             on_toggle(this, !checked, window, cx);
         }))
     });

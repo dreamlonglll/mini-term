@@ -21,24 +21,31 @@
 //!    等价且可单测。
 //! 2. **「已断开」判据取 [`AppStore::is_pty_exited`]**,那是本批新补的
 //!    `exitedPtyIds` 等价物(`pty-exit` 登记),与原版同一时机同一集合。
-//! 3. 原版卡上的 `menuPopIn` 进场(在 `prefers-reduced-motion` 豁免名单里)
-//!    已经补上,**只是不缩放**:两张卡都收一个 `progress` 入参,由持有
-//!    [`mt_ui::motion::Transition`] 的调用方(项目列表 / 终端区)喂进来 ——
-//!    卡本身是纯函数,没有地方挂状态。`scale(0.96)` 丢掉的理由见
-//!    [`mt_ui::motion::menu_pop_in`](缩放在 gpui 里只能改尺寸,而这张卡里
-//!    `MiniTerminalElement` 会跟着每帧反解一次字号)。
+//! 3. 原版卡上的 `menuPopIn`(淡入 + 上移)**换成了裁剪窗展开**([`HoverCard`]):
+//!    卡里的内容从第一帧起就按最终尺寸排好,只是被一个从触发它的 tab / 项目行那一侧
+//!    长出来的裁剪窗露出来([`crate::popover_reveal::reveal_frame`]),收起反向播完再卸。
+//!    不淡入(从 0 起的不透明度读作「闪一下」,用户否掉)、也不缩放(缩放在 gpui 里只能
+//!    改尺寸,而卡里的 `MiniTerminalElement` 会跟着每帧反解一次字号)。
+//!
+//! # 开合与换卡([`HoverCard`])
+//!
+//! 只有**第一次**弹出播展开;卡还开着(或正在收)时鼠标扫到相邻目标,不再等 250ms、
+//! 也不重播开合:内容当场换成新目标的,卡身从旧锚点短促地滑到新锚点
+//! ([`mt_ui::motion::LIST_REFLOW`])。移开整片目标才收起。
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
-    AnyElement, App, Bounds, Div, IntoElement, ParentElement, Pixels, Size, Styled, div,
-    prelude::FluentBuilder, px, size,
+    AnyElement, App, Bounds, Div, IntoElement, ParentElement, Pixels, Point, Size, Styled, Window,
+    div, prelude::FluentBuilder, px, size,
 };
 use mt_terminal::TerminalEmulator;
 use mt_ui::icons::{AiVendor, BrandIcon};
 use mt_ui::{MiniTerminalElement, TerminalStyle, TerminalTheme};
 
 use crate::i18n::t;
+use crate::popover_reveal::{Chrome, RevealFrameState, RevealState, ShadowMode};
 use crate::store::AppStore;
 use crate::tree::{PaneState, SplitDirection, SplitNode, StatusLight};
 use crate::ui;
@@ -356,33 +363,40 @@ fn mini_node(layout: &MiniLayout, style: &TerminalStyle, area: Size<Pixels>) -> 
     }
 }
 
-/// 卡片外壳:半透明底 + 强边框 + 阴影(与 `.ctx-menu` 同配方)。
-///
-/// `progress` 是 `menuPopIn` 这一帧的进度(1.0 = 已就位)。两张卡都挂在
-/// `anchored` 里,负 margin 只挪自己、不影响任何别的东西。
-fn card_shell(progress: f32) -> Div {
-    let (opacity, dy) = mt_ui::motion::menu_pop_in(progress);
+/// 卡片框体:底色 + 强边框 + 阴影(与 `.ctx-menu` 同配方)。由
+/// [`crate::popover_reveal::reveal_frame`] 按开合进度插值出的矩形去画,卡本体
+/// ([`card_body`])只画内容。不拦鼠标 —— 卡是纯展示(原版 `pointer-events: none`)。
+pub fn card_chrome() -> Chrome {
+    Chrome {
+        bg: ui::bg_overlay(),
+        hover_bg: None,
+        border_color: ui::border_strong(),
+        border_width: px(1.0),
+        radius: px(6.0).into(),
+        shadow: ShadowMode::Always,
+        occlude: false,
+    }
+}
+
+/// 卡本体的外层:边框位用透明边占住(框体由 [`card_chrome`] 画),内容区与带边框时
+/// 逐像素同位 —— 两张卡里有 absolute 定位的画面,内衬换成 padding 会让它们挪一像素。
+fn card_body() -> Div {
     div()
         .rounded(px(6.0))
         .border_1()
-        .border_color(ui::border_strong())
-        .bg(ui::bg_overlay())
-        .shadow_lg()
-        .opacity(opacity)
-        .mt(px(dy))
+        .border_color(gpui::transparent_black())
 }
 
-/// 项目行悬停卡。`layout` 为 `None` 时画「尚未打开过终端」占位
-/// (原版那个防御性分支:卡头仍要把绝对路径显出来)。
+/// 项目行悬停卡的内容(框体与开合见 [`card_chrome`] / [`HoverCard`])。`layout` 为
+/// `None` 时画「尚未打开过终端」占位(原版那个防御性分支:卡头仍要把绝对路径显出来)。
 pub fn project_preview_card(
     project_name: &str,
     project_path: &str,
     layout: Option<&MiniLayout>,
     style: &TerminalStyle,
-    progress: f32,
 ) -> AnyElement {
     let board_area = size(px(CARD_WIDTH - BOARD_PAD * 2.0), px(BOARD_HEIGHT));
-    card_shell(progress)
+    card_body()
         .w(px(CARD_WIDTH))
         // 卡头:项目名 + 绝对路径。原版把路径从行 title 挪到这里 ——
         // 原生 tooltip 会盖住浮层
@@ -437,10 +451,10 @@ pub fn project_preview_card(
         .into_any_element()
 }
 
-/// 非激活 tab 悬停卡(单格版,无卡头、无标签条 —— 原版就只有画面与断开遮罩)。
-pub fn tab_preview_card(info: &MiniPaneInfo, style: &TerminalStyle, progress: f32) -> AnyElement {
+/// 非激活 tab 悬停卡的内容(单格版,无卡头、无标签条 —— 原版就只有画面与断开遮罩)。
+pub fn tab_preview_card(info: &MiniPaneInfo, style: &TerminalStyle) -> AnyElement {
     let area = size(px(TAB_CARD_WIDTH), px(TAB_CARD_HEIGHT));
-    card_shell(progress)
+    card_body()
         .relative()
         .w(area.width)
         .h(area.height)
@@ -482,6 +496,186 @@ pub fn project_anchor(row: Bounds<Pixels>) -> gpui::Point<Pixels> {
 /// 由 `snap_to_window_with_margin` 代劳)。
 pub fn tab_anchor(tab: Bounds<Pixels>) -> gpui::Point<Pixels> {
     gpui::point(tab.origin.x, tab.origin.y + tab.size.height + px(6.0))
+}
+
+// ─── 开合与换卡 ──────────────────────────────────────────────────
+
+/// 换卡那一刻卡身相对**新**锚点位置的偏移:沿用当前这一帧的偏移,再加上旧锚点位置
+/// 与新锚点位置之差 —— 卡在屏幕上原地不动,接着从这里滑向新位置(半路再换也不跳)。
+/// **纯函数**,单测钉住「换卡那一刻视觉位置不变」。
+fn switch_offset(current: (f32, f32), old_at: (f32, f32), new_at: (f32, f32)) -> (f32, f32) {
+    (
+        current.0 + old_at.0 - new_at.0,
+        current.1 + old_at.1 - new_at.1,
+    )
+}
+
+/// 换卡位移这一帧的偏移:`from` 是起步偏移,`progress` 已缓动;终点精确归零。
+fn slide_offset(from: (f32, f32), progress: f32) -> (f32, f32) {
+    let p = progress.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        return (0.0, 0.0);
+    }
+    (from.0 * (1.0 - p), from.1 * (1.0 - p))
+}
+
+/// 卡上正在显示的那一个目标。
+struct CardShown<K> {
+    key: K,
+    /// 触发它的 tab / 项目行在弹出(或换卡)那一刻的屏幕矩形
+    anchor: Bounds<Pixels>,
+    /// 换卡位移:起步偏移 + 起始时刻。`None` = 已就位
+    slide: Option<((f32, f32), Instant)>,
+}
+
+impl<K> CardShown<K> {
+    fn offset_at(&self, now: Instant) -> (f32, f32) {
+        match self.slide {
+            Some((from, start)) => slide_offset(
+                from,
+                mt_ui::motion::LIST_REFLOW.progress_live(now.saturating_duration_since(start)),
+            ),
+            None => (0.0, 0.0),
+        }
+    }
+}
+
+/// render 取到的这一帧(见 [`HoverCard::frame`])。
+pub struct CardFrame<K> {
+    pub key: K,
+    pub anchor: Bounds<Pixels>,
+    /// 交给 `reveal_frame` 的开合进度;调用方补上原点(触发它的 tab / 项目行)
+    pub reveal: RevealFrameState,
+    /// 卡身这一帧相对锚点位置的偏移(换卡位移中非零)
+    pub offset: Point<Pixels>,
+}
+
+/// 悬停卡的开合 + 换卡状态(两张卡共用,挂在画卡的视图上;见模块注释「开合与换卡」)。
+pub struct HoverCard<K> {
+    reveal: RevealState,
+    shown: Option<CardShown<K>>,
+    /// 目标是开着(收起动画里为 `false`)。
+    open: bool,
+}
+
+impl<K: Clone + PartialEq> Default for HoverCard<K> {
+    fn default() -> Self {
+        Self {
+            reveal: RevealState::new(),
+            shown: None,
+            open: false,
+        }
+    }
+}
+
+impl<K: Clone + PartialEq> HoverCard<K> {
+    /// 卡还在屏幕上(开着,或收起动画没播完)。这时悬停到别的目标就直接换卡,不再等
+    /// [`HOVER_DELAY_MS`]、也不重播开合。
+    pub fn is_warm(&self) -> bool {
+        self.shown.is_some() && self.reveal.is_mounted()
+    }
+
+    /// 卡在屏幕上、且正显示 `key`(开着,或收起途中)。
+    pub fn is_on(&self, key: &K) -> bool {
+        self.is_warm() && self.shown.as_ref().is_some_and(|shown| shown.key == *key)
+    }
+
+    /// 卡正显示 `key` 时它记着的锚点矩形(见 [`Self::is_on`]),否则 `None`。
+    ///
+    /// 收起途中悬停回原目标时拿它重开:调用方手上的「最近一次量到的矩形」若只有一格
+    /// (项目列表的量尺只挂在被悬停的那一行上),此刻可能已被中间悬停过的那一行盖掉。
+    pub fn anchor_of(&self, key: &K) -> Option<Bounds<Pixels>> {
+        self.shown
+            .as_ref()
+            .filter(|_| self.is_on(key))
+            .map(|shown| shown.anchor)
+    }
+
+    /// 弹出 / 换到 `key`。`place` 把锚点矩形换成卡的落点(与渲染处同一个函数),
+    /// 换卡位移按两个落点之差算。
+    ///
+    /// - 卡不在屏幕上:从头播展开;
+    /// - 卡在屏幕上、还是同一个目标(收起途中又悬停回来):从当前进度往回长;
+    /// - 卡在屏幕上、换了目标:内容当场换,卡身从旧落点滑到新落点,不重播开合。
+    pub fn open(
+        &mut self,
+        key: K,
+        anchor: Bounds<Pixels>,
+        place: fn(Bounds<Pixels>) -> Point<Pixels>,
+        cx: &App,
+    ) {
+        let now = Instant::now();
+        let mounted = self.reveal.is_mounted();
+        match self.shown.as_mut().filter(|_| mounted) {
+            Some(shown) if shown.key == key => shown.anchor = anchor,
+            Some(shown) => {
+                let (old_at, new_at) = (place(shown.anchor), place(anchor));
+                let from = switch_offset(
+                    shown.offset_at(now),
+                    (f32::from(old_at.x), f32::from(old_at.y)),
+                    (f32::from(new_at.x), f32::from(new_at.y)),
+                );
+                shown.key = key;
+                shown.anchor = anchor;
+                let moves = from.0.abs() >= 0.5 || from.1.abs() >= 0.5;
+                shown.slide = (moves && mt_ui::motion::animations_enabled()).then_some((from, now));
+            }
+            None => {
+                self.reveal.hide_now();
+                self.shown = Some(CardShown {
+                    key,
+                    anchor,
+                    slide: None,
+                });
+            }
+        }
+        self.open = true;
+        self.reveal.show(cx);
+    }
+
+    /// 收起(播收起动画,播完才卸)。幂等:已在收的不重起。返回「这一下真收了」。
+    pub fn close(&mut self, cx: &App) -> bool {
+        if !std::mem::take(&mut self.open) {
+            return false;
+        }
+        self.reveal.hide(cx);
+        true
+    }
+
+    /// 直接卸掉,不播动画:卡挂的目标已经不在了(tab 被关、项目被删、AI 退了)。
+    pub fn close_now(&mut self) {
+        self.open = false;
+        self.reveal.hide_now();
+        self.shown = None;
+    }
+
+    /// render 里调:不在屏幕上返回 `None`(并收掉记录);开合 / 换卡位移还在跑就顺手
+    /// 要下一帧(`request_animation_frame` 通知的是当前视图,所以必须在画卡的视图的
+    /// render 调用链里调)。
+    pub fn frame(&mut self, window: &Window) -> Option<CardFrame<K>> {
+        let Some(reveal) = self.reveal.frame(window) else {
+            self.shown = None;
+            self.open = false;
+            return None;
+        };
+        let shown = self.shown.as_mut()?;
+        let now = Instant::now();
+        let running = shown.slide.is_some_and(|(_, start)| {
+            mt_ui::motion::LIST_REFLOW.running_live(now.saturating_duration_since(start))
+        });
+        let (dx, dy) = shown.offset_at(now);
+        if running {
+            window.request_animation_frame();
+        } else {
+            shown.slide = None;
+        }
+        Some(CardFrame {
+            key: shown.key.clone(),
+            anchor: shown.anchor,
+            reveal,
+            offset: gpui::point(px(dx), px(dy)),
+        })
+    }
 }
 
 /// 缩略图用的终端字体参数:只有字族/回退族有意义,字号由
@@ -588,6 +782,25 @@ mod tests {
         assert!(!has_ai_pane(Some(&layout), false));
     }
 
+    /// 换卡:那一刻卡在屏幕上原地不动,之后滑到新落点;半路再换也不跳。
+    #[test]
+    fn 换卡位移从旧落点滑到新落点且不跳() {
+        // 从 tab A(卡落点 x=100)换到 tab B(x=260):起步偏移 −160,屏幕上仍在 100
+        let from = switch_offset((0.0, 0.0), (100.0, 62.0), (260.0, 62.0));
+        assert_eq!(from, (-160.0, 0.0));
+        assert_eq!(260.0 + slide_offset(from, 0.0).0, 100.0);
+        assert_eq!(slide_offset(from, 1.0), (0.0, 0.0), "终点精确归零");
+        assert_eq!(slide_offset(from, 1.5), (0.0, 0.0), "越界不滑过头");
+        // 滑到一半(画在 180)又换到 tab C(x=40):新起步偏移让它仍画在 180
+        let half = slide_offset(from, 0.5);
+        assert_eq!(260.0 + half.0, 180.0);
+        let again = switch_offset(half, (260.0, 62.0), (40.0, 62.0));
+        assert_eq!(40.0 + again.0, 180.0, "半路再换,视觉位置不跳");
+        // 项目卡是竖向换行:纵向同理
+        let from = switch_offset((0.0, 0.0), (248.0, 100.0), (248.0, 128.0));
+        assert_eq!(from, (0.0, -28.0));
+    }
+
     #[test]
     fn 项目卡锚点贴行右缘() {
         let row = Bounds {
@@ -608,5 +821,31 @@ mod tests {
         let at = tab_anchor(tab);
         assert_eq!(f32::from(at.x), 50.0);
         assert_eq!(f32::from(at.y), 62.0);
+    }
+
+    /// 项目 A 的卡弹出 → 移到没有 AI 的 B(B 的量尺把那一格矩形量成了 B 的,卡开始收)
+    /// → 收起途中移回 A:重开要用卡上记着的 A 的锚点,不能贴到 B 那一行旁边。
+    #[gpui::test]
+    fn 收起途中回到原目标_锚点沿用卡上记着的(cx: &mut gpui::TestAppContext) {
+        let row = |y: f32| Bounds {
+            origin: gpui::point(px(0.0), px(y)),
+            size: size(px(240.0), px(28.0)),
+        };
+        cx.update(|cx| {
+            let mut card: HoverCard<&'static str> = HoverCard::default();
+            card.open("a", row(100.0), project_anchor, cx);
+            assert_eq!(card.anchor_of(&"a"), Some(row(100.0)));
+            assert_eq!(card.anchor_of(&"b"), None, "卡上显示的不是 b");
+            assert!(card.close(cx));
+            if mt_ui::motion::animations_enabled() {
+                // 收起途中仍在屏幕上:A 的锚点还在,拿它重开就回到 A 的那一行
+                let anchor = card.anchor_of(&"a");
+                assert_eq!(anchor, Some(row(100.0)));
+                card.open("a", anchor.unwrap(), project_anchor, cx);
+                assert_eq!(card.anchor_of(&"a"), Some(row(100.0)));
+            }
+            card.close_now();
+            assert_eq!(card.anchor_of(&"a"), None, "卸掉之后没有锚点");
+        });
     }
 }

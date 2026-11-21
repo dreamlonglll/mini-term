@@ -6,23 +6,24 @@
 //! 三个**通用**弹窗 —— 调用点只给标题与文案,不关心怎么画。原版同样是这么分的
 //! (`components/*Modal.tsx` vs `utils/prompt.ts`)。
 //!
-//! 三个都走 [`gpui_component::dialog::Dialog`],因此窗口根视图必须是
-//! `gpui_component::Root`(见 `main.rs`)。
+//! 全仓弹窗都走 [`crate::dialog_host`](自建的弹窗外壳:栈 / 焦点链 / 进出场动画,
+//! 构造器与 `gpui_component::dialog::Dialog` 同名同方法)。窗口根视图仍是
+//! `gpui_component::Root`(Tab 焦点陷阱、通知层、Input 都要它在场)。
 //!
 //! # 防叠开([`open_guarded`])
 //!
-//! 审计记的「同一 modal 可叠开(缺 isOpen 守卫)」就修在这儿:`window.open_dialog`
-//! 是**栈**,连按两次 Ctrl+, 会摞出两个一模一样的设置框(下面那个永远关不掉,
+//! 审计记的「同一 modal 可叠开(缺 isOpen 守卫)」就修在这儿:弹窗宿主是**栈**,
+//! 连按两次 Ctrl+, 会摞出两个一模一样的设置框(下面那个永远关不掉,
 //! 因为 Esc 只关栈顶)。守卫走 [`crate::overlay`] 那个统一的覆盖物栈:同种类第二次
 //! 直接忽略,**不同**种类照样能叠(设置框里再弹确认框是合法的,原版 `prompt.ts`
 //! 也专门为此写了栈顶判定)。P 批把右键菜单与三件新浮层一并并进那个栈,
 //! 全局快捷键的让路判据从此只有它一处。
 //!
-//! 摘表放在 `Dialog::on_close` 里 —— 它在确定 / 取消 / Esc / 遮罩 / 关闭按钮
-//! **五条路**上都会被调到(见 dialog.rs 的 `render`),不会漏掉某一条把种类
-//! 永久钉在表里。**第六条路是程序化关闭**([`close_guarded`]):
-//! `window.close_dialog` 只弹 Root 的栈、**不会**触发 `on_close`,所以那条路要
-//! 自己摘表,否则该种类再也开不出来。
+//! 摘表放在 `Dialog::on_close` 里 —— 它在确定 / 取消 / Esc / 遮罩**四条路**上都会被
+//! 调到(见 `dialog_host::render_one`;上游那颗右上角 ✕ 宿主不画,见 [`dialog_title`]),
+//! 不会漏掉某一条把种类永久钉在表里。**第五条路是程序化关闭**([`close_guarded`]):
+//! `dialog_host::close` 只收起那一层、**不会**触发 `on_close`(与上游
+//! `window.close_dialog` 同一语义),所以那条路要自己摘表,否则该种类再也开不出来。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -31,11 +32,11 @@ use gpui::{
     App, AppContext, ClickEvent, Entity, Focusable as _, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::WindowExt as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::dialog::{Cancel, Dialog, DialogFooter};
+use gpui_component::dialog::{Cancel, DialogFooter};
 use gpui_component::input::{Input, InputState, SelectAll};
 
+use crate::dialog_host::{self, Dialog};
 use crate::git_ui;
 use crate::i18n::{t, tr};
 use crate::overlay;
@@ -124,7 +125,7 @@ fn footer_with_alt(
 /// 弹窗只是覆盖物的一种,常量表和右键菜单/浮层共用一份。
 pub use crate::overlay::kind;
 
-/// 同种类只允许开一个的 `open_dialog`。`kind` 是种类标识,取值见
+/// 同种类只允许开一个的开弹窗入口。`kind` 是种类标识,取值见
 /// [`kind`] 模块里的常量 —— 写字面量容易打错,而打错的后果是守卫静默失效。
 pub fn open_guarded<F>(kind: &'static str, window: &mut Window, cx: &mut App, build: F)
 where
@@ -146,18 +147,59 @@ where
     F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     C: Fn(&mut Window, &mut App) + 'static,
 {
+    open_guarded_inner(kind, window, cx, build, on_close, None)
+}
+
+/// [`open_guarded`] 再带一个关窗收尾:**任何一条路**关掉(含程序化 [`close_guarded`])都在
+/// 退场开始那一刻调一次;守卫拦下没开成时不调。
+///
+/// 关窗要收尾(提交草稿、记住停在哪一页)的弹窗走它,别把收尾挂在内容实体的 `on_release`
+/// 上 —— 弹窗外壳有退场动画,实体要等退场播完才释放(判据见 `dialog_host::open_with_dismiss`)。
+pub(crate) fn open_guarded_with_dismiss<F, D>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_dismiss: D,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    D: FnOnce(&mut Window, &mut App) + 'static,
+{
+    open_guarded_inner(
+        kind,
+        window,
+        cx,
+        build,
+        |_window, _cx| {},
+        Some(Box::new(on_dismiss)),
+    )
+}
+
+fn open_guarded_inner<F, C>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_close: C,
+    on_dismiss: Option<dialog_host::Dismiss>,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    C: Fn(&mut Window, &mut App) + 'static,
+{
     if !overlay::push(overlay::key(kind)) {
         on_close(window, cx);
         return false;
     }
     let on_close = Rc::new(on_close);
-    window.open_dialog(cx, move |dialog, window, cx| {
+    let build = move |dialog: Dialog, window: &mut Window, cx: &mut App| {
         let on_close = on_close.clone();
         // on_ok 垫在 build **之前**,设了自己 on_ok 的弹窗(prompt / confirm /
         // 重命名…)照常覆盖;没设的(设置 / SSH / 移动端这类面板)回车就什么都
         // 不发生。gpui-component 0.6 把 `on_ok` 的默认值从「无」改成了
-        // 「返回 true」(`dialog.rs:46`),而 Enter 在 `Dialog` 上下文里绑的是
-        // `Confirm`、单行输入框的 enter 处理器又以 `cx.propagate()` 收尾 ——
+        // 「返回 true」(`dialog.rs:46`,弹窗宿主照抄了这个默认),而 Enter 在 `Dialog`
+        // 上下文里绑的是 `Confirm`、单行输入框的 enter 处理器又以 `cx.propagate()` 收尾 ——
         // 三条凑一起,0.5.1 靠「没 on_ok 就不处理」白嫖的行为在 0.6 变成
         // 「输入框里一回车整个面板关掉」(添加远程项目那条更糟:窗关了、
         // 回车标志等下一帧 builder 消费却再也没有下一帧,路径静默丢失)。
@@ -172,20 +214,22 @@ where
                 overlay::pop(overlay::key(kind));
                 on_close(window, cx);
             })
-    });
+    };
+    dialog_host::open_with_dismiss(kind, window, cx, build, on_dismiss);
     true
 }
 
 /// 主动关掉某种弹窗(Ctrl+Shift+F 第二次按下要能把搜索框关回去)。
 ///
-/// 只在它**正在栈顶**时才动手:上面还压着别人(比如搜索框里又弹了确认框)的话,
-/// `window.close_dialog` 关掉的会是那个别人。返回值 = 这次有没有真关。
+/// 只在它**正在覆盖物栈顶**时才动手:上面还压着别人(比如搜索框里又弹了确认框、
+/// 或开着右键菜单)的话不关 —— 调用方据此判「关没关成」(冲突逐段解决、添加远程项目
+/// 都靠这条返回值)。宿主按种类找层,关的一定是这一种。返回值 = 这次有没有真关。
 pub fn close_guarded(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
     if !overlay::is_top(overlay::key(kind)) {
         return false;
     }
     overlay::pop(overlay::key(kind));
-    window.close_dialog(cx);
+    dialog_host::close(kind, window, cx);
     true
 }
 
@@ -258,9 +302,9 @@ pub fn is_open(kind: &'static str) -> bool {
 ///
 /// # 为什么不能在开弹窗之前聚焦
 ///
-/// `window.open_dialog` 内部有一句 `focus_handle.focus(window)`(gpui-component
-/// `root.rs`)——**弹窗一开就把焦点抢到自己的面板上**。而 `Window::focus` 只是
-/// 把 `window.focus` 改写成新的 id、后来者无条件覆盖前者,所以「先聚焦输入框、
+/// `dialog_host::open_with_dismiss` 里有一句 `focus.focus(window, cx)`(照抄 gpui-component
+/// `root.rs` 的 `open_dialog`)——**弹窗一开就把焦点抢到自己的面板上**。而 `Window::focus`
+/// 只是把 `window.focus` 改写成新的 id、后来者无条件覆盖前者,所以「先聚焦输入框、
 /// 再开弹窗」等于白聚焦:落地时焦点在 Dialog 面板上。
 ///
 /// 这正是「弹出来整段是选中的、敲字却毫无反应,鼠标点一下才能打」的成因 ——
@@ -270,7 +314,7 @@ pub fn is_open(kind: &'static str) -> bool {
 ///
 /// # 为什么还要再 defer 一层
 ///
-/// `open_dialog` 的抢焦点发生在 `Root::update` 里,与调用点同处一轮 effect;
+/// 开弹窗的抢焦点与调用点同处一轮 effect;
 /// 排在它后面直接 focus 虽然通常也能赢,但 `window.defer` 让这一手稳稳落在
 /// **本轮 effect 全部跑完之后**,不必去推敲弹窗内部还会不会再动焦点。
 /// 输入框元素这时尚未画出并不要紧:`window.focus` 只记 id,下一帧
@@ -369,16 +413,18 @@ pub fn show_prompt(
 /// 「确定」(按钮 / 回车)收尾:回调跑完后**当场**关掉本弹窗、把焦点还回去,返回值直接
 /// 交给 `on_ok`(`false` = 已经自己关了)。
 ///
-/// 不走 Dialog 默认的确认关闭,是因为那条路是 gpui-component 的 `defer_close_dialog`
-/// (0.6.2 `root.rs:341`):弹窗当场出栈,焦点却要等动画时长(250ms)之后才还给开弹窗
-/// 之前的焦点。回调里异步发起、恰在这 250ms 内落地的焦点交接会被这次迟到的还原整个盖掉:
-/// 新建文件后编辑器刚拿到焦点就被抢回文件树(键入无效);「保存并关闭」后焦点已交给
-/// 相邻页,又被还原到刚关掉那页的编辑器上 —— 落进一个不再画出来的元素,键盘失灵到点
-/// 一下为止。取消 / Esc 本来就是即时关闭(`close_dialog`),第三颗钮
-/// ([`Confirm::alt_action`])也早是先关框再干活;这里让确认与它们同一种还焦点时机。
+/// 来历:gpui-component 的确认关闭走 `defer_close_dialog`(0.6.2 `root.rs:341`):弹窗当场
+/// 出栈,焦点却要等动画时长(250ms)之后才还给开弹窗之前的焦点。回调里异步发起、恰在这
+/// 250ms 内落地的焦点交接会被这次迟到的还原整个盖掉:新建文件后编辑器刚拿到焦点就被抢回
+/// 文件树(键入无效);「保存并关闭」后焦点已交给相邻页,又被还原到刚关掉那页的编辑器上
+/// —— 落进一个不再画出来的元素,键盘失灵到点一下为止。弹窗宿主([`crate::dialog_host`])
+/// 自建之后四条关窗路一律在**退场开始那一刻**还焦点,这条坑已经不在了;这里仍先关框再
+/// 返回 `false`,保住「回调先跑、框后关」的顺序,与第三颗钮([`Confirm::alt_action`])
+/// 同一种还焦点时机。
 ///
-/// 回调先跑、框后关,回调执行期间弹窗仍在栈顶(`has_active_dialog` 等判据不变)。回调里
-/// 同步又开了别的弹窗(本弹窗不在栈顶)时关不了,退回默认关闭,与改动前一致。
+/// 回调执行期间弹窗仍开着([`crate::dialog_host::has_open`] 等判据不变)。回调里同步又开了
+/// 别的弹窗(本弹窗不在覆盖物栈顶)时关不了,退回默认关闭 —— 宿主按层关的就是本弹窗,
+/// 焦点留给上面那层。
 fn close_after_ok(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
     !close_guarded(kind, window, cx)
 }
@@ -746,12 +792,12 @@ mod tests {
     }
 
     /// 「确定」关框后,回调随后发起的焦点交接(新建文件后编辑器取焦点、「保存并关闭」后交给
-    /// 相邻页)不会被组件库延迟关闭那次迟到 250ms 的焦点还原盖掉,见 [`close_after_ok`]。
+    /// 相邻页)不会被迟到的焦点还原盖掉,见 [`close_after_ok`]。
     #[gpui::test]
     fn 确定关框后的焦点交接不被迟到的还原盖掉(cx: &mut gpui::TestAppContext) {
         use std::time::Duration;
 
-        /// 只画弹窗层的宿主(`Root` 自己不画,要宿主调 `render_dialog_layer`,同 `main.rs`)。
+        /// 只画弹窗层的宿主(弹窗层要由窗口根视图画,同 `main.rs`)。
         struct DialogHost;
         impl gpui::Render for DialogHost {
             fn render(
@@ -761,7 +807,7 @@ mod tests {
             ) -> impl IntoElement {
                 div()
                     .size_full()
-                    .children(gpui_component::Root::render_dialog_layer(window, cx))
+                    .children(crate::dialog_host::render_layer(window, cx))
             }
         }
 

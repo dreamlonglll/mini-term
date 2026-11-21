@@ -378,6 +378,8 @@ struct WorktreeModal {
     /// 两个下拉的选项(见 [`OptionsCache`])。
     options_cache: RefCell<Option<OptionsCache>>,
     mode: Mode,
+    /// 「已有分支 / 新分支」段控件的滑动选中块(见 `segment_slider`)。
+    mode_slider: crate::segment_slider::IndicatorSlider,
     sel_branch: String,
     base_branch: String,
     new_branch: Entity<InputState>,
@@ -555,6 +557,7 @@ pub fn open(
         branches_by_repo: HashMap::new(),
         options_cache: RefCell::new(None),
         mode: Mode::Existing,
+        mode_slider: crate::segment_slider::IndicatorSlider::new(),
         sel_branch: String::new(),
         base_branch: String::new(),
         new_branch: cx.new(|cx| {
@@ -1265,18 +1268,28 @@ fn render_create_section(
             ui::accent(),
         ));
     }
-    let mut seg = git_ui::segmented().ml_auto();
-    for (mode, label) in [
+    // 选中底色是一块滑动的绝对定位块(见 `segment_slider`):两段宽度随文字变,先量再滑
+    let slider = s.mode_slider.clone();
+    let active_ix = usize::from(s.mode == Mode::New);
+    let own_bg = !slider.ready(active_ix);
+    let mut seg = git_ui::segmented()
+        .ml_auto()
+        .child(git_ui::segmented_slider(&slider, active_ix));
+    for (ix, (mode, label)) in [
         (Mode::Existing, t("worktree", "modeExisting")),
         (Mode::New, t("worktree", "modeNew")),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let active = s.mode == mode;
         let state_for_mode = state.clone();
         let id = match mode {
             Mode::New => "worktree-mode-new",
             Mode::Existing => "worktree-mode-existing",
         };
-        seg = seg.child(git_ui::segment(id, label, active).on_click(
+        let segment = git_ui::segment(id, label, active, own_bg).child(slider.probe(ix));
+        seg = seg.child(segment.on_click(
             move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                 let input = state_for_mode.update(cx, |s, cx| {
                     s.mode = mode;

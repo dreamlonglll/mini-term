@@ -149,9 +149,9 @@ impl SettingsView {
                         &self.num_scrollback,
                         false,
                     ))
-                    // 终端区换场动画总开关。⚠️ 只管终端区那批(切 tab/面板/
-                    // 最大化/拆分),抽屉进出场等浮层动画不归它 ——
-                    // 那批是布局反馈不是装饰
+                    // 动画总开关。2026-11-21 起管**全部**动画(终端区换场、弹窗 /
+                    // 菜单 / 浮层开合、抽屉、toast…),写进配置后由
+                    // `patch_config` 同步到 `mt_ui::motion` 与 gpui 那道闸
                     .child(toggle_row(
                         "terminal-animations",
                         "terminal.animationsTitle",

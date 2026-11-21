@@ -63,20 +63,31 @@
 //!
 //! about 页要用的版本比较与 GitHub 查询**不在这棵树里** —— 它同时被 `main.rs`
 //! 的启动自检引用,住在顶层 [`crate::update_check`]。
+//!
+//! # 切页动画
+//!
+//! 导航是竖排的:往下面那一页切,新页从内容列底边推入、旧页向上推出,反向镜像
+//! (`motion_kit::push_pair`,[`mt_ui::motion::PANEL_SWAP`])。push 层包在内容列的滚动
+//! 容器**外面**,新旧两页各是一个滚动容器(出场层停在离开时的滚动位置;新页从顶上看起)。
+//! 导航的选中底色 + 左侧竖条是一块滑块(`segment_slider`),导航里夹着分组标题、各项的
+//! y 不规则,所以先量再滑([`mt_ui::motion::TAB_INDICATOR`])。
 
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, div, prelude::FluentBuilder, px,
+    KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use mt_ai::hook_registry::HookRegistrationInfo;
 
+use crate::dialog_host::Dialog;
 use crate::env_vars::EnvRow;
 use crate::i18n::t;
-use crate::prompt::{kind, open_guarded};
+use crate::motion_kit::{KeyedSwap, PushAxis, push_pair};
+use crate::prompt::{kind, open_guarded_with_dismiss};
+use crate::segment_slider::IndicatorSlider;
 use crate::store::{AppStore, MAX_SCROLLBACK, resolve_scrollback};
 use crate::ui;
 use crate::update_check::ReleaseInfo;
@@ -364,6 +375,14 @@ pub struct SettingsView {
     store: Entity<AppStore>,
     page: SettingsPage,
     focus: FocusHandle,
+    /// 切页的整幅 push(见模块注释「切页动画」)。
+    page_swap: KeyedSwap<SettingsPage>,
+    /// 内容列的滚动位置(换页回到顶上)。
+    page_scroll: ScrollHandle,
+    /// 切页出场层的滚动位置:换页那一刻从 `page_scroll` 抄过来,旧页停在离开时的位置滑走。
+    exit_scroll: ScrollHandle,
+    /// 导航的滑动选中块。
+    nav_slider: IndicatorSlider,
 
     // ── terminal 页:shell 列表 ──
     shell_editing: Editing,
@@ -447,6 +466,9 @@ pub struct SettingsView {
     /// 下载目录选择与校验独立持有，避免覆盖其它设置页正在运行的任务。
     _download_dir_job: Option<Task<()>>,
     _subs: Vec<Subscription>,
+    /// 关面板的收尾做过了没有(见 [`SettingsView::finish`]);`on_release` 只给没走关窗收尾的
+    /// 路兜底。
+    finished: bool,
 }
 
 /// 面板头部高度(含 1px 下边框)。正文高度按它扣,见 [`render_dialog_header`]。
@@ -505,7 +527,7 @@ fn render_dialog_header() -> impl IntoElement {
         )
 }
 
-/// 本次运行里设置面板上次停在哪一页(关面板时记下,见 `SettingsView::new` 的 `on_release`)。
+/// 本次运行里设置面板上次停在哪一页(关面板那一刻记下,见 [`SettingsView::finish`])。
 /// **不落盘**:重启后从第一页开始,与原版一致;只省掉「同一次运行里来回改同一页」的那几下点击。
 struct LastSettingsPage(SettingsPage);
 impl gpui::Global for LastSettingsPage {}
@@ -536,10 +558,18 @@ pub fn open_settings(
     let page = resolve_initial_page(initial_page, remembered);
     let view = cx.new(|cx| SettingsView::new(store, Some(page), window, cx));
     let focus = view.read(cx).focus.clone();
-
-    open_guarded(kind::SETTINGS, window, cx, {
+    // 关窗收尾:关面板那一刻(退场开始时)提交草稿、记页,不等实体释放(见 `SettingsView::finish`)。
+    // defer 出去:收尾哪天从面板自己的 update 里触发(面板里加一颗关闭),也不会重入同一实体
+    let on_dismiss = {
         let view = view.clone();
-        move |dialog, window, _cx| {
+        move |_window: &mut Window, cx: &mut App| {
+            cx.defer(move |cx| view.update(cx, |view, cx| view.finish(cx)));
+        }
+    };
+
+    let build = {
+        let view = view.clone();
+        move |dialog: Dialog, window: &mut Window, _cx: &mut App| {
             // 原版 `w-[680px] max-h-[80vh]`(`SettingsModal.tsx:2099`)。两条都要
             // 按视口现算:`Dialog` 的宽是定值、位置按「视口中心 − 宽/2」推,
             // 窗口比它窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)。
@@ -570,7 +600,8 @@ pub fn open_settings(
                         .child(div().h(body).child(view.clone())),
                 )
         }
-    });
+    };
+    open_guarded_with_dismiss(kind::SETTINGS, window, cx, build, on_dismiss);
 
     // Dialog 打开时会把焦点抢到自己面板上,↑↓ 导航要的焦点必须排在它后面
     window.defer(cx, move |window, cx| {
@@ -669,6 +700,10 @@ impl SettingsView {
             store,
             page: initial_page.unwrap_or(SettingsPage::Terminal),
             focus: cx.focus_handle(),
+            page_swap: KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
+            page_scroll: ScrollHandle::new(),
+            exit_scroll: ScrollHandle::new(),
+            nav_slider: IndicatorSlider::new(),
             shell_editing: None,
             shell_name: ph(cx, window, t("settings", "terminal.newNamePlaceholder")),
             shell_command: ph(cx, window, t("settings", "terminal.newCommandPlaceholder")),
@@ -721,6 +756,7 @@ impl SettingsView {
             _job: None,
             _download_dir_job: None,
             _subs: Vec::new(),
+            finished: false,
         };
 
         // 草稿行:失焦 / 回车才归一并提交(见模块注释第 2 条)。
@@ -754,13 +790,12 @@ impl SettingsView {
 
         // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
         // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口。
-        // 草稿在这里兜底提交一次:点 ✕ / Esc 关面板不保证输入框先失焦
+        // 草稿提交与记页**不在这里做**:关面板那一刻由关窗收尾做掉(见 [`Self::finish`]),
+        // 这里只给没走那条路的情形兜底
         cx.on_release(|this: &mut Self, cx: &mut App| {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
-            this.commit_drafts(cx);
-            // 下次不指定分页打开时回到这一页(见 [`resolve_initial_page`])
-            cx.set_global(LastSettingsPage(this.page));
+            this.finish(cx);
         })
         .detach();
 
@@ -770,6 +805,20 @@ impl SettingsView {
     }
 
     // ── 提交 ──
+
+    /// 关面板的收尾(只做一次):草稿兜底提交(点 ✕ / Esc 关面板不保证输入框先失焦)、记住停在
+    /// 哪一页(下次不指定分页打开时回到这一页,见 [`resolve_initial_page`])。
+    ///
+    /// 关窗那一刻调(`open_settings` 登记的关窗收尾),**不等实体释放**:弹窗外壳有退场动画,
+    /// 实体要等它播完、层出栈才放,这期间再按 Ctrl+, 的话新面板会先按没提交的旧配置建好
+    /// 输入框、落在上上次的那一页,旧实体随后释放时再提交 —— 新面板显示的是旧值。
+    fn finish(&mut self, cx: &mut App) {
+        if std::mem::replace(&mut self.finished, true) {
+            return;
+        }
+        self.commit_drafts(cx);
+        cx.set_global(LastSettingsPage(self.page));
+    }
 
     /// 数字草稿行。失焦 / 回车的订阅与关面板兜底共用这张表,新增一行两边都有。
     fn number_inputs(&self) -> [(Entity<InputState>, NumField); 7] {
@@ -800,8 +849,9 @@ impl SettingsView {
         ]
     }
 
-    /// 把还没提交的草稿全部落盘。收 `&mut App`:关面板时的兜底在 `on_release` 里,
-    /// 那里只有 `App`,也写不回输入框 —— 面板都关了,不用写。没改的行到 setter 都是空转。
+    /// 把还没提交的草稿全部落盘。收 `&mut App`:关面板时的兜底([`Self::finish`])也会从
+    /// `on_release` 里调,那里只有 `App`,也写不回输入框 —— 面板都关了,不用写。没改的行
+    /// 到 setter 都是空转。
     fn commit_drafts(&mut self, cx: &mut App) {
         for (input, field) in self.number_inputs() {
             self.save_number(field, &input, cx);
@@ -926,10 +976,20 @@ impl SettingsView {
     fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if page != self.page {
             self.leave_shortcuts_page(cx);
+            // 出场层停在旧页离开时的位置;新页从顶上看起(同一个滚动容器换了内容,
+            // 沿用旧页的偏移没有意义)
+            self.exit_scroll.set_offset(self.page_scroll.offset());
+            self.page_scroll.set_offset(gpui::Point::default());
         }
         self.page = page;
         cx.notify();
     }
+}
+
+/// 切页的推移方向:往导航下面那一页切 = 新页从底边进(`> 0`),往上切反之。
+fn page_order(old: SettingsPage, new: SettingsPage) -> f32 {
+    let index = |page: SettingsPage| ALL_PAGES.iter().position(|p| *p == page).unwrap_or(0);
+    if index(new) > index(old) { 1.0 } else { -1.0 }
 }
 
 /// 这次输入事件算不算「提交」(失焦 / 回车)。
@@ -948,8 +1008,38 @@ const TERMINAL_CJK_FONT_PLACEHOLDER: &str = "'Sarasa Fixed SC', 'Microsoft YaHei
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 先对账再画:换走了外观页 / 皮肤列表变了,缩略图在这一帧放掉
-        self.release_stale_theme_thumbs(window, cx);
+        widgets::drive_knobs(window);
+        // 切页:先报这一帧谁在台上,再取出场信息(见模块注释「切页动画」)
+        let page = self.page;
+        self.page_swap
+            .observe(&page, |old, new| page_order(*old, *new));
+        let swap = self.page_swap.frame(window);
+        // 先对账再画:换走了外观页 / 皮肤列表变了,缩略图在这一帧放掉(外观页正作为出场层
+        // 滑走时还在画,不放)
+        let appearance_showing = page == SettingsPage::Appearance
+            || swap.is_some_and(|(old, _, _)| old == SettingsPage::Appearance);
+        self.release_stale_theme_thumbs(appearance_showing, window, cx);
+        let current = self.page_column(page, "settings-page", self.page_scroll.clone(), window, cx);
+        let body = match swap {
+            Some((old, progress, dir)) => {
+                let leaving = self.page_column(
+                    old,
+                    "settings-page-exit",
+                    self.exit_scroll.clone(),
+                    window,
+                    cx,
+                );
+                push_pair(
+                    current,
+                    Some(leaving.into_any_element()),
+                    progress,
+                    PushAxis::Vertical,
+                    dir,
+                )
+                .into_any_element()
+            }
+            None => current.into_any_element(),
+        };
         div()
             .id("settings-root")
             .size_full()
@@ -970,7 +1060,6 @@ impl Render for SettingsView {
             .child(self.render_menu(cx))
             .child(
                 div()
-                    .id("settings-page")
                     .flex_1()
                     // ⚠️ 少了 `min_w_0()` 这一列会**撑破面板**:taffy 按 CSS 的
                     // 「flex 子项 min-width:auto = min-content」给它兜底,而 gpui
@@ -987,15 +1076,32 @@ impl Render for SettingsView {
                     // 不做 CSS 那个跨轴的 visible→auto 修正,所以得显式写。
                     .min_w_0()
                     .h_full()
-                    .overflow_y_scroll()
-                    .px(px(20.0))
-                    .py(px(16.0))
-                    .child(self.render_page(window, cx)),
+                    .child(body),
             )
     }
 }
 
 impl SettingsView {
+    /// 内容列里的一页:滚动容器(`id` 区分在台上的与正在滑走的那一份,滚动位置各管各的)。
+    fn page_column(
+        &mut self,
+        page: SettingsPage,
+        id: &'static str,
+        scroll: ScrollHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size_full()
+            .min_w_0()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .px(px(20.0))
+            .py(px(16.0))
+            .child(self.render_page(page, window, cx))
+    }
+
     fn render_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut menu = div()
             .id("settings-menu")
@@ -1009,6 +1115,27 @@ impl SettingsView {
             .px(px(8.0))
             .flex()
             .flex_col();
+
+        // 选中底色 + 左侧竖条是一块滑块(见模块注释「切页动画」),排在各项之前;还没量到
+        // 位置那一帧由选中项自己画(与滑块落位后一模一样)
+        let active_ix = ALL_PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
+        let ready = self.nav_slider.ready(active_ix);
+        menu = menu.child(self.nav_slider.block(active_ix, |el| {
+            el.flex()
+                .items_center()
+                .px(px(12.0))
+                .rounded(px(4.0))
+                .bg(ui::accent_subtle())
+                .child(
+                    div()
+                        .w(px(2.0))
+                        .h(px(16.0))
+                        .flex_none()
+                        .rounded(px(1.0))
+                        .bg(ui::accent()),
+                )
+        }));
+        let mut item_ix = 0usize;
 
         for (gi, (title_key, pages)) in MENU_GROUPS.iter().enumerate() {
             menu = menu.child(if title_key.is_empty() {
@@ -1031,6 +1158,8 @@ impl SettingsView {
             for page in *pages {
                 let page = *page;
                 let active = self.page == page;
+                let probe = self.nav_slider.probe(item_ix);
+                item_ix += 1;
                 menu = menu.child(
                     div()
                         .id(SharedString::from(format!("settings-tab-{}", page.id())))
@@ -1044,7 +1173,8 @@ impl SettingsView {
                         .cursor_pointer()
                         .text_size(ui::font_px(13.0))
                         .when(active, |el| {
-                            el.bg(ui::accent_subtle()).text_color(ui::accent())
+                            el.text_color(ui::accent())
+                                .when(!ready, |el| el.bg(ui::accent_subtle()))
                         })
                         .when(!active, |el| {
                             el.text_color(ui::text_secondary()).hover(|el| {
@@ -1052,15 +1182,16 @@ impl SettingsView {
                             })
                         })
                         // 左侧激活竖条:**未选中时留位不留色** —— 切页时标签文字
-                        // 不会横向抖一下(原版 :2150 的注释)
+                        // 不会横向抖一下(原版 :2150 的注释)。量到位置之后由滑块画
                         .child(
                             div()
                                 .w(px(2.0))
                                 .h(px(16.0))
                                 .flex_none()
                                 .rounded(px(1.0))
-                                .when(active, |el| el.bg(ui::accent())),
+                                .when(active && !ready, |el| el.bg(ui::accent())),
                         )
+                        .child(probe)
                         .child(
                             div()
                                 .min_w(px(0.0))
@@ -1076,8 +1207,13 @@ impl SettingsView {
         menu.into_any_element()
     }
 
-    fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        match self.page {
+    fn render_page(
+        &mut self,
+        page: SettingsPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match page {
             SettingsPage::Terminal => self.render_terminal_page(cx),
             SettingsPage::Clipboard => self.render_clipboard_page(cx),
             SettingsPage::EnvVars => self.render_env_vars_page(cx),
@@ -1098,6 +1234,20 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 切页方向跟导航的竖排次序:往下面那页切新页从底边进(`> 0`),往上切从顶上进。
+    #[test]
+    fn 切页方向跟导航次序() {
+        assert_eq!(page_order(SettingsPage::Terminal, SettingsPage::Font), 1.0);
+        assert_eq!(
+            page_order(SettingsPage::About, SettingsPage::Terminal),
+            -1.0
+        );
+        assert_eq!(
+            page_order(SettingsPage::AiHook, SettingsPage::AiNotification),
+            -1.0
+        );
+    }
 
     /// 分页 id 与原版**一字不差** —— 改了会让外部深链(`initialPage`)失效。
     /// `env-vars` 是 GPUI 版新增的,同一条规矩。

@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
+    AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, SharedString, Size,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, canvas, deferred,
@@ -60,6 +60,10 @@ use crate::ssh_activity::{ButtonState, SshActivityView};
 use crate::store::AppStore;
 use crate::tree::{DropZone, PaneState, SplitDirection, SplitNode, StatusLight};
 use crate::ui;
+
+/// tab chip 位移补间与关分屏后邻居扩张(FLIP 一族),见该模块注释。
+#[path = "terminal_area_fx.rs"]
+mod fx;
 
 /// 终端区还没量出尺寸时的兜底(首帧)。比例照样对,只是绝对值不准。
 const FALLBACK_AREA: Size<Pixels> = Size {
@@ -92,14 +96,19 @@ const FALLBACK_AREA: Size<Pixels> = Size {
 //    这批动画是被点名要保留的;
 // 3. **同一个 pane 实体不许同帧双挂** —— 最大化开合的前后两个视图共享同一批
 //    pane,出场层只好省略(enter-only);切 tab / 切面板的新旧两侧 pane 天然
-//    互斥,才有资格上双层。
+//    互斥,才有资格上双层。关掉激活 tab(或把它拖去别的组)时旧 pane 已不在本组,
+//    同样只播进场:新激活的 pane 从被关那一侧推入(见 [`tab_swap_plan`])。
+//
+// 布局变了之后的补位(tab chip 新建 / 关闭 / 拖拽落位的位移补间、关掉分屏后邻居从旧
+// 格子扩张到新格子)是另一族,零尺寸变化、按 prepaint 拿到的终位当帧补偿,见 [`fx`]。
 
 /// 分屏进场的滑入偏移(新格子从右滑到位;它没有「旧内容」,不走 push)。
 const SWAP_SLIDE_PX: f32 = 14.0;
-/// 面板切换 / 最大化还原的整块换场时长。
-const AREA_SWAP_MS: u64 = 240;
-/// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作)。
-const TAB_SWAP_MS: u64 = 200;
+/// 面板切换 / 最大化还原的整块换场时长(规格 `mt_ui::motion::AREA_SWAP`;这里的毫秒数
+/// 只给「到点摘除」的计时器用)。
+const AREA_SWAP_MS: u64 = mt_ui::motion::AREA_SWAP.duration.as_millis() as u64;
+/// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作;规格 `TERMINAL_SWAP`)。
+const TAB_SWAP_MS: u64 = mt_ui::motion::TERMINAL_SWAP.duration.as_millis() as u64;
 
 /// 分屏进场滑入这一帧的偏移量。**纯函数**,单测钉在这上面:终点必须精确归零,
 /// 残留半像素会让终端内容永久错位半格。
@@ -212,6 +221,14 @@ pub struct TerminalArea {
     /// 点一下终端才能继续 —— 与 `pane.rs::dismiss_search` 那句 `window.focus` 同一条红线
     /// (原版这个浮层压根不收焦点,所以没有这个问题)。
     marker_prev_focus: Option<FocusHandle>,
+    /// 标记浮层**画在**哪个 pane 上:开着,或者收起动画还没播完(`marker_open` 已经是
+    /// `None`)。播完 / pane 没了才清 —— 与命令库浮层的 `cmd_shown` 同一套。
+    marker_shown: Option<(String, u32)>,
+    /// 标记浮层的开合动画(见 [`crate::popover_reveal`]),原点取 [`Self::marker_anchors`]。
+    marker_reveal: RevealState,
+    /// 各叶子「⚑ N」按钮的窗口坐标,按该叶子 active pane 的 id 索引(探针报来),
+    /// 理由同 [`Self::cmd_anchors`]。
+    marker_anchors: HashMap<String, Bounds<Pixels>>,
     /// 命令库浮层(issue #81)本体。**懒建、常驻**:分组折叠态要跨次打开记住,
     /// 而且它自带一个 `InputState`,每次开都重建等于每次都丢焦点句柄。
     cmd_popover: Option<Entity<CommandPopover>>,
@@ -257,9 +274,10 @@ pub struct TerminalArea {
     /// (原版是 `bar.querySelectorAll('[data-pane-tab]')` 逐个 `getBoundingClientRect`,
     /// 这张表就是它的等价物)。
     tab_rects: HashMap<String, Bounds<Pixels>>,
-    /// 缩略图开在哪个 tab 上 + 弹出那一刻的矩形 + 卡片进场(`menuPopIn`)。
-    /// 进场状态与这一份同生共死:收起时一起没,下次悬停从头播。
-    tab_preview: Option<(String, Bounds<Pixels>, mt_ui::motion::Transition)>,
+    /// 缩略图开在哪个 tab 上(key = pane id)+ 弹出那一刻的矩形 + 开合 / 换卡动画
+    /// (见 [`pane_preview::HoverCard`]):首次弹出从 tab 下缘展开,卡还在屏幕上时扫到
+    /// 相邻 tab 直接换卡,收起播完再卸。
+    tab_card: pane_preview::HoverCard<String>,
     /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄等于 `clearTimeout`**。
     _tab_preview_task: Option<Task<()>>,
 
@@ -281,9 +299,13 @@ pub struct TerminalArea {
     tab_swaps: HashMap<String, TabSwap>,
     /// 整块(面板切换 / 最大化开合)的换场记录。
     area_swap: Option<AreaSwap>,
-    /// 上一帧「每个叶子的激活 pane」—— 检测切 tab 用。**不按帧回收**
-    /// (与 `pane_enter` 同理:切面板再回来不该被误判成一次切换)。
-    last_leaf_active: HashMap<String, String>,
+    /// 上一次画到「每个叶子」时的激活 pane + 它在组里的下标 + 那一轮 render 的代次 ——
+    /// 检测切 tab 用;下标给「关掉激活 tab 后新激活的从哪一侧推入」定方向。**不按帧回收**
+    /// (与 `pane_enter` 同理:切面板再回来不该被误判成一次切换);隔了几轮才再画到的
+    /// 叶子只对齐不起过渡(见 [`leaf_drawn_recently`])。
+    last_leaf_active: HashMap<String, LeafActive>,
+    /// render 的代次(每次 `render` 加一)。[`LeafActive::drawn_gen`] 拿它判「上一轮画没画到」。
+    render_gen: u64,
     /// 上一帧的整块内容键:(项目, 面板, 最大化叶)。项目一换只记不播。
     last_area_key: Option<(String, String, Option<String>)>,
     /// 换场动画序号:同一处连续快速切换时,上一场动画的 id 必须让位。
@@ -291,15 +313,19 @@ pub struct TerminalArea {
     /// 终端区在窗口里的原点(量尺 canvas 顺手记的)。`pane_rects` 是窗口坐标,
     /// Reveal 的起点矩形要换算成相对终端区的坐标。
     area_origin: gpui::Point<Pixels>,
-    /// RevealBack 在飞期间,整树里这个 pane 的格子只画底色不挂实体 ——
-    /// 实体在飞行层上,同帧双挂会撞元素 id。只在渲染进场内容时置位。
-    suppress_entity_pane: Option<String>,
+    /// RevealBack 在飞期间,整树里这一组(叶子 id)整个挖空 —— 整组(tab 栏 +
+    /// 终端实体)在飞行层上,同帧双挂会撞元素 id、焦点句柄与 `tab_rects`。
+    /// 只在渲染进场内容时置位。
+    suppress_leaf: Option<String>,
     /// 上一次点 ×(tab 上的与控制条的)的时刻,判连点用
     /// (见 [`pane_actions::swallows_close_click`])。
     last_close_click: Option<std::time::Instant>,
     /// 每个分组页签区的横向滚动状态(key = leaf id)。跨帧保留 —— 句柄一重建,
     /// 用户滚到的位置就丢了;回收与 `split_states` 同一时机(布局变了的那一帧)。
     tab_strips: HashMap<String, TabStripScroll>,
+    /// tab chip 位移补间与关分屏后邻居扩张的共用状态(见 [`fx`])。包装元素在自己的
+    /// prepaint 里读写它,所以是 `Rc<RefCell>`;每帧 render 开头 [`fx::LayoutFx::begin_frame`]。
+    fx: fx::SharedFx,
     /// 键盘焦点的兜底落点:项目里一个终端都不剩时焦点落到这里,不落空。挂在终端区根上一个
     /// 零尺寸的元素上 —— 点不到(不抢鼠标点击的焦点),但在 Workspace 的派发路径里,
     /// 全局快捷键照样收得到。见 [`Self::restore_lost_focus`]。
@@ -373,18 +399,54 @@ impl TabFollow {
     }
 }
 
+/// 叶内切 tab 这一次怎么推:`(方向, 出场层画不画旧 pane)`。
+///
+/// - 旧 pane 还在本组(`old_idx = Some`):普通切 tab,往右边的 tab 切新内容从右进
+///   (`+1`),往左镜像;新旧两层都画。
+/// - 旧 pane 已不在本组(关掉了激活 tab / 把它拖去了别的组):只播进场,新激活的
+///   pane 从**被关那一侧**推入 —— 方向按「从被关的那一格切到它」算:它原先在被关那格
+///   的右边(现在顶到了被关的下标上,`new_idx >= old_prev_idx`)就从右进,在左边就从左进。
+///   与关面板的「只做进场」同一口径。
+///
+/// `old_prev_idx` 是旧激活 pane 上一帧在组里的下标,`new_idx` 是新激活 pane 现在的下标。
+fn tab_swap_plan(old_idx: Option<usize>, old_prev_idx: usize, new_idx: usize) -> (f32, bool) {
+    match old_idx {
+        Some(old) => (if new_idx > old { 1.0 } else { -1.0 }, true),
+        None => (if new_idx >= old_prev_idx { 1.0 } else { -1.0 }, false),
+    }
+}
+
+/// 上一次以展开态画到某个叶子时它的激活 pane(见 [`TerminalArea::last_leaf_active`])。
+struct LeafActive {
+    pane_id: String,
+    /// 激活 pane 当时在组里的下标。
+    index: usize,
+    /// 记下它的那一轮 render 的代次([`TerminalArea::render_gen`])。
+    drawn_gen: u64,
+}
+
+/// 记录是不是**上一轮(或这一轮)**render 画到这一叶时留下的。
+///
+/// 不是 = 这一叶有一阵子没以展开态画过:缩在最大化的折叠条里(折叠条不走 `render_leaf`)、
+/// 在别的面板 / 项目里。那期间激活项的变化(折叠条上右键关掉激活 tab、从终端列表跳过去)
+/// 不是「刚刚发生」的,再画到时只对齐记录、不起过渡 —— 否则还原 / 切回来的同时
+/// 这一叶又横推一次。
+fn leaf_drawn_recently(drawn_gen: u64, current_gen: u64) -> bool {
+    drawn_gen.saturating_add(1) >= current_gen
+}
+
 /// 叶内切 tab 的一次 push 过渡。
 struct TabSwap {
     seq: u64,
     /// `+1.0` = 目标在右侧(新内容从右推入、旧内容向左推出);`-1.0` 反之。
     dir: f32,
-    /// 出场层要画的旧 pane。
-    old_pane_id: String,
+    /// 出场层要画的旧 pane。`None` = 旧 pane 已不在本组(关掉了 / 拖走了),只播进场。
+    old_pane_id: Option<String>,
     /// 到点摘除出场层(丢句柄即取消)。
     _timer: Task<()>,
 }
 
-/// 整块内容(面板切换 / 最大化开合 / 折叠条换铺满组)的一次换场。
+/// 整块内容(面板切换 / 最大化开合)的一次换场。折叠条上换铺满组是瞬切,不进这里。
 struct AreaSwap {
     seq: u64,
     /// Push/Drift 的方向号(`+1` = 从下方推入 / 上浮落位)。Reveal 不用。
@@ -407,8 +469,10 @@ enum AreaMotion {
     Reveal { from: RevealFrom },
     /// 还原:[`Reveal`](Self::Reveal) 的反向 —— 裁剪窗从整幅**收回**到该格
     /// 还原后的目标矩形(按分屏比例算,见 [`leaf_rect_in`])。飞行层里是旧铺满
-    /// 主体(拿 `exit` 的 MaxBody 画),底下的整树把该格挖成空洞
-    /// (`suppress_entity_pane`)—— 同一个终端实体不许同帧双挂。
+    /// 的那一整组(拿 `exit` 的 MaxLeaf 画:tab 栏 + 终端主体 + 折叠区占位,与
+    /// [`TerminalArea::render_maximized`] 逐层同高),底下的整树把这一组整个挖空
+    /// (`suppress_leaf`)—— 同一个终端实体不许同帧双挂,tab 的焦点句柄与
+    /// `tab_rects` 也只许一处在写。
     ///
     /// 最大化状态下**换铺满组刻意没有动画**:整块过渡在满屏尺度上一律读作
     /// 闪烁(push / 淡化都试过,用户点名不要),瞬时切换即可。
@@ -431,11 +495,15 @@ enum AreaExitSrc {
     None,
     /// 旧面板的整树(切面板)。
     Panel(String),
-    /// 旧铺满叶的**终端主体**(折叠条上换铺满组)。只画主体不画 tab 栏/折叠条
-    /// —— 新旧两侧的 pane 实体天然互斥,但 tab 的焦点句柄两边都要挂,双挂
-    /// 只能砍出场层这边。`bar_count` 用来按旧折叠区同高占位:出场层里终端的
-    /// 尺寸必须与在台上时一字不差,差出一格就是一次多余的 PTY reflow。
-    MaxBody { pane_id: String, bar_count: usize },
+    /// 还原飞行层:旧铺满的**那一整组**(带 tab 栏)+ 按旧折叠区同高的占位。
+    ///
+    /// 飞行层里终端的尺寸必须与铺满态一字不差,差出一点就是还原第一帧多一次 PTY
+    /// resize、画面跳一下 —— 早先这里只画终端主体、漏了铺满组自己那条 `TAB_BAR_H`
+    /// 的 tab 栏,终端凭空高出 30px。现在整组照 `render_leaf` 画,底下的整树把这组
+    /// 挖空(见 [`AreaMotion::RevealBack`]),tab 栏只在飞行层上挂一份。
+    /// `bar_count` 是铺满时折叠条的条数(= **还原前那一帧**的叶子数 − 1,
+    /// 见 [`restore_bar_count`])。
+    MaxLeaf { leaf_id: String, bar_count: usize },
 }
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离(最大化钮不在场时)。
@@ -687,6 +755,28 @@ fn tab_icon_slot(
 /// 折叠标题条区最多吃掉终端区多高。叶子多到码不下时那一区自己滚,
 /// **绝不挤掉铺满的那一格** —— 最大化的本意就是给它腾地方。
 const COLLAPSED_ZONE_MAX: f32 = 0.4;
+
+/// 折叠区的高度上限(终端区高 × [`COLLAPSED_ZONE_MAX`],至少一条的高)。
+fn collapsed_zone_max(area_h: f32) -> f32 {
+    (area_h * COLLAPSED_ZONE_MAX).max(TAB_BAR_H)
+}
+
+/// 铺满态下折叠区的**实际**高度:`bars` 条折叠条按内容撑开,顶到上限就自己滚。
+/// 与 [`TerminalArea::render_maximized`] 里 `max_h(上限)` + 每条 `TAB_BAR_H` 的排法同值,
+/// 还原飞行层按它占位 —— 差一点,飞行层里的终端就比铺满态高 / 矮,多一次 PTY resize。
+fn collapsed_zone_height(area_h: f32, bars: usize) -> f32 {
+    collapsed_zone_max(area_h).min(bars as f32 * TAB_BAR_H)
+}
+
+/// 还原飞行层的折叠条条数:按**还原开始前那一帧**(铺满态真正画出来的)的布局数,
+/// 不按变更之后的。
+///
+/// 最大化状态下分屏(`split_pane_with_cwd`、拖到终端区边缘)会先 `clear_maximized`,
+/// 同一帧叶子数 +1 并开始还原 —— 按新布局数,飞行层的折叠区比铺满态多一条、终端主体
+/// 矮 `TAB_BAR_H`,还原第一帧多一次 PTY resize。上一帧快照缺席(理论走不到)才退回现布局。
+fn restore_bar_count(prev: Option<&SplitNode>, now: &SplitNode) -> usize {
+    prev.unwrap_or(now).leaves().len().saturating_sub(1)
+}
 
 // ─── 控件簇的描边图标(照抄 `PaneGroup.tsx:40-62` 的 SVG,viewBox 16 归一化;
 //     自绘理由见 `mt_ui::icons::vector` 模块注释,换算套路同 `activity_bar`)───
@@ -1285,6 +1375,9 @@ impl TerminalArea {
             marker_open: None,
             marker_focus: cx.focus_handle(),
             marker_prev_focus: None,
+            marker_shown: None,
+            marker_reveal: RevealState::new(),
+            marker_anchors: HashMap::new(),
             cmd_popover: None,
             cmd_open: None,
             cmd_shown: None,
@@ -1298,7 +1391,7 @@ impl TerminalArea {
             hovered_tab: None,
             tab_click: SwitchClickGuard::default(),
             tab_rects: HashMap::new(),
-            tab_preview: None,
+            tab_card: pane_preview::HoverCard::default(),
             _tab_preview_task: None,
             pane_drag: None,
             pane_drop: None,
@@ -1306,12 +1399,14 @@ impl TerminalArea {
             tab_swaps: HashMap::new(),
             area_swap: None,
             last_leaf_active: HashMap::new(),
+            render_gen: 0,
             last_area_key: None,
             swap_seq: 0,
             area_origin: gpui::Point::default(),
-            suppress_entity_pane: None,
+            suppress_leaf: None,
             last_close_click: None,
             tab_strips: HashMap::new(),
+            fx: Rc::default(),
             focus_sink: cx.focus_handle(),
         }
     }
@@ -1369,18 +1464,30 @@ impl TerminalArea {
 
     // ─── 非激活 tab 的悬停缩略图(`PaneGroup.tsx:234-277`) ─────
 
-    /// 收起浮层并取消在飞的计时。
+    /// 收起浮层(播收起动画,播完才卸)并取消在飞的计时。
     fn close_tab_preview(&mut self, cx: &mut Context<Self>) {
         self._tab_preview_task = None;
-        if self.tab_preview.take().is_some() {
+        if self.tab_card.close(cx) {
             cx.notify();
         }
     }
 
     /// 悬停到某个**非激活** tab:排一次 250ms 计时;到点后按 500ms 节拍续活。
+    ///
+    /// 卡还在屏幕上(开着,或刚离开上一个 tab、收起动画还没播完)时**不等**:直接换到
+    /// 这个 tab,卡身从上一个 tab 下面滑过来,不重播开合(见 [`pane_preview::HoverCard`])。
     fn schedule_tab_preview(&mut self, pane_id: String, cx: &mut Context<Self>) {
         self._tab_preview_task = None;
-        self.tab_preview = None;
+        if self.tab_card.is_warm() {
+            if self.open_tab_preview(&pane_id, cx) {
+                self._tab_preview_task = Some(cx.spawn(async move |this, cx| {
+                    Self::keep_tab_preview_alive(this, cx).await;
+                }));
+            } else {
+                self.close_tab_preview(cx);
+            }
+            return;
+        }
         self._tab_preview_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(
@@ -1389,89 +1496,120 @@ impl TerminalArea {
                 .await;
             let opened = this
                 .update(cx, |this: &mut TerminalArea, cx| {
-                    // 到点时再核对:还悬着同一个 tab、且量到过矩形
-                    if this.hovered_tab.as_deref() != Some(pane_id.as_str()) {
-                        return false;
-                    }
-                    let Some(rect) = this.tab_rects.get(&pane_id).copied() else {
-                        return false;
-                    };
-                    this.tab_preview = Some((
-                        pane_id.clone(),
-                        rect,
-                        mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
-                    ));
-                    cx.notify();
-                    true
+                    this.open_tab_preview(&pane_id, cx)
                 })
                 .unwrap_or(false);
-            if !opened {
-                return;
-            }
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
-                    .await;
-                let alive = this
-                    .update(cx, |this: &mut TerminalArea, cx| {
-                        if this.tab_preview.is_some() {
-                            cx.notify();
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .unwrap_or(false);
-                if !alive {
-                    return;
-                }
+            if opened {
+                Self::keep_tab_preview_alive(this, cx).await;
             }
         }));
     }
 
+    /// 弹出 / 换到 `pane_id` 的缩略图。核对:还悬着同一个 tab、且量到过矩形。
+    fn open_tab_preview(&mut self, pane_id: &str, cx: &mut Context<Self>) -> bool {
+        if self.hovered_tab.as_deref() != Some(pane_id) {
+            return false;
+        }
+        let Some(rect) = self.tab_rects.get(pane_id).copied() else {
+            return false;
+        };
+        self.tab_card
+            .open(pane_id.to_string(), rect, pane_preview::tab_anchor, cx);
+        cx.notify();
+        true
+    }
+
+    /// 卡开着期间按 500ms 节拍重画 —— 缩略图是活的(`MiniTerminalElement` 自己也按
+    /// 这个节拍取数)。卡下了屏幕就停。
+    async fn keep_tab_preview_alive(this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp) {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
+                .await;
+            let alive = this
+                .update(cx, |this: &mut TerminalArea, cx| {
+                    let warm = this.tab_card.is_warm();
+                    if warm {
+                        cx.notify();
+                    }
+                    warm
+                })
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+        }
+    }
+
     /// 组装 tab 缩略图浮层。
     ///
-    /// 渲染处每帧重判(原版的双闸模式):tab 被关掉 / 被激活的那一帧就不画,
+    /// 渲染处每帧重判(原版的双闸模式):tab 被关掉的那一帧就直接卸(不播动画,
     /// **状态本身也收掉** —— 用 ✕ 关掉被悬停的 tab 时点击被 `stop_propagation`
-    /// 拦下,`on_hover(false)` 不一定来得及,旧锚点会残留到下次悬停。
+    /// 拦下,`on_hover(false)` 不一定来得及,旧锚点会残留到下次悬停);被激活了
+    /// (画面已经在眼前)就播收起。
+    ///
+    /// 开合走 [`crate::popover_reveal::reveal_frame`]:卡里的内容(含
+    /// `MiniTerminalElement`)按最终尺寸排,只被一个从 tab 下缘、以 tab 水平中心为原点
+    /// 长出来的裁剪窗露出来 —— 不淡入,缩略图也不逐帧反解字号。
     fn render_tab_preview(
         &mut self,
         layout: &SplitNode,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (pane_id, rect, fade) = self.tab_preview.clone()?;
-        let fade = fade.drive(window);
-        let store = self.store.read(cx);
-        // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
-        let project_id = store.active_project_id.clone().unwrap_or_default();
-        let leaf = layout.leaf_of_pane(&pane_id);
-        // 最大化时**折叠掉的那些组整组都不在屏幕上**,连它们的「激活 tab」也该给
-        // 预览 —— 展开态那条「只有非激活 tab 需要」的判据在这里不成立
-        let folded_away = store
-            .maximized_pane_id(&project_id)
-            .and_then(|id| layout.leaf_of_pane(id))
-            .is_some_and(|max_leaf| leaf.map(|l| l.id()) != Some(max_leaf.id()));
-        let still_hidden = folded_away
-            || match leaf {
-                Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
-                _ => false,
-            };
-        let Some(pane) = layout.pane(&pane_id).filter(|_| still_hidden) else {
-            self.tab_preview = None;
+        let mut frame = self.tab_card.frame(window)?;
+        let (pane_id, rect) = (frame.key.clone(), frame.anchor);
+        let (project_id, still_hidden) = {
+            let store = self.store.read(cx);
+            // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
+            let project_id = store.active_project_id.clone().unwrap_or_default();
+            let leaf = layout.leaf_of_pane(&pane_id);
+            // 最大化时**折叠掉的那些组整组都不在屏幕上**,连它们的「激活 tab」也该给
+            // 预览 —— 展开态那条「只有非激活 tab 需要」的判据在这里不成立
+            let folded_away = store
+                .maximized_pane_id(&project_id)
+                .and_then(|id| layout.leaf_of_pane(id))
+                .is_some_and(|max_leaf| leaf.map(|l| l.id()) != Some(max_leaf.id()));
+            let still_hidden = folded_away
+                || match leaf {
+                    Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
+                    _ => false,
+                };
+            (project_id, still_hidden)
+        };
+        let Some(pane) = layout.pane(&pane_id) else {
+            self.tab_card.close_now();
             return None;
         };
+        // 被激活了(Ctrl+数字 / Ctrl+Tab / 聚焦 chip 上回车):收起,且**本帧就按收起之后的
+        // 状态画** —— 上面那份是 close 之前取的(全开、不要帧),照它画的话:总开关关着时
+        // close 已直达收起、再没人重画,卡一直盖着;开着时收起动画第一帧没人要。重取一次:
+        // 关着拿到 None、当帧不画;开着从这一帧起播收起并自己要帧
+        if !still_hidden && self.tab_card.close(cx) {
+            frame = self.tab_card.frame(window)?;
+        }
+        let store = self.store.read(cx);
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
         let info =
             pane_preview::snapshot_pane(pane, &project_id, 0, None, store, auto_resume, cx);
         let style = pane_preview::preview_style(store);
+        let mut state = frame.reveal;
+        state.origin_x = Some(rect.left() + rect.size.width / 2.0);
+        // 卡是纯展示(不拦鼠标):收起途中也别让 reveal_frame 盖拦截层,否则移开 tab 后
+        // 马上点下面的终端,那一下会被正在收的卡吞掉
+        state.open = true;
+        let card = reveal_frame(
+            pane_preview::tab_preview_card(&info, &style),
+            state,
+            Some(pane_preview::card_chrome()),
+        );
         Some(
             deferred(
                 anchored()
-                    .position(pane_preview::tab_anchor(rect))
+                    .position(pane_preview::tab_anchor(rect) + frame.offset)
                     // 「底下放不下就翻到 tab 上方」由贴边收拢代劳
                     .snap_to_window_with_margin(px(6.0))
-                    .child(pane_preview::tab_preview_card(&info, &style, fade)),
+                    .child(card),
             )
             .with_priority(1)
             .into_any_element(),
@@ -1498,13 +1636,23 @@ impl TerminalArea {
         // scrollback,不能每帧跑,见 `store::refresh_markers`
         self.store
             .update(cx, |store, cx| store.refresh_markers_for_pty(pty_id, cx));
-        self.marker_open = Some((pane_id.to_string(), pty_id));
+        let target = (pane_id.to_string(), pty_id);
+        // 收起动画播到一半又在同一个 pane 上打开:从当前进度往回长;换了 pane 就从头长
+        if self.marker_shown.as_ref() != Some(&target) {
+            self.marker_reveal.hide_now();
+        }
+        self.marker_open = Some(target.clone());
+        self.marker_shown = Some(target);
         self.marker_prev_focus = window.focused(cx);
         window.focus(&self.marker_focus, cx);
+        self.marker_reveal.show(cx);
         cx.notify();
     }
 
-    /// 收起浮层(幂等),焦点还给打开浮层前的那个元素(多半是终端)。
+    /// 收起浮层(幂等),播收起动画(播完才卸,见 [`Self::render_marker_popover`])。
+    ///
+    /// 焦点**一开始就**还给打开浮层前的那个元素(多半是终端):正在收的浮层不再接按键,
+    /// 覆盖物登记也当场摘掉。
     fn close_marker_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.marker_open.take().is_none() {
             return;
@@ -1513,7 +1661,29 @@ impl TerminalArea {
         if let Some(prev) = self.marker_prev_focus.take() {
             window.focus(&prev, cx);
         }
+        self.marker_reveal.hide(cx);
         cx.notify();
+    }
+
+    /// 直接卸掉标记浮层,不播动画(它挂的 pane / pty 已经没了,或者整个项目切走了)。
+    /// 与 [`Self::drop_command_popover`] 同口径。
+    fn drop_marker_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_marker_popover(window, cx);
+        self.marker_reveal.hide_now();
+        self.marker_shown = None;
+    }
+
+    /// 「⚑ N」按钮上的探针报来按钮窗口坐标(`pane_id` = 该叶子的 active pane)。
+    /// 返回「变了、且浮层正画在这个 pane 上」—— 只有那时才要再画一帧。
+    fn note_marker_anchor(&mut self, pane_id: &str, bounds: Bounds<Pixels>) -> bool {
+        if self.marker_anchors.get(pane_id) == Some(&bounds) {
+            return false;
+        }
+        self.marker_anchors.insert(pane_id.to_string(), bounds);
+        self.marker_shown
+            .as_ref()
+            .is_some_and(|(pane, _)| pane == pane_id)
+            && self.marker_reveal.is_mounted()
     }
 
     // ─── 命令库浮层(issue #81)────────────────────────────────
@@ -1932,18 +2102,33 @@ impl TerminalArea {
     /// 按下即关)→ `anchored(按钮下缘).snap_to_window_with_margin(4px)` → 面板。
     /// **不复用 `menu::show`**:`MenuItem` 只有 label/shortcut/danger/disabled/submenu
     /// 五种表达,装不下「#seq + 时间 + 正文 + 进行中圆点」四栏。
+    ///
+    /// 开合动画照命令库浮层那套([`crate::popover_reveal`]):原点是「⚑ N」按钮的水平中心,
+    /// 框体(底色 / 边框 / 阴影)由这里按插值矩形画,面板本体只画内容;收起动画里遮罩
+    /// 不画、面板不接鼠标,播完才卸。
     fn render_marker_popover(
         &mut self,
         layout: &SplitNode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (pane_id, pty_id) = self.marker_open.clone()?;
-        // 切 tab / 关 pane / 分屏切换 → 无条件关(`PaneGroup.tsx:306-308`)
+        let (pane_id, pty_id) = self.marker_shown.clone()?;
+        // 切 tab / 关 pane / 分屏切换 → 无条件关(`PaneGroup.tsx:306-308`):
+        // 浮层挂的地方没了,直接卸,不播动画
         if !marker_popover_alive(layout, &pane_id, pty_id) {
-            self.close_marker_popover(window, cx);
+            self.drop_marker_popover(window, cx);
             return None;
         }
+        let Some(mut state) = self.marker_reveal.frame(window) else {
+            // 收起动画播完了
+            self.marker_shown = None;
+            return None;
+        };
+        state.origin_x = self
+            .marker_anchors
+            .get(&pane_id)
+            .map(|anchor| anchor.left() + anchor.size.width / 2.0);
+        let open = self.marker_open.is_some();
         // 按钮的位置由 pane 矩形反推:pane body 的上缘就是 tab 栏下缘,
         // 右缘就是叶子右缘(见 MARKER_ANCHOR_INSET 的说明)
         let rect = self.pane_rects.get(&pane_id)?;
@@ -2083,6 +2268,8 @@ impl TerminalArea {
             }
         }
 
+        // 框体(圆角 / 边框 / 底色 / 阴影 / 拦鼠标)交给 reveal_frame 的 Chrome 按插值矩形画,
+        // 面板本体只留内容;边框位用透明边占住,内容区与原先逐像素同位
         let panel = div()
             .track_focus(&self.marker_focus)
             .key_context("MarkerList")
@@ -2093,16 +2280,25 @@ impl TerminalArea {
                 }
             }))
             .w(panel_width)
-            .rounded(px(6.0))
             .border_1()
-            .border_color(ui::border_subtle())
-            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
-            // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
-            .bg(ui::bg_overlay())
-            .shadow_lg()
-            // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定
-            .occlude()
+            .border_color(gpui::transparent_black())
             .child(list);
+        let panel = reveal_frame(
+            panel,
+            state,
+            Some(Chrome {
+                // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+                // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+                bg: ui::bg_overlay(),
+                hover_bg: None,
+                border_color: ui::border_subtle(),
+                border_width: px(1.0),
+                radius: px(6.0).into(),
+                shadow: ShadowMode::Always,
+                // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定
+                occlude: true,
+            }),
+        );
 
         let size = window.viewport_size();
         Some(
@@ -2113,20 +2309,22 @@ impl TerminalArea {
                         .h(size.height)
                         // 点浮层外任意处关闭(原版挂 document 的 mousedown)。
                         // occlude 让这一层吃掉这次按下 —— 否则关浮层那一下会顺手
-                        // 点到底下的终端/tab
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.close_marker_popover(window, cx);
-                            }),
-                        )
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
-                                this.close_marker_popover(window, cx);
-                            }),
-                        )
+                        // 点到底下的终端/tab。收起动画里不拦:点哪儿都直接落到下面
+                        .when(open, |el| {
+                            el.occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.close_marker_popover(window, cx);
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                        this.close_marker_popover(window, cx);
+                                    }),
+                                )
+                        })
                         .child(
                             anchored()
                                 .position(anchor)
@@ -2151,9 +2349,17 @@ impl TerminalArea {
         match node {
             SplitNode::Leaf { id, .. } => {
                 let leaf_id = id.clone();
+                if self.suppress_leaf.as_deref() == Some(leaf_id.as_str()) {
+                    // RevealBack 在飞:这一整组画在飞行层上,整树里只留空位。飞行层的
+                    // 裁剪窗任何时刻都罩得住这块(从整幅收到它),空位不会露出来
+                    return div().size_full().into_any_element();
+                }
                 let animate = self.animations_enabled(cx);
                 let el = self.render_leaf(node, project_id, window, cx);
-                self.wrap_pane_enter(&leaf_id, project_id, el, animate, window)
+                let el = self.wrap_pane_enter(&leaf_id, project_id, el, animate, window);
+                // 关掉相邻分屏后,这一格从旧格子的裁剪窗长到新格子(见 [`fx`]);
+                // 平时只记一下本帧的矩形,不裁剪、不挪
+                fx::leaf_slot(el, self.fx.clone(), leaf_id).into_any_element()
             }
             SplitNode::Split {
                 id,
@@ -2327,8 +2533,9 @@ impl TerminalArea {
             .map(|l| self.render_collapsed_leaf(l, project_id, cx))
             .collect();
         // 折叠区自己滚,铺满那格恒占剩下的全部(`min_h(0)` 是 flex 子项能收缩的
-        // 前提 —— 缺了它内容撑高时会把折叠区顶出可视区)
-        let zone_max = (self.area_size.height * COLLAPSED_ZONE_MAX).max(px(TAB_BAR_H));
+        // 前提 —— 缺了它内容撑高时会把折叠区顶出可视区)。实际高度 = min(条数 × 条高,
+        // 上限),还原飞行层按同一公式占位([`collapsed_zone_height`])
+        let zone_max = px(collapsed_zone_max(f32::from(self.area_size.height)));
         div()
             .size_full()
             .flex()
@@ -2513,7 +2720,11 @@ impl TerminalArea {
                             },
                             |_, _, _, _| {},
                         )
+                        // 钉住 inset:tab 是带 px(10) 的 flex,不写会按静态位置右移 10px,
+                        // 缩略图锚点跟着偏(见 `segment_slider::IndicatorSlider::probe`)
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full()
                     })
                     .text_color(if is_active {
@@ -2603,14 +2814,12 @@ impl TerminalArea {
         .into_any_element()
     }
 
-    /// 终端区换场动画总开关(设置页「启用动画」)。缺省开启。
-    /// 只闸终端区这批(切 tab/切面板/最大化/拆分);抽屉等浮层动画不归它。
-    fn animations_enabled(&self, cx: &App) -> bool {
-        self.store
-            .read(cx)
-            .config()
-            .terminal_animations
-            .unwrap_or(true)
+    /// 动画总开关(设置页「启用动画」,缺省开启)。2026-11-21 起管**全部**动画,
+    /// 真身是 [`mt_ui::motion::animations_enabled`](与配置的同步见 `crate::motion::sync_switch`)。
+    /// 终端区这批换场在**检测层**就判它(关掉时不记过渡、不起计时器),比让过渡
+    /// 直达终态更省 —— 出场层一帧都不画。
+    fn animations_enabled(&self, _cx: &App) -> bool {
+        mt_ui::motion::animations_enabled()
     }
 
     /// 折叠条的落点:这一组接管铺满,原先铺满的那组缩回折叠区。
@@ -2644,18 +2853,21 @@ impl TerminalArea {
         panes: &[PaneState],
         active_id: &str,
         cx: &mut Context<Self>,
-    ) -> Option<(u64, f32, String)> {
+    ) -> Option<(u64, f32, Option<String>)> {
         let animations_enabled = self.animations_enabled(cx);
+        let now_gen = self.render_gen;
+        let new_idx = panes.iter().position(|p| p.id == active_id);
         match self.last_leaf_active.get(leaf_id) {
-            Some(prev) if prev.as_str() != active_id => {
-                let old = prev.clone();
+            Some(rec) if rec.pane_id != active_id => {
+                let (old, old_prev_idx) = (rec.pane_id.clone(), rec.index);
+                let recent = leaf_drawn_recently(rec.drawn_gen, now_gen);
                 let old_idx = panes.iter().position(|p| p.id == old);
-                let new_idx = panes.iter().position(|p| p.id == active_id);
-                if !animations_enabled {
-                    // 开关关着:只对齐记录,不起过渡(也把可能在飞的收掉)
+                let swap = new_idx.map(|n| tab_swap_plan(old_idx, old_prev_idx, n));
+                if !animations_enabled || !recent {
+                    // 开关关着 / 这一叶隔了几轮才再画到(变化不是刚发生的):只对齐记录,
+                    // 不起过渡(也把可能在飞的收掉)
                     self.tab_swaps.remove(leaf_id);
-                } else if let (Some(o), Some(n)) = (old_idx, new_idx) {
-                    let dir = if n > o { 1.0 } else { -1.0 };
+                } else if let Some((dir, keeps_old)) = swap {
                     self.swap_seq += 1;
                     let seq = self.swap_seq;
                     let lid = leaf_id.to_string();
@@ -2675,23 +2887,56 @@ impl TerminalArea {
                         TabSwap {
                             seq,
                             dir,
-                            old_pane_id: old,
+                            // 旧 pane 已不在本组(被 × 掉 / 拖去别的组):实体要么已回收、
+                            // 要么正画在别的组里 —— 出场层一律不画,只播进场
+                            old_pane_id: keeps_old.then_some(old),
                             _timer: timer,
                         },
                     );
                 } else {
-                    // 旧 pane 已不在(被 × 掉 / 拖去别的组):终端实体已回收,
-                    // 出场层无从画起,这一次不做过渡
                     self.tab_swaps.remove(leaf_id);
                 }
-                self.last_leaf_active
-                    .insert(leaf_id.to_string(), active_id.to_string());
+                match new_idx {
+                    Some(n) => {
+                        self.last_leaf_active.insert(
+                            leaf_id.to_string(),
+                            LeafActive {
+                                pane_id: active_id.to_string(),
+                                index: n,
+                                drawn_gen: now_gen,
+                            },
+                        );
+                    }
+                    None => {
+                        if let Some(rec) = self.last_leaf_active.get_mut(leaf_id) {
+                            rec.drawn_gen = now_gen;
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                // 激活项没换,但它在组里的位置可能挪了(拖拽重排 / 关掉它左边的 tab):
+                // 下标跟着记,下次关掉它时才算得出被关的那一侧。代次每轮都刷(原地改,
+                // 不分配)
+                if let Some(rec) = self.last_leaf_active.get_mut(leaf_id) {
+                    if let Some(n) = new_idx {
+                        rec.index = n;
+                    }
+                    rec.drawn_gen = now_gen;
+                }
             }
             None => {
-                self.last_leaf_active
-                    .insert(leaf_id.to_string(), active_id.to_string());
+                if let Some(n) = new_idx {
+                    self.last_leaf_active.insert(
+                        leaf_id.to_string(),
+                        LeafActive {
+                            pane_id: active_id.to_string(),
+                            index: n,
+                            drawn_gen: now_gen,
+                        },
+                    );
+                }
             }
-            _ => {}
         }
         self.tab_swaps
             .get(leaf_id)
@@ -2757,6 +3002,10 @@ impl TerminalArea {
             strip_scroll.handle.scroll_to_item(active_idx);
         }
         let scroll_handle = strip_scroll.handle.clone();
+        // 这组页签的顺序比上一帧变了(新建 / 关闭 / 拖拽落位 / 左右移):这一帧被挤动的
+        // chip 起位移补间,新出现的原地展开(见 [`fx`])。拖拽进行中布局不动,只在落位
+        // 那一刻起补间
+        let reflow = self.fx.borrow_mut().arm_tab_strip(leaf_id, panes);
         let mut strip = div()
             .id(gpui::SharedString::from(format!("tabstrip-{leaf_id}")))
             .flex()
@@ -2812,303 +3061,302 @@ impl TerminalArea {
             // 悬停态本来就由下面那个 `on_hover` 维护着(它给缩略图预览用),
             // 这里直接读:chip 的悬停底色与「× 现不现身」都看它
             let is_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
-            strip = strip.child(
-                div()
-                    .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
-                    // 量矩形的 canvas 要一个定位上下文;`relative` 对 flex 项
-                    // 本身的布局没有影响
-                    .relative()
-                    // tab 键盘可达(原版 `role="tab"` + `tabIndex`):拿到焦点后
-                    // Enter/Space 激活。原版是 roving tabindex(只有激活 tab 是
-                    // 0),这里所有 tab 都可 Tab 到 —— gpui 没有 roving 语义,
-                    // 而「Tab 只能到激活 tab」等于隐藏 tab 键盘不可达
-                    .when_some(tab_focus, |el, focus| el.track_focus(&focus).tab_index(0))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                            cx.stop_propagation();
-                            this.store.update(cx, |store, cx| {
-                                store.activate_pane(&pid_key, &pane_id_key, window, cx)
-                            });
+            let chip = div()
+                .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
+                .relative()
+                // tab 键盘可达(原版 `role="tab"` + `tabIndex`):拿到焦点后
+                // Enter/Space 激活。原版是 roving tabindex(只有激活 tab 是
+                // 0),这里所有 tab 都可 Tab 到 —— gpui 没有 roving 语义,
+                // 而「Tab 只能到激活 tab」等于隐藏 tab 键盘不可达
+                .when_some(tab_focus, |el, focus| el.track_focus(&focus).tab_index(0))
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        this.store.update(cx, |store, cx| {
+                            store.activate_pane(&pid_key, &pane_id_key, window, cx)
+                        });
+                    }
+                }))
+                // 激活 tab 的画面就在眼前,只有隐藏 tab 需要预览。
+                // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一个」:相邻
+                // 元素的 enter/leave 到达顺序不保证,直接清会把刚进来的那个
+                // 抹掉(鼠标沿 tab 栏横扫时预览再也弹不出来)
+                .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                    let mine = this.hovered_tab.as_deref() == Some(pane_id_hover.as_str());
+                    if *hovered {
+                        if mine {
+                            return;
                         }
-                    }))
-                    // 激活 tab 的画面就在眼前,只有隐藏 tab 需要预览。
-                    // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一个」:相邻
-                    // 元素的 enter/leave 到达顺序不保证,直接清会把刚进来的那个
-                    // 抹掉(鼠标沿 tab 栏横扫时预览再也弹不出来)
-                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        let mine = this.hovered_tab.as_deref() == Some(pane_id_hover.as_str());
-                        if *hovered {
-                            if mine {
-                                return;
-                            }
-                            this.hovered_tab = Some(pane_id_hover.clone());
-                            if is_active {
-                                this.close_tab_preview(cx);
-                            } else {
-                                this.schedule_tab_preview(pane_id_hover.clone(), cx);
-                            }
-                        } else {
-                            if !mine {
-                                return;
-                            }
-                            this.hovered_tab = None;
+                        this.hovered_tab = Some(pane_id_hover.clone());
+                        if is_active {
                             this.close_tab_preview(cx);
+                        } else {
+                            this.schedule_tab_preview(pane_id_hover.clone(), cx);
                         }
-                        cx.notify();
-                    }))
-                    // 只量不画:缩略图锚点 + tab 栏拖拽插入位都要 tab 的屏幕矩形。
-                    // **每个 tab 都挂**(原先只挂悬停中的那一个):插入位要算的是
-                    // 「指针落在哪个 tab 的中线哪一侧」,那需要**全部** tab 的横向
-                    // 区间,只有悬停那一个不够用。故意不 notify —— 量完再触发重画
-                    // 就是每帧一个死循环。
-                    .child({
+                    } else {
+                        if !mine {
+                            return;
+                        }
+                        this.hovered_tab = None;
+                        this.close_tab_preview(cx);
+                    }
+                    cx.notify();
+                }))
+                // ── 胶囊(chip)形态 ──────────────────────────────────
+                //
+                // **这一层不画 accent 顶线**:顶线是「哪一页在前台」的标识,
+                // 归上面那条工作台页签条独占。两层各画一条橙线时两条线上下
+                // 贴着、层级根本读不出来。这一层改用「底色 + 描边」的胶囊:
+                // 激活 = elevated 底 + 描边 + 主文色;未激活 = 透明底 + 弱文色;
+                // 悬停未激活 = 一层极淡的底(从前鼠标扫过 chip 毫无反馈,
+                // 只有 500ms 后弹出的缩略图)。
+                .h(px(TAB_CHIP_H))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .min_w(px(TAB_CHIP_MIN_W))
+                .max_w(px(TAB_CHIP_MAX_W))
+                .rounded(px(TAB_CHIP_ROUND))
+                .cursor_pointer()
+                // 描边**三态都占位**,只换颜色:只给激活态加 border 会让未激活
+                // 的 chip 内容区少 2px,切 tab 时整条 tab 栏横跳一下
+                .border_1()
+                .when(is_active, |el| {
+                    el.bg(ui::bg_elevated())
+                        .text_color(ui::text_primary())
+                        .border_color(ui::border_default())
+                })
+                .when(!is_active, |el| {
+                    el.text_color(ui::text_muted())
+                        .border_color(ui::with_alpha(ui::border_default(), 0.0))
+                        .when(is_hovered, |el| {
+                            el.bg(ui::with_alpha(ui::text_muted(), 0.12))
+                        })
+                })
+                // ── tab 拖起(v0.14.0):移动 / 合并 / 重排 ─────────────
+                //
+                // 照 `project_list.rs` 的既有模式:记下源 id 让本行变淡 +
+                // 交出一个跟着鼠标走的拖影。**起拖阈值是 gpui 内建的 2px**
+                // (原版是 5px 曼哈顿),差异见 `dnd` 模块注释第 3 条。
+                // 原版那套「松手后一次性抑制 click」不需要 —— gpui 拖起时
+                // 会把 `clicked_state` 清掉。
+                .on_drag(
+                    crate::dnd::DragPane {
+                        project_id: pid_drag.clone(),
+                        pane_id: pane.id.clone(),
+                    },
+                    {
                         let this = this_area.clone();
-                        let id = pane.id.clone();
-                        canvas(
-                            move |bounds, _window, cx| {
-                                this.update(cx, |area: &mut TerminalArea, _cx| {
-                                    area.tab_rects.insert(id.clone(), bounds);
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full()
-                    })
-                    // ── 胶囊(chip)形态 ──────────────────────────────────
-                    //
-                    // **这一层不画 accent 顶线**:顶线是「哪一页在前台」的标识,
-                    // 归上面那条工作台页签条独占。两层各画一条橙线时两条线上下
-                    // 贴着、层级根本读不出来。这一层改用「底色 + 描边」的胶囊:
-                    // 激活 = elevated 底 + 描边 + 主文色;未激活 = 透明底 + 弱文色;
-                    // 悬停未激活 = 一层极淡的底(从前鼠标扫过 chip 毫无反馈,
-                    // 只有 500ms 后弹出的缩略图)。
-                    .h(px(TAB_CHIP_H))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(8.0))
-                    .min_w(px(TAB_CHIP_MIN_W))
-                    .max_w(px(TAB_CHIP_MAX_W))
-                    .rounded(px(TAB_CHIP_ROUND))
-                    .cursor_pointer()
-                    // 描边**三态都占位**,只换颜色:只给激活态加 border 会让未激活
-                    // 的 chip 内容区少 2px,切 tab 时整条 tab 栏横跳一下
-                    .border_1()
-                    .when(is_active, |el| {
-                        el.bg(ui::bg_elevated())
-                            .text_color(ui::text_primary())
-                            .border_color(ui::border_default())
-                    })
-                    .when(!is_active, |el| {
-                        el.text_color(ui::text_muted())
-                            .border_color(ui::with_alpha(ui::border_default(), 0.0))
-                            .when(is_hovered, |el| {
-                                el.bg(ui::with_alpha(ui::text_muted(), 0.12))
-                            })
-                    })
-                    // ── tab 拖起(v0.14.0):移动 / 合并 / 重排 ─────────────
-                    //
-                    // 照 `project_list.rs` 的既有模式:记下源 id 让本行变淡 +
-                    // 交出一个跟着鼠标走的拖影。**起拖阈值是 gpui 内建的 2px**
-                    // (原版是 5px 曼哈顿),差异见 `dnd` 模块注释第 3 条。
-                    // 原版那套「松手后一次性抑制 click」不需要 —— gpui 拖起时
-                    // 会把 `clicked_state` 清掉。
-                    .on_drag(
-                        crate::dnd::DragPane {
-                            project_id: pid_drag.clone(),
-                            pane_id: pane.id.clone(),
-                        },
-                        {
-                            let this = this_area.clone();
-                            let label = label_text.clone();
-                            move |item: &crate::dnd::DragPane, _offset, _window, cx| {
-                                let id = item.pane_id.clone();
-                                this.update(cx, |area: &mut TerminalArea, _cx| {
-                                    area.pane_drag = Some(id);
-                                });
-                                crate::dnd::preview(
-                                    label.clone(),
-                                    crate::dnd::PreviewIcon::Terminal,
-                                    cx,
-                                )
-                            }
-                        },
-                    )
-                    // 源 tab 变淡(原版 `el.style.opacity = '0.4'`)
-                    .when(is_dragging_self, |el| el.opacity(0.4))
-                    // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」);切过来的
-                    // 那一下凑成的双击不改名(见 `SwitchClickGuard`)。
-                    // ⚠️ 必须 `stop_propagation`:tab 栏那层挂着「双击空白处最大化」,
-                    // 不截断的话在 tab 上双击会**同时**改名和最大化
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        let label = label_text.clone();
+                        move |item: &crate::dnd::DragPane, _offset, _window, cx| {
+                            let id = item.pane_id.clone();
+                            this.update(cx, |area: &mut TerminalArea, _cx| {
+                                area.pane_drag = Some(id);
+                            });
+                            crate::dnd::preview(
+                                label.clone(),
+                                crate::dnd::PreviewIcon::Terminal,
+                                cx,
+                            )
+                        }
+                    },
+                )
+                // 源 tab 变淡(原版 `el.style.opacity = '0.4'`)
+                .when(is_dragging_self, |el| el.opacity(0.4))
+                // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」);切过来的
+                // 那一下凑成的双击不改名(见 `SwitchClickGuard`)。
+                // ⚠️ 必须 `stop_propagation`:tab 栏那层挂着「双击空白处最大化」,
+                // 不截断的话在 tab 上双击会**同时**改名和最大化
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.close_tab_preview(cx);
+                    let count = click_count(event);
+                    match this.tab_click.click(&pane_id, is_active, count) {
+                        SwitchClick::Switch => this.store.update(cx, |store, cx| {
+                            store.activate_pane(&pid_click, &pane_id, window, cx)
+                        }),
+                        SwitchClick::Rename => {
+                            // 先把焦点交给这个(本来就激活的)页签的终端再开改名框:
+                            // tab 可聚焦(上面的 `tab_index`),双击的第二下按下时焦点
+                            // 落在 tab 元素上,弹窗关掉会把焦点还给它 —— 改完名敲的字
+                            // 进不了终端,要再按一下空格把 tab 激活才行。右键菜单那条
+                            // 「重命名」不受影响:菜单收起时已把焦点还回终端
+                            this.store.update(cx, |store, cx| {
+                                store.focus_pane(&pid_click, &pane_id, window, cx)
+                            });
+                            let (label, store) = (label_rename.clone(), this.store.clone());
+                            modal::open_rename_pane(
+                                store,
+                                pid_rename.clone(),
+                                pane_id_rename.clone(),
+                                label,
+                                window,
+                                cx,
+                            );
+                        }
+                        // 前一下刚把它切过来:第二下按下时焦点又落回 tab 元素(同上),
+                        // 不交回去的话切过去之后敲的字全丢。它此刻已是激活页签
+                        SwitchClick::Ignore => this.store.update(cx, |store, cx| {
+                            store.focus_pane(&pid_click, &pane_id, window, cx)
+                        }),
+                    }
+                }))
+                // tab 右键菜单(`PaneGroup.tsx` 的 paneContextMenu)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        // 开菜单前先收缩略图(原版 onContextMenu 第一句)
+                        this.close_tab_preview(cx);
+                        let entries =
+                            tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
+                        menu::show(event.position, entries, window, cx);
+                    }),
+                )
+                // 中键单击 = 关闭(浏览器 / IDE 的惯例,松开时关;文件页签同一手法)。
+                // 与 × 一字不差:同一道连点闸、同一个 AI 感知确认入口
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _event: &MouseUpEvent, window, cx| {
                         cx.stop_propagation();
                         this.close_tab_preview(cx);
-                        let count = click_count(event);
-                        match this.tab_click.click(&pane_id, is_active, count) {
-                            SwitchClick::Switch => this.store.update(cx, |store, cx| {
-                                store.activate_pane(&pid_click, &pane_id, window, cx)
-                            }),
-                            SwitchClick::Rename => {
-                                // 先把焦点交给这个(本来就激活的)页签的终端再开改名框:
-                                // tab 可聚焦(上面的 `tab_index`),双击的第二下按下时焦点
-                                // 落在 tab 元素上,弹窗关掉会把焦点还给它 —— 改完名敲的字
-                                // 进不了终端,要再按一下空格把 tab 激活才行。右键菜单那条
-                                // 「重命名」不受影响:菜单收起时已把焦点还回终端
-                                this.store.update(cx, |store, cx| {
-                                    store.focus_pane(&pid_click, &pane_id, window, cx)
-                                });
-                                let (label, store) = (label_rename.clone(), this.store.clone());
-                                modal::open_rename_pane(
-                                    store,
-                                    pid_rename.clone(),
-                                    pane_id_rename.clone(),
-                                    label,
-                                    window,
-                                    cx,
-                                );
-                            }
-                            // 前一下刚把它切过来:第二下按下时焦点又落回 tab 元素(同上),
-                            // 不交回去的话切过去之后敲的字全丢。它此刻已是激活页签
-                            SwitchClick::Ignore => this.store.update(cx, |store, cx| {
-                                store.focus_pane(&pid_click, &pane_id, window, cx)
-                            }),
+                        let dead = pane_actions::pane_is_dead(
+                            this.store.read(cx),
+                            &pid_middle,
+                            &pane_id_middle,
+                        );
+                        if this.swallows_close_click(dead, cx) {
+                            return;
                         }
-                    }))
-                    // tab 右键菜单(`PaneGroup.tsx` 的 paneContextMenu)
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            // 开菜单前先收缩略图(原版 onContextMenu 第一句)
-                            this.close_tab_preview(cx);
-                            let entries =
-                                tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
-                            menu::show(event.position, entries, window, cx);
-                        }),
+                        pane_actions::close_pane(
+                            this.store.clone(),
+                            pid_middle.clone(),
+                            pane_id_middle.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                // ── 图标槽(16×16,固定)──────────────────────────
+                //
+                // 闲着的时候画 **shell 图标**,有状态的时候才让位给状态灯:
+                // `idle` 那颗状态灯是个空心圈,一屏五个闲置终端就是五颗
+                // 一模一样的 ○,占着位置不带任何信息。
+                //
+                // 两个分支都塞进同一个固定尺寸的盒子 —— 状态一变(idle ↔
+                // ai-working ↔ 等你处理)标题就跟着横跳一格是绝对不行的。
+                //
+                // 画的是**显示档位**(四态 + attention):Claude 等授权不再是绿勾、
+                // Codex 等授权不再是转圈,而是第五档的叹号。
+                .child(tab_icon_slot(
+                    pane.light(),
+                    &pane.shell_name,
+                    is_active,
+                    // fish 的眼睛是挖空语义,给它 chip 的底色
+                    if is_active {
+                        ui::bg_elevated()
+                    } else {
+                        ui::bg_terminal()
+                    },
+                ))
+                // AI 品牌图标(原版 `PaneGroup.tsx` 的 `aiActive && <BrandIcon/>`):
+                // 只在这个 pane 真有 AI 会话身份时出现,认不出厂商就不占位
+                .when_some(vendor, |el, vendor| {
+                    el.child(
+                        BrandIcon::new(Some(vendor))
+                            .size(px(12.0))
+                            // VectorIcon 不继承 text_color,跟着 tab 的明暗自己喂
+                            .color(if is_active {
+                                ui::text_primary()
+                            } else {
+                                ui::text_muted()
+                            }),
                     )
-                    // 中键单击 = 关闭(浏览器 / IDE 的惯例,松开时关;文件页签同一手法)。
-                    // 与 × 一字不差:同一道连点闸、同一个 AI 感知确认入口
-                    .on_mouse_up(
-                        MouseButton::Middle,
-                        cx.listener(move |this, _event: &MouseUpEvent, window, cx| {
+                })
+                .child(tab_label(
+                    primary.into(),
+                    secondary.map(SharedString::from),
+                    is_active,
+                ))
+                // ── × 槽位(14×14,常驻)────────────────────────────
+                //
+                // 「做完了还没看」的绿点也住在这一格(VS Code 未保存点的做法):
+                // 有点就画点,鼠标进 chip 才换回 ×。此前绿点是标题后面另插的
+                // 一颗,每次完成都让胶囊宽 11px、后面的页签整排挪一下;共用这一格
+                // 之后绿点来去是零宽度变化。
+                .child(
+                    div()
+                        .id(gpui::SharedString::from(format!("tab-close-{}", pane.id)))
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.0))
+                        .text_color(ui::text_muted())
+                        .hover(|el| el.bg(ui::bg_overlay()).text_color(ui::color_error()))
+                        // × **始终占位**,只是平时透明:靠 `when` 把它整个摘掉
+                        // 的话,鼠标一进 chip 就多出 14+6px、标题当场被挤窄,
+                        // 长标题还会在悬停的一瞬间换一次省略位置
+                        .when(!has_unseen && !is_active && !is_hovered, |el| {
+                            el.opacity(0.0)
+                        })
+                        // tab 上的 × 与右键「关闭此终端」同一个入口:关之前
+                        // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
+                        .on_click(cx.listener(move |this, _event, window, cx| {
                             cx.stop_propagation();
-                            this.close_tab_preview(cx);
                             let dead = pane_actions::pane_is_dead(
                                 this.store.read(cx),
-                                &pid_middle,
-                                &pane_id_middle,
+                                &pid_close,
+                                &pane_id_close,
                             );
                             if this.swallows_close_click(dead, cx) {
                                 return;
                             }
                             pane_actions::close_pane(
                                 this.store.clone(),
-                                pid_middle.clone(),
-                                pane_id_middle.clone(),
+                                pid_close.clone(),
+                                pane_id_close.clone(),
                                 window,
                                 cx,
                             );
-                        }),
-                    )
-                    // ── 图标槽(16×16,固定)──────────────────────────
-                    //
-                    // 闲着的时候画 **shell 图标**,有状态的时候才让位给状态灯:
-                    // `idle` 那颗状态灯是个空心圈,一屏五个闲置终端就是五颗
-                    // 一模一样的 ○,占着位置不带任何信息。
-                    //
-                    // 两个分支都塞进同一个固定尺寸的盒子 —— 状态一变(idle ↔
-                    // ai-working ↔ 等你处理)标题就跟着横跳一格是绝对不行的。
-                    //
-                    // 画的是**显示档位**(四态 + attention):Claude 等授权不再是绿勾、
-                    // Codex 等授权不再是转圈,而是第五档的叹号。
-                    .child(tab_icon_slot(
-                        pane.light(),
-                        &pane.shell_name,
-                        is_active,
-                        // fish 的眼睛是挖空语义,给它 chip 的底色
-                        if is_active {
-                            ui::bg_elevated()
+                        }))
+                        // 悬停时一律是 ×:点下去的只会是关闭钮,不会是绿点
+                        .child(if has_unseen && !is_hovered {
+                            div()
+                                .w(px(TAB_UNSEEN_DOT))
+                                .h(px(TAB_UNSEEN_DOT))
+                                .rounded_full()
+                                .bg(ui::color_success())
+                                .into_any_element()
                         } else {
-                            ui::bg_terminal()
-                        },
-                    ))
-                    // AI 品牌图标(原版 `PaneGroup.tsx` 的 `aiActive && <BrandIcon/>`):
-                    // 只在这个 pane 真有 AI 会话身份时出现,认不出厂商就不占位
-                    .when_some(vendor, |el, vendor| {
-                        el.child(
-                            BrandIcon::new(Some(vendor))
-                                .size(px(12.0))
-                                // VectorIcon 不继承 text_color,跟着 tab 的明暗自己喂
-                                .color(if is_active {
-                                    ui::text_primary()
-                                } else {
-                                    ui::text_muted()
-                                }),
-                        )
-                    })
-                    .child(tab_label(
-                        primary.into(),
-                        secondary.map(SharedString::from),
-                        is_active,
-                    ))
-                    // ── × 槽位(14×14,常驻)────────────────────────────
-                    //
-                    // 「做完了还没看」的绿点也住在这一格(VS Code 未保存点的做法):
-                    // 有点就画点,鼠标进 chip 才换回 ×。此前绿点是标题后面另插的
-                    // 一颗,每次完成都让胶囊宽 11px、后面的页签整排挪一下;共用这一格
-                    // 之后绿点来去是零宽度变化。
-                    .child(
-                        div()
-                            .id(gpui::SharedString::from(format!("tab-close-{}", pane.id)))
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .text_color(ui::text_muted())
-                            .hover(|el| el.bg(ui::bg_overlay()).text_color(ui::color_error()))
-                            // × **始终占位**,只是平时透明:靠 `when` 把它整个摘掉
-                            // 的话,鼠标一进 chip 就多出 14+6px、标题当场被挤窄,
-                            // 长标题还会在悬停的一瞬间换一次省略位置
-                            .when(!has_unseen && !is_active && !is_hovered, |el| {
-                                el.opacity(0.0)
-                            })
-                            // tab 上的 × 与右键「关闭此终端」同一个入口:关之前
-                            // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                cx.stop_propagation();
-                                let dead = pane_actions::pane_is_dead(
-                                    this.store.read(cx),
-                                    &pid_close,
-                                    &pane_id_close,
-                                );
-                                if this.swallows_close_click(dead, cx) {
-                                    return;
-                                }
-                                pane_actions::close_pane(
-                                    this.store.clone(),
-                                    pid_close.clone(),
-                                    pane_id_close.clone(),
-                                    window,
-                                    cx,
-                                );
-                            }))
-                            // 悬停时一律是 ×:点下去的只会是关闭钮,不会是绿点
-                            .child(if has_unseen && !is_hovered {
-                                div()
-                                    .w(px(TAB_UNSEEN_DOT))
-                                    .h(px(TAB_UNSEEN_DOT))
-                                    .rounded_full()
-                                    .bg(ui::color_success())
-                                    .into_any_element()
-                            } else {
-                                "×".into_any_element()
-                            }),
-                    ),
+                            "×".into_any_element()
+                        }),
+                );
+            // 包一层位移补间(见 [`fx`]):新建 / 关闭 / 拖拽落位挤动它时从旧位置滑过来,
+            // 新出现时原地裁剪展开。tab 的屏幕矩形也由这一层报 —— 报的是**排版**位置
+            // (挪动之前),缩略图锚点 + tab 栏拖拽插入位都要它。**每个 tab 都报**(原先
+            // 只量悬停中的那一个):插入位要算的是「指针落在哪个 tab 的中线哪一侧」,
+            // 那需要**全部** tab 的横向区间。故意不 notify —— 量完再触发重画就是每帧
+            // 一个死循环。
+            let report_id = pane.id.clone();
+            strip = strip.child(
+                fx::flip_slot(
+                    chip,
+                    self.fx.clone(),
+                    format!("{leaf_id}\u{1}{}", pane.id),
+                    Some(idx),
+                    scroll_handle.clone(),
+                    reflow,
+                )
+                .on_bounds(move |bounds, cx| {
+                    this_area.update(cx, |area: &mut TerminalArea, _cx| {
+                        area.tab_rects.insert(report_id.clone(), bounds);
+                    });
+                }),
             );
         }
 
@@ -3145,80 +3393,82 @@ impl TerminalArea {
         // 新建终端(在滚动区外,页签再多也停在视野里)
         let pid_new = project_id.to_string();
         let anchor_new = active.id.clone();
-        bar = bar.child(
-            div()
-                .id(gpui::SharedString::from(format!("tab-new-{leaf_id}")))
-                // 与 chip 同一套手感:方形圆角 + 悬停底色(原先只是一个裸「+」,
-                // 悬停只换文字色,按上去没有「这是一颗按钮」的实感)
-                .w(px(TAB_CHIP_H))
-                .h(px(TAB_CHIP_H))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(TAB_CHIP_ROUND))
-                .cursor_pointer()
-                .text_color(ui::text_muted())
-                .hover(|el| {
-                    el.bg(ui::with_alpha(ui::text_muted(), 0.12))
-                        .text_color(ui::accent())
-                })
-                // 左键单击**直接弹 shell 选择菜单**(不是长按、不是下拉箭头);
-                // 只有一个 shell 时不弹 —— 否则单 shell 用户每次多点一下
-                // (`PaneGroup.tsx:218-232` 那道 `<= 1` 的闸)
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    // 与 tab 同理:别让这一下冒到 tab 栏的「双击空白处最大化」上
-                    cx.stop_propagation();
-                    let (shells, launchers) =
-                        pane_actions::new_terminal_menu_data(this.store.read(cx), &pid_new);
-                    if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
-                        this.store.update(cx, |store, cx| {
-                            store.new_terminal(
-                                &pid_new,
-                                None,
-                                Some(anchor_new.clone()),
-                                window,
-                                cx,
-                            );
-                        });
-                        return;
-                    }
-                    let mut entries = pane_actions::new_terminal_menu_entries(
-                        shells,
-                        launchers,
-                        {
-                            let store = this.store.clone();
-                            let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
-                            move |shell, window, cx| {
-                                let (pid, anchor) = (pid.clone(), anchor.clone());
-                                store.update(cx, |store, cx| {
-                                    store.new_terminal(&pid, Some(shell), Some(anchor), window, cx);
-                                });
-                            }
-                        },
-                        {
-                            let store = this.store.clone();
-                            let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
-                            move |launcher, window, cx| {
-                                let (pid, anchor) = (pid.clone(), anchor.clone());
-                                store.update(cx, |store, cx| {
-                                    store.new_terminal_from_launcher(
-                                        &pid,
-                                        &launcher,
-                                        Some(anchor),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }
-                        },
-                    );
-                    entries.push(menu::separator());
-                    entries.push(reopen_closed_menu_item(&this.store, &pid_new, cx));
-                    menu::show(click_position(event, window), entries, window, cx);
-                }))
-                .child("+"),
-        );
+        let new_btn = div()
+            .id(gpui::SharedString::from(format!("tab-new-{leaf_id}")))
+            // 与 chip 同一套手感:方形圆角 + 悬停底色(原先只是一个裸「+」,
+            // 悬停只换文字色,按上去没有「这是一颗按钮」的实感)
+            .w(px(TAB_CHIP_H))
+            .h(px(TAB_CHIP_H))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(TAB_CHIP_ROUND))
+            .cursor_pointer()
+            .text_color(ui::text_muted())
+            .hover(|el| {
+                el.bg(ui::with_alpha(ui::text_muted(), 0.12))
+                    .text_color(ui::accent())
+            })
+            // 左键单击**直接弹 shell 选择菜单**(不是长按、不是下拉箭头);
+            // 只有一个 shell 时不弹 —— 否则单 shell 用户每次多点一下
+            // (`PaneGroup.tsx:218-232` 那道 `<= 1` 的闸)
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // 与 tab 同理:别让这一下冒到 tab 栏的「双击空白处最大化」上
+                cx.stop_propagation();
+                let (shells, launchers) =
+                    pane_actions::new_terminal_menu_data(this.store.read(cx), &pid_new);
+                if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
+                    this.store.update(cx, |store, cx| {
+                        store.new_terminal(&pid_new, None, Some(anchor_new.clone()), window, cx);
+                    });
+                    return;
+                }
+                let mut entries = pane_actions::new_terminal_menu_entries(
+                    shells,
+                    launchers,
+                    {
+                        let store = this.store.clone();
+                        let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
+                        move |shell, window, cx| {
+                            let (pid, anchor) = (pid.clone(), anchor.clone());
+                            store.update(cx, |store, cx| {
+                                store.new_terminal(&pid, Some(shell), Some(anchor), window, cx);
+                            });
+                        }
+                    },
+                    {
+                        let store = this.store.clone();
+                        let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
+                        move |launcher, window, cx| {
+                            let (pid, anchor) = (pid.clone(), anchor.clone());
+                            store.update(cx, |store, cx| {
+                                store.new_terminal_from_launcher(
+                                    &pid,
+                                    &launcher,
+                                    Some(anchor),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                    },
+                );
+                entries.push(menu::separator());
+                entries.push(reopen_closed_menu_item(&this.store, &pid_new, cx));
+                menu::show(click_position(event, window), entries, window, cx);
+            }))
+            .child("+");
+        // 「+」钮跟着页签区的宽度挪:新建 / 关闭让它挪位时同样从旧位置滑过来(见 [`fx`]);
+        // 页签多到溢出、随窗口宽度挪的不补间(那一帧没上膛)
+        bar = bar.child(fx::flip_slot(
+            new_btn,
+            self.fx.clone(),
+            format!("{leaf_id}\u{1}+"),
+            None,
+            scroll_handle,
+            reflow,
+        ));
 
         bar
     }
@@ -3329,8 +3579,15 @@ impl TerminalArea {
         let marker_pty = active.pty_id.filter(|_| marker_count > 0);
         let marker_pane_id = active.id.clone();
         let marker_btn = marker_pty.map(|pty_id| {
+            // 标记浮层开合动画的原点探针:报给本视图,按该叶子的 active pane 记(见
+            // [`Self::note_marker_anchor`])
+            let anchor_pane = active.id.clone();
+            let probe = anchor_probe(cx.entity(), move |area, bounds| {
+                area.note_marker_anchor(&anchor_pane, bounds)
+            });
             div()
                 .id(gpui::SharedString::from(format!("markers-{leaf_id}")))
+                .relative()
                 .mr(px(MARKER_BTN_MARGIN_RIGHT))
                 .px(px(6.0))
                 .py(px(2.0))
@@ -3354,6 +3611,7 @@ impl TerminalArea {
                 }))
                 .child("⚑")
                 .child(div().child(marker_count.to_string()))
+                .child(probe)
         });
         // SSH 交互(该组 active pane 的 AI SSH 调用记录)。没有记录时整个不画 —— 用
         // `children(Option)` 而不是画一个空占位,簇里不多出一格 gap、别的图标不挪位。
@@ -3668,19 +3926,14 @@ impl TerminalArea {
         // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
         let tab_swap = self.note_leaf_tab_swap(leaf_id, panes, &active.id, cx);
 
-        // RevealBack 的空洞:实体此刻在飞行层上,这格只画底色(见 render 里的置位)
-        let suppressed = self.suppress_entity_pane.as_deref() == Some(active.id.as_str());
         let store = self.store.read(cx);
-        let terminal = if suppressed {
-            None
-        } else {
-            active.pty_id.and_then(|id| store.terminal(id)).cloned()
-        };
-        // 出场层的旧终端实体(旧 pane 还没起 PTY 时出场层只好省略)
+        let terminal = active.pty_id.and_then(|id| store.terminal(id)).cloned();
+        // 出场层的旧终端实体(旧 pane 还没起 PTY 时出场层只好省略;旧 pane 已不在本组 ——
+        // 关掉了 / 拖去别的组 —— 时过渡记录里压根没有它,只播进场)
         let exit_terminal = tab_swap.as_ref().and_then(|(_, _, old)| {
             store
                 .project_state(project_id)
-                .and_then(|s| s.pane(old))
+                .and_then(|s| s.pane(old.as_deref()?))
                 .and_then(|p| p.pty_id)
                 .and_then(|id| store.terminal(id))
                 .cloned()
@@ -3734,6 +3987,8 @@ impl TerminalArea {
         // 这里**故意不 notify**:量尺寸再触发重画就是每帧一个死循环。
         let this = cx.entity();
         let rect_pane_id = active_id.clone();
+        // 关分屏后的扩张中,整格被 LeafSlot 挪着画:量尺减掉那份偏移,记的仍是排版位置
+        let rect_fx = self.fx.clone();
 
         // 终端区落点预览的档位(只画本组自己那一份)
         let body_zone = self
@@ -3853,6 +4108,7 @@ impl TerminalArea {
                     .child(
                         canvas(
                             move |bounds: Bounds<Pixels>, _window, cx| {
+                                let bounds = rect_fx.borrow().unshift(bounds);
                                 this.update(cx, |area: &mut TerminalArea, _cx| {
                                     area.pane_rects.insert(
                                         rect_pane_id.clone(),
@@ -3875,7 +4131,6 @@ impl TerminalArea {
                         terminal,
                         exit_terminal,
                         tab_swap.as_ref(),
-                        suppressed,
                     ))
                     // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
                     // 拖拽被中断时 gpui 会清 active_drag 并重画,残留状态自动失效。
@@ -4193,11 +4448,13 @@ fn cached_terminal(entity: Entity<crate::pane::TerminalPane>) -> AnyElement {
 /// 叶内切 tab 的方向性 push 两层(见文件头注释):新 pane 按方向推入、旧 pane
 /// 同向推出;两层都是全尺寸 absolute,只动 `left`,PTY 不收 resize。没有在场
 /// 记录时零包装 —— 只包终端主体,tab 栏不参与(它没换内容,动了反而怪)。
+///
+/// 关掉激活 tab / 把它拖去别的组时旧 pane 已不在本组,`exit_terminal` 为 `None`:
+/// 只播进场层,新激活的 pane 照方向推入(与关面板同一口径)。
 fn leaf_terminal_layer(
     terminal: Option<Entity<crate::pane::TerminalPane>>,
     exit_terminal: Option<Entity<crate::pane::TerminalPane>>,
-    tab_swap: Option<&(u64, f32, String)>,
-    suppressed: bool,
+    tab_swap: Option<&(u64, f32, Option<String>)>,
 ) -> AnyElement {
     match terminal {
         Some(entity) => match tab_swap {
@@ -4218,14 +4475,7 @@ fn leaf_terminal_layer(
                                 gpui::SharedString::from(format!(
                                     "tab-exit-{seq}"
                                 )),
-                                Animation::new(
-                                    std::time::Duration::from_millis(
-                                        TAB_SWAP_MS,
-                                    ),
-                                )
-                                .with_easing(ui::cubic_bezier(
-                                    0.16, 1.0, 0.3, 1.0,
-                                )),
+                                mt_ui::motion::TERMINAL_SWAP.animation(),
                                 move |el, delta| {
                                     el.left(gpui::relative(push_exit_x(
                                         dir, delta,
@@ -4244,14 +4494,7 @@ fn leaf_terminal_layer(
                                 gpui::SharedString::from(format!(
                                     "tab-enter-{seq}"
                                 )),
-                                Animation::new(
-                                    std::time::Duration::from_millis(
-                                        TAB_SWAP_MS,
-                                    ),
-                                )
-                                .with_easing(ui::cubic_bezier(
-                                    0.16, 1.0, 0.3, 1.0,
-                                )),
+                                mt_ui::motion::TERMINAL_SWAP.animation(),
                                 move |el, delta| {
                                     el.left(gpui::relative(push_enter_x(
                                         dir, delta,
@@ -4263,21 +4506,15 @@ fn leaf_terminal_layer(
             }
             None => cached_terminal(entity),
         },
-        // 空洞态(RevealBack 在飞)只画底色,不出「正在启动」——
-        // 那行字会在飞行层落位前闪一下
-        None => {
-            div().size_full().bg(ui::bg_terminal()).when(
-                !suppressed,
-                |el| {
-                    el.flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(ui::text_muted())
-                        .child(t("paneGroup", "starting"))
-                },
-            )
-            .into_any_element()
-        }
+        None => div()
+            .size_full()
+            .bg(ui::bg_terminal())
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(ui::text_muted())
+            .child(t("paneGroup", "starting"))
+            .into_any_element(),
     }
 }
 
@@ -4406,6 +4643,17 @@ pub(crate) fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point
     }
 }
 
+/// 布局从 `prev` 变到 `now`,叶子是不是**只少不多**:关掉了一个分屏(或把独占一组的
+/// tab 并进了别的组)。有增有减的(拖出去分屏)与没增没减的(切 tab、改比例)都不算 ——
+/// 关分屏后邻居扩张(见 [`fx`])只认这一种。
+fn leaves_only_shrank(prev: &SplitNode, now: &SplitNode) -> bool {
+    let (prev, now) = (prev.leaves(), now.leaves());
+    now.len() < prev.len()
+        && now
+            .iter()
+            .all(|leaf| prev.iter().any(|old| old.id() == leaf.id()))
+}
+
 /// 把 `snapshot` 对齐到 store 里那棵活树,返回**这一帧是不是换了棵树**。
 ///
 /// [`TerminalArea::layout_snapshot`] 存在的理由见那个字段的注释。这里是它唯一的
@@ -4446,6 +4694,11 @@ impl Render for TerminalArea {
         // `&mut Context<Self>`。只要 `layout` 还挂在 store 的借用上,那三处就一个
         // 都调不了 —— 这不是语句顺序能绕开的,是「渲染要边读树边改视图状态」
         // 这件事本身的形状。`Rc` 快照是同一目标的等价落点:热路径上不再有深拷贝。
+        //
+        // 上一帧的那份先留一个引用计数:关分屏后邻居扩张要比对「哪些叶子没了」
+        self.fx.borrow_mut().begin_frame();
+        self.render_gen += 1;
+        let prev_layout = self.layout_snapshot.clone();
         let layout_changed = {
             let store = self.store.read(cx);
             sync_layout_snapshot(&mut self.layout_snapshot, store.active_layout())
@@ -4474,8 +4727,8 @@ impl Render for TerminalArea {
 
         // 切走项目 / 关光了终端 → 浮层无处可挂。下面两条早退路径压根走不到浮层
         // 组装那一步,不在这里收掉的话覆盖物栈里会留一条永远摘不掉的登记。
-        if self.marker_open.is_some() && self.store.read(cx).active_layout().is_none() {
-            self.close_marker_popover(window, cx);
+        if self.marker_shown.is_some() && self.store.read(cx).active_layout().is_none() {
+            self.drop_marker_popover(window, cx);
         }
         if self.cmd_shown.is_some() && self.store.read(cx).active_layout().is_none() {
             self.drop_command_popover(window, cx);
@@ -4650,6 +4903,19 @@ impl Render for TerminalArea {
             active_panel_id.clone(),
             maximized_leaf.as_ref().map(|l| l.id().to_string()),
         );
+        // ── 关掉一个分屏:剩下的叶子从上一帧的格子扩张到新格子(见 [`fx`])────
+        // 判据:同一项目 / 面板 / 最大化态(整块换场另有一套)、整树铺开(最大化时剩下的
+        // 那一组本来就铺满)、叶子只少不多(拖出去分屏这类有增有减的不算)
+        let closed_split = layout_changed
+            && self.measured
+            && maximized_leaf.is_none()
+            // 整块换场还在飞时,上一帧量到的格子是推移途中的位置,不作数
+            && self.area_swap.is_none()
+            && self.last_area_key.as_ref() == Some(&area_key)
+            && prev_layout
+                .as_deref()
+                .is_some_and(|prev| leaves_only_shrank(prev, &layout));
+        self.fx.borrow_mut().arm_split_grow(closed_split);
         if self.last_area_key.as_ref() != Some(&area_key) {
             let prev = self.last_area_key.replace(area_key.clone());
             // 项目一换只记不播:旧面板属于别的项目,出场层无从画起,
@@ -4678,28 +4944,19 @@ impl Render for TerminalArea {
                     };
                     Some((dir, AreaMotion::Push, exit))
                 } else {
-                    // 旧铺满叶的主体(实体 + 占位高度)—— 换组的淡出层与还原的
-                    // 飞行层共用这一份取法
-                    let max_body_exit = |old_leaf: &str| -> AreaExitSrc {
-                        layout
-                            .node(old_leaf)
-                            .and_then(|node| match node {
-                                SplitNode::Leaf {
-                                    panes,
-                                    active_pane_id,
-                                    ..
-                                } => panes
-                                    .iter()
-                                    .find(|p| &p.id == active_pane_id)
-                                    .or_else(|| panes.first())
-                                    .map(|p| p.id.clone()),
-                                _ => None,
-                            })
-                            .map(|pane_id| AreaExitSrc::MaxBody {
-                                pane_id,
-                                bar_count: layout.leaves().len().saturating_sub(1),
-                            })
-                            .unwrap_or(AreaExitSrc::None)
+                    // 还原飞行层画的旧铺满组(整组 + 折叠区占位)。最大化状态下换
+                    // 铺满组早已改成瞬切,这份取法只剩还原一个用处。折叠条条数按
+                    // 上一帧的布局数(见 [`restore_bar_count`])
+                    let max_leaf_exit = |old_leaf: &str| -> AreaExitSrc {
+                        match layout.node(old_leaf) {
+                            Some(SplitNode::Leaf { panes, .. }) if !panes.is_empty() => {
+                                AreaExitSrc::MaxLeaf {
+                                    leaf_id: old_leaf.to_string(),
+                                    bar_count: restore_bar_count(prev_layout.as_deref(), &layout),
+                                }
+                            }
+                            _ => AreaExitSrc::None,
+                        }
                     };
                     match (&prev_max, &area_key.2) {
                         // 最大化状态下换铺满组:**瞬时切换,不做动画**。
@@ -4713,13 +4970,19 @@ impl Render for TerminalArea {
                                 ..
                             }) = layout.node(new_leaf)
                             {
-                                if let Some(p) = panes
+                                let active = panes
                                     .iter()
-                                    .find(|p| &p.id == active_pane_id)
-                                    .or_else(|| panes.first())
-                                {
-                                    self.last_leaf_active
-                                        .insert(new_leaf.clone(), p.id.clone());
+                                    .position(|p| &p.id == active_pane_id)
+                                    .or_else(|| (!panes.is_empty()).then_some(0));
+                                if let Some(i) = active {
+                                    self.last_leaf_active.insert(
+                                        new_leaf.clone(),
+                                        LeafActive {
+                                            pane_id: panes[i].id.clone(),
+                                            index: i,
+                                            drawn_gen: self.render_gen,
+                                        },
+                                    );
                                 }
                             }
                             None
@@ -4758,9 +5021,9 @@ impl Render for TerminalArea {
                                 f32::from(self.area_size.width),
                                 f32::from(self.area_size.height),
                             );
-                            let exit = max_body_exit(old_leaf);
+                            let exit = max_leaf_exit(old_leaf);
                             match (to, &exit) {
-                                (Some(to), AreaExitSrc::MaxBody { .. }) => {
+                                (Some(to), AreaExitSrc::MaxLeaf { .. }) => {
                                     Some((-1.0, AreaMotion::RevealBack { to }, exit))
                                 }
                                 _ => Some((-1.0, AreaMotion::Drift, AreaExitSrc::None)),
@@ -4837,23 +5100,13 @@ impl Render for TerminalArea {
                 .and_then(|st| st.panels.iter().find(|p| p.id == panel_id))
                 .map(|p| p.layout.clone())
                 .map(|l| self.render_node(&l, &project_id, self.area_size, window, cx)),
-            // 折叠条换铺满组:旧铺满叶的终端主体 + 按旧折叠区同高占位
-            (AreaExitSrc::MaxBody { pane_id, bar_count }, true) => {
-                let entity = {
-                    let store = self.store.read(cx);
-                    store
-                        .project_state(&project_id)
-                        .and_then(|s| s.pane(&pane_id))
-                        .and_then(|p| p.pty_id)
-                        .and_then(|id| store.terminal(id))
-                        .cloned()
-                };
-                entity.map(|entity| {
-                    // 占位高度 = render_maximized 里折叠区的实际高度公式:
-                    // min(条数 × TAB_BAR_H, 区上限);对不齐就是滑出途中一次 PTY reflow
-                    let zone_h = (self.area_size.height * COLLAPSED_ZONE_MAX)
-                        .max(px(TAB_BAR_H))
-                        .min(px(bar_count as f32 * TAB_BAR_H));
+            // 还原飞行层:旧铺满的整组(tab 栏 + 终端主体,与 render_maximized 的 body
+            // 同一个 render_leaf)+ 按旧折叠区同高占位 —— 终端主体与铺满态逐像素同高,
+            // 还原第一帧不多一次 PTY resize(见 [`AreaExitSrc::MaxLeaf`])
+            (AreaExitSrc::MaxLeaf { leaf_id, bar_count }, true) => {
+                layout.node(&leaf_id).cloned().map(|leaf| {
+                    let body = self.render_leaf(&leaf, &project_id, window, cx);
+                    let zone_h = collapsed_zone_height(f32::from(self.area_size.height), bar_count);
                     div()
                         .size_full()
                         .flex()
@@ -4863,9 +5116,9 @@ impl Render for TerminalArea {
                                 .flex_1()
                                 .min_h(px(0.0))
                                 .bg(ui::bg_terminal())
-                                .child(entity),
+                                .child(body),
                         )
-                        .child(div().flex_none().h(zone_h))
+                        .child(div().flex_none().h(px(zone_h)))
                         .into_any_element()
                 })
             }
@@ -4876,21 +5129,22 @@ impl Render for TerminalArea {
         // 首帧只量不画:百分比要按真实可用尺寸换算,而 ResizablePanel 只认第一帧的
         // 初值(见模块注释)。量到之后主动 notify 一次,下一帧把分屏树铺上去。
         //
-        // RevealBack 在飞时,进场内容里那个 pane 的格子挖成空洞(实体在飞行层),
+        // RevealBack 在飞时,进场内容里把那一整组挖空(整组在飞行层上),
         // 只在这一次 render 调用期间置位 —— 出了这里谁也别受影响
-        self.suppress_entity_pane = self.area_swap.as_ref().and_then(|s| {
-            match (&s.motion, &s.exit) {
-                (AreaMotion::RevealBack { .. }, AreaExitSrc::MaxBody { pane_id, .. }) => {
-                    Some(pane_id.clone())
+        self.suppress_leaf = self
+            .area_swap
+            .as_ref()
+            .and_then(|s| match (&s.motion, &s.exit) {
+                (AreaMotion::RevealBack { .. }, AreaExitSrc::MaxLeaf { leaf_id, .. }) => {
+                    Some(leaf_id.clone())
                 }
                 _ => None,
-            }
-        });
+            });
         let content = self.measured.then(|| match &maximized_leaf {
             Some(leaf) => self.render_maximized(&layout, leaf, &project_id, window, cx),
             None => self.render_node(&layout, &project_id, self.area_size, window, cx),
         });
-        self.suppress_entity_pane = None;
+        self.suppress_leaf = None;
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
@@ -4932,10 +5186,7 @@ impl Render for TerminalArea {
             )
             .children(content.map(|c| {
                 // 整块换场:有在场记录才包动画层,否则零包装
-                let mk_anim = || {
-                    Animation::new(std::time::Duration::from_millis(AREA_SWAP_MS))
-                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0))
-                };
+                let mk_anim = || mt_ui::motion::AREA_SWAP.animation();
                 match area_anim {
                     // 整幅竖直 push:出场层(如有)与进场层首尾相接
                     Some((seq, dir, AreaMotion::Push)) => div()
@@ -5278,6 +5529,117 @@ mod tests {
             assert!(spec.running_at(std::time::Duration::ZERO, true));
             assert!(spec.progress_at(std::time::Duration::ZERO, true) < 0.01);
         });
+    }
+
+    /// 还原飞行层与铺满态的终端主体逐像素同高(此前飞行层漏了铺满组自己那条 tab 栏,
+    /// 终端凭空高出 `TAB_BAR_H`,还原第一帧多一次 PTY resize、画面跳 30px)。
+    ///
+    /// 铺满态:`render_leaf`(tab 栏 + 主体)占 flex_1,折叠区按内容撑开、顶到上限就滚;
+    /// 飞行层:同一个 `render_leaf` + 按 [`collapsed_zone_height`] 占位。两边主体都是
+    /// 「整幅 − tab 栏 − 折叠区」。
+    #[test]
+    fn 还原飞行层与铺满态终端主体等高() {
+        for area_h in [240.0_f32, 600.0, 853.5, 1400.0] {
+            for bars in 1..=12 {
+                // 铺满态折叠区:每条 TAB_BAR_H 的内容高,max_h 封顶
+                let zone_in_maximized = (bars as f32 * TAB_BAR_H).min(collapsed_zone_max(area_h));
+                let zone_in_flight = collapsed_zone_height(area_h, bars);
+                assert_eq!(zone_in_flight, zone_in_maximized, "h={area_h} bars={bars}");
+                let body_maximized = area_h - TAB_BAR_H - zone_in_maximized;
+                let body_in_flight = area_h - TAB_BAR_H - zone_in_flight;
+                assert_eq!(body_in_flight, body_maximized);
+                // 旧写法(飞行层只有主体 + 占位)差的正是一条 tab 栏
+                let old_body = area_h - zone_in_flight;
+                assert!((old_body - body_maximized - TAB_BAR_H).abs() < 1e-3);
+            }
+        }
+        // 上限至少一条的高(终端区很矮时也放得下一条折叠条)
+        assert_eq!(collapsed_zone_max(10.0), TAB_BAR_H);
+    }
+
+    /// 最大化状态下分屏:`clear_maximized` 与叶子 +1 落在同一帧,还原飞行层的折叠区
+    /// 必须按上一帧(铺满态真正画出来的)条数占位,终端主体才与铺满态等高。
+    #[test]
+    fn 还原同帧叶子数变化时折叠条按上一帧算() {
+        use crate::tree::PaneState;
+        let leaf = |name: &str| SplitNode::leaf(PaneState::new(name));
+        let split = |children: Vec<SplitNode>| SplitNode::Split {
+            id: crate::tree::gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![],
+            children,
+        };
+        let (a, b) = (leaf("a"), leaf("b"));
+        // 铺满 a、底部一条 b 的折叠条;在 a 上分屏 → 同一帧还原且多出一格
+        let before = split(vec![a.clone(), b.clone()]);
+        let after = split(vec![split(vec![a.clone(), leaf("new")]), b.clone()]);
+        assert_eq!(restore_bar_count(Some(&before), &after), 1);
+        // 旧写法按变更后的布局数:多一条
+        assert_eq!(after.leaves().len() - 1, 2);
+        let area_h = 600.0_f32;
+        let zone_in_maximized = (1.0 * TAB_BAR_H).min(collapsed_zone_max(area_h));
+        let bars = restore_bar_count(Some(&before), &after);
+        assert_eq!(collapsed_zone_height(area_h, bars), zone_in_maximized);
+        // 布局没变的还原:两种取法一致
+        assert_eq!(restore_bar_count(Some(&before), &before), 1);
+        // 上一帧快照缺席时退回现布局
+        assert_eq!(restore_bar_count(None, &after), 2);
+    }
+
+    /// 切 tab / 关激活 tab 的推移方向与出场层取舍(见 [`tab_swap_plan`])。
+    #[test]
+    fn 切tab与关激活tab的推移方向() {
+        // 普通切 tab:往右切从右进,往左切从左进,两层都画
+        assert_eq!(tab_swap_plan(Some(0), 0, 2), (1.0, true));
+        assert_eq!(tab_swap_plan(Some(2), 2, 0), (-1.0, true));
+        // [A, B, C] 关掉激活的 B(上一帧下标 1):
+        // 右邻 C 顶到下标 1 → 从右推入;左邻 A 在下标 0 → 从左推入;都只播进场
+        assert_eq!(tab_swap_plan(None, 1, 1), (1.0, false));
+        assert_eq!(tab_swap_plan(None, 1, 0), (-1.0, false));
+        // 关掉最后一个(下标 2),激活退到左邻(下标 1):从左推入
+        assert_eq!(tab_swap_plan(None, 2, 1), (-1.0, false));
+        // 「关闭其他」从最左的 A 发起、激活的 C(下标 2)被关:A 从左推入
+        assert_eq!(tab_swap_plan(None, 2, 0), (-1.0, false));
+    }
+
+    /// 叶内切 tab 的过渡只认「上一轮 render 刚画过这一叶」时发生的变化。
+    ///
+    /// 最大化 A、在 B 的折叠条上右键关掉 B 的激活 tab(折叠条不走 `render_leaf`,记录停在
+    /// 最大化之前),还原时 B 再以展开态画到:记录是好几轮之前的,只对齐不横推。
+    #[test]
+    fn 隔了几轮才再画到的叶子不起切tab过渡() {
+        // 上一轮刚画过(普通点 tab / 关 tab):起过渡
+        assert!(leaf_drawn_recently(41, 42));
+        // 这一轮已经画过一次(还原飞行层与整树各画一遍):同样算
+        assert!(leaf_drawn_recently(42, 42));
+        // 中间隔了至少一轮没画到(折叠在最大化里 / 切去了别的面板、项目):只对齐
+        assert!(!leaf_drawn_recently(40, 42));
+        assert!(!leaf_drawn_recently(3, 1_000));
+        // 代次溢出边界不 panic
+        assert!(leaf_drawn_recently(u64::MAX, u64::MAX));
+    }
+
+    /// 关分屏后邻居扩张只认「叶子只少不多」。
+    #[test]
+    fn 只有关掉分屏才算叶子只少不多() {
+        use crate::tree::PaneState;
+        let leaf = |name: &str| SplitNode::leaf(PaneState::new(name));
+        let (a, b, c) = (leaf("a"), leaf("b"), leaf("c"));
+        let split = |children: Vec<SplitNode>| SplitNode::Split {
+            id: crate::tree::gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![],
+            children,
+        };
+        let three = split(vec![a.clone(), b.clone(), c.clone()]);
+        let two = split(vec![a.clone(), c.clone()]);
+        assert!(leaves_only_shrank(&three, &two), "关掉 b");
+        assert!(leaves_only_shrank(&two, &a), "关到只剩一格");
+        assert!(!leaves_only_shrank(&two, &three), "分屏是多了一格");
+        assert!(!leaves_only_shrank(&two, &two), "没增没减");
+        // 有增有减(把 c 拖出去在别处新分了一格):不算
+        let moved = split(vec![a.clone(), leaf("d")]);
+        assert!(!leaves_only_shrank(&three, &moved));
     }
 
     /// 子节点数与存的百分比对不上 / 有非法值 → 均分,不许拿 0 去乘。

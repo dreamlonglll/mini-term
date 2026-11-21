@@ -62,7 +62,7 @@ use gpui_component::dialog::{Cancel, Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::GitStatus;
 use mt_remote::GitContext;
-use mt_ui::icons::{FileIcon, Shape};
+use mt_ui::icons::{FileIcon, Shape, VectorIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
@@ -478,10 +478,13 @@ pub fn segmented() -> Div {
 }
 
 /// 分段控件里的一段:24px 高、12px 字;选中 = accent 淡底 + accent 字。
+/// `own_bg = false` 时选中段**不画**自己的淡底 —— 底色由 [`segmented_slider`] 的滑块画
+/// (还没量到位置那一帧传 `true`,两帧一模一样)。
 pub fn segment(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     active: bool,
+    own_bg: bool,
 ) -> Stateful<Div> {
     div()
         .id(id)
@@ -492,13 +495,25 @@ pub fn segment(
         .text_size(ui::font_px(12.0))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(ui::accent_subtle()).text_color(ui::accent())
+            el.text_color(ui::accent())
+                .when(own_bg, |el| el.bg(ui::accent_subtle()))
         })
         .when(!active, |el| {
             el.text_color(ui::text_secondary())
                 .hover(|el| el.bg(hover_bg()).text_color(ui::text_primary()))
         })
         .child(label.into())
+}
+
+/// 分段控件的滑动选中块(diff 的「并排 / 内联」、worktree 的「已有 / 新分支」):
+/// 外框 [`segmented`] 里排在各段之前,各段里挂 `slider.probe(i)`、用
+/// [`segment`]`(.., !slider.ready(active))`。各段宽度随文字变,先量再滑,首次出现
+/// 不滑(见 `segment_slider` 模块注释)。
+pub fn segmented_slider(
+    slider: &crate::segment_slider::IndicatorSlider,
+    active: usize,
+) -> crate::segment_slider::SliderBlock {
+    slider.block(active, |el| el.bg(ui::accent_subtle()))
 }
 
 // ─── 胶囊 ─────────────────────────────────────────────────────
@@ -653,6 +668,12 @@ pub fn more_pill(id: impl Into<ElementId>, hidden: usize) -> Stateful<Div> {
 
 // ─── 标题 ─────────────────────────────────────────────────────
 
+/// 折叠箭头:一枚右指的 chevron 按 `turns` 圈旋转(0 右指、0.25 下指)。区块标题、
+/// 目录行、冲突弹窗的「共同祖先」共用,尺寸颜色与原先两个图标硬换时一致。
+pub fn chevron(turns: f32) -> VectorIcon {
+    icon(ICON_CHEVRON_RIGHT, ICON_SIZE_SM, ui::text_muted()).rotation(turns)
+}
+
 /// 区块 / 分组标题:折叠箭头 + (图标)+ 标题 + 数量胶囊 + 右侧操作。
 ///
 /// 两档:区块(面板里的「更改」「提交历史」「提交详情」,30px、13px 主色半粗)与
@@ -664,6 +685,8 @@ pub struct SectionHeader {
     title: SharedString,
     group: bool,
     open: Option<bool>,
+    /// 折叠箭头这一帧转多少圈(`None` = 按 `open` 画静止值)。见 [`Self::chevron_turns`]。
+    turns: Option<f32>,
     tone: Option<Hsla>,
     icon: Option<&'static [Shape]>,
     count: Option<usize>,
@@ -677,6 +700,7 @@ impl SectionHeader {
             title: title.into(),
             group: false,
             open: None,
+            turns: None,
             tone: None,
             icon: None,
             count: None,
@@ -693,6 +717,14 @@ impl SectionHeader {
     /// 可折叠,`open` = 当前是否展开。
     pub fn collapsible(mut self, open: bool) -> Self {
         self.open = Some(open);
+        self
+    }
+
+    /// 折叠箭头这一帧的旋转(圈,0 = 右指、[`crate::fold_motion::OPEN_TURNS`] = 下指)。
+    /// 只画一枚箭头、转过去,不再两个图标硬换;补间状态在持有这块列表的视图上
+    /// ([`crate::fold_motion::FlipTweens`]),不传就按 `open` 画静止值。
+    pub fn chevron_turns(mut self, turns: f32) -> Self {
+        self.turns = Some(turns);
         self
     }
 
@@ -731,6 +763,7 @@ impl SectionHeader {
             ui::text_primary()
         });
         let has_trailing = !self.trailing.is_empty();
+        let turns = self.turns;
         div()
             .id(self.id)
             .flex()
@@ -747,15 +780,10 @@ impl SectionHeader {
                         .w(px(ICON_SIZE))
                         .flex()
                         .justify_center()
-                        .child(icon(
-                            if open {
-                                ICON_CHEVRON_DOWN
-                            } else {
-                                ICON_CHEVRON_RIGHT
-                            },
-                            ICON_SIZE_SM,
-                            ui::text_muted(),
-                        )),
+                        .child(chevron(turns.unwrap_or(crate::fold_motion::settled_value(
+                            open,
+                            crate::fold_motion::OPEN_TURNS,
+                        )))),
                 )
             })
             .when_some(self.icon, |el, shapes| {

@@ -597,46 +597,9 @@ pub fn diff_gray_edge() -> Hsla {
     alpha(token(|p| p.text_muted), 0.6)
 }
 
-// --- 缓动 ---
-
-/// CSS `cubic-bezier(x1, y1, x2, y2)` 的等价缓动函数。
-///
-/// `styles.css:67-78` 那两条浮层缓动(`--ease-overlay-in:
-/// cubic-bezier(0.16, 1, 0.3, 1)` / `--ease-overlay-out:
-/// cubic-bezier(0.4, 0, 0.9, 0.6)`)在 gpui 侧没有现成对应物,
-/// `Animation::with_easing` 又只要一个 `Fn(f32) -> f32`,于是自己解一次。
-///
-/// 做法与浏览器一致:x(t) 与 y(t) 都是控制点为 `(0,0) (x1,y1) (x2,y2) (1,1)`
-/// 的三次贝塞尔,给定 `x` 先用二分法反解 `t`,再取 `y(t)`。
-/// 二分 20 次的精度是 1e-6,对 240ms 的动画绰绰有余(比牛顿法慢但恒收敛 ——
-/// 控制点在 0..1 外时牛顿法会跑飞)。
-pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> impl Fn(f32) -> f32 {
-    fn bezier(a: f32, b: f32, t: f32) -> f32 {
-        let u = 1.0 - t;
-        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
-    }
-    move |x: f32| {
-        let x = x.clamp(0.0, 1.0);
-        if x <= 0.0 {
-            return 0.0;
-        }
-        if x >= 1.0 {
-            return 1.0;
-        }
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        let mut t = x;
-        for _ in 0..20 {
-            let sample = bezier(x1, x2, t);
-            if sample < x {
-                lo = t;
-            } else {
-                hi = t;
-            }
-            t = (lo + hi) * 0.5;
-        }
-        bezier(y1, y2, t)
-    }
-}
+// 缓动曲线不在这里:时长与曲线一律取 `mt_ui::motion` 的规格常量
+// (`TransitionSpec::animation()` 给 `with_animation` 用,`cubic_bezier_at` 是解算本体)。
+// 原先这里另有一份 `cubic_bezier`,2026-11-21 动画打磨批统一取规格后已无调用方,删了。
 
 // --- 复用小件 ---
 //
@@ -860,7 +823,13 @@ pub fn setting_row(
 /// 几何逐值照抄:`w-9 h-5`(36×20)的圆角胶囊 + `w-4 h-4`(16)的白滑块,
 /// 开时 `translate-x-[18px]`、关时 `translate-x-0.5`。
 /// **不随 `uiFontSize` 缩放** —— 原版这几个值是 Tailwind 的固定尺寸类。
-pub fn toggle(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
+///
+/// 滑块停在行程的 `travel` 处(0 = 关、1 = 开):滑块横向走位、底色在关 / 开两色之间
+/// 同步过渡(原版 `transition-colors` + `transition-transform`)。补间状态由调用方持有、
+/// 只让**刚翻的那一颗**动(设置页的 `widgets::knob_toggle`,`fold_motion::FlipTweens` +
+/// [`mt_ui::motion::TOGGLE_KNOB`]);静止的开关传 0 / 1。
+pub fn toggle_at(id: impl Into<ElementId>, travel: f32) -> Stateful<Div> {
+    let (knob_left, bg) = toggle_frame(travel);
     div()
         .id(id)
         .relative()
@@ -869,17 +838,43 @@ pub fn toggle(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
         .flex_none()
         .rounded_full()
         .cursor_pointer()
-        .bg(if checked { accent() } else { border_strong() })
+        .bg(bg)
         .child(
             div()
                 .absolute()
                 .top(px(2.0))
-                .left(px(if checked { 18.0 } else { 2.0 }))
+                .left(px(knob_left))
                 .w(px(16.0))
                 .h(px(16.0))
                 .rounded_full()
                 .bg(white()),
         )
+}
+
+/// 开关在行程 `travel` 处的(滑块 left, 底色)。滑块 2 → 18 线性走,底色在 RGB 空间里从
+/// `border_strong` 过渡到 `accent`(HSL 插值会绕色相环,中途冒出不相干的颜色)。
+fn toggle_frame(travel: f32) -> (f32, Hsla) {
+    let t = travel.clamp(0.0, 1.0);
+    (2.0 + 16.0 * t, mix_rgb(border_strong(), accent(), t))
+}
+
+/// 两色在 RGB 空间里按 `t` 线性混合(含透明度)。
+fn mix_rgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0.0 {
+        return from;
+    }
+    if t >= 1.0 {
+        return to;
+    }
+    let (a, b) = (gpui::Rgba::from(from), gpui::Rgba::from(to));
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    gpui::Rgba {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+        a: lerp(a.a, b.a),
+    }
+    .into()
 }
 
 /// 复选框(hook 页的注入目标列表,原版是 `<input type=checkbox accent-[var(--accent)]>`)。
@@ -1197,6 +1192,26 @@ pub fn highlight_runs(text: &str, ranges: &[(usize, usize)]) -> Vec<(String, boo
 mod tests {
     use super::*;
 
+    /// 开关滑块:两端与原先的静止样子逐值一致(left 2 / 18),中途线性;底色两端就是关 /
+    /// 开那两色本身(不经 RGB 往返,免得差一位舍入),中途在 RGB 里混。
+    #[test]
+    fn 开关滑块两端精确_中途线性() {
+        assert_eq!(toggle_frame(0.0).0, 2.0);
+        assert_eq!(toggle_frame(1.0).0, 18.0);
+        assert_eq!(toggle_frame(0.5).0, 10.0);
+        assert_eq!(toggle_frame(-1.0).0, 2.0, "越界钳住");
+        assert_eq!(toggle_frame(3.0).0, 18.0);
+
+        let off = gpui::hsla(0.0, 0.0, 0.2, 1.0);
+        let on = gpui::hsla(0.6, 0.8, 0.5, 1.0);
+        assert_eq!(mix_rgb(off, on, 0.0), off);
+        assert_eq!(mix_rgb(off, on, 1.0), on);
+        let mid = gpui::Rgba::from(mix_rgb(off, on, 0.5));
+        let (a, b) = (gpui::Rgba::from(off), gpui::Rgba::from(on));
+        assert!((mid.r - (a.r + b.r) / 2.0).abs() < 1e-3);
+        assert!((mid.b - (a.b + b.b) / 2.0).abs() < 1e-3);
+    }
+
     /// 弹窗宽度:够宽时用原版那个定值,窗口比它窄就压回窗口宽
     /// (原版靠 flex-shrink + `overflow-hidden`,gpui 的 `Dialog` 是定值宽,
     /// 不钳制的话按「中心 − 宽/2」定位会两侧一起出界)。
@@ -1282,31 +1297,6 @@ mod tests {
             highlight_runs("你好世界", &[(1, 3)]),
             vec![("你".into(), false), ("好世".into(), true), ("界".into(), false)]
         );
-    }
-
-    /// 缓动曲线:两端钉死、单调不回头、`ease-overlay-in` 前段就冲得很快
-    /// (`cubic-bezier(0.16, 1, 0.3, 1)` 是「快出慢收」)。
-    #[test]
-    fn 三次贝塞尔缓动() {
-        let ease_in = cubic_bezier(0.16, 1.0, 0.3, 1.0);
-        assert_eq!(ease_in(0.0), 0.0);
-        assert_eq!(ease_in(1.0), 1.0);
-        assert_eq!(ease_in(-1.0), 0.0, "越界要夹住");
-        assert_eq!(ease_in(2.0), 1.0);
-        // 单调
-        let mut prev = 0.0;
-        for i in 0..=20 {
-            let v = ease_in(i as f32 / 20.0);
-            assert!(v >= prev - 1e-4, "缓动必须单调:{prev} → {v}");
-            prev = v;
-        }
-        // 快出:走到一半时间已经完成大半位移
-        assert!(ease_in(0.5) > 0.8, "{}", ease_in(0.5));
-
-        // ease-overlay-out 是「慢出快收」,半程时位移不到一半
-        let ease_out = cubic_bezier(0.4, 0.0, 0.9, 0.6);
-        assert!(ease_out(0.5) < 0.5, "{}", ease_out(0.5));
-        assert_eq!(ease_out(1.0), 1.0);
     }
 
     /// 坏区间(越界 / 逆序 / 重叠)跳过而不是 panic。
