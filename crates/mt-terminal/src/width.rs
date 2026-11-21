@@ -56,7 +56,8 @@
 use std::sync::Arc;
 
 use alacritty_terminal::event::EventListener;
-use alacritty_terminal::index::Column;
+use alacritty_terminal::grid::{Dimensions as _, GridCell as _};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
@@ -131,7 +132,25 @@ impl Scratch {
     }
 }
 
-/// 套在 `Term` 外面的 `Handler`:只拦 `input`(列宽)与 Kitty 图形关心的三条序列,
+/// 算出主屏 `ClearMode::All`(`CSI 2J`)里 `Grid::clear_viewport` 会把视口往上滚入
+/// scrollback 的精确行数：自视口底行往上找最后一行含非空 cell 的行号 + 1；全空且已有
+/// 历史时为 0，全空且 `history_size == 0` 时 `Grid::clear_viewport` 的反向迭代器停在
+/// `(Line(0), Column(0))` 仍会上滚 1 行。口径与 `alacritty_terminal::grid::Grid::clear_viewport`
+/// 逐行一致，保证旋转后的选区与被顶进历史的原内容严丝合缝。
+fn clear_viewport_lines<T>(term: &Term<T>) -> usize {
+    let grid = term.grid();
+    let cols = term.columns();
+    for row in (0..term.screen_lines()).rev() {
+        let line = &grid[Line(row as i32)];
+        if (0..cols).any(|col| !line[Column(col)].is_empty()) {
+            return row + 1;
+        }
+    }
+    usize::from(term.history_size() == 0 && term.screen_lines() > 0)
+}
+
+/// 套在 `Term` 外面的 `Handler`:拦 `input`(列宽)、Kitty 图形关心的三条序列、
+/// ConPTY 的 `CSI ? 9001h/l`，以及 `clear_line` / `clear_screen`（重绘不抹选区），
 /// 其余全部原样转发。
 ///
 /// ⚠️ 升级 `vte` 时对照 `Handler` 的方法清单——新增的方法有默认空实现,
@@ -316,13 +335,55 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         self.term.set_hyperlink(hyperlink);
     }
 
+    /// `CSI 0K / 1K / 2K`（EL）：TUI（Bubble Tea / Ink / ConPTY 差分重绘）工作时每帧都会
+    /// 发清行序列刷新局部或原地重画整行。`alacritty_terminal` 默认只要擦除行碰到选区任意
+    /// 一行就把 `selection` 整块置 `None`，导致 TUI 工作期几乎无法框选内容。
+    /// 这里对齐 xterm.js / Windows Terminal 的口径：清行不销毁本地选区。
+    fn clear_line(&mut self, mode: LineClearMode) {
+        let selection = self.term.selection.take();
+        self.term.clear_line(mode);
+        self.term.selection = selection;
+    }
+
+    /// `CSI 0J / 1J / 2J / 3J`（ED）：
+    /// - `Above` / `Below`（`1J` / `0J`）：原地擦除不滚行，保留本地选区（TUI 常用的
+    ///   `CUP + CSI 0J` 动态区重绘不再打断框选）；
+    /// - `All`（`2J`）：alt screen 原地清屏重画，直接保留选区；主屏 `clear_viewport`
+    ///   实际是把视口非空行顶进 scrollback，按同样行数 `rotate` 选区——既不留空白视口
+    ///   上的残留高亮，也不丢历史区选区（`alacritty_terminal` 原实现无条件置 `None`）；
+    /// - `Saved`（`3J`）：真的清空了历史缓冲，沿用 `alacritty_terminal` 原语义清掉指向
+    ///   历史区的选区、保留视口选区。
     fn clear_screen(&mut self, mode: ClearMode) {
         if let Some(kitty) = self.kitty
             && matches!(mode, ClearMode::All)
         {
             kitty.on_clear_screen(self.term);
         }
-        self.term.clear_screen(mode);
+        match mode {
+            ClearMode::Above | ClearMode::Below => {
+                let selection = self.term.selection.take();
+                self.term.clear_screen(mode);
+                self.term.selection = selection;
+            }
+            ClearMode::All => {
+                let selection = self.term.selection.take();
+                let scrolled = if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                    0
+                } else {
+                    clear_viewport_lines(self.term)
+                };
+                self.term.clear_screen(mode);
+                self.term.selection = if scrolled > 0 {
+                    let region = Line(0)..Line(self.term.screen_lines() as i32);
+                    selection.and_then(|s| s.rotate(self.term, &region, scrolled as i32))
+                } else {
+                    selection
+                };
+            }
+            ClearMode::Saved => {
+                self.term.clear_screen(mode);
+            }
+        }
     }
 
     fn reset_state(&mut self) {
@@ -390,7 +451,6 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         move_forward_tabs(count: u16);
         save_cursor_position();
         restore_cursor_position();
-        clear_line(mode: LineClearMode);
         clear_tabs(mode: TabulationClearMode);
         set_tabs(interval: u16);
         reverse_index();
@@ -778,5 +838,185 @@ mod tests {
             cols(&e, 1),
             vec![(0, '['), (1, '👍'), (3, ']'), (4, ' '), (5, ' '), (6, '2')]
         );
+    }
+
+    // ───────────────────────── TUI 重绘不抹选区 ─────────────────────────
+
+    fn select_span(e: &TerminalEmulator, start: (i32, usize), end: (i32, usize)) {
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{Selection, SelectionType};
+
+        e.with_term_mut(|term| {
+            let mut sel = Selection::new(
+                SelectionType::Simple,
+                Point::new(Line(start.0), Column(start.1)),
+                Side::Left,
+            );
+            sel.update(Point::new(Line(end.0), Column(end.1)), Side::Right);
+            term.selection = Some(sel);
+        });
+    }
+
+    fn selected_text(e: &TerminalEmulator) -> Option<String> {
+        e.with_term(|term| term.selection_to_string())
+    }
+
+    /// `CSI 0K / 1K / 2K` 原地清行并重绘后，已有选区（包括刚按下的单点锚点）不被清掉。
+    #[test]
+    fn 清行重绘不销毁选区() {
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{Selection, SelectionType};
+
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(b"hello world\r\nspinner 1\r\nfooter");
+        select_span(&e, (0, 0), (0, 4));
+        assert_eq!(selected_text(&e).as_deref(), Some("hello"));
+
+        // 光标回到第 0 行做 0K / 1K / 2K 并重写同一行
+        e.advance(b"\x1b[1;6H\x1b[0K world");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("hello"),
+            "CSI 0K 不抹选区"
+        );
+        e.advance(b"\x1b[1;1H\x1b[2Khello world");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("hello"),
+            "CSI 2K 不抹选区"
+        );
+        e.advance(b"\x1b[1;3H\x1b[1K\x1b[1;1Hhello");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("hello"),
+            "CSI 1K 不抹选区"
+        );
+
+        // 刚 MouseDown 的单点空选区（to_range 为 None）在清行后也不能变 None，
+        // 否则紧接着的 MouseMove 无法延伸
+        e.with_term_mut(|term| {
+            term.selection = Some(Selection::new(
+                SelectionType::Simple,
+                Point::new(Line(1), Column(0)),
+                Side::Left,
+            ));
+        });
+        e.advance(b"\x1b[2;1H\x1b[2Kspinner 2");
+        assert!(
+            e.with_term(|term| term.selection.is_some()),
+            "刚按下的拖选锚点不能被 CSI 2K 抹掉"
+        );
+    }
+
+    /// Bubble Tea / Ink / agy 工作期常见重绘：`CSI ? 2026h` + `CSI H` + `CSI 0J` / `CSI 1J`
+    /// + 重画帧 + `CSI ? 2026l`，全过程选区保持存活。
+    #[test]
+    fn 局部清屏与同步重绘不销毁选区() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(b"line-0 answer text\r\nline-1 working...\r\nline-2 input");
+        select_span(&e, (0, 7), (0, 12));
+        assert_eq!(selected_text(&e).as_deref(), Some("answer"));
+
+        // 同步输出块里的 CSI H + CSI 0J 整块重绘
+        e.advance(b"\x1b[?2026h\x1b[H\x1b[0Jline-0 answer text\r\nline-1 working... 2s\r\nline-2 input\x1b[?2026l");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("answer"),
+            "CSI 0J 动态重绘后选区必须保留"
+        );
+
+        // CSI 1J 清光标上方后重写
+        e.advance(b"\x1b[2;1H\x1b[1J\x1b[Hline-0 answer text");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("answer"),
+            "CSI 1J 后选区必须保留"
+        );
+    }
+
+    /// alt-screen 里的 TUI 发 `CSI 2J` 整屏重绘时，选区停留在原坐标、不被清空。
+    #[test]
+    fn 备用屏整屏清屏重绘不销毁选区() {
+        let e = TerminalEmulator::new(TermSize::new(40, 5));
+        e.advance(b"\x1b[?1049h\x1b[Hcopy-me\r\nspinner-1");
+        select_span(&e, (0, 0), (0, 6));
+        assert_eq!(selected_text(&e).as_deref(), Some("copy-me"));
+
+        e.advance(b"\x1b[2J\x1b[Hcopy-me\r\nspinner-2");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("copy-me"),
+            "alt-screen CSI 2J 重绘后选区必须保留"
+        );
+    }
+
+    /// 主屏 `CSI 2J` 把视口非空行顶进 scrollback：选区跟着上移指向同一批原文字，
+    /// 历史区里的选区也一起上移而不被无条件清零。
+    #[test]
+    fn 主屏_2j_选区随内容顶进回看而不丢失() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 4), 100);
+        e.advance(b"h0\r\nh1\r\nv0\r\nv1\r\nv2\r\nv3");
+        // 4 行视口写 6 行：history = 2（h0 在 Line(-2), h1 在 Line(-1)），视口 v0..=v3 在 Line(0..=3)
+        select_span(&e, (-2, 0), (-2, 1));
+        assert_eq!(selected_text(&e).as_deref(), Some("h0"));
+
+        e.advance(b"\x1b[2J\x1b[Hfresh");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("h0"),
+            "历史区选区应随 2J 同步上移，仍指向 h0"
+        );
+
+        // 视口选区经 2J 顶进 scrollback 后也跟着指向原文字，不在新视口留幽灵高亮
+        select_span(&e, (0, 0), (0, 4));
+        assert_eq!(selected_text(&e).as_deref(), Some("fresh"));
+        e.advance(b"\x1b[2J\x1b[Hnext");
+        assert_eq!(
+            selected_text(&e).as_deref(),
+            Some("fresh"),
+            "视口选区经 2J 顶进历史后仍指向 fresh"
+        );
+        let range = e
+            .with_term(|term| term.selection.as_ref().and_then(|s| s.to_range(term)))
+            .expect("选区应在历史区存活");
+        assert!(range.start.line.0 < 0, "已顶进历史，不应留在空视口 Line(0)");
+
+        // 空屏且 history == 0 时 Grid::clear_viewport 仍会上滚 1 行，选区旋转行数须与之对齐
+        let empty = TerminalEmulator::with_scrollback(TermSize::new(40, 4), 100);
+        select_span(&empty, (0, 0), (0, 2));
+        empty.advance(b"\x1b[2J");
+        let empty_range = empty
+            .with_term(|term| term.selection.as_ref().and_then(|s| s.to_range(term)))
+            .expect("空屏 2J 后选区应随上滚的空行落到 Line(-1)");
+        assert_eq!(empty_range.start.line, Line(-1));
+    }
+
+    /// 真正让坐标失效的操作仍按原语义清空：`CSI 3J` 清历史、切主备屏、RIS 复位。
+    #[test]
+    fn 清历史_切屏_复位仍按原语义清选区() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 3), 100);
+        e.advance(b"old0\r\nold1\r\ncur0\r\ncur1\r\ncur2");
+        // 3 行视口写 5 行：old0 在 Line(-2), old1 在 Line(-1), cur0..=cur2 在 Line(0..=2)
+        select_span(&e, (-2, 0), (-2, 3));
+        assert_eq!(selected_text(&e).as_deref(), Some("old0"));
+        e.advance(b"\x1b[3J");
+        assert_eq!(selected_text(&e), None, "CSI 3J 应清掉历史区选区");
+
+        // 视口选区在 CSI 3J 下保留（alacritty 原语义）
+        select_span(&e, (0, 0), (0, 3));
+        assert_eq!(selected_text(&e).as_deref(), Some("cur0"));
+        e.advance(b"\x1b[3J");
+        assert_eq!(selected_text(&e).as_deref(), Some("cur0"));
+
+        // 切入备用屏清空主屏选区
+        e.advance(b"\x1b[?1049h");
+        assert_eq!(selected_text(&e), None, "切入 alt screen 应清选区");
+
+        // RIS 复位清空选区
+        e.advance(b"\x1b[Habc");
+        select_span(&e, (0, 0), (0, 2));
+        assert_eq!(selected_text(&e).as_deref(), Some("abc"));
+        e.advance(b"\x1bc");
+        assert_eq!(selected_text(&e), None, "RIS 复位应清选区");
     }
 }

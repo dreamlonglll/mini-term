@@ -79,6 +79,7 @@ impl TerminalElement {
         let scroll_ctx = AutoScrollCtx {
             emulator: self.emulator.clone(),
             selecting: state.selecting.clone(),
+            drag_anchor: state.drag_anchor.clone(),
             shared: state.autoscroll.clone(),
             touched: state.scrollbar_touched.clone(),
             dwell: state.dwell.clone(),
@@ -235,6 +236,7 @@ impl TerminalElement {
             let emulator = self.emulator.clone();
             let hitbox = hitbox.clone();
             let selecting = state.selecting.clone();
+            let drag_anchor = state.drag_anchor.clone();
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
@@ -263,8 +265,9 @@ impl TerminalElement {
                     cx.notify(view_id);
                 }
                 // 上一次拖选的残局一律作废(丢了 MouseUp 的兜底):挂着的 ⌥+单击、还在跑的
-                // 自动滚屏。正常松手时两样早就收干净了,这里是空操作
+                // 自动滚屏、旧拖选锚点。正常松手时这些早就收干净了,这里是空操作
                 alt_press.set(None);
+                drag_anchor.set(None);
                 stop_autoscroll(&autoscroll, &autoscroll_task);
                 let mods = modifiers_of(&event.modifiers);
                 let (col, row, side) =
@@ -358,6 +361,7 @@ impl TerminalElement {
                     // 程序接管鼠标了,残留的本地高亮只会让人误以为还能复制
                     emulator.with_term_mut(|term| term.selection = None);
                     selecting.set(false);
+                    drag_anchor.set(None);
                     // 抹掉的是本元素的高亮,别的面板没读过选区
                     cx.notify(view_id);
                     return;
@@ -368,13 +372,19 @@ impl TerminalElement {
                 if event.button != MouseButton::Left {
                     return;
                 }
-                let display_offset = emulator.with_term(|t| t.grid().display_offset());
-                // 「手上有没有看得见的选区」只有按着 Shift 时用得上,别的时候不白拿一次锁
-                let has_selection = event.modifiers.shift
-                    && emulator.with_term(|t| {
-                        t.selection
-                            .as_ref()
-                            .is_some_and(|sel| sel.to_range(t).is_some())
+                let (display_offset, history, alt_screen, has_selection) =
+                    emulator.with_term(|t| {
+                        // 「手上有没有看得见的选区」只有按着 Shift 时用得上
+                        let has_selection = event.modifiers.shift
+                            && t.selection
+                                .as_ref()
+                                .is_some_and(|sel| sel.to_range(t).is_some());
+                        (
+                            t.grid().display_offset(),
+                            t.grid().history_size(),
+                            t.mode().contains(TermMode::ALT_SCREEN),
+                            has_selection,
+                        )
                     });
                 // ⌥+单击定位光标只在**没滚动回看**时生效:滚上去之后视口行号与光标所在的
                 // grid 行不是一回事,差值算出来会把光标带到莫名其妙的地方
@@ -401,6 +411,8 @@ impl TerminalElement {
                             row,
                             anchor: point,
                             side,
+                            history,
+                            alt_screen,
                         }));
                         return;
                     }
@@ -411,14 +423,25 @@ impl TerminalElement {
                                 sel.update(point, side);
                             }
                         });
+                        // 扩选的真实锚点在 Selection 私有字段里,不另存副本避免角点反转
+                        drag_anchor.set(None);
                         selecting.set(true);
                     }
                     LeftPress::Start(ty) => {
-                        emulator.with_term_mut(|term| {
+                        let anchor = emulator.with_term_mut(|term| {
                             term.selection = Some(Selection::new(ty, point, side));
+                            DragAnchor {
+                                ty,
+                                point,
+                                side,
+                                history: term.grid().history_size(),
+                                alt_screen: term.mode().contains(TermMode::ALT_SCREEN),
+                            }
                         });
                         // 双击 / 三击选出的词与行不跟着拖(与从前一致)
-                        selecting.set(event.click_count == 1);
+                        let drag = event.click_count == 1;
+                        selecting.set(drag);
+                        drag_anchor.set(drag.then_some(anchor));
                     }
                 }
 
@@ -476,6 +499,7 @@ impl TerminalElement {
             let emulator = self.emulator.clone();
             let hitbox = hitbox.clone();
             let selecting = state.selecting.clone();
+            let drag_anchor = state.drag_anchor.clone();
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
@@ -633,14 +657,19 @@ impl TerminalElement {
                         return;
                     }
                     alt_press.set(None);
+                    let anchor = DragAnchor {
+                        ty: SelectionType::Block,
+                        point: press.anchor,
+                        side: press.side,
+                        history: press.history,
+                        alt_screen: press.alt_screen,
+                    };
                     emulator.with_term_mut(|term| {
-                        term.selection = Some(Selection::new(
-                            SelectionType::Block,
-                            press.anchor,
-                            press.side,
-                        ));
+                        term.selection = None;
+                        update_or_restore_selection(term, Some(anchor), press.anchor, press.side);
                     });
                     selecting.set(true);
+                    drag_anchor.set(Some(anchor));
                     // 停留复制从转块选这一刻起算:按下那会儿还不知道这一下是不是在选
                     let generation = dwell_state.borrow_mut().on_press(
                         &dwell_cfg,
@@ -699,20 +728,27 @@ impl TerminalElement {
                 }
 
                 if !selecting.get() || event.pressed_button != Some(MouseButton::Left) {
-                    // 没在拖选(或按着的已经不是左键 —— 丢了 MouseUp):自动滚屏一并停掉。
+                    // 没在拖选(或按着的已经不是左键 —— 丢了 MouseUp):自动滚屏与拖选锚点一并收干净。
                     // 没在跑时只是一次 Cell 读
+                    selecting.set(false);
+                    drag_anchor.set(None);
                     stop_autoscroll(&autoscroll, &autoscroll_task);
                     return;
                 }
                 // 拖出元素外也要继续选,所以这里不判 hover
-                let (display_offset, history) =
-                    emulator.with_term(|t| (t.grid().display_offset(), t.grid().history_size()));
                 let (col, row, side) =
                     Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
-                emulator.with_term_mut(|term| {
-                    if let Some(sel) = term.selection.as_mut() {
-                        sel.update(Self::grid_point(col, row, display_offset), side);
-                    }
+                let anchor = drag_anchor.get();
+                let (display_offset, history) = emulator.with_term_mut(|term| {
+                    let display_offset = term.grid().display_offset();
+                    let history = term.grid().history_size();
+                    update_or_restore_selection(
+                        term,
+                        anchor,
+                        Self::grid_point(col, row, display_offset),
+                        side,
+                    );
+                    (display_offset, history)
                 });
                 // ── 拖到可视区上 / 下边外:起自动滚屏;回到区内、滚到头:停。指针停在区外
                 //    不动时没有 mouse-move 可等,节拍任务自己读这里记下的指针
@@ -752,6 +788,7 @@ impl TerminalElement {
         {
             let emulator = self.emulator.clone();
             let selecting = state.selecting.clone();
+            let drag_anchor = state.drag_anchor.clone();
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
@@ -840,6 +877,7 @@ impl TerminalElement {
                     return;
                 }
                 let was_selecting = selecting.replace(false);
+                drag_anchor.set(None);
                 // 定时器一律作废:松手之后不该再弹「已复制」
                 dwell_task.borrow_mut().take();
                 let action = dwell_state.borrow_mut().on_release(&dwell_cfg);
@@ -991,6 +1029,7 @@ pub(super) fn arm_dwell(
 pub(super) struct AutoScrollCtx {
     pub(super) emulator: Arc<TerminalEmulator>,
     pub(super) selecting: Rc<StdCell<bool>>,
+    pub(super) drag_anchor: Rc<StdCell<Option<DragAnchor>>>,
     pub(super) shared: Rc<StdCell<AutoScroll>>,
     /// 滚动条的「最近碰过」时刻:滚了就让它亮起来。
     pub(super) touched: Rc<StdCell<Option<Instant>>>,
@@ -1063,8 +1102,11 @@ pub(super) fn autoscroll_tick(ctx: &AutoScrollCtx, window: &mut Window, cx: &mut
     if !shared.running || !ctx.selecting.get() || !window.is_window_active() {
         return false;
     }
+    let anchor = ctx.drag_anchor.get();
+    let can_restore = anchor.is_some_and(|a| !a.alt_screen);
     let moved = ctx.emulator.with_term_mut(|term| {
-        if term.mode().contains(TermMode::ALT_SCREEN) || term.selection.is_none() {
+        if term.mode().contains(TermMode::ALT_SCREEN) || (term.selection.is_none() && !can_restore)
+        {
             return false;
         }
         let lines = {
@@ -1089,9 +1131,12 @@ pub(super) fn autoscroll_tick(ctx: &AutoScrollCtx, window: &mut Window, cx: &mut
             shared.columns,
             shared.screen_lines,
         );
-        if let Some(sel) = term.selection.as_mut() {
-            sel.update(TerminalElement::grid_point(col, row, display_offset), side);
-        }
+        update_or_restore_selection(
+            term,
+            anchor,
+            TerminalElement::grid_point(col, row, display_offset),
+            side,
+        );
         true
     });
     if !moved {

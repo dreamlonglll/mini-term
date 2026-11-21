@@ -90,8 +90,8 @@ use super::damage::{
     CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature,
 };
 use super::drag_select::{
-    AUTOSCROLL_TICK, LeftPress, ScrollZone, autoscroll_lines, cell_in_selection,
-    classify_left_press, drag_exceeds_cell,
+    AUTOSCROLL_TICK, DragAnchor, LeftPress, ScrollZone, autoscroll_lines, cell_in_selection,
+    classify_left_press, drag_exceeds_cell, update_or_restore_selection,
 };
 use super::input::{Arrow, arrow_bytes};
 use super::links::{
@@ -452,6 +452,8 @@ struct TerminalElementState {
     scroll_remainder: Rc<StdCell<f32>>,
     /// 左键是否正在**本地**拖选。
     selecting: Rc<StdCell<bool>>,
+    /// 当前拖选的起选锚点(中途 `term.selection` 意外被清时用于重建，见 [`DragAnchor`])。
+    drag_anchor: Rc<StdCell<Option<DragAnchor>>>,
     /// 正在被上报的按键(按下时上报过,松开要配对上报)。
     reported_button: Rc<StdCell<Option<MouseBtn>>>,
     /// 上一次上报过的格子。移动上报只在**跨格**时发,否则一个像素一条消息。
@@ -510,6 +512,9 @@ struct AltPress {
     /// 块选的锚点(grid 坐标)与半格。
     anchor: AlacPoint,
     side: Side,
+    /// 按下那一刻的 `history_size` 与是否在 alt screen(转块选时带进 [`DragAnchor`])。
+    history: usize,
+    alt_screen: bool,
 }
 
 /// 拖选自动滚屏的共享状态。指针停在区外不动时没有 mouse-move 可等,节拍任务只能读这里。
@@ -532,6 +537,7 @@ impl Default for TerminalElementState {
         Self {
             scroll_remainder: Rc::new(StdCell::new(0.0)),
             selecting: Rc::new(StdCell::new(false)),
+            drag_anchor: Rc::new(StdCell::new(None)),
             reported_button: Rc::new(StdCell::new(None)),
             last_reported_cell: Rc::new(StdCell::new(None)),
             rows: Rc::new(RefCell::new(RowCache::new())),

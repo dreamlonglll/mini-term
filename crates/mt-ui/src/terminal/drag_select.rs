@@ -39,9 +39,11 @@
 //! 自动隐藏时指针根本出不了窗口,没有这条带就永远滚不起来(alacritty 同样留了 5px)。
 //! 滚到头(回看顶 / 底部)就算 0 行 —— 节拍任务据此自己停,鼠标回到区内同样停。
 
-use alacritty_terminal::index::Point as AlacPoint;
-use alacritty_terminal::selection::{SelectionRange, SelectionType};
+use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::{Term, TermMode};
 use std::time::Duration;
 
 /// 自动滚屏的节拍。20Hz:一拍至少一行,贴边时每秒 20 行,看得清在滚,又不至于一下冲过头。
@@ -163,6 +165,56 @@ pub(super) fn autoscroll_lines(
     } else {
         0
     }
+}
+
+/// 一次正在进行中的本地拖选的起选锚点。
+///
+/// `mt-terminal` 已在清行 / 清屏时保护 `Term::selection`，正常拖选只需 `sel.update(...)`；
+/// 但某些局部滚动区操作（例如 `CSI nM` / `CSI nL` 让 `Selection::rotate` 越界返回 `None`）
+/// 仍可能在按住鼠标拖动期间把 `term.selection` 置空。留一份锚点后，下一发 mouse-move 或
+/// 自动滚屏节拍就能在同一块屏上补建选区，避免整次拖动后续全部变成空操作。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DragAnchor {
+    pub ty: SelectionType,
+    pub point: AlacPoint,
+    pub side: Side,
+    /// 起选那一刻的 `history_size`：主屏新输出把行顶进 scrollback 时按差值上移锚点行号。
+    pub history: usize,
+    /// 起选时是否在 alt screen：中途切屏后不再拿旧屏锚点去重建。
+    pub alt_screen: bool,
+}
+
+/// 拖选移动 / 自动滚屏时更新选区活动端；若 `term.selection` 中途被置空且仍在同一块屏上，
+/// 按 `anchor` 重建后再延伸到 `(target, side)`。
+pub(super) fn update_or_restore_selection<T>(
+    term: &mut Term<T>,
+    anchor: Option<DragAnchor>,
+    target: AlacPoint,
+    side: Side,
+) {
+    if let Some(sel) = term.selection.as_mut() {
+        sel.update(target, side);
+        return;
+    }
+    let Some(anchor) = anchor else {
+        return;
+    };
+    let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+    if alt_screen != anchor.alt_screen {
+        return;
+    }
+    let scroll_delta = if alt_screen {
+        0
+    } else {
+        term.history_size().saturating_sub(anchor.history) as i32
+    };
+    let line = Line(
+        (anchor.point.line.0 - scroll_delta).clamp(term.topmost_line().0, term.bottommost_line().0),
+    );
+    let col = Column(anchor.point.column.0.min(term.last_column().0));
+    let mut sel = Selection::new(anchor.ty, AlacPoint::new(line, col), anchor.side);
+    sel.update(target, side);
+    term.selection = Some(sel);
 }
 
 /// 这一格要不要画选中底色。
@@ -400,5 +452,83 @@ mod tests {
         assert!(!cell_in_selection(&block, p(0, 6), Flags::empty()));
         // 第 0 列的 spacer(理论上不存在)不往左越界
         assert!(!cell_in_selection(&block, p(0, 0), Flags::WIDE_CHAR_SPACER));
+    }
+
+    #[test]
+    fn 拖选中途选区被清时按锚点重建并跟滚屏上移() {
+        use mt_terminal::{TermSize, TerminalEmulator};
+
+        let e = TerminalEmulator::with_scrollback(TermSize::new(20, 4), 50);
+        e.advance(b"row-0\r\nrow-1\r\nrow-2\r\nrow-3");
+        let anchor = e.with_term_mut(|term| {
+            let point = p(1, 0);
+            term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+            DragAnchor {
+                ty: SelectionType::Simple,
+                point,
+                side: Side::Left,
+                history: term.grid().history_size(),
+                alt_screen: false,
+            }
+        });
+
+        // 模拟拖选中途有新行滚入历史且局部滚动区把 term.selection 置空
+        e.advance(b"\r\nrow-4\r\nrow-5");
+        e.with_term_mut(|term| {
+            term.selection = None;
+            // 原来的 row-1 已从 Line(1) 滚到 Line(-1)；把活动端拖到当前视口 Line(0) 第 4 列
+            update_or_restore_selection(term, Some(anchor), p(0, 4), Side::Right);
+        });
+        assert_eq!(
+            e.with_term(|term| term.selection_to_string()).as_deref(),
+            Some("row-1\nrow-2")
+        );
+    }
+
+    #[test]
+    fn 拖选中途切屏后不拿旧屏锚点重建() {
+        use mt_terminal::{TermSize, TerminalEmulator};
+
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"primary");
+        let anchor = DragAnchor {
+            ty: SelectionType::Simple,
+            point: p(0, 0),
+            side: Side::Left,
+            history: 0,
+            alt_screen: false,
+        };
+        // 切入 alt screen 会清空主屏选区
+        e.advance(b"\x1b[?1049h\x1b[Halt-text");
+        e.with_term_mut(|term| {
+            update_or_restore_selection(term, Some(anchor), p(0, 5), Side::Right);
+            assert!(term.selection.is_none(), "跨屏不该复活旧屏锚点");
+        });
+    }
+
+    #[test]
+    fn 块选锚点中途被清也能按块选重建且安全钳界() {
+        use mt_terminal::{TermSize, TerminalEmulator};
+
+        let e = TerminalEmulator::new(TermSize::new(10, 3));
+        e.advance(b"012345\r\nabcdef");
+        let anchor = DragAnchor {
+            ty: SelectionType::Block,
+            point: p(0, 1),
+            side: Side::Left,
+            history: 0,
+            alt_screen: false,
+        };
+        e.with_term_mut(|term| {
+            term.selection = None;
+            update_or_restore_selection(term, Some(anchor), p(1, 3), Side::Right);
+            let range = term
+                .selection
+                .as_ref()
+                .and_then(|s| s.to_range(term))
+                .unwrap();
+            assert!(range.is_block, "应保持块选类型");
+            assert_eq!(term.selection_to_string().as_deref(), Some("123\nbcd"));
+        });
     }
 }
