@@ -63,6 +63,7 @@ use mt_ui::tooltip::TooltipExt as _;
 use super::git_blame::{AnnotationPaint, BlameDiffInput};
 use super::{DocumentSource, FileViewer, normalize_to_lf};
 use crate::i18n::{t, tr};
+use crate::popover_reveal::{Chrome, RevealState, ShadowMode, reveal_frame};
 use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 use crate::ui;
 
@@ -486,6 +487,26 @@ pub(super) struct GitGutter {
     poll_task: Option<Task<()>>,
     poll_inflight: bool,
     pub(super) popup: Option<ChangePopup>,
+    /// 变更小窗的开合动画(见 [`crate::popover_reveal`]):原点是被点的那一块标记 ——
+    /// 小窗从那一行下面、正文左缘那一点往下往右长出来,收起反向播完再卸。
+    reveal: RevealState,
+    /// 目标是开着(收起动画里为 `false`)。
+    reveal_open: bool,
+    /// 屏幕上那一份小窗的内容快照(开着,或收起动画还没播完)。收起时 `popup` 已经是
+    /// `None`、块也可能已经重算过,退场那几帧照这一份画。
+    shown: Option<ShownPopup>,
+}
+
+/// 屏幕上那一份变更小窗要画的东西(见 [`GitGutter::shown`])。
+struct ShownPopup {
+    /// 在 [`GitGutter::hunks`] 里的下标(按钮回调要它)
+    index: usize,
+    hunk: LineHunk,
+    head: Rc<HeadBase>,
+    total: usize,
+    anchor: Point<Pixels>,
+    width: Pixels,
+    copied: bool,
 }
 
 impl GitGutter {
@@ -743,6 +764,63 @@ impl FileViewer {
 
     // ── 浮层 ─────────────────────────────────────────────
 
+    /// render 开头调:把变更小窗的开合动画对齐到 [`GitGutter::popup`] 的现状。
+    ///
+    /// `popup` 有十来处地方会直接置空(点外部 / Esc / 回滚 / 编辑 / HEAD 换代 / 块重算……),
+    /// 与其逐处补「播收起」,不如在这一处对账:`popup` 有、排好了位 → 开(换了一块就从头
+    /// 长,同一块收到一半又开就从当前进度往回长);没了 → 播收起,退场那几帧照
+    /// [`GitGutter::shown`] 的快照画;导航过去、位置还没回填 → 保持开着,这一帧不画;编辑器
+    /// 没了 / 切去了预览 → 直接卸,不播动画(判据不成立,与终端区浮层的 `hide_now` 同口径)。
+    pub(super) fn sync_change_popup(&mut self, cx: &mut Context<Self>) {
+        let gone = self.editor.is_none() || (self.has_preview_toggle() && self.preview);
+        let live = (!gone)
+            .then_some(self.gutter.popup.as_ref())
+            .flatten()
+            .and_then(|popup| {
+                let anchor = popup.anchor?;
+                Some(ShownPopup {
+                    index: popup.hunk,
+                    hunk: self.gutter.hunks.get(popup.hunk)?.clone(),
+                    head: self.gutter.head_base()?.clone(),
+                    total: self.gutter.hunks.len(),
+                    anchor,
+                    width: popup.width,
+                    copied: popup.copied,
+                })
+            });
+        let gutter = &mut self.gutter;
+        if let Some(snapshot) = live {
+            if !gutter.reveal_open {
+                let same = gutter
+                    .shown
+                    .as_ref()
+                    .is_some_and(|shown| shown.index == snapshot.index);
+                if !same {
+                    gutter.reveal.hide_now();
+                }
+                gutter.reveal.show(cx);
+                gutter.reveal_open = true;
+            }
+            gutter.shown = Some(snapshot);
+            return;
+        }
+        // 小窗还在、却画不出来:要么刚导航过去等回填位置(保持开着),要么它指的那一块 /
+        // HEAD 已经不在了(判据不成立,直接卸)
+        let pending = gutter
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.anchor.is_none());
+        if gone || (gutter.popup.is_some() && !pending) {
+            gutter.reveal.hide_now();
+            gutter.reveal_open = false;
+        } else if gutter.popup.is_none() && std::mem::take(&mut gutter.reveal_open) {
+            gutter.reveal.hide(cx);
+        }
+        if !gutter.reveal.is_mounted() {
+            gutter.shown = None;
+        }
+    }
+
     /// 点了某块的标记。`was_open` 取的是**按下之前**那一帧的状态:浮层自己的
     /// 「点外部关闭」在捕获阶段已经先把它关掉了,这里不能再看实体上的现状,否则点同一块
     /// 标记只会「关掉又打开」。
@@ -950,18 +1028,35 @@ impl FileViewer {
     }
 
     /// 变更小窗(画在整窗之上)。导航后位置还没回填时不画。
-    pub(super) fn render_change_popup(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.editor.is_none() || (self.has_preview_toggle() && self.preview) {
+    ///
+    /// 开合走 [`crate::popover_reveal::reveal_frame`]:原点是被点的那一块标记 —— 小窗从那一块
+    /// 下面、正文左缘那一点往下往右长出来(原点钳在小窗左缘),收起反向播完再卸;框体
+    /// (底色 / 边框 / 阴影)按插值矩形画,小窗本体只画内容。画的是 [`GitGutter::shown`] 那份
+    /// 快照(开合对账见 [`Self::sync_change_popup`]):收起那几帧 `popup` 已经没了。
+    pub(super) fn render_change_popup(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let mut state = self.gutter.reveal.frame(window)?;
+        // 导航过去、位置还没回填:这一帧不画(免得在旧位置闪一帧)
+        if self
+            .gutter
+            .popup
+            .as_ref()
+            .is_some_and(|popup| popup.anchor.is_none())
+        {
             return None;
         }
-        let popup = self.gutter.popup.as_ref()?;
-        let anchor = popup.anchor?;
-        let hunk = self.gutter.hunks.get(popup.hunk)?.clone();
+        let shown = self.gutter.shown.as_ref()?;
+        state.origin_x = Some(shown.anchor.x);
+        let anchor = shown.anchor;
+        let hunk = shown.hunk.clone();
         // 借着 HEAD 那份,不整块克隆;行是 `SharedString`,建元素时只加引用计数
-        let head = self.gutter.head_base()?.clone();
+        let head = shown.head.clone();
         let old_lines = head.old_lines(&hunk)?;
-        let total = self.gutter.hunks.len();
-        let index = popup.hunk;
+        let total = shown.total;
+        let index = shown.index;
 
         let count = match hunk.kind {
             LineChangeKind::Deleted => hunk.old_len,
@@ -1073,7 +1168,7 @@ impl FileViewer {
                 })),
             )
             .when(has_old, |el| {
-                let (icon, tip) = if popup.copied {
+                let (icon, tip) = if shown.copied {
                     (ICON_CHECK, t("gitGutter", "copied"))
                 } else {
                     (ICON_COPY, t("gitGutter", "copyOriginal"))
@@ -1131,23 +1226,36 @@ impl FileViewer {
                 .into_any_element()
         });
 
+        // 框体(圆角 / 边框 / 底色 / 阴影)交给 reveal_frame 的 Chrome;边框位用透明边占住,
+        // 内容与原先逐像素同位
         let card = div()
             .id("git-change-popup")
             .occlude()
-            .w(popup.width)
+            .w(shown.width)
             .flex()
             .flex_col()
             .rounded(px(6.0))
             .border_1()
-            .border_color(ui::border_default())
-            .bg(ui::bg_surface())
-            .shadow_lg()
+            .border_color(gpui::transparent_black())
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                 this.close_change_popup(cx);
             }))
             .child(toolbar)
             .children(body);
+        let card = reveal_frame(
+            card,
+            state,
+            Some(Chrome {
+                bg: ui::bg_surface(),
+                hover_bg: None,
+                border_color: ui::border_default(),
+                border_width: px(1.0),
+                radius: px(6.0).into(),
+                shadow: ShadowMode::Always,
+                occlude: true,
+            }),
+        );
 
         Some(
             deferred(

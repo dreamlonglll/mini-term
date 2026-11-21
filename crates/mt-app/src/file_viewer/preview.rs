@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement, Resource,
@@ -29,6 +30,7 @@ use super::markdown::{
 };
 use super::mermaid::{MermaidAsset, MermaidError, MermaidKey, release_mermaid_assets};
 use super::sanitize::sanitize_remote_markdown;
+use super::view_motion::{outline_offset, outline_tween};
 use super::{DocumentSource, FileViewer};
 use crate::i18n::t;
 use crate::image_lightbox::{ImageLightbox, ImageLightboxEvent};
@@ -740,6 +742,8 @@ impl FileViewer {
         let next = !md_outline_visible(cx);
         // 重新打开时把当前高亮条目滚进可视区(关着的那段时间正文可能滚走了)
         self.outline_active.set(None);
+        // 本页签点的这一下:下一次画目录栏时开合补间(别的页签跟着配置变时直接到位)
+        self.outline_toggled.set(true);
         crate::store::AppStore::global(cx).update(cx, |store, cx| {
             store.patch_config(|config| config.md_outline_visible = Some(next), cx)
         });
@@ -1168,19 +1172,105 @@ impl FileViewer {
             .child(content)
             .child(self.scrollbar_overlay("file-viewer-md-scrollbar", &self.md_list));
         // 目录栏在左(对照 PDF 阅读器的目录)。开合会改正文宽度,块高由
-        // sync_md_list 的「视口宽变了」那一支作废重量,滚动位置保住
+        // sync_md_list 的「视口宽变了」那一支作废重量,滚动位置保住。
+        //
+        // 开合动画:正文宽度**一次跳到位**(给宽度补间的话每帧都要让虚拟列表重量块高),
+        // 只让目录栏内容在裁剪层里横向滑 —— 打开时目录栏那一栏当场占好,内容从左缘外滑进来;
+        // 收起时正文当场铺满,一层短暂的出场层画着旧目录栏滑出左缘
         let outline = self.md_cache.borrow().as_ref().map(|c| c.outline.clone());
+        let available = outline
+            .as_ref()
+            .is_some_and(|outline| outline.len() >= MD_OUTLINE_MIN_HEADINGS);
+        let open = md_outline_visible(cx);
+        let openness = self.md_outline_openness(open, available, window);
         match outline {
-            Some(outline) if outline.len() >= MD_OUTLINE_MIN_HEADINGS && md_outline_visible(cx) => {
+            Some(outline) if available && open => {
+                let panel = self.render_md_outline(&outline, cx);
+                let column = if openness >= 1.0 {
+                    panel
+                } else {
+                    div()
+                        .flex_none()
+                        .w(px(MD_OUTLINE_WIDTH))
+                        .h_full()
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(px(outline_offset(openness, MD_OUTLINE_WIDTH)))
+                                .w(px(MD_OUTLINE_WIDTH))
+                                .h_full()
+                                .child(panel),
+                        )
+                        .into_any_element()
+                };
                 div()
                     .size_full()
                     .flex()
-                    .child(self.render_md_outline(&outline, cx))
+                    .child(column)
                     .child(div().flex_1().min_w_0().h_full().child(body))
                     .into_any_element()
             }
+            // 收起途中:正文已铺满,出场层叠在正文左侧滑走。目录栏本身不刷底色(着色归
+            // 容器层),出场层得自己垫一层页面底色,否则底下正文的字会透上来;不接鼠标
+            Some(outline) if available && openness > 0.0 => div()
+                .size_full()
+                .relative()
+                .child(body)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w(px(MD_OUTLINE_WIDTH))
+                        .h_full()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left(px(outline_offset(openness, MD_OUTLINE_WIDTH)))
+                                .w(px(MD_OUTLINE_WIDTH))
+                                .h_full()
+                                .bg(ui::bg_document())
+                                .occlude()
+                                .child(self.render_md_outline(&outline, cx)),
+                        ),
+                )
+                .into_any_element(),
             _ => body.into_any_element(),
         }
+    }
+
+    /// md 目录栏这一帧的开合程度(0 = 收起,1 = 展开,已缓动;见 `render_markdown`)。
+    ///
+    /// 只有**本页签**刚点过「目录」按钮才补间([`FileViewer::outline_toggled`]):开关是
+    /// 所有页签共用的一份配置,别的页签跟着它变时直接到位;标题不够数、出不了目录栏时也
+    /// 直接到位。动画中顺手要下一帧。
+    fn md_outline_openness(&self, open: bool, available: bool, window: &Window) -> f32 {
+        let now = Instant::now();
+        let target = if open { 1.0 } else { 0.0 };
+        let animate = self.outline_toggled.replace(false);
+        let tween = match self.outline_slide.get() {
+            Some(mut tween) if available => {
+                if (tween.target() - target).abs() > f32::EPSILON {
+                    if animate {
+                        tween.retarget_at(target, now);
+                    } else {
+                        tween = outline_tween(open);
+                    }
+                }
+                tween
+            }
+            _ => outline_tween(open),
+        };
+        self.outline_slide.set(Some(tween));
+        if tween.running_at(now) {
+            window.request_animation_frame();
+        }
+        tween.value_at(now)
     }
 
     /// 虚拟化列表的一项 = 一块正文([`MdBlock`]),只有视口附近的块会被调到

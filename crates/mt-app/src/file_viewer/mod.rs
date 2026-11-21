@@ -86,10 +86,10 @@ use std::time::Instant;
 use futures::StreamExt;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Pixels, Render, Resource,
-    ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Task, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Pixels,
+    Render, Resource, ScrollHandle, StatefulInteractiveElement, Styled, Subscription, Task, Window,
+    canvas, div, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{EditorState, Escape, InputEvent, Search, TabSize};
@@ -97,6 +97,7 @@ use mt_project::encoding::{EncodeError, TextEncoding};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::{FsWatcher, WATCH_READY_BUDGET, WatchReady};
 use mt_ui::icons::FileIcon;
+use mt_ui::motion::ValueTween;
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
@@ -116,6 +117,7 @@ mod mermaid;
 mod preview;
 mod reveal;
 mod sanitize;
+mod view_motion;
 mod webview;
 
 // 行尾三件套的对外路径:`tab_expansion` 的单测与文档链接按 `crate::file_viewer::…`
@@ -146,6 +148,7 @@ use images::{
 use mermaid::{MermaidKey, release_mermaid_assets};
 use preview::MdCache;
 use reveal::PendingReveal;
+use view_motion::{seg_tween, strip_tween};
 
 /// 文档的读写来源。远程来源持有打开时的连接快照；保存前还会与 `AppStore`
 /// 中的当前连接身份复核，避免连接配置原地变化后旧页签写到错误主机。
@@ -452,6 +455,22 @@ pub struct FileViewer {
     web_preview: RefCell<webview::WebPreview>,
 
     preview: bool,
+    /// 「预览 ↔ 源码」内容那条带的位置(0 = 预览在台上,1 = 源码在台上;见
+    /// [`view_motion`])。只有点段控件切 Markdown 时才补间 —— HTML 预览是原生 WebView
+    /// 子窗口(见 `native_view` 模块头),平移 / 裁剪都管不住它,那一侧一律瞬切;
+    /// 搜索跳行这类程序切换也瞬切。
+    preview_strip: ValueTween,
+    /// 段控件滑块的位置(0 = 盖住「预览」段,1 = 盖住「源码」段)。HTML 也滑:滑块
+    /// 不是 WebView。
+    preview_seg: ValueTween,
+    /// 段控件两段上一帧的屏幕矩形(量尺 canvas 报来),滑块按它们插值。
+    preview_seg_rects: Cell<[Option<Bounds<Pixels>>; 2]>,
+    /// md 目录栏的开合(0 = 收起,1 = 展开;见 `preview.rs` 的 `render_markdown`)。
+    /// `Cell` 的理由同 [`Self::md_cache`]。`None` = 还没画过目录栏。
+    outline_slide: Cell<Option<ValueTween>>,
+    /// 本页签刚点过「目录」按钮:下一次画目录栏时开合要补间。开关是所有页签共用的
+    /// 一份配置,别的页签跟着它变时不该在自己身上补一遍 —— 只认自己点的这一下。
+    outline_toggled: Cell<bool>,
     /// 外部改动提示条「对比」没能打开(重读磁盘失败 / 盘上变成了二进制)的原因。
     compare_error: Option<String>,
     /// 「保存并关闭」在等的保存(见 [`Self::save_for_close`]):保存收口时逐个报
@@ -540,6 +559,11 @@ impl FileViewer {
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight.is_none(),
+            preview_strip: strip_tween(highlight.is_none()),
+            preview_seg: seg_tween(highlight.is_none()),
+            preview_seg_rects: Cell::new([None, None]),
+            outline_slide: Cell::new(None),
+            outline_toggled: Cell::new(false),
             compare_error: None,
             close_waiters: Vec::new(),
             watcher,
@@ -857,7 +881,8 @@ impl FileViewer {
         // 还在读盘时先记着,内容到位由 `install_editor` 接着定位
         self.highlight = highlight;
         if highlight.is_some() && self.has_preview_toggle() && self.preview {
-            self.preview = false;
+            // 程序切换(搜索跳行):直接到位,不推
+            self.set_preview(false, false);
             cx.notify();
         }
         let Some(editor) = self.editor.as_ref() else {
@@ -1353,6 +1378,25 @@ impl FileViewer {
             && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
     }
 
+    /// 切「预览 / 源码」。`animate` = 用户点的段控件:滑块滑过去,Markdown 的内容左右推
+    /// (预览在左、源码在右);HTML 的内容一侧瞬切 —— 那是原生 WebView 子窗口,裁剪 /
+    /// 平移都管不住它。程序切换(搜索跳行、Ctrl+F 先露源码)两样都直接到位。
+    fn set_preview(&mut self, preview: bool, animate: bool) {
+        self.preview = preview;
+        if !animate {
+            self.preview_seg = seg_tween(preview);
+            self.preview_strip = strip_tween(preview);
+            return;
+        }
+        let (target, now) = (view_motion::position(preview), Instant::now());
+        self.preview_seg.retarget_at(target, now);
+        if is_markdown_file(&self.path_str()) {
+            self.preview_strip.retarget_at(target, now);
+        } else {
+            self.preview_strip = strip_tween(preview);
+        }
+    }
+
     pub fn focus_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.editor {
             Some(editor) if !(self.has_preview_toggle() && self.preview) => {
@@ -1372,12 +1416,13 @@ impl FileViewer {
         {
             return;
         }
-        let Some(editor) = self.editor.as_ref() else {
+        let Some(editor) = self.editor.clone() else {
             return;
         };
         let was_preview = self.has_preview_toggle() && self.preview;
         if was_preview {
-            self.preview = false;
+            // 程序切换(Ctrl+F 先露源码):直接到位,不推
+            self.set_preview(false, false);
             cx.notify();
         }
         editor.update(cx, |state, cx| state.focus(window, cx));
@@ -1448,7 +1493,7 @@ impl FileViewer {
 
     // ── 渲染 ──────────────────────────────────────────────
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.file_name();
         let path = self.path_str();
         let is_html = !self.source.is_remote() && is_html_file(&path);
@@ -1595,55 +1640,129 @@ impl FileViewer {
                         )
                     })
                     .when(self.has_preview_toggle(), |el| {
-                        el.child(self.render_preview_toggle(cx))
+                        el.child(self.render_preview_toggle(window, cx))
                     }),
             )
     }
 
     /// 「预览 / 源码」段控件(`FileViewerModal.tsx:355-374`)。
-    fn render_preview_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// 选中底块是一块**滑块**:切的时候在两段之间滑过去([`mt_ui::motion::TAB_INDICATOR`],
+    /// 与抽屉段控件同一档),字色跟着滑块盖住这一段的比例过渡(见 [`view_motion`])。
+    /// 静止时照旧由选中那一段自己刷底 —— 两段的矩形靠每段挂的量尺 canvas 报,还没量到
+    /// 的那一帧(刚打开)不画滑块,退回这条老路。
+    fn render_preview_toggle(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let preview = self.preview;
-        let seg = |id: &'static str, label: String, active: bool| {
+        let now = Instant::now();
+        let sliding = self.preview_seg.running_at(now);
+        if sliding {
+            window.request_animation_frame();
+        }
+        // 滑块这一帧的 `(左缘, 宽)`,相对「预览」段的左缘(= 段控件内容区左缘)
+        let slider = match self.preview_seg_rects.get() {
+            [Some(first), Some(second)] if sliding => {
+                let span = |b: Bounds<Pixels>| {
+                    (
+                        f32::from(b.origin.x - first.origin.x),
+                        f32::from(b.size.width),
+                    )
+                };
+                let (a, b) = (span(first), span(second));
+                Some((
+                    view_motion::slider_span(a, b, self.preview_seg.value_at(now)),
+                    [a, b],
+                ))
+            }
+            _ => None,
+        };
+        let viewer = cx.entity();
+        let seg = |id: &'static str, ix: usize, label: String, active: bool| {
+            let viewer = viewer.clone();
+            // 段的字色:静止时选中段是底色字;滑动中按滑块盖住它的比例在两色之间过渡
+            let ink = match &slider {
+                Some((span, segs)) => view_motion::mix(
+                    ui::text_muted(),
+                    ui::bg_base(),
+                    view_motion::coverage(*span, segs[ix]),
+                ),
+                None if active => ui::bg_base(),
+                None => ui::text_muted(),
+            };
             div()
                 .id(id)
+                .relative()
                 .px(px(10.0))
                 .py(px(4.0))
                 .text_size(ui::font_px(12.0))
                 .cursor_pointer()
-                .when(active, |el| el.bg(ui::accent()).text_color(ui::bg_base()))
-                .when(!active, |el| el.text_color(ui::text_muted()))
+                .when(active && slider.is_none(), |el| el.bg(ui::accent()))
+                .text_color(ink)
                 .child(label)
+                // 只量不画:滑块按两段的矩形插值。故意不 notify(量完再重画是死循环)
+                .child(
+                    canvas(
+                        move |bounds, _window, cx| {
+                            viewer.update(cx, |this: &mut FileViewer, _| {
+                                let mut rects = this.preview_seg_rects.get();
+                                rects[ix] = Some(bounds);
+                                this.preview_seg_rects.set(rects);
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
         };
 
         div()
+            .relative()
             .flex()
             .rounded(px(4.0))
             .border_1()
             .border_color(ui::border_default())
             .overflow_hidden()
+            .children(slider.map(|((left, width), _)| {
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(left))
+                    .w(px(width))
+                    .bg(ui::accent())
+            }))
             .child(
                 seg(
                     "file-viewer-preview",
+                    0,
                     t("fileViewer", "preview").to_string(),
                     preview,
                 )
-                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     // 切到预览时拍一份草稿快照:预览渲染的是「正在编辑的内容」,
                     // 不是磁盘旧文;干净时置 None,直接用磁盘内容
                     let draft = this.draft(cx);
                     this.preview_draft = (draft != this.doc.saved()).then_some(draft);
-                    this.preview = true;
+                    this.set_preview(true, true);
+                    // 焦点当场从编辑器上收回来:推出去的编辑器还要在出场层上画一会儿,
+                    // 不收的话这几帧里敲的字会落进正在离场的源码里
+                    this.focus_content(window, cx);
                     cx.notify();
                 })),
             )
             .child(
                 seg(
                     "file-viewer-source",
+                    1,
                     t("fileViewer", "source").to_string(),
                     !preview,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.preview = false;
+                    this.set_preview(false, true);
                     this.focus_content(window, cx);
                     cx.notify();
                 })),
@@ -2113,40 +2232,85 @@ impl FileViewer {
                 )
                 .into_any_element(),
             Branch::Editor => {
+                let is_md = is_markdown_file(&self.path_str());
+                // 「预览 ↔ 源码」在推(只有 Markdown 会推,见 [`Self::set_preview`]):
+                // 预览层与编辑器层是两样不同的东西(markdown 列表 / 编辑器实体),
+                // 同一帧各挂一份,不会双挂同一个实体
+                if let Some(pos) = self.preview_strip_frame(window)
+                    && is_md
+                    && self.has_preview_toggle()
+                    && let Some(editor) = &self.editor
+                {
+                    let to_source = !self.preview;
+                    let (progress, dir) = view_motion::strip_push(pos, to_source);
+                    let source = self.render_editor_layer(editor, window, cx);
+                    let preview = self.render_markdown(window, cx);
+                    let (enter, exit) = if to_source {
+                        (source, preview)
+                    } else {
+                        (preview, source)
+                    };
+                    return crate::motion_kit::push_pair(
+                        enter,
+                        Some(exit),
+                        progress,
+                        crate::motion_kit::PushAxis::Horizontal,
+                        dir,
+                    )
+                    .into_any_element();
+                }
                 if self.has_preview_toggle() && self.preview {
-                    return if is_markdown_file(&self.path_str()) {
+                    return if is_md {
                         self.render_markdown(window, cx)
                     } else {
                         self.render_html(window, cx)
                     };
                 }
                 match &self.editor {
-                    Some(editor) => {
-                        // 编辑器排版对齐原版 `CodeEditor.tsx:109-129`:固定 13px
-                        // (字面量,**不随 uiFontSize 缩放** —— 原版就是 '13px' 而非
-                        // rem)、行高 1.6、字族 `--app-font-mono`。原版的 mono 链是
-                        // JetBrains Mono → Cascadia Code → Consolas;gpui 字族单值,
-                        // 主族取 Win11 自带的 Cascadia Code,链尾走 font_fallbacks
-                        // (含 CJK/emoji 兜底,文件里的中文注释靠它)。用户配置过
-                        // uiFontFamily 时原版把 `--app-font-mono` 一并覆盖
-                        // (fontManager.ts:8-18),这里同样让它优先。Input 与行号列
-                        // 都吃 window.text_style(),包一层即全部生效。
-                        // 编辑器外面再包一层 Git 标记 / 注解(见 `git_gutter`)。
-                        let mut wrap = div().size_full();
-                        let ts = wrap.text_style();
-                        ts.font_family = Some(editor_font_family());
-                        ts.font_fallbacks = Some(editor_font_fallbacks());
-                        ts.font_size = Some(px(13.0).into());
-                        ts.line_height = Some(gpui::relative(1.6));
-                        wrap.child(self.render_code_editor(editor, window, cx))
-                            // 透明而不是不画:编辑器得照常排版,定位才量得到行
-                            .when(self.conceals_editor(), |el| el.opacity(0.))
-                            .into_any_element()
-                    }
+                    Some(editor) => self.render_editor_layer(editor, window, cx),
                     None => div().into_any_element(),
                 }
             }
         }
+    }
+
+    /// 「预览 ↔ 源码」内容带这一帧的位置;不在补间中返回 `None`(动画中顺手要下一帧)。
+    fn preview_strip_frame(&self, window: &Window) -> Option<f32> {
+        let now = Instant::now();
+        if !self.preview_strip.running_at(now) {
+            return None;
+        }
+        window.request_animation_frame();
+        Some(self.preview_strip.value_at(now))
+    }
+
+    /// 源码态的编辑器层(编辑器 + Git 标记 / 注解)。
+    fn render_editor_layer(
+        &self,
+        editor: &Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // 编辑器排版对齐原版 `CodeEditor.tsx:109-129`:固定 13px
+        // (字面量,**不随 uiFontSize 缩放** —— 原版就是 '13px' 而非
+        // rem)、行高 1.6、字族 `--app-font-mono`。原版的 mono 链是
+        // JetBrains Mono → Cascadia Code → Consolas;gpui 字族单值,
+        // 主族取 Win11 自带的 Cascadia Code,链尾走 font_fallbacks
+        // (含 CJK/emoji 兜底,文件里的中文注释靠它)。用户配置过
+        // uiFontFamily 时原版把 `--app-font-mono` 一并覆盖
+        // (fontManager.ts:8-18),这里同样让它优先。Input 与行号列
+        // 都吃 window.text_style(),包一层即全部生效。
+        // 编辑器外面再包一层 Git 标记 / 注解(见 `git_gutter`)。
+        let mut wrap = div().size_full();
+        let ts = wrap.text_style();
+        ts.font_family = Some(editor_font_family());
+        ts.font_fallbacks = Some(editor_font_fallbacks());
+        ts.font_size = Some(px(13.0).into());
+        ts.line_height = Some(gpui::relative(1.6));
+        wrap.child(self.render_code_editor(editor, window, cx))
+            // 透明而不是不画:编辑器得照常排版,定位才量得到行
+            .when(self.conceals_editor(), |el| el.opacity(0.))
+            .into_any_element()
     }
 }
 
@@ -2159,6 +2323,8 @@ impl Focusable for FileViewer {
 impl Render for FileViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.schedule_reveal(window, cx);
+        // Git 变更小窗的开合对账(播收起要 `&mut`,render 下面那一路全是 `&self`)
+        self.sync_change_popup(cx);
         // 内容区先建:markdown 的分块缓存(含目录条目)在这一步才填好,工具栏的
         // 「目录」按钮要看它
         let content = self.render_content(window, cx);
@@ -2213,7 +2379,7 @@ impl Render for FileViewer {
             .on_action(cx.listener(|this, _: &GitPrevChange, window, cx| {
                 this.goto_change(false, window, cx);
             }))
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(window, cx))
             .child(self.render_banners(cx))
             .child(
                 div()
@@ -2226,7 +2392,7 @@ impl Render for FileViewer {
             // 挂根上是为了不随预览列表的行一起被回收
             .when_some(self.lightbox.clone(), |el, lightbox| el.child(lightbox))
             // Git 变更小窗与注解悬停详情:同样 `deferred` 到整窗之上
-            .children(self.render_change_popup(cx))
+            .children(self.render_change_popup(window, cx))
             .children(self.render_blame_tooltip())
     }
 }

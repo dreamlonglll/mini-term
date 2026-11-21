@@ -1169,18 +1169,6 @@ struct Editing {
     _sub: Subscription,
 }
 
-/// 悬停缩略图的开启态。`anchor` 是弹出那一刻行的屏幕矩形 ——
-/// 与原版「到点时才 `getBoundingClientRect()`」同一时机(悬停这 250ms 里
-/// 列表可能增删过行,进入那一刻的矩形已经不作数)。
-struct RowPreview {
-    project_id: String,
-    anchor: Bounds<Pixels>,
-    /// 卡片进场(`menuPopIn`)。状态挂在**这里**而不是卡上 —— 卡是纯函数,
-    /// 而这一份的生命周期恰好就是「卡在不在」:收起时随 `RowPreview` 一起没,
-    /// 下次悬停自然从头播。
-    fade: mt_ui::motion::Transition,
-}
-
 pub struct ProjectList {
     store: Entity<AppStore>,
     /// 正在被拖的节点 id(拖影起来那一刻记下),源行据此变淡。
@@ -1206,8 +1194,11 @@ pub struct ProjectList {
     /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点之后
     /// Enter/Space、Delete、F2 才有落点,见 [`Self::on_project_key`]。
     row_focus: HashMap<String, FocusHandle>,
-    /// 悬停缩略图当前开在哪一行。
-    preview: Option<RowPreview>,
+    /// 悬停缩略图开在哪一行(key = 项目 id)+ 弹出那一刻行的屏幕矩形 + 开合 / 换卡
+    /// 动画(见 [`pane_preview::HoverCard`])。矩形与原版「到点时才
+    /// `getBoundingClientRect()`」同一时机(悬停这 250ms 里列表可能增删过行,进入那一刻
+    /// 的矩形已经不作数)。
+    preview: pane_preview::HoverCard<String>,
     /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄就等于 `clearTimeout`**。
     _preview_task: Option<Task<()>>,
     /// 正被悬停的那一行的屏幕矩形(只给被悬停的那一行挂 `canvas` 量)。
@@ -1271,7 +1262,7 @@ impl ProjectList {
             kinds_key: String::new(),
             was_focused: true,
             row_focus: HashMap::new(),
-            preview: None,
+            preview: pane_preview::HoverCard::default(),
             _preview_task: None,
             hover_rect: None,
             pending_select_all: None,
@@ -1609,10 +1600,14 @@ impl ProjectList {
 
     // ─── 悬停缩略图(`ProjectList.tsx:446-496`) ────────────────
 
-    /// 收起浮层并取消在飞的计时(原版 `closePreview`)。
+    /// 换卡时等新的一行量出矩形:每隔多久看一次、最多看几次(约四帧)。
+    const WARM_RECT_POLL: std::time::Duration = std::time::Duration::from_millis(8);
+    const WARM_RECT_POLLS: usize = 8;
+
+    /// 收起浮层(播收起动画,播完才卸)并取消在飞的计时(原版 `closePreview`)。
     fn close_preview(&mut self, cx: &mut Context<Self>) {
         self._preview_task = None;
-        if self.preview.take().is_some() {
+        if self.preview.close(cx) {
             cx.notify();
         }
     }
@@ -1621,9 +1616,52 @@ impl ProjectList {
     ///
     /// **AI 判定放在到点时而非进入时**(原版专门记了这条):这 250ms 里 AI 完全
     /// 可能刚起来,读当下的 store 才拿得到最新一份。矩形同理到点再取。
+    ///
+    /// 卡还在屏幕上(开着,或刚离开上一行、收起动画还没播完)时**不等**:当场按同样
+    /// 三道闸换到这一行,卡身从上一行旁边滑过来,不重播开合(见
+    /// [`pane_preview::HoverCard`]);这一行没有 AI 会话就让卡照常收起。
     fn schedule_preview(&mut self, project_id: String, cx: &mut Context<Self>) {
         self._preview_task = None;
-        self.preview = None;
+        if self.preview.is_on(&project_id) {
+            // 收起途中又悬停回卡正显示的那一行:矩形还是这一行的,当场从当前进度往回长
+            if self.fire_preview(&project_id, cx) {
+                self._preview_task = Some(cx.spawn(async move |this, cx| {
+                    Self::keep_preview_alive(this, cx).await;
+                }));
+            }
+            return;
+        }
+        if self.preview.is_warm() {
+            // 矩形的量尺只挂在被悬停的那一行上(见 render_project),新的这一行要等下一帧
+            // 画过才量得到:手上的 `hover_rect` 还是上一行的。等它变了再换卡,最多等
+            // 几帧 —— 这是交互时序,不是动画
+            let stale = self.hover_rect;
+            self._preview_task = Some(cx.spawn(async move |this, cx| {
+                for _ in 0..Self::WARM_RECT_POLLS {
+                    cx.background_executor().timer(Self::WARM_RECT_POLL).await;
+                    let measured = this
+                        .update(cx, |this: &mut ProjectList, _| this.hover_rect != stale)
+                        .unwrap_or(true);
+                    if measured {
+                        break;
+                    }
+                }
+                let opened = this
+                    .update(cx, |this: &mut ProjectList, cx| {
+                        let opened = this.fire_preview(&project_id, cx);
+                        if !opened && this.preview.close(cx) {
+                            // 这一行没有 AI 会话:卡照常收起
+                            cx.notify();
+                        }
+                        opened
+                    })
+                    .unwrap_or(false);
+                if opened {
+                    Self::keep_preview_alive(this, cx).await;
+                }
+            }));
+            return;
+        }
         self._preview_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(pane_preview::HOVER_DELAY_MS))
@@ -1632,28 +1670,31 @@ impl ProjectList {
                 .update(cx, |this: &mut ProjectList, cx| this.fire_preview(&project_id, cx))
                 .unwrap_or(false)
             {
-                // 开着期间按原版的 500ms 节拍重画 —— 缩略图是活的。
-                // MiniTerminalElement 自己也按这个节拍取数,更密的重画只命中缓存
-                loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
-                        .await;
-                    let alive = this
-                        .update(cx, |this: &mut ProjectList, cx| {
-                            if this.preview.is_some() {
-                                cx.notify();
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .unwrap_or(false);
-                    if !alive {
-                        return;
-                    }
-                }
+                Self::keep_preview_alive(this, cx).await;
             }
         }));
+    }
+
+    /// 开着期间按原版的 500ms 节拍重画 —— 缩略图是活的。MiniTerminalElement 自己也按
+    /// 这个节拍取数,更密的重画只命中缓存。卡下了屏幕就停。
+    async fn keep_preview_alive(this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp) {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
+                .await;
+            let alive = this
+                .update(cx, |this: &mut ProjectList, cx| {
+                    let warm = this.preview.is_warm();
+                    if warm {
+                        cx.notify();
+                    }
+                    warm
+                })
+                .unwrap_or(false);
+            if !alive {
+                return;
+            }
+        }
     }
 
     /// 计时到点:三道闸(还悬着同一行 / 量到过矩形 / 项目里真有 AI 会话)。
@@ -1670,53 +1711,73 @@ impl ProjectList {
         if !pane_preview::has_ai_pane(layout, auto_resume) {
             return false;
         }
-        self.preview = Some(RowPreview {
-            project_id: project_id.to_string(),
+        self.preview.open(
+            project_id.to_string(),
             anchor,
-            fade: mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
-        });
+            pane_preview::project_anchor,
+            cx,
+        );
         cx.notify();
         true
     }
 
     /// 组装浮层。渲染处**每帧重判开闸**(原版的双闸模式):AI 退出后不光不画,
-    /// 状态本身也收掉 —— 留着的话同一次悬停里 AI 再起来会拿**旧锚点**复活。
+    /// 状态本身也收掉(直接卸,不播动画)—— 留着的话同一次悬停里 AI 再起来会拿
+    /// **旧锚点**复活。
+    ///
+    /// 开合走 [`crate::popover_reveal::reveal_frame`]:卡在行的右边弹出,框体从紧贴
+    /// 项目行的左上角长出来(原点钳在卡的左缘),内容按最终尺寸排、只裁剪 ——
+    /// 不淡入,拼图里的缩略图也不逐帧反解字号。
     fn render_preview(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let preview = self.preview.as_ref()?;
-        // 进场进度先取(后面 `self.preview = None` 那两条早退路径会把它拿走)
-        let fade = preview.fade.drive(window);
-        let store = self.store.read(cx);
-        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
-        let Some(project) = store.project(&preview.project_id) else {
-            self.preview = None;
-            return None;
+        let frame = self.preview.frame(window)?;
+        let project_id = frame.key.clone();
+        let (alive, name, path) = {
+            let store = self.store.read(cx);
+            let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+            match store.project(&project_id) {
+                Some(project) => {
+                    let layout = store
+                        .project_state(&project_id)
+                        .and_then(|s| s.active_layout());
+                    (
+                        pane_preview::has_ai_pane(layout, auto_resume),
+                        project.name.clone(),
+                        project.path.clone(),
+                    )
+                }
+                None => (false, String::new(), String::new()),
+            }
         };
-        let (name, path) = (project.name.clone(), project.path.clone());
-        let layout = store
-            .project_state(&preview.project_id)
-            .and_then(|s| s.active_layout());
-        if !pane_preview::has_ai_pane(layout, auto_resume) {
-            self.preview = None;
+        if !alive {
+            self.preview.close_now();
             return None;
         }
-        let mini: Option<MiniLayout> = layout.and_then(|l| {
-            pane_preview::snapshot_layout(l, &preview.project_id, store, auto_resume, cx)
-        });
+        let store = self.store.read(cx);
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let layout = store
+            .project_state(&project_id)
+            .and_then(|s| s.active_layout());
+        let mini: Option<MiniLayout> = layout
+            .and_then(|l| pane_preview::snapshot_layout(l, &project_id, store, auto_resume, cx));
         let style = pane_preview::preview_style(store);
-        let at = pane_preview::project_anchor(preview.anchor);
+        let at = pane_preview::project_anchor(frame.anchor) + frame.offset;
+        let mut state = frame.reveal;
+        // 原点取行的右缘(卡紧挨着它弹出):钳到卡的左缘,框体从左上角往右下长
+        state.origin_x = Some(frame.anchor.right());
+        // 卡是纯展示(不拦鼠标):收起途中也别让 reveal_frame 盖拦截层
+        state.open = true;
+        let card = crate::popover_reveal::reveal_frame(
+            pane_preview::project_preview_card(&name, &path, mini.as_ref(), &style),
+            state,
+            Some(pane_preview::card_chrome()),
+        );
         Some(
             deferred(
                 anchored()
                     .position(at)
                     // 原版那两句 `Math.min/max` 的贴边收拢在 gpui 里是白拿的
                     .snap_to_window_with_margin(px(8.0))
-                    .child(pane_preview::project_preview_card(
-                        &name,
-                        &path,
-                        mini.as_ref(),
-                        &style,
-                        fade,
-                    )),
+                    .child(card),
             )
             .with_priority(1)
             .into_any_element(),
