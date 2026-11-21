@@ -751,6 +751,123 @@ fn accumulate_session_content_stops_when_offset_does_not_advance() {
     assert_eq!(out.len(), 1, "已解析到的内容要保留,不能连带丢掉");
 }
 
+// --- 远程 agy 会话扫描与正文解析(离线纯逻辑) ---
+
+fn agy_conv(
+    id: &str,
+    workspaces: &[&str],
+    updated_at: Option<&str>,
+) -> mt_ai::sessions::AgyConversation {
+    mt_ai::sessions::AgyConversation {
+        id: id.into(),
+        title: String::new(),
+        preview: String::new(),
+        workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
+        updated_at: updated_at.map(String::from),
+        last_user_input_at: None,
+        step_count: 2,
+        parent_id: None,
+        nesting_depth: 0,
+    }
+}
+
+#[test]
+fn remote_agy_transcript_path_uses_posix_and_guards_traversal() {
+    assert_eq!(
+        remote_agy_transcript_path("/home/u/.gemini/antigravity-cli", "conv-123").as_deref(),
+        Some(
+            "/home/u/.gemini/antigravity-cli/brain/conv-123/.system_generated/logs/transcript_full.jsonl"
+        )
+    );
+    for bad in ["", "../etc/passwd", "a/b", r"a\b", "a b"] {
+        assert!(
+            remote_agy_transcript_path("/home/u/.gemini/antigravity-cli", bad).is_none(),
+            "{bad:?} 应被拒绝"
+        );
+    }
+}
+
+#[test]
+fn select_remote_agy_candidates_filters_orders_and_caps() {
+    let old = agy_conv("old", &["/srv/app"], Some("2026-11-19T10:00:00.000Z"));
+    let sub_dir = agy_conv(
+        "sub-dir",
+        &["/srv/app/backend"],
+        Some("2026-11-19T12:00:00.000Z"),
+    );
+    let newest = agy_conv("newest", &["/srv/app/"], Some("2026-11-19T14:00:00.000Z"));
+    let mut subagent = agy_conv("subagent", &["/srv/app"], Some("2026-11-19T15:00:00.000Z"));
+    subagent.parent_id = Some("newest".into());
+    let mut empty = agy_conv("empty", &["/srv/app"], Some("2026-11-19T16:00:00.000Z"));
+    empty.step_count = 0;
+    let other = agy_conv("other", &["/srv/app-2"], Some("2026-11-19T17:00:00.000Z"));
+
+    let selected = select_remote_agy_candidates(
+        vec![old, sub_dir, newest, subagent, empty, other],
+        "/srv/app",
+        2,
+    );
+    let ids: Vec<&str> = selected.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["newest", "sub-dir"]);
+}
+
+#[test]
+fn parse_remote_session_lines_supports_agy_and_skips_non_dialogue() {
+    let chunk = concat!(
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-19T13:54:00Z","content":"<USER_REQUEST>\nCheck logs\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nx\n</ADDITIONAL_METADATA>"}"#,
+        "\n",
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:54:01Z","model":"gemini-3.8-flash-high","tool_calls":[{"name":"run_command","args":{"CommandLine":"ls"}}]}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-19T13:54:02Z","content":"Created At: x\nCompleted At: x\nfile.txt"}"#,
+        "\n",
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-19T13:54:03Z","content":"All green."}"#,
+        "\n",
+    );
+    let msgs = parse_remote_session_lines("agy", chunk).unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].content, "Check logs");
+    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[1].content, "All green.");
+
+    // 分段续读集成:模拟半行切分后拼接两段
+    let bytes = chunk.as_bytes();
+    let split_at = bytes.len() / 2;
+    let mut off = 0u64;
+    let assembled = accumulate_session_content(|cursor| {
+        assert_eq!(cursor, off);
+        let start = cursor as usize;
+        if start >= bytes.len() {
+            return Ok(RemoteSessionContent {
+                messages: vec![],
+                next_offset: cursor,
+            });
+        }
+        let end = if start == 0 { split_at } else { bytes.len() };
+        let (consumed, complete) = split_complete_lines(&bytes[start..end]);
+        off = cursor + consumed as u64;
+        Ok(RemoteSessionContent {
+            messages: parse_remote_session_lines("agy", &String::from_utf8_lossy(complete))?,
+            next_offset: off,
+        })
+    })
+    .unwrap();
+    assert_eq!(assembled.len(), 2);
+    assert_eq!(assembled[0].content, "Check logs");
+    assert_eq!(assembled[1].content, "All green.");
+
+    // 非法 id 在触网前拦截;远程删除对 agy 仍不支持
+    let c = conn("c1");
+    assert_eq!(
+        ai_session_content(&c, "agy", "../evil", "/srv/app", 0).unwrap_err(),
+        "非法会话 id"
+    );
+    assert_eq!(
+        plan_remote_session_delete(&c, "agy", "conv-1", "/srv/app").unwrap_err(),
+        mt_ai::sessions::SessionDeleteError::Unsupported
+    );
+}
+
 #[test]
 fn accumulate_session_content_caps_total_bytes() {
     // 每轮都「读满」一整块:撞到总量护栏就停,不会无限吃内存

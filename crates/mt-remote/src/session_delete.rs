@@ -7,7 +7,7 @@
 //!
 //! 与本机同样分两步、同样找全再删(口径见 `mt_ai::sessions` 的 `delete.rs`),差别:
 //!
-//! - 远程列表只有 Claude 与 Codex;
+//! - 远程删除仅支持 Claude 与 Codex(远程列表另含 agy,但 agy 同本机口径不提供删除);
 //! - 写入指纹只有 readdir 给的秒级 mtime(SFTP 目录项这里没带 size);
 //! - 远程 pane 拿不到 hook 上报的会话身份,「还在跑」主要靠 mtime 提示。
 

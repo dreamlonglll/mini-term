@@ -49,17 +49,25 @@
 //! **已含**思考 token。
 
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use mt_core::path_key::windows_eq_key;
+use mt_core::path_key::{posix_ci_eq_key, windows_eq_key};
 use serde_json::Value;
 
 use super::grok::percent_decode;
 
 /// 索引库里 CLI 会话的 `app_data_dir` 取值
 const CLI_APP_DATA_DIR: &str = "antigravity-cli";
+
+/// 快照读取(WSL 9P / SSH SFTP)单个索引文件(`.db` 或 `-wal`)的字节上限。
+/// 护栏而非功能上限:正常数十到数千会话摘要为几百 KB 到数 MB,32 MB 已留足余量,
+/// 避免病态大库把桌面端内存或网络打满。
+pub const AGY_INDEX_SNAPSHOT_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// `~/.gemini`
 fn gemini_dir() -> Option<PathBuf> {
@@ -153,6 +161,30 @@ impl AgyConversation {
                     .is_some_and(|rest| rest.starts_with('/'))
         })
     }
+
+    /// POSIX 语义下的项目归属判定(供 WSL 与 SSH 远程项目用):比较走 [`posix_ci_eq_key`]
+    /// (不把 `\` 当分隔符、去尾 `/`、折叠大小写以兼容 WSL `/mnt/*` drvfs)。
+    /// 任一工作区与项目路径相同或位于其子目录下即匹配;项目根为 `/` 时匹配所有 POSIX 绝对路径。
+    pub fn belongs_to_posix(&self, project_path: &str) -> bool {
+        let trimmed = project_path.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if trimmed.starts_with('/') && trimmed.bytes().all(|b| b == b'/') {
+            return self.workspaces.iter().any(|ws| ws.starts_with('/'));
+        }
+        let project = posix_ci_eq_key(trimmed);
+        if project.is_empty() {
+            return false;
+        }
+        self.workspaces.iter().any(|ws| {
+            let ws = posix_ci_eq_key(ws);
+            ws == project
+                || ws
+                    .strip_prefix(&project)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
 }
 
 /// 读本机索引库里的全部 CLI 会话(含子代理会话,调用方按 [`AgyConversation::is_subagent`]
@@ -184,6 +216,10 @@ pub fn read_agy_conversations_from(db: &Path) -> Result<Vec<AgyConversation>, St
     )
     .map_err(|e| format!("打开 {} 失败: {e}", db.display()))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+    query_agy_conversations(&conn)
+}
+
+fn query_agy_conversations(conn: &rusqlite::Connection) -> Result<Vec<AgyConversation>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT conversation_id, title, preview, step_count, last_modified_time, \
@@ -212,6 +248,121 @@ pub fn read_agy_conversations_from(db: &Path) -> Result<Vec<AgyConversation>, St
         .flatten()
         .filter(|c| super::session_id_path_safe(&c.id))
         .collect())
+}
+
+struct TempSnapshotDir(PathBuf);
+
+impl TempSnapshotDir {
+    fn create() -> Result<Self, String> {
+        let seq = SNAPSHOT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("mt-agy-snap-{}-{ts}-{seq}", std::process::id()));
+        fs::create_dir_all(&dir).map_err(|e| format!("创建临时快照目录失败: {e}"))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TempSnapshotDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 从内存字节快照(`conversation_summaries.db` + 可选 `-wal`)解析 agy 会话索引。
+///
+/// 供 WSL(经 9P 拷贝后读)与 SSH 远程(经 SFTP 下载后读)共用:
+/// - **不拷贝 `-shm`**:那是原宿主内核私有的 WAL index,SQLite 打开我们的本地临时副本时
+///   会自动根据 `-wal` 重建本地 `-shm` 并回放已提交帧;
+/// - 带 `-wal` 时先以读写模式打开**临时副本**(绝不碰源库)让 SQLite 回放 `-wal`;
+///   若跨网络拷贝碰上 WAL reset 导致带 WAL 打开/查询失败,自动剥掉 `-wal` 降级仅读主库。
+pub fn read_agy_conversations_from_snapshot(
+    db_bytes: &[u8],
+    wal_bytes: Option<&[u8]>,
+) -> Result<Vec<AgyConversation>, String> {
+    use rusqlite::{Connection, OpenFlags};
+
+    if db_bytes.is_empty() {
+        return Err("会话索引快照为空".to_string());
+    }
+    let tmp = TempSnapshotDir::create()?;
+    let db_path = tmp.0.join("conversation_summaries.db");
+    let wal_path = tmp.0.join("conversation_summaries.db-wal");
+    let shm_path = tmp.0.join("conversation_summaries.db-shm");
+
+    fs::write(&db_path, db_bytes).map_err(|e| format!("写入临时索引库失败: {e}"))?;
+
+    if let Some(wal) = wal_bytes.filter(|w| !w.is_empty()) {
+        fs::write(&wal_path, wal).map_err(|e| format!("写入临时 WAL 失败: {e}"))?;
+        let with_wal = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("打开临时索引库(含 WAL)失败: {e}"))
+        .and_then(|conn| query_agy_conversations(&conn));
+        if with_wal.is_ok() {
+            return with_wal;
+        }
+        // 带 WAL 读取失败(例如拷贝瞬间撞上 WAL reset):移除临时 WAL/SHM 后回退仅读主库
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(&shm_path);
+    }
+
+    // 仅主库(不含 WAL):先只读打开;若主库头部记录了 WAL journal mode 且禁止建 shm,
+    // 再用读写打开本私有副本(仅在临时目录下创建空 shm,不修改源库)。
+    let ro = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开临时索引库失败: {e}"))
+    .and_then(|conn| query_agy_conversations(&conn));
+    if ro.is_ok() {
+        return ro;
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开临时索引库失败: {e}"))?;
+    query_agy_conversations(&conn)
+}
+
+/// 带字节上限地读一个本地/UNC 文件;超限返回 `Err`。
+fn read_file_capped(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+    let mut out = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    file.take(limit)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+    if out.len() > max_bytes {
+        return Err(format!(
+            "{} 超过快照大小上限({max_bytes} 字节)",
+            path.display()
+        ));
+    }
+    Ok(out)
+}
+
+/// 经本地临时快照读磁盘上的 agy 索引库(供 WSL 9P `\\wsl$` 用)。
+///
+/// 跨 9P 直接 `rusqlite::open` 正在被 Linux 侧写入的 WAL 库容易因 `-shm` 共享锁
+/// 不兼容而报 `SQLITE_PROTOCOL` / `SQLITE_IOERR_SHMOPEN`;按「先主库、后 `-wal`」
+/// 只读拷贝到本地临时目录后再打开,完全不与 Linux 侧争锁,也不漏未 checkpoint 的新会话。
+pub fn read_agy_conversations_via_snapshot(db: &Path) -> Result<Vec<AgyConversation>, String> {
+    let db_bytes = read_file_capped(db, AGY_INDEX_SNAPSHOT_MAX_BYTES)?;
+    let mut wal_os = db.as_os_str().to_os_string();
+    wal_os.push("-wal");
+    let wal_path = PathBuf::from(wal_os);
+    let wal_bytes = if wal_path.is_file() {
+        read_file_capped(&wal_path, AGY_INDEX_SNAPSHOT_MAX_BYTES).ok()
+    } else {
+        None
+    };
+    read_agy_conversations_from_snapshot(&db_bytes, wal_bytes.as_deref())
 }
 
 /// TEXT 列取字符串;NULL / 非文本按空串(Go 的 sqlite 驱动把 datetime 存成 TEXT,
@@ -651,6 +802,110 @@ mod tests {
             .execute_batch("CREATE TABLE conversation_summaries (conversation_id text);")
             .unwrap();
         assert!(read_agy_conversations_from(&bad).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn posix_项目归属_保留反斜杠_支持子目录与根目录() {
+        let c = conv(&["/home/User/proj"]);
+        assert!(c.belongs_to_posix("/home/user/proj"));
+        assert!(c.belongs_to_posix("/home/User/proj/"));
+        assert!(!c.belongs_to_posix("/home/user/pro"), "前缀不是目录边界");
+        assert!(
+            !c.belongs_to_posix("/home/user/proj/sub"),
+            "项目是会话的子目录不算"
+        );
+        assert!(conv(&["/home/user/proj/crates/mt-ai"]).belongs_to_posix("/home/user/proj"));
+        assert!(conv(&["/mnt/d/Git/Mini-Term"]).belongs_to_posix("/mnt/d/git/mini-term"));
+        // 反斜杠在 POSIX 里是普通文件名字符,不等价于 `/`
+        assert!(!conv(&[r"/home/u/a\b"]).belongs_to_posix("/home/u/a/b"));
+        // 根目录 `/` 匹配任何绝对 POSIX 工作区,不匹配空串或相对路径
+        assert!(c.belongs_to_posix("/"));
+        assert!(!conv(&["relative/dir"]).belongs_to_posix("/"));
+        assert!(!c.belongs_to_posix(""));
+    }
+
+    /// 模拟运行中的 agy(WAL 模式、写连接仍打开、尚未 checkpoint):
+    /// 只拷贝 `.db` 与 `.db-wal`(绝不拷 `-shm`)到临时快照,新写入的未 checkpoint 会话必须可读;
+    /// WAL 损坏时优雅回退仅读主库而不报错。
+    #[test]
+    fn 快照读取覆盖未_checkpoint_的_wal_并容忍损坏_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-agy-wal-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conversation_summaries.db");
+        let schema = "CREATE TABLE `conversation_summaries` (`conversation_id` text,`title` text NOT NULL DEFAULT \"\",`preview` text NOT NULL DEFAULT \"\",`step_count` integer NOT NULL DEFAULT 0,`last_modified_time` datetime NOT NULL,`workspace_uris` text NOT NULL,`parent_conversation_id` text NOT NULL DEFAULT \"\",`nesting_depth` integer NOT NULL DEFAULT 0,`last_user_input_time` datetime NOT NULL,`app_data_dir` text NOT NULL DEFAULT \"\",PRIMARY KEY (`conversation_id`));";
+
+        // 1) 建库并 checkpoint 一条基线记录进入主库
+        let writer = rusqlite::Connection::open(&db).unwrap();
+        writer
+            .execute_batch(&format!(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 {schema}
+                 INSERT INTO conversation_summaries VALUES
+                   ('base-1','Base','Base',3,'2026-11-19 10:00:00+00:00','[\"file:///home/u/proj\"]','',0,'2026-11-19 10:00:00+00:00','antigravity-cli');
+                 PRAGMA wal_checkpoint(TRUNCATE);"
+            ))
+            .unwrap();
+
+        // 2) 写一条新会话,保持写连接打开且禁止 autocheckpoint —— 它只存在于 `-wal` 中
+        writer
+            .execute(
+                "INSERT INTO conversation_summaries VALUES
+                   ('wal-2','Fresh In WAL','Fresh',2,'2026-11-19 12:00:00+00:00','[\"file:///home/u/proj/sub\"]','',0,'2026-11-19 12:00:00+00:00','antigravity-cli')",
+                [],
+            )
+            .unwrap();
+
+        let wal = dir.join("conversation_summaries.db-wal");
+        assert!(wal.is_file() && fs::metadata(&wal).unwrap().len() > 0);
+
+        // 通过经快照读(模拟 WSL 9P):两条都可读
+        let mut via = read_agy_conversations_via_snapshot(&db).unwrap();
+        via.sort_by(|a, b| a.id.cmp(&b.id));
+        let via_ids: Vec<&str> = via.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(via_ids, ["base-1", "wal-2"]);
+
+        // 通过内存字节快照读(模拟 SSH SFTP):带 WAL 读出两条,不带 WAL 只读出主库基线
+        let db_bytes = fs::read(&db).unwrap();
+        let wal_bytes = fs::read(&wal).unwrap();
+        let mut from_snap =
+            read_agy_conversations_from_snapshot(&db_bytes, Some(&wal_bytes)).unwrap();
+        from_snap.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            from_snap.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["base-1", "wal-2"]
+        );
+
+        let main_only = read_agy_conversations_from_snapshot(&db_bytes, None).unwrap();
+        assert_eq!(
+            main_only.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["base-1"]
+        );
+
+        // WAL 损坏时回退仅读主库,不报错
+        let fallback =
+            read_agy_conversations_from_snapshot(&db_bytes, Some(b"corrupted-wal-bytes")).unwrap();
+        assert_eq!(
+            fallback.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["base-1"]
+        );
+
+        // 空字节快照报错
+        assert!(read_agy_conversations_from_snapshot(&[], None).is_err());
+
+        // 大小上限守卫
+        assert!(read_file_capped(&db, 8).is_err());
+        assert!(read_file_capped(&db, db_bytes.len()).is_ok());
+
+        drop(writer);
         let _ = fs::remove_dir_all(&dir);
     }
 }

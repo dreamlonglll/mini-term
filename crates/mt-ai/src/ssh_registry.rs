@@ -10,12 +10,13 @@
 //! 启用时(全部幂等):
 //! - 写 `<project>/.claude/skills/mini-term-ssh/SKILL.md`(含 `allowed-tools`)
 //! - 写 `<project>/.codex/skills/mini-term-ssh/SKILL.md`(无 `allowed-tools`)
-//! - `.gitignore` 幂等追加两个 skill 目录
+//! - 写 `<project>/.agents/skills/mini-term-ssh/SKILL.md`(无 `allowed-tools`,供 Antigravity CLI / agy 等遵循 `.agents/skills/` 标准的 agent 发现)
+//! - `.gitignore` 幂等追加三个 skill 目录
 //! - Codex 项目信任保留(项目级 `.codex/` 内容大概率仍要求 trusted,写入无害)
 //! - **迁移清理**:摘除该项目的旧 MCP 注册(`.mcp.json` 条目、项目 Codex 配置、
 //!   Claude 免审批白名单 —— 他人条目毫发无损)
 //!
-//! 停用时:删两份 SKILL.md 及空目录(`skills/` 若空一并删除,不留空壳),
+//! 停用时:删三份 SKILL.md 及空目录(`skills/` 若空一并删除,不留空壳),
 //! 并同样执行 MCP 迁移清理兜底存量。Codex 信任与 `.gitignore` 不回收。
 //!
 //! **dev 实例隔离**:sidecar 只读装机版数据目录里的 `config.json` 投影,本实例的投影
@@ -298,8 +299,8 @@ Do NOT base64-echo file contents through exec — use upload/download.
     )
 }
 
-/// 两份 SKILL.md 的落盘路径。
-fn skill_paths(project_dir: &Path) -> [(PathBuf, bool); 2] {
+/// 三份 SKILL.md 的落盘路径:Claude Code、Codex、以及 `.agents/skills/`(Antigravity CLI 等)。
+fn skill_paths(project_dir: &Path) -> [(PathBuf, bool); 3] {
     [
         (
             project_dir
@@ -317,10 +318,18 @@ fn skill_paths(project_dir: &Path) -> [(PathBuf, bool); 2] {
                 .join("SKILL.md"),
             false,
         ),
+        (
+            project_dir
+                .join(".agents")
+                .join("skills")
+                .join(SKILL_DIR_NAME)
+                .join("SKILL.md"),
+            false, // Antigravity CLI(agy)等遵循 `.agents/skills/` 标准的 agent
+        ),
     ]
 }
 
-/// 整文件覆盖写入两份 SKILL.md(mini-term 独占生成物,无需合并语义)。
+/// 整文件覆盖写入三份 SKILL.md(mini-term 独占生成物,无需合并语义)。
 fn write_skill_files(
     project_dir: &Path,
     binary_path: &str,
@@ -338,8 +347,8 @@ fn write_skill_files(
     Ok(())
 }
 
-/// 删除两份 SKILL.md 及空目录:`mini-term-ssh/` 一定删;`skills/` 若空一并删;
-/// `.claude/` / `.codex/` 若因此彻底变空也顺手收掉(remove_dir 只删空目录,
+/// 删除三份 SKILL.md 及空目录:`mini-term-ssh/` 一定删;`skills/` 若空一并删;
+/// `.claude/` / `.codex/` / `.agents/` 若因此彻底变空也顺手收掉(remove_dir 只删空目录,
 /// 有其它内容时静默失败,安全)。文件不存在视为已停用(幂等)。
 fn remove_skill_files(project_dir: &Path) -> Result<(), String> {
     for (path, _) in skill_paths(project_dir) {
@@ -347,7 +356,7 @@ fn remove_skill_files(project_dir: &Path) -> Result<(), String> {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("删除 {} 失败: {}", path.display(), e))?;
         }
-        // mini-term-ssh/ → skills/ → .claude|.codex/,逐级尝试删空目录。
+        // mini-term-ssh/ → skills/ → .claude|.codex|.agents/,逐级尝试删空目录。
         let mut dir = path.parent();
         for _ in 0..3 {
             let Some(d) = dir else { break };
@@ -367,6 +376,7 @@ fn remove_skill_files(project_dir: &Path) -> Result<(), String> {
 const GITIGNORE_ENTRIES: &[&str] = &[
     ".claude/skills/mini-term-ssh/",
     ".codex/skills/mini-term-ssh/",
+    ".agents/skills/mini-term-ssh/",
 ];
 
 /// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。抽出便于单测。
@@ -748,13 +758,13 @@ fn enable_with_scope(
         Ok(()) => String::new(),
         Err(e) => {
             eprintln!("[ssh_skill] 追加 .gitignore 失败(不影响启用): {}", e);
-            "（.gitignore 未能自动更新，建议手动忽略两个 skills/mini-term-ssh/ 目录）".to_string()
+            "（.gitignore 未能自动更新，建议手动忽略三个 skills/mini-term-ssh/ 目录）".to_string()
         }
     };
 
     Ok(EnableResult {
         message: format!(
-            "已为该项目启用 SSH 工具：已生成 Claude / Codex 两份 SKILL.md。{}",
+            "已为该项目启用 SSH 工具：已生成 Claude / Codex / Antigravity 三份 SKILL.md。{}",
             gitignore_note
         ),
         project_token,
@@ -804,7 +814,7 @@ pub struct SkillReconcileTarget {
 
 /// 启动时校正项目里的 SKILL.md,返回重写的文件数。
 ///
-/// 只动 [`enable`] 写过的那两份文件(Claude / Codex):文件存在、是 mini-term 生成的(生成
+/// 只动 [`enable`] 写过的那三份文件(Claude / Codex / Agents):文件存在、是 mini-term 生成的(生成
 /// 标记),且 [`rewrite_reason`] 说要改,才按 enable 的写法重写。规则按生成标记里的模板版本
 /// 分三档 —— 比本机新的不动(由更新的 mini-term 管)、比本机旧或没有版本号的重写、同版本的只在
 /// 引用的 CLI 不在 / 令牌不符 / 本机的 CLI 比引用的那份更新时重写 —— 同机两份安装各跑各的
@@ -1255,7 +1265,7 @@ mod tests {
     // ─── 写入 / 覆盖 / 清理 ───
 
     #[test]
-    fn write_skill_files_creates_both_variants() {
+    fn write_skill_files_creates_all_variants() {
         let dir = unique_test_dir("write");
         write_skill_files(&dir, "/bin/mt-ssh-cli", "p1").unwrap();
 
@@ -1269,13 +1279,23 @@ mod tests {
             .join("skills")
             .join(SKILL_DIR_NAME)
             .join("SKILL.md");
+        let agents = dir
+            .join(".agents")
+            .join("skills")
+            .join(SKILL_DIR_NAME)
+            .join("SKILL.md");
         assert!(claude.exists());
         assert!(codex.exists());
+        assert!(agents.exists());
         let claude_md = std::fs::read_to_string(&claude).unwrap();
         let codex_md = std::fs::read_to_string(&codex).unwrap();
+        let agents_md = std::fs::read_to_string(&agents).unwrap();
         assert!(claude_md.contains("allowed-tools"));
         assert!(!codex_md.contains("allowed-tools"));
+        assert!(!agents_md.contains("allowed-tools"));
+        assert_eq!(agents_md, codex_md);
         assert!(claude_md.contains("--project-token 'p1'"));
+        assert!(agents_md.contains("--project-token 'p1'"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1306,9 +1326,10 @@ mod tests {
         write_skill_files(&dir, "/bin/mt-ssh-cli", "p1").unwrap();
         remove_skill_files(&dir).unwrap();
 
-        // SKILL.md、mini-term-ssh/、skills/ 乃至空的 .claude/.codex 都不残留
+        // SKILL.md、mini-term-ssh/、skills/ 乃至空的 .claude/.codex/.agents 都不残留
         assert!(!dir.join(".claude").exists(), "空壳目录应被清理");
         assert!(!dir.join(".codex").exists(), "空壳目录应被清理");
+        assert!(!dir.join(".agents").exists(), "空壳目录应被清理");
         // 项目目录本身不受影响
         assert!(dir.exists());
 
@@ -1317,13 +1338,16 @@ mod tests {
 
     #[test]
     fn remove_skill_files_keeps_sibling_content() {
-        // .claude/ 里有用户自己的文件时,只删本 skill,不动其它内容。
+        // .claude/ 与 .agents/ 里有用户自己的文件时,只删本 skill,不动其它内容。
         let dir = unique_test_dir("keep-sibling");
         write_skill_files(&dir, "/bin/mt-ssh-cli", "p1").unwrap();
         std::fs::write(dir.join(".claude").join("settings.local.json"), b"{}").unwrap();
         let other_skill = dir.join(".claude").join("skills").join("my-skill");
         std::fs::create_dir_all(&other_skill).unwrap();
         std::fs::write(other_skill.join("SKILL.md"), b"mine").unwrap();
+        let agent_rule = dir.join(".agents").join("rules");
+        std::fs::create_dir_all(&agent_rule).unwrap();
+        std::fs::write(agent_rule.join("style.md"), b"user rule").unwrap();
 
         remove_skill_files(&dir).unwrap();
 
@@ -1333,9 +1357,14 @@ mod tests {
                 .join(SKILL_DIR_NAME)
                 .exists()
         );
+        assert!(
+            !dir.join(".agents").join("skills").exists(),
+            "空的 .agents/skills/ 应被清理"
+        );
         // 用户内容毫发无损
         assert!(dir.join(".claude").join("settings.local.json").exists());
         assert!(other_skill.join("SKILL.md").exists());
+        assert!(agent_rule.join("style.md").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1351,27 +1380,29 @@ mod tests {
     // ─── .gitignore 追加 ───
 
     #[test]
-    fn gitignore_append_on_empty_adds_both_entries() {
+    fn gitignore_append_on_empty_adds_all_entries() {
         let result = compute_gitignore_append("").unwrap();
         assert!(result.contains(".claude/skills/mini-term-ssh/"));
         assert!(result.contains(".codex/skills/mini-term-ssh/"));
+        assert!(result.contains(".agents/skills/mini-term-ssh/"));
     }
 
     #[test]
     fn gitignore_append_skips_existing_entries() {
-        let existing =
-            "node_modules\n.claude/skills/mini-term-ssh/\n.codex/skills/mini-term-ssh/\n";
+        let existing = "node_modules\n.claude/skills/mini-term-ssh/\n.codex/skills/mini-term-ssh/\n.agents/skills/mini-term-ssh/\n";
         assert!(compute_gitignore_append(existing).is_none());
     }
 
     #[test]
     fn gitignore_append_adds_only_missing_entry() {
-        let existing = "node_modules\n.claude/skills/mini-term-ssh/\n";
+        let existing =
+            "node_modules\n.claude/skills/mini-term-ssh/\n.codex/skills/mini-term-ssh/\n";
         let result = compute_gitignore_append(existing).unwrap();
         assert!(result.contains("node_modules"));
-        assert!(result.contains(".codex/skills/mini-term-ssh/"));
+        assert!(result.contains(".agents/skills/mini-term-ssh/"));
         // 已有条目不重复
         assert_eq!(result.matches(".claude/skills/mini-term-ssh/").count(), 1);
+        assert_eq!(result.matches(".codex/skills/mini-term-ssh/").count(), 1);
     }
 
     #[test]
@@ -1386,6 +1417,7 @@ mod tests {
         assert!(content.contains("node_modules"));
         assert_eq!(content.matches(".claude/skills/mini-term-ssh/").count(), 1);
         assert_eq!(content.matches(".codex/skills/mini-term-ssh/").count(), 1);
+        assert_eq!(content.matches(".agents/skills/mini-term-ssh/").count(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1747,6 +1779,7 @@ mod tests {
         // 一个文件都没写:没有 SKILL.md、没有 .gitignore
         assert!(!dir.join(".claude").exists());
         assert!(!dir.join(".codex").exists());
+        assert!(!dir.join(".agents").exists());
         assert!(!dir.join(".gitignore").exists());
         // 存量项目没令牌照样生成一个(关联要能存进本实例配置)
         let fresh = enable_with_scope(
@@ -1825,6 +1858,10 @@ mod tests {
         skill_paths(dir)[1].0.clone()
     }
 
+    fn agents_md(dir: &Path) -> PathBuf {
+        skill_paths(dir)[2].0.clone()
+    }
+
     #[test]
     fn reconcile_leaves_up_to_date_files_alone() {
         let dir = unique_test_dir("reconcile-uptodate");
@@ -1851,9 +1888,13 @@ mod tests {
         assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &bin), 1);
         let fixed = std::fs::read_to_string(claude_md(&dir)).unwrap();
         assert_eq!(fixed, render_skill_md(&bin, "tok", true));
-        // Codex 那份本来就是最新的,不动
+        // Codex / Agents 那两份本来就是最新的,不动
         assert_eq!(
             std::fs::read_to_string(codex_md(&dir)).unwrap(),
+            render_skill_md(&bin, "tok", false)
+        );
+        assert_eq!(
+            std::fs::read_to_string(agents_md(&dir)).unwrap(),
             render_skill_md(&bin, "tok", false)
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1864,7 +1905,7 @@ mod tests {
         let dir = unique_test_dir("reconcile-token");
         let bin = fake_binary(&dir, "mt-ssh-cli");
         write_skill_files(&dir, &bin, "old-token").unwrap();
-        assert_eq!(reconcile_with_binary(&[target(&dir, "new-token")], &bin), 2);
+        assert_eq!(reconcile_with_binary(&[target(&dir, "new-token")], &bin), 3);
         for (path, with_allowed_tools) in skill_paths(&dir) {
             let md = std::fs::read_to_string(&path).unwrap();
             assert_eq!(md, render_skill_md(&bin, "new-token", with_allowed_tools));
@@ -1888,10 +1929,14 @@ mod tests {
         let gone = dir.join("old-install").join("mt-ssh-cli");
         write_skill_files(&dir, &gone.to_string_lossy(), "tok").unwrap();
         let bin = fake_binary(&dir, "mt-ssh-cli");
-        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &bin), 2);
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &bin), 3);
         assert_eq!(
             std::fs::read_to_string(claude_md(&dir)).unwrap(),
             render_skill_md(&bin, "tok", true)
+        );
+        assert_eq!(
+            std::fs::read_to_string(agents_md(&dir)).unwrap(),
+            render_skill_md(&bin, "tok", false)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1931,8 +1976,8 @@ mod tests {
         set_modified(&newer, 2_000_000_000);
         write_skill_files(&dir, &older, "tok").unwrap();
 
-        // 新安装启动:本机的 CLI 更新 → 两份都改指本机。
-        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &newer), 2);
+        // 新安装启动:本机的 CLI 更新 → 三份都改指本机。
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &newer), 3);
         for (path, with_allowed_tools) in skill_paths(&dir) {
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
@@ -2050,8 +2095,9 @@ mod tests {
             std::fs::read_to_string(claude_md(&dir)).unwrap(),
             "---\nname: mini-term-ssh\n---\nmy own notes\n"
         );
-        // 缺失的 Codex 那份不重建
+        // 缺失的 Codex / Agents 那两份不重建
         assert!(!codex_md(&dir).exists());
+        assert!(!agents_md(&dir).exists());
         // 空令牌 / 不存在的项目目录:跳过
         assert_eq!(
             reconcile_with_binary(

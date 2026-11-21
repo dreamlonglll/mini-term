@@ -21,12 +21,17 @@ mod tool_activity;
 mod tool_path;
 
 pub use agy::{
-    AgyConversation, AgyStep, AgyStepKind, AgyToolCall, agy_app_data_dir, agy_config_dir,
-    agy_summaries_db_path_in, agy_tool_result_text, agy_transcript_path_in, agy_user_request_text,
-    file_uri_to_path, find_agy_transcript, normalize_db_time, parse_agy_step, parse_workspace_uris,
-    read_agy_conversations, read_agy_conversations_from, read_agy_transcript,
+    AGY_INDEX_SNAPSHOT_MAX_BYTES, AgyConversation, AgyStep, AgyStepKind, AgyToolCall,
+    agy_app_data_dir, agy_config_dir, agy_summaries_db_path_in, agy_tool_result_text,
+    agy_transcript_path_in, agy_user_request_text, file_uri_to_path, find_agy_transcript,
+    normalize_db_time, parse_agy_step, parse_workspace_uris, read_agy_conversations,
+    read_agy_conversations_from, read_agy_conversations_from_snapshot,
+    read_agy_conversations_via_snapshot, read_agy_transcript,
 };
-pub use agy_history::{agy_dialogue_step_from_line, agy_message_from_step, newest_agy_transcript};
+pub use agy_history::{
+    agy_dialogue_step_from_line, agy_first_user_text_from_str, agy_message_from_step,
+    agy_session_title_from_head, newest_agy_transcript,
+};
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
     codex_question_answer_from_line, codex_question_from_line, codex_user_title_from_line,
@@ -57,7 +62,10 @@ pub use tool_activity::{
 };
 pub use tool_path::ToolPathScope;
 
-use agy_history::{get_agy_sessions, read_agy_session_content};
+use agy_history::{
+    get_agy_sessions, get_wsl_agy_sessions_in, read_agy_session_content,
+    read_wsl_agy_session_content,
+};
 use codex::{
     get_codex_sessions, get_codex_sessions_in, read_codex_session_content,
     read_wsl_codex_session_content,
@@ -401,9 +409,10 @@ fn derive_wsl_target(project_path: &str, distro: Option<String>) -> Option<(Stri
     Some((distro, unix_cwd))
 }
 
-/// 枚举发行版内可能装有 claude/codex 的 home:`\home\*` + `\root`,
-/// 凡含 `.claude` 或 `.codex` 目录的都纳入(多用户 distro 场景;防串项目由
-/// cwd 精确校验兜底)。发行版未安装 / VM 启动失败等一切 IO 失败静默返回空。
+/// 枚举发行版内可能装有 claude/codex/agy 的 home:`\home\*` + `\root`,
+/// 凡含 `.claude`、`.codex` 或 `.gemini/antigravity-cli` 目录的都纳入(多用户 distro 场景;
+/// 防串项目由 cwd / workspace_uris 精确校验兜底)。发行版未安装 / VM 启动失败等一切 IO 失败
+/// 静默返回空。
 /// 注意:读 `\\wsl$\<distro>\` 时若 VM 未运行,Windows 会自动启动它(可能数秒)。
 fn wsl_candidate_homes(distro: &str) -> Vec<PathBuf> {
     let root = PathBuf::from(format!(r"\\wsl$\{}", distro));
@@ -418,7 +427,11 @@ fn wsl_candidate_homes(distro: &str) -> Vec<PathBuf> {
     }
     homes.push(root.join("root"));
 
-    homes.retain(|h| h.join(".claude").is_dir() || h.join(".codex").is_dir());
+    homes.retain(|h| {
+        h.join(".claude").is_dir()
+            || h.join(".codex").is_dir()
+            || h.join(".gemini").join("antigravity-cli").is_dir()
+    });
     homes
 }
 
@@ -1107,6 +1120,7 @@ pub fn get_ai_session_content(
                 read_wsl_claude_session_content(&distro, &unix_cwd, &session_id)
             }
             Some(AgentKind::Codex) => read_wsl_codex_session_content(&distro, &session_id),
+            Some(AgentKind::Agy) => read_wsl_agy_session_content(&distro, &session_id),
             _ => Err(format!("不支持的会话类型: {}", session_type)),
         };
     }
@@ -1183,10 +1197,11 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     Ok(sessions)
 }
 
-/// 获取项目在 WSL 发行版内的 claude/codex 会话。
+/// 获取项目在 WSL 发行版内的 claude/codex/agy 会话。
 /// - WSL 根项目(UNC 路径):distro 从路径推导,忽略入参;
 /// - WSL 关联项目(Windows 路径):按入参 distro + /mnt 映射;
 /// - 无法推导来源 / 一切 IO 失败:静默返回空列表。
+///
 /// `force` 绕过缓存,供手动刷新使用。
 /// 标注 async:9P 扫描 + 可能的 VM 冷启动是秒级操作,不能阻塞主线程。
 pub fn get_wsl_ai_sessions(
@@ -1234,6 +1249,7 @@ pub fn get_wsl_ai_sessions(
             MAX_WSL_CODEX_SESSION_FILES_TO_SCAN,
             Some(&distro),
         ));
+        sessions.extend(get_wsl_agy_sessions_in(&home, &unix_cwd, &distro));
     }
 
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1438,17 +1454,24 @@ mod tests {
         assert!(r.is_err());
     }
 
-    /// agy 只有宿主来源:WSL 来源的正文请求(列表里不会有,防御)报不支持而不是去 9P
-    /// 里找;本机找不到的 id 报错而不 panic。
+    /// agy 找不到的 id(本机与不存在的 WSL 发行版)返回明确错误而不 panic;
+    /// 不支持 WSL 来源的 agent(如 grok)仍报不支持。
     #[test]
-    fn agy_content_unsupported_sources_are_errors() {
-        let wsl = get_ai_session_content(
+    fn agy_content_missing_and_unsupported_wsl_sources_are_errors() {
+        let wsl_missing = get_ai_session_content(
             "agy".into(),
+            "7e54f704-1278-4123-8ad4-11e8f6922c82".into(),
+            r"\\wsl$\mt-test-no-such-distro\home\u\p".into(),
+            Some("mt-test-no-such-distro".into()),
+        );
+        assert!(wsl_missing.unwrap_err().contains("未找到 agy 会话文件"));
+        let grok_wsl = get_ai_session_content(
+            "grok".into(),
             "7e54f704-1278-4123-8ad4-11e8f6922c82".into(),
             r"\\wsl$\Ubuntu\home\u\p".into(),
             Some("Ubuntu".into()),
         );
-        assert!(wsl.unwrap_err().contains("不支持"));
+        assert!(grok_wsl.unwrap_err().contains("不支持"));
         let missing = get_ai_session_content(
             "agy".into(),
             "mt-test-no-such-agy-conversation".into(),
