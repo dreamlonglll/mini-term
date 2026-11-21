@@ -860,7 +860,13 @@ pub fn setting_row(
 /// 几何逐值照抄:`w-9 h-5`(36×20)的圆角胶囊 + `w-4 h-4`(16)的白滑块,
 /// 开时 `translate-x-[18px]`、关时 `translate-x-0.5`。
 /// **不随 `uiFontSize` 缩放** —— 原版这几个值是 Tailwind 的固定尺寸类。
-pub fn toggle(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
+///
+/// 滑块停在行程的 `travel` 处(0 = 关、1 = 开):滑块横向走位、底色在关 / 开两色之间
+/// 同步过渡(原版 `transition-colors` + `transition-transform`)。补间状态由调用方持有、
+/// 只让**刚翻的那一颗**动(设置页的 `widgets::knob_toggle`,`fold_motion::FlipTweens` +
+/// [`mt_ui::motion::TOGGLE_KNOB`]);静止的开关传 0 / 1。
+pub fn toggle_at(id: impl Into<ElementId>, travel: f32) -> Stateful<Div> {
+    let (knob_left, bg) = toggle_frame(travel);
     div()
         .id(id)
         .relative()
@@ -869,17 +875,43 @@ pub fn toggle(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
         .flex_none()
         .rounded_full()
         .cursor_pointer()
-        .bg(if checked { accent() } else { border_strong() })
+        .bg(bg)
         .child(
             div()
                 .absolute()
                 .top(px(2.0))
-                .left(px(if checked { 18.0 } else { 2.0 }))
+                .left(px(knob_left))
                 .w(px(16.0))
                 .h(px(16.0))
                 .rounded_full()
                 .bg(white()),
         )
+}
+
+/// 开关在行程 `travel` 处的(滑块 left, 底色)。滑块 2 → 18 线性走,底色在 RGB 空间里从
+/// `border_strong` 过渡到 `accent`(HSL 插值会绕色相环,中途冒出不相干的颜色)。
+fn toggle_frame(travel: f32) -> (f32, Hsla) {
+    let t = travel.clamp(0.0, 1.0);
+    (2.0 + 16.0 * t, mix_rgb(border_strong(), accent(), t))
+}
+
+/// 两色在 RGB 空间里按 `t` 线性混合(含透明度)。
+fn mix_rgb(from: Hsla, to: Hsla, t: f32) -> Hsla {
+    if t <= 0.0 {
+        return from;
+    }
+    if t >= 1.0 {
+        return to;
+    }
+    let (a, b) = (gpui::Rgba::from(from), gpui::Rgba::from(to));
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    gpui::Rgba {
+        r: lerp(a.r, b.r),
+        g: lerp(a.g, b.g),
+        b: lerp(a.b, b.b),
+        a: lerp(a.a, b.a),
+    }
+    .into()
 }
 
 /// 复选框(hook 页的注入目标列表,原版是 `<input type=checkbox accent-[var(--accent)]>`)。
@@ -1196,6 +1228,26 @@ pub fn highlight_runs(text: &str, ranges: &[(usize, usize)]) -> Vec<(String, boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 开关滑块:两端与原先的静止样子逐值一致(left 2 / 18),中途线性;底色两端就是关 /
+    /// 开那两色本身(不经 RGB 往返,免得差一位舍入),中途在 RGB 里混。
+    #[test]
+    fn 开关滑块两端精确_中途线性() {
+        assert_eq!(toggle_frame(0.0).0, 2.0);
+        assert_eq!(toggle_frame(1.0).0, 18.0);
+        assert_eq!(toggle_frame(0.5).0, 10.0);
+        assert_eq!(toggle_frame(-1.0).0, 2.0, "越界钳住");
+        assert_eq!(toggle_frame(3.0).0, 18.0);
+
+        let off = gpui::hsla(0.0, 0.0, 0.2, 1.0);
+        let on = gpui::hsla(0.6, 0.8, 0.5, 1.0);
+        assert_eq!(mix_rgb(off, on, 0.0), off);
+        assert_eq!(mix_rgb(off, on, 1.0), on);
+        let mid = gpui::Rgba::from(mix_rgb(off, on, 0.5));
+        let (a, b) = (gpui::Rgba::from(off), gpui::Rgba::from(on));
+        assert!((mid.r - (a.r + b.r) / 2.0).abs() < 1e-3);
+        assert!((mid.b - (a.b + b.b) / 2.0).abs() < 1e-3);
+    }
 
     /// 弹窗宽度:够宽时用原版那个定值,窗口比它窄就压回窗口宽
     /// (原版靠 flex-shrink + `overflow-hidden`,gpui 的 `Dialog` 是定值宽,

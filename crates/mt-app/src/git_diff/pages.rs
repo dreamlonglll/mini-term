@@ -297,6 +297,7 @@ impl FilesPage {
             tree,
             collapsed: HashSet::new(),
             rows: None,
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
         });
         match files.get(first) {
             Some(file) => load_modal_file(&state, &repo_path, file, Fetch::Fresh, cx),
@@ -360,12 +361,18 @@ impl FilesPage {
                 uniform_list(
                     "git-commit-files",
                     rows.len(),
-                    move |range, _window, _cx: &mut App| {
+                    move |range, window, cx: &mut App| {
+                        // 目录行的折叠箭头在转就要下一帧(这里就是画左栏的那个视图的调用链)
+                        let chevrons = &pick.read(cx).chevrons;
+                        chevrons.drive(window);
                         range
                             .map(|ix| {
                                 rows.get(ix)
                                     .and_then(|row| {
-                                        modal_row(row, &files, &pick, &state, &repo, selected, tree)
+                                        modal_row(
+                                            row, &files, &pick, &state, &repo, selected, tree,
+                                            chevrons,
+                                        )
                                     })
                                     // 数不上的行(不会出现)占住一行高,别把后面的行挤乱
                                     .unwrap_or_else(|| {

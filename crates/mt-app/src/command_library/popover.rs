@@ -18,9 +18,22 @@
 //!
 //! 浮层里再叠一个 Dialog 太重(遮罩叠遮罩),改成**行内二次确认**:点 🗑 后该行
 //! 的动作区换成「确认删除 / 取消」,再点一下才真删;点别的行、Esc、关浮层都算取消。
+//!
+//! # 分组折叠的动画
+//!
+//! 点分组标题:箭头转过去(`fold_motion`),组里那几行高度裁剪展开 / 收起
+//! (`height_reveal`,收起时照旧画着那几行、收完才摘)。浮层框体的开合动画由宿主按内容的
+//! 自然尺寸逐帧插值,两者叠在一起框体会追着一个变化的目标走 —— 所以**浮层打开后
+//! [`crate::popover_reveal::REVEAL_OPEN`] 之内点的那一下不播高度**,直接到位
+//! ([`fold_animates`];本实体看不到宿主的开合状态,按打开时刻推算)。每次打开都清掉
+//! 上一次残留的折叠动画。
+//!
+//! 每个分组**常驻**一份 `HeightReveal`(展开静止时只是一层不设高度的外壳 + 一块量高度的
+//! 探针):收起要从「眼下的自然高度」起收,那个高度得在点之前就量好 —— 临点时才建的话
+//! 第一帧不知道多高,会先塌成 0 再弹回来。
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement,
@@ -32,13 +45,15 @@ use mt_config::SavedCommand;
 use mt_ui::icons::VectorIcon;
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::fold_motion::{FlipTweens, OPEN_TURNS};
+use crate::height_reveal::HeightReveal;
 use crate::i18n::t;
 use crate::store::AppStore;
 use crate::ui;
 
 use super::{
-    ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_COPY, ICON_EDIT, ICON_FOLDER_PLUS,
-    ICON_PLAY, ICON_PLUS, ICON_TRASH, VisibleBucket, flatten_rows, visible_buckets,
+    ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_COPY, ICON_EDIT, ICON_FOLDER_PLUS, ICON_PLAY, ICON_PLUS,
+    ICON_TRASH, VisibleBucket, flatten_rows, visible_buckets,
 };
 
 actions!(
@@ -61,6 +76,12 @@ const COPIED_MS: u64 = 1200;
 /// 行内小图标钮的边长 / 图标尺寸。
 const ACT_BTN: f32 = 20.0;
 const ACT_ICON: f32 = 12.0;
+
+/// 这一下折叠要不要播高度动画:浮层打开(`opened`)满 [`crate::popover_reveal::REVEAL_OPEN`]
+/// 之后才播 —— 那时宿主的开合动画已落定(见模块注释「分组折叠的动画」)。
+fn fold_animates(opened: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(opened) >= crate::popover_reveal::REVEAL_OPEN
+}
 
 /// 浮层要宿主替它做的事。宿主先关浮层(还焦点),再开对应弹窗 —— 顺序反了
 /// Dialog 抢到的焦点会被焦点还原覆盖掉。
@@ -93,6 +114,12 @@ pub struct CommandPopover {
     /// 刚复制了哪条(短暂显示「已复制」)。
     copied: Option<String>,
     _copied_timer: Option<Task<()>>,
+    /// 分组标题的折叠箭头:只让刚点的那一组转(见 `fold_motion`)。
+    chevrons: FlipTweens,
+    /// 各分组的高度展开 / 收起(键同 `collapsed`,每组常驻一份,见模块注释)。
+    folds: HashMap<String, HeightReveal>,
+    /// 这一次打开的时刻(折叠动画等宿主开合落定再播,见 [`fold_animates`])。
+    opened_at: Instant,
     _subs: Vec<Subscription>,
 }
 
@@ -126,6 +153,9 @@ impl CommandPopover {
             pending_delete: None,
             copied: None,
             _copied_timer: None,
+            chevrons: FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
+            folds: HashMap::new(),
+            opened_at: Instant::now(),
             _subs: vec![sub],
         }
     }
@@ -143,6 +173,12 @@ impl CommandPopover {
         self.pending_delete = None;
         self.copied = None;
         self._copied_timer = None;
+        // 上一次残留的折叠动画作废:重新打开时各组按状态静止地画
+        self.chevrons = FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE);
+        for (key, fold) in self.folds.iter_mut() {
+            fold.jump(!self.collapsed.contains(key));
+        }
+        self.opened_at = Instant::now();
         self.query.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus(window, cx);
@@ -211,8 +247,21 @@ impl CommandPopover {
     }
 
     fn toggle_group(&mut self, key: &str, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(key) {
+        let open = self.collapsed.remove(key);
+        if !open {
             self.collapsed.insert(key.to_string());
+        }
+        self.chevrons.flip_open(key, open, OPEN_TURNS);
+        // 在飞的那一场从当前高度掉头;浮层还在开合动画里就直接到位(见 [`fold_animates`])
+        let animate = fold_animates(self.opened_at, Instant::now());
+        let fold = self
+            .folds
+            .entry(key.to_string())
+            .or_insert_with(|| HeightReveal::new(!open));
+        if animate {
+            fold.set_open(open);
+        } else {
+            fold.jump(open);
         }
         self.cursor = 0;
         self.pending_delete = None;
@@ -267,11 +316,10 @@ impl CommandPopover {
             Some(g) => g.clone().into(),
             None => t("commandLibrary", "ungrouped").into(),
         };
-        let chevron = if bucket.collapsed {
-            ICON_CHEVRON_RIGHT
-        } else {
-            ICON_CHEVRON_DOWN
-        };
+        // 只画一枚右指箭头、按圈转到下指(见 `fold_motion`)
+        let turns = self
+            .chevrons
+            .value_open(&key, !bucket.collapsed, OPEN_TURNS);
         let group_for_add = bucket.group.clone();
         let group_for_rename = bucket.group.clone();
         let group_for_dissolve = bucket.group.clone();
@@ -303,7 +351,11 @@ impl CommandPopover {
                     .w(px(11.0))
                     .h(px(11.0))
                     .when(searching, |el| el.opacity(0.0))
-                    .child(VectorIcon::new(chevron, px(11.0)).ink(ui::text_muted())),
+                    .child(
+                        VectorIcon::new(ICON_CHEVRON_RIGHT, px(11.0))
+                            .ink(ui::text_muted())
+                            .rotation(turns),
+                    ),
             )
             .child(div().flex_1().min_w_0().truncate().child(name))
             // 具名分组的管理动作:往这组里加 / 改名 / 解散,悬停才显形。排在计数
@@ -630,10 +682,39 @@ impl CommandPopover {
 }
 
 impl Render for CommandPopover {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let buckets = self.buckets(cx);
         let query = self.query.read(cx).value().to_string();
         let searching = !query.trim().is_empty();
+        self.chevrons.drive(window);
+        // 每组常驻一份折叠件:新出现的组按状态建成静止的,没了的组丢掉;状态被别处改过
+        // (解散分组、搜索中改了库)就直接到位。搜索中折叠不生效,整块不走折叠件
+        if !searching {
+            self.folds
+                .retain(|key, _| buckets.iter().any(|b| b.key() == key.as_str()));
+            for bucket in &buckets {
+                let open = !bucket.collapsed;
+                let fold = self
+                    .folds
+                    .entry(bucket.key().to_string())
+                    .or_insert_with(|| HeightReveal::new(open));
+                if fold.is_open() != open {
+                    fold.jump(open);
+                }
+            }
+        }
+        // 正在收起的组:条目已不在可见桶里,从「全部展开」的那份里取来画最后一程
+        let collapsing = !searching
+            && self
+                .folds
+                .values()
+                .any(|fold| !fold.is_open() && fold.is_mounted());
+        let expanded = if collapsing {
+            let lib = self.store.read(cx).command_library();
+            visible_buckets(lib, &query, &HashSet::new())
+        } else {
+            Vec::new()
+        };
         let rows = flatten_rows(&buckets);
         let cursor = self.cursor.min(rows.len().saturating_sub(1));
         let lib_empty = self.store.read(cx).command_library().is_empty();
@@ -687,11 +768,34 @@ impl Render for CommandPopover {
                 if bucket.group.is_some() || show_ungrouped_header {
                     list = list.child(self.render_group_header(bucket, searching, cx));
                 }
-                for cmd in &bucket.items {
-                    let is_cursor = flat_idx == cursor;
-                    list = list.child(self.render_row(cmd, flat_idx, is_cursor, mono.clone(), cx));
-                    flat_idx += 1;
+                let fold = (!searching).then(|| self.folds.get(bucket.key())).flatten();
+                let Some(fold) = fold.filter(|fold| fold.is_mounted()) else {
+                    // 搜索中(不走折叠件),或收起且静止(一行都不画)
+                    for cmd in &bucket.items {
+                        let is_cursor = flat_idx == cursor;
+                        list =
+                            list.child(self.render_row(cmd, flat_idx, is_cursor, mono.clone(), cx));
+                        flat_idx += 1;
+                    }
+                    continue;
+                };
+                // 组里那几行装进折叠件(静止展开时只是一层外壳)。展开着的照常进游标序列;
+                // 收起中的已不在游标序列里(也接不到鼠标),只画最后一程
+                let mut rows = div();
+                if fold.is_open() {
+                    for cmd in &bucket.items {
+                        let is_cursor = flat_idx == cursor;
+                        rows =
+                            rows.child(self.render_row(cmd, flat_idx, is_cursor, mono.clone(), cx));
+                        flat_idx += 1;
+                    }
+                } else if let Some(full) = expanded.iter().find(|b| b.key() == bucket.key()) {
+                    for cmd in &full.items {
+                        rows =
+                            rows.child(self.render_row(cmd, usize::MAX, false, mono.clone(), cx));
+                    }
                 }
+                list = list.child(fold.render(rows, window));
             }
         }
 
@@ -727,5 +831,22 @@ impl Render for CommandPopover {
             )
             .child(list)
             .child(self.render_footer(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 浮层自己还在开合动画里(打开不满 `REVEAL_OPEN`)时点的那一下不播高度,直接到位 ——
+    /// 否则框体会追着一个变化的目标插值。
+    #[test]
+    fn 浮层开合落定之前点的折叠不播高度() {
+        let t0 = Instant::now();
+        let open = crate::popover_reveal::REVEAL_OPEN;
+        assert!(!fold_animates(t0, t0));
+        assert!(!fold_animates(t0, t0 + open / 2));
+        assert!(fold_animates(t0, t0 + open));
+        assert!(fold_animates(t0, t0 + open * 3));
     }
 }

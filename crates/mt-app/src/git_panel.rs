@@ -110,6 +110,18 @@
 //! 「更改」与「提交历史」按拖拽比例分,但内容比分到的矮的那一块收到内容高度、把富余
 //! 让给另一块(见 [`section_heights`]):冲突演练里「已暂存」不必再滚动去找、下面的历史
 //! 却空着半截。两块都放不下时照旧按比例。
+//!
+//! # 折叠动画
+//!
+//! 两块的内容区本来就是 `flex-basis: 0` + `overflow: hidden` 的竖向裁剪窗,折叠 / 展开只是
+//! 把 flex-grow 在 0 与分到的份额之间切。点标题那一刻记下屏上的两块 grow,之后
+//! [`SECTION_TOGGLE`](mt_ui::motion::SECTION_TOGGLE) 时长里从它补到目标([`blend_grows`]);
+//! 目标照旧每帧按上面的规则现算(内容让位、拖拽比例都不受影响),动画期间只是不直接用它。
+//! canvas 量的是整块面板的高度,与两块怎么分无关,不会跟补间互相拉扯。标题上的箭头同步
+//! 转过去(`fold_motion`)。
+//!
+//! 进行中操作横幅(①')出现 / 消失时高度裁剪展开 / 收起(`height_reveal`),两块可分配的
+//! 高度按它这一帧的插值高度扣。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -132,6 +144,7 @@ use mt_project::git::{
 use mt_remote::GitContext;
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::fold_motion::{FlipTweens, OPEN_TURNS};
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_dir_watch::{
     GitDirWatch, IndexLockGate, LockProbe, RepoObservation, WorktreeBatch, WorktreeWatch,
@@ -139,6 +152,7 @@ use crate::git_dir_watch::{
 use crate::git_history::{CommitDetailPane, GitHistoryContent, GitHistoryEvent};
 use crate::git_ui::{self, Tone, estimate_text_width};
 use crate::git_watch;
+use crate::height_reveal::HeightReveal;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
 use crate::prompt::Confirm;
@@ -438,6 +452,22 @@ pub struct GitPanel {
     /// 上一帧左段的让位档(同上)。
     bar_squeeze: BarSqueeze,
     drag: Option<SectionDrag>,
+    /// 两块折叠区标题上的箭头:只让刚点的那一块转(见 `fold_motion`)。
+    chevrons: FlipTweens,
+    /// 区块折叠 / 展开的 flex-grow 补间(见模块注释「折叠动画」):点标题时重播。
+    grow_anim: mt_ui::motion::Transition,
+    /// 点标题那一刻屏上的两块 grow(补间起点)。
+    grow_from: (f32, f32),
+    /// 上一帧实际画的两块 grow。
+    grow_shown: (f32, f32),
+    /// 进行中操作横幅的高度裁剪展开 / 收起。
+    banner: HeightReveal,
+    /// 横幅最近一次画的操作 —— 收起动画里 `meta.op` 已经清了,照它画旧的那条。
+    banner_op: RepoOpState,
+    /// 上一帧看横幅时的「仓库 + 数据到没到」:换了仓库或数据刚到就直接到位、不播。
+    banner_seen: Option<(String, bool)>,
+    /// 这一帧横幅占多高(canvas 换算两块可分配高度用,与画出来的是同一个数)。
+    banner_h: f32,
     _tick: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
@@ -718,6 +748,14 @@ impl GitPanel {
             sync_badge: SyncBadge::Full,
             bar_squeeze: BarSqueeze::None,
             drag: None,
+            chevrons: FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
+            grow_anim: mt_ui::motion::Transition::settled(mt_ui::motion::SECTION_TOGGLE),
+            grow_from: (0.5, 0.5),
+            grow_shown: (0.5, 0.5),
+            banner: HeightReveal::new(false),
+            banner_op: RepoOpState::default(),
+            banner_seen: None,
+            banner_h: 0.0,
             _tick: None,
             _subs: subs,
         }
@@ -729,6 +767,8 @@ impl GitPanel {
             return;
         }
         self.visible = visible;
+        // 抽屉重新打开:横幅按眼下的状态直接到位,不在抽屉滑进来的同时再长一遍
+        self.banner_seen = None;
         let context = self.active_project_context(cx);
         let project_id = self.store.read(cx).active_project_id.clone();
         if context.as_ref().is_some_and(GitContext::is_remote)
@@ -2917,6 +2957,27 @@ fn native_path_display(path: &str) -> String {
     }
 }
 
+/// 区块折叠动画这一帧的两块 grow:从点标题那一刻屏上的 `from` 按进度 `p`(已缓动)
+/// 补到这一帧现算的 `target`(见模块注释「折叠动画」)。两块各自线性插值 —— 起止两端的
+/// grow 之和都是 1(或收起的那块为 0),中途也就落在两者之间,不会忽大忽小。
+fn blend_grows(from: (f32, f32), target: (f32, f32), p: f32) -> (f32, f32) {
+    let p = p.clamp(0.0, 1.0);
+    if p >= 1.0 {
+        return target;
+    }
+    (
+        from.0 + (target.0 - from.0) * p,
+        from.1 + (target.1 - from.1) * p,
+    )
+}
+
+/// 横幅这次开合要不要播:上一帧看的是**同一个仓库**、且那时与此刻数据都已到位。换了仓库、
+/// 刚换项目(数据还没到)、抽屉重新打开(`seen` 被清掉)都直接到位 —— 那是整块上下文换了,
+/// 不是「合并开始了 / 结束了」。
+fn banner_animates(seen: Option<&(String, bool)>, repo: &str, loaded: bool) -> bool {
+    seen.is_some_and(|(prev, was_loaded)| prev == repo && *was_loaded && loaded)
+}
+
 /// 任意 flex-grow(gpui 的 `flex_grow()` 只会设成 1)。
 fn grow<E: Styled>(mut el: E, value: f32) -> E {
     el.style().flex_grow = Some(value);
@@ -2930,7 +2991,7 @@ fn shrink<E: Styled>(mut el: E, value: f32) -> E {
 }
 
 impl Render for GitPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 空态按顺序短路(`GitHistory.tsx:331-345`)
         if self.store.read(cx).active_project().is_none() {
             return div().size_full().child(centered_hint(
@@ -2963,7 +3024,7 @@ impl Render for GitPanel {
             if recovery.is_none() && self.visible && self.enable_prompted.insert(project_id.clone())
             {
                 let store = self.store.clone();
-                _window.defer(cx, move |window, cx| {
+                window.defer(cx, move |window, cx| {
                     crate::git_backend::request_enable(store, project_id, window, cx)
                 });
             }
@@ -3026,6 +3087,22 @@ impl Render for GitPanel {
             self.effective_ratio = section.ratio;
             (changes_grow, history_grow)
         };
+        // 折叠 / 展开的补间(见模块注释「折叠动画」):动画期间从点击那一刻的屏上值补到目标
+        let folding = self.grow_anim.running();
+        let fold_p = self.grow_anim.drive(window);
+        let (changes_grow, history_grow) = if folding {
+            blend_grows(self.grow_from, (changes_grow, history_grow), fold_p)
+        } else {
+            (changes_grow, history_grow)
+        };
+        self.grow_shown = (changes_grow, history_grow);
+        self.chevrons.drive(window);
+        let changes_turns =
+            self.chevrons
+                .value_open("git-section-changes", section.changes_open, OPEN_TURNS);
+        let history_turns =
+            self.chevrons
+                .value_open("git-section-history", section.history_open, OPEN_TURNS);
         let section_box = |grow_by: f32| {
             grow(
                 div().flex_basis(px(0.0)).min_h(px(0.0)).overflow_hidden(),
@@ -3044,9 +3121,15 @@ impl Render for GitPanel {
 
         if !self.repos.is_empty() {
             root = root.child(self.render_repo_bar(cx));
-            if let Some(banner) = self.render_op_banner(cx) {
-                root = root.child(banner);
+            self.sync_banner();
+            if self.banner.is_mounted()
+                && let Some(banner) = self.render_op_banner(self.banner_op, cx)
+            {
+                root = root.child(self.banner.render(banner, window));
             }
+            self.banner_h = self.banner.shown_height(BAR_HEIGHT);
+        } else {
+            self.banner_h = 0.0;
         }
         if let Some(error) = &self.load_error {
             root = root.child(git_ui::error_block(error.clone()));
@@ -3060,14 +3143,16 @@ impl Render for GitPanel {
                 "git-section-changes",
                 t("panels", "changes"),
                 section.changes_open,
+                changes_turns,
                 false,
                 Some(self.render_view_mode_toggle(cx)),
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    SECTION_UI.with(|s| {
+                    let open = SECTION_UI.with(|s| {
                         let mut s = s.borrow_mut();
                         s.changes_open = !s.changes_open;
+                        s.changes_open
                     });
-                    let _ = this;
+                    this.start_section_toggle("git-section-changes", open);
                     cx.notify();
                 }),
             ))
@@ -3077,14 +3162,16 @@ impl Render for GitPanel {
             "git-section-history",
             t("panels", "history"),
             section.history_open,
+            history_turns,
             true,
             None,
             cx.listener(|this, _: &ClickEvent, _window, cx| {
-                SECTION_UI.with(|s| {
+                let open = SECTION_UI.with(|s| {
                     let mut s = s.borrow_mut();
                     s.history_open = !s.history_open;
+                    s.history_open
                 });
-                let _ = this;
+                this.start_section_toggle("git-section-history", open);
                 cx.notify();
             }),
         );
@@ -3106,13 +3193,12 @@ impl Render for GitPanel {
                 canvas(
                     move |bounds: Bounds<Pixels>, window, cx| {
                         let stale = this.update(cx, |panel: &mut GitPanel, cx| {
-                            // 整块面板的高度减掉固定件(仓库栏 + 横幅 + 两个 header 30)
+                            // 整块面板的高度减掉固定件(仓库栏 + 横幅 + 两个 header 30)。
+                            // 横幅开合时按它这一帧的插值高度扣
                             let fixed = if panel.repos.is_empty() {
                                 60.0
-                            } else if panel.meta.op.kind.is_some() {
-                                60.0 + BAR_HEIGHT * 2.0
                             } else {
-                                60.0 + BAR_HEIGHT
+                                60.0 + BAR_HEIGHT + panel.banner_h
                             };
                             let total = (f32::from(bounds.size.height) - fixed).max(1.0);
                             let resized = (total - panel.sections_height).abs() > 0.5;
@@ -3171,15 +3257,19 @@ impl Render for GitPanel {
 /// SectionHeader(`GitHistory.tsx:69-100`),走共用的 [`git_ui::SectionHeader`]。
 /// `bordered` 只有下方「提交历史」用。`trailing` 是右侧的动作位(「更改」的视图切换
 /// 按钮住这);共用图标按钮自己拦住冒泡,不会连带触发 header 的折叠。
+/// `turns` 是折叠箭头这一帧的旋转(见 `fold_motion`)。
 fn section_header(
     id: &'static str,
     label: &'static str,
     open: bool,
+    turns: f32,
     bordered: bool,
     trailing: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let mut header = git_ui::SectionHeader::new(id, label).collapsible(open);
+    let mut header = git_ui::SectionHeader::new(id, label)
+        .collapsible(open)
+        .chevron_turns(turns);
     if let Some(trailing) = trailing {
         header = header.trailing(trailing);
     }
@@ -3193,6 +3283,36 @@ fn section_header(
 }
 
 impl GitPanel {
+    /// 点了某块的标题(状态已翻成 `open`):grow 从屏上的当前值起补、箭头转过去。
+    fn start_section_toggle(&mut self, key: &'static str, open: bool) {
+        self.grow_from = self.grow_shown;
+        self.grow_anim.restart();
+        self.chevrons.flip_open(key, open, OPEN_TURNS);
+    }
+
+    /// 横幅的开合跟着 `meta.op` 走(见 [`banner_animates`]):状态变了才播,换了上下文直接到位。
+    /// 收起动画里内容照 [`Self::banner_op`] 画最后那一条。
+    fn sync_banner(&mut self) {
+        let op = self.meta.op;
+        let shown = op.kind.is_some();
+        if shown {
+            self.banner_op = op;
+        }
+        let loaded = self.sig_observed_at.is_some();
+        if banner_animates(self.banner_seen.as_ref(), &self.selected_repo, loaded) {
+            self.banner.set_open(shown);
+        } else if self.banner.is_open() != shown || self.banner.is_running() {
+            self.banner.jump(shown);
+        }
+        let stale = self
+            .banner_seen
+            .as_ref()
+            .is_none_or(|(repo, was_loaded)| *repo != self.selected_repo || *was_loaded != loaded);
+        if stale {
+            self.banner_seen = Some((self.selected_repo.clone(), loaded));
+        }
+    }
+
     /// 中缝拖拽手柄(`GitHistory.tsx:516-523`):骑在「提交历史」标题上沿的 6px 绝对定位条
     /// (上下各 3px)。
     ///
@@ -3722,9 +3842,11 @@ impl GitPanel {
 
     /// 进行中操作横幅:attention 语义 —— 左侧 3px 竖条 + 淡底 + 图标 + 加粗动词 +
     /// 冲突数胶囊,右对齐「继续」(主)「中止」(次)。仍有冲突时「继续」禁用。
-    fn render_op_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let kind = self.meta.op.kind?;
-        let conflicted = self.meta.op.conflicted;
+    ///
+    /// `op` 是要画的那一条:平时就是 `meta.op`,收起动画里是消失前的最后一条。
+    fn render_op_banner(&self, op: RepoOpState, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let kind = op.kind?;
+        let conflicted = op.conflicted;
         let color = ui::color_attention();
         let verb = t(
             "gitBranch",
@@ -4103,6 +4225,43 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
+    }
+
+    /// 折叠补间:起止两端精确,中途两块各自线性走,和不跑出 [起点和, 终点和] 之间。
+    #[test]
+    fn 区块折叠的_grow_补间端点精确() {
+        // 两块都开(0.4 / 0.6)→ 折起「更改」(0 / 1)
+        let from = (0.4, 0.6);
+        let target = (0.0, 1.0);
+        assert_eq!(blend_grows(from, target, 0.0), from);
+        assert_eq!(blend_grows(from, target, 1.0), target);
+        assert_eq!(blend_grows(from, target, 1.7), target, "越界钳住");
+        let (c, h) = blend_grows(from, target, 0.5);
+        assert!((c - 0.2).abs() < 1e-6 && (h - 0.8).abs() < 1e-6, "{c} {h}");
+        assert!((c + h - 1.0).abs() < 1e-6, "两端和都是 1,中途也是");
+        // 只开着「提交历史」再把它折起(0 / 1 → 0 / 0):grow 之和小于 1 时 flex 只分
+        // 那一部分富余,高度随之连续收到 0
+        let (c, h) = blend_grows((0.0, 1.0), (0.0, 0.0), 0.25);
+        assert_eq!(c, 0.0);
+        assert!((h - 0.75).abs() < 1e-6);
+    }
+
+    /// 横幅开合只在「同一个仓库、数据早已到位」时播;换仓库 / 数据刚到 / 抽屉重开直接到位。
+    #[test]
+    fn 横幅只在同仓库数据到位时播() {
+        let seen = ("D:/repo".to_string(), true);
+        assert!(banner_animates(Some(&seen), "D:/repo", true));
+        assert!(!banner_animates(Some(&seen), "D:/other", true), "换了仓库");
+        assert!(
+            !banner_animates(Some(&seen), "D:/repo", false),
+            "数据被清空(换项目)"
+        );
+        let unloaded = ("D:/repo".to_string(), false);
+        assert!(
+            !banner_animates(Some(&unloaded), "D:/repo", true),
+            "数据刚到"
+        );
+        assert!(!banner_animates(None, "D:/repo", true), "抽屉刚重新打开");
     }
 
     /// 比例钳在 0.15~0.85。

@@ -274,6 +274,8 @@ const NOTICE_TTL: Duration = Duration::from_secs(5);
 
 pub struct FileTree {
     store: Entity<AppStore>,
+    /// 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`),按目录路径索引。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 已列出的目录 → 子项。
     entries: HashMap<PathBuf, Vec<FileEntry>>,
     /// 正在列的目录(防重复排队)。
@@ -549,6 +551,7 @@ impl FileTree {
             pending_reload: HashMap::new(),
             watcher,
             watched: HashSet::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             current_project: None,
             source_signature: None,
             source_generation: 0,
@@ -1604,6 +1607,8 @@ impl FileTree {
         };
         let key = path.to_string_lossy().to_string();
         let expanded = self.store.read(cx).is_dir_expanded(&project_id, &key);
+        self.chevrons
+            .flip_open(key.clone(), !expanded, crate::fold_motion::OPEN_TURNS);
         self.store.update(cx, |store, cx| {
             store.set_dir_expanded(&project_id, &key, !expanded, cx)
         });
@@ -2270,6 +2275,7 @@ impl Render for FileTree {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 记下这一帧看到的 store(下面各处的读取点都在这份指纹里,见 store_render_signature)
         self.rendered_store_signature = self.store_signature(cx);
+        self.chevrons.drive(window);
         // 工作区的当前文件同理:画的是哪一份就记哪一份,工作区通知时拿现值来比
         self.active_file = self.current_active_file(cx);
         if !cx.has_active_drag() {
@@ -3018,12 +3024,18 @@ impl FileTree {
                     crate::menu::show(event.position, entries, window, cx);
                 }),
             )
+            // 折叠箭头:同大小同位置的矢量三角(原先是 ▸ / ▾ 两个字形硬换),只让刚点的
+            // 那一行转过去(见 `fold_motion`)
             .child(
                 div()
                     .w(px(10.0))
                     .text_color(ui::text_muted())
                     .when(row.is_dir, |el| {
-                        el.child(if row.expanded { "▾" } else { "▸" })
+                        el.child(crate::fold_motion::fold_glyph(self.chevrons.value_open(
+                            &row.path.to_string_lossy(),
+                            row.expanded,
+                            crate::fold_motion::OPEN_TURNS,
+                        )))
                     }),
             )
             .child(icon)

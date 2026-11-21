@@ -214,8 +214,14 @@ mod tests {
                 );
                 assert!(exempt.progress_at(half, mt_ui::motion::reduce_motion()) < 1.0);
             }
-            // 对照组:不在豁免名单里的照旧直达终态
-            assert!(!mt_ui::motion::TAG_FADE_IN.running_at(half, mt_ui::motion::reduce_motion()));
+            // 完成标进场 2026-11-21 起也豁免(用户机器上系统动画关着,过闸就从来没播过)
+            assert!(mt_ui::motion::TAG_FADE_IN.running_at(half, mt_ui::motion::reduce_motion()));
+            // 对照组:不豁免的规格照旧直达终态(仓里已没有过闸的规格,现造一条)
+            let gated = mt_ui::motion::TransitionSpec::new(
+                Duration::from_millis(300),
+                mt_ui::motion::Easing::EaseOut,
+            );
+            assert!(!gated.running_at(half, mt_ui::motion::reduce_motion()));
         });
     }
 }

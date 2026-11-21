@@ -68,7 +68,7 @@
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
     px,
 };
@@ -82,6 +82,7 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
 use crate::menu;
+use crate::motion_kit::{KeyedSwap, PushAxis, push_pair};
 use crate::notify::ToastKind;
 use crate::prompt::{Confirm, show_alert};
 use crate::session_branch::{
@@ -596,6 +597,14 @@ pub struct SessionPanel {
     /// 断链的远程项目:列表恒空,头部给一句断链提示。
     remote_broken: bool,
     preview: Option<Preview>,
+    /// 「列表 ↔ 详情」下钻的横向 push:进详情内容向左推,返回向右推(`motion_kit`,
+    /// [`mt_ui::motion::PANEL_SWAP`])。键 = 详情开着没有。
+    drill: KeyedSwap<bool>,
+    /// 刚返回时那一份详情:返回动画里它还要作为出场层画最后一程,播完即丢。
+    preview_exit: Option<Preview>,
+    /// 列表的滚动位置。放句柄里:看详情时列表不在树上,元素自带的滚动状态会随之丢掉,
+    /// 返回之后得回到原来那一屏。
+    list_scroll: ScrollHandle,
     /// 正文加载。不放 `_tasks`:那边只进不换,旧任务迟到时回写的是**当前**那份预览
     /// (打开 A → 返回 → 打开 B,A 晚回来就是 B 的标题配 A 的正文)。这里每次打开
     /// 覆盖、返回与刷新置空,丢掉句柄即取消回写。已经在跑的同步读取停不下来,
@@ -672,6 +681,9 @@ impl SessionPanel {
             remote: false,
             remote_broken: false,
             preview: None,
+            drill: KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
+            preview_exit: None,
+            list_scroll: ScrollHandle::new(),
             preview_task: None,
             _tasks: Vec::new(),
             delete_busy: false,
@@ -766,6 +778,9 @@ impl SessionPanel {
         self.lineage.clear();
         self.display_count = PAGE_SIZE;
         self.preview = None;
+        // 换了一整块上下文(项目):直接回列表,不把上一个项目的正文推出来
+        self.drill.jump(&false);
+        self.preview_exit = None;
         self.preview_task = None;
         self._tasks.clear();
 
@@ -1366,15 +1381,10 @@ impl SessionPanel {
     ///
     /// 选区**跨不了消息**(组件的选区坐标相对单个 TextView 自己的 bounds),
     /// 所以每条消息头上留一颗「复制」、顶上留一颗「复制全文」把整条/整份兜住。
-    fn render_preview(
-        &mut self,
-        preview_title: String,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(preview) = self.preview.as_ref() else {
-            return div().into_any_element();
-        };
+    ///
+    /// `preview` 通常就是 `self.preview`;返回动画里是刚退出的那一份(`preview_exit`)。
+    fn render_preview(&self, preview: &Preview, cx: &mut Context<Self>) -> AnyElement {
+        let preview_title = preview.title.clone();
         let loading = preview.loading;
         let error = preview.error.clone();
         let command = preview.command.clone();
@@ -1521,7 +1531,8 @@ impl SessionPanel {
                         )
                         .on_click(cx.listener(
                             |this: &mut Self, _, _window, cx| {
-                                this.preview = None;
+                                // 留一份给返回动画当出场层(见 `drill`)
+                                this.preview_exit = this.preview.take();
                                 this.preview_task = None;
                                 cx.notify();
                             },
@@ -1578,11 +1589,42 @@ impl Render for SessionPanel {
             .border_l_1()
             .border_color(ui::border_default());
 
-        if let Some(title) = self.preview.as_ref().map(|p| p.title.clone()) {
-            let body = self.render_preview(title, window, cx);
-            return container.child(body);
+        // 「列表 ↔ 详情」下钻(见 `drill`):往详情走新内容从右进、列表向左出,返回镜像
+        let detail = self.preview.is_some();
+        self.drill
+            .observe(&detail, |_, to_detail| if *to_detail { 1.0 } else { -1.0 });
+        let swap = self.drill.frame(window);
+        if swap.is_none() {
+            self.preview_exit = None;
         }
+        let current = match self.preview.as_ref() {
+            Some(preview) => self.render_preview(preview, cx),
+            None => self.render_list(window, cx),
+        };
+        let Some((was_detail, progress, dir)) = swap else {
+            return container.child(current);
+        };
+        let leaving = if was_detail {
+            self.preview_exit
+                .as_ref()
+                .map(|preview| self.render_preview(preview, cx))
+        } else {
+            Some(self.render_list(window, cx))
+        };
+        container.child(push_pair(
+            current,
+            leaving,
+            progress,
+            PushAxis::Horizontal,
+            dir,
+        ))
+    }
+}
 
+impl SessionPanel {
+    /// 会话列表(标题行 + 过滤框 + 列表)。下钻动画里它与详情同帧各画一份(一边进场、
+    /// 一边出场),列表本身一帧至多一份 —— 过滤框的输入框实体不会被挂两次。
+    fn render_list(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let needle = self.filter_needle(cx);
         let filtering = needle.is_some();
         let (rows, total) = self.rows(needle.as_deref());
@@ -1640,6 +1682,7 @@ impl Render for SessionPanel {
             .id("session-list")
             .flex_1()
             .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
             .px(px(6.0))
             .flex()
             .flex_col();
@@ -1871,7 +1914,10 @@ impl Render for SessionPanel {
             );
         }
 
-        container
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
             .child(
                 div()
                     .flex()
@@ -1993,6 +2039,7 @@ impl Render for SessionPanel {
                 )
             })
             .child(list)
+            .into_any_element()
     }
 }
 

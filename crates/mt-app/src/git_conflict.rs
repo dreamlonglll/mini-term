@@ -63,8 +63,8 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::git_diff;
 use crate::git_dir_watch::RepoObservation;
 use crate::git_ui::{
-    self, ButtonKind, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CHEVRON_DOWN, ICON_CHEVRON_RIGHT,
-    ICON_CLOSE, ICON_MERGE, ICON_REFRESH, Tone, mono,
+    self, ButtonKind, ICON_ARROW_DOWN, ICON_ARROW_UP, ICON_CLOSE, ICON_MERGE, ICON_REFRESH, Tone,
+    mono,
 };
 use crate::i18n::{t, tr};
 use crate::prompt::{close_guarded, is_open, kind, open_guarded};
@@ -234,6 +234,8 @@ struct SegmentDialog {
     current: usize,
     /// 展开着共同祖先的段
     base_open: HashSet<usize>,
+    /// 「共同祖先」折叠箭头:只让刚点的那一段转(见 `fold_motion`),按段号索引。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 正在重读文件
     loading: bool,
     /// 读取的请求令牌(连按刷新时迟到的旧结果丢掉)
@@ -292,6 +294,7 @@ pub fn open(
         picks: Vec::new(),
         current: 0,
         base_open: HashSet::new(),
+        chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
         loading: false,
         request: 0,
         writing: None,
@@ -308,6 +311,8 @@ pub fn open(
         move |dialog, window, cx| {
             let (width, body_h) = git_diff::modal_size(window.viewport_size());
             let s = state.read(cx);
+            // 「共同祖先」的折叠箭头在转就要下一帧(弹窗正文每帧经这里重建)
+            s.chevrons.drive(window);
             let keep = s.writing.is_some() || s.picks.iter().any(Option::is_some);
             dialog
                 .w(width)
@@ -450,9 +455,12 @@ fn set_pick(state: &Entity<SegmentDialog>, index: usize, pick: Option<ConflictPi
 
 fn toggle_base(state: &Entity<SegmentDialog>, index: usize, cx: &mut App) {
     state.update(cx, |s, cx| {
-        if !s.base_open.remove(&index) {
+        let open = !s.base_open.remove(&index);
+        if open {
             s.base_open.insert(index);
         }
+        s.chevrons
+            .flip_open(index.to_string(), open, crate::fold_motion::OPEN_TURNS);
         s.current = index;
         cx.notify();
     });
@@ -834,12 +842,15 @@ fn render_card(
             file.theirs_text(block).is_empty(),
         ));
     let base = view.base.as_ref().map(|base_view| {
+        let open = s.base_open.contains(&index);
         render_base(
             state,
             block,
             base_view,
             file.base_text(block).is_some_and(str::is_empty),
-            s.base_open.contains(&index),
+            open,
+            s.chevrons
+                .value_open(&index.to_string(), open, crate::fold_motion::OPEN_TURNS),
             index,
         )
     });
@@ -948,12 +959,14 @@ fn code_box(view: &Entity<TextareaState>, empty: bool) -> AnyElement {
 }
 
 /// 共同祖先:默认折着(一行「▸ 共同祖先(base) · 名字 · N 行」),点开看原文。
+/// `turns` 是折叠箭头这一帧的旋转(见 `fold_motion`)。
 fn render_base(
     state: &Entity<SegmentDialog>,
     block: &ConflictBlock,
     view: &Entity<TextareaState>,
     empty: bool,
     open: bool,
+    turns: f32,
     index: usize,
 ) -> Div {
     let toggle_state = state.clone();
@@ -967,15 +980,7 @@ fn render_base(
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_secondary())
         .hover(|el| el.text_color(ui::text_primary()))
-        .child(git_ui::icon(
-            if open {
-                ICON_CHEVRON_DOWN
-            } else {
-                ICON_CHEVRON_RIGHT
-            },
-            git_ui::ICON_SIZE_SM,
-            ui::text_muted(),
-        ))
+        .child(git_ui::chevron(turns))
         .child(div().flex_none().child(t("gitCommit", "segments.base")))
         .child(
             mono(div())

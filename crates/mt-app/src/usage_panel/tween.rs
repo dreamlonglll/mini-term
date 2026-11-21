@@ -2,7 +2,7 @@
 //!
 //! 与 `mt_ui::motion::ValueTween`(排行条宽度用的那条)的区别:这里是 KPI 数字
 //! 自己的一份 —— 400ms easeOutCubic、不过减弱动效那道闸、目标中途变了从**当前
-//! 显示值**接着补。
+//! 显示值**接着补。服从「启用动画」总开关(关掉即直达终值)。
 
 use std::time::Instant;
 
@@ -47,7 +47,8 @@ impl Tween {
     }
 
     fn progress(&self, now: Instant) -> f32 {
-        if self.from == self.to {
+        // 「启用动画」总开关关掉:数字直达终值(与 `mt_ui::motion` 的基件同口径)
+        if self.from == self.to || !mt_ui::motion::animations_enabled() {
             return 1.0;
         }
         (now.duration_since(self.start).as_secs_f32() * 1000.0 / TWEEN_MS).clamp(0.0, 1.0)

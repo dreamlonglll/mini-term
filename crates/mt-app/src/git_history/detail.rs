@@ -132,6 +132,8 @@ pub(super) struct DetailState {
     pending_body: Option<String>,
     /// 改动文件树里收起的目录(完整路径)。换了一份详情就全部展开。
     collapsed: HashSet<String>,
+    /// 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`)。
+    chevrons: crate::fold_motion::FlipTweens,
     /// 详情区的滚动位置。换了一个提交就回到顶上(标题与元信息在最上面),
     /// 不然上一个提交往下翻过,新提交一进来先看到的是文件列表的半截。
     scroll: ScrollHandle,
@@ -181,6 +183,7 @@ impl DetailState {
             body: cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, BODY_MAX_ROWS)),
             pending_body: None,
             collapsed: HashSet::new(),
+            chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             scroll: ScrollHandle::new(),
             file_rows: RefCell::new(None),
             containing_order: RefCell::new(None),
@@ -679,6 +682,7 @@ fn render_pane(
 ) -> AnyElement {
     // 后台取回来的正文这时写进只读框(写框要窗口)
     this.detail.flush_body(window, cx);
+    this.detail.chevrons.drive(window);
     let this = &*this;
     let multi = this.selection.len() >= 2;
 
@@ -958,6 +962,7 @@ fn render_content(
             more_key: "detail.moreFiles",
         },
         open,
+        &this.detail.chevrons,
         cx,
     ))
 }
@@ -1244,6 +1249,7 @@ fn render_multi(
                     more_key: "multi.moreFiles",
                 },
                 open,
+                &this.detail.chevrons,
                 cx,
             ))
         }
@@ -1293,12 +1299,15 @@ struct FileTexts {
 /// 文件区:标题行(文件数 + 合计行数 + 列表 / 树形切换)+ 文件行(最多 [`MAX_FILE_ROWS`]
 /// 行)+「还有 N 个文件」。行序取缓存的 [`FileRows`],`file(下标)` 给出那个文件,
 /// `count` 是文件总数。
+/// `chevrons` 是目录行折叠箭头的补间表(见 `fold_motion`)。
+#[allow(clippy::too_many_arguments)]
 fn render_files<'a>(
     model: &FileRows,
     count: usize,
     file: &dyn Fn(usize) -> Option<FileEntry<'a>>,
     texts: FileTexts,
     open: OpenFile,
+    chevrons: &crate::fold_motion::FlipTweens,
     cx: &mut Context<GitHistoryContent>,
 ) -> gpui::Div {
     let tree = model.tree;
@@ -1359,12 +1368,20 @@ fn render_files<'a>(
             } => {
                 let id = SharedString::from(format!("git-log-detail-dir-{full_path}"));
                 let full_path = full_path.clone();
+                let turns =
+                    chevrons.value_open(&full_path, !*collapsed, crate::fold_motion::OPEN_TURNS);
                 list = list.child(
-                    git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed)
+                    git_ui::tree_dir_row(id, name.clone(), *file_count, *depth, *collapsed, turns)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                            if !this.detail.collapsed.remove(&full_path) {
+                            let open = this.detail.collapsed.remove(&full_path);
+                            if !open {
                                 this.detail.collapsed.insert(full_path.clone());
                             }
+                            this.detail.chevrons.flip_open(
+                                full_path.clone(),
+                                open,
+                                crate::fold_motion::OPEN_TURNS,
+                            );
                             this.detail.files_changed();
                             cx.notify();
                         })),
