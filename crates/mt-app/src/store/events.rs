@@ -204,8 +204,8 @@ impl StoreEvent {
     /// 移动端结构同步(`RelayBridge::sync_now` 与 `refresh_mirror`)读的数据可能变了。
     ///
     /// 依赖:项目的名字 / 路径 / 远程连接、项目树次序与分组名链、pane 集合与各自的
-    /// PTY 编号、pane 状态与黄灯、pane 标题(`customTitle ?? shellName`,**不是**
-    /// OSC 标题)、AI 启动器。
+    /// PTY 编号、pane 状态与黄灯、pane 会话身份(历史列表「运行中」与 resume 精确镜像)、
+    /// pane 标题(`customTitle ?? shellName`,**不是** OSC 标题)、AI 启动器。
     pub fn touches_relay_sync(self) -> bool {
         matches!(
             self,
@@ -213,6 +213,7 @@ impl StoreEvent {
                 | Self::ProjectTreeChanged
                 | Self::LayoutChanged
                 | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
                 | Self::PaneRenamed
                 | Self::Config(ConfigSection::MobileRelay)
         )
@@ -325,14 +326,13 @@ mod tests {
     }
 
     /// 改造的出发点:AI 工作时的 OSC 标题热路径**一个非渲染观察者都不叫醒**。
-    /// 焦点 / 标记 / 会话身份 / 主题字号同理 —— 它们只有 render 在读。
+    /// 焦点 / 标记 / 主题字号同理 —— 它们只有 render 在读。
     #[test]
     fn 标题等纯渲染数据不唤醒任何非渲染观察者() {
         let render_only = [
             StoreEvent::PaneTitleChanged,
             StoreEvent::FocusedPaneChanged,
             StoreEvent::MarkersChanged,
-            StoreEvent::PaneSessionChanged,
             StoreEvent::ExpandedDirsChanged,
             StoreEvent::MobileRelayStatusChanged,
             StoreEvent::Config(ConfigSection::Appearance),
@@ -378,6 +378,7 @@ mod tests {
                 StoreEvent::ProjectTreeChanged,
                 StoreEvent::LayoutChanged,
                 StoreEvent::PaneStatusChanged,
+                StoreEvent::PaneSessionChanged,
                 StoreEvent::PaneRenamed,
                 StoreEvent::Config(ConfigSection::MobileRelay),
             ]

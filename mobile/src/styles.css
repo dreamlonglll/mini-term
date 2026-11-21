@@ -1343,6 +1343,380 @@ body {
 }
 
 
+/* ===== 首页分段标签 + 历史会话视图 ===== */
+
+.home-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px 2px;
+}
+
+.home-tab {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.home-tab.is-active {
+  background: rgba(74, 158, 255, 0.16);
+  border-color: rgba(74, 158, 255, 0.5);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.home-tab-count {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11.5px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-tab.is-active .home-tab-count {
+  background: rgba(74, 158, 255, 0.22);
+}
+
+.project-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-card-head .project-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-history-btn {
+  flex-shrink: 0;
+  padding: 8px 14px 6px 10px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.project-history-btn:active:not(:disabled) {
+  color: var(--accent);
+}
+
+.project-history-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.history-proj-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 13px 14px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-card > .history-proj-row:last-child,
+.project-card > .sheet-group:last-child {
+  border-bottom: none;
+}
+
+.history-proj-row:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.history-proj-row:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.history-proj-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-proj-active {
+  flex-shrink: 0;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(76, 175, 120, 0.16);
+  color: var(--color-success);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.history-view {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.history-header-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.history-header-name {
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-header-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-refresh-btn {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.history-refresh-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.history-search-bar {
+  padding: 10px 16px 4px;
+  flex-shrink: 0;
+}
+
+.history-search-input {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 15px;
+}
+
+.history-search-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.history-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 16px calc(env(safe-area-inset-bottom, 0px) + 20px);
+}
+
+.history-state {
+  text-align: center;
+  padding: 48px 20px;
+  font-size: 13.5px;
+  color: var(--text-muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.history-state-error {
+  color: var(--color-error);
+}
+
+.history-retry-btn {
+  padding: 7px 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.history-retry-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.history-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.history-session-row:first-child {
+  border-top: none;
+}
+
+.history-session-open {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 6px 12px 14px;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.history-session-open:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.history-session-open:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.history-session-title {
+  font-size: 14.5px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: break-word;
+}
+
+.history-session-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.history-agent-badge {
+  padding: 1px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+}
+
+.history-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-success);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.history-session-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.history-quick-btn {
+  flex-shrink: 0;
+  margin-right: 12px;
+  min-height: 32px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(74, 158, 255, 0.45);
+  background: rgba(74, 158, 255, 0.14);
+  color: var(--accent);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.history-quick-btn.is-live {
+  border-color: rgba(76, 175, 120, 0.45);
+  background: rgba(76, 175, 120, 0.14);
+  color: var(--color-success);
+}
+
+.history-quick-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.history-preview-footer {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  padding: 10px 16px calc(env(safe-area-inset-bottom, 0px) + 12px);
+  flex-shrink: 0;
+}
+
+.history-resume-btn {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.history-resume-btn:active:not(:disabled) {
+  opacity: 0.88;
+}
+
+.history-resume-btn:disabled {
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  cursor: default;
+}
+
 /* ===== 镜像首屏骨架 =====
    拉整段会话记录要一会儿，一行「加载中…」看起来像卡死；给出气泡形状的占位，
    让等待有个「内容正在来」的形，而不是「什么都没有」。 */

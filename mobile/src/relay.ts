@@ -18,8 +18,10 @@ import { create } from 'zustand';
 import {
   PROTOCOL_VERSION,
   type CommandFailReason,
+  type HistoryFailReason,
   type MirrorMessage,
   type MobileHello,
+  type MobileHistorySession,
   type MobileLauncher,
   type MobileProject,
   type MobileRejectReason,
@@ -92,29 +94,69 @@ export interface MirrorState {
   receipt: { ok: boolean; reason?: CommandFailReason } | null;
 }
 
-/** 发起新会话的进行态(一次只允许一个,防连点)。 */
+/** 发起/恢复会话的进行态(一次只允许一个,防连点)。 */
 export interface StartSessionState {
   requestId: string;
+  /** 'start' = 启动器新开;'resume' = 基于历史会话继续对话 */
+  mode: 'start' | 'resume';
   /** 目标项目名(提示文案用) */
   projectName: string;
   /** 桌面端回执里的 pane id;null = 回执还没回来 */
   paneId: string | null;
+  /** mode === 'resume' 时记录目标历史会话 id,起来后顺手把历史列表里的运行态点亮 */
+  resumeSessionId?: string;
 }
+
+export type HistoryError = HistoryFailReason | 'timeout';
+
+/** 某项目的历史会话列表页状态 */
+export interface HistoryListState {
+  projectId: string;
+  projectName: string;
+  requestId: string | null;
+  sessions: MobileHistorySession[];
+  loading: boolean;
+  error: HistoryError | null;
+}
+
+/** 单条历史会话的只读预览页状态 */
+export interface HistoryPreviewState {
+  projectId: string;
+  projectName: string;
+  session: MobileHistorySession;
+  requestId: string | null;
+  /** 本次在途请求是不是「上拉加载更早」 */
+  loadingOlder: boolean;
+  messages: MirrorMessage[];
+  hasMore: boolean;
+  loaded: boolean;
+  error: HistoryError | null;
+}
+
+export type HomeTab = 'active' | 'history';
 
 interface RelayStore {
   phase: Phase;
   rejectReason: MobileRejectReason | null;
   /** 桌面端在线状态;null = 尚未收到 presence */
   desktopOnline: boolean | null;
+  /** 桌面端是否支持历史会话展示与继续对话(旧桌面端为 false) */
+  supportsHistory: boolean;
+  /** 首页分段标签:活跃会话 / 历史会话 */
+  homeTab: HomeTab;
   /** 项目列表(全部项目,含没有活跃会话的;来自桌面端快照/增量) */
   projects: MobileProject[];
   /** 可用的 AI 启动器(只有 id 与展示名) */
   launchers: MobileLauncher[];
-  /** 当前打开的对话镜像;null = 在列表页 */
+  /** 当前打开的对话镜像;null = 不在镜像页 */
   mirror: MirrorState | null;
-  /** 发起会话进行中;null = 空闲(+ 按钮可用) */
+  /** 当前打开的项目历史列表;null = 不在历史列表页 */
+  historyList: HistoryListState | null;
+  /** 当前打开的历史会话只读预览;null = 不在预览页 */
+  historyPreview: HistoryPreviewState | null;
+  /** 发起/恢复会话进行中;null = 空闲 */
   starting: StartSessionState | null;
-  /** 最近一次发起失败的原因;'timeout' = 命令写进去了但会话迟迟没出现 */
+  /** 最近一次发起/恢复失败的原因;'timeout' = 命令写进去了但会话迟迟没出现 */
   startError: StartSessionFailReason | 'timeout' | null;
 }
 
@@ -122,9 +164,13 @@ export const useRelayStore = create<RelayStore>(() => ({
   phase: 'idle',
   rejectReason: null,
   desktopOnline: null,
+  supportsHistory: false,
+  homeTab: 'active',
   projects: [],
   launchers: [],
   mirror: null,
+  historyList: null,
+  historyPreview: null,
   starting: null,
   startError: null,
 }));
@@ -296,25 +342,73 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
         clearCredential();
         setPhase('revoked');
         break;
-      case 'presence':
+      case 'presence': {
         useRelayStore.setState({ desktopOnline: msg.desktopOnline });
-        // 桌面端在等待期间掉线:这次发起再也不会有下文,立刻给出原因而不是等超时
-        if (!msg.desktopOnline && useRelayStore.getState().starting) {
-          finishStart('desktopOffline');
+        // 桌面端在等待期间掉线:在途的发起 / 历史拉取再也不会有下文,立刻给出原因而不是等超时
+        if (!msg.desktopOnline) {
+          const st = useRelayStore.getState();
+          if (st.starting) finishStart('desktopOffline');
+          if (st.historyList?.loading) {
+            clearHistoryListTimer();
+            useRelayStore.setState({
+              historyList: {
+                ...st.historyList,
+                requestId: null,
+                loading: false,
+                error: 'desktopOffline',
+              },
+            });
+          }
+          if (st.historyPreview && (st.historyPreview.requestId !== null)) {
+            clearHistoryPreviewTimer();
+            useRelayStore.setState({
+              historyPreview: {
+                ...st.historyPreview,
+                requestId: null,
+                loadingOlder: false,
+                error: 'desktopOffline',
+              },
+            });
+          }
         }
         break;
+      }
       case 'sessionsSnapshot': {
-        useRelayStore.setState({
+        const supportsHistory = msg.supportsHistory === true;
+        useRelayStore.setState((prev) => ({
           projects: msg.projects,
           launchers: msg.launchers ?? [],
-        });
+          supportsHistory,
+          // 旧桌面端不支持历史:避免停在不可用的历史 tab
+          homeTab: supportsHistory ? prev.homeTab : 'active',
+        }));
         snapshotReady = true;
         // 全量快照 = 桌面端刚连上中转(或应本连接的握手请求回发):它那边的镜像订阅
         // 此时是空的(断线即撤),正在看的会话要重新订阅一次,桌面端会回发镜像快照。
         // 要在 onProjectsChanged 之前做:那里可能为刚发起的会话 openMirror,那次自带订阅
-        const { mirror } = useRelayStore.getState();
+        const { mirror, historyList, historyPreview } = useRelayStore.getState();
         if (mirror && !mirror.closed) {
           sendToRelay({ type: 'subscribePane', paneId: mirror.paneId });
+        }
+        // 断线重连后若历史列表/预览正卡在加载中,立刻补发一次(不必等满 15s 超时)
+        if (supportsHistory && historyList?.loading && historyList.requestId) {
+          sendToRelay({
+            type: 'requestSessionHistory',
+            requestId: historyList.requestId,
+            projectId: historyList.projectId,
+          });
+        }
+        if (supportsHistory && historyPreview?.requestId) {
+          sendToRelay({
+            type: 'requestSessionContent',
+            requestId: historyPreview.requestId,
+            projectId: historyPreview.projectId,
+            agent: historyPreview.session.agent,
+            sessionId: historyPreview.session.sessionId,
+            ...(historyPreview.loadingOlder && historyPreview.messages.length > 0
+              ? { beforeSeq: historyPreview.messages[0].seq }
+              : {}),
+          });
         }
         onProjectsChanged();
         if (pendingPaneId) {
@@ -421,6 +515,52 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
           starting: { ...starting, paneId: msg.paneId ?? null },
         });
         onProjectsChanged();
+        break;
+      }
+      case 'sessionHistory': {
+        const { historyList } = useRelayStore.getState();
+        if (!historyList || historyList.requestId !== msg.requestId) break;
+        clearHistoryListTimer();
+        useRelayStore.setState({
+          historyList: {
+            ...historyList,
+            requestId: null,
+            loading: false,
+            sessions: msg.ok ? msg.sessions : historyList.sessions,
+            error: msg.ok ? null : (msg.reason ?? 'readFailed'),
+          },
+        });
+        break;
+      }
+      case 'sessionContent': {
+        const { historyPreview } = useRelayStore.getState();
+        if (!historyPreview || historyPreview.requestId !== msg.requestId) break;
+        clearHistoryPreviewTimer();
+        if (!msg.ok) {
+          useRelayStore.setState({
+            historyPreview: {
+              ...historyPreview,
+              requestId: null,
+              loadingOlder: false,
+              error: msg.reason ?? 'readFailed',
+            },
+          });
+          break;
+        }
+        const messages = historyPreview.loadingOlder
+          ? [...msg.messages, ...historyPreview.messages]
+          : msg.messages;
+        useRelayStore.setState({
+          historyPreview: {
+            ...historyPreview,
+            requestId: null,
+            loadingOlder: false,
+            loaded: true,
+            messages,
+            hasMore: msg.hasMore,
+            error: null,
+          },
+        });
         break;
       }
     }
@@ -606,7 +746,24 @@ function onProjectsChanged() {
   if (!starting?.paneId) return;
   const pane = findPane(projects, starting.paneId);
   if (!pane) return;
+  const resumedId = starting.resumeSessionId;
   finishStart(null);
+  // 恢复成功后关掉只读预览页,并把历史列表里该会话标为运行中(返回列表立刻看得出)
+  const { historyPreview, historyList } = useRelayStore.getState();
+  const patch: Partial<RelayStore> = {};
+  if (historyPreview) {
+    clearHistoryPreviewTimer();
+    patch.historyPreview = null;
+  }
+  if (resumedId && historyList) {
+    patch.historyList = {
+      ...historyList,
+      sessions: historyList.sessions.map((s) =>
+        s.sessionId === resumedId ? { ...s, livePaneId: pane.paneId } : s,
+      ),
+    };
+  }
+  if (Object.keys(patch).length > 0) useRelayStore.setState(patch);
   openMirror(pane.paneId, pane.title);
 }
 
@@ -625,11 +782,263 @@ export function startAiSession(
 
   const requestId = crypto.randomUUID();
   useRelayStore.setState({
-    starting: { requestId, projectName, paneId: null },
+    starting: { requestId, mode: 'start', projectName, paneId: null },
     startError: null,
   });
   sendToRelay({ type: 'startAiSession', requestId, projectId, launcherId });
   // 回执迟迟不回(中转/桌面端半死)也要有出路,不能让 + 按钮永远禁用
+  armStartTimeout(requestId);
+  return true;
+}
+
+// ── 历史会话浏览与继续对话 ──
+
+const HISTORY_REQUEST_TIMEOUT_MS = 15_000;
+
+let historyListTimer: ReturnType<typeof setTimeout> | null = null;
+let historyPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearHistoryListTimer() {
+  if (historyListTimer) {
+    clearTimeout(historyListTimer);
+    historyListTimer = null;
+  }
+}
+
+function clearHistoryPreviewTimer() {
+  if (historyPreviewTimer) {
+    clearTimeout(historyPreviewTimer);
+    historyPreviewTimer = null;
+  }
+}
+
+export function setHomeTab(tab: HomeTab) {
+  useRelayStore.setState({ homeTab: tab });
+}
+
+/** 检查历史条目里记的 livePaneId 此刻是否仍在活跃快照里。 */
+export function findLivePaneForHistory(
+  projects: MobileProject[],
+  livePaneId?: string,
+) {
+  if (!livePaneId) return undefined;
+  return findPane(projects, livePaneId);
+}
+
+/** 进入某项目的历史会话列表并向桌面端拉取最新列表。 */
+export function openProjectHistory(projectId: string, projectName: string) {
+  const { phase, desktopOnline } = useRelayStore.getState();
+  clearHistoryListTimer();
+  clearHistoryPreviewTimer();
+  if (phase !== 'connected' || desktopOnline === false) {
+    useRelayStore.setState({
+      historyPreview: null,
+      historyList: {
+        projectId,
+        projectName,
+        requestId: null,
+        sessions: [],
+        loading: false,
+        error: 'desktopOffline',
+      },
+    });
+    return;
+  }
+  const requestId = crypto.randomUUID();
+  useRelayStore.setState({
+    historyPreview: null,
+    historyList: {
+      projectId,
+      projectName,
+      requestId,
+      sessions: [],
+      loading: true,
+      error: null,
+    },
+  });
+  sendToRelay({ type: 'requestSessionHistory', requestId, projectId });
+  historyListTimer = setTimeout(() => {
+    const cur = useRelayStore.getState().historyList;
+    if (cur && cur.requestId === requestId) {
+      useRelayStore.setState({
+        historyList: { ...cur, requestId: null, loading: false, error: 'timeout' },
+      });
+    }
+  }, HISTORY_REQUEST_TIMEOUT_MS);
+}
+
+/** 重新拉取当前打开项目的历史会话列表。 */
+export function refreshProjectHistory() {
+  const cur = useRelayStore.getState().historyList;
+  if (!cur) return;
+  const { phase, desktopOnline } = useRelayStore.getState();
+  clearHistoryListTimer();
+  if (phase !== 'connected' || desktopOnline === false) {
+    useRelayStore.setState({
+      historyList: { ...cur, requestId: null, loading: false, error: 'desktopOffline' },
+    });
+    return;
+  }
+  const requestId = crypto.randomUUID();
+  useRelayStore.setState({
+    historyList: { ...cur, requestId, loading: true, error: null },
+  });
+  sendToRelay({ type: 'requestSessionHistory', requestId, projectId: cur.projectId });
+  historyListTimer = setTimeout(() => {
+    const latest = useRelayStore.getState().historyList;
+    if (latest && latest.requestId === requestId) {
+      useRelayStore.setState({
+        historyList: { ...latest, requestId: null, loading: false, error: 'timeout' },
+      });
+    }
+  }, HISTORY_REQUEST_TIMEOUT_MS);
+}
+
+/** 退出项目历史列表,回到首页。 */
+export function closeProjectHistory() {
+  clearHistoryListTimer();
+  clearHistoryPreviewTimer();
+  useRelayStore.setState({ historyList: null, historyPreview: null });
+}
+
+/** 打开一条历史会话的只读预览页并请求最近一页正文。 */
+export function openHistoryPreview(
+  projectId: string,
+  projectName: string,
+  session: MobileHistorySession,
+) {
+  const { phase, desktopOnline } = useRelayStore.getState();
+  clearHistoryPreviewTimer();
+  if (phase !== 'connected' || desktopOnline === false) {
+    useRelayStore.setState({
+      historyPreview: {
+        projectId,
+        projectName,
+        session,
+        requestId: null,
+        loadingOlder: false,
+        messages: [],
+        hasMore: false,
+        loaded: false,
+        error: 'desktopOffline',
+      },
+    });
+    return;
+  }
+  const requestId = crypto.randomUUID();
+  useRelayStore.setState({
+    historyPreview: {
+      projectId,
+      projectName,
+      session,
+      requestId,
+      loadingOlder: false,
+      messages: [],
+      hasMore: false,
+      loaded: false,
+      error: null,
+    },
+  });
+  sendToRelay({
+    type: 'requestSessionContent',
+    requestId,
+    projectId,
+    agent: session.agent,
+    sessionId: session.sessionId,
+  });
+  historyPreviewTimer = setTimeout(() => {
+    const cur = useRelayStore.getState().historyPreview;
+    if (cur && cur.requestId === requestId) {
+      useRelayStore.setState({
+        historyPreview: { ...cur, requestId: null, loadingOlder: false, error: 'timeout' },
+      });
+    }
+  }, HISTORY_REQUEST_TIMEOUT_MS);
+}
+
+/** 历史预览页上拉加载更早消息。 */
+export function loadOlderHistoryPreview() {
+  const { historyPreview, phase, desktopOnline } = useRelayStore.getState();
+  if (
+    !historyPreview ||
+    !historyPreview.hasMore ||
+    historyPreview.requestId !== null ||
+    historyPreview.messages.length === 0 ||
+    phase !== 'connected' ||
+    desktopOnline === false
+  ) {
+    return;
+  }
+  const requestId = crypto.randomUUID();
+  clearHistoryPreviewTimer();
+  useRelayStore.setState({
+    historyPreview: { ...historyPreview, requestId, loadingOlder: true, error: null },
+  });
+  sendToRelay({
+    type: 'requestSessionContent',
+    requestId,
+    projectId: historyPreview.projectId,
+    agent: historyPreview.session.agent,
+    sessionId: historyPreview.session.sessionId,
+    beforeSeq: historyPreview.messages[0].seq,
+  });
+  historyPreviewTimer = setTimeout(() => {
+    const cur = useRelayStore.getState().historyPreview;
+    if (cur && cur.requestId === requestId) {
+      useRelayStore.setState({
+        historyPreview: { ...cur, requestId: null, loadingOlder: false, error: 'timeout' },
+      });
+    }
+  }, HISTORY_REQUEST_TIMEOUT_MS);
+}
+
+/** 退出历史会话预览页,返回历史列表。 */
+export function closeHistoryPreview() {
+  clearHistoryPreviewTimer();
+  useRelayStore.setState({ historyPreview: null });
+}
+
+/**
+ * 基于历史会话发起继续对话:
+ * - 若该会话此刻正跑在某个活跃 AI pane 里,直接打开那个 pane 的实时镜像;
+ * - 否则向桌面端发 `resumeAiSession`,复用 `starting` 进行态与 15 秒超时,
+ *   pane 起来出现在快照里即自动进入实时对话镜像。
+ */
+export function resumeAiSession(
+  projectId: string,
+  projectName: string,
+  session: MobileHistorySession,
+): boolean {
+  const { phase, desktopOnline, starting, projects } = useRelayStore.getState();
+  const live = findLivePaneForHistory(projects, session.livePaneId);
+  if (live) {
+    clearHistoryPreviewTimer();
+    useRelayStore.setState({ historyPreview: null });
+    openMirror(live.paneId, live.title);
+    return true;
+  }
+  if (!session.canResume) return false;
+  if (starting) return false;
+  if (phase !== 'connected' || desktopOnline === false) return false;
+
+  const requestId = crypto.randomUUID();
+  useRelayStore.setState({
+    starting: {
+      requestId,
+      mode: 'resume',
+      projectName,
+      paneId: null,
+      resumeSessionId: session.sessionId,
+    },
+    startError: null,
+  });
+  sendToRelay({
+    type: 'resumeAiSession',
+    requestId,
+    projectId,
+    agent: session.agent,
+    sessionId: session.sessionId,
+  });
   armStartTimeout(requestId);
   return true;
 }

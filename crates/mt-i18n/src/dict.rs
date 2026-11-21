@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1920;
+pub const ZH_ENTRY_COUNT: usize = 1921;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1920;
+pub const EN_ENTRY_COUNT: usize = 1921;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -49,6 +49,7 @@ static APP_ZH: &[(&str, &str)] = &[
     ("hookHint.title", "AI 状态精确感知"),
     ("layoutLoadFailed", "界面布局库不可用，本次调整的分屏、栏宽与窗口位置不会保存。\n\n错误：{detail}"),
     ("menu.settings", "设置"),
+    ("mobileResumeSession", "移动端恢复了会话（{agent}）"),
     ("mobileStartSession", "移动端新建了会话（{launcher}）"),
     ("storageIssueTitle", "数据保存异常"),
     ("titleBar.close", "关闭"),
@@ -112,6 +113,7 @@ static APP_EN: &[(&str, &str)] = &[
     ("hookHint.title", "Precise AI status"),
     ("layoutLoadFailed", "The layout database is unavailable. Split panes, column widths and window position changed this session won't be saved.\n\nError: {detail}"),
     ("menu.settings", "Settings"),
+    ("mobileResumeSession", "Mobile resumed a session ({agent})"),
     ("mobileStartSession", "Mobile started a session ({launcher})"),
     ("storageIssueTitle", "Storage problem"),
     ("titleBar.close", "Close"),

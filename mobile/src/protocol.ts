@@ -62,6 +62,32 @@ export interface MobileStartAiSession {
   launcherId: string;
 }
 
+/** 请求某项目的本机历史会话列表 */
+export interface MobileRequestSessionHistory {
+  type: 'requestSessionHistory';
+  requestId: string;
+  projectId: string;
+}
+
+/** 请求某条历史会话的只读正文(beforeSeq 缺省取最近一页,带值取更早一页) */
+export interface MobileRequestSessionContent {
+  type: 'requestSessionContent';
+  requestId: string;
+  projectId: string;
+  agent: string;
+  sessionId: string;
+  beforeSeq?: number;
+}
+
+/** 基于历史会话发起继续对话(回执复用 startSessionReceipt) */
+export interface MobileResumeAiSession {
+  type: 'resumeAiSession';
+  requestId: string;
+  projectId: string;
+  agent: string;
+  sessionId: string;
+}
+
 /**
  * 点选作答 agent 的提问:按镜像消息 seq + 提问身份(questionId)定位提问卡片,
  * 按题序+选项下标选择。桌面端校验该提问仍挂起后向 PTY 注入按键;回执复用
@@ -86,7 +112,10 @@ export type MobileToRelay =
   | MobileCommandMsg
   | MobileAnswerQuestion
   | MobileRenamePane
-  | MobileStartAiSession;
+  | MobileStartAiSession
+  | MobileRequestSessionHistory
+  | MobileRequestSessionContent
+  | MobileResumeAiSession;
 
 // ── 中转 → 移动端 ──
 
@@ -158,6 +187,8 @@ export interface MobileSessionsSnapshot {
   type: 'sessionsSnapshot';
   projects: MobileProject[];
   launchers: MobileLauncher[];
+  /** 桌面端是否支持「历史会话展示与继续对话」(旧桌面端缺省 false) */
+  supportsHistory?: boolean;
 }
 
 export interface MobileSessionsDelta {
@@ -258,15 +289,57 @@ export type StartSessionFailReason =
   | 'projectNotFound'
   | 'launcherNotFound'
   | 'notSupported'
-  | 'spawnFailed';
+  | 'spawnFailed'
+  | 'sessionNotFound'
+  | 'resumeUnsupported';
 
-/** 发起回执:ok = pane 已建、启动命令已写入(AI 是否真起来以会话出现在列表为准) */
+/** 发起/恢复回执:ok = pane 已建且命令已写入(AI 是否真起来以会话出现在列表为准) */
 export interface MobileStartSessionReceipt {
   type: 'startSessionReceipt';
   requestId: string;
   ok: boolean;
   paneId?: string;
   reason?: StartSessionFailReason;
+}
+
+/** 移动端可见的一条历史会话摘要(仅本机宿主来源) */
+export interface MobileHistorySession {
+  sessionId: string;
+  agent: string;
+  agentLabel: string;
+  title: string;
+  timestamp: string;
+  canResume: boolean;
+  /** 若该会话此刻正跑在桌面端某个活跃 AI pane 里,携带其 paneId */
+  livePaneId?: string;
+}
+
+export type HistoryFailReason =
+  | 'desktopOffline'
+  | 'projectNotFound'
+  | 'notSupported'
+  | 'sessionNotFound'
+  | 'unsupportedAgent'
+  | 'readFailed';
+
+export interface MobileSessionHistory {
+  type: 'sessionHistory';
+  requestId: string;
+  projectId: string;
+  ok: boolean;
+  sessions: MobileHistorySession[];
+  reason?: HistoryFailReason;
+}
+
+export interface MobileSessionContent {
+  type: 'sessionContent';
+  requestId: string;
+  projectId: string;
+  sessionId: string;
+  ok: boolean;
+  messages: MirrorMessage[];
+  hasMore: boolean;
+  reason?: HistoryFailReason;
 }
 
 export type RelayToMobile =
@@ -281,4 +354,6 @@ export type RelayToMobile =
   | MobileMirrorHistory
   | MobilePaneClosed
   | MobileCommandReceipt
-  | MobileStartSessionReceipt;
+  | MobileStartSessionReceipt
+  | MobileSessionHistory
+  | MobileSessionContent;

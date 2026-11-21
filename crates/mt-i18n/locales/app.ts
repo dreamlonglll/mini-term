@@ -80,6 +80,7 @@ export const app = {
     },
     wslOverride: "已检测到 WSL 项目,使用 wsl.exe 启动终端 ({path})",
     mobileStartSession: "移动端新建了会话（{launcher}）",
+    mobileResumeSession: "移动端恢复了会话（{agent}）",
   },
   en: {
     menu: {
@@ -162,5 +163,6 @@ export const app = {
     },
     wslOverride: "WSL project detected, launching terminal with wsl.exe ({path})",
     mobileStartSession: "Mobile started a session ({launcher})",
+    mobileResumeSession: "Mobile resumed a session ({agent})",
   },
 } as const;

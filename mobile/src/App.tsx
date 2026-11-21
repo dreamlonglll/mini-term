@@ -2,6 +2,7 @@ import { useRelayStore } from './relay';
 import { useI18nStore, useT } from './i18n';
 import { SessionList } from './SessionList';
 import { MirrorView } from './MirrorView';
+import { HistoryListView, HistoryPreviewView } from './HistoryView';
 
 function LanguageToggle() {
   const lang = useI18nStore((s) => s.lang);
@@ -34,6 +35,8 @@ export function App() {
   const phase = useRelayStore((s) => s.phase);
   const rejectReason = useRelayStore((s) => s.rejectReason);
   const mirrorOpen = useRelayStore((s) => s.mirror !== null);
+  const historyPreviewOpen = useRelayStore((s) => s.historyPreview !== null);
+  const historyListOpen = useRelayStore((s) => s.historyList !== null);
 
   let body;
   switch (phase) {
@@ -50,7 +53,15 @@ export function App() {
       body = <StatusScreen icon="◌" title={t('pair.reconnecting')} spinning />;
       break;
     case 'connected':
-      body = mirrorOpen ? <MirrorView /> : <SessionList />;
+      body = mirrorOpen ? (
+        <MirrorView />
+      ) : historyPreviewOpen ? (
+        <HistoryPreviewView />
+      ) : historyListOpen ? (
+        <HistoryListView />
+      ) : (
+        <SessionList />
+      );
       break;
     case 'revoked':
       body = <StatusScreen icon="⊘" title={t('pair.revoked')} hint={t('pair.revokedHint')} />;

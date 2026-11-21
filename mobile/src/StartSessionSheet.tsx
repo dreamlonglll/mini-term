@@ -2,6 +2,7 @@ import { Fragment, useMemo, useState } from 'react';
 import { startAiSession, useRelayStore } from './relay';
 import { useT } from './i18n';
 import type { MobileProject } from './protocol';
+import { buildProjectTree, countProjects, type ProjectTreeNode } from './projectTree';
 
 /**
  * 发起新 AI 会话的弹层:选项目 → 选启动器。
@@ -14,58 +15,6 @@ import type { MobileProject } from './protocol';
  * 每项带 `groupPath`(祖先分组名链),据此重建成可折叠的树。折叠状态是**手机本地**的
  * (默认全展开)——桌面端折叠了什么与这里无关,小屏上跟着折叠只会让人找不到项目。
  */
-
-interface GroupNode {
-  kind: 'group';
-  /** 全路径 key:同名但不同父的组不会被并到一起 */
-  key: string;
-  name: string;
-  children: SheetNode[];
-}
-
-type SheetNode = GroupNode | { kind: 'project'; project: MobileProject };
-
-/**
- * 把带 groupPath 的扁平清单重建成分组树。
- *
- * 组按整条路径索引复用,**不**要求同组项目在输入里连续:增量是原位替换的,项目在桌面端
- * 换组后位置不动、只有 groupPath 变,照样能落进正确的组(组自身的排位则要等下次全量快照
- * 才完全对齐桌面端)。没有任何项目的空组不会出现——选项目时它也没有意义。
- * groupPath 缺省(旧桌面端 / 旧中转把字段吃掉)时整棵树退化成平铺列表。
- */
-function buildTree(projects: MobileProject[]): SheetNode[] {
-  const roots: SheetNode[] = [];
-  const groups = new Map<string, GroupNode>();
-
-  for (const project of projects) {
-    let siblings = roots;
-    const path: string[] = [];
-    for (const name of project.groupPath ?? []) {
-      path.push(name);
-      // 整条路径序列化当 key:没有分隔符歧义,同名但不同父的组不会被并到一起
-      const key = JSON.stringify(path);
-      let group = groups.get(key);
-      if (!group) {
-        group = { kind: 'group', key, name, children: [] };
-        groups.set(key, group);
-        siblings.push(group);
-      }
-      siblings = group.children;
-    }
-    siblings.push({ kind: 'project', project });
-  }
-  return roots;
-}
-
-/** 组内项目总数(含子组),对齐桌面端组名后面的计数 */
-function countProjects(group: GroupNode): number {
-  let total = 0;
-  for (const child of group.children) {
-    total += child.kind === 'group' ? countProjects(child) : 1;
-  }
-  return total;
-}
-
 export function StartSessionSheet({ onClose }: { onClose: () => void }) {
   const t = useT();
   const projects = useRelayStore((s) => s.projects);
@@ -73,7 +22,7 @@ export function StartSessionSheet({ onClose }: { onClose: () => void }) {
   const [picked, setPicked] = useState<MobileProject | null>(null);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set<string>());
 
-  const tree = useMemo(() => buildTree(projects), [projects]);
+  const tree = useMemo(() => buildProjectTree(projects), [projects]);
 
   const launch = (project: MobileProject, launcherId: string) => {
     if (startAiSession(project.projectId, project.name, launcherId)) onClose();
@@ -95,7 +44,7 @@ export function StartSessionSheet({ onClose }: { onClose: () => void }) {
     });
   };
 
-  const renderNode = (node: SheetNode, depth: number) => {
+  const renderNode = (node: ProjectTreeNode, depth: number) => {
     const indent = { paddingLeft: `${16 + depth * 16}px` };
 
     if (node.kind === 'project') {

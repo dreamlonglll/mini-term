@@ -73,7 +73,7 @@ pub enum CommandFailReason {
     QuestionNotPending,
 }
 
-/// 移动端发起新 AI 会话失败的原因。
+/// 移动端发起新 AI 会话或恢复历史会话失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StartSessionFailReason {
@@ -83,10 +83,53 @@ pub enum StartSessionFailReason {
     ProjectNotFound,
     /// 启动器已被删除
     LauncherNotFound,
-    /// 目标项目不支持远程发起(SSH 远程项目 / WSL 根项目:对话镜像不可用)
+    /// 目标项目不支持远程发起/恢复(SSH 远程项目 / WSL 根项目:对话镜像不可用)
     NotSupported,
     /// 终端创建失败
     SpawnFailed,
+    /// 目标历史会话不存在或不属于该项目
+    SessionNotFound,
+    /// 该 agent 不支持续接或会话 id 不合法
+    ResumeUnsupported,
+}
+
+/// 移动端可见的一条历史会话摘要(仅本机宿主来源,与桌面端历史面板口径一致)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileHistorySession {
+    pub session_id: String,
+    /// 规范标识:"claude" | "codex" | "grok" | "pi" | "omp" | "agy"
+    pub agent: String,
+    /// 展示名:"Claude Code" | "Codex" | "Grok" | "pi" | "oh-my-pi" | "Antigravity CLI"
+    pub agent_label: String,
+    pub title: String,
+    /// ISO 8601 时间戳(排序与相对时间展示用)
+    pub timestamp: String,
+    /// 桌面端按 AgentKind::resume 与会话 id 白名单判定是否支持继续对话
+    #[serde(default)]
+    pub can_resume: bool,
+    /// 该会话此刻若正跑在桌面端某个活跃 AI pane 里,携带其 paneId,
+    /// 移动端可直接进入实时对话镜像,不必重开新 tab
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_pane_id: Option<String>,
+}
+
+/// 移动端拉取历史会话列表或历史正文失败的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryFailReason {
+    /// 桌面端离线:中转在路由层直接拒绝
+    DesktopOffline,
+    /// 目标项目已不存在
+    ProjectNotFound,
+    /// 目标项目不支持移动端历史会话(SSH 远程项目 / WSL 根项目)
+    NotSupported,
+    /// 目标会话不存在或不属于该项目
+    SessionNotFound,
+    /// 该 agent 或会话 id 不支持读取
+    UnsupportedAgent,
+    /// 桌面端读取磁盘失败
+    ReadFailed,
 }
 
 /// 桌面端握手被拒绝的原因(中转 → 桌面端)。
@@ -183,6 +226,10 @@ pub enum DesktopToRelay {
         projects: Vec<MobileProject>,
         #[serde(default)]
         launchers: Vec<MobileLauncher>,
+        /// 桌面端是否支持「历史会话展示与继续对话」。旧桌面端不发 → 缺省 false,
+        /// 新 PWA 据此隐藏历史入口,避免对旧桌面端发请求后空等。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_history: bool,
     },
     /// 活跃 AI 会话结构增量:整项目 upsert + 项目移除。
     SessionsDelta {
@@ -219,6 +266,7 @@ pub enum DesktopToRelay {
     },
     /// 发起会话回执:ok = pane 已创建且启动命令已写入 PTY,**不**承诺 AI 已起来。
     /// 真正的成功信号是该 pane 出现在活跃会话快照里。
+    /// 恢复历史会话(`ResumeAiSession`)复用同一回执通道。
     StartSessionReceipt {
         request_id: String,
         ok: bool,
@@ -226,6 +274,29 @@ pub enum DesktopToRelay {
         pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<StartSessionFailReason>,
+    },
+    /// 项目的历史会话列表响应(按时间降序)。
+    SessionHistory {
+        request_id: String,
+        project_id: String,
+        ok: bool,
+        #[serde(default)]
+        sessions: Vec<MobileHistorySession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<HistoryFailReason>,
+    },
+    /// 单条历史会话的正文响应(复用 MirrorMessage 结构,按 before_seq 分页)。
+    SessionContent {
+        request_id: String,
+        project_id: String,
+        session_id: String,
+        ok: bool,
+        #[serde(default)]
+        messages: Vec<MirrorMessage>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<HistoryFailReason>,
     },
 }
 
@@ -287,6 +358,29 @@ pub enum RelayToDesktop {
         project_id: String,
         launcher_id: String,
     },
+    /// 移动端请求某项目的本机历史会话列表(转发自移动端)。
+    RequestSessionHistory {
+        request_id: String,
+        project_id: String,
+    },
+    /// 移动端请求某条历史会话的只读正文(转发自移动端;before_seq 为 None 取最近一页)。
+    RequestSessionContent {
+        request_id: String,
+        project_id: String,
+        agent: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_seq: Option<u64>,
+    },
+    /// 移动端请求基于某条历史会话继续对话(转发自移动端)。
+    /// 移动端只传会话标识,桌面端校验其归属该项目后由本地白名单模板生成 resume 命令,
+    /// 命令文本不经过移动端或中转(与 ADR 0002 同一红线)。
+    ResumeAiSession {
+        request_id: String,
+        project_id: String,
+        agent: String,
+        session_id: String,
+    },
 }
 
 /// 移动端 → 中转
@@ -339,6 +433,27 @@ pub enum MobileToRelay {
         project_id: String,
         launcher_id: String,
     },
+    /// 请求某项目的本机历史会话列表。
+    RequestSessionHistory {
+        request_id: String,
+        project_id: String,
+    },
+    /// 请求某条历史会话的正文(before_seq 缺省取最近一页,带值取更早一页)。
+    RequestSessionContent {
+        request_id: String,
+        project_id: String,
+        agent: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_seq: Option<u64>,
+    },
+    /// 基于历史会话发起继续对话(回执复用 StartSessionReceipt)。
+    ResumeAiSession {
+        request_id: String,
+        project_id: String,
+        agent: String,
+        session_id: String,
+    },
 }
 
 /// 中转 → 移动端
@@ -363,6 +478,9 @@ pub enum RelayToMobile {
         projects: Vec<MobileProject>,
         #[serde(default)]
         launchers: Vec<MobileLauncher>,
+        /// 桌面端是否支持「历史会话展示与继续对话」(旧桌面端缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_history: bool,
     },
     /// 活跃 AI 会话结构增量(转发自桌面端)。
     SessionsDelta {
@@ -396,7 +514,7 @@ pub enum RelayToMobile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<CommandFailReason>,
     },
-    /// 发起会话回执:桌面端的创建结果,或中转在桌面离线时的路由层拒绝。
+    /// 发起/恢复会话回执:桌面端的创建结果,或中转在桌面离线时的路由层拒绝。
     StartSessionReceipt {
         request_id: String,
         ok: bool,
@@ -404,6 +522,29 @@ pub enum RelayToMobile {
         pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<StartSessionFailReason>,
+    },
+    /// 项目的历史会话列表响应(转发自桌面端,或离线时中转路由层直接拒绝)。
+    SessionHistory {
+        request_id: String,
+        project_id: String,
+        ok: bool,
+        #[serde(default)]
+        sessions: Vec<MobileHistorySession>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<HistoryFailReason>,
+    },
+    /// 单条历史会话的正文响应(转发自桌面端,或离线时中转路由层直接拒绝)。
+    SessionContent {
+        request_id: String,
+        project_id: String,
+        session_id: String,
+        ok: bool,
+        #[serde(default)]
+        messages: Vec<MirrorMessage>,
+        #[serde(default)]
+        has_more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<HistoryFailReason>,
     },
 }
 
@@ -594,6 +735,7 @@ mod tests {
                 id: "l1".into(),
                 name: "Claude".into(),
             }],
+            supports_history: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -602,7 +744,8 @@ mod tests {
                 && json.contains(r#""status":"ai-working""#)
                 && json.contains(r#""canStartSession":true"#)
                 && json.contains(r#""groupPath":["工作","后端"]"#)
-                && json.contains(r#""launchers":[{"id":"l1","name":"Claude"}]"#),
+                && json.contains(r#""launchers":[{"id":"l1","name":"Claude"}]"#)
+                && json.contains(r#""supportsHistory":true"#),
             "serde camelCase 对齐被破坏: {json}"
         );
         // 启动器只下发 id 与展示名:命令/shell 绝不出现在 wire 上
@@ -623,12 +766,25 @@ mod tests {
         let msg = RelayToMobile::SessionsSnapshot {
             projects: vec![empty.clone()],
             launchers: vec![],
+            supports_history: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""panes":[]"#) && json.contains(r#""canStartSession":false"#), "{json}");
-        // 顶层项目不占 wire:空 groupPath 整个字段省略
+        // 顶层项目不占 wire:空 groupPath 与 false supportsHistory 整个字段省略
         assert!(!json.contains("groupPath"), "{json}");
+        assert!(!json.contains("supportsHistory"), "{json}");
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), msg);
+
+        // 旧桌面端发来的不带 supportsHistory 的快照按 false 解析
+        let legacy = r#"{"type":"sessionsSnapshot","projects":[],"launchers":[]}"#;
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(legacy).unwrap(),
+            DesktopToRelay::SessionsSnapshot {
+                projects: vec![],
+                launchers: vec![],
+                supports_history: false,
+            }
+        );
     }
 
     #[test]
@@ -697,8 +853,134 @@ mod tests {
             (StartSessionFailReason::LauncherNotFound, r#""launcherNotFound""#),
             (StartSessionFailReason::NotSupported, r#""notSupported""#),
             (StartSessionFailReason::SpawnFailed, r#""spawnFailed""#),
+            (StartSessionFailReason::SessionNotFound, r#""sessionNotFound""#),
+            (
+                StartSessionFailReason::ResumeUnsupported,
+                r#""resumeUnsupported""#,
+            ),
         ];
         for (reason, expected) in cases {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn history_and_resume_messages_round_trip() {
+        let req_list = MobileToRelay::RequestSessionHistory {
+            request_id: "h-1".into(),
+            project_id: "p1".into(),
+        };
+        let json = serde_json::to_string(&req_list).unwrap();
+        assert!(
+            json.contains(r#""type":"requestSessionHistory""#)
+                && json.contains(r#""requestId":"h-1""#)
+                && json.contains(r#""projectId":"p1""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), req_list);
+
+        let res_list = DesktopToRelay::SessionHistory {
+            request_id: "h-1".into(),
+            project_id: "p1".into(),
+            ok: true,
+            sessions: vec![MobileHistorySession {
+                session_id: "sess-1".into(),
+                agent: "claude".into(),
+                agent_label: "Claude Code".into(),
+                title: "重构登录".into(),
+                timestamp: "2026-11-21T08:00:00Z".into(),
+                can_resume: true,
+                live_pane_id: Some("pane-2".into()),
+            }],
+            reason: None,
+        };
+        let json = serde_json::to_string(&res_list).unwrap();
+        assert!(
+            json.contains(r#""type":"sessionHistory""#)
+                && json.contains(r#""sessionId":"sess-1""#)
+                && json.contains(r#""agentLabel":"Claude Code""#)
+                && json.contains(r#""canResume":true"#)
+                && json.contains(r#""livePaneId":"pane-2""#)
+                && !json.contains("reason"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), res_list);
+
+        let req_content = MobileToRelay::RequestSessionContent {
+            request_id: "c-1".into(),
+            project_id: "p1".into(),
+            agent: "codex".into(),
+            session_id: "sess-2".into(),
+            before_seq: Some(50),
+        };
+        let json = serde_json::to_string(&req_content).unwrap();
+        assert!(
+            json.contains(r#""type":"requestSessionContent""#)
+                && json.contains(r#""beforeSeq":50"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<MobileToRelay>(&json).unwrap(),
+            req_content
+        );
+
+        let req_content_head = RelayToDesktop::RequestSessionContent {
+            request_id: "c-2".into(),
+            project_id: "p1".into(),
+            agent: "codex".into(),
+            session_id: "sess-2".into(),
+            before_seq: None,
+        };
+        let json = serde_json::to_string(&req_content_head).unwrap();
+        assert!(!json.contains("beforeSeq"), "{json}");
+        assert_eq!(
+            serde_json::from_str::<RelayToDesktop>(&json).unwrap(),
+            req_content_head
+        );
+
+        let res_content = RelayToMobile::SessionContent {
+            request_id: "c-1".into(),
+            project_id: "p1".into(),
+            session_id: "sess-2".into(),
+            ok: false,
+            messages: vec![],
+            has_more: false,
+            reason: Some(HistoryFailReason::SessionNotFound),
+        };
+        let json = serde_json::to_string(&res_content).unwrap();
+        assert!(
+            json.contains(r#""type":"sessionContent""#)
+                && json.contains(r#""reason":"sessionNotFound""#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<RelayToMobile>(&json).unwrap(),
+            res_content
+        );
+
+        let resume = MobileToRelay::ResumeAiSession {
+            request_id: "r-1".into(),
+            project_id: "p1".into(),
+            agent: "claude".into(),
+            session_id: "sess-1".into(),
+        };
+        let json = serde_json::to_string(&resume).unwrap();
+        assert!(
+            json.contains(r#""type":"resumeAiSession""#)
+                && json.contains(r#""sessionId":"sess-1""#)
+                && !json.contains("command"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), resume);
+
+        for (reason, expected) in [
+            (HistoryFailReason::DesktopOffline, r#""desktopOffline""#),
+            (HistoryFailReason::ProjectNotFound, r#""projectNotFound""#),
+            (HistoryFailReason::NotSupported, r#""notSupported""#),
+            (HistoryFailReason::SessionNotFound, r#""sessionNotFound""#),
+            (HistoryFailReason::UnsupportedAgent, r#""unsupportedAgent""#),
+            (HistoryFailReason::ReadFailed, r#""readFailed""#),
+        ] {
             assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
         }
     }

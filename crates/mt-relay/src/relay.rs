@@ -16,8 +16,9 @@ use futures_util::{SinkExt, StreamExt};
 use mt_ai::AgentKind;
 use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{
-    CommandFailReason, DesktopRejectReason, DesktopToRelay, MirrorMessage, MobileLauncher,
-    MobilePane, MobileProject, RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
+    CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason, MirrorMessage,
+    MobileHistorySession, MobileLauncher, MobilePane, MobileProject, RelayToDesktop,
+    StartSessionFailReason, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -358,6 +359,15 @@ fn find_mobile_cmd(
         })
 }
 
+/// 最近一次历史预览的全量消息缓存(单槽):上拉翻页时直接从内存按 `before_seq` 切片,
+/// 不必每次翻页都重新扫盘解析整个 JSONL;换看别的会话或断线即覆盖/清空。
+struct HistoryPreviewCache {
+    project_id: String,
+    agent: String,
+    session_id: String,
+    messages: Vec<MirrorMessage>,
+}
+
 /// 当前连接会话的取消句柄;整个 manager 由上层用 `Arc` 长期持有。
 pub struct MobileRelayManager {
     cancel: Mutex<Option<watch::Sender<bool>>>,
@@ -374,6 +384,8 @@ pub struct MobileRelayManager {
     pane_ptys: Mutex<HashMap<String, u32>>,
     /// 已订阅镜像的 pane 集合
     mirror_subs: Mutex<HashMap<String, MirrorSub>>,
+    /// 历史会话只读预览的单槽分页缓存(断线清空)
+    history_preview_cache: Mutex<Option<HistoryPreviewCache>>,
     /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
     /// user 消息来源改标为 "mobile"(见 relabel_mobile_sources)
     recent_mobile_cmds: Mutex<HashMap<String, Vec<MobileCmd>>>,
@@ -406,6 +418,7 @@ impl MobileRelayManager {
             pane_paths: Mutex::new(HashMap::new()),
             pane_ptys: Mutex::new(HashMap::new()),
             mirror_subs: Mutex::new(HashMap::new()),
+            history_preview_cache: Mutex::new(None),
             recent_mobile_cmds: Mutex::new(HashMap::new()),
             command_tail: Mutex::new(None),
             submit_delay: MOBILE_SUBMIT_DELAY,
@@ -605,8 +618,9 @@ impl MobileRelayManager {
         }
     }
 
-    /// 撤销全部镜像订阅(与中转断线时调用;移动端重连后会重新订阅)。
+    /// 撤销全部镜像订阅并清空历史预览缓存(与中转断线时调用;移动端重连后会重新订阅)。
     fn clear_mirror_subs(&self) {
+        *self.history_preview_cache.lock() = None;
         let subs: Vec<MirrorSub> = self
             .mirror_subs
             .lock()
@@ -764,9 +778,17 @@ impl MobileRelayManager {
         }
     }
 
+    /// 某 PTY 已知的精确会话身份:hook 上报优先(会随 `/clear` / `/new` 实时切换),
+    /// 缺席时回落桌面端 pane 上记录的会话身份(如未开 hook 或 Codex resume 不重报 SessionStart)。
+    fn known_session(&self, pty_id: u32) -> Option<crate::host::HookSessionId> {
+        self.host
+            .hook_session(pty_id)
+            .or_else(|| self.host.pane_session(pty_id))
+    }
+
     /// 这一轮的定位输入。绑定分两层,每轮重取(PTY 映射、hook 上报都可能后到):
-    /// 1. hook 上报过会话身份 → 只认该会话的文件,未落盘就等(空镜像),
-    ///    不退启发式——退了就会串到同项目其他 pane 的会话;
+    /// 1. 已有精确会话身份(hook 上报或 resume 写回的 pane 身份)→ 只认该会话的文件,
+    ///    未落盘就等(空镜像),不退启发式——退了就会串到同项目其他 pane 的会话;
     /// 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式,
     ///    只找本 pane 那家 agent 的记录;同项目多个 Codex pane 按 [`CodexPeers`] 分。
     ///
@@ -775,7 +797,7 @@ impl MobileRelayManager {
     fn mirror_locate_key(&self, pane_id: &str) -> LocateKey {
         let pty_id = self.pane_ptys.lock().get(pane_id).copied();
         if let Some(pty) = pty_id
-            && let Some(s) = self.host.hook_session(pty)
+            && let Some(s) = self.known_session(pty)
         {
             return LocateKey::Hook {
                 pty_id: pty,
@@ -845,7 +867,7 @@ impl MobileRelayManager {
         };
         for (peer_id, pty) in peer_ptys {
             let peer_agent = self.host.ai_session_agent(pty);
-            if let Some(hook) = self.host.hook_session(pty) {
+            if let Some(hook) = self.known_session(pty) {
                 // codex 的 SessionStart 会被误推断成 claude-code,输入检测那边认的是 codex 也算
                 if is_codex(hook.agent.as_deref()) || is_codex(peer_agent.as_deref()) {
                     peers.claimed.push(hook.session_id);
@@ -978,6 +1000,7 @@ impl MobileRelayManager {
         let _ = self.send(DesktopToRelay::SessionsSnapshot {
             projects,
             launchers,
+            supports_history: true,
         });
     }
 
@@ -1299,6 +1322,33 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             project_id,
             launcher_id,
         }) => handle_start_ai_session(manager, request_id, project_id, launcher_id),
+        // 移动端请求项目的历史会话列表
+        Ok(RelayToDesktop::RequestSessionHistory {
+            request_id,
+            project_id,
+        }) => handle_request_session_history(manager, request_id, project_id),
+        // 移动端请求单条历史会话的只读正文(分页)
+        Ok(RelayToDesktop::RequestSessionContent {
+            request_id,
+            project_id,
+            agent,
+            session_id,
+            before_seq,
+        }) => handle_request_session_content(
+            manager,
+            request_id,
+            project_id,
+            agent,
+            session_id,
+            before_seq,
+        ),
+        // 移动端基于历史会话继续对话:校验归属与白名单、反查 cwd 后交给上层建 pane
+        Ok(RelayToDesktop::ResumeAiSession {
+            request_id,
+            project_id,
+            agent,
+            session_id,
+        }) => handle_resume_ai_session(manager, request_id, project_id, agent, session_id),
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
     }
@@ -1342,6 +1392,366 @@ pub struct StartSessionPayload {
     pub shell_name: Option<String>,
     /// 要写入 PTY 的启动命令
     pub command: String,
+}
+
+/// [`RelayEvents::resume_session`] 的载荷:历史会话校验与 cwd 反查完成后交给上层执行。
+/// 命令由桌面端按 `mt_ai::agent::resume_command` 本地模板生成,从不经过移动端或中转。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeSessionPayload {
+    pub request_id: String,
+    pub project_id: String,
+    /// 规范标识("claude" / "codex" / …)
+    pub agent: String,
+    /// 展示名("Claude Code" / "Codex" / …),用于桌面端审计通知
+    pub agent_label: String,
+    pub session_id: String,
+    /// 收敛后的展示标题,用作新 pane 的自定义名
+    pub title: String,
+    /// 要写入 PTY 的续接命令
+    pub command: String,
+    /// 反查所得的会话原始启动目录(Claude 子目录会话续接用)
+    pub cwd: Option<String>,
+}
+
+/// 历史会话标题 → 适合放到桌面端 tab 栏的 pane 标题:取第一个非空行、走
+/// [`sanitize_pane_title`] 收敛,仍为空则回落 agent 展示名。
+fn resume_pane_title(raw_title: &str, agent_label: &str) -> String {
+    let first_line = raw_title
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let cleaned = sanitize_pane_title(first_line);
+    if cleaned.is_empty() {
+        sanitize_pane_title(agent_label)
+    } else {
+        cleaned
+    }
+}
+
+/// 把 `mt_ai::sessions::AiSession` 映射成移动端历史条目。
+fn to_mobile_history_session(
+    session: mt_ai::sessions::AiSession,
+    live_pane_id: Option<String>,
+) -> MobileHistorySession {
+    let kind = AgentKind::parse(&session.session_type);
+    let agent = kind
+        .map(|k| k.key().to_string())
+        .unwrap_or_else(|| session.session_type.clone());
+    let agent_label = kind
+        .map(|k| k.spec().label.to_string())
+        .unwrap_or_else(|| session.session_type.clone());
+    let can_resume = mt_ai::agent::resume_command(Some(&agent), &session.id).is_some();
+    MobileHistorySession {
+        session_id: session.id,
+        agent,
+        agent_label,
+        title: session.title,
+        timestamp: session.timestamp,
+        can_resume,
+        live_pane_id,
+    }
+}
+
+/// 处理移动端拉取某项目的历史会话列表。
+///
+/// 范围与 `StartAiSession` 一致:只覆盖本机宿主来源(SSH 远程项目与 WSL 根项目拒绝),
+/// 磁盘扫描放到 tokio 阻塞线程池,不阻塞 WebSocket 读写与心跳。
+fn handle_request_session_history(
+    manager: &Arc<MobileRelayManager>,
+    request_id: String,
+    project_id: String,
+) {
+    let Some(project) = manager.host.project(&project_id) else {
+        let _ = manager.send(DesktopToRelay::SessionHistory {
+            request_id,
+            project_id,
+            ok: false,
+            sessions: Vec::new(),
+            reason: Some(HistoryFailReason::ProjectNotFound),
+        });
+        return;
+    };
+    if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
+        let _ = manager.send(DesktopToRelay::SessionHistory {
+            request_id,
+            project_id,
+            ok: false,
+            sessions: Vec::new(),
+            reason: Some(HistoryFailReason::NotSupported),
+        });
+        return;
+    }
+
+    let mgr = Arc::clone(manager);
+    let path = project.path;
+    manager.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || mt_ai::sessions::get_ai_sessions(path))
+            .await
+            .map_err(|_| "history task cancelled".to_string())
+            .and_then(|r| r);
+        match result {
+            Ok(raw) => {
+                let sessions = raw
+                    .into_iter()
+                    .map(|s| {
+                        let live = mgr.host.live_session_pane(&s.id);
+                        to_mobile_history_session(s, live)
+                    })
+                    .collect();
+                let _ = mgr.send(DesktopToRelay::SessionHistory {
+                    request_id,
+                    project_id,
+                    ok: true,
+                    sessions,
+                    reason: None,
+                });
+            }
+            Err(_) => {
+                let _ = mgr.send(DesktopToRelay::SessionHistory {
+                    request_id,
+                    project_id,
+                    ok: false,
+                    sessions: Vec::new(),
+                    reason: Some(HistoryFailReason::ReadFailed),
+                });
+            }
+        }
+    });
+}
+
+/// 处理移动端拉取某条历史会话的只读正文(按 `before_seq` 分页)。
+///
+/// 首次打开(`before_seq = None`)或缓存未命中时,先核对该会话确实归属目标项目
+/// (防跨项目按 id 读全局目录里的 Codex / agy 记录),再整份解析并写入单槽缓存;
+/// 上拉翻页(`before_seq = Some(_)`)命中缓存直接内存切片,零磁盘 IO。
+fn handle_request_session_content(
+    manager: &Arc<MobileRelayManager>,
+    request_id: String,
+    project_id: String,
+    agent: String,
+    session_id: String,
+    before_seq: Option<u64>,
+) {
+    let send_fail = |mgr: &MobileRelayManager,
+                     request_id: String,
+                     project_id: String,
+                     session_id: String,
+                     reason: HistoryFailReason| {
+        let _ = mgr.send(DesktopToRelay::SessionContent {
+            request_id,
+            project_id,
+            session_id,
+            ok: false,
+            messages: Vec::new(),
+            has_more: false,
+            reason: Some(reason),
+        });
+    };
+
+    let Some(project) = manager.host.project(&project_id) else {
+        send_fail(
+            manager,
+            request_id,
+            project_id,
+            session_id,
+            HistoryFailReason::ProjectNotFound,
+        );
+        return;
+    };
+    if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
+        send_fail(
+            manager,
+            request_id,
+            project_id,
+            session_id,
+            HistoryFailReason::NotSupported,
+        );
+        return;
+    }
+    let Some(kind) = AgentKind::parse(&agent) else {
+        send_fail(
+            manager,
+            request_id,
+            project_id,
+            session_id,
+            HistoryFailReason::UnsupportedAgent,
+        );
+        return;
+    };
+    if !kind.spec().history || !mt_ai::agent::session_id_ok(&session_id) {
+        send_fail(
+            manager,
+            request_id,
+            project_id,
+            session_id,
+            HistoryFailReason::UnsupportedAgent,
+        );
+        return;
+    }
+
+    let canonical_agent = kind.key().to_string();
+    // 翻页命中同会话单槽缓存:直接内存切片返回
+    if let Some(before) = before_seq {
+        let cached = manager.history_preview_cache.lock();
+        if let Some(entry) = cached.as_ref()
+            && entry.project_id == project_id
+            && entry.agent == canonical_agent
+            && entry.session_id == session_id
+        {
+            let (messages, has_more) =
+                history_slice(&entry.messages, Some(before), MIRROR_PAGE_SIZE);
+            drop(cached);
+            let _ = manager.send(DesktopToRelay::SessionContent {
+                request_id,
+                project_id,
+                session_id,
+                ok: true,
+                messages,
+                has_more,
+                reason: None,
+            });
+            return;
+        }
+    }
+
+    let mgr = Arc::clone(manager);
+    let path = project.path;
+    manager.spawn(async move {
+        let pid = project_id.clone();
+        let sid = session_id.clone();
+        let agent_key = canonical_agent.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let sessions = mt_ai::sessions::get_ai_sessions(path.clone())
+                .map_err(|_| HistoryFailReason::ReadFailed)?;
+            let belongs = sessions.iter().any(|s| {
+                s.id == sid && AgentKind::parse(&s.session_type) == Some(kind)
+            });
+            if !belongs {
+                return Err(HistoryFailReason::SessionNotFound);
+            }
+            mirror::parse_session_history_messages(&path, &agent_key, &sid)
+                .map_err(|_| HistoryFailReason::ReadFailed)
+        })
+        .await
+        .map_err(|_| HistoryFailReason::ReadFailed)
+        .and_then(|r| r);
+
+        match loaded {
+            Ok(all_messages) => {
+                let (messages, has_more) =
+                    history_slice(&all_messages, before_seq, MIRROR_PAGE_SIZE);
+                *mgr.history_preview_cache.lock() = Some(HistoryPreviewCache {
+                    project_id: pid,
+                    agent: canonical_agent,
+                    session_id: session_id.clone(),
+                    messages: all_messages,
+                });
+                let _ = mgr.send(DesktopToRelay::SessionContent {
+                    request_id,
+                    project_id,
+                    session_id,
+                    ok: true,
+                    messages,
+                    has_more,
+                    reason: None,
+                });
+            }
+            Err(reason) => {
+                let _ = mgr.send(DesktopToRelay::SessionContent {
+                    request_id,
+                    project_id,
+                    session_id,
+                    ok: false,
+                    messages: Vec::new(),
+                    has_more: false,
+                    reason: Some(reason),
+                });
+            }
+        }
+    });
+}
+
+/// 处理移动端基于历史会话继续对话:校验项目、白名单、项目归属并反查 cwd,
+/// 再把本地模板生成的 resume 命令交由上层在后台新建 pane(或直接复用已在运行的 pane)。
+fn handle_resume_ai_session(
+    manager: &Arc<MobileRelayManager>,
+    request_id: String,
+    project_id: String,
+    agent: String,
+    session_id: String,
+) {
+    let Some(project) = manager.host.project(&project_id) else {
+        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::ProjectNotFound));
+        return;
+    };
+    if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
+        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::NotSupported));
+        return;
+    }
+    let Some(kind) = AgentKind::parse(&agent) else {
+        manager.send_start_receipt(
+            request_id,
+            None,
+            Some(StartSessionFailReason::ResumeUnsupported),
+        );
+        return;
+    };
+    if kind.resume_command(&session_id).is_none() {
+        manager.send_start_receipt(
+            request_id,
+            None,
+            Some(StartSessionFailReason::ResumeUnsupported),
+        );
+        return;
+    }
+
+    let mgr = Arc::clone(manager);
+    let path = project.path;
+    manager.spawn(async move {
+        let sid = session_id.clone();
+        let resolved = tokio::task::spawn_blocking(move || {
+            let sessions = mt_ai::sessions::get_ai_sessions(path)
+                .map_err(|_| StartSessionFailReason::SessionNotFound)?;
+            let matched = sessions
+                .into_iter()
+                .find(|s| s.id == sid && AgentKind::parse(&s.session_type) == Some(kind))
+                .ok_or(StartSessionFailReason::SessionNotFound)?;
+            let command = kind
+                .resume_command(&matched.id)
+                .ok_or(StartSessionFailReason::ResumeUnsupported)?;
+            let cwd = if kind.looks_up_session_cwd() {
+                mt_ai::sessions::lookup_ai_session_cwd(matched.id.clone())
+            } else {
+                None
+            };
+            Ok((matched, command, cwd))
+        })
+        .await
+        .map_err(|_| StartSessionFailReason::SpawnFailed)
+        .and_then(|r| r);
+
+        match resolved {
+            Ok((matched, command, cwd)) => {
+                let agent_label = kind.spec().label.to_string();
+                let title = resume_pane_title(&matched.title, &agent_label);
+                mgr.events.resume_session(ResumeSessionPayload {
+                    request_id,
+                    project_id,
+                    agent: kind.key().to_string(),
+                    agent_label,
+                    session_id: matched.id,
+                    title,
+                    command,
+                    cwd,
+                });
+            }
+            Err(reason) => {
+                mgr.send_start_receipt(request_id, None, Some(reason));
+            }
+        }
+    });
 }
 
 /// 校验移动端的发起请求,通过则交给上层执行,不通过直接回失败回执。
@@ -3115,5 +3525,309 @@ mod tests {
             },
         );
         assert_eq!(peers_of(&fx, "pane-1"), CodexPeers::default());
+    }
+
+    // ── issue #104:历史会话列表、预览缓存与续接校验 ──
+
+    #[derive(Default)]
+    struct HistoryTestHost {
+        projects: Mutex<HashMap<String, RelayProject>>,
+        pane_sessions: Mutex<HashMap<u32, HookSessionId>>,
+    }
+
+    impl RelayHost for HistoryTestHost {
+        fn launchers(&self) -> Vec<AiLauncher> {
+            Vec::new()
+        }
+        fn project(&self, project_id: &str) -> Option<RelayProject> {
+            self.projects.lock().get(project_id).cloned()
+        }
+        fn write_pty(&self, _pty_id: u32, _data: String) -> Result<(), String> {
+            Ok(())
+        }
+        fn hook_session(&self, _pty_id: u32) -> Option<HookSessionId> {
+            None
+        }
+        fn pane_session(&self, pty_id: u32) -> Option<HookSessionId> {
+            self.pane_sessions.lock().get(&pty_id).cloned()
+        }
+        fn ai_session_agent(&self, _pty_id: u32) -> Option<String> {
+            Some("codex".into())
+        }
+        fn ai_session_started_at(&self, _pty_id: u32) -> Option<SystemTime> {
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(100))
+        }
+    }
+
+    #[test]
+    fn resume_pane_title_takes_first_non_empty_line_and_falls_back() {
+        assert_eq!(
+            resume_pane_title("\n  \n  修复登录\t问题\n第二行", "Claude Code"),
+            "修复登录问题"
+        );
+        assert_eq!(resume_pane_title("   \n\r\n  ", "Codex"), "Codex");
+    }
+
+    #[test]
+    fn to_mobile_history_session_maps_agent_label_resume_and_live_pane() {
+        let claude = to_mobile_history_session(
+            mt_ai::sessions::AiSession {
+                id: "0199a1b2-c3d4-7e8f-9012-3456789abcde".into(),
+                session_type: "claude".into(),
+                title: "排查性能".into(),
+                timestamp: "2026-11-21T08:00:00Z".into(),
+                model: None,
+                wsl_distro: None,
+                ssh_connection_id: None,
+            },
+            Some("pane-9".into()),
+        );
+        assert_eq!(claude.agent, "claude");
+        assert_eq!(claude.agent_label, "Claude Code");
+        assert!(claude.can_resume);
+        assert_eq!(claude.live_pane_id.as_deref(), Some("pane-9"));
+
+        let bad = to_mobile_history_session(
+            mt_ai::sessions::AiSession {
+                id: "--dangerously-skip-permissions".into(),
+                session_type: "claude".into(),
+                title: "可疑".into(),
+                timestamp: String::new(),
+                model: None,
+                wsl_distro: None,
+                ssh_connection_id: None,
+            },
+            None,
+        );
+        assert!(!bad.can_resume, "参数注入形态的 id 不允许续接");
+    }
+
+    #[test]
+    fn history_and_resume_reject_missing_remote_and_invalid_inputs_synchronously() {
+        let host = Arc::new(HistoryTestHost::default());
+        {
+            let mut projects = host.projects.lock();
+            projects.insert(
+                "local".into(),
+                RelayProject {
+                    path: r"D:\proj".into(),
+                    ssh_connection_id: None,
+                },
+            );
+            projects.insert(
+                "remote".into(),
+                RelayProject {
+                    path: "/srv/app".into(),
+                    ssh_connection_id: Some("conn-1".into()),
+                },
+            );
+            projects.insert(
+                "wsl".into(),
+                RelayProject {
+                    path: r"\\wsl$\Ubuntu\home\u\app".into(),
+                    ssh_connection_id: None,
+                },
+            );
+        }
+        let manager = Arc::new(MobileRelayManager::new(host, Arc::new(NoopRelayHost)));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *manager.outbound.lock() = Some(tx);
+
+        // 历史列表:不存在 / 远程 / WSL 根项目
+        handle_request_session_history(&manager, "h1".into(), "gone".into());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::SessionHistory {
+                request_id: "h1".into(),
+                project_id: "gone".into(),
+                ok: false,
+                sessions: vec![],
+                reason: Some(HistoryFailReason::ProjectNotFound),
+            }
+        );
+        for pid in ["remote", "wsl"] {
+            handle_request_session_history(&manager, "h2".into(), pid.into());
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                DesktopToRelay::SessionHistory {
+                    request_id: "h2".into(),
+                    project_id: pid.into(),
+                    ok: false,
+                    sessions: vec![],
+                    reason: Some(HistoryFailReason::NotSupported),
+                }
+            );
+        }
+
+        // 正文请求:非法 id / 无历史记录的 opencode 同步拒绝
+        handle_request_session_content(
+            &manager,
+            "c1".into(),
+            "local".into(),
+            "claude".into(),
+            "../etc/passwd".into(),
+            None,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::SessionContent {
+                request_id: "c1".into(),
+                project_id: "local".into(),
+                session_id: "../etc/passwd".into(),
+                ok: false,
+                messages: vec![],
+                has_more: false,
+                reason: Some(HistoryFailReason::UnsupportedAgent),
+            }
+        );
+        handle_request_session_content(
+            &manager,
+            "c2".into(),
+            "local".into(),
+            "opencode".into(),
+            "abc123".into(),
+            None,
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::SessionContent {
+                request_id: "c2".into(),
+                project_id: "local".into(),
+                session_id: "abc123".into(),
+                ok: false,
+                messages: vec![],
+                has_more: false,
+                reason: Some(HistoryFailReason::UnsupportedAgent),
+            }
+        );
+
+        // 续接:非法 id(命令注入 / 参数注入)与远程项目同步拒绝
+        for bad_id in ["abc;rm -rf /", "--dangerously-skip-permissions"] {
+            handle_resume_ai_session(
+                &manager,
+                "r1".into(),
+                "local".into(),
+                "claude".into(),
+                bad_id.into(),
+            );
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                DesktopToRelay::StartSessionReceipt {
+                    request_id: "r1".into(),
+                    ok: false,
+                    pane_id: None,
+                    reason: Some(StartSessionFailReason::ResumeUnsupported),
+                }
+            );
+        }
+        handle_resume_ai_session(
+            &manager,
+            "r2".into(),
+            "remote".into(),
+            "claude".into(),
+            "abc123".into(),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::StartSessionReceipt {
+                request_id: "r2".into(),
+                ok: false,
+                pane_id: None,
+                reason: Some(StartSessionFailReason::NotSupported),
+            }
+        );
+    }
+
+    #[test]
+    fn history_content_pagination_hits_single_slot_cache() {
+        let host = Arc::new(HistoryTestHost::default());
+        host.projects.lock().insert(
+            "local".into(),
+            RelayProject {
+                path: r"D:\proj".into(),
+                ssh_connection_id: None,
+            },
+        );
+        let manager = Arc::new(MobileRelayManager::new(host, Arc::new(NoopRelayHost)));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *manager.outbound.lock() = Some(tx);
+
+        let msgs: Vec<MirrorMessage> = (0..60u64)
+            .map(|seq| MirrorMessage {
+                seq,
+                source: "assistant".into(),
+                content: format!("m-{seq}"),
+                timestamp: String::new(),
+                ..Default::default()
+            })
+            .collect();
+        *manager.history_preview_cache.lock() = Some(HistoryPreviewCache {
+            project_id: "local".into(),
+            agent: "claude".into(),
+            session_id: "sid-1".into(),
+            messages: msgs,
+        });
+
+        handle_request_session_content(
+            &manager,
+            "page-2".into(),
+            "local".into(),
+            "claude".into(),
+            "sid-1".into(),
+            Some(10),
+        );
+        let reply = rx.try_recv().unwrap();
+        match reply {
+            DesktopToRelay::SessionContent {
+                request_id,
+                ok,
+                messages,
+                has_more,
+                ..
+            } => {
+                assert_eq!(request_id, "page-2");
+                assert!(ok);
+                assert!(!has_more);
+                assert_eq!(messages.len(), 10);
+                assert_eq!(messages[0].seq, 0);
+                assert_eq!(messages[9].seq, 9);
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    }
+
+    /// 无 hook 但有 `pane_session`(例如 codex resume 写回的身份)时:
+    /// 本 pane 精确走 LocateKey::Hook,且同项目其他无 hook Codex pane 把它记进 claimed。
+    #[test]
+    fn pane_session_fallback_binds_precisely_and_claims_codex_peer() {
+        let host = Arc::new(HistoryTestHost::default());
+        host.pane_sessions.lock().insert(
+            7,
+            HookSessionId {
+                agent: Some("codex".into()),
+                session_id: "resumed-sid".into(),
+            },
+        );
+        let manager = MobileRelayManager::new(host, Arc::new(NoopRelayHost));
+        manager.pane_paths.lock().insert("pane-1".into(), r"D:\proj".into());
+        manager.pane_paths.lock().insert("pane-2".into(), r"D:\proj".into());
+        manager.pane_ptys.lock().insert("pane-1".into(), 7);
+        manager.pane_ptys.lock().insert("pane-2".into(), 8);
+
+        assert_eq!(
+            manager.mirror_locate_key("pane-1"),
+            LocateKey::Hook {
+                pty_id: 7,
+                agent: Some("codex".into()),
+                session_id: "resumed-sid".into(),
+            }
+        );
+        match manager.mirror_locate_key("pane-2") {
+            LocateKey::Heuristic { codex_peers, .. } => {
+                assert_eq!(codex_peers.claimed, vec!["resumed-sid".to_string()]);
+                assert!(!codex_peers.contested);
+            }
+            other => panic!("pane-2 应走启发式并排除已认领会话: {other:?}"),
+        }
     }
 }
