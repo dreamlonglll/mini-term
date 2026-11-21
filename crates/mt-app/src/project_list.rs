@@ -1013,9 +1013,9 @@ fn project_menu(
                 let source_store = store.clone();
                 menu::item(t("projectList", "menu.worktrees"), move |window, cx| {
                     if source_store.read(cx).is_remote_project(&id)
-                        && !crate::git_backend::remote_git_enabled(source_store.read(cx), &id)
+                        && !crate::git::backend::remote_git_enabled(source_store.read(cx), &id)
                     {
-                        crate::git_backend::request_enable(
+                        crate::git::backend::request_enable(
                             source_store.clone(),
                             id.clone(),
                             window,
@@ -1023,8 +1023,8 @@ fn project_menu(
                         );
                         return;
                     }
-                    crate::git_worktree::open(
-                        crate::git_backend::project_context(source_store.read(cx), &id),
+                    crate::git::worktree::open(
+                        crate::git::backend::project_context(source_store.read(cx), &id),
                         // 项目里可能挂着多个仓库,与原版的项目级入口同口径
                         true,
                         Some(id.clone()),
@@ -1039,7 +1039,7 @@ fn project_menu(
             ProjectMenuAction::ToggleRemoteGit => {
                 let id = row.id.clone();
                 let source_store = store.clone();
-                let enabled = crate::git_backend::remote_git_enabled(store.read(cx), &id);
+                let enabled = crate::git::backend::remote_git_enabled(store.read(cx), &id);
                 let broken = store.read(cx).remote_connection_of(&id).is_none();
                 MenuItem::new(t(
                     "projectList",
@@ -1061,7 +1061,7 @@ fn project_menu(
                             store.set_project_remote_git_enabled(&id, false, cx)
                         });
                     } else {
-                        crate::git_backend::request_enable(
+                        crate::git::backend::request_enable(
                             source_store.clone(),
                             id.clone(),
                             window,

@@ -166,7 +166,7 @@ impl LayoutStore {
                 if fs::rename(&path, &corrupt).is_err() {
                     return Err(first);
                 }
-                eprintln!(
+                tracing::warn!(
                     "[layout] {} 打不开({first:#}),已挪至 {} 并重建空库",
                     path.display(),
                     corrupt.display()
@@ -208,7 +208,7 @@ impl LayoutStore {
             .and_then(|v| v.parse::<i64>().ok());
         match found {
             Some(v) if v > SCHEMA_VERSION => {
-                eprintln!("[layout] 库版本 {v} 高于本程序的 {SCHEMA_VERSION},按兼容模式读写");
+                tracing::warn!("[layout] 库版本 {v} 高于本程序的 {SCHEMA_VERSION},按兼容模式读写");
             }
             Some(v) if v == SCHEMA_VERSION => {}
             _ => {
@@ -334,7 +334,7 @@ impl LayoutStore {
                     mt_config::normalize_saved_layout(&mut layout);
                     out.insert(project_id, layout);
                 }
-                Err(e) => eprintln!("[layout] 项目 {project_id} 的布局解析失败,已跳过: {e}"),
+                Err(e) => tracing::warn!("[layout] 项目 {project_id} 的布局解析失败,已跳过: {e}"),
             }
         }
         out

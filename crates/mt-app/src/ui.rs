@@ -301,12 +301,6 @@ pub fn set_palette(palette: Palette) {
     CURRENT.with(|p| *p.borrow_mut() = palette);
 }
 
-/// 当前配色的一份拷贝。
-#[allow(dead_code)] // 整套取色的口子(皮肤预览卡片改成逐色取,暂无调用点)
-pub fn palette() -> Palette {
-    CURRENT.with(|p| p.borrow().clone())
-}
-
 // ─── 界面字号 / 字族 ──────────────────────────────────────────
 //
 // 原版把 `uiFontSize` 写进 `html` 的 inline `font-size`(App.tsx:141),Tailwind 的

@@ -141,7 +141,7 @@ fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
         // 传输层失败(断网 / DNS / TLS)的原文是英文且没什么可操作性,
         // 与原版一样收成一句「检查失败,请稍后重试」
         .map_err(|e| {
-            eprintln!("[settings] 检查更新失败: {e}");
+            tracing::warn!("[settings] 检查更新失败: {e}");
             t("settings", "about.checkFailed").to_string()
         })?;
     let status = resp.status().as_u16();

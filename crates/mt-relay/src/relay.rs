@@ -452,7 +452,7 @@ impl MobileRelayManager {
                 .enable_all()
                 .build()
                 .map(Spawner::Owned)
-                .map_err(|e| eprintln!("[mobile-relay] tokio runtime unavailable: {e}"))
+                .map_err(|e| tracing::error!("[mobile-relay] tokio runtime unavailable: {e}"))
                 .ok()
         });
         match spawner {
@@ -1156,7 +1156,7 @@ async fn connect_once(
         r = connect => match r {
             Ok((ws, _)) => ws,
             Err(e) => {
-                eprintln!("[mobile-relay] connect failed: {e}");
+                tracing::warn!("[mobile-relay] connect failed: {e}");
                 return Attempt::Failed;
             }
         },
@@ -1234,7 +1234,7 @@ async fn connect_once(
                     Some(Ok(Message::Close(_))) | None => break Attempt::ConnectedThenLost,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        eprintln!("[mobile-relay] connection lost: {e}");
+                        tracing::warn!("[mobile-relay] connection lost: {e}");
                         break Attempt::ConnectedThenLost;
                     }
                 }
@@ -1242,7 +1242,7 @@ async fn connect_once(
             _ = ping.tick() => {
                 let silent = last_rx.elapsed();
                 if silent >= keepalive.timeout {
-                    eprintln!(
+                    tracing::warn!(
                         "[mobile-relay] no frame from relay for {}s, reconnecting",
                         silent.as_secs()
                     );
@@ -1345,7 +1345,7 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             session_id,
         }) => handle_resume_ai_session(manager, request_id, project_id, agent, session_id),
         Ok(_) => {}
-        Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
+        Err(_) => tracing::warn!("[mobile-relay] unparseable relay message (ignored)"),
     }
 }
 

@@ -191,7 +191,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
     let (key_value, key_unreadable) = match crate::secrets::reveal_relay_key(&relay.desktop_key) {
         Ok(plain) => (plain, false),
         Err(err) => {
-            eprintln!("[mobile-panel] 已存桌面密钥无法解密,密钥框回填为空: {err}");
+            tracing::warn!("[mobile-panel] 已存桌面密钥无法解密,密钥框回填为空: {err}");
             (String::new(), true)
         }
     };
@@ -1088,7 +1088,7 @@ fn render_pair_link(state: &Entity<MobilePanel>, link: &str, copied: bool) -> im
         // 父级是 `items_center`,不撑满的话行宽跟着内容走,链接折不了行
         .w_full()
         .child(
-            crate::git_ui::mono(div())
+            crate::git::ui::mono(div())
                 .flex_1()
                 .min_w(px(0.0))
                 .text_size(ui::font_px(13.0))

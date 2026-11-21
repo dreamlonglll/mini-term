@@ -534,7 +534,7 @@ impl TerminalPane {
                 // **这条线程上不跑任何模式匹配**:总闸关着时只有一次原子读,
                 // 开着时也只是把尾部字节塞进有界环形缓冲,5 条口径在主线程节拍上跑。
                 // 详见 `git_watch` 模块注释(后续 Y 批的 git 着色与本条共用)。
-                crate::git_watch::observe_output(pty_id, bytes);
+                crate::git::watch::observe_output(pty_id, bytes);
                 let _ = tx.unbounded_send(PaneSignal::Output);
             }
         };
@@ -857,7 +857,7 @@ impl TerminalPane {
         match self.pty.resize(rows, cols) {
             Ok(true) => self.ai.perception().note_resize(self.pty_id),
             Ok(false) => {}
-            Err(err) => eprintln!("[pane {}] resize 失败: {err:#}", self.pty_id),
+            Err(err) => tracing::warn!("[pane {}] resize 失败: {err:#}", self.pty_id),
         }
     }
 
@@ -886,11 +886,11 @@ impl TerminalPane {
                 };
                 match filled.resized {
                     Some(Ok(true)) => self.ai.perception().note_resize(self.pty_id),
-                    Some(Err(err)) => eprintln!("[pane {}] resize 失败: {err:#}", self.pty_id),
+                    Some(Err(err)) => tracing::warn!("[pane {}] resize 失败: {err:#}", self.pty_id),
                     Some(Ok(false)) | None => {}
                 }
                 for err in &filled.write_errors {
-                    eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+                    tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
                 }
                 // WSL 启动器重写的一次性告知(`App.tsx:367-379`)。判定与重写早在
                 // `mt_pty::launch::plan` 里做完了,结论挂在会话上 —— 这里只是**唯一的
@@ -906,7 +906,7 @@ impl TerminalPane {
             }
             Err(err) => {
                 let msg = format!("{err:#}");
-                eprintln!("[pane {}] PTY 启动失败: {msg}", self.pty_id);
+                tracing::error!("[pane {}] PTY 启动失败: {msg}", self.pty_id);
                 // 已关闭的 pane 不必再画错误
                 if !self.pty.fail() {
                     return;
@@ -1202,7 +1202,7 @@ impl TerminalPane {
     pub fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.observe_user_write(bytes, cx);
         if let Err(err) = self.pty.write(bytes) {
-            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+            tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
@@ -1225,7 +1225,7 @@ impl TerminalPane {
         };
         self.observe_user_write(line, cx);
         if let Err(err) = self.pty.write_then_arm_ssh_autofill(line, password) {
-            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+            tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
@@ -1546,7 +1546,7 @@ impl TerminalPane {
     /// 相对顺序不变。
     fn write_raw(&mut self, bytes: &[u8]) {
         if let Err(err) = self.pty.write_reply(bytes) {
-            eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+            tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
 
@@ -1627,7 +1627,7 @@ impl TerminalPane {
         if let Some(mut pty) = self.pty.close()
             && let Err(err) = pty.kill()
         {
-            eprintln!("[pane {}] kill 失败: {err:#}", self.pty_id);
+            tracing::warn!("[pane {}] kill 失败: {err:#}", self.pty_id);
         }
         self.settle_spawn_waiters(false);
         self.ai.remove_pane(self.pty_id);
@@ -1846,7 +1846,7 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
                 return PasteAction::Raw(clipboard::quote_path(&mapped));
             }
             Err(detail) => {
-                eprintln!("[pane {pty_id}] 粘贴内容转存失败: {detail}");
+                tracing::warn!("[pane {pty_id}] 粘贴内容转存失败: {detail}");
                 toast::push_message(
                     ToastKind::PasteError,
                     project_id,
@@ -1877,7 +1877,7 @@ fn paste_image(
 ) -> PasteAction {
     if ctx.target == PasteTarget::Ssh {
         let Some((conn, project_path)) = ctx.remote else {
-            eprintln!("[pane {pty_id}] 远程连接不在场,剪贴板图片未粘贴");
+            tracing::warn!("[pane {pty_id}] 远程连接不在场,剪贴板图片未粘贴");
             toast::push_message(
                 ToastKind::PasteError,
                 ctx.project_id,
@@ -2286,7 +2286,7 @@ pub(crate) fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window,
                     match prepared {
                         Ok(temp) => Some(temp),
                         Err(err) => {
-                            eprintln!("[ssh] 准备私钥临时副本失败,回退原始路径: {err}");
+                            tracing::warn!("[ssh] 准备私钥临时副本失败,回退原始路径: {err}");
                             Some(path)
                         }
                     }

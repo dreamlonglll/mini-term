@@ -932,7 +932,7 @@ where
         // 非法正则:start_search 在起线程前就拦下了,只有直接调 run_search 才会走到这
         Ok(Err(_)) => false,
         Err(_) => {
-            eprintln!("[search] worker panicked while searching {:?}", req.query);
+            tracing::error!("[search] worker panicked while searching {:?}", req.query);
             false
         }
     };

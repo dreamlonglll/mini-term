@@ -89,7 +89,7 @@ async fn relay_process_leaves_no_files_behind() {
         let mut port = None;
         let mut line = String::new();
         while reader.read_line(&mut line).unwrap_or(0) > 0 {
-            if let Some(rest) = line.trim().strip_prefix("[relay] listening on 127.0.0.1:") {
+            if let Some((_, rest)) = line.trim().split_once("[relay] listening on 127.0.0.1:") {
                 port = rest
                     .split_whitespace()
                     .next()

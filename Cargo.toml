@@ -117,6 +117,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util
 futures = "0.3"
 # 主题包 manifest 的 sha256 校验(mt-theme-packs)。
 sha2 = "0.11.0"
+# 跨多个工作区 crate 共用的基础编码与 TOML 编辑库(mt-secret / mt-ssh / sidecars
+# 因被独立工作区 path 依赖仍保持显式版本号,与之对齐)。
+base64 = "0.22"
+toml_edit = "0.22"
+# 结构化日志门面与订阅器(已在 gpui / tokio 依赖树里锁死同版本,净新增 crate = 0)。
+tracing = "0.1"
+tracing-subscriber = "0.3"
 # SQLite:config.db(mt-config)/ layout.db(mt-layout)/ usage.db(mt-usage) 三家共用。
 #
 # ⚠️ **版本必须三家一致**:同一棵依赖树里出现两个 rusqlite 会连带两份

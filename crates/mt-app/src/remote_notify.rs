@@ -552,7 +552,7 @@ pub fn deliver(alert: RemoteAlert) {
             continue;
         }
         if let Err(err) = send_one(channel, &alert.config, &alert.message) {
-            eprintln!("[remote-notify] {} 推送失败: {err}", channel.label());
+            tracing::warn!("[remote-notify] {} 推送失败: {err}", channel.label());
         }
     }
 }

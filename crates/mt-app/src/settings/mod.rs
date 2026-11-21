@@ -169,7 +169,7 @@ impl SettingsPage {
 
     /// 按深链 id 反查分页。眼下的深链入口(首屏引导、Hook 提示 toast)直接传枚举,
     /// 只有单测在用;留着是给将来从字符串来的入口(移动端、命令行参数)。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn from_id(id: &str) -> Option<Self> {
         ALL_PAGES.iter().copied().find(|p| p.id() == id)
     }

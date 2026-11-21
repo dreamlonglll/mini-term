@@ -209,7 +209,7 @@ pub fn normalize_pricing_table(api: &serde_json::Value) -> PricingMap {
     if collision_count > 0 {
         // 不静默丢:碰撞本身是常态(一个模型被几十家登记),但数量突变往往
         // 意味着上游 id 规则变了,值得留痕以便对账
-        eprintln!(
+        tracing::warn!(
             "[pricing] {} 个模型键被多家 provider 重复登记(共 {collision_count} 条重复),已按一方 provider 优先择优",
             collided.len()
         );

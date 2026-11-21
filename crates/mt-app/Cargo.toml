@@ -115,6 +115,8 @@ mt-core.workspace = true
 # 已存 SSH 密码的封存/解封(`secrets.rs` 接线):表单保存时封存、编辑与自动填充时解开。
 mt-secret.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 # 活 pane 列表要在 GPUI 主线程与 mt-ai 的 500ms 轮询线程之间共享。
 parking_lot.workspace = true
 # PTY reader 线程 → 主线程的唤醒信号(gpui 的 AsyncApp 是 Rc,不能跨线程)。
@@ -133,7 +135,7 @@ qrcode.workspace = true
 # 系统随机源)与 `out` 帧的 base64 解码。两者都已在依赖树里(mt-secret / mt-ssh 带进来的
 # 同一份 ring 0.17 / base64 0.22),净新增 crate = 0。
 ring = "0.17"
-base64 = "0.22"
+base64.workspace = true
 # 价格表响应的解析(`pricing::fetch_models_dev`)、布局/设置等处的 JSON 读写。
 # 价格表缓存信封(model-pricing.json / .cache.json)的 serde 镜像已随归一 / 缓存
 # 逻辑挪进 mt-usage(`models_dev`),本 crate 不再直接依赖 serde。

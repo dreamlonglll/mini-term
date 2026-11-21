@@ -107,7 +107,7 @@ impl RemoteNotifyForm {
             |which: PushSecret| match crate::secrets::reveal_secret(which.stored(config)) {
                 Ok(plain) => plain,
                 Err(err) => {
-                    eprintln!("[settings] 远程通知已存凭据无法解密,回填为空: {err}");
+                    tracing::warn!("[settings] 远程通知已存凭据无法解密,回填为空: {err}");
                     unreadable.insert(which);
                     String::new()
                 }
@@ -273,7 +273,7 @@ impl SettingsView {
                 self.remote.notice = None;
             }
             Err(err) => {
-                eprintln!("[settings] 远程通知凭据加密失败,本次未保存: {err}");
+                tracing::error!("[settings] 远程通知凭据加密失败,本次未保存: {err}");
                 self.remote.notice =
                     Some(tr!("settings", "remoteNotify.err.sealFailed", detail = err));
             }

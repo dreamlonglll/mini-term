@@ -82,13 +82,14 @@ use paths::PathSemantics;
 
 use crate::file_ops::FileBackendIdentity;
 use crate::file_viewer::{DocumentSource, FileViewer, LineTarget, SaveForClose};
-use crate::git_diff::{DiffKey, DiffTab, DiffTabEvent};
+use crate::git::diff::{DiffKey, DiffTab, DiffTabEvent};
+use crate::git::ui as git_ui;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_alert};
 use crate::store::{AppStore, StoreEvent};
 use crate::terminal_area::TerminalArea;
-use crate::{git_ui, ui};
+use crate::ui;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum DocumentBackendKey {

@@ -206,7 +206,7 @@ impl AppStore {
     pub(super) fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         // 对应 `terminalCache.ts:546` 的 `aiPtyIds.delete(ptyId)` ——
         // 不摘的话新 PTY 复用同一个编号时会被误当成 AI pane(嗅探静默失效)
-        crate::git_watch::forget_pane(pty_id);
+        crate::git::watch::forget_pane(pty_id);
         // 关 pane / 关整组 / 项目移除三条路的唯一汇合点,标记与游标在这里一并回收
         // (原版分散在 `setProjectLayout` 的 ptyId 集合比对、`disposePane`、
         // `removeProject` 三处,漏一处就是「pty id 复用后接手了上一任的标记」)
@@ -251,7 +251,7 @@ impl AppStore {
         if let Some(code) = code
             && code != 0
         {
-            eprintln!("[store] pane {pty_id} 子进程退出,退出码 {code}");
+            tracing::info!("[store] pane {pty_id} 子进程退出,退出码 {code}");
         }
         // fork 命令没能起起会话就退了 —— 这条登记不该等到下一个进程头上
         // (原版把 `clearPendingFork` 挂在 `pty-exit` 监听里,同一时机)
@@ -390,7 +390,7 @@ impl AppStore {
                 // `App.tsx:284` 的 `markAiPty(ptyId, status === 'ai-working' ||
                 // status === 'ai-idle')` 一字不差(见 `git_watch` 模块注释)。
                 // 放在找到活 pane 之后:死掉的 PTY 不该再被标记
-                crate::git_watch::set_ai_pane(
+                crate::git::watch::set_ai_pane(
                     change.pty_id,
                     matches!(status, PaneStatus::AiWorking | PaneStatus::AiIdle),
                 );

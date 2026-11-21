@@ -198,7 +198,7 @@ pub fn read_agy_conversations() -> Vec<AgyConversation> {
         return Vec::new();
     }
     read_agy_conversations_from(&db).unwrap_or_else(|e| {
-        eprintln!("[agy-sessions] 读会话索引失败: {e}");
+        tracing::warn!("[agy-sessions] 读会话索引失败: {e}");
         Vec::new()
     })
 }

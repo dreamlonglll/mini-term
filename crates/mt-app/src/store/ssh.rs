@@ -121,7 +121,7 @@ impl AppStore {
                 .revoke_remote_git_permissions_for_connection(&id);
         }
         self.config.clear_invalid_remote_git_permissions();
-        crate::git_backend::sync_remote_git_permissions(&self.config);
+        crate::git::backend::sync_remote_git_permissions(&self.config);
         drop(source_change);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
@@ -159,7 +159,7 @@ impl AppStore {
         }
         mt_remote::invalidate_connection(id);
         self.config.revoke_remote_git_permissions_for_connection(id);
-        crate::git_backend::sync_remote_git_permissions(&self.config);
+        crate::git::backend::sync_remote_git_permissions(&self.config);
         drop(source_change);
         self.save_config_now();
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));

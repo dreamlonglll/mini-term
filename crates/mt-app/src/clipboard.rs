@@ -232,7 +232,7 @@ pub fn read_clipboard_image(item: Option<&gpui::ClipboardItem>) -> ClipboardImag
         // 剪贴板里确实没有位图 —— 还可能有 gpui 认得的注册格式,继续往下问
         Err(win::ReadError::NoImage) => {}
         Err(win::ReadError::Failed(detail)) => {
-            eprintln!("[clipboard] Win32 读剪贴板图片失败: {detail}");
+            tracing::warn!("[clipboard] Win32 读剪贴板图片失败: {detail}");
             // 有图却读不出:gpui 那条路还有机会(某些应用只放 PNG 注册格式),
             // 都不行才认输退 Alt+V。
             return match gpui_image(item) {
@@ -246,7 +246,7 @@ pub fn read_clipboard_image(item: Option<&gpui::ClipboardItem>) -> ClipboardImag
         Some(Ok(path)) => ClipboardImage::Saved(path),
         // 有图但写盘失败:同样别退回文本分支(那会静默),退 Alt+V 至少还有一条路
         Some(Err(detail)) => {
-            eprintln!("[clipboard] 剪贴板图片落盘失败: {detail}");
+            tracing::warn!("[clipboard] 剪贴板图片落盘失败: {detail}");
             ClipboardImage::Unreadable
         }
         None => ClipboardImage::None,
@@ -854,7 +854,7 @@ pub fn spawn_remote_paste(
             .await;
         in_flight_end(pty_id);
 
-        let _ = store.update(cx, |store, cx| {
+        store.update(cx, |store, cx| {
             let Some((project, pane)) = store.pane_of_pty(pty_id) else {
                 return; // pane 在上传期间被关掉了
             };
@@ -863,7 +863,7 @@ pub fn spawn_remote_paste(
                     store.write_to_pane(&project, &pane, &quote_path(&remote_path), cx);
                 }
                 Err(detail) => {
-                    eprintln!("[pane {pty_id}] 粘贴内容上传到远端失败: {detail}");
+                    tracing::warn!("[pane {pty_id}] 粘贴内容上传到远端失败: {detail}");
                     toast::push_message(
                         ToastKind::PasteError,
                         project_id,

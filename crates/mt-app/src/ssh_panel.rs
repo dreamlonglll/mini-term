@@ -1069,7 +1069,7 @@ fn new_form(
         .map(|stored| match crate::secrets::reveal_password(stored) {
             Ok(plain) => plain,
             Err(err) => {
-                eprintln!(
+                tracing::warn!(
                     "[ssh-panel] 连接 {} 的已存密码无法解密,表单回填为空: {err}",
                     conn.map(|c| c.id.as_str()).unwrap_or_default()
                 );
@@ -1356,11 +1356,11 @@ fn finish_test(
         },
         Err(failure) => {
             // 原文不含密码与私钥内容(mt-ssh 的报错口径),可以进日志
-            eprintln!("[ssh-panel] 测试连接失败: {}", failure.message);
+            tracing::warn!("[ssh-panel] 测试连接失败: {}", failure.message);
             let detail = failure_detail(&failure, unreadable_hint);
             ConnTestOutcome::Failed {
                 headline: failure_headline_key(failure.kind),
-                detail: crate::git_ui::error_text_state(&detail, 10, window, cx),
+                detail: crate::git::ui::error_text_state(&detail, 10, window, cx),
             }
         }
     };
@@ -2479,7 +2479,7 @@ fn render_test_result(test: &ConnTest, current_fingerprint: u64) -> Option<AnyEl
                     .text_color(ui::color_error())
                     .child(t("sshModal", headline)),
             )
-            .child(crate::git_ui::error_text_box(detail))
+            .child(crate::git::ui::error_text_box(detail))
             .into_any_element(),
     };
     Some(

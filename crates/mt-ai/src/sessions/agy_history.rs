@@ -125,7 +125,7 @@ pub(super) fn get_wsl_agy_sessions_in(home: &Path, unix_cwd: &str, distro: &str)
     let conversations = match read_agy_conversations_via_snapshot(&db) {
         Ok(list) => list,
         Err(e) => {
-            eprintln!("[agy-sessions] 读 WSL({distro}) 会话索引失败: {e}");
+            tracing::warn!("[agy-sessions] 读 WSL({distro}) 会话索引失败: {e}");
             return Vec::new();
         }
     };

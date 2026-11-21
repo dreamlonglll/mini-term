@@ -2029,14 +2029,14 @@ impl FileViewer {
                 }
                 match outcome {
                     Ok(disk) => {
-                        let spec = crate::git_diff::TextDiffSpec {
+                        let spec = crate::git::diff::TextDiffSpec {
                             name,
                             source,
                             viewer,
                             disk,
                             mine: input.mine,
                         };
-                        crate::git_diff::open_text_diff(spec, window, cx);
+                        crate::git::diff::open_text_diff(spec, window, cx);
                     }
                     Err(err) => {
                         view.compare_error = Some(err);

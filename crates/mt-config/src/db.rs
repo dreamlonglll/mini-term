@@ -209,7 +209,7 @@ impl ConfigDb {
                 let db = Self::try_open(&path).map_err(|second| {
                     anyhow!("配置库损坏且备份不可用: {first:#} / 备份: {second:#}")
                 })?;
-                eprintln!(
+                tracing::warn!(
                     "[config] config.db 打不开({first:#}),已用备份 {} 恢复(坏库留在 {})",
                     bak.display(),
                     corrupt.display()
@@ -254,7 +254,7 @@ impl ConfigDb {
             .and_then(|v| v.parse::<i64>().ok())
         {
             Some(v) if v > SCHEMA_VERSION => {
-                eprintln!("[config] 库版本 {v} 高于本程序的 {SCHEMA_VERSION},按兼容模式读写");
+                tracing::warn!("[config] 库版本 {v} 高于本程序的 {SCHEMA_VERSION},按兼容模式读写");
             }
             Some(v) if v == SCHEMA_VERSION => {}
             _ => self.meta_set(META_SCHEMA_VERSION, &SCHEMA_VERSION.to_string()),
@@ -541,7 +541,7 @@ fn settings_from_raw(raw: Vec<(String, String)>) -> Result<(AppConfig, Vec<Strin
                 map.insert(key, value);
             }
             Err(err) => {
-                eprintln!(
+                tracing::warn!(
                     "[config] 配置项 {key} 的值不是合法 JSON({err}),本次按默认值,库里原值保留"
                 );
                 bad.push(key);
@@ -569,7 +569,7 @@ fn settings_from_raw(raw: Vec<(String, String)>) -> Result<(AppConfig, Vec<Strin
             let mut probe = defaults.clone();
             probe.insert(key.clone(), value);
             if let Err(err) = parse_settings(probe) {
-                eprintln!(
+                tracing::warn!(
                     "[config] 配置项 {key} 的值不符合当前 schema({err}),本次按默认值,库里原值保留"
                 );
                 map.remove(&key);
@@ -691,7 +691,7 @@ fn read_rows<T: DeserializeOwned>(
         match serde_json::from_str::<T>(&raw) {
             Ok(item) => out.push(item),
             Err(err) => {
-                eprintln!(
+                tracing::warn!(
                     "[config] {table} 里 id={id} 的一行解析失败({err}),本次跳过,库里原样保留"
                 );
                 bad.insert(id);

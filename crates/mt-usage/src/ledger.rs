@@ -335,7 +335,7 @@ impl Ledger {
                     true
                 }
                 Err(e) => {
-                    eprintln!("[usage_stats] 账本 v3→v4 就地迁移失败，改为重建: {e}");
+                    tracing::warn!("[usage_stats] 账本 v3→v4 就地迁移失败，改为重建: {e}");
                     false
                 }
             }
@@ -720,7 +720,7 @@ pub fn usage_ledger_sync(db_path: &Path, blocking: bool, sink: &SyncSink) {
         run_sync(db_path, blocking, sink);
     }));
     if outcome.is_err() {
-        eprintln!("[usage_stats] ledger sync panicked");
+        tracing::error!("[usage_stats] ledger sync panicked");
     }
 }
 
@@ -743,7 +743,7 @@ fn sync_round(db_path: &Path, sink: &SyncSink) {
     let mut ledger = match Ledger::open(db_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[usage_stats] 账本打开失败: {e}");
+            tracing::error!("[usage_stats] 账本打开失败: {e}");
             return;
         }
     };
@@ -769,7 +769,7 @@ fn sync_round(db_path: &Path, sink: &SyncSink) {
             Ok(true) => added += 1,
             Ok(false) => {}
             // 单文件失败不拖垮全量（下轮指纹仍不匹配，会重试）
-            Err(e) => eprintln!("[usage_stats] 同步文件失败: {e}"),
+            Err(e) => tracing::warn!("[usage_stats] 同步文件失败: {e}"),
         }
         if backfill && last_emit.elapsed() >= Duration::from_millis(250) {
             sink(SyncEvent::Progress { processed: i + 1, total });

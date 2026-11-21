@@ -323,7 +323,7 @@ impl Tray {
         let (tx, rx) = mpsc::unbounded();
         let handle = main_window_handle(window).and_then(|hwnd| platform::start(hwnd, tx));
         if handle.is_none() {
-            eprintln!("[tray] 托盘未启用(平台不支持或初始化失败)");
+            tracing::warn!("[tray] 托盘未启用(平台不支持或初始化失败)");
         }
         (
             Self {

@@ -730,7 +730,7 @@ pub fn note_user_interrupt(
     }
     hook_state.update(pty_id, "ai-idle".to_string());
     emitter.emit_if_changed(pty_id, "ai-idle", Some("Interrupt"), agent);
-    eprintln!("[hook-server] pty_id={} 用户打断 -> ai-idle", pty_id);
+    tracing::info!("[hook-server] pty_id={} 用户打断 -> ai-idle", pty_id);
 }
 
 /// 启动 hook HTTP 服务器
@@ -750,7 +750,7 @@ pub fn start_hook_server(
 ) -> Result<(), String> {
     // 如果已经在运行，不重复启动
     if hook_state.is_server_running() {
-        eprintln!("[hook-server] 服务器已在运行，跳过启动");
+        tracing::info!("[hook-server] 服务器已在运行，跳过启动");
         return Ok(());
     }
 
@@ -762,13 +762,13 @@ pub fn start_hook_server(
             let addr = format!("127.0.0.1:{}", port);
             match tiny_http::Server::http(&addr) {
                 Ok(s) => {
-                    eprintln!("[hook-server] 监听 {}", addr);
+                    tracing::info!("[hook-server] 监听 {}", addr);
                     hook_state.set_port(port);
                     result = Some((s, port));
                     break;
                 }
                 Err(e) => {
-                    eprintln!("[hook-server] 端口 {} 被占用: {}", port, e);
+                    tracing::warn!("[hook-server] 端口 {} 被占用: {}", port, e);
                 }
             }
         }
@@ -778,7 +778,7 @@ pub fn start_hook_server(
     let (server, port) = match bound {
         Some(s) => s,
         None => {
-            eprintln!("[hook-server] 无法绑定任何端口，hook 服务器未启动");
+            tracing::error!("[hook-server] 无法绑定任何端口，hook 服务器未启动");
             return Err("无法绑定端口 (23456-23460)，hook 服务器启动失败".to_string());
         }
     };
@@ -832,7 +832,7 @@ pub fn start_hook_server(
                 continue;
             }
             if body.len() > MAX_HOOK_BODY_BYTES {
-                eprintln!(
+                tracing::warn!(
                     "[hook-server] body 超过 {} 字节上限，已拒绝",
                     MAX_HOOK_BODY_BYTES
                 );
@@ -846,7 +846,7 @@ pub fn start_hook_server(
             let payload: HookPayload = match serde_json::from_str(&body) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[hook-server] JSON 解析失败: {}", e);
+                    tracing::warn!("[hook-server] JSON 解析失败: {}", e);
                     let response =
                         tiny_http::Response::from_string("Bad Request").with_status_code(400);
                     let _ = request.respond(response);
@@ -879,7 +879,7 @@ pub fn start_hook_server(
                         }
                         None => None,
                     };
-                    eprintln!(
+                    tracing::info!(
                         "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}(settled={})，不改状态",
                         pty_id, event, payload.session_id, settled
                     );
@@ -888,7 +888,7 @@ pub fn start_hook_server(
                         hook_state.get_status(pty_id).as_deref(),
                         emitter.last_cause(pty_id).as_deref(),
                     ) {
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} 子代理已全部收尾,但主会话已不在工作中(打断/退出),延后的完成作废",
                             pty_id
                         );
@@ -900,7 +900,7 @@ pub fn start_hook_server(
                         tracker.mark_ai_session(pty_id, AgentKind::Agy.key());
                         hook_state.update(pty_id, status.to_string());
                         emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} 子代理已全部收尾,补记主会话延后的完成 -> status={} cause={}",
                             pty_id, status, cause
                         );
@@ -919,7 +919,7 @@ pub fn start_hook_server(
                     if payload.reason.as_deref() == Some("clear") {
                         // /clear 换会话不是退出：紧随其后的 SessionStart 会带新
                         // session id 刷新状态，这里只靠墓碑挡住旧会话的迟到事件
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} event=SessionEnd(clear) -> 仅记录墓碑",
                             pty_id
                         );
@@ -928,7 +928,7 @@ pub fn start_hook_server(
                         // `claude -p` / `codex exec`,继承 MINITERM_PTY_ID)结束,
                         // 或退出后立刻重开、新 SessionStart 先到的乱序。此时清
                         // hook 状态 / AI 会话标记会误杀仍在跑的会话,只留墓碑。
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} event=SessionEnd 非最后活跃会话,仅记录墓碑",
                             pty_id
                         );
@@ -939,7 +939,7 @@ pub fn start_hook_server(
                         hook_state.remove(pty_id);
                         tracker.clear_ai_session(pty_id);
                         emitter.emit_if_changed(pty_id, "idle", Some("SessionEnd"), None);
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
                             pty_id, payload.reason
                         );
@@ -953,7 +953,7 @@ pub fn start_hook_server(
                         if event == "SessionStart" {
                             hook_state.revive_session(pty_id, sid);
                         } else if hook_state.is_session_ended(pty_id, sid) {
-                            eprintln!(
+                            tracing::info!(
                                 "[hook-server] pty_id={} event={} 来自已结束会话 {}，忽略",
                                 pty_id, event, sid
                             );
@@ -1014,7 +1014,7 @@ pub fn start_hook_server(
                         // 决定播报与托盘黄绿灯（见 notify.rs 与 store 的 attention 判定）
                         emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
 
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={}{}",
                             pty_id,
                             event,
@@ -1028,9 +1028,9 @@ pub fn start_hook_server(
                                 .unwrap_or_default()
                         );
                     } else if let EventRoute::KeepStatus(why) = route {
-                        eprintln!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
+                        tracing::info!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
                     } else if route == EventRoute::DeferStop {
-                        eprintln!(
+                        tracing::info!(
                             "[hook-server] pty_id={} event={} fullyIdle=false:后台子代理还在跑,完成延后到它们收尾",
                             pty_id, event
                         );
@@ -1051,7 +1051,7 @@ pub fn stop_hook_server(hook_state: &HookState, data_dir: &Path) {
     let server = hook_state.server.lock().take();
     if let Some(s) = server {
         s.unblock();
-        eprintln!("[hook-server] 服务器已停止");
+        tracing::info!("[hook-server] 服务器已停止");
     }
     hook_state.set_port(0);
     // 清理端口文件
@@ -1095,9 +1095,9 @@ fn write_port_file(dir: &Path, port: u16) {
     let path = dir.join("hook-server.json");
     let content = format!("{{\"port\":{}}}", port);
     if let Err(e) = crate::util::atomic_write(&path, content.as_bytes()) {
-        eprintln!("[hook-server] 写入端口文件失败 {}: {}", path.display(), e);
+        tracing::warn!("[hook-server] 写入端口文件失败 {}: {}", path.display(), e);
     } else {
-        eprintln!("[hook-server] 端口文件已写入 {}", path.display());
+        tracing::info!("[hook-server] 端口文件已写入 {}", path.display());
     }
 }
 
@@ -1106,9 +1106,9 @@ fn delete_port_file(dir: &Path) {
     let path = dir.join("hook-server.json");
     if path.exists() {
         if let Err(e) = std::fs::remove_file(&path) {
-            eprintln!("[hook-server] 删除端口文件失败 {}: {}", path.display(), e);
+            tracing::warn!("[hook-server] 删除端口文件失败 {}: {}", path.display(), e);
         } else {
-            eprintln!("[hook-server] 端口文件已删除 {}", path.display());
+            tracing::info!("[hook-server] 端口文件已删除 {}", path.display());
         }
     }
 }

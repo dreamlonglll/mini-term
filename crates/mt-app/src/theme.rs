@@ -93,7 +93,7 @@ pub fn theme_packs() -> mt_config::ThemePacks {
 /// 可用的外置主题包(坏包跳过,设置页的皮肤列表用它)。
 pub fn list_packs() -> Vec<ThemePackListing> {
     theme_bridge::list_theme_packs(&theme_packs()).unwrap_or_else(|err| {
-        eprintln!("[theme] 主题目录读取失败: {err:#}");
+        tracing::warn!("[theme] 主题目录读取失败: {err:#}");
         Vec::new()
     })
 }
@@ -152,7 +152,7 @@ fn apply_inner(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App
                 };
             }
             Err(err) => {
-                eprintln!("[theme] 自定义主题 {theme_id} 加载失败,回落内置外观: {err:#}");
+                tracing::warn!("[theme] 自定义主题 {theme_id} 加载失败,回落内置外观: {err:#}");
                 let appearance = resolve_appearance(&config.theme, cx);
                 let palette = builtin_palette(appearance);
                 // 返回值就是该明暗的内置终端配色;`terminalFollowTheme` 那道闸

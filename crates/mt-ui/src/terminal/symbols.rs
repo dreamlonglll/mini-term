@@ -73,7 +73,9 @@ pub fn install_symbol_font(cx: &App) -> bool {
             true
         }
         Err(err) => {
-            eprintln!("[mt-ui] 内置 Nerd Font 图标字体注册失败,终端里的图标仍会画成方块: {err:#}");
+            tracing::warn!(
+                "[mt-ui] 内置 Nerd Font 图标字体注册失败,终端里的图标仍会画成方块: {err:#}"
+            );
             false
         }
     }

@@ -55,7 +55,7 @@ impl AiProjectKind {
     /// 拼不出来,于是那条路走的是 [`Self::tray_status_key`](见下),emoji 那半
     /// 走 [`crate::tray::kind_emoji`] 的 match。留着它是为了钉住四个档位的对外
     /// 字符串口径与 TS 一致。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Attention => "attention",
@@ -198,7 +198,7 @@ impl TitleBarLight {
     /// 于是这条**暂时没有生产调用方** —— 档位类型、归并算法与这张文案表都留着:
     /// 它们仍由 [`compute_title_bar_light`] 那几条单测把着,哪天要把灯挂回来
     /// (或换个位置画)不必从头再推一遍优先级。
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn i18n_key(self) -> &'static str {
         match self {
             Self::Error => "titleBar.status.error",

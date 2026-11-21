@@ -1134,7 +1134,7 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
         // 「未填密钥」建连:中转回「密钥不正确」后连接循环停在那个状态上,
         // 不重试不刷屏;面板打开时再就地提示重填(`mobile_panel::open`)。
         let key = crate::secrets::reveal_relay_key(&relay.desktop_key).unwrap_or_else(|err| {
-            eprintln!("[mobile-relay] 已存桌面密钥无法解密,按未填写处理: {err}");
+            tracing::warn!("[mobile-relay] 已存桌面密钥无法解密,按未填写处理: {err}");
             String::new()
         });
         manager.apply(&relay.relay_url, &key);

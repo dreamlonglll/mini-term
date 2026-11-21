@@ -196,7 +196,7 @@ pub fn parse_theme_pack(theme_id: &str, json: &str) -> Result<ThemePackDef> {
     }
     if def.id != theme_id {
         // 与前端同样只警告：以目录名为准，包还是能用
-        eprintln!(
+        tracing::warn!(
             "[mt-ui] 主题包目录名 {theme_id} 与 theme.json id {} 不一致，以目录名为准",
             def.id
         );
@@ -832,7 +832,7 @@ pub fn resolve_theme_pack(def: &ThemePackDef, dir: Option<&Path>) -> AppliedThem
         let path = dir.join(image);
         // 图不在盘上就当没有背景图：否则终端被透明化、氛围层却是空的
         if !path.is_file() {
-            eprintln!(
+            tracing::warn!(
                 "[mt-ui] 主题包 {} 声明了背景图 {image}，但文件不存在，按无背景图处理",
                 def.id
             );
@@ -1028,7 +1028,7 @@ pub fn list_theme_packs(packs: &mt_theme_packs::ThemePacks) -> Result<Vec<ThemeP
                 def,
                 dir: entry.dir,
             }),
-            Err(e) => eprintln!("[mt-ui] 主题包 {} 无效，已跳过: {e:#}", entry.theme_id),
+            Err(e) => tracing::warn!("[mt-ui] 主题包 {} 无效，已跳过: {e:#}", entry.theme_id),
         }
     }
     Ok(out)

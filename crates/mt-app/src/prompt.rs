@@ -37,7 +37,7 @@ use gpui_component::dialog::{Cancel, DialogFooter};
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::dialog_host::{self, Dialog};
-use crate::git_ui;
+use crate::git::ui as git_ui;
 use crate::i18n::{t, tr};
 use crate::overlay;
 use crate::ui;
@@ -788,7 +788,7 @@ mod tests {
     /// 通用确认框与 Git 的确认类小弹窗同宽(360 时中文末尾一两个字单独成行)。
     #[test]
     fn 通用弹窗与_git_小弹窗同宽() {
-        assert_eq!(DIALOG_W, crate::git_ui::DIALOG_W_SM);
+        assert_eq!(DIALOG_W, crate::git::ui::DIALOG_W_SM);
     }
 
     /// 「确定」关框后,回调随后发起的焦点交接(新建文件后编辑器取焦点、「保存并关闭」后交给

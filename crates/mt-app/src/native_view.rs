@@ -547,7 +547,7 @@ mod hosted {
                 if !SetWindowSubclass(root, Some(key_menu_subclass), KEY_MENU_SUBCLASS_ID, 0)
                     .as_bool()
                 {
-                    eprintln!("[webview] 拦截键盘菜单失败,WebView 里单按 Alt 可能卡死界面");
+                    tracing::warn!("[webview] 拦截键盘菜单失败,WebView 里单按 Alt 可能卡死界面");
                 }
             }
         }

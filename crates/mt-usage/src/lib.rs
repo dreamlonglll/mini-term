@@ -187,7 +187,7 @@ fn collect_agy_jobs(app_data_dir: &Path, jobs: &mut Vec<SessionJob>) {
         Ok(c) => c,
         Err(e) => {
             if !WARNED.swap(true, Ordering::Relaxed) {
-                eprintln!("[usage_stats] 读 agy 会话索引失败,本轮跳过 agy: {e}");
+                tracing::warn!("[usage_stats] 读 agy 会话索引失败,本轮跳过 agy: {e}");
             }
             return;
         }

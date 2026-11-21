@@ -668,7 +668,7 @@ impl SearchModal {
         }) {
             Ok(handle) => handle,
             Err(err) => {
-                eprintln!("[search] 启动失败: {err:#}");
+                tracing::warn!("[search] 启动失败: {err:#}");
                 self.status = Status::Done;
                 cx.notify();
                 return;

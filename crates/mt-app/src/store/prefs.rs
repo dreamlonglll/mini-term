@@ -92,7 +92,7 @@ impl AppStore {
             // 只清内存不落盘:主题目录可能只是这次读不到(盘没挂载、文件正被替换),
             // 落盘会把用户的选择永久抹掉,下次启动就找不回来了(旧版同一红线)。
             self.config.custom_theme_id = None;
-            eprintln!("[store] 主题包 {failed} 本次不可用,已回落内置外观(配置未改盘)");
+            tracing::warn!("[store] 主题包 {failed} 本次不可用,已回落内置外观(配置未改盘)");
         }
         crate::ui::set_palette(applied.palette);
         self.background_art = applied.background;
@@ -106,8 +106,7 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::Appearance));
     }
 
-    /// 当前主题的背景图参数(渲染归 mt-ui,这里只是取数口)。
-    #[allow(dead_code)] // 消费方是 mt-ui 的背景图渲染,尚未落地
+    /// 当前主题的背景图参数(由 `Workspace` 根容器窗口级渲染)。
     pub fn background_art(&self) -> Option<&BackgroundArt> {
         self.background_art.as_ref()
     }
@@ -254,7 +253,7 @@ impl AppStore {
             }
         }
         self.config.clear_invalid_remote_git_permissions();
-        crate::git_backend::sync_remote_git_permissions(&self.config);
+        crate::git::backend::sync_remote_git_permissions(&self.config);
         drop(source_change);
         self.save_config_soon(cx);
         // 「启用动画」管全部动画:改了就同步两道闸(mt-ui 总开关 + gpui 那道),

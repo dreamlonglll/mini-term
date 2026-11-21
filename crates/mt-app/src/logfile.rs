@@ -37,7 +37,62 @@
 //! 每次启动先写一行会话头(版本 / pid / 时刻),多次运行的日志拼在同一个文件里
 //! 也分得开。
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
+
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
+/// 启用默认 `info` 级别记录的内部 crate 目标名列表(其余第三方 crate 默认 `warn`,
+/// 避免 gpui / hyper / notify 等上游噪声淹没 `mini-term.log`)。
+const INTERNAL_LOG_TARGETS: &[&str] = &[
+    "mini_term",
+    "mt_app",
+    "mt_ai",
+    "mt_config",
+    "mt_layout",
+    "mt_project",
+    "mt_pty",
+    "mt_relay",
+    "mt_remote",
+    "mt_ui",
+    "mt_usage",
+];
+
+/// 按 `RUST_LOG` 构造日志过滤器;未设置或语法无效时回落到默认级别
+/// (`warn` 兜底 + 内部 crate 全部 `info`)。
+fn build_log_filter(env_spec: Option<&str>) -> Targets {
+    if let Some(raw) = env_spec
+        && !raw.trim().is_empty()
+        && let Ok(parsed) = Targets::from_str(raw.trim())
+    {
+        return parsed;
+    }
+    let mut targets = Targets::new().with_default(LevelFilter::WARN);
+    for target in INTERNAL_LOG_TARGETS {
+        targets = targets.with_target(*target, LevelFilter::INFO);
+    }
+    targets
+}
+
+/// 在 [`install`] 之后立即调用:初始化全局 `tracing` 订阅器,将结构化日志
+/// (时间戳 / 级别 / 模块目标)统一写往 stderr —— 装机版下已由 [`install`]
+/// 接管到 `mini-term.log`,交互终端下自动启用 ANSI 着色。重复调用安全无害。
+pub fn init_tracing() {
+    let env_spec = std::env::var("RUST_LOG").ok();
+    let filter = build_log_filter(env_spec.as_deref());
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .compact(),
+        )
+        .try_init();
+}
 
 /// 日志文件名。落在 `{active_data_dir}` 下,与 `config.db` / `layout.db` 同目录。
 pub const LOG_FILE_NAME: &str = "mini-term.log";
@@ -224,5 +279,25 @@ mod tests {
         assert!(!dir.join("mini-term.log.2").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tracing_过滤器默认值与环境变量覆写() {
+        let default = build_log_filter(None);
+        assert_eq!(default.default_level(), Some(LevelFilter::WARN));
+        assert!(default.would_enable("mt_app::store", &tracing::Level::INFO));
+        assert!(default.would_enable("mt_ai::hook_server", &tracing::Level::INFO));
+        assert!(!default.would_enable("mt_app::store", &tracing::Level::DEBUG));
+        assert!(!default.would_enable("third_party_crate", &tracing::Level::INFO));
+        assert!(default.would_enable("third_party_crate", &tracing::Level::WARN));
+
+        let custom = build_log_filter(Some("error,mt_ai=debug"));
+        assert_eq!(custom.default_level(), Some(LevelFilter::ERROR));
+        assert!(custom.would_enable("mt_ai::hook_server", &tracing::Level::DEBUG));
+        assert!(!custom.would_enable("mt_app::store", &tracing::Level::WARN));
+
+        let fallback = build_log_filter(Some("not===valid"));
+        assert_eq!(fallback.default_level(), Some(LevelFilter::WARN));
+        assert!(fallback.would_enable("mt_app::store", &tracing::Level::INFO));
     }
 }

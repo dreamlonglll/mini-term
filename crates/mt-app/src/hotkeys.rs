@@ -80,6 +80,10 @@ use std::collections::BTreeMap;
 
 use gpui::{App, KeyBinding, Keystroke, Modifiers, NoAction, Unbind};
 
+use crate::git::{
+    changes as git_changes, conflict as git_conflict, diff as git_diff,
+    file_history as git_file_history, history as git_history, stash as git_stash,
+};
 use crate::pane::{TerminalZoomIn, TerminalZoomOut, TerminalZoomReset};
 use crate::{
     ClosePane, CloseTerminalTab, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch,
@@ -88,7 +92,6 @@ use crate::{
     ResizeSplitDown, ResizeSplitLeft, ResizeSplitRight, ResizeSplitUp, SelectPane, SplitDown,
     SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMaximizePane,
     ToggleMiddleColumn, ToggleSessions, ToggleUsage, ToggleWorkbenchPage, command_library,
-    git_changes, git_conflict, git_diff, git_file_history, git_history, git_stash,
     project_switcher, quick_open, search_modal,
 };
 
@@ -1551,21 +1554,21 @@ fn internal_bindings() -> Vec<KeyBinding> {
     // Git 分支弹窗:↑↓ 移动高亮、→ 弹出高亮分支的操作菜单。与项目切换器同一套理由
     // (谓词与 `Input` 同深度才压得过它自带的 up/down/right);→ 只在光标位于搜索词
     // 末尾时才接管,否则处理器 `propagate()` 让给输入框的 MoveRight(见 git_branches)。
-    let branch_popup = format!("{} > Input", crate::git_branches::BRANCH_POPUP_CONTEXT);
+    let branch_popup = format!("{} > Input", crate::git::branches::BRANCH_POPUP_CONTEXT);
     let branch_popup = Some(branch_popup.as_str());
     bindings.push(KeyBinding::new(
         "up",
-        crate::git_branches::BranchPopupPrev,
+        crate::git::branches::BranchPopupPrev,
         branch_popup,
     ));
     bindings.push(KeyBinding::new(
         "down",
-        crate::git_branches::BranchPopupNext,
+        crate::git::branches::BranchPopupNext,
         branch_popup,
     ));
     bindings.push(KeyBinding::new(
         "right",
-        crate::git_branches::BranchPopupMenu,
+        crate::git::branches::BranchPopupMenu,
         branch_popup,
     ));
 

@@ -17,11 +17,12 @@ chrono-tz = "0.10"
 # ——工作区 rust-version = 1.95 的底线就是为它定的
 rusqlite.workspace = true
 # 读 ~/.codex/config.toml 的 model_providers.<id>.base_url(供应商归属)
-toml_edit = "0.22"
+toml_edit.workspace = true
 # 会话文件枚举/元信息行解析/grok_home 直连 mt-ai(ai_shim 临时副本已删)
 mt-ai.workspace = true
 # 路径比较键(项目 scope 的 cwd 匹配,`path_key::windows_eq_key`)
 mt-core.workspace = true
+tracing.workspace = true
 
 # 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
 # (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。

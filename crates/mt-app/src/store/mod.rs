@@ -505,14 +505,14 @@ fn open_layout_store(
     let dir = match mt_config::active_data_dir() {
         Ok(dir) => dir,
         Err(err) => {
-            eprintln!("[layout] 定位数据目录失败({err:#}),本次布局不落盘");
+            tracing::warn!("[layout] 定位数据目录失败({err:#}),本次布局不落盘");
             return Err(format!("{err:#}"));
         }
     };
     let store = match mt_layout::LayoutStore::open_at(&dir) {
         Ok(store) => store,
         Err(err) => {
-            eprintln!("[layout] 布局库打不开({err:#}),本次布局不落盘");
+            tracing::error!("[layout] 布局库打不开({err:#}),本次布局不落盘");
             return Err(format!("{err:#}"));
         }
     };
@@ -520,12 +520,12 @@ fn open_layout_store(
         let fallback = layout_migration_fallback(config, &dir);
         let source = fallback.as_ref().unwrap_or(config);
         match store.migrate_from_config(source) {
-            Ok(n) => eprintln!(
+            Ok(n) => tracing::info!(
                 "[layout] 已迁入 {n} 个项目的布局 → {}",
                 store.path().display()
             ),
             Err(err) => {
-                eprintln!("[layout] 布局迁移失败({err:#}),本次布局不落盘");
+                tracing::error!("[layout] 布局迁移失败({err:#}),本次布局不落盘");
                 return Err(format!("{err:#}"));
             }
         }
@@ -553,7 +553,7 @@ fn layout_migration_fallback(config: &AppConfig, dir: &Path) -> Option<AppConfig
     if !archived.projects.iter().any(|p| p.saved_layout.is_some()) {
         return None;
     }
-    eprintln!(
+    tracing::info!(
         "[layout] 内存里的配置已无 savedLayout,改从存档迁移: {}",
         archive.display()
     );
@@ -599,7 +599,7 @@ fn apply_layout_db(
     if config_loaded {
         let live: HashSet<String> = config.projects.iter().map(|p| p.id.clone()).collect();
         if let Err(err) = store.retain_projects(&live) {
-            eprintln!("[layout] 清理无主项目行失败: {err:#}");
+            tracing::warn!("[layout] 清理无主项目行失败: {err:#}");
         }
     }
 
@@ -642,12 +642,12 @@ impl AppStore {
                 // 加载失败**绝不**伪装成空配置:令牌留 0,后续所有保存都会被自己挡下,
                 // 免得一次读盘故障把用户的项目列表清空(旧版同一条红线)。
                 // 详情留给首帧之后的提示框(`ReadOnlyState`),不能只进 stderr。
-                eprintln!("[store] 配置加载失败({err:#}),本次以只读模式运行");
+                tracing::error!("[store] 配置加载失败({err:#}),本次以只读模式运行");
                 (AppConfig::default(), 0, Some(format!("{err:#}")))
             }
         };
         config.clear_invalid_remote_git_permissions();
-        crate::git_backend::sync_remote_git_permissions(&config);
+        crate::git::backend::sync_remote_git_permissions(&config);
 
         // 布局库:开库 →(首次)从 config.json 灌一次 → 把库里的值覆盖回
         // `config` 的对应字段。**覆盖这一步是整个改造的支点** —— 各处 getter

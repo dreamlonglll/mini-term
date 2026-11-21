@@ -9,10 +9,35 @@
 //!   的请求头。**反代后面必须配**(Cloudflare 橙云填 `CF-Connecting-IP`),否则所有
 //!   连接的对端都是反代自己;没有反代改写该头时**不要**配(客户端可自报任意值)。
 
+use std::io::IsTerminal as _;
 use std::net::SocketAddr;
+use std::str::FromStr as _;
 
 use axum::http::HeaderName;
 use mt_relay_server::{app_with_pwa, RelayLimits, RelayState};
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
+fn init_tracing() {
+    let filter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|raw| Targets::from_str(raw.trim()).ok())
+        .unwrap_or_else(|| {
+            Targets::new()
+                .with_default(LevelFilter::WARN)
+                .with_target("mt_relay_server", LevelFilter::INFO)
+        });
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .compact(),
+        )
+        .try_init();
+}
 
 /// 读一个正整数环境变量;没设 / 空串 / 解析不出 / 为 0 都回落默认值(后两种打一行提示)。
 /// 空串按没设处理:docker-compose 里 `"${VAR:-}"` 透传未配置的变量时就是空串。
@@ -23,7 +48,7 @@ fn env_count(name: &str, default: usize) -> usize {
         Ok(raw) => match raw.trim().parse::<usize>() {
             Ok(n) if n > 0 => n,
             _ => {
-                eprintln!("[relay] {name}={raw:?} is not a positive integer, using {default}");
+                tracing::warn!("[relay] {name}={raw:?} is not a positive integer, using {default}");
                 default
             }
         },
@@ -40,7 +65,9 @@ fn env_client_ip_header() -> Option<HeaderName> {
     match HeaderName::from_bytes(raw.as_bytes()) {
         Ok(name) => Some(name),
         Err(_) => {
-            eprintln!("[relay] RELAY_CLIENT_IP_HEADER={raw:?} is not a valid header name, ignored");
+            tracing::warn!(
+                "[relay] RELAY_CLIENT_IP_HEADER={raw:?} is not a valid header name, ignored"
+            );
             None
         }
     }
@@ -48,6 +75,7 @@ fn env_client_ip_header() -> Option<HeaderName> {
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let bind = std::env::var("RELAY_BIND").unwrap_or_else(|_| "0.0.0.0".into());
     let port = std::env::var("RELAY_PORT")
         .ok()
@@ -73,20 +101,22 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind {bind}:{port}: {e}"));
     // 打实际绑定端口(RELAY_PORT=0 时为系统分配的临时端口,测试据此定位)
     let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-    eprintln!(
+    tracing::info!(
         "[relay] listening on {bind}:{actual_port} (protocol v{}, pwa dir: {pwa_dir})",
         mt_relay_protocol::PROTOCOL_VERSION
     );
     if state.desktop_key_configured() {
-        eprintln!("[relay] desktop key configured: desktop connections require MT_RELAY_DESKTOP_KEY");
+        tracing::info!(
+            "[relay] desktop key configured: desktop connections require MT_RELAY_DESKTOP_KEY"
+        );
     } else {
-        eprintln!(
+        tracing::warn!(
             "[relay] MT_RELAY_DESKTOP_KEY is NOT set — ALL desktop connections will be rejected. \
              Set it on the relay and enter the same value in mini-term's Mobile panel."
         );
     }
     let limits = state.limits();
-    eprintln!(
+    tracing::info!(
         "[relay] limits: {} connections total, {} per client ({}), outbound queue {} frames",
         limits.max_connections,
         limits.max_connections_per_ip,

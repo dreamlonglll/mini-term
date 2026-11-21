@@ -842,7 +842,7 @@ fn truncated_highlighted(text: &str, ranges: &[(usize, usize)], size: f32, base:
     };
     let highlights: Vec<_> = ranges
         .iter()
-        .filter_map(|&(start, end)| crate::git_branches::char_range_to_bytes(text, start, end))
+        .filter_map(|&(start, end)| crate::git::branches::char_range_to_bytes(text, start, end))
         .map(|range| (range, style))
         .collect();
     div()

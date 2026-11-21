@@ -672,7 +672,7 @@ fn registry_scope(projection_dir: &Path) -> RegistryScope {
     if projection_reaches_sidecar(projection_dir) {
         RegistryScope::Live
     } else {
-        eprintln!(
+        tracing::warn!(
             "[ssh_skill] 本实例的配置目录 {} 不是 mt-ssh-cli 读取的目录 {}:跳过 SKILL.md / \
              .gitignore / Claude、Codex 配置的一切改动",
             projection_dir.display(),
@@ -757,7 +757,7 @@ fn enable_with_scope(
     let gitignore_note = match append_gitignore_entries(&dir) {
         Ok(()) => String::new(),
         Err(e) => {
-            eprintln!("[ssh_skill] 追加 .gitignore 失败(不影响启用): {}", e);
+            tracing::warn!("[ssh_skill] 追加 .gitignore 失败(不影响启用): {}", e);
             "（.gitignore 未能自动更新，建议手动忽略三个 skills/mini-term-ssh/ 目录）".to_string()
         }
     };
@@ -836,13 +836,13 @@ pub fn reconcile_skill_files_on_startup(
     let binary_path = match ssh_cli_binary_path() {
         Ok(path) => path,
         Err(e) => {
-            eprintln!("[ssh_skill] 启动校正跳过:{e}");
+            tracing::warn!("[ssh_skill] 启动校正跳过:{e}");
             return 0;
         }
     };
     if !Path::new(&binary_path).is_file() {
         // 指向一个不存在的 CLI 只会更糟 —— 安装不完整时宁可不改。
-        eprintln!("[ssh_skill] 启动校正跳过:找不到 {binary_path}");
+        tracing::warn!("[ssh_skill] 启动校正跳过:找不到 {binary_path}");
         return 0;
     }
     reconcile_with_binary(targets, &binary_path)
@@ -877,9 +877,9 @@ fn reconcile_with_binary(targets: &[SkillReconcileTarget], binary_path: &str) ->
             match atomic_write(&path, fresh.as_bytes()) {
                 Ok(()) => {
                     rewritten += 1;
-                    eprintln!("[ssh_skill] 启动校正:已重写 {}({reason})", path.display());
+                    tracing::info!("[ssh_skill] 启动校正:已重写 {}({reason})", path.display());
                 }
-                Err(e) => eprintln!("[ssh_skill] 启动校正:重写 {} 失败: {e}", path.display()),
+                Err(e) => tracing::warn!("[ssh_skill] 启动校正:重写 {} 失败: {e}", path.display()),
             }
         }
     }

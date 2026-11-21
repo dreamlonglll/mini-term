@@ -81,7 +81,7 @@ impl AiBridge {
         if hook_enabled
             && let Err(err) = bridge.perception.start_hook_server(bridge.data_dir.clone())
         {
-            eprintln!("[ai] hook server 起不来: {err}");
+            tracing::warn!("[ai] hook server 起不来: {err}");
         }
 
         // 输入检测那一路(无 hook 时的降级判定)不依赖 hook server,轮询恒开。

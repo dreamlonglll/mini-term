@@ -355,7 +355,7 @@ fn settle_exited_ai(
     let agent = hook_state.session_of(pty_id).and_then(|s| s.agent);
     hook_state.remove(pty_id);
     emitter.emit_if_changed(pty_id, "idle", Some(STALL_EXIT_CAUSE), None);
-    eprintln!(
+    tracing::info!(
         "[monitor] pty_id={} agent={:?} 已判退出且 ai-idle 静默 {}s -> idle (cause={})",
         pty_id,
         agent,
@@ -403,7 +403,7 @@ fn settle_stalled_ai(
         (STALL_CAUSE, tracker.ai_session_agent(pty_id))
     };
     emitter.emit_if_changed(pty_id, target, Some(cause), agent);
-    eprintln!(
+    tracing::info!(
         "[monitor] pty_id={} ai-working 静默 {}s -> {} (cause={})",
         pty_id,
         timeout.as_secs(),

@@ -135,12 +135,12 @@ where
 
 fn log_decision(decision: &ConptyBootstrapDecision) {
     match decision {
-        ConptyBootstrapDecision::Portable { directory, .. } => eprintln!(
+        ConptyBootstrapDecision::Portable { directory, .. } => tracing::info!(
             "[conpty-bootstrap] backend=portable arch={} dir={} dll=preloaded hosts=x64,arm64 fallback_boundary=preload-only",
             std::env::consts::ARCH,
             directory.display()
         ),
-        ConptyBootstrapDecision::System { reason, .. } => eprintln!(
+        ConptyBootstrapDecision::System { reason, .. } => tracing::warn!(
             "[conpty-bootstrap] backend=system arch={} reason={reason}",
             std::env::consts::ARCH
         ),

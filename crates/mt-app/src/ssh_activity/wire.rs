@@ -553,7 +553,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         let stream = match stream {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("[ssh-activity] accept 失败: {:?}", err.kind());
+                tracing::warn!("[ssh-activity] accept 失败: {:?}", err.kind());
                 // 持续出错(句柄耗尽之类)时别空转吃满一个核
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -561,7 +561,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         };
         if shared.active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
             shared.active.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("[ssh-activity] 连接数已达上限 {MAX_CONNECTIONS},断开新连接");
+            tracing::warn!("[ssh-activity] 连接数已达上限 {MAX_CONNECTIONS},断开新连接");
             continue;
         }
         let conn = shared.clone();
@@ -573,7 +573,7 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
             });
         if spawned.is_err() {
             shared.active.fetch_sub(1, Ordering::AcqRel);
-            eprintln!("[ssh-activity] 起连接线程失败,断开该连接");
+            tracing::warn!("[ssh-activity] 起连接线程失败,断开该连接");
         }
     }
 }
@@ -596,7 +596,7 @@ fn handle_connection(stream: TcpStream, shared: &Shared) {
     match served {
         Served::Completed => {}
         Served::Rejected(why) | Served::Interrupted(why) => {
-            eprintln!("[ssh-activity] 断开连接: {why}");
+            tracing::warn!("[ssh-activity] 断开连接: {why}");
         }
     }
     // 显式关一下:对端(CLI)若还在写,立刻拿到错误而不是等内核缓冲写满

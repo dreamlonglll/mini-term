@@ -14,7 +14,7 @@ unicode-segmentation.workspace = true
 # 都是依赖树里已有的那一份:image 与 mt-app 同取 0.25(只开 png),base64 与 mt-secret
 # 同取 0.22,memchr 是 vte 自己也在用的。
 image = { version = "0.25", default-features = false, features = ["png"] }
-base64 = "0.22"
+base64.workspace = true
 memchr = "2"
 
 [dev-dependencies]

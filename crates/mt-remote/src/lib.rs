@@ -293,7 +293,7 @@ impl RemoteSshState {
         let pool = lock(&self.pool).take();
         let Some(pool) = pool else { return };
         let Ok(rt) = self.runtime() else { return };
-        eprintln!("[remote-ssh] draining ssh session pool on exit");
+        tracing::info!("[remote-ssh] draining ssh session pool on exit");
         rt.block_on(async move {
             pool.shutdown().await;
         });
@@ -395,7 +395,7 @@ async fn open_sftp_with_session(
             Ok((session, h))
         }
         Err(e) if e.is_transport() => {
-            eprintln!("[remote-ssh] sftp open failed (transport), retrying once: {e}");
+            tracing::warn!("[remote-ssh] sftp open failed (transport), retrying once: {e}");
             pool.evict_if_same(&conn.id, &session).await;
             let session2 = acquire_session(&pool, conn).await?;
             let h = SftpHandle::open_on_session(session2.clone(), SFTP_REQUEST_TIMEOUT)
@@ -495,7 +495,7 @@ pub fn prepare_remote_launch(
         Some(stored) => match mt_secret::reveal_global(stored) {
             Ok(plain) => Some(plain),
             Err(err) => {
-                eprintln!(
+                tracing::warn!(
                     "[remote-ssh] 连接 {} 的已存密码无法解密,本次不自动填充: {err}",
                     conn.id
                 );

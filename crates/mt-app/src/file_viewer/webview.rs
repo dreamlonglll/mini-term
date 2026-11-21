@@ -433,7 +433,7 @@ mod imp {
                 })
         };
         if let Err(err) = result {
-            eprintln!("[pdf-preview] 隐藏阅读器保存按钮失败: {err}");
+            tracing::warn!("[pdf-preview] 隐藏阅读器保存按钮失败: {err}");
         }
     }
 
@@ -625,7 +625,9 @@ mod imp {
                 match PreviewWebView::new(kind, &root, &doc, &body, tx, links_task, window, cx) {
                     Ok(view) => WebPreview::Ready(Rc::new(view)),
                     Err(err) => {
-                        eprintln!("[web-preview] {kind:?} 的 WebView 建立失败,改走回落: {err}");
+                        tracing::warn!(
+                            "[web-preview] {kind:?} 的 WebView 建立失败,改走回落: {err}"
+                        );
                         WebPreview::Failed
                     }
                 };

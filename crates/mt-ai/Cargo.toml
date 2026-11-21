@@ -21,7 +21,7 @@ tiny_http = "0.12"
 # Codex 的 ~/.codex/config.toml 要开 features.hooks(旧名 codex_hooks 已弃用),
 # 迁移时必须保留用户自己的注释与排版,故用 toml_edit 而非 toml。
 # `ssh_registry` 摘除项目级 / 全局 Codex 配置里的历史 MCP 注册、写项目信任同理。
-toml_edit = "0.22"
+toml_edit.workspace = true
 # AI 感知的那批状态表横跨三条线程(GPUI 主线程 / 500ms 轮询 / hook HTTP)。
 # std::sync::Mutex 的锁中毒会把任一线程的 panic 传染成全进程崩溃,故统一
 # 换 parking_lot(mt-app/mt-pty/mt-terminal 已是同款)。
@@ -34,6 +34,7 @@ uuid.workspace = true
 # 只读打开 agy 进程开着的 WAL 库。工作区统一版本(mt-config / mt-layout / mt-usage 同款),
 # 红线「mt-core 不带 rusqlite」不受影响 —— 三个 sidecar 不依赖本 crate。
 rusqlite.workspace = true
+tracing.workspace = true
 
 # 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
 # (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。

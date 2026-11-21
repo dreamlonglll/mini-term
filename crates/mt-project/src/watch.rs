@@ -760,7 +760,7 @@ impl Hub {
         {
             // 起不了线程(句柄耗尽)极罕见。此后 watch 一律直接失败:界面照常用,
             // 只是目录变化不再自动刷新
-            eprintln!("[watch] 起注册线程失败,目录监听停用: {err}");
+            tracing::error!("[watch] 起注册线程失败,目录监听停用: {err}");
             shared.state.lock().dead = Some(format!("起注册线程失败: {err}"));
         }
         Arc::new(Hub { shared })
@@ -817,7 +817,7 @@ impl Hub {
         };
         if let Some(err) = &st.dead {
             entry.phase = Phase::Failed;
-            eprintln!("[{label}] 监听 {} 失败: {err}", path.display());
+            tracing::warn!("[{label}] 监听 {} 失败: {err}", path.display());
             return WatchReady::settled(WatchOutcome::Failed(err.clone()));
         }
         let ready = ReadySignal::new();
@@ -1004,7 +1004,7 @@ fn worker_loop(shared: Arc<Shared>, mut factory: BackendFactory) {
 
 fn print_logs(logs: Vec<String>) {
     for line in logs {
-        eprintln!("{line}");
+        tracing::warn!("{line}");
     }
 }
 

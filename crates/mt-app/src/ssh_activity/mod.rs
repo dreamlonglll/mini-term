@@ -54,7 +54,7 @@ pub fn start(cx: &mut App) {
     }) {
         Ok(server) => server,
         Err(err) => {
-            eprintln!(
+            tracing::warn!(
                 "[ssh-activity] 监听 127.0.0.1 失败,SSH 交互浮层不可用: {:?}",
                 err.kind()
             );

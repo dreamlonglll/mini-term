@@ -419,7 +419,7 @@ impl QuickOpenPanel {
                 let _ = tx.send(index);
             });
         if let Err(err) = spawned {
-            eprintln!("[quick-open] 建索引线程起不来: {err}");
+            tracing::error!("[quick-open] 建索引线程起不来: {err}");
             return;
         }
         if let Some(previous) = entry.building.replace(cancel) {
@@ -548,7 +548,7 @@ impl QuickOpenPanel {
         };
         if let Err(err) = spawned {
             // 线程起不来就当场算:卡一下总比没结果好
-            eprintln!("[quick-open] 打分线程起不来: {err}");
+            tracing::error!("[quick-open] 打分线程起不来: {err}");
             let outcome = index
                 .search(&needle, &recent, MAX_RESULTS, None)
                 .unwrap_or_else(empty_outcome);
@@ -807,7 +807,7 @@ fn highlighted_label(text: &str, hits: &[usize], size: f32, base: Hsla) -> Div {
     };
     let highlights: Vec<_> = char_runs(hits)
         .into_iter()
-        .filter_map(|(start, end)| crate::git_branches::char_range_to_bytes(text, start, end))
+        .filter_map(|(start, end)| crate::git::branches::char_range_to_bytes(text, start, end))
         .map(|range| (range, style))
         .collect();
     div()

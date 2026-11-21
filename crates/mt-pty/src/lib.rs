@@ -566,7 +566,7 @@ fn spawn_writer(writer: Arc<Mutex<BoxedWriter>>) -> Result<mpsc::Sender<Vec<u8>>
         .spawn(move || {
             for chunk in rx {
                 if let Err(err) = write_chunked(&mut **writer.lock(), &chunk) {
-                    eprintln!("[mt-pty] 写 PTY 失败,写线程退出: {err:#}");
+                    tracing::error!("[mt-pty] 写 PTY 失败,写线程退出: {err:#}");
                     break;
                 }
             }

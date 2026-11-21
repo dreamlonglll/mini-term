@@ -216,7 +216,7 @@ impl Drop for PartialCleanup {
                     tokio::time::timeout(Duration::from_secs(5), remove_partial(&sftp, &path))
                         .await;
                 if !matches!(cleanup, Ok(Ok(()))) {
-                    eprintln!("[remote-git] helper partial cleanup unconfirmed: '{path}'");
+                    tracing::warn!("[remote-git] helper partial cleanup unconfirmed: '{path}'");
                 }
             });
         }

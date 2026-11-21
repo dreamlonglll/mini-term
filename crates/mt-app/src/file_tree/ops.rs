@@ -297,7 +297,7 @@ pub(super) fn spawn_tree_op_planned(
                     }
                 }
                 Err(err) => {
-                    eprintln!("[files] 操作失败: {err}");
+                    tracing::warn!("[files] 操作失败: {err}");
                     let (operation_owned, same_source) = tree.update(cx, |tree, cx| {
                         if tree.active_operation_context.as_ref() != Some(&context) {
                             return (false, false);

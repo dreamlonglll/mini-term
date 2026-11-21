@@ -127,18 +127,18 @@ pub(crate) fn migrate_app_data_at(new_dir: &Path) {
         return;
     }
     if let Err(e) = fs::create_dir_all(new_dir) {
-        eprintln!("[migrate] 创建新数据目录失败 {}: {e}", new_dir.display());
+        tracing::warn!("[migrate] 创建新数据目录失败 {}: {e}", new_dir.display());
         return;
     }
     match fs::copy(&old_config, &new_config) {
         Ok(_) => {
-            eprintln!(
+            tracing::info!(
                 "[migrate] 已将旧 config.json 迁移至新目录: {}",
                 new_config.display()
             );
         }
         Err(e) => {
-            eprintln!("[migrate] 拷贝旧 config.json 失败: {e}");
+            tracing::warn!("[migrate] 拷贝旧 config.json 失败: {e}");
         }
     }
 }

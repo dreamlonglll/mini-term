@@ -183,7 +183,7 @@ pub fn open_external(how: ExternalOpen, path: PathBuf, cx: &mut App) {
         let Err(err) = result else {
             return;
         };
-        eprintln!("[files] 外部程序打开 {} 失败: {err:#}", path.display());
+        tracing::warn!("[files] 外部程序打开 {} 失败: {err:#}", path.display());
         let (title, message) = how.failure_text(format!("{err:#}"));
         cx.update(|cx| crate::toast::push_open_external_failure(title, message, cx));
     })

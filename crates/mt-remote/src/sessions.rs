@@ -140,7 +140,7 @@ pub fn ai_sessions(
     let sessions = match scan_remote_sessions(conn, project_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[remote-ssh] session scan failed (degrading to empty): {e}");
+            tracing::warn!("[remote-ssh] session scan failed (degrading to empty): {e}");
             Vec::new()
         }
     };
@@ -521,13 +521,13 @@ async fn scan_remote_agy(
     {
         Ok(SftpBoundedFileRead::Complete(bytes)) => bytes,
         Ok(SftpBoundedFileRead::TooLarge) => {
-            eprintln!(
+            tracing::warn!(
                 "[remote-ssh] agy index exceeds snapshot limit ({AGY_INDEX_SNAPSHOT_MAX_BYTES} bytes), skipping"
             );
             return vec![];
         }
         Err(e) => {
-            eprintln!(
+            tracing::warn!(
                 "[remote-ssh] failed to read agy index (degrading to empty): {}",
                 e.message()
             );
@@ -551,7 +551,7 @@ async fn scan_remote_agy(
     {
         Ok(list) => list,
         Err(e) => {
-            eprintln!("[remote-ssh] failed to parse agy index (degrading to empty): {e}");
+            tracing::warn!("[remote-ssh] failed to parse agy index (degrading to empty): {e}");
             return vec![];
         }
     };

@@ -500,7 +500,7 @@ impl AppStore {
                 window: self.window_geometry,
             };
             if let Err(err) = store.save_globals(&globals) {
-                eprintln!("[layout] 全局布局写盘失败: {err:#}");
+                tracing::warn!("[layout] 全局布局写盘失败: {err:#}");
             }
         }
 
@@ -512,7 +512,7 @@ impl AppStore {
             // 项目在防抖窗口里被删掉了 → 删行(它的树已经不在 config 里了)
             let Some(project) = self.config.projects.iter().find(|p| p.id == project_id) else {
                 if let Err(err) = store.delete_project_layout(&project_id) {
-                    eprintln!("[layout] 删除项目 {project_id} 的布局失败: {err:#}");
+                    tracing::warn!("[layout] 删除项目 {project_id} 的布局失败: {err:#}");
                 }
                 continue;
             };
@@ -521,7 +521,7 @@ impl AppStore {
                 None => store.delete_project_layout(&project_id),
             };
             if let Err(err) = result {
-                eprintln!("[layout] 项目 {project_id} 的布局写盘失败: {err:#}");
+                tracing::warn!("[layout] 项目 {project_id} 的布局写盘失败: {err:#}");
             }
         }
     }
@@ -594,7 +594,7 @@ impl AppStore {
             match self.config_store.load() {
                 Ok(loaded) => self.token = loaded.token,
                 Err(err) => {
-                    eprintln!("[store] 令牌过期后重读配置失败: {err:#}");
+                    tracing::warn!("[store] 令牌过期后重读配置失败: {err:#}");
                     return;
                 }
             }

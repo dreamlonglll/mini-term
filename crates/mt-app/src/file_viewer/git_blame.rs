@@ -579,7 +579,7 @@ impl FileViewer {
             self.project_root.to_string_lossy(),
         )
         .with_path(view.repo.root.to_string_lossy());
-        let opening = crate::git_diff::open_commit_diff_loading(
+        let opening = crate::git::diff::open_commit_diff_loading(
             store,
             root,
             info.hash,

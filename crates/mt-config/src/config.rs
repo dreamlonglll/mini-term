@@ -1215,7 +1215,7 @@ pub fn read_config_from(path: &Path) -> Result<Option<AppConfig>> {
                     .and_then(|c| serde_json::from_str(&c).ok())
                 {
                     Some(parsed) => {
-                        eprintln!(
+                        tracing::warn!(
                             "[config] config.json 解析失败({}), 已用备份 {} 恢复",
                             parse_err,
                             bak.display()
@@ -1501,7 +1501,7 @@ impl ConfigStore {
         self.write_ssh_projection(&config);
 
         let token = self.token.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-        eprintln!("[config] load ok, token={token}");
+        tracing::info!("[config] load ok, token={token}");
         Ok(LoadedConfig { config, token })
     }
 
@@ -1512,7 +1512,7 @@ impl ConfigStore {
             .db()
             .and_then(|db| db.backup_to(&self.db_backup_path()));
         if let Err(err) = result {
-            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
+            tracing::warn!("[config] 配置库备份失败(不影响本次运行): {err:#}");
         }
     }
 
@@ -1529,9 +1529,9 @@ impl ConfigStore {
             if !archive.exists()
                 && let Err(err) = fs::copy(&self.path, &archive)
             {
-                eprintln!("[config] 旧 config.json 存档失败: {err}");
+                tracing::warn!("[config] 旧 config.json 存档失败: {err}");
             }
-            eprintln!(
+            tracing::info!(
                 "[config] 已把 config.json 迁入 {}(项目 {} / SSH 连接 {},原文件存档于 {})",
                 db.path().display(),
                 config.projects.len(),
@@ -1557,7 +1557,7 @@ impl ConfigStore {
                 _ => migrate_config(AppConfig::default()),
             },
             Err(e) => {
-                eprintln!("[config] {e:#}; 后台本次按默认配置启动");
+                tracing::warn!("[config] {e:#}; 后台本次按默认配置启动");
                 migrate_config(AppConfig::default())
             }
         }
@@ -1567,7 +1567,7 @@ impl ConfigStore {
     pub fn save(&self, token: u64, config: &AppConfig) -> Result<(), SaveError> {
         let current = self.current_token();
         if token == 0 || token != current {
-            eprintln!(
+            tracing::warn!(
                 "[config] REJECT save: token {} != current {} (projects={})",
                 token,
                 current,
@@ -1599,7 +1599,7 @@ impl ConfigStore {
         let vault = match self.vault() {
             Ok(vault) => vault,
             Err(err) => {
-                eprintln!("[config] {err:#};已存 SSH 密码与中转密钥本次保持原样(未封存)");
+                tracing::warn!("[config] {err:#};已存 SSH 密码与中转密钥本次保持原样(未封存)");
                 return;
             }
         };
@@ -1612,12 +1612,14 @@ impl ConfigStore {
                 .and_then(|()| db.scrub_after_secret_rewrite())
             {
                 Ok(()) => {
-                    eprintln!(
+                    tracing::info!(
                         "[config] 已把 {sealed} 条凭据(SSH 密码 / 中转密钥 / 推送凭据)封存进 config.db"
                     )
                 }
                 Err(err) => {
-                    eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
+                    tracing::warn!(
+                        "[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}"
+                    )
                 }
             }
         }
@@ -1634,14 +1636,14 @@ impl ConfigStore {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
             Err(err) => {
-                eprintln!("[config] 读存档失败,跳过密码封存: {err}");
+                tracing::warn!("[config] 读存档失败,跳过密码封存: {err}");
                 return;
             }
         };
         let mut root: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(root) => root,
             Err(err) => {
-                eprintln!("[config] 存档不是合法 JSON,跳过密码封存: {err}");
+                tracing::warn!("[config] 存档不是合法 JSON,跳过密码封存: {err}");
                 return;
             }
         };
@@ -1653,16 +1655,16 @@ impl ConfigStore {
         let json = match serde_json::to_string_pretty(&root) {
             Ok(json) => json,
             Err(err) => {
-                eprintln!("[config] 存档序列化失败,跳过密码封存: {err}");
+                tracing::warn!("[config] 存档序列化失败,跳过密码封存: {err}");
                 return;
             }
         };
         match atomic_write(&path, json.as_bytes()) {
-            Ok(()) => eprintln!(
+            Ok(()) => tracing::warn!(
                 "[config] 已把存档 {} 里的 {sealed} 条凭据(SSH 密码 / 中转密钥)封存",
                 path.display()
             ),
-            Err(err) => eprintln!("[config] 存档密码封存写盘失败: {err}"),
+            Err(err) => tracing::warn!("[config] 存档密码封存写盘失败: {err}"),
         }
     }
 
@@ -1678,7 +1680,7 @@ impl ConfigStore {
         let vault = match self.vault() {
             Ok(vault) => vault,
             Err(err) => {
-                eprintln!("[config] {err:#};本次按原样写盘");
+                tracing::warn!("[config] {err:#};本次按原样写盘");
                 return Cow::Borrowed(config);
             }
         };
@@ -1686,7 +1688,7 @@ impl ConfigStore {
         let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault)
             + usize::from(seal_plaintext_relay_key(&mut owned, &vault))
             + seal_plaintext_push_secrets(&mut owned.remote_notify, &vault);
-        eprintln!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥 / 推送凭据)");
+        tracing::info!("[config] 写盘前兜底封存了 {sealed} 条凭据(SSH 密码 / 中转密钥 / 推送凭据)");
         Cow::Owned(owned)
     }
 
@@ -1700,7 +1702,7 @@ impl ConfigStore {
         let json = match serde_json::to_string_pretty(&ssh_projection(config)) {
             Ok(json) => json,
             Err(err) => {
-                eprintln!("[config] SSH 投影序列化失败: {err}");
+                tracing::warn!("[config] SSH 投影序列化失败: {err}");
                 return;
             }
         };
@@ -1708,7 +1710,7 @@ impl ConfigStore {
             return;
         }
         if let Err(err) = atomic_write(&self.path, json.as_bytes()) {
-            eprintln!("[config] SSH 投影写盘失败(sidecar 会读到上一版): {err}");
+            tracing::warn!("[config] SSH 投影写盘失败(sidecar 会读到上一版): {err}");
         }
     }
 }
@@ -1750,7 +1752,7 @@ fn seal_plaintext_relay_key(config: &mut AppConfig, vault: &Vault) -> bool {
             true
         }
         Err(err) => {
-            eprintln!("[config] 中转桌面密钥封存失败,保持原样: {err}");
+            tracing::warn!("[config] 中转桌面密钥封存失败,保持原样: {err}");
             false
         }
     }
@@ -1789,7 +1791,7 @@ fn seal_plaintext_push_secrets(notify: &mut RemoteNotifyConfig, vault: &Vault) -
                 *value = envelope;
                 sealed += 1;
             }
-            Err(err) => eprintln!("[config] 远程通知 {label} 封存失败,保持原样: {err}"),
+            Err(err) => tracing::warn!("[config] 远程通知 {label} 封存失败,保持原样: {err}"),
         }
     }
     sealed
@@ -1813,7 +1815,7 @@ fn seal_plaintext_passwords(connections: &mut [SshConnection], vault: &Vault) ->
                 conn.password = Some(envelope);
                 sealed += 1;
             }
-            Err(err) => eprintln!("[config] 连接 {} 的密码封存失败,保持原样: {err}", conn.id),
+            Err(err) => tracing::warn!("[config] 连接 {} 的密码封存失败,保持原样: {err}", conn.id),
         }
     }
     sealed

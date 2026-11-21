@@ -5422,6 +5422,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "toml_edit 0.22.27",
+ "tracing",
  "uuid",
 ]
 
@@ -5463,6 +5464,8 @@ dependencies = [
  "ring",
  "ropey",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
  "trash",
  "tree-sitter",
  "tree-sitter-batch",
@@ -5498,6 +5501,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -5536,6 +5540,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -5555,6 +5560,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tracing",
  "windows-registry 0.6.1",
  "windows-sys 0.52.0",
 ]
@@ -5567,6 +5573,7 @@ dependencies = [
  "mt-core",
  "parking_lot",
  "portable-pty",
+ "tracing",
 ]
 
 [[package]]
@@ -5585,6 +5592,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]
@@ -5612,6 +5620,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5684,6 +5693,7 @@ dependencies = [
  "mt-theme-packs",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -5699,6 +5709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml_edit 0.22.27",
+ "tracing",
 ]
 
 [[package]]

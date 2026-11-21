@@ -35,7 +35,7 @@ pub fn init() {
 /// 它也是 `if let Some(..) = T0.get()`)。
 pub fn mark(label: &str) {
     if let Some(t0) = T0.get() {
-        eprintln!("{}", format_mark(t0.elapsed().as_millis(), label));
+        tracing::info!("{}", format_mark(t0.elapsed().as_millis(), label));
     }
 }
 

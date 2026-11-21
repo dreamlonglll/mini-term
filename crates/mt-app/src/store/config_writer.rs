@@ -230,7 +230,7 @@ impl Shared {
         let mut queue = self.lock();
         while !queue.is_idle() {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                eprintln!(
+                tracing::warn!(
                     "[config] 等配置写盘超过 {}s 仍未收摊,本次放弃排干(最后一次改动可能没落盘)",
                     DRAIN_DEADLINE.as_secs()
                 );
@@ -286,7 +286,7 @@ impl ConfigWriter {
             .map_err(|err| {
                 // 起不了线程(句柄耗尽)极罕见。此时 `enqueue` 退化成主线程同步写,
                 // 卡顿回到改造前的样子 —— 但绝不能因此不落盘。
-                eprintln!("[config] 配置写线程起不来({err}),本次运行退回主线程同步写盘");
+                tracing::error!("[config] 配置写线程起不来({err}),本次运行退回主线程同步写盘");
                 err
             })
             .ok();
@@ -404,10 +404,10 @@ fn write_once(store: &ConfigStore, snapshot: &Snapshot, failures: &UnboundedSend
             // 手上这份快照是基于旧配置改的。**跳过是唯一正确的处置**:重试会
             // 拿陈旧内容盖掉刚读进来的那份。单进程壳里走不到这条(load 只在
             // 启动与令牌过期重试时发生,两处都在主线程)。
-            eprintln!("[config] 配置快照已过期(token {provided} != {current}),本次跳过不覆盖");
+            tracing::warn!("[config] 配置快照已过期(token {provided} != {current}),本次跳过不覆盖");
         }
         Err(err) => {
-            eprintln!("[store] 配置保存失败: {err}");
+            tracing::error!("[store] 配置保存失败: {err}");
             if let Some(failure) = SaveFailure::from_error(&err) {
                 let _ = failures.unbounded_send(failure);
             }

@@ -585,7 +585,7 @@ impl FileViewer {
             Ok(outcome) => outcome,
             Err(err) => {
                 // gutter 是被动展示,取不到就不画;记一笔方便排查
-                eprintln!("[git-gutter] 取 HEAD 版本失败: {err:#}");
+                tracing::warn!("[git-gutter] 取 HEAD 版本失败: {err:#}");
                 HeadOutcome {
                     repo: None,
                     base: None,
@@ -973,14 +973,14 @@ impl FileViewer {
         // 开的是另一个(diff)页签:等本实体的这次 update 收口再开,免得页签区回读页签状态时
         // 撞租约(`open_file_diff` 自己也会再延一轮,这里先延是为了让小窗先收起来)
         window.defer(cx, move |window, cx| {
-            let file = crate::git_diff::DiffFile {
+            let file = crate::git::diff::DiffFile {
                 path: rel,
                 old_path: None,
                 side: DiffSide::Working,
                 status_label: "M".to_string(),
                 hunk_actions: false,
             };
-            crate::git_diff::open_file_diff(store, root, vec![file], 0, None, window, cx);
+            crate::git::diff::open_file_diff(store, root, vec![file], 0, None, window, cx);
         });
     }
 

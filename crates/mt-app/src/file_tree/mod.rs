@@ -36,7 +36,7 @@
 //! Git IO 通过 `mt_remote::run_git_on` 在本地/远程独立配额线程执行，键为以 `/` 分隔的相对路径。
 //! 远程授权关闭时，切项目、刷新、计划和菜单全部停在入口，不安排任何 Git IO。
 //! 刷新时机照抄原版四条:切项目 / `fs-change`(500ms 去抖)/ 终端里跑过 git 命令
-//! (同一个去抖)/ 头部刷新按钮。第三条走 [`crate::git_watch`] 的**输出旁路**,
+//! (同一个去抖)/ 头部刷新按钮。第三条走 [`crate::git::watch`] 的**输出旁路**,
 //! 本模块是它的第二个订阅者([`git_watch::Subscriber::FileTree`])——
 //! `isAiPty` 那道闸在旁路里,AI pane 刷屏带不起这边的刷新。
 //!
@@ -51,7 +51,7 @@
 //! (理由与口径见那个模块)。Git 面板开着时还会点名:`.git` 判出变化叫它比签名;工作区
 //! 监听命中把路径交过来(只认这边没在监听的 —— 折起来的目录的汇总字母靠它跟上),这一路
 //! 抽屉收着时也不停(见 `git_panel.rs` 模块注释「抽屉与窗口」)。
-//! 拉状态是**单飞**的([`crate::git_ui::flight`]):同一时刻一份,期间攒的计划跑完补一趟,
+//! 拉状态是**单飞**的([`crate::git::ui::flight`]):同一时刻一份,期间攒的计划跑完补一趟,
 //! 迟到的旧结果不会盖掉新的;结果与眼下一样不重画(整树是拍平重建的)。
 //!
 //! # store 变化 → 重画的闸
@@ -113,8 +113,8 @@ use crate::dnd::DragFilePath;
 use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
 use crate::focus_nav::{self, RowNav};
 use crate::fs_ops;
-use crate::git_ui::flight::{Flight, Landing};
-use crate::git_watch;
+use crate::git::ui::flight::{Flight, Landing};
+use crate::git::watch as git_watch;
 use crate::i18n::{t, tr};
 use crate::menu::MenuEntry;
 use crate::store::AppStore;
@@ -747,7 +747,8 @@ impl FileTree {
         let plan = std::mem::take(&mut self.git_plan);
         let known = self.git_sigs.clone();
         let root = context.root.clone();
-        let backend = crate::git_backend::project_context(self.store.read(cx), &context.project_id);
+        let backend =
+            crate::git::backend::project_context(self.store.read(cx), &context.project_id);
         cx.spawn(async move |this, cx| {
             let execution = backend.clone();
             // 目录汇总表也在后台一次性算好(变更数 × 深度),render 逐行只查表
@@ -934,7 +935,7 @@ impl FileTree {
         let remote = store.is_remote_project(&project.id);
         git_io_allowed(
             remote,
-            crate::git_backend::remote_git_enabled(store, &project.id),
+            crate::git::backend::remote_git_enabled(store, &project.id),
             remote && store.remote_connection_of(&project.id).is_none(),
         )
     }
@@ -1140,7 +1141,7 @@ impl FileTree {
                         tree.entries.insert(dir, entries);
                     }
                     Err(err) => {
-                        eprintln!("[files] 列目录失败: {err:#}");
+                        tracing::warn!("[files] 列目录失败: {err:#}");
                         if is_root {
                             tree.root_error = Some(format!("{err:#}"));
                         } else {

@@ -22,7 +22,7 @@ use super::{FileTree, Row};
 /// 文件树右键菜单的**项序**。`None` = 分隔线。
 ///
 /// 逐条对照 `FileTree.tsx:210-325`。「查看变更」(`ViewDiff`)在 V 批把
-/// [`crate::git_diff::open_file_diff`] 建好之后补上,**条件与原版一字不差**:
+/// [`crate::git::diff::open_file_diff`] 建好之后补上,**条件与原版一字不差**:
 /// 非目录、且这个文件在 git 状态表里有条目,前置一条分隔线接在最末。
 /// 「移动到 ▸」(`MoveTo`)原版没有,GPUI 版补的,紧跟「重命名」——
 /// 两者都是「换路径」的操作,本地/远程、文件/目录一律有。
@@ -361,9 +361,9 @@ pub(super) fn file_menu(
                 let label = row.git.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
                 menu::item(t("fileTree", "menu.viewDiff"), move |window, cx| {
                     if remote
-                        && !crate::git_backend::remote_git_enabled(store.read(cx), &project_id)
+                        && !crate::git::backend::remote_git_enabled(store.read(cx), &project_id)
                     {
-                        crate::git_backend::request_enable(
+                        crate::git::backend::request_enable(
                             store.clone(),
                             project_id.clone(),
                             window,
@@ -371,15 +371,15 @@ pub(super) fn file_menu(
                         );
                         return;
                     }
-                    let repo = crate::git_backend::project_context(store.read(cx), &project_id);
+                    let repo = crate::git::backend::project_context(store.read(cx), &project_id);
                     // 单元素序列、不支持按块操作(HEAD → 工作区两侧都不是能写回的那一侧)
-                    crate::git_diff::open_file_diff(
+                    crate::git::diff::open_file_diff(
                         store.clone(),
                         repo.clone(),
-                        vec![crate::git_diff::DiffFile {
+                        vec![crate::git::diff::DiffFile {
                             path: rel.clone(),
                             old_path: None,
-                            side: crate::git_diff::DiffSide::Working,
+                            side: crate::git::diff::DiffSide::Working,
                             status_label: label.clone(),
                             hunk_actions: false,
                         }],
@@ -397,9 +397,9 @@ pub(super) fn file_menu(
                 let project_id = context.project_id.clone();
                 menu::item(t("gitLog", "fileHistory.menu"), move |window, cx| {
                     if remote
-                        && !crate::git_backend::remote_git_enabled(store.read(cx), &project_id)
+                        && !crate::git::backend::remote_git_enabled(store.read(cx), &project_id)
                     {
-                        crate::git_backend::request_enable(
+                        crate::git::backend::request_enable(
                             store.clone(),
                             project_id.clone(),
                             window,
@@ -407,8 +407,8 @@ pub(super) fn file_menu(
                         );
                         return;
                     }
-                    let project = crate::git_backend::project_context(store.read(cx), &project_id);
-                    crate::git_file_history::open(
+                    let project = crate::git::backend::project_context(store.read(cx), &project_id);
+                    crate::git::file_history::open(
                         store.clone(),
                         project.clone(),
                         rel.clone(),

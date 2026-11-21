@@ -351,7 +351,7 @@ impl SettingsView {
                                 })
                                 .await;
                             if let Err(err) = result {
-                                eprintln!("[settings] 打开主题目录失败: {err}");
+                                tracing::warn!("[settings] 打开主题目录失败: {err}");
                                 let _ = this.update(cx, |this: &mut Self, cx| {
                                     this.theme_error = Some(err.to_string());
                                     cx.notify();
