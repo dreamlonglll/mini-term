@@ -257,7 +257,7 @@ impl ScrollbarLayout {
 ///
 /// - `active` = 正在拖 / 鼠标悬在条上 → 恒定全不透明;
 /// - 闲置未超过 `fade_delay` → 全不透明;
-/// - 之后在 `fade_duration` 内线性衰减到 `resting`(不在底部)或 0(在底部)。
+/// - 之后在 `fade_duration` 内按 `EaseOut` 衰减到 `resting`(不在底部)或 0(在底部)。
 pub fn alpha(style: &ScrollbarStyle, idle: Duration, active: bool, at_bottom: bool) -> f32 {
     if active {
         return 1.0;
@@ -273,16 +273,41 @@ pub fn alpha(style: &ScrollbarStyle, idle: Duration, active: bool, at_bottom: bo
     if t >= 1.0 {
         floor
     } else {
-        floor + (1.0 - floor) * (1.0 - t)
+        let eased = crate::motion::ease(crate::motion::Easing::EaseOut, t);
+        floor + (1.0 - floor) * (1.0 - eased)
     }
 }
 
-/// 淡出还没走完 → 还要请求下一帧。为 0 时可以停下,不再空转。
-pub fn needs_animation_frame(style: &ScrollbarStyle, idle: Duration, active: bool) -> bool {
+/// 滚动条下一拍的唤醒策略。**纯函数**。
+///
+/// - `Idle`: 正在交互或已淡完,彻底静止;
+/// - `Wait(remaining)`: 还在 `fade_delay` 静止保持期内,`alpha` 恒为 `1.0`,
+///   只需挂一只单发定时器在 `remaining` 后唤醒视图,禁止每帧空转;
+/// - `Animate`: 正在 `fade_duration` 淡出补间窗口内,请求下一动画帧。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FadeSchedule {
+    Idle,
+    Wait(Duration),
+    Animate,
+}
+
+pub fn fade_schedule(style: &ScrollbarStyle, idle: Duration, active: bool) -> FadeSchedule {
     if active {
-        return false;
+        return FadeSchedule::Idle;
     }
-    idle < style.fade_delay + style.fade_duration
+    if idle < style.fade_delay {
+        return FadeSchedule::Wait(style.fade_delay.saturating_sub(idle));
+    }
+    if !style.fade_duration.is_zero() && idle < style.fade_delay + style.fade_duration {
+        FadeSchedule::Animate
+    } else {
+        FadeSchedule::Idle
+    }
+}
+
+/// 淡出补间正在进行中 → 还要请求下一动画帧。保持期与静息态均返回 `false`。
+pub fn needs_animation_frame(style: &ScrollbarStyle, idle: Duration, active: bool) -> bool {
+    matches!(fade_schedule(style, idle, active), FadeSchedule::Animate)
 }
 
 /// 滚动条的跨帧交互状态。挂在 `TerminalElementState` 上。
@@ -417,9 +442,13 @@ mod tests {
         assert_eq!(alpha(&s, Duration::from_secs(60), true, true), 1.0);
         // 延迟内恒亮
         assert_eq!(alpha(&s, Duration::from_millis(500), false, false), 1.0);
-        // 中点约在 1 与 floor 的一半处
+        // 中点走 EaseOut(比线性衰减得快一点),仍落在 (floor, 1.0) 内且单调下降
+        let early = alpha(&s, Duration::from_millis(900 + 100), false, false);
         let mid = alpha(&s, Duration::from_millis(900 + 225), false, false);
-        assert!((mid - (0.5 + 0.5 * 0.5)).abs() < 0.01, "实际 {mid}");
+        let late = alpha(&s, Duration::from_millis(900 + 350), false, false);
+        assert!(early > mid && mid > late && late > 0.5, "{early} {mid} {late}");
+        let expected_mid = 0.5 + 0.5 * (1.0 - crate::motion::ease(crate::motion::Easing::EaseOut, 0.5));
+        assert!((mid - expected_mid).abs() < 0.01, "实际 {mid}");
         // 在底部彻底消失,不在底部留一半 —— 「我还在回看」要一直看得见
         assert_eq!(alpha(&s, Duration::from_secs(5), false, true), 0.0);
         assert_eq!(alpha(&s, Duration::from_secs(5), false, false), 0.5);
@@ -449,26 +478,46 @@ mod tests {
             g.fade_delay, s.fade_delay,
             "「闲置多久才收」不是动画,不动它"
         );
-        // 延迟内照常全亮,过了延迟直接落到静息值(没有中间帧)
+        // 延迟内照常全亮,但走单发定时唤醒、绝不请求动画帧
         assert_eq!(alpha(&g, Duration::from_millis(500), false, false), 1.0);
+        assert_eq!(
+            fade_schedule(&g, Duration::from_millis(500), false),
+            FadeSchedule::Wait(Duration::from_millis(400))
+        );
+        assert!(!needs_animation_frame(&g, Duration::from_millis(500), false));
+        // 过了延迟直接落到静息值(没有中间帧)
         assert_eq!(
             alpha(&g, Duration::from_millis(901), false, false),
             g.resting
         );
-        assert!(!needs_animation_frame(
-            &g,
-            Duration::from_millis(901),
-            false
-        ));
+        assert_eq!(
+            fade_schedule(&g, Duration::from_millis(901), false),
+            FadeSchedule::Idle
+        );
     }
 
     #[test]
-    fn 淡出走完就不再请求动画帧() {
+    fn 延迟期走单发定时_淡出走完即停() {
         let s = ScrollbarStyle::default();
-        assert!(needs_animation_frame(&s, Duration::from_millis(0), false));
+        // 延迟保持期:只挂单发定时器,不每帧空转
+        assert_eq!(
+            fade_schedule(&s, Duration::from_millis(0), false),
+            FadeSchedule::Wait(Duration::from_millis(900))
+        );
+        assert!(!needs_animation_frame(&s, Duration::from_millis(0), false));
+        // 进入淡出补间窗口:请求动画帧
+        assert_eq!(
+            fade_schedule(&s, Duration::from_millis(1200), false),
+            FadeSchedule::Animate
+        );
         assert!(needs_animation_frame(&s, Duration::from_millis(1200), false));
+        // 淡完彻底静止
+        assert_eq!(
+            fade_schedule(&s, Duration::from_millis(1400), false),
+            FadeSchedule::Idle
+        );
         assert!(!needs_animation_frame(&s, Duration::from_millis(1400), false));
         // 手还按着的时候不用自转,鼠标事件自己会带来重绘
-        assert!(!needs_animation_frame(&s, Duration::ZERO, true));
+        assert_eq!(fade_schedule(&s, Duration::ZERO, true), FadeSchedule::Idle);
     }
 }

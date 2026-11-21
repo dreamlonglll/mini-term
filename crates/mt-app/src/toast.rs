@@ -100,6 +100,10 @@ const SETTINGS_HINT_TTL: Duration = Duration::from_secs(15);
 const MAX_VISIBLE: usize = 5;
 /// 卡片宽度(`styles.css:551`)。
 const CARD_WIDTH: f32 = 280.0;
+/// 栈距离窗口右缘与底边的外边距(`right:16 bottom:16`)。
+const STACK_MARGIN: f32 = 16.0;
+/// 滑入/滑出总位移:卡片宽 + 右侧外边距,确保卡片彻底从视口右缘之外滑进/滑出而不硬切。
+const SLIDE_DISTANCE: f32 = CARD_WIDTH + STACK_MARGIN;
 
 /// `wsl-info` 那条用的占位项目 id(`App.tsx:369`)。**不参与任何跳转**,
 /// 也不会匹配到真实项目 —— 关项目时的清理因此天然放过它。
@@ -932,8 +936,8 @@ impl Render for ToastLayer {
         // 容器本身**不 occlude**(原版 `pointer-events:none`),卡片自己收事件。
         let mut stack = div()
             .absolute()
-            .right(px(16.0))
-            .bottom(px(16.0))
+            .right(px(STACK_MARGIN))
+            .bottom(px(STACK_MARGIN))
             .w(px(CARD_WIDTH))
             .flex()
             .flex_col()
@@ -957,20 +961,18 @@ impl Render for ToastLayer {
 
         for item in visible {
             let id = item.id;
-            // `toastSlideIn 0.25s ease-out`:translateX(100%)→0。gpui 没有 transform,用相对
-            // 定位的 `left` 补一条等效位移(容器宽度就是卡片宽度,所以 100% = CARD_WIDTH)。
-            // **不做透明度**(原版那条 opacity 0→1 读作「闪一下」,用户口径否掉了)。
-            //
-            // 减弱动效下**照播**:原版 `.toast-card` 不在 reduce 豁免名单里,曾按
-            // 通配规则压成瞬时(此处不挂动画元素);2026-09-19 用户拍板改为豁免
-            // (`mt_ui::motion::TOAST_SLIDE_IN` 已是 exempt 规格),口径与浮层进出场
-            // 同类。gpui 自己那道 `App::reduce_motion` 闸只跟「启用动画」总开关
-            // (`motion::sync_switch`),所以这里的 `with_animation` 在系统 reduce 下也会真的动。
-            let card = self.card(&item, true, cx).with_animation(
-                SharedString::from(format!("toast-slide-{id}")),
-                mt_ui::motion::TOAST_SLIDE_IN.animation(),
-                |el, delta| el.left(px(CARD_WIDTH * (1.0 - delta))),
-            );
+            // `toastSlideIn 0.25s ease-out`:从视口右缘之外(卡片宽 + 右边距)滑到位。
+            // 滑入位移挂在独立外层 div 上,与内层卡片的 `.hover(|el| el.left(px(-2.0)))` 解耦,
+            // 避免滑入途中鼠标划过卡片时两个 `left` 互相打架。
+            let card = div()
+                .relative()
+                .w_full()
+                .child(self.card(&item, true, cx))
+                .with_animation(
+                    SharedString::from(format!("toast-slide-{id}")),
+                    mt_ui::motion::TOAST_SLIDE_IN.animation(),
+                    |el, delta| el.left(px(SLIDE_DISTANCE * (1.0 - delta))),
+                );
             stack = stack.child(Reflowed {
                 id,
                 child: card.into_any_element(),
@@ -979,13 +981,13 @@ impl Render for ToastLayer {
         }
 
         // 退场中的卡片:已经离开排版(其余卡片当场补位),按出队那一刻的离底距离原地画,
-        // 向右滑出屏外
+        // 彻底向右滑出视口右缘(含 16px 边距)再卸载
         for (item, gap, progress) in leaving {
             stack = stack.child(
                 div()
                     .absolute()
                     .bottom(px(gap))
-                    .right(px(-CARD_WIDTH * progress))
+                    .right(px(-SLIDE_DISTANCE * progress))
                     .w_full()
                     .child(self.card(&item, false, cx)),
             );

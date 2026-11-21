@@ -85,9 +85,19 @@ export function SessionList() {
   // ── 下拉刷新 ──
   // 列表本身是实时同步的，但「怀疑它卡住了」时用户需要一个能自己动手的动作。
   const [pull, setPull] = useState(0);
+  const [pulling, setPulling] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const pullStart = useRef<number | null>(null);
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const PULL_TRIGGER = 64;
+
+  useEffect(() => {
+    return () => {
+      if (refreshTimer.current !== null) {
+        clearTimeout(refreshTimer.current);
+      }
+    };
+  }, []);
 
   const onTouchStart = (e: React.TouchEvent) => {
     // 只在真正滚到顶时才接管手势，否则会和正常滚动打架
@@ -95,6 +105,7 @@ export function SessionList() {
     if (scroller && scroller.scrollTop > 0) return;
     if (refreshing) return;
     pullStart.current = e.touches[0].clientY;
+    setPulling(true);
   };
 
   const onTouchMove = (e: React.TouchEvent) => {
@@ -112,12 +123,19 @@ export function SessionList() {
     if (pullStart.current === null) return;
     const shouldRefresh = pull >= PULL_TRIGGER;
     pullStart.current = null;
+    setPulling(false);
     setPull(0);
     if (!shouldRefresh) return;
     if (!refreshSessions()) return;
     setRefreshing(true);
     // 重连握手 + 全量快照通常在 1s 内；这里只是指示器的收尾，不是真等待
-    setTimeout(() => setRefreshing(false), 1200);
+    if (refreshTimer.current !== null) {
+      clearTimeout(refreshTimer.current);
+    }
+    refreshTimer.current = setTimeout(() => {
+      refreshTimer.current = null;
+      setRefreshing(false);
+    }, 1200);
   };
 
   // 失败提示展示 6s 后自动消失(超时文案偏长,给足阅读时间)
@@ -182,7 +200,7 @@ export function SessionList() {
         </div>
       )}
       <div
-        className="pull-indicator"
+        className={pulling ? 'pull-indicator is-pulling' : 'pull-indicator'}
         style={{ height: refreshing ? 36 : pull }}
         aria-hidden={!refreshing && pull === 0}
       >

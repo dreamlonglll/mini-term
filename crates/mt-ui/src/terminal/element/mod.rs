@@ -472,6 +472,9 @@ struct TerminalElementState {
     scrollbar: Rc<StdCell<ScrollbarDrag>>,
     /// 上一次「滚动条该亮起来」的时刻(滚动、拖动、悬停)。淡出计时的起点。
     scrollbar_touched: Rc<StdCell<Option<Instant>>>,
+    /// `fade_delay` 保持期的单发定时唤醒句柄(记录对应的 `touched` 时刻,防止同一次
+    /// 停留重复建任务;再次滚动或进入淡出/静息时覆写/清空自动取消旧定时器)。
+    scrollbar_fade_task: Rc<RefCell<Option<(Instant, gpui::Task<()>)>>>,
     /// 上一帧的 display_offset。变了就说明滚过,滚动条要重新亮起。
     last_offset: Rc<StdCell<usize>>,
     /// 拖选停留复制的状态机。
@@ -544,6 +547,7 @@ impl Default for TerminalElementState {
             advance: Rc::new(RefCell::new(AdvanceCache::default())),
             scrollbar: Rc::new(StdCell::new(ScrollbarDrag::default())),
             scrollbar_touched: Rc::new(StdCell::new(None)),
+            scrollbar_fade_task: Rc::new(RefCell::new(None)),
             last_offset: Rc::new(StdCell::new(0)),
             dwell: Rc::new(RefCell::new(DwellTracker::default())),
             dwell_task: Rc::new(RefCell::new(None)),
@@ -1302,7 +1306,7 @@ impl Element for TerminalElement {
 
             // ── 滚动条画在最上层。**只发 quad,不碰 RowCache 也不碰帧指纹** ——
             //    拖滑块时行缓存该命中还是命中(滚屏行只是换了个 y)。
-            self.paint_scrollbar(prepared, window);
+            self.paint_scrollbar(prepared, window, cx);
         });
 
         if hovered_link.is_some() {

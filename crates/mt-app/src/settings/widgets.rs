@@ -46,6 +46,11 @@ pub(super) fn drive_knobs(window: &Window) {
     KNOBS.with(|knobs| knobs.borrow().drive(window));
 }
 
+/// 清空残留的开关滑块补间(打开/关闭设置面板时调,避免快速关开继承上一次的残留)。
+pub(super) fn clear_knobs() {
+    KNOBS.with(|knobs| knobs.borrow_mut().clear());
+}
+
 /// 页根节点:`space-y-6`。
 pub(super) fn page_root() -> gpui::Div {
     div().flex().flex_col().gap(px(24.0))

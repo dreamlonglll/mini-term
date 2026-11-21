@@ -269,8 +269,9 @@ impl DatePicker {
         self.unregister();
         let now = Instant::now();
         self.reveal.hide(now);
-        if self.reveal.mounted_at(now) {
-            overlay_motion::linger(cx.entity().into(), OVERLAY_OUT.duration, cx);
+        let remaining = self.reveal.remaining_at(now);
+        if !remaining.is_zero() {
+            overlay_motion::linger(cx.entity().into(), remaining, cx);
         }
         cx.notify();
     }
@@ -516,7 +517,8 @@ impl Render for DatePicker {
                     .bg(ui::bg_overlay())
                     .shadow_lg()
             }))
-            .interactive(interactive);
+            .interactive(interactive)
+            .occlude_native(true);
 
         div().child(
             deferred(

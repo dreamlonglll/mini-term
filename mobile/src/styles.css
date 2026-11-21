@@ -3,7 +3,9 @@
 :root {
   --bg-base: #1a1a1a;
   --bg-surface: #232323;
+  --bg-elevated: #2c2c2c;
   --border-subtle: #333;
+  --border-strong: #444;
   --text-primary: #e8e6e3;
   --text-secondary: #b5b2ad;
   --text-muted: #7a7772;
@@ -121,6 +123,7 @@ body {
   justify-content: flex-start;
   padding: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
 }
 
 .session-list {
@@ -271,10 +274,9 @@ body {
   background: var(--color-error);
 }
 
-/* 黄灯:提问待答/等待授权,展示优先于常规状态 */
+/* 黄灯:提问待答/等待授权,与桌面端口径一致,靠醒目琥珀色表达而不闪烁 */
 .dot-attention {
   background: var(--color-attention);
-  animation: pulse 1.2s ease-in-out infinite;
 }
 
 .pane-status-attention {
@@ -1743,16 +1745,26 @@ body {
 }
 
 .skeleton-line {
+  position: relative;
+  overflow: hidden;
   height: 10px;
   border-radius: 5px;
+  background: var(--border-subtle);
+}
+
+.skeleton-line::after {
+  content: "";
+  position: absolute;
+  inset: 0;
   background: linear-gradient(
     90deg,
-    var(--border-subtle) 25%,
-    var(--border-strong) 37%,
-    var(--border-subtle) 63%
+    transparent 0%,
+    var(--border-strong) 50%,
+    transparent 100%
   );
-  background-size: 400% 100%;
+  transform: translateX(-100%);
   animation: skeletonShimmer 1.4s ease-in-out infinite;
+  will-change: transform;
 }
 
 .skeleton-line.w-40 { width: 40%; }
@@ -1760,8 +1772,8 @@ body {
 .skeleton-line.w-75 { width: 75%; }
 
 @keyframes skeletonShimmer {
-  0% { background-position: 100% 50%; }
-  100% { background-position: 0 50%; }
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
 }
 
 /* ===== 下拉刷新 ===== */
@@ -1773,6 +1785,11 @@ body {
   color: var(--text-muted);
   font-size: 13px;
   transition: height 0.18s ease;
+}
+
+/* 手指拖拽中禁用高度过渡,确保完全跟手;松手回弹时恢复过渡 */
+.pull-indicator.is-pulling {
+  transition: none;
 }
 
 .pull-indicator .spinner {
@@ -1791,10 +1808,16 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   /* 装饰性/循环性动效一律停掉 */
-  .skeleton-line,
+  .skeleton-line::after,
   .status-icon.spinning,
   .dot-working {
     animation: none;
+  }
+
+  .tool-group-chevron,
+  .sheet-group-arrow,
+  .pull-indicator {
+    transition: none;
   }
 
   /* 例外：下拉刷新的 spinner 是「正在刷新」的唯一反馈，停住就等于假装卡死。
@@ -1804,8 +1827,16 @@ body {
   }
 
   /* 镜像页「AI 工作中」的三点同理:停住就像卡死了,放慢即可。
-     状态行的入场位移是一次性的换场,不在此列 */
+     周期放慢 2 倍时同步拉大 2 倍错峰延迟,维持均匀波浪节奏。 */
   .activity-dots > span {
     animation-duration: 2.4s;
+  }
+
+  .activity-dots > span:nth-child(2) {
+    animation-delay: 0.3s;
+  }
+
+  .activity-dots > span:nth-child(3) {
+    animation-delay: 0.6s;
   }
 }

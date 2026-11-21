@@ -264,6 +264,11 @@ impl LayoutFx {
         self.grow_armed = armed;
     }
 
+    /// 上一帧量到的叶子完整窗口坐标(含 30px tab 栏),供最大化 Reveal 起步矩形用。
+    pub fn leaf_rect(&self, leaf: &str) -> Option<Rect> {
+        self.leaves.get(leaf).map(|(rect, _)| *rect)
+    }
+
     /// 子树里量到的矩形换回排版位置(见 [`Self::leaf_offset`])。只在 prepaint 里调。
     pub fn unshift(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         unshift(bounds, self.leaf_offset)

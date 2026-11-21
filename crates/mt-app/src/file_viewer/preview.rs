@@ -1236,7 +1236,8 @@ impl FileViewer {
                                 .left(px(outline_offset(openness, MD_OUTLINE_WIDTH)))
                                 .w(px(MD_OUTLINE_WIDTH))
                                 .h_full()
-                                .bg(ui::bg_document())
+                                // 外置主题包下 `bg_document` 可能带半透明,退场滑走层用不透明 `bg_overlay` 防止透出正文重影
+                                .bg(ui::bg_overlay())
                                 .child(self.render_md_outline(&outline, cx))
                                 .child(div().absolute().inset_0().occlude()),
                         ),

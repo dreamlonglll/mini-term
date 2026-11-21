@@ -377,12 +377,16 @@ pub struct SettingsView {
     focus: FocusHandle,
     /// 切页的整幅 push(见模块注释「切页动画」)。
     page_swap: KeyedSwap<SettingsPage>,
+    /// 键盘 ↑/↓ 环形切页时的显式方向(防止首尾回绕时按索引大小判断反向倒车)。
+    pending_page_dir: Option<f32>,
     /// 内容列的滚动位置(换页回到顶上)。
     page_scroll: ScrollHandle,
     /// 切页出场层的滚动位置:换页那一刻从 `page_scroll` 抄过来,旧页停在离开时的位置滑走。
     exit_scroll: ScrollHandle,
     /// 导航的滑动选中块。
     nav_slider: IndicatorSlider,
+    /// 外观页「语言」段控件的滑动选中块。
+    lang_slider: IndicatorSlider,
 
     // ── terminal 页:shell 列表 ──
     shell_editing: Editing,
@@ -696,14 +700,17 @@ impl SettingsView {
         });
         let remote = RemoteNotifyForm::new(&config.remote_notify, window, cx);
 
+        widgets::clear_knobs();
         let mut this = Self {
             store,
             page: initial_page.unwrap_or(SettingsPage::Terminal),
             focus: cx.focus_handle(),
             page_swap: KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
+            pending_page_dir: None,
             page_scroll: ScrollHandle::new(),
             exit_scroll: ScrollHandle::new(),
             nav_slider: IndicatorSlider::new(),
+            lang_slider: IndicatorSlider::new(),
             shell_editing: None,
             shell_name: ph(cx, window, t("settings", "terminal.newNamePlaceholder")),
             shell_command: ph(cx, window, t("settings", "terminal.newCommandPlaceholder")),
@@ -817,6 +824,7 @@ impl SettingsView {
             return;
         }
         self.commit_drafts(cx);
+        widgets::clear_knobs();
         cx.set_global(LastSettingsPage(self.page));
     }
 
@@ -968,6 +976,8 @@ impl SettingsView {
     fn move_page(&mut self, delta: i32, cx: &mut Context<Self>) {
         let len = ALL_PAGES.len() as i32;
         let idx = ALL_PAGES.iter().position(|p| *p == self.page).unwrap_or(0) as i32;
+        // 记住按键移动方向:末页按 ↓ 回绕到首页仍向下推入,首页按 ↑ 回绕到末页仍向上推入
+        self.pending_page_dir = Some(if delta >= 0 { 1.0 } else { -1.0 });
         self.set_page(ALL_PAGES[(((idx + delta) % len + len) % len) as usize], cx);
     }
 
@@ -1011,8 +1021,9 @@ impl Render for SettingsView {
         widgets::drive_knobs(window);
         // 切页:先报这一帧谁在台上,再取出场信息(见模块注释「切页动画」)
         let page = self.page;
+        let explicit_dir = self.pending_page_dir.take();
         self.page_swap
-            .observe(&page, |old, new| page_order(*old, *new));
+            .observe(&page, |old, new| explicit_dir.unwrap_or_else(|| page_order(*old, *new)));
         let swap = self.page_swap.frame(window);
         // 先对账再画:换走了外观页 / 皮肤列表变了,缩略图在这一帧放掉(外观页正作为出场层
         // 滑走时还在画,不放)

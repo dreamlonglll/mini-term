@@ -1078,9 +1078,33 @@ impl ContextMenu {
             // `gpui_component::scroll::scrollable` 的包法一致)。`Scrollbar`
             // 元素自身虽是 absolute,却不带 inset —— 只给尺寸不给位置,taffy
             // 就按「静态位置」把它摆在列表**下方**,滚动条会掉到菜单外面去。
+            //
+            // 关动画模式下菜单不会自动跑第 2 帧,首帧 `overflowing` 为 false 时
+            // 挂一片零开销探针在 `list` 之后:本帧 prepaint 后若发现真实溢出,
+            // 约下一帧补刷一次把滚动条画出来(随后 `overflowing` 为 true,探针摘除)。
             div()
                 .relative()
                 .child(list)
+                .when(!overflowing, |el| {
+                    let probe_handle = handle.clone();
+                    let menu_entity = cx.entity();
+                    el.child(
+                        gpui::canvas(
+                            move |_bounds, window, _cx| {
+                                if probe_handle.max_offset().y > SCROLLBAR_EPSILON {
+                                    let entity = menu_entity.clone();
+                                    window.on_next_frame(move |_, cx| {
+                                        entity.update(cx, |_, cx| cx.notify());
+                                    });
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .w_0()
+                        .h_0(),
+                    )
+                })
                 .when(overflowing, |el| {
                     el.child(
                         div()
@@ -1229,11 +1253,14 @@ impl ContextMenu {
             let submenu = match item.submenu_element.as_ref() {
                 Some(render) => {
                     let (progress, live) = panel_motion(menu, &child_path, interactive, window);
-                    // 自绘面板自带框体:只裁剪,不另画
+                    // 自绘子面板与普通子菜单共用同一套外框(底色/边框/阴影随裁剪窗同步长出)
+                    // 并抠出 WebView2 区域,避免展开途中右边框被裁切或被网页盖住
                     reveal_box(render(window, cx), progress)
                         .origin(RevealOrigin::Fraction(0.0, 0.5))
                         .start(SUBMENU_REVEAL_START.0, SUBMENU_REVEAL_START.1)
+                        .chrome(panel_chrome())
                         .interactive(live)
+                        .occlude_native(true)
                         .into_any_element()
                 }
                 None => self.render_panel(menu, &item.submenu, child_path, interactive, window, cx),
@@ -1347,6 +1374,7 @@ fn reveal_panel(
         .start(start_w, start_h)
         .chrome(panel_chrome())
         .interactive(interactive)
+        .occlude_native(true)
         .into_any_element()
 }
 

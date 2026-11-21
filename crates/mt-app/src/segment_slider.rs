@@ -59,6 +59,11 @@ struct SliderState {
     /// 上一次排版时滑块落在哪一项。
     shown: Option<usize>,
     tweens: Option<[ValueTween; 4]>,
+    /// 本帧 `render` 中是否有人读过 `coverage()`。用于在 `request_layout` 刚发生瞬移
+    /// 或末帧刚好跨阈值落位时兜底补一帧,防止文字反白停在上一帧的旧值。
+    coverage_read: bool,
+    /// 上一次 `plan_ex` 结束时补间是否仍在运行,用来捕捉「跨过终点落位」那一帧。
+    was_running: bool,
 }
 
 impl SliderState {
@@ -73,12 +78,13 @@ impl SliderState {
         ])
     }
 
-    /// 这一次排版滑块画在哪(`None` = 还没量到,不画)+ 还在不在动。见模块注释的三条规则。
-    fn plan(&mut self, active: usize, now: Instant) -> Option<(SlotRect, bool)> {
+    /// 这一次排版滑块画在哪(`None` = 还没量到,不画)+ `(还在不在动, 本帧是否发生了切项或到位)`。
+    fn plan_ex(&mut self, active: usize, now: Instant) -> Option<(SlotRect, bool, bool)> {
         let target = self.rect_of(active)?;
         let spec = self.spec;
         let settled = |rect: SlotRect| rect.map(|v| ValueTween::settled(v, spec));
         let moved = self.shown.is_some_and(|prev| prev != active);
+        let prev_running = self.was_running;
         match self.tweens.as_mut() {
             // 换了选中项:四个量从当前显示值补过去
             Some(tweens) if moved => {
@@ -113,6 +119,15 @@ impl SliderState {
         let tweens = self.tweens.as_ref()?;
         let rect = [0, 1, 2, 3].map(|i| tweens[i].value_at(now));
         let running = tweens.iter().any(|t| moving(t, now));
+        self.was_running = running;
+        let needs_settle_frame = (moved && !running) || (prev_running && !running);
+        Some((rect, running, needs_settle_frame))
+    }
+
+    /// 供单测与常规路径使用的简版返回。
+    #[cfg(test)]
+    fn plan(&mut self, active: usize, now: Instant) -> Option<(SlotRect, bool)> {
+        let (rect, running, _) = self.plan_ex(active, now)?;
         Some((rect, running))
     }
 }
@@ -165,6 +180,8 @@ impl IndicatorSlider {
             origin: None,
             shown: None,
             tweens: None,
+            coverage_read: false,
+            was_running: false,
         })))
     }
 
@@ -174,12 +191,20 @@ impl IndicatorSlider {
         self.0.borrow().rect_of(active).is_some()
     }
 
+    /// 在 `render` 读取 [`Self::coverage`] 之前同步最新选中项:
+    /// `SliderBlock::request_layout` 排在 `render` 之后,提前规划目标可确保关动画瞬移或
+    /// 刚切项的那一帧就能读到正确覆盖率,避免文字反白停在旧段上。
+    pub fn sync(&self, active: usize) {
+        let _ = self.0.borrow_mut().plan_ex(active, Instant::now());
+    }
+
     /// 滑块**此刻**盖住第 `index` 项的面积比例(0..1)。还没画过 / 没量到为 `None`。
     ///
     /// 实底滑块上的选中字是反白的:字色要跟着滑块走(盖过一半才反白),否则新选中那一段
     /// 在滑块到达之前是一行白字压在面板底上,几乎看不见。
     pub fn coverage(&self, index: usize) -> Option<f32> {
-        let s = self.0.borrow();
+        let mut s = self.0.borrow_mut();
+        s.coverage_read = true;
         let item = s.rect_of(index)?;
         let tweens = s.tweens.as_ref()?;
         let now = Instant::now();
@@ -260,10 +285,14 @@ impl Element for SliderBlock {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, SliderLayout) {
-        let plan = self.state.borrow_mut().plan(self.active, Instant::now());
+        let (plan, coverage_read) = {
+            let mut s = self.state.borrow_mut();
+            let coverage_read = std::mem::take(&mut s.coverage_read);
+            (s.plan_ex(self.active, Instant::now()), coverage_read)
+        };
         let (inner, offset) = match plan {
-            Some(([x, y, w, h], running)) => {
-                if running {
+            Some(([x, y, w, h], running, needs_settle_frame)) => {
+                if running || (coverage_read && needs_settle_frame) {
                     window.request_animation_frame();
                 }
                 let style = self.style.take().unwrap_or_else(|| Box::new(|el| el));
@@ -351,6 +380,8 @@ mod tests {
             origin: Some(point(px(100.0), px(10.0))),
             shown: None,
             tweens: None,
+            coverage_read: false,
+            was_running: false,
         }
     }
 
@@ -479,5 +510,57 @@ mod tests {
             assert!(running);
             assert_eq!(rect, [1.0, 0.0, 40.0, 24.0]);
         }
+    }
+
+    #[test]
+    fn 关动画瞬移与到位末帧都会标出反白补刷并同步覆盖率() {
+        let t0 = Instant::now();
+        // 1) 关动画时换项瞬移:不继续跑动画,但 needs_settle_frame=true,且 sync 后覆盖率立即可读
+        crate::motion::with_reduce(true, || {
+            let slider = IndicatorSlider::with_spec(TransitionSpec::new(
+                Duration::from_millis(200),
+                mt_ui::motion::Easing::Linear,
+            ));
+            {
+                let mut s = slider.0.borrow_mut();
+                let rect = |x: f32, w: f32| {
+                    Some(Bounds::new(point(px(x), px(10.0)), size(px(w), px(24.0))))
+                };
+                s.items = vec![rect(101.0, 40.0), rect(141.0, 64.0)];
+                s.origin = Some(point(px(100.0), px(10.0)));
+                let (_, running, _) = s.plan_ex(0, t0).unwrap();
+                assert!(!running);
+            }
+            assert_eq!(slider.coverage(0), Some(1.0));
+            assert_eq!(slider.coverage(1), Some(0.0));
+
+            // 模拟未调 sync 时直接进入 plan_ex(1):需标 needs_settle_frame 让文字重读覆盖率
+            let (rect, running, needs_settle) = slider
+                .0
+                .borrow_mut()
+                .plan_ex(1, t0 + Duration::from_millis(20))
+                .unwrap();
+            assert_eq!(rect, [41.0, 0.0, 64.0, 24.0]);
+            assert!(!running);
+            assert!(needs_settle, "关动画换项瞬移后必须补刷一次以更新反白");
+
+            // 再模拟切回第 0 项前显式 sync(0):同帧读取 coverage 就已到位
+            slider.sync(0);
+            assert_eq!(slider.coverage(0), Some(1.0));
+            assert_eq!(slider.coverage(1), Some(0.0));
+        });
+
+        // 2) 开动画到位的那一帧(was_running -> !running):同样标 needs_settle_frame
+        crate::motion::with_reduce(false, || {
+            let mut s = state();
+            s.plan_ex(0, t0);
+            let (_, running, _) = s.plan_ex(1, t0 + Duration::from_millis(10)).unwrap();
+            assert!(running);
+            let (end_rect, running, needs_settle) =
+                s.plan_ex(1, t0 + Duration::from_millis(250)).unwrap();
+            assert_eq!(end_rect, [41.0, 0.0, 64.0, 24.0]);
+            assert!(!running);
+            assert!(needs_settle, "补间跨过终点那一帧必须补刷确保文字反白到位");
+        });
     }
 }

@@ -277,22 +277,23 @@ impl TerminalElement {
 
     /// 滚动条的两个 quad(轨道可选 + 滑块)。
     ///
-    /// 淡出是「按时间算 alpha + 没淡完就再要一帧」,不走 `with_animation` ——
-    /// 那玩意要求一个稳定的 ElementId 且会持续请求帧,而滚动条**大多数时候
-    /// 应该是完全静止的**,空转帧对一个终端来说太贵。
-    pub(super) fn paint_scrollbar(&self, prepared: &PreparedFrame, window: &mut Window) {
+    /// 保持期(`fade_delay`)改走单发定时器唤醒,淡出补间窗口(`fade_duration`)内再按帧推进,
+    /// 彻底避免 900ms 静止保持期满刷新率空转重绘。
+    pub(super) fn paint_scrollbar(
+        &self,
+        prepared: &PreparedFrame,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let Some(layout) = prepared.scrollbar else {
+            *prepared.state.scrollbar_fade_task.borrow_mut() = None;
             return;
         };
         let drag = prepared.state.scrollbar.get();
-        let idle = prepared
-            .state
-            .scrollbar_touched
-            .get()
-            .map(|t| t.elapsed())
-            .unwrap_or(Duration::MAX);
+        let touched = prepared.state.scrollbar_touched.get();
+        let idle = touched.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
         let active = drag.active();
-        // 减弱动效下淡出补间归零(延迟不变),见 `ScrollbarStyle::gated`
+        // 动画总开关关掉时淡出补间归零(延迟保留),见 `ScrollbarStyle::gated`
         let style = self.scrollbar.gated();
         let alpha = scrollbar::alpha(&style, idle, active, layout.at_bottom());
 
@@ -332,9 +333,31 @@ impl TerminalElement {
             );
         }
 
-        // 淡出还没走完就再要一帧;走完了就此打住,不空转
-        if scrollbar::needs_animation_frame(&style, idle, active) {
-            window.request_animation_frame();
+        // 保持期走单发定时唤醒;进入淡出补间窗口才请求动画帧;走完/交互中彻底安静
+        match scrollbar::fade_schedule(&style, idle, active) {
+            scrollbar::FadeSchedule::Animate => {
+                *prepared.state.scrollbar_fade_task.borrow_mut() = None;
+                window.request_animation_frame();
+            }
+            scrollbar::FadeSchedule::Wait(wait) => {
+                if let Some(stamp) = touched {
+                    let mut slot = prepared.state.scrollbar_fade_task.borrow_mut();
+                    let armed = slot.as_ref().is_some_and(|(t, _)| *t == stamp);
+                    if !armed {
+                        let view_id = window.current_view();
+                        // 加 2ms 余量:保证定时器醒来时 `stamp.elapsed() >= fade_delay`
+                        let delay = wait + Duration::from_millis(2);
+                        let task = window.spawn(cx, async move |cx| {
+                            cx.background_executor().timer(delay).await;
+                            let _ = cx.update(|_, cx| cx.notify(view_id));
+                        });
+                        *slot = Some((stamp, task));
+                    }
+                }
+            }
+            scrollbar::FadeSchedule::Idle => {
+                *prepared.state.scrollbar_fade_task.borrow_mut() = None;
+            }
         }
     }
 }

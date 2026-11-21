@@ -189,31 +189,67 @@ fn spin_period_with(base: Duration, reduced: bool, enabled: bool) -> Duration {
 // view,其余面板照走缓存 —— 与上游 `request_animation_frame` 的
 // 「notify 当前 view」同一语义,只是节拍从每帧换成了低频定时。
 
-/// 前台保底节拍:100ms(10fps)。AI 思考中无输出时 spinner 靠它步进。
-const PULSE_TICK: Duration = Duration::from_millis(100);
+/// 前台保底节拍毫秒数:100ms(10fps)。AI 思考中无输出时 spinner 靠它步进。
+const PULSE_TICK_MS: u64 = 100;
+const PULSE_TICK: Duration = Duration::from_millis(PULSE_TICK_MS);
 
 /// 后台每几拍刷一次(5 × 100ms = 500ms)。后台窗口上的 spinner 只是「还活着」
 /// 的信号,2fps 足够传达,代价是前台满帧档的 1/30。
 const PULSE_INACTIVE_EVERY: u64 = 5;
+
+/// 纯后台可见时的单拍睡眠时长:直接睡满 500ms,免去每 100ms 无效切回主线程。
+const PULSE_INACTIVE_TICK: Duration = Duration::from_millis(PULSE_TICK_MS * PULSE_INACTIVE_EVERY);
 
 /// 后台把动画周期放慢的倍数。500ms 拍距若踩在 0.9s 周期上,相邻两帧相位差
 /// 过半圈,旋转会走样成来回抖;放慢到 3.6s 后每拍走约 1/7 圈,方向清晰。
 const PULSE_INACTIVE_SLOWDOWN: u32 = 4;
 
 thread_local! {
-    /// 相位的时间原点。进程级 —— 所有窗口所有动画共用一条钟,
-    /// 同状态的多颗灯天然同相(原版 CSS animation 各自挂载反而会错相)。
-    static PULSE_EPOCH: Instant = Instant::now();
-
     static PULSE: RefCell<PulsePump> = RefCell::new(PulsePump::default());
+}
+
+/// 连续推进的虚拟相位时钟:记录累计有效毫秒数,前台 1:1 推进,后台按 `1 / PULSE_INACTIVE_SLOWDOWN`
+/// 推进。切焦点时只改变后续流速、不重算历史,彻底消除相位瞬间跳变。
+#[derive(Clone, Copy, Debug)]
+struct PhaseClock {
+    last: Instant,
+    last_active: bool,
+    accum_ms: f64,
+}
+
+impl PhaseClock {
+    fn new(now: Instant, active: bool) -> Self {
+        Self {
+            last: now,
+            last_active: active,
+            accum_ms: 0.0,
+        }
+    }
+
+    fn advance(&mut self, now: Instant, active: bool) -> f64 {
+        let dt_ms = now.saturating_duration_since(self.last).as_secs_f64() * 1000.0;
+        let scale = if self.last_active {
+            1.0
+        } else {
+            1.0 / PULSE_INACTIVE_SLOWDOWN as f64
+        };
+        self.accum_ms += dt_ms * scale;
+        self.last = now;
+        self.last_active = active;
+        self.accum_ms
+    }
 }
 
 /// 保底泵本体。状态全在主线程,`thread_local` 零通知 —— 与全局闸同款朴素做法。
 #[derive(Default)]
 struct PulsePump {
-    /// 泵在跑吗。同一时刻只该有一条。
+    /// 泵在跑吗。同一时刻只有最新 `generation` 的任务有效。
     running: bool,
-    /// 第几拍。后台窗口按 [`PULSE_INACTIVE_EVERY`] 的整数拍刷新。
+    /// 任务代号:从 500ms 后台慢睡切回前台时递增,旧任务醒来自退。
+    generation: u64,
+    /// 当前运行中的任务是不是正睡在 500ms 后台慢档。
+    slow_sleep: bool,
+    /// 第几拍(100ms 档)。后台窗口按 [`PULSE_INACTIVE_EVERY`] 的整数拍刷新。
     tick: u64,
     windows: Vec<PulseWindow>,
 }
@@ -223,6 +259,8 @@ struct PulseWindow {
     /// 自上次泵触发以来,窗口里登记过动画的 view(= [`pulse_phase`] 的调用方)。
     /// 触发即取走;一轮下来还是空的,说明动画都卸载了,该摘除这个窗口。
     views: Vec<EntityId>,
+    /// 本窗口的连续相位时钟:同窗内所有同周期指示灯共用,天然同相且切焦点不跳。
+    clock: PhaseClock,
     /// 可见性订阅。**一 drop 就退订**,所以必须存住;窗口被摘除时随之失效,
     /// 下次有动画登记会连订阅一起重建。回调见 [`on_pulse_visibility`]。
     _visibility: Subscription,
@@ -263,51 +301,88 @@ fn pulse_action(
     }
 }
 
-/// 窗口可见性变了。恢复可见时把登记过的 view 叫醒一帧 —— 它们一渲染就会重新调
-/// [`pulse_phase`],泵随之起来;变不可见时什么都不做,在跑的那条泵下一拍自停。
+/// 决定下一拍睡多久:`None` = 停泵;有前台活跃窗睡 100ms;全为后台可见窗直接睡 500ms。
+fn next_pulse_delay(has_windows: bool, any_awake: bool, any_active: bool) -> Option<Duration> {
+    if !has_windows || !any_awake {
+        None
+    } else if any_active {
+        Some(PULSE_TICK)
+    } else {
+        Some(PULSE_INACTIVE_TICK)
+    }
+}
+
+/// 窗口可见性变了。恢复可见时整条移出条目并把登记过的 view 叫醒一帧:
+/// 若动画仍在树上,它们一渲染就重新调 [`pulse_phase`],条目、订阅与泵随之重建;
+/// 若动画在最小化期间已卸载,不会带着空 views 与可见性订阅残留在泵里。
 fn on_pulse_visibility(visibility: WindowVisibility, window: &mut Window, cx: &mut App) {
     if !visibility.is_visible() {
         return;
     }
     let id = window.window_handle().window_id();
-    let views = PULSE.with(|pump| {
-        pump.borrow_mut()
-            .windows
-            .iter_mut()
-            .find(|w| w.handle.window_id() == id)
-            .map(|w| std::mem::take(&mut w.views))
-            .unwrap_or_default()
+    let removed = PULSE.with(|pump| {
+        let mut pump = pump.borrow_mut();
+        pump.windows
+            .iter()
+            .position(|w| w.handle.window_id() == id)
+            .map(|pos| pump.windows.swap_remove(pos))
     });
-    // 与 `PulseAction::Refresh` 同款语义:取走即开始新一轮观察
-    for view in views {
-        cx.notify(view);
+    if let Some(mut entry) = removed {
+        let views = std::mem::take(&mut entry.views);
+        // 延迟到当前回调返回后再 drop Subscription,避免在订阅分派中重入退订
+        cx.defer(move |_| drop(entry));
+        for view in views {
+            cx.notify(view);
+        }
     }
 }
 
+/// 把累计有效毫秒数折成 `period` 周期里的相位(0..1)。
+fn phase_of_ms(accum_ms: f64, period: Duration) -> f32 {
+    let period_ms = period.as_secs_f64() * 1000.0;
+    if period_ms <= 0.0 {
+        return 0.0;
+    }
+    (accum_ms.rem_euclid(period_ms) / period_ms) as f32
+}
+
 /// 当前墙钟在 `period` 周期里的相位(0..1)。
+#[cfg(test)]
 fn phase_of(elapsed: Duration, period: Duration) -> f32 {
-    let period_ms = period.as_millis().max(1) as u64;
-    (elapsed.as_millis() as u64 % period_ms) as f32 / period_ms as f32
+    phase_of_ms(elapsed.as_secs_f64() * 1000.0, period)
+}
+
+fn spawn_pulse_loop(generation: u64, initial_delay: Duration, cx: &mut App) {
+    // gpui 的 `AsyncApp::update` 不会失败:App 退出时这个任务连同循环一起被丢弃。
+    cx.spawn(async move |cx| {
+        let mut delay = initial_delay;
+        loop {
+            cx.background_executor().timer(delay).await;
+            let slept_slow = delay >= PULSE_INACTIVE_TICK;
+            match cx.update(|cx| pulse_tick(generation, slept_slow, cx)) {
+                Some(next) => delay = next,
+                None => return,
+            }
+        }
+    })
+    .detach();
 }
 
 /// 取一个永续动画这一帧的相位(0..1 一圈),并把窗口挂上保底泵。
 ///
 /// **render 里替代 `with_animation(Animation::new(period).repeat())` 用**:
-/// 拿返回值直接喂 `VectorIcon::rotation` / 闪烁曲线。窗口在后台时周期自动
-/// 放慢 [`PULSE_INACTIVE_SLOWDOWN`] 倍。
+/// 拿返回值直接喂 `VectorIcon::rotation` / 闪烁曲线。窗口在后台时流速自动
+/// 放慢 [`PULSE_INACTIVE_SLOWDOWN`] 倍且相位连续不跳变。
 ///
 /// 减弱动效的口径由调用方把住(旋转过 [`spin_period`]、闪烁过 [`blinks`]),
 /// 本函数不做判断 —— 谁都不挂树,泵自然就停。
 pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
-    let period = if window.is_window_active() {
-        period
-    } else {
-        period * PULSE_INACTIVE_SLOWDOWN
-    };
+    let active = window.is_window_active();
     let handle = window.window_handle();
     let view = window.current_view();
     let visible = window.is_visible();
     let id = handle.window_id();
+    let now = Instant::now();
     // 订阅要在借出 PULSE 之前建好:`observe_window_visibility` 只登记不回调,
     // 但把它塞进 borrow_mut 的作用域里徒增一层嵌套借用的风险
     let fresh = PULSE
@@ -319,12 +394,13 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
                 .any(|w| w.handle.window_id() == id)
         })
         .then(|| window.observe_window_visibility(on_pulse_visibility));
-    let start_pump = PULSE.with(|pump| {
+    let (spawn_args, accum_ms) = PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
         if let Some(visibility) = fresh {
             pump.windows.push(PulseWindow {
                 handle,
                 views: Vec::new(),
+                clock: PhaseClock::new(now, active),
                 _visibility: visibility,
             });
         }
@@ -336,59 +412,86 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
         if !entry.views.contains(&view) {
             entry.views.push(view);
         }
-        // 不可见时**不起泵**:登记留着,恢复可见由订阅叫醒
-        visible && !std::mem::replace(&mut pump.running, true)
+        let accum_ms = entry.clock.advance(now, active);
+        // 不可见时不起泵:登记留着,恢复可见由订阅叫醒。
+        // 已在跑但处于 500ms 后台慢睡档而现在出现了前台活跃窗口:换一代 100ms 任务接管。
+        let spawn_args = if !visible {
+            None
+        } else if !pump.running {
+            pump.running = true;
+            pump.generation = pump.generation.wrapping_add(1);
+            pump.slow_sleep = !active;
+            Some((
+                pump.generation,
+                if active {
+                    PULSE_TICK
+                } else {
+                    PULSE_INACTIVE_TICK
+                },
+            ))
+        } else if active && pump.slow_sleep {
+            pump.generation = pump.generation.wrapping_add(1);
+            pump.slow_sleep = false;
+            Some((pump.generation, PULSE_TICK))
+        } else {
+            None
+        };
+        (spawn_args, accum_ms)
     });
-    if start_pump {
-        // gpui-pre 的 `AsyncApp::update` 不再会失败:App 退出时这个任务连同
-        // 循环一起被丢弃,不必再有「App 没了就收 running」的尾巴。
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(PULSE_TICK).await;
-                if cx.update(pulse_tick) {
-                    return;
-                }
-            }
-        })
-        .detach();
+    if let Some((generation, delay)) = spawn_args {
+        spawn_pulse_loop(generation, delay, cx);
     }
-    phase_of(PULSE_EPOCH.with(|e| e.elapsed()), period)
+    phase_of_ms(accum_ms, period)
 }
 
-/// 泵的一拍:按处置口径刷新/摘除各窗口。返回**是否该停泵**(停时已自收
-/// `running`)。
+/// 泵的一拍:按处置口径刷新/摘除各窗口。返回下一次该睡多久,`None` 表示停泵(停时已自收 `running`)。
 ///
 /// 停泵有两条路:窗口全摘光(动画都卸载了),或**所有窗口都不可见**
 /// ([`PulseAction::Sleep`])—— 后者是「最小化就一帧不画」那条,
 /// 连定时器都不留,恢复由 [`on_pulse_visibility`] 接手。
-fn pulse_tick(cx: &mut App) -> bool {
-    let (tick, entries) = PULSE.with(|pump| {
+fn pulse_tick(generation: u64, slept_slow: bool, cx: &mut App) -> Option<Duration> {
+    let (stale, inactive_due, entries) = PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
-        pump.tick = pump.tick.wrapping_add(1);
+        if !pump.running || pump.generation != generation {
+            return (true, false, Vec::new());
+        }
+        let inactive_due = if slept_slow {
+            pump.tick = 0;
+            true
+        } else {
+            pump.tick = pump.tick.wrapping_add(1);
+            pump.tick % PULSE_INACTIVE_EVERY == 0
+        };
         let entries: Vec<(AnyWindowHandle, bool)> = pump
             .windows
             .iter()
             .map(|w| (w.handle, !w.views.is_empty()))
             .collect();
-        (pump.tick, entries)
+        (false, inactive_due, entries)
     });
-    let inactive_due = tick % PULSE_INACTIVE_EVERY == 0;
+    if stale {
+        return None;
+    }
 
-    // 有没有窗口还醒着。全睡了就没必要再留一条定时器空转
+    // 有没有还活着的可见窗口。全睡了或全摘光就没必要再留定时器空转
     let mut any_awake = false;
+    let mut any_active = false;
     for (handle, painted) in entries {
         // 窗口已关按 Drop 处理 —— 弱引用失效是正常生命周期
-        let action = handle
+        let (action, active) = handle
             .update(cx, |_, window, _| {
-                pulse_action(
-                    window.is_visible(),
-                    window.is_window_active(),
-                    inactive_due,
-                    painted,
+                let visible = window.is_visible();
+                let active = window.is_window_active();
+                (
+                    pulse_action(visible, active, inactive_due, painted),
+                    visible && active,
                 )
             })
-            .unwrap_or(PulseAction::Drop);
-        any_awake |= action != PulseAction::Sleep;
+            .unwrap_or((PulseAction::Drop, false));
+        if matches!(action, PulseAction::Refresh | PulseAction::Wait) {
+            any_awake = true;
+            any_active |= active;
+        }
         let views = PULSE.with(|pump| {
             let mut pump = pump.borrow_mut();
             let id = handle.window_id();
@@ -415,11 +518,19 @@ fn pulse_tick(cx: &mut App) -> bool {
 
     PULSE.with(|pump| {
         let mut pump = pump.borrow_mut();
-        if pump.windows.is_empty() || !any_awake {
-            pump.running = false;
-            true
-        } else {
-            false
+        if pump.generation != generation {
+            return None;
+        }
+        match next_pulse_delay(!pump.windows.is_empty(), any_awake, any_active) {
+            Some(delay) => {
+                pump.slow_sleep = delay >= PULSE_INACTIVE_TICK;
+                Some(delay)
+            }
+            None => {
+                pump.running = false;
+                pump.slow_sleep = false;
+                None
+            }
         }
     })
 }
@@ -1022,6 +1133,44 @@ mod tests {
         let tick_ms = (PULSE_TICK.as_millis() as u64 * PULSE_INACTIVE_EVERY) as f32;
         let slowest_ms = 800.0 * PULSE_INACTIVE_SLOWDOWN as f32;
         assert!(tick_ms / slowest_ms < 0.25, "后台每拍相位差应小于 1/4 圈");
+    }
+
+    #[test]
+    fn 相位时钟切换前后台连续不跳变() {
+        let period = Duration::from_millis(1000);
+        let t0 = Instant::now();
+        let mut clock = PhaseClock::new(t0, true);
+        // 前台走 300ms → 相位 0.3
+        let p1 = phase_of_ms(clock.advance(t0 + Duration::from_millis(300), true), period);
+        assert!((p1 - 0.3).abs() < 1e-4, "{p1}");
+        // 同一时刻切到后台:相位不得跳变
+        let p2 = phase_of_ms(clock.advance(t0 + Duration::from_millis(300), false), period);
+        assert!((p2 - p1).abs() < 1e-6, "失焦瞬间跳变: {p1} -> {p2}");
+        // 后台走 400ms(1/4 流速 = 有效 100ms)→ 相位 0.4
+        let p3 = phase_of_ms(clock.advance(t0 + Duration::from_millis(700), false), period);
+        assert!((p3 - 0.4).abs() < 1e-4, "{p3}");
+        // 同一时刻切回前台:相位同样连续不跳变
+        let p4 = phase_of_ms(clock.advance(t0 + Duration::from_millis(700), true), period);
+        assert!((p4 - p3).abs() < 1e-6, "聚焦瞬间跳变: {p3} -> {p4}");
+        // 前台再走 200ms → 相位 0.6
+        let p5 = phase_of_ms(clock.advance(t0 + Duration::from_millis(900), true), period);
+        assert!((p5 - 0.6).abs() < 1e-4, "{p5}");
+    }
+
+    #[test]
+    fn 保底泵按前后台动态决定睡眠间隔() {
+        assert_eq!(next_pulse_delay(false, false, false), None);
+        assert_eq!(next_pulse_delay(true, false, false), None, "全不可见即停泵");
+        assert_eq!(
+            next_pulse_delay(true, true, false),
+            Some(PULSE_INACTIVE_TICK),
+            "全后台可见直接睡满 500ms"
+        );
+        assert_eq!(
+            next_pulse_delay(true, true, true),
+            Some(PULSE_TICK),
+            "有前台活跃窗口维持 100ms"
+        );
     }
 
     #[test]

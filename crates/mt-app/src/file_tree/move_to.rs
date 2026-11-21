@@ -454,6 +454,8 @@ impl Render for MoveToPanel {
             }
         }
 
+        // 根层(level == 0)挂在 `menu.rs` 的 `reveal_box` 下,外框由 `panel_chrome()` 随裁剪窗画,
+        // 这里只留 1px 边框占位;递归子目录面板(level > 0)由本视图自己 deferred 挂出,自绘外框并抠 WebView2。
         div()
             .relative()
             .flex()
@@ -461,11 +463,14 @@ impl Render for MoveToPanel {
             .min_w(px(180.0))
             .max_w(px(320.0))
             .p(px(4.0))
-            .rounded(px(6.0))
             .border_1()
-            .border_color(ui::border_default())
-            .bg(ui::bg_overlay())
-            .shadow_lg()
+            .when(self.level > 0, |el| {
+                el.rounded(px(6.0))
+                    .border_color(ui::border_default())
+                    .bg(ui::bg_overlay())
+                    .shadow_lg()
+                    .child(crate::native_view::occluder())
+            })
             .text_size(ui::font_px(12.0))
             // 面板挂在菜单项里,菜单面板已经 occlude 了;这里再挡一道,
             // 免得滚动条上的按下穿到底下去(与 branch_family 同)

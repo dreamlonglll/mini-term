@@ -19,6 +19,7 @@ impl Workspace {
         //
         // 图却留到外壳全部收完(`frost_keep`):退场途中又开弹窗就从零淡入、沿用这张,
         // **不重抓** —— 这时抓到的上一帧里有正在收起的那层(抓进去就是一团糊在新弹窗背后)。
+        overlay::observe_changes(cx);
         let dialog_open = dialog_host::has_open(window, cx);
         let lightbox_open = overlay::contains(overlay::key(overlay::kind::IMAGE_LIGHTBOX));
         let frost_target = dialog_open || self.usage_open || lightbox_open;
@@ -148,26 +149,30 @@ impl Workspace {
         // 外壳上的 `occlude` 挡不住自己的子元素(滑走中的项目行照样能点、能起拖拽),
         // 整宽常驻又会在内容滑走后继续吞掉终端区左段的点击
         let middle_exit = match middle_frame {
-            Some((false, progress)) => Some(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(activity_bar::WIDTH))
-                    .h_full()
-                    .w(px(columns[0] as f32))
-                    .overflow_hidden()
-                    .child(native_view::occluder())
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .h_full()
-                            .w_full()
-                            .left(gpui::relative(middle_content_left(false, progress)))
-                            .child(self.middle_group(middle))
-                            .child(div().absolute().inset_0().occlude()),
-                    ),
-            ),
+            Some((false, progress)) => {
+                let exit_w = (columns[0] as f32).clamp(180.0, 700.0);
+                Some(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(px(activity_bar::WIDTH))
+                        .h_full()
+                        .w(px(exit_w))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .h_full()
+                                .w_full()
+                                .left(gpui::relative(middle_content_left(false, progress)))
+                                // 挂在滑动内层:WebView2 抠洞随内容一起向左收,不挡已露出的左侧区域
+                                .child(native_view::occluder())
+                                .child(self.middle_group(middle))
+                                .child(div().absolute().inset_0().occlude()),
+                        ),
+                )
+            }
             _ => None,
         };
 
@@ -227,7 +232,7 @@ impl Workspace {
                 // 盖住真在跑的 AI。徽标本体(含 ai-working 档的闪烁)在
                 // `activity_bar::status_badge`。
                 .when(global_status != crate::tree::StatusLight::Idle, |el| {
-                    el.child(activity_bar::status_badge(global_status))
+                    el.child(activity_bar::corner_dot_slot(self.ai_status_dot.clone()))
                 })
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.store
@@ -355,6 +360,7 @@ impl Workspace {
                     "open-update",
                     tr!("app", "update.title", version = release.version.as_str()),
                     self.activity_bar_hover.is_visible("open-update"),
+                    self.update_dot.clone(),
                     Self::activity_bar_item_hover_listener("open-update", cx),
                 )
                 .on_click(move |_event, window, cx: &mut gpui::App| {
@@ -383,58 +389,15 @@ impl Workspace {
         &mut self,
         drawer_panel: Option<DrawerPanel>,
         drawer_width: f64,
-        detail_pane: Option<Entity<git_history::CommitDetailPane>>,
-        detail_width: Option<f32>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        // 右侧悬浮抽屉(Sessions ⇄ Git):**absolute 悬浮层**,贴右边缘盖在终端之上。
-        //
-        // 原版就是这个形态(`RightDrawer.tsx:67`:`absolute top-0 right-0 h-full
-        // z-[45]`),GPUI 侧此前借 resizable 的第三栏实现,代价是**开合会改终端
-        // 宽度、连带触发一次 PTY resize**(刷屏进程正在跑时肉眼可见地重排)。
-        // 改成悬浮层之后终端尺寸不动,PTY 也就不再收到 SIGWINCH。
-        //
-        // **停在文件 / diff 页签上时改为挤占**:抽屉本身仍是同一个悬浮层(位置、动画、
-        // 拖宽一概不变),只是页签区那一栏里垫了一块等宽的占位(上面的 `squeeze`),
-        // 页签区变窄、抽屉落在让出来的那一截里,不再盖住 diff。终端页照旧悬浮 ——
-        // 终端区与页签页不同时渲染,切页时终端拿到的始终是整栏宽,开合抽屉不会让它重排。
-        // 进场时占位一步到位、抽屉照旧从右缘滑进那一截;收起那一刻占位就撤掉,抽屉在
-        // 退场驻留的 400ms 里从页签区上方滑走;拖抽屉 / 详情栏左缘时占位逐帧跟着变。
-        //
-        // 层级对照:原版 `z-45` 压过 allotment 分隔条(35)、低于弹窗(50)——
-        // 这里 `.children(...)` 的顺序等价:抽屉排在三栏之后、弹窗/菜单层之前。
-        // 抽屉**不进 [`overlay`] 栈**(原版 `RightDrawer` 同样没压栈),
-        // 所以它开着时全局快捷键照常生效。
-        //
-        // 动画三条(`styles.css:284-313`):
-        // - 进场 `drawerSlideIn` 240ms:整层从 `translateX(100%)` 滑进来 ——
-        //   gpui 没有 transform,改成把 `right` 从 `-width` 补到 0(等效);
-        // - 退场 `drawerSlideOut` 140ms:反过来,期间**面板实体仍留在树上**
-        //   (`drawer_exit` 驻留 400ms),否则内容会先空掉;
-        // - 换面板 200ms:左右整幅 push(`motion_kit::push_pair`),方向跟段控件次序
-        //   (会话在左、Git 在右);会话 / Git 是两个不同实体,同帧挂两份没问题。**只在
-        //   换面板时播**(`drawer_swap` 由 `set_drawer` 驱动),开抽屉不播 —— 此前内容层的
-        //   id 带面板名,每次开抽屉都是新 id,连同整层滑入一起再淡一遍;原版的
-        //   `panelSwapIn`(opacity 0→1 + 右移 10px)按口径改成不淡入的方向性位移。
-        //
-        // ⚠️ 这三条在原版被**显式豁免** `prefers-reduced-motion`
-        // (`styles.css:424-451`),所以 GPUI 侧不加任何减弱动效判定,始终播放。
         let drawer_swap = self.drawer_swap.frame(window);
         let drawer_layer = drawer_panel.map(|panel| {
-            let leaving = self.right_drawer.is_none();
+            let drawer_open = self.right_drawer.is_some();
+            let leaving = !drawer_open;
             let width = drawer_width as f32;
-            // ⚠️ 抽屉里这两块**不套** [`cached_panel`](Git 面板里的「更改」「提交历史」
-            // 两个子视图也没单独套):
-            // ① 它们身上压着整层滑入滑出的 `with_animation`(此前还有换面板的
-            //    `panelSwapIn` 改 opacity),而 opacity 是 paint 期烙进图元的、
-            //    `reuse_paint` 原样重放 —— 命中缓存就会把某一帧的透明度定死。连带的
-            //    `ml(10·(1−δ))` 在末几帧被布局按设备像素取整成 0,缓存键与终态相同,
-            //    挡不住复用;动画的起止对面板又不可见,「动画期间不走缓存」没有干净的判据;
-            // ② 收起时这两个实体压根不进元素树。开着时每帧确实整个重跑,但最重的
-            //    「更改」列表已虚拟化(只建视口里那几行,见 `git_changes` 模块注释),
-            //    剩下的开销与改动数无关;提交历史区每行按墙钟现算「x 分钟前」、没有
-            //    定时 notify,套缓存会把它冻住。
+            let drawer_progress = self.drawer_presence.drive(window);
             let panel_view = |panel: DrawerPanel| -> gpui::AnyElement {
                 match panel {
                     DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
@@ -453,26 +416,32 @@ impl Workspace {
                 .into_any_element(),
                 _ => panel_view(panel),
             };
-            // Git 面板选中提交时,抽屉左侧再挂一栏「提交详情」
-            let detail_layer = detail_pane
-                .clone()
-                .zip(detail_width)
-                .map(|(pane, detail)| {
-                    self.render_commit_detail_layer(pane, width, detail, cx)
-                        .into_any_element()
-                })
-                .or_else(|| {
-                    self.detail_exit.as_ref().map(|exit| {
-                        Self::render_detail_exit_layer(exit, width, window).into_any_element()
-                    })
-                });
+            // Git 面板选中提交(或正在退场)时,抽屉左侧挂「提交详情」栏。
+            // 整个抽屉在退场时详情栏保持冻结形态随抽屉整体滑出视口右缘,且一并禁交互。
+            let mut detail_visible_w = 0.0f32;
+            let detail_layer = self.detail_last.clone().map(|(pane, detail_w)| {
+                let detail_progress = self.detail_presence.drive(window);
+                detail_visible_w = detail_w * detail_progress.clamp(0.0, 1.0);
+                let detail_interactive = drawer_open && self.detail_presence.target_open();
+                self.render_commit_detail_layer(
+                    pane,
+                    width,
+                    detail_w,
+                    detail_progress,
+                    detail_interactive,
+                    cx,
+                )
+                .into_any_element()
+            });
+            let right_offset = drawer_slide_right(width, detail_visible_w, drawer_progress);
+
             div()
                 .absolute()
                 .top_0()
-                .right_0()
+                .right(px(right_offset))
                 .h_full()
                 .w(px(width))
-                .occlude()
+                .when(drawer_open, |el| el.occlude())
                 .flex()
                 .flex_col()
                 .bg(ui::bg_overlay())
@@ -493,54 +462,41 @@ impl Workspace {
                         .overflow_hidden()
                         .child(content),
                 )
-                // 左缘拖拽手柄:抽屉贴右边缘,把左缘往左拖 = 变宽,
-                // 所以位移取 `start_x - 当前 x`(照抄 `RightDrawer.tsx:48`)
-                .child(
-                    div()
-                        .id("drawer-resize-handle")
-                        .absolute()
-                        // 原版用 `-translate-x-1/2` 骑在边缘上;gpui 侧整条留在
-                        // 抽屉内(压着左边框那 6px),免得被父级裁掉
-                        .left_0()
-                        .top_0()
-                        .h_full()
-                        .w(px(6.0))
-                        .cursor_col_resize()
-                        .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(
-                                move |this: &mut Self,
-                                      event: &gpui::MouseDownEvent,
-                                      _window,
-                                      cx| {
-                                    cx.stop_propagation();
-                                    this.drawer_drag = Some(DrawerDrag {
-                                        start_x: event.position.x,
-                                        start_width: drawer_width,
-                                        width: drawer_width,
-                                    });
-                                },
+                .when(drawer_open, |el| {
+                    // 左缘拖拽手柄:抽屉贴右边缘,把左缘往左拖 = 变宽
+                    el.child(
+                        div()
+                            .id("drawer-resize-handle")
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .h_full()
+                            .w(px(6.0))
+                            .cursor_col_resize()
+                            .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(
+                                    move |this: &mut Self,
+                                          event: &gpui::MouseDownEvent,
+                                          _window,
+                                          cx| {
+                                        cx.stop_propagation();
+                                        this.drawer_drag = Some(DrawerDrag {
+                                            start_x: event.position.x,
+                                            start_width: drawer_width,
+                                            width: drawer_width,
+                                        });
+                                    },
+                                ),
                             ),
-                        ),
-                )
+                    )
+                })
+                .when(leaving, |el| {
+                    // 退场途中盖住抽屉本体,阻止误点标题栏按钮 / 列表项 / 拖拽手柄
+                    el.child(div().absolute().inset_0().occlude())
+                })
                 .children(detail_layer)
-                .with_animation(
-                    SharedString::from(if leaving {
-                        "drawer-slide-out"
-                    } else {
-                        "drawer-slide-in"
-                    }),
-                    if leaving {
-                        mt_ui::motion::OVERLAY_OUT.animation()
-                    } else {
-                        mt_ui::motion::OVERLAY_IN.animation()
-                    },
-                    move |el, delta| {
-                        let offset = if leaving { delta } else { 1.0 - delta };
-                        el.right(px(-width * offset))
-                    },
-                )
         });
 
         drawer_layer.map(IntoElement::into_any_element)
@@ -672,6 +628,7 @@ impl Workspace {
                                 .rounded(px(6.0))
                                 .border_1()
                                 .border_color(ui::border_default())
+                                .shadow_lg()
                         }))
                         .interactive(open)
                         .occlude_native(!open),
@@ -746,46 +703,65 @@ impl Render for Workspace {
             self.activity_bar_hover_task = None;
         }
 
+        // 同步两颗独立角标视图(仅状态/配色真变了才 notify 各自的小视图)
+        if global_status != crate::tree::StatusLight::Idle {
+            let color = ui::status_color(global_status);
+            let blinking = activity_bar::badge_blinks(global_status);
+            self.ai_status_dot
+                .update(cx, |dot, cx| dot.sync(color, blinking, cx));
+        }
+        if update_shown.is_some() {
+            let color = ui::accent();
+            let blinking = activity_bar::update_dot_blinks();
+            self.update_dot
+                .update(cx, |dot, cx| dot.sync(color, blinking, cx));
+        }
+
         let (frost_wanted, frost_alpha) = self.sync_frost_snapshot(window, cx);
 
         let store_for_columns = self.store.clone();
         // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)
         let drawer_width = self.drawer_drag.map(|d| d.width).unwrap_or(drawer_width);
-        // 抽屉里正画着哪一块(退场动画驻留期间是刚收起的那块),以及 Git 抽屉左侧的提交详情栏
-        // 有多宽 —— 画抽屉层与挤占页签区共用这一份
-        let exiting = self.drawer_exit.as_ref().map(|e| e.panel);
-        let drawer_panel = self.right_drawer.or(exiting);
-        let detail_pane = match drawer_panel {
+        let now = std::time::Instant::now();
+        // 抽屉退场播完后回收旧面板与提交详情栏引用
+        if self.right_drawer.is_none() && !self.drawer_presence.mounted_at(now) {
+            self.drawer_last_panel = None;
+            self.detail_last = None;
+            self.detail_presence = overlay_motion::Presence::hidden(
+                mt_ui::motion::OVERLAY_IN,
+                mt_ui::motion::OVERLAY_OUT,
+            );
+        }
+        let drawer_panel = self.right_drawer.or_else(|| {
+            self.drawer_presence
+                .mounted_at(now)
+                .then_some(self.drawer_last_panel)
+                .flatten()
+        });
+        let detail_pane = match self.right_drawer {
             Some(DrawerPanel::Git) => self.git_panel.read(cx).detail_pane(cx),
             _ => None,
         };
         let detail_width = detail_pane
             .as_ref()
             .map(|_| self.detail_width(drawer_width as f32, window, cx));
-        // 提交详情栏刚没了(取消选中 / 关栏 / 换到会话面板)且抽屉还开着:起退场,播完再卸。
-        // 整个抽屉收起时详情栏随抽屉一起滑走,不另播
-        match detail_pane.clone().zip(detail_width) {
-            Some(shown) => {
-                self.detail_exit = None;
-                self.detail_seen = Some(shown);
-            }
-            None => {
-                if let Some((pane, width)) = self.detail_seen.take()
-                    && self.right_drawer.is_some()
-                    && mt_ui::motion::animations_enabled()
-                {
-                    self.detail_exit = Some(DetailExit {
-                        pane,
-                        width,
-                        transition: mt_ui::motion::Transition::new(mt_ui::motion::OVERLAY_OUT),
-                    });
+        // 抽屉开着时维护提交详情栏的进出场(支持半路掉头与关动画即卸);
+        // 整层抽屉收起时已在 `set_drawer` 里定格 `detail_presence`,随抽屉整体滑走。
+        if self.right_drawer.is_some() {
+            match detail_pane.clone().zip(detail_width) {
+                Some((pane, width)) => {
+                    self.detail_last = Some((pane, width));
+                    if !self.detail_presence.target_open() {
+                        self.detail_presence.show(now);
+                    }
                 }
-                if self
-                    .detail_exit
-                    .as_ref()
-                    .is_some_and(|exit| !exit.transition.running() || self.right_drawer.is_none())
-                {
-                    self.detail_exit = None;
+                None => {
+                    if self.detail_presence.target_open() {
+                        self.detail_presence.hide(now);
+                    }
+                    if !self.detail_presence.mounted_at(now) {
+                        self.detail_last = None;
+                    }
                 }
             }
         }
@@ -892,14 +868,7 @@ impl Render for Workspace {
 
         let toggle_strip =
             self.render_activity_bar(middle_visible, global_status, unread, update_shown, cx);
-        let drawer_layer = self.render_right_drawer(
-            drawer_panel,
-            drawer_width,
-            detail_pane,
-            detail_width,
-            window,
-            cx,
-        );
+        let drawer_layer = self.render_right_drawer(drawer_panel, drawer_width, window, cx);
         let usage_layer = self.render_usage_layer(window, cx);
         // 三栏 + 悬浮抽屉的那一层。标题栏之下的**全部**内容都在这里 ——
         // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉的

@@ -305,11 +305,9 @@ impl Render for BranchFamilyPanel {
 
         div()
             .w(px(CARD_WIDTH))
-            .rounded(px(6.0))
+            // 框体(底色 / 边框色 / 圆角 / 阴影)交由外层 `menu.rs` 的 `reveal_box` 随裁剪窗同步绘制,
+            // 这里只留 1px 边框占位
             .border_1()
-            .border_color(ui::border_strong())
-            .bg(ui::bg_overlay())
-            .shadow_lg()
             .text_size(ui::font_px(12.0))
             // 面板挂在菜单项里,菜单面板已经 occlude 了;这里再挡一道,
             // 免得滚动条上的按下穿到底下去

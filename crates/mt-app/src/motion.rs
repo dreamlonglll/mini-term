@@ -98,16 +98,32 @@ pub(crate) fn gate_values(system_reduce: bool, animations_enabled: bool) -> (boo
     (system_reduce, !animations_enabled)
 }
 
+/// 写入 gpui 那道闸,并经 `gpui_base::set_reduce_motion_preference` 显式接管所有权:
+/// 直接调 `cx.set_reduce_motion` 在同值写入时不会置位 `overridden`,Linux 上异步 XDG
+/// portal 探测稍后返回时可能把闸悄悄覆写回去,冻结全部 `with_animation`。
+fn apply_gpui_gate(gpui_reduce: bool, cx: &mut gpui::App) {
+    let pref = if gpui_reduce {
+        gpui_base::ReduceMotionPreference::Reduce
+    } else {
+        gpui_base::ReduceMotionPreference::Allow
+    };
+    gpui_base::set_reduce_motion_preference(pref, cx);
+}
+
 /// 启动时探测一次并写进两道闸(总开关先按缺省「开」,配置读出来后由
 /// [`sync_switch`] 校正)。返回系统口径(= mt-ui 那道闸的值)。
 ///
-/// **必须排在 `gpui_component::init` 之后**:接管 gpui 那道闸的前提是
-/// Base 已经把系统值写过一遍(`apply_preference` 靠「闸里还是不是我上次写的值」
-/// 判断应用有没有接管,反过来会被它随后的 init 覆盖回去)。
+/// **必须排在 `gpui_component::init` 之后**:
+/// - 非 Windows 上先读取 `gpui_base::init` 刚探测写入的系统值(macOS `NSWorkspace`);
+/// - 随后立即用 [`apply_gpui_gate`] 接管 `gpui` 那道闸,使其只跟用户总开关。
 pub fn install(cx: &mut gpui::App) -> bool {
-    let (reduce, gpui_reduce) = gate_values(probe(), mt_ui::motion::animations_enabled());
+    #[cfg(windows)]
+    let system_reduce = probe();
+    #[cfg(not(windows))]
+    let system_reduce = cx.reduce_motion();
+    let (reduce, gpui_reduce) = gate_values(system_reduce, mt_ui::motion::animations_enabled());
     mt_ui::motion::set_reduce_motion(reduce);
-    cx.set_reduce_motion(gpui_reduce);
+    apply_gpui_gate(gpui_reduce, cx);
     reduce
 }
 
@@ -116,24 +132,25 @@ pub fn install(cx: &mut gpui::App) -> bool {
 /// 不会自己更新)。
 ///
 /// 调用点:配置加载后一次(`AppStore` 建好时)、每次 `patch_config` 之后、窗口
-/// 重新激活时([`refresh`] 里顺手重按 gpui 那道 —— Linux 上 Base 会跟着门户信号
-/// 改写它,值碰巧与 Base 上次写的相同时它认为自己仍持有这道闸)。
+/// 重新激活时([`refresh`])。
 pub fn sync_switch(enabled: bool, cx: &mut gpui::App) -> bool {
     let changed = mt_ui::motion::set_animations_enabled(enabled);
     let (_, gpui_reduce) = gate_values(mt_ui::motion::reduce_motion(), enabled);
-    if cx.reduce_motion() != gpui_reduce {
-        cx.set_reduce_motion(gpui_reduce);
-        return true;
-    }
-    changed
+    let prev = cx.reduce_motion();
+    apply_gpui_gate(gpui_reduce, cx);
+    changed || prev != gpui_reduce
 }
 
 /// 重新探测。**返回是否发生了变化** —— 变了的话调用方要刷一遍窗口,
 /// 否则已经画出来的那一帧不会自己更新。
 ///
-/// mt-ui 那道跟系统;gpui 那道按当前总开关重按一遍(见 [`sync_switch`])。
+/// Windows 上重探 `SPI_GETCLIENTAREAANIMATION`;非 Windows 保留已有系统值(macOS/Linux
+/// 启动时已承接 `gpui-base` 探测,不无故清回 `false`)。
 pub fn refresh(cx: &mut gpui::App) -> bool {
+    #[cfg(windows)]
     let reduce_changed = mt_ui::motion::set_reduce_motion(probe());
+    #[cfg(not(windows))]
+    let reduce_changed = false;
     let switch_changed = sync_switch(mt_ui::motion::animations_enabled(), cx);
     reduce_changed || switch_changed
 }

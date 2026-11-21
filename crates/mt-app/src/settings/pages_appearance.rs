@@ -276,31 +276,48 @@ impl SettingsView {
 
     /// 语言切换段控件。逐条对照 `src/components/LanguageToggle.tsx`:
     /// 两个选项、各写各自的**母语名**(中文 / English —— endonym 永不翻译)、
-    /// 选中项 accent 底色白字,未选中透明底淡字。
+    /// 选中底色走 `IndicatorSlider` 滑动实底块,文字覆盖过半反白。
     fn render_language_toggle(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.store.read(cx).locale();
+        let active_ix = Locale::ALL
+            .iter()
+            .position(|option| *option == current)
+            .unwrap_or(0);
+        self.lang_slider.sync(active_ix);
+        let ready = self.lang_slider.ready(active_ix);
         let mut seg = div()
+            .relative()
             .flex()
             .rounded(px(4.0))
             .overflow_hidden()
             .border_1()
-            .border_color(ui::border_default());
-        for option in Locale::ALL {
-            let active = option == current;
+            .border_color(ui::border_default())
+            .child(self.lang_slider.block(active_ix, |el| el.bg(ui::accent())));
+        for (ix, option) in Locale::ALL.into_iter().enumerate() {
+            let active = ix == active_ix;
+            let own_bg = !ready && active;
+            let inverted = if !ready {
+                active
+            } else {
+                self.lang_slider
+                    .coverage(ix)
+                    .map_or(active, |coverage| coverage >= 0.5)
+            };
             seg = seg.child(
                 div()
                     .id(SharedString::from(format!("lang-{}", option.code())))
+                    .relative()
                     .px(px(12.0))
                     .py(px(3.0))
                     .text_size(ui::font_px(11.0))
                     .cursor_pointer()
-                    .when(active, |el| {
-                        el.bg(ui::accent()).text_color(ui::bg_base())
-                    })
-                    .when(!active, |el| {
+                    .when(own_bg, |el| el.bg(ui::accent()))
+                    .when(inverted, |el| el.text_color(ui::bg_base()))
+                    .when(!inverted, |el| {
                         el.text_color(ui::text_muted())
                             .hover(|el| el.text_color(ui::text_primary()))
                     })
+                    .child(self.lang_slider.probe(ix))
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.store.update(cx, |store, cx| store.set_locale(option, cx));
                     }))

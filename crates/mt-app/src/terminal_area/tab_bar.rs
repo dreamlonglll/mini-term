@@ -661,22 +661,26 @@ impl TerminalArea {
             // 只量悬停中的那一个):插入位要算的是「指针落在哪个 tab 的中线哪一侧」,
             // 那需要**全部** tab 的横向区间。故意不 notify —— 量完再触发重画就是每帧
             // 一个死循环。
-            let report_id = pane.id.clone();
-            strip = strip.child(
-                fx::flip_slot(
-                    chip,
-                    self.fx.clone(),
-                    format!("{leaf_id}\u{1}{}", pane.id),
-                    Some(idx),
-                    scroll_handle.clone(),
-                    reflow,
-                )
-                .on_bounds(move |bounds, cx| {
-                    this_area.update(cx, |area: &mut TerminalArea, _cx| {
-                        area.tab_rects.insert(report_id.clone(), bounds);
-                    });
-                }),
-            );
+            if self.rendering_exit {
+                strip = strip.child(chip);
+            } else {
+                let report_id = pane.id.clone();
+                strip = strip.child(
+                    fx::flip_slot(
+                        chip,
+                        self.fx.clone(),
+                        format!("{leaf_id}\u{1}{}", pane.id),
+                        Some(idx),
+                        scroll_handle.clone(),
+                        reflow,
+                    )
+                    .on_bounds(move |bounds, cx| {
+                        this_area.update(cx, |area: &mut TerminalArea, _cx| {
+                            area.tab_rects.insert(report_id.clone(), bounds);
+                        });
+                    }),
+                );
+            }
         }
 
         // ⚠️ 外层这条**不刷底色**(原先是 `bg_elevated()`)。

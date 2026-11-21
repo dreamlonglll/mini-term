@@ -65,6 +65,8 @@ pub(super) fn leaf_terminal_layer(
                             .w_full()
                             .h_full()
                             .child(old_entity)
+                            // 正在推出的旧终端不接点击与悬停
+                            .child(div().absolute().inset_0().occlude())
                             .with_animation(
                                 gpui::SharedString::from(format!("tab-exit-{seq}")),
                                 mt_ui::motion::TERMINAL_SWAP.animation(),
@@ -106,6 +108,7 @@ impl TerminalArea {
         node: &SplitNode,
         project_id: &str,
         available: Size<Pixels>,
+        enter_axis: SplitDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -117,9 +120,13 @@ impl TerminalArea {
                     // 裁剪窗任何时刻都罩得住这块(从整幅收到它),空位不会露出来
                     return div().size_full().into_any_element();
                 }
-                let animate = self.animations_enabled(cx);
                 let el = self.render_leaf(node, project_id, window, cx);
-                let el = self.wrap_pane_enter(&leaf_id, project_id, el, animate, window);
+                if self.rendering_exit {
+                    // 出场旧面板不走 pane_enter 与 fx::leaf_slot,避免污染活跃布局账本
+                    return el;
+                }
+                let animate = self.animations_enabled(cx);
+                let el = self.wrap_pane_enter(&leaf_id, project_id, enter_axis, el, animate, window);
                 // 关掉相邻分屏后,这一格从旧格子的裁剪窗长到新格子(见 [`fx`]);
                 // 平时只记一下本帧的矩形,不裁剪、不挪
                 fx::leaf_slot(el, self.fx.clone(), leaf_id).into_any_element()
@@ -151,7 +158,14 @@ impl TerminalArea {
                                 height: available.height * fraction,
                             }
                         };
-                        let el = self.render_node(child, project_id, child_available, window, cx);
+                        let el = self.render_node(
+                            child,
+                            project_id,
+                            child_available,
+                            *direction,
+                            window,
+                            cx,
+                        );
                         let main = if horizontal {
                             child_available.width
                         } else {
@@ -233,6 +247,7 @@ impl TerminalArea {
         &mut self,
         leaf_id: &str,
         project_id: &str,
+        axis: SplitDirection,
         el: AnyElement,
         animate: bool,
         window: &Window,
@@ -249,21 +264,17 @@ impl TerminalArea {
             // (匿名 div 不带 ElementId,加/摘不影响子树的元素状态路径)
             return el;
         }
-        // 与换场滑入同一形态(见文件头注释):新格子从右侧滑到位,内容全程
-        // 不透明 —— 淡入在深色终端上读作「闪一下」,已被否掉。
+        // 滑入方向与分屏轴一致:左右分屏从右侧滑入,上下分屏从下方滑入,全程不透明
+        let shift = px(swap_slide_offset(progress));
+        let inner = match axis {
+            SplitDirection::Horizontal => div().absolute().top_0().left(shift).w_full().h_full(),
+            SplitDirection::Vertical => div().absolute().left_0().top(shift).w_full().h_full(),
+        };
         div()
             .size_full()
             .relative()
             .overflow_hidden()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left(px(swap_slide_offset(progress)))
-                    .w_full()
-                    .h_full()
-                    .child(el),
-            )
+            .child(inner.child(el))
             .into_any_element()
     }
 
@@ -653,8 +664,12 @@ impl TerminalArea {
             return div().into_any_element();
         };
 
-        // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
-        let tab_swap = self.note_leaf_tab_swap(leaf_id, panes, &active.id, cx);
+        // ── 检测叶内切 tab,起一条方向性 push 过渡(出场旧面板不检测也不写记录)────
+        let tab_swap = if self.rendering_exit {
+            None
+        } else {
+            self.note_leaf_tab_swap(leaf_id, panes, &active.id, cx)
+        };
 
         let store = self.store.read(cx);
         let terminal = active.pty_id.and_then(|id| store.terminal(id)).cloned();
@@ -840,28 +855,30 @@ impl TerminalArea {
                             this.insert_path_into_pane(&pid, &pane_id, &text, window, cx);
                         }
                     }))
-                    .child(
-                        canvas(
-                            move |bounds: Bounds<Pixels>, _window, cx| {
-                                let bounds = rect_fx.borrow().unshift(bounds);
-                                this.update(cx, |area: &mut TerminalArea, _cx| {
-                                    area.pane_rects.insert(
-                                        rect_pane_id.clone(),
-                                        PaneRect {
-                                            pane_id: rect_pane_id.clone(),
-                                            left: bounds.origin.x.into(),
-                                            top: bounds.origin.y.into(),
-                                            width: bounds.size.width.into(),
-                                            height: bounds.size.height.into(),
-                                        },
-                                    );
-                                });
-                            },
-                            |_, _, _, _| {},
+                    .when(!self.rendering_exit, |el| {
+                        el.child(
+                            canvas(
+                                move |bounds: Bounds<Pixels>, _window, cx| {
+                                    let bounds = rect_fx.borrow().unshift(bounds);
+                                    this.update(cx, |area: &mut TerminalArea, _cx| {
+                                        area.pane_rects.insert(
+                                            rect_pane_id.clone(),
+                                            PaneRect {
+                                                pane_id: rect_pane_id.clone(),
+                                                left: bounds.origin.x.into(),
+                                                top: bounds.origin.y.into(),
+                                                width: bounds.size.width.into(),
+                                                height: bounds.size.height.into(),
+                                            },
+                                        );
+                                    });
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
                         )
-                        .absolute()
-                        .size_full(),
-                    )
+                    })
                     .child(leaf_terminal_layer(
                         terminal,
                         exit_terminal,

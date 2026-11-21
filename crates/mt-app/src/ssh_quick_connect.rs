@@ -903,12 +903,9 @@ impl Render for SshQuickPanel {
             .w(ui::font_px(PANEL_WIDTH))
             .flex()
             .flex_col()
-            .rounded(px(6.0))
+            // 框体(底色 / 边框色 / 圆角 / 阴影)交由外层 `menu.rs` 的 `reveal_box` 随裁剪窗同步绘制,
+            // 这里只留 1px 边框占位,免得横向展开途中右边框与阴影被裁切
             .border_1()
-            .border_color(ui::border_default())
-            // 浮层用 `bg_overlay`(主题包下恒不透明),与菜单面板同一张底
-            .bg(ui::bg_overlay())
-            .shadow_lg()
             .text_size(ui::font_px(12.0))
             // 面板挂在菜单项里,菜单面板已经 occlude 了;这里再挡一道,
             // 免得列表滚动区上的按下穿到底下去(同 `branch_family`)

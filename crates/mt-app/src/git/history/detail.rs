@@ -210,6 +210,7 @@ impl DetailState {
         self.retired = None;
         self.pending_body = None;
         self.collapsed.clear();
+        self.chevrons.clear();
         self.files_changed();
         self.containing_changed();
     }

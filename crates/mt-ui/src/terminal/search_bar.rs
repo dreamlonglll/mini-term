@@ -189,6 +189,10 @@ pub struct TerminalSearchBar {
     /// 文案来源。[`Render::render`] 每帧调一次,所以切语言不需要额外的刷新通道。
     labels: Rc<dyn Fn() -> SearchBarLabels>,
     on_close: Option<OnSearchClose>,
+    /// 是否由自身绘制外框(底色 / 边框色 / 圆角 / 阴影)。
+    /// 宿主用外层开合框体(如 `reveal_frame`)统一绘框时设为 `false`,只留 1px 边框占位,
+    /// 彻底避免动画期间双层阴影/边框叠加以及落定瞬间阴影骤跳。
+    framed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -230,8 +234,15 @@ impl TerminalSearchBar {
             input,
             labels,
             on_close: None,
+            framed: true,
             _subscriptions: vec![subscription],
         }
+    }
+
+    /// 是否由自身绘制外框(默认 `true`)。设为 `false` 时由宿主外壳负责绘制底色、边框与阴影。
+    pub fn framed(mut self, framed: bool) -> Self {
+        self.framed = framed;
+        self
     }
 
     /// 关闭回调(Esc / `✕` / [`Self::close`])。**必须接** —— 焦点要还给终端。
@@ -460,7 +471,7 @@ impl Render for TerminalSearchBar {
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;
 
-        h_flex()
+        let mut bar = h_flex()
             .id("terminal-search-bar")
             .key_context("TerminalSearch")
             .on_key_down(cx.listener(Self::on_key_down))
@@ -477,11 +488,15 @@ impl Render for TerminalSearchBar {
             .gap_1()
             .px_2()
             .py_1()
-            .rounded_md()
-            .bg(cx.theme().popover)
-            .border_1()
-            .border_color(cx.theme().border)
-            .shadow_lg()
+            .border_1();
+        if self.framed {
+            bar = bar
+                .rounded_md()
+                .bg(cx.theme().popover)
+                .border_color(cx.theme().border)
+                .shadow_lg();
+        }
+        bar
             .child(
                 Input::new(&self.input)
                     .small()
