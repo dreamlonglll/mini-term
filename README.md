@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -59,7 +59,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 |:--|---|
 | **AI事件通知** | 直接接入 **Claude Code / Codex / Grok Build / oh-my-pi / pi / Antigravity CLI 官方 Hook API**（oh-my-pi 与 pi 走各自的进程内扩展机制），使用轮询作为兜底。<br />注意：windows端的 GrokBuild 需要将本程序安装到`非空格`目录，才能保证hook功能正常<br />Windows 下卸载 Mini-Term 时会自动摘掉它写进各家 AI 工具配置里的 hook 条目（升级安装不动） |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。外链一律走同一道闸（禁 `@import`，指向包外的引用全拒）。点「更多皮肤」直达仓库 [`theme/`](theme/) 皮肤库（现有 Blue Hour 蓝调时分、雨光、暮紫鎏金等五款深色，Morning Mist 晨雾、晨曦云庭、澄空清吟等五款浅色，共十款），挑一份下载后导入即用；想自己做一份，字段说明在 [`docs/theme-pack-example/`](docs/theme-pack-example/) |
-| **手机端支持** | 手机上实时看桌面 AI 会话的对话镜像：GFM 表格与代码块一键复制，连续的工具调用折叠成「工具调用 N 次」（读写了哪些文件、跑了什么命令），底部显示「AI 工作中 / 等你处理」，系统注入噪声自动滤掉；可直接给 AI 发指令、点选作答它的提问；首页「历史」标签按项目浏览本机历史会话，点「继续对话」由桌面端在后台新开终端续接（已在运行的会话直接进入实时镜像）。<br />**前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
+| **手机端支持** | 手机上实时看桌面 AI 会话的对话镜像：GFM 表格与代码块一键复制，连续的工具调用折叠成「工具调用 N 次」（读写了哪些文件、跑了什么命令），底部显示「AI 工作中 / 等你处理」，系统注入噪声自动滤掉；可直接给 AI 发指令、点选作答它的提问；首页「历史」标签按项目浏览本机历史会话，点「继续对话」由桌面端在后台新开终端续接（已在运行的会话直接进入实时镜像）。同一中转支持接入**多台桌面端**（各台电脑可自定义设备名，独立绑定一部手机、互不干扰），手机端顶部可随时在多台已配对电脑间切换，也支持按 `/?desktop=<id>` 分别收藏书签或多标签并行打开。<br />**前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
 | **远程通知** | 人不在电脑前也不漏：AI 任务完成、或停下来等你批权限 / 填表单 / 因 API 错误中断时，推送到手机。「设置 → AI → 远程通知」里多选渠道：**Bark**（直接粘贴 App 里的推送地址即可）、**Telegram** 机器人、**通用 Webhook**（JSON 模板，ntfy / Server酱 / 企业微信 / 飞书 / 钉钉 / Gotify / Discord 都能接），每个渠道可一键测试发送。配了移动端中转时通知附带手机端链接，点开直接进入该会话的对话镜像；推送只含项目名、AI 名与终端名，凭据加密保存 |
 | **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok / Antigravity CLI 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **历史会话** | 会话面板读取 Claude / Codex / Grok / pi / oh-my-pi / Antigravity CLI 的历史记录，右键续接或复制恢复命令；右键「删除会话」直接删除磁盘上的原始记录（oh-my-pi 与 Antigravity CLI 不支持删除），确认框列出每条路径，能确认正在运行的会话会被拦下。Claude / Codex / Antigravity CLI 覆盖本机、WSL 与 SSH 远程，Grok / pi / oh-my-pi 只覆盖本机；平铺列表单击即查看，可按标题与 agent 过滤 |
@@ -94,7 +94,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **添加项目即打开** | 弹窗、分组右键、拖目录进列表、SSH 远程、Worktree 设为项目——任何一条入口添加完直接切过去并开好第一个终端，不必再面对空态页点一次「新建终端」 |
 | **项目行悬停预览** | 悬停 250ms 弹出该项目正在运行的 AI Session 终端区 |
 | **设置面板分组** | 侧栏两级菜单：终端、外观、AI、系统，每页只剩一屏，不用滚半页找开关 |
-| **界面动效** | 全部动画走方向性位移或裁剪窗展开，不做淡入闪烁：弹窗、菜单、浮层、悬停卡从触发它的控件长出来，关闭时反向收回；切 tab 左右推、切面板上下推、最大化从原格子展开并原路收回，关 tab / 关分屏时邻居推入或扩张到位且只 resize 一次；折叠、分段控件、开关都有过渡。「设置 → 终端 → 启用动画」一个开关管全部动画，系统关掉窗口动画时转场照常保留 |
+| **界面动效** | 全部动画走方向性位移或裁剪窗展开，不做淡入闪烁：活动栏大面板（用量统计 / 设置 / SSH / 移动端）从窗口顶边整块向下滑入、关闭时向上收回，中栏开合与右侧工作区同步推拉（零白底空洞、零逐帧重排），其余弹窗、菜单、浮层、悬停卡从触发它的控件长出来并反向收回；切 tab 左右推、切面板上下推、最大化从原格子展开并原路收回，关 tab / 关分屏时邻居推入或扩张到位且只 resize 一次；折叠、分段控件、开关都有过渡。「设置 → 终端 → 启用动画」一个开关管全部动画，系统关掉窗口动画时转场照常保留 |
 
 ---
 
@@ -104,7 +104,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 
 | 层 | 实现 |
 |---|---|
-| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程；仅 HTML / PDF 预览按需嵌入系统 WebView） |
+| 壳 / 渲染 | GPUI（gpui-fast 0.1.17 + gpui-kit 0.10.0；保留模式 GPU 原生渲染，单进程；仅 HTML / PDF 预览按需嵌入系统 WebView） |
 | UI | 纯 Rust：gpui-component + 自绘组件 |
 | 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化）· portable-pty · Windows 随包 ConPTY（Windows Terminal 1.24） |
 | 状态 / 布局 | 单一 Store · 递归 SplitNode 分屏树 |
@@ -112,7 +112,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **3889 个 Rust 测试**（43 个测试目标） |
+| 测试 | **3909 个 Rust 测试**（43 个测试目标） |
 
 ---
 

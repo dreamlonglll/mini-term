@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -57,7 +57,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 |:--|---|
 | **AI event notifications** | Plugs directly into the **official Claude Code / Codex / Grok Build / oh-my-pi / pi / Antigravity CLI Hook APIs** (oh-my-pi and pi through their in-process extension mechanisms), with polling kept as a fallback.<br />Note: on Windows, Grok Build requires this app to be installed in a path **without spaces** for hooks to work properly<br />On Windows, uninstalling Mini-Term automatically strips the hook entries it wrote into each AI tool's config (upgrades leave them alone) |
 | **External theme packs** | Dream Skin-compatible skins: import from a folder or a zip, sha256-verified against the manifest, hot-reloaded when you edit a file. A pack can ship its own background image, in which case the terminal goes translucent over that ambient layer. External references all pass the same gate (no `@import`; anything pointing outside the pack is rejected). Hit "More skins" to jump straight to the [`theme/`](theme/) gallery in this repo (currently ten: five dark ones such as Blue Hour, and five light ones such as Morning Mist) — pick one, download it, import it; to roll your own, the field reference lives in [`docs/theme-pack-example/`](docs/theme-pack-example/) |
-| **Mobile support** | Follow desktop AI sessions live from your phone: GFM tables and one-tap code copy, consecutive tool calls folded into a "N tool calls" bar (which files were read or edited, which commands ran), an "AI working / needs you" status line, and injected system noise filtered out; send the AI commands and answer its questions with a tap; the home screen's History tab browses local past sessions per project, and "Continue conversation" has the desktop resume it in a new background terminal (a session that is already running opens straight into its live mirror).<br />**Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). See the [deployment guide](docs/deploy-relay.md). |
+| **Mobile support** | Follow desktop AI sessions live from your phone: GFM tables and one-tap code copy, consecutive tool calls folded into a "N tool calls" bar (which files were read or edited, which commands ran), an "AI working / needs you" status line, and injected system noise filtered out; send the AI commands and answer its questions with a tap; the home screen's History tab browses local past sessions per project, and "Continue conversation" has the desktop resume it in a new background terminal (a session that is already running opens straight into its live mirror). One relay can host **multiple desktops** (each computer gets a customizable device name and pairs independently to one phone without interfering with others); switch paired desktops from the top bar on your phone, or bookmark `/?desktop=<id>` and keep separate tabs open side by side.<br />**Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). See the [deployment guide](docs/deploy-relay.md). |
 | **Remote notifications** | Away from the desk? Get a push on your phone when an AI task finishes, or when the AI stops to ask for permission, needs a form filled in, or ends a turn on an API error. Pick any channels under "Settings → AI → Remote notifications": **Bark** (just paste the push URL from the app), a **Telegram** bot, or a **generic Webhook** (JSON template — ntfy / ServerChan / WeCom / Feishu / DingTalk / Gotify / Discord all work), each with a one-click test send. With the mobile relay configured, notifications carry a mobile link that opens the session's conversation mirror directly; pushes contain only the project, AI and terminal names, and credentials are stored encrypted |
 | **Cost statistics** | The "Stats" panel in the top bar aggregates Claude Code / Codex / Grok / Antigravity CLI **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away; custom ranges go down to the second, and a range within a single day charts by the hour.<br />Cost computation follows the approach of the ccusage project — [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **Session history** | The session panel reads Claude / Codex / Grok / pi / oh-my-pi / Antigravity CLI history; right-click to resume or copy the resume command. "Delete session" removes the original records from disk (not available for oh-my-pi and Antigravity CLI): the confirmation lists every path, and a session known to be running is refused. Claude / Codex / Antigravity CLI cover local, WSL and SSH remote; Grok / pi / oh-my-pi cover local only; in the flat list a single click opens a session, and you can filter by title and agent |
@@ -92,7 +92,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **Adding a project opens it** | Every entry point — the dialog, a group's right-click menu, dropping a folder onto the list, SSH remote, "add worktree as project" — switches to the new project and opens its first terminal, instead of leaving you on an empty state to click "New terminal" once more |
 | **Hover preview for project rows** | Hover for 250ms to pop up a preview of the project's running AI session terminal area |
 | **Grouped settings panel** | A two-level sidebar: Terminal, Appearance, AI, System — every page fits on one screen instead of scrolling half a page to find a toggle |
-| **Interface motion** | Every animation is a directional slide or a clip-window reveal, never a fade-in flash: dialogs, menus, popovers and hover cards grow out of the control that opened them and retract the same way; tabs push left / right, panels up / down, maximize grows from the original cell and restores along the same path, and closing a tab or split pushes / grows the neighbour into place with a single resize; folds, segmented controls and toggles all transition. One switch — Settings → Terminal → Enable animations — governs every animation, and transitions keep playing when the system turns window animations off |
+| **Interface motion** | Every animation is a directional slide or a clip-window reveal, never a fade-in flash: the four large activity-bar sheets (Usage stats / Settings / SSH / Mobile) slide smoothly down from the top edge and retract back up, the middle sidebar pushes and pulls inline in sync with the workspace (no blank flash, no per-frame terminal reflow), and other dialogs, menus, popovers and hover cards grow out of the control that opened them and retract the same way; tabs push left / right, panels up / down, maximize grows from the original cell and restores along the same path, and closing a tab or split pushes / grows the neighbour into place with a single resize; folds, segmented controls and toggles all transition. One switch — Settings → Terminal → Enable animations — governs every animation, and transitions keep playing when the system turns window animations off |
 
 ---
 
@@ -102,7 +102,7 @@ The whole application is **native Rust**:
 
 | Layer | Implementation |
 |---|---|
-| Shell / rendering | GPUI (gpui-pre 0.3, a 2026-09 snapshot of Zed's framework — GPU-native rendering, single process; only the HTML / PDF previews embed the system WebView on demand) |
+| Shell / rendering | GPUI (gpui-fast 0.1.17 + gpui-kit 0.10.0 — retained-mode GPU-native rendering, single process; only the HTML / PDF previews embed the system WebView on demand) |
 | UI | Pure Rust: gpui-component + hand-drawn widgets |
 | Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) · portable-pty · bundled ConPTY on Windows (Windows Terminal 1.24) |
 | State / layout | Single store · recursive SplitNode tree |
@@ -110,7 +110,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **3,889 Rust tests** (43 test targets) |
+| Tests | **3,909 Rust tests** (43 test targets) |
 
 ---
 
