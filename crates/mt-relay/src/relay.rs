@@ -49,6 +49,26 @@ const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 ///   比真人粘贴后按回车还快,只多压回执一拍。
 const MOBILE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 
+/// 桌面端 ↔ 中转长连的保活与探活参数(生产恒为 [`KEEPALIVE`],单测改短)。
+#[derive(Debug, Clone, Copy)]
+struct Keepalive {
+    /// 已连接时多久发一次 WebSocket ping
+    interval: Duration,
+    /// 这么久没从中转收到任何帧(pong 也算)就判连接已死、断开重连
+    timeout: Duration,
+}
+
+/// 保活:中间网络会悄悄回收空闲长连 —— CF 橙云约 100s,运营商 NAT 几分钟。连接一断,
+/// 桌面端就撤掉全部镜像订阅,手机那边正在看的会话收不到内容;定时 ping 让连接不空闲。
+///
+/// 探活:TCP 半开(笔记本睡眠唤醒、切网络、对端被掐但没收到 FIN)时读不到 EOF,
+/// 不主动判就一直以为在线,手机发来的订阅与指令全部落空。中转读到 ping 会自动回 pong,
+/// 超过 `timeout`(约三个 ping 周期)一个帧都没收到就当连接已死。
+const KEEPALIVE: Keepalive = Keepalive {
+    interval: Duration::from_secs(25),
+    timeout: Duration::from_secs(70),
+};
+
 /// 启发式绑定(无 hook 会话身份)**已绑上**时多久重新定位一次。
 ///
 /// 启发式定位要把四家的会话目录各扫一遍 —— Codex 那条递归整个
@@ -345,6 +365,8 @@ pub struct MobileRelayManager {
     command_tail: Mutex<Option<oneshot::Receiver<()>>>,
     /// 指令正文与提交回车之间的间隔:生产恒为 [`MOBILE_SUBMIT_DELAY`],单测改短
     submit_delay: Duration,
+    /// 长连保活 / 探活参数:生产恒为 [`KEEPALIVE`],单测改短
+    keepalive: Keepalive,
     /// 桌面侧状态查询(项目表 / 启动器 / PTY 写穿 / AI 会话身份)
     host: Arc<dyn RelayHost>,
     /// 状态与动作出口(原来的四个 Tauri 事件)
@@ -370,6 +392,7 @@ impl MobileRelayManager {
             recent_mobile_cmds: Mutex::new(HashMap::new()),
             command_tail: Mutex::new(None),
             submit_delay: MOBILE_SUBMIT_DELAY,
+            keepalive: KEEPALIVE,
             host,
             events,
             spawner: OnceLock::new(),
@@ -1080,15 +1103,42 @@ async fn connect_once(
     // 连上即推一份全量快照:覆盖"桌面端重连时移动端已在线"的场景
     manager.send_snapshot();
 
+    // 保活 / 探活:定时 ping,中转(axum)读到即自动回 pong;收到任何帧都算活着
+    let keepalive = manager.keepalive;
+    let mut last_rx = Instant::now();
+    let mut ping = tokio::time::interval_at(
+        tokio::time::Instant::now() + keepalive.interval,
+        keepalive.interval,
+    );
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // 已连接:读循环 + 出站转发,直到断线/取消
     let outcome = loop {
         tokio::select! {
-            msg = ws.next() => match msg {
-                Some(Ok(Message::Text(text))) => handle_relay_message(manager, &text),
-                Some(Ok(Message::Close(_))) | None => break Attempt::ConnectedThenLost,
-                Some(Ok(_)) => {}
-                Some(Err(e)) => {
-                    eprintln!("[mobile-relay] connection lost: {e}");
+            msg = ws.next() => {
+                if matches!(msg, Some(Ok(_))) {
+                    last_rx = Instant::now();
+                }
+                match msg {
+                    Some(Ok(Message::Text(text))) => handle_relay_message(manager, &text),
+                    Some(Ok(Message::Close(_))) | None => break Attempt::ConnectedThenLost,
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        eprintln!("[mobile-relay] connection lost: {e}");
+                        break Attempt::ConnectedThenLost;
+                    }
+                }
+            },
+            _ = ping.tick() => {
+                let silent = last_rx.elapsed();
+                if silent >= keepalive.timeout {
+                    eprintln!(
+                        "[mobile-relay] no frame from relay for {}s, reconnecting",
+                        silent.as_secs()
+                    );
+                    break Attempt::ConnectedThenLost;
+                }
+                if ws.send(Message::Ping(Default::default())).await.is_err() {
                     break Attempt::ConnectedThenLost;
                 }
             },
@@ -2718,5 +2768,107 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
         assert_eq!(fx.bound(), None);
+    }
+
+    // ── 长连保活 / 探活 ──
+
+    /// 本机起一个中转替身:收下桌面端 hello、回 HelloAck,之后交给 `after` 处置连接。
+    async fn fake_relay<F, Fut>(after: F) -> String
+    where
+        F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let _hello = ws.next().await;
+            let ack = RelayToDesktop::HelloAck {
+                protocol_version: PROTOCOL_VERSION,
+            };
+            ws.send(Message::Text(serde_json::to_string(&ack).unwrap().into()))
+                .await
+                .unwrap();
+            after(ws).await;
+        });
+        format!("ws://{addr}/ws/desktop")
+    }
+
+    fn keepalive_manager() -> Arc<MobileRelayManager> {
+        let mut manager = MobileRelayManager::new(Arc::new(NoopRelayHost), Arc::new(NoopRelayHost));
+        manager.keepalive = Keepalive {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(300),
+        };
+        Arc::new(manager)
+    }
+
+    fn keepalive_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// 连接半开:中转一个帧都不回(不读也就不回 pong),桌面端超时后自己判死重连,
+    /// 不会一直挂着「已连接」让手机的订阅落空。
+    #[test]
+    fn keepalive_gives_up_on_silent_relay() {
+        keepalive_runtime().block_on(async {
+            let url = fake_relay(|ws| async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(ws);
+            })
+            .await;
+            let manager = keepalive_manager();
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_once(&manager, &url, "key", &mut cancel_rx),
+            )
+            .await
+            .expect("应在探活超时后自行断开");
+            assert!(matches!(outcome, Attempt::ConnectedThenLost));
+            assert!(started.elapsed() >= Duration::from_millis(300));
+            assert!(manager.outbound.lock().is_none(), "断开后出站通道已撤");
+        });
+    }
+
+    /// 中转正常读(自动回 pong)时,超过探活时限也不断:ping 的回音让连接一直算活着。
+    #[test]
+    fn keepalive_keeps_responsive_relay() {
+        keepalive_runtime().block_on(async {
+            let url = fake_relay(|mut ws| async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
+                loop {
+                    tokio::select! {
+                        msg = ws.next() => if msg.is_none() { return },
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
+                }
+                let _ = ws.close(None).await;
+            })
+            .await;
+            let manager = keepalive_manager();
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let started = Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_once(&manager, &url, "key", &mut cancel_rx),
+            )
+            .await
+            .expect("中转关闭后应返回");
+            assert!(matches!(outcome, Attempt::ConnectedThenLost));
+            assert!(
+                started.elapsed() >= Duration::from_millis(900),
+                "一直有 pong 回来,不该在 {:?} 就判死",
+                started.elapsed()
+            );
+        });
     }
 }
