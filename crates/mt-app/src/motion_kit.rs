@@ -119,14 +119,6 @@ pub struct Shifted {
     offset: (f32, f32),
 }
 
-impl IntoElement for Shifted {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Shifted {
     type RequestLayoutState = ();
     type PrepaintState = ();

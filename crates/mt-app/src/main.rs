@@ -2793,7 +2793,9 @@ impl Render for Workspace {
                     // 遮罩已经不拦点击,WebView 跟着恢复(与 Dialog 族同口径,画面本来就压在
                     // WebView 之上);正在收的面板那块由 `occlude_native` 让出来
                     .when(open, |el| {
-                        el.child(native_view::input_blocker()).on_mouse_down(
+                        el.child(native_view::input_blocker())
+                            .child(native_view::occluder())
+                            .on_mouse_down(
                             gpui::MouseButton::Left,
                             cx.listener(|this, _event, window, cx| {
                                 if this.usage_open {
@@ -2911,10 +2913,9 @@ impl Render for Workspace {
             // (浮层 50 / 分隔条 35)。
             //
             // S 批记档的「gpui-component 是右上角起堆」这条差异到此为止:自建层
-            // 按原版右下角起堆。`render_notification_layer` 留着不动(组件库内部
-            // 别处可能还用),只是 mt-app 不再往它里面推东西。
-            .child(self.toast_layer.clone())
-            .children(Root::render_notification_layer(window, cx));
+            // 按原版右下角起堆。gpui-component 0.10 起 `Root` 的插件层自动挂通知层,
+            // 无需宿主手动 `render_notification_layer`,mt-app 也不再往它里面推东西。
+            .child(self.toast_layer.clone());
 
         div()
             .size_full()

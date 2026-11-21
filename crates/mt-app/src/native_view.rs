@@ -66,12 +66,40 @@
 
 use std::cell::RefCell;
 
-use gpui::{App, Bounds, ContentMask, Hsla, IntoElement, Pixels, Styled, Window, canvas, fill};
+use gpui::{
+    App, Bounds, ContentMask, Global, Hsla, IntoElement, Pixels, Styled, Window, canvas, fill,
+};
+
+/// 给 gpui-fast 的依赖追踪器当「原生子视图同步世代」哨兵:
+///
+/// gpui-fast 默认对所有未变脏的 `View` 做保留子树复用(跳过 `prepaint`/`paint`),
+/// 也可能跳过未变脏的根 `Workspace` 直接拼接(splice)某个子视图。而本模块靠
+/// `root_bg` 的 `begin_frame`/`finish_frame` 与各子视图里的 `Slot`/`hole_bg`/
+/// `occluder`/`input_blocker` 同帧协作挖洞与裁点击区:
+/// - **无活跃 WebView 时**:绝不推进本全局,所有视图照享 gpui-fast 完整的保留与拼接加速;
+/// - **有活跃 WebView 时**:`finish_frame` 推进本全局世代(`set_global`,无观察者所以**不触发
+///   额外空闲帧**),所有在 prepaint 读过它的视图会在下一次真正绘制时被标记重建,不会因
+///   缓存复用丢掉洞、隐藏子窗口或漏掉浮层遮挡区;
+/// - **根视图被拼接时首次出现 `Slot`**:`frame_open == false`,由 `Slot::prepaint` 推进世代
+///   并约一帧重跑完整对账,随后再显身。
+struct FrameSync;
+
+impl Global for FrameSync {}
+
+fn subscribe(cx: &App) {
+    let _ = cx.try_global::<FrameSync>();
+}
+
+fn bump_sync(cx: &mut App) {
+    cx.set_global(FrameSync);
+}
 
 #[derive(Default)]
 struct FrameState {
     /// 帧序号,每帧 [`begin_frame`] 加一。[`Slot`] 盖的戳与它比对,判「本帧摆过没有」。
     frame: u64,
+    /// 本帧是否已跑过 [`begin_frame`] 且尚未收尾(区分根视图完整绘制 vs gpui-fast 拼接跳过)。
+    frame_open: bool,
     /// 本帧登记的洞(窗口坐标)。
     holes: Vec<Bounds<Pixels>>,
     /// 本帧画在 WebView 之上的不透明浮层矩形([`occluder`])。
@@ -94,6 +122,7 @@ pub fn begin_frame() {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         s.frame += 1;
+        s.frame_open = true;
         s.holes.clear();
         s.occluders.clear();
         s.block_input = false;
@@ -102,6 +131,10 @@ pub fn begin_frame() {
 
 fn current_frame() -> u64 {
     STATE.with(|s| s.borrow().frame)
+}
+
+fn frame_open() -> bool {
+    STATE.with(|s| s.borrow().frame_open)
 }
 
 fn punch(hole: Bounds<Pixels>) {
@@ -124,7 +157,7 @@ fn holes() -> Vec<Bounds<Pixels>> {
 /// `relative` / `absolute`)下当子节点,本帧的矩形就从 WebView 的显示与点击
 /// 区域里让出来。用于常驻、不模态的浮层(右侧抽屉、toast 卡片)。
 pub fn occluder() -> impl IntoElement {
-    canvas(|bounds, _, _| occlude_rect(bounds), |_, _, _, _| {})
+    canvas(|bounds, _, cx| occlude_rect(bounds, cx), |_, _, _, _| {})
         .absolute()
         .inset_0()
 }
@@ -132,8 +165,14 @@ pub fn occluder() -> impl IntoElement {
 /// [`occluder`] 的直登版:本帧把窗口坐标里的 `rect` 登记成画在 WebView 之上的不透明浮层。
 /// **只能在 prepaint 期调**(收尾在根底色的 paint 期)。给矩形不等于布局盒的浮层用 ——
 /// 正在收起的弹窗面板按插值矩形画([`crate::overlay_motion::RevealBox`])。
-pub fn occlude_rect(rect: Bounds<Pixels>) {
-    STATE.with(|s| s.borrow_mut().occluders.push(rect));
+pub fn occlude_rect(rect: Bounds<Pixels>, cx: &App) {
+    subscribe(cx);
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.frame_open {
+            s.occluders.push(rect);
+        }
+    });
 }
 
 /// 标记「本帧有吃整窗点击的透明遮罩」(点外关闭的下拉、自绘模态):WebView
@@ -141,7 +180,15 @@ pub fn occlude_rect(rect: Bounds<Pixels>) {
 /// 不必挂,[`finish_frame`] 自己会查。
 pub fn input_blocker() -> impl IntoElement {
     canvas(
-        |_, _, _| STATE.with(|s| s.borrow_mut().block_input = true),
+        |_, _, cx| {
+            subscribe(cx);
+            STATE.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.frame_open {
+                    s.block_input = true;
+                }
+            });
+        },
         |_, _, _, _| {},
     )
     .absolute()
@@ -215,8 +262,9 @@ fn paint_around_holes(
 /// **第一个**子节点(最先画 = 垫在最底下)。
 pub fn hole_bg(color: Hsla) -> impl IntoElement {
     canvas(
-        |_, _, _| {},
-        move |bounds, _, window, _| {
+        |_, _, cx| subscribe(cx),
+        move |bounds, _, window, cx| {
+            subscribe(cx);
             paint_around_holes(bounds, window, |piece, window| {
                 window.paint_quad(fill(piece, color));
             });
@@ -230,8 +278,12 @@ pub fn hole_bg(color: Hsla) -> impl IntoElement {
 /// ([`begin_frame`] / [`finish_frame`])。放在根节点的**第一个**子节点。
 pub fn root_bg(color: Hsla) -> impl IntoElement {
     canvas(
-        |_, _, _| begin_frame(),
+        |_, _, cx| {
+            subscribe(cx);
+            begin_frame();
+        },
         move |bounds, _, window, cx| {
+            subscribe(cx);
             finish_frame(window, cx);
             paint_around_holes(bounds, window, |piece, window| {
                 window.paint_quad(fill(piece, color));
@@ -246,8 +298,9 @@ pub fn root_bg(color: Hsla) -> impl IntoElement {
 pub fn hole_art(art: mt_ui::theme_bridge::BackgroundArt) -> impl IntoElement {
     let element = mt_ui::background_art(art);
     canvas(
-        |_, _, _| {},
+        |_, _, cx| subscribe(cx),
         move |bounds, _, window, cx| {
+            subscribe(cx);
             paint_around_holes(bounds, window, |_, window| {
                 // 图按整块 bounds 摆(cover 的裁切与焦点不随切块变),切块只做遮罩
                 element.paint_into(bounds, window, cx);
@@ -261,29 +314,45 @@ pub fn hole_art(art: mt_ui::theme_bridge::BackgroundArt) -> impl IntoElement {
 /// 一帧收尾(paint 期,此时全树 prepaint 已完成):没被摆放的子视图等呈现后隐藏,
 /// 摆着的按本帧浮层对账输入(见模块注释「输入的空域」),清屏色跟着洞的有无切换。
 fn finish_frame(window: &mut Window, cx: &mut App) {
-    let any_hole = STATE.with(|s| !s.borrow().holes.is_empty());
+    let any_hole = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.frame_open = false;
+        !s.holes.is_empty()
+    });
+    let mut any_shown = false;
 
     #[cfg(any(windows, target_os = "macos"))]
     {
         let frame = current_frame();
+        // 弹窗只看「开着」的(退场中的不算):gpui-fast-windows 把 DirectComposition 建成
+        // `CreateTargetForHwnd(hwnd, false)`(子窗口叠在 GPUI 之上),所以全窗模态开着时
+        // 除了禁用鼠标(`EnableWindow(false)`),还要把整窗压入 occluders 用 `SetWindowRgn`
+        // 把子窗口裁空,防止 WebView2 压住设置/确认弹窗与毛玻璃背板;退场时交给
+        // `RevealBox::occlude_native` 按收起矩形逐帧裁剪。
+        let dialog_open = crate::dialog_host::has_open(window, cx);
+        let lightbox_open =
+            crate::overlay::contains(crate::overlay::key(crate::overlay::kind::IMAGE_LIGHTBOX));
+        if dialog_open || lightbox_open {
+            let full = Bounds::new(gpui::Point::default(), window.viewport_size());
+            STATE.with(|s| s.borrow_mut().occluders.push(full));
+        }
         let (views, occluders, block_input) = STATE.with(|s| {
             let mut s = s.borrow_mut();
             s.views.retain(|view| view.strong_count() > 0);
             let views: Vec<_> = s.views.iter().filter_map(|view| view.upgrade()).collect();
             (views, s.occluders.clone(), s.block_input)
         });
-        // 弹窗只看「开着」的(退场中的不算):GPUI 的画面本来就压在 WebView 之上(模块注释
-        // 「为什么要挖洞」),这里管的只是输入。弹窗一开始收,遮罩就不再拦点击,网页随即可点;
-        // 正在收的面板那块由它自己登记成 occluder(`RevealBox::occlude_native`),点不穿
         let modal = block_input
-            || crate::dialog_host::has_open(window, cx)
+            || dialog_open
             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay);
         for view in views {
             if view.stamped() == frame {
+                any_shown = true;
                 view.sync_input(!modal, &occluders, window.scale_factor());
                 continue;
             }
             if view.shown() {
+                any_shown = true;
                 let weak = std::rc::Rc::downgrade(&view);
                 // 呈现之后再藏:`on_next_frame` 在下一帧开画前回调,此时本帧(已经
                 // 不带这个洞)已经上屏
@@ -297,8 +366,6 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
             }
         }
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = cx;
 
     let transparent = STATE.with(|s| s.borrow().transparent);
     if any_hole && !transparent {
@@ -317,6 +384,13 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
         #[cfg(not(windows))]
         let _ = window;
     }
+
+    // 只要本帧仍有活跃 WebView(或正在退场),推进同步世代:不触发新帧,仅令下一次
+    // 真实重绘时所有参与挖洞/遮挡的保留视图重新跑 prepaint/paint,防止 gpui-fast
+    // 跳过 Slot 或拼接跳过 root_bg。无 WebView 时不推进,保留模式零额外开销。
+    if any_hole || any_shown {
+        bump_sync(cx);
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -328,18 +402,18 @@ mod hosted {
     use std::rc::Rc;
 
     use gpui::{
-        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
+        App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
         LayoutId, MouseDownEvent, Pixels, Size, Style, Window,
     };
 
-    use super::{STATE, current_frame, punch};
+    use super::{STATE, bump_sync, current_frame, frame_open, punch, subscribe};
 
     /// 容器内物理像素矩形 `(左, 上, 右, 下)`。
     type PxRect = (i32, i32, i32, i32);
 
     /// 一个挂在 GPUI 窗口上的系统 WebView,以及它在合成里的记账。
     pub struct Hosted {
-        webview: gpui_wry::WebView,
+        webview: gpui_webview::WebView,
         /// wry 包在 WebView2 外面的那层容器子窗口(`WRY_WEBVIEW`)。禁用与裁区域都
         /// 作用在它身上 —— 子窗口的命中测试与显示都受父窗口约束,里面 Chromium 的
         /// 几层窗口不必一一去碰。
@@ -364,7 +438,7 @@ mod hosted {
             let container = win::container_of(&webview);
             #[cfg(windows)]
             win::guard_key_menu(container);
-            let mut webview = gpui_wry::WebView::new(webview, window, cx);
+            let mut webview = gpui_webview::WebView::new(webview, window, cx);
             webview.hide();
             let hosted = Rc::new(Self {
                 webview,
@@ -647,14 +721,6 @@ mod hosted {
         }
     }
 
-    impl IntoElement for Slot {
-        type Element = Self;
-
-        fn into_element(self) -> Self::Element {
-            self
-        }
-    }
-
     impl Element for Slot {
         type RequestLayoutState = ();
         type PrepaintState = ();
@@ -688,11 +754,19 @@ mod hosted {
             bounds: Bounds<Pixels>,
             _: &mut (),
             window: &mut Window,
-            _: &mut App,
+            cx: &mut App,
         ) {
+            subscribe(cx);
             // 被祖先裁掉的部分(滚动容器、页签切换动画)不该露出子窗口
             let visible = window.content_mask().bounds.intersect(&bounds);
             if visible.size.width <= gpui::px(0.0) || visible.size.height <= gpui::px(0.0) {
+                return;
+            }
+            if !frame_open() {
+                // 根视图本帧被 gpui-fast 拼接跳过,未跑 begin_frame/finish_frame:
+                // 推进同步世代并约下一帧完整对账后再显身,避免洞被旧底色盖住。
+                bump_sync(cx);
+                window.request_animation_frame();
                 return;
             }
             self.hosted.stamped.set(current_frame());
@@ -801,5 +875,26 @@ mod tests {
             &[rect(0.0, 0.0, 10.0, 10.0), rect(50.0, 50.0, 10.0, 10.0)],
         );
         assert_eq!(area(&pieces), 100.0 * 100.0 - 200.0);
+    }
+
+    #[test]
+    fn 未开帧时_occluder_不会残留脏矩形() {
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.frame_open = false;
+            s.occluders.clear();
+            s.block_input = false;
+        });
+        assert!(!frame_open());
+        begin_frame();
+        assert!(frame_open());
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.occluders.push(rect(10.0, 10.0, 20.0, 20.0));
+            s.frame_open = false;
+        });
+        assert!(!frame_open());
+        begin_frame();
+        assert!(STATE.with(|s| s.borrow().occluders.is_empty()));
     }
 }

@@ -37,7 +37,7 @@ use std::time::Instant;
 use gpui::{
     AnyElement, App, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, Size, StatefulInteractiveElement, Styled,
+    PinchEvent, Pixels, Point, Render, ScrollEvent, Size, StatefulInteractiveElement, Styled,
     StyledImage as _, Window, anchored, deferred, div, img, point, prelude::FluentBuilder, px,
     size,
 };
@@ -311,7 +311,7 @@ impl ImageLightbox {
 
     fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -571,7 +571,7 @@ impl Render for ImageLightbox {
                                 .key_context("ImageLightbox")
                                 .occlude()
                                 .on_key_down(cx.listener(Self::on_key_down))
-                                .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                                .on_scroll(cx.listener(Self::on_scroll_wheel))
                                 .on_pinch(cx.listener(Self::on_pinch))
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                                 .on_mouse_move(cx.listener(Self::on_mouse_move))

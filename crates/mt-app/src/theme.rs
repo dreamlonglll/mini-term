@@ -281,76 +281,74 @@ fn install_highlight_theme(palette: &Palette, appearance: Appearance, cx: &mut A
     let operator = plain(palette.text_secondary); // --syn-operator(含 punctuation/bracket)
     let primary = plain(palette.text_primary);
 
-    let syntax = SyntaxColors {
-        keyword,
-        boolean: number,
-        constant: number,
-        number,
-        variable_special: number,
-        string,
-        string_escape: string,
-        string_regex: string,
-        string_special: string,
-        string_special_symbol: string,
-        text_literal: string,
-        comment,
-        comment_doc: comment,
-        // 原版 `meta` / `processingInstruction` 也走 --syn-comment
-        preproc: comment,
-        function,
-        constructor: function,
-        type_,
-        enum_: type_,
-        variant: type_,
-        property,
-        attribute: property,
-        label: property,
-        link_text: property,
-        link_uri: property,
-        tag,
-        tag_doctype: tag,
-        operator,
-        punctuation: operator,
-        punctuation_bracket: operator,
-        punctuation_delimiter: operator,
-        punctuation_list_marker: operator,
-        punctuation_special: operator,
-        // 标题在原版是 accent + 600(Markdown 源码态)
-        title: style(palette.accent, false, true),
-        emphasis: style(palette.text_primary, true, false),
-        emphasis_strong: style(palette.text_primary, false, true),
-        variable: primary,
-        primary,
-        embedded: primary,
-        // 补全提示类:灰掉(原版没有对应 tag,取 --text-muted 最接近)
-        hint: plain(palette.text_muted),
-        predictive: plain(palette.text_muted),
-        // 0.6.1 新增:Markdown 行内代码,与代码块同色
-        text_code_span: primary,
-    };
+    let mut syntax = SyntaxColors::default();
+    syntax.keyword = keyword;
+    syntax.boolean = number;
+    syntax.constant = number;
+    syntax.number = number;
+    syntax.variable_special = number;
+    syntax.string = string;
+    syntax.string_escape = string;
+    syntax.string_regex = string;
+    syntax.string_special = string;
+    syntax.string_special_symbol = string;
+    syntax.text_literal = string;
+    syntax.comment = comment;
+    syntax.comment_doc = comment;
+    // 原版 `meta` / `processingInstruction` 也走 --syn-comment
+    syntax.preproc = comment;
+    syntax.function = function;
+    syntax.constructor = function;
+    syntax.type_ = type_;
+    syntax.enum_ = type_;
+    syntax.variant = type_;
+    syntax.property = property;
+    syntax.attribute = property;
+    syntax.label = property;
+    syntax.link_text = property;
+    syntax.link_uri = property;
+    syntax.tag = tag;
+    syntax.tag_doctype = tag;
+    syntax.operator = operator;
+    syntax.punctuation = operator;
+    syntax.punctuation_bracket = operator;
+    syntax.punctuation_delimiter = operator;
+    syntax.punctuation_list_marker = operator;
+    syntax.punctuation_special = operator;
+    // 标题在原版是 accent + 600(Markdown 源码态)
+    syntax.title = style(palette.accent, false, true);
+    syntax.emphasis = style(palette.text_primary, true, false);
+    syntax.emphasis_strong = style(palette.text_primary, false, true);
+    syntax.variable = primary;
+    syntax.primary = primary;
+    syntax.embedded = primary;
+    // 补全提示类:灰掉(原版没有对应 tag,取 --text-muted 最接近)
+    syntax.hint = plain(palette.text_muted);
+    syntax.predictive = plain(palette.text_muted);
+    // 0.6.1 新增:Markdown 行内代码,与代码块同色
+    syntax.text_code_span = primary;
 
-    let theme = HighlightTheme {
-        name: "mini-term".to_string(),
-        appearance: match appearance {
-            Appearance::Dark => ThemeMode::Dark,
-            Appearance::Light => ThemeMode::Light,
-        },
-        style: HighlightThemeStyle {
-            // 行号栏那条整高 quad 用它(gpui-component input/element.rs 的
-            // 「Paint line numbers」段)。跟 bg_document 走:背景图皮肤下文件页
-            // 整页半透明,行号栏刷不透明 bg_base 会留一条实色竖带。代价是长行
-            // 横向滚进行号栏下方时遮不严(28% 透底),与「终端文字直接坐在
-            // 氛围图上」同档,可接受
-            editor_background: Some(palette.bg_document),
-            editor_foreground: Some(palette.text_primary),
-            // 活动行:accent 的极淡一档(原版 `.cm-activeLine` 用 --accent-subtle)
-            editor_active_line: Some(palette.accent_subtle),
-            editor_line_number: Some(palette.text_muted),
-            editor_active_line_number: Some(palette.text_primary),
-            syntax,
-            ..Default::default()
-        },
+    let mut highlight_style = HighlightThemeStyle::default();
+    // 行号栏那条整高 quad 用它(gpui-component input/element.rs 的
+    // 「Paint line numbers」段)。跟 bg_document 走:背景图皮肤下文件页
+    // 整页半透明,行号栏刷不透明 bg_base 会留一条实色竖带。代价是长行
+    // 横向滚进行号栏下方时遮不严(28% 透底),与「终端文字直接坐在
+    // 氛围图上」同档,可接受
+    highlight_style.editor_background = Some(palette.bg_document);
+    highlight_style.editor_foreground = Some(palette.text_primary);
+    // 活动行:accent 的极淡一档(原版 `.cm-activeLine` 用 --accent-subtle)
+    highlight_style.editor_active_line = Some(palette.accent_subtle);
+    highlight_style.editor_line_number = Some(palette.text_muted);
+    highlight_style.editor_active_line_number = Some(palette.text_primary);
+    highlight_style.syntax = syntax;
+
+    let mut theme = (*HighlightTheme::default_dark()).clone();
+    theme.name = "mini-term".to_string();
+    theme.appearance = match appearance {
+        Appearance::Dark => ThemeMode::Dark,
+        Appearance::Light => ThemeMode::Light,
     };
+    theme.style = highlight_style;
     Theme::global_mut(cx).highlight_theme = std::sync::Arc::new(theme);
 }
 

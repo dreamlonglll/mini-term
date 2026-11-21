@@ -1352,7 +1352,7 @@ impl SearchModal {
             .when(!is_cursor, |el| el.hover(|el| el.bg(ui::border_subtle())))
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    let keep_open = event.modifiers().secondary();
+                    let keep_open = event.modifiers().secondary(cx);
                     this.open_result(index, event.click_count(), keep_open, window, cx);
                 }),
             )
@@ -1405,7 +1405,7 @@ impl SearchModal {
             .when(!is_cursor, |el| el.hover(|el| el.bg(ui::border_subtle())))
             .on_click(
                 cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                    let keep_open = event.modifiers().secondary();
+                    let keep_open = event.modifiers().secondary(cx);
                     this.open_result(index, event.click_count(), keep_open, window, cx);
                 }),
             )
@@ -1786,11 +1786,16 @@ mod tests {
             [InputMoveUp, InputPageDown, InputEnter, InputMoveToStart]
         );
         let predicate = format!("{CONTEXT} > Input");
+        let secondary = if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        };
         let keymap = Keymap::new(vec![
             // 组件库先注册(gpui_component::init)
             KeyBinding::new("up", InputMoveUp, Some("Input")),
             KeyBinding::new("pagedown", InputPageDown, Some("Input")),
-            KeyBinding::new("secondary-enter", InputEnter, Some("Input")),
+            KeyBinding::new(secondary, InputEnter, Some("Input")),
             KeyBinding::new("ctrl-home", InputMoveToStart, Some("Input")),
             // 壳后注册(hotkeys::bind_keys)
             KeyBinding::new("up", SearchCursorPrev, Some(predicate.as_str())),
@@ -1803,18 +1808,13 @@ mod tests {
             .iter()
             .map(|c| KeyContext::parse(c).unwrap())
             .collect();
-        let first = |ks: &str| {
+        let first = |ks: &'static str| {
             let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
             bindings[0].action().boxed_clone()
         };
         assert!(first("up").partial_eq(&SearchCursorPrev));
         assert!(first("pagedown").partial_eq(&SearchCursorPageDown));
         assert!(first("ctrl-home").partial_eq(&SearchCursorFirst));
-        let secondary = if cfg!(target_os = "macos") {
-            "cmd-enter"
-        } else {
-            "ctrl-enter"
-        };
         assert!(first(secondary).partial_eq(&SearchOpenKeep));
     }
 

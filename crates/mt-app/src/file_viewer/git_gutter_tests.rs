@@ -300,7 +300,7 @@ fn 变更跳转键位不与编辑器和全局键冲突() {
         .iter()
         .map(|n| KeyContext::parse(n).unwrap())
         .collect();
-    let first = |ks: &str| {
+    let first = |ks: &'static str| {
         let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
         bindings.first().map(|b| b.action().boxed_clone())
     };

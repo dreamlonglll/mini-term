@@ -20,8 +20,14 @@ fn main() {
             parts.next().unwrap_or(0),
         );
         let version_u64 = (major << 48) | (minor << 32) | (patch << 16);
+        println!("cargo:rerun-if-changed=resources/icon.ico");
+        println!("cargo:rerun-if-changed=resources/mini-term.manifest.xml");
         let mut res = winresource::WindowsResource::new();
         res.set_icon("resources/icon.ico");
+        // gpui-component 0.10 为 gpui-fast 开启了 `windows-manifest-provided-by-host`,
+        // 加上我们用空壳 stub 替换掉了 gpui-pre,PerMonitorV2 / SegmentHeap / Common-Controls v6
+        // 清单统一由宿主在唯一一份 .res 里嵌入。
+        res.set_manifest_file("resources/mini-term.manifest.xml");
         res.set("ProductName", "Mini-Term");
         res.set("FileDescription", "Mini-Term");
         res.set("ProductVersion", &semver);

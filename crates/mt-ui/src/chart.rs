@@ -45,7 +45,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Bounds, Corners, Element, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
+    App, Bounds, Corners, Element, GlobalElementId, Hsla, InspectorElementId, LayoutId,
     PathBuilder, Pixels, Point, Style, Window, fill, point, px, size,
 };
 
@@ -398,13 +398,6 @@ fn lerp_hsla(a: Hsla, b: Hsla, t: f32) -> Hsla {
         a: ra.a + (rb.a - ra.a) * t,
     }
     .into()
-}
-
-impl IntoElement for ChartCanvas {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for ChartCanvas {

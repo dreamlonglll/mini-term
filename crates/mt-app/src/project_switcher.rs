@@ -1589,7 +1589,7 @@ mod tests {
             KeyBinding::new("ctrl-end", SwitcherLast, Some("ProjectSwitcher > Input")),
         ]);
         let stack = context_stack(&["Workspace", "Dialog", "ProjectSwitcher", "Input"]);
-        let first = |ks: &str| {
+        let first = |ks: &'static str| {
             let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
             bindings[0].action().boxed_clone()
         };

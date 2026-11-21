@@ -1,0 +1,15 @@
+[package]
+name = "gpui-pre"
+version = "0.3.12"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+font-kit = []
+inspector = []
+profiler = []
+test-support = []
+wayland = []
+windows-manifest = []
+x11 = []

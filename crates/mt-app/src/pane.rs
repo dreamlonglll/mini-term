@@ -100,7 +100,8 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Div, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::ActiveTheme as _;
 use mt_config::{ShellConfig, SshConnection};
@@ -113,8 +114,8 @@ use mt_ui::icons::ShellKind;
 use mt_ui::terminal::{MouseMods, TerminalLink, prefers_local_handling};
 use mt_ui::tooltip::TooltipExt as _;
 use mt_ui::{
-    CopiedTip, DwellConfig, FlashLine, PasteAction, TerminalSearch, TerminalSearchBar,
-    TerminalStyle, TerminalTheme, TerminalView,
+    CopiedTip, DwellConfig, FlashLine, PasteAction, SearchBarEvent, TerminalSearch,
+    TerminalSearchBar, TerminalStyle, TerminalTheme, TerminalView,
 };
 
 use crate::ai::AiBridge;
@@ -251,6 +252,12 @@ pub struct TerminalPane {
     search_exit: Option<Entity<TerminalSearchBar>>,
     /// 查找条的开合动画 + 原点(标题栏「查找」按钮,探针报来),见 [`crate::popover_reveal`]。
     search_reveal: RevealState,
+    /// 查找条事件订阅:gpui-fast 下查找条 notify 不会连带重绘同级 `TerminalView`,
+    /// 关键词/导航变化时经本订阅显式标脏 `self.view`。
+    _search_sub: Option<Subscription>,
+    /// 监听 `self.view` 的重绘:gpui-fast 下 `TerminalView` 滚动/翻页时会拼接跳过
+    /// `TerminalPane`,这里在 `scrolled_back` 状态翻转时标脏外壳以显隐「回到底部」浮钮。
+    _view_sub: Subscription,
     /// 标记跳转后那 300ms 闪烁的撤销计时器。与 `_tip_timer` 同理必须存句柄:
     /// 连着跳两条时上一个计时器随之被丢弃,否则第一次的到点回调会把第二次刚
     /// 亮起来的那一行提前抹掉。
@@ -701,6 +708,15 @@ impl TerminalPane {
 
         ai.add_pane(pty_id);
 
+        let view_sub = cx.observe(&view, |this: &mut Self, _, cx| {
+            let scrolled = this
+                .emulator
+                .with_term(|term| term.grid().display_offset() > 0);
+            if scrolled != this.scrolled_back {
+                cx.notify();
+            }
+        });
+
         let ssh_activity = {
             let focus = focus.clone();
             let mono_font = style.font_family.clone();
@@ -733,6 +749,8 @@ impl TerminalPane {
             search_bar: None,
             search_exit: None,
             search_reveal: RevealState::new(),
+            _search_sub: None,
+            _view_sub: view_sub,
             _flash_timer: None,
             pending_marks: Vec::new(),
             _marks_timer: None,
@@ -1014,6 +1032,21 @@ impl TerminalPane {
         (self.scrolled_back, self.unseen_output)
     }
 
+    /// 节拍器通知本 pane 有新输出需要重绘。
+    ///
+    /// gpui-fast 下子视图 `TerminalView` 默认保留复用,只 notify 外壳 `TerminalPane`
+    /// 不会重绘 `Arc<TerminalEmulator>` 里的新 grid —— 必须直接标脏 `self.view`;
+    /// 回看浮钮状态未变时不惊动外壳,让 gpui-fast 直接拼接 `TerminalView`。
+    pub(crate) fn notify_redraw(&mut self, cx: &mut Context<Self>) {
+        self.view.update(cx, |_, cx| cx.notify());
+        let scrolled = self
+            .emulator
+            .with_term(|term| term.grid().display_offset() > 0);
+        if scrolled != self.scrolled_back || (scrolled && self.unseen_output) {
+            cx.notify();
+        }
+    }
+
     /// 「回到底部」浮钮:滚回底部、熄掉小圆点、把键盘还给终端(点浮钮不该让人再去点一下
     /// 终端才能接着打字)。
     fn scroll_to_bottom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1021,6 +1054,7 @@ impl TerminalPane {
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
         self.unseen_output = false;
         window.focus(&self.focus, cx);
+        self.view.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 
@@ -1161,9 +1195,22 @@ impl TerminalPane {
         };
         // 选区预填 + 开引擎 + 按关键词搜一遍 + 聚焦全选
         bar.update(cx, |bar, cx| bar.open(window, cx));
+        self._search_sub = Some(cx.subscribe(
+            &bar,
+            |this: &mut Self, _, _event: &SearchBarEvent, cx| {
+                this.view.update(cx, |_, cx| cx.notify());
+                let scrolled = this
+                    .emulator
+                    .with_term(|term| term.grid().display_offset() > 0);
+                if scrolled != this.scrolled_back {
+                    cx.notify();
+                }
+            },
+        ));
         self.search_bar = Some(bar);
         // 开合动画(点按钮与 Ctrl+F 都走这里)
         self.search_reveal.show(cx);
+        self.view.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 
@@ -1189,6 +1236,7 @@ impl TerminalPane {
         self.search_exit = Some(bar);
         self.search_reveal.hide(cx);
         window.focus(&self.focus, cx);
+        self.view.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 
@@ -1428,7 +1476,8 @@ impl TerminalPane {
         });
         self.flash_line(line, cx);
         // 闪烁那一行没变时 `set_flash` 不 notify(同一条标记 300ms 内连跳两次),
-        // 回看位置却可能刚被滚过 —— pane 套着 view 级缓存,这里自己 notify
+        // 回看位置却可能刚被滚过 —— 标脏子视图与外壳
+        self.view.update(cx, |_, cx| cx.notify());
         cx.notify();
         true
     }
@@ -1609,6 +1658,7 @@ impl TerminalPane {
     /// 缓存(`terminal_area::cached_terminal`),不 notify 就要等下一次输出才重画。
     pub fn set_scrollback(&mut self, lines: usize, cx: &mut Context<Self>) {
         self.emulator.set_scrollback(lines);
+        self.view.update(cx, |_, cx| cx.notify());
         cx.notify();
     }
 

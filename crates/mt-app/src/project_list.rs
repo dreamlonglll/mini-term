@@ -60,7 +60,7 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
     ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Pixels, Render, ScrollEvent, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, Window, anchored, canvas, deferred, div,
     prelude::FluentBuilder, px,
 };
@@ -2669,7 +2669,7 @@ impl ProjectList {
             // 滚动偏移交给句柄持有,揭示才滚得动它(见模块注释「揭示」)
             .track_scroll(&self.rows_scroll)
             // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
-            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
+            .on_scroll(cx.listener(|this, _event: &ScrollEvent, _window, cx| {
                 this.close_preview(cx);
             }));
         for item in ordered {

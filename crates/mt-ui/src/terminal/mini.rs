@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::term::cell::Flags;
 use gpui::{
     App, Bounds, ContentMask, Element, ElementId, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Style, TextRun, Window, fill,
+    LayoutId, Pixels, Point, ShapedLine, SharedString, Style, TextRun, Window, fill,
     point, px,
 };
 use mt_terminal::TerminalEmulator;
@@ -355,14 +355,6 @@ impl MiniTerminalElement {
             }
         }
         pieces
-    }
-}
-
-impl IntoElement for MiniTerminalElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 

@@ -51,7 +51,7 @@ use gpui::{
     AnyElement, App, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, CursorStyle,
     DispatchPhase, Entity, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement,
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, PathBuilder, Pixels,
-    Point, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity,
+    Point, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, Task, WeakEntity,
     Window, actions, anchored, canvas, deferred, div, fill, point, prelude::FluentBuilder as _, px,
     size, uniform_list,
 };
@@ -1456,7 +1456,7 @@ fn paint_overlay(
     }
     if snap.active.is_some() {
         let (hitbox, view) = (hitbox.clone(), snap.view.clone());
-        window.on_mouse_event(move |_: &ScrollWheelEvent, phase, window, cx| {
+        window.on_mouse_event(move |_: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                 let _ = view.update(cx, |view, cx| view.close_change_popup(cx));
             }

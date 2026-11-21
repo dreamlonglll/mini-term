@@ -327,14 +327,6 @@ struct Reflowed {
     book: Rc<RefCell<Reflow>>,
 }
 
-impl IntoElement for Reflowed {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for Reflowed {
     type RequestLayoutState = ();
     type PrepaintState = ();

@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Bounds, ContentMask, Corners, DevicePixels, Element, GlobalElementId, ImageAssetLoader,
-    InspectorElementId, IntoElement, LayoutId, Pixels, RenderImage, Resource, Size, Style, Window,
+    InspectorElementId, LayoutId, Pixels, RenderImage, Resource, Size, Style, Window,
     fill, point, px, size,
 };
 
@@ -188,14 +188,6 @@ impl BackgroundArtElement {
                 window.paint_quad(fill(bounds, dim));
             }
         });
-    }
-}
-
-impl IntoElement for BackgroundArtElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 

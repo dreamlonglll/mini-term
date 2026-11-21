@@ -1257,7 +1257,7 @@ mod tests {
             .iter()
             .map(|c| KeyContext::parse(c).unwrap())
             .collect();
-        let first = |ks: &str| {
+        let first = |ks: &'static str| {
             let (bindings, _) = keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &stack);
             bindings[0].action().boxed_clone()
         };

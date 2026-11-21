@@ -235,14 +235,6 @@ pub struct SliderBlock {
     style: Option<Box<dyn FnOnce(Div) -> Div>>,
 }
 
-impl IntoElement for SliderBlock {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 /// 排版时定下的东西:内层元素 + 被放的偏移(prepaint 拿自己的位置减它得参照原点)。
 pub struct SliderLayout {
     inner: AnyElement,

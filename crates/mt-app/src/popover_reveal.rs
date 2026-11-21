@@ -416,14 +416,6 @@ pub struct RevealFramePrepaint {
     hitbox: Option<Hitbox>,
 }
 
-impl IntoElement for RevealFrame {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for RevealFrame {
     type RequestLayoutState = ();
     type PrepaintState = RevealFramePrepaint;
@@ -468,6 +460,9 @@ impl Element for RevealFrame {
             .map_or(0.0, |chrome| f32::from(chrome.border_width));
         let frame = rect.to_bounds();
         let mask = rect.inset(border).to_bounds();
+        // gpui-fast-windows 的子窗口叠在 GPUI 之上:浮层与右键菜单的当前矩形要从
+        // WebView2 的窗口区域里抠掉,避免被网页盖住或穿透点击。
+        crate::native_view::occlude_rect(frame, cx);
 
         let occlude = self.chrome.as_ref().is_some_and(|chrome| chrome.occlude);
         let hover = self.chrome.as_ref().is_some_and(Chrome::hover_dependent);

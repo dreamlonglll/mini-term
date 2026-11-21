@@ -176,7 +176,8 @@ gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 # 本地 HTML 预览与 PDF 页签的系统 WebView(见 `file_viewer::webview` 模块注释)。
-gpui-wry.workspace = true
+gpui-kit.workspace = true
+gpui-webview.workspace = true
 wry.workspace = true
 
 [target.'cfg(windows)'.dependencies]

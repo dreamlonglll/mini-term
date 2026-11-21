@@ -874,7 +874,7 @@ impl TerminalView {
         if self.file_links.is_none() {
             return;
         }
-        let held = event.modifiers.secondary();
+        let held = event.modifiers.secondary(cx);
         if held == self.link_modifier_held {
             return;
         }

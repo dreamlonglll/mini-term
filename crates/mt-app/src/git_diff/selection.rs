@@ -525,14 +525,6 @@ pub(super) struct RecordedText {
     scroll: Point<Pixels>,
 }
 
-impl IntoElement for RecordedText {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl Element for RecordedText {
     type RequestLayoutState = ();
     type PrepaintState = ();
