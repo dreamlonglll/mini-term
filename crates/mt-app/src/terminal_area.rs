@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
+    AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseUpEvent, ParentElement, Pixels, Render, ScrollHandle, SharedString, Size,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, canvas, deferred,
@@ -96,10 +96,11 @@ const FALLBACK_AREA: Size<Pixels> = Size {
 
 /// 分屏进场的滑入偏移(新格子从右滑到位;它没有「旧内容」,不走 push)。
 const SWAP_SLIDE_PX: f32 = 14.0;
-/// 面板切换 / 最大化还原的整块换场时长。
-const AREA_SWAP_MS: u64 = 240;
-/// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作)。
-const TAB_SWAP_MS: u64 = 200;
+/// 面板切换 / 最大化还原的整块换场时长(规格 `mt_ui::motion::AREA_SWAP`;这里的毫秒数
+/// 只给「到点摘除」的计时器用)。
+const AREA_SWAP_MS: u64 = mt_ui::motion::AREA_SWAP.duration.as_millis() as u64;
+/// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作;规格 `TERMINAL_SWAP`)。
+const TAB_SWAP_MS: u64 = mt_ui::motion::TERMINAL_SWAP.duration.as_millis() as u64;
 
 /// 分屏进场滑入这一帧的偏移量。**纯函数**,单测钉在这上面:终点必须精确归零,
 /// 残留半像素会让终端内容永久错位半格。
@@ -2603,14 +2604,12 @@ impl TerminalArea {
         .into_any_element()
     }
 
-    /// 终端区换场动画总开关(设置页「启用动画」)。缺省开启。
-    /// 只闸终端区这批(切 tab/切面板/最大化/拆分);抽屉等浮层动画不归它。
-    fn animations_enabled(&self, cx: &App) -> bool {
-        self.store
-            .read(cx)
-            .config()
-            .terminal_animations
-            .unwrap_or(true)
+    /// 动画总开关(设置页「启用动画」,缺省开启)。2026-11-21 起管**全部**动画,
+    /// 真身是 [`mt_ui::motion::animations_enabled`](与配置的同步见 `crate::motion::sync_switch`)。
+    /// 终端区这批换场在**检测层**就判它(关掉时不记过渡、不起计时器),比让过渡
+    /// 直达终态更省 —— 出场层一帧都不画。
+    fn animations_enabled(&self, _cx: &App) -> bool {
+        mt_ui::motion::animations_enabled()
     }
 
     /// 折叠条的落点:这一组接管铺满,原先铺满的那组缩回折叠区。
@@ -4218,14 +4217,7 @@ fn leaf_terminal_layer(
                                 gpui::SharedString::from(format!(
                                     "tab-exit-{seq}"
                                 )),
-                                Animation::new(
-                                    std::time::Duration::from_millis(
-                                        TAB_SWAP_MS,
-                                    ),
-                                )
-                                .with_easing(ui::cubic_bezier(
-                                    0.16, 1.0, 0.3, 1.0,
-                                )),
+                                mt_ui::motion::TERMINAL_SWAP.animation(),
                                 move |el, delta| {
                                     el.left(gpui::relative(push_exit_x(
                                         dir, delta,
@@ -4244,14 +4236,7 @@ fn leaf_terminal_layer(
                                 gpui::SharedString::from(format!(
                                     "tab-enter-{seq}"
                                 )),
-                                Animation::new(
-                                    std::time::Duration::from_millis(
-                                        TAB_SWAP_MS,
-                                    ),
-                                )
-                                .with_easing(ui::cubic_bezier(
-                                    0.16, 1.0, 0.3, 1.0,
-                                )),
+                                mt_ui::motion::TERMINAL_SWAP.animation(),
                                 move |el, delta| {
                                     el.left(gpui::relative(push_enter_x(
                                         dir, delta,
@@ -4932,10 +4917,7 @@ impl Render for TerminalArea {
             )
             .children(content.map(|c| {
                 // 整块换场:有在场记录才包动画层,否则零包装
-                let mk_anim = || {
-                    Animation::new(std::time::Duration::from_millis(AREA_SWAP_MS))
-                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0))
-                };
+                let mk_anim = || mt_ui::motion::AREA_SWAP.animation();
                 match area_anim {
                     // 整幅竖直 push:出场层(如有)与进场层首尾相接
                     Some((seq, dir, AreaMotion::Push)) => div()

@@ -41,8 +41,6 @@ use gpui::{
 };
 use mt_ui::motion::{Easing, cubic_bezier_at, ease};
 
-use crate::store::AppStore;
-
 /// 打开动画的全程时长(ease-out)。半路掉头时按剩余路程折算。
 pub const REVEAL_OPEN: Duration = Duration::from_millis(220);
 /// 收起动画的全程时长(ease-in)。
@@ -199,14 +197,10 @@ impl Reveal {
     }
 }
 
-/// 终端动画总开关(设置页「启用动画」,缺省开)。与 `terminal_area` 的
-/// `animations_enabled` 读同一项配置。
-pub fn animations_enabled(cx: &App) -> bool {
-    AppStore::global(cx)
-        .read(cx)
-        .config()
-        .terminal_animations
-        .unwrap_or(true)
+/// 动画总开关(设置页「启用动画」,缺省开;管全部动画)。真身是
+/// [`mt_ui::motion::animations_enabled`],由 `crate::motion::sync_switch` 跟配置同步。
+pub fn animations_enabled(_cx: &App) -> bool {
+    mt_ui::motion::animations_enabled()
 }
 
 /// 一个浮层的开合状态 + 原点(标题栏按钮的窗口坐标)。挂在负责画这个浮层的视图上。

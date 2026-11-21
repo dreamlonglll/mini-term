@@ -84,8 +84,6 @@ const SETTINGS_HINT_TTL: Duration = Duration::from_secs(15);
 const MAX_VISIBLE: usize = 5;
 /// 卡片宽度(`styles.css:551`)。
 const CARD_WIDTH: f32 = 280.0;
-/// 进场动画时长(`toastSlideIn 0.25s ease-out`)。
-const SLIDE_IN_MS: u64 = 250;
 
 /// `wsl-info` 那条用的占位项目 id(`App.tsx:369`)。**不参与任何跳转**,
 /// 也不会匹配到真实项目 —— 关项目时的清理因此天然放过它。
@@ -758,8 +756,7 @@ impl Render for ToastLayer {
             stack = stack.child(
                 card.with_animation(
                     SharedString::from(format!("toast-slide-{id}")),
-                    gpui::Animation::new(Duration::from_millis(SLIDE_IN_MS))
-                        .with_easing(ui::cubic_bezier(0.0, 0.0, 0.58, 1.0)),
+                    mt_ui::motion::TOAST_SLIDE_IN.animation(),
                     |el, delta| el.opacity(delta).left(px(CARD_WIDTH * (1.0 - delta))),
                 )
                 .into_any_element(),

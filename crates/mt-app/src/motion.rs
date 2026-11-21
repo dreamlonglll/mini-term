@@ -85,36 +85,57 @@ pub fn probe() -> bool {
 ///
 /// - mt-ui 那道跟随系统:它是逐条动画的判据,豁免与否由各自的
 ///   `respects_reduce` 说了算;
-/// - gpui 那道恒 `false`:它是个「所有 `with_animation` 一刀切按终态画一帧」
-///   的总开关(`gpui-pre-0.3.5/src/elements/animation.rs:407-414`),粒度粗到
-///   无法表达本仓的豁免面 —— 系统口径进它一次,转场就全没了。理由详见模块注释。
+/// - gpui 那道**只跟用户的「启用动画」总开关**(`!animations_enabled`),与系统无关:
+///   它是个「所有 `with_animation` 一刀切按终态画一帧」的闸
+///   (`gpui-pre-0.3.5/src/elements/animation.rs:407-414`),粒度粗到无法表达本仓的
+///   豁免面 —— 系统口径进它一次,转场就全没了(理由详见模块注释)。用户亲手关掉
+///   「启用动画」时要的恰恰是「一刀切」,所以总开关可以、也只有它可以拧这道闸
+///   (2026-11-21 用户拍板「启用动画管全部动画」,组件库内部的动画一并停)。
 ///
 /// 单独拎成纯函数是为了钉住这条口径:日后谁把系统值顺手转发给 gpui 那道闸,
 /// 下面那个用例会红。
-pub(crate) fn gate_values(system_reduce: bool) -> (bool, bool) {
-    (system_reduce, false)
+pub(crate) fn gate_values(system_reduce: bool, animations_enabled: bool) -> (bool, bool) {
+    (system_reduce, !animations_enabled)
 }
 
-/// 启动时探测一次并写进两道闸。返回系统口径(= mt-ui 那道闸的值)。
+/// 启动时探测一次并写进两道闸(总开关先按缺省「开」,配置读出来后由
+/// [`sync_switch`] 校正)。返回系统口径(= mt-ui 那道闸的值)。
 ///
 /// **必须排在 `gpui_component::init` 之后**:接管 gpui 那道闸的前提是
 /// Base 已经把系统值写过一遍(`apply_preference` 靠「闸里还是不是我上次写的值」
 /// 判断应用有没有接管,反过来会被它随后的 init 覆盖回去)。
 pub fn install(cx: &mut gpui::App) -> bool {
-    let (reduce, gpui_reduce) = gate_values(probe());
+    let (reduce, gpui_reduce) = gate_values(probe(), mt_ui::motion::animations_enabled());
     mt_ui::motion::set_reduce_motion(reduce);
     cx.set_reduce_motion(gpui_reduce);
     reduce
 }
 
+/// 把设置页「启用动画」(`terminalAnimations`,缺省开)同步进两处:mt-ui 的总开关与
+/// gpui 那道闸。**返回是否发生了变化**(变了调用方要刷窗口,已经画出来的那一帧
+/// 不会自己更新)。
+///
+/// 调用点:配置加载后一次(`AppStore` 建好时)、每次 `patch_config` 之后、窗口
+/// 重新激活时([`refresh`] 里顺手重按 gpui 那道 —— Linux 上 Base 会跟着门户信号
+/// 改写它,值碰巧与 Base 上次写的相同时它认为自己仍持有这道闸)。
+pub fn sync_switch(enabled: bool, cx: &mut gpui::App) -> bool {
+    let changed = mt_ui::motion::set_animations_enabled(enabled);
+    let (_, gpui_reduce) = gate_values(mt_ui::motion::reduce_motion(), enabled);
+    if cx.reduce_motion() != gpui_reduce {
+        cx.set_reduce_motion(gpui_reduce);
+        return true;
+    }
+    changed
+}
+
 /// 重新探测。**返回是否发生了变化** —— 变了的话调用方要刷一遍窗口,
 /// 否则已经画出来的那一帧不会自己更新。
 ///
-/// 只动 mt-ui 那道闸:gpui 那道在 [`install`] 里被顶成 `false` 之后不会有人
-/// 再写它(Base 只在自己的 `init` 里读一次系统,且已经认了我们的接管),
-/// 所以不必每次激活都重按一遍。
-pub fn refresh() -> bool {
-    mt_ui::motion::set_reduce_motion(probe())
+/// mt-ui 那道跟系统;gpui 那道按当前总开关重按一遍(见 [`sync_switch`])。
+pub fn refresh(cx: &mut gpui::App) -> bool {
+    let reduce_changed = mt_ui::motion::set_reduce_motion(probe());
+    let switch_changed = sync_switch(mt_ui::motion::animations_enabled(), cx);
+    reduce_changed || switch_changed
 }
 
 /// 闸是进程级全局量,**本 crate 里所有要动闸的用例统一走这个夹具**
@@ -155,19 +176,22 @@ mod tests {
         assert!(!probe());
     }
 
-    /// 系统口径只许落在 mt-ui 那道闸上;gpui 那道恒 `false`。
+    /// 系统口径只许落在 mt-ui 那道闸上;gpui 那道只跟用户的总开关。
     ///
     /// 把系统值转发给 gpui 的后果不是「少播几个动画」,而是**所有**
     /// `with_animation` 一刀切按终态画一帧(抽屉、面板换场、页签指示条、
     /// 切终端的整幅推移全部瞬间跳变)—— 本仓的豁免面在那道闸上无从表达。
     #[test]
-    fn gpui_那道闸恒不减少() {
+    fn gpui_那道闸不跟系统只跟总开关() {
         assert_eq!(
-            gate_values(true),
+            gate_values(true, true),
             (true, false),
             "系统要求减少时转场仍须照播"
         );
-        assert_eq!(gate_values(false), (false, false));
+        assert_eq!(gate_values(false, true), (false, false));
+        // 用户亲手关掉「启用动画」:gpui 那道一刀切,组件库内部的动画一并停
+        assert_eq!(gate_values(false, false), (false, true));
+        assert_eq!(gate_values(true, false), (true, true));
     }
 
     /// 两道闸的语义必须对得上:mt-ui 那道置位时,**豁免类**过渡照跑不误 ——

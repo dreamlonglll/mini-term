@@ -70,20 +70,25 @@ pub struct ScrollbarStyle {
 }
 
 impl ScrollbarStyle {
-    /// 过一遍减弱动效的闸:淡出**时长**归零(延迟保留)。
+    /// 过一遍动画总开关:关掉时淡出**时长**归零(延迟保留)。
     ///
-    /// 原版这条滚动条是浏览器原生的、常显不淡出,没有直接对应物;按 `styles.css`
-    /// reduce 段的通配口径处理 —— 「一次性动画保留但压到瞬时」(它压的是
-    /// `animation-duration`,`animation-delay` 不动),所以这里也只把补间干掉,
-    /// 「闲置 0.9s 后收起来」这条时序保持不变。
+    /// 只看设置页「启用动画」,**不看**系统 reduce(2026-11-21 改口径):它不是闪烁类,
+    /// 与其它一次性过渡同属豁免面。关掉时只把补间干掉,「闲置 0.9s 后收起来」这条
+    /// 时序保持不变(与原版 reduce 段「压 `animation-duration`、不动 `animation-delay`」
+    /// 同一手法)。
     pub fn gated(&self) -> Self {
-        if crate::motion::reduce_motion() {
+        self.gated_with(crate::motion::animations_enabled())
+    }
+
+    /// [`gated`](Self::gated) 的纯函数本体(单测不拧进程级总开关)。
+    fn gated_with(&self, animations_enabled: bool) -> Self {
+        if animations_enabled {
+            self.clone()
+        } else {
             Self {
                 fade_duration: Duration::ZERO,
                 ..self.clone()
             }
-        } else {
-            self.clone()
         }
     }
 }
@@ -427,20 +432,34 @@ mod tests {
     }
 
     #[test]
-    fn 减弱动效下淡出瞬时完成但延迟不变() {
+    fn 总开关关掉时淡出瞬时完成但延迟不变() {
         let s = ScrollbarStyle::default();
-        crate::motion::with_reduce(false, || {
-            assert_eq!(s.gated().fade_duration, s.fade_duration, "没开减弱就原样");
-        });
+        assert_eq!(
+            s.gated_with(true).fade_duration,
+            s.fade_duration,
+            "开着就原样"
+        );
+        // 系统 reduce 不再压它(豁免面):只有总开关说了算
         crate::motion::with_reduce(true, || {
-            let g = s.gated();
-            assert!(g.fade_duration.is_zero(), "补间归零");
-            assert_eq!(g.fade_delay, s.fade_delay, "「闲置多久才收」不是动画,不动它");
-            // 延迟内照常全亮,过了延迟直接落到静息值(没有中间帧)
-            assert_eq!(alpha(&g, Duration::from_millis(500), false, false), 1.0);
-            assert_eq!(alpha(&g, Duration::from_millis(901), false, false), g.resting);
-            assert!(!needs_animation_frame(&g, Duration::from_millis(901), false));
+            assert_eq!(s.gated_with(true).fade_duration, s.fade_duration);
         });
+        let g = s.gated_with(false);
+        assert!(g.fade_duration.is_zero(), "补间归零");
+        assert_eq!(
+            g.fade_delay, s.fade_delay,
+            "「闲置多久才收」不是动画,不动它"
+        );
+        // 延迟内照常全亮,过了延迟直接落到静息值(没有中间帧)
+        assert_eq!(alpha(&g, Duration::from_millis(500), false, false), 1.0);
+        assert_eq!(
+            alpha(&g, Duration::from_millis(901), false, false),
+            g.resting
+        );
+        assert!(!needs_animation_frame(
+            &g,
+            Duration::from_millis(901),
+            false
+        ));
     }
 
     #[test]

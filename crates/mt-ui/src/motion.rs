@@ -80,12 +80,30 @@ use std::time::{Duration, Instant};
 use gpui::{AnyWindowHandle, App, EntityId, Subscription, Window, WindowVisibility};
 
 // ─── 闸 ──────────────────────────────────────────────────────
+//
+// 两道闸,来源与粒度都不同:
+//
+// | 闸 | 来源 | 管什么 |
+// |---|---|---|
+// | [`reduce_motion`] | 系统「动画效果」开关(宿主探测写入) | 只管**没被豁免**的那几条([`TransitionSpec::respects_reduce`])+ 闪烁 + spinner 放慢 |
+// | [`animations_enabled`] | 设置页「启用动画」(`terminalAnimations`,宿主同步写入) | **全部**动画:关掉时一次性过渡一律直达终态,闪烁停,spinner 放慢 |
+//
+// 2026-11-21 用户拍板「启用动画开关管全部动画」:此前它只闸终端区换场与三处浮层开合,
+// 抽屉 / 菜单 / 弹窗 / toast / 用量面板各说各话。现在它是全仓唯一的用户口径 ——
+// 走本模块基件([`Transition`] / [`ValueTween`] / [`TweenMap`])的天然服从;
+// 走 `gpui::with_animation` 的那些由宿主把 gpui 自己那道 `App::reduce_motion`
+// 闸跟着它拧(`mt-app::motion::sync_switch`),同样服从。
+//
+// **spinner 关了也只放慢不停**:停住的「进行中」指示器读作卡死,与 reduce 同一口径。
 
 /// 进程级「减少动画」开关。默认 `false`(= 不减少)——非 Windows 平台没有探测
 /// 实现,也就恒定按「系统没开减弱动效」处理。
 static REDUCE_MOTION: AtomicBool = AtomicBool::new(false);
 
-/// 系统是否要求减少动画。所有动画消费方的唯一判据。
+/// 用户的「启用动画」总开关。默认 `true`(配置缺省就是开)。
+static ANIMATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 系统是否要求减少动画。
 pub fn reduce_motion() -> bool {
     REDUCE_MOTION.load(Ordering::Relaxed)
 }
@@ -95,19 +113,40 @@ pub fn set_reduce_motion(reduce: bool) -> bool {
     REDUCE_MOTION.swap(reduce, Ordering::Relaxed) != reduce
 }
 
-/// 闪烁类动画这一帧该不该动。reduce 下恒 `false` —— 状态本身由形状+颜色编码,
-/// 不靠闪烁传达(原版通配规则把 `.animate-blink` / `.animate-pulse` 停在第一帧)。
+/// 用户开没开「启用动画」。关掉 = 全部动画直达终态(spinner 例外,只放慢)。
+pub fn animations_enabled() -> bool {
+    ANIMATIONS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// 写入总开关,返回**是否发生了变化**。只该由宿主的同步点调(见模块注释)。
+pub fn set_animations_enabled(enabled: bool) -> bool {
+    ANIMATIONS_ENABLED.swap(enabled, Ordering::Relaxed) != enabled
+}
+
+/// 闪烁类动画这一帧该不该动。reduce 或总开关关掉时恒 `false` —— 状态本身由
+/// 形状+颜色编码,不靠闪烁传达(原版通配规则把 `.animate-blink` /
+/// `.animate-pulse` 停在第一帧)。
 pub fn blinks() -> bool {
-    !reduce_motion()
+    blinks_with(reduce_motion(), animations_enabled())
+}
+
+/// [`blinks`] 的纯函数本体(单测不碰进程级闸:别的用例在并发读它)。
+fn blinks_with(reduced: bool, enabled: bool) -> bool {
+    !reduced && enabled
 }
 
 /// reduce 下「进行中」指示器的旋转周期(`styles.css:409-413` 的 2.4s)。
 pub const REDUCED_SPIN_PERIOD: Duration = Duration::from_millis(2400);
 
 /// 旋转周期过闸。**不会返回 0** —— 一个停住的 spinner 不是「安静」,是在说谎
-/// (看上去就是卡死),所以 reduce 下只放慢不停。
+/// (看上去就是卡死),所以 reduce / 总开关关掉时只放慢不停。
 pub fn spin_period(base: Duration) -> Duration {
-    if reduce_motion() {
+    spin_period_with(base, reduce_motion(), animations_enabled())
+}
+
+/// [`spin_period`] 的纯函数本体。
+fn spin_period_with(base: Duration, reduced: bool, enabled: bool) -> Duration {
+    if reduced || !enabled {
         REDUCED_SPIN_PERIOD
     } else {
         base
@@ -487,9 +526,15 @@ impl TransitionSpec {
         }
     }
 
-    /// 这一帧的进度(已缓动)。`reduced` 由调用方给,便于单测。
-    pub fn progress_at(&self, elapsed: Duration, reduced: bool) -> f32 {
-        if (reduced && self.respects_reduce) || self.duration.is_zero() {
+    /// 这条规格这一刻是否**直达终态**:总开关关掉(一律)、系统 reduce 且本条不豁免、
+    /// 或时长为 0。两道闸的值由调用方给,便于单测。
+    pub fn skipped(&self, reduced: bool, enabled: bool) -> bool {
+        !enabled || (reduced && self.respects_reduce) || self.duration.is_zero()
+    }
+
+    /// 这一帧的进度(已缓动)。两道闸的值由调用方给,便于单测。
+    pub fn progress_with(&self, elapsed: Duration, reduced: bool, enabled: bool) -> f32 {
+        if self.skipped(reduced, enabled) {
             return 1.0;
         }
         let t = elapsed.as_secs_f32() / self.duration.as_secs_f32();
@@ -501,11 +546,38 @@ impl TransitionSpec {
     }
 
     /// 还在跑吗(= 还要不要请求下一帧)。终态之后恒 `false`,这是本基件存在的理由。
+    pub fn running_with(&self, elapsed: Duration, reduced: bool, enabled: bool) -> bool {
+        !self.skipped(reduced, enabled) && elapsed < self.duration
+    }
+
+    /// [`progress_with`](Self::progress_with) 的「总开关开着」特例(只看系统 reduce)。
+    pub fn progress_at(&self, elapsed: Duration, reduced: bool) -> f32 {
+        self.progress_with(elapsed, reduced, true)
+    }
+
+    /// [`running_with`](Self::running_with) 的「总开关开着」特例(只看系统 reduce)。
     pub fn running_at(&self, elapsed: Duration, reduced: bool) -> bool {
-        if (reduced && self.respects_reduce) || self.duration.is_zero() {
-            return false;
+        self.running_with(elapsed, reduced, true)
+    }
+
+    /// 按**当前**两道闸取进度 —— 运行期的消费方一律走这个(或 [`Transition`])。
+    pub fn progress_live(&self, elapsed: Duration) -> f32 {
+        self.progress_with(elapsed, reduce_motion(), animations_enabled())
+    }
+
+    /// 按**当前**两道闸判还在不在跑。
+    pub fn running_live(&self, elapsed: Duration) -> bool {
+        self.running_with(elapsed, reduce_motion(), animations_enabled())
+    }
+
+    /// 换成 `gpui::Animation`(给仍走 `with_animation` 的调用点用:时长与曲线
+    /// 只在本模块定义一次)。总开关由宿主拧 gpui 那道闸兜住,这里不判。
+    pub fn animation(&self) -> gpui::Animation {
+        let anim = gpui::Animation::new(self.duration);
+        match self.easing.control_points() {
+            None => anim,
+            Some((x1, y1, x2, y2)) => anim.with_easing(move |t| cubic_bezier_at(x1, y1, x2, y2, t)),
         }
-        elapsed < self.duration
     }
 }
 
@@ -547,6 +619,30 @@ pub const TOAST_SLIDE_IN: TransitionSpec =
 /// 豁免它 —— 与 toast 同一档,reduce 下由通配规则压成瞬时。
 pub const TAG_FADE_IN: TransitionSpec =
     TransitionSpec::new(Duration::from_millis(300), Easing::EaseOut);
+
+// ── 2026-11-21 动画打磨一批补的规格(全部豁免 reduce,全部服从总开关) ──
+//
+// 此前这些时长散落在 `main.rs` / `terminal_area.rs` / `toast.rs` 的硬编码毫秒与
+// 手写 `cubic_bezier` 里,改口径必漏。新加动画一律从这里取,别再写毫秒字面量。
+
+/// 终端区整块换场:切面板(上下推)/ 最大化开合 / 关分屏后邻居扩到位。
+pub const AREA_SWAP: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(240), Easing::EaseOutExpo);
+/// 非终端内容的整幅换场:抽屉换面板、设置页切页、会话面板下钻、文件页「预览 / 源码」、
+/// 日期翻月。与 [`TERMINAL_SWAP`] 同档,单列一条是为了两边能各自调。
+pub const PANEL_SWAP: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(200), Easing::EaseOutExpo);
+/// 列表里的条目被挤动后补位(FLIP:tab chip 新建 / 关闭 / 拖拽落位,toast 叠放重排)。
+pub const LIST_REFLOW: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(200), Easing::EaseOutExpo);
+/// 开关滑块左右走位 + 底色过渡。
+pub const TOGGLE_KNOB: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(160), Easing::EaseOutExpo);
+/// 折叠箭头旋转(与 [`SECTION_TOGGLE`] 同时长,箭头要与区块同步到位)。
+pub const CHEVRON_ROTATE: TransitionSpec = SECTION_TOGGLE;
+/// toast 退场:向右滑出屏外。比进场短,与 [`OVERLAY_OUT`] 同一条缓动。
+pub const TOAST_SLIDE_OUT: TransitionSpec =
+    TransitionSpec::exempt(Duration::from_millis(180), Easing::EaseOverlayOut);
 
 // ─── 关键帧的 gpui 近似 ──────────────────────────────────────
 
@@ -638,13 +734,13 @@ impl Transition {
         self.start.elapsed()
     }
 
-    /// 这一帧的进度(已缓动、已过闸)。
+    /// 这一帧的进度(已缓动、已过两道闸)。
     pub fn progress(&self) -> f32 {
-        self.spec.progress_at(self.elapsed(), reduce_motion())
+        self.spec.progress_live(self.elapsed())
     }
 
     pub fn running(&self) -> bool {
-        self.spec.running_at(self.elapsed(), reduce_motion())
+        self.spec.running_live(self.elapsed())
     }
 
     /// 取进度 + 没跑完就请求下一帧。**render 里只调这一个**。
@@ -701,13 +797,13 @@ impl ValueTween {
 
     pub fn value_at(&self, now: Instant) -> f32 {
         let elapsed = now.saturating_duration_since(self.start);
-        let p = self.spec.progress_at(elapsed, reduce_motion());
+        let p = self.spec.progress_live(elapsed);
         self.from + (self.to - self.from) * p
     }
 
     pub fn running_at(&self, now: Instant) -> bool {
         self.spec
-            .running_at(now.saturating_duration_since(self.start), reduce_motion())
+            .running_live(now.saturating_duration_since(self.start))
     }
 
     pub fn target(&self) -> f32 {
@@ -814,6 +910,50 @@ mod tests {
             assert!(reduce_motion());
             assert!(!blinks(), "reduce 下闪烁必须停");
         });
+    }
+
+    /// 总开关关掉:闪烁停、spinner 只放慢不停(与 reduce 同口径)。
+    /// 走纯函数 —— 进程级总开关别的用例在并发读,不在单测里拧它。
+    #[test]
+    fn 总开关关掉时闪烁停_spinner_放慢() {
+        let base = Duration::from_millis(900);
+        assert!(blinks_with(false, true));
+        assert!(!blinks_with(false, false), "总开关关掉闪烁必须停");
+        assert!(!blinks_with(true, true));
+        assert_eq!(spin_period_with(base, false, true), base);
+        assert_eq!(spin_period_with(base, false, false), REDUCED_SPIN_PERIOD);
+        assert!(
+            !spin_period_with(base, false, false).is_zero(),
+            "关了也不许停转"
+        );
+    }
+
+    /// 总开关关掉:豁免与否一律直达终态 —— 这正是它与系统 reduce 的区别。
+    #[test]
+    fn 总开关关掉时豁免的也直达终态() {
+        let normal = TransitionSpec::new(Duration::from_millis(250), Easing::EaseOut);
+        let exempt = TransitionSpec::exempt(Duration::from_millis(250), Easing::EaseOut);
+        let half = Duration::from_millis(125);
+        for spec in [normal, exempt] {
+            for reduced in [false, true] {
+                assert_eq!(spec.progress_with(half, reduced, false), 1.0, "{spec:?}");
+                assert!(
+                    !spec.running_with(Duration::ZERO, reduced, false),
+                    "{spec:?}"
+                );
+                assert!(spec.skipped(reduced, false));
+            }
+        }
+        // 开着时与只看 reduce 的旧入口同语义
+        assert_eq!(
+            exempt.progress_with(half, true, true),
+            exempt.progress_at(half, true)
+        );
+        assert!(exempt.running_with(half, true, true));
+        assert!(
+            !normal.running_with(half, true, true),
+            "不豁免的照旧过 reduce 闸"
+        );
     }
 
     #[test]
@@ -969,6 +1109,13 @@ mod tests {
             USAGE_FADE_IN,
             RANK_BAR,
             TOAST_SLIDE_IN,
+            // 11-21 打磨批补的规格:转场类,一律豁免
+            AREA_SWAP,
+            PANEL_SWAP,
+            LIST_REFLOW,
+            TOGGLE_KNOB,
+            CHEVRON_ROTATE,
+            TOAST_SLIDE_OUT,
         ] {
             assert!(!exempt.respects_reduce, "{exempt:?} 应属豁免面");
         }

@@ -96,6 +96,7 @@ mod mobile_panel;
 mod mobile_relay;
 mod modal;
 mod motion;
+mod motion_kit;
 mod native_view;
 mod notify;
 mod overlay;
@@ -296,12 +297,9 @@ const DEFAULT_COLUMNS: [f64; 2] = [520.0, 1000.0];
 const DEFAULT_MIDDLE: [f64; 2] = [320.0, 380.0];
 
 /// 浮层退场后 DOM 还留多久(`src/hooks/useOverlayMotion.ts:19` 的 `OVERLAY_EXIT_MS`)。
+/// 动画时长本身一律取 `mt_ui::motion` 的规格常量(`OVERLAY_IN` / `OVERLAY_OUT` /
+/// `PANEL_SWAP` / `TAB_INDICATOR`),这里只是驻留时长。
 const OVERLAY_EXIT_MS: u64 = 400;
-/// `--motion-overlay-in` / `--motion-overlay-out` / `--motion-terminal-swap`
-/// (`styles.css:67-78`)。
-const MOTION_OVERLAY_IN_MS: u64 = 240;
-const MOTION_OVERLAY_OUT_MS: u64 = 140;
-const MOTION_PANEL_SWAP_MS: u64 = 200;
 
 /// 应用数据目录:`config.db`(配置本体)、`layout.db`(界面布局)、
 /// `config.json`(给 sidecar 读的 SSH 投影)、`hook-server.json` 的落点。
@@ -570,7 +568,7 @@ impl Workspace {
             redraw::set_window_active(active, cx);
             // 顺手重探一次「减少动画」:用户多半是切到系统设置里改完再切回来的。
             // 变了才刷窗口(闪烁类动画的挂/摘只发生在 render 里)。
-            if active && motion::refresh() {
+            if active && motion::refresh(cx) {
                 cx.refresh_windows();
             }
         });
@@ -1639,10 +1637,7 @@ impl Workspace {
                     )
                     .with_animation(
                         "git-detail-slide-in",
-                        gpui::Animation::new(std::time::Duration::from_millis(
-                            MOTION_OVERLAY_IN_MS,
-                        ))
-                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                        mt_ui::motion::OVERLAY_IN.animation(),
                         move |el, delta| el.left(px(width * (1.0 - delta))),
                     ),
             )
@@ -1680,8 +1675,7 @@ impl Workspace {
                     .bg(ui::accent_subtle())
                     .with_animation(
                         SharedString::from(format!("drawer-tab-slide-{}", panel.key())),
-                        gpui::Animation::new(std::time::Duration::from_millis(220))
-                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                        mt_ui::motion::TAB_INDICATOR.animation(),
                         move |el, delta| {
                             // 起点是另一半,终点是自己那一半
                             let from = if to_git { 0.0 } else { 0.5 };
@@ -2431,10 +2425,7 @@ impl Render for Workspace {
                         .child(content)
                         .with_animation(
                             SharedString::from(format!("panel-swap-{}", panel.key())),
-                            gpui::Animation::new(std::time::Duration::from_millis(
-                                MOTION_PANEL_SWAP_MS,
-                            ))
-                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                            mt_ui::motion::PANEL_SWAP.animation(),
                             // `panelSwapIn`:opacity 0→1 且 translateX(10px)→0
                             |el, delta| el.opacity(delta).ml(px(10.0 * (1.0 - delta))),
                         ),
@@ -2472,16 +2463,11 @@ impl Render for Workspace {
                     } else {
                         "drawer-slide-in"
                     }),
-                    gpui::Animation::new(std::time::Duration::from_millis(if leaving {
-                        MOTION_OVERLAY_OUT_MS
+                    if leaving {
+                        mt_ui::motion::OVERLAY_OUT.animation()
                     } else {
-                        MOTION_OVERLAY_IN_MS
-                    }))
-                    .with_easing(if leaving {
-                        ui::cubic_bezier(0.4, 0.0, 0.9, 0.6)
-                    } else {
-                        ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)
-                    }),
+                        mt_ui::motion::OVERLAY_IN.animation()
+                    },
                     move |el, delta| {
                         let offset = if leaving { delta } else { 1.0 - delta };
                         el.right(px(-width * offset))
