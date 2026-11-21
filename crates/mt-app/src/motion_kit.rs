@@ -40,9 +40,6 @@
 //! (flex_1 / size_full 链条),否则容器塌成 0 高。内容高度由内容决定的场合(滚动列表里
 //! 的一段)别用它。
 
-// 打磨批的地基先落、各处调用点随后接入;全部接上后删掉这一行
-#![allow(dead_code)]
-
 use gpui::{AnyElement, Div, InteractiveElement, IntoElement, ParentElement, Styled, Window, div};
 use mt_ui::motion::{Transition, TransitionSpec};
 
@@ -159,7 +156,8 @@ impl<K: Clone + PartialEq> KeyedSwap<K> {
         Some((previous, progress, self.dir))
     }
 
-    /// 还在换场吗(不要帧,只判)。
+    /// 还在换场吗(不要帧,只判)。目前只有单测在问。
+    #[cfg(test)]
     pub fn in_flight(&self) -> bool {
         self.previous.is_some() && self.transition.running()
     }

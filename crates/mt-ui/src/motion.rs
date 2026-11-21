@@ -466,9 +466,8 @@ pub fn ease(easing: Easing, t: f32) -> f32 {
 /// 的三次贝塞尔,给定 `x` 先**二分**反解 `t` 再取 `y(t)`。二分 20 次精度 1e-6,
 /// 比牛顿法慢但恒收敛(控制点在 0..1 之外时牛顿法会跑飞)。
 ///
-/// ⚠️ mt-app 的 `ui::cubic_bezier` 是同一算法的另一份实现(它返回闭包喂给
-/// `gpui::Animation::with_easing`)。两份都很短,合并要动 ui.rs 的公开签名,
-/// 留作技术债。
+/// 全仓唯一一份:mt-app 原先那份 `ui::cubic_bezier` 已删,`with_animation` 的缓动由
+/// [`TransitionSpec::animation`] 包这一个函数给出。
 pub fn cubic_bezier_at(x1: f32, y1: f32, x2: f32, y2: f32, x: f32) -> f32 {
     fn bezier(a: f32, b: f32, t: f32) -> f32 {
         let u = 1.0 - t;

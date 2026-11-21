@@ -597,46 +597,9 @@ pub fn diff_gray_edge() -> Hsla {
     alpha(token(|p| p.text_muted), 0.6)
 }
 
-// --- 缓动 ---
-
-/// CSS `cubic-bezier(x1, y1, x2, y2)` 的等价缓动函数。
-///
-/// `styles.css:67-78` 那两条浮层缓动(`--ease-overlay-in:
-/// cubic-bezier(0.16, 1, 0.3, 1)` / `--ease-overlay-out:
-/// cubic-bezier(0.4, 0, 0.9, 0.6)`)在 gpui 侧没有现成对应物,
-/// `Animation::with_easing` 又只要一个 `Fn(f32) -> f32`,于是自己解一次。
-///
-/// 做法与浏览器一致:x(t) 与 y(t) 都是控制点为 `(0,0) (x1,y1) (x2,y2) (1,1)`
-/// 的三次贝塞尔,给定 `x` 先用二分法反解 `t`,再取 `y(t)`。
-/// 二分 20 次的精度是 1e-6,对 240ms 的动画绰绰有余(比牛顿法慢但恒收敛 ——
-/// 控制点在 0..1 外时牛顿法会跑飞)。
-pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> impl Fn(f32) -> f32 {
-    fn bezier(a: f32, b: f32, t: f32) -> f32 {
-        let u = 1.0 - t;
-        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
-    }
-    move |x: f32| {
-        let x = x.clamp(0.0, 1.0);
-        if x <= 0.0 {
-            return 0.0;
-        }
-        if x >= 1.0 {
-            return 1.0;
-        }
-        let (mut lo, mut hi) = (0.0f32, 1.0f32);
-        let mut t = x;
-        for _ in 0..20 {
-            let sample = bezier(x1, x2, t);
-            if sample < x {
-                lo = t;
-            } else {
-                hi = t;
-            }
-            t = (lo + hi) * 0.5;
-        }
-        bezier(y1, y2, t)
-    }
-}
+// 缓动曲线不在这里:时长与曲线一律取 `mt_ui::motion` 的规格常量
+// (`TransitionSpec::animation()` 给 `with_animation` 用,`cubic_bezier_at` 是解算本体)。
+// 原先这里另有一份 `cubic_bezier`,2026-11-21 动画打磨批统一取规格后已无调用方,删了。
 
 // --- 复用小件 ---
 //
@@ -1334,31 +1297,6 @@ mod tests {
             highlight_runs("你好世界", &[(1, 3)]),
             vec![("你".into(), false), ("好世".into(), true), ("界".into(), false)]
         );
-    }
-
-    /// 缓动曲线:两端钉死、单调不回头、`ease-overlay-in` 前段就冲得很快
-    /// (`cubic-bezier(0.16, 1, 0.3, 1)` 是「快出慢收」)。
-    #[test]
-    fn 三次贝塞尔缓动() {
-        let ease_in = cubic_bezier(0.16, 1.0, 0.3, 1.0);
-        assert_eq!(ease_in(0.0), 0.0);
-        assert_eq!(ease_in(1.0), 1.0);
-        assert_eq!(ease_in(-1.0), 0.0, "越界要夹住");
-        assert_eq!(ease_in(2.0), 1.0);
-        // 单调
-        let mut prev = 0.0;
-        for i in 0..=20 {
-            let v = ease_in(i as f32 / 20.0);
-            assert!(v >= prev - 1e-4, "缓动必须单调:{prev} → {v}");
-            prev = v;
-        }
-        // 快出:走到一半时间已经完成大半位移
-        assert!(ease_in(0.5) > 0.8, "{}", ease_in(0.5));
-
-        // ease-overlay-out 是「慢出快收」,半程时位移不到一半
-        let ease_out = cubic_bezier(0.4, 0.0, 0.9, 0.6);
-        assert!(ease_out(0.5) < 0.5, "{}", ease_out(0.5));
-        assert_eq!(ease_out(1.0), 1.0);
     }
 
     /// 坏区间(越界 / 逆序 / 重叠)跳过而不是 panic。
