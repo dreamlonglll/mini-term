@@ -331,10 +331,9 @@ impl HostState {
 
     /// 每帧现算位置档(开着的层)。
     fn assign_slots(&mut self) {
-        let mut open_below = 0;
-        for layer in self.layers.iter_mut().filter(|layer| !layer.closing) {
+        let open = self.layers.iter_mut().filter(|layer| !layer.closing);
+        for (open_below, layer) in open.enumerate() {
             layer.slot = open_below;
-            open_below += 1;
         }
     }
 }
