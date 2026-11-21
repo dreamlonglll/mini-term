@@ -977,7 +977,7 @@ impl RelayBridge {
         }
     }
 
-        /// 刷新 [`RelayHost`] 用的镜像快照(主线程写,tokio 线程读)。
+    /// 刷新 [`RelayHost`] 用的镜像快照(主线程写,tokio 线程读)。
     fn refresh_mirror(&mut self, cx: &mut Context<Self>) {
         let store = self.store.read(cx);
         let launchers = store
@@ -1567,7 +1567,10 @@ mod tests {
         assert_eq!(live.get("s-work").map(String::as_str), Some("p-work"));
         assert_eq!(live.get("s-idle-ai").map(String::as_str), Some("p-idle-ai"));
         assert_eq!(by_pty.len(), 2);
-        assert_eq!(by_pty.get(&1).map(|h| h.session_id.as_str()), Some("s-work"));
+        assert_eq!(
+            by_pty.get(&1).map(|h| h.session_id.as_str()),
+            Some("s-work")
+        );
         assert_eq!(
             by_pty.get(&2).map(|h| h.session_id.as_str()),
             Some("s-idle-ai")

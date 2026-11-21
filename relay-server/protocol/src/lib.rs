@@ -853,7 +853,10 @@ mod tests {
             (StartSessionFailReason::LauncherNotFound, r#""launcherNotFound""#),
             (StartSessionFailReason::NotSupported, r#""notSupported""#),
             (StartSessionFailReason::SpawnFailed, r#""spawnFailed""#),
-            (StartSessionFailReason::SessionNotFound, r#""sessionNotFound""#),
+            (
+                StartSessionFailReason::SessionNotFound,
+                r#""sessionNotFound""#,
+            ),
             (
                 StartSessionFailReason::ResumeUnsupported,
                 r#""resumeUnsupported""#,
@@ -877,7 +880,10 @@ mod tests {
                 && json.contains(r#""projectId":"p1""#),
             "{json}"
         );
-        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), req_list);
+        assert_eq!(
+            serde_json::from_str::<MobileToRelay>(&json).unwrap(),
+            req_list
+        );
 
         let res_list = DesktopToRelay::SessionHistory {
             request_id: "h-1".into(),
@@ -904,7 +910,10 @@ mod tests {
                 && !json.contains("reason"),
             "{json}"
         );
-        assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), res_list);
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(&json).unwrap(),
+            res_list
+        );
 
         let req_content = MobileToRelay::RequestSessionContent {
             request_id: "c-1".into(),
@@ -971,7 +980,10 @@ mod tests {
                 && !json.contains("command"),
             "{json}"
         );
-        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), resume);
+        assert_eq!(
+            serde_json::from_str::<MobileToRelay>(&json).unwrap(),
+            resume
+        );
 
         for (reason, expected) in [
             (HistoryFailReason::DesktopOffline, r#""desktopOffline""#),

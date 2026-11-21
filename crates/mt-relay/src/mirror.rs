@@ -163,7 +163,11 @@ impl MirrorParser {
                 self.parse_line(line, &mut out);
             }
         }
-        if let Some(raw) = self.grok.as_mut().and_then(ai_sessions::GrokUpdateParser::flush) {
+        if let Some(raw) = self
+            .grok
+            .as_mut()
+            .and_then(ai_sessions::GrokUpdateParser::flush)
+        {
             let msg = self.next_text_message(raw);
             out.push(msg);
         }

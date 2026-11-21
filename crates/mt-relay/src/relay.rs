@@ -17,8 +17,8 @@ use mt_ai::AgentKind;
 use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{
     CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason, MirrorMessage,
-    MobileHistorySession, MobileLauncher, MobilePane, MobileProject, RelayToDesktop,
-    StartSessionFailReason, PROTOCOL_VERSION,
+    MobileHistorySession, MobileLauncher, MobilePane, MobileProject, PROTOCOL_VERSION,
+    RelayToDesktop, StartSessionFailReason,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1335,12 +1335,7 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             session_id,
             before_seq,
         }) => handle_request_session_content(
-            manager,
-            request_id,
-            project_id,
-            agent,
-            session_id,
-            before_seq,
+            manager, request_id, project_id, agent, session_id, before_seq,
         ),
         // 移动端基于历史会话继续对话:校验归属与白名单、反查 cwd 后交给上层建 pane
         Ok(RelayToDesktop::ResumeAiSession {
@@ -1625,9 +1620,9 @@ fn handle_request_session_content(
         let loaded = tokio::task::spawn_blocking(move || {
             let sessions = mt_ai::sessions::get_ai_sessions(path.clone())
                 .map_err(|_| HistoryFailReason::ReadFailed)?;
-            let belongs = sessions.iter().any(|s| {
-                s.id == sid && AgentKind::parse(&s.session_type) == Some(kind)
-            });
+            let belongs = sessions
+                .iter()
+                .any(|s| s.id == sid && AgentKind::parse(&s.session_type) == Some(kind));
             if !belongs {
                 return Err(HistoryFailReason::SessionNotFound);
             }
@@ -1683,7 +1678,11 @@ fn handle_resume_ai_session(
     session_id: String,
 ) {
     let Some(project) = manager.host.project(&project_id) else {
-        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::ProjectNotFound));
+        manager.send_start_receipt(
+            request_id,
+            None,
+            Some(StartSessionFailReason::ProjectNotFound),
+        );
         return;
     };
     if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
@@ -1765,7 +1764,11 @@ fn handle_start_ai_session(
     launcher_id: String,
 ) {
     let Some(project) = manager.host.project(&project_id) else {
-        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::ProjectNotFound));
+        manager.send_start_receipt(
+            request_id,
+            None,
+            Some(StartSessionFailReason::ProjectNotFound),
+        );
         return;
     };
     if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
@@ -3809,8 +3812,14 @@ mod tests {
             },
         );
         let manager = MobileRelayManager::new(host, Arc::new(NoopRelayHost));
-        manager.pane_paths.lock().insert("pane-1".into(), r"D:\proj".into());
-        manager.pane_paths.lock().insert("pane-2".into(), r"D:\proj".into());
+        manager
+            .pane_paths
+            .lock()
+            .insert("pane-1".into(), r"D:\proj".into());
+        manager
+            .pane_paths
+            .lock()
+            .insert("pane-2".into(), r"D:\proj".into());
         manager.pane_ptys.lock().insert("pane-1".into(), 7);
         manager.pane_ptys.lock().insert("pane-2".into(), 8);
 
