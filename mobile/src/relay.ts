@@ -3,7 +3,13 @@
  *
  * - 扫码首连:URL hash 携带一次性配对码(#pair=CODE),兑换长期凭证存 localStorage
  * - 配对码兑换不了(过期 / 已兑换过 / 书签里存的是配对链接)而本地有凭证:退回凭证重连
- * - 重开/断线:凭凭证自动重连(指数退避,封顶 30s;页面回前台立即重试)
+ * - 重开/断线:凭凭证自动重连(指数退避,封顶 30s;页面回前台 / 网络恢复立即重试)
+ * - 握手限时:建连到 helloAck 超过 {@link HANDSHAKE_TIMEOUT_MS} 就断开重来,不干等浏览器超时
+ * - 后台久了回前台:连接多半已被系统或中间网络掐掉,却可能还显示「已连接」(半开),
+ *   直接重连,见 {@link STALE_AFTER_HIDDEN_MS}
+ * - 镜像订阅以「这条连接上收到的结构快照」为准:桌面端每次连上中转都会推一份快照,
+ *   收到就把正在看的会话重新订阅一次。桌面端断线时会撤掉全部镜像订阅,中转也不替它
+ *   重放,不这样做的话桌面端断过一次,镜像页就再也收不到内容(一直「加载中」)
  * - 被吊销(新设备顶替/桌面端重置):清除凭证,提示重新扫码,不再重连
  * - 通知深链:桌面端远程通知附的 `#pane=ID`,连上后在快照里找到该 pane 就直接进它的
  *   对话镜像;找不到(会话已结束)停在列表页
@@ -33,6 +39,20 @@ const CRED_KEY = 'mt-mobile-credential';
  * 杀掉的破坏性大于留着。
  */
 const START_SESSION_TIMEOUT_MS = 15_000;
+
+/**
+ * 建连 + 握手(收到 helloAck)的上限。浏览器自己的 WebSocket 建连超时动辄几十秒到
+ * 几分钟,期间界面一直是「连接中」;到点就关掉,交给断线重连的退避重试。
+ */
+const HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * 页面在后台待了这么久,回前台就直接重连。手机切后台后系统会冻结或掐掉连接,
+ * 中间网络也会回收空闲连接;浏览器不一定马上报 close,界面还显示「已连接」,
+ * 发出去的订阅 / 指令却石沉大海。协议里没有应用层心跳可以探活,重连是最直接的
+ * 「重新对齐」:握手后桌面端会推完整快照,正在看的会话随之重订阅。
+ */
+const STALE_AFTER_HIDDEN_MS = 30_000;
 
 export type Phase =
   | 'idle' // 无配对码也无凭证:提示去桌面端扫码
@@ -219,6 +239,10 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
   const socket = new WebSocket(wsUrl());
   ws = socket;
   let handshakeDone = false;
+  // 到点还没握手成功:关掉,走 onclose 的退避重连(CONNECTING 态 close 也会触发 onclose)
+  const handshakeTimer = setTimeout(() => {
+    if (!handshakeDone && ws === socket) socket.close();
+  }, HANDSHAKE_TIMEOUT_MS);
 
   socket.onopen = () => {
     const hello: MobileHello = {
@@ -240,14 +264,12 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
     switch (msg.type) {
       case 'helloAck': {
         handshakeDone = true;
+        clearTimeout(handshakeTimer);
         reconnectAttempt = 0;
         if (msg.credential) saveCredential(msg.credential);
         setPhase('connected');
-        // 断线前若在看某个镜像:重连后自动恢复订阅(桌面端会重发快照)
-        const { mirror } = useRelayStore.getState();
-        if (mirror && !mirror.closed) {
-          sendToRelay({ type: 'subscribePane', paneId: mirror.paneId });
-        }
+        // 断线前在看的镜像不在这里重订阅:桌面端在线时中转会请它回发结构快照,
+        // 收到快照再订阅(见 sessionsSnapshot 分支);桌面端不在线时订阅本来就到不了它
         break;
       }
       case 'helloReject': {
@@ -281,12 +303,19 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
           finishStart('desktopOffline');
         }
         break;
-      case 'sessionsSnapshot':
+      case 'sessionsSnapshot': {
         useRelayStore.setState({
           projects: msg.projects,
           launchers: msg.launchers ?? [],
         });
         snapshotReady = true;
+        // 全量快照 = 桌面端刚连上中转(或应本连接的握手请求回发):它那边的镜像订阅
+        // 此时是空的(断线即撤),正在看的会话要重新订阅一次,桌面端会回发镜像快照。
+        // 要在 onProjectsChanged 之前做:那里可能为刚发起的会话 openMirror,那次自带订阅
+        const { mirror } = useRelayStore.getState();
+        if (mirror && !mirror.closed) {
+          sendToRelay({ type: 'subscribePane', paneId: mirror.paneId });
+        }
         onProjectsChanged();
         if (pendingPaneId) {
           const paneId = pendingPaneId;
@@ -294,6 +323,7 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
           openPaneLink(paneId);
         }
         break;
+      }
       case 'sessionsDelta': {
         const { projects } = useRelayStore.getState();
         const removed = new Set(msg.removedProjectIds);
@@ -397,6 +427,7 @@ function connect(auth: { pairingCode?: string; credential?: string; staleCode?: 
   };
 
   socket.onclose = () => {
+    clearTimeout(handshakeTimer);
     if (ws !== socket) return; // 已被新连接取代
     ws = null;
     if (stopped) return;
@@ -682,13 +713,37 @@ window.addEventListener('hashchange', () => {
   }
 });
 
-// 手机浏览器切后台常导致连接被杀:回前台且处于重连等待时立即重试
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return;
+/** 页面最近一次转入后台的时刻;null = 在前台。 */
+let hiddenAt: number | null = null;
+
+/** 正处于断线重连的退避等待里:不等了,立即重连。 */
+function reconnectNowIfWaiting() {
   const { phase } = useRelayStore.getState();
   if (phase === 'reconnecting' && !ws) {
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
     const cred = getCredential();
     if (cred) connect({ credential: cred });
   }
+}
+
+// 手机浏览器切后台常导致连接被杀:回前台时,待得久就直接重连(连接多半已死却未必
+// 报 close,见 STALE_AFTER_HIDDEN_MS),否则只在处于重连等待时立即重试
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    hiddenAt = Date.now();
+    return;
+  }
+  const hiddenFor = hiddenAt === null ? 0 : Date.now() - hiddenAt;
+  hiddenAt = null;
+  const { phase } = useRelayStore.getState();
+  const live = phase === 'connected' || phase === 'connecting' || phase === 'reconnecting';
+  if (hiddenFor >= STALE_AFTER_HIDDEN_MS && live && !stopped) {
+    refreshSessions();
+    return;
+  }
+  reconnectNowIfWaiting();
 });
+
+// 网络恢复(切 Wi-Fi / 蜂窝、出电梯):在退避等待里就别等到点了
+window.addEventListener('online', reconnectNowIfWaiting);
