@@ -1174,6 +1174,16 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// 让终端子视图重画:只给视图实体标脏(与在它的 update 里 `cx.notify()` 等价),
+    /// **不借用**视图。
+    ///
+    /// ⚠️ 别写回 `self.view.update(cx, |_, cx| cx.notify())`:按键 / 粘贴经
+    /// `TerminalView::on_input` 回调进 [`Self::write`] 时视图正被借用着,同实体嵌套
+    /// update 当场 panic —— 内置 SSH 建连中按 Ctrl+C 取消 → 收场 / 退出 → 刷视图,E2E 实测崩过。
+    fn notify_view(&self, cx: &mut App) {
+        cx.notify(self.view.entity_id());
+    }
+
     /// 子进程退出:退出条 + 上报。只从「回填之后」的路径进来(见 `PtySlot::note_exit`)。
     fn emit_exit(&mut self, code: Option<u32>, cx: &mut Context<Self>) {
         self.exited = true;
@@ -1182,7 +1192,7 @@ impl TerminalPane {
         self.disarm_quick_ssh(cx);
         cx.emit(PaneEvent::Exited(code));
         // 同步刷新终端子视图,确保进程退出前同一批输出的最后几行必刷出而不被节拍/缓存吞掉
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         // 退出是一次性事件:不进节拍器,当场画完收工
         cx.notify();
     }
@@ -1254,7 +1264,7 @@ impl TerminalPane {
         }
         // 回看没了,滚动条与「回到底部」浮钮都要跟着变
         self.unseen_output = false;
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1279,7 +1289,7 @@ impl TerminalPane {
     /// 回看浮钮状态未变时不惊动外壳,让 gpui-fast 直接拼接 `TerminalView`。
     pub(crate) fn notify_redraw(&mut self, cx: &mut Context<Self>) {
         self.dirty_while_hidden = false;
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         let scrolled = self
             .emulator
             .with_term(|term| term.grid().display_offset() > 0);
@@ -1300,7 +1310,7 @@ impl TerminalPane {
     /// 确保首帧即绘出最新内容并同步「回到底部」浮钮(防止保留模式与 view 缓存停在旧帧)。
     pub(crate) fn flush_hidden_redraw(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.dirty_while_hidden) {
-            self.view.update(cx, |_, cx| cx.notify());
+            self.notify_view(cx);
             cx.notify();
         }
     }
@@ -1312,7 +1322,7 @@ impl TerminalPane {
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
         self.unseen_output = false;
         window.focus(&self.focus, cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1475,7 +1485,7 @@ impl TerminalPane {
         self.search_bar = Some(bar);
         // 开合动画(点按钮与 Ctrl+F 都走这里)
         self.search_reveal.show(cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1501,7 +1511,7 @@ impl TerminalPane {
         self.search_exit = Some(bar);
         self.search_reveal.hide(cx);
         window.focus(&self.focus, cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1859,7 +1869,7 @@ impl TerminalPane {
         self.flash_line(line, cx);
         // 闪烁那一行没变时 `set_flash` 不 notify(同一条标记 300ms 内连跳两次),
         // 回看位置却可能刚被滚过 —— 标脏子视图与外壳
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
         true
     }
@@ -2064,7 +2074,7 @@ impl TerminalPane {
     /// 缓存(`terminal_area::cached_terminal`),不 notify 就要等下一次输出才重画。
     pub fn set_scrollback(&mut self, lines: usize, cx: &mut Context<Self>) {
         self.emulator.set_scrollback(lines);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 

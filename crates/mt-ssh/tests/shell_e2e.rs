@@ -718,6 +718,8 @@ enum Answer {
     Line(String),
     /// 想一会儿再答。
     Later(Duration, String),
+    /// 作答之前先跑一段(模拟用户思考期间别处发生的事),再答。
+    After(Box<dyn FnOnce() + Send>, String),
     Cancel,
 }
 
@@ -814,6 +816,10 @@ async fn open_with(
                             tokio::time::sleep(delay).await;
                             Some(text)
                         }
+                        Some(Answer::After(meanwhile, text)) => {
+                            meanwhile();
+                            Some(text)
+                        }
                         Some(Answer::Cancel) | None => None,
                     };
                     let _ = reply.send(answer);
@@ -899,6 +905,38 @@ async fn 首见主机答_yes_后写入_known_hosts_第二次不再问() {
     let _session = again.session();
     assert!(again.seen.is_empty(), "{:?}", again.seen);
     assert_eq!(dir.known_hosts(), recorded, "没有重复登记");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 首见主机作答期间别处已登记同一把_答_yes_不重复追加() {
+    let server = FakeServer::start(Spec::password("pw")).await;
+    let port = server.port();
+    // 先在另一份 known_hosts 里拿到这台主机的登记行
+    let source = TestDir::new("hostkey-race-source");
+    let first = open(&source, with_password(port, "pw"), vec![line("yes")]).await;
+    let _first_session = first.session();
+    let recorded = source.known_hosts();
+
+    // 再从一份空的 known_hosts 连:提问挂着时,会话池 / 另一个终端先把同一把登记进来
+    let dir = TestDir::new("hostkey-race");
+    let path = dir.known_hosts_path();
+    let written = recorded.clone();
+    let opened = open(
+        &dir,
+        with_password(port, "pw"),
+        vec![Answer::After(
+            Box::new(move || std::fs::write(path, written).unwrap()),
+            "yes".into(),
+        )],
+    )
+    .await;
+    let _session = opened.session();
+    // 这回没有追加,也就不说「Permanently added」
+    assert_eq!(
+        opened.seen,
+        [host_notice(port), ask(HOST_KEY_QUESTION, true)]
+    );
+    assert_eq!(dir.known_hosts(), recorded, "同一把密钥只登记一次");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

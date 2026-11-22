@@ -628,18 +628,27 @@ impl Handler for MtClient {
                  后重试)"
             ))),
             HostKeyMatch::Unknown => {
+                // 等用户作答期间,会话池 / 另一个终端可能已把同一把密钥登记进来:
+                // 答完重读一遍,已登记就不再重复追加(其余情形照旧追加)
+                let mut already_recorded = false;
                 if let Some(interaction) = self.interaction.clone() {
                     if !self.confirm_new_host(&interaction, server_pubkey).await {
                         return Ok(false);
                     }
+                    already_recorded = read_known_hosts(&self.known_hosts_path).is_ok_and(|raw| {
+                        match_known_host(&raw, &name, server_pubkey) == HostKeyMatch::Match
+                    });
                 }
-                if let Err(e) = append_known_host(&self.known_hosts_path, &name, server_pubkey) {
-                    return Ok(self.reject(format!(
-                        "known_hosts write failed ({path}: {e}): 无法把 {name} 的新主机密钥写入 \
-                         known_hosts({path}: {e}),拒绝连接"
-                    )));
+                if !already_recorded {
+                    if let Err(e) = append_known_host(&self.known_hosts_path, &name, server_pubkey)
+                    {
+                        return Ok(self.reject(format!(
+                            "known_hosts write failed ({path}: {e}): 无法把 {name} 的新主机密钥\
+                             写入 known_hosts({path}: {e}),拒绝连接"
+                        )));
+                    }
                 }
-                if let Some(interaction) = &self.interaction {
+                if let Some(interaction) = self.interaction.as_ref().filter(|_| !already_recorded) {
                     interaction.notice(format!(
                         "Warning: Permanently added '{name}' ({}) to the list of known hosts.\r\n",
                         openssh_key_type(&server_pubkey.algorithm())

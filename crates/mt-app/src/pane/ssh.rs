@@ -633,7 +633,7 @@ impl TerminalPane {
         if let Some(takeover) = self.takeover.as_mut() {
             takeover.slot.task = Some(task);
         }
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -701,7 +701,7 @@ impl TerminalPane {
         if let Some((kind, message)) = toast {
             self.toast_later(kind, message, cx);
         }
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
