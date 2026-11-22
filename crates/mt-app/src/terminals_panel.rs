@@ -109,8 +109,14 @@ pub struct TerminalsPanel {
 
 impl TerminalsPanel {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        // 数据全在 store 里,任何变化(切面板/开关终端/状态灯)都只需重画
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 仅在面板列表/聚合状态灯/AI 会话标识/外观语言设置变化时重画,
+        // 屏蔽 OSC 标题(4Hz 热路径)、焦点 pane、标记与文件树事件。
+        cx.subscribe(&store, |_, _, event: &crate::store::StoreEvent, cx| {
+            if event.touches_terminals_panel() {
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             store,
             item_click: SwitchClickGuard::default(),

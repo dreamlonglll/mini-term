@@ -378,9 +378,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // 根视图的 render 直接读 store(三栏比例、徽标、未读数、背景……),
-        // 任何变化都照旧重画。
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 根视图按 `touches_workspace` 细粒度订阅:三栏几何、活动项目、状态灯、未读数、
+        // 外观与设置变化才重画;屏蔽 OSC 标题 / 焦点 pane / 文件树展开等高频无关事件。
+        cx.subscribe(&store, |_, _, event: &StoreEvent, cx| {
+            if event.touches_workspace() {
+                cx.notify();
+            }
+        })
+        .detach();
         // 子视图挂起的整窗覆盖物(如 Markdown 预览里的 ImageLightbox)改完覆盖物栈后
         // 推进 OverlayRevision,这里必须收到通知以同步抓拍 / 释放毛玻璃快照。
         overlay::observe_in(cx);

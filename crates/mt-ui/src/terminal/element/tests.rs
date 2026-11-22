@@ -65,8 +65,9 @@ fn 图标后面紧跟空格才放宽到两列() {
         1,
         "下一格不是紧挨着的那列"
     );
+    let mut zw = Vec::new();
     let mut combining = blank;
-    combining.zerowidth[0] = '\u{0301}';
+    combining.push_zerowidth(&mut zw, &['\u{0301}']);
     assert_eq!(
         symbol_columns(&folder, Some(&combining)),
         1,
@@ -287,4 +288,113 @@ fn 布局动画期_grid_resize_冻结闸状态切换() {
     assert!(!set_grid_resize_frozen(true));
     assert!(set_grid_resize_frozen(false));
     assert!(!is_grid_resize_frozen());
+}
+
+#[test]
+fn advance_cache_参数变化清空wide并受上限保护() {
+    let mut cache = AdvanceCache::default();
+    let fonts = VariantFonts {
+        ids: [FontId(1), FontId(2), FontId(3), FontId(4)],
+    };
+    cache.begin_frame(&fonts, px(14.0), px(8.0));
+    cache.insert_wide_for_test(FontId(1), px(14.0), '中', Coverage::Alone);
+    assert_eq!(cache.wide_len(), 1);
+
+    // 参数未变:保留缓存
+    cache.begin_frame(&fonts, px(14.0), px(8.0));
+    assert_eq!(cache.wide_len(), 1);
+
+    // 字号变化:清空 wide 防止无界堆积
+    cache.begin_frame(&fonts, px(16.0), px(9.0));
+    assert_eq!(cache.wide_len(), 0);
+
+    // 超出上限时清空后再写入
+    for idx in 0..WIDE_CACHE_LIMIT {
+        let ch = char::from_u32(0x4E00 + idx as u32).unwrap();
+        cache.insert_wide_for_test(FontId(1), px(16.0), ch, Coverage::Alone);
+    }
+    assert_eq!(cache.wide_len(), WIDE_CACHE_LIMIT);
+    cache.insert_wide_for_test(FontId(1), px(16.0), '界', Coverage::Alone);
+    assert_eq!(cache.wide_len(), 1);
+}
+
+#[test]
+fn 整屏快路径键值各维度变化均触发失效() {
+    let theme_a = TerminalTheme::default();
+    let theme_b = TerminalTheme {
+        foreground: gpui::red(),
+        ..TerminalTheme::default()
+    };
+    assert_ne!(theme_fingerprint(&theme_a), theme_fingerprint(&theme_b));
+
+    let base = FullFrameKey {
+        emulator_ptr: 0x1000,
+        frame_key: FrameKey::builder().push(1u32).finish(),
+        theme_hash: theme_fingerprint(&theme_a),
+        screen_lines: 40,
+        generation: 10,
+        total_lines: 100,
+        display_offset: 0,
+        mode: TermMode::empty(),
+        selection: None,
+        cursor_point: AlacPoint::new(
+            alacritty_terminal::index::Line(0),
+            alacritty_terminal::index::Column(0),
+        ),
+        cursor_shape: CursorShape::Block,
+        highlights: None,
+    };
+    assert_eq!(base, base);
+
+    let variants = [
+        FullFrameKey {
+            frame_key: FrameKey::builder().push(2u32).finish(),
+            ..base
+        },
+        FullFrameKey {
+            theme_hash: theme_fingerprint(&theme_b),
+            ..base
+        },
+        FullFrameKey {
+            screen_lines: 41,
+            ..base
+        },
+        FullFrameKey {
+            generation: 11,
+            ..base
+        },
+        FullFrameKey {
+            display_offset: 3,
+            ..base
+        },
+        FullFrameKey {
+            selection: Some((
+                AlacPoint::new(
+                    alacritty_terminal::index::Line(0),
+                    alacritty_terminal::index::Column(0),
+                ),
+                AlacPoint::new(
+                    alacritty_terminal::index::Line(0),
+                    alacritty_terminal::index::Column(5),
+                ),
+                false,
+            )),
+            ..base
+        },
+        FullFrameKey {
+            cursor_shape: CursorShape::Beam,
+            ..base
+        },
+        FullFrameKey {
+            highlights: Some((0x2000, 1)),
+            ..base
+        },
+        FullFrameKey {
+            mode: TermMode::ALT_SCREEN,
+            ..base
+        },
+    ];
+    for (i, variant) in variants.iter().enumerate() {
+        assert_ne!(&base, variant, "第 {i} 个维度变化必须使整屏快路径失效");
+    }
 }

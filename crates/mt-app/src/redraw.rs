@@ -68,9 +68,11 @@ use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use gpui::{App, Subscription, WeakEntity};
+use gpui::{App, Entity, Subscription, WeakEntity};
 
 use crate::pane::TerminalPane;
+use crate::store::AppStore;
+use crate::tree::SplitNode;
 
 /// 前台默认帧率:30fps。
 ///
@@ -98,6 +100,101 @@ pub const FOREGROUND_FPS: RangeInclusive<u32> = 10..=240;
 
 /// 后台帧率的可选区间。**下限 1 而不是 0**,理由见 [`DEFAULT_BACKGROUND_FPS`]。
 pub const BACKGROUND_FPS: RangeInclusive<u32> = 1..=60;
+
+/// 判定某个 `pty_id` 当前在屏幕上是否可见(是否应驱动全局重绘节拍器)。
+///
+/// 可见条件:
+/// 1. 工作区停在终端页(`terminal_page_active == true`,不在文件 / diff 页签);
+/// 2. `target_pty_id` 属于以下任意之一:
+///    - 活动项目活动面板的当前可视激活 tab(若存在最大化叶子,仅限该叶子的激活 tab;
+///      否则是活动布局中全部叶子的激活 tab);
+///    - 活动布局中正处于叶内切 tab 推出动画(`tab_swaps`)的旧 pane;
+///    - 正处于切面板出场动画(`AreaExitSrc::Panel`)中的旧面板可视激活 tab。
+///
+/// 注:`pane_preview` 悬停缩略图使用独立的 `mt_ui::MiniTerminalElement`(自带 500ms
+/// 刷新并直接读 `Arc<TerminalEmulator>`),不渲染 `TerminalPane` 也不经过全局节拍器。
+pub(crate) fn pty_is_visible_in_layout<'a>(
+    terminal_page_active: bool,
+    active_layout: Option<&SplitNode>,
+    maximized_pane_id: Option<&str>,
+    exit_panel_layout: Option<&SplitNode>,
+    tab_swap_old_pane_ids: impl IntoIterator<Item = &'a str>,
+    target_pty_id: u32,
+) -> bool {
+    if !terminal_page_active {
+        return false;
+    }
+    if let Some(layout) = active_layout {
+        let scope = maximized_pane_id
+            .and_then(|id| layout.leaf_of_pane(id))
+            .unwrap_or(layout);
+        if scope
+            .visible_panes()
+            .into_iter()
+            .any(|p| p.pty_id == Some(target_pty_id))
+        {
+            return true;
+        }
+        for old_id in tab_swap_old_pane_ids {
+            if scope
+                .pane(old_id)
+                .is_some_and(|p| p.pty_id == Some(target_pty_id))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(old_layout) = exit_panel_layout
+        && old_layout
+            .visible_panes()
+            .into_iter()
+            .any(|p| p.pty_id == Some(target_pty_id))
+    {
+        return true;
+    }
+    false
+}
+
+/// 列出活动项目当前在终端页上可见的全部 `pty_id`(切回可见时统一补刷用)。
+pub(crate) fn visible_pty_ids_in_layout(
+    active_layout: Option<&SplitNode>,
+    maximized_pane_id: Option<&str>,
+) -> Vec<u32> {
+    let Some(layout) = active_layout else {
+        return Vec::new();
+    };
+    let scope = maximized_pane_id
+        .and_then(|id| layout.leaf_of_pane(id))
+        .unwrap_or(layout);
+    scope
+        .visible_panes()
+        .into_iter()
+        .filter_map(|p| p.pty_id)
+        .collect()
+}
+
+/// 切回终端页 / 切项目 / 切面板 / 切 tab / 退出最大化时,把当前可见且在后台
+/// 跳过过重绘的 `TerminalPane` 立即补刷一次(同步 `TerminalView` 与回看浮钮)。
+pub(crate) fn flush_visible_hidden_panes(store: &Entity<AppStore>, cx: &mut App) {
+    let dirty_panes: Vec<Entity<TerminalPane>> = {
+        let store = store.read(cx);
+        let Some(project_id) = store.active_project_id.as_deref() else {
+            return;
+        };
+        let active_layout = store
+            .project_state(project_id)
+            .and_then(|s| s.active_layout());
+        let maximized_pane_id = store.maximized_pane_id(project_id);
+        visible_pty_ids_in_layout(active_layout, maximized_pane_id)
+            .into_iter()
+            .filter_map(|pty_id| store.terminal(pty_id).cloned())
+            .filter(|pane| pane.read(cx).is_dirty_while_hidden())
+            .collect()
+    };
+    for pane in dirty_panes {
+        pane.update(cx, |pane, cx| pane.flush_hidden_redraw(cx));
+    }
+}
 
 /// 配置值 → 实际生效的前台帧率。`None` = 默认;越界钳回区间(手改坏的配置)。
 pub fn resolve_foreground_fps(fps: Option<u32>) -> u32 {
@@ -608,5 +705,156 @@ mod tests {
         s.visible = false;
         assert!(s.tick(true));
         assert!(!s.arm());
+    }
+
+    fn test_pane(id: &str, pty_id: u32) -> crate::tree::PaneState {
+        let mut p = crate::tree::PaneState::new("pwsh");
+        p.id = id.to_string();
+        p.pty_id = Some(pty_id);
+        p
+    }
+
+    fn test_leaf(id: &str, panes: Vec<crate::tree::PaneState>, active_index: usize) -> SplitNode {
+        let active_pane_id = panes[active_index].id.clone();
+        SplitNode::Leaf {
+            id: id.to_string(),
+            panes,
+            active_pane_id,
+        }
+    }
+
+    #[test]
+    fn 停在文档页签时所有终端均不可见() {
+        let layout = test_leaf("leaf-1", vec![test_pane("p1", 10)], 0);
+        assert!(!pty_is_visible_in_layout(
+            false,
+            Some(&layout),
+            None,
+            None,
+            std::iter::empty(),
+            10,
+        ));
+    }
+
+    #[test]
+    fn 同组未激活tab与后台面板不判为可见() {
+        let leaf_a = test_leaf("leaf-a", vec![test_pane("p1", 1), test_pane("p2", 2)], 0);
+        let leaf_b = test_leaf("leaf-b", vec![test_pane("p3", 3)], 0);
+        let split = SplitNode::Split {
+            id: "split-1".into(),
+            direction: crate::tree::SplitDirection::Horizontal,
+            children: vec![leaf_a, leaf_b],
+            sizes: vec![50.0, 50.0],
+        };
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            None,
+            None,
+            std::iter::empty(),
+            1,
+        ));
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            None,
+            None,
+            std::iter::empty(),
+            3,
+        ));
+        // 同组未激活 tab
+        assert!(!pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            None,
+            None,
+            std::iter::empty(),
+            2,
+        ));
+        // 后台面板或非激活项目的 pty
+        assert!(!pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            None,
+            None,
+            std::iter::empty(),
+            99,
+        ));
+        assert_eq!(visible_pty_ids_in_layout(Some(&split), None), vec![1, 3]);
+    }
+
+    #[test]
+    fn 切tab与切面板出场动画中的旧pane保持可见() {
+        let layout = test_leaf("leaf-a", vec![test_pane("p1", 1), test_pane("p2", 2)], 1);
+        let old_panel = test_leaf(
+            "leaf-old",
+            vec![test_pane("p-old-active", 20), test_pane("p-old-bg", 21)],
+            0,
+        );
+        // p1 已不是激活 tab,但正在 tab_swaps 推出动画中 → 可见
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&layout),
+            None,
+            Some(&old_panel),
+            ["p1"],
+            1,
+        ));
+        // 旧面板的激活 tab 在切面板退场动画期间仍可见,未激活 tab 不可见
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&layout),
+            None,
+            Some(&old_panel),
+            std::iter::empty(),
+            20,
+        ));
+        assert!(!pty_is_visible_in_layout(
+            true,
+            Some(&layout),
+            None,
+            Some(&old_panel),
+            std::iter::empty(),
+            21,
+        ));
+    }
+
+    #[test]
+    fn 最大化时只判最大化叶子的激活tab可见() {
+        let leaf_a = test_leaf("leaf-a", vec![test_pane("p1", 1), test_pane("p2", 2)], 0);
+        let leaf_b = test_leaf("leaf-b", vec![test_pane("p3", 3)], 0);
+        let split = SplitNode::Split {
+            id: "split-1".into(),
+            direction: crate::tree::SplitDirection::Horizontal,
+            children: vec![leaf_a, leaf_b],
+            sizes: vec![50.0, 50.0],
+        };
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            Some("p1"),
+            None,
+            std::iter::empty(),
+            1,
+        ));
+        // 折叠掉的另一个叶子在最大化期间不可见
+        assert!(!pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            Some("p1"),
+            None,
+            std::iter::empty(),
+            3,
+        ));
+        // 最大化叶子内正在推出的旧 tab 仍可见
+        assert!(pty_is_visible_in_layout(
+            true,
+            Some(&split),
+            Some("p1"),
+            None,
+            ["p2"],
+            2,
+        ));
+        assert_eq!(visible_pty_ids_in_layout(Some(&split), Some("p1")), vec![1]);
     }
 }

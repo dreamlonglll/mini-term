@@ -246,6 +246,229 @@ impl StoreEvent {
     pub fn touches_ssh_connections(self) -> bool {
         matches!(self, Self::Config(ConfigSection::SshConnections))
     }
+
+    // ─── 核心渲染视图的细粒度过滤判定 ────────────────────────────
+
+    /// 主窗口根视图(`Workspace`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:三栏与抽屉几何、中栏与终端列表竖条显隐、未读完成计数、全局 AI 状态灯、
+    /// 活动项目(提交详情栏归属)、背景图/主题/语言/更新提示与动画开关。
+    /// **不含** OSC 标题 / 焦点 pane / 改名 / 会话绑定 / 标记 / 技术栈 / 展开目录 / 分组树。
+    pub fn touches_workspace(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::LayoutChanged
+                | Self::PaneStatusChanged
+                | Self::DoneChanged
+                | Self::WindowFocusChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::View
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 右栏工作区外壳(`WorkbenchArea`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目 id、项目列表与 SSH 连接来源、外观/语言与设置。
+    /// **不含** 终端/AI 全部高频事件与文件树/项目树状态。
+    pub fn touches_workbench_area(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 终端分屏区(`TerminalArea`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目与分屏树、最大化、焦点 pane、状态灯/退出/未看完成、会话徽章、
+    /// tab 标题(OSC + 改名)、AI 标记数、终端/外观/语言/shell/SSH/命令库/设置。
+    /// **不含** 项目分组树、技术栈缓存、文件树展开态、中转状态、视图偏好。
+    pub fn touches_terminal_area(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::LayoutChanged
+                | Self::FocusedPaneChanged
+                | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
+                | Self::PaneTitleChanged
+                | Self::PaneRenamed
+                | Self::MarkersChanged
+                | Self::DoneChanged
+                | Self::WindowFocusChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Terminal
+                        | ConfigSection::Locale
+                        | ConfigSection::Shells
+                        | ConfigSection::SshConnections
+                        | ConfigSection::CommandLibrary
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 终端面板列表竖条(`TerminalsPanel`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目、面板列表与面板名(`LayoutChanged`)、聚合状态灯、AI 会话指示、
+    /// 外观/语言与自动续接设置。**不含** OSC 标题、pane 改名、焦点 pane、标记与文件树。
+    pub fn touches_terminals_panel(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::LayoutChanged
+                | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
+                | Self::Config(
+                    ConfigSection::Appearance | ConfigSection::Locale | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 顶栏(`TitleBar`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:`title_bar_snapshot()`(全项目 pane 状态/黄灯/完成序与项目名)、活动项目名、
+    /// 窗口聚焦(清未读)、外观与语言。**不含** OSC 标题、焦点 pane、改名、会话绑定与文件树。
+    pub fn touches_title_bar(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::LayoutChanged
+                | Self::PaneStatusChanged
+                | Self::DoneChanged
+                | Self::WindowFocusChanged
+                | Self::Config(ConfigSection::Appearance | ConfigSection::Locale)
+        )
+    }
+
+    /// 中栏上段项目列表(`ProjectList`)渲染与 `done_tags_stale` 跟踪依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目、项目表与分组树、布局/状态/会话/pane 改名(悬停预览标签)、技术栈徽标、
+    /// 中栏显隐(`View`)、远程连接徽章、预览终端样式、外观/语言/自动续接设置。
+    /// **不含** OSC 标题(4Hz 热路径)、焦点 pane、AI 标记、文件树展开态、中转状态。
+    pub fn touches_project_list(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::ProjectTreeChanged
+                | Self::LayoutChanged
+                | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
+                | Self::PaneRenamed
+                | Self::DirKindsChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Terminal
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::View
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 中栏下段文件树(`FileTree`)渲染与 `sync_project` 依赖的状态是否可能变了。
+    ///
+    /// 与 `file_tree::store_render_signature` 五项指纹逐一对齐:活动项目与后端连接、
+    /// 外部编辑器配置与远程 Git 授权(`Settings`)、展开目录(`ExpandedDirsChanged`)、
+    /// 目录技术栈(`DirKindsChanged`)、主题/UI 字体/语言。
+    /// **不含** 终端/AI 全部高频事件与项目分组树。
+    pub fn touches_file_tree(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::DirKindsChanged
+                | Self::ExpandedDirsChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 右侧会话抽屉(`SessionPanel`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目、项目名、远程连接名、树模式在跑会话实时状态(`find_live_session_pane`)、
+    /// 视图切换(`View`)与外观/语言。**不含** OSC 标题、改名、焦点、标记与文件树。
+    pub fn touches_session_panel(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::LayoutChanged
+                | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::View
+                )
+        )
+    }
+
+    /// 右侧 Git 抽屉(`GitPanel`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:活动项目、远程连接与远程 Git 授权(`Settings`)、更改区列表/树视图(`View`)、
+    /// 外观与语言。**不含** 终端/AI 全部高频事件、项目树与文件树展开态。
+    pub fn touches_git_panel(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::View
+                        | ConfigSection::Settings
+                )
+        )
+    }
+
+    /// 快速项目/终端切换弹窗(`ProjectSwitcher`)渲染依赖的状态是否可能变了。
+    ///
+    /// 依赖:项目与分组树、活动项目、面板与 pane 布局/焦点/状态/会话/标题/改名、
+    /// 外观/语言/远程连接名/自动续接设置。
+    pub fn touches_project_switcher(self) -> bool {
+        matches!(
+            self,
+            Self::ActiveProjectChanged
+                | Self::ProjectsChanged
+                | Self::ProjectTreeChanged
+                | Self::LayoutChanged
+                | Self::FocusedPaneChanged
+                | Self::PaneStatusChanged
+                | Self::PaneSessionChanged
+                | Self::PaneTitleChanged
+                | Self::PaneRenamed
+                | Self::Config(
+                    ConfigSection::Appearance
+                        | ConfigSection::Locale
+                        | ConfigSection::SshConnections
+                        | ConfigSection::Settings
+                )
+        )
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +654,88 @@ mod tests {
             accepted(StoreEvent::touches_ssh_connections),
             vec![StoreEvent::Config(ConfigSection::SshConnections)]
         );
+    }
+
+    /// 高频 OSC 标题变化只应唤醒真正展示标题的终端区与切换弹窗,不惊动侧栏与抽屉。
+    #[test]
+    fn osc标题变化不唤醒无关核心视图() {
+        let title = StoreEvent::PaneTitleChanged;
+        assert!(title.touches_terminal_area());
+        assert!(title.touches_project_switcher());
+        assert!(!title.touches_workspace());
+        assert!(!title.touches_workbench_area());
+        assert!(!title.touches_terminals_panel());
+        assert!(!title.touches_title_bar());
+        assert!(!title.touches_project_list());
+        assert!(!title.touches_file_tree());
+        assert!(!title.touches_session_panel());
+        assert!(!title.touches_git_panel());
+    }
+
+    /// 文件树展开态变化只应唤醒文件树本身。
+    #[test]
+    fn 展开目录变化只唤醒文件树() {
+        let expanded = StoreEvent::ExpandedDirsChanged;
+        assert!(expanded.touches_file_tree());
+        assert!(!expanded.touches_workspace());
+        assert!(!expanded.touches_workbench_area());
+        assert!(!expanded.touches_terminal_area());
+        assert!(!expanded.touches_terminals_panel());
+        assert!(!expanded.touches_title_bar());
+        assert!(!expanded.touches_project_list());
+        assert!(!expanded.touches_session_panel());
+        assert!(!expanded.touches_git_panel());
+        assert!(!expanded.touches_project_switcher());
+    }
+
+    /// 逐项钉死其余核心视图的精确事件集合,防止高频热路径回流。
+    #[test]
+    fn 核心视图谓词过滤高频无关事件() {
+        // 文件树与 Git 面板免疫全部终端/AI 高频状态
+        for e in [
+            StoreEvent::LayoutChanged,
+            StoreEvent::FocusedPaneChanged,
+            StoreEvent::PaneStatusChanged,
+            StoreEvent::PaneSessionChanged,
+            StoreEvent::PaneTitleChanged,
+            StoreEvent::PaneRenamed,
+            StoreEvent::MarkersChanged,
+            StoreEvent::DoneChanged,
+            StoreEvent::WindowFocusChanged,
+            StoreEvent::ProjectTreeChanged,
+            StoreEvent::MobileRelayStatusChanged,
+        ] {
+            assert!(!e.touches_file_tree(), "FileTree 不应响应 {e:?}");
+            assert!(!e.touches_git_panel(), "GitPanel 不应响应 {e:?}");
+            assert!(!e.touches_workbench_area(), "WorkbenchArea 不应响应 {e:?}");
+        }
+
+        // TerminalsPanel / TitleBar / ProjectList / SessionPanel 不响应焦点与标记与中转
+        for e in [
+            StoreEvent::FocusedPaneChanged,
+            StoreEvent::MarkersChanged,
+            StoreEvent::MobileRelayStatusChanged,
+        ] {
+            assert!(!e.touches_terminals_panel(), "{e:?}");
+            assert!(!e.touches_title_bar(), "{e:?}");
+            assert!(!e.touches_project_list(), "{e:?}");
+            assert!(!e.touches_session_panel(), "{e:?}");
+            assert!(!e.touches_workspace(), "{e:?}");
+        }
+
+        // 必达护栏:关键视觉数据绝不漏订阅
+        assert!(StoreEvent::Config(ConfigSection::View).touches_workspace());
+        assert!(StoreEvent::Config(ConfigSection::View).touches_project_list());
+        assert!(StoreEvent::Config(ConfigSection::View).touches_session_panel());
+        assert!(StoreEvent::Config(ConfigSection::View).touches_git_panel());
+        assert!(StoreEvent::DirKindsChanged.touches_project_list());
+        assert!(StoreEvent::DirKindsChanged.touches_file_tree());
+        assert!(StoreEvent::PaneStatusChanged.touches_session_panel());
+        assert!(StoreEvent::PaneSessionChanged.touches_session_panel());
+        assert!(StoreEvent::MarkersChanged.touches_terminal_area());
+        assert!(StoreEvent::FocusedPaneChanged.touches_terminal_area());
+        assert!(StoreEvent::DoneChanged.touches_title_bar());
+        assert!(StoreEvent::DoneChanged.touches_workspace());
     }
 
     /// 「每一次 notify 都带着事件」的机械护栏:store 目录下除本文件外,

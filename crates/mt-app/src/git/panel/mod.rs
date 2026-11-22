@@ -362,6 +362,8 @@ pub struct GitPanel {
     visible: bool,
     /// 收着的时候项目切过 → 打开时补拉一次。
     stale: bool,
+    /// 抽屉收起期间收到过仅影响渲染的 store 事件 → 打开时补刷。
+    dirty_while_hidden: bool,
     /// Captured backend identity; identical paths on different hosts never share state.
     project_context: Option<GitContext>,
     project_path: Option<String>,
@@ -544,8 +546,19 @@ impl GitPanel {
                 }
             },
         ));
-        // Original renderer and view-mode state remain shared by both backends.
-        subs.push(cx.observe(&store, |_, _, cx| cx.notify()));
+        // 仅订阅本面板渲染依赖的 store 事件;抽屉关闭时不触发空重绘,等展开再补刷。
+        subs.push(
+            cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+                if !event.touches_git_panel() {
+                    return;
+                }
+                if this.visible {
+                    cx.notify();
+                } else {
+                    this.dirty_while_hidden = true;
+                }
+            }),
+        );
         // 项目路径的比对只在活动项目可能变了时做(`StoreEvent::touches_active_project`),
         // 不再被 OSC 标题 / AI 状态这些与仓库无关的变化叫醒
         subs.push(
@@ -561,8 +574,10 @@ impl GitPanel {
                         this.stale = true;
                         if this.visible {
                             this.on_project_changed(cx);
+                            cx.notify();
+                        } else {
+                            this.dirty_while_hidden = true;
                         }
-                        cx.notify();
                     }
                     return;
                 }
@@ -581,7 +596,11 @@ impl GitPanel {
                         this.stale = true;
                         this.refresh_hidden_repo(cx);
                     }
-                    cx.notify();
+                    if this.visible {
+                        cx.notify();
+                    } else {
+                        this.dirty_while_hidden = true;
+                    }
                 }
             }),
         );
@@ -618,6 +637,7 @@ impl GitPanel {
             enable_prompted,
             visible: false,
             stale: true,
+            dirty_while_hidden: false,
             project_path,
             project_context,
             project_id,
@@ -668,6 +688,9 @@ impl GitPanel {
             return;
         }
         self.visible = visible;
+        if visible {
+            self.dirty_while_hidden = false;
+        }
         // 抽屉重新打开:横幅按眼下的状态直接到位,不在抽屉滑进来的同时再长一遍
         self.banner_seen = None;
         let context = self.active_project_context(cx);

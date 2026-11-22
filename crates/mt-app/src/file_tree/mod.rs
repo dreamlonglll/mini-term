@@ -485,14 +485,20 @@ impl FileTree {
     }
 
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        // store 的 notify 大多与文件树无关(OSC 标题、AI 状态、焦点……),先比一遍
-        // render 真正从 store 读的那些东西,变了才重画(见模块注释「store 变化 → 重画的闸」)
-        cx.observe(&store, |this: &mut Self, _, cx| {
-            let source_changed = this.sync_project(cx);
-            if source_changed || this.store_signature(cx) != this.rendered_store_signature {
-                cx.notify();
-            }
-        })
+        // 先经 `touches_file_tree` 过滤掉全部终端/AI 高频事件(OSC 标题、AI 状态、焦点、布局……),
+        // 放行后再比一遍 render 真正从 store 读的五项指纹,变了才重画(见模块注释「store 变化 → 重画的闸」)。
+        cx.subscribe(
+            &store,
+            |this: &mut Self, _, event: &crate::store::StoreEvent, cx| {
+                if !event.touches_file_tree() {
+                    return;
+                }
+                let source_changed = this.sync_project(cx);
+                if source_changed || this.store_signature(cx) != this.rendered_store_signature {
+                    cx.notify();
+                }
+            },
+        )
         .detach();
 
         // 丢过去的是**变动文件的完整路径**:重列只要它的父目录,但技术栈缓存的

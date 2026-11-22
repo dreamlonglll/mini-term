@@ -478,52 +478,54 @@ impl AppStore {
         }));
     }
 
-    /// 立即把攒下的布局写进 `layout.db`(退出前 / 防抖到点)。
+    /// 立即把攒下的布局脏快照交给后台写线程写进 `layout.db`(退出前 / 防抖到点)。
     ///
-    /// 库开不起来时是 no-op —— 脏标记照样清掉,免得每次退出都重试一遍必然失败的
-    /// 写入、把日志刷满。
+    /// 主线程只采快照并入队,不阻塞在 SQLite 事务上;进程退出前由 `App::on_app_quit`
+    /// 同步 `drain` 保证最后一次布局必落盘。库开不起来时是 no-op —— 脏标记照样清掉,
+    /// 免得每次退出都重试一遍必然失败的写入、把日志刷满。
     pub fn flush_layout_now(&mut self) {
         let dirty_projects = std::mem::take(&mut self.layout_dirty_projects);
         let globals_dirty = std::mem::take(&mut self.layout_globals_dirty);
-        let Some(store) = self.layout_store.clone() else {
+        let Some(writer) = self.layout_writer.as_ref() else {
             return;
         };
 
-        if globals_dirty {
-            let globals = mt_layout::GlobalLayout {
-                layout_sizes: self.config.layout_sizes.clone(),
-                middle_column_sizes: self.config.middle_column_sizes.clone(),
-                middle_column_visible: Some(self.config.middle_column_visible),
-                right_drawer_width: self.config.right_drawer_width,
-                terminals_panel_visible: Some(self.terminals_panel_visible),
-                git_detail_width: self.git_detail_width,
-                window: self.window_geometry,
-            };
-            if let Err(err) = store.save_globals(&globals) {
-                tracing::warn!("[layout] 全局布局写盘失败: {err:#}");
+        let globals = globals_dirty.then(|| mt_layout::GlobalLayout {
+            layout_sizes: self.config.layout_sizes.clone(),
+            middle_column_sizes: self.config.middle_column_sizes.clone(),
+            middle_column_visible: Some(self.config.middle_column_visible),
+            right_drawer_width: self.config.right_drawer_width,
+            terminals_panel_visible: Some(self.terminals_panel_visible),
+            git_detail_width: self.git_detail_width,
+            window: self.window_geometry,
+        });
+
+        let mut projects = Vec::with_capacity(dirty_projects.len());
+        if !dirty_projects.is_empty() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            for project_id in dirty_projects {
+                // 项目在防抖窗口里被删掉了 → 删行(它的树已经不在 config 里了)
+                let op = match self
+                    .config
+                    .projects
+                    .iter()
+                    .find(|p| p.id == project_id)
+                    .and_then(|p| p.saved_layout.as_ref())
+                {
+                    Some(layout) => super::layout_writer::ProjectLayoutOp::Save {
+                        layout: layout.clone(),
+                        now_ms,
+                    },
+                    None => super::layout_writer::ProjectLayoutOp::Delete,
+                };
+                projects.push((project_id, op));
             }
         }
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        for project_id in dirty_projects {
-            // 项目在防抖窗口里被删掉了 → 删行(它的树已经不在 config 里了)
-            let Some(project) = self.config.projects.iter().find(|p| p.id == project_id) else {
-                if let Err(err) = store.delete_project_layout(&project_id) {
-                    tracing::warn!("[layout] 删除项目 {project_id} 的布局失败: {err:#}");
-                }
-                continue;
-            };
-            let result = match project.saved_layout.as_ref() {
-                Some(layout) => store.save_project_layout(&project_id, layout, now_ms),
-                None => store.delete_project_layout(&project_id),
-            };
-            if let Err(err) = result {
-                tracing::warn!("[layout] 项目 {project_id} 的布局写盘失败: {err:#}");
-            }
-        }
+        writer.enqueue(super::layout_writer::LayoutBatch { globals, projects });
     }
 
     /// 窗口几何(退出时的样子)。`None` = 没存过 / 存的值不可用,由开窗那一步
@@ -583,8 +585,9 @@ impl AppStore {
     /// `self.token`,而且实际走不到(load 只发生在启动)。
     ///
     /// 顺手把布局也刷下去:两条落盘路径分家后,退出钩子只调这一个入口 ——
-    /// 让它把两边都收干净,比要求每个调用点记得调两次可靠。布局那次仍是同步的:
-    /// 一行 upsert、库也没开 `synchronous=FULL`,搬去后台换不来什么。
+    /// 让它把两边都收干净,比要求每个调用点记得调两次可靠。布局同样走后台单写者
+    /// [`crate::store::layout_writer::LayoutWriter`] 入队,退出时由 `App::on_app_quit`
+    /// 统一排干。
     pub fn save_config_now(&mut self) {
         self.flush_layout_now();
         if self.token == 0 {

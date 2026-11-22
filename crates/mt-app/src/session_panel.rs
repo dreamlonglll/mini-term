@@ -592,6 +592,8 @@ pub struct SessionPanel {
     visible: bool,
     /// 关着的时候项目切过 → 打开时补拉一次。
     stale: bool,
+    /// 抽屉关闭期间收到过仅影响渲染的 store 事件 → 重新打开时补一次 `cx.notify()`。
+    dirty_while_hidden: bool,
     /// 当前项目是 SSH 远程项目(转圈提示要区分 WSL 与远程两种来源)。
     remote: bool,
     /// 断链的远程项目:列表恒空,头部给一句断链提示。
@@ -620,8 +622,18 @@ pub struct SessionPanel {
 
 impl SessionPanel {
     pub fn new(store: Entity<AppStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 别的 store 变化(状态灯之类)只重画
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 仅订阅本面板渲染真正依赖的 store 事件;抽屉收起时不触发空重绘,等展开再补刷
+        cx.subscribe(&store, |this: &mut Self, _, event: &StoreEvent, cx| {
+            if !event.touches_session_panel() {
+                return;
+            }
+            if this.visible {
+                cx.notify();
+            } else {
+                this.dirty_while_hidden = true;
+            }
+        })
+        .detach();
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("sessionList", "filterPlaceholder"))
         });
@@ -650,12 +662,13 @@ impl SessionPanel {
                     }
                     if this.visible {
                         this.refresh(false, cx);
+                        cx.notify();
                     } else {
                         // 收着的时候不去扫:WSL 那一路要冷启动整台 VM,不该由「切了个
                         // 项目」触发(旧版收起时组件根本没挂载)
                         this.stale = true;
+                        this.dirty_while_hidden = true;
                     }
-                    cx.notify();
                 }
             },
         );
@@ -678,6 +691,7 @@ impl SessionPanel {
             request_id: 0,
             visible: false,
             stale: true,
+            dirty_while_hidden: false,
             remote: false,
             remote_broken: false,
             preview: None,
@@ -715,14 +729,20 @@ impl SessionPanel {
         cx.notify();
     }
 
-    /// 抽屉开合。第一次展开(或关着的时候项目切过)在这里补拉。
+    /// 抽屉开合。第一次展开(或关着的时候项目切过)在这里补拉;
+    /// 关着期间攒下的渲染脏标记在这里补一次 `cx.notify()`。
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
         }
         self.visible = visible;
-        if visible && self.stale {
-            self.refresh(false, cx);
+        if visible {
+            let dirty = std::mem::take(&mut self.dirty_while_hidden);
+            if self.stale {
+                self.refresh(false, cx);
+            } else if dirty {
+                cx.notify();
+            }
         }
     }
 

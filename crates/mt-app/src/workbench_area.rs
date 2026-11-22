@@ -480,6 +480,20 @@ fn global(cx: &App) -> Option<Entity<WorkbenchArea>> {
         .map(|global| global.0.clone())
 }
 
+/// 当前工作区是否停在终端页(而非文件 / diff 页签)。尚未安装工作区(如单测)时按 `true` 兜底。
+pub fn is_terminal_page_active(cx: &App) -> bool {
+    global(cx).is_none_or(|area| area.read(cx).is_terminal_active(cx))
+}
+
+/// 判定给定 `pty_id` 对应的终端 pane 当前是否在屏幕上可见(用于决定后台输出是否驱动
+/// 全局重绘节拍器)。尚未安装工作区(如单测)时按 `true` 放行。
+pub fn is_pty_visible(pty_id: u32, cx: &App) -> bool {
+    let Some(area) = global(cx) else {
+        return true;
+    };
+    area.read(cx).is_pty_visible(pty_id, cx)
+}
+
 fn project_documents_are_dirty(project: &ProjectDocuments, cx: &App) -> bool {
     project.tabs.iter().any(|tab| tab.content.is_dirty(cx))
 }
@@ -893,8 +907,14 @@ impl WorkbenchArea {
         terminal_area: Entity<TerminalArea>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // render 读活动项目等 store 数据,任何变化都照旧重画
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // render 只读活动项目、项目/连接表、外观与语言,按 `touches_workbench_area` 细粒度订阅,
+        // 不再被终端 OSC 标题、AI 状态灯、布局与文件树高频事件空唤醒。
+        cx.subscribe(&store, |_, _, event: &StoreEvent, cx| {
+            if event.touches_workbench_area() {
+                cx.notify();
+            }
+        })
+        .detach();
         // 页签的回收与远程来源校验只看「项目还在不在 / 路径 / SSH 连接」
         // (见 `StoreEvent::touches_document_sources`)。此前挂在 notify 上,AI 工作时
         // OSC 标题约 4Hz/pane 就把每个文档页签的校验全跑一遍。
@@ -979,6 +999,35 @@ impl WorkbenchArea {
             return true;
         };
         self.is_terminal_page_for_project(&project_id, cx)
+    }
+
+    /// 判定给定 `pty_id` 当前是否在终端页的可见槽位(或切出动画)中。
+    pub fn is_pty_visible(&self, pty_id: u32, cx: &App) -> bool {
+        if !self.is_terminal_active(cx) {
+            return false;
+        }
+        let store = self.store.read(cx);
+        let Some(project_id) = store.active_project_id.as_deref() else {
+            return false;
+        };
+        let state = store.project_state(project_id);
+        let active_layout = state.and_then(|s| s.active_layout());
+        let maximized_pane_id = store.maximized_pane_id(project_id);
+        let term_area = self.terminal_area.read(cx);
+        let exit_panel_layout = term_area.exit_panel_id().and_then(|panel_id| {
+            state
+                .and_then(|s| s.panels.iter().find(|p| p.id == panel_id))
+                .map(|p| &p.layout)
+        });
+        let tab_swap_old = term_area.tab_swap_old_pane_ids();
+        crate::redraw::pty_is_visible_in_layout(
+            true,
+            active_layout,
+            maximized_pane_id,
+            exit_panel_layout,
+            tab_swap_old,
+            pty_id,
+        )
     }
 
     fn is_terminal_page_for_project(&self, project_id: &str, cx: &App) -> bool {
@@ -1187,6 +1236,7 @@ impl WorkbenchArea {
             project.last_tab = Some(key.clone());
         }
         project.active = WorkbenchPage::Terminal;
+        crate::redraw::flush_visible_hidden_panes(&self.store, cx);
         let pane_id = self.store.read(cx).active_pane_id(&project_id);
         if let Some(pane_id) = pane_id {
             self.store.update(cx, |store, cx| {
@@ -2178,8 +2228,11 @@ impl Render for WorkbenchArea {
                     let store = self.store.clone();
                     let project_id = project_id.clone();
                     window.defer(cx, move |window, cx| {
-                        if !area.read(cx).is_terminal_page_for_project(&project_id, cx)
-                            || crate::dialog_host::has_open(window, cx)
+                        if !area.read(cx).is_terminal_page_for_project(&project_id, cx) {
+                            return;
+                        }
+                        crate::redraw::flush_visible_hidden_panes(&store, cx);
+                        if crate::dialog_host::has_open(window, cx)
                             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay)
                         {
                             return;

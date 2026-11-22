@@ -65,6 +65,7 @@ mod commands;
 mod config_writer;
 mod events;
 mod layout;
+mod layout_writer;
 mod panes;
 mod prefs;
 mod projects;
@@ -73,6 +74,7 @@ mod reopen;
 mod ssh;
 
 use config_writer::ConfigWriter;
+use layout_writer::LayoutWriter;
 
 pub use events::{ConfigSection, StoreEvent};
 pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH};
@@ -399,10 +401,10 @@ pub struct AppStore {
     config_writer: ConfigWriter,
     /// 写线程回报的写盘失败 → toast(去重后)。句柄一丢泵就停。
     _save_failure_pump: Task<()>,
-    /// 界面布局的落盘口(`layout.db`)。`None` = 库开不起来(盘满 / 权限),
+    /// 界面布局的后台单写者(`layout.db`)。`None` = 库开不起来(盘满 / 权限),
     /// 此时布局**只在内存里活着**:界面照常用,退出即忘 —— 与配置加载失败时
     /// 「只读模式」同一条红线,绝不因为存不下就不让用。
-    layout_store: Option<Arc<mt_layout::LayoutStore>>,
+    layout_writer: Option<LayoutWriter>,
     /// 窗口几何(退出时的大小/位置/最大化态)。config 里没有对应字段 ——
     /// 这是 GPUI 版新补的能力,只住在 `layout.db` 与这里。
     window_geometry: Option<mt_layout::WindowGeometry>,
@@ -697,7 +699,9 @@ impl AppStore {
         // 加载失败(令牌 0)时不备份:与原来 `load()` 失败就走不到备份那一步同口径
         let (config_writer, mut save_failures) =
             ConfigWriter::spawn(config_store.clone(), token != 0);
-        let drain = config_writer.drain_handle();
+        let config_drain = config_writer.drain_handle();
+        let layout_writer = layout_store.map(LayoutWriter::spawn);
+        let layout_drain = layout_writer.as_ref().map(LayoutWriter::drain_handle);
         // 后台写盘失败 → 主线程推 toast(写线程里不碰 GPUI,经 channel 回来)。
         // 盘满 / 杀软锁库会让之后每一次保存都失败,同类 60s 内只提示一次。
         // ⚠️ toast 层画在弹窗遮罩之下:失败恰好发生在弹窗开着时这条会被挡住,
@@ -714,9 +718,13 @@ impl AppStore {
         // `&mut AppStore`,而后者会在退出那一刻回头 `update` 本实体 —— 平白多一
         // 条「实体还在不在」的依赖。
         App::on_app_quit(cx, move |_cx| {
-            let drain = drain.clone();
+            let config_drain = config_drain.clone();
+            let layout_drain = layout_drain.clone();
             async move {
-                drain.drain();
+                config_drain.drain();
+                if let Some(layout_drain) = layout_drain {
+                    layout_drain.drain();
+                }
             }
         })
         .detach();
@@ -731,7 +739,7 @@ impl AppStore {
             config_store,
             config_writer,
             _save_failure_pump: save_failure_pump,
-            layout_store,
+            layout_writer,
             window_geometry,
             // 缺省展开:面板是发现型入口,收着的话没人知道它存在
             terminals_panel_visible: terminals_panel_visible.unwrap_or(true),

@@ -258,7 +258,23 @@ pub fn lost_focus_handoff(
 
 impl TerminalArea {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &store,
+            |this: &mut Self, _, event: &crate::store::StoreEvent, cx| {
+                if matches!(
+                    event,
+                    crate::store::StoreEvent::ActiveProjectChanged
+                        | crate::store::StoreEvent::LayoutChanged
+                ) && crate::workbench_area::is_terminal_page_active(cx)
+                {
+                    crate::redraw::flush_visible_hidden_panes(&this.store, cx);
+                }
+                if event.touches_terminal_area() {
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         Self {
             store,
             layout_snapshot: None,
@@ -304,6 +320,22 @@ impl TerminalArea {
             fx: Rc::default(),
             focus_sink: cx.focus_handle(),
         }
+    }
+
+    /// 供可见性判定读取:若正处于切面板出场动画,返回正在退场的旧面板 id。
+    pub(crate) fn exit_panel_id(&self) -> Option<&str> {
+        match self.area_swap.as_ref().map(|swap| &swap.exit) {
+            Some(AreaExitSrc::Panel(id)) => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// 供可见性判定读取:当前叶内切 tab 出场动画中仍在屏幕上推出的旧 pane id 列表。
+    pub(crate) fn tab_swap_old_pane_ids(&self) -> Vec<&str> {
+        self.tab_swaps
+            .values()
+            .filter_map(|swap| swap.old_pane_id.as_deref())
+            .collect()
     }
 
     /// 键盘焦点落空(拿着焦点的终端 / 页签被关掉、弹窗把焦点还给了已经关掉的终端)之后接回来。

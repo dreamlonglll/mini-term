@@ -254,8 +254,12 @@ impl ProjectSwitcher {
                 _ => {}
             },
         );
-        // 开着的时候 pane 可能被关掉、灯可能在变:候选是渲染时现算的,这里只负责重画
-        let store_sub = cx.observe(&store, |_, _, cx| cx.notify());
+        // 开着的时候 pane 可能被关掉、灯可能在变:候选是渲染时现算的,按谓词过滤后重画
+        let store_sub = cx.subscribe(&store, |_, _, event: &crate::store::StoreEvent, cx| {
+            if event.touches_project_switcher() {
+                cx.notify();
+            }
+        });
         let mut this = Self {
             store,
             query,

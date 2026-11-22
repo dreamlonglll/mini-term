@@ -492,7 +492,12 @@ pub struct TitleBar {
 
 impl TitleBar {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(&store, |_, _, event: &crate::store::StoreEvent, cx| {
+            if event.touches_title_bar() {
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             store,
             switcher_open: false,

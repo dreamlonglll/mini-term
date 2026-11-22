@@ -1409,10 +1409,14 @@ struct PendingReveal {
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        // 本视图套了 view 级缓存(`main.rs::cached_panel`),render 读的状态灯 / 名字 /
-        // 完成标全靠这条 notify 重画。中栏收着时本视图不渲染(这条照样跑):记一笔,
-        // 再展开时完成标表直接对齐、不补播(见 `sync_done_tags`)
-        cx.observe(&store, |this: &mut Self, store, cx| {
+        // 本视图套了 view 级缓存(`main.rs::cached_panel`),按 `touches_project_list`
+        // 细粒度订阅:OSC 标题(4Hz 热路径)、焦点 pane、AI 标记与文件树展开态不再唤醒本视图。
+        // 中栏收着时本视图不渲染(这条照样跑):记一笔,再展开时完成标表直接对齐、不补播
+        // (见 `sync_done_tags`)。
+        cx.subscribe(&store, |this: &mut Self, store, event: &StoreEvent, cx| {
+            if !event.touches_project_list() {
+                return;
+            }
             if !store.read(cx).config().middle_column_visible {
                 this.done_tags_stale = true;
             }

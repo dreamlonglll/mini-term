@@ -45,7 +45,7 @@
 //! 每一行的画面都会变但签名不动 —— 它们进 [`FrameKey`]，变了就清空整表。
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use alacritty_terminal::term::cell::Flags;
 use gpui::Hsla;
@@ -61,13 +61,19 @@ pub const MAX_ZEROWIDTH_CHARS: usize = 10;
 ///
 /// 颜色取的是**解析之后**的值：OSC 4 改调色板、主题切换都会让它变，
 /// 不需要额外的失效通道。
+///
+/// 组合符号（99.9% 的格子为空）外置到每帧复用的 `Vec<char>` arena，格子内只存
+/// `(zw_start, zw_len)` 索引，把单格体量从 96B 压到 56B，大幅减少整屏遍历时的
+/// 缓存行压力。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellSignature {
     /// 列号。同样的字符挪了列就是不同的画面。
     pub col: usize,
     pub ch: char,
-    /// 组合符号（不足补 `\0`）。
-    pub zerowidth: [char; MAX_ZEROWIDTH_CHARS],
+    /// 组合符号在外部 `Vec<char>` arena 中的起始下标（`zw_len == 0` 时无效）。
+    pub zw_start: u32,
+    /// 组合符号数量（`0..=MAX_ZEROWIDTH_CHARS`）。
+    pub zw_len: u8,
     pub fg: Hsla,
     pub bg: Hsla,
     /// 背景是不是「默认背景」（决定发不发 quad，背景图能否透出）。
@@ -92,7 +98,8 @@ impl CellSignature {
         Self {
             col,
             ch,
-            zerowidth: ['\0'; MAX_ZEROWIDTH_CHARS],
+            zw_start: 0,
+            zw_len: 0,
             fg,
             bg,
             bg_default: true,
@@ -101,6 +108,42 @@ impl CellSignature {
             cursor: 0,
             search: 0,
         }
+    }
+
+    #[inline]
+    pub fn has_zerowidth(&self) -> bool {
+        self.zw_len > 0
+    }
+
+    /// 取出这个格子附带的 0 宽组合符号切片（外置 arena 越界时安全截断为空）。
+    #[inline]
+    pub fn zerowidth<'a>(&self, arena: &'a [char]) -> &'a [char] {
+        if self.zw_len == 0 {
+            return &[];
+        }
+        let start = self.zw_start as usize;
+        let end = start.saturating_add(self.zw_len as usize);
+        arena.get(start..end).unwrap_or(&[])
+    }
+
+    /// 把组合符号追加进外置 arena 并记录索引（超出 [`MAX_ZEROWIDTH_CHARS`] 截断）。
+    #[inline]
+    pub fn push_zerowidth(&mut self, arena: &mut Vec<char>, chars: &[char]) {
+        let len = chars.len().min(MAX_ZEROWIDTH_CHARS);
+        if len == 0 {
+            self.zw_start = 0;
+            self.zw_len = 0;
+            return;
+        }
+        let start = u32::try_from(arena.len()).unwrap_or(u32::MAX);
+        if start == u32::MAX {
+            self.zw_start = 0;
+            self.zw_len = 0;
+            return;
+        }
+        arena.extend_from_slice(&chars[..len]);
+        self.zw_start = start;
+        self.zw_len = len as u8;
     }
 }
 
@@ -128,25 +171,26 @@ impl CellSignature {
     /// 把这个格子摊成若干个 64 位字，逐个喂给 `push`。
     ///
     /// 逐字段 `Hash::hash` 一趟是 19 次零碎 write（char / usize / bool / u8
-    /// 各自一次），这里手工打包成 **6 个字**（带组合符号的格子再加 5 个），
-    /// 写入次数掉到三分之一，且每个字都已经是对齐好的 u64 —— 哈希器不用再走
-    /// 小写入的缓冲逻辑。[`Hash`] 与 [`row_signature`] 共用这一份口径，
-    /// 免得两条路各写一遍迟早写漂。
+    /// 各自一次），这里手工打包成 **6 个字**（带组合符号的格子按实际数量追加
+    /// 1~5 个字），写入次数掉到三分之一，且每个字都已经是对齐好的 u64 —— 哈希器
+    /// 不用再走小写入的缓冲逻辑。[`Hash`] 与 [`row_signature_with_zerowidth`]
+    /// 共用这一份口径，免得两条路各写一遍迟早写漂。
     #[inline]
-    fn write_words(&self, mut push: impl FnMut(u64)) {
+    fn write_words_with(&self, zerowidths: &[char], mut push: impl FnMut(u64)) {
+        let zw = self.zerowidth(zerowidths);
         // 列号在高 32 位、字符在低 32 位：列号是 grid 列下标（上限是元素侧的
         // `MAX_COLUMNS` = 1024），char 是 21 位，两个都塞得进 32 位。
         push(((self.col as u64) << 32) | self.ch as u64);
-        // 属性位（u16）与那几个小标量拼成一个字。**组合符号有没有货也记在这里**：
-        // 有货才多喂 3 个字，而「多喂了几个字」本身不能是唯一的区分依据 ——
-        // 记进这个字之后，带组合符号与不带的格子第一处差异就落在这里。
+        // 属性位（u16）与那几个小标量拼成一个字。组合符号的实际长度（0..=10，占 4 bit）
+        // 与有无标记一同写进这个字，确保带与不带或长度不同在第一个差异字就分开。
         push(
             ((self.flags.bits() as u64) << 32)
                 | ((self.search as u64) << 24)
                 | ((self.cursor as u64) << 16)
                 | ((self.selected as u64) << 8)
+                | ((zw.len() as u64) << 2)
                 | ((self.bg_default as u64) << 1)
-                | (self.zerowidth[0] != '\0') as u64,
+                | (!zw.is_empty()) as u64,
         );
         for word in hsla_words(&self.fg) {
             push(word);
@@ -154,9 +198,9 @@ impl CellSignature {
         for word in hsla_words(&self.bg) {
             push(word);
         }
-        if self.zerowidth[0] != '\0' {
+        if !zw.is_empty() {
             // 两个组合符号挤一个字（不足补 0）
-            for pair in self.zerowidth.chunks(2) {
+            for pair in zw.chunks(2) {
                 let hi = pair[0] as u64;
                 let lo = pair.get(1).map_or(0, |c| *c as u64);
                 push((hi << 32) | lo);
@@ -167,7 +211,10 @@ impl CellSignature {
 
 impl Hash for CellSignature {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.write_words(|word| state.write_u64(word));
+        self.write_words_with(&[], |word| state.write_u64(word));
+        if self.zw_len > 0 {
+            state.write_u64(((self.zw_start as u64) << 32) | self.zw_len as u64);
+        }
     }
 }
 
@@ -205,15 +252,46 @@ impl FxHasher {
     }
 }
 
-/// 一行的内容签名。空行（全部是默认属性的空格）也会得到一个稳定值。
-pub fn row_signature(cells: &[CellSignature]) -> u64 {
+/// 零成本恒等哈希器：[`RowCache`] 的键本身已是 64 位混匀后的 [`FxHasher`] 行签名，
+/// 直接透传给哈希表作桶哈希，省去 `std::collections::HashMap` 默认 SipHash-1-3 的二次哈希。
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut buf = [0u8; 8];
+        for (dst, src) in buf.iter_mut().zip(bytes.iter().copied()) {
+            *dst = src;
+        }
+        self.0 = u64::from_ne_bytes(buf);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+/// 一行的内容签名（带外置组合符号 arena）。空行（全部是默认属性的空格）也会得到稳定值。
+pub fn row_signature_with_zerowidth(cells: &[CellSignature], zerowidths: &[char]) -> u64 {
     let mut hasher = FxHasher::new();
     // 长度先进哈希：`["ab"]` 与 `["a","b"]` 这类拼接歧义直接堵死。
     hasher.write_u64(cells.len() as u64);
     for cell in cells {
-        cell.write_words(|word| hasher.write_u64(word));
+        cell.write_words_with(zerowidths, |word| hasher.write_u64(word));
     }
     hasher.finish()
+}
+
+/// 一行的内容签名（无组合符号快捷口）。
+pub fn row_signature(cells: &[CellSignature]) -> u64 {
+    row_signature_with_zerowidth(cells, &[])
 }
 
 /// 「全局渲染参数」的指纹。任一分量变化 ⇒ 整张缓存作废。
@@ -298,7 +376,7 @@ struct CacheEntry<T> {
 /// 单测能在没有 gpui `Window` 的情况下把失效逻辑跑完。
 pub struct RowCache<T> {
     key: FrameKey,
-    entries: HashMap<u64, CacheEntry<T>>,
+    entries: HashMap<u64, CacheEntry<T>, BuildHasherDefault<IdentityHasher>>,
     frame: u64,
     stats: DamageStats,
     /// 本帧已见行数，`end_frame` 时并进 stats。
@@ -316,12 +394,21 @@ impl<T: Clone> RowCache<T> {
     pub fn new() -> Self {
         Self {
             key: FrameKey::default(),
-            entries: HashMap::new(),
+            entries: HashMap::with_hasher(BuildHasherDefault::default()),
             frame: 0,
             stats: DamageStats::default(),
             rows_this_frame: 0,
             rebuilt_this_frame: 0,
         }
+    }
+
+    /// 整屏快路径命中时的等价记账：跳过逐行查表与重建，但保持 [`DamageStats`]
+    /// 的 `frames` 与 `rows_seen` 统计口径与全命中帧完全一致。
+    pub fn record_fast_frame(&mut self, key: FrameKey, live_rows: usize) {
+        self.frame += 1;
+        debug_assert_eq!(self.key, key);
+        self.stats.frames += 1;
+        self.stats.rows_seen += live_rows as u64;
     }
 
     /// 开一帧。`key` 与上一帧不同就清空整表，返回 `true`。
@@ -560,7 +647,7 @@ mod tests {
         let cells = row("hi", 4);
         let words_of = |cell: &CellSignature| {
             let mut got = Vec::new();
-            cell.write_words(|w| got.push(w));
+            cell.write_words_with(&[], |w| got.push(w));
             got
         };
         // 同一个格子摊出来的字流稳定
@@ -585,9 +672,48 @@ mod tests {
     #[test]
     fn 组合符号进签名() {
         let base = row("e", 4);
+        let mut zw_acute = Vec::new();
         let mut combining = base.clone();
-        combining[0].zerowidth[0] = '\u{0301}'; // 锐音符
-        assert_ne!(row_signature(&base), row_signature(&combining));
+        combining[0].push_zerowidth(&mut zw_acute, &['\u{0301}']); // 锐音符
+        let mut zw_grave = Vec::new();
+        let mut grave = base.clone();
+        grave[0].push_zerowidth(&mut zw_grave, &['\u{0300}']); // 抑音符
+        let mut zw_double = Vec::new();
+        let mut double = base.clone();
+        double[0].push_zerowidth(&mut zw_double, &['\u{0301}', '\u{0323}']);
+
+        let sig_base = row_signature_with_zerowidth(&base, &[]);
+        let sig_acute = row_signature_with_zerowidth(&combining, &zw_acute);
+        let sig_grave = row_signature_with_zerowidth(&grave, &zw_grave);
+        let sig_double = row_signature_with_zerowidth(&double, &zw_double);
+        assert_ne!(sig_base, sig_acute);
+        assert_ne!(sig_acute, sig_grave);
+        assert_ne!(sig_acute, sig_double);
+        assert_eq!(combining[0].zerowidth(&zw_acute), &['\u{0301}']);
+    }
+
+    #[test]
+    fn cell_signature_外置组合符号后体量收紧() {
+        assert!(
+            std::mem::size_of::<CellSignature>() <= 64,
+            "CellSignature 不应再内联 40B 组合符号数组，当前 {}B",
+            std::mem::size_of::<CellSignature>()
+        );
+    }
+
+    #[test]
+    fn 整屏快路径记账与全命中一致() {
+        let mut cache: RowCache<u64> = RowCache::new();
+        let key = FrameKey::builder().push("14px").finish();
+        let sigs: Vec<u64> = (0..30)
+            .map(|r| row_signature(&row(&format!("row {r}"), 40)))
+            .collect();
+        run_frame(&mut cache, key, &sigs);
+        cache.record_fast_frame(key, sigs.len());
+        assert_eq!(cache.stats().frames, 2);
+        assert_eq!(cache.stats().rows_seen, 60);
+        assert_eq!(cache.stats().rows_rebuilt, 30);
+        assert_eq!(cache.stats().full_invalidations, 0);
     }
 
     /// 场景 A：静止画面里打字 —— 每帧只有光标行 + 提示行变化。

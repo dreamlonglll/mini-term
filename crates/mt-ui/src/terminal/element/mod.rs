@@ -85,9 +85,7 @@ use gpui::{
 use mt_terminal::{SettledCursor, TermSize, TerminalEmulator};
 
 use super::colors;
-use super::damage::{
-    CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature,
-};
+use super::damage::{CellSignature, DamageStats, FrameKey, RowCache, row_signature_with_zerowidth};
 use super::drag_select::{
     AUTOSCROLL_TICK, DragAnchor, LeftPress, ScrollZone, autoscroll_lines, cell_in_selection,
     classify_left_press, drag_exceeds_cell, update_or_restore_selection,
@@ -489,6 +487,10 @@ struct TerminalElementState {
     /// (200 列 × 72B ≈ 14KB),而刷屏时整屏都是未命中。容量按「一帧未命中行数 ×
     /// 列数」的高水位收敛,一屏满打满算几百 KB —— 与行缓存自己那份产物同一量级。
     cells: Rc<RefCell<Vec<CellSignature>>>,
+    /// 组合符号的跨帧外置暂存区(配合 [`CellSignature::zw_start`] / `zw_len` 使用)。
+    zerowidths: Rc<RefCell<Vec<char>>>,
+    /// 上一帧的整屏渲染产物快照。当 [`FullFrameKey`] 完全一致时直接复用,跳过整屏格子遍历与签名计算。
+    last_frame: Rc<RefCell<Option<CachedFullFrame>>>,
     /// 「这个字符归哪类画法」(并段 / 单画 / 换内置图标字体)的缓存,见 [`AdvanceCache`]。
     advance: Rc<RefCell<AdvanceCache>>,
     /// 滚动条的拖动/悬停状态。
@@ -567,6 +569,8 @@ impl Default for TerminalElementState {
             last_reported_cell: Rc::new(StdCell::new(None)),
             rows: Rc::new(RefCell::new(RowCache::new())),
             cells: Rc::new(RefCell::new(Vec::new())),
+            zerowidths: Rc::new(RefCell::new(Vec::new())),
+            last_frame: Rc::new(RefCell::new(None)),
             advance: Rc::new(RefCell::new(AdvanceCache::default())),
             scrollbar: Rc::new(StdCell::new(ScrollbarDrag::default())),
             scrollbar_touched: Rc::new(StdCell::new(None)),
@@ -614,6 +618,60 @@ struct CursorLayout {
     bounds: Bounds<Pixels>,
     shape: CursorShape,
     color: Hsla,
+}
+
+/// 整屏快路径的完整校验键。覆盖所有会影响 `rows` 与 `cursor` 产物的输入:
+/// 任一字段变化即失效,退回逐行缓存与重建;全部相等时可直接复用上一帧整屏产物。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FullFrameKey {
+    emulator_ptr: usize,
+    frame_key: FrameKey,
+    theme_hash: u64,
+    screen_lines: usize,
+    generation: u64,
+    total_lines: usize,
+    display_offset: usize,
+    mode: TermMode,
+    selection: Option<(AlacPoint, AlacPoint, bool)>,
+    cursor_point: AlacPoint,
+    cursor_shape: CursorShape,
+    highlights: Option<(usize, u64)>,
+}
+
+/// 整屏快路径缓存的上一帧产物(`rows` 的 `y` 与 `local_cursor` 均相对元素原点,
+/// 元素在窗口内平移时照样命中,只做一次原点平移即可)。
+#[derive(Clone)]
+struct CachedFullFrame {
+    key: FullFrameKey,
+    rows: Vec<(Pixels, Rc<RowRender>)>,
+    local_cursor: Option<CursorLayout>,
+    rows_seen: usize,
+}
+
+/// 把 `TerminalTheme` 全部配色哈希成一个 64 位指纹,避免换主题时误命中整屏快路径。
+fn theme_fingerprint(theme: &TerminalTheme) -> u64 {
+    let mut b = FrameKey::builder()
+        .push_hsla(theme.background)
+        .push_hsla(theme.foreground)
+        .push_hsla(theme.bright_foreground)
+        .push_hsla(theme.dim_foreground)
+        .push_hsla(theme.cursor)
+        .push_hsla(theme.cursor_text)
+        .push_hsla(theme.selection);
+    for color in theme.ansi {
+        b = b.push_hsla(color);
+    }
+    b.finish().raw()
+}
+
+fn selection_key(
+    range: Option<alacritty_terminal::selection::SelectionRange>,
+) -> Option<(AlacPoint, AlacPoint, bool)> {
+    range.map(|r| (r.start, r.end, r.is_block))
+}
+
+fn highlights_key(highlights: Option<&Rc<SearchHighlights>>) -> Option<(usize, u64)> {
+    highlights.map(|h| (Rc::as_ptr(h) as usize, h.revision()))
 }
 
 /// 一行的完整渲染产物,几何全部相对该行左上角。
@@ -805,9 +863,10 @@ impl Element for TerminalElement {
             .push_hsla(self.search_colors.current)
             .push_hsla(self.search_colors.current_border)
             .finish();
-        state.rows.borrow_mut().begin_frame(frame_key);
+        let theme_hash = theme_fingerprint(&self.theme);
+        let hl_key = highlights_key(highlights.as_ref());
 
-        let mut placed: Vec<(usize, Rc<RowRender>)> = Vec::with_capacity(screen_lines);
+        let mut placed: Vec<(usize, Rc<RowRender>)> = Vec::new();
         let mut pending: Vec<RowPending> = Vec::new();
         let mode;
         let mut rows_seen = 0usize;
@@ -815,6 +874,8 @@ impl Element for TerminalElement {
         let total_lines;
         let frame_display_offset;
         let images;
+        let full_key: FullFrameKey;
+        let mut fast_hit: Option<CachedFullFrame> = None;
 
         {
             let term_lock = self.emulator.term().lock();
@@ -824,6 +885,7 @@ impl Element for TerminalElement {
                 .kitty()
                 .map_or_else(Vec::new, |kitty| kitty.visible_images(&term_lock));
             total_lines = term_lock.grid().total_lines();
+            let generation = self.emulator.generation();
             let content = term_lock.renderable_content();
             let display_offset = content.display_offset;
             frame_display_offset = display_offset;
@@ -833,205 +895,272 @@ impl Element for TerminalElement {
             let cursor_point = content.cursor.point;
             let cursor_shape = content.cursor.shape;
 
-            let mut cache = state.rows.borrow_mut();
-            // 逐行解析出来的格子写进这根跨帧复用的 arena(见 `TerminalElementState::cells`):
-            // 一行解析完就算签名,命中缓存的把尾巴截掉、未命中的原地留着,
-            // 只把「这一段的下标」交给 shaping —— 全程零分配、零拷贝。
-            let mut arena = state.cells.borrow_mut();
-            arena.clear();
-            // 一帧最多用到「可视行 × 列」这么多格子。窗口拖小 / 字号调大之后按新的
-            // 上限收一收容量,免得旧的高水位一路留到进程退出(只在真的超了才重分配)。
-            arena.shrink_to(columns.saturating_mul(screen_lines));
-            // 当前行在 arena 里的起点。命中就退回它,未命中就前进到行尾。
-            let mut row_start = 0usize;
-            let mut current_row: Option<usize> = None;
-            // 每帧新建:阈值在一帧内恒定,不必进键(见 `ContrastMemo` 的说明)。
-            let mut contrast = colors::ContrastMemo::default();
-            // 命中按行取一次就够:逐格去问 1000 条命中是一屏一千万次比较。
-            let mut row_spans: &[HighlightSpan] = &[];
-
-            let flush_row = |row: usize,
-                             arena: &mut Vec<CellSignature>,
-                             row_start: &mut usize,
-                             cache: &mut RowCache<Rc<RowRender>>,
-                             placed: &mut Vec<(usize, Rc<RowRender>)>,
-                             pending: &mut Vec<RowPending>| {
-                let start = *row_start;
-                if arena.len() == start {
-                    return;
-                }
-                let sig = row_signature(&arena[start..]);
-                match cache.get(sig) {
-                    // 命中:格子已经没用了,截回行首让下一行接着写这段容量
-                    Some(render) => {
-                        placed.push((row, render));
-                        arena.truncate(start);
-                    }
-                    // 未命中:留在 arena 里等放锁之后 shape,只记一段下标
-                    None => {
-                        pending.push(RowPending {
-                            row,
-                            sig,
-                            cells: start..arena.len(),
-                        });
-                        *row_start = arena.len();
-                    }
-                }
+            full_key = FullFrameKey {
+                emulator_ptr: Arc::as_ptr(&self.emulator) as usize,
+                frame_key,
+                theme_hash,
+                screen_lines,
+                generation,
+                total_lines,
+                display_offset,
+                mode,
+                selection: selection_key(selection_range),
+                cursor_point,
+                cursor_shape,
+                highlights: hl_key,
             };
 
-            for indexed in content.display_iter {
-                let row = (indexed.point.line.0 + display_offset as i32).max(0) as usize;
-                if current_row != Some(row) {
-                    if let Some(prev) = current_row {
-                        flush_row(
-                            prev,
-                            &mut arena,
-                            &mut row_start,
-                            &mut cache,
-                            &mut placed,
-                            &mut pending,
-                        );
-                        rows_seen += 1;
+            if let Some(cached) = state
+                .last_frame
+                .borrow()
+                .as_ref()
+                .filter(|c| c.key == full_key)
+            {
+                fast_hit = Some(cached.clone());
+            }
+
+            if fast_hit.is_none() {
+                placed.reserve(screen_lines);
+                let mut cache = state.rows.borrow_mut();
+                cache.begin_frame(frame_key);
+                // 逐行解析出来的格子写进这根跨帧复用的 arena(见 `TerminalElementState::cells`):
+                // 一行解析完就算签名,命中缓存的把尾巴截掉、未命中的原地留着,
+                // 只把「这一段的下标」交给 shaping —— 全程零分配、零拷贝。
+                let mut arena = state.cells.borrow_mut();
+                arena.clear();
+                // 一帧最多用到「可视行 × 列」这么多格子。窗口拖小 / 字号调大之后按新的
+                // 上限收一收容量,免得旧的高水位一路留到进程退出(只在真的超了才重分配)。
+                arena.shrink_to(columns.saturating_mul(screen_lines));
+                let mut zw_arena = state.zerowidths.borrow_mut();
+                zw_arena.clear();
+                // 当前行在 arena / zw_arena 里的起点。命中就退回它,未命中就前进到行尾。
+                let mut row_start = 0usize;
+                let mut zw_row_start = 0usize;
+                let mut current_row: Option<usize> = None;
+                // 每帧新建:阈值在一帧内恒定,不必进键(见 `ContrastMemo` 的说明)。
+                let mut contrast = colors::ContrastMemo::default();
+                // 命中按行取一次就够:逐格去问 1000 条命中是一屏一千万次比较。
+                let mut row_spans: &[HighlightSpan] = &[];
+
+                let flush_row = |row: usize,
+                                 arena: &mut Vec<CellSignature>,
+                                 zw_arena: &mut Vec<char>,
+                                 row_start: &mut usize,
+                                 zw_row_start: &mut usize,
+                                 cache: &mut RowCache<Rc<RowRender>>,
+                                 placed: &mut Vec<(usize, Rc<RowRender>)>,
+                                 pending: &mut Vec<RowPending>| {
+                    let start = *row_start;
+                    if arena.len() == start {
+                        return;
                     }
-                    current_row = Some(row);
-                    arena.reserve(columns);
-                    row_spans = highlights
+                    let sig = row_signature_with_zerowidth(&arena[start..], zw_arena);
+                    match cache.get(sig) {
+                        // 命中:格子已经没用了,截回行首让下一行接着写这段容量
+                        Some(render) => {
+                            placed.push((row, render));
+                            arena.truncate(start);
+                            zw_arena.truncate(*zw_row_start);
+                        }
+                        // 未命中:留在 arena 里等放锁之后 shape,只记一段下标
+                        None => {
+                            pending.push(RowPending {
+                                row,
+                                sig,
+                                cells: start..arena.len(),
+                            });
+                            *row_start = arena.len();
+                            *zw_row_start = zw_arena.len();
+                        }
+                    }
+                };
+
+                for indexed in content.display_iter {
+                    let row = (indexed.point.line.0 + display_offset as i32).max(0) as usize;
+                    if current_row != Some(row) {
+                        if let Some(prev) = current_row {
+                            flush_row(
+                                prev,
+                                &mut arena,
+                                &mut zw_arena,
+                                &mut row_start,
+                                &mut zw_row_start,
+                                &mut cache,
+                                &mut placed,
+                                &mut pending,
+                            );
+                            rows_seen += 1;
+                        }
+                        current_row = Some(row);
+                        arena.reserve(columns);
+                        row_spans = highlights
+                            .as_ref()
+                            .map(|h| h.row(indexed.point.line.0))
+                            .unwrap_or(&[]);
+                    }
+                    let col = indexed.point.column.0;
+                    let cell: &Cell = indexed.cell;
+                    let flags = cell.flags;
+
+                    // ── 颜色:INVERSE 就把前后景对调
+                    let mut fg = colors::foreground(cell.fg, flags, colors_table, &self.theme);
+                    let mut bg = colors::background(cell.bg, colors_table, &self.theme);
+                    let mut bg_is_default = colors::is_default_background(cell.bg, flags);
+                    if flags.contains(Flags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                        bg_is_default = false;
+                    }
+                    // ── 最小对比度:前景与背景近似同色时把前景推开。
+                    //
+                    //    **夹在 INVERSE 与 HIDDEN 之间是硬要求**:在 INVERSE 之后才对得上
+                    //    「真正画出来的那一对」;在 HIDDEN 之前才不会把 `read -s` 的密码
+                    //    强行显形(HIDDEN 就是靠 fg = bg 实现的,修正跑在它后面等于撤销它)。
+                    //    块状光标那格随后会把 fg 覆盖成 cursor_text,这里白算一次但不出错。
+                    //    powerline 分隔符/块元素这类「拿字符当色块画」的字形不在修正之列,
+                    //    理由见 [`colors::is_fill_glyph`]。
+                    if colors::wants_contrast_fix(cell.c, flags) {
+                        fg = contrast.resolve(fg, bg, colors::MIN_CONTRAST_RATIO);
+                    }
+                    if flags.contains(Flags::HIDDEN) {
+                        fg = bg;
+                    }
+
+                    // 逐格按 alacritty 的区间判(块选按列区间);宽字符跨在边上时整字一起亮,
+                    // 与复制出来的内容对得上(见 [`cell_in_selection`])
+                    let selected = selection_range
                         .as_ref()
-                        .map(|h| h.row(indexed.point.line.0))
-                        .unwrap_or(&[]);
-                }
-                let col = indexed.point.column.0;
-                let cell: &Cell = indexed.cell;
-                let flags = cell.flags;
-
-                // ── 颜色:INVERSE 就把前后景对调
-                let mut fg = colors::foreground(cell.fg, flags, colors_table, &self.theme);
-                let mut bg = colors::background(cell.bg, colors_table, &self.theme);
-                let mut bg_is_default = colors::is_default_background(cell.bg, flags);
-                if flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                    bg_is_default = false;
-                }
-                // ── 最小对比度:前景与背景近似同色时把前景推开。
-                //
-                //    **夹在 INVERSE 与 HIDDEN 之间是硬要求**:在 INVERSE 之后才对得上
-                //    「真正画出来的那一对」;在 HIDDEN 之前才不会把 `read -s` 的密码
-                //    强行显形(HIDDEN 就是靠 fg = bg 实现的,修正跑在它后面等于撤销它)。
-                //    块状光标那格随后会把 fg 覆盖成 cursor_text,这里白算一次但不出错。
-                //    powerline 分隔符/块元素这类「拿字符当色块画」的字形不在修正之列,
-                //    理由见 [`colors::is_fill_glyph`]。
-                if colors::wants_contrast_fix(cell.c, flags) {
-                    fg = contrast.resolve(fg, bg, colors::MIN_CONTRAST_RATIO);
-                }
-                if flags.contains(Flags::HIDDEN) {
-                    fg = bg;
-                }
-
-                // 逐格按 alacritty 的区间判(块选按列区间);宽字符跨在边上时整字一起亮,
-                // 与复制出来的内容对得上(见 [`cell_in_selection`])
-                let selected = selection_range
-                    .as_ref()
-                    .is_some_and(|r| cell_in_selection(r, indexed.point, flags));
-                let is_cursor =
-                    indexed.point == cursor_point && cursor_shape != CursorShape::Hidden;
-                if is_cursor && focused && cursor_shape == CursorShape::Block {
-                    // 块状光标底下的字反白
-                    fg = self.theme.cursor_text;
-                }
-
-                let mut zerowidth = ['\0'; MAX_ZEROWIDTH_CHARS];
-                if let Some(zw) = cell.zerowidth() {
-                    for (slot, ch) in zerowidth.iter_mut().zip(zw.iter().copied()) {
-                        *slot = ch;
+                        .is_some_and(|r| cell_in_selection(r, indexed.point, flags));
+                    let is_cursor =
+                        indexed.point == cursor_point && cursor_shape != CursorShape::Hidden;
+                    if is_cursor && focused && cursor_shape == CursorShape::Block {
+                        // 块状光标底下的字反白
+                        fg = self.theme.cursor_text;
                     }
+
+                    let search = row_spans
+                        .iter()
+                        .find(|s| col >= s.start && col <= s.end)
+                        .map(|s| s.kind.code())
+                        .unwrap_or(0);
+
+                    let mut sig_cell = CellSignature {
+                        col,
+                        ch: cell.c,
+                        zw_start: 0,
+                        zw_len: 0,
+                        fg,
+                        bg,
+                        bg_default: bg_is_default,
+                        flags,
+                        selected,
+                        cursor: if is_cursor {
+                            cursor_code(cursor_shape)
+                        } else {
+                            0
+                        },
+                        search,
+                    };
+                    if let Some(zw) = cell.zerowidth()
+                        && !zw.is_empty()
+                    {
+                        sig_cell.push_zerowidth(&mut zw_arena, zw);
+                    }
+                    arena.push(sig_cell);
                 }
-
-                let search = row_spans
-                    .iter()
-                    .find(|s| col >= s.start && col <= s.end)
-                    .map(|s| s.kind.code())
-                    .unwrap_or(0);
-
-                arena.push(CellSignature {
-                    col,
-                    ch: cell.c,
-                    zerowidth,
-                    fg,
-                    bg,
-                    bg_default: bg_is_default,
-                    flags,
-                    selected,
-                    cursor: if is_cursor {
-                        cursor_code(cursor_shape)
-                    } else {
-                        0
-                    },
-                    search,
-                });
-            }
-            if let Some(row) = current_row {
-                flush_row(
-                    row,
-                    &mut arena,
-                    &mut row_start,
-                    &mut cache,
-                    &mut placed,
-                    &mut pending,
-                );
-                rows_seen += 1;
+                if let Some(row) = current_row {
+                    flush_row(
+                        row,
+                        &mut arena,
+                        &mut zw_arena,
+                        &mut row_start,
+                        &mut zw_row_start,
+                        &mut cache,
+                        &mut placed,
+                        &mut pending,
+                    );
+                    rows_seen += 1;
+                }
             }
         }
 
-        // ── shape 只发生在「内容真的变了」的行上。
-        //    锁已经放掉了 —— shaping 会往 DirectWrite 里跑,别拿着 grid 锁做。
-        {
-            // arena 与「步进是否一列宽」的表都借一次,整批 shape 共用。
-            let arena = state.cells.borrow();
-            let mut advance = state.advance.borrow_mut();
-            advance.begin_frame(&variant_fonts, font_size, cell_width);
-            for row in pending {
-                let render = Rc::new(build_row(
-                    window,
-                    &arena[row.cells],
-                    &font,
-                    font_size,
-                    &variant_fonts,
-                    &mut advance,
-                    symbol_font.as_ref(),
-                    cell_width,
-                    line_height,
-                    &self.theme,
-                    self.style.ligatures,
-                ));
-                state.rows.borrow_mut().insert(row.sig, render.clone());
-                placed.push((row.row, render));
-            }
-        }
-
-        {
+        let (rows, cursor) = if let Some(cached) = fast_hit {
             let mut cache = state.rows.borrow_mut();
-            cache.end_frame(rows_seen);
+            cache.record_fast_frame(frame_key, cached.rows_seen);
             if let Some(sink) = self.damage_sink.as_ref() {
                 sink.set(cache.stats());
             }
-        }
-
-        // ── 摆到元素坐标系
-        let mut cursor: Option<CursorLayout> = None;
-        let rows: Vec<(Pixels, Rc<RowRender>)> = placed
-            .into_iter()
-            .map(|(row, render)| {
-                let y = line_height * row as f32;
-                if let Some(c) = render.cursor.as_ref() {
-                    cursor = Some(CursorLayout {
-                        bounds: translate(c.bounds, point(bounds.origin.x, bounds.origin.y + y)),
-                        shape: c.shape,
-                        color: c.color,
-                    });
+            let cursor = cached.local_cursor.map(|c| CursorLayout {
+                bounds: translate(c.bounds, bounds.origin),
+                shape: c.shape,
+                color: c.color,
+            });
+            (cached.rows, cursor)
+        } else {
+            // ── shape 只发生在「内容真的变了」的行上。
+            //    锁已经放掉了 —— shaping 会往 DirectWrite 里跑,别拿着 grid 锁做。
+            {
+                // arena 与「步进是否一列宽」的表都借一次,整批 shape 共用。
+                let arena = state.cells.borrow();
+                let zw_arena = state.zerowidths.borrow();
+                let mut advance = state.advance.borrow_mut();
+                advance.begin_frame(&variant_fonts, font_size, cell_width);
+                for row in pending {
+                    let render = Rc::new(build_row(
+                        window,
+                        &arena[row.cells],
+                        &zw_arena,
+                        &font,
+                        font_size,
+                        &variant_fonts,
+                        &mut advance,
+                        symbol_font.as_ref(),
+                        cell_width,
+                        line_height,
+                        &self.theme,
+                        self.style.ligatures,
+                    ));
+                    state.rows.borrow_mut().insert(row.sig, render.clone());
+                    placed.push((row.row, render));
                 }
-                (y, render)
-            })
-            .collect();
+            }
+
+            {
+                let mut cache = state.rows.borrow_mut();
+                cache.end_frame(rows_seen);
+                if let Some(sink) = self.damage_sink.as_ref() {
+                    sink.set(cache.stats());
+                }
+            }
+
+            // ── 摆到元素坐标系(缓存存相对元素原点的 cursor,命中快路径时只需平移 bounds.origin)
+            let mut local_cursor: Option<CursorLayout> = None;
+            let rows: Vec<(Pixels, Rc<RowRender>)> = placed
+                .into_iter()
+                .map(|(row, render)| {
+                    let y = line_height * row as f32;
+                    if let Some(c) = render.cursor.as_ref() {
+                        local_cursor = Some(CursorLayout {
+                            bounds: translate(c.bounds, point(px(0.0), y)),
+                            shape: c.shape,
+                            color: c.color,
+                        });
+                    }
+                    (y, render)
+                })
+                .collect();
+            let cursor = local_cursor.as_ref().map(|c| CursorLayout {
+                bounds: translate(c.bounds, bounds.origin),
+                shape: c.shape,
+                color: c.color,
+            });
+            *state.last_frame.borrow_mut() = Some(CachedFullFrame {
+                key: full_key,
+                rows: rows.clone(),
+                local_cursor,
+                rows_seen,
+            });
+            (rows, cursor)
+        };
 
         // ── 光标格。上面那个 `cursor`(CursorLayout)是「要画的光标」,可能没有,而且
         //    这一帧可能正赶上 TUI 重绘途中;这个是「光标停稳的那一格」,永远有

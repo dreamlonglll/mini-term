@@ -283,6 +283,9 @@ pub struct TerminalPane {
     sync_release_armed: bool,
     /// 同步块的释放定时器。掉了任务就没了,必须存着。
     _sync_release_timer: Option<Task<()>>,
+    /// 后台隐藏期间跳过过至少一次 `redraw::request`。切回可见时必须补一次重绘,
+    /// 确保 `TerminalView` 与「回到底部」浮钮同步到最新帧,不停留在保留模式旧缓存里。
+    dirty_while_hidden: bool,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
     /// SSH 交互浮层:记录模型 + 内容区右上角的悬浮框(入口按钮在终端组标题栏上,
@@ -598,10 +601,10 @@ impl TerminalPane {
                     return;
                 }
                 // 重绘交给全局节拍器:多个 pane 一起刷屏也只出一帧,窗口在后台
-                // 时还会自动降到 5fps。**这里不再自己 `notify`** —— 缘由见
-                // `crate::redraw` 的模块注释。
+                // 时还会自动降到 5fps。后台/不可见 pane 跳过节拍器只记脏标记,
+                // 避免非激活项目、后台面板、未激活 tab 或停在文档页签时的刷屏持续唤醒 GPUI。
                 if exit.is_none() {
-                    cx.update(|cx| redraw::request(this.clone(), cx));
+                    cx.update(|cx| request_redraw_if_visible(this.clone(), pty_id, cx));
                 }
                 cx.background_executor().timer(DRAIN_PERIOD).await;
             }
@@ -760,6 +763,7 @@ impl TerminalPane {
             _pty_resize_timer: None,
             sync_release_armed: false,
             _sync_release_timer: None,
+            dirty_while_hidden: false,
             _wake: wake,
             ssh_activity,
         }
@@ -800,6 +804,7 @@ impl TerminalPane {
             return;
         };
         self.sync_release_armed = true;
+        let pty_id = self.pty_id;
         // 不在任务里清自己的句柄(从运行中的任务里丢掉自己的 `Task` 是在给自己拆脚手架),
         // 下次排定时器时句柄自然被顶掉
         self._sync_release_timer = Some(cx.spawn(async move |pane, cx| {
@@ -822,7 +827,7 @@ impl TerminalPane {
                     Ok(SyncRelease::Pending(next)) => deadline = next,
                     Ok(SyncRelease::Released) => {
                         // 走节拍器,不在 `pane.update` 里调:它当场 flush 时要 update 这个 pane
-                        cx.update(|cx| redraw::request(pane.clone(), cx));
+                        cx.update(|cx| request_redraw_if_visible(pane.clone(), pty_id, cx));
                         return;
                     }
                     Ok(SyncRelease::Idle) | Err(_) => return,
@@ -1040,11 +1045,29 @@ impl TerminalPane {
     /// 不会重绘 `Arc<TerminalEmulator>` 里的新 grid —— 必须直接标脏 `self.view`;
     /// 回看浮钮状态未变时不惊动外壳,让 gpui-fast 直接拼接 `TerminalView`。
     pub(crate) fn notify_redraw(&mut self, cx: &mut Context<Self>) {
+        self.dirty_while_hidden = false;
         self.view.update(cx, |_, cx| cx.notify());
         let scrolled = self
             .emulator
             .with_term(|term| term.grid().display_offset() > 0);
         if scrolled != self.scrolled_back || (scrolled && self.unseen_output) {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn mark_dirty_while_hidden(&mut self) {
+        self.dirty_while_hidden = true;
+    }
+
+    pub(crate) fn is_dirty_while_hidden(&self) -> bool {
+        self.dirty_while_hidden
+    }
+
+    /// 后台隐藏期间跳过过重绘的 pane 切回可见时,同时标脏 `TerminalView` 与外壳自身,
+    /// 确保首帧即绘出最新内容并同步「回到底部」浮钮(防止保留模式与 view 缓存停在旧帧)。
+    pub(crate) fn flush_hidden_redraw(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.dirty_while_hidden) {
+            self.view.update(cx, |_, cx| cx.notify());
             cx.notify();
         }
     }
@@ -2710,8 +2733,27 @@ fn ssh_activity_probe(view: Entity<SshActivityView>) -> impl IntoElement {
     .size_full()
 }
 
+/// 仅当该 pane 当前屏幕可见时才向全局节拍器排重绘;不可见时只记脏标记,
+/// 等切回可见再由 `flush_hidden_redraw` 一次性补刷。
+fn request_redraw_if_visible(pane: gpui::WeakEntity<TerminalPane>, pty_id: u32, cx: &mut App) {
+    if crate::workbench_area::is_pty_visible(pty_id, cx) {
+        redraw::request(pane, cx);
+    } else {
+        let _ = pane.update(cx, |pane, _| pane.mark_dirty_while_hidden());
+    }
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 双保险兜底:若某条切回可见的路径未在切换事件期提前调 `flush_hidden_redraw`,
+        // 首次重新渲染外壳时显式在下一帧标脏内部 `TerminalView`(外壳本身此刻正在重跑
+        // `sync_scrollback_state`,回看浮钮本帧即同步)。
+        if std::mem::take(&mut self.dirty_while_hidden) {
+            let view = self.view.clone();
+            window.on_next_frame(move |_, cx| {
+                view.update(cx, |_, cx| cx.notify());
+            });
+        }
         if let Some(err) = self.spawn_error.clone() {
             return self.render_spawn_error(err, cx).into_any_element();
         }

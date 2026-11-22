@@ -58,6 +58,9 @@ pub(super) enum Coverage {
     Symbol,
 }
 
+/// `AdvanceCache::wide` 的最大条目数，防止长会话缩放字号或海量 Unicode 字符下无界增长。
+pub(super) const WIDE_CACHE_LIMIT: usize = 4096;
+
 impl Default for AdvanceCache {
     fn default() -> Self {
         Self {
@@ -69,7 +72,7 @@ impl Default for AdvanceCache {
 }
 
 impl AdvanceCache {
-    /// 每帧开头对一次表:字体度量换了就把 ASCII 快表清掉。
+    /// 每帧开头对一次表:字体 / 字号 / 列宽换了就把 ASCII 与 wide 缓存一并清掉。
     pub(super) fn begin_frame(
         &mut self,
         fonts: &VariantFonts,
@@ -80,6 +83,7 @@ impl AdvanceCache {
         if self.key != Some(key) {
             self.key = Some(key);
             self.ascii = [[None; 128]; 4];
+            self.wide.clear();
         }
     }
 
@@ -123,8 +127,31 @@ impl AdvanceCache {
             return hit;
         }
         let coverage = classify_glyph(window, base, slot, font_size, ch, cell_width);
-        self.wide.insert(key, coverage);
+        self.insert_wide(key, coverage);
         coverage
+    }
+
+    fn insert_wide(&mut self, key: (FontId, u32, char), coverage: Coverage) {
+        if self.wide.len() >= WIDE_CACHE_LIMIT {
+            self.wide.clear();
+        }
+        self.wide.insert(key, coverage);
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_wide_for_test(
+        &mut self,
+        font_id: FontId,
+        font_size: Pixels,
+        ch: char,
+        coverage: Coverage,
+    ) {
+        self.insert_wide((font_id, f(font_size).to_bits(), ch), coverage);
+    }
+
+    #[cfg(test)]
+    pub(super) fn wide_len(&self) -> usize {
+        self.wide.len()
     }
 }
 
@@ -288,7 +315,7 @@ pub(super) fn symbol_columns(cell: &CellSignature, next: Option<&CellSignature>)
     let followed_by_blank = next.is_some_and(|next| {
         next.col == cell.col + 1
             && next.ch == ' '
-            && next.zerowidth[0] == '\0'
+            && !next.has_zerowidth()
             && next.bg_default == cell.bg_default
             && (cell.bg_default || next.bg == cell.bg)
             && next.selected == cell.selected
@@ -374,6 +401,7 @@ pub(super) fn cursor_move_bytes(
 pub(super) fn build_row(
     window: &Window,
     cells: &[CellSignature],
+    zerowidths: &[char],
     font: &gpui::Font,
     font_size: Pixels,
     variant_fonts: &VariantFonts,
@@ -481,7 +509,7 @@ pub(super) fn build_row(
                 }),
         };
 
-        let has_zerowidth = cell.zerowidth[0] != '\0';
+        let has_zerowidth = cell.has_zerowidth();
         let slot = VariantFonts::slot(style_key.bold, style_key.italic);
         let run_font_id = variant_fonts.id_at(slot);
         // 字形归属只问窄字符(宽字符一律单独画)。光标格 / 带组合符号的格子本来就
@@ -543,8 +571,8 @@ pub(super) fn build_row(
             flush_text(&mut text_run, &mut pieces);
             let mut text = String::new();
             text.push(cell.ch);
-            for z in cell.zerowidth.iter().take_while(|c| **c != '\0') {
-                text.push(*z);
+            for &z in cell.zerowidth(zerowidths) {
+                text.push(z);
             }
             pieces.push(PendingPiece {
                 start: col,
