@@ -48,6 +48,12 @@
 //!
 //! 网址复用同一套走法,但**没有盘可验**,接错就是开错页面,所以判据收得更紧(见
 //! [`URL_WRAP`]):行尾要真贴着右边缘,下一行开头还得像网址的后半截。
+//!
+//! 终端里的表格(Markdown 渲染器 / AI CLI 用 `│` `─` `┼` 或 `|` 拼出的多列表)是
+//! 同类硬换行的分栏版:网址或路径贴着**单元格右框线**折到同一列下一行,而非整个终端
+//! 右边缘,相邻列的内容又夹在同一条物理行里。检测到当前格落在纵向延续的竖框线栏位
+//! ([`table_cell_at`])时,把每行截到该单元格的列区间再按同一套规则上下接,遇到横
+//! 分隔线(`├──┼──┤`、`│───│`、`|---|`)即止。
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -139,14 +145,15 @@ impl LogicalLine {
     }
 
     /// 内容写到了最后一个物理行的右边缘附近、收尾是接得上的字符 —— 像是被 TUI 折下去了。
-    fn runs_to_edge(&self, columns: usize, rule: &HardWrapRule) -> bool {
+    /// `right_edge` 在整行模式下是 `grid.columns()`,在表格单元格模式下是右框线列号。
+    fn runs_to_edge(&self, right_edge: usize, rule: &HardWrapRule) -> bool {
         let Some((_, last)) = self.content_bounds() else {
             return false;
         };
         let cell = self.cells[last];
         let end = cell.column + if cell.wide { 2 } else { 1 };
         self.cells.last().is_some_and(|tail| tail.line == cell.line)
-            && end + rule.edge_slack >= columns
+            && end + rule.edge_slack >= right_edge
             && (rule.is_char)(self.chars[last])
     }
 
@@ -160,7 +167,8 @@ impl LogicalLine {
     ///
     /// 散文在词边界被折行时下一行开头是普通单词(`and`),网址没有盘可验,接上去就是
     /// 开错页面,所以光「是网址字符」不够:要带数字或网址的结构字符;或者它独占这一行
-    /// (长网址最后一截经常是几个字母)。自带 scheme 的是下一条网址,不是后半截。
+    /// (长网址最后一截经常是几个字母)。自带 scheme(含被括号/单引号包着的新网址)的是
+    /// 下一条网址,不是后半截。
     fn looks_like_url_tail(&self) -> bool {
         let Some((first, _)) = self.content_bounds() else {
             return false;
@@ -169,7 +177,11 @@ impl LogicalLine {
             .find(|&i| !is_url_char(self.chars[i]))
             .unwrap_or(self.chars.len());
         let word = &self.chars[first..end];
-        if scheme_len_at(word, 0).is_some() {
+        let open_prefix = word
+            .iter()
+            .position(|c| !matches!(c, '(' | '[' | '{' | '\''))
+            .unwrap_or(word.len());
+        if scheme_len_at(word, open_prefix).is_some() {
             return false;
         }
         let trimmed = word.len() - trailing_url_punct(word);
@@ -209,9 +221,9 @@ impl TerminalEmulator {
 
     /// 鼠标对着 grid 的 `(line, column)` 时的路径候选,连同候选下标所指的那条行。
     ///
-    /// 先按终端软换行拼整行;路径贴着行首 / 行尾时,再试着接上 TUI 自己折开的上下行
-    /// (见模块注释「硬换行」)。接上的候选排前面,没接的垫底 —— 接错了由宿主验盘淘汰。
-    /// 整个过程只拿一次 grid 锁。
+    /// 先按终端软换行拼整行(落在表格单元格内时截到该列区间);路径贴着行首 / 行尾时,
+    /// 再试着接上 TUI 自己折开的上下行(见模块注释「硬换行」)。接上的候选排前面,
+    /// 没接的垫底 —— 接错了由宿主验盘淘汰。整个过程只拿一次 grid 锁。
     pub fn path_candidates_at(
         &self,
         line: i32,
@@ -219,7 +231,7 @@ impl TerminalEmulator {
     ) -> Option<(LogicalLine, Vec<PathCandidate>)> {
         let term = self.term.lock();
         let grid = term.grid();
-        let current = logical_line(grid, line)?;
+        let (current, table_cell) = row_at_cursor(grid, line, column)?;
         let index = current.index_at(line, column)?;
         // 鼠标不在路径字符上就不必往上下找了。反过来不成立:`:20` 这种只剩行号的
         // 后半截自己认不出候选,接上前半截才是完整的 `…lib.rs:20`
@@ -228,7 +240,7 @@ impl TerminalEmulator {
         }
         let plain = path_candidates(&current.chars, index);
 
-        let (before, after) = hard_wrap_neighbors(grid, &current, &PATH_WRAP)?;
+        let (before, after) = hard_wrap_neighbors(grid, &current, table_cell.as_ref(), &PATH_WRAP)?;
         drop(term);
         let Some(joined) = join_hard_wrapped(&current, &before, &after, index) else {
             return Some((current, plain));
@@ -270,12 +282,12 @@ impl TerminalEmulator {
                 from_osc8: true,
             });
         }
-        let current = logical_line(grid, line)?;
+        let (current, table_cell) = row_at_cursor(grid, line, column)?;
         let index = current.index_at(line, column)?;
         if !current.chars.get(index).is_some_and(|&c| is_url_char(c)) {
             return None;
         }
-        let (before, after) = hard_wrap_neighbors(grid, &current, &URL_WRAP)?;
+        let (before, after) = hard_wrap_neighbors(grid, &current, table_cell.as_ref(), &URL_WRAP)?;
         drop(term);
         // 接得上就先按接好的认:网址贴着接缝时这才是完整的。接缝附近没有网址
         // (上一行末尾只是个碰巧贴边的词)时落回当前行自己
@@ -285,22 +297,203 @@ impl TerminalEmulator {
     }
 }
 
+/// 表格单元格(或由竖框线隔开的栏位)的列范围与边框特征。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableCell {
+    /// 单元格内容的列区间(不含左右竖框线)。
+    cols: Range<usize>,
+    /// 左框线的 `(列号, 字符)`。无外框表格的最左列为 `None`。
+    left: Option<(usize, char)>,
+    /// 右框线的 `(列号, 字符)`。无外框表格的最右列或仅带左装饰线时为 `None`。
+    right: Option<(usize, char)>,
+}
+
+fn is_spacer(cell: &Cell) -> bool {
+    cell.flags
+        .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
+/// Unicode 框线竖线字符(常见终端表格的列分隔线 / 卡片侧边框)。
+fn is_box_vborder(c: char) -> bool {
+    matches!(c, '│' | '┃' | '║' | '┆' | '┇' | '┊' | '┋' | '╎' | '╏')
+}
+
+fn is_table_vborder(c: char) -> bool {
+    is_box_vborder(c) || c == '|'
+}
+
+/// `line` 是独立物理行:在 grid 范围内,且首尾都没有 `WRAPLINE` 软换行。
+fn is_single_physical_line(grid: &Grid<Cell>, line: i32) -> bool {
+    let top = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let columns = grid.columns();
+    if columns == 0 || line < top || line > bottom {
+        return false;
+    }
+    let wraps = |l: i32| {
+        grid[Line(l)][Column(columns - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    };
+    !(line > top && wraps(line - 1)) && !wraps(line)
+}
+
+fn has_border_char(grid: &Grid<Cell>, line: i32, col: usize, ch: char) -> bool {
+    let cell = &grid[Line(line)][Column(col)];
+    !is_spacer(cell) && cell.c == ch
+}
+
+/// 这一行的 `cols` 里是不是表格的横分隔线(`────`、`----`、`====`、`:---:` 之类)。
+///
+/// 多数表格分隔行在边框列上是 `├`/`┼`/`+`,边框比对已经拦住;少数表格用 `|---|---|`
+/// 或 `│───│` 这种保留竖框线的写法,靠这里拦住,防止把横线拼进网址或跨到下一条记录。
+fn is_horizontal_rule_in_cols(grid: &Grid<Cell>, line: i32, cols: &Range<usize>) -> bool {
+    let row = &grid[Line(line)];
+    let mut non_ws = 0usize;
+    let mut box_h = 0usize;
+    let mut ascii_dash_eq = 0usize;
+    let mut ascii_colon = 0usize;
+    for col in cols.clone() {
+        let cell = &row[Column(col)];
+        if is_spacer(cell) || cell.c.is_whitespace() {
+            continue;
+        }
+        non_ws += 1;
+        match cell.c {
+            '─' | '━' | '═' | '┄' | '┅' | '┈' | '┉' | '╌' | '╍' => box_h += 1,
+            '-' | '=' => ascii_dash_eq += 1,
+            ':' => ascii_colon += 1,
+            _ => return false,
+        }
+    }
+    if non_ws == 0 {
+        return false;
+    }
+    box_h == non_ws || (ascii_dash_eq >= 3 && ascii_dash_eq + ascii_colon == non_ws)
+}
+
+/// 鼠标所在格是不是落在表格单元格(或竖框线隔开的栏位)内。
+///
+/// 只有独立物理行才认表格。先找左右最近的、且在上下相邻行同列也出现的 Unicode 竖框线;
+/// 找不到时再看 ASCII `|` —— 单元格正文里的管道符不会截断 Unicode 表格,普通命令行里
+/// 孤立的 `a | b` 也不会被误认成表格。
+fn table_cell_at(grid: &Grid<Cell>, line: i32, column: usize) -> Option<TableCell> {
+    let columns = grid.columns();
+    if columns == 0 || column >= columns || !is_single_physical_line(grid, line) {
+        return None;
+    }
+    let row = &grid[Line(line)];
+    let at = &row[Column(column)];
+    if !is_spacer(at) && is_table_vborder(at.c) {
+        return None;
+    }
+    let find_with = |is_border: fn(char) -> bool| -> Option<TableCell> {
+        let matches_border = |col: usize| -> Option<(usize, char)> {
+            let cell = &row[Column(col)];
+            if is_spacer(cell) || !is_border(cell.c) {
+                return None;
+            }
+            let ch = cell.c;
+            let continues = |adj: i32| {
+                is_single_physical_line(grid, adj) && has_border_char(grid, adj, col, ch)
+            };
+            (continues(line - 1) || continues(line + 1)).then_some((col, ch))
+        };
+        let left = (0..column).rev().find_map(&matches_border);
+        let right = (column + 1..columns).find_map(&matches_border);
+        if left.is_none() && right.is_none() {
+            return None;
+        }
+        let col_start = left.map_or(0, |(c, _)| c + 1);
+        let col_end = right.map_or(columns, |(c, _)| c);
+        if col_start >= col_end {
+            return None;
+        }
+        let cell = TableCell {
+            cols: col_start..col_end,
+            left,
+            right,
+        };
+        (!is_horizontal_rule_in_cols(grid, line, &cell.cols)).then_some(cell)
+    };
+    find_with(is_box_vborder).or_else(|| find_with(|c| c == '|'))
+}
+
+/// `line` 这一行是否属于同一个 `cell`(同列有相同竖框线,且单元格内不是横分隔线)。
+fn matches_table_cell(grid: &Grid<Cell>, line: i32, cell: &TableCell) -> bool {
+    if !is_single_physical_line(grid, line) {
+        return false;
+    }
+    if let Some((col, ch)) = cell.left
+        && !has_border_char(grid, line, col, ch)
+    {
+        return false;
+    }
+    if let Some((col, ch)) = cell.right
+        && !has_border_char(grid, line, col, ch)
+    {
+        return false;
+    }
+    !is_horizontal_rule_in_cols(grid, line, &cell.cols)
+}
+
+/// 把 `line` 在 `cell.cols` 里的内容切成一条 [`LogicalLine`],坐标保留真实的 grid 列号。
+fn table_cell_line(grid: &Grid<Cell>, line: i32, cell: &TableCell) -> Option<LogicalLine> {
+    if !matches_table_cell(grid, line, cell) {
+        return None;
+    }
+    let row = &grid[Line(line)];
+    let mut out = LogicalLine::default();
+    for col in cell.cols.clone() {
+        let grid_cell = &row[Column(col)];
+        if is_spacer(grid_cell) {
+            continue;
+        }
+        out.chars.push(grid_cell.c);
+        out.cells.push(LineCell {
+            line,
+            column: col,
+            wide: grid_cell.flags.contains(Flags::WIDE_CHAR),
+        });
+    }
+    Some(out)
+}
+
+/// 鼠标所在行:落在表格单元格内时只取该单元格列区间,否则取整条软换行逻辑行。
+fn row_at_cursor(
+    grid: &Grid<Cell>,
+    line: i32,
+    column: usize,
+) -> Option<(LogicalLine, Option<TableCell>)> {
+    if let Some(cell) = table_cell_at(grid, line, column) {
+        let current = table_cell_line(grid, line, &cell)?;
+        Some((current, Some(cell)))
+    } else {
+        Some((logical_line(grid, line)?, None))
+    }
+}
+
 /// 顺着 TUI 硬换行找 `current` 上下接得上的行,上面的由近及远。
 fn hard_wrap_neighbors(
     grid: &Grid<Cell>,
     current: &LogicalLine,
+    table_cell: Option<&TableCell>,
     rule: &HardWrapRule,
 ) -> Option<(Vec<LogicalLine>, Vec<LogicalLine>)> {
-    let columns = grid.columns();
+    let right_edge = table_cell.map_or(grid.columns(), |cell| cell.cols.end);
+    let fetch = |l: i32| match table_cell {
+        Some(cell) => table_cell_line(grid, l, cell),
+        None => logical_line(grid, l),
+    };
     // 往上:当前行开头接得上,上一行写满且以接得上的字符收尾
     let mut before: Vec<LogicalLine> = Vec::new();
     let mut head = current.top_line()?;
     let mut head_continues = (rule.continues)(current);
     while head_continues && before.len() < rule.max_rows {
-        let Some(prev) = logical_line(grid, head - 1) else {
+        let Some(prev) = fetch(head - 1) else {
             break;
         };
-        if !prev.runs_to_edge(columns, rule) {
+        if !prev.runs_to_edge(right_edge, rule) {
             break;
         }
         head = prev.top_line()?;
@@ -310,16 +503,16 @@ fn hard_wrap_neighbors(
     // 往下:当前行写满且以接得上的字符收尾,下一行开头接得上
     let mut after: Vec<LogicalLine> = Vec::new();
     let mut tail = current.bottom_line()?;
-    let mut tail_continues = current.runs_to_edge(columns, rule);
+    let mut tail_continues = current.runs_to_edge(right_edge, rule);
     while tail_continues && after.len() < rule.max_rows {
-        let Some(next) = logical_line(grid, tail + 1) else {
+        let Some(next) = fetch(tail + 1) else {
             break;
         };
         if !(rule.continues)(&next) {
             break;
         }
         tail = next.bottom_line()?;
-        tail_continues = next.runs_to_edge(columns, rule);
+        tail_continues = next.runs_to_edge(right_edge, rule);
         after.push(next);
     }
     Some((before, after))
@@ -867,6 +1060,7 @@ fn hyperlink_cells(grid: &Grid<Cell>, line: i32, column: usize, link: &Hyperlink
 }
 
 /// 从 `(line, column)` 那一段往上下走,跨行时只容忍行尾与行首的空白。
+/// 落在表格单元格内时把空白与搜索范围收在单元格列区间内,遇到横分隔线即止。
 fn adjacent_runs(
     grid: &Grid<Cell>,
     (line, column): (i32, usize),
@@ -874,6 +1068,10 @@ fn adjacent_runs(
     same: &dyn Fn(&Cell) -> bool,
 ) -> VecDeque<(i32, Range<usize>)> {
     let columns = grid.columns();
+    let table_cell = table_cell_at(grid, line, column);
+    let col_range = table_cell
+        .as_ref()
+        .map_or(0..columns, |cell| cell.cols.clone());
     // 空格且不属于任何链接。宽字符的 spacer 也是空格,但它是内容
     let blank = |cell: &Cell| {
         cell.c == ' ' && cell.hyperlink().is_none() && !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
@@ -881,11 +1079,11 @@ fn adjacent_runs(
     let run_at = |l: i32, col: usize| {
         let row = &grid[Line(l)];
         let mut start = col;
-        while start > 0 && same(&row[Column(start - 1)]) {
+        while start > col_range.start && same(&row[Column(start - 1)]) {
             start -= 1;
         }
         let mut end = col + 1;
-        while end < columns && same(&row[Column(end)]) {
+        while end < col_range.end && same(&row[Column(end)]) {
             end += 1;
         }
         start..end
@@ -894,9 +1092,14 @@ fn adjacent_runs(
     let (mut up, mut up_start) = (line, first.start);
     let (mut down, mut down_end) = (line, first.end);
     let mut out = VecDeque::from([(line, first)]);
-    while up > *rows.start() && (0..up_start).all(|c| blank(&grid[Line(up)][Column(c)])) {
+    while up > *rows.start()
+        && table_cell
+            .as_ref()
+            .is_none_or(|cell| matches_table_cell(grid, up - 1, cell))
+        && (col_range.start..up_start).all(|c| blank(&grid[Line(up)][Column(c)]))
+    {
         let prev = &grid[Line(up - 1)];
-        let Some(last) = (0..columns).rev().find(|&c| !blank(&prev[Column(c)])) else {
+        let Some(last) = col_range.clone().rev().find(|&c| !blank(&prev[Column(c)])) else {
             break;
         };
         if !same(&prev[Column(last)]) {
@@ -907,9 +1110,14 @@ fn adjacent_runs(
         up_start = run.start;
         out.push_front((up, run));
     }
-    while down < *rows.end() && (down_end..columns).all(|c| blank(&grid[Line(down)][Column(c)])) {
+    while down < *rows.end()
+        && table_cell
+            .as_ref()
+            .is_none_or(|cell| matches_table_cell(grid, down + 1, cell))
+        && (down_end..col_range.end).all(|c| blank(&grid[Line(down)][Column(c)]))
+    {
         let next = &grid[Line(down + 1)];
-        let Some(first) = (0..columns).find(|&c| !blank(&next[Column(c)])) else {
+        let Some(first) = col_range.clone().find(|&c| !blank(&next[Column(c)])) else {
             break;
         };
         if !same(&next[Column(first)]) {
@@ -1883,5 +2091,387 @@ mod tests {
         assert_eq!(url_at(&e, top - 1, 1), None);
         assert_eq!(url_at(&e, 3, 1), None);
         assert_eq!(url_at(&e, 0, 40), None);
+    }
+
+    // ── 表格单元格内的跨行链接 ────────────────────────────────────────────────
+
+    /// 按终端列宽(ASCII = 1, 其余 = 2)给单元格文本右侧补空格,保证各行竖框线对齐。
+    fn pad_cell(text: &str, width: usize) -> String {
+        let used: usize = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        assert!(used <= width, "{text:?} 宽 {used} 超过 {width}");
+        format!(" {text}{} ", " ".repeat(width - used))
+    }
+
+    fn box_row(cells: &[(&str, usize)], sep: char) -> String {
+        let mut out = String::new();
+        out.push(sep);
+        for &(text, width) in cells {
+            out.push_str(&pad_cell(text, width));
+            out.push(sep);
+        }
+        out
+    }
+
+    fn box_sep(widths: &[usize]) -> String {
+        let mut out = String::from("├");
+        for (i, &w) in widths.iter().enumerate() {
+            out.push_str(&"─".repeat(w + 2));
+            out.push(if i + 1 == widths.len() { '┤' } else { '┼' });
+        }
+        out
+    }
+
+    /// 还原 Markdown 表格在终端里按列宽折行的典型布局(含跨 2 行、纯字母尾巴、仅 `)`
+    /// 折行、右侧列跨 3 行、以及行分隔线 `├──┼──┤` 拦断)。
+    #[test]
+    fn 表格单元格里折行的网址整条接回来() {
+        let widths = [32, 16, 33];
+        let c3 = 1 + (widths[0] + 2) + 1 + (widths[1] + 2) + 1;
+        let rows = [
+            // line 0..=2: Chatless (第 1 列纯字母尾巴 hatless), 第 3 列两行 release)
+            box_row(&[("Chatless", 32), ("说明A", 16), ("约 21.0 MiB", 33)], '│'),
+            box_row(
+                &[
+                    ("(https://github.com/kamjin3086/c", 32),
+                    ("第二行", 16),
+                    ("(https://github.com/kamjin3086/ch", 33),
+                ],
+                '│',
+            ),
+            box_row(
+                &[
+                    ("hatless)", 32),
+                    ("", 16),
+                    ("atless/releases/tag/v0.8.2)", 33),
+                ],
+                '│',
+            ),
+            // line 3: 分隔线
+            box_sep(&widths),
+            // line 4..=6: Talkio (仅 `)` 折到下一行)
+            box_row(&[("Talkio", 32), ("说明B", 16), ("约 9.3 MiB", 33)], '│'),
+            box_row(
+                &[
+                    ("(https://github.com/llt22/talkio", 32),
+                    ("工具", 16),
+                    ("(https://github.com/llt22/talkio/", 33),
+                ],
+                '│',
+            ),
+            box_row(&[(")", 32), ("", 16), ("releases/tag/v2.16.3)", 33)], '│'),
+            // line 7: 分隔线
+            box_sep(&widths),
+            // line 8..=11: Chatshell (第 1 列两行, 第 3 列跨 3 行)
+            box_row(
+                &[("Chatshell", 32), ("说明C", 16), ("约 28.9 MiB, MSI", 33)],
+                '│',
+            ),
+            box_row(
+                &[
+                    ("(https://github.com/chatshellapp", 32),
+                    ("工具审批", 16),
+                    ("(https://github.com/chatshellapp/", 33),
+                ],
+                '│',
+            ),
+            box_row(
+                &[
+                    ("/chatshell-desktop)", 32),
+                    ("", 16),
+                    ("chatshell-desktop/releases/tag/v0", 33),
+                ],
+                '│',
+            ),
+            box_row(&[("", 32), ("", 16), (".12.0)", 33)], '│'),
+            // line 12: 分隔线
+            box_sep(&widths),
+            // line 13..=14: 行分隔线紧贴上下两行贴边 URL 也不串拼
+            box_row(
+                &[
+                    ("(https://github.com/aidyou/chats", 32),
+                    ("说明D", 16),
+                    ("(https://github.com/aidyou/chatsp", 33),
+                ],
+                '│',
+            ),
+            box_row(
+                &[("peed)", 32), ("", 16), ("eed/releases/tag/v2.1.4)", 33)],
+                '│',
+            ),
+        ];
+        // 终端比表格宽,证明不依赖终端右边缘
+        let e = TerminalEmulator::new(TermSize::new(120, 20));
+        e.advance(rows.join("\r\n").as_bytes());
+
+        // Chatless 第 1 列(纯字母尾巴 `hatless)`)
+        for (line, col) in [(1, 3), (1, 33), (2, 2), (2, 8)] {
+            let link = e.url_at(line, col).expect("Chatless 网址");
+            assert_eq!(link.url, "https://github.com/kamjin3086/chatless");
+            assert_eq!(link.cells.first().map(|c| (c.line, c.column)), Some((1, 3)));
+            assert_eq!(link.cells.last().map(|c| (c.line, c.column)), Some((2, 8)));
+        }
+        assert_eq!(url_at(&e, 2, 9), None, "尾部右括号不算网址");
+
+        // Talkio 第 1 列(仅 `)` 折到下一行)
+        assert_eq!(
+            url_at(&e, 5, 5).as_deref(),
+            Some("https://github.com/llt22/talkio")
+        );
+        assert_eq!(url_at(&e, 6, 2), None, "单独折到下一行的 `)` 不算网址");
+
+        // Chatshell 第 1 列(悬停第一行或第二行都拿整条且下划线跨两行)
+        for (line, col) in [(9, 3), (9, 33), (10, 2), (10, 19)] {
+            let link = e.url_at(line, col).expect("Chatshell 网址");
+            assert_eq!(
+                link.url, "https://github.com/chatshellapp/chatshell-desktop",
+                "({line},{col})"
+            );
+            assert_eq!(link.cells.first().map(|c| (c.line, c.column)), Some((9, 3)));
+            assert_eq!(
+                link.cells.last().map(|c| (c.line, c.column)),
+                Some((10, 19))
+            );
+        }
+        assert_eq!(url_at(&e, 9, 0), None, "竖框线不算网址");
+        assert_eq!(url_at(&e, 9, 2), None, "开括号不算网址");
+
+        // Chatshell 第 3 列(跨 3 行折行的 release 网址)
+        let want3 = "https://github.com/chatshellapp/chatshell-desktop/releases/tag/v0.12.0";
+        for (line, col) in [(9, c3 + 2), (10, c3 + 10), (11, c3 + 1), (11, c3 + 5)] {
+            let link = e.url_at(line, col).expect("三行 release 网址");
+            assert_eq!(link.url, want3, "({line},{col})");
+            assert_eq!(
+                link.cells.first().map(|c| (c.line, c.column)),
+                Some((9, c3 + 2))
+            );
+            assert_eq!(
+                link.cells.last().map(|c| (c.line, c.column)),
+                Some((11, c3 + 5))
+            );
+        }
+
+        // Chatspeed 第 1 列与第 3 列
+        assert_eq!(
+            url_at(&e, 13, 5).as_deref(),
+            Some("https://github.com/aidyou/chatspeed")
+        );
+        assert_eq!(
+            url_at(&e, 14, 2).as_deref(),
+            Some("https://github.com/aidyou/chatspeed")
+        );
+        assert_eq!(
+            url_at(&e, 13, c3 + 5).as_deref(),
+            Some("https://github.com/aidyou/chatspeed/releases/tag/v2.1.4")
+        );
+    }
+
+    /// 单元格里紧贴行分隔线的两条贴边记录不会跨分隔线串拼;括号包裹的新网址不会拼到
+    /// 上一行贴边网址后面;单元格里不贴右框线的短网址不与下一行拼接。
+    #[test]
+    fn 表格内分隔线与短网址与新网址不误拼() {
+        // 1. 跨 `├──┼──┤` 不串拼:line 0 末尾贴边,line 2 是 `/tail`
+        let rows = [
+            box_row(&[("https://a.com/123456", 20), ("col2", 6)], '│'),
+            box_sep(&[20, 6]),
+            box_row(&[("/next-row-tail", 20), ("col2", 6)], '│'),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 6));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/123456"));
+        assert_eq!(url_at(&e, 2, 3), None);
+
+        // 2. 上一行贴边 URL,下一行是括号包着的新 URL `(https://b.com/x)` -> 不合并
+        let rows = [
+            box_row(&[("https://a.com/123456", 20), ("col2", 6)], '│'),
+            box_row(&[("(https://b.com/x)", 20), ("col2", 6)], '│'),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/123456"));
+        assert_eq!(url_at(&e, 1, 5).as_deref(), Some("https://b.com/x"));
+
+        // 3. 单元格内短网址离右框线超过 2 列 -> 不接下一行
+        let rows = [
+            box_row(&[("https://a.com/ab", 20), ("col2", 6)], '│'),
+            box_row(&[("/not-joined", 20), ("col2", 6)], '│'),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(url_at(&e, 0, 3).as_deref(), Some("https://a.com/ab"));
+        assert_eq!(url_at(&e, 1, 3), None);
+    }
+
+    /// 无外框表格(只画列间竖线)、只有左侧竖框线的引用块、以及带缩进的表格。
+    #[test]
+    fn 无外框表格与引用块与缩进表格的折行网址() {
+        // 无左右外框:左列只有右框线 `│`
+        let e = TerminalEmulator::new(TermSize::new(50, 4));
+        e.advance("https://a.com/abcde │ 说明一\r\n/fghij              │ 说明二".as_bytes());
+        assert_eq!(
+            url_at(&e, 0, 4).as_deref(),
+            Some("https://a.com/abcde/fghij")
+        );
+        assert_eq!(
+            url_at(&e, 1, 2).as_deref(),
+            Some("https://a.com/abcde/fghij")
+        );
+
+        // 只有左侧框线 `│`,网址写到终端右边缘折行
+        let e = TerminalEmulator::new(TermSize::new(22, 4));
+        e.advance("│ https://a.com/abcdef\r\n│ /ghij".as_bytes());
+        assert_eq!(
+            url_at(&e, 0, 4).as_deref(),
+            Some("https://a.com/abcdef/ghij")
+        );
+        assert_eq!(
+            url_at(&e, 1, 3).as_deref(),
+            Some("https://a.com/abcdef/ghij")
+        );
+
+        // 带左侧缩进的表格
+        let rows = [
+            format!("  {}", box_row(&[("https://a.com/123456", 20)], '│')),
+            format!("  {}", box_row(&[("/789", 20)], '│')),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(
+            url_at(&e, 0, 6).as_deref(),
+            Some("https://a.com/123456/789")
+        );
+        assert_eq!(
+            url_at(&e, 1, 4).as_deref(),
+            Some("https://a.com/123456/789")
+        );
+    }
+
+    /// ASCII `|` 表格支持跨行拼接,且 `|---|---|` / `│───│` 水平分隔线会被拦住。
+    #[test]
+    fn ascii_表格与保留竖框线的水平分隔线() {
+        let rows = [
+            "+----------------------+------+",
+            "| https://a.com/123456 | col2 |",
+            "| /tail-path           |      |",
+            "|----------------------|------|",
+            "| /after-sep           |      |",
+            "+----------------------+------+",
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 8));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(
+            url_at(&e, 1, 4).as_deref(),
+            Some("https://a.com/123456/tail-path")
+        );
+        assert_eq!(
+            url_at(&e, 2, 4).as_deref(),
+            Some("https://a.com/123456/tail-path")
+        );
+        // 紧贴 `|---|` 之上与之下不会把 `---` 或下一条拼进来
+        let rows = [
+            "| https://a.com/123456 | col2 |",
+            "|----------------------|------|",
+            "| /after-sep           |      |",
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 6));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(url_at(&e, 0, 4).as_deref(), Some("https://a.com/123456"));
+        assert_eq!(url_at(&e, 2, 4), None);
+
+        // `│───│` 保留竖框线的 Unicode 分隔行同样拦住
+        let rows = [
+            "│ https://a.com/123456 │ col2 │",
+            "│──────────────────────│──────│",
+            "│ /after-sep           │      │",
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 6));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(url_at(&e, 0, 4).as_deref(), Some("https://a.com/123456"));
+        assert_eq!(url_at(&e, 2, 4), None);
+    }
+
+    /// Unicode 表格单元格正文里出现孤立的 ASCII `|` 不截断单元格;命令行里的普通管道
+    /// 不被误认成表格。
+    #[test]
+    fn unicode_表格内嵌管道符与命令行管道() {
+        let rows = [
+            box_row(&[("a | https://a.com/123456", 24), ("col2", 6)], '│'),
+            box_row(&[("/tail", 24), ("col2", 6)], '│'),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(rows.join("\r\n").as_bytes());
+        assert_eq!(
+            url_at(&e, 0, 10).as_deref(),
+            Some("https://a.com/123456/tail")
+        );
+        assert_eq!(
+            url_at(&e, 1, 3).as_deref(),
+            Some("https://a.com/123456/tail")
+        );
+
+        // 普通命令行管道:下一行同列没有 `|`,不认表格也不误拼
+        let e = TerminalEmulator::new(TermSize::new(60, 4));
+        e.advance(b"curl https://a.com/123456 | grep ok\r\n/unrelated");
+        assert_eq!(url_at(&e, 0, 8).as_deref(), Some("https://a.com/123456"));
+        assert_eq!(url_at(&e, 1, 2), None);
+    }
+
+    /// 表格单元格里折行的文件路径同样能接回来,且下划线坐标留在单元格内。
+    #[test]
+    fn 表格单元格里折行的文件路径接回来() {
+        let rows = [
+            box_row(&[("crates/mt-terminal/src", 22), ("说明", 8)], '│'),
+            box_row(&[("/links.rs:260", 22), ("", 8)], '│'),
+            box_sep(&[22, 8]),
+            box_row(&[("other/file.rs", 22), ("", 8)], '│'),
+        ];
+        let e = TerminalEmulator::new(TermSize::new(60, 6));
+        e.advance(rows.join("\r\n").as_bytes());
+        for (line, col) in [(0, 4), (1, 4)] {
+            let (joined, cands) = e.path_candidates_at(line, col).unwrap();
+            let first = &cands[0];
+            assert_eq!(
+                (first.path.as_str(), first.line),
+                ("crates/mt-terminal/src/links.rs", Some(260)),
+                "({line},{col})"
+            );
+            let covered = &joined.cells[first.range.clone()];
+            assert_eq!(covered.first().map(|c| (c.line, c.column)), Some((0, 2)));
+            assert_eq!(covered.last().map(|c| (c.line, c.column)), Some((1, 14)));
+        }
+    }
+
+    /// 表格单元格里无 `id=` 的 OSC 8 跨行高亮整段,遇到行分隔线不串到下一条记录。
+    #[test]
+    fn 表格单元格里无_id_的_osc8_跨行高亮且不跨分隔线() {
+        let e = TerminalEmulator::new(TermSize::new(40, 6));
+        e.advance("│ ".as_bytes());
+        e.advance(&osc8("", "https://a.com", "Chat"));
+        e.advance("   │ col2 │\r\n│ ".as_bytes());
+        e.advance(&osc8("", "https://a.com", "shell"));
+        e.advance("  │      │\r\n├─────────┼──────┤\r\n│ ".as_bytes());
+        e.advance(&osc8("", "https://a.com", "again"));
+        e.advance("  │      │".as_bytes());
+
+        for (line, col) in [(0, 3), (1, 3)] {
+            let link = e.url_at(line, col).expect("第一条记录的 OSC 8");
+            assert_eq!(link.url, "https://a.com");
+            let lines: Vec<i32> = link.cells.iter().map(|c| c.line).collect();
+            assert!(lines.contains(&0) && lines.contains(&1), "两行一起亮");
+            assert!(!lines.contains(&3), "不能跨分隔线亮到下一条记录");
+            assert_eq!(link.cells.len(), "Chatshell".len());
+        }
+        let next = e.url_at(3, 3).expect("分隔线后的第二条记录");
+        assert_eq!(next.cells.len(), "again".len());
+        assert!(next.cells.iter().all(|c| c.line == 3));
+    }
+
+    /// 终端太窄导致带 `│` 的行发生 `WRAPLINE` 软换行时,按软换行逻辑行拼回,不误走表格裁剪。
+    #[test]
+    fn 软换行带竖框线的行不误走表格裁剪() {
+        let e = TerminalEmulator::new(TermSize::new(16, 4));
+        e.advance("│ https://a.com/long/path".as_bytes());
+        // 宽 16 列:第 0 行写满触发 WRAPLINE 折到第 1 行
+        assert_eq!(url_at(&e, 0, 5).as_deref(), Some("https://a.com/long/path"));
+        assert_eq!(url_at(&e, 1, 2).as_deref(), Some("https://a.com/long/path"));
     }
 }

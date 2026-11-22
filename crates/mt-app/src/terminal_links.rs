@@ -433,4 +433,137 @@ mod tests {
             PathBuf::from(r"\\wsl.localhost\Ubuntu\home\u\proj\crates\x\a.rs")
         );
     }
+
+    /// 端到端:真实 GPUI 窗口渲染 `TerminalView` + Unicode 框线表格,模拟按住 Ctrl(⌘)
+    /// 点击表格里折成 2~3 行的网址(首行 / 续行 / 末行),验证 `open_url` 收到完整链接、
+    /// 右键 `link_at` 命中同一完整链接,普通单击与分隔线后行不误触发。
+    #[gpui::test]
+    fn 终端表格折行网址_ctrl_单击打开完整链接(cx: &mut gpui::TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        use gpui::{Modifiers, point};
+        use mt_terminal::{TermSize, TerminalEmulator};
+        use mt_ui::terminal::TerminalLink;
+        use mt_ui::{TerminalStyle, TerminalTheme, TerminalView};
+
+        let emulator = Arc::new(TerminalEmulator::new(TermSize::new(100, 24)));
+        let opened: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let opened_cb = opened.clone();
+        let emu_for_view = emulator.clone();
+
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let focus = cx.focus_handle();
+            TerminalView::new(
+                "e2e-table-links",
+                emu_for_view,
+                focus,
+                TerminalStyle::default(),
+                TerminalTheme::default(),
+                cx,
+            )
+            .file_links(
+                |_cand, _cx| None,
+                |_file, _window, _cx| {},
+                move |url, _cx| opened_cb.borrow_mut().push(url.to_string()),
+            )
+            .link_hover_hint(|| "Ctrl+单击打开".into())
+        });
+
+        // 先画一帧让 TerminalElement 按测试窗口尺寸完成首次排版与 resize
+        cx.run_until_parked();
+        let geom = view.read_with(cx, |v, _| v.frame_geometry());
+        assert!(
+            geom.columns >= 74 && geom.screen_lines >= 12,
+            "测试窗口太小: {}x{}",
+            geom.columns,
+            geom.screen_lines
+        );
+
+        let pad_cell = |text: &str, width: usize| -> String {
+            let used: usize = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+            format!(" {text}{} ", " ".repeat(width - used))
+        };
+        let row = |a: &str, b: &str| -> String {
+            format!("│{}│{}│", pad_cell(a, 32), pad_cell(b, 33))
+        };
+        let sep = format!("├{}┼{}┤", "─".repeat(34), "─".repeat(35));
+        let table = [
+            row("Chatless", "约 21.0 MiB"),
+            row(
+                "(https://github.com/kamjin3086/c",
+                "(https://github.com/kamjin3086/ch",
+            ),
+            row("hatless)", "atless/releases/tag/v0.8.2)"),
+            sep.clone(),
+            row("Chatshell", "约 28.9 MiB, MSI"),
+            row(
+                "(https://github.com/chatshellapp",
+                "(https://github.com/chatshellapp/",
+            ),
+            row("/chatshell-desktop)", "chatshell-desktop/releases/tag/v0"),
+            row("", ".12.0)"),
+            sep,
+            row("/after-sep", ""),
+        ]
+        .join("\r\n");
+        emulator.advance(table.as_bytes());
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let geom = view.read_with(cx, |v, _| v.frame_geometry());
+        let cell_center = |col: usize, row_ix: usize| {
+            point(
+                geom.origin.x + geom.cell_size.width * (col as f32 + 0.5),
+                geom.origin.y + geom.cell_size.height * (row_ix as f32 + 0.5),
+            )
+        };
+        let ctrl = cx.update(|_, cx| Modifiers::secondary_key(cx));
+        // 右侧列左框线在 col 35,内容从 col 37 开始
+        let right_col = 37usize;
+
+        // 1. Chatshell 第 1 列:Ctrl+单击第一行与第二行都打开完整 URL
+        let line1_pos = cell_center(8, 5);
+        let line2_pos = cell_center(8, 6);
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.link_at(line1_pos, cx)),
+            Some(TerminalLink::Url(
+                "https://github.com/chatshellapp/chatshell-desktop".into()
+            ))
+        );
+        assert_eq!(
+            view.read_with(cx, |v, cx| v.link_at(line2_pos, cx)),
+            Some(TerminalLink::Url(
+                "https://github.com/chatshellapp/chatshell-desktop".into()
+            ))
+        );
+        // 普通单击(不按 Ctrl)不打开链接
+        cx.simulate_click(line1_pos, Modifiers::default());
+        assert!(opened.borrow().is_empty(), "不按 Ctrl 单击不应打开链接");
+
+        cx.simulate_click(line1_pos, ctrl);
+        cx.simulate_click(line2_pos, ctrl);
+        // 2. Chatless 纯字母续行 `hatless)`
+        cx.simulate_click(cell_center(4, 2), ctrl);
+        // 3. 右侧列跨 3 行 release 链接(点第 1 行与第 3 行 `.12.0)`)
+        cx.simulate_click(cell_center(right_col + 5, 5), ctrl);
+        cx.simulate_click(cell_center(right_col + 2, 7), ctrl);
+        // 4. 分隔线后的 `/after-sep` 与尾括号 `)` 不触发打开
+        cx.simulate_click(cell_center(4, 9), ctrl);
+        cx.simulate_click(cell_center(9, 2), ctrl);
+
+        assert_eq!(
+            *opened.borrow(),
+            vec![
+                "https://github.com/chatshellapp/chatshell-desktop".to_string(),
+                "https://github.com/chatshellapp/chatshell-desktop".to_string(),
+                "https://github.com/kamjin3086/chatless".to_string(),
+                "https://github.com/chatshellapp/chatshell-desktop/releases/tag/v0.12.0"
+                    .to_string(),
+                "https://github.com/chatshellapp/chatshell-desktop/releases/tag/v0.12.0"
+                    .to_string(),
+            ]
+        );
+    }
 }

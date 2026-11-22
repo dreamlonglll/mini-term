@@ -379,3 +379,156 @@ fn 宽字符换行时不会被劈成两半() {
         "宽字符在行尾放不下时应整体挪到下一行行首"
     );
 }
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// 真实 PTY 端到端:子进程经 ConPTY / PTY 输出带 Unicode 框线与中文宽字符的 Markdown 表格,
+/// 单元格内折成 2~3 行的网址在 grid 里能完整拼回,且不跨行分隔线串拼。
+#[test]
+fn 表格单元格折行网址穿过真_pty_完整识别() {
+    announce_conpty_backend();
+    let (mut pty, emulator) = spawn_shell(TermSize::new(120, 30));
+    let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        e.visible_lines().iter().any(|l| !l.trim().is_empty())
+    });
+    assert!(ready, "shell 20s 内没有任何输出");
+
+    let pad_cell = |text: &str, width: usize| -> String {
+        let used: usize = text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+        assert!(used <= width);
+        format!(" {text}{} ", " ".repeat(width - used))
+    };
+    let row = |a: &str, b: &str, c: &str| -> String {
+        format!(
+            "│{}│{}│{}│",
+            pad_cell(a, 32),
+            pad_cell(b, 14),
+            pad_cell(c, 33)
+        )
+    };
+    let sep = format!("├{}┼{}┼{}┤", "─".repeat(34), "─".repeat(16), "─".repeat(35));
+    const END_MARK: &str = "MT_TABLE_E2E_DONE";
+    let table = [
+        row("Chatless", "说明A", "约 21.0 MiB"),
+        row(
+            "(https://github.com/kamjin3086/c",
+            "本地知识库",
+            "(https://github.com/kamjin3086/ch",
+        ),
+        row("hatless)", "", "atless/releases/tag/v0.8.2)"),
+        sep.clone(),
+        row("Chatshell", "说明B", "约 28.9 MiB, MSI"),
+        row(
+            "(https://github.com/chatshellapp",
+            "工具审批",
+            "(https://github.com/chatshellapp/",
+        ),
+        row(
+            "/chatshell-desktop)",
+            "",
+            "chatshell-desktop/releases/tag/v0",
+        ),
+        row("", "", ".12.0)"),
+        sep,
+        row("/after-separator-should-not-join", "说明C", ""),
+        END_MARK.to_string(),
+    ]
+    .join("\r\n")
+        + "\r\n";
+
+    let b64 = encode_base64(table.as_bytes());
+    #[cfg(windows)]
+    let command = format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;[Console]::Out.Write([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}')))\r"
+    );
+    #[cfg(not(windows))]
+    let command = format!("printf '%s' '{b64}' | base64 -d\r");
+    pty.write(command.as_bytes()).expect("写 PTY 失败");
+
+    let shown = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        lines_with(e, END_MARK) > 0
+    });
+    assert!(
+        shown,
+        "20s 内表格没上屏,grid 现状:\n{}",
+        emulator.visible_lines().join("\n")
+    );
+
+    let find_cell = |needle: &str| -> (i32, usize) {
+        let lines = emulator.visible_lines();
+        let cols = emulator.visible_columns();
+        let r = lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("找不到 {needle:?}, grid:\n{}", lines.join("\n")));
+        let c = cols[r]
+            .windows(needle.chars().count())
+            .find(|w| w.iter().map(|&(_, ch)| ch).eq(needle.chars()))
+            .map(|w| w[0].0)
+            .expect("找列位置");
+        (r as i32, c)
+    };
+
+    // 1. Chatshell 第 1 列(2 行折行):点第 1 行与第 2 行都拿到完整 URL 且下划线跨两行
+    let (r1, c1) = find_cell("https://github.com/chatshellapp ");
+    let (r2, c2) = find_cell("/chatshell-desktop)");
+    for (r, c) in [(r1, c1 + 4), (r2, c2 + 4)] {
+        let link = emulator
+            .url_at(r, c)
+            .unwrap_or_else(|| panic!("({r},{c}) 应识别出 Chatshell 链接"));
+        assert_eq!(
+            link.url,
+            "https://github.com/chatshellapp/chatshell-desktop"
+        );
+        assert_eq!(link.cells.first().map(|cell| cell.line), Some(r1));
+        assert_eq!(link.cells.last().map(|cell| cell.line), Some(r2));
+    }
+
+    // 2. Chatless 第 1 列(纯字母尾巴 `hatless)`):两行均完整识别
+    let (cr1, cc1) = find_cell("https://github.com/kamjin3086/c ");
+    let (cr2, cc2) = find_cell("hatless)");
+    for (r, c) in [(cr1, cc1 + 4), (cr2, cc2 + 2)] {
+        let link = emulator.url_at(r, c).expect("Chatless 链接");
+        assert_eq!(link.url, "https://github.com/kamjin3086/chatless");
+    }
+
+    // 3. Chatshell 右侧列(跨 3 行折行):3 行任意位置均识别为完整 release URL
+    let (rr1, rc1) = find_cell("https://github.com/chatshellapp/");
+    let (rr2, rc2) = find_cell("chatshell-desktop/releases/tag/v0");
+    let (rr3, rc3) = find_cell(".12.0)");
+    let want_release = "https://github.com/chatshellapp/chatshell-desktop/releases/tag/v0.12.0";
+    for (r, c) in [(rr1, rc1 + 4), (rr2, rc2 + 6), (rr3, rc3 + 2)] {
+        let link = emulator.url_at(r, c).expect("3 行 release 链接");
+        assert_eq!(link.url, want_release);
+        assert_eq!(link.cells.first().map(|cell| cell.line), Some(rr1));
+        assert_eq!(link.cells.last().map(|cell| cell.line), Some(rr3));
+    }
+
+    // 4. 分隔线后的单元格不串拼到上方链接
+    let (sr, sc) = find_cell("/after-separator-should-not-join");
+    assert_eq!(emulator.url_at(sr, sc + 4), None);
+
+    let _ = pty.kill();
+}
