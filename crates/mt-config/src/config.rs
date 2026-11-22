@@ -1338,10 +1338,13 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 
     // 连接上的未知字段(`extra`,新版本写的)不进投影:投影形状只认本版本
     // 已知的字段,sidecar 与本程序同版本,读不懂也用不上;新版本自己会写它的投影。
+    // `useSystemSsh` 只管主程序的终端启动,sidecar 用不上:置 false 让它不序列化,
+    // 投影形状与加这个字段之前逐字一致(装机目录里的旧 sidecar 不必认它)。
     let connections: Vec<SshConnection> = config
         .ssh_connections
         .iter()
         .map(|c| SshConnection {
+            use_system_ssh: false,
             extra: Map::new(),
             ..c.clone()
         })
@@ -1906,6 +1909,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }
@@ -2997,6 +3001,7 @@ mod tests {
             password: None,
             identity_file: Some("/k".into()),
             group: Some("内网".into()),
+            use_system_ssh: false,
             extra: Default::default(),
         };
         let json = serde_json::to_string(&conn).unwrap();
@@ -3362,6 +3367,8 @@ mod tests {
                     password: Some("secret".into()),
                     identity_file: None,
                     group: None,
+                    // 只管主程序终端启动的开关:库里往返保留,但不进投影
+                    use_system_ssh: true,
                     // 新版本写的未知字段:库里原样往返,但不许进投影
                     extra: serde_json::from_str(r#"{"jumpHost":"bastion"}"#).unwrap(),
                 },
@@ -3374,6 +3381,7 @@ mod tests {
                     password: None,
                     identity_file: None,
                     group: None,
+                    use_system_ssh: false,
                     extra: Default::default(),
                 },
             ],
@@ -3422,6 +3430,18 @@ mod tests {
             "未知字段漏进了投影: {projection}"
         );
         assert!(scoped[0].extra.is_empty());
+        // 「终端使用系统 OpenSSH」开关同样不进投影(sidecar 不读它),库里仍是 true
+        assert!(
+            !projection.contains("useSystemSsh"),
+            "终端开关漏进了投影: {projection}"
+        );
+        assert!(!scoped[0].use_system_ssh);
+        let reloaded = store.load().unwrap().config;
+        assert!(
+            reloaded.ssh_connections[0].use_system_ssh,
+            "开关在 config.db 里往返保留"
+        );
+        assert!(!reloaded.ssh_connections[1].use_system_ssh);
 
         // 未知令牌仍 fail closed
         assert!(mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "nope").is_err());
@@ -3445,6 +3465,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }
@@ -3639,6 +3660,7 @@ mod tests {
             password: Some(password.into()),
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }

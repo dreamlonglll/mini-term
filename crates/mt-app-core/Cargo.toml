@@ -27,6 +27,11 @@ parking_lot.workspace = true
 ring = "0.17"
 serde_json.workspace = true
 tracing.workspace = true
+# `line_input`(终端内读一行):字位簇切分 / 东亚宽度与缓冲清零。三个都是依赖树里
+# 已有的那一份(mt-terminal 用前两个,mt-secret 用 zeroize),不新增第三方 crate。
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+zeroize = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -869,6 +869,7 @@ mod tests {
             password: Some("secret".into()),
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }
@@ -1338,6 +1339,51 @@ mod tests {
         let again = db.load().unwrap().unwrap();
         assert_eq!(again.projects[0].extra.len(), 2);
         assert_eq!(again.ssh_connections[0].extra.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「终端使用系统 OpenSSH」开关:true 在库里往返保留,只落成一个 `useSystemSsh` 键;
+    /// false 不落盘;旧版本写的行(没有这个键)读回来是 false(走内置客户端)。
+    #[test]
+    fn 连接的系统_ssh_开关往返() {
+        let dir = temp_dir("use-system-ssh");
+        let db = ConfigDb::open_at(&dir).unwrap();
+        let mut config = AppConfig {
+            ssh_connections: vec![conn("c1"), conn("c2")],
+            ..Default::default()
+        };
+        config.ssh_connections[0].use_system_ssh = true;
+        db.save(&config).unwrap();
+
+        let raw_on = row_raw(&db, "ssh_connections", "c1").unwrap();
+        assert_eq!(
+            raw_on.matches("\"useSystemSsh\":true").count(),
+            1,
+            "{raw_on}"
+        );
+        let raw_off = row_raw(&db, "ssh_connections", "c2").unwrap();
+        assert!(!raw_off.contains("useSystemSsh"), "false 不落盘: {raw_off}");
+
+        let back = db.load().unwrap().unwrap();
+        assert!(back.ssh_connections[0].use_system_ssh);
+        assert!(
+            back.ssh_connections[0].extra.is_empty(),
+            "已知字段不进 extra"
+        );
+        assert!(!back.ssh_connections[1].use_system_ssh);
+
+        // 旧版本写的行:没有这个键 → false
+        put_raw(
+            &db,
+            "INSERT INTO ssh_connections(id, ord, data) VALUES(?1, 2, ?2)",
+            &[
+                "c3",
+                r#"{"id":"c3","name":"old","host":"h","port":22,"user":"u"}"#,
+            ],
+        );
+        let again = db.load().unwrap().unwrap();
+        assert_eq!(again.ssh_connections.len(), 3);
+        assert!(!again.ssh_connections[2].use_system_ssh);
         fs::remove_dir_all(&dir).ok();
     }
 

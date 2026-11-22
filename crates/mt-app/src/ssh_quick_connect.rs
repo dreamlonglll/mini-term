@@ -990,6 +990,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }

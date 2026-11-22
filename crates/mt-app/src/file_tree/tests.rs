@@ -293,6 +293,7 @@ fn 项目授权独立控制文件树缓存和菜单能力() {
         password: None,
         identity_file: None,
         group: None,
+        use_system_ssh: false,
         extra: Default::default(),
     };
     let mut project_a = project_config("project-a", "/workspace/repo");

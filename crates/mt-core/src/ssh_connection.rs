@@ -21,6 +21,18 @@ pub struct SshConnection {
     pub identity_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// 终端里的 SSH 是否沿用本机 `ssh` 命令(JSON 键 `useSystemSsh`)。
+    ///
+    /// - `false`(默认):右键「SSH 连接」与远程项目终端走内置 russh 客户端,
+    ///   主机密钥 / 密码 / OTP 在终端里确认;
+    /// - `true`:这两处沿用系统 OpenSSH 客户端(`ssh`),兼容内置客户端不支持的东西 ——
+    ///   `~/.ssh/config`(别名 / ProxyJump)、默认私钥 `~/.ssh/id_*`、端口转发等。
+    ///
+    /// 只影响主程序的**终端启动**:SFTP / 远程 Git / sidecar 的 SSH 工具恒走内置会话池,
+    /// sidecar 不读它(mt-config 写 `config.json` 投影时不带这个键)。
+    /// 为 `false` 时不序列化,存量连接的落盘形状不变;它是已知字段,不会落进 `extra`。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_system_ssh: bool,
     /// 本版本不认识的字段(多半是更新的版本写进配置库的),原样带着往返 ——
     /// 用户在预览版 / 正式版之间来回装时,旧版本存一次配置不该把它们抹掉
     /// (口径见 mt-config `db.rs` 的「前向兼容」段)。
@@ -58,12 +70,33 @@ mod tests {
             password: Some("secret".into()),
             identity_file: None,
             group: Some("内网".into()),
+            use_system_ssh: false,
             extra: Default::default(),
         };
         let json = serde_json::to_string(&conn).unwrap();
         let parsed: SshConnection = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.port, 2222);
         assert_eq!(parsed.group.as_deref(), Some("内网"));
+    }
+
+    /// `useSystemSsh`:缺省(存量连接)是 false;false 不落盘;true 往返保留,
+    /// 且作为已知字段不会落进 `extra`(不然 flatten 序列化会出两个同名键)。
+    #[test]
+    fn use_system_ssh_defaults_off_and_round_trips() {
+        let json = r#"{"id":"1","name":"n","host":"h","port":22,"user":"u"}"#;
+        let conn: SshConnection = serde_json::from_str(json).unwrap();
+        assert!(!conn.use_system_ssh, "存量连接默认走内置客户端");
+        let out = serde_json::to_string(&conn).unwrap();
+        assert!(!out.contains("useSystemSsh"), "false 不序列化: {out}");
+
+        let json = r#"{"id":"1","name":"n","host":"h","port":22,"user":"u","useSystemSsh":true}"#;
+        let conn: SshConnection = serde_json::from_str(json).unwrap();
+        assert!(conn.use_system_ssh);
+        assert!(conn.extra.is_empty(), "已知字段不该落进 extra");
+        let out = serde_json::to_string(&conn).unwrap();
+        assert_eq!(out.matches("\"useSystemSsh\":true").count(), 1, "{out}");
+        let back: SshConnection = serde_json::from_str(&out).unwrap();
+        assert!(back.use_system_ssh);
     }
 
     #[test]
@@ -77,6 +110,7 @@ mod tests {
             password: None,
             identity_file: Some("/k".into()),
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         };
         let json = serde_json::to_string(&conn).unwrap();

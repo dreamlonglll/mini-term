@@ -3400,6 +3400,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         }];
         let mut p = project("p1", "/home/u/proj", None);

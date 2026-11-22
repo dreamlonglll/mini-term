@@ -5527,6 +5527,9 @@ dependencies = [
  "ring",
  "serde_json",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+ "zeroize",
 ]
 
 [[package]]

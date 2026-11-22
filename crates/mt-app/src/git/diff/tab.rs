@@ -1091,6 +1091,7 @@ mod tests {
                 password: None,
                 identity_file: None,
                 group: None,
+                use_system_ssh: false,
                 extra: Default::default(),
             },
             "/Repo".into(),
