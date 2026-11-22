@@ -144,17 +144,16 @@ trash.workspace = true
 # 用量分桶要 IANA 时区名:mt-usage 按每条记录自身时刻求当地偏移,
 # 只给固定偏移的话 DST 地区的历史记录会错日。
 iana-time-zone = "0.1"
-# 价格表拉取(https://models.dev/api.json,一次 HTTPS GET)。
+# 价格表 / 预览外链图 / 更新检查 / 远程通知共用的异步 HTTP 客户端(`src/http.rs`)。
 #
-# **净新增 crate = 0**:`zed-reqwest` 已经在依赖树里(gpui → gpui_http_client),
-# `blocking` feature 只额外要 futures-channel + tokio/sync,两者也都在树里。
+# **净新增 crate = 0**:`zed-reqwest` 已经在依赖树里(gpui → gpui_http_client)。
 # 不用 `cx.http_client()`:gpui 的默认实现是 `NullHttpClient`,`send()` 直接
 # `bail!("No HttpClient available")`,而 `gpui_http_client` 只提供 trait、不带
 # reqwest 后端(Zed 把那部分放在未发布的 reqwest_client crate 里)。
-# blocking 客户端自己起 current-thread 运行时,mt-app 不必接 tokio;
-# 调用一律丢 background executor(见 `pricing::fetch_models_dev` 的注释)。
+# 不再开启 `blocking` feature(省掉其自带的额外同步运行时线程):异步 `reqwest::Client`
+# 经 `mt_remote::run_on_shared_runtime` 复跑在共享的 `mt-async-io` tokio 运行时上,
+# mt-app 仍不直接依赖 tokio,且弱网请求不再占满 GPUI 后台线程池。
 reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = [
-    "blocking",
     "rustls-tls-native-roots",
     "charset",
     "http2",

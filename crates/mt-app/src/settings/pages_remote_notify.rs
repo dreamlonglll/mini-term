@@ -345,7 +345,7 @@ impl SettingsView {
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { remote_notify::send_one(channel, &config, &message) })
+                .spawn(async move { remote_notify::send_one(channel, &config, &message).await })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 let state = match result {

@@ -684,7 +684,7 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async {
-                    fetch_latest_release().map(|release| {
+                    fetch_latest_release().await.map(|release| {
                         let notes =
                             crate::file_viewer::sanitize_session_markdown(release.body.trim());
                         (release, SharedString::from(notes))

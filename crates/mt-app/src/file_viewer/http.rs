@@ -20,11 +20,11 @@ use gpui::http_client::{
 /// - `file://`:本地图片。md / html 源里的相对路径在渲染前被改写成绝对 file URL
 ///   ([`super::markdown::rewrite_md_image_urls`] /
 ///   [`super::html_urls::rewrite_html_urls`]),到这里读盘返回。
-/// - `http(s)://`:网络图片(README 顶上的徽章、外链截图)。`reqwest::blocking`
-///   拉回来 —— 与价格表那条链同一个客户端库(见 `pricing::fetch_models_dev`)。
+/// - `http(s)://`:网络图片(README 顶上的徽章、外链截图)。经共享异步 `reqwest::Client`
+///   在 `mt-async-io` 运行时拉回 —— 与价格表那条链共用同一客户端(见 `crate::http`)。
 ///
 /// 其余 scheme 一律拒绝。本地资源只读普通文件并限制 32MB；出网资源另有 10s
-/// 超时(`reqwest::blocking` 默认无限等)，同样限制 32MB。详见
+/// 超时(`reqwest::Client` 默认无限等)，同样限制 32MB。详见
 /// [`fetch_local_preview_bytes`] / [`fetch_remote_bytes`]。
 ///
 /// 这是进程级客户端，不只服务文件页；其它富文本入口必须先走对应安全策略。
@@ -60,7 +60,7 @@ impl HttpClient for PreviewHttpClient {
                         .map_err(|_| anyhow::anyhow!("不是本地文件路径: {uri}"))?;
                     fetch_local_preview_bytes(&path)?
                 }
-                "http" | "https" => fetch_remote_bytes(&uri)?,
+                "http" | "https" => fetch_remote_bytes(uri).await?,
                 other => anyhow::bail!("预览不支持的协议 {other}: {uri}"),
             };
             Ok(Response::builder()
@@ -120,45 +120,44 @@ fn fetch_local_preview_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(body)
 }
 
-/// 一次 GET,把响应体整个读回来。**阻塞**,只许在后台执行器上调 —— gpui 的
-/// asset 系统正是这么跑的(`app.rs:2018` 的 `background_executor().spawn`)。
+/// 一次异步 GET,流式读取响应体并逐块守住 32MB 硬上限。
 ///
-/// 复用 [`crate::http::client`] 的进程级单例:每次请求现建客户端要重做 TLS 栈初始化,
-/// 而 README 顶上一排徽章就是一串并发请求。
-///
-/// ⚠️ 已知取舍:每个请求会占住一个后台线程直到超时,一屏全是拉不动的远程图片时
-/// (离线 / 墙)线程池会被占满 10s。超时因此压得比价格表那条链(15s)短 ——
-/// 图片拉不回来只是少一张图,不值得把后台线程按住更久。
-fn fetch_remote_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+/// 经 [`crate::http::run_async`] 派发到进程级共享 tokio 运行时(`mt-async-io`)执行,
+/// 复用 [`crate::http::client`] 的连接池与 TLS 会话缓存:弱网 / 并发多枚徽章时不再
+/// 阻塞 GPUI 后台线程池,且外层预览任务取消时同步 abort 底层连接。
+async fn fetch_remote_bytes(url: String) -> anyhow::Result<Vec<u8>> {
     /// 徽章服务(shields.io 之流)对没有 UA 的请求有的直接 403
     const UA: &str = concat!("mini-term/", env!("CARGO_PKG_VERSION"));
-    use std::io::Read as _;
 
-    let resp = crate::http::client()
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .header(reqwest::header::USER_AGENT, UA)
-        .send()?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "HTTP {} — {url}",
-        resp.status().as_u16()
-    );
-    // content-length 可能缺席(chunked),所以读的时候再兜一次上限
-    if let Some(len) = resp.content_length() {
+    crate::http::run_async(async move {
+        let mut resp = crate::http::client()
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .header(reqwest::header::USER_AGENT, UA)
+            .send()
+            .await?;
         anyhow::ensure!(
-            len <= PREVIEW_IMAGE_MAX_BYTES,
-            "图片过大({len} 字节): {url}"
+            resp.status().is_success(),
+            "HTTP {} — {url}",
+            resp.status().as_u16()
         );
-    }
-    let mut body = Vec::new();
-    resp.take(PREVIEW_IMAGE_MAX_BYTES + 1)
-        .read_to_end(&mut body)?;
-    anyhow::ensure!(
-        body.len() as u64 <= PREVIEW_IMAGE_MAX_BYTES,
-        "图片过大: {url}"
-    );
-    Ok(body)
+        // content-length 可能缺席(chunked),所以逐块读取时再兜一次上限
+        if let Some(len) = resp.content_length() {
+            anyhow::ensure!(
+                len <= PREVIEW_IMAGE_MAX_BYTES,
+                "图片过大({len} 字节): {url}"
+            );
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            let next_len = (body.len() as u64).saturating_add(chunk.len() as u64);
+            anyhow::ensure!(next_len <= PREVIEW_IMAGE_MAX_BYTES, "图片过大: {url}");
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!(err))?
 }
 
 #[cfg(test)]

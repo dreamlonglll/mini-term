@@ -4,8 +4,8 @@
 //! 两个消费方 —— `main.rs` 的启动自检([`newer_release`])与设置面板 about
 //! 页的手动检查([`fetch_latest_release`])—— 共用同一套判据。
 //!
-//! 网络调用([`fetch_releases`] / [`fetch_latest_release`])**整体阻塞**,
-//! 调用方一律丢 `cx.background_executor()`。
+//! 网络调用([`fetch_releases`] / [`fetch_latest_release`])经共享异步 HTTP 客户端
+//! 跑在 `mt-async-io` 运行时上,调用方在后台任务中 `.await` 即可。
 
 use crate::i18n::{t, tr};
 
@@ -119,37 +119,60 @@ pub struct ReleaseInfo {
     pub body: String,
 }
 
-/// 拉 release 列表。**整体阻塞**,调用方一律丢 `cx.background_executor()`。
+/// 拉 release 列表(异步跑在共享 tokio 运行时上,不占 GPUI 后台线程)。
 ///
 /// ⚠️ 不用 `/releases/latest`:那个端点**永远不含预发布**,v1.0.0-beta 起
 /// beta 用户会两头落空 —— 看不到下一个 beta,也等不到它变 stable 前的任何
 /// 通知。改拉列表,频道取舍在本地由 [`pick_latest`] 决定。
 ///
-/// 复用 `pricing` 那份 `zed-reqwest`(blocking feature 已开,净新增 crate = 0)。
+/// 复用共享异步 `zed-reqwest` 客户端(`crate::http`)。
 /// GitHub API 强制要求 `User-Agent`,缺了直接 403。
-fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
+async fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
+    enum FetchErr {
+        Client(String),
+        Transport(String),
+        Status(u16),
+        Body(String),
+    }
+
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=20");
-    let client = crate::http::try_client().map_err(|e| e.to_string())?;
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(15))
-        .header("User-Agent", "mini-term")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        // 传输层失败(断网 / DNS / TLS)的原文是英文且没什么可操作性,
-        // 与原版一样收成一句「检查失败,请稍后重试」
-        .map_err(|e| {
+    let text = match crate::http::run_async(async move {
+        let client = crate::http::try_client().map_err(|e| FetchErr::Client(e.to_string()))?;
+        let resp = client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(15))
+            .header("User-Agent", "mini-term")
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| FetchErr::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        if !resp.status().is_success() {
+            return Err(FetchErr::Status(status));
+        }
+        resp.text().await.map_err(|e| FetchErr::Body(e.to_string()))
+    })
+    .await
+    {
+        Ok(Ok(text)) => text,
+        Ok(Err(FetchErr::Client(e) | FetchErr::Body(e))) => return Err(e),
+        Ok(Err(FetchErr::Transport(e))) => {
+            // 传输层失败(断网 / DNS / TLS)的原文是英文且没什么可操作性,
+            // 与原版一样收成一句「检查失败,请稍后重试」
             tracing::warn!("[settings] 检查更新失败: {e}");
-            t("settings", "about.checkFailed").to_string()
-        })?;
-    let status = resp.status().as_u16();
-    if status == 404 {
-        return Err(t("updateChecker", "noRelease").to_string());
-    }
-    if !resp.status().is_success() {
-        return Err(tr!("updateChecker", "requestFailed", status = status));
-    }
-    let text = resp.text().map_err(|e| e.to_string())?;
+            return Err(t("settings", "about.checkFailed").to_string());
+        }
+        Ok(Err(FetchErr::Status(404))) => {
+            return Err(t("updateChecker", "noRelease").to_string());
+        }
+        Ok(Err(FetchErr::Status(status))) => {
+            return Err(tr!("updateChecker", "requestFailed", status = status));
+        }
+        Err(e) => {
+            tracing::warn!("[settings] 检查更新失败: {e}");
+            return Err(t("settings", "about.checkFailed").to_string());
+        }
+    };
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let releases: Vec<ReleaseInfo> = json
         .as_array()
@@ -197,8 +220,8 @@ pub fn pick_latest(releases: Vec<ReleaseInfo>, current: &str) -> Option<ReleaseI
 }
 
 /// 拉列表 + 频道过滤后的「最新 release」,about 页手动检查用。
-pub(crate) fn fetch_latest_release() -> Result<ReleaseInfo, String> {
-    pick_latest(fetch_releases()?, env!("CARGO_PKG_VERSION"))
+pub(crate) async fn fetch_latest_release() -> Result<ReleaseInfo, String> {
+    pick_latest(fetch_releases().await?, env!("CARGO_PKG_VERSION"))
         .ok_or_else(|| t("updateChecker", "noRelease").to_string())
 }
 
@@ -229,10 +252,8 @@ pub fn should_announce(latest: &ReleaseInfo, current: &str, ignored: Option<&str
 /// 原版那边是 `checkForUpdate(ver).then(...).catch(() => {})` ——
 /// **失败静默**,启动时联不上网 / GitHub 限流都不该弹任何东西给用户看。
 /// 这里同样把错误吃掉(只留一行 stderr,`fetch_latest_release` 已经打了)。
-///
-/// **整体阻塞**,调用方一律丢 `cx.background_executor()`。
-pub fn newer_release(current: &str) -> Option<ReleaseInfo> {
-    pick_newer(fetch_latest_release().ok()?, current)
+pub async fn newer_release(current: &str) -> Option<ReleaseInfo> {
+    pick_newer(fetch_latest_release().await.ok()?, current)
 }
 
 #[cfg(test)]

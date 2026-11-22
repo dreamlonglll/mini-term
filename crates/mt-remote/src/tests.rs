@@ -939,3 +939,57 @@ fn shared_runtime_handle_reuses_runtime_without_creating_pool() {
     let still_alive = h1.block_on(async { 42u32 });
     assert_eq!(still_alive, 42);
 }
+
+#[test]
+fn run_on_shared_runtime_executes_and_aborts_on_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll, Waker};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // 1. 正常完成:能在共享 tokio 运行时里执行 timer 与 IO
+    let val = rt
+        .block_on(run_on_shared_runtime(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            123u32
+        }))
+        .expect("共享运行时任务应正常完成");
+    assert_eq!(val, 123);
+
+    // 2. 外部 future 被 drop(例如关闭预览页/弹窗)时应立即 abort 底层任务
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let dropped_task = dropped.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    {
+        let mut fut = Box::pin(run_on_shared_runtime(async move {
+            let _guard = DropFlag(dropped_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("底层任务应在共享运行时上启动");
+        // fut 离开作用域 -> AbortOnDrop::drop() -> abort 挂起中的任务
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !dropped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "外层 future 被 drop 后底层共享运行时任务应被 abort 释放"
+    );
+}

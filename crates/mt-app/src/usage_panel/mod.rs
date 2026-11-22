@@ -479,7 +479,7 @@ impl UsagePanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let pricing = pricing::ensure_pricing(&dir, now_ms);
+                    let pricing = pricing::ensure_pricing(&dir, now_ms).await;
                     // 手动刷新:等增量同步真正跑完再查 —— 数字一步到位。
                     // 「先查再同步」每点一次必然先闪一次同步前的旧值。
                     if let (Some(sink), Some(db)) = (sink, db_path) {

@@ -410,6 +410,59 @@ pub fn ensure_pricing(
     Ok(result)
 }
 
+/// [`resolve_pricing`] 的异步版:手工表 / 新鲜缓存命中时不触发 `fetch`,未命中才 `.await`
+/// 外部注入的异步拉网 future,失败或空表时按同样口径降级到过期缓存。
+pub async fn resolve_pricing_async<F, Fut>(
+    manual: Option<PricingMap>,
+    cache: Option<PricingCache>,
+    now_ms: i64,
+    fetch: F,
+) -> Result<(PricingMap, PricingSource), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PricingMap, String>>,
+{
+    if let Some(table) = manual {
+        return Ok((table, PricingSource::Manual));
+    }
+    if let Some(cache) = &cache
+        && cache.is_fresh(now_ms)
+    {
+        return Ok((cache.to_map(), PricingSource::FreshCache));
+    }
+    match fetch().await {
+        Ok(table) if !table.is_empty() => Ok((table, PricingSource::Network)),
+        Ok(_) => match cache {
+            Some(cache) => Ok((cache.to_map(), PricingSource::StaleCache)),
+            None => Err("empty pricing table".to_string()),
+        },
+        Err(err) => match cache {
+            Some(cache) => Ok((cache.to_map(), PricingSource::StaleCache)),
+            None => Err(err),
+        },
+    }
+}
+
+/// [`ensure_pricing`] 的异步版:供异步 HTTP 客户端在后台任务中 `.await`,避免拉网期阻塞
+/// 调用方线程池。
+pub async fn ensure_pricing_async<F, Fut>(
+    dir: &Path,
+    now_ms: i64,
+    fetch: F,
+) -> Result<(PricingMap, PricingSource), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<PricingMap, String>>,
+{
+    let manual = load_manual_pricing(dir);
+    let cache = read_cache(dir);
+    let result = resolve_pricing_async(manual, cache, now_ms, fetch).await?;
+    if result.1 == PricingSource::Network {
+        write_cache(dir, &result.0, now_ms);
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +806,54 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(MANUAL_FILE), "{}").unwrap();
         assert!(load_manual_pricing(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 异步降级链路与缓存写回一致() {
+        fn poll_ready<F: std::future::Future>(fut: F) -> F::Output {
+            let mut fut = std::pin::pin!(fut);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(val) => val,
+                std::task::Poll::Pending => panic!("纯同步桩 future 不应返回 Pending"),
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "mt-usage-pricing-async-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. 首次拉网命中并落盘缓存
+        let (table, src) = poll_ready(ensure_pricing_async(&dir, 1_000, || async {
+            Ok(table_of("async-model", 3.0))
+        }))
+        .unwrap();
+        assert_eq!(src, PricingSource::Network);
+        assert!(table.contains_key("async-model"));
+
+        // 2. TTL 内直接命中新鲜缓存，不调用异步 fetch
+        let (cached, src) = poll_ready(ensure_pricing_async(&dir, 2_000, || async {
+            panic!("新鲜缓存命中时不应触发网络拉取")
+        }))
+        .unwrap();
+        assert_eq!(src, PricingSource::FreshCache);
+        assert!(cached.contains_key("async-model"));
+
+        // 3. TTL 过期且拉网失败 -> 降级到过期缓存
+        let (stale, src) = poll_ready(ensure_pricing_async(
+            &dir,
+            1_000 + CACHE_TTL_MS + 1,
+            || async { Err("offline".to_string()) },
+        ))
+        .unwrap();
+        assert_eq!(src, PricingSource::StaleCache);
+        assert!(stale.contains_key("async-model"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

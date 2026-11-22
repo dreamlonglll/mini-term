@@ -328,6 +328,42 @@ pub fn shared_runtime_handle() -> Result<tokio::runtime::Handle, String> {
     state().runtime_handle()
 }
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+/// 在进程级共享 tokio 运行时(`mt-async-io`)上执行一段异步 future 并等待其结果。
+///
+/// 供不直接依赖 `tokio` 的上层 crate(如 `mt-app` 的异步 `reqwest::Client` 调用)
+/// 在 GPUI 异步任务中 `.await` 需要 tokio reactor / timer 的 future:既不阻塞 GPUI
+/// 后台线程池,也不另起一套 tokio 运行时;调用方 future 被取消(drop)时同步 abort
+/// 底层任务,立即释放慢网连接。仅懒建运行时,不触发 `SshPool` 初始化。
+pub async fn run_on_shared_runtime<F, T>(fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let handle = shared_runtime_handle()?;
+    AbortOnDrop(handle.spawn(fut))
+        .await
+        .map_err(|err| format!("共享异步任务执行失败: {err}"))
+}
+
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。
 pub fn shutdown_on_exit() {
     git_service::shutdown_workspaces();

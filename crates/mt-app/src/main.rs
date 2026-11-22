@@ -349,8 +349,8 @@ fn main() {
         syntax_languages::register();
         // 预览器里的图片要靠它取字节:gpui 默认装 `NullHttpClient`(什么都发不出),
         // 而富文本渲染器把图片一律画成 `img(SharedUri)` —— 本地图片走 `file://`
-        // (md / html 源里的相对路径在渲染前被改写成绝对 file URL),网络图片走
-        // `reqwest::blocking`。细节与两条硬约束见 `file_viewer::PreviewHttpClient`。
+        // (md / html 源里的相对路径在渲染前被改写成绝对 file URL),网络图片走共享异步
+        // `reqwest::Client`。细节与两条硬约束见 `file_viewer::PreviewHttpClient`。
         cx.set_http_client(Arc::new(file_viewer::PreviewHttpClient));
         // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
         // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。

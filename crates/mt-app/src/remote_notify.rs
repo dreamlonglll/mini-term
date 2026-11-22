@@ -34,7 +34,7 @@ use crate::notify::ToastKind;
 pub const BARK_DEFAULT_SERVER: &str = "https://api.day.app";
 /// 官方 Telegram Bot API(`telegram.apiBase` 留空时用)。
 pub const TELEGRAM_DEFAULT_API: &str = "https://api.telegram.org";
-/// 单次请求的总超时。`reqwest::blocking` 默认无限等,而一条推送卡住不该拖住后面的渠道。
+/// 单次请求的总超时。`reqwest::Client` 默认无限等,而一条推送卡住不该拖住后面的渠道。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 错误信息里引用响应体的上限(字符)。
 const ERROR_BODY_CHARS: usize = 200;
@@ -468,22 +468,26 @@ pub fn judge_response(channel: Channel, status: u16, body: &str) -> Result<(), S
     }
 }
 
-// ─── 发送(阻塞,一律丢后台) ─────────────────────────────────
+// ─── 发送(异步,经共享 tokio 运行时执行) ─────────────────────
 
-/// 一次 POST,返回 `(状态码, 响应体)`。**阻塞**。
-fn post(req: &JsonPost) -> Result<(u16, String), String> {
-    let resp = crate::http::try_client()
-        .map_err(|e| e.without_url().to_string())?
-        .post(&req.url)
-        .timeout(REQUEST_TIMEOUT)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(req.body.clone())
-        .send()
-        .map_err(|e| e.without_url().to_string())?;
-    let status = resp.status().as_u16();
-    // 响应体读不出来不算失败:成败主要看状态码
-    let body = resp.text().unwrap_or_default();
-    Ok((status, body))
+/// 一次异步 POST,返回 `(状态码, 响应体)`。reqwest 错误一律 `without_url()` 脱敏。
+async fn post(req: JsonPost) -> Result<(u16, String), String> {
+    crate::http::run_async(async move {
+        let resp = crate::http::try_client()
+            .map_err(|e| e.without_url().to_string())?
+            .post(&req.url)
+            .timeout(REQUEST_TIMEOUT)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(req.body)
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?;
+        let status = resp.status().as_u16();
+        // 响应体读不出来不算失败:成败主要看状态码
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, body))
+    })
+    .await?
 }
 
 /// 已存凭据 → 明文。解不开给可展示的原因(「请重新填写」),不把信封交出去。
@@ -519,19 +523,19 @@ fn build_request(
     }
 }
 
-/// 经一个渠道发一条(不看它勾没勾 —— 测试发送也走这里)。**阻塞**。
-pub fn send_one(
+/// 经一个渠道发一条(不看它勾没勾 —— 测试发送也走这里)。
+pub async fn send_one(
     channel: Channel,
     config: &RemoteNotifyConfig,
     msg: &RemoteMessage,
 ) -> Result<(), String> {
     let req = build_request(channel, config, msg)?;
-    let (status, body) = post(&req)?;
+    let (status, body) = post(req).await?;
     judge_response(channel, status, &body)
 }
 
-/// 一次 AI 提醒:逐个勾选的渠道发,失败只记日志(不含凭据)。**阻塞**,调用方丢后台。
-pub fn deliver(alert: RemoteAlert) {
+/// 一次 AI 提醒:逐个勾选的渠道异步发送,失败只记日志(不含凭据)。
+pub async fn deliver(alert: RemoteAlert) {
     if !alert.config.is_active() {
         return;
     }
@@ -539,7 +543,7 @@ pub fn deliver(alert: RemoteAlert) {
         if !channel.enabled(&alert.config) {
             continue;
         }
-        if let Err(err) = send_one(channel, &alert.config, &alert.message) {
+        if let Err(err) = send_one(channel, &alert.config, &alert.message).await {
             tracing::warn!("[remote-notify] {} 推送失败: {err}", channel.label());
         }
     }
@@ -768,9 +772,9 @@ mod tests {
     fn 未启用时不发() {
         let mut config = RemoteNotifyConfig::default();
         config.bark.enabled = true;
-        deliver(RemoteAlert {
+        futures::executor::block_on(deliver(RemoteAlert {
             config,
             message: msg("test", None),
-        });
+        }));
     }
 }

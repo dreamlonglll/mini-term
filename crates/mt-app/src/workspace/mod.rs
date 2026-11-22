@@ -513,12 +513,14 @@ impl Workspace {
 
         // 启动版本自检(audit #30)。原版在拿到版本号之后立刻 `checkForUpdate(ver)`
         // 并 `.catch(() => {})`(`App.tsx:273-281`)—— 每次启动查一次、失败静默、
-        // 没有开关(「忽略此版本」是后加的,在渲染端判,见 `update_release`)。HTTP 是
-        // 阻塞的,丢后台执行器,回主线程只改一个字段(与 `pricing.rs` 拉价格表同一套路)。
+        // 没有开关(「忽略此版本」是后加的,在渲染端判,见 `update_release`)。网络调用经共享
+        // 异步 HTTP 客户端跑在 `mt-async-io` 运行时上,回主线程只改一个字段。
         let update_check = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
-                .spawn(async { crate::update_check::newer_release(env!("CARGO_PKG_VERSION")) })
+                .spawn(async {
+                    crate::update_check::newer_release(env!("CARGO_PKG_VERSION")).await
+                })
                 .await;
             let Some(release) = found else { return };
             let _ = this.update(cx, |workspace: &mut Self, cx| {
@@ -754,10 +756,10 @@ impl Workspace {
         if alert.plan.flash {
             notify::flash_taskbar(window);
         }
-        // 远程通知:几次 HTTPS 往返(每个渠道限时 10s),一律丢后台;失败只记日志
+        // 远程通知:几次 HTTPS 往返(每个渠道限时 10s),经共享异步运行时后台发送;失败只记日志
         if let Some(remote) = alert.remote {
             cx.background_executor()
-                .spawn(async move { remote_notify::deliver(remote) })
+                .spawn(async move { remote_notify::deliver(remote).await })
                 .detach();
         }
         let Some(kind) = alert.plan.toast else { return };
