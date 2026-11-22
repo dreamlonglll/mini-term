@@ -896,7 +896,7 @@ async fn unlock_candidate(
     match key_unlock::unlock_with_prompts(path, interaction).await {
         Unlock::Key(key) => Ok(Some(KeyCandidate {
             label,
-            source: KeySource::Local(Arc::new(key)),
+            source: KeySource::Local(Arc::new(*key)),
         })),
         Unlock::Skipped => {
             report.note(format!(
@@ -1079,7 +1079,9 @@ fn offer_retry_without_keys(
         matches!(plan.password, PasswordInput::Available(_)) || plan.interaction.is_some();
     match error {
         AuthError::Rejected(message)
-            if password_accepted && matches!(plan.round, AuthRound::First) && password_available =>
+            if password_accepted
+                && matches!(plan.round, AuthRound::First)
+                && password_available =>
         {
             AuthError::RetryWithoutKeys {
                 message,

@@ -126,6 +126,7 @@ fn connection(port: u16) -> SshConnection {
         password: None,
         identity_file: None,
         group: None,
+        use_system_ssh: false,
         extra: Default::default(),
     }
 }
@@ -276,7 +277,10 @@ impl Fake {
     }
 
     fn accepts(&self, key: &PublicKey) -> bool {
-        self.spec.keys.iter().any(|k| k.key_data() == key.key_data())
+        self.spec
+            .keys
+            .iter()
+            .any(|k| k.key_data() == key.key_data())
     }
 
     /// 像 sshd 那样拒绝:剩余方法照旧是全部(russh 服务端默认会把刚失败的 password 方法摘掉,
@@ -1266,7 +1270,11 @@ async fn 等用户期间服务器因_login_grace_time_断开给出清楚的报�
         "{}",
         error.message
     );
-    assert!(error.message.contains("LoginGraceTime"), "{}", error.message);
+    assert!(
+        error.message.contains("LoginGraceTime"),
+        "{}",
+        error.message
+    );
     assert_eq!(server.count("password"), 0, "密码没有送出去");
 }
 
@@ -1291,8 +1299,14 @@ async fn pty_请求带上_term_尺寸与终端模式() {
     assert!(pty.modes.contains(&(Pty::IUTF8, 1)), "{:?}", pty.modes);
     assert!(pty.modes.contains(&(Pty::VERASE, 127)), "{:?}", pty.modes);
     let events = server.events();
-    assert!(events.contains(&"env LANG=en_US.UTF-8".to_string()), "{events:?}");
-    assert!(events.contains(&"env COLORTERM=truecolor".to_string()), "{events:?}");
+    assert!(
+        events.contains(&"env LANG=en_US.UTF-8".to_string()),
+        "{events:?}"
+    );
+    assert!(
+        events.contains(&"env COLORTERM=truecolor".to_string()),
+        "{events:?}"
+    );
     assert!(events.contains(&"shell".to_string()), "{events:?}");
 }
 
@@ -1525,7 +1539,9 @@ async fn 大量输出按序完整交付() {
     let session = opened.session();
     assert!(opened.capture.wait_for("ready").await);
     let lines = 150_000;
-    session.write(format!("flood {lines}\r").as_bytes()).unwrap();
+    session
+        .write(format!("flood {lines}\r").as_bytes())
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     while !opened.capture.text().contains("flood-done") {
         assert!(Instant::now() < deadline, "flood did not finish");

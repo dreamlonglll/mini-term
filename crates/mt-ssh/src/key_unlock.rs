@@ -26,7 +26,7 @@ use crate::interact::Interaction;
 
 /// 在终端里问口令解开私钥的结果。
 pub(crate) enum Unlock {
-    Key(PrivateKey),
+    Key(Box<PrivateKey>),
     /// 用户输了空口令:跳过这把 key(OpenSSH 同样如此)。
     Skipped,
     /// 问满次数,口令都不对。
@@ -63,7 +63,7 @@ pub(crate) async fn unlock_with_prompts(path: &Path, interaction: &Interaction) 
             tokio::task::spawn_blocking(move || locked.decrypt(&passphrase)).await
         };
         match attempt {
-            Ok(Ok(key)) => return Unlock::Key(key),
+            Ok(Ok(key)) => return Unlock::Key(Box::new(key)),
             Ok(Err(Decrypt::WrongPassphrase)) => continue,
             Ok(Err(Decrypt::Failed(reason))) => return Unlock::Unsupported(reason),
             Err(e) => return Unlock::Unsupported(format!("decryption did not finish: {e}")),
@@ -88,7 +88,7 @@ fn is_encrypted_ppk(text: &str) -> bool {
 
 /// 一把等着口令的私钥。
 enum LockedKey {
-    OpenSsh(PrivateKey),
+    OpenSsh(Box<PrivateKey>),
     /// PKCS#8 加密 / PuTTY PPK:整段文本交给 russh 带口令解码。
     Russh(String),
     LegacyPem(LegacyPem),
@@ -114,7 +114,7 @@ impl LockedKey {
             let key = PrivateKey::from_openssh(text)
                 .map_err(|e| format!("invalid OpenSSH private key ({e})"))?;
             return if key.is_encrypted() {
-                Ok(Self::OpenSsh(key))
+                Ok(Self::OpenSsh(Box::new(key)))
             } else {
                 Err("the private key is not encrypted".into())
             };
@@ -197,7 +197,11 @@ impl LegacyPem {
             other => return Err(format!("unsupported PEM encryption {other}")),
         };
         let iv = hex_decode(iv_hex.trim())
-            .filter(|iv| cipher.key_and_iv_size().is_some_and(|(_, size)| iv.len() == size))
+            .filter(|iv| {
+                cipher
+                    .key_and_iv_size()
+                    .is_some_and(|(_, size)| iv.len() == size)
+            })
             .ok_or_else(|| format!("malformed IV in DEK-Info header ({dek_info})"))?;
         let body = {
             use base64::Engine;
@@ -272,7 +276,7 @@ fn pkcs7_unpadded_len(data: &[u8], block: usize) -> Option<usize> {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len())
@@ -388,7 +392,8 @@ vcfZuaOLcQ==
 ";
 
     /// 上面那把 EC key 的公钥(`ssh-keygen -y`)。
-    const EC_PUBLIC: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAB\
+    const EC_PUBLIC: &str =
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAB\
                              BBLWeubnzkEvI6fP3nrpGwuMQsXFBDHbwAFV2sxGOJBOfGGsv+B0eLiku0VUKsO2uW7htN\
                              XXYteZ1gr65LfThQSk=";
 

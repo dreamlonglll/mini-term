@@ -273,7 +273,10 @@ impl ShellSession {
 
     fn ensure_open(&self) -> Result<(), String> {
         if self.shared.is_ended() {
-            Err(format!("the SSH session to {} has ended", self.target_label))
+            Err(format!(
+                "the SSH session to {} has ended",
+                self.target_label
+            ))
         } else {
             Ok(())
         }
@@ -429,10 +432,7 @@ fn open_error(error: AcquireError, interaction: &Interaction, target: &str) -> S
         );
     }
     if interaction.host_key_declined() {
-        return ShellOpenError::new(
-            ShellOpenErrorKind::HostKey,
-            "Host key verification failed.",
-        );
+        return ShellOpenError::new(ShellOpenErrorKind::HostKey, "Host key verification failed.");
     }
     let kind = match error.kind {
         AcquireErrorKind::Config => ShellOpenErrorKind::Config,
@@ -645,7 +645,9 @@ const STATE_CLOSED: u8 = 1;
 const STATE_EXITED: u8 = 2;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 三个执行体与 [`ShellSession`] 共享的状态。

@@ -162,8 +162,7 @@ async fn connect_target(
         interaction,
     };
     let notes = Arc::clone(&link.notes);
-    let first =
-        auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker).await;
+    let first = auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker).await;
     let earlier = match first {
         Ok(()) => {
             link.method = notes.take_authenticated();

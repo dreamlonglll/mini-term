@@ -20,7 +20,9 @@ use tokio::time::Instant;
 use crate::shell::ShellPrompt;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 一次终端 shell 建连的交互通道。
@@ -329,7 +331,10 @@ mod tests {
         });
         interaction.notice("hello\r\n");
         assert_eq!(
-            interaction.read_line("first: ".into(), true).await.as_deref(),
+            interaction
+                .read_line("first: ".into(), true)
+                .await
+                .as_deref(),
             Some("one")
         );
         assert!(!interaction.is_cancelled());
