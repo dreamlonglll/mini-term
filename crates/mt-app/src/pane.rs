@@ -143,7 +143,6 @@ use mt_app_core::shell_link::{self, LinkPhase};
 use mt_app_core::ssh_takeover::{self, Admission, BaseState, Sink, TakeoverState};
 use mt_config::{ShellConfig, SshConnection};
 use mt_pty::{PtySession, PtySpawn};
-use parking_lot::Mutex;
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
@@ -155,6 +154,7 @@ use mt_ui::{
     CopiedTip, DwellConfig, FlashLine, PasteAction, SearchBarEvent, TerminalSearch,
     TerminalSearchBar, TerminalStyle, TerminalTheme, TerminalView,
 };
+use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
 use crate::clipboard::{self, ClipboardImage, PasteTarget, RemotePaste};

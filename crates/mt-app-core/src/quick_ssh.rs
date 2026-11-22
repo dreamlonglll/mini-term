@@ -157,9 +157,9 @@ impl QuickSshTracker {
     pub fn poll_interval(&self) -> Option<Duration> {
         match self.phase {
             QuickSshPhase::Inactive => None,
-            QuickSshPhase::Launching
-            | QuickSshPhase::WaitingPrompt
-            | QuickSshPhase::Verifying => Some(Duration::from_millis(250)),
+            QuickSshPhase::Launching | QuickSshPhase::WaitingPrompt | QuickSshPhase::Verifying => {
+                Some(Duration::from_millis(250))
+            }
             QuickSshPhase::Connected => Some(Duration::from_millis(700)),
         }
     }
@@ -216,7 +216,10 @@ impl QuickSshTracker {
 
     /// 用户向 PTY 键入真实字节时的旁路通知。
     pub fn on_user_input(&mut self, bytes: &[u8], _now: Instant) {
-        if matches!(self.phase, QuickSshPhase::Inactive | QuickSshPhase::Connected) {
+        if matches!(
+            self.phase,
+            QuickSshPhase::Inactive | QuickSshPhase::Connected
+        ) {
             return;
         }
         // Ctrl+C 打断连接或提示：先清候选，后续由进程探针决定 ssh 是退出了还是继续运行
@@ -239,8 +242,10 @@ impl QuickSshTracker {
 
     /// 远端 shell 发来 OSC 0/2 标题变化时的旁路通知（仅在已跨过回显且非等待提示时采信）。
     pub fn on_osc_title(&mut self, now: Instant) {
-        if matches!(self.phase, QuickSshPhase::Launching | QuickSshPhase::Verifying)
-            && self.echo_passed
+        if matches!(
+            self.phase,
+            QuickSshPhase::Launching | QuickSshPhase::Verifying
+        ) && self.echo_passed
             && self.saw_ssh_process
             && self.candidate_since.is_none()
         {
@@ -362,42 +367,42 @@ impl QuickSshTracker {
                     QuickSshOutcome::Changed(None)
                 }
             },
-            QuickSshPhase::Launching
-            | QuickSshPhase::WaitingPrompt
-            | QuickSshPhase::Verifying => match probe {
-                SshProcessProbe::Running => {
-                    self.saw_ssh_process = true;
-                    self.try_promote_connected(now)
+            QuickSshPhase::Launching | QuickSshPhase::WaitingPrompt | QuickSshPhase::Verifying => {
+                match probe {
+                    SshProcessProbe::Running => {
+                        self.saw_ssh_process = true;
+                        self.try_promote_connected(now)
+                    }
+                    SshProcessProbe::Unavailable => {
+                        self.probe_unavailable = true;
+                        let res = self.try_promote_connected(now);
+                        if res != QuickSshOutcome::Noop {
+                            return res;
+                        }
+                        let start = self.pty_ready_at.or(self.armed_at).unwrap_or(now);
+                        if self.candidate_since.is_none()
+                            && now.saturating_duration_since(start) >= UNAVAILABLE_CONNECT_TIMEOUT
+                        {
+                            self.disarm();
+                        }
+                        QuickSshOutcome::Noop
+                    }
+                    SshProcessProbe::Exited => {
+                        if self.saw_ssh_process {
+                            // ssh 进程已经起过又退出了（失败 / 秒退 / 用户取消）
+                            self.disarm();
+                            return QuickSshOutcome::Noop;
+                        }
+                        // 还没见过 ssh：若 PTY 已就绪且超过启动宽限，放弃追踪
+                        if let Some(ready_at) = self.pty_ready_at
+                            && now.saturating_duration_since(ready_at) >= START_PROCESS_TIMEOUT
+                        {
+                            self.disarm();
+                        }
+                        QuickSshOutcome::Noop
+                    }
                 }
-                SshProcessProbe::Unavailable => {
-                    self.probe_unavailable = true;
-                    let res = self.try_promote_connected(now);
-                    if res != QuickSshOutcome::Noop {
-                        return res;
-                    }
-                    let start = self.pty_ready_at.or(self.armed_at).unwrap_or(now);
-                    if self.candidate_since.is_none()
-                        && now.saturating_duration_since(start) >= UNAVAILABLE_CONNECT_TIMEOUT
-                    {
-                        self.disarm();
-                    }
-                    QuickSshOutcome::Noop
-                }
-                SshProcessProbe::Exited => {
-                    if self.saw_ssh_process {
-                        // ssh 进程已经起过又退出了（失败 / 秒退 / 用户取消）
-                        self.disarm();
-                        return QuickSshOutcome::Noop;
-                    }
-                    // 还没见过 ssh：若 PTY 已就绪且超过启动宽限，放弃追踪
-                    if let Some(ready_at) = self.pty_ready_at
-                        && now.saturating_duration_since(ready_at) >= START_PROCESS_TIMEOUT
-                    {
-                        self.disarm();
-                    }
-                    QuickSshOutcome::Noop
-                }
-            },
+            }
         }
     }
 
@@ -484,10 +489,7 @@ impl QuickSshTracker {
 ///   （宿主机看不到 WSL 虚拟机内部的 Linux 进程）
 /// - 否则沿 `ppid -> pid` 做带 `visited` 防环的 BFS，命中任意 `ssh` / `ssh.exe` 后代即
 ///   [`SshProcessProbe::Running`]，未命中即 [`SshProcessProbe::Exited`]。
-pub fn has_ssh_in_process_table(
-    root_pid: u32,
-    entries: &[(u32, u32, &str)],
-) -> SshProcessProbe {
+pub fn has_ssh_in_process_table(root_pid: u32, entries: &[(u32, u32, &str)]) -> SshProcessProbe {
     let mut children: HashMap<u32, Vec<(u32, &str)>> = HashMap::new();
     let mut root_name: Option<&str> = None;
 
@@ -753,7 +755,10 @@ mod tests {
         );
         // 远端极速返回 MOTD + prompt（第 80ms，此时进程探针还没跑过）
         assert_eq!(
-            tr.on_output(b"Last login: Sat Nov 22 10:00:00 2026\r\nroot@vps:~# ", t(80)),
+            tr.on_output(
+                b"Last login: Sat Nov 22 10:00:00 2026\r\nroot@vps:~# ",
+                t(80)
+            ),
             QuickSshOutcome::Noop
         );
         // 第 250ms 探针看到 ssh 活着，但距离 80ms 还不足 300ms 确认窗口

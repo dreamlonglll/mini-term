@@ -107,7 +107,10 @@ mod platform {
     use std::process::Command;
 
     pub(super) fn probe(root_pid: u32) -> SshProcessProbe {
-        let Ok(output) = Command::new("ps").args(["-eo", "pid=,ppid=,comm="]).output() else {
+        let Ok(output) = Command::new("ps")
+            .args(["-eo", "pid=,ppid=,comm="])
+            .output()
+        else {
             return SshProcessProbe::Unavailable;
         };
         if !output.status.success() {
