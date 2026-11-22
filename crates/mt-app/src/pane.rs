@@ -436,7 +436,7 @@ impl EventEmitter<PaneEvent> for TerminalPane {}
 /// 起 pane 的「启动预案」:在**后台线程**上兑现成真正要 spawn 的东西。
 ///
 /// 为什么是闭包而不是现成的 [`PtySpawn`]:有两条支路光是定 spec 本身就要碰盘 ——
-/// SSH 远程项目的预检(PATH 里找 ssh 客户端、复制私钥并起 `icacls` 收紧权限、
+/// SSH 远程项目的预检(PATH 里找 ssh 客户端、复制私钥并收紧权限、
 /// 解开已存密码)与启动恢复的续接 cwd 反查(翻 `~/.claude/projects`)。它们与
 /// spawn 进同一个后台任务,按「先定 spec、再 spawn」的顺序跑,主线程一步都不等。
 ///
@@ -2454,7 +2454,7 @@ pub(crate) fn connect_ssh_from_menu(
 
 /// 在指定终端里连 SSH:写入 `ssh` 命令并回车,有密码则**写完再**注册自动填充。
 ///
-/// 私钥那一步(`mt_core::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
+/// 私钥那一步(`mt_pty::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
 /// OpenSSH 的 `UNPROTECTED PRIVATE KEY FILE` 拒绝)是**阻塞文件 IO**,丢后台;
 /// 失败**回退原始路径**让 ssh 自己报错(原版 `console.error` 后照走)。
 ///
@@ -2490,7 +2490,7 @@ pub(crate) fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window,
                     let source = path.clone();
                     let prepared = cx
                         .background_executor()
-                        .spawn(async move { mt_core::prepare_ssh_key(&source) })
+                        .spawn(async move { mt_pty::prepare_ssh_key(&source) })
                         .await;
                     match prepared {
                         Ok(temp) => Some(temp),

@@ -156,7 +156,7 @@ pub(crate) enum KeyLoad {
 }
 
 /// 读一个私钥文件。只读不改,也不需要文件权限收紧(那是系统 ssh 的要求,见
-/// `mt_core::prepare_ssh_key`)。
+/// `mt_pty::prepare_ssh_key`)。
 ///
 /// russh 原生解析覆盖 OpenSSH / PKCS#8 / PuTTY 明文私钥;传统 PKCS#1 RSA
 /// (`-----BEGIN RSA PRIVATE KEY-----`)由 [`try_parse_pkcs1_rsa`] 兜底。带口令的私钥

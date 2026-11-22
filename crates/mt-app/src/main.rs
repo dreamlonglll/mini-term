@@ -366,11 +366,11 @@ fn main() {
             .detach();
         // SSH 临时私钥副本的清理(装机版 `lib.rs::setup` 里的
         // `ssh::cleanup_ssh_temp_keys()`)。远程 pane 起 ssh 前会把私钥复制成
-        // 权限收紧的临时文件(`mt_core::prepare_ssh_key`),上一轮的副本必须在
+        // 权限收紧的临时文件(`mt_pty::prepare_ssh_key`),上一轮的副本必须在
         // 启动时清掉 —— 否则那个目录随连接次数无界增长,且留着别人机器上的
         // 私钥明文副本。同样丢后台:它要遍历目录。
         cx.background_executor()
-            .spawn(async { mt_core::cleanup_ssh_temp_keys() })
+            .spawn(async { mt_pty::cleanup_ssh_temp_keys() })
             .detach();
         // 已注册用户的启动期自愈,每家一条。装机版 `lib.rs::setup` 里原本也是
         // 一个后台线程按序跑这几条,GPUI 迁移时 hook_registry 逐字搬进了 mt-ai、

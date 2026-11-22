@@ -51,6 +51,7 @@
 //!
 //! - [`conpty`] —— 便携 ConPTY 预载(**必须早于任何 spawn**,见该模块文档)
 //! - [`ssh`] —— SSH 密码自动填充状态机 + 远程启动器 argv 拼装
+//! - `ssh_key`(内部) —— 系统 `ssh -i` 所需的权限收紧临时私钥副本,导出见下方 re-export
 //! - `launch`(内部) —— cwd / WSL 启动器重写 / 环境变量装配,导出见下方 re-export
 //!
 //! # 用法梗概
@@ -92,12 +93,14 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 pub mod conpty;
 mod launch;
 pub mod ssh;
+mod ssh_key;
 
 pub use conpty::{ConptyBootstrapDecision, choose_conpty_bootstrap};
 pub use launch::{
     WslOverride, build_wslenv_value, decide_wsl_override, fallback_local_cwd, fallback_windows_cwd,
 };
 pub use ssh::SshAutofill;
+pub use ssh_key::{cleanup_ssh_temp_keys, prepare_ssh_key, restrict_permissions, temp_keys_dir};
 
 /// reader 单次读取的缓冲区大小。
 ///

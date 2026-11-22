@@ -14,3 +14,15 @@ parking_lot.workspace = true
 # 路径依赖按原计划换成工作区依赖,代码零改动。
 mt-core.workspace = true
 tracing.workspace = true
+
+# Windows 临时 SSH 私钥副本的受保护 DACL 全量覆写（仅当前用户 SID，阻断继承）：
+# 版本对齐工作区依赖树里已有的 windows-sys 0.61（mt-secret / mt-project / sidecars 同份），
+# 净新增 crate = 0。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }

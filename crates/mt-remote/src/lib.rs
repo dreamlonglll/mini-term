@@ -504,7 +504,7 @@ pub struct RemoteLaunch {
 ///
 /// 失败面(两条,都给可直接展示的中文):
 /// - 本机没有 OpenSSH 客户端;
-/// - 私钥文件不存在 / 复制临时副本失败(`mt_core::prepare_ssh_key`)。
+/// - 私钥文件不存在 / 复制临时副本失败(`mt_pty::prepare_ssh_key`)。
 ///
 /// **断链**(连接被删)由更早的 [`find_connection`] 挡下,不在本函数里。
 pub fn prepare_remote_launch(
@@ -525,7 +525,7 @@ pub fn prepare_remote_launch(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(path) => Some(mt_core::prepare_ssh_key(path)?),
+        Some(path) => Some(mt_pty::prepare_ssh_key(path)?),
         None => None,
     };
 

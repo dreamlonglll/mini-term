@@ -32,7 +32,6 @@ pub mod paste;
 pub mod path;
 pub mod path_key;
 mod ssh_connection;
-mod ssh_key;
 mod ssh_prompt;
 mod tui_line;
 mod wsl_path;
@@ -43,7 +42,6 @@ pub use config_reader::{
     read_ssh_connections_for_token, read_ssh_connections_for_token_at, TokenScopeError,
 };
 pub use ssh_connection::SshConnection;
-pub use ssh_key::{cleanup_ssh_temp_keys, prepare_ssh_key, restrict_permissions, temp_keys_dir};
 pub use ssh_prompt::{scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
 pub use tui_line::strip_tui_decoration;
 pub use wsl_path::{parse_unc as parse_wsl_unc, WslPath};

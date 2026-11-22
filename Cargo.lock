@@ -5615,6 +5615,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

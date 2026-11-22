@@ -138,7 +138,7 @@ mt-ai = { path = "crates/mt-ai" }
 mt-app-core = { path = "crates/mt-app-core" }
 mt-config = { path = "crates/mt-config" }
 # tauri-free 的叶子共享库(收尾-1 批自 `src-tauri/mt-core` 移入):WSL UNC 解析 /
-# SSH 提示扫描 + ANSI 剥离 / 原子写 / SshConnection / 临时私钥落盘。
+# SSH 提示扫描 + ANSI 剥离 / 原子写 / SshConnection。
 # ⚠️ 依赖方向铁律:mt-core **只依赖 serde/serde_json/dirs**,绝不反向依赖
 # mt-config 等上层 crate —— 它同时被三个 sidecar 二进制(miniterm-hook /
 # mt-ssh-mcp / mt-ssh-cli)与 mt-ssh 链接,加一层就把整套上层依赖拖进小二进制。
