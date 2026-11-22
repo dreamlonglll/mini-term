@@ -319,7 +319,10 @@ fn finish_frame(window: &mut Window, cx: &mut App) {
         s.frame_open = false;
         !s.holes.is_empty()
     });
+    #[cfg(any(windows, target_os = "macos"))]
     let mut any_shown = false;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let any_shown = false;
 
     #[cfg(any(windows, target_os = "macos"))]
     {
