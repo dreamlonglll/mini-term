@@ -19,9 +19,10 @@ name: Build & Release
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
 #   该目录收集 —— 目录布局即最终包布局
 # - 每个桌面安装包都带齐 Linux x64/arm64 与 macOS x64/arm64 四种远端 Git helper;
-#   remote-git-helpers 全平台成功后 build-gpui 才组装,stage-git-helpers --verify-all
-#   拒绝缺失或动态链接的 Linux helper。手动补建即使只选一个桌面平台也不缩减 helper
-#   矩阵;任一 helper 构建 / 兼容性冒烟失败同样阻止打包与 publish。
+#   build-desktop 与 remote-git-helpers 并行编译,全部就绪后再由 package-release
+#   统一组装并跑 stage-git-helpers --verify-all(拒绝缺失或动态链接的 Linux helper)。
+#   手动补建即使只选一个桌面平台也不缩减 helper 矩阵;任一 helper 构建 / 兼容性冒烟
+#   失败同样阻止打包与 publish。
 # - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
 #   各平台只向其上传产物,避免并行抢建 release;全部平台构建成功后 publish 作业
 #   算出 SHA256SUMS.txt 一并上传,再把 draft 转正。匿名请求看不到 draft ——
@@ -65,7 +66,8 @@ on:
         default: 'macos-x64'
         type: string
 
-# 默认只读。要写 release 的 create-release / build-gpui / publish 各自提到 contents: write
+# 默认只读。要写 release 的 create-release / package-release / publish 各自提到 contents: write;
+# build-desktop 与 remote-git-helpers 只编产物、不碰 release,保持最小只读权限
 permissions:
   contents: read
 
@@ -79,7 +81,7 @@ env:
 
 jobs:
   create-release:
-    # 手动补建时 release 已经在了,跳过;build-gpui / publish 的 if 里把 skipped 视同成功
+    # 手动补建时 release 已经在了,跳过;build-desktop / package-release / publish 的 if 里把 skipped 视同成功
     if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
@@ -130,7 +132,7 @@ jobs:
           case "$RELEASE_TAG" in *-*) flags+=(--prerelease) ;; esac
           gh release create "$RELEASE_TAG" "${flags[@]}"
 
-  # 算出 build-gpui 的矩阵:push 全量四条;手动补建只留 inputs.platforms 点名的。
+  # 算出 build-desktop / package-release 的矩阵:push 全量四条;手动补建只留 inputs.platforms 点名的。
   # 平台表与过滤规则在 .github/scripts/release_matrix.mjs(job 级 if 拿不到
   # matrix 上下文,过滤只能在这里做完再 fromJSON 喂进 strategy.matrix)
   plan:
@@ -184,24 +186,50 @@ jobs:
         run: |
           rustup toolchain install --no-self-update
           rustup target add "$HELPER_RUST_TARGET"
+          rustc -vV
+      # 只读复用 cache-warm.yml 在 main 上预热的 release 缓存(不往 tag 写缓存,守住 10 GB 额度):
+      # - shared-key / workspaces 与 cache-warm.yml 的 release 作业逐字对齐,确保精确命中;
+      # - macOS (arm64 / x64) 原生编译与 mt-app 共享同一 target/release/deps,git2 / libgit2-sys /
+      #   openssl-sys 等重型依赖可直接复用;
+      # - Linux x64 命中 ~/.cargo/registry 与 host proc-macro/build-script 缓存;
+      # - Linux arm64 未在 cache-warm.yml 预热,save-if: false 下安全 miss 后冷编。
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release
+          save-if: false
+          workspaces: |
+            . -> target
+            sidecars -> target
       - name: Build remote Git helper
+        id: build
         shell: bash
         env:
           HELPER_RUST_TARGET: ${{ matrix.rust-target }}
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             bash scripts/build-git-helper-musl.sh "$HELPER_RUST_TARGET"
+            echo "binary=target/$HELPER_RUST_TARGET/release/mt-git-helper" >> "$GITHUB_OUTPUT"
           else
-            cargo build --locked --release --target "$HELPER_RUST_TARGET" --package mt-git-helper
+            HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+            if [ "$HELPER_RUST_TARGET" = "$HOST_TRIPLE" ]; then
+              # 与 cache-warm.yml 的 `cargo build --locked --release --package mt-app` 落在同一
+              # target/release/ 目录,直接命中已预热的 openssl-sys / libgit2-sys / git2 产物
+              cargo build --locked --release --package mt-git-helper
+              echo "binary=target/release/mt-git-helper" >> "$GITHUB_OUTPUT"
+            else
+              cargo build --locked --release --target "$HELPER_RUST_TARGET" --package mt-git-helper
+              echo "binary=target/$HELPER_RUST_TARGET/release/mt-git-helper" >> "$GITHUB_OUTPUT"
+            fi
           fi
       - name: Validate binary and stage target asset
         shell: bash
         env:
           HELPER_TARGET: ${{ matrix.target }}
-          HELPER_RUST_TARGET: ${{ matrix.rust-target }}
+          HELPER_BINARY: ${{ steps.build.outputs.binary }}
         run: |
           node scripts/stage-git-helpers.mjs --target "$HELPER_TARGET" \
-            --binary "target/$HELPER_RUST_TARGET/release/mt-git-helper" --output helper-assets
+            --binary "$HELPER_BINARY" --output helper-assets
       - name: Framed discover/status with system Git on glibc 2.31 (Linux)
         if: runner.os == 'Linux'
         shell: bash
@@ -224,21 +252,22 @@ jobs:
           name: remote-git-helper-${{ matrix.target }}
           path: helper-assets/
           if-no-files-found: error
+          retention-days: 7
 
-  build-gpui:
-    needs: [create-release, plan, remote-git-helpers]
+  # 编译阶段:与 remote-git-helpers 完全并行(编译 mt-app 与 sidecars 本身不依赖 helper 二进制),
+  # 完成后将本平台可执行文件与打包前置元数据上传为临时 artifact,交给 package-release 统一组装。
+  # 不碰 release,继承顶层 contents: read 最小权限。
+  build-desktop:
+    needs: [create-release, plan]
     # 手动补建时 create-release 是 skipped,默认隐含的 success() 会把本作业一起
     # 跳掉;显式写状态函数(!cancelled())才能覆盖那个默认,再自己放行 skipped
-    if: needs.plan.result == 'success' && needs.remote-git-helpers.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    if: needs.plan.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.include) }}
 
     runs-on: ${{ matrix.platform }}
-    permissions:
-      # 只为最后一步把产物传进 release;token 只在那一步的 env 里出现
-      contents: write
 
     steps:
       # 按 tag 检出而不是默认的触发 sha:手动补建时触发 sha 是分支 HEAD,
@@ -297,18 +326,154 @@ jobs:
             . -> target
             sidecars -> target
 
+      - name: Build & stage sidecars (+ portable ConPTY on Windows)
+        run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
+
+      - name: Build GPUI app
+        run: cargo build --locked --release --package mt-app
+
+      # ── Linux 运行时依赖(Depends)前置计算 ──
+      # dpkg-shlibdeps 必须对着构建期实际链接的那套系统库(/var/lib/dpkg/info/*.shlibs)
+      # 反查四个二进制的 ELF NEEDED;在这里算完随 artifact 传给 package-release,
+      # 打包阶段就无需重装十几个 lib*-dev 包,且版本与链接上下文 100% 一致。
+      # 算不出来时写空文件并打 warning —— 不为打包细节挡住整次发版。
+      - name: Compute Debian shlibdeps (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          mkdir -p staging/desktop
+          SHLIBS_DIR="$(mktemp -d)"
+          mkdir -p "$SHLIBS_DIR/debian"
+          printf 'Source: mini-term\n\nPackage: mini-term\nArchitecture: amd64\n' > "$SHLIBS_DIR/debian/control"
+          BIN_ARGS=()
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            BIN_ARGS+=("-e$PWD/target/release/$name")
+          done
+          DEPENDS=""
+          if SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "${BIN_ARGS[@]}") \
+             && [ "${SHLIBS#shlibs:Depends=}" != "$SHLIBS" ]; then
+            DEPENDS="${SHLIBS#shlibs:Depends=}"
+          else
+            echo "::warning::dpkg-shlibdeps 没算出依赖,deb 不带 Depends: ${SHLIBS:-<no output>}"
+          fi
+          # Ubuntu 24.04 的 64 位 time_t 过渡给一批库改了名(libasound2 → libasound2t64 …),
+          # 22.04 runner 上算出的旧名在 24.04 上只剩虚包。对过渡改名名单里的包补一个
+          # `| <名>t64` 备选,两代发行版都装得上。名单是那次一次性改名的历史事实,与
+          # 「依赖列表」不同,不会随代码变化而过期;不在名单里的依赖原样保留。
+          T64_RENAMED=" libasound2 libglib2.0-0 libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 libssl3 libcurl4 libpng16-16 "
+          if [ -n "$DEPENDS" ]; then
+            DEPENDS=$(printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
+              | while IFS= read -r dep; do
+                  name="${dep%% *}"
+                  case "$T64_RENAMED" in
+                    *" $name "*) printf '%s | %st64\n' "$dep" "$name" ;;
+                    *) printf '%s\n' "$dep" ;;
+                  esac
+                done | paste -sd, - | sed 's/,/, /g')
+          fi
+          echo "Depends: ${DEPENDS:-<none>}"
+          printf '%s' "$DEPENDS" > staging/desktop/deb-depends.txt
+
+      - name: Stage desktop build (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging/desktop | Out-Null
+          foreach ($f in @('mini-term.exe', 'miniterm-hook.exe', 'mt-ssh-cli.exe', 'mt-ssh-mcp.exe', 'mini_term.pdb')) {
+            $src = Join-Path 'target/release' $f
+            if (-not (Test-Path $src)) { throw "缺少构建产物: $src" }
+            Copy-Item -Path $src -Destination 'staging/desktop/' -Force
+          }
+          if (-not (Test-Path 'target/release/portable-conpty')) { throw '缺少构建产物: target/release/portable-conpty' }
+          Copy-Item -Path 'target/release/portable-conpty' -Destination 'staging/desktop/portable-conpty' -Recurse -Force
+
+      # macOS / Linux 用 tar 归档再上传:actions/upload-artifact 的 zip 封装不保留 Unix 可执行权限位,
+      # tar 完整保留 0755 权限与元数据,交由 upload-artifact 单次压缩传输。
+      - name: Stage desktop build archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging/desktop
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            test -x "target/release/$name" || { echo "::error::缺少可执行构建产物: target/release/$name"; exit 1; }
+          done
+          tar -C target/release -cf staging/desktop/desktop-build.tar \
+            mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp
+
+      - name: Upload desktop build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-build-${{ matrix.key }}
+          path: staging/desktop/
+          if-no-files-found: error
+          retention-days: 7
+
+  # 打包上传阶段:汇合桌面编译产物与全部 4 平台远端 Git helper,校验后按平台组装并上传到 release。
+  # 无需 Rust 工具链、rust-cache 或 Linux 编译期 apt 依赖,失败时 Re-run failed jobs 也不重编桌面。
+  package-release:
+    needs: [create-release, plan, remote-git-helpers, build-desktop]
+    # - 放行 create-release == skipped(手动补建路径);
+    # - 要求 remote-git-helpers == success(任一 helper 失败必须阻止打包,不发残包);
+    # - 放行 build-desktop == failure:与 fail-fast: false 配套,macOS/Linux 编译失败时仍允许
+    #   已编译成功的平台(如 Windows)继续组装进 draft release;编译失败的平台会在下面下载本平台
+    #   desktop-build artifact 时报错退出,且 publish 要求 build-desktop 与 package-release 均全绿。
+    if: >-
+      !cancelled() &&
+      needs.plan.result == 'success' &&
+      needs.remote-git-helpers.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped') &&
+      (needs.build-desktop.result == 'success' || needs.build-desktop.result == 'failure')
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      # 只为最后一步把产物传进 release;token 只在那一步的 env 里出现
+      contents: write
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+
+      - name: Download desktop build artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-build-${{ matrix.key }}
+          path: staging/desktop
+
+      - name: Restore desktop build (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target | Out-Null
+          if (Test-Path 'target/release') { Remove-Item -Recurse -Force 'target/release' }
+          Move-Item -Path 'staging/desktop' -Destination 'target/release'
+
+      - name: Restore desktop build (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p target/release
+          tar -C target/release -xf staging/desktop/desktop-build.tar
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            test -x "target/release/$name" || { echo "::error::解包后缺少可执行产物: target/release/$name"; exit 1; }
+          done
+
       - name: Download remote Git helper assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: remote-git-helper-*
           path: target/release/remote-git-helpers
           merge-multiple: true
-
-      - name: Build & stage sidecars (+ portable ConPTY on Windows)
-        run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
-
-      - name: Build GPUI app
-        run: cargo build --locked --release --package mt-app
 
       # Required for every desktop matrix row, including Windows. The validator
       # reads binary headers itself (no host file/readelf dependency), rejects
@@ -486,40 +651,9 @@ jobs:
           done
           cp -R target/release/remote-git-helpers "$PKG/usr/lib/mini-term/"
           # ── 运行时依赖(Depends)──
-          # 由 dpkg-shlibdeps(build-essential 带的 dpkg-dev)按四个二进制实际链接的 .so
-          # (ELF NEEDED)反查所属包与最低版本算出,不手写死一份会过期的列表:哪天多链 / 少链
-          # 一个库,这里自动跟着变。它只认「源码包」目录布局,临时造一个最小的 debian/control。
-          # 算不出来时退回此前的「不声明依赖」并打 warning —— 不为打包细节挡住整次发版
-          # (publish 要全部平台成功)。
-          SHLIBS_DIR="$(mktemp -d)"
-          mkdir -p "$SHLIBS_DIR/debian"
-          printf 'Source: mini-term\n\nPackage: mini-term\nArchitecture: amd64\n' > "$SHLIBS_DIR/debian/control"
-          BIN_ARGS=()
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
-            BIN_ARGS+=("-e$PWD/$PKG/usr/lib/mini-term/$name")
-          done
-          DEPENDS=""
-          if SHLIBS=$(cd "$SHLIBS_DIR" && dpkg-shlibdeps -O "${BIN_ARGS[@]}") \
-             && [ "${SHLIBS#shlibs:Depends=}" != "$SHLIBS" ]; then
-            DEPENDS="${SHLIBS#shlibs:Depends=}"
-          else
-            echo "::warning::dpkg-shlibdeps 没算出依赖,deb 不带 Depends: ${SHLIBS:-<no output>}"
-          fi
-          # Ubuntu 24.04 的 64 位 time_t 过渡给一批库改了名(libasound2 → libasound2t64 …),
-          # 22.04 runner 上算出的旧名在 24.04 上只剩虚包。对过渡改名名单里的包补一个
-          # `| <名>t64` 备选,两代发行版都装得上。名单是那次一次性改名的历史事实,与
-          # 「依赖列表」不同,不会随代码变化而过期;不在名单里的依赖原样保留。
-          T64_RENAMED=" libasound2 libglib2.0-0 libgtk-3-0 libatk1.0-0 libatk-bridge2.0-0 libcups2 libssl3 libcurl4 libpng16-16 "
-          if [ -n "$DEPENDS" ]; then
-            DEPENDS=$(printf '%s\n' "$DEPENDS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
-              | while IFS= read -r dep; do
-                  name="${dep%% *}"
-                  case "$T64_RENAMED" in
-                    *" $name "*) printf '%s | %st64\n' "$dep" "$name" ;;
-                    *) printf '%s\n' "$dep" ;;
-                  esac
-                done | paste -sd, - | sed 's/,/, /g')
-          fi
+          # 由 build-desktop 在构建期同一共享库上下文里经 dpkg-shlibdeps + t64 兼容补齐后产出,
+          # 这里原样读取写入 DEBIAN/control。
+          DEPENDS="$(cat staging/desktop/deb-depends.txt)"
           echo "Depends: ${DEPENDS:-<none>}"
           ln -s ../lib/mini-term/mini-term "$PKG/usr/bin/mini-term"
           cp docs/icon.png "$PKG/usr/share/icons/hicolor/512x512/apps/mini-term.png"
@@ -579,11 +713,14 @@ jobs:
   # 不改 draft / prerelease —— 已发布的版本不能被改回 draft,还在 draft 的也不由补建来转正。
   # 校验:下载全部资产后 `sha256sum -c SHA256SUMS.txt`(或 --ignore-missing 只验下载的那个)
   publish:
-    needs: [create-release, build-gpui]
-    # 与 build-gpui 同一手法:显式 !cancelled() 才能把 skipped 的 create-release 放行;
-    # 矩阵作业的 result 只有全部成功才是 success
+    needs: [create-release, remote-git-helpers, build-desktop, package-release]
+    # 与 package-release 同一手法:显式 !cancelled() 才能把 skipped 的 create-release 放行;
+    # 矩阵作业的 result 只有全部成功才是 success,必须等 helper / 编译 / 打包全绿才转正
     if: >-
-      !cancelled() && needs.build-gpui.result == 'success' &&
+      !cancelled() &&
+      needs.remote-git-helpers.result == 'success' &&
+      needs.build-desktop.result == 'success' &&
+      needs.package-release.result == 'success' &&
       (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     runs-on: ubuntu-22.04
     permissions:

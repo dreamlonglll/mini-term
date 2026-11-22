@@ -909,3 +909,33 @@ fn accumulate_session_content_error_policy() {
     .unwrap();
     assert_eq!(out.len(), 1);
 }
+
+#[test]
+fn shared_runtime_handle_reuses_runtime_without_creating_pool() {
+    let st = RemoteSshState::new();
+    let h1 = st.runtime_handle().expect("共享 tokio 运行时应可用");
+    let h2 = st
+        .runtime_handle()
+        .expect("重复取用共享 tokio 运行时应可用");
+    assert_eq!(h1.id(), h2.id(), "多次取用应指向同一个进程级 tokio 运行时");
+    assert!(
+        lock(&st.pool).is_none(),
+        "仅取共享运行时句柄不应顺带初始化 SshPool"
+    );
+
+    // 验证 time + net 两个驱动均就绪(满足 mt-relay::MobileRelayManager::with_runtime 前置)
+    let bound_port = h1.block_on(async {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("net 驱动应已启用");
+        listener.local_addr().expect("local_addr").port()
+    });
+    assert!(bound_port > 0);
+
+    // 退出钩子只关池、不 drop 共享运行时,确保共享方在退出路径上不会撞已关闭运行时
+    st.shutdown_pool_blocking();
+    assert!(lock(&st.pool).is_none());
+    let still_alive = h1.block_on(async { 42u32 });
+    assert_eq!(still_alive, 42);
+}

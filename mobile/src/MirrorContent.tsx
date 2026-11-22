@@ -2,6 +2,7 @@ import { memo, useLayoutEffect, useRef, useState } from 'react';
 import { answerQuestion, useRelayStore } from './relay';
 import { useT } from './i18n';
 import { Markdown } from './MirrorMarkdown';
+import type { MirrorRow } from './mirrorRows';
 import type { MirrorMessage } from './protocol';
 
 function sourceKey(source: string): string {
@@ -35,7 +36,31 @@ export function isAtBottom(el: HTMLElement): boolean {
 /** 输入内容超过这个高度才折叠;折叠后的高度由样式 `.input-clip.is-collapsed` 定 */
 const COLLAPSE_THRESHOLD = 320;
 
-function CollapsibleInput({
+/**
+ * 模块级共享的单个 ResizeObserver:长对话里有几十上百条用户输入时,不再为每条
+ * CollapsibleInput 各自创建 observer 实例,统一按 WeakMap 分发并在 unmount 时退订。
+ */
+const resizeListeners = new WeakMap<Element, () => void>();
+let sharedResizeObserver: ResizeObserver | null = null;
+
+function observeElementResize(el: Element, onResize: () => void): (() => void) | undefined {
+  if (typeof ResizeObserver === 'undefined') return undefined;
+  if (!sharedResizeObserver) {
+    sharedResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        resizeListeners.get(entry.target)?.();
+      }
+    });
+  }
+  resizeListeners.set(el, onResize);
+  sharedResizeObserver.observe(el);
+  return () => {
+    sharedResizeObserver?.unobserve(el);
+    resizeListeners.delete(el);
+  };
+}
+
+const CollapsibleInput = memo(function CollapsibleInput({
   content,
   rowKey,
   onUserResize,
@@ -56,10 +81,7 @@ function CollapsibleInput({
     if (!el) return;
     const measure = () => setTall(el.offsetHeight > COLLAPSE_THRESHOLD);
     measure();
-    if (typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
+    return observeElementResize(el, measure);
   }, []);
 
   useLayoutEffect(() => {
@@ -93,7 +115,7 @@ function CollapsibleInput({
       )}
     </>
   );
-}
+});
 
 export const MessageRow = memo(function MessageRow({
   msg,
@@ -151,13 +173,17 @@ export const QuestionCard = memo(function QuestionCard({
   readOnly?: boolean;
 }) {
   const t = useT();
-  const mirrorOpen = useRelayStore((s) => s.mirror !== null && !s.mirror.closed);
-  const sending = useRelayStore((s) => s.mirror?.pendingCommandId != null);
-  const progress = useRelayStore((s) => s.mirror?.answeredProgress[msg.seq] ?? 0);
-  const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const answered = marker != null;
+  // 历史/已答/只读卡片永远不可交互:条件短路返回稳定常量,避免发指令或切在线态时惊动全部旧卡片
+  const interactive = !readOnly && active && !answered;
+  const mirrorOpen = useRelayStore((s) => interactive && s.mirror !== null && !s.mirror.closed);
+  const sending = useRelayStore((s) => interactive && s.mirror?.pendingCommandId != null);
+  const progress = useRelayStore((s) =>
+    interactive ? (s.mirror?.answeredProgress[msg.seq] ?? 0) : 0,
+  );
+  const desktopOnline = useRelayStore((s) => (interactive ? s.desktopOnline : true));
   const chosen = marker?.labels ?? [];
-  const canAnswer = !readOnly && active && !answered && mirrorOpen && desktopOnline !== false;
+  const canAnswer = interactive && mirrorOpen && desktopOnline !== false;
   const time = formatMessageTime(msg.timestamp);
   const items = msg.questions ?? [];
   const questionId = msg.questionId ?? '';
@@ -269,6 +295,64 @@ export const ToolGroupRow = memo(function ToolGroupRow({
         </ol>
       )}
     </div>
+  );
+});
+
+/**
+ * 对话行列表主体:单独 memo 隔离外层视图的标题/状态灯/弹层/分页按钮重渲染,
+ * 长对话里这些外层状态变化时不必整表重走 `rows.map`。
+ */
+export const MirrorRowList = memo(function MirrorRowList({
+  rows,
+  expandedTools,
+  onToggleTools,
+  onUserResize,
+  readOnly = false,
+}: {
+  rows: readonly MirrorRow[];
+  expandedTools: ReadonlySet<number>;
+  onToggleTools: (firstSeq: number) => void;
+  onUserResize?: (rowKey: number) => void;
+  readOnly?: boolean;
+}) {
+  return (
+    <>
+      {rows.map((row) => {
+        switch (row.kind) {
+          case 'question':
+            // 作答状态由后续的 questionAnswered 标记回推;标记本身不单独成行
+            return (
+              <QuestionCard
+                key={row.key}
+                msg={row.msg}
+                active={readOnly ? false : row.active}
+                marker={row.marker}
+                readOnly={readOnly}
+              />
+            );
+          case 'tools':
+            return (
+              <ToolGroupRow
+                key={row.key}
+                firstSeq={row.key}
+                tools={row.tools}
+                expanded={expandedTools.has(row.key)}
+                onToggle={onToggleTools}
+              />
+            );
+          case 'interrupt':
+            return <InterruptRow key={row.key} msg={row.msg} />;
+          default:
+            return (
+              <MessageRow
+                key={row.key}
+                msg={row.msg}
+                onUserResize={readOnly ? undefined : onUserResize}
+              />
+            );
+        }
+      })}
+    </>
   );
 });
 

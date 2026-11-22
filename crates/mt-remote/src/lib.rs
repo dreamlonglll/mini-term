@@ -31,9 +31,9 @@
 //! 原版是 `#[tauri::command(async)]`,跑在 Tauri 自带的全局 tokio runtime 上。
 //! GPUI 没有 tokio,主线程也不能阻塞,于是:
 //!
-//! - **本模块自持一个小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`),
-//!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
-//!   工作线程、进程内唯一;
+//! - **本模块自持进程级共享的小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`,
+//!   由 [`shared_runtime_handle`] 暴露给同进程内其它异步子系统如 `mt_relay` 复用)——
+//!   懒建、2 个工作线程、进程内唯一,避免远程 SSH 与移动端中转各起一套线程池;
 //! - Existing synchronous SSH APIs retain their blocking boundary. Git UI callers use
 //!   `run_git_on(&context, move || captured.some_git_method()).await`, which admits closures
 //!   asynchronously onto the service-owned executor. Managed synchronous requests reject
@@ -177,11 +177,12 @@ const DEFAULT_REMOTE_PASTE_DIR: &str = ".mini-term/pasted";
 /// 远程 SSH 的进程级状态。原版是 Tauri managed state,这里是 [`state()`] 后面的
 /// 全局单例 —— 后台任务拿不到 `Entity<AppStore>`,而所有 SFTP 调用都在后台。
 pub struct RemoteSshState {
-    /// 懒初始化的 tokio 运行时。russh / russh-sftp 的 IO 依赖 tokio driver,
-    /// gpui 的执行器喂不动它们,只能自持一个。
+    /// 懒初始化的进程级共享 tokio 运行时:承载 russh / russh-sftp / 托管远端 Git
+    /// IO,并经 [`shared_runtime_handle`] 复用给 `mt-relay`(gpui 执行器喂不动 tokio
+    /// 的 net/time 驱动,统一收敛到这一份小运行时,避免进程内并存两套线程池)。
     ///
-    /// 2 个工作线程:全部操作都是网络等待型,与 `mt_relay` 的 `Owned` 分支同值。
-    /// **不主动 shutdown**(见 [`RemoteSshState::shutdown_pool_blocking`] 的注释)。
+    /// 2 个工作线程:全部操作都是网络等待型。**不主动 shutdown**(见
+    /// [`RemoteSshState::shutdown_pool_blocking`] 的注释)。
     runtime: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
     /// 懒初始化的 russh 会话池。session 按 `connection.id` 全局复用。
     pool: Mutex<Option<Arc<SshPool>>>,
@@ -209,8 +210,8 @@ impl RemoteSshState {
         }
     }
 
-    /// 拿(或懒建)tokio 运行时。建不起来时返回明确错误 —— 全部远程能力随之
-    /// 报错,而不是 panic 掉整个应用。
+    /// 拿(或懒建)进程级共享 tokio 运行时。建不起来时返回明确错误 —— 全部远程能力
+    /// 随之报错,而不是 panic 掉整个应用。
     fn runtime(&self) -> Result<Arc<tokio::runtime::Runtime>, String> {
         let mut guard = lock(&self.runtime);
         if let Some(rt) = guard.as_ref() {
@@ -219,12 +220,17 @@ impl RemoteSshState {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
-            .thread_name("mt-remote-ssh")
+            .thread_name("mt-async-io")
             .build()
-            .map_err(|e| format!("SSH 运行时不可用: {e}"))?;
+            .map_err(|e| format!("共享异步运行时不可用: {e}"))?;
         let rt = Arc::new(rt);
         *guard = Some(rt.clone());
         Ok(rt)
+    }
+
+    /// 取共享 tokio 运行时的轻量 `Handle`(只按需懒建运行时,不触发 `SshPool` 初始化)。
+    pub(crate) fn runtime_handle(&self) -> Result<tokio::runtime::Handle, String> {
+        self.runtime().map(|rt| rt.handle().clone())
     }
 
     /// 拿(或懒建)会话池。
@@ -310,6 +316,16 @@ impl Default for RemoteSshState {
 pub fn state() -> &'static RemoteSshState {
     static STATE: OnceLock<RemoteSshState> = OnceLock::new();
     STATE.get_or_init(RemoteSshState::new)
+}
+
+/// 取进程级共享 tokio 运行时的 `Handle`,供同进程内其它异步子系统(如 `mt-relay`)
+/// 经 `with_runtime` 复用,避免再起第二套 tokio 线程池。
+///
+/// 底层由 [`state`] 懒建(2 个工作线程、`enable_all` 含 time + net 驱动,线程名
+/// `mt-async-io`),不会顺带初始化 `SshPool`;退出时 [`shutdown_on_exit`] 刻意不
+/// drop 该运行时,因此与 `mt-relay` 共享不存在退出顺序竞态。
+pub fn shared_runtime_handle() -> Result<tokio::runtime::Handle, String> {
+    state().runtime_handle()
 }
 
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。

@@ -1,4 +1,4 @@
-// 算出 release.yml 里 build-gpui 的矩阵(strategy.matrix.include 数组)。
+// 算出 release.yml 里 build-desktop / package-release 的矩阵(strategy.matrix.include 数组)。
 //
 //   EVENT_NAME=push node .github/scripts/release_matrix.mjs
 //   EVENT_NAME=workflow_dispatch PLATFORMS="macos-x64, linux" node .github/scripts/release_matrix.mjs

@@ -1,4 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   clearStartError,
   closeHistoryPreview,
@@ -15,13 +24,7 @@ import { useT } from './i18n';
 import type { MirrorMessage, MobileHistorySession } from './protocol';
 import { buildProjectTree, countProjects, type ProjectTreeNode } from './projectTree';
 import { buildMirrorRows, type MirrorRow } from './mirrorRows';
-import {
-  InterruptRow,
-  MessageRow,
-  MirrorSkeleton,
-  QuestionCard,
-  ToolGroupRow,
-} from './MirrorContent';
+import { MirrorRowList, MirrorSkeleton } from './MirrorContent';
 
 /** ISO 8601 → 相对时间(与桌面端 `session_panel::format_time` 同口径)。 */
 function formatRelativeTime(
@@ -123,7 +126,7 @@ export function HistoryProjects() {
 }
 
 /** 历史会话列表的一行:点行进入只读预览,右侧快捷按钮可直接「继续」或「进入实时对话」。 */
-function HistorySessionRow({
+const HistorySessionRow = memo(function HistorySessionRow({
   projectId,
   projectName,
   session,
@@ -133,13 +136,19 @@ function HistorySessionRow({
   session: MobileHistorySession;
 }) {
   const t = useT();
-  const projects = useRelayStore((s) => s.projects);
+  // 返回标量而非订阅整个 projects 数组:桌面端任意 pane 推送增量时,未关联该 pane 的历史行零重渲染
+  const liveDot = useRelayStore((s): 'attention' | 'working' | 'idle' | null => {
+    const live = findLivePaneForHistory(s.projects, session.livePaneId);
+    if (!live) return null;
+    if (live.needsAttention) return 'attention';
+    return live.status === 'ai-working' ? 'working' : 'idle';
+  });
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
-  const starting = useRelayStore((s) => s.starting);
+  const starting = useRelayStore((s) => s.starting !== null);
   const offline = desktopOnline === false;
-  const live = findLivePaneForHistory(projects, session.livePaneId);
+  const isLive = liveDot !== null;
   const timeText = formatRelativeTime(session.timestamp, t);
-  const canAct = live !== undefined || (session.canResume && !offline && !starting);
+  const canAct = isLive || (session.canResume && !offline && !starting);
 
   return (
     <div className="history-session-row">
@@ -152,36 +161,28 @@ function HistorySessionRow({
         <div className="history-session-title">{session.title || session.agentLabel}</div>
         <div className="history-session-meta">
           <span className="history-agent-badge">{session.agentLabel}</span>
-          {live && (
+          {liveDot && (
             <span className="history-live-badge">
-              <span
-                className={`status-dot ${
-                  live.needsAttention
-                    ? 'dot-attention'
-                    : live.status === 'ai-working'
-                      ? 'dot-working'
-                      : 'dot-idle'
-                }`}
-              />
+              <span className={`status-dot dot-${liveDot}`} />
               {t('history.runningBadge')}
             </span>
           )}
           {timeText && <span className="history-session-time">{timeText}</span>}
         </div>
       </button>
-      {(live || session.canResume) && (
+      {(isLive || session.canResume) && (
         <button
           type="button"
-          className={`history-quick-btn${live ? ' is-live' : ''}`}
+          className={`history-quick-btn${isLive ? ' is-live' : ''}`}
           disabled={!canAct}
           onClick={() => resumeAiSession(projectId, projectName, session)}
         >
-          {t(live ? 'history.openLiveAction' : 'history.continueAction')}
+          {t(isLive ? 'history.openLiveAction' : 'history.continueAction')}
         </button>
       )}
     </div>
   );
-}
+});
 
 /** 项目历史会话列表页 */
 export function HistoryListView() {
@@ -303,7 +304,10 @@ const EMPTY_MESSAGES: MirrorMessage[] = [];
 export function HistoryPreviewView() {
   const t = useT();
   const preview = useRelayStore((s) => s.historyPreview);
-  const projects = useRelayStore((s) => s.projects);
+  // 只取目标会话是否正运行中这个布尔值:桌面端其他终端高频推送 SessionsDelta 时不重渲染预览页
+  const hasLivePane = useRelayStore(
+    (s) => findLivePaneForHistory(s.projects, s.historyPreview?.session.livePaneId) !== undefined,
+  );
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const starting = useRelayStore((s) => s.starting);
   const startError = useRelayStore((s) => s.startError);
@@ -376,46 +380,16 @@ export function HistoryPreviewView() {
     }
   }, [messages, loaded, loadingOlder]);
 
-  if (!preview) return null;
-
-  const live = findLivePaneForHistory(projects, preview.session.livePaneId);
-  const canResume = preview.session.canResume;
-  const actionDisabled = live ? false : !canResume || offline || starting !== null;
-
-  const onScroll = () => {
+  const onScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     if (el.scrollTop < 30) requestOlder();
-  };
+  }, [requestOlder]);
 
-  const renderRow = (row: MirrorRow) => {
-    switch (row.kind) {
-      case 'question':
-        return (
-          <QuestionCard
-            key={row.key}
-            msg={row.msg}
-            active={false}
-            marker={row.marker}
-            readOnly
-          />
-        );
-      case 'tools':
-        return (
-          <ToolGroupRow
-            key={row.key}
-            firstSeq={row.key}
-            tools={row.tools}
-            expanded={expandedTools.has(row.key)}
-            onToggle={toggleTools}
-          />
-        );
-      case 'interrupt':
-        return <InterruptRow key={row.key} msg={row.msg} />;
-      default:
-        return <MessageRow key={row.key} msg={row.msg} />;
-    }
-  };
+  if (!preview) return null;
+
+  const canResume = preview.session.canResume;
+  const actionDisabled = hasLivePane ? false : !canResume || offline || starting !== null;
 
   return (
     <div className="mirror-view">
@@ -479,7 +453,12 @@ export function HistoryPreviewView() {
         ) : rows.length === 0 ? (
           <div className="mirror-empty">{t('history.previewEmpty')}</div>
         ) : (
-          rows.map(renderRow)
+          <MirrorRowList
+            rows={rows}
+            expandedTools={expandedTools}
+            onToggleTools={toggleTools}
+            readOnly
+          />
         )}
       </div>
 
@@ -490,7 +469,7 @@ export function HistoryPreviewView() {
           disabled={actionDisabled}
           onClick={() => resumeAiSession(preview.projectId, preview.projectName, preview.session)}
         >
-          {live
+          {hasLivePane
             ? t('history.openLiveConversation')
             : !canResume
               ? t('history.resumeUnsupported')

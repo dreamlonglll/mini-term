@@ -8,14 +8,7 @@ import {
 } from './relay';
 import { useT } from './i18n';
 import { RenameSheet } from './RenameSheet';
-import {
-  InterruptRow,
-  isAtBottom,
-  MessageRow,
-  MirrorSkeleton,
-  QuestionCard,
-  ToolGroupRow,
-} from './MirrorContent';
+import { isAtBottom, MirrorRowList, MirrorSkeleton } from './MirrorContent';
 import { buildMirrorRows, hasActiveQuestion, type MirrorRow } from './mirrorRows';
 import type { MirrorMessage } from './protocol';
 
@@ -86,16 +79,17 @@ const ActivityIndicator = memo(function ActivityIndicator({ kind }: { kind: Indi
 });
 
 /** 镜像底部的指令输入区:桌面离线/会话结束置灰;发送后展示回执。 */
-function CommandComposer() {
+const CommandComposer = memo(function CommandComposer() {
   const t = useT();
-  const mirror = useRelayStore((s) => s.mirror);
+  // 细粒度订阅:只关心开关与发送回执,AI 每秒推新消息时不打扰正在输入的输入框
+  const mirrorAvailable = useRelayStore((s) => s.mirror !== null && !s.mirror.closed);
+  const receipt = useRelayStore((s) => s.mirror?.receipt ?? null);
+  const sending = useRelayStore((s) => s.mirror?.pendingCommandId != null);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const [text, setText] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const receipt = mirror?.receipt ?? null;
-  const sending = mirror?.pendingCommandId != null;
-  const disabled = !mirror || mirror.closed || desktopOnline === false;
+  const disabled = !mirrorAvailable || desktopOnline === false;
 
   // 回执短暂展示后自动清除
   useEffect(() => {
@@ -160,7 +154,7 @@ function CommandComposer() {
       </div>
     </div>
   );
-}
+});
 
 const EMPTY_MESSAGES: MirrorMessage[] = [];
 
@@ -170,7 +164,15 @@ const EMPTY_MESSAGES: MirrorMessage[] = [];
  */
 export function MirrorView() {
   const t = useT();
-  const mirror = useRelayStore((s) => s.mirror);
+  // 细粒度订阅 mirror 渲染实际用到的字段:发指令回执 / answeredProgress 等变动不再驱动整页重渲染
+  const hasMirror = useRelayStore((s) => s.mirror !== null);
+  const paneId = useRelayStore((s) => s.mirror?.paneId ?? '');
+  const title = useRelayStore((s) => s.mirror?.title ?? '');
+  const closed = useRelayStore((s) => s.mirror?.closed ?? false);
+  const hasMore = useRelayStore((s) => s.mirror?.hasMore ?? false);
+  const loaded = useRelayStore((s) => s.mirror?.loaded ?? false);
+  const loadingOlder = useRelayStore((s) => s.mirror?.loadingOlder ?? false);
+  const messages = useRelayStore((s) => s.mirror?.messages ?? EMPTY_MESSAGES);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const activity = useRelayStore(selectActivity);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -182,9 +184,6 @@ export function MirrorView() {
   const [renaming, setRenaming] = useState(false);
   const [expandedTools, setExpandedTools] = useState<ReadonlySet<number>>(() => new Set());
 
-  const messages = mirror?.messages ?? EMPTY_MESSAGES;
-  const loaded = mirror?.loaded ?? false;
-  const loadingOlder = mirror?.loadingOlder ?? false;
   const rows = useMemo(() => buildMirrorRows(messages, rowsCache.current), [messages]);
   const answerPending = useMemo(() => hasActiveQuestion(rows), [rows]);
   const indicator: Indicator | null = !loaded
@@ -286,39 +285,15 @@ export function MirrorView() {
     syncStick(key);
   }, [expandedTools, syncStick]);
 
-  if (!mirror) return null;
-
-  const onScroll = () => {
+  const onScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     stickToBottom.current = isAtBottom(el);
     // 滚到顶部附近自动加载更早
     if (el.scrollTop < 30) requestOlder();
-  };
+  }, [requestOlder]);
 
-  const renderRow = (row: MirrorRow) => {
-    switch (row.kind) {
-      case 'question':
-        // 作答状态由后续的 questionAnswered 标记回推;标记本身不单独成行
-        return (
-          <QuestionCard key={row.key} msg={row.msg} active={row.active} marker={row.marker} />
-        );
-      case 'tools':
-        return (
-          <ToolGroupRow
-            key={row.key}
-            firstSeq={row.key}
-            tools={row.tools}
-            expanded={expandedTools.has(row.key)}
-            onToggle={toggleTools}
-          />
-        );
-      case 'interrupt':
-        return <InterruptRow key={row.key} msg={row.msg} />;
-      default:
-        return <MessageRow key={row.key} msg={row.msg} onUserResize={syncStick} />;
-    }
-  };
+  if (!hasMirror) return null;
 
   return (
     <div className="mirror-view">
@@ -329,20 +304,16 @@ export function MirrorView() {
         {/* 标题即改名入口。会话已结束/桌面端离线时改不动:pane 没了或消息送不到 */}
         <button
           className="mirror-title"
-          disabled={mirror.closed || desktopOnline === false}
+          disabled={closed || desktopOnline === false}
           title={t('sessions.rename.action')}
           onClick={() => setRenaming(true)}
         >
-          {mirror.title}
+          {title}
         </button>
       </div>
 
       {renaming && (
-        <RenameSheet
-          paneId={mirror.paneId}
-          current={mirror.title}
-          onClose={() => setRenaming(false)}
-        />
+        <RenameSheet paneId={paneId} current={title} onClose={() => setRenaming(false)} />
       )}
 
       {desktopOnline === false && (
@@ -351,7 +322,7 @@ export function MirrorView() {
         </div>
       )}
 
-      {mirror.closed && (
+      {closed && (
         <div className="mirror-closed">
           <div className="mirror-closed-text">{t('mirror.paneClosed')}</div>
           <button className="mirror-closed-btn" onClick={closeMirror}>
@@ -361,22 +332,27 @@ export function MirrorView() {
       )}
 
       <div className="mirror-scroll" ref={scrollRef} onScroll={onScroll}>
-        {mirror.hasMore && (
+        {hasMore && (
           <button
             className="mirror-load-older"
             onClick={requestOlder}
-            disabled={mirror.loadingOlder}
+            disabled={loadingOlder}
           >
-            {mirror.loadingOlder ? t('mirror.loading') : t('mirror.loadOlder')}
+            {loadingOlder ? t('mirror.loading') : t('mirror.loadOlder')}
           </button>
         )}
-        {!mirror.loaded ? (
+        {!loaded ? (
           // 骨架屏而不是一行「加载中…」：首屏要拉整段会话记录，纯文字会让人以为卡住了
           <MirrorSkeleton label={t('mirror.loading')} />
         ) : rows.length === 0 ? (
           <div className="mirror-empty">{t('mirror.empty')}</div>
         ) : (
-          rows.map(renderRow)
+          <MirrorRowList
+            rows={rows}
+            expandedTools={expandedTools}
+            onToggleTools={toggleTools}
+            onUserResize={syncStick}
+          />
         )}
         {indicator && <ActivityIndicator key={indicator} kind={indicator} />}
       </div>

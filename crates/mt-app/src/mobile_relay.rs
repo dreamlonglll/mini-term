@@ -28,10 +28,12 @@
 //!
 //! # tokio 运行时
 //!
-//! mt-app **没有**全局 tokio 运行时(gpui 自带 executor),所以这里用
-//! [`MobileRelayManager::new`],让 mt-relay 自持它那两个工作线程(首次 `apply`
-//! 时才惰性创建)。不为这一处给 mt-app 引 tokio —— 那会在进程里多出一个线程池,
-//! 而中转是低频链路。宿主将来若真有了运行时,改用 `with_runtime` 注入即可。
+//! mt-app 不直接依赖 tokio(gpui 自带 executor),而是把 [`mt_remote::shared_runtime_handle`]
+//! 返回的进程级共享 tokio 运行时句柄经 [`MobileRelayManager::with_runtime`] 注入给
+//! `mt-relay`:远程 SSH / 托管 Git 与移动端中转共用同一套 2 线程 `mt-async-io` 运行时,
+//! 不再各自建池;只在共享运行时创建失败的极端情况下才回落到 [`MobileRelayManager::new`]。
+//! 取共享句柄不会顺带初始化 `SshPool`,应用退出时 `mt_remote::shutdown_on_exit` 也刻意不
+//! drop 该运行时,因此单开中转或退出阶段都安全无竞态。
 //!
 //! # ADR 0002 的边界
 //!
@@ -1114,6 +1116,22 @@ impl RelayBridge {
     }
 }
 
+/// 构造 [`MobileRelayManager`]:优先复用 [`mt_remote::shared_runtime_handle`] 的进程级
+/// 共享 tokio 运行时,避免与远程 SSH / 托管 Git 各建一套线程池;共享运行时不可用时优雅
+/// 回落到 `mt-relay` 自持运行时。
+fn build_relay_manager(
+    host: Arc<dyn RelayHost>,
+    events: Arc<dyn RelayEvents>,
+) -> Arc<MobileRelayManager> {
+    match mt_remote::shared_runtime_handle() {
+        Ok(handle) => Arc::new(MobileRelayManager::with_runtime(host, events, handle)),
+        Err(err) => {
+            tracing::warn!("[mobile-relay] 共享 tokio 运行时不可用,回落到自持运行时: {err}");
+            Arc::new(MobileRelayManager::new(host, events))
+        }
+    }
+}
+
 /// 建桥、登记全局、按配置建连一次。
 ///
 /// 返回的实体要被宿主持有(泵与观察者靠它的生命周期保活),
@@ -1129,7 +1147,7 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
         tx: tx.clone(),
     });
     let events: Arc<dyn RelayEvents> = Arc::new(EventsImpl { tx });
-    let manager = Arc::new(MobileRelayManager::new(host, events));
+    let manager = build_relay_manager(host, events);
 
     let entity = cx.new(|cx: &mut Context<RelayBridge>| {
         // 只订阅快照真正读的那几类变化(见 `StoreEvent::touches_relay_sync`)。
@@ -1652,5 +1670,20 @@ mod tests {
             by_pty.get(&2).map(|h| h.session_id.as_str()),
             Some("s-idle-ai")
         );
+    }
+
+    #[test]
+    fn 移动端中转复用_mt_remote_共享运行时构造成功() {
+        struct NoopEvents;
+        impl RelayEvents for NoopEvents {
+            fn status_changed(&self, _: MobileRelayStatusPayload) {}
+            fn pairing_code(&self, _: String) {}
+            fn rename_pane(&self, _: RenamePanePayload) {}
+            fn start_session(&self, _: StartSessionPayload) {}
+            fn resume_session(&self, _: ResumeSessionPayload) {}
+        }
+
+        let manager = build_relay_manager(Arc::new(mt_relay::NoopRelayHost), Arc::new(NoopEvents));
+        assert_eq!(manager.current_status().status, "disconnected");
     }
 }

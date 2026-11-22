@@ -608,11 +608,15 @@ body {
   padding: 40px 0;
 }
 
+/* 仅隔离布局与样式计算(不含 size,刻意不用 content-visibility:auto:
+   上拉加载历史靠精确 el.scrollHeight 锚定且容器关了 overflow-anchor,估算高度会导致跳动
+   并破坏 CollapsibleInput 的同步 offsetHeight 折叠测量) */
 .mirror-msg {
   max-width: 92%;
   display: flex;
   flex-direction: column;
   gap: 3px;
+  contain: layout style;
 }
 
 .mirror-msg.from-input {
@@ -711,6 +715,7 @@ body {
   border-radius: 999px;
   color: var(--text-muted);
   font-size: 12px;
+  contain: layout style;
 }
 
 /* ── 工具活动折叠条 ── */
@@ -723,6 +728,7 @@ body {
   border: 1px solid var(--border-subtle);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.025);
+  contain: layout style;
 }
 
 .tool-group-head {
@@ -829,6 +835,7 @@ body {
   gap: 10px;
   border-radius: 12px;
   font-size: 14px;
+  contain: layout style;
   /* 入场是自下而上的位移,不从透明起播(深色底上淡入读起来像闪烁) */
   animation: activityEnter 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
@@ -1754,6 +1761,7 @@ body {
   align-items: center;
   gap: 8px;
   border-top: 1px solid var(--border-subtle);
+  contain: layout style;
 }
 
 .history-session-row:first-child {
