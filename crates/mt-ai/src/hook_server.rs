@@ -12,16 +12,19 @@ use crate::agent::AgentKind;
 use crate::monitor::{SessionIdentity, StatusEmitter};
 use crate::tracker::SessionTracker;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 // hook HTTP 线程与 GPUI 主线程、500ms 轮询线程共享这几张表:std::sync::Mutex 一旦
 // 有持锁者 panic 就整把锁中毒,主线程下一次 lock 跟着 panic 整个进程就没了。
 // parking_lot 没有中毒概念(与 mt-app/mt-pty/mt-terminal 同款)。
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 /// 默认监听端口
 const DEFAULT_PORT: u16 = 23456;
@@ -34,9 +37,22 @@ const ENDED_SESSIONS_CAP: usize = 8;
 const ACTIVE_SESSIONS_CAP: usize = 8;
 /// 每个 pane 记多少个在跑的 agy 子代理会话(正常是个位数;上限只防灌假 id)
 const AGY_SUBAGENTS_CAP: usize = 64;
-/// 单个 hook 请求 body 的字节上限。真实 payload 只有几百字节（三家 CLI 发的都是
+/// 单个 hook 请求 body 的字节上限。真实 payload 只有几百字节（各家 CLI 发的都是
 /// 一小段 JSON），1 MiB 已宽出三个数量级；超限直接 413，不进 JSON 解析。
 const MAX_HOOK_BODY_BYTES: usize = 1024 * 1024;
+/// 请求行 + 全部请求头的总字节上限，防御畸形/慢速无限请求头耗尽内存。
+const MAX_HOOK_HEADER_BYTES: usize = 64 * 1024;
+/// 单个 TCP 连接读取请求头与 body 的总超时（本机回环正常请求不足 1ms）。
+const CONNECTION_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// 单个 TCP 连接写回响应的超时。
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 处理 hook 请求的最大并发 worker 线程数：少量挂起的慢连接不会卡死正常上报，
+/// 同时上限封住本地端口被并发灌爆时的线程开销。
+const MAX_CONCURRENT_WORKERS: usize = 8;
+/// worker 队列的最大待处理连接数，满载时由 accept 线程直接丢弃，避免阻塞 accept/stop。
+const MAX_QUEUED_CONNECTIONS: usize = 32;
+/// 空闲 worker 线程的存活时间：空闲时自然回收，不常驻多余线程。
+const WORKER_IDLE_TTL: Duration = Duration::from_secs(30);
 /// Hook 事件的 JSON payload
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // 保留完整字段供未来 UI 细化使用
@@ -97,34 +113,66 @@ pub struct HookSessionId {
     pub session_id: String,
 }
 
-/// Hook 状态管理器，记录每个 PTY 的最后 hook 事件时间和状态
-#[derive(Clone)]
-pub struct HookState {
-    last_hook_time: Arc<Mutex<HashMap<u32, Instant>>>,
-    last_hook_status: Arc<Mutex<HashMap<u32, String>>>,
+/// 合并在单把锁下的全部按 PTY 索引的 hook 状态表。
+///
+/// 此前 8 张表各自持一把 `Arc<Mutex<...>>`，跨表读写（`update` / `remove` / `purge` /
+/// `agy_subagent_settled` / `note_user_interrupt`）存在中间态窗口，且单次操作要反复加解锁。
+/// 收拢进同一把 `parking_lot::Mutex` 后，跨表变更天然原子一致。
+#[derive(Default)]
+struct HookTables {
+    last_hook_time: HashMap<u32, Instant>,
+    last_hook_status: HashMap<u32, String>,
     /// pty → 当前会话身份；/clear 等换会话时随下一个 hook 事件自动刷新
-    last_session: Arc<Mutex<HashMap<u32, HookSessionId>>>,
+    last_session: HashMap<u32, HookSessionId>,
     /// 记录哪些 PTY 曾经收到过 hook 事件（一旦标记，永不降级回轮询）
-    hook_enabled: Arc<Mutex<std::collections::HashSet<u32>>>,
+    hook_enabled: HashSet<u32>,
     /// pty → 已结束会话 id 的环形墓碑。hook 脚本是独立进程，POST 到达
     /// 顺序无保证：SessionEnd 之后仍可能收到旧会话迟到的 Stop/Notification，
     /// 若放行会把已退出的 pane 重新推回 ai-idle。`remove()` 不清墓碑
     /// （SessionEnd 自身要先打墓碑再 remove），PTY 关闭时由 `purge()` 清理。
-    ended_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
+    ended_sessions: HashMap<u32, VecDeque<String>>,
     /// pty → 当前活跃会话 id 集合（有序去重）。SessionEnd 只有在移除该会话后
     /// 集合为空时才执行销毁动作：嵌套非交互实例（Bash 工具里跑 `claude -p` /
     /// `codex exec`，继承 MINITERM_PTY_ID）与"退出后立刻重开"的乱序场景下，
     /// pane 上还有别的活跃会话，误销毁会把正在工作的外层会话打回 idle。
-    active_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
+    active_sessions: HashMap<u32, VecDeque<String>>,
     /// agy:pane 上还在跑的子代理会话 id(子代理调模型时记入、它的收尾 Stop 时移出)。
     /// 只服务「主会话的完成被延后」的判定,见 [`EventRoute::DeferStop`]
-    agy_subagents: Arc<Mutex<HashMap<u32, std::collections::HashSet<String>>>>,
+    agy_subagents: HashMap<u32, HashSet<String>>,
     /// agy:主会话以 `Stop(fullyIdle=false)` 收尾、正等子代理收尾的 pane → 那次 Stop 的
     /// terminationReason。主会话再有任何事件即清除
-    agy_deferred_stop: Arc<Mutex<HashMap<u32, Option<String>>>>,
+    agy_deferred_stop: HashMap<u32, Option<String>>,
+}
+
+impl HookTables {
+    fn should_settle_interrupt(&self, pty_id: u32) -> bool {
+        self.hook_enabled.contains(&pty_id)
+            && self.last_hook_status.get(&pty_id).map(String::as_str) == Some("ai-working")
+    }
+
+    fn update(&mut self, pty_id: u32, status: String) {
+        self.hook_enabled.insert(pty_id);
+        self.last_hook_time.insert(pty_id, Instant::now());
+        self.last_hook_status.insert(pty_id, status);
+    }
+
+    fn remove_pty(&mut self, pty_id: u32) {
+        self.hook_enabled.remove(&pty_id);
+        self.last_hook_time.remove(&pty_id);
+        self.last_hook_status.remove(&pty_id);
+        self.last_session.remove(&pty_id);
+        self.agy_subagents.remove(&pty_id);
+        self.agy_deferred_stop.remove(&pty_id);
+    }
+}
+
+/// Hook 状态管理器，记录每个 PTY 的最后 hook 事件时间和状态
+#[derive(Clone)]
+pub struct HookState {
+    tables: Arc<Mutex<HookTables>>,
     port: Arc<Mutex<u16>>,
-    /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
-    server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
+    /// 保存运行中的 server 句柄，供运行时停止以及 `with_server_lock` 与启停串行化
+    server: Arc<Mutex<Option<Arc<ServerHandle>>>>,
 }
 
 impl Default for HookState {
@@ -136,14 +184,7 @@ impl Default for HookState {
 impl HookState {
     pub fn new() -> Self {
         Self {
-            last_hook_time: Arc::new(Mutex::new(HashMap::new())),
-            last_hook_status: Arc::new(Mutex::new(HashMap::new())),
-            last_session: Arc::new(Mutex::new(HashMap::new())),
-            hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            ended_sessions: Arc::new(Mutex::new(HashMap::new())),
-            active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            agy_subagents: Arc::new(Mutex::new(HashMap::new())),
-            agy_deferred_stop: Arc::new(Mutex::new(HashMap::new())),
+            tables: Arc::new(Mutex::new(HookTables::default())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -153,27 +194,28 @@ impl HookState {
     ///
     /// 一旦启用，完全信任 hook 状态，不再降级回进程轮询。
     pub fn is_hook_enabled(&self, pty_id: u32) -> bool {
-        self.hook_enabled.lock().contains(&pty_id)
+        self.tables.lock().hook_enabled.contains(&pty_id)
     }
 
     /// 获取指定 PTY 的 hook 状态
     pub fn get_status(&self, pty_id: u32) -> Option<String> {
-        self.last_hook_status.lock().get(&pty_id).cloned()
+        self.tables.lock().last_hook_status.get(&pty_id).cloned()
     }
 
     /// 距上一次 hook 事件（或上一次状态落盘）的时长；从未收到过事件返回 None。
     /// 停摆兜底（`monitor::stall_settle_target`）用它确认「状态本身也
     /// 已经静置足够久」，而不只是 PTY 没输出。
     pub(crate) fn status_age(&self, pty_id: u32) -> Option<Duration> {
-        self.last_hook_time
+        self.tables
             .lock()
+            .last_hook_time
             .get(&pty_id)
             .map(|t| t.elapsed())
     }
 
     /// 当前会话身份;从未收到带 session_id 的事件时返回 None
     pub fn session_of(&self, pty_id: u32) -> Option<HookSessionId> {
-        self.last_session.lock().get(&pty_id).cloned()
+        self.tables.lock().last_session.get(&pty_id).cloned()
     }
 
     /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)。
@@ -186,39 +228,33 @@ impl HookState {
         agent: Option<String>,
         session_id: String,
     ) -> bool {
-        let mut map = self.last_session.lock();
-        let changed = map
+        let mut tables = self.tables.lock();
+        let changed = tables
+            .last_session
             .get(&pty_id)
             .is_none_or(|prev| prev.session_id != session_id || prev.agent != agent);
-        map.insert(pty_id, HookSessionId { agent, session_id });
+        tables
+            .last_session
+            .insert(pty_id, HookSessionId { agent, session_id });
         changed
     }
 
     /// 更新指定 PTY 的 hook 状态
     pub(crate) fn update(&self, pty_id: u32, status: String) {
-        self.hook_enabled.lock().insert(pty_id);
-        self.last_hook_time
-            .lock()
-            .insert(pty_id, Instant::now());
-        self.last_hook_status.lock().insert(pty_id, status);
+        self.tables.lock().update(pty_id, status);
     }
 
     /// 移除指定 PTY 的 hook 状态。不清墓碑：SessionEnd 打完墓碑后调用
     /// 本方法，墓碑要继续挡住旧会话的迟到事件。
     pub fn remove(&self, pty_id: u32) {
-        self.hook_enabled.lock().remove(&pty_id);
-        self.last_hook_time.lock().remove(&pty_id);
-        self.last_hook_status.lock().remove(&pty_id);
-        self.last_session.lock().remove(&pty_id);
-        self.agy_subagents.lock().remove(&pty_id);
-        self.agy_deferred_stop.lock().remove(&pty_id);
+        self.tables.lock().remove_pty(pty_id);
     }
 
     /// agy 子代理会话又有动静(调模型):记进该 pane 的在跑集合。容量封顶,防同机
     /// 进程往无鉴权端口灌假 id 撑内存。
     pub(crate) fn agy_subagent_active(&self, pty_id: u32, session_id: &str) {
-        let mut map = self.agy_subagents.lock();
-        let set = map.entry(pty_id).or_default();
+        let mut tables = self.tables.lock();
+        let set = tables.agy_subagents.entry(pty_id).or_default();
         if set.len() < AGY_SUBAGENTS_CAP || set.contains(session_id) {
             set.insert(session_id.to_string());
         }
@@ -231,18 +267,16 @@ impl HookState {
         pty_id: u32,
         session_id: &str,
     ) -> Option<Option<String>> {
-        let all_settled = {
-            let mut map = self.agy_subagents.lock();
-            match map.get_mut(&pty_id) {
-                Some(set) => {
-                    set.remove(session_id);
-                    set.is_empty()
-                }
-                None => true,
+        let mut tables = self.tables.lock();
+        let all_settled = match tables.agy_subagents.get_mut(&pty_id) {
+            Some(set) => {
+                set.remove(session_id);
+                set.is_empty()
             }
+            None => true,
         };
         if all_settled {
-            self.agy_deferred_stop.lock().remove(&pty_id)
+            tables.agy_deferred_stop.remove(&pty_id)
         } else {
             None
         }
@@ -250,29 +284,31 @@ impl HookState {
 
     /// 主会话以 `Stop(fullyIdle=false)` 收尾:记下,等子代理收尾时再判完成。
     pub(crate) fn agy_defer_stop(&self, pty_id: u32, termination_reason: Option<String>) {
-        self.agy_deferred_stop
+        self.tables
             .lock()
+            .agy_deferred_stop
             .insert(pty_id, termination_reason);
     }
 
     /// 主会话又有动静(继续干活 / 自己发了 fullyIdle=true 的 Stop):延后的完成作废。
     pub(crate) fn agy_clear_deferred_stop(&self, pty_id: u32) {
-        self.agy_deferred_stop.lock().remove(&pty_id);
+        self.tables.lock().agy_deferred_stop.remove(&pty_id);
     }
 
     /// PTY 关闭时的彻底清理：hook 状态 + 墓碑 + 活跃会话集
     pub fn purge(&self, pty_id: u32) {
-        self.remove(pty_id);
-        self.ended_sessions.lock().remove(&pty_id);
-        self.active_sessions.lock().remove(&pty_id);
+        let mut tables = self.tables.lock();
+        tables.remove_pty(pty_id);
+        tables.ended_sessions.remove(&pty_id);
+        tables.active_sessions.remove(&pty_id);
     }
 
     /// 记录会话为活跃。任意非 SessionEnd 事件都调（不只 SessionStart：
     /// hook server 中途启用时首个事件可能是 Stop/PreToolUse）。
     /// 有序去重；超容量挤掉最老的——正常情况集合里只有 1 个。
     fn note_session_active(&self, pty_id: u32, session_id: &str) {
-        let mut map = self.active_sessions.lock();
-        let queue = map.entry(pty_id).or_default();
+        let mut tables = self.tables.lock();
+        let queue = tables.active_sessions.entry(pty_id).or_default();
         if queue.iter().any(|s| s == session_id) {
             return;
         }
@@ -287,8 +323,8 @@ impl HookState {
     /// 非空 → pane 上还有别的活跃会话（嵌套 `claude -p` / 退出后立刻重开的
     /// 乱序），只打墓碑不销毁。payload 无 session_id 时不移除，仅报告空否。
     fn end_session(&self, pty_id: u32, session_id: Option<&str>) -> bool {
-        let mut map = self.active_sessions.lock();
-        let Some(queue) = map.get_mut(&pty_id) else {
+        let mut tables = self.tables.lock();
+        let Some(queue) = tables.active_sessions.get_mut(&pty_id) else {
             return true;
         };
         if let Some(sid) = session_id {
@@ -296,15 +332,15 @@ impl HookState {
         }
         let empty = queue.is_empty();
         if empty {
-            map.remove(&pty_id);
+            tables.active_sessions.remove(&pty_id);
         }
         empty
     }
 
     /// 给已结束的会话 id 打墓碑
     pub fn mark_session_ended(&self, pty_id: u32, session_id: String) {
-        let mut map = self.ended_sessions.lock();
-        let queue = map.entry(pty_id).or_default();
+        let mut tables = self.tables.lock();
+        let queue = tables.ended_sessions.entry(pty_id).or_default();
         if queue.iter().any(|s| s == &session_id) {
             return;
         }
@@ -316,8 +352,9 @@ impl HookState {
 
     /// 该会话是否已被打墓碑（已结束）
     pub fn is_session_ended(&self, pty_id: u32, session_id: &str) -> bool {
-        self.ended_sessions
+        self.tables
             .lock()
+            .ended_sessions
             .get(&pty_id)
             .is_some_and(|q| q.iter().any(|s| s == session_id))
     }
@@ -325,7 +362,7 @@ impl HookState {
     /// 摘除墓碑:SessionStart 表明同 id 会话再次存活(退出后 claude -c / --resume
     /// 重开),不摘的话该会话的后续事件被永久忽略,身份也无法重新记录
     pub fn revive_session(&self, pty_id: u32, session_id: &str) {
-        if let Some(queue) = self.ended_sessions.lock().get_mut(&pty_id) {
+        if let Some(queue) = self.tables.lock().ended_sessions.get_mut(&pty_id) {
             queue.retain(|s| s != session_id);
         }
     }
@@ -340,8 +377,9 @@ impl HookState {
         *self.port.lock() = port;
     }
 
-    /// 保存 server 实例
-    fn set_server(&self, server: Option<Arc<tiny_http::Server>>) {
+    /// 保存 server 实例（测试用）
+    #[cfg(test)]
+    fn set_server(&self, server: Option<Arc<ServerHandle>>) {
         *self.server.lock() = server;
     }
 
@@ -697,9 +735,9 @@ pub(crate) fn agent_sends_session_end(agent: Option<&str>) -> bool {
 /// 两道闸：hook 未启用的 pane 走的是轮询降级路径，那条路径本就按输出活跃度给出
 /// ai-idle，插手只会互相打架；当前状态不是 ai-working 说明没什么可打断的
 /// （已经在等用户，或压根不在 AI 会话里，Esc 只是 shell/TUI 的普通按键）。
+#[cfg(test)]
 fn interrupt_should_settle(hook_state: &HookState, pty_id: u32) -> bool {
-    hook_state.is_hook_enabled(pty_id)
-        && hook_state.get_status(pty_id).as_deref() == Some("ai-working")
+    hook_state.tables.lock().should_settle_interrupt(pty_id)
 }
 
 /// 用户按 Esc / 单次 Ctrl+C 打断 AI 时的状态收敛。
@@ -725,12 +763,866 @@ pub fn note_user_interrupt(
     pty_id: u32,
     agent: Option<String>,
 ) {
-    if !interrupt_should_settle(hook_state, pty_id) {
+    let settled = {
+        let mut tables = hook_state.tables.lock();
+        if tables.should_settle_interrupt(pty_id) {
+            tables.update(pty_id, "ai-idle".to_string());
+            true
+        } else {
+            false
+        }
+    };
+    if !settled {
         return;
     }
-    hook_state.update(pty_id, "ai-idle".to_string());
     emitter.emit_if_changed(pty_id, "ai-idle", Some("Interrupt"), agent);
     tracing::info!("[hook-server] pty_id={} 用户打断 -> ai-idle", pty_id);
+}
+
+// ─── 基于标准库 TcpListener 的轻量 HTTP/1.x 服务端 ───────────────────────────
+
+/// 运行中的 hook HTTP 服务器句柄。
+///
+/// 通过 `shutdown` 标记 + 唤醒自连接立刻中断阻塞中的 `TcpListener::accept()`，
+/// 再回收 accept 线程，保证 `stop_hook_server` 返回时端口已经释放。
+struct ServerHandle {
+    addr: Option<SocketAddr>,
+    shutdown: Arc<AtomicBool>,
+    pool: Arc<WorkerPool>,
+    accept_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl ServerHandle {
+    fn stop(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.pool.close();
+        // 幂等守卫：`stop_hook_server` 显式调过 `stop()` 后，`Arc<ServerHandle>`
+        // 紧接着落出作用域还会触发 `Drop::drop` 再次进入这里；此时 accept 线程已回收、
+        // 端口已关，直接返回可避免向已关闭端口再发一次 200ms 超时的唤醒连接。
+        let Some(handle) = self.accept_thread.lock().take() else {
+            return;
+        };
+        let woke = match self.addr {
+            Some(addr) => match TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!("[hook-server] 唤醒停止连接失败 ({}): {}", addr, e);
+                    false
+                }
+            },
+            None => true,
+        };
+        if woke {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            addr: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            pool: Arc::new(WorkerPool::new(
+                MAX_CONCURRENT_WORKERS,
+                MAX_QUEUED_CONNECTIONS,
+            )),
+            accept_thread: Mutex::new(None),
+        }
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct ServerContext {
+    hook_state: HookState,
+    emitter: StatusEmitter,
+    tracker: SessionTracker,
+    /// 串行化事件处理，避免并发连接在同一 pane 的多步状态变更间交错。
+    /// 慢速 TCP 读/写全在锁外并发进行，不会互相阻塞。
+    dispatch_lock: Mutex<()>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+}
+
+struct PoolState {
+    queue: VecDeque<TcpStream>,
+    total_workers: usize,
+    idle_workers: usize,
+    closed: bool,
+}
+
+/// 惰性伸缩的有限并发 worker 池：空闲时 0 线程，突发或遇到慢连接时按需扩到
+/// `max_workers`，空闲超过 `WORKER_IDLE_TTL` 自动退出。
+struct WorkerPool {
+    state: Mutex<PoolState>,
+    cv: Condvar,
+    max_workers: usize,
+    max_queued: usize,
+}
+
+struct WorkerGuard(Arc<WorkerPool>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.total_workers = state.total_workers.saturating_sub(1);
+    }
+}
+
+impl WorkerPool {
+    fn new(max_workers: usize, max_queued: usize) -> Self {
+        Self {
+            state: Mutex::new(PoolState {
+                queue: VecDeque::new(),
+                total_workers: 0,
+                idle_workers: 0,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+            max_workers,
+            max_queued,
+        }
+    }
+
+    fn submit(self: &Arc<Self>, stream: TcpStream, ctx: &Arc<ServerContext>) {
+        let need_spawn = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return;
+            }
+            if state.queue.len() >= self.max_queued {
+                tracing::warn!(
+                    "[hook-server] 待处理连接数达上限 ({})，已丢弃新连接",
+                    self.max_queued
+                );
+                return;
+            }
+            state.queue.push_back(stream);
+            let spawn =
+                state.queue.len() > state.idle_workers && state.total_workers < self.max_workers;
+            if spawn {
+                state.total_workers += 1;
+            }
+            self.cv.notify_one();
+            spawn
+        };
+
+        if need_spawn {
+            let pool = Arc::clone(self);
+            let guard = WorkerGuard(Arc::clone(self));
+            let ctx = Arc::clone(ctx);
+            if let Err(e) = thread::Builder::new()
+                .name("mt-hook-worker".into())
+                .spawn(move || {
+                    let _guard = guard;
+                    pool.worker_loop(&ctx);
+                })
+            {
+                tracing::warn!("[hook-server] 启动 worker 线程失败: {}", e);
+            }
+        }
+    }
+
+    fn worker_loop(&self, ctx: &ServerContext) {
+        loop {
+            let stream = {
+                let mut state = self.state.lock();
+                loop {
+                    if let Some(stream) = state.queue.pop_front() {
+                        break Some(stream);
+                    }
+                    if state.closed {
+                        break None;
+                    }
+                    state.idle_workers += 1;
+                    let timed_out = self.cv.wait_for(&mut state, WORKER_IDLE_TTL).timed_out();
+                    state.idle_workers -= 1;
+                    if timed_out && state.queue.is_empty() {
+                        break None;
+                    }
+                }
+            };
+            let Some(stream) = stream else {
+                break;
+            };
+            handle_connection(stream, ctx);
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.queue.clear();
+        self.cv.notify_all();
+    }
+}
+
+/// 带总截止时间的 `TcpStream` 读包装：既每次 `read` 设置 socket `read_timeout`，
+/// 又以绝对 `deadline` 封死总耗时（抵御逐字节慢速发送的 slowloris 连接）。
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let now = Instant::now();
+            if now >= self.deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "hook request read timed out",
+                ));
+            }
+            let remaining = self.deadline.saturating_duration_since(now);
+            let timeout = remaining.max(Duration::from_millis(1));
+            self.stream.set_read_timeout(Some(timeout))?;
+            match self.stream.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => return other,
+            }
+        }
+    }
+}
+
+enum LineRead {
+    Line,
+    EofEmpty,
+    EofPartial,
+}
+
+enum RequestError {
+    EmptyConnection,
+    TimedOut,
+    MethodNotAllowed,
+    NotFound,
+    PayloadTooLarge,
+    BadRequest,
+}
+
+fn is_timeout_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    buf: &mut Vec<u8>,
+    max_total: usize,
+    total_read: &mut usize,
+) -> Result<LineRead, RequestError> {
+    buf.clear();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(slice) => slice,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if is_timeout_error(&e) => return Err(RequestError::TimedOut),
+            Err(_) => return Err(RequestError::BadRequest),
+        };
+        if available.is_empty() {
+            return Ok(if buf.is_empty() {
+                LineRead::EofEmpty
+            } else {
+                LineRead::EofPartial
+            });
+        }
+        let (take_len, done) = match available.iter().position(|&b| b == b'\n') {
+            Some(pos) => (pos + 1, true),
+            None => (available.len(), false),
+        };
+        if total_read.saturating_add(take_len) > max_total {
+            return Err(RequestError::BadRequest);
+        }
+        buf.extend_from_slice(&available[..take_len]);
+        *total_read += take_len;
+        reader.consume(take_len);
+        if done {
+            return Ok(LineRead::Line);
+        }
+    }
+}
+
+fn strip_line_ending(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn read_exact_into(
+    reader: &mut impl Read,
+    out: &mut Vec<u8>,
+    mut remaining: usize,
+) -> Result<(), RequestError> {
+    let mut buf = [0u8; 8192];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        match reader.read(&mut buf[..to_read]) {
+            Ok(0) => return Err(RequestError::BadRequest),
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                remaining -= n;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if is_timeout_error(&e) => return Err(RequestError::TimedOut),
+            Err(_) => return Err(RequestError::BadRequest),
+        }
+    }
+    Ok(())
+}
+
+fn read_chunked_body(reader: &mut impl BufRead, max_bytes: usize) -> Result<Vec<u8>, RequestError> {
+    let mut body = Vec::new();
+    let mut line = Vec::new();
+    let mut meta_bytes = 0usize;
+
+    loop {
+        match read_bounded_line(reader, &mut line, MAX_HOOK_HEADER_BYTES, &mut meta_bytes)? {
+            LineRead::Line => {}
+            LineRead::EofEmpty | LineRead::EofPartial => return Err(RequestError::BadRequest),
+        }
+        let raw =
+            std::str::from_utf8(strip_line_ending(&line)).map_err(|_| RequestError::BadRequest)?;
+        let size_str = raw.split(';').next().unwrap_or("").trim();
+        if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RequestError::BadRequest);
+        }
+        let chunk_size =
+            usize::from_str_radix(size_str, 16).map_err(|_| RequestError::BadRequest)?;
+
+        if chunk_size == 0 {
+            // 读完可选 trailer 头直到空行
+            loop {
+                match read_bounded_line(reader, &mut line, MAX_HOOK_HEADER_BYTES, &mut meta_bytes)?
+                {
+                    LineRead::Line => {
+                        if strip_line_ending(&line).is_empty() {
+                            return Ok(body);
+                        }
+                    }
+                    LineRead::EofEmpty | LineRead::EofPartial => {
+                        return Err(RequestError::BadRequest);
+                    }
+                }
+            }
+        }
+
+        if body.len().saturating_add(chunk_size) > max_bytes {
+            return Err(RequestError::PayloadTooLarge);
+        }
+
+        read_exact_into(reader, &mut body, chunk_size)?;
+
+        // 每个 chunk 数据后必须跟 CRLF
+        let mut crlf = [0u8; 2];
+        let mut read = 0usize;
+        while read < 2 {
+            match reader.read(&mut crlf[read..]) {
+                Ok(0) => return Err(RequestError::BadRequest),
+                Ok(n) => read += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if is_timeout_error(&e) => return Err(RequestError::TimedOut),
+                Err(_) => return Err(RequestError::BadRequest),
+            }
+        }
+        if crlf != *b"\r\n" {
+            return Err(RequestError::BadRequest);
+        }
+    }
+}
+
+fn read_hook_request_body(reader: &mut BufReader<DeadlineStream>) -> Result<String, RequestError> {
+    let mut line = Vec::new();
+    let mut header_bytes = 0usize;
+
+    // 1. 解析请求行: METHOD TARGET HTTP/1.x
+    match read_bounded_line(reader, &mut line, MAX_HOOK_HEADER_BYTES, &mut header_bytes)? {
+        LineRead::EofEmpty => return Err(RequestError::EmptyConnection),
+        LineRead::EofPartial => return Err(RequestError::BadRequest),
+        LineRead::Line => {}
+    }
+    let req_line =
+        std::str::from_utf8(strip_line_ending(&line)).map_err(|_| RequestError::BadRequest)?;
+    let mut parts = req_line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(RequestError::BadRequest);
+    };
+    if method.is_empty() || target.is_empty() || !version.starts_with("HTTP/1.") {
+        return Err(RequestError::BadRequest);
+    }
+    let method = method.to_string();
+    let target = target.to_string();
+    let is_http11 = version == "HTTP/1.1";
+
+    // 2. 解析请求头（大小写不敏感）
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut expect_continue = false;
+
+    loop {
+        match read_bounded_line(reader, &mut line, MAX_HOOK_HEADER_BYTES, &mut header_bytes)? {
+            LineRead::Line => {}
+            LineRead::EofEmpty | LineRead::EofPartial => return Err(RequestError::BadRequest),
+        }
+        let trimmed = strip_line_ending(&line);
+        if trimmed.is_empty() {
+            break;
+        }
+        let header_str = std::str::from_utf8(trimmed).map_err(|_| RequestError::BadRequest)?;
+        let Some((name, value)) = header_str.split_once(':') else {
+            return Err(RequestError::BadRequest);
+        };
+        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+            return Err(RequestError::BadRequest);
+        }
+        let value = value.trim();
+
+        if name.eq_ignore_ascii_case("content-length") {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RequestError::BadRequest);
+            }
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| RequestError::BadRequest)?;
+            if let Some(prev) = content_length
+                && prev != parsed
+            {
+                return Err(RequestError::BadRequest);
+            }
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            let codings: Vec<&str> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if codings.len() == 1 && codings[0].eq_ignore_ascii_case("chunked") {
+                is_chunked = true;
+            } else if codings.len() == 1 && codings[0].eq_ignore_ascii_case("identity") {
+                // 非分块
+            } else {
+                return Err(RequestError::BadRequest);
+            }
+        } else if name.eq_ignore_ascii_case("expect") && value.eq_ignore_ascii_case("100-continue")
+        {
+            expect_continue = true;
+        }
+    }
+
+    // RFC 9112 §6.3: 同时携带 Transfer-Encoding 与 Content-Length 按非法请求拒绝
+    if is_chunked && content_length.is_some() {
+        return Err(RequestError::BadRequest);
+    }
+
+    // 3. 方法与路由校验（先于 100-continue 与读 body）
+    if method != "POST" {
+        return Err(RequestError::MethodNotAllowed);
+    }
+    if target != "/hook" {
+        return Err(RequestError::NotFound);
+    }
+
+    // 4. 端点监听在 127.0.0.1 且无鉴权(改鉴权要动 sidecar 协议),
+    // 同机任意进程都能 POST 过来,不封顶等于把内存交给对方:先看
+    // Content-Length 拦掉声明超限的,分块传输同样在读每块前校验上限。
+    if let Some(len) = content_length
+        && len > MAX_HOOK_BODY_BYTES
+    {
+        return Err(RequestError::PayloadTooLarge);
+    }
+
+    // 5. 若客户端发了 Expect: 100-continue，路由与长度都合法后再放行继续发 body
+    if expect_continue && is_http11 {
+        let stream = &mut reader.get_mut().stream;
+        if stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err() || stream.flush().is_err() {
+            return Err(RequestError::TimedOut);
+        }
+    }
+
+    // 6. 读取 body
+    let body_bytes = if is_chunked {
+        read_chunked_body(reader, MAX_HOOK_BODY_BYTES)?
+    } else if let Some(len) = content_length {
+        let mut buf = Vec::with_capacity(len.min(8192));
+        read_exact_into(reader, &mut buf, len)?;
+        buf
+    } else {
+        Vec::new()
+    };
+
+    String::from_utf8(body_bytes).map_err(|_| RequestError::BadRequest)
+}
+
+fn send_http_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Write);
+}
+
+fn handle_connection(stream: TcpStream, ctx: &ServerContext) {
+    let _ = stream.set_write_timeout(Some(ctx.write_timeout));
+    let _ = stream.set_nodelay(true);
+    let deadline = Instant::now() + ctx.read_timeout;
+    let mut reader = BufReader::with_capacity(8192, DeadlineStream { stream, deadline });
+
+    let body = match read_hook_request_body(&mut reader) {
+        Ok(body) => body,
+        Err(RequestError::EmptyConnection) => return,
+        Err(RequestError::TimedOut) => {
+            tracing::debug!("[hook-server] 连接读取超时，已主动断开");
+            return;
+        }
+        Err(RequestError::MethodNotAllowed) => {
+            send_http_response(
+                &mut reader.get_mut().stream,
+                405,
+                "Method Not Allowed",
+                "Method Not Allowed",
+            );
+            return;
+        }
+        Err(RequestError::NotFound) => {
+            send_http_response(&mut reader.get_mut().stream, 404, "Not Found", "Not Found");
+            return;
+        }
+        Err(RequestError::PayloadTooLarge) => {
+            tracing::warn!(
+                "[hook-server] body 超过 {} 字节上限，已拒绝",
+                MAX_HOOK_BODY_BYTES
+            );
+            send_http_response(
+                &mut reader.get_mut().stream,
+                413,
+                "Payload Too Large",
+                "Payload Too Large",
+            );
+            return;
+        }
+        Err(RequestError::BadRequest) => {
+            send_http_response(
+                &mut reader.get_mut().stream,
+                400,
+                "Bad Request",
+                "Bad Request",
+            );
+            return;
+        }
+    };
+
+    // 解析 JSON payload
+    let payload: HookPayload = match serde_json::from_str(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("[hook-server] JSON 解析失败: {}", e);
+            send_http_response(
+                &mut reader.get_mut().stream,
+                400,
+                "Bad Request",
+                "Bad Request",
+            );
+            return;
+        }
+    };
+
+    // 立即响应 200 并释放连接，不阻塞 hook 脚本
+    send_http_response(&mut reader.get_mut().stream, 200, "OK", "OK");
+    drop(reader);
+
+    // 串行处理事件，确保跨表状态与去重发射顺序一致
+    let _dispatch_guard = ctx.dispatch_lock.lock();
+    handle_hook_payload(payload, &ctx.hook_state, &ctx.emitter, &ctx.tracker);
+}
+
+fn handle_hook_payload(
+    payload: HookPayload,
+    hook_state: &HookState,
+    emitter: &StatusEmitter,
+    tracker: &SessionTracker,
+) {
+    // 处理事件。事件名优先取 sidecar 从 argv 注入的 `event`；缺失时回落
+    // payload 自带的 `hook_event_name`（用户手改配置漏写命令行参数的兜底，
+    // 否则整条事件会因无事件名被静默丢弃）。
+    let resolved_event = payload
+        .event
+        .clone()
+        .or_else(|| payload.hook_event_name.clone());
+    let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) else {
+        return;
+    };
+
+    let route = route_event(event, &payload);
+    if let EventRoute::Subagent { settled } = route {
+        // agy 子代理会话的事件:它带自己的 conversationId,记下来会把 pane 的
+        // 会话身份换成子代理的,状态也会被子代理的 Stop 提前收成「完成」。
+        // 只拿它追踪在跑的子代理:主会话的完成可能正等着它们收尾
+        let deferred = match payload.session_id.as_deref() {
+            Some(sid) if settled => hook_state.agy_subagent_settled(pty_id, sid),
+            Some(sid) => {
+                hook_state.agy_subagent_active(pty_id, sid);
+                None
+            }
+            None => None,
+        };
+        tracing::info!(
+            "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}(settled={})，不改状态",
+            pty_id,
+            event,
+            payload.session_id,
+            settled
+        );
+        let Some(reason) = deferred else { return };
+        if !deferred_stop_applies(
+            hook_state.get_status(pty_id).as_deref(),
+            emitter.last_cause(pty_id).as_deref(),
+        ) {
+            tracing::info!(
+                "[hook-server] pty_id={} 子代理已全部收尾,但主会话已不在工作中(打断/退出),延后的完成作废",
+                pty_id
+            );
+            return;
+        }
+        if let EventRoute::Status { status, cause } =
+            route_agy_event("Stop", reason.as_deref(), None, None)
+        {
+            tracker.mark_ai_session(pty_id, AgentKind::Agy.key());
+            hook_state.update(pty_id, status.to_string());
+            emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
+            tracing::info!(
+                "[hook-server] pty_id={} 子代理已全部收尾,补记主会话延后的完成 -> status={} cause={}",
+                pty_id,
+                status,
+                cause
+            );
+        }
+        return;
+    }
+
+    if event == "SessionEnd" {
+        // 只用 payload 自带的 session_id 打墓碑。不要退回 session_of:
+        // 新会话的 SessionStart 若先到,session_of 已是新会话,兜底会
+        // 把新会话误打进墓碑,冻结其全部后续事件。
+        if let Some(sid) = payload.session_id.clone() {
+            hook_state.mark_session_ended(pty_id, sid);
+        }
+        let was_last = hook_state.end_session(pty_id, payload.session_id.as_deref());
+        if payload.reason.as_deref() == Some("clear") {
+            // /clear 换会话不是退出：紧随其后的 SessionStart 会带新
+            // session id 刷新状态，这里只靠墓碑挡住旧会话的迟到事件
+            tracing::info!(
+                "[hook-server] pty_id={} event=SessionEnd(clear) -> 仅记录墓碑",
+                pty_id
+            );
+        } else if !was_last {
+            // pane 上还有别的活跃会话:嵌套非交互实例(Bash 工具里跑
+            // `claude -p` / `codex exec`,继承 MINITERM_PTY_ID)结束,
+            // 或退出后立刻重开、新 SessionStart 先到的乱序。此时清
+            // hook 状态 / AI 会话标记会误杀仍在跑的会话,只留墓碑。
+            tracing::info!(
+                "[hook-server] pty_id={} event=SessionEnd 非最后活跃会话,仅记录墓碑",
+                pty_id
+            );
+        } else {
+            // 最后一个活跃会话结束 → 权威退出信号：清 hook 状态回退
+            // 到轮询，同时清输入检测的 AI 会话标记——双击 Ctrl+C
+            // 间隔超窗漏检时靠这里自愈
+            hook_state.remove(pty_id);
+            tracker.clear_ai_session(pty_id);
+            emitter.emit_if_changed(pty_id, "idle", Some("SessionEnd"), None);
+            tracing::info!(
+                "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
+                pty_id,
+                payload.reason
+            );
+        }
+    } else {
+        // 已结束会话的迟到事件直接丢弃：hook 脚本是独立进程，
+        // POST 到达顺序无保证，放行会把退出后的 pane 推回 ai-idle。
+        // 例外:SessionStart 是会话再次存活的肯定证据(退出后 claude -c /
+        // --resume 同 id 重开),复活墓碑走正常记录,否则该会话被永久忽略
+        if let Some(sid) = payload.session_id.as_deref() {
+            if event == "SessionStart" {
+                hook_state.revive_session(pty_id, sid);
+            } else if hook_state.is_session_ended(pty_id, sid) {
+                tracing::info!(
+                    "[hook-server] pty_id={} event={} 来自已结束会话 {}，忽略",
+                    pty_id,
+                    event,
+                    sid
+                );
+                return;
+            }
+        }
+        // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
+        // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
+        if let Some(sid) = payload.session_id.clone() {
+            // 活跃集只服务 SessionEnd 的「是不是最后一个」判定。不发 SessionEnd
+            // 的 agent(agy)的会话进去了就永远出不来:同一 pane 之后再跑 claude,
+            // claude 退出时的 SessionEnd 会被这些残留挡成「非最后活跃会话」,
+            // 状态收不回 idle。所以它们不进
+            if agent_sends_session_end(payload.agent.as_deref()) {
+                hook_state.note_session_active(pty_id, &sid);
+            }
+            if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
+                // hook 端点无鉴权,cwd 是任何本地进程都能塞的字段,而上层会
+                // 把它持久化成「未来某次 PTY 的启动目录」。只放行确实存在的
+                // 目录:构造出来的假路径与已被删掉的 worktree 一并挡在这里,
+                // 续接时回落 pane 自己的 cwd,而不是让 create_pty 直接失败。
+                let cwd = payload
+                    .cwd
+                    .clone()
+                    .filter(|p| std::path::Path::new(p).is_dir());
+                // 会话身份变化(新会话/换会话)时通知上层,供布局持久化
+                // 记录「退出时该 pane 正跑着哪个 AI 会话」以便重启续接
+                emitter.notify_session_identity(SessionIdentity {
+                    pty_id,
+                    agent: payload.agent.clone(),
+                    session_id: sid,
+                    cwd,
+                });
+            }
+        }
+        // agy 主会话的事件:`Stop(fullyIdle=false)` 记下延后的完成,其余任何事件
+        // (继续干活 / 自己的 fullyIdle=true 收尾)都让它作废
+        if payload.agent.as_deref().and_then(AgentKind::parse) == Some(AgentKind::Agy) {
+            if route == EventRoute::DeferStop {
+                hook_state.agy_defer_stop(pty_id, payload.termination_reason.clone());
+            } else {
+                hook_state.agy_clear_deferred_stop(pty_id);
+            }
+        }
+        if let EventRoute::Status { status, cause } = route {
+            // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
+            // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
+            // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
+            tracker.mark_ai_session(
+                pty_id,
+                payload.agent.as_deref().unwrap_or(AgentKind::Claude.key()),
+            );
+            hook_state.update(pty_id, status.to_string());
+
+            // 通知上层（与 monitor 共享同一份去重表）。cause 带
+            // 归一化后的事件名(见 route_mapped):Stop/PermissionRequest/
+            // Notification 都落 ai-idle,但只有 Stop 是「任务做完了」,UI 据此
+            // 决定播报与托盘黄绿灯（见 notify.rs 与 store 的 attention 判定）
+            emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
+
+            tracing::info!(
+                "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={}{}",
+                pty_id,
+                event,
+                payload.agent,
+                status,
+                cause,
+                payload
+                    .error_type
+                    .as_deref()
+                    .map(|e| format!(" error_type={}", e))
+                    .unwrap_or_default()
+            );
+        } else if let EventRoute::KeepStatus(why) = route {
+            tracing::info!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
+        } else if route == EventRoute::DeferStop {
+            tracing::info!(
+                "[hook-server] pty_id={} event={} fullyIdle=false:后台子代理还在跑,完成延后到它们收尾",
+                pty_id,
+                event
+            );
+        }
+    }
+}
+
+/// 在已绑定的 `TcpListener` 上启动 hook HTTP 监听循环。
+/// 返回 `Ok(Some(port))` 表示本次安装成功，`Ok(None)` 表示并发竞态下已有实例在跑。
+fn start_hook_server_on_listener(
+    listener: TcpListener,
+    hook_state: HookState,
+    emitter: StatusEmitter,
+    tracker: SessionTracker,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<Option<u16>, String> {
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("获取 hook 服务器监听地址失败: {}", e))?;
+    let port = addr.port();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let pool = Arc::new(WorkerPool::new(
+        MAX_CONCURRENT_WORKERS,
+        MAX_QUEUED_CONNECTIONS,
+    ));
+    let ctx = Arc::new(ServerContext {
+        hook_state: hook_state.clone(),
+        emitter,
+        tracker,
+        dispatch_lock: Mutex::new(()),
+        read_timeout,
+        write_timeout,
+    });
+
+    let accept_shutdown = Arc::clone(&shutdown);
+    let accept_pool = Arc::clone(&pool);
+    let accept_thread = thread::Builder::new()
+        .name("mt-hook-accept".into())
+        .spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if accept_shutdown.load(Ordering::Acquire) {
+                            drop(stream);
+                            break;
+                        }
+                        accept_pool.submit(stream, &ctx);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        if accept_shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if accept_shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                        tracing::warn!("[hook-server] accept 失败: {}", e);
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        })
+        .map_err(|e| format!("启动 hook 监听线程失败: {}", e))?;
+
+    let handle = Arc::new(ServerHandle {
+        addr: Some(addr),
+        shutdown,
+        pool,
+        accept_thread: Mutex::new(Some(accept_thread)),
+    });
+
+    {
+        let mut slot = hook_state.server.lock();
+        if slot.is_some() {
+            drop(slot);
+            handle.stop();
+            return Ok(None);
+        }
+        *slot = Some(handle);
+        hook_state.set_port(port);
+    }
+
+    Ok(Some(port))
 }
 
 /// 启动 hook HTTP 服务器
@@ -754,17 +1646,16 @@ pub fn start_hook_server(
         return Ok(());
     }
 
-    // 在当前线程绑定端口，以便同步获取 server 实例
+    // 在当前线程绑定端口，以便同步得知结果
     let bound = {
         let mut result = None;
         for offset in 0..MAX_PORT_ATTEMPTS {
             let port = DEFAULT_PORT + offset;
             let addr = format!("127.0.0.1:{}", port);
-            match tiny_http::Server::http(&addr) {
-                Ok(s) => {
+            match TcpListener::bind(&addr) {
+                Ok(listener) => {
                     tracing::info!("[hook-server] 监听 {}", addr);
-                    hook_state.set_port(port);
-                    result = Some((s, port));
+                    result = Some(listener);
                     break;
                 }
                 Err(e) => {
@@ -775,285 +1666,43 @@ pub fn start_hook_server(
         result
     };
 
-    let (server, port) = match bound {
-        Some(s) => s,
+    let listener = match bound {
+        Some(l) => l,
         None => {
             tracing::error!("[hook-server] 无法绑定任何端口，hook 服务器未启动");
             return Err("无法绑定端口 (23456-23460)，hook 服务器启动失败".to_string());
         }
     };
 
-    // 用 Arc 包装 server，共享给 HookState 和监听线程
-    let server = Arc::new(server);
-    hook_state.set_server(Some(server.clone()));
-
-    // 写入端口文件
-    write_port_file(&data_dir, port);
-
-    std::thread::spawn(move || {
-        // 处理请求
-        for mut request in server.incoming_requests() {
-            if request.method() != &tiny_http::Method::Post {
-                let response =
-                    tiny_http::Response::from_string("Method Not Allowed").with_status_code(405);
-                let _ = request.respond(response);
-                continue;
-            }
-
-            let url = request.url().to_string();
-            if url != "/hook" {
-                let response = tiny_http::Response::from_string("Not Found").with_status_code(404);
-                let _ = request.respond(response);
-                continue;
-            }
-
-            // 读取 body。端点监听在 127.0.0.1 且无鉴权(改鉴权要动 sidecar 协议),
-            // 同机任意进程都能 POST 过来,不封顶等于把内存交给对方:先看
-            // Content-Length 拦掉声明超限的,再用 take() 兜住谎报/分块传输的情形。
-            if request
-                .body_length()
-                .is_some_and(|n| n > MAX_HOOK_BODY_BYTES)
-            {
-                let response =
-                    tiny_http::Response::from_string("Payload Too Large").with_status_code(413);
-                let _ = request.respond(response);
-                continue;
-            }
-            let mut body = String::new();
-            // 多读一个字节:读满 MAX+1 说明真身超限,而不是刚好卡在上限
-            let read = request
-                .as_reader()
-                .take(MAX_HOOK_BODY_BYTES as u64 + 1)
-                .read_to_string(&mut body);
-            if read.is_err() {
-                let response =
-                    tiny_http::Response::from_string("Bad Request").with_status_code(400);
-                let _ = request.respond(response);
-                continue;
-            }
-            if body.len() > MAX_HOOK_BODY_BYTES {
-                tracing::warn!(
-                    "[hook-server] body 超过 {} 字节上限，已拒绝",
-                    MAX_HOOK_BODY_BYTES
-                );
-                let response =
-                    tiny_http::Response::from_string("Payload Too Large").with_status_code(413);
-                let _ = request.respond(response);
-                continue;
-            }
-
-            // 解析 JSON payload
-            let payload: HookPayload = match serde_json::from_str(&body) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("[hook-server] JSON 解析失败: {}", e);
-                    let response =
-                        tiny_http::Response::from_string("Bad Request").with_status_code(400);
-                    let _ = request.respond(response);
-                    continue;
-                }
-            };
-
-            // 立即响应 200，不阻塞 hook 脚本
-            let response = tiny_http::Response::from_string("OK").with_status_code(200);
-            let _ = request.respond(response);
-
-            // 处理事件。事件名优先取 sidecar 从 argv 注入的 `event`；缺失时回落
-            // payload 自带的 `hook_event_name`（用户手改配置漏写命令行参数的兜底，
-            // 否则整条事件会因无事件名被静默丢弃）。
-            let resolved_event = payload
-                .event
-                .clone()
-                .or_else(|| payload.hook_event_name.clone());
-            if let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) {
-                let route = route_event(event, &payload);
-                if let EventRoute::Subagent { settled } = route {
-                    // agy 子代理会话的事件:它带自己的 conversationId,记下来会把 pane 的
-                    // 会话身份换成子代理的,状态也会被子代理的 Stop 提前收成「完成」。
-                    // 只拿它追踪在跑的子代理:主会话的完成可能正等着它们收尾
-                    let deferred = match payload.session_id.as_deref() {
-                        Some(sid) if settled => hook_state.agy_subagent_settled(pty_id, sid),
-                        Some(sid) => {
-                            hook_state.agy_subagent_active(pty_id, sid);
-                            None
-                        }
-                        None => None,
-                    };
-                    tracing::info!(
-                        "[hook-server] pty_id={} event={} 来自 agy 子代理会话 {:?}(settled={})，不改状态",
-                        pty_id, event, payload.session_id, settled
-                    );
-                    let Some(reason) = deferred else { continue };
-                    if !deferred_stop_applies(
-                        hook_state.get_status(pty_id).as_deref(),
-                        emitter.last_cause(pty_id).as_deref(),
-                    ) {
-                        tracing::info!(
-                            "[hook-server] pty_id={} 子代理已全部收尾,但主会话已不在工作中(打断/退出),延后的完成作废",
-                            pty_id
-                        );
-                        continue;
-                    }
-                    if let EventRoute::Status { status, cause } =
-                        route_agy_event("Stop", reason.as_deref(), None, None)
-                    {
-                        tracker.mark_ai_session(pty_id, AgentKind::Agy.key());
-                        hook_state.update(pty_id, status.to_string());
-                        emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
-                        tracing::info!(
-                            "[hook-server] pty_id={} 子代理已全部收尾,补记主会话延后的完成 -> status={} cause={}",
-                            pty_id, status, cause
-                        );
-                    }
-                    continue;
-                }
-                if event == "SessionEnd" {
-                    // 只用 payload 自带的 session_id 打墓碑。不要退回 session_of:
-                    // 新会话的 SessionStart 若先到,session_of 已是新会话,兜底会
-                    // 把新会话误打进墓碑,冻结其全部后续事件。
-                    if let Some(sid) = payload.session_id.clone() {
-                        hook_state.mark_session_ended(pty_id, sid);
-                    }
-                    let was_last =
-                        hook_state.end_session(pty_id, payload.session_id.as_deref());
-                    if payload.reason.as_deref() == Some("clear") {
-                        // /clear 换会话不是退出：紧随其后的 SessionStart 会带新
-                        // session id 刷新状态，这里只靠墓碑挡住旧会话的迟到事件
-                        tracing::info!(
-                            "[hook-server] pty_id={} event=SessionEnd(clear) -> 仅记录墓碑",
-                            pty_id
-                        );
-                    } else if !was_last {
-                        // pane 上还有别的活跃会话:嵌套非交互实例(Bash 工具里跑
-                        // `claude -p` / `codex exec`,继承 MINITERM_PTY_ID)结束,
-                        // 或退出后立刻重开、新 SessionStart 先到的乱序。此时清
-                        // hook 状态 / AI 会话标记会误杀仍在跑的会话,只留墓碑。
-                        tracing::info!(
-                            "[hook-server] pty_id={} event=SessionEnd 非最后活跃会话,仅记录墓碑",
-                            pty_id
-                        );
-                    } else {
-                        // 最后一个活跃会话结束 → 权威退出信号：清 hook 状态回退
-                        // 到轮询，同时清输入检测的 AI 会话标记——双击 Ctrl+C
-                        // 间隔超窗漏检时靠这里自愈
-                        hook_state.remove(pty_id);
-                        tracker.clear_ai_session(pty_id);
-                        emitter.emit_if_changed(pty_id, "idle", Some("SessionEnd"), None);
-                        tracing::info!(
-                            "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
-                            pty_id, payload.reason
-                        );
-                    }
-                } else {
-                    // 已结束会话的迟到事件直接丢弃：hook 脚本是独立进程，
-                    // POST 到达顺序无保证，放行会把退出后的 pane 推回 ai-idle。
-                    // 例外:SessionStart 是会话再次存活的肯定证据(退出后 claude -c /
-                    // --resume 同 id 重开),复活墓碑走正常记录,否则该会话被永久忽略
-                    if let Some(sid) = payload.session_id.as_deref() {
-                        if event == "SessionStart" {
-                            hook_state.revive_session(pty_id, sid);
-                        } else if hook_state.is_session_ended(pty_id, sid) {
-                            tracing::info!(
-                                "[hook-server] pty_id={} event={} 来自已结束会话 {}，忽略",
-                                pty_id, event, sid
-                            );
-                            continue;
-                        }
-                    }
-                    // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
-                    // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
-                    if let Some(sid) = payload.session_id.clone() {
-                        // 活跃集只服务 SessionEnd 的「是不是最后一个」判定。不发 SessionEnd
-                        // 的 agent(agy)的会话进去了就永远出不来:同一 pane 之后再跑 claude,
-                        // claude 退出时的 SessionEnd 会被这些残留挡成「非最后活跃会话」,
-                        // 状态收不回 idle。所以它们不进
-                        if agent_sends_session_end(payload.agent.as_deref()) {
-                            hook_state.note_session_active(pty_id, &sid);
-                        }
-                        if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
-                            // hook 端点无鉴权,cwd 是任何本地进程都能塞的字段,而上层会
-                            // 把它持久化成「未来某次 PTY 的启动目录」。只放行确实存在的
-                            // 目录:构造出来的假路径与已被删掉的 worktree 一并挡在这里,
-                            // 续接时回落 pane 自己的 cwd,而不是让 create_pty 直接失败。
-                            let cwd = payload
-                                .cwd
-                                .clone()
-                                .filter(|p| std::path::Path::new(p).is_dir());
-                            // 会话身份变化(新会话/换会话)时通知上层,供布局持久化
-                            // 记录「退出时该 pane 正跑着哪个 AI 会话」以便重启续接
-                            emitter.notify_session_identity(SessionIdentity {
-                                pty_id,
-                                agent: payload.agent.clone(),
-                                session_id: sid,
-                                cwd,
-                            });
-                        }
-                    }
-                    // agy 主会话的事件:`Stop(fullyIdle=false)` 记下延后的完成,其余任何事件
-                    // (继续干活 / 自己的 fullyIdle=true 收尾)都让它作废
-                    if payload.agent.as_deref().and_then(AgentKind::parse) == Some(AgentKind::Agy) {
-                        if route == EventRoute::DeferStop {
-                            hook_state.agy_defer_stop(pty_id, payload.termination_reason.clone());
-                        } else {
-                            hook_state.agy_clear_deferred_stop(pty_id);
-                        }
-                    }
-                    if let EventRoute::Status { status, cause } = route {
-                        // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
-                        // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
-                        // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
-                        tracker.mark_ai_session(
-                            pty_id,
-                            payload.agent.as_deref().unwrap_or(AgentKind::Claude.key()),
-                        );
-                        hook_state.update(pty_id, status.to_string());
-
-                        // 通知上层（与 monitor 共享同一份去重表）。cause 带
-                        // 归一化后的事件名(见 route_mapped):Stop/PermissionRequest/
-                        // Notification 都落 ai-idle,但只有 Stop 是「任务做完了」,UI 据此
-                        // 决定播报与托盘黄绿灯（见 notify.rs 与 store 的 attention 判定）
-                        emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
-
-                        tracing::info!(
-                            "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={}{}",
-                            pty_id,
-                            event,
-                            payload.agent,
-                            status,
-                            cause,
-                            payload
-                                .error_type
-                                .as_deref()
-                                .map(|e| format!(" error_type={}", e))
-                                .unwrap_or_default()
-                        );
-                    } else if let EventRoute::KeepStatus(why) = route {
-                        tracing::info!("[hook-server] pty_id={} event={} {}", pty_id, event, why);
-                    } else if route == EventRoute::DeferStop {
-                        tracing::info!(
-                            "[hook-server] pty_id={} event={} fullyIdle=false:后台子代理还在跑,完成延后到它们收尾",
-                            pty_id, event
-                        );
-                    }
-                }
-            }
-        }
-    });
+    if let Some(port) = start_hook_server_on_listener(
+        listener,
+        hook_state,
+        emitter,
+        tracker,
+        CONNECTION_READ_TIMEOUT,
+        CONNECTION_WRITE_TIMEOUT,
+    )? {
+        // 写入端口文件
+        write_port_file(&data_dir, port);
+    }
 
     Ok(())
 }
 
 /// 停止 hook HTTP 服务器
 ///
-/// 取出保存的 server 实例，调用 `unblock()` 中断阻塞循环，
+/// 取出保存的 server 句柄，立刻中断阻塞的监听循环，
 /// 清理端口文件并重置端口。
 pub fn stop_hook_server(hook_state: &HookState, data_dir: &Path) {
-    let server = hook_state.server.lock().take();
+    let server = {
+        let mut slot = hook_state.server.lock();
+        hook_state.set_port(0);
+        slot.take()
+    };
     if let Some(s) = server {
-        s.unblock();
+        s.stop();
         tracing::info!("[hook-server] 服务器已停止");
     }
-    hook_state.set_port(0);
     // 清理端口文件
     delete_port_file(data_dir);
 }
@@ -1116,7 +1765,6 @@ fn delete_port_file(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     /// 回归测试:server 没运行时回调**照样执行**。
     ///
@@ -1136,8 +1784,7 @@ mod tests {
     #[test]
     fn server_lock_blocks_stop_until_callback_finishes() {
         let state = HookState::new();
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        state.set_server(Some(Arc::new(server)));
+        state.set_server(Some(Arc::new(ServerHandle::for_test())));
 
         let guarded_state = state.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1961,5 +2608,265 @@ mod tests {
                 "{event} 无状态映射"
             );
         }
+    }
+
+    // ---- HTTP 服务端健壮性与并发超时测试 ----
+
+    struct TestHookServer {
+        state: HookState,
+        port: u16,
+        events: Arc<Mutex<Vec<crate::monitor::StatusChange>>>,
+    }
+
+    impl TestHookServer {
+        fn start(read_timeout: Duration) -> Self {
+            let events: Arc<Mutex<Vec<crate::monitor::StatusChange>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let sink_events = Arc::clone(&events);
+            let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
+                sink_events.lock().push(c);
+            }));
+            let state = HookState::new();
+            let tracker = SessionTracker::new();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            let port = start_hook_server_on_listener(
+                listener,
+                state.clone(),
+                emitter,
+                tracker,
+                read_timeout,
+                Duration::from_secs(2),
+            )
+            .expect("start test hook server")
+            .expect("server installed");
+            Self {
+                state,
+                port,
+                events,
+            }
+        }
+
+        fn send_raw(&self, raw: &[u8]) -> String {
+            let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+            stream.write_all(raw).expect("write request");
+            stream.flush().expect("flush");
+            let mut resp = String::new();
+            let _ = stream.read_to_string(&mut resp);
+            resp
+        }
+
+        fn wait_for_status(&self, pty_id: u32, expected: &str) {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if self.state.get_status(pty_id).as_deref() == Some(expected) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "pty_id={pty_id} 未在时限内变为 {expected:?}，当前={:?}",
+                self.state.get_status(pty_id)
+            );
+        }
+    }
+
+    impl Drop for TestHookServer {
+        fn drop(&mut self) {
+            let server = self.state.server.lock().take();
+            if let Some(s) = server {
+                s.stop();
+            }
+            self.state.set_port(0);
+        }
+    }
+
+    /// 慢速 / 挂起的 TCP 连接（只发请求头不发 body）不得阻塞后续正常的 `/hook` 上报，
+    /// 且服务端会在 read_timeout 到期后主动断开该挂起连接。
+    #[test]
+    fn slow_stalled_connection_does_not_block_subsequent_hooks_and_times_out() {
+        let srv = TestHookServer::start(Duration::from_millis(250));
+
+        // 1. 建立一个只发请求头、声明 64 字节 body 却永不发送的慢连接
+        let mut stalled = TcpStream::connect(("127.0.0.1", srv.port)).expect("connect stalled");
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        stalled
+            .write_all(b"POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n")
+            .expect("write partial headers");
+        stalled.flush().expect("flush");
+
+        // 2. 趁慢连接挂着，立刻发一条正常的 /hook 上报，必须在远短于超时时间内完成
+        let body =
+            r#"{"pty_id":42,"event":"UserPromptSubmit","agent":"claude-code","session_id":"s1"}"#;
+        let req = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\ncOnTeNt-LeNgTh: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let started = Instant::now();
+        let resp = srv.send_raw(req.as_bytes());
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "正常请求被阻或返回异常: {resp:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "正常请求耗时 {:?}，疑似被慢连接阻塞",
+            started.elapsed()
+        );
+        srv.wait_for_status(42, "ai-working");
+        assert!(
+            srv.events
+                .lock()
+                .iter()
+                .any(|e| e.pty_id == 42 && e.status == "ai-working")
+        );
+
+        // 3. 验证慢连接在超时后被服务端自行关闭（对端读到 EOF 或连接重置）
+        let mut buf = [0u8; 64];
+        let closed = match stalled.read(&mut buf) {
+            Ok(0) => true,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                true
+            }
+            other => panic!("慢连接应在超时后由服务端断开，实测: {other:?}"),
+        };
+        assert!(closed);
+    }
+
+    /// Transfer-Encoding: chunked（含分片、chunk extension 与 trailer）与 1 MiB 上限校验。
+    #[test]
+    fn http_server_supports_chunked_encoding_and_size_limit() {
+        let srv = TestHookServer::start(Duration::from_secs(2));
+
+        let part1 = r#"{"pty_id":7,"event":"#;
+        let part2 = r#""Stop","agent":"codex"}"#;
+        let req = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\ntRaNsFeR-eNcOdInG: chunked\r\n\r\n\
+             {:x};ext=1\r\n{}\r\n{:x}\r\n{}\r\n0\r\nX-Trailer: done\r\n\r\n",
+            part1.len(),
+            part1,
+            part2.len(),
+            part2
+        );
+        let resp = srv.send_raw(req.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
+        srv.wait_for_status(7, "ai-idle");
+
+        // 超过 1 MiB 上限的分块立即返回 413，不尝试分配巨额缓冲
+        let huge_chunk = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            MAX_HOOK_BODY_BYTES + 1
+        );
+        let resp = srv.send_raw(huge_chunk.as_bytes());
+        assert!(
+            resp.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "{resp:?}"
+        );
+    }
+
+    /// Expect: 100-continue 握手，以及超限 Content-Length 直接 413 而不回 100 Continue。
+    #[test]
+    fn http_server_handles_expect_100_continue() {
+        let srv = TestHookServer::start(Duration::from_secs(2));
+
+        let body = r#"{"pty_id":9,"event":"PreToolUse","agent":"claude-code"}"#;
+        let mut stream = TcpStream::connect(("127.0.0.1", srv.port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let headers = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).expect("write headers");
+        stream.flush().expect("flush");
+
+        let mut interim = [0u8; 64];
+        let n = stream.read(&mut interim).expect("read 100 continue");
+        let interim_str = std::str::from_utf8(&interim[..n]).expect("utf8");
+        assert!(
+            interim_str.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+            "未收到 100 Continue: {interim_str:?}"
+        );
+
+        stream.write_all(body.as_bytes()).expect("write body");
+        stream.flush().expect("flush");
+        let mut final_resp = String::new();
+        let _ = stream.read_to_string(&mut final_resp);
+        assert!(
+            final_resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "{final_resp:?}"
+        );
+        srv.wait_for_status(9, "ai-working");
+
+        // 超大 Content-Length + Expect: 100-continue 必须直接 413
+        let oversized = format!(
+            "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+            MAX_HOOK_BODY_BYTES + 1
+        );
+        let resp = srv.send_raw(oversized.as_bytes());
+        assert!(
+            resp.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "{resp:?}"
+        );
+    }
+
+    /// 路由、方法、错误 JSON、超限 Content-Length 状态码与 stop 立即释放端口。
+    #[test]
+    fn http_server_status_codes_and_immediate_stop() {
+        let srv = TestHookServer::start(Duration::from_secs(2));
+        let port = srv.port;
+
+        let r405 = srv.send_raw(b"GET /hook HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        assert!(
+            r405.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "{r405:?}"
+        );
+
+        let r404 =
+            srv.send_raw(b"POST /other HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}");
+        assert!(r404.starts_with("HTTP/1.1 404 Not Found\r\n"), "{r404:?}");
+
+        let r413 = srv.send_raw(
+            format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_HOOK_BODY_BYTES + 1
+            )
+            .as_bytes(),
+        );
+        assert!(
+            r413.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "{r413:?}"
+        );
+
+        let r400 = srv
+            .send_raw(b"POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n\r\n{bad");
+        assert!(r400.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{r400:?}");
+
+        // stop 后立刻释放端口且 is_server_running 变为 false，且 Drop 不再触发第二次 200ms 唤醒超时
+        let state = srv.state.clone();
+        let stop_started = Instant::now();
+        drop(srv);
+        assert!(
+            stop_started.elapsed() < Duration::from_millis(150),
+            "stop_hook_server + Drop 不应重复触发 200ms 唤醒超时，实际耗时: {:?}",
+            stop_started.elapsed()
+        );
+        assert!(!state.is_server_running());
+        assert_eq!(state.get_port(), 0);
+        let rebound = TcpListener::bind(("127.0.0.1", port));
+        assert!(rebound.is_ok(), "stop 后端口应立即释放，实际: {rebound:?}");
     }
 }

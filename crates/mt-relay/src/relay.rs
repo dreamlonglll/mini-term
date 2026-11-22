@@ -1221,13 +1221,14 @@ async fn connect_once(
         desktop_id,
         desktop_name,
     };
-    if ws
-        .send(Message::Text(
-            serde_json::to_string(&hello).unwrap().into(),
-        ))
-        .await
-        .is_err()
-    {
+    let hello_text = match serde_json::to_string(&hello) {
+        Ok(text) => text,
+        Err(e) => {
+            tracing::error!("[mobile-relay] failed to serialize hello message: {e}");
+            return Attempt::Failed;
+        }
+    };
+    if ws.send(Message::Text(hello_text.into())).await.is_err() {
         return Attempt::Failed;
     }
 
@@ -1314,7 +1315,13 @@ async fn connect_once(
             },
             out = outbound_rx.recv() => {
                 if let Some(msg) = out {
-                    let text = serde_json::to_string(&msg).unwrap();
+                    let text = match serde_json::to_string(&msg) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            tracing::error!("[mobile-relay] failed to serialize outbound message: {e}");
+                            continue;
+                        }
+                    };
                     if ws.send(Message::Text(text.into())).await.is_err() {
                         break Attempt::ConnectedThenLost;
                     }

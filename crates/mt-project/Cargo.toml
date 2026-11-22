@@ -20,7 +20,7 @@ mt-core.workspace = true
 # git2 必须保留 vendored-openssl:Windows MSVC 上不 vendored 会去找系统 OpenSSL,
 # 依据见 spec/backend/rust-crypto-on-windows-msvc.md。
 git2 = { version = "0.19", features = ["vendored-openssl"] }
-notify = "7"
+notify = "8"
 ignore = "0.4"
 pathdiff = "0.2"
 # 非 UTF-8 文本的编解码(`encoding` 模块:GBK / Shift_JIS / UTF-16 …)。依赖树里本来就有
@@ -34,14 +34,14 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。
-# 版本跟 gpui-pre-windows 已经在用的那份对齐(此前是 0.2,依赖树里同时编
+# 版本跟 gpui-fast-windows 已经在用的那份对齐(此前是 0.2,依赖树里同时编
 # 0.2 / 0.4 / 0.6 三份;0.4 是 zed-reqwest 带进来的,对不齐)。
 windows-registry = "0.6"
 # git CLI 超时要连孙进程一起杀(`git.exe` 只是启动器,hook / ssh 都是它的后代):
-# spawn 后挂进 Job Object,超时 `TerminateJobObject`。版本与 mt-secret 那份对齐
-# (根 Cargo.toml 的 workspace.dependencies 里没有它,mt-secret 也是直接写版本)。
+# spawn 后挂进 Job Object,超时 `TerminateJobObject`。版本与 mt-secret / notify 8 /
+# tokio 在树里已有的 0.61 对齐(根 Cargo.toml 的 workspace.dependencies 里没有它)。
 # `Win32_System_Threading`:等 git 退出用 `WaitForSingleObject`(退出即醒,不轮询)。
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_JobObjects",

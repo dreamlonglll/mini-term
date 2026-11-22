@@ -1320,9 +1320,24 @@ fn load_binding<A: gpui::Action>(
     action: A,
     context: Option<&str>,
     cx: &App,
-) -> KeyBinding {
-    let predicate = context.map(|c| gpui::KeyBindingContextPredicate::parse(c).unwrap().into());
-    KeyBinding::load(keystroke, Box::new(action), predicate, false, None, cx).unwrap()
+) -> Option<KeyBinding> {
+    let predicate = match context {
+        Some(c) => match gpui::KeyBindingContextPredicate::parse(c) {
+            Ok(parsed) => Some(parsed.into()),
+            Err(err) => {
+                tracing::warn!("[hotkeys] 解析快捷键上下文谓词失败 ({c:?}): {err}");
+                return None;
+            }
+        },
+        None => None,
+    };
+    match KeyBinding::load(keystroke, Box::new(action), predicate, false, None, cx) {
+        Ok(binding) => Some(binding),
+        Err(err) => {
+            tracing::warn!("[hotkeys] 加载快捷键绑定失败 ({keystroke:?}): {err}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1339,11 +1354,11 @@ fn make_binding<A: gpui::Action>(
     action: A,
     context: Option<&str>,
     cx: Option<&App>,
-) -> KeyBinding {
+) -> Option<KeyBinding> {
     match cx {
         Some(cx) => load_binding(keystroke, action, context, cx),
         #[cfg(test)]
-        None => test_binding(keystroke, action, context),
+        None => Some(test_binding(keystroke, action, context)),
         #[cfg(not(test))]
         None => unreachable!("runtime hotkey binding always has App"),
     }
@@ -1371,7 +1386,10 @@ fn table_bindings_with(platform: Platform, cx: Option<&App>) -> Vec<KeyBinding> 
         if def.id == SELECT_PANE_N {
             // 选中叶内第 N 个 tab(表里是一条,这里展开成九条)
             for (n, keystroke) in digit_keystrokes(platform) {
-                bindings.push(make_binding(&keystroke, SelectPane(n), Some(WORKSPACE), cx));
+                if let Some(binding) = make_binding(&keystroke, SelectPane(n), Some(WORKSPACE), cx)
+                {
+                    bindings.push(binding);
+                }
             }
             continue;
         }
@@ -1423,13 +1441,14 @@ fn rebind_bindings_with(
         }
         if let Some(keystroke) = before
             && let Some(binding) = binding_for_with(def.id, &keystroke, cx)
-        {
-            unbinds.push(make_binding(
+            && let Some(unbind) = make_binding(
                 &keystroke,
                 Unbind(binding.action().name().into()),
                 Some(context_of(def)),
                 cx,
-            ));
+            )
+        {
+            unbinds.push(unbind);
         }
         if let Some(keystroke) = after
             && let Some(binding) = binding_for_with(def.id, &keystroke, cx)
@@ -1903,7 +1922,7 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
 }
 
 fn binding_for_with(id: &str, keystroke: &str, cx: Option<&App>) -> Option<KeyBinding> {
-    Some(match id {
+    match id {
         "newTerminal" => make_binding(keystroke, NewTerminal, Some(WORKSPACE), cx),
         "closePane" => make_binding(keystroke, ClosePane, Some(WORKSPACE), cx),
         "closeTab" => make_binding(keystroke, CloseTerminalTab, Some(WORKSPACE), cx),
@@ -1941,8 +1960,8 @@ fn binding_for_with(id: &str, keystroke: &str, cx: Option<&App>) -> Option<KeyBi
         "zoomIn" => make_binding(keystroke, TerminalZoomIn, Some(TERMINAL), cx),
         "zoomOut" => make_binding(keystroke, TerminalZoomOut, Some(TERMINAL), cx),
         "zoomReset" => make_binding(keystroke, TerminalZoomReset, Some(TERMINAL), cx),
-        _ => return None,
-    })
+        _ => None,
+    }
 }
 
 #[cfg(test)]

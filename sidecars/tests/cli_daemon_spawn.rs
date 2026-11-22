@@ -16,13 +16,13 @@
 #![cfg(windows)]
 
 use std::io::Read;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
@@ -102,9 +102,9 @@ impl<'a> DaemonCleanup<'a> {
         let access = PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
         // SAFETY: 失败返回 NULL;成功的句柄交给 OwnedHandle 关闭。
         let raw = unsafe { OpenProcess(access, 0, pid) };
-        assert_ne!(raw, 0, "OpenProcess(pid {pid}) failed");
+        assert!(!raw.is_null(), "OpenProcess(pid {pid}) failed");
         // SAFETY: raw 是刚打开、无人共享的有效句柄。
-        let process = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
         let image = process_image(&process).expect("query daemon image path");
         assert!(
             same_file(&image, Path::new(CLI)),
@@ -122,7 +122,7 @@ impl Drop for DaemonCleanup<'_> {
             Duration::from_secs(15),
         );
         if let Some(process) = &self.process {
-            let raw = process.as_raw_handle() as HANDLE;
+            let raw = process.as_raw_handle();
             // SAFETY: raw 由 self.process 持有,此刻有效。
             unsafe {
                 if WaitForSingleObject(raw, 10_000) != WAIT_OBJECT_0 {
@@ -143,7 +143,7 @@ fn process_image(process: &OwnedHandle) -> Option<PathBuf> {
     // SAFETY: buf 可写 len 个 u16;成功后 len 是写入的字符数(不含 NUL)。
     let ok = unsafe {
         QueryFullProcessImageNameW(
-            process.as_raw_handle() as HANDLE,
+            process.as_raw_handle(),
             PROCESS_NAME_WIN32,
             buf.as_mut_ptr(),
             &mut len,

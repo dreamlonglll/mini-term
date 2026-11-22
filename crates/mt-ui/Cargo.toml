@@ -35,3 +35,6 @@ image = { version = "0.25", default-features = false }
 # 单测现场编一张 PNG、走一遍真的传输。
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

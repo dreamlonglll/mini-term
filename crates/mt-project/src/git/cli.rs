@@ -343,12 +343,12 @@ pub(super) mod job_object {
         pub(super) fn attach(child: &std::process::Child) -> Option<Job> {
             // SAFETY:两个参数都允许为空(默认安全属性、匿名);返回的句柄归 Job 所有
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle == 0 {
+            if handle.is_null() {
                 return None;
             }
             let job = Job(handle);
             // SAFETY:child 存活期间它的进程句柄一直有效
-            let ok = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
+            let ok = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) };
             (ok != 0).then_some(job)
         }
 
@@ -401,7 +401,7 @@ pub(super) fn wait_child_until(
     {
         use std::os::windows::io::AsRawHandle;
 
-        use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED};
+        use windows_sys::Win32::Foundation::WAIT_FAILED;
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
         loop {
@@ -417,7 +417,7 @@ pub(super) fn wait_child_until(
                 .unwrap_or(u32::MAX - 1)
                 .max(1);
             // SAFETY:child 存活期间它的进程句柄一直有效;只等、不关句柄
-            let woke = unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, millis) };
+            let woke = unsafe { WaitForSingleObject(child.as_raw_handle(), millis) };
             if woke == WAIT_FAILED {
                 // 等不了(极少见):退回旧的固定间隔轮询
                 std::thread::sleep(Duration::from_millis(15));

@@ -30,9 +30,10 @@ license = "MIT"
 # ---------------------------------------------------------------------------
 # 全部取自 crates.io，不用 git 依赖 —— 可复现、可锁版本。
 #
-# ⚠️ 不要换成 `gpui-ce`:gpui-component 0.6 依赖的是 `gpui-pre`(下面那份 Zed 快照,
-#    与本仓 `gpui` 别名指向的是同一个包),混用会在依赖树里出现两个不同的 gpui
-#    crate，类型无法互通。
+# ⚠️ 不要换成 `gpui-ce`:gpui-component 0.10(开启 `gpui-fast` feature)依赖的是
+#    `gpui-fast`(与本仓 `gpui` 别名指向同一个包;上游残留在 Cargo.toml 里的
+#    `gpui-pre` 由文末 `[patch.crates-io]` 空壳 stub 拦截),混用会在依赖树里出现
+#    两个不同的 gpui crate,类型无法互通。
 #    (gpui-ce 的卖点是 wgpu 单一后端，代价是没有任何组件库可用，且
 #     crates.io 版本停在 0.3.3 / 2025-12-27。)
 #

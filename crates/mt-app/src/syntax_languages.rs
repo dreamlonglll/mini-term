@@ -36,22 +36,18 @@
 //! 的查询把 `(identifier) @variable` 放最前、靠「后者覆盖前者」让带谓词的特化模式
 //! (`((identifier) @constant (#match? "^[A-Z_]+$"))`)生效 —— 在组件库里正好反过来,
 //! 常量色永远出不来。[`demote_catch_alls`] 把这类兜底模式整条挪到查询末尾,两种
-//! 风格的查询在组件库里都对。(眼下受下一节那个 bug 牵连,带谓词的特化模式本来
-//! 就不命中,这一步的效果看不见;上游修了就能看见,留着。)
+//! 风格的查询在组件库里都对(上游在 gpui-component 0.10.0 修复了 `ByteChunks` 谓词 bug
+//! 后,带谓词的特化模式现已正常生效)。
 //!
-//! # 组件库里带文本谓词的模式永远不命中(上游 bug,记档)
+//! # 历史记档:0.5.1 的 `ByteChunks` 文本谓词 bug(0.10.0 已修复)
 //!
-//! `highlighter.rs` 给 tree-sitter 的 `TextProvider` 用 ropey 的 `ChunkCursor`,但
-//! `ByteChunks::next` 先 `cursor.next()` 再取 chunk —— 单 chunk 的小文件一个字节都
-//! 吐不出来,多 chunk 的文件吐的是**下一块**。于是 `#eq?` / `#match?` / `#any-of?`
-//! 这些正向谓词拿到的节点文本永远是空串、永远不满足,带它们的模式整条失效
-//! (Kotlin 的 `it` 不会变 variable.special,Java 系的全大写常量色出不来);
-//! `#not-eq?` / `#not-match?` 则永远满足。gpui-component 0.5.1 钉死不升,只能记档:
-//! 挑查询时别指望谓词,靠节点结构上色的部分才是真能看到的。
+//! 旧版 gpui-component 0.5.1 里 `highlighter.rs` 给 tree-sitter 的 `TextProvider`
+//! 使用 ropey 的 `ChunkCursor`,但 `ByteChunks::next` 先 `cursor.next()` 再取 chunk,
+//! 导致 `#eq?` / `#match?` / `#any-of?` 拿不到正确的节点文本、带谓词的模式大面积失效。
+//! gpui-component 0.10.0 上游已修复该 bug,带谓词的模式现在可正常命中。
 //!
-//! `#lua-match?` 翻成 `#match?` 之后也落在这个坑里 —— 但翻译前它是「不求值、无条件
-//! 命中」,CMake 会把所有变量涂成常量色;翻译后是「永不命中」,退成普通变量色。
-//! 后者是正确的失败方向,所以翻译照做。
+//! `#lua-match?` 仍需翻译成 `#match?`:tree-sitter 本身把 `#lua-match?` 当作未求值的
+//! 一般谓词无条件放行(CMake 会把所有变量涂成常量色),翻成 `#match?` 才能按正则求值。
 //!
 //! # 注入只支持 `#set! injection.language`
 //!

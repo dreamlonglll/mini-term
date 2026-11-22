@@ -16,11 +16,12 @@ const PRICING_URL: &str = "https://models.dev/api.json";
 /// 无自定义头(旧版就是裸 `fetch(PRICING_URL)`),15s 超时是 GPUI 侧新加的
 /// ——浏览器有自己的超时,`reqwest::blocking` 默认无限等。
 fn fetch_models_dev() -> Result<PricingMap, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::http::try_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .get(PRICING_URL)
         .timeout(std::time::Duration::from_secs(15))
-        .build()
+        .send()
         .map_err(|e| e.to_string())?;
-    let resp = client.get(PRICING_URL).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }

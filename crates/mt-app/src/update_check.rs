@@ -129,12 +129,10 @@ pub struct ReleaseInfo {
 /// GitHub API 强制要求 `User-Agent`,缺了直接 403。
 fn fetch_releases() -> Result<Vec<ReleaseInfo>, String> {
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=20");
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::http::try_client().map_err(|e| e.to_string())?;
     let resp = client
         .get(url)
+        .timeout(std::time::Duration::from_secs(15))
         .header("User-Agent", "mini-term")
         .header("Accept", "application/vnd.github+json")
         .send()

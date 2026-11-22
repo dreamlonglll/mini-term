@@ -395,7 +395,7 @@ impl std::fmt::Display for ConnectError {
 pub async fn connect(endpoint: &str) -> Result<Box<dyn IpcStream>, ConnectError> {
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::AsHandle;
         use tokio::net::windows::named_pipe::ClientOptions;
         // ClientOptions 默认带 SECURITY_IDENTIFICATION:服务端最多只能「识别」我们,
         // 冒充不了我们的令牌去提权;剩下的风险(看请求、伪造响应)靠下面的身份核验堵。
@@ -404,8 +404,7 @@ pub async fn connect(endpoint: &str) -> Result<Box<dyn IpcStream>, ConnectError>
         loop {
             match ClientOptions::new().open(endpoint) {
                 Ok(client) => {
-                    let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-                    match windows_security::verify_pipe_server(pipe) {
+                    match windows_security::verify_pipe_server(client.as_handle()) {
                         Ok(()) => return Ok(Box::new(client)),
                         // 核验失败先断开重来一次:daemon 恰在此刻退出(进程已没、实例刚断)
                         // 也会让核验链断掉。重连就分得清 —— 真退出了会变成「连不上」,
@@ -524,17 +523,17 @@ pub mod windows_security {
     //! - 本进程是否提权([`current_process_is_elevated`]):提权时 CLI 不用 daemon。
 
     use std::ffi::c_void;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 
-    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, PSID};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
     use windows_sys::Win32::Security::{
         CopySid, EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TokenElevation,
-        TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY,
-        TOKEN_USER,
+        TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_ELEVATION,
+        TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
     use windows_sys::Win32::System::Threading::{
@@ -635,7 +634,7 @@ pub mod windows_security {
 
     /// 读 token 的用户 SID(`TokenUser`)。
     fn token_user_sid(token: &OwnedHandle) -> Result<OwnedSid, String> {
-        let raw = token.as_raw_handle() as HANDLE;
+        let raw = token.as_raw_handle();
         let mut needed: u32 = 0;
         // SAFETY: 探长度调用 —— 缓冲为 NULL、长度 0,预期失败并写回所需字节数。
         unsafe { GetTokenInformation(raw, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
@@ -666,8 +665,8 @@ pub mod windows_security {
 
     /// 当前进程的 token(`TOKEN_QUERY`)。
     fn current_process_token() -> Result<OwnedHandle, String> {
-        // windows-sys 0.52:HANDLE = isize,0 即 NULL。
-        let mut token: HANDLE = 0;
+        // windows-sys 0.61: HANDLE = *mut c_void, null_mut() 即 NULL。
+        let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: GetCurrentProcess 是无需关闭的伪句柄。
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(format!(
@@ -676,7 +675,7 @@ pub mod windows_security {
             ));
         }
         // SAFETY: token 是刚打开、无人共享的有效句柄,交给 OwnedHandle 负责关闭。
-        Ok(unsafe { OwnedHandle::from_raw_handle(token as RawHandle) })
+        Ok(unsafe { OwnedHandle::from_raw_handle(token) })
     }
 
     /// 当前进程 token 的用户 SID。
@@ -695,7 +694,7 @@ pub mod windows_security {
         // SAFETY: elevation 是本地可写的 TOKEN_ELEVATION,长度如实传入。
         let ok = unsafe {
             GetTokenInformation(
-                token.as_raw_handle() as HANDLE,
+                token.as_raw_handle(),
                 TokenElevation,
                 (&mut elevation as *mut TOKEN_ELEVATION).cast(),
                 std::mem::size_of::<TOKEN_ELEVATION>() as u32,
@@ -724,18 +723,17 @@ pub mod windows_security {
     pub fn process_user_sid(pid: u32) -> Result<OwnedSid, String> {
         // SAFETY: 失败返回 NULL,不涉及调用方内存。
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if process == 0 {
+        if process.is_null() {
             return Err(format!(
                 "OpenProcess(pid {pid}) failed: {}",
                 std::io::Error::last_os_error()
             ));
         }
         // SAFETY: process 是刚打开的有效句柄,交给 OwnedHandle 负责关闭。
-        let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
-        let mut token: HANDLE = 0;
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: process 在本作用域内有效。
-        let opened =
-            unsafe { OpenProcessToken(process.as_raw_handle() as HANDLE, TOKEN_QUERY, &mut token) };
+        let opened = unsafe { OpenProcessToken(process.as_raw_handle(), TOKEN_QUERY, &mut token) };
         if opened == 0 {
             return Err(format!(
                 "OpenProcessToken(pid {pid}) failed: {}",
@@ -743,15 +741,15 @@ pub mod windows_security {
             ));
         }
         // SAFETY: 同上,token 交给 OwnedHandle 关闭。
-        let token = unsafe { OwnedHandle::from_raw_handle(token as RawHandle) };
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
         token_user_sid(&token)
     }
 
     /// 管道服务端(创建这个管道实例的)进程的 PID。在客户端句柄上调用。
-    pub fn pipe_server_process_id(pipe: HANDLE) -> Result<u32, String> {
+    pub fn pipe_server_process_id(pipe: BorrowedHandle<'_>) -> Result<u32, String> {
         let mut pid: u32 = 0;
-        // SAFETY: pipe 是调用方持有的有效管道句柄。
-        if unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } == 0 {
+        // SAFETY: pipe 是调用方借出的有效管道句柄。
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
             return Err(format!(
                 "GetNamedPipeServerProcessId failed: {}",
                 std::io::Error::last_os_error()
@@ -762,14 +760,14 @@ pub mod windows_security {
 
     /// 管道对象的 owner SID。在客户端句柄上调用,句柄要有 `READ_CONTROL` —— tokio 的
     /// `ClientOptions` 以 `GENERIC_READ | GENERIC_WRITE` 打开,含这一项。
-    pub fn pipe_owner_sid(pipe: HANDLE) -> Result<OwnedSid, String> {
+    pub fn pipe_owner_sid(pipe: BorrowedHandle<'_>) -> Result<OwnedSid, String> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: pipe 是调用方持有的有效句柄;只要 owner,其余出参传 NULL。成功时 owner 指向
+        // SAFETY: pipe 是调用方借出的有效句柄;只要 owner,其余出参传 NULL。成功时 owner 指向
         // descriptor 内部,descriptor 由系统 LocalAlloc,拷完 SID 即释放。
         let status = unsafe {
             GetSecurityInfo(
-                pipe,
+                pipe.as_raw_handle(),
                 SE_KERNEL_OBJECT,
                 OWNER_SECURITY_INFORMATION,
                 &mut owner,
@@ -807,13 +805,13 @@ pub mod windows_security {
     /// 跑着的 daemon —— 未提权进程打不开它的 token,它建的管道 owner 通常也是 Administrators
     /// 组(提权令牌的默认 owner)而不是用户本人。0.4.11 起 daemon 不再提权运行;遇到旧的,
     /// 代价只是这次降级 one-shot。
-    pub fn verify_pipe_server(pipe: HANDLE) -> Result<(), String> {
+    pub fn verify_pipe_server(pipe: BorrowedHandle<'_>) -> Result<(), String> {
         verify_pipe_server_as(pipe, current_user_sid())
     }
 
     /// [`verify_pipe_server`] 的可注入版本:`own` 由调用方给(测试借此走通「SID 不同」分支)。
     pub(crate) fn verify_pipe_server_as(
-        pipe: HANDLE,
+        pipe: BorrowedHandle<'_>,
         own: Result<OwnedSid, String>,
     ) -> Result<(), String> {
         let process = pipe_server_process_id(pipe).and_then(process_user_sid);
@@ -1370,7 +1368,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn pipe_owner_is_the_current_user() {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::AsHandle;
         use tokio::net::windows::named_pipe::ClientOptions;
 
         let ep = unique_pipe("owner");
@@ -1381,7 +1379,7 @@ mod tests {
             server
         });
         let client = ClientOptions::new().open(&ep).unwrap();
-        let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let pipe = client.as_handle();
 
         let owner = windows_security::pipe_owner_sid(pipe).unwrap();
         assert_eq!(owner, windows_security::current_user_sid().unwrap());
@@ -1415,7 +1413,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn pipe_server_identity_mismatch_is_rejected() {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::AsHandle;
         use tokio::net::windows::named_pipe::ClientOptions;
 
         let ep = unique_pipe("mismatch");
@@ -1426,7 +1424,7 @@ mod tests {
             server
         });
         let client = ClientOptions::new().open(&ep).unwrap();
-        let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let pipe = client.as_handle();
 
         // 真实服务端就是本进程:按本进程身份核验必然通过……
         assert!(windows_security::verify_pipe_server(pipe).is_ok());

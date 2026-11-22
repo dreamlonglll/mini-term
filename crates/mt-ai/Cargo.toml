@@ -15,9 +15,6 @@ dirs.workspace = true
 # `src-tauri/` 下,反向依赖会把整套 Tauri 依赖拖进来)。mt-core 移入 `crates/`
 # 后副本已删,统一走它。mt-core 是叶子(serde/serde_json/dirs),不带包袱。
 mt-core.workspace = true
-# hook 上报接收端。三家 CLI 里已注册的 hook 命令 POST 到 127.0.0.1:23456/hook,
-# 端口/协议/路由都是用户机器上的既成事实,不能改(版本照抄 src-tauri/Cargo.toml)。
-tiny_http = "0.12"
 # Codex 的 ~/.codex/config.toml 要开 features.hooks(旧名 codex_hooks 已弃用),
 # 迁移时必须保留用户自己的注释与排版,故用 toml_edit 而非 toml。
 # `ssh_registry` 摘除项目级 / 全局 Codex 配置里的历史 MCP 注册、写项目信任同理。

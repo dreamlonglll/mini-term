@@ -63,7 +63,7 @@ mod file_viewer;
 mod first_run;
 mod focus_nav;
 mod fold_motion;
-// dev-only 度量工具(gpui-pre 内置帧剖析叠层)。默认不编译:整个模块连同
+// dev-only 度量工具(gpui-fast 内置帧剖析叠层)。默认不编译:整个模块连同
 // `open_window` 之后那唯一一处调用都挂在 `frame-profiler` feature 下,
 // 正式版零代码零依赖。用法见该模块的注释。
 #[cfg(feature = "frame-profiler")]
@@ -74,6 +74,7 @@ mod git;
 mod height_reveal;
 mod hook_hint;
 mod hotkeys;
+mod http;
 mod i18n;
 mod image_lightbox;
 mod kitty_graphics;

@@ -12,3 +12,6 @@ mt-project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,4 +1,4 @@
-//! **dev-only 帧剖析叠层**:gpui-pre 内置 `DebugFrameOverlay` 的开关,外加一份
+//! **dev-only 帧剖析叠层**:gpui-fast 内置 `DebugFrameOverlay` 的开关,外加一份
 //! 从 gpui 前台 journal 抽出来的周期汇总。给 `docs/` 那条 GPU/重绘性能诊断线
 //! 当量尺用 —— 此前「陈旧感 / 节拍器有没有生效」只能靠任务管理器的 GPU% 和肉眼。
 //!
@@ -10,7 +10,7 @@
 //! # 怎么用
 //!
 //! ```bash
-//! # 1. 带 feature 编译(会把 gpui-pre 连同依赖它的 crate 重编一遍,几分钟)
+//! # 1. 带 feature 编译(会把 gpui-fast 连同依赖它的 crate 重编一遍,几分钟)
 //! cargo build -p mt-app --features frame-profiler
 //!
 //! # 2. 带环境变量启动(⚠️ 与装机版并跑时照例要隔离数据目录)
@@ -107,7 +107,7 @@
 //! - 动画播完之后 `帧` 必须落回 0;落不回去就是有泵没停(`Transition` 没到
 //!   终态 / 有人每帧 `refresh`)。
 //!
-//! # 上游 API 出处(gpui-pre 0.3.5)
+//! # 上游 API 出处(gpui-fast 0.1.17,源自 Zed / gpui-pre 0.3.x)
 //!
 //! - `Cargo.toml:67` —— `profiler = ["dep:hdrhistogram"]`,非默认 feature。
 //! - `src/debug_overlay.rs` —— 叠层本体与 `DebugFrameOverlayMode`(整个模块

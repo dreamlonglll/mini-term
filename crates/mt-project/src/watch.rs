@@ -111,7 +111,7 @@
 //!
 //! # 平台
 //!
-//! Linux inotify、macOS FSEvents 走同一个单例。macOS 有一笔代价:notify 7 的 FSEvents
+//! Linux inotify、macOS FSEvents 走同一个单例。macOS 有一笔代价:notify 8 的 FSEvents
 //! 后端**每次 watch/unwatch 都停掉整条流**(`CFRunLoopStop` + join runloop 线程)再按
 //! 全部路径重建(`since = Now`),重建那几毫秒里所有被监听目录的事件都可能丢,每次
 //! 注册的开销也随路径数线性增长;旧实现一目录一条流,互不打扰。换来的是 N 条 runloop

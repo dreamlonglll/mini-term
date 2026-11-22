@@ -32,13 +32,16 @@ fn main() {
         .ok()
         .filter(|s| !s.is_empty());
 
-    // agy 的判定要看 payload（见 `classify_source`），所以带它的环境变量时先把 stdin 读了；
+    // agy 的判定要看 payload（见 `classify_source`），所以带它的环境变量时先把 stdin 读了并解析；
     // 不带的照旧走原来的顺序（先判 grok 兼容层要不要丢，再读 stdin），别家行为一点不变
-    let early_stdin = agy_conversation.as_ref().map(|_| read_stdin_with_timeout());
-    let early_payload = early_stdin
-        .as_ref()
-        .and_then(|raw| raw.as_deref())
-        .and_then(parse_payload_object);
+    let early_stdin_read = agy_conversation.is_some();
+    let early_payload = if early_stdin_read {
+        read_stdin_with_timeout()
+            .as_deref()
+            .and_then(parse_payload_object)
+    } else {
+        None
+    };
 
     // agy 要求 hook 往 stdout 输出 JSON 对象：**先于一切早退**（拿不到端口、连不上服务器、
     // stdin 超时）交上 `{}`。只打这一个：`{}` 在 PreInvocation / Stop 上 = 不注入、放行
@@ -77,10 +80,13 @@ fn main() {
         resolve_event_name(&argv_event)
     };
 
-    // 2. 从 stdin 读取 JSON payload（带超时）；agy 环境变量在场时上面已经读过
-    let stdin_payload = match early_stdin {
-        Some(raw) => raw,
-        None => read_stdin_with_timeout(),
+    // 2. 从 stdin 读取并解析 JSON payload（带超时）；agy 环境变量在场时上面已读并解析过，直接复用
+    let parsed_payload = match early_payload {
+        Some(payload) => Some(payload),
+        None if early_stdin_read => None,
+        None => read_stdin_with_timeout()
+            .as_deref()
+            .and_then(parse_payload_object),
     };
 
     // 3. 读取环境变量
@@ -99,10 +105,7 @@ fn main() {
     };
 
     // 5. 构造 POST body（顶层不是对象的按空对象算：下面要往里插字段）
-    let mut body = stdin_payload
-        .as_deref()
-        .and_then(parse_payload_object)
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut body = parsed_payload.unwrap_or_else(|| serde_json::json!({}));
 
     // agy：会话 id / Stop 字段改名，`lastUserInput` 正文换成一个布尔（隐私 + body 上限）
     if is_agy {
@@ -401,46 +404,12 @@ fn get_server_port() -> Option<u16> {
     json.get("port")?.as_u64().map(|p| p as u16)
 }
 
-/// 获取 hook-server.json 的平台特定路径
+/// 获取 hook-server.json 的平台特定路径。
+///
+/// 与 `mt_core::config_json_path()` 平台分支口径完全一致（均按装机版数据目录定位，
+/// 不认 `MT_APP_DATA_DIR`），直接复用并替换文件名。
 fn get_port_file_path() -> Option<std::path::PathBuf> {
-    let app_id = "com.mini-term.app";
-
-    #[cfg(target_os = "windows")]
-    {
-        // Windows: %APPDATA%/com.mini-term.app/hook-server.json
-        std::env::var("APPDATA").ok().map(|appdata| {
-            std::path::PathBuf::from(appdata)
-                .join(app_id)
-                .join("hook-server.json")
-        })
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        // macOS: ~/Library/Application Support/com.mini-term.app/hook-server.json
-        dirs::home_dir().map(|h| {
-            h.join("Library")
-                .join("Application Support")
-                .join(app_id)
-                .join("hook-server.json")
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // Linux: $XDG_DATA_HOME/com.mini-term.app/hook-server.json
-        // 或 ~/.local/share/com.mini-term.app/hook-server.json
-        let data_dir = std::env::var("XDG_DATA_HOME")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")));
-        data_dir.map(|d| d.join(app_id).join("hook-server.json"))
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    mt_core::config_json_path().map(|path| path.with_file_name("hook-server.json"))
 }
 
 /// 使用原始 HTTP 发送 POST 请求到本地 hook 服务器
@@ -722,5 +691,21 @@ mod tests {
             long["error_type"].as_str().unwrap().chars().count(),
             AGY_ERROR_MAX_CHARS
         );
+    }
+
+    #[test]
+    fn port_file_lives_beside_config_json() {
+        let port_path = get_port_file_path();
+        let config_path = mt_core::config_json_path();
+        assert_eq!(
+            port_path.as_ref().and_then(|p| p.parent()),
+            config_path.as_ref().and_then(|p| p.parent())
+        );
+        if let Some(path) = port_path {
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("hook-server.json")
+            );
+        }
     }
 }

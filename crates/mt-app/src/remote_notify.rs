@@ -22,7 +22,6 @@
 //! - **错误串里不许出现凭据**:reqwest 的错误自带完整 URL(Telegram 的 token 就在路径里、
 //!   Webhook 的 key 常在查询串里),一律 `without_url()`。
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use mt_config::RemoteNotifyConfig;
@@ -471,23 +470,12 @@ pub fn judge_response(channel: Channel, status: u16, body: &str) -> Result<(), S
 
 // ─── 发送(阻塞,一律丢后台) ─────────────────────────────────
 
-fn client() -> Result<&'static reqwest::blocking::Client, String> {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client);
-    }
-    // 默认会读系统代理(Windows 注册表 / HTTPS_PROXY):国内连 Telegram 靠它
-    let built = reqwest::blocking::Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| e.without_url().to_string())?;
-    Ok(CLIENT.get_or_init(|| built))
-}
-
 /// 一次 POST,返回 `(状态码, 响应体)`。**阻塞**。
 fn post(req: &JsonPost) -> Result<(u16, String), String> {
-    let resp = client()?
+    let resp = crate::http::try_client()
+        .map_err(|e| e.without_url().to_string())?
         .post(&req.url)
+        .timeout(REQUEST_TIMEOUT)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(req.body.clone())
         .send()

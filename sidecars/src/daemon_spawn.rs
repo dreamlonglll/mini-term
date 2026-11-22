@@ -112,7 +112,7 @@ pub fn disable_std_handle_inheritance() {
 #[cfg(windows)]
 fn is_usable_std_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    handle != 0 && handle != INVALID_HANDLE_VALUE
+    !handle.is_null() && handle != INVALID_HANDLE_VALUE
 }
 
 /// 清掉句柄的可继承位,其余属性不动;返回是否成功。
@@ -151,9 +151,9 @@ mod tests {
     #[test]
     fn std_handle_sentinels_are_skipped() {
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        assert!(!is_usable_std_handle(0));
+        assert!(!is_usable_std_handle(std::ptr::null_mut()));
         assert!(!is_usable_std_handle(INVALID_HANDLE_VALUE));
-        assert!(is_usable_std_handle(0x44));
+        assert!(is_usable_std_handle(std::ptr::without_provenance_mut(0x44)));
     }
 
     #[cfg(windows)]
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn clear_inherit_flag_makes_an_inheritable_handle_private() {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
 
         let path = std::env::temp_dir().join(format!(
             "mt-ssh-cli-inherit-{}-{}.tmp",
@@ -180,7 +180,7 @@ mod tests {
                 .as_nanos()
         ));
         let file = std::fs::File::create(&path).unwrap();
-        let handle = file.as_raw_handle() as HANDLE;
+        let handle = file.as_raw_handle();
         // 先人为设成可继承 —— 模拟父进程为传给 CLI 而建的管道写端。
         // SAFETY: handle 由 file 持有,在本测试内有效。
         assert_ne!(

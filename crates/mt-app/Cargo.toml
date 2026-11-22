@@ -10,15 +10,15 @@ name = "mini-term"
 path = "src/main.rs"
 
 [features]
-# dev-only 度量工具:打开 gpui-pre 内置的帧剖析叠层(`src/frame_profiler.rs`)。
+# dev-only 度量工具:打开 gpui-fast 内置的帧剖析叠层(`src/frame_profiler.rs`)。
 # **默认关**,发布构建一行代码、一个依赖都不带。
 #
-# 透传到 `gpui/profiler`(gpui-pre 0.3.5 `Cargo.toml:67` 的非默认 feature):
+# 透传到 `gpui/profiler`(gpui-fast 0.1.17 的非默认 feature):
 # 上游整套 `debug_overlay` 模块、`Window::set_debug_frame_overlay_mode`、
 # `App::foreground_journal` 与 `WindowInvalidator` 里那两个计数字段全由它挂着,
 # 不开就根本不编译;它唯一的新依赖是 `hdrhistogram`(上游拿它存帧耗时直方图)。
 #
-# ⚠️ feature 一开,gpui-pre 连同依赖它的 crate 会整棵重编(几分钟),且与默认
+# ⚠️ feature 一开,gpui-fast 连同依赖它的 crate 会整棵重编(几分钟),且与默认
 # 构建**不共用** target 缓存 —— 来回切换会反复重编,量化诊断时一次编完再用。
 frame-profiler = ["gpui/profiler"]
 
@@ -185,7 +185,7 @@ wry.workspace = true
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate
-# (gpui-pre 0.3.5 用 0.62;此前这里停在 0.61,等于多编一整套 windows 0.61 家族。
+# (gpui-fast 0.1.17 用 0.62;此前这里停在 0.61,等于多编一整套 windows 0.61 家族。
 # 依赖树里另有一份 0.58 是 gpui-component / gpui-base 带进来的,本仓对不齐)。
 windows = { version = "0.62", features = [
     "Win32_Foundation",

@@ -6,7 +6,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 **mini-term** — GPUI 原生桌面终端管理器，支持多项目、多标签、分屏布局，并能感知 AI 进程（Claude/Codex/Grok 等）状态；带移动端中转镜像与 SSH 远程项目能力。
 
-- **UI/渲染**: [gpui-pre](https://crates.io/crates/gpui-pre) 0.3.5（Zed 快照，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-pre-platform`）+ gpui-component 0.6.2（Resizable/Modal/Input/Tree 等）
+- **UI/渲染**: [gpui-fast](https://crates.io/crates/gpui-fast) 0.1.17（Longbridge 维护的 GPUI 分支，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-fast-platform`）+ gpui-component 0.10.0（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
 - **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉六家 AI 工具里的 hook 注册，升级不摘）+ macOS dmg + Linux deb/tar.gz。各桌面发布包还随附 `remote-git-helpers/<platform>/mt-git-helper` 四平台资源：`linux-x86_64` / `linux-aarch64`（musl 静态构建）、`macos-x86_64` / `macos-aarch64`；按 SSH 服务器平台选择，不按桌面平台选择，缺失资源明确报错且不回落本机 Git。目标与打包范围不表示已完成所有平台或服务器环境验证
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）

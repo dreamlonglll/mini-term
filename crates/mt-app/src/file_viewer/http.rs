@@ -123,8 +123,8 @@ fn fetch_local_preview_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// 一次 GET,把响应体整个读回来。**阻塞**,只许在后台执行器上调 —— gpui 的
 /// asset 系统正是这么跑的(`app.rs:2018` 的 `background_executor().spawn`)。
 ///
-/// 客户端存成进程级单例:每次请求现建一个要重做 TLS 栈初始化,而 README 顶上
-/// 一排徽章就是一串并发请求。
+/// 复用 [`crate::http::client`] 的进程级单例:每次请求现建客户端要重做 TLS 栈初始化,
+/// 而 README 顶上一排徽章就是一串并发请求。
 ///
 /// ⚠️ 已知取舍:每个请求会占住一个后台线程直到超时,一屏全是拉不动的远程图片时
 /// (离线 / 墙)线程池会被占满 10s。超时因此压得比价格表那条链(15s)短 ——
@@ -132,17 +132,13 @@ fn fetch_local_preview_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
 fn fetch_remote_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
     /// 徽章服务(shields.io 之流)对没有 UA 的请求有的直接 403
     const UA: &str = concat!("mini-term/", env!("CARGO_PKG_VERSION"));
-    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
     use std::io::Read as _;
 
-    let client = CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent(UA)
-            .build()
-            .unwrap_or_default()
-    });
-    let resp = client.get(url).send()?;
+    let resp = crate::http::client()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .header(reqwest::header::USER_AGENT, UA)
+        .send()?;
     anyhow::ensure!(
         resp.status().is_success(),
         "HTTP {} — {url}",

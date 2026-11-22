@@ -29,10 +29,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -224,7 +224,7 @@ impl LayoutStore {
     // ─── meta ────────────────────────────────────────────────────────────
 
     fn meta_get(&self, key: &str) -> Option<String> {
-        let conn = self.conn.lock().ok()?;
+        let conn = self.conn.lock();
         conn.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
             r.get::<_, String>(0)
         })
@@ -234,13 +234,12 @@ impl LayoutStore {
     }
 
     fn meta_set(&self, key: &str, value: &str) {
-        if let Ok(conn) = self.conn.lock() {
-            let _ = conn.execute(
-                "INSERT INTO meta(key, value) VALUES(?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            );
-        }
+        let conn = self.conn.lock();
+        let _ = conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        );
     }
 
     /// 是否还没从 config.json 灌过。首启(空库)返回 true。
@@ -253,17 +252,14 @@ impl LayoutStore {
     /// 读全部全局项。库里没有 / 值解析不出来的键一律当 `None`
     /// ——手改坏一个键不该让整份布局读不出来。
     pub fn load_globals(&self) -> GlobalLayout {
-        let Ok(conn) = self.conn.lock() else {
-            return GlobalLayout::default();
-        };
+        let conn = self.conn.lock();
         let mut map: HashMap<String, String> = HashMap::new();
-        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM app_layout") {
-            if let Ok(rows) =
+        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM app_layout")
+            && let Ok(rows) =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            {
-                for (key, value) in rows.flatten() {
-                    map.insert(key, value);
-                }
+        {
+            for (key, value) in rows.flatten() {
+                map.insert(key, value);
             }
         }
         GlobalLayout {
@@ -280,7 +276,7 @@ impl LayoutStore {
     /// 整体写回全局项。`None` 的字段**保持库里原样**(不删除)——
     /// 调用方通常只改了其中一项,不该因为没填其余字段就把它们抹掉。
     pub fn save_globals(&self, globals: &GlobalLayout) -> Result<()> {
-        let mut conn = self.conn.lock().map_err(|_| anyhow::anyhow!("布局库锁中毒"))?;
+        let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -316,9 +312,7 @@ impl LayoutStore {
     /// 读全部项目布局。某一行的 JSON 解析失败只丢那一个项目,其余照常返回。
     pub fn load_project_layouts(&self) -> HashMap<String, SavedProjectLayout> {
         let mut out = HashMap::new();
-        let Ok(conn) = self.conn.lock() else {
-            return out;
-        };
+        let conn = self.conn.lock();
         let Ok(mut stmt) = conn.prepare("SELECT project_id, layout_json FROM project_layout")
         else {
             return out;
@@ -352,7 +346,7 @@ impl LayoutStore {
             return self.delete_project_layout(project_id);
         }
         let json = serde_json::to_string(layout)?;
-        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("布局库锁中毒"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO project_layout(project_id, layout_json, updated_at_ms) VALUES(?1, ?2, ?3)
              ON CONFLICT(project_id) DO UPDATE SET
@@ -364,7 +358,7 @@ impl LayoutStore {
     }
 
     pub fn delete_project_layout(&self, project_id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("布局库锁中毒"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "DELETE FROM project_layout WHERE project_id = ?1",
             params![project_id],
@@ -376,7 +370,7 @@ impl LayoutStore {
     /// 启动时对一次账收口 —— 单个删除漏调也不会攒出无主行。
     pub fn retain_projects(&self, live: &HashSet<String>) -> Result<()> {
         let stale: Vec<String> = {
-            let conn = self.conn.lock().map_err(|_| anyhow::anyhow!("布局库锁中毒"))?;
+            let conn = self.conn.lock();
             let mut stmt = conn.prepare("SELECT project_id FROM project_layout")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.flatten().filter(|id| !live.contains(id)).collect()
@@ -671,7 +665,7 @@ mod tests {
         // `save_project_layout` 反而写不出这种形状 —— 这里模拟的是存量库/迁移
         // 时从 config.json 原样搬过来的那份数据。
         {
-            let conn = store.conn.lock().unwrap();
+            let conn = store.conn.lock();
             let json = r#"{"tabs":[{"splitLayout":{"type":"leaf","pane":{"shellName":"cmd","cwd":"D:/x"}}}],"activeTabIndex":0}"#;
             conn.execute(
                 "INSERT INTO project_layout(project_id, layout_json, updated_at_ms) VALUES('p1', ?1, 0)",

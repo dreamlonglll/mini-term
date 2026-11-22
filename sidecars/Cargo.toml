@@ -86,8 +86,6 @@ mt-ssh = { path = "../crates/mt-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
-# portable-pty 仅 miniterm-hook 仍在使用；mt-ssh-mcp 重构到 russh 后不再依赖。
-portable-pty = "0.8"
 # mt-ssh-mcp 的 MCP server 实现：官方 rmcp stdio server。
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
 # mt-ssh-cli 的参数解析：clap derive（用法错误信息对 agent 可读性好，--help 即文档）。
@@ -103,7 +101,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-
 # Win32_System_Pipes：客户端取管道服务端 PID 核验身份（GetNamedPipeServerProcessId）；
 # Win32_System_Console：拉起 daemon 前取标准句柄、清掉可继承位（GetStdHandle）。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
