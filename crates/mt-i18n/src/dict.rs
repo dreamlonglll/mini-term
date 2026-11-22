@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1926;
+pub const ZH_ENTRY_COUNT: usize = 1929;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1926;
+pub const EN_ENTRY_COUNT: usize = 1929;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -55,9 +55,10 @@ static APP_ZH: &[(&str, &str)] = &[
     ("titleBar.close", "关闭"),
     ("titleBar.maximize", "最大化"),
     ("titleBar.minimize", "最小化"),
-    ("titleBar.noAiProjects", "暂无进入 AI 会话的项目"),
+    ("titleBar.noAiProjects", "暂无 AI 会话或 SSH 连接的项目"),
     ("titleBar.projectSwitcher", "当前项目，点击切换"),
     ("titleBar.restore", "向下还原"),
+    ("titleBar.sshConnected", "SSH 已连接"),
     ("titleBar.status.attention", "有会话在等待确认，点击前往"),
     ("titleBar.status.done", "有会话已完成，点击前往最先完成的"),
     ("titleBar.status.error", "有会话异常，点击前往"),
@@ -119,9 +120,10 @@ static APP_EN: &[(&str, &str)] = &[
     ("titleBar.close", "Close"),
     ("titleBar.maximize", "Maximize"),
     ("titleBar.minimize", "Minimize"),
-    ("titleBar.noAiProjects", "No projects with AI sessions"),
+    ("titleBar.noAiProjects", "No projects with active AI or SSH sessions"),
     ("titleBar.projectSwitcher", "Current project — click to switch"),
     ("titleBar.restore", "Restore down"),
+    ("titleBar.sshConnected", "SSH connected"),
     ("titleBar.status.attention", "A session is awaiting confirmation — click to jump there"),
     ("titleBar.status.done", "A session finished — click to jump to the earliest one"),
     ("titleBar.status.error", "A session errored — click to jump there"),
@@ -2439,6 +2441,8 @@ static PANELS_ZH: &[(&str, &str)] = &[
     ("statusDot.ai-working", "AI 运行中"),
     ("statusDot.error", "出错"),
     ("statusDot.idle", "空闲"),
+    ("statusDot.ssh-connected", "已连接"),
+    ("statusDot.sshConnectedWith", "已连接 · {name}"),
     ("unstage", "取消暂存"),
     ("unstagedChanges", "未暂存"),
     ("untrackedFiles", "未跟踪"),
@@ -2461,6 +2465,8 @@ static PANELS_EN: &[(&str, &str)] = &[
     ("statusDot.ai-working", "AI working"),
     ("statusDot.error", "Error"),
     ("statusDot.idle", "Idle"),
+    ("statusDot.ssh-connected", "Connected"),
+    ("statusDot.sshConnectedWith", "Connected · {name}"),
     ("unstage", "Unstage"),
     ("unstagedChanges", "Changes"),
     ("untrackedFiles", "Untracked Files"),

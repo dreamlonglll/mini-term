@@ -198,6 +198,9 @@ windows = { version = "0.62", features = [
     "Win32_Media_Audio",
     # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
     "Win32_System_Diagnostics_Debug",
+    # 右键 SSH 连接存活探测(ssh_process.rs):CreateToolhelp32Snapshot / Process32FirstW /
+    # Process32NextW 扫描 PTY 根进程下的 ssh.exe 子进程。
+    "Win32_System_Diagnostics_ToolHelp",
     # 剪贴板图片(截图粘贴,见 clipboard::win):OpenClipboard / GetClipboardData /
     # IsClipboardFormatAvailable 住在 DataExchange,CF_DIB 句柄的
     # GlobalLock / GlobalSize 住在 Memory。gpui 自己的剪贴板只认

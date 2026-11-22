@@ -313,6 +313,7 @@ impl AppStore {
                 pane.attention = false;
                 // 起不来永远是红灯(不是「正常收工」)
                 pane.clean_exit = false;
+                pane.ssh_connected = None;
                 dead = Some(pane.id.clone());
                 break;
             }

@@ -92,6 +92,7 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -104,8 +105,10 @@ use gpui::{
     px,
 };
 use gpui_component::ActiveTheme as _;
+use mt_app_core::quick_ssh::{QuickSshOutcome, QuickSshTracker, SshProcessProbe};
 use mt_config::{ShellConfig, SshConnection};
 use mt_pty::{PtySession, PtySpawn};
+use parking_lot::Mutex;
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
@@ -170,6 +173,8 @@ pub enum PaneEvent {
     /// 启动恢复时后台反查到的会话 cwd(见 [`PreparedLaunch::resume_cwd`]),
     /// 回填完成后交还 store 随身份写回并落盘,下次重启免查。
     ResumeCwd(ResumeCwd),
+    /// 鼠标右键「SSH 连接」的已连接状态变化(`Some(连接名)` = 已连上,`None` = 已断开/清除)。
+    SshConnected(Option<String>),
 }
 
 /// 续接反查所得的会话启动目录,连同它属于哪个会话。
@@ -183,6 +188,7 @@ pub struct ResumeCwd {
 enum PaneSignal {
     Output,
     Exit(Option<u32>),
+    SshConnected(Option<String>),
 }
 
 pub struct TerminalPane {
@@ -288,6 +294,15 @@ pub struct TerminalPane {
     dirty_while_hidden: bool,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
+    /// PTY 子进程(本地 shell)的 PID,回填时由 `PtySession::process_id` 取得。
+    /// 右键「SSH 连接」的后台探针据此检查其子进程树里 `ssh` 是否仍存活。
+    child_pid: Option<u32>,
+    /// 鼠标右键「SSH 连接」的「已连接」状态机(与 AI 感知完全独立)。
+    quick_ssh: Arc<Mutex<QuickSshTracker>>,
+    /// 快速原子闸:未右键连过 VPS 的普通终端在 reader 热路径上零锁、零分配。
+    quick_ssh_watching: Arc<AtomicBool>,
+    /// 右键 SSH 连接的后台轻轮询任务(只在追踪活跃时运行,连上断开或放弃后自动收工)。
+    _quick_ssh_poll: Option<Task<()>>,
     /// SSH 交互浮层:记录模型 + 内容区右上角的悬浮框(入口按钮在终端组标题栏上,
     /// `terminal_area::render_leaf_controls` 读它的状态来画)。**恒挂在右上角那一列里**,
     /// 悬浮框关着时画空,理由见 [`crate::ssh_activity`] 视图模块注释。事件由
@@ -527,6 +542,8 @@ impl TerminalPane {
 
         let (tx, mut rx) = mpsc::unbounded::<PaneSignal>();
         let exit_tx = tx.clone();
+        let quick_ssh = Arc::new(Mutex::new(QuickSshTracker::new()));
+        let quick_ssh_watching = Arc::new(AtomicBool::new(false));
         let options = mt_pty::PtyOptions::default()
             .with_user_env(user_env)
             .on_exit(move |code| {
@@ -535,6 +552,8 @@ impl TerminalPane {
         let on_output = {
             let emulator = emulator.clone();
             let ai = ai.clone();
+            let quick_ssh = quick_ssh.clone();
+            let quick_ssh_watching = quick_ssh_watching.clone();
             move |bytes: &[u8]| {
                 // reader 线程:直接推进状态机,没有 IPC、没有批缓冲、没有序列化。
                 emulator.advance(bytes);
@@ -545,6 +564,17 @@ impl TerminalPane {
                 // 开着时也只是把尾部字节塞进有界环形缓冲,5 条口径在主线程节拍上跑。
                 // 详见 `git_watch` 模块注释(后续 Y 批的 git 着色与本条共用)。
                 crate::git::watch::observe_output(pty_id, bytes);
+                // 右键「SSH 连接」的已连接状态机旁路:普通终端只有一次原子读(零开销),
+                // 已进入原生 Connected 态后 `on_output` 同样直接短路。
+                if quick_ssh_watching.load(Ordering::Relaxed) {
+                    let outcome = quick_ssh.lock().on_output(bytes, Instant::now());
+                    if let QuickSshOutcome::Changed(next) = outcome {
+                        if next.is_none() {
+                            quick_ssh_watching.store(false, Ordering::Relaxed);
+                        }
+                        let _ = tx.unbounded_send(PaneSignal::SshConnected(next));
+                    }
+                }
                 let _ = tx.unbounded_send(PaneSignal::Output);
             }
         };
@@ -571,15 +601,18 @@ impl TerminalPane {
             while let Some(signal) = rx.next().await {
                 let mut exit: Option<Option<u32>> = None;
                 let mut output = false;
+                let mut ssh_connected: Option<Option<String>> = None;
                 match signal {
                     PaneSignal::Output => output = true,
                     PaneSignal::Exit(code) => exit = Some(code),
+                    PaneSignal::SshConnected(next) => ssh_connected = Some(next),
                 }
                 // 把已经排队的信号一次抽干,避免一次读一个信号地重绘。
                 while let Ok(extra) = rx.try_recv() {
                     match extra {
                         PaneSignal::Output => output = true,
                         PaneSignal::Exit(code) => exit = Some(code),
+                        PaneSignal::SshConnected(next) => ssh_connected = Some(next),
                     }
                 }
                 if this
@@ -589,6 +622,9 @@ impl TerminalPane {
                         if output {
                             pane.note_output();
                             pane.purge_cleared_scrollback();
+                        }
+                        if let Some(next) = ssh_connected {
+                            cx.emit(PaneEvent::SshConnected(next));
                         }
                         // 子进程快到回填之前就退了:先挂着,回填完成后再报
                         // (`PtySlot::note_exit`)—— 退出永远排在回填之后
@@ -765,6 +801,10 @@ impl TerminalPane {
             _sync_release_timer: None,
             dirty_while_hidden: false,
             _wake: wake,
+            child_pid: None,
+            quick_ssh,
+            quick_ssh_watching,
+            _quick_ssh_poll: None,
             ssh_activity,
         }
     }
@@ -899,6 +939,7 @@ impl TerminalPane {
         let exit = match session {
             Ok(session) => {
                 let wsl = session.wsl_override().cloned();
+                let child_pid = session.process_id();
                 let filled = match self.pty.backfill(session) {
                     Ok(filled) => filled,
                     Err(session) => {
@@ -907,6 +948,10 @@ impl TerminalPane {
                         return;
                     }
                 };
+                self.child_pid = child_pid;
+                if self.quick_ssh_watching.load(Ordering::Relaxed) {
+                    self.quick_ssh.lock().on_pty_ready(Instant::now());
+                }
                 match filled.resized {
                     Some(Ok(true)) => self.ai.perception().note_resize(self.pty_id),
                     Some(Err(err)) => tracing::warn!("[pane {}] resize 失败: {err:#}", self.pty_id),
@@ -936,6 +981,7 @@ impl TerminalPane {
                 }
                 self.spawn_error = Some(msg);
                 self.dead_since = Some(Instant::now());
+                self.disarm_quick_ssh(cx);
                 self.settle_spawn_waiters(false);
                 cx.emit(PaneEvent::SpawnFailed);
                 None
@@ -956,6 +1002,7 @@ impl TerminalPane {
         self.exited = true;
         self.exit_code = code;
         self.dead_since = Some(Instant::now());
+        self.disarm_quick_ssh(cx);
         cx.emit(PaneEvent::Exited(code));
         // 同步刷新终端子视图,确保进程退出前同一批输出的最后几行必刷出而不被节拍/缓存吞掉
         self.view.update(cx, |_, cx| cx.notify());
@@ -1303,8 +1350,88 @@ impl TerminalPane {
         }
     }
 
+    /// 右键「SSH 连接」触发后启动「已连接」状态追踪与后台子进程树轻轮询。
+    ///
+    /// 必须在写入 `ssh …\r` **之前**调用,确保 reader 线程从首个字节就能看见命令回显与
+    /// 随后的 SSH 输出;若此前该 pane 正连着别的 VPS,会先对外清掉旧的已连接标记。
+    pub fn arm_quick_ssh(&mut self, conn_name: String, command: &str, cx: &mut Context<Self>) {
+        let pty_running = self.pty.phase() == PtyPhase::Running;
+        let outcome = self
+            .quick_ssh
+            .lock()
+            .arm(conn_name, command, pty_running, Instant::now());
+        self.quick_ssh_watching.store(true, Ordering::Relaxed);
+        if let QuickSshOutcome::Changed(next) = outcome {
+            cx.emit(PaneEvent::SshConnected(next));
+        }
+        self._quick_ssh_poll = Some(cx.spawn(async move |pane, cx| {
+            loop {
+                let state = pane.update(cx, |pane: &mut TerminalPane, _cx| {
+                    let interval = pane.quick_ssh.lock().poll_interval();
+                    let starting = pane.pty.phase() == PtyPhase::Starting;
+                    (interval, pane.child_pid, starting)
+                });
+                let Ok((Some(interval), _, _)) = state else {
+                    return;
+                };
+                cx.background_executor().timer(interval).await;
+
+                let snap = pane.update(cx, |pane: &mut TerminalPane, _cx| {
+                    let active = pane.quick_ssh.lock().is_active();
+                    let starting = pane.pty.phase() == PtyPhase::Starting;
+                    (active, pane.child_pid, starting)
+                });
+                let Ok((true, child_pid, starting)) = snap else {
+                    return;
+                };
+                if starting && child_pid.is_none() {
+                    continue;
+                }
+
+                let probe = match child_pid {
+                    Some(pid) => {
+                        cx.background_executor()
+                            .spawn(async move { crate::ssh_process::probe_ssh_descendant(pid) })
+                            .await
+                    }
+                    None => SshProcessProbe::Unavailable,
+                };
+
+                let keep_going = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                    let (outcome, active) = {
+                        let mut guard = pane.quick_ssh.lock();
+                        let outcome = guard.on_process_probe(probe, Instant::now());
+                        let active = guard.is_active();
+                        (outcome, active)
+                    };
+                    pane.quick_ssh_watching.store(active, Ordering::Relaxed);
+                    if let QuickSshOutcome::Changed(next) = outcome {
+                        cx.emit(PaneEvent::SshConnected(next));
+                    }
+                    active
+                });
+                if !keep_going.unwrap_or(false) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// 停止右键 SSH 追踪并在必要时清除已连接状态。
+    fn disarm_quick_ssh(&mut self, cx: &mut Context<Self>) {
+        self.quick_ssh_watching.store(false, Ordering::Relaxed);
+        self._quick_ssh_poll = None;
+        let outcome = self.quick_ssh.lock().reset();
+        if let QuickSshOutcome::Changed(next) = outcome {
+            cx.emit(PaneEvent::SshConnected(next));
+        }
+    }
+
     /// 用户写入交给 PTY **之前**的旁路:AI 输入识别、`UserInput` 事件、AI 任务标记。
     fn observe_user_write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if self.quick_ssh_watching.load(Ordering::Relaxed) {
+            self.quick_ssh.lock().on_user_input(bytes, Instant::now());
+        }
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
         // 只能在回车前抓一份当前可见行补判(见 observe_input_with_line_snapshot)。
         let snapshot = if self.ai.perception().wants_line_snapshot(bytes) {
@@ -1544,6 +1671,9 @@ impl TerminalPane {
     /// 从运行中的任务里丢掉自己的 `Task` 是在给自己拆脚手架;下次排窗口时
     /// 句柄自然被新任务顶掉。
     fn note_osc_title(&mut self, title: Option<String>, cx: &mut Context<Self>) {
+        if title.is_some() && self.quick_ssh_watching.load(Ordering::Relaxed) {
+            self.quick_ssh.lock().on_osc_title(Instant::now());
+        }
         let armed = self.pending_osc_title.is_some();
         self.pending_osc_title = Some(title);
         if armed {
@@ -1706,6 +1836,9 @@ impl TerminalPane {
             tracing::warn!("[pane {}] kill 失败: {err:#}", self.pty_id);
         }
         self.settle_spawn_waiters(false);
+        self.quick_ssh_watching.store(false, Ordering::Relaxed);
+        self._quick_ssh_poll = None;
+        self.quick_ssh.lock().reset();
         self.ai.remove_pane(self.pty_id);
         // SSH 交互浮层的 nonce(store 的 dispose 路径也注销一次;实体直接被丢弃的
         // 路径 —— 项目移除 / 应用退出 —— 只走到这里)。幂等
@@ -2370,9 +2503,15 @@ pub(crate) fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window,
                 None => None,
             };
             let command = build_ssh_command(&conn, identity.as_deref());
+            let conn_name = if conn.name.trim().is_empty() {
+                conn.host.clone()
+            } else {
+                conn.name.clone()
+            };
             let _ = cx.update(|window, cx| {
                 let line = format!("{command}\r");
                 terminal.update(cx, |pane, cx| {
+                    pane.arm_quick_ssh(conn_name, &command, cx);
                     pane.write_ssh_command(line.as_bytes(), password, cx)
                 });
                 // 写完把键盘还给终端(原版 `term.focus()`)

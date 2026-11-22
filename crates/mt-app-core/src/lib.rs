@@ -17,6 +17,7 @@ pub mod markers;
 pub mod persist;
 pub mod project_tree;
 pub mod pty_slot;
+pub mod quick_ssh;
 pub mod session_branch;
 pub mod shell_ops;
 pub mod ssh_activity;

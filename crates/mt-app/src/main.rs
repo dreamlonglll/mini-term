@@ -106,6 +106,7 @@ mod settings;
 mod ssh_activity;
 mod ssh_assoc;
 mod ssh_panel;
+mod ssh_process;
 mod ssh_quick_connect;
 mod store;
 mod syntax_languages;

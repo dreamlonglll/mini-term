@@ -23,6 +23,8 @@ export const panels = {
     done: "完成",
     statusDot: {
       idle: "空闲",
+      "ssh-connected": "已连接",
+      sshConnectedWith: "已连接 · {name}",
       "ai-idle": "AI 已完成",
       "ai-working": "AI 运行中",
       error: "出错",
@@ -46,6 +48,8 @@ export const panels = {
     done: "DONE",
     statusDot: {
       idle: "Idle",
+      "ssh-connected": "Connected",
+      sshConnectedWith: "Connected · {name}",
       "ai-idle": "AI done",
       "ai-working": "AI working",
       error: "Error",

@@ -106,6 +106,10 @@ pub enum StoreEvent {
     /// 某 pane 的 AI 状态 / attention 黄灯 / 检测到的 agent 变了(含 PTY 退出落 error)。
     /// 完成账本与项目行的完成提示点随之更新。
     PaneStatusChanged,
+    /// 某 pane 通过右键「SSH 连接」的已连接状态变了(与 AI 状态完全正交)。
+    /// 只唤醒展示它的页签栏(`TerminalArea`)、项目列表(`ProjectList`)与顶栏胶囊
+    /// (`TitleBar`),不触碰托盘、中转或全局 AI 徽标。
+    PaneSshStatusChanged,
     /// 某 pane 的 AI 会话身份写入了(hook 上报 / 续接 / 跳转;手动写入时连带清续接标记)。
     PaneSessionChanged,
     /// 某 pane 的 OSC 窗口标题变了 —— **热路径**(AI 工作时约 4Hz/pane)。
@@ -303,6 +307,7 @@ impl StoreEvent {
                 | Self::LayoutChanged
                 | Self::FocusedPaneChanged
                 | Self::PaneStatusChanged
+                | Self::PaneSshStatusChanged
                 | Self::PaneSessionChanged
                 | Self::PaneTitleChanged
                 | Self::PaneRenamed
@@ -350,6 +355,7 @@ impl StoreEvent {
                 | Self::ProjectsChanged
                 | Self::LayoutChanged
                 | Self::PaneStatusChanged
+                | Self::PaneSshStatusChanged
                 | Self::DoneChanged
                 | Self::WindowFocusChanged
                 | Self::Config(ConfigSection::Appearance | ConfigSection::Locale)
@@ -369,6 +375,7 @@ impl StoreEvent {
                 | Self::ProjectTreeChanged
                 | Self::LayoutChanged
                 | Self::PaneStatusChanged
+                | Self::PaneSshStatusChanged
                 | Self::PaneSessionChanged
                 | Self::PaneRenamed
                 | Self::DirKindsChanged
@@ -509,6 +516,7 @@ mod tests {
             StoreEvent::LayoutChanged,
             StoreEvent::FocusedPaneChanged,
             StoreEvent::PaneStatusChanged,
+            StoreEvent::PaneSshStatusChanged,
             StoreEvent::PaneSessionChanged,
             StoreEvent::PaneTitleChanged,
             StoreEvent::PaneRenamed,
@@ -527,6 +535,7 @@ mod tests {
                 | StoreEvent::LayoutChanged
                 | StoreEvent::FocusedPaneChanged
                 | StoreEvent::PaneStatusChanged
+                | StoreEvent::PaneSshStatusChanged
                 | StoreEvent::PaneSessionChanged
                 | StoreEvent::PaneTitleChanged
                 | StoreEvent::PaneRenamed
@@ -553,6 +562,7 @@ mod tests {
     #[test]
     fn 标题等纯渲染数据不唤醒任何非渲染观察者() {
         let render_only = [
+            StoreEvent::PaneSshStatusChanged,
             StoreEvent::PaneTitleChanged,
             StoreEvent::FocusedPaneChanged,
             StoreEvent::MarkersChanged,
@@ -696,6 +706,7 @@ mod tests {
             StoreEvent::LayoutChanged,
             StoreEvent::FocusedPaneChanged,
             StoreEvent::PaneStatusChanged,
+            StoreEvent::PaneSshStatusChanged,
             StoreEvent::PaneSessionChanged,
             StoreEvent::PaneTitleChanged,
             StoreEvent::PaneRenamed,
@@ -724,6 +735,16 @@ mod tests {
         }
 
         // 必达护栏:关键视觉数据绝不漏订阅
+        assert!(StoreEvent::PaneSshStatusChanged.touches_terminal_area());
+        assert!(StoreEvent::PaneSshStatusChanged.touches_project_list());
+        assert!(StoreEvent::PaneSshStatusChanged.touches_title_bar());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_workspace());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_terminals_panel());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_project_switcher());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_session_panel());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_file_tree());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_git_panel());
+        assert!(!StoreEvent::PaneSshStatusChanged.touches_workbench_area());
         assert!(StoreEvent::Config(ConfigSection::View).touches_workspace());
         assert!(StoreEvent::Config(ConfigSection::View).touches_project_list());
         assert!(StoreEvent::Config(ConfigSection::View).touches_session_panel());

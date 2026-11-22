@@ -237,6 +237,16 @@ impl ProjectState {
             .unwrap_or_default()
     }
 
+    /// 跨全部面板查找是否存在右键「SSH 连接」已连上的活 pane,返回 `(pane_id, 连接名)`。
+    pub fn ssh_connected_pane(&self) -> Option<(&str, &str)> {
+        self.layouts().find_map(SplitNode::ssh_connected_pane)
+    }
+
+    /// 跨全部面板查找是否存在右键「SSH 连接」已连上的活 pane(用于项目列表次级状态灯)。
+    pub fn ssh_connected(&self) -> Option<&str> {
+        self.ssh_connected_pane().map(|(_, name)| name)
+    }
+
     /// 按节点 id 找叶子/split(跨全部面板;节点 id 全局唯一)。
     pub fn node(&self, node_id: &str) -> Option<&SplitNode> {
         self.layouts().find_map(|l| l.node(node_id))

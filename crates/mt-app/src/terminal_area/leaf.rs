@@ -368,6 +368,7 @@ impl TerminalArea {
             secondary: Option<String>,
             shell_name: String,
             light: StatusLight,
+            ssh_connected: Option<String>,
             vendor: Option<AiVendor>,
             unseen: bool,
         }
@@ -390,6 +391,7 @@ impl TerminalArea {
                     secondary,
                     shell_name: pane.shell_name.clone(),
                     light: pane.light(),
+                    ssh_connected: pane.ssh_connected.clone(),
                     vendor,
                     unseen: store.is_pane_unseen_done(&pane.id),
                 }
@@ -434,6 +436,7 @@ impl TerminalArea {
             secondary,
             shell_name,
             light,
+            ssh_connected,
             vendor,
             unseen,
         } in tabs
@@ -523,7 +526,9 @@ impl TerminalArea {
                     )
                     // 折叠条底色是 bg_elevated(悬停 bg_overlay),挖空笔画取前者
                     .child(tab_icon_slot(
+                        &pane_id,
                         light,
+                        ssh_connected.as_deref(),
                         &shell_name,
                         is_active,
                         ui::bg_elevated(),

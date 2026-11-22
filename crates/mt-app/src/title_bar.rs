@@ -69,7 +69,7 @@ use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::rgb8;
 use mt_ui::tooltip::TooltipExt as _;
 
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::popover_reveal::{
     Chrome, RevealFrameState, RevealState, ShadowMode, anchor_probe, reveal_frame,
 };
@@ -238,6 +238,72 @@ pub fn kind_color(kind: AiProjectKind) -> Hsla {
         AiProjectKind::Done => TitleBarLight::Done,
         AiProjectKind::Idle => TitleBarLight::Idle,
     })
+}
+
+/// 标题栏项目切换胶囊的档位:在 AI 四档之后补一档右键「SSH 已连接」(AI 状态优先)。
+///
+/// 独立于 [`AiProjectKind`]:托盘菜单与计数仍只看 AI 会话,不被右键 SSH 污染。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum SwitcherKind {
+    Ai(AiProjectKind),
+    SshConnected,
+}
+
+/// 标题栏胶囊下拉里的一行项目。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SwitcherEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: SwitcherKind,
+    /// 右键 SSH 已连接项的跳转目标 `(pane_id, 连接名)`。AI 项为 `None`。
+    pub ssh_target: Option<(String, String)>,
+}
+
+/// 胶囊色点与下拉行色点的取色:AI 四档沿用 [`kind_color`],SSH 已连接用蓝色 `color_info`。
+pub fn switcher_dot_color(kind: SwitcherKind) -> Hsla {
+    match kind {
+        SwitcherKind::Ai(ai) => kind_color(ai),
+        SwitcherKind::SshConnected => ui::color_info(),
+    }
+}
+
+/// 胶囊下拉行右侧状态文案的 `app` 字典 key。
+pub fn switcher_status_key(kind: SwitcherKind) -> &'static str {
+    match kind {
+        SwitcherKind::Ai(ai) => ai.tray_status_key(),
+        SwitcherKind::SshConnected => "titleBar.sshConnected",
+    }
+}
+
+/// 把 AI 项目列表与右键 SSH 已连接项目合并为胶囊下拉列表(**AI 状态优先**)。
+///
+/// 同一个项目同时有 AI 会话与 SSH 已连接时,保留它的 AI 档位、不重复入列;
+/// 仅有 SSH 已连接的项目按 `ssh_projects` 的配置序追加在 AI 项目之后。
+pub fn merge_switcher_entries(
+    ai_entries: Vec<AiProjectEntry>,
+    ssh_projects: Vec<(String, String, String, String)>,
+) -> Vec<SwitcherEntry> {
+    let mut out: Vec<SwitcherEntry> = ai_entries
+        .into_iter()
+        .map(|e| SwitcherEntry {
+            id: e.id,
+            name: e.name,
+            kind: SwitcherKind::Ai(e.kind),
+            ssh_target: None,
+        })
+        .collect();
+    for (id, name, pane_id, conn_name) in ssh_projects {
+        if out.iter().any(|e| e.id == id) {
+            continue;
+        }
+        out.push(SwitcherEntry {
+            id,
+            name,
+            kind: SwitcherKind::SshConnected,
+            ssh_target: Some((pane_id, conn_name)),
+        });
+    }
+    out
 }
 
 /// 0.8s 一轮的「呼吸」进度:`0 → 1 → 0` 的三角波再抹平成 ease-in-out。
@@ -591,8 +657,8 @@ impl TitleBar {
     fn switcher(
         &self,
         project_name: String,
-        active_kind: Option<AiProjectKind>,
-        entries: Vec<AiProjectEntry>,
+        active_kind: Option<SwitcherKind>,
+        entries: Vec<SwitcherEntry>,
         active_project_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -601,8 +667,10 @@ impl TitleBar {
         // 开合进度(收起动画播完前都是 `Some`);箭头的半圈旋转同吃这个进度
         let reveal = self.switcher_reveal.frame(window);
         let turned = reveal.map_or(0.0, |state| state.progress);
-        // 当前项目自己的 AI 状态色点;没有 AI 会话时压暗,和全局灯一个口径
-        let dot_color = active_kind.map(kind_color).unwrap_or_else(ui::text_muted);
+        // 当前项目自己的状态色点(AI 优先,其次右键 SSH 已连接);两者均无时压暗
+        let dot_color = active_kind
+            .map(switcher_dot_color)
+            .unwrap_or_else(ui::text_muted);
         let dot_alpha = if active_kind.is_some() { 1.0 } else { 0.45 };
 
         let button = div()
@@ -706,7 +774,7 @@ impl TitleBar {
     /// 外壳按插值矩形画,从胶囊水平中心往下长;面板本体只画内容。收起动画里面板不接鼠标。
     fn switcher_panel(
         &self,
-        entries: Vec<AiProjectEntry>,
+        entries: Vec<SwitcherEntry>,
         active_project_id: Option<String>,
         state: RevealFrameState,
         cx: &mut Context<Self>,
@@ -737,6 +805,14 @@ impl TitleBar {
         for entry in entries {
             let is_active = active_project_id.as_deref() == Some(entry.id.as_str());
             let target = entry.id.clone();
+            let ssh_pane_id = entry.ssh_target.as_ref().map(|(pid, _)| pid.clone());
+            let ssh_tip = entry.ssh_target.as_ref().map(|(_, conn_name)| {
+                tr!(
+                    "panels",
+                    "statusDot.sshConnectedWith",
+                    name = conn_name.clone()
+                )
+            });
             panel = panel.child(
                 div()
                     .id(SharedString::from(format!("titlebar-proj-{}", entry.id)))
@@ -747,6 +823,7 @@ impl TitleBar {
                     .py(px(6.0))
                     .text_size(ui::font_px(12.0))
                     .cursor_pointer()
+                    .when_some(ssh_tip, |el, tip| el.tip(tip))
                     .map(|el| {
                         if is_active {
                             el.bg(ui::accent_subtle()).text_color(ui::accent())
@@ -760,22 +837,29 @@ impl TitleBar {
                         // 终端视图并聚焦它,反过来会被还原焦点抢走光标
                         this.dismiss_switcher(window, cx);
                         let store = this.store.clone();
-                        // 定位不到目标(pane 已安静)也要把项目切过去,不能没反应
-                        if !focus_attention_target(&store, Some(&target), window, cx) {
+                        if let Some(ref pane_id) = ssh_pane_id {
+                            // 右键 SSH 已连接项:切到该项目并直接激活那个终端页签
+                            store.update(cx, |store, cx| {
+                                store.set_active_project(&target, cx);
+                                store.activate_pane(&target, pane_id, window, cx);
+                            });
+                            crate::workbench_area::activate_terminal_page(window, cx);
+                        } else if !focus_attention_target(&store, Some(&target), window, cx) {
+                            // 定位不到目标(pane 已安静)也要把项目切过去,不能没反应
                             store.update(cx, |store, cx| store.set_active_project(&target, cx));
                         }
                         // 两条路都落在 target 上:「项目」块里把它揭示出来
                         // (折叠组里的展开、可视区外的滚进来),只换高亮等于没看见
                         crate::project_list::reveal(&target, cx);
                     }))
-                    // 左:6px 状态点(**不压暗** —— 这一行必然有 AI 会话)
+                    // 左:6px 状态点(**不压暗** —— 这一行必然有 AI 会话或已连上的 SSH)
                     .child(
                         div()
                             .w(px(6.0))
                             .h(px(6.0))
                             .flex_none()
                             .rounded_full()
-                            .bg(kind_color(entry.kind)),
+                            .bg(switcher_dot_color(entry.kind)),
                     )
                     .child(
                         div()
@@ -787,7 +871,7 @@ impl TitleBar {
                         div()
                             .flex_none()
                             .text_color(ui::text_muted())
-                            .child(t("app", entry.kind.tray_status_key())),
+                            .child(t("app", switcher_status_key(entry.kind))),
                     ),
             );
         }
@@ -839,13 +923,27 @@ impl Render for TitleBar {
             // 本来就是同一趟遍历里顺手归并出来的,留着不多一次扫描,也省得动
             // `title_bar_snapshot` 的签名与它那几条单测。
             let (_light, projects) = store.title_bar_snapshot();
+            // 按配置里的项目序收集右键 SSH 已连接的项目,与 AI 列表合并(AI 优先)
+            let ssh_projects: Vec<(String, String, String, String)> = store
+                .projects()
+                .iter()
+                .filter_map(|p| {
+                    let (pane_id, conn_name) = store.project_state(&p.id)?.ssh_connected_pane()?;
+                    Some((
+                        p.id.clone(),
+                        p.name.clone(),
+                        pane_id.to_string(),
+                        conn_name.to_string(),
+                    ))
+                })
+                .collect();
             (
-                projects.entries,
+                merge_switcher_entries(projects.entries, ssh_projects),
                 store.active_project().map(|p| p.name.clone()),
                 store.active_project_id.clone(),
             )
         };
-        // 当前项目的 AI 状态档位;`None` = 当前项目没有 AI 会话
+        // 当前项目的状态档位(AI 优先,其次右键 SSH 已连接);`None` = 两者均无
         let active_kind = active_project_id
             .as_deref()
             .and_then(|id| entries.iter().find(|e| e.id == id))
@@ -1035,7 +1133,13 @@ mod tests {
     /// 三键的 tooltip key 都在字典里(拼错的后果是空 tooltip,真机上很难发现)。
     #[test]
     fn 窗口控制键文案_key_齐全() {
-        let mut keys = vec!["titleBar.minimize", "titleBar.close", "titleBar.projectSwitcher", "titleBar.noAiProjects"];
+        let mut keys = vec![
+            "titleBar.minimize",
+            "titleBar.close",
+            "titleBar.projectSwitcher",
+            "titleBar.noAiProjects",
+            "titleBar.sshConnected",
+        ];
         keys.push(max_button_face(false).1);
         keys.push(max_button_face(true).1);
         for key in keys {
@@ -1079,10 +1183,53 @@ mod tests {
                 assert!(i == j || a != b, "第 {i} 档与第 {j} 档撞色");
             }
         }
-        // 胶囊/下拉的四档色与状态灯同一张表
+        // 胶囊/下拉的四档色与状态灯同一张表;SSH 已连接色独立于这五档
         assert_eq!(kind_color(AiProjectKind::Attention), colors[1]);
         assert_eq!(kind_color(AiProjectKind::Working), colors[2]);
         assert_eq!(kind_color(AiProjectKind::Done), colors[3]);
         assert_eq!(kind_color(AiProjectKind::Idle), colors[4]);
+        let ssh_color = switcher_dot_color(SwitcherKind::SshConnected);
+        for (i, c) in colors.iter().enumerate() {
+            assert_ne!(ssh_color, *c, "SSH 已连接色与第 {i} 档 AI 色撞色");
+        }
+    }
+
+    #[test]
+    fn 胶囊列表合并_ai优先且不重复_纯ssh项目排在ai之后() {
+        let ai = vec![
+            AiProjectEntry {
+                id: "p1".into(),
+                name: "Alpha".into(),
+                kind: AiProjectKind::Working,
+            },
+            AiProjectEntry {
+                id: "p2".into(),
+                name: "Beta".into(),
+                kind: AiProjectKind::Idle,
+            },
+        ];
+        let ssh = vec![
+            // p1 同时有 AI 与 SSH:AI 优先,不应再追加一条
+            ("p1".into(), "Alpha".into(), "pane-1".into(), "vps-1".into()),
+            // p3 仅有 SSH 已连接:应入列并保留跳转目标
+            ("p3".into(), "Gamma".into(), "pane-3".into(), "vps-3".into()),
+        ];
+        let merged = merge_switcher_entries(ai, ssh);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].id, "p1");
+        assert_eq!(merged[0].kind, SwitcherKind::Ai(AiProjectKind::Working));
+        assert_eq!(merged[0].ssh_target, None);
+        assert_eq!(merged[1].id, "p2");
+        assert_eq!(merged[1].kind, SwitcherKind::Ai(AiProjectKind::Idle));
+        assert_eq!(merged[2].id, "p3");
+        assert_eq!(merged[2].kind, SwitcherKind::SshConnected);
+        assert_eq!(
+            merged[2].ssh_target,
+            Some(("pane-3".into(), "vps-3".into()))
+        );
+        assert_eq!(
+            switcher_status_key(SwitcherKind::SshConnected),
+            "titleBar.sshConnected"
+        );
     }
 }

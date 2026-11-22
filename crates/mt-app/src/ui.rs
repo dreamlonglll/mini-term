@@ -1141,6 +1141,17 @@ pub fn status_dot(light: impl Into<StatusLight>) -> impl IntoElement {
         .contrast(bg_elevated())
 }
 
+/// 右键「SSH 连接」已连上远端 VPS 的状态灯(`◉`,蓝色 `color_info`)。
+///
+/// 与 [`status_dot`] 同尺寸(11px),独立于 AI 五档 [`StatusLight`] —— 只在页签与
+/// 项目列表处于 `Idle`(无 AI 状态/错误)时展示。
+pub fn ssh_connected_dot() -> impl IntoElement {
+    StatusDot::new(StatusKind::SshConnected)
+        .size(px(11.0))
+        .color(color_info())
+        .contrast(bg_elevated())
+}
+
 /// 把一行文本按「命中区间」切成 `(片段, 是否命中)` 序列 —— 搜索结果与项目切换器
 /// 的关键词高亮共用这一份。
 ///

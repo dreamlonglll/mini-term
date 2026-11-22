@@ -70,16 +70,17 @@ use std::time::Duration;
 use super::vector::{Geom, Ink, Shape, VectorIcon};
 use crate::terminal::rgb8;
 
-/// 状态灯的五档。前四档与 `mt_app::tree::PaneStatus`、后端 `mt_ai::StatusChange::status`
-/// 的字符串口径一致(`idle` / `ai-idle` / `ai-working` / `error`);`attention` 是
-/// **显示层**的第五档(宿主拿 pane 的状态叠上 attention 位得出),后端与移动端协议里
-/// 没有这个值。
+/// 状态灯的六档。前四档与 `mt_app::tree::PaneStatus`、后端 `mt_ai::StatusChange::status`
+/// 的字符串口径一致(`idle` / `ai-idle` / `ai-working` / `error`);`attention` 与
+/// `ssh-connected` 是**显示层**档位(后端与移动端协议里没有这两个值)。
 ///
 /// mt-ui 不依赖 mt-app,所以这里独立定义一份;宿主在接线处转换即可。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum StatusKind {
     #[default]
     Idle,
+    /// 鼠标右键「SSH 连接」已连上远端 VPS（与 AI 状态正交，仅在普通终端态展示）。
+    SshConnected,
     AiIdle,
     AiWorking,
     /// AI 停下来等你处理:授权 / 表单 / 回合因 API 错误结束。
@@ -91,6 +92,7 @@ impl StatusKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::SshConnected => "ssh-connected",
             Self::AiIdle => "ai-idle",
             Self::AiWorking => "ai-working",
             Self::Attention => "attention",
@@ -103,6 +105,7 @@ impl StatusKind {
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "idle" => Self::Idle,
+            "ssh-connected" => Self::SshConnected,
             "ai-idle" => Self::AiIdle,
             "ai-working" => Self::AiWorking,
             "attention" => Self::Attention,
@@ -112,20 +115,22 @@ impl StatusKind {
     }
 
     /// 默认色,前四档逐值取自 `src/styles.css` 的暗色变量(与 `mt_app::ui` 那张表同源);
-    /// `attention` 取 `mt_app::ui` 暗色表里的 `color_attention`。
+    /// `ssh-connected` 取 `color_info` 暗色,`attention` 取 `color_attention` 暗色。
     pub fn default_color(self) -> Hsla {
         match self {
-            Self::Idle => rgb8(0x6a, 0x62, 0x58),      // --text-muted
-            Self::AiIdle => rgb8(0x6b, 0xb8, 0x7a),    // --color-success
-            Self::AiWorking => rgb8(0xf5, 0xc5, 0x18), // --color-ai-working
-            Self::Attention => rgb8(0xf0, 0x88, 0x3e), // color_attention(暗色)
-            Self::Error => rgb8(0xd4, 0x60, 0x5a),     // --color-error
+            Self::Idle => rgb8(0x6a, 0x62, 0x58),         // --text-muted
+            Self::SshConnected => rgb8(0x6a, 0x9f, 0xd4), // --color-info(暗色)
+            Self::AiIdle => rgb8(0x6b, 0xb8, 0x7a),       // --color-success
+            Self::AiWorking => rgb8(0xf5, 0xc5, 0x18),    // --color-ai-working
+            Self::Attention => rgb8(0xf0, 0x88, 0x3e),    // color_attention(暗色)
+            Self::Error => rgb8(0xd4, 0x60, 0x5a),        // --color-error
         }
     }
 
     fn shapes(self) -> &'static [Shape] {
         match self {
             Self::Idle => IDLE,
+            Self::SshConnected => SSH_CONNECTED,
             Self::AiIdle => AI_IDLE,
             Self::AiWorking => AI_WORKING,
             Self::Attention => ATTENTION,
@@ -148,6 +153,28 @@ const IDLE: &[Shape] = &[Shape::line(
         r: 4.5 / 16.0,
     },
 )];
+
+/// `ssh-connected`:描边外环 + 实心内核圆(`◉`)。
+///
+/// 与其余五态形状全部不同(非空心单圈 / 非实心圆挖空 / 非旋转弧),色觉障碍下
+/// 同样可一眼识别为「远端端点已连通」。
+const SSH_CONNECTED: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        1.6 / 16.0,
+        Geom::Circle {
+            c: (0.5, 0.5),
+            r: 6.0 / 16.0,
+        },
+    ),
+    Shape::fill(
+        Ink::Current,
+        Geom::Circle {
+            c: (0.5, 0.5),
+            r: 3.0 / 16.0,
+        },
+    ),
+];
 
 /// `ai-idle`:实心圆 + 对勾(原版 `r=6.5` + `M5 8.2l2 2 4-4.2`)。
 const AI_IDLE: &[Shape] = &[
@@ -240,9 +267,10 @@ const ATTENTION: &[Shape] = &[
     ),
 ];
 
-/// 全部五态(遍历/演示用)。
+/// 全部六态(遍历/演示用)。
 pub const ALL_STATUS_KINDS: &[StatusKind] = &[
     StatusKind::Idle,
+    StatusKind::SshConnected,
     StatusKind::AiIdle,
     StatusKind::AiWorking,
     StatusKind::Attention,
@@ -340,20 +368,24 @@ mod tests {
     }
 
     #[test]
-    fn 五态形状互不相同_不是只换颜色() {
+    fn 六态形状互不相同_不是只换颜色() {
         use super::super::vector::Pen;
         // 色觉障碍下的可分辨性全靠这条:形状必须真的不一样
         let counts: Vec<usize> = ALL_STATUS_KINDS.iter().map(|k| k.shapes().len()).collect();
         assert_eq!(
             counts,
-            vec![1, 2, 2, 3, 3],
-            "笔画数:圈 / 圆+勾 / 环+弧 / 圆+叹号(竖笔+点) / 圆+叉"
+            vec![1, 2, 2, 2, 3, 3],
+            "笔画数:圈 / 外环+核 / 圆+勾 / 环+弧 / 圆+叹号(竖笔+点) / 圆+叉"
         );
-        // idle 是描边(空心),ai-idle / attention / error 是填充(实心)—— 填充与否是第一层区分
+        // idle / ssh-connected 第一笔是描边圆,ai-idle / attention / error 是填充圆
         assert!(matches!(IDLE[0].pen, Pen::Line(_)));
+        assert!(matches!(SSH_CONNECTED[0].pen, Pen::Line(_)));
+        assert!(matches!(SSH_CONNECTED[1].pen, Pen::Fill));
         assert!(matches!(AI_IDLE[0].pen, Pen::Fill));
         assert!(matches!(ATTENTION[0].pen, Pen::Fill));
         assert!(matches!(ERROR[0].pen, Pen::Fill));
+        // ssh-connected 与 ai-working 同为「第一笔描边圆 + 2 笔」,第二笔分别是填充圆核 vs 描边弧
+        assert!(matches!(AI_WORKING[1].pen, Pen::Line(_)));
         // 同为「实心圆 + 三笔」的叹号与叉靠第三笔区分:叹号的第三笔是填充的圆点,
         // 叉的第三笔是描边 —— 两枚灯的字形不会只差颜色
         assert!(matches!(ATTENTION[2].pen, Pen::Fill));

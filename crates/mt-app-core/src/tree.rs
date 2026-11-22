@@ -208,6 +208,12 @@ pub struct PaneState {
     /// **运行时派生,不进磁盘格式**(与 `osc_title` 同一口径)。`AppStore::on_pty_exit`
     /// 置位,重连 / 起不来时清掉。
     pub clean_exit: bool,
+    /// 鼠标右键「SSH 连接」确认已连上时的连接名(`None` = 未连接)。
+    ///
+    /// **只用于显示层**(页签与项目列表),与 AI 状态完全正交、**AI 状态优先**:
+    /// 不进 [`PaneStatus`] 与 [`StatusLight`],不触发托盘 / 全局 AI 徽标 / 移动端协议,
+    /// 也不进磁盘布局格式(`SavedPane`)。
+    pub ssh_connected: Option<String>,
 }
 
 impl PaneState {
@@ -225,6 +231,7 @@ impl PaneState {
             attention: false,
             osc_title: None,
             clean_exit: false,
+            ssh_connected: None,
         }
     }
 
@@ -403,6 +410,27 @@ impl SplitNode {
             Self::Split { children, .. } => children.iter().map(|c| c.highest_light_by(map)).max(),
         };
         highest.unwrap_or_default()
+    }
+
+    /// 子树中是否存在右键「SSH 连接」已连上的活 pane;有则返回 `(pane_id, 连接名)`(DFS 序首个)。
+    ///
+    /// 与 AI 状态正交,不进 [`Self::highest_light`] —— 项目列表与标题栏胶囊仅在没有
+    /// AI 活跃态时才回落展示它(AI 状态优先)。
+    pub fn ssh_connected_pane(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Leaf { panes, .. } => panes.iter().find_map(|p| {
+                (p.status != PaneStatus::Error)
+                    .then_some(p.ssh_connected.as_deref())
+                    .flatten()
+                    .map(|name| (p.id.as_str(), name))
+            }),
+            Self::Split { children, .. } => children.iter().find_map(Self::ssh_connected_pane),
+        }
+    }
+
+    /// 子树中是否存在右键「SSH 连接」已连上的活 pane;有则返回其连接名(DFS 序首个)。
+    pub fn ssh_connected(&self) -> Option<&str> {
+        self.ssh_connected_pane().map(|(_, name)| name)
     }
 
     /// 深度优先(左到右)收集所有 pane —— 与屏幕上的排列同序。
@@ -1091,6 +1119,9 @@ impl SplitNode {
                 pane.ai_session = None;
                 pane.resume_pending = false;
                 pane.detected_agent = None;
+                if status == PaneStatus::Error {
+                    pane.ssh_connected = None;
+                }
                 if was_ai {
                     pane.osc_title = None;
                 }
@@ -1168,6 +1199,33 @@ mod tests {
         assert_eq!(root.highest_light(), StatusLight::Attention);
         root.pane_by_pty_mut(2).unwrap().status = PaneStatus::Error;
         assert_eq!(root.highest_light(), StatusLight::Error);
+    }
+
+    #[test]
+    fn 右键ssh已连接独立于ai状态并在退出落error时清除() {
+        let mut root = leaf("a", 1);
+        let target = root.panes()[0].id.clone();
+        assert!(root.insert_split(&target, SplitDirection::Horizontal, leaf("b", 2)));
+
+        assert_eq!(root.ssh_connected(), None);
+        root.pane_by_pty_mut(2).unwrap().ssh_connected = Some("prod-vps".into());
+        // 与 AI 状态灯完全正交：highest_light 仍为 Idle
+        assert_eq!(root.highest_light(), StatusLight::Idle);
+        assert_eq!(root.ssh_connected(), Some("prod-vps"));
+
+        // 另一个 pane 进入 AI 工作态：AI 聚合灯优先，ssh_connected 本身不丢
+        root.pane_by_pty_mut(1).unwrap().status = PaneStatus::AiWorking;
+        assert_eq!(root.highest_light(), StatusLight::AiWorking);
+        assert_eq!(root.ssh_connected(), Some("prod-vps"));
+
+        // 退出 AI 后仍能恢复展示 ssh_connected
+        assert!(root.update_status_by_pty(1, PaneStatus::Idle, false, None));
+        assert_eq!(root.highest_light(), StatusLight::Idle);
+        assert_eq!(root.ssh_connected(), Some("prod-vps"));
+
+        // 对应 PTY 退出落 Error：自动清掉 ssh_connected
+        assert!(root.update_status_by_pty(2, PaneStatus::Error, false, None));
+        assert_eq!(root.ssh_connected(), None);
     }
 
     /// 第五档怎么叠出来:attention 只在两个 AI 态上生效,error 永远最高。

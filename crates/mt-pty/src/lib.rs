@@ -531,6 +531,14 @@ impl PtySession {
         self.child.lock().kill().context("kill 失败")
     }
 
+    /// 子进程 PID(portable-pty 在平台拿不到时为 `None`)。
+    ///
+    /// 上层用于按进程树判定终端内派生出的子进程(例如右键「SSH 连接」拉起的
+    /// `ssh` 客户端)是否仍在运行。
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.lock().process_id()
+    }
+
     /// 非阻塞地看一眼子进程是否已退出。
     pub fn try_wait(&mut self) -> Result<Option<u32>> {
         Ok(self.child.lock().try_wait()?.map(|s| s.exit_code()))

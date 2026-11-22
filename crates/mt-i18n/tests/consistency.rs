@@ -282,8 +282,12 @@ use mt_i18n::{
 /// 1921 → 1926（issue #106）：单中转接入多台桌面端 —— 移动端面板新增「本机设备名称」
 /// 输入项与说明（`mobileRelay.{desktopNameLabel,desktopNamePlaceholder,desktopNameHint}`），
 /// 连接状态补两条配置/上限拒绝文案（`mobileRelay.status.{invalidDesktopId,roomLimitReached}`）。
+/// 1926 → 1928：右键「SSH 连接」已连接状态灯的悬停提示文案
+/// （`panels.statusDot.{ssh-connected,sshConnectedWith}`）。
+/// 1928 → 1929：顶栏项目胶囊纳入右键 SSH 已连接项目（新增 `app.titleBar.sshConnected`，
+/// 同步调整 `app.titleBar.noAiProjects` 空态描述）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1926;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1929;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

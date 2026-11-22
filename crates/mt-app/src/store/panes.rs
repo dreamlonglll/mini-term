@@ -1087,6 +1087,10 @@ impl AppStore {
                 }
                 // 启动恢复的续接反查结果,随 PTY 回填一起回来
                 PaneEvent::ResumeCwd(found) => store.apply_resume_cwd(pty_id, found, cx),
+                // 鼠标右键「SSH 连接」的已连接状态变化(独立于 AI 状态)
+                PaneEvent::SshConnected(name) => {
+                    store.set_pane_ssh_connected_by_pty(pty_id, name.clone(), cx)
+                }
             }
         });
         self.pane_subs.insert(pty_id, sub);
@@ -1171,6 +1175,38 @@ impl AppStore {
             return;
         };
         self.set_pane_osc_title(&project_id, &pane_id, title, cx);
+    }
+
+    /// 更新指定 pane 通过鼠标右键「SSH 连接」的已连接状态(`Some(连接名)` / `None`)。
+    ///
+    /// 与 AI 状态完全独立:只发 [`StoreEvent::PaneSshStatusChanged`],不碰托盘、
+    /// 移动端中转与完成账本;PTY 已死(`PaneStatus::Error`)时一律只接受清除。
+    pub fn set_pane_ssh_connected_by_pty(
+        &mut self,
+        pty_id: u32,
+        connected: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((project_id, pane_id)) = find_pane_of_pty(&self.project_states, pty_id) else {
+            return;
+        };
+        let Some(pane) = self
+            .project_states
+            .get_mut(&project_id)
+            .and_then(|s| s.pane_mut(&pane_id))
+        else {
+            return;
+        };
+        let next = if pane.status == PaneStatus::Error {
+            None
+        } else {
+            connected
+        };
+        if pane.ssh_connected == next {
+            return;
+        }
+        pane.ssh_connected = next;
+        cx.changed(StoreEvent::PaneSshStatusChanged);
     }
 
     /// 拖选停留自动复制的参数(`config.selectionAutoCopySecs`)。

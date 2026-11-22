@@ -28,7 +28,8 @@ export const app = {
         idle: "没有正在运行的 AI 会话",
       },
       projectSwitcher: "当前项目，点击切换",
-      noAiProjects: "暂无进入 AI 会话的项目",
+      noAiProjects: "暂无 AI 会话或 SSH 连接的项目",
+      sshConnected: "SSH 已连接",
     },
     update: {
       badge: "新版本 {version}",
@@ -111,7 +112,8 @@ export const app = {
         idle: "No AI sessions running",
       },
       projectSwitcher: "Current project — click to switch",
-      noAiProjects: "No projects with AI sessions",
+      noAiProjects: "No projects with active AI or SSH sessions",
+      sshConnected: "SSH connected",
     },
     update: {
       badge: "New version {version}",

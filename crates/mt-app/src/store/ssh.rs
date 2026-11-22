@@ -650,6 +650,7 @@ impl AppStore {
         pane.attention = false;
         // 上一条 PTY 的退出码随它一起作废(见 `PaneState::clean_exit`)
         pane.clean_exit = false;
+        pane.ssh_connected = None;
         // 旧 shell 报的标题属于上一条会话,新 shell 起来会自己重报;留着的话,
         // 不设标题的 shell 会一直顶着上一条连接的目录名
         pane.osc_title = None;

@@ -202,22 +202,25 @@ pub(super) fn tab_label(
         })
 }
 
-/// tab 最左的图标槽:闲置 pane 画 shell 图标,其余四档画状态灯(含第五档
-/// 「等你处理」,见 [`StatusLight`])。
+/// tab 最左的图标槽:有 AI / 错误 / 待处理状态时画对应状态灯(**AI 状态优先**);
+/// 否则若是鼠标右键「SSH 连接」已连上的终端,画蓝色「已连接」灯(`◉`);
+/// 再否则画 shell 图标。
 ///
-/// `idle` 那颗状态灯是个空心圈,一屏五个闲置终端就是五颗一模一样的 ○,占着
-/// 位置不带任何信息;换成 shell 图标至少能看出这是 pwsh 还是 bash。两个分支都
-/// 塞进同一个固定尺寸的盒子 —— 状态一变(idle ↔ ai-working ↔ 等你处理)标题就
-/// 跟着横跳一格是绝对不行的。展开态 chip 与折叠标题条共用。
+/// 全部落进同一个固定尺寸的盒子 —— 状态一变(shell ↔ 已连接 ↔ ai-working ↔ 等你处理)
+/// 标题绝不横跳。展开态 chip 与折叠标题条共用。
 ///
 /// `contrast` 给挖空语义的笔画(fish 的眼睛)用,传图标所在容器的底色。
 pub(super) fn tab_icon_slot(
+    pane_id: &str,
     light: StatusLight,
+    ssh_connected: Option<&str>,
     shell_name: &str,
     is_active: bool,
     contrast: Hsla,
 ) -> impl IntoElement {
+    let show_ssh = light == StatusLight::Idle && ssh_connected.is_some();
     div()
+        .id(gpui::SharedString::from(format!("tab-icon-{pane_id}")))
         .w(px(TAB_ICON_SLOT))
         .h(px(TAB_ICON_SLOT))
         .flex_none()
@@ -229,7 +232,22 @@ pub(super) fn tab_icon_slot(
         .when(!is_active && light != StatusLight::Attention, |el| {
             el.opacity(0.7)
         })
-        .child(if light == StatusLight::Idle {
+        .when_some(
+            show_ssh.then_some(ssh_connected).flatten(),
+            |el, conn_name| {
+                el.tip(tr!(
+                    "panels",
+                    "statusDot.sshConnectedWith",
+                    name = conn_name.to_string()
+                ))
+            },
+        )
+        .child(if light != StatusLight::Idle {
+            // 动画相位来自进程级墙钟,不带逐元素状态,所以不需要 id
+            ui::status_dot(light).into_any_element()
+        } else if show_ssh {
+            ui::ssh_connected_dot().into_any_element()
+        } else {
             ShellIcon::new(ShellKind::from_shell_name(shell_name))
                 .size(px(14.0))
                 // 「未知」那枚跟随主题色;其余八家写死品牌色
@@ -240,9 +258,6 @@ pub(super) fn tab_icon_slot(
                 })
                 .contrast(contrast)
                 .into_any_element()
-        } else {
-            // 动画相位来自进程级墙钟,不带逐元素状态,所以不需要 id
-            ui::status_dot(light).into_any_element()
         })
 }
 
@@ -570,7 +585,9 @@ impl TerminalArea {
                 // 画的是**显示档位**(四态 + attention):Claude 等授权不再是绿勾、
                 // Codex 等授权不再是转圈,而是第五档的叹号。
                 .child(tab_icon_slot(
+                    &pane.id,
                     pane.light(),
+                    pane.ssh_connected.as_deref(),
                     &pane.shell_name,
                     is_active,
                     // fish 的眼睛是挖空语义,给它 chip 的底色

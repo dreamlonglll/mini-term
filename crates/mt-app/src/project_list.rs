@@ -480,16 +480,18 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
         })
 }
 
-/// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
+/// 完成标 / AI 状态灯 / 右键 SSH 已连接灯三选一,**均无时都不画**。
 ///
-/// 灯按显示档位画(含第五档「等你处理」):项目里有 pane 在等授权,行上就是叹号 ——
-/// 标题栏那颗全局灯撤掉之后,跨项目找「谁在等我」主要就看这一列。
+/// 优先级严格保持 **AI 状态优先**:完成标 > AI/错误/待处理灯(`StatusLight != Idle`) >
+/// 右键「SSH 连接」已连接灯(`◉`)。
 ///
 /// 完成标退场期间(`tag` 还在、`show_done_tag` 已经 false)照旧只画标:收回去之后才轮到灯。
 fn row_status_mark(
+    id: &str,
     show_done_tag: bool,
     tag: Option<&DoneTagAnim>,
     light: StatusLight,
+    ssh_connected: Option<&str>,
 ) -> Option<AnyElement> {
     if let Some(tag) = tag {
         let settled = tag.leaving.is_none() && !tag.transition.running();
@@ -504,7 +506,20 @@ fn row_status_mark(
     } else if light != StatusLight::Idle {
         Some(ui::status_dot(light).into_any_element())
     } else {
-        None
+        ssh_connected.map(|conn_name| {
+            div()
+                .id(SharedString::from(format!("ssh-dot-{id}")))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .tip(tr!(
+                    "panels",
+                    "statusDot.sshConnectedWith",
+                    name = conn_name.to_string()
+                ))
+                .child(ui::ssh_connected_dot())
+                .into_any_element()
+        })
     }
 }
 
@@ -672,6 +687,8 @@ struct Row {
     path: String,
     /// 项目聚合的状态灯档位(含第五档 attention)。
     light: StatusLight,
+    /// 项目内是否存在鼠标右键「SSH 连接」已连上的终端(连接名,AI 状态优先于它)。
+    ssh_connected: Option<String>,
     /// 非激活项目里有 AI 任务完成(行尾那颗绿点)。
     needs_attention: bool,
     /// 领位图标的技术栈;`None` = 走通用目录图标。
@@ -2723,6 +2740,7 @@ impl ProjectList {
                         name: p.name.clone(),
                         path: p.path.clone(),
                         light: state.map(|s| s.highest_light()).unwrap_or_default(),
+                        ssh_connected: state.and_then(|s| s.ssh_connected()).map(str::to_string),
                         needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
                         kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
                         detected_kind,
@@ -3130,6 +3148,7 @@ impl ProjectList {
         } = row;
         let name = row.name.clone();
         let description = row.description.clone();
+        let ssh_connected = row.ssh_connected.clone();
         let ai_vendors = row.ai_vendors.clone();
         let worktree_branch = row.worktree_branch.clone();
         let remote = row.remote.clone();
@@ -3177,8 +3196,14 @@ impl ProjectList {
             // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
             // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
-            // 完成标 / 状态灯二选一,**idle 时两个都不画**
-            .children(row_status_mark(show_done_tag, done_tag, light))
+            // 完成标 / AI 状态灯 / 右键 SSH 已连接灯三选一,**均无时都不画**
+            .children(row_status_mark(
+                id,
+                show_done_tag,
+                done_tag,
+                light,
+                ssh_connected.as_deref(),
+            ))
             // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
             .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
 
