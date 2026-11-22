@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use super::INTRA_LINE_NOISE_RATIO;
+/// 变动词元占比超过它就不细分 —— 整行都变了的时候,细分出来的高亮全是噪音,
+/// 还不如原版那样整行一个底色干净。
+pub const INTRA_LINE_NOISE_RATIO: f32 = 0.6;
 
 /// 一侧超过这么多行就不按块比(取自 Winc 的 `INLINE_LIMIT`):改动段这么长时通常整段都
 /// 改了,逐词标记没有区分度。
@@ -37,11 +39,11 @@ const MAX_EDITS: usize = 400;
 const MAX_WORK: usize = 2_000_000;
 /// 一份 diff 的词级高亮总工作量(各块的 Myers 步数 + 逐对配对的 DP 格子数)。用完了剩下的
 /// 行就整行一个底色 —— 几万行的大改动不能在 UI 线程上卡住一帧。
-pub(super) const DIFF_BUDGET: usize = 20_000_000;
+pub const DIFF_BUDGET: usize = 20_000_000;
 
 /// 一块的词级标记。
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum BlockMarks {
+pub enum BlockMarks {
     /// 按块比出来了:两侧逐行的改动片段(显示文本的字节区间;空 = 整行一个底色)
     Lines {
         old: Vec<Vec<Range<usize>>>,
@@ -53,7 +55,7 @@ pub(super) enum BlockMarks {
 
 /// 一块改动(连续的删除行 `old` + 新增行 `new`,都是显示文本)按块比出词级标记。纯新增 /
 /// 纯删除没得比,两侧都给空。`budget` 是这份 diff 剩下的工作量(见 [`DIFF_BUDGET`])。
-pub(super) fn block_marks(old: &[&str], new: &[&str], budget: &mut usize) -> BlockMarks {
+pub fn block_marks(old: &[&str], new: &[&str], budget: &mut usize) -> BlockMarks {
     if old.is_empty() || new.is_empty() {
         return BlockMarks::Lines {
             old: vec![Vec::new(); old.len()],

@@ -93,12 +93,12 @@ use mt_config::{AppConfig, ConfigStore, SaveError};
 const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// 同一类写盘失败多久只提示一次。
-pub(super) const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
+pub const FAILURE_NOTICE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 写盘失败的类别 —— 去重的粒度。令牌过期不在其列:那是设计内的跳过
 /// (见 [`write_once`]),不是故障。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum FailureKind {
+pub enum FailureKind {
     Serialize,
     Io,
     Db,
@@ -106,11 +106,11 @@ pub(super) enum FailureKind {
 
 /// 一次写盘失败,由写线程交回主线程。
 #[derive(Debug)]
-pub(super) struct SaveFailure {
-    pub(super) kind: FailureKind,
+pub struct SaveFailure {
+    pub kind: FailureKind,
     /// 可直接展示的原因(已去掉 `SaveError` 的「配置写盘失败:」前缀,
     /// toast 正文自己会说)。
-    pub(super) detail: String,
+    pub detail: String,
 }
 
 impl SaveFailure {
@@ -128,14 +128,14 @@ impl SaveFailure {
 
 /// 失败提示的去重闸(主线程持有)。**纯状态**,单测直接驱动。
 #[derive(Default)]
-pub(super) struct FailureThrottle {
+pub struct FailureThrottle {
     last_shown: HashMap<FailureKind, Instant>,
 }
 
 impl FailureThrottle {
     /// 这一类失败现在该不该提示。放行即记下时间;窗口内同类再来一律压掉。
     /// 不同类互不影响 —— 库写失败压不住随后冒出来的另一种故障。
-    pub(super) fn admit(&mut self, kind: FailureKind, now: Instant) -> bool {
+    pub fn admit(&mut self, kind: FailureKind, now: Instant) -> bool {
         if let Some(last) = self.last_shown.get(&kind)
             && now.saturating_duration_since(*last) < FAILURE_NOTICE_INTERVAL
         {
@@ -248,7 +248,7 @@ impl Shared {
 /// 配置落盘的入口:主线程只管入队,写盘在自己的线程上。
 ///
 /// 一个 `AppStore` 一份,随 store 一起活到进程结束。
-pub(super) struct ConfigWriter {
+pub struct ConfigWriter {
     shared: Arc<Shared>,
     handle: Option<JoinHandle<()>>,
 }
@@ -263,7 +263,7 @@ impl ConfigWriter {
     ///
     /// `backup_first`:先给 config.db 留这一代备份,再开始处理保存(见模块注释
     /// 「启动那一代库备份也在这条线程上」)。配置没加载成功时传 `false`。
-    pub(super) fn spawn(
+    pub fn spawn(
         store: Arc<ConfigStore>,
         backup_first: bool,
     ) -> (Self, UnboundedReceiver<SaveFailure>) {
@@ -301,7 +301,7 @@ impl ConfigWriter {
     /// 入队一份快照。**不阻塞**(一次加锁 + 一次唤醒)。
     ///
     /// 写线程起不来时退化成当场同步写 —— 语义不变,只是卡顿回到改造前。
-    pub(super) fn enqueue(&self, store: &ConfigStore, token: u64, config: AppConfig) {
+    pub fn enqueue(&self, store: &ConfigStore, token: u64, config: AppConfig) {
         let snapshot = Snapshot { token, config };
         if self.handle.is_none() {
             write_once(store, &snapshot, &self.shared.failures);
@@ -315,7 +315,7 @@ impl ConfigWriter {
     }
 
     /// 给退出钩子用的排干句柄(`on_app_quit` 的闭包要 `'static`,不能借 store)。
-    pub(super) fn drain_handle(&self) -> DrainHandle {
+    pub fn drain_handle(&self) -> DrainHandle {
         DrainHandle(self.shared.clone())
     }
 }
@@ -339,11 +339,11 @@ impl Drop for ConfigWriter {
 
 /// 退出钩子手上的那一份。克隆自 [`ConfigWriter::drain_handle`]。
 #[derive(Clone)]
-pub(super) struct DrainHandle(Arc<Shared>);
+pub struct DrainHandle(Arc<Shared>);
 
 impl DrainHandle {
     /// 阻塞到 pending 快照全部落盘。
-    pub(super) fn drain(&self) {
+    pub fn drain(&self) {
         self.0.drain();
     }
 }
@@ -516,8 +516,10 @@ mod tests {
 
         let (writer, mut failures) = ConfigWriter::spawn(store.clone(), false);
         for size in [14.0_f64, 15.0, 16.0, 17.0] {
-            let mut config = AppConfig::default();
-            config.ui_font_size = size;
+            let config = AppConfig {
+                ui_font_size: size,
+                ..AppConfig::default()
+            };
             writer.enqueue(&store, token, config);
         }
         writer.drain_handle().drain();

@@ -20,14 +20,14 @@ use mt_project::git::{HunkPick, LinePick};
 
 /// 勾选的内容键:增 / 删 + 原文 + 这段内容在同类行里是第几次出现(0 起,整份 diff 里数)。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct PickKey {
+pub struct PickKey {
     add: bool,
     text: String,
     nth: usize,
 }
 
 /// 能打勾的行种类:`Some(true)` = 新增,`Some(false)` = 删除,其余(上下文 / 认不出)不能勾。
-pub(super) fn pickable_kind(kind: &str) -> Option<bool> {
+pub fn pickable_kind(kind: &str) -> Option<bool> {
     match kind {
         "add" => Some(true),
         "delete" => Some(false),
@@ -64,7 +64,7 @@ fn keys_of_lines(lines: &[(&str, &str)], skip: &BTreeSet<usize>) -> Vec<Option<P
 /// `skip` 是刚才那次块操作已经落下去的行:重取之后它们从 diff 里消失了,数「第几次出现」
 /// 时先把它们剔掉,剩下的勾选才与新 diff 里的计数对得上 —— 否则前面同内容的一行被暂存走,
 /// 后面的编号整体前移,记着「第 2 个 `}`」的勾就会落到原先第 3 个 `}` 上。
-pub(super) fn pick_keys(
+pub fn pick_keys(
     lines: &[(&str, &str)],
     picks: &BTreeSet<usize>,
     skip: &BTreeSet<usize>,
@@ -81,7 +81,7 @@ pub(super) fn pick_keys(
 }
 
 /// 重取之后:新 diff 里内容键还对得上的行(下标进新的 `lines`)。
-pub(super) fn remap_picks(lines: &[(&str, &str)], keys: &HashSet<PickKey>) -> BTreeSet<usize> {
+pub fn remap_picks(lines: &[(&str, &str)], keys: &HashSet<PickKey>) -> BTreeSet<usize> {
     if keys.is_empty() {
         return BTreeSet::new();
     }
@@ -95,7 +95,7 @@ pub(super) fn remap_picks(lines: &[(&str, &str)], keys: &HashSet<PickKey>) -> BT
 
 /// 拍平行下标属于第几块。`hunk_base[k]` 是第 k 块的第一行,末尾多一个 = 块里的总行数;
 /// 落在块外(展开出来的上下文行)是 `None`。
-pub(super) fn hunk_of(hunk_base: &[usize], ix: usize) -> Option<usize> {
+pub fn hunk_of(hunk_base: &[usize], ix: usize) -> Option<usize> {
     let end = *hunk_base.last()?;
     if ix >= end {
         return None;
@@ -105,7 +105,7 @@ pub(super) fn hunk_of(hunk_base: &[usize], ix: usize) -> Option<usize> {
 
 /// 勾选按块分组成后端要的 [`HunkPick`](块号递增,行号是块内下标)。`only = Some(k)` 只要
 /// 第 k 块的。
-pub(super) fn group_picks(
+pub fn group_picks(
     hunk_base: &[usize],
     picks: &BTreeSet<usize>,
     only: Option<usize>,

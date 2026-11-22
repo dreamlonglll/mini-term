@@ -109,7 +109,7 @@ pub struct FlatRow {
 pub fn merge_lineage_edges(disk: Vec<LineageEdge>, bookkept: Vec<LineageEdge>) -> Vec<LineageEdge> {
     let mut by_child: std::collections::HashMap<String, LineageEdge> = Default::default();
     let mut order: Vec<String> = Vec::new();
-    for e in bookkept.into_iter().chain(disk.into_iter()) {
+    for e in bookkept.into_iter().chain(disk) {
         if !by_child.contains_key(&e.session_id) {
             order.push(e.session_id.clone());
         }
@@ -159,7 +159,9 @@ pub fn build_session_tree(
             if !seen.insert(hop) {
                 return None;
             }
-            let Some(next) = parent_of.get(hop) else { break };
+            let Some(next) = parent_of.get(hop) else {
+                break;
+            };
             let next_parent = edges[*next].parent_session_id.as_str();
             if !index_of.contains_key(next_parent) {
                 break;
@@ -318,7 +320,10 @@ mod tests {
     /// 磁盘边压过自记账边(同一个 child 两边都有时,磁盘那条留下)。
     #[test]
     fn 边合并磁盘优先() {
-        let merged = merge_lineage_edges(vec![edge("c", "disk-parent")], vec![edge("c", "book-parent")]);
+        let merged = merge_lineage_edges(
+            vec![edge("c", "disk-parent")],
+            vec![edge("c", "book-parent")],
+        );
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].parent_session_id, "disk-parent");
 
@@ -343,7 +348,11 @@ mod tests {
             .collect::<Vec<_>>();
         let edges = vec![edge("c1", "r1"), edge("c2", "r1")];
         let rows = flatten_session_tree(&build_session_tree(&ids, &ts, &edges));
-        assert_eq!(order(&rows, &ids), vec!["r1", "c1", "c2", "r2"], "子按时间升序");
+        assert_eq!(
+            order(&rows, &ids),
+            vec!["r1", "c1", "c2", "r2"],
+            "子按时间升序"
+        );
         assert_eq!(prefixes(&rows), vec!["", "├─ ", "└─ ", ""]);
     }
 
@@ -359,15 +368,19 @@ mod tests {
             edge("b1", "b"),
         ];
         let rows = flatten_session_tree(&build_session_tree(&ids, &ts, &edges));
-        assert_eq!(order(&rows, &ids), vec!["r", "a", "a1", "b", "b1"], "先根深度优先");
+        assert_eq!(
+            order(&rows, &ids),
+            vec!["r", "a", "a1", "b", "b1"],
+            "先根深度优先"
+        );
         assert_eq!(
             prefixes(&rows),
             vec![
                 "",
-                "├─ ",     // a 不是最后一个孩子
-                "│  └─ ",  // a1 在 a 下,祖先 a 非末位 → 竖线延续
-                "└─ ",     // b 是最后一个孩子
-                "   └─ ",  // b1 的祖先 b 是末位 → 留白
+                "├─ ",    // a 不是最后一个孩子
+                "│  └─ ", // a1 在 a 下,祖先 a 非末位 → 竖线延续
+                "└─ ",    // b 是最后一个孩子
+                "   └─ ", // b1 的祖先 b 是末位 → 留白
             ]
         );
     }

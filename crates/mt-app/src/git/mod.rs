@@ -9,7 +9,6 @@ pub mod branches;
 pub mod changes;
 pub mod conflict;
 pub mod diff;
-pub mod dir_watch;
 pub mod file_history;
 pub mod graph;
 pub mod history;
@@ -17,5 +16,6 @@ pub mod panel;
 pub mod push;
 pub mod stash;
 pub mod ui;
-pub mod watch;
 pub mod worktree;
+
+pub use mt_app_core::git::{dir_watch, watch};

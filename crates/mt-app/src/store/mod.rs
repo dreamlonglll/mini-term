@@ -62,16 +62,16 @@ use crate::tree::{PaneState, ProjectPanel, SplitNode, StatusLight};
 
 mod ai;
 mod commands;
-mod config_writer;
 mod events;
 mod layout;
-mod layout_writer;
 mod panes;
 mod prefs;
 mod projects;
 mod pure;
 mod reopen;
 mod ssh;
+
+pub(crate) use mt_app_core::{config_writer, layout_writer};
 
 use config_writer::ConfigWriter;
 use layout_writer::LayoutWriter;

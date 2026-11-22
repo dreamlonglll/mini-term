@@ -181,9 +181,18 @@ mod tests {
     /// 左右两格:向右到右格,向左回左格,上下没有邻居。
     #[test]
     fn 左右分屏的四向导航() {
-        let rects = vec![rect("a", 0.0, 0.0, 500.0, 800.0), rect("b", 500.0, 0.0, 500.0, 800.0)];
-        assert_eq!(adjacent_pane(&rects, "a", Direction::Right).as_deref(), Some("b"));
-        assert_eq!(adjacent_pane(&rects, "b", Direction::Left).as_deref(), Some("a"));
+        let rects = vec![
+            rect("a", 0.0, 0.0, 500.0, 800.0),
+            rect("b", 500.0, 0.0, 500.0, 800.0),
+        ];
+        assert_eq!(
+            adjacent_pane(&rects, "a", Direction::Right).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            adjacent_pane(&rects, "b", Direction::Left).as_deref(),
+            Some("a")
+        );
         assert_eq!(adjacent_pane(&rects, "a", Direction::Up), None);
         assert_eq!(adjacent_pane(&rects, "a", Direction::Down), None);
     }
@@ -191,9 +200,18 @@ mod tests {
     /// 上下两格。
     #[test]
     fn 上下分屏的导航() {
-        let rects = vec![rect("a", 0.0, 0.0, 800.0, 300.0), rect("b", 0.0, 300.0, 800.0, 300.0)];
-        assert_eq!(adjacent_pane(&rects, "a", Direction::Down).as_deref(), Some("b"));
-        assert_eq!(adjacent_pane(&rects, "b", Direction::Up).as_deref(), Some("a"));
+        let rects = vec![
+            rect("a", 0.0, 0.0, 800.0, 300.0),
+            rect("b", 0.0, 300.0, 800.0, 300.0),
+        ];
+        assert_eq!(
+            adjacent_pane(&rects, "a", Direction::Down).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            adjacent_pane(&rects, "b", Direction::Up).as_deref(),
+            Some("a")
+        );
     }
 
     /// 田字格:向右取正对面那格,而不是斜对角(交叉轴惩罚 ×2 的作用)。
@@ -205,10 +223,22 @@ mod tests {
             rect("bl", 0.0, 300.0, 400.0, 300.0),
             rect("br", 400.0, 300.0, 400.0, 300.0),
         ];
-        assert_eq!(adjacent_pane(&rects, "tl", Direction::Right).as_deref(), Some("tr"));
-        assert_eq!(adjacent_pane(&rects, "tl", Direction::Down).as_deref(), Some("bl"));
-        assert_eq!(adjacent_pane(&rects, "br", Direction::Left).as_deref(), Some("bl"));
-        assert_eq!(adjacent_pane(&rects, "br", Direction::Up).as_deref(), Some("tr"));
+        assert_eq!(
+            adjacent_pane(&rects, "tl", Direction::Right).as_deref(),
+            Some("tr")
+        );
+        assert_eq!(
+            adjacent_pane(&rects, "tl", Direction::Down).as_deref(),
+            Some("bl")
+        );
+        assert_eq!(
+            adjacent_pane(&rects, "br", Direction::Left).as_deref(),
+            Some("bl")
+        );
+        assert_eq!(
+            adjacent_pane(&rects, "br", Direction::Up).as_deref(),
+            Some("tr")
+        );
     }
 
     /// 跨层 split:右边一列被再切成上下两格时,从左格向右应落到几何上更近的那个。
@@ -229,7 +259,10 @@ mod tests {
     /// 零尺寸的格子(还没布局出来 / 隐藏)不参与,起点缺失时不动。
     #[test]
     fn 零尺寸与缺失起点都不动() {
-        let rects = vec![rect("a", 0.0, 0.0, 500.0, 800.0), rect("b", 500.0, 0.0, 0.0, 0.0)];
+        let rects = vec![
+            rect("a", 0.0, 0.0, 500.0, 800.0),
+            rect("b", 500.0, 0.0, 0.0, 0.0),
+        ];
         assert_eq!(adjacent_pane(&rects, "a", Direction::Right), None);
         assert_eq!(adjacent_pane(&rects, "missing", Direction::Right), None);
     }
@@ -237,7 +270,10 @@ mod tests {
     /// 完全重叠(容差之内)不算「在该方向上」。
     #[test]
     fn 完全重叠不算相邻() {
-        let rects = vec![rect("a", 0.0, 0.0, 500.0, 800.0), rect("b", 0.5, 0.0, 500.0, 800.0)];
+        let rects = vec![
+            rect("a", 0.0, 0.0, 500.0, 800.0),
+            rect("b", 0.5, 0.0, 500.0, 800.0),
+        ];
         assert_eq!(adjacent_pane(&rects, "a", Direction::Right), None);
     }
 }

@@ -1,0 +1,32 @@
+[package]
+name = "mt-app-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+# mt-app 的非 GPUI 应用域逻辑与服务层:布局树 / 持久化写线程 / 任务标记 /
+# 项目树与 SSH 分组纯逻辑 / 会话分支森林 / PTY 槽位 / SSH 活动抄送协议 /
+# 文件树与 Git 监听及 diff 算法。
+#
+# **铁律**:绝不依赖 gpui / gpui-component / mt-ui(由 tests/layers.test.cjs 守门),
+# 自动进入 .github/scripts/non_gpui_packages.mjs 的 Windows 快速单测集合。
+
+[dependencies]
+mt-ai.workspace = true
+mt-config.workspace = true
+mt-core.workspace = true
+mt-layout.workspace = true
+mt-project.workspace = true
+mt-pty.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+ring = "0.17"
+serde_json.workspace = true
+tracing.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

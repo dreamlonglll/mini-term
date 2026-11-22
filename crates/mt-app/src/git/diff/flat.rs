@@ -14,7 +14,7 @@ pub(super) const INTRA_LINE_MAX_CELLS: usize = 120_000;
 
 /// 变动词元占比超过它就不细分 —— 整行都变了的时候,细分出来的高亮全是噪音,
 /// 还不如原版那样整行一个底色干净。
-pub(super) const INTRA_LINE_NOISE_RATIO: f32 = 0.6;
+pub(super) use super::word_diff::INTRA_LINE_NOISE_RATIO;
 
 /// 词元类别。相邻同类字符并成一个词元;`Other`(标点/符号)一个字符一个词元。
 ///

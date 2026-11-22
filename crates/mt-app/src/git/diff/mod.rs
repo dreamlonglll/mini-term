@@ -92,14 +92,13 @@
 //! `loading → error → isBinary → tooLarge → 正常`(`DiffModal.tsx:233-259`)。
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
 
-mod fold;
 mod pages;
-mod picks;
 mod ribbon;
 mod selection;
 mod split;
 mod tab;
-mod word_diff;
+
+use mt_app_core::git::{diff_fold as fold, diff_picks as picks, diff_word as word_diff};
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};

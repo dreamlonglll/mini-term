@@ -455,12 +455,11 @@ impl Record {
     }
 
     /// 列表里一共占几项:头部 + 输出行 + 状态行。
-    #[cfg(test)]
     pub fn row_count(&self) -> usize {
         1 + self.output.row_count() + self.status_rows()
     }
 
-    pub(super) fn take_dirty(&mut self) -> Option<usize> {
+    pub fn take_dirty(&mut self) -> Option<usize> {
         self.dirty_from.take()
     }
 
@@ -645,7 +644,7 @@ impl Activity {
         self.records.iter()
     }
 
-    pub(super) fn records_mut(&mut self) -> impl Iterator<Item = &mut Record> {
+    pub fn records_mut(&mut self) -> impl Iterator<Item = &mut Record> {
         self.records.iter_mut()
     }
 

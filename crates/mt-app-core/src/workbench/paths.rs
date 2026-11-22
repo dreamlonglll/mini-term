@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// 按哪种语义比路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PathSemantics {
+pub enum PathSemantics {
     /// Windows 本地:`\` 与 `/` 都是分隔符,不分大小写。
     Windows,
     /// POSIX:只有 `/` 是分隔符,大小写有意义。
@@ -18,7 +18,7 @@ pub(super) enum PathSemantics {
 
 impl PathSemantics {
     /// 文件页签的路径按哪种语义比:远程一律 POSIX,本地看宿主平台。
-    pub(super) fn for_document(remote: bool) -> Self {
+    pub fn for_document(remote: bool) -> Self {
         if !remote && cfg!(windows) {
             Self::Windows
         } else {
@@ -76,13 +76,13 @@ fn segments_under<'a>(path: &'a str, base: &str, sem: PathSemantics) -> Option<V
 }
 
 /// `path` 是不是 `base` 本身或在它之下(删除用:被删的是目录时,它下面的页签都算)。
-pub(super) fn is_within(path: &Path, base: &Path, sem: PathSemantics) -> bool {
+pub fn is_within(path: &Path, base: &Path, sem: PathSemantics) -> bool {
     segments_under(&path.to_string_lossy(), &base.to_string_lossy(), sem).is_some()
 }
 
 /// 重命名 / 移动之后 `path` 该换成什么:`path` 就是 `from` 或在它之下时,把 `from` 那一截
 /// 换成 `to`、剩下的各段原样接上(分隔符随 `to`);不相干的路径返回 `None`。
-pub(super) fn rebase(path: &Path, from: &Path, to: &Path, sem: PathSemantics) -> Option<PathBuf> {
+pub fn rebase(path: &Path, from: &Path, to: &Path, sem: PathSemantics) -> Option<PathBuf> {
     let path = path.to_string_lossy();
     let rest = segments_under(&path, &from.to_string_lossy(), sem)?;
     Some(PathBuf::from(join_segments(
@@ -93,7 +93,7 @@ pub(super) fn rebase(path: &Path, from: &Path, to: &Path, sem: PathSemantics) ->
 }
 
 /// 路径的最后一段(页签标题):按同一套分隔符切,尾随分隔符不算。
-pub(super) fn leaf_name(path: &Path, sem: PathSemantics) -> String {
+pub fn leaf_name(path: &Path, sem: PathSemantics) -> String {
     let text = path.to_string_lossy();
     sem.segments(&text)
         .last()

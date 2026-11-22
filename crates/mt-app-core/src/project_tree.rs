@@ -22,6 +22,20 @@ use mt_config::{AppConfig, ProjectConfig, ProjectGroup, ProjectTreeItem};
 /// 分组嵌套上限(含项目那一层)。与 `projectTree.ts:3` 同值。
 pub const MAX_DEPTH: usize = 3;
 
+/// before/after 落点 → 插入下标。
+///
+/// `dragged_idx` 只在被拖项**原本就在同一父级**时才传:先删后插会让它后面的
+/// 元素统统前移一格,所以下标要补偿 1(`ProjectList.tsx:592-595` 的那三行)。
+pub fn insert_index(target_idx: usize, dragged_idx: Option<usize>, after: bool) -> usize {
+    let mut idx = if after { target_idx + 1 } else { target_idx };
+    if let Some(dragged_idx) = dragged_idx
+        && dragged_idx < idx
+    {
+        idx -= 1;
+    }
+    idx
+}
+
 // ─── 节点类型判断 ─────────────────────────────────────────────
 
 pub fn item_id(item: &ProjectTreeItem) -> &str {
@@ -92,7 +106,11 @@ pub fn contains_id(items: &[ProjectTreeItem], id: &str) -> bool {
 }
 
 /// 落进组里(`inside`)合法吗:无自环 且 落地后深度不超 [`MAX_DEPTH`]。
-pub fn can_drop(tree: &[ProjectTreeItem], target_group_id: &str, dragged: &ProjectTreeItem) -> bool {
+pub fn can_drop(
+    tree: &[ProjectTreeItem],
+    target_group_id: &str,
+    dragged: &ProjectTreeItem,
+) -> bool {
     let dragged_id = item_id(dragged);
     if dragged_id == target_group_id {
         return false;
@@ -129,7 +147,11 @@ pub fn can_drop_at(tree: &[ProjectTreeItem], target_id: &str, dragged: &ProjectT
 
 /// 节点所在的父组 id。顶层 → `None`,找不到也 → `None`(与 TS 同口径)。
 pub fn find_parent_group_id(tree: &[ProjectTreeItem], target_id: &str) -> Option<String> {
-    fn walk(items: &[ProjectTreeItem], target: &str, parent: Option<&str>) -> Option<Option<String>> {
+    fn walk(
+        items: &[ProjectTreeItem],
+        target: &str,
+        parent: Option<&str>,
+    ) -> Option<Option<String>> {
         for item in items {
             if item_id(item) == target {
                 return Some(parent.map(str::to_string));
@@ -248,10 +270,7 @@ pub fn insert_into_tree(
 }
 
 /// 删组:**组员(含子组)原位晋升到父级**,一个都不删。
-pub fn remove_group_and_promote_children(
-    tree: &mut Vec<ProjectTreeItem>,
-    group_id: &str,
-) -> bool {
+pub fn remove_group_and_promote_children(tree: &mut Vec<ProjectTreeItem>, group_id: &str) -> bool {
     for i in 0..tree.len() {
         if let ProjectTreeItem::Group(group) = &tree[i] {
             if group.id == group_id {
@@ -637,7 +656,10 @@ mod tests {
 
     #[test]
     fn 深度按层数从零起算() {
-        let tree = vec![proj("a"), group("g1", vec![proj("b"), group("g2", vec![proj("c")])])];
+        let tree = vec![
+            proj("a"),
+            group("g1", vec![proj("b"), group("g2", vec![proj("c")])]),
+        ];
         assert_eq!(get_depth(&tree, "a"), Some(0));
         assert_eq!(get_depth(&tree, "g1"), Some(0));
         assert_eq!(get_depth(&tree, "b"), Some(1));
@@ -708,7 +730,10 @@ mod tests {
 
     #[test]
     fn 摘节点递归进分组() {
-        let mut tree = vec![proj("a"), group("g1", vec![proj("b"), group("g2", vec![proj("c")])])];
+        let mut tree = vec![
+            proj("a"),
+            group("g1", vec![proj("b"), group("g2", vec![proj("c")])]),
+        ];
         let removed = remove_from_tree(&mut tree, "c").expect("c 在 g2 里");
         assert_eq!(item_id(&removed), "c");
         assert_eq!(dump(&tree), "a,g1[b,g2[]]");
@@ -737,7 +762,12 @@ mod tests {
     #[test]
     fn 插入找不到目标组时返回假且不改树() {
         let mut tree = vec![proj("a")];
-        assert!(!insert_into_tree(&mut tree, Some("查无此组"), proj("b"), None));
+        assert!(!insert_into_tree(
+            &mut tree,
+            Some("查无此组"),
+            proj("b"),
+            None
+        ));
         assert_eq!(dump(&tree), "a");
     }
 
@@ -751,14 +781,21 @@ mod tests {
     /// 删组不删项目:组员**原位**晋升到父级,顺序不变。
     #[test]
     fn 删组组员原位晋升() {
-        let mut tree = vec![proj("头"), group("g1", vec![proj("a"), group("g2", vec![proj("b")])]), proj("尾")];
+        let mut tree = vec![
+            proj("头"),
+            group("g1", vec![proj("a"), group("g2", vec![proj("b")])]),
+            proj("尾"),
+        ];
         assert!(remove_group_and_promote_children(&mut tree, "g1"));
         assert_eq!(dump(&tree), "头,a,g2[b],尾");
     }
 
     #[test]
     fn 删嵌套子组也走同一条路() {
-        let mut tree = vec![group("g1", vec![proj("a"), group("g2", vec![proj("b"), proj("c")])])];
+        let mut tree = vec![group(
+            "g1",
+            vec![proj("a"), group("g2", vec![proj("b"), proj("c")])],
+        )];
         assert!(remove_group_and_promote_children(&mut tree, "g2"));
         assert_eq!(dump(&tree), "g1[a,b,c]");
         assert!(!remove_group_and_promote_children(&mut tree, "查无此组"));
@@ -792,7 +829,10 @@ mod tests {
 
     #[test]
     fn 父组定位顶层为空() {
-        let tree = vec![proj("a"), group("g1", vec![proj("b"), group("g2", vec![proj("c")])])];
+        let tree = vec![
+            proj("a"),
+            group("g1", vec![proj("b"), group("g2", vec![proj("c")])]),
+        ];
         assert_eq!(find_parent_group_id(&tree, "a"), None);
         assert_eq!(find_parent_group_id(&tree, "g1"), None);
         assert_eq!(find_parent_group_id(&tree, "b").as_deref(), Some("g1"));
@@ -877,10 +917,7 @@ mod tests {
         );
         let ordered = get_ordered_tree(&config);
         assert_eq!(
-            ordered
-                .iter()
-                .map(|i| i.id())
-                .collect::<Vec<_>>(),
+            ordered.iter().map(|i| i.id()).collect::<Vec<_>>(),
             vec!["p1", "wt", "p2"]
         );
         assert_eq!(
@@ -1076,10 +1113,20 @@ mod tests {
         let mut tree = vec![proj("a")];
         assert!(insert_into_tree(&mut tree, None, group("g1", vec![]), None));
         assert_eq!(dump(&tree), "a,g1[]");
-        assert!(insert_into_tree(&mut tree, Some("g1"), group("g2", vec![]), None));
+        assert!(insert_into_tree(
+            &mut tree,
+            Some("g1"),
+            group("g2", vec![]),
+            None
+        ));
         assert_eq!(dump(&tree), "a,g1[g2[]]");
         // 父组不存在 → 返回 false,树原样
-        assert!(!insert_into_tree(&mut tree, Some("没这组"), group("g3", vec![]), None));
+        assert!(!insert_into_tree(
+            &mut tree,
+            Some("没这组"),
+            group("g3", vec![]),
+            None
+        ));
         assert_eq!(dump(&tree), "a,g1[g2[]]");
     }
 
@@ -1109,7 +1156,7 @@ mod tests {
         // 把 a 拖到 b 之后
         let target_idx = index_in_parent(&tree, None, "b").expect("b 在");
         let dragged_idx = index_in_parent(&tree, None, "a");
-        let idx = crate::dnd::insert_index(target_idx, dragged_idx, true);
+        let idx = insert_index(target_idx, dragged_idx, true);
         let item = remove_from_tree(&mut tree, "a").expect("a 在");
         assert!(insert_into_tree(&mut tree, None, item, Some(idx)));
         assert_eq!(dump(&tree), "b,a,c");
@@ -1122,7 +1169,7 @@ mod tests {
         // 把 c 拖到 a 之前
         let target_idx = index_in_parent(&tree, None, "a").expect("a 在");
         let dragged_idx = index_in_parent(&tree, None, "c");
-        let idx = crate::dnd::insert_index(target_idx, dragged_idx, false);
+        let idx = insert_index(target_idx, dragged_idx, false);
         let item = remove_from_tree(&mut tree, "c").expect("c 在");
         assert!(insert_into_tree(&mut tree, None, item, Some(idx)));
         assert_eq!(dump(&tree), "c,a,b");
@@ -1162,8 +1209,20 @@ mod tests {
     fn 移动目标为自己或子孙时原树不动() {
         let mut tree = vec![group("g1", vec![proj("p1"), group("g2", vec![])])];
         let mut projects = vec![project_cfg("p1", None)];
-        assert!(!move_item_in_tree(&mut tree, &mut projects, "g1", Some("g1"), None));
-        assert!(!move_item_in_tree(&mut tree, &mut projects, "g1", Some("g2"), None));
+        assert!(!move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "g1",
+            Some("g1"),
+            None
+        ));
+        assert!(!move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "g1",
+            Some("g2"),
+            None
+        ));
         assert_eq!(dump(&tree), "g1[p1,g2[]]");
     }
 
@@ -1172,7 +1231,13 @@ mod tests {
     fn 目标组消失时分组原样退回根层() {
         let mut tree = vec![group("g1", vec![proj("p1"), proj("p2")]), proj("外")];
         let mut projects: Vec<ProjectConfig> = Vec::new();
-        assert!(move_item_in_tree(&mut tree, &mut projects, "g1", Some("查无此组"), None));
+        assert!(move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "g1",
+            Some("查无此组"),
+            None
+        ));
         assert_eq!(dump(&tree), "外,g1[p1,p2]");
     }
 
@@ -1182,9 +1247,21 @@ mod tests {
     fn 树外孤儿项目移动时收编入组() {
         let mut tree = vec![group("g1", vec![])];
         let mut projects = vec![project_cfg("孤儿", None)];
-        assert!(move_item_in_tree(&mut tree, &mut projects, "孤儿", Some("g1"), None));
+        assert!(move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "孤儿",
+            Some("g1"),
+            None
+        ));
         assert_eq!(dump(&tree), "g1[孤儿]");
-        assert!(!move_item_in_tree(&mut tree, &mut projects, "查无此项", None, None));
+        assert!(!move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "查无此项",
+            None,
+            None
+        ));
         assert_eq!(dump(&tree), "g1[孤儿]");
     }
 
@@ -1193,7 +1270,13 @@ mod tests {
     fn 子项目移动即脱离父项目() {
         let mut tree = vec![proj("父"), group("g1", vec![])];
         let mut projects = vec![project_cfg("父", None), project_cfg("子", Some("父"))];
-        assert!(move_item_in_tree(&mut tree, &mut projects, "子", Some("g1"), None));
+        assert!(move_item_in_tree(
+            &mut tree,
+            &mut projects,
+            "子",
+            Some("g1"),
+            None
+        ));
         assert_eq!(dump(&tree), "父,g1[子]");
         assert_eq!(projects[1].parent_project_id, None);
     }

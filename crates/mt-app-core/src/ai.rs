@@ -53,8 +53,8 @@ pub struct AiBridge {
 
 impl AiBridge {
     /// Real perception state without a hook server, polling thread, or data-dir lookup.
-    #[cfg(test)]
-    pub(crate) fn for_git_test(data_dir: PathBuf) -> Self {
+    #[doc(hidden)]
+    pub fn for_git_test(data_dir: PathBuf) -> Self {
         let (tx, _rx) = mpsc::unbounded();
         Self {
             perception: AiPerception::new(Arc::new(ChannelSink { tx })),
@@ -69,7 +69,7 @@ impl AiBridge {
         let perception = AiPerception::new(Arc::new(ChannelSink { tx }));
         // 数据目录统一走 mt_config —— hook-server.json 与 usage.db 必须落在
         // 与装机版同一个目录下(见迁移文档的技术债清单)。
-        let data_dir = crate::app_data_dir();
+        let data_dir = mt_config::active_data_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let live_panes: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let bridge = Self {

@@ -134,6 +134,8 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # 工作区内部
 # ---------------------------------------------------------------------------
 mt-ai = { path = "crates/mt-ai" }
+# mt-app 的非 GPUI 应用域逻辑与服务层(布局树 / 写线程 / 监听 / diff 算法等,不依赖 gpui)。
+mt-app-core = { path = "crates/mt-app-core" }
 mt-config = { path = "crates/mt-config" }
 # tauri-free 的叶子共享库(收尾-1 批自 `src-tauri/mt-core` 移入):WSL UNC 解析 /
 # SSH 提示扫描 + ANSI 剥离 / 原子写 / SshConnection / 临时私钥落盘。

@@ -33,7 +33,7 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 /// 单个项目的一条待落盘布局动作。
 #[derive(Debug, Clone)]
-pub(super) enum ProjectLayoutOp {
+pub enum ProjectLayoutOp {
     Save {
         layout: SavedProjectLayout,
         now_ms: i64,
@@ -43,13 +43,13 @@ pub(super) enum ProjectLayoutOp {
 
 /// 主线程一次 `flush_layout_now` 采集出来的不可变脏快照。
 #[derive(Debug, Clone, Default)]
-pub(super) struct LayoutBatch {
+pub struct LayoutBatch {
     pub globals: Option<GlobalLayout>,
     pub projects: Vec<(String, ProjectLayoutOp)>,
 }
 
 impl LayoutBatch {
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.globals.is_none() && self.projects.is_empty()
     }
 }
@@ -153,18 +153,18 @@ impl Shared {
 
 /// 退出前等待全部待写布局落盘的轻量句柄,可跨 `App::on_app_quit` 闭包持有。
 #[derive(Clone)]
-pub(super) struct LayoutDrainHandle {
+pub struct LayoutDrainHandle {
     shared: Arc<Shared>,
 }
 
 impl LayoutDrainHandle {
-    pub(super) fn drain(&self) {
+    pub fn drain(&self) {
         self.shared.drain();
     }
 }
 
 /// `layout.db` 后台单写者。
-pub(super) struct LayoutWriter {
+pub struct LayoutWriter {
     store: Arc<LayoutStore>,
     shared: Arc<Shared>,
     /// `None` = 写线程启动失败,退回主线程同步写盘。
@@ -172,7 +172,7 @@ pub(super) struct LayoutWriter {
 }
 
 impl LayoutWriter {
-    pub(super) fn spawn(store: Arc<LayoutStore>) -> Self {
+    pub fn spawn(store: Arc<LayoutStore>) -> Self {
         let shared = Arc::new(Shared::new());
         let worker_store = store.clone();
         let worker_shared = shared.clone();
@@ -194,7 +194,7 @@ impl LayoutWriter {
     }
 
     /// 投递一批布局变更。写线程不可用时同步直写。
-    pub(super) fn enqueue(&self, batch: LayoutBatch) {
+    pub fn enqueue(&self, batch: LayoutBatch) {
         if batch.is_empty() {
             return;
         }
@@ -209,7 +209,7 @@ impl LayoutWriter {
     }
 
     /// 供 `App::on_app_quit` 持有的同步排干句柄。
-    pub(super) fn drain_handle(&self) -> LayoutDrainHandle {
+    pub fn drain_handle(&self) -> LayoutDrainHandle {
         LayoutDrainHandle {
             shared: self.shared.clone(),
         }

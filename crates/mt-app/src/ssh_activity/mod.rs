@@ -25,9 +25,9 @@
 //!
 //! 日志纪律:本模块的 `eprintln!` 只写连接数 / 错误类别,**绝不写命令原文或输出**。
 
-mod model;
 mod view;
-mod wire;
+
+use mt_app_core::ssh_activity::{model, wire};
 
 use std::sync::OnceLock;
 

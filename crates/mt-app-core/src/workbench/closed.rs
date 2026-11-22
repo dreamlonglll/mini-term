@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use super::paths::{self, PathSemantics};
 
 /// 栈里最多记几条。再多就从最早关掉的那条开始丢。
-pub(super) const MAX_CLOSED_TABS: usize = 20;
+pub const MAX_CLOSED_TABS: usize = 20;
 
 /// 关掉的一个文件页签。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ClosedTab {
+pub struct ClosedTab {
     /// 打开时的原样路径(本地是平台路径,远程是 POSIX 路径)。
     pub path: PathBuf,
     /// 来源:远程(SSH)还是本地。重开时项目已经换了形态(本地 ↔ 远程)就不认。
@@ -38,19 +38,19 @@ impl ClosedTab {
 
 /// 已关闭页签栈。栈顶在 `items` 末尾。
 #[derive(Debug, Default)]
-pub(super) struct ClosedTabs {
+pub struct ClosedTabs {
     items: Vec<ClosedTab>,
 }
 
 impl ClosedTabs {
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// 一批关掉的页签入栈。`batch` 按页签条从左到右给:**倒着压**,最左那个落在栈顶 ——
     /// 逐个重开时先回来的是最左边的,各自插回原来的位置,顺序就还原了。单个关闭就是只有
     /// 一条的批。同一个文件已经在栈里的,先摘掉旧的那条(只留最近关的那次)。
-    pub(super) fn push_batch(&mut self, batch: Vec<ClosedTab>) {
+    pub fn push_batch(&mut self, batch: Vec<ClosedTab>) {
         for tab in batch.into_iter().rev() {
             self.items.retain(|existing| !existing.same_file(&tab));
             self.items.push(tab);
@@ -60,13 +60,13 @@ impl ClosedTabs {
     }
 
     /// 从栈顶往下的快照:重开时按这个次序一条条试,第一条还在的那个就是要开的。
-    pub(super) fn candidates(&self) -> Vec<ClosedTab> {
+    pub fn candidates(&self) -> Vec<ClosedTab> {
         self.items.iter().rev().cloned().collect()
     }
 
     /// 摘掉这些条目(重开成功的那一条,与试过但文件已不在的那些)。按内容认、各摘一条:
     /// 试的这一会儿又有新关掉的页签压上来也不受影响。
-    pub(super) fn remove(&mut self, done: &[ClosedTab]) {
+    pub fn remove(&mut self, done: &[ClosedTab]) {
         for tab in done {
             if let Some(index) = self.items.iter().rposition(|existing| existing == tab) {
                 self.items.remove(index);
@@ -75,7 +75,7 @@ impl ClosedTabs {
     }
 
     /// 文件树里改名 / 移动了 `from`(文件或目录):栈里在它之下的路径跟着换成 `to` 之下。
-    pub(super) fn rebase(&mut self, from: &Path, to: &Path, remote: bool) {
+    pub fn rebase(&mut self, from: &Path, to: &Path, remote: bool) {
         let sem = PathSemantics::for_document(remote);
         for tab in self.items.iter_mut().filter(|tab| tab.remote == remote) {
             if let Some(path) = paths::rebase(&tab.path, from, to, sem) {
@@ -85,7 +85,7 @@ impl ClosedTabs {
     }
 
     /// 文件树里删掉了 `path`(文件或目录):栈里在它之下的条目一并丢掉,重开也开不出来。
-    pub(super) fn forget_within(&mut self, path: &Path, remote: bool) {
+    pub fn forget_within(&mut self, path: &Path, remote: bool) {
         let sem = PathSemantics::for_document(remote);
         self.items
             .retain(|tab| tab.remote != remote || !paths::is_within(&tab.path, path, sem));
@@ -94,7 +94,7 @@ impl ClosedTabs {
 
 /// 重开时挑出来的结果,见 [`pick_reopen`]。
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct ReopenPick {
+pub struct ReopenPick {
     /// 试过但开不出来的(文件已经不在 / 来源对不上),要从栈里摘掉。
     pub tried: Vec<ClosedTab>,
     /// 第一条还在的,就重开它。
@@ -107,7 +107,7 @@ pub(super) struct ReopenPick {
 /// 本地 / 远程形态)或 `exists` 说文件已经不在的跳过,第一条还在的就是要重开的。
 /// `exists` 报错就停下 —— 断网时不该把整个栈当成「全都不在了」丢掉。阻塞(`exists` 要碰盘 /
 /// 走 SFTP),调用方丢后台。
-pub(super) fn pick_reopen(
+pub fn pick_reopen(
     candidates: Vec<ClosedTab>,
     remote: bool,
     mut exists: impl FnMut(&Path) -> Result<bool, String>,

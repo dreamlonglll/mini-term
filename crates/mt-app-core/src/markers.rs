@@ -604,7 +604,13 @@ pub fn format_time(ts: i64) -> String {
 pub fn truncate_line(s: &str, max: usize) -> String {
     let flat: String = s
         .chars()
-        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     if flat.chars().count() <= max {
         return flat;
@@ -731,7 +737,10 @@ mod tests {
 
         assert!(prune(&mut list, 10_000, 10_000), "饱和了,全删");
         assert!(list.is_empty());
-        assert!(!prune(&mut list, 10_000, 10_000), "空列表上再跑一遍是空操作");
+        assert!(
+            !prune(&mut list, 10_000, 10_000),
+            "空列表上再跑一遍是空操作"
+        );
 
         // 饱和期再打点:push + prune 是同一次,净效果是列表仍然空的
         marker(&mut list, "c", 30);
@@ -742,7 +751,10 @@ mod tests {
     /// 指纹口径:定锚与校验必须走同一个函数,同文本必然同值、不同文本必然不同值。
     #[test]
     fn 指纹按行文本定值() {
-        assert_eq!(fingerprint_line("> 帮我看看这段"), fingerprint_line("> 帮我看看这段"));
+        assert_eq!(
+            fingerprint_line("> 帮我看看这段"),
+            fingerprint_line("> 帮我看看这段")
+        );
         assert_ne!(fingerprint_line("> a"), fingerprint_line("> b"));
         // 被 ESC[2K 擦白之后就是空串 —— 与任何有内容的行都不同,这正是判据的支点
         assert_ne!(fingerprint_line(""), fingerprint_line("> a"));
@@ -841,7 +853,11 @@ mod tests {
 
         // 探针对 100 交回任意内容(挂着的条目本来就没有「原来那行」可言)
         assert!(!prune_stale(&mut list, |anchor| Some(fingerprint_line(
-            if anchor == 100 { "每帧都在变的动态区" } else { "> b" }
+            if anchor == 100 {
+                "每帧都在变的动态区"
+            } else {
+                "> b"
+            }
         ))));
         assert_eq!(list.len(), 2, "挂着的那条必须留住");
         assert!(list[0].anchor.is_pending());
@@ -1046,14 +1062,21 @@ mod tests {
         let 空屏 = screen(&[]);
 
         // bottom = 1000、屏高 24 → 起点推到 1000 - 24 + 1 = 977,最后一屏留着
-        assert!(!relocate_pending(&mut list, 1000, 24, &空屏), "没补上不算变过");
+        assert!(
+            !relocate_pending(&mut list, 1000, 24, &空屏),
+            "没补上不算变过"
+        );
         assert_eq!(list[0].anchor, MarkerAnchor::Pending { from: 977 });
 
         // 缓冲区还没长够一屏时不推进(算出来的起点比原来还靠上)
         let mut 短的 = Vec::new();
         pending(&mut 短的, "等不到的这句", 100);
         assert!(!relocate_pending(&mut 短的, 110, 24, &空屏));
-        assert_eq!(短的[0].anchor, MarkerAnchor::Pending { from: 100 }, "不能往回退");
+        assert_eq!(
+            短的[0].anchor,
+            MarkerAnchor::Pending { from: 100 },
+            "不能往回退"
+        );
 
         // 留下的那一屏里后来打出了那条消息 —— 推进过也照样找得到
         let 上屏了 = screen(&[(990, "> 等不到的这句")]);
@@ -1093,7 +1116,11 @@ mod tests {
     fn 行首装饰逐层剥掉() {
         assert_eq!(strip_line_decoration("  > hi"), "hi");
         assert_eq!(strip_line_decoration("│ ❯ hi"), "hi", "TUI 常常套两层");
-        assert_eq!(strip_line_decoration("hi > there"), "hi > there", "只剥行首");
+        assert_eq!(
+            strip_line_decoration("hi > there"),
+            "hi > there",
+            "只剥行首"
+        );
         assert_eq!(strip_line_decoration(""), "");
         assert_eq!(strip_line_decoration(">>>"), "");
     }

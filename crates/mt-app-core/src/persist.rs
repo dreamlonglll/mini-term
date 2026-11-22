@@ -178,21 +178,22 @@ mod tests {
     use mt_config::ShellConfig;
 
     fn config() -> AppConfig {
-        let mut c = AppConfig::default();
-        c.available_shells = vec![
-            ShellConfig {
-                name: "PowerShell".into(),
-                command: "powershell.exe".into(),
-                args: None,
-            },
-            ShellConfig {
-                name: "cmd".into(),
-                command: "cmd.exe".into(),
-                args: None,
-            },
-        ];
-        c.default_shell = "PowerShell".into();
-        c
+        AppConfig {
+            available_shells: vec![
+                ShellConfig {
+                    name: "PowerShell".into(),
+                    command: "powershell.exe".into(),
+                    args: None,
+                },
+                ShellConfig {
+                    name: "cmd".into(),
+                    command: "cmd.exe".into(),
+                    args: None,
+                },
+            ],
+            default_shell: "PowerShell".into(),
+            ..AppConfig::default()
+        }
     }
 
     fn leaf(shell: &str) -> SplitNode {
@@ -257,7 +258,11 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].custom_title, None);
         assert_eq!(back[1].custom_title.as_deref(), Some("构建"));
-        assert_eq!(active.as_deref(), Some(back[1].id.as_str()), "活动面板是第 1 个");
+        assert_eq!(
+            active.as_deref(),
+            Some(back[1].id.as_str()),
+            "活动面板是第 1 个"
+        );
     }
 
     /// 活动下标越界(手改/旧数据)→ 回落第一个面板,不 panic。
@@ -395,7 +400,10 @@ mod tests {
 
         let saved = serialize_layout(&one_panel(tree), 0);
         let json = serde_json::to_string(&saved).unwrap();
-        assert!(!json.contains("resume"), "磁盘格式里不许出现这个字段: {json}");
+        assert!(
+            !json.contains("resume"),
+            "磁盘格式里不许出现这个字段: {json}"
+        );
 
         // 没有 ai_session 的 pane 转一圈回来标记必须是 false(不是被"记住"了)
         let back = restore_first(&saved, &config());

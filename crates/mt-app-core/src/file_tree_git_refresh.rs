@@ -25,7 +25,7 @@ const PLAN_PATH_CAP: usize = 256;
 
 /// 去抖期间攒下的刷新理由。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(super) struct GitRefreshPlan {
+pub struct GitRefreshPlan {
     /// 无条件拉:切项目 / 手动刷新 / 终端里跑了 git / Git 面板点名 / `.git` 出现或消失
     pub force: bool,
     /// `.git` 内部变了:比签名,变了才拉
@@ -57,11 +57,11 @@ impl GitRefreshPlan {
 }
 
 /// 多仓库项目的签名表(按仓库路径排好):仓库路径 → 签名(读不到为 `None`)。
-pub(super) type RepoSigs = Vec<(PathBuf, Option<RepoSignature>)>;
+pub type RepoSigs = Vec<(PathBuf, Option<RepoSignature>)>;
 
 /// 这条变化是不是项目里某个仓库的 git 目录里的(`<任意层>/.git` 或其下)。文件树只监听
 /// 列出来的目录,`.git` 永远隐藏、从不展开,所以实际只会看到「`<dir>/.git` 被修改」这一种。
-pub(super) fn is_git_internal(root: &Path, path: &Path) -> bool {
+pub fn is_git_internal(root: &Path, path: &Path) -> bool {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components().any(|c| c.as_os_str() == ".git")
 }
@@ -79,7 +79,7 @@ fn path_key(path: &Path) -> String {
 
 /// 把路径分到**最深**的那个包含它的仓库下(嵌套仓库里的改动归嵌套的那个)。返回按仓库
 /// 下标分好的组,以及有没有落在所有仓库之外的路径。
-pub(super) fn group_by_repo(
+pub fn group_by_repo(
     repos: &[PathBuf],
     paths: &HashSet<PathBuf>,
 ) -> (Vec<(usize, Vec<PathBuf>)>, bool) {
@@ -113,7 +113,7 @@ pub(super) fn group_by_repo(
 /// 攒下的路径里有没有值得拉一次的:任一仓库里有没被忽略的,或者有落在所有仓库之外的
 /// (认不出归属时宁可多拉一次 —— 路径写法对不上不该吞掉一次刷新)。项目里一个仓库都没有
 /// 时什么都不必拉。`unignored` 是 [`mt_project::git::any_unignored_change`] 的替身(单测用)。
-pub(super) fn paths_need_refresh(
+pub fn paths_need_refresh(
     repos: &[PathBuf],
     paths: &HashSet<PathBuf>,
     mut unignored: impl FnMut(&Path, &[PathBuf]) -> bool,
@@ -129,7 +129,7 @@ pub(super) fn paths_need_refresh(
 ///
 /// 返回 `None` = 不必拉(签名没变 / 全是被忽略的路径);`Some((签名表, 状态))` = 拉了,
 /// 签名是拉状态**之前**读的。`known` 是上次拉状态时记下的签名表。
-pub(super) fn run_plan(
+pub fn run_plan(
     root: &Path,
     plan: &GitRefreshPlan,
     known: Option<&RepoSigs>,

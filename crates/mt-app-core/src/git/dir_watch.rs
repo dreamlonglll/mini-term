@@ -147,6 +147,12 @@ pub struct GitDirWatch {
     target: Option<Target>,
 }
 
+impl Default for GitDirWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GitDirWatch {
     pub fn new() -> Self {
         let shared = Arc::new(Mutex::new(Shared::default()));
@@ -433,6 +439,12 @@ pub struct WorktreeWatch {
     watcher: FsWatcher,
     shared: Arc<Mutex<WorkShared>>,
     target: Option<WorkTarget>,
+}
+
+impl Default for WorktreeWatch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorktreeWatch {

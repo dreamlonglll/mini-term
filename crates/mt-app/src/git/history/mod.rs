@@ -79,7 +79,8 @@
 
 mod actions;
 mod detail;
-mod selection;
+
+use mt_app_core::git::history_selection as selection;
 
 pub use actions::GitLogRewordConfirm;
 pub(crate) use actions::REWORD_CONTEXT;

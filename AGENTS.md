@@ -71,7 +71,8 @@ tools/promo/build.sh
 
 | crate | 职责 |
 |-------|------|
-| `mt-app` | GPUI 应用壳：Workspace 组件树、AppStore 全局状态、SplitNode 布局树、各面板/弹窗/托盘/标题栏。组件树图见 `main.rs` 模块注释 |
+| `mt-app` | GPUI 应用壳：Workspace 组件树、AppStore 全局状态、各面板/弹窗/托盘/标题栏。组件树图见 `main.rs` 模块注释 |
+| `mt-app-core` | `mt-app` 下沉的非 GPUI 应用域逻辑与服务层：SplitNode 布局树与序列化、任务标记、项目树与 SSH 分组纯逻辑、会话分支森林、PTY 槽位、config/layout 后台单写者、SSH 活动抄送协议、文件树/Git 监听与 diff 算法。不依赖 gpui / mt-ui / mt-remote（`unsafe_code = "forbid"`），自动归入 Windows 快速单测集 |
 | `mt-ui` | GPUI 渲染层：终端 view/element、主题桥。不含业务逻辑。**不依赖 mt-config / mt-i18n / mt-project**（前两者改得勤，一改就连带重编这两万多行；后者带 git2）：终端查找条文案由宿主注入（`TerminalSearchBar::new` 的 labels 参数），技术栈徽标按落盘字符串查表（`TechIcon::new(kind.as_str())`）。内嵌 Nerd Font 图标字体（`assets/fonts/`，`terminal/symbols.rs`）：Windows 上 gpui 的回退表只认系统已装字体，内嵌字体进不去，所以是渲染层逐格把主字体缺的私用区图标换成该字体的 run，不是往 `font_fallbacks` 里加名字 |
 | `mt-terminal` | VT 状态机 + grid 模型（alacritty_terminal 封装）。不依赖 gpui |
 | `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载；mt-app `main()` 启动时调一次，必须早于任何 spawn） |

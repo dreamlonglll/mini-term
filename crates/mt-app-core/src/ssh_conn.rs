@@ -76,10 +76,7 @@ impl GroupBuckets {
 
 /// 按分组归类连接。具名分组 = 连接中出现的组(按首次出现顺序)∪ 显式创建的
 /// `ssh_groups`(允许空组);未分组连接单独成桶。
-pub fn build_group_buckets(
-    connections: &[SshConnection],
-    ssh_groups: &[String],
-) -> GroupBuckets {
+pub fn build_group_buckets(connections: &[SshConnection], ssh_groups: &[String]) -> GroupBuckets {
     let mut named: Vec<(String, Vec<SshConnection>)> = Vec::new();
     let ensure = |named: &mut Vec<(String, Vec<SshConnection>)>, name: &str| -> usize {
         if let Some(i) = named.iter().position(|(g, _)| g == name) {
@@ -115,7 +112,11 @@ pub fn build_group_buckets(
 /// 逐条 trim、丢空名、**按首次出现去重** —— 重命名成一个已存在的组名时
 /// 两个桶自然合并成一个,而不是留下两条同名条目(原版注释:「重命名为已有
 /// 组名时自然合并,去重」)。连接的 `group` 字段由调用方另行改名。
-pub fn merge_ssh_groups_on_rename(groups: &[String], old_name: &str, new_name: &str) -> Vec<String> {
+pub fn merge_ssh_groups_on_rename(
+    groups: &[String],
+    old_name: &str,
+    new_name: &str,
+) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::new();
     for raw in groups {
@@ -322,8 +323,7 @@ pub fn remote_project_name(name: &str, remote_path: &str) -> String {
     }
     remote_path
         .split('/')
-        .filter(|s| !s.is_empty())
-        .next_back()
+        .rfind(|s| !s.is_empty())
         .unwrap_or(remote_path)
         .to_string()
 }
@@ -784,14 +784,23 @@ mod tests {
     #[test]
     fn rename_keeps_order_and_drops_blank_names() {
         let groups = ids(&["a", "", "  ", "b"]);
-        assert_eq!(merge_ssh_groups_on_rename(&groups, "a", "z"), ids(&["z", "b"]));
+        assert_eq!(
+            merge_ssh_groups_on_rename(&groups, "a", "z"),
+            ids(&["z", "b"])
+        );
         // 老名字不在表里(只有连接带着它)→ 列表原样保留(去空白/去重)
-        assert_eq!(merge_ssh_groups_on_rename(&groups, "x", "y"), ids(&["a", "b"]));
+        assert_eq!(
+            merge_ssh_groups_on_rename(&groups, "x", "y"),
+            ids(&["a", "b"])
+        );
     }
 
     #[test]
     fn remote_project_name_falls_back_to_last_path_segment() {
-        assert_eq!(remote_project_name("  我的项目 ", "/home/u/proj"), "我的项目");
+        assert_eq!(
+            remote_project_name("  我的项目 ", "/home/u/proj"),
+            "我的项目"
+        );
         assert_eq!(remote_project_name("", "/home/u/proj"), "proj");
         assert_eq!(remote_project_name("  ", "/home/u/proj/"), "proj");
         // 根目录:末段取不到 → 用整条路径
@@ -1193,7 +1202,10 @@ mod tests {
         assert!(!is_remote_project(&p));
         p.ssh_connection_id = Some("c1".into());
         assert!(is_remote_project(&p));
-        assert_eq!(remote_connection(&p, &conns).map(|c| c.id.as_str()), Some("c1"));
+        assert_eq!(
+            remote_connection(&p, &conns).map(|c| c.id.as_str()),
+            Some("c1")
+        );
         assert_eq!(remote_pane_label(&p, &conns), "n-c1");
         // 断链:连接被删 → 标签回退 'ssh',但项目仍是远程项目
         p.ssh_connection_id = Some("gone".into());

@@ -60,8 +60,7 @@
 //! 后台探文件还在不在([`closed::pick_reopen`]),不在的跳过,第一条还在的插回原位置、定位到
 //! 关闭时那一行;已经开着的直接切过去。全都不在时页签条右端给一行就地提示,几秒后自己收。
 
-mod closed;
-mod paths;
+use mt_app_core::workbench::{closed, paths};
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};

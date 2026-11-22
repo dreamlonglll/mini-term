@@ -44,9 +44,10 @@
 //! 只读取数的调度(同一时刻一份 + 脏位补跑)在 [`flight`]。
 
 mod change_tree;
-pub mod flight;
 pub mod gate;
 mod icons;
+
+pub use mt_app_core::git::flight;
 
 pub use change_tree::*;
 pub use icons::*;

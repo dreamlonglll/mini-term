@@ -52,8 +52,14 @@ mod tests {
     /// 格式与装机版逐字符一致:5 位右对齐的毫秒数 + `ms] rust: ` + 标签。
     #[test]
     fn 日志行格式与装机版一致() {
-        assert_eq!(format_mark(0, "run() enter"), "[startup +    0ms] rust: run() enter");
-        assert_eq!(format_mark(12, "setup exit"), "[startup +   12ms] rust: setup exit");
+        assert_eq!(
+            format_mark(0, "run() enter"),
+            "[startup +    0ms] rust: run() enter"
+        );
+        assert_eq!(
+            format_mark(12, "setup exit"),
+            "[startup +   12ms] rust: setup exit"
+        );
         // 超过 5 位不截断,只是不再对齐(装机版 `{:>5}` 同款行为)
         assert_eq!(format_mark(123456, "x"), "[startup +123456ms] rust: x");
     }

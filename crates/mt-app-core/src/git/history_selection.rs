@@ -20,13 +20,13 @@ use mt_project::git::GitCommitInfo;
 
 /// 单击时的修饰键(`toggle` = Ctrl/Cmd,`range` = Shift)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct ClickMods {
-    pub(super) toggle: bool,
-    pub(super) range: bool,
+pub struct ClickMods {
+    pub toggle: bool,
+    pub range: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(super) struct CommitSelection {
+pub struct CommitSelection {
     selected: HashSet<String>,
     anchor: Option<String>,
     lead: Option<String>,
@@ -37,20 +37,20 @@ fn index_of(commits: &[GitCommitInfo], hash: &str) -> Option<usize> {
 }
 
 impl CommitSelection {
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.selected.len()
     }
 
-    pub(super) fn contains(&self, hash: &str) -> bool {
+    pub fn contains(&self, hash: &str) -> bool {
         self.selected.contains(hash)
     }
 
     /// 只选中了一个时是它。
-    pub(super) fn single(&self) -> Option<&str> {
+    pub fn single(&self) -> Option<&str> {
         match self.selected.len() {
             1 => self.selected.iter().next().map(String::as_str),
             _ => None,
@@ -59,21 +59,21 @@ impl CommitSelection {
 
     /// 当前行(可能已被 Ctrl 单击取消选中,仍是键盘移动的起点)。
     #[cfg(test)]
-    pub(super) fn lead(&self) -> Option<&str> {
+    pub fn lead(&self) -> Option<&str> {
         self.lead.as_deref()
     }
 
     #[cfg(test)]
-    pub(super) fn anchor(&self) -> Option<&str> {
+    pub fn anchor(&self) -> Option<&str> {
         self.anchor.as_deref()
     }
 
-    pub(super) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         *self = Self::default();
     }
 
     /// 单选这一个(锚点、当前行都落在它上面)。
-    pub(super) fn select_only(&mut self, hash: &str) {
+    pub fn select_only(&mut self, hash: &str) {
         self.selected.clear();
         self.selected.insert(hash.to_string());
         self.anchor = Some(hash.to_string());
@@ -81,12 +81,12 @@ impl CommitSelection {
     }
 
     /// 选中的 hash(无序)。
-    pub(super) fn hashes(&self) -> impl Iterator<Item = &str> {
+    pub fn hashes(&self) -> impl Iterator<Item = &str> {
         self.selected.iter().map(String::as_str)
     }
 
     /// 选中的提交,按列表顺序。
-    pub(super) fn ordered<'a>(&self, commits: &'a [GitCommitInfo]) -> Vec<&'a GitCommitInfo> {
+    pub fn ordered<'a>(&self, commits: &'a [GitCommitInfo]) -> Vec<&'a GitCommitInfo> {
         commits
             .iter()
             .filter(|c| self.selected.contains(&c.hash))
@@ -112,7 +112,7 @@ impl CommitSelection {
     }
 
     /// 单击第 `index` 行(修饰键口径见模块注释)。
-    pub(super) fn click(&mut self, commits: &[GitCommitInfo], index: usize, mods: ClickMods) {
+    pub fn click(&mut self, commits: &[GitCommitInfo], index: usize, mods: ClickMods) {
         let Some(hash) = commits.get(index).map(|c| c.hash.clone()) else {
             return;
         };
@@ -134,7 +134,7 @@ impl CommitSelection {
 
     /// 键盘移动当前行。`extend = false` 是单选移动(↑/↓);`true` 是锚点不动、选择换成
     /// 锚点..新当前行(Shift+↑/↓)。还没有当前行时落到第一行。返回新当前行的下标。
-    pub(super) fn move_lead(
+    pub fn move_lead(
         &mut self,
         commits: &[GitCommitInfo],
         delta: isize,
@@ -163,7 +163,7 @@ impl CommitSelection {
 
     /// 列表重载之后:只留还在列表里的提交。当前行 / 锚点不在了就落到剩下的第一个
     /// 选中项上(都没了就清掉)。返回选中集合变没变。
-    pub(super) fn retain(&mut self, commits: &[GitCommitInfo]) -> bool {
+    pub fn retain(&mut self, commits: &[GitCommitInfo]) -> bool {
         let present: HashSet<&str> = commits.iter().map(|c| c.hash.as_str()).collect();
         let before = self.selected.len();
         self.selected.retain(|hash| present.contains(hash.as_str()));
@@ -194,7 +194,18 @@ impl CommitSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::graph::test_commit;
+
+    fn test_commit(hash: &str, parents: &[&str]) -> GitCommitInfo {
+        GitCommitInfo {
+            hash: hash.to_string(),
+            short_hash: hash.chars().take(7).collect(),
+            message: format!("msg {hash}"),
+            body: None,
+            author: "tester".into(),
+            timestamp: 0,
+            parent_hashes: parents.iter().map(|p| p.to_string()).collect(),
+        }
+    }
 
     /// c0(最新)… c5(最旧)。
     fn commits() -> Vec<GitCommitInfo> {

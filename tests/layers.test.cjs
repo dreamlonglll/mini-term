@@ -76,6 +76,12 @@ const CLOSURE_BANS = [
     rule: 'mt-remote 不许依赖 gpui',
     source: 'AGENTS.md crate 表 mt-remote 行「不依赖 gpui」+ crates/mt-remote/Cargo.toml',
   },
+  {
+    crate: 'mt-app-core',
+    ban: ['gpui-pre', 'gpui-fast', 'mt-ui', 'mt-remote'],
+    rule: 'mt-app-core 不许依赖 gpui / mt-ui / mt-remote',
+    source: 'AGENTS.md crate 表 mt-app-core 行「不依赖 gpui」+ crates/mt-app-core/Cargo.toml',
+  },
 ];
 
 /**

@@ -5450,7 +5450,6 @@ name = "mt-app"
 version = "1.14.3"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
  "chrono",
  "futures",
  "gpui-base",
@@ -5466,6 +5465,7 @@ dependencies = [
  "markdown",
  "mermaid-rs-renderer",
  "mt-ai",
+ "mt-app-core",
  "mt-config",
  "mt-core",
  "mt-i18n",
@@ -5507,6 +5507,26 @@ dependencies = [
  "windows-core 0.61.2",
  "winresource",
  "zed-reqwest",
+]
+
+[[package]]
+name = "mt-app-core"
+version = "1.14.3"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "mt-ai",
+ "mt-config",
+ "mt-core",
+ "mt-layout",
+ "mt-project",
+ "mt-pty",
+ "parking_lot",
+ "ring",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

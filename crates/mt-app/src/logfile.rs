@@ -50,6 +50,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 const INTERNAL_LOG_TARGETS: &[&str] = &[
     "mini_term",
     "mt_app",
+    "mt_app_core",
     "mt_ai",
     "mt_config",
     "mt_layout",

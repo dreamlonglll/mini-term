@@ -28,12 +28,12 @@ use std::rc::Rc;
 use mt_project::git::DiffHunk;
 
 /// 「向上 / 向下展开」一次露出多少行(GitHub 的口径)。
-pub(super) const EXPAND_STEP: u32 = 20;
+pub const EXPAND_STEP: u32 = 20;
 
 /// 两块之间没改动的一段:两侧起始行号(1 起)+ 行数。两侧行数必然相同 —— 中间全是
 /// 两侧逐行相等的行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct Gap {
+pub struct Gap {
     pub old_from: u32,
     pub new_from: u32,
     pub len: u32,
@@ -68,7 +68,7 @@ fn side_span(hunk: &DiffHunk, old: bool) -> (u32, u32) {
 /// diff 不画「N 行未改动」)。
 ///
 /// 防御:两侧算出来的行数理应相同,不同时取小的;越出全文的部分截掉。
-pub(super) fn gaps(hunks: &[DiffHunk], old_len: usize, new_len: usize) -> Vec<Gap> {
+pub fn gaps(hunks: &[DiffHunk], old_len: usize, new_len: usize) -> Vec<Gap> {
     if hunks.is_empty() {
         return Vec::new();
     }
@@ -103,7 +103,7 @@ pub(super) fn gaps(hunks: &[DiffHunk], old_len: usize, new_len: usize) -> Vec<Ga
 
 /// 一段 gap 切出来的显示段(区间是 gap 内的偏移)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Run {
+pub enum Run {
     /// 展开着的连续行
     Shown(Range<u32>),
     /// 仍折着的一段(画成一条分隔行)
@@ -111,7 +111,7 @@ pub(super) enum Run {
 }
 
 /// 按「gap 里第 i 行展开了没有」把一段 gap 切成显示段。只有一行的折叠直接显示(见模块注释)。
-pub(super) fn gap_runs(len: u32, shown: impl Fn(u32) -> bool) -> Vec<Run> {
+pub fn gap_runs(len: u32, shown: impl Fn(u32) -> bool) -> Vec<Run> {
     let mut out: Vec<Run> = Vec::new();
     let mut at = 0u32;
     while at < len {
@@ -134,7 +134,7 @@ pub(super) fn gap_runs(len: u32, shown: impl Fn(u32) -> bool) -> Vec<Run> {
 
 /// 眼下仍折着的一段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Fold {
+pub struct Fold {
     /// 属于第几段 gap([`gaps`] 的下标)
     pub gap: usize,
     /// 折着的行在 gap 里的偏移区间 `[start, start + len)`
@@ -153,7 +153,7 @@ pub(super) struct Fold {
 
 /// 分隔行上的三种展开。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Expand {
+pub enum Expand {
     /// 露出最上面 [`EXPAND_STEP`] 行(接着上面的内容往下)
     Down,
     /// 露出最下面 [`EXPAND_STEP`] 行(接着下面的内容往上)
@@ -163,7 +163,7 @@ pub(super) enum Expand {
 }
 
 /// 这一次展开露出 gap 里的哪几行(偏移区间)。
-pub(super) fn reveal_range(fold: &Fold, how: Expand) -> Range<u32> {
+pub fn reveal_range(fold: &Fold, how: Expand) -> Range<u32> {
     let end = fold.start + fold.len;
     let step = EXPAND_STEP.min(fold.len);
     match how {
@@ -175,7 +175,7 @@ pub(super) fn reveal_range(fold: &Fold, how: Expand) -> Range<u32> {
 
 /// 分隔行上该画哪几颗展开按钮:`(向下, 向上)`。剩的行不多于一步时只给「全部展开」——
 /// 向上 / 向下各露 20 行与全部展开是同一回事。
-pub(super) fn step_buttons(fold: &Fold) -> (bool, bool) {
+pub fn step_buttons(fold: &Fold) -> (bool, bool) {
     if fold.len <= EXPAND_STEP {
         return (false, false);
     }
@@ -184,25 +184,25 @@ pub(super) fn step_buttons(fold: &Fold) -> (bool, bool) {
 
 /// 展开过的上下文行(见模块注释「展开状态记行号 + 内容」)。
 #[derive(Debug, Default, Clone)]
-pub(super) struct Revealed {
+pub struct Revealed {
     by_old: HashMap<u32, Rc<str>>,
     by_new: HashMap<u32, Rc<str>>,
 }
 
 impl Revealed {
-    pub(super) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.by_old.is_empty() && self.by_new.is_empty()
     }
 
     /// 记下一行:两侧行号 + 原文。
-    pub(super) fn insert(&mut self, old: u32, new: u32, text: &str) {
+    pub fn insert(&mut self, old: u32, new: u32, text: &str) {
         let text: Rc<str> = Rc::from(text);
         self.by_old.insert(old, text.clone());
         self.by_new.insert(new, text);
     }
 
     /// 这一行(两侧行号 + 原文)展开过没有:任一侧行号对得上、且那一行的内容没变。
-    pub(super) fn contains(&self, old: u32, new: u32, text: &str) -> bool {
+    pub fn contains(&self, old: u32, new: u32, text: &str) -> bool {
         let same =
             |map: &HashMap<u32, Rc<str>>, no: u32| map.get(&no).is_some_and(|t| **t == *text);
         same(&self.by_old, old) || same(&self.by_new, new)

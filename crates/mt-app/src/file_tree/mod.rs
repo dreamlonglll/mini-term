@@ -120,13 +120,14 @@ use crate::menu::MenuEntry;
 use crate::store::AppStore;
 use crate::ui;
 
-mod git_refresh;
 mod menu;
 mod move_to;
 mod ops;
 mod recycle;
 #[cfg(test)]
 mod tests;
+
+use mt_app_core::file_tree_git_refresh as git_refresh;
 
 use git_refresh::{GitRefreshPlan, RepoSigs};
 

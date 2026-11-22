@@ -151,7 +151,7 @@ impl FeedEvent {
 
 /// 一帧解码之后的形态。
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Frame {
+pub enum Frame {
     Start { nonce: String, info: StartInfo },
     Out { stream: Stream, data: Vec<u8> },
     End(EndInfo),
@@ -159,7 +159,7 @@ pub(crate) enum Frame {
 
 /// 帧解码失败的类别(只用于断开时的日志类别与单测)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FrameError {
+pub enum FrameError {
     /// 不是合法 JSON。
     Json,
     /// JSON 对,但形状不对(不是对象 / `type` 不认识 / 缺必填字段 / 字段类型不对)。
@@ -171,7 +171,7 @@ pub(crate) enum FrameError {
 }
 
 /// 解一行 NDJSON(已去掉行尾换行)。
-pub(crate) fn parse_frame(line: &[u8]) -> Result<Frame, FrameError> {
+pub fn parse_frame(line: &[u8]) -> Result<Frame, FrameError> {
     let value: Value = serde_json::from_slice(line).map_err(|_| FrameError::Json)?;
     let obj = value.as_object().ok_or(FrameError::Shape)?;
     match obj.get("type").and_then(Value::as_str) {
@@ -258,12 +258,12 @@ fn parse_end(obj: &Map<String, Value>) -> EndInfo {
 }
 
 /// nonce 的形状:32 个小写十六进制字符(128 bit)。
-pub(crate) fn is_nonce(s: &str) -> bool {
+pub fn is_nonce(s: &str) -> bool {
     s.len() == 32 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// 新起一个 128 bit 随机 nonce(小写 hex)。系统随机源出错时返回 `None` —— 调用方就不注入变量。
-pub(crate) fn new_nonce() -> Option<String> {
+pub fn new_nonce() -> Option<String> {
     let mut bytes = [0u8; 16];
     SystemRandom::new().fill(&mut bytes).ok()?;
     Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
@@ -344,7 +344,7 @@ fn is_timeout(kind: io::ErrorKind) -> bool {
 
 /// 一条连接的结局(日志类别 + 单测)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Served {
+pub enum Served {
     /// 首帧阶段就断开,没有产生任何事件。
     Rejected(&'static str),
     /// 收到 `end`。
@@ -358,7 +358,7 @@ pub(crate) enum Served {
 /// - `resolve`:nonce → pty_id(只读 nonce 表);
 /// - `lift_deadline`:`start` 认过之后调一次,撤掉首帧期限(真 socket 上是取消读超时);
 /// - `sink`:事件出口。
-pub(crate) fn serve<R: Read>(
+pub fn serve<R: Read>(
     reader: &mut BufReader<R>,
     call: u64,
     resolve: &dyn Fn(&str) -> Option<u32>,

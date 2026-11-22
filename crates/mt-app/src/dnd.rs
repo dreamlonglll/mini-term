@@ -140,19 +140,7 @@ pub fn hit_ratio(bounds: Bounds<Pixels>, position: Point<Pixels>) -> Option<f32>
     Some((y / height).clamp(0.0, 1.0))
 }
 
-/// before/after 落点 → 插入下标。
-///
-/// `dragged_idx` 只在被拖项**原本就在同一父级**时才传:先删后插会让它后面的
-/// 元素统统前移一格,所以下标要补偿 1(`ProjectList.tsx:592-595` 的那三行)。
-pub fn insert_index(target_idx: usize, dragged_idx: Option<usize>, after: bool) -> usize {
-    let mut idx = if after { target_idx + 1 } else { target_idx };
-    if let Some(dragged_idx) = dragged_idx
-        && dragged_idx < idx
-    {
-        idx -= 1;
-    }
-    idx
-}
+pub use crate::project_tree::insert_index;
 
 // ─── pane 拖拽的两个几何判档 ──────────────────────────────────
 

@@ -113,7 +113,10 @@ mod tests {
     fn 改名时默认项跟着改() {
         let mut l = list();
         l.update(0, shell("pwsh"));
-        assert_eq!(l.default_shell, "pwsh", "默认项不跟着改就会指向不存在的名字");
+        assert_eq!(
+            l.default_shell, "pwsh",
+            "默认项不跟着改就会指向不存在的名字"
+        );
 
         // 改非默认行不动默认
         l.update(1, shell("cmd2"));

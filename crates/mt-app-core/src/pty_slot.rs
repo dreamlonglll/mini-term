@@ -41,7 +41,7 @@
 use anyhow::Result;
 
 /// 会话一侧要用到的四个口。生产实现是 [`mt_pty::PtySession`];抽出来只为单测。
-pub(crate) trait PtyPort {
+pub trait PtyPort {
     /// 用户输入(观察器旁路 + 解除 SSH 自动填充,见 `PtySession::write`)。
     fn write(&self, bytes: &[u8]) -> Result<()>;
     /// 终端自己的应答(不解除自动填充、不经观察器)。
@@ -80,7 +80,7 @@ enum PendingWrite {
 
 /// 会话还在后台起的时候攒下的一切。
 #[derive(Default)]
-pub(crate) struct Pending {
+pub struct Pending {
     writes: Vec<PendingWrite>,
     /// 最新一次 `(rows, cols)`。只留最后一次:中间尺寸下发出去只会让 TUI 多重绘几遍。
     size: Option<(u16, u16)>,
@@ -90,7 +90,7 @@ pub(crate) struct Pending {
 
 /// 对外可见的阶段(给「是否存活」一类的查询用)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PtyPhase {
+pub enum PtyPhase {
     /// 后台还在起(或还在反查启动目录 / 做远程预检)。
     Starting,
     Running,
@@ -100,7 +100,7 @@ pub(crate) enum PtyPhase {
     Closed,
 }
 
-pub(crate) enum PtySlot<S> {
+pub enum PtySlot<S> {
     Starting(Pending),
     Running(S),
     Failed,
@@ -108,7 +108,7 @@ pub(crate) enum PtySlot<S> {
 }
 
 /// 回填的产物:调用方据此补 AI 感知旁路、打日志、补发退出事件。
-pub(crate) struct Backfilled {
+pub struct Backfilled {
     /// 回填时补下发的那次 resize(`None` = 空窗期没收到过尺寸)。
     pub resized: Option<Result<bool>>,
     /// 冲刷队列时失败的写入(逐条,调用方打日志)。

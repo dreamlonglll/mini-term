@@ -48,20 +48,16 @@
 //! 状态形状与操作语义对照 `src/store.ts`,见 [`store`] 与 [`tree`] 两个模块的注释。
 
 mod activity_bar;
-mod ai;
 mod branch_family;
-mod cli;
 mod clipboard;
 mod command_library;
 mod date_picker;
 mod dialog_host;
 mod dnd;
 mod env_vars;
-mod file_ops;
 mod file_tree;
 mod file_viewer;
 mod first_run;
-mod focus_nav;
 mod fold_motion;
 // dev-only 度量工具(gpui-fast 内置帧剖析叠层)。默认不编译:整个模块连同
 // `open_window` 之后那唯一一处调用都挂在 `frame-profiler` feature 下,
@@ -77,9 +73,7 @@ mod hotkeys;
 mod http;
 mod i18n;
 mod image_lightbox;
-mod kitty_graphics;
 mod logfile;
-mod markers;
 mod menu;
 mod mermaid_compat;
 mod mobile_panel;
@@ -94,14 +88,11 @@ mod overlay_motion;
 mod pane;
 mod pane_actions;
 mod pane_preview;
-mod persist;
 mod popover_reveal;
 mod pricing;
 mod project_list;
 mod project_switcher;
-mod project_tree;
 mod prompt;
-mod pty_slot;
 mod quick_open;
 mod redraw;
 mod remote_directory_picker;
@@ -110,16 +101,12 @@ mod remote_project;
 mod search_modal;
 mod secrets;
 mod segment_slider;
-mod session_branch;
 mod session_panel;
 mod settings;
-mod shell_ops;
 mod ssh_activity;
 mod ssh_assoc;
-mod ssh_conn;
 mod ssh_panel;
 mod ssh_quick_connect;
-mod startup_trace;
 mod store;
 mod syntax_languages;
 mod tab_expansion;
@@ -130,13 +117,18 @@ mod theme;
 mod title_bar;
 mod toast;
 mod tray;
-mod tree;
 mod ui;
 mod update_check;
 mod update_dialog;
 mod usage_panel;
 mod workbench_area;
 mod workspace;
+
+// 下沉到非 GPUI 应用域核心 crate(`mt-app-core`)的模块，在壳层原路径再导出以保持调用点稳定。
+pub(crate) use mt_app_core::{
+    ai, cli, file_ops, focus_nav, kitty_graphics, markers, persist, project_tree, pty_slot,
+    session_branch, shell_ops, ssh_conn, startup_trace, tree,
+};
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -73,6 +73,7 @@ pub enum PaneStatus {
 
 impl PaneStatus {
     /// 与后端(`mt_ai::StatusChange::status`)之间的字符串口径,一字不改。
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "idle" => Some(Self::Idle),
@@ -329,6 +330,7 @@ impl SplitDirection {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         // 磁盘上只有这两个值;非法值按 horizontal 处理(与 TS 侧同样宽容)
         if s == "vertical" {
@@ -487,9 +489,7 @@ impl SplitNode {
     pub fn pane_mut(&mut self, pane_id: &str) -> Option<&mut PaneState> {
         match self {
             Self::Leaf { panes, .. } => panes.iter_mut().find(|p| p.id == pane_id),
-            Self::Split { children, .. } => {
-                children.iter_mut().find_map(|c| c.pane_mut(pane_id))
-            }
+            Self::Split { children, .. } => children.iter_mut().find_map(|c| c.pane_mut(pane_id)),
         }
     }
 
@@ -993,9 +993,7 @@ impl SplitNode {
         let mut next = self.clone().remove_pane(pane_id)?;
         // 摘除可能把锚所在的叶子一并收走(锚与被拖 pane 同格且只剩这一个时),
         // 那种情况下没有可插入的位置 —— 原版同一道 `findPaneById(removed, anchorId)` 闸
-        if next.pane(&anchor_id).is_none() {
-            return None;
-        }
+        next.pane(&anchor_id)?;
         let direction = match zone {
             DropZone::Left | DropZone::Right => SplitDirection::Horizontal,
             _ => SplitDirection::Vertical,
@@ -1280,7 +1278,10 @@ mod tests {
         let SplitNode::Split { children, .. } = &root else {
             panic!()
         };
-        assert!(matches!(children[0], SplitNode::Leaf { .. }), "兄弟没被动过");
+        assert!(
+            matches!(children[0], SplitNode::Leaf { .. }),
+            "兄弟没被动过"
+        );
         let SplitNode::Split {
             direction,
             children: inner,
@@ -1373,7 +1374,10 @@ mod tests {
 
         let b = root.pane_by_pty(2).unwrap().id.clone();
         let root = root.remove_pane(&b).unwrap();
-        let SplitNode::Split { sizes, children, .. } = &root else {
+        let SplitNode::Split {
+            sizes, children, ..
+        } = &root
+        else {
             panic!("还有两格,不该塌陷")
         };
         assert_eq!(children.len(), 2);
@@ -1514,8 +1518,16 @@ mod tests {
         let ids: Vec<String> = root.panes().iter().map(|p| p.id.clone()).collect();
 
         assert_eq!(root.cycle_target(&ids[0], 1).as_ref(), Some(&ids[1]));
-        assert_eq!(root.cycle_target(&ids[2], 1).as_ref(), Some(&ids[0]), "环形回头");
-        assert_eq!(root.cycle_target(&ids[0], -1).as_ref(), Some(&ids[2]), "环形往前");
+        assert_eq!(
+            root.cycle_target(&ids[2], 1).as_ref(),
+            Some(&ids[0]),
+            "环形回头"
+        );
+        assert_eq!(
+            root.cycle_target(&ids[0], -1).as_ref(),
+            Some(&ids[2]),
+            "环形往前"
+        );
         assert_eq!(root.cycle_target(&ids[1], -1).as_ref(), Some(&ids[0]));
         assert_eq!(root.cycle_target("不存在的 pane", 1), None);
     }
@@ -1742,7 +1754,9 @@ mod tests {
         assert_eq!(child_names(&root), vec![vec!["a"], vec!["b"]]);
         match &root {
             SplitNode::Split {
-                direction, children, ..
+                direction,
+                children,
+                ..
             } => {
                 assert_eq!(*direction, SplitDirection::Vertical);
                 assert_eq!(children[0].id(), leaf_id, "原叶子 id 不变");
