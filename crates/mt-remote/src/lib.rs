@@ -20,6 +20,10 @@
 //! | `ssh_remote_ai_sessions` | [`ai_sessions`] |
 //! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
 //!
+//! 终端里的内置 SSH(远程项目 pane 的 shell、右键「SSH 连接」接管)不走会话池:每个终端独占
+//! 一条连接,建连放在共享运行时上、提示通道包成不含 tokio 类型的样子交给 GPUI 壳,见
+//! [`open_terminal_shell`]。系统 OpenSSH 回退那条路仍是 [`prepare_remote_launch`]。
+//!
 //! [`RemoteGitWorkspace`] manages lazy packaged-helper deployment and persistent Git channels.
 //! Managed Git IO runs through [`run_git_on`] or the workspace's bounded async request queue;
 //! GPUI executor threads only await and never wait on a blocking service mutex.
@@ -101,6 +105,7 @@ mod git_service;
 mod paths;
 mod session_delete;
 mod sessions;
+mod terminal_shell;
 mod transfer;
 
 pub use conn_test::*;
@@ -120,6 +125,7 @@ pub use mt_ssh::{AuthFailureReport, AuthMethodUsed, ProbeSuccess};
 pub use paths::*;
 pub use session_delete::*;
 pub use sessions::*;
+pub use terminal_shell::*;
 pub use transfer::*;
 
 /// SFTP 协议层每请求超时(readdir / stat / 单个 read 包)。

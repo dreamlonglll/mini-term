@@ -41,6 +41,15 @@ sha2.workspace = true
 # 但那是**别人的**依赖声明 —— 显式写出来,免得哪天依赖树一变就静默失灵。
 tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
+# 终端内置 SSH 的读行应答(`terminal_shell::PromptReply`):SSH 层已不收时,退回来的明文当场清零。
+# 依赖树里已有的那一份(mt-secret / mt-app-core 在用),不新增 crate。
+zeroize = "1"
+
+[dev-dependencies]
+# 终端内置 SSH 的冒烟测试(tests/terminal_shell.rs):假 sshd + mt-app-core 的连接中状态机
+# (`shell_link` / `line_input`),把「pane 胶水 + 真 shell 通道」放在不依赖 GPUI 的这一层跑。
+# 只是 dev 依赖:mt-app-core 本身不依赖 mt-remote(分层测试守着),不成环。
+mt-app-core.workspace = true
 
 # 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
 # (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。

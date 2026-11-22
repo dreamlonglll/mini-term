@@ -9,7 +9,7 @@ use mt_config::{AiLauncher, ProjectConfig, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::{DwellConfig, TerminalStyle};
 
-use crate::pane::{PaneEvent, PaneLaunch, PreparedLaunch, ResumeCwd, TerminalPane};
+use crate::pane::{PaneEvent, PaneStart, PreparedLaunch, ResumeCwd, TerminalPane};
 use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
 };
@@ -699,6 +699,14 @@ impl AppStore {
             .map(|(pty_id, _)| *pty_id)
     }
 
+    /// 应用退出:关掉全部终端里的内置 SSH 会话(远程项目 pane 的基底、右键「SSH 连接」的
+    /// 接管层),不画、不报。关闭序列入队即返回,见 `TerminalPane::close_ssh_sessions`。
+    pub fn close_ssh_sessions(&mut self, cx: &mut Context<Self>) {
+        for terminal in self.terminals.values() {
+            terminal.update(cx, |pane, _| pane.close_ssh_sessions());
+        }
+    }
+
     /// 把一段文本当作用户键入写进某个 pane。
     ///
     /// 走 `TerminalPane::write` 而不是裸 PTY 写,是为了保住 AI 输入检测那一路 ——
@@ -964,12 +972,17 @@ impl AppStore {
             env.push(feed);
         }
 
-        // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
-        // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的远端命令
-        // `cd '<path>' 2>/dev/null; exec $SHELL -l` 进入,项目的 `path` 是远程 POSIX 路径,
-        // 传给 portable-pty 只会让 ConPTY 静默退回 `$USERPROFILE`。
+        // SSH 远程分支,按连接的「终端使用系统 OpenSSH」(`use_system_ssh`)二选一:
+        // - **内置客户端**(默认):pane 的基底直接是 mt-ssh 的 shell 会话
+        //   (`PaneStart::RemoteShell`),`exec` 远端命令 `cd '<path>' 2>/dev/null; exec $SHELL -l`;
+        //   不找 ssh 客户端、不复制私钥临时副本、不走密码 autofill —— 主机密钥 / 密码 / OTP 在
+        //   终端里问(见 `pane` 模块注释「后端」与 `mt_remote::open_terminal_shell`);
+        // - **系统 OpenSSH**(回退,行为不变):直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,
+        //   对齐 WSL 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的同一句远端命令
+        //   进入,项目的 `path` 是远程 POSIX 路径,传给 portable-pty 只会让 ConPTY 静默退回
+        //   `$USERPROFILE`。
         //
-        // AI 状态感知在这条路上走 PTY 输入/输出扫描的降级路径(输入检测作用于
+        // AI 状态感知在这两条路上都走输入/输出扫描的降级路径(输入检测作用于
         // 数据流,对远程天然可用);hook 精确状态不可用,PRD 已接受。
         //
         // 项目级与全局环境变量对远程 pane **不注入**(装机版同款:那些变量属于本地
@@ -987,10 +1000,10 @@ impl AppStore {
             shell.command.clone(),
             shell.args.clone().unwrap_or_default(),
         );
-        let launch: PaneLaunch = match remote {
+        let start = match remote {
             None => {
                 let project_path = project.path.clone();
-                Box::new(move || {
+                PaneStart::Pty(Box::new(move || {
                     let (start_cwd, resume_cwd) = match resume {
                         None => (cwd, None),
                         // 续接:先反查会话 cwd、定启动目录(pane cwd 优先、会话 cwd 兜底、
@@ -1020,9 +1033,14 @@ impl AppStore {
                         ssh_password: None,
                         resume_cwd,
                     })
-                })
+                }))
             }
-            Some(Ok(conn)) => Box::new(move || {
+            // 内置客户端:建 pane 时当场开始建连(建连本身在 mt-remote 的共享运行时上)
+            Some(Ok(conn)) if !conn.use_system_ssh => PaneStart::RemoteShell {
+                conn: Box::new(conn),
+                remote_path: cwd,
+            },
+            Some(Ok(conn)) => PaneStart::Pty(Box::new(move || {
                 // 预检失败(本机缺 ssh 客户端 / 私钥不在):`?` 交回 Err,不 spawn,
                 // pane 里直接显示这条错误
                 let launch = mt_remote::prepare_remote_launch(&conn, &cwd)?;
@@ -1038,9 +1056,9 @@ impl AppStore {
                     ssh_password: launch.password,
                     resume_cwd: None,
                 })
-            }),
+            })),
             // 连接已被删(断链):同上,不 spawn,错误画在 pane 里
-            Some(Err(err)) => Box::new(move || Err(err)),
+            Some(Err(err)) => PaneStart::Pty(Box::new(move || Err(err))),
         };
         let is_remote = project.ssh_connection_id.is_some();
         // 全局(设置 → 环境变量)+ 项目级环境变量走 user_env —— 它会被 `MINITERM_`
@@ -1062,7 +1080,7 @@ impl AppStore {
         let ai = self.ai.clone();
         let entity = cx.new(|cx| {
             TerminalPane::new(
-                pty_id, launch, user_env, style, theme, dwell, scrollback, ai, cx,
+                pty_id, start, user_env, style, theme, dwell, scrollback, ai, cx,
             )
             // 远程 pane 退出后不出本地那条「重新启动」,断线重连归 terminal_area 的遮罩
             .with_remote(is_remote)

@@ -72,7 +72,7 @@ tools/promo/build.sh
 | crate | 职责 |
 |-------|------|
 | `mt-app` | GPUI 应用壳：Workspace 组件树、AppStore 全局状态、各面板/弹窗/托盘/标题栏。组件树图见 `main.rs` 模块注释 |
-| `mt-app-core` | `mt-app` 下沉的非 GPUI 应用域逻辑与服务层：SplitNode 布局树与序列化、任务标记、项目树与 SSH 分组纯逻辑、会话分支森林、PTY 槽位、config/layout 后台单写者、SSH 活动抄送协议、文件树/Git 监听与 diff 算法。不依赖 gpui / mt-ui / mt-remote（`unsafe_code = "forbid"`），自动归入 Windows 快速单测集 |
+| `mt-app-core` | `mt-app` 下沉的非 GPUI 应用域逻辑与服务层：SplitNode 布局树与序列化、任务标记、项目树与 SSH 分组纯逻辑、会话分支森林、PTY 槽位、config/layout 后台单写者、SSH 活动抄送协议、文件树/Git 监听与 diff 算法；终端内置 SSH 的纯逻辑：输出闸（`output_gate`）、一条 SSH 链路的连接中状态机（`shell_link`：提示队列 / 行编辑 / 预输入 / Ctrl+C 取消）、终端内行编辑器（`line_input`）、右键接管的路由表 / 准入 / 等首屏（`ssh_takeover`）。不依赖 gpui / mt-ui / mt-remote（`unsafe_code = "forbid"`），自动归入 Windows 快速单测集 |
 | `mt-ui` | GPUI 渲染层：终端 view/element、主题桥。不含业务逻辑。**不依赖 mt-config / mt-i18n / mt-project**（前两者改得勤，一改就连带重编这两万多行；后者带 git2）：终端查找条文案由宿主注入（`TerminalSearchBar::new` 的 labels 参数），技术栈徽标按落盘字符串查表（`TechIcon::new(kind.as_str())`）。内嵌 Nerd Font 图标字体（`assets/fonts/`，`terminal/symbols.rs`）：Windows 上 gpui 的回退表只认系统已装字体，内嵌字体进不去，所以是渲染层逐格把主字体缺的私用区图标换成该字体的 run，不是往 `font_fallbacks` 里加名字 |
 | `mt-terminal` | VT 状态机 + grid 模型（alacritty_terminal 封装）。不依赖 gpui |
 | `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载；mt-app `main()` 启动时调一次，必须早于任何 spawn） |
@@ -84,8 +84,8 @@ tools/promo/build.sh
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
-| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连只看连接配置本身（`target.rs`）。⚠️ `~/.ssh` 里**只碰 `known_hosts`**：不读 `~/.ssh/config`（不认别名 / ProxyJump）、不试默认私钥 `~/.ssh/id_*`（用户明确要求，曾加过又撤回，别加回来）。`auth.rs` 依次试连接私钥 / ssh-agent / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开 |
-| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、项目级授权校验（默认拒绝，绑定 SSH 端点与远端根目录，变化即重新授权）、托管 SSH Git 会话与身份失效；写结果未知时阻止后续写入，支持原通道 barrier/proof 核对及通道丢失后的只读快照，两条路径均须用户明确确认且重核快照有效性后恢复，不自动重放写操作，不将丢失原通道后的确认视为旧进程已退出。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。不依赖 gpui |
+| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连只看连接配置本身（`target.rs`）。⚠️ `~/.ssh` 里**只碰 `known_hosts`**：不读 `~/.ssh/config`（不认别名 / ProxyJump）、不试默认私钥 `~/.ssh/id_*`（用户明确要求，曾加过又撤回，别加回来）。`auth.rs` 依次试连接私钥 / ssh-agent / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开。终端里的交互式 shell 在 `shell.rs`（`open_shell` → `ShellSession`）：每个终端独占一条连接、开 pty + `shell` / `exec`，首见主机的 yes/no/指纹、密码、keyboard-interactive、私钥口令经 `ShellPrompt` 通道交给宿主在终端里问（`interact.rs` / `key_unlock.rs`，等用户的时间不计入建连超时）；建连 + 认证与会话池共用 `connect.rs`，池 / 「测试连接」/ sidecar 不带提示器，行为不变 |
+| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、项目级授权校验（默认拒绝，绑定 SSH 端点与远端根目录，变化即重新授权）、托管 SSH Git 会话与身份失效；写结果未知时阻止后续写入，支持原通道 barrier/proof 核对及通道丢失后的只读快照，两条路径均须用户明确确认且重核快照有效性后恢复，不自动重放写操作，不将丢失原通道后的确认视为旧进程已退出。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。终端内置 SSH 的宿主层在 `terminal_shell.rs`：`open_terminal_shell` 当场把 `mt_ssh::open_shell` spawn 到共享运行时（返回的 `OpeningShell` drop 即中止建连），提示通道包成不含 tokio 类型的 `TerminalPrompts` / `PromptReply`（mt-app 不直接依赖 tokio / mt-ssh），远程 pane 与右键接管的 shell 请求（`remote_shell_request` / `login_shell_request`，TERM=xterm-256color，env 只带 `COLORTERM` 与本机有的 `LANG`）；系统 OpenSSH 回退仍是 `prepare_remote_launch`。不依赖 gpui |
 | `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价；models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路（`models_dev.rs`，拉网那一跳由 mt-app 的 `pricing.rs` 注入） |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
@@ -112,6 +112,32 @@ ASCII 字节喂给便携与系统 conhost 扫出来的）。前台程序对 Shif
 AI 会话里 `Ctrl+J` 算换行，`Shift+Enter` 只有 codex / omp 算换行；Esc 记录换算成
 裸 Esc，清行、摘回合闩、打断都与传统 Esc 一致。非 Windows 不跟踪；
 `MT_DISABLE_WIN32_INPUT_MODE=1` 可关闭。
+
+### 终端里的 SSH（内置 russh，系统 OpenSSH 回退）
+
+连接的「终端使用系统 OpenSSH 客户端」（`SshConnection::use_system_ssh`）没勾时，终端里的 SSH 全走
+mt-ssh 的 `ShellSession`，远端字节由 mt-ssh 自己的输出线程直接喂 emulator，不经 ssh.exe、不经 ConPTY；
+勾了就原样走旧实现（远程 pane 起 ssh.exe、右键连接敲 `ssh …\r` + `SshAutofill` + `quick_ssh`），一字不变。
+pane 的后端分两层（`mt-app::pane` 模块注释「后端」）：
+
+- **基底**：本地 PTY（含 ssh.exe 回退的远程 pane），或内置 SSH 的远程项目 pane（`exec` 远端命令
+  `cd '<path>' 2>/dev/null; exec $SHELL -l`，与回退那条同一句）；
+- **接管层**：右键「SSH 连接」= 在基底上叠一条内置 SSH 会话。基底**不杀**、不给它发任何字节，它的输出
+  关闸丢弃（不进 emulator / AI 感知 / git 观察，`mt-app-core::output_gate`）；先关闸再
+  `TerminalEmulator::begin_takeover` 拍本地屏幕快照，会话收场后 `end_takeover` 写回、远端内容留在回看里，
+  再开闸。新开的终端要等本地 PTY 回填、首屏提示符画完（光标停在字后面、静默 300ms，最多 5s）才接。
+  写入 / 终端应答 / resize / 基底退出按接管阶段路由，路由表在 `mt-app-core::ssh_takeover`；
+  接管中右键菜单多一项「断开 SSH」，已在接管中的终端再点连接只提示、不嵌套。
+
+每条内置 SSH 链路一条前台任务，**严格按序**回主线程：建连提示 → 建连结果 → 远端退出；远端输出在
+链路闸后暂扣，主线程画完提示、处理完建连结果才放行（提示一定先于 motd 上屏）。首见主机 / 密码 / OTP /
+私钥口令在终端里读一行（`mt-app-core::line_input`）：这期间按键**只**喂行编辑器，不进 AI 输入旁路、
+不发 `UserInput`、不进移动端；没在读行时 Ctrl+C 取消建连，其余按键进预输入（读行提示一出现即清空，
+shell 就绪时才过旁路冲刷）。⚠️ `begin_takeover` 会关掉 win32-input-mode（键盘编码回到传统字节，
+行编辑器认的就是这个），`end_takeover` 按快照还原；内置 SSH 的远程 pane 没有 ConPTY，本来就不开
+（远端程序自己发 `CSI ? 9001h` 时照常跟踪）。失败 / 取消：醒目的一行进终端 —— 远程 pane 落成「退出」
+（重连遮罩照常），接管则还原屏幕后再补一条 toast；收场留一行 `Connection to <host> closed.`
+（断线是原因）。「SSH 已连接」灯：接管按会话生命周期报，`quick_ssh` 进程树轮询只留给回退那条。
 
 ### 持久化布局：数据目录里有什么
 

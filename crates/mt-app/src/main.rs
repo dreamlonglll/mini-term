@@ -514,6 +514,8 @@ fn main() {
         let store_for_quit = store.clone();
         cx.on_app_quit(move |cx| {
             store_for_quit.update(cx, |store, _| store.save_config_now());
+            // 终端里的内置 SSH 会话(远程项目 pane / 右键「SSH 连接」接管)发关闭序列,不留连接
+            store_for_quit.update(cx, |store, cx| store.close_ssh_sessions(cx));
             ai_for_quit.shutdown();
             // SSH 会话池优雅断开(对齐装机版 `RunEvent::Exit` 里的那一调)。
             // 池没建过时是 no-op,不会为此现起 tokio 运行时。

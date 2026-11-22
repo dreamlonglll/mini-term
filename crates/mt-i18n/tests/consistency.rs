@@ -288,8 +288,12 @@ use mt_i18n::{
 /// 同步调整 `app.titleBar.noAiProjects` 空态描述）。
 /// 1929 → 1931：终端 SSH 改走内置 russh，连接表单加「终端使用系统 OpenSSH 客户端」
 /// 勾选项与说明（`sshModal.{useSystemSshLabel,useSystemSshHint}`）。
+/// 1931 → 1937：右键「SSH 连接」改成接管终端（内置 russh）—— 接管中的右键「断开 SSH」、
+/// 已在接管中 / 终端接不了两条提示、建连失败 / 取消 / 断线三条 toast
+/// （`terminal.{sshDisconnect,sshAlreadyConnected,sshTakeoverUnavailable,sshConnectFailed,
+/// sshConnectCancelled,sshConnectionLost}`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1931;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1937;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

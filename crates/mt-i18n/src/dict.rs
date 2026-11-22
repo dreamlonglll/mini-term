@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1931;
+pub const ZH_ENTRY_COUNT: usize = 1937;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1931;
+pub const EN_ENTRY_COUNT: usize = 1937;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3798,9 +3798,14 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("saveBufferFailed", "保存终端缓冲失败：{detail}"),
     ("scrollToBottom", "回到底部（{shortcut}）"),
     ("selectAll", "全选"),
+    ("sshAlreadyConnected", "这个终端已经在 SSH 会话里了，先右键「断开 SSH」再连接"),
     ("sshAuthKey", "密钥"),
     ("sshAuthPassword", "密码"),
     ("sshConnect", "SSH 连接"),
+    ("sshConnectCancelled", "已取消 SSH 连接"),
+    ("sshConnectFailed", "SSH 连接失败：{detail}"),
+    ("sshConnectionLost", "SSH 连接已断开：{detail}"),
+    ("sshDisconnect", "断开 SSH"),
     ("sshEmpty", "还没有 SSH 连接"),
     ("sshEmptyHint", "添加后即可在这里一键连接到当前终端"),
     ("sshFooterHint", "↑↓ 选择 · ↵ 连接 · Ctrl+↵ 新终端"),
@@ -3809,6 +3814,7 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("sshNewTerminalRemote", "远程项目里不能在新终端中自动连接：新终端要先登录服务器，预先输入的 ssh 命令会被登录提示吞掉。请在空闲的终端里连接"),
     ("sshNoMatch", "没有匹配的连接"),
     ("sshSearchPlaceholder", "搜索名称、主机或用户…"),
+    ("sshTakeoverUnavailable", "这个终端还在连接或已经退出，没法在里面连接 SSH"),
     ("ungrouped", "未分组"),
 ];
 #[rustfmt::skip]
@@ -3830,9 +3836,14 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("saveBufferFailed", "Failed to save the terminal buffer: {detail}"),
     ("scrollToBottom", "Scroll to bottom ({shortcut})"),
     ("selectAll", "Select all"),
+    ("sshAlreadyConnected", "This terminal is already in an SSH session. Disconnect it first (right-click → Disconnect SSH)"),
     ("sshAuthKey", "Key"),
     ("sshAuthPassword", "Password"),
     ("sshConnect", "SSH Connection"),
+    ("sshConnectCancelled", "SSH connection cancelled"),
+    ("sshConnectFailed", "SSH connection failed: {detail}"),
+    ("sshConnectionLost", "SSH connection lost: {detail}"),
+    ("sshDisconnect", "Disconnect SSH"),
     ("sshEmpty", "No SSH connections yet"),
     ("sshEmptyHint", "Add one to connect from this terminal in a click"),
     ("sshFooterHint", "↑↓ Select · ↵ Connect · Ctrl+↵ New tab"),
@@ -3841,6 +3852,7 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("sshNewTerminalRemote", "Can't connect in a new terminal of a remote project: the new terminal logs in to the server first and its login prompt would swallow the typed ssh command. Connect from an idle terminal instead"),
     ("sshNoMatch", "No matching connections"),
     ("sshSearchPlaceholder", "Search name, host or user…"),
+    ("sshTakeoverUnavailable", "This terminal is still connecting or has exited, so it can't start an SSH connection"),
     ("ungrouped", "Ungrouped"),
 ];
 
