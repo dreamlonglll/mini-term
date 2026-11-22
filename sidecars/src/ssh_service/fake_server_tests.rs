@@ -273,6 +273,7 @@ fn fake_conn(port: u16) -> mt_core::SshConnection {
         password: Some("pw".into()),
         identity_file: None,
         group: None,
+        use_system_ssh: false,
         extra: Default::default(),
     }
 }

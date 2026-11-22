@@ -63,8 +63,8 @@ use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::cursor_icon::CursorIcon;
 use alacritty_terminal::vte::ansi::{
     Attr, CharsetIndex, ClearMode, CursorShape, CursorStyle, Handler, Hyperlink, KeyboardModes,
-    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, PrivateMode, Rgb,
-    ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
+    KeyboardModesApplyBehavior, LineClearMode, Mode, ModifyOtherKeys, NamedPrivateMode,
+    PrivateMode, Rgb, ScpCharPath, ScpUpdateMode, StandardCharset, TabulationClearMode,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -124,6 +124,12 @@ pub(crate) struct Scratch {
     text: String,
     /// Kitty 图形。`None` = 开关关着,下面那几条序列原样转发。
     kitty: Option<Arc<KittyShared>>,
+    /// 最近一次生效的 DECSTBM(`CSI top;bottom r`)参数,`None` = 整屏。
+    ///
+    /// alacritty 的滚动区域是 `Term` 的私有字段、没有读回口,SSH 接管
+    /// ([`crate::takeover`])要拍下再还原它,只能在这里跟着记:合法的 DECSTBM 记下,
+    /// RIS / DECCOLM / 换尺寸(alacritty 在这三处把区域复位成整屏)清掉。
+    pub(crate) scroll_region: Option<(usize, Option<usize>)>,
 }
 
 impl Scratch {
@@ -163,6 +169,8 @@ pub(crate) struct WidthOverride<'a, T> {
     /// ConPTY 的 win32-input-mode(`CSI ? 9001h/l`)开关。`None` = 本次运行禁用
     /// (`MT_DISABLE_WIN32_INPUT_MODE=1`),序列照常喂给 `Term`,只是不置位。
     win32_input: Option<&'a AtomicBool>,
+    /// 滚动区域的跟踪值,见 [`Scratch::scroll_region`]。
+    scroll_region: &'a mut Option<(usize, Option<usize>)>,
 }
 
 impl<'a, T: EventListener> WidthOverride<'a, T> {
@@ -176,6 +184,7 @@ impl<'a, T: EventListener> WidthOverride<'a, T> {
             cluster: &mut scratch.text,
             kitty: scratch.kitty.as_deref(),
             win32_input,
+            scroll_region: &mut scratch.scroll_region,
         }
     }
 
@@ -393,6 +402,7 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         if let Some(kitty) = self.kitty {
             kitty.on_reset();
         }
+        *self.scroll_region = None;
         self.term.reset_state();
     }
 
@@ -405,6 +415,10 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         {
             flag.store(true, Ordering::Relaxed);
         }
+        if matches!(mode, PrivateMode::Named(NamedPrivateMode::ColumnMode)) {
+            // DECCOLM 在 alacritty 里顺带把滚动区域复位成整屏
+            *self.scroll_region = None;
+        }
         self.term.set_private_mode(mode);
     }
 
@@ -414,7 +428,22 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         {
             flag.store(false, Ordering::Relaxed);
         }
+        if matches!(mode, PrivateMode::Named(NamedPrivateMode::ColumnMode)) {
+            *self.scroll_region = None;
+        }
         self.term.unset_private_mode(mode);
+    }
+
+    /// DECSTBM:照常转发,顺手记下生效的参数(见 [`Scratch::scroll_region`])。
+    /// 判据与 alacritty 一致 —— `top >= bottom` 的区域它不认,这里也不记;
+    /// 底边越过屏幕的按整屏底边记,整屏记成 `None`。
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        let lines = self.term.screen_lines();
+        if top < bottom.unwrap_or(lines) {
+            let bottom = bottom.filter(|&b| b < lines);
+            *self.scroll_region = (top > 1 || bottom.is_some()).then_some((top, bottom));
+        }
+        self.term.set_scrolling_region(top, bottom);
     }
 
     forward_to_term! {
@@ -459,7 +488,6 @@ impl<T: EventListener> Handler for WidthOverride<'_, T> {
         unset_mode(mode: Mode);
         report_mode(mode: Mode);
         report_private_mode(mode: PrivateMode);
-        set_scrolling_region(top: usize, bottom: Option<usize>);
         set_keypad_application_mode();
         unset_keypad_application_mode();
         set_active_charset(index: CharsetIndex);

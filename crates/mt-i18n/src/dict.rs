@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1929;
+pub const ZH_ENTRY_COUNT: usize = 1931;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1929;
+pub const EN_ENTRY_COUNT: usize = 1931;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3703,6 +3703,8 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("test.succeeded", "连接成功：{target}"),
     ("title", "SSH 连接"),
     ("ungrouped", "未分组"),
+    ("useSystemSshHint", "默认用内置 SSH，主机密钥与密码在终端内确认；需要 ~/.ssh/config、ProxyJump、默认私钥或端口转发时勾选"),
+    ("useSystemSshLabel", "终端使用系统 OpenSSH 客户端"),
     ("userLabel", "用户名 *"),
     ("userPlaceholder", "root"),
     ("userRequired", "请填写用户名"),
@@ -3770,6 +3772,8 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("test.succeeded", "Connected: {target}"),
     ("title", "SSH Connections"),
     ("ungrouped", "Ungrouped"),
+    ("useSystemSshHint", "By default the built-in SSH client is used and host keys and passwords are confirmed in the terminal; check this if you need ~/.ssh/config, ProxyJump, default private keys or port forwarding"),
+    ("useSystemSshLabel", "Use the system OpenSSH client in terminals"),
     ("userLabel", "Username *"),
     ("userPlaceholder", "root"),
     ("userRequired", "Username is required"),

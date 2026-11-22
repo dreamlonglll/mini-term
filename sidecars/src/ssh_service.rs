@@ -2352,6 +2352,7 @@ mod tests {
             password: password.map(|s| s.into()),
             identity_file: Some("/home/u/.ssh/id_rsa".into()),
             group: Some("内网".into()),
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }

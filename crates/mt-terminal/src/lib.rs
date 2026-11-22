@@ -42,8 +42,10 @@ use std::time::{Duration, Instant};
 pub mod buffer;
 pub mod kitty;
 pub mod links;
+mod takeover;
 pub mod width;
 
+pub use takeover::TakeoverSnapshot;
 use width::{Scratch, WidthOverride};
 
 /// 把 alacritty 整个重新导出。渲染层(`mt-ui`)要用 `Cell` / `Flags` / `Color` /
@@ -497,6 +499,10 @@ impl TerminalEmulator {
 
     pub fn resize(&self, size: TermSize) {
         let mut term = self.term.lock();
+        if term.columns() != size.columns || term.screen_lines() != size.screen_lines {
+            // 尺寸真变了 alacritty 才把滚动区域复位成整屏(`Term::resize`),跟踪值随之作废
+            self.parser.lock().cluster.scroll_region = None;
+        }
         term.resize(size);
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.cursor_settle

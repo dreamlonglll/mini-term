@@ -232,7 +232,8 @@ fn strip_copy_suffix(name: &str) -> &str {
 }
 
 /// 复制一条连接:换上 `new_id` 与 [`duplicate_name`] 起的名字,其余字段 —— 密码
-/// 信封、私钥路径、分组、新版本写的未知字段(`extra`)—— 原样照抄,插在原连接
+/// 信封、私钥路径、分组、「终端使用系统 OpenSSH」开关、新版本写的未知字段(`extra`)
+/// —— 原样照抄,插在原连接
 /// **紧后面**(同组相邻,左栏组序不动)。返回新的整张连接表;`source_id` 不存在时 `None`。
 ///
 /// 密码信封直接照抄而不是解开再封:同一把钥匙解得开;而「表单 → 封存」那条路
@@ -582,6 +583,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }
@@ -1147,6 +1149,7 @@ mod tests {
         src.port = 2222;
         src.password = Some("enc:v1:xxxx".into());
         src.identity_file = Some("/k".into());
+        src.use_system_ssh = true;
         src.extra = serde_json::from_str(r#"{"jumpHost":"bastion"}"#).unwrap();
         let list = vec![src.clone(), conn("c2", None)];
 
@@ -1164,6 +1167,7 @@ mod tests {
         assert_eq!(copy.password, src.password, "信封原样照抄,不再封一层");
         assert_eq!(copy.identity_file, src.identity_file);
         assert_eq!(copy.group, src.group);
+        assert!(copy.use_system_ssh, "「终端使用系统 OpenSSH」开关一并照抄");
         assert_eq!(copy.extra, src.extra);
 
         assert!(duplicate_connection(&list, "gone", "c9".into()).is_none());

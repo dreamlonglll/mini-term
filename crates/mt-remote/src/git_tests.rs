@@ -433,7 +433,8 @@ impl Fixture {
             let connection = SshConnection {
                 id: "git-test".into(), name: "git-test".into(), host: "127.0.0.1".into(),
                 port, user: "tester".into(), password: Some("test-only".into()),
-                identity_file: None, group: None, extra: Default::default(),
+                identity_file: None, group: None, use_system_ssh: false,
+                extra: Default::default(),
             };
             (pool, connection, counts, listener)
         });

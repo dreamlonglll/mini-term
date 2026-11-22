@@ -1085,6 +1085,7 @@ impl Client {
             password: Some("pw".into()),
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         };
         let session = pool.try_acquire(&conn).await.expect("connects");

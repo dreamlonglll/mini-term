@@ -13,6 +13,7 @@ pub mod focus_nav;
 pub mod git;
 pub mod kitty_graphics;
 pub mod layout_writer;
+pub mod line_input;
 pub mod markers;
 pub mod persist;
 pub mod project_tree;
