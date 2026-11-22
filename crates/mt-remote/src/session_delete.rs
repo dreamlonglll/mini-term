@@ -445,6 +445,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         };
         for bad in ["../../etc/passwd", "a/b", "", "a b"] {

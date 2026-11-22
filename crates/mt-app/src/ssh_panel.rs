@@ -604,6 +604,8 @@ pub(crate) struct FormValues {
     pub password: String,
     pub identity: String,
     pub group: String,
+    /// 「终端使用系统 OpenSSH 客户端」勾选框(`SshConnection::use_system_ssh`)。
+    pub use_system_ssh: bool,
 }
 
 impl FormValues {
@@ -640,6 +642,7 @@ impl FormValues {
             password: (!self.password.is_empty()).then(|| self.password.clone()),
             identity_file: opt(&self.identity),
             group: opt(&self.group),
+            use_system_ssh: self.use_system_ssh,
             extra: Default::default(),
         })
     }
@@ -773,6 +776,8 @@ struct ConnForm {
     password_unreadable: bool,
     identity: Entity<InputState>,
     group: Entity<InputState>,
+    /// 「终端使用系统 OpenSSH 客户端」勾选态。开表单时取自连接,新增时为 false。
+    use_system_ssh: bool,
     /// 上次点「保存」/「测试连接」时没过校验的字段,连同当时的值(见 [`issue_visible`])。
     /// 画在各自输入框下方,**不走 toast**(理由同 `password_unreadable`)。
     issues: Vec<(FormField, String)>,
@@ -799,6 +804,7 @@ impl ConnForm {
             password: read(&self.password),
             identity: read(&self.identity),
             group: read(&self.group),
+            use_system_ssh: self.use_system_ssh,
         }
     }
 
@@ -1123,6 +1129,7 @@ fn new_form(
             window,
             cx,
         ),
+        use_system_ssh: conn.is_some_and(|c| c.use_system_ssh),
         issues: Vec::new(),
         test: ConnTest::Idle,
         test_seq: 0,
@@ -2354,6 +2361,7 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                     }
                 })),
         ))
+        .child(system_ssh_toggle(state, values.use_system_ssh))
         .children(test_result)
         .child(
             div()
@@ -2404,6 +2412,53 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                     }),
                 ),
         )
+        .into_any_element()
+}
+
+/// 「终端使用系统 OpenSSH 客户端」勾选行:复选框 + 标签 + 说明,整行可点(与设置页
+/// hook「注入目标」同一种勾选行;字号沿用本表单的标签 / 说明两档)。
+///
+/// 只改表单里的勾选态,点「保存」才落盘;它不参与「测试连接」(测试恒走内置客户端),
+/// 但与其余字段一样计入表单指纹 —— 动过就把上次的测试结果标成「表单已修改」。
+fn system_ssh_toggle(state: &Entity<SshPanel>, checked: bool) -> AnyElement {
+    div()
+        .id("ssh-use-system-ssh")
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .child(ui::checkbox("ssh-use-system-ssh-check", checked))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_primary())
+                        .child(t("sshModal", "useSystemSshLabel")),
+                )
+                .child(
+                    div()
+                        .text_size(ui::font_px(10.0))
+                        .text_color(ui::text_muted())
+                        .child(t("sshModal", "useSystemSshHint")),
+                ),
+        )
+        .on_click({
+            let state = state.clone();
+            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                state.update(cx, |panel, cx| {
+                    if let Some(form) = panel.form.as_mut() {
+                        form.use_system_ssh = !form.use_system_ssh;
+                        cx.notify();
+                    }
+                });
+            }
+        })
         .into_any_element()
 }
 
@@ -2663,6 +2718,7 @@ mod tests {
             password: " pa ss ".into(),
             identity: "  ".into(),
             group: "  内网 ".into(),
+            use_system_ssh: true,
         };
         let c = form.to_connection("id1".into()).unwrap();
         assert_eq!(c.id, "id1");
@@ -2673,11 +2729,13 @@ mod tests {
         assert_eq!(c.password.as_deref(), Some(" pa ss "), "密码前后空格是合法口令字符");
         assert_eq!(c.identity_file, None);
         assert_eq!(c.group.as_deref(), Some("内网"));
+        assert!(c.use_system_ssh, "勾选态原样带进连接");
 
         let empty = values("n", "h", "", "u").to_connection("i".into()).unwrap();
         assert_eq!(empty.password, None);
         assert_eq!(empty.group, None);
         assert_eq!(empty.port, 22);
+        assert!(!empty.use_system_ssh, "默认不勾选 = 走内置客户端");
     }
 
     /// 测试结果过期判定:任何一格改了指纹就变;改回原值指纹也回来(同一进程内稳定)。
@@ -2700,6 +2758,10 @@ mod tests {
             },
             FormValues {
                 group: "g".into(),
+                ..base.clone()
+            },
+            FormValues {
+                use_system_ssh: true,
                 ..base.clone()
             },
         ] {
@@ -2789,6 +2851,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: None,
+            use_system_ssh: false,
             extra: Default::default(),
         };
         assert_eq!(copy_payload(&conn), "生产 服务器");

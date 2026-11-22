@@ -5527,6 +5527,9 @@ dependencies = [
  "ring",
  "serde_json",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+ "zeroize",
 ]
 
 [[package]]
@@ -5651,6 +5654,7 @@ version = "1.14.3"
 dependencies = [
  "anyhow",
  "mt-ai",
+ "mt-app-core",
  "mt-config",
  "mt-core",
  "mt-git-helper",
@@ -5663,6 +5667,7 @@ dependencies = [
  "sha2 0.11.0",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -5685,6 +5690,7 @@ dependencies = [
  "base64 0.22.1",
  "dirs 6.0.0",
  "futures",
+ "md5",
  "mt-core",
  "mt-secret",
  "ring",

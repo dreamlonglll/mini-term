@@ -10,13 +10,26 @@
 //! - `@revoked` 行:服务器这次给出的密钥命中任何一条对该主机生效的吊销行就拒绝,
 //!   优先级高于普通条目(同一主机同时登记了这把密钥也一样拒绝)。
 //! - `@cert-authority` 行跳过,理由见 [`known_host_entries`]。
+//!
+//! 首见主机的处理分两种:会话池 / 「测试连接」/ sidecar 没有提示器,按 `accept-new` 静默追加;
+//! 终端 shell(带 [`Interaction`])照 OpenSSH 的原文在终端里问 yes / no / 指纹,见
+//! [`MtClient::check_server_key`]。不符 / 吊销 / 读写失败两种情形都直接拒绝,不问。
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use russh::client::Handler;
+use russh::keys::HashAlg;
 
 use crate::auth::{ClientNotes, SessionEnd};
+use crate::interact::Interaction;
+
+/// 首见主机时的提问(OpenSSH `confirm()` 原文)。
+const HOST_KEY_QUESTION: &str =
+    "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+/// 答得不清楚时重问(OpenSSH 原文)。
+const HOST_KEY_QUESTION_AGAIN: &str = "Please type 'yes', 'no' or the fingerprint: ";
 
 /// OpenSSH `match_pattern`:`*` 匹配任意长(含空)串,`?` 恰好一个字符,其余逐字符
 /// 相等(区分大小写 —— 需要不敏感的调用方自己先转小写)。
@@ -385,6 +398,11 @@ pub struct MtClient {
     /// russh 拿走 —— 建连方持同一个 `Arc`,在错误路径上取出具体原因拼进报错
     /// (主程序远程项目 / sidecar 都把这条错误原样展示给用户)。
     notes: Arc<ClientNotes>,
+    /// 终端 shell 的交互提示器:首见主机在终端里问、认证 banner 显示给用户。会话池、
+    /// 「测试连接」与 sidecar 为 `None`,行为与引入它之前一字不变。
+    interaction: Option<Arc<Interaction>>,
+    /// 连上的对端地址,只用于首见主机提示里括号中的那个地址。
+    peer: Option<SocketAddr>,
 }
 
 impl MtClient {
@@ -397,7 +415,20 @@ impl MtClient {
             known_hosts_name,
             known_hosts_path,
             notes,
+            interaction: None,
+            peer: None,
         }
+    }
+
+    /// 带上终端 shell 的交互提示器(见 [`Self::check_server_key`] 与 `auth_banner`)。
+    pub(crate) fn interactive(
+        mut self,
+        interaction: Arc<Interaction>,
+        peer: Option<SocketAddr>,
+    ) -> Self {
+        self.interaction = Some(interaction);
+        self.peer = peer;
+        self
     }
 
     /// 记下拒绝原因并打一行日志。返回 `false`,调用处直接 `Ok(self.reject(..))`。
@@ -407,6 +438,85 @@ impl MtClient {
             *slot = Some(reason);
         }
         false
+    }
+
+    /// 首见主机:照 OpenSSH 的原文在终端里问(先两行说明,再问 yes / no / 指纹)。返回用户是否
+    /// 接受;答 `no` 或取消时已记下拒绝原因。
+    ///
+    /// 这一步在 russh 的会话任务里 await 用户 —— 期间会话任务不读 socket,服务器若因
+    /// LoginGraceTime 断开,要到认证的第一个请求才发现,报错见 `auth.rs` 的
+    /// `interactive_loss`。
+    async fn confirm_new_host(
+        &self,
+        interaction: &Interaction,
+        server_pubkey: &russh::keys::ssh_key::PublicKey,
+    ) -> bool {
+        let name = &self.known_hosts_name;
+        let address = self
+            .peer
+            .map(|peer| host_pattern(&peer.ip().to_string(), peer.port()))
+            .unwrap_or_else(|| name.clone());
+        let key_type = openssh_key_type(&server_pubkey.algorithm());
+        let fingerprint = server_pubkey.fingerprint(HashAlg::Sha256).to_string();
+        interaction.notice(format!(
+            "The authenticity of host '{name} ({address})' can't be established.\r\n\
+             {key_type} key fingerprint is {fingerprint}.\r\n"
+        ));
+        let mut question = HOST_KEY_QUESTION;
+        loop {
+            let Some(answer) = interaction.read_line(question.to_string(), true).await else {
+                self.reject(format!(
+                    "host key confirmation for {name} was cancelled: 已取消 {name} 的主机密钥确认"
+                ));
+                return false;
+            };
+            match host_key_answer(&answer, &fingerprint) {
+                HostKeyAnswer::Accept => return true,
+                HostKeyAnswer::Decline => {
+                    interaction.mark_host_key_declined();
+                    self.reject("Host key verification failed.".to_string());
+                    return false;
+                }
+                HostKeyAnswer::Unclear => question = HOST_KEY_QUESTION_AGAIN,
+            }
+        }
+    }
+}
+
+/// 用户对首见主机提问的回答。
+#[derive(Debug, PartialEq, Eq)]
+enum HostKeyAnswer {
+    Accept,
+    Decline,
+    /// 既不是 yes / no 也不是指纹(含空行):重问。
+    Unclear,
+}
+
+/// 解读首见主机提问的回答(纯函数便于单测):去掉首尾空白后,`yes` / `no` 大小写不敏感,
+/// 指纹要与 `SHA256:…` 逐字一致(OpenSSH 同样如此)。空行不当成 `no`(OpenSSH 会),免得手滑
+/// 一个回车就断开 —— 照样重问。
+fn host_key_answer(answer: &str, fingerprint: &str) -> HostKeyAnswer {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("yes") || answer == fingerprint {
+        HostKeyAnswer::Accept
+    } else if answer.eq_ignore_ascii_case("no") {
+        HostKeyAnswer::Decline
+    } else {
+        HostKeyAnswer::Unclear
+    }
+}
+
+/// OpenSSH 提示里的密钥类型名(`sshkey_type()`):ED25519 / RSA / ECDSA ……
+fn openssh_key_type(algorithm: &russh::keys::Algorithm) -> String {
+    use russh::keys::Algorithm;
+    match algorithm {
+        Algorithm::Rsa { .. } => "RSA".into(),
+        Algorithm::Dsa => "DSA".into(),
+        Algorithm::Ecdsa { .. } => "ECDSA".into(),
+        Algorithm::Ed25519 => "ED25519".into(),
+        Algorithm::SkEcdsaSha2NistP256 => "ECDSA-SK".into(),
+        Algorithm::SkEd25519 => "ED25519-SK".into(),
+        other => other.as_str().to_ascii_uppercase(),
     }
 }
 
@@ -418,6 +528,7 @@ impl Handler for MtClient {
         &mut self,
         reason: russh::client::DisconnectReason<Self::Error>,
     ) -> Result<(), Self::Error> {
+        let mut io_kind = None;
         let (end, result) = match reason {
             russh::client::DisconnectReason::ReceivedDisconnect(info) => {
                 let message = if info.message.trim().is_empty() {
@@ -430,12 +541,35 @@ impl Handler for MtClient {
             russh::client::DisconnectReason::Error(russh::Error::NoAuthMethod) => {
                 (SessionEnd::NoMoreMethods, Err(russh::Error::NoAuthMethod))
             }
-            russh::client::DisconnectReason::Error(e) => (SessionEnd::Error(e.to_string()), Err(e)),
+            russh::client::DisconnectReason::Error(e) => {
+                if let russh::Error::IO(io) = &e {
+                    io_kind = Some(io.kind());
+                }
+                (SessionEnd::Error(e.to_string()), Err(e))
+            }
         };
         if let Ok(mut slot) = self.notes.ended.lock() {
+            if slot.is_none() {
+                if let Ok(mut kind) = self.notes.ended_io.lock() {
+                    *kind = io_kind;
+                }
+            }
             slot.get_or_insert(end);
         }
         result
+    }
+
+    /// 认证 banner(`SSH_MSG_USERAUTH_BANNER`):终端 shell 净化控制字符后显示给用户;没有
+    /// 提示器时照默认实现忽略。
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(interaction) = &self.interaction {
+            interaction.notice(crate::interact::banner_text(banner));
+        }
+        Ok(())
     }
 
     /// host-key 校验:accept-new 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
@@ -446,7 +580,9 @@ impl Handler for MtClient {
     /// - 该 host 只登记了**其它算法**的 key → 拒绝且不追加,视同换 key。连接前已把
     ///   已登记的类型排到首选(`preferred_host_key_algorithms`),服务器还支持它时
     ///   根本走不到这里;走到了说明服务器不再提供登记过的那把 key。
-    /// - 该 host 没有任何条目 → 把当前 key 以 plaintext 追加到 known_hosts,通过。
+    /// - 该 host 没有任何条目 → 把当前 key 以 plaintext 追加到 known_hosts,通过。带交互提示器
+    ///   (终端 shell)时先照 OpenSSH 的原文问用户([`Self::confirm_new_host`]),答 yes 或照抄
+    ///   指纹才追加、并提示「Permanently added」;答 no / 取消即拒绝。
     /// - known_hosts 读失败(文件不存在除外,那等于空文件)或追加失败 → 拒绝,
     ///   绝不在没法校验时悄悄放行。
     ///
@@ -492,11 +628,31 @@ impl Handler for MtClient {
                  后重试)"
             ))),
             HostKeyMatch::Unknown => {
-                if let Err(e) = append_known_host(&self.known_hosts_path, &name, server_pubkey) {
-                    return Ok(self.reject(format!(
-                        "known_hosts write failed ({path}: {e}): 无法把 {name} 的新主机密钥写入 \
-                         known_hosts({path}: {e}),拒绝连接"
-                    )));
+                // 等用户作答期间,会话池 / 另一个终端可能已把同一把密钥登记进来:
+                // 答完重读一遍,已登记就不再重复追加(其余情形照旧追加)
+                let mut already_recorded = false;
+                if let Some(interaction) = self.interaction.clone() {
+                    if !self.confirm_new_host(&interaction, server_pubkey).await {
+                        return Ok(false);
+                    }
+                    already_recorded = read_known_hosts(&self.known_hosts_path).is_ok_and(|raw| {
+                        match_known_host(&raw, &name, server_pubkey) == HostKeyMatch::Match
+                    });
+                }
+                if !already_recorded {
+                    if let Err(e) = append_known_host(&self.known_hosts_path, &name, server_pubkey)
+                    {
+                        return Ok(self.reject(format!(
+                            "known_hosts write failed ({path}: {e}): 无法把 {name} 的新主机密钥\
+                             写入 known_hosts({path}: {e}),拒绝连接"
+                        )));
+                    }
+                }
+                if let Some(interaction) = self.interaction.as_ref().filter(|_| !already_recorded) {
+                    interaction.notice(format!(
+                        "Warning: Permanently added '{name}' ({}) to the list of known hosts.\r\n",
+                        openssh_key_type(&server_pubkey.algorithm())
+                    ));
                 }
                 Ok(true)
             }
@@ -1183,6 +1339,40 @@ mod tests {
             .disconnected(DisconnectReason::Error(russh::Error::NoAuthMethod))
             .await;
         assert_eq!(fresh.ended(), Some(SessionEnd::NoMoreMethods));
+    }
+
+    #[test]
+    fn host_key_answers_follow_openssh() {
+        let fp = "SHA256:abcDEF123";
+        assert_eq!(host_key_answer("yes", fp), HostKeyAnswer::Accept);
+        assert_eq!(host_key_answer("  YeS \r\n", fp), HostKeyAnswer::Accept);
+        assert_eq!(host_key_answer(fp, fp), HostKeyAnswer::Accept);
+        assert_eq!(
+            host_key_answer("sha256:abcdef123", fp),
+            HostKeyAnswer::Unclear,
+            "指纹逐字比对"
+        );
+        assert_eq!(host_key_answer("No", fp), HostKeyAnswer::Decline);
+        assert_eq!(host_key_answer("y", fp), HostKeyAnswer::Unclear);
+        assert_eq!(
+            host_key_answer("", fp),
+            HostKeyAnswer::Unclear,
+            "空行重问,不当成 no"
+        );
+    }
+
+    #[test]
+    fn openssh_key_type_names() {
+        use russh::keys::{Algorithm, EcdsaCurve};
+        assert_eq!(openssh_key_type(&Algorithm::Ed25519), "ED25519");
+        assert_eq!(openssh_key_type(&Algorithm::Rsa { hash: None }), "RSA");
+        assert_eq!(
+            openssh_key_type(&Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256
+            }),
+            "ECDSA"
+        );
+        assert_eq!(openssh_key_type(&Algorithm::SkEd25519), "ED25519-SK");
     }
 
     #[test]

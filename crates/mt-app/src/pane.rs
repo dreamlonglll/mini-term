@@ -19,6 +19,38 @@
 //! 回填前的写入 / resize / 退出通知怎么攒、回填时按什么顺序交出去,全在
 //! [`crate::pty_slot`](与 GPUI 无关,有单测)。
 //!
+//! # 后端:基底 + 可选的 SSH 接管层
+//!
+//! pane 的**基底**([`PaneBase`])二选一:
+//!
+//! - **本地 PTY**:本地 shell,或系统 OpenSSH 回退的远程项目 pane(连接勾了「终端使用系统
+//!   OpenSSH」:PTY 里直接跑 ssh.exe,密码走 `SshAutofill`)—— 上面那套,一字未动;
+//! - **内置 SSH**(远程项目 pane 的默认形态):mt-ssh 的 `ShellSession` 直接开 pty + `exec` 远端
+//!   登录命令,远端字节直接进 emulator,不经 ssh.exe、不经 ConPTY。生命周期(连接中 → 在跑 →
+//!   结束)在 [`mt_app_core::shell_link`]。
+//!
+//! 右键「SSH 连接」(连接没勾系统 OpenSSH)= **接管**([`Takeover`]):在基底上叠一条内置 SSH
+//! 会话。基底不杀、它的输出关闸丢弃(不进 emulator / AI 感知 / git 观察),终端交给叠加会话;
+//! 叠加会话收场后屏幕还原成接管前的样子(`TerminalEmulator::begin_takeover` / `end_takeover`,
+//! 远端内容留在回看里),再开闸。不给基底发任何字节。三种基底都能被接管。写入 / 应答 / resize /
+//! 基底退出按接管阶段路由,路由表在 [`mt_app_core::ssh_takeover`]。
+//!
+//! ```text
+//! 本地 PTY reader 线程 ─→ 基底闸 ─┬─(放行)→ emulator + AI 输出旁路 + git 观察 + quick_ssh
+//! 内置 SSH 输出线程   ─→ 链路闸 ─┘  (接管期间基底闸丢弃;链路闸在建连提示画完前暂扣)
+//! 用户写入 ─→ 路由 ─┬→ 基底(PtySlot 排队 / 内置 SSH 链路)
+//!                  └→ 叠加层(连接中:行编辑 / 预输入 / Ctrl+C 取消;在跑:旁路后写会话)
+//! ```
+//!
+//! 每条内置 SSH 链路一条前台任务([`spawn_link`]),**严格按序**回主线程:建连提示(读到提示流
+//! 结束)→ 建连结果 → 远端退出。远端输出在链路闸后暂扣,主线程处理完建连结果才放行 —— 所以
+//! 主机密钥提问、`Permanently added`、banner 这些一定先于 motd 画出来。建连期间要用户答的
+//! (主机密钥 / 密码 / OTP / 私钥口令)在终端里读一行,按键**只**喂行编辑器,不进 AI 输入旁路、
+//! 不发 `UserInput`、不进移动端;口径见 [`mt_app_core::shell_link`] 模块注释。
+//!
+//! 链路回调、接管的开始 / 收场这些 SSH 胶水在子模块 `ssh`(`pane/ssh.rs`),本文件只留路由的入口
+//! (写入 / 应答 / resize / 退出)。
+//!
 //! # 渲染/键盘/IME 归 [`mt_ui::TerminalView`]
 //!
 //! 本模块**不**处理按键:`TerminalView` 自己 `track_focus` + `key_context("Terminal")`
@@ -105,7 +137,10 @@ use gpui::{
     px,
 };
 use gpui_component::ActiveTheme as _;
+use mt_app_core::output_gate::{GateState, OutputGate};
 use mt_app_core::quick_ssh::{QuickSshOutcome, QuickSshTracker, SshProcessProbe};
+use mt_app_core::shell_link::{self, LinkPhase};
+use mt_app_core::ssh_takeover::{self, Admission, BaseState, Sink, TakeoverState};
 use mt_config::{ShellConfig, SshConnection};
 use mt_pty::{PtySession, PtySpawn};
 use parking_lot::Mutex;
@@ -134,6 +169,11 @@ use crate::redraw;
 use crate::ssh_activity::SshActivityView;
 use crate::store::{AppStore, TerminalZoom};
 use crate::toast;
+
+// 内置 SSH 的胶水(链路的前台任务与回调、接管的开始与收场),见模块注释「后端」
+mod ssh;
+
+use ssh::{DeferredExit, LinkRole, LinkSlot, OutputSink, Takeover, spawn_link, toast_for_pty};
 
 gpui::actions!(
     mini_term,
@@ -195,13 +235,18 @@ pub struct TerminalPane {
     /// 后端 pane 编号,见模块注释。
     pty_id: u32,
     emulator: Arc<TerminalEmulator>,
-    /// PTY 会话。**建 pane 时还不存在**(后台在起),见模块注释「PTY 在后台起」与
-    /// [`crate::pty_slot`]。
-    pty: PtySlot<PtySession>,
+    /// 基底后端(本地 PTY / 内置 SSH),见模块注释「后端」。本地 PTY **建 pane 时还不存在**
+    /// (后台在起),见「PTY 在后台起」与 [`crate::pty_slot`]。
+    base: PaneBase,
+    /// 基底的输出闸:本地 PTY 的 reader 回调 / 内置 SSH 基底的输出回调都过它(内置 SSH 基底时
+    /// 与链路上那一份是同一个)。接管期间关成 `Drop`,见 [`mt_app_core::output_gate`]。
+    base_gate: Arc<OutputGate>,
+    /// 右键「SSH 连接」(内置客户端)的接管层。`None` = 没在接管。
+    takeover: Option<Takeover>,
     /// 后台起 PTY 的那条前台任务(等后台结果、回主线程回填)。实体释放时随字段一起
     /// 丢掉 —— 后台还没开跑就连 spawn 都不做;已经在跑的,产出的会话随之被丢弃
-    /// (= kill)。`shutdown` 不动它,理由见那边。
-    _spawn: Task<()>,
+    /// (= kill)。`shutdown` 不动它,理由见那边。内置 SSH 基底没有这一条(任务挂在链路上)。
+    _spawn: Option<Task<()>>,
     /// 等「PTY 起没起来」定局的人(移动端发起会话的回执)。定局即逐个回 `true/false`,
     /// pane 没了则 sender 随之丢弃,接收端拿到 `Canceled` 按失败算。
     spawn_waiters: Vec<oneshot::Sender<bool>>,
@@ -308,6 +353,26 @@ pub struct TerminalPane {
     /// 悬浮框关着时画空,理由见 [`crate::ssh_activity`] 视图模块注释。事件由
     /// `ssh_activity` 的泵直接投给它,不经本 pane 的 update。
     ssh_activity: Entity<SshActivityView>,
+    /// 往唤醒循环发信号:主线程自己往 emulator 里画了字(建连提示、行编辑回显、收场那一行),
+    /// 借它排重绘、收应答。
+    signal: mpsc::UnboundedSender<PaneSignal>,
+    /// 内置 SSH 链路的代数:前台任务回调时核对是不是还是那一条。
+    next_link_id: u64,
+    /// 基底就绪(本地 PTY 回填 / 内置 SSH 开好 shell)的时刻 —— 接管前等首屏用。
+    base_ready_at: Option<Instant>,
+    /// 最近一次有输出的时刻(唤醒循环记)—— 同上。
+    last_output_at: Option<Instant>,
+    /// shell 最近一次报的 OSC 标题(还在限流窗口里没推上去的也算)。接管开始存一份,
+    /// 结束时还原。
+    osc_title: Option<String>,
+}
+
+/// pane 的基底后端,见模块注释「后端」。
+enum PaneBase {
+    /// 本地 PTY:本地 shell,或系统 OpenSSH 回退的远程项目 pane(PTY 里跑 ssh.exe)。
+    Pty(PtySlot<PtySession>),
+    /// 内置 SSH 的远程项目 pane。
+    Shell(LinkSlot),
 }
 
 /// 标记跳转后整行闪烁的底色与时长(`terminalCache.ts:193-194` 的
@@ -464,6 +529,18 @@ pub struct PreparedLaunch {
     pub resume_cwd: Option<ResumeCwd>,
 }
 
+/// pane 的基底怎么起,见模块注释「后端」。
+pub enum PaneStart {
+    /// 本地 PTY(本地 shell / 系统 OpenSSH 回退的远程项目 pane),在后台兑现启动预案。
+    Pty(PaneLaunch),
+    /// 内置 SSH 的远程项目 pane:建 pane 时当场开始建连(放在 mt-remote 的共享运行时上),
+    /// 远端命令 `cd '<remote_path>' 2>/dev/null; exec $SHELL -l`。
+    RemoteShell {
+        conn: Box<SshConnection>,
+        remote_path: String,
+    },
+}
+
 /// 后台任务交回主线程的结果。
 struct SpawnOutcome {
     session: anyhow::Result<PtySession>,
@@ -481,8 +558,8 @@ where
 {
     let prepared = match launch() {
         Ok(prepared) => prepared,
-        // 预检失败:根本不 spawn。`options` / `on_output` 随之丢弃,它们手里的
-        // 信号 sender 一没,pane 的唤醒循环自然收摊(与此前起失败同)。
+        // 预检失败:根本不 spawn。`options` / `on_output` 随之丢弃(唤醒循环还挂着 pane
+        // 自己那份信号 sender,闲着不占 CPU,随 pane 一起释放)。
         Err(err) => {
             return SpawnOutcome {
                 session: Err(anyhow::anyhow!(err)),
@@ -507,7 +584,8 @@ where
 
 impl TerminalPane {
     /// 建 emulator 与视图、登记 AI 感知后**立即返回**;PTY 由 `launch` 在后台起,
-    /// 完成后回主线程回填(见模块注释「PTY 在后台起」)。
+    /// 完成后回主线程回填(见模块注释「PTY 在后台起」)。内置 SSH 的远程项目 pane
+    /// ([`PaneStart::RemoteShell`])当场开始建连,见模块注释「后端」。
     ///
     /// `user_env` 是用户配的环境变量(全局 + 项目级,已合并):走
     /// [`mt_pty::PtyOptions::user_env`] 而不是 `spec.env`,
@@ -516,7 +594,7 @@ impl TerminalPane {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pty_id: u32,
-        launch: PaneLaunch,
+        start: PaneStart,
         user_env: Vec<(String, String)>,
         style: TerminalStyle,
         theme: TerminalTheme,
@@ -541,61 +619,69 @@ impl TerminalPane {
         let emulator = Arc::new(emulator.with_kitty_graphics(crate::kitty_graphics::active()));
 
         let (tx, mut rx) = mpsc::unbounded::<PaneSignal>();
-        let exit_tx = tx.clone();
         let quick_ssh = Arc::new(Mutex::new(QuickSshTracker::new()));
         let quick_ssh_watching = Arc::new(AtomicBool::new(false));
-        let options = mt_pty::PtyOptions::default()
-            .with_user_env(user_env)
-            .on_exit(move |code| {
-                let _ = exit_tx.unbounded_send(PaneSignal::Exit(code));
-            });
-        let on_output = {
-            let emulator = emulator.clone();
-            let ai = ai.clone();
-            let quick_ssh = quick_ssh.clone();
-            let quick_ssh_watching = quick_ssh_watching.clone();
-            move |bytes: &[u8]| {
-                // reader 线程:直接推进状态机,没有 IPC、没有批缓冲、没有序列化。
-                emulator.advance(bytes);
-                // AI 感知的输出旁路(命令 echo 回扫 + 输出活跃度)
-                ai.perception().observe_output(pty_id, bytes);
-                // Git 面板的输出旁路(外部跑了 git 命令 → 刷新变更与仓库元信息)。
-                // **这条线程上不跑任何模式匹配**:总闸关着时只有一次原子读,
-                // 开着时也只是把尾部字节塞进有界环形缓冲,5 条口径在主线程节拍上跑。
-                // 详见 `git_watch` 模块注释(后续 Y 批的 git 着色与本条共用)。
-                crate::git::watch::observe_output(pty_id, bytes);
-                // 右键「SSH 连接」的已连接状态机旁路:普通终端只有一次原子读(零开销),
-                // 已进入原生 Connected 态后 `on_output` 同样直接短路。
-                if quick_ssh_watching.load(Ordering::Relaxed) {
-                    let outcome = quick_ssh.lock().on_output(bytes, Instant::now());
-                    if let QuickSshOutcome::Changed(next) = outcome {
-                        if next.is_none() {
-                            quick_ssh_watching.store(false, Ordering::Relaxed);
-                        }
-                        let _ = tx.unbounded_send(PaneSignal::SshConnected(next));
-                    }
-                }
-                let _ = tx.unbounded_send(PaneSignal::Output);
+        let sink = OutputSink {
+            pty_id,
+            emulator: emulator.clone(),
+            ai: ai.clone(),
+            signal: tx.clone(),
+            quick_ssh: Some((quick_ssh.clone(), quick_ssh_watching.clone())),
+        };
+        let mut next_link_id = 0;
+        let (base, base_gate, spawn) = match start {
+            PaneStart::Pty(launch) => {
+                let gate = Arc::new(OutputGate::new(GateState::Pass));
+                let exit_tx = tx.clone();
+                let options = mt_pty::PtyOptions::default()
+                    .with_user_env(user_env)
+                    .on_exit(move |code| {
+                        let _ = exit_tx.unbounded_send(PaneSignal::Exit(code));
+                    });
+                // reader 线程:直接推进状态机,没有 IPC、没有批缓冲、没有序列化(过闸,
+                // 见 `OutputSink::deliver`)
+                let on_output = sink.callback(gate.clone());
+
+                // 起 PTY:整段在后台跑,回主线程回填。
+                //
+                // 回填前 pane 没了有两种形态,都不留孤儿进程:
+                // - **实体已释放**(或应用在退出):`this.update` 返回 Err,闭包连同捕获的
+                //   outcome 一起被丢弃,`PtySession::drop` 当场杀子进程;实体释放时这条任务
+                //   本身也随 `_spawn` 字段一起被丢掉,后台还没开跑的话连 spawn 都不做;
+                // - **只是关掉了**(`shutdown`,实体还在):`PtySlot` 已是 Closed,
+                //   `finish_spawn` 里 `backfill` 把会话退回来丢弃。
+                let spawn = cx.spawn(async move |this, cx| {
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move { spawn_in_background(launch, options, on_output) })
+                        .await;
+                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.finish_spawn(outcome, cx)
+                    });
+                });
+                (PaneBase::Pty(PtySlot::starting()), gate, Some(spawn))
+            }
+            PaneStart::RemoteShell { conn, remote_path } => {
+                // 远程项目 pane 不注入用户环境变量(与系统 OpenSSH 那条路同:那些变量属于本机)
+                drop(user_env);
+                let gate = Arc::new(OutputGate::new(GateState::Hold));
+                let (rows, cols) = (mt_pty::INITIAL_PTY_ROWS, mt_pty::INITIAL_PTY_COLS);
+                let mut slot = LinkSlot::new(next_link_id, &conn, rows, cols, gate.clone());
+                next_link_id += 1;
+                // 还没量过 grid:先按初值开 pty,就绪时补一次 resize(`ShellLink::opened`)
+                let (rows, cols) = slot.link.request_size().unwrap_or((rows, cols));
+                let request = mt_remote::remote_shell_request(&remote_path, rows, cols);
+                emulator.advance(shell_link::connecting_notice(&slot.target).as_bytes());
+                slot.task = Some(spawn_link(
+                    slot.id,
+                    *conn,
+                    request,
+                    sink.callback(gate.clone()),
+                    cx,
+                ));
+                (PaneBase::Shell(slot), gate, None)
             }
         };
-
-        // 起 PTY:整段在后台跑,回主线程回填。
-        //
-        // 回填前 pane 没了有两种形态,都不留孤儿进程:
-        // - **实体已释放**(或应用在退出):`this.update` 返回 Err,闭包连同捕获的
-        //   outcome 一起被丢弃,`PtySession::drop` 当场杀子进程;实体释放时这条任务
-        //   本身也随 `_spawn` 字段一起被丢掉,后台还没开跑的话连 spawn 都不做;
-        // - **只是关掉了**(`shutdown`,实体还在):`PtySlot` 已是 Closed,
-        //   `finish_spawn` 里 `backfill` 把会话退回来丢弃。
-        let spawn = cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { spawn_in_background(launch, options, on_output) })
-                .await;
-            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
-                pane.finish_spawn(outcome, cx)
-            });
-        });
 
         let wake = cx.spawn(async move |this, cx| {
             while let Some(signal) = rx.next().await {
@@ -615,31 +701,32 @@ impl TerminalPane {
                         PaneSignal::SshConnected(next) => ssh_connected = Some(next),
                     }
                 }
-                if this
-                    .update(cx, |pane, cx| {
-                        pane.drain_term_events(cx);
-                        pane.arm_sync_release(cx);
-                        if output {
-                            pane.note_output();
-                            pane.purge_cleared_scrollback();
-                        }
-                        if let Some(next) = ssh_connected {
-                            cx.emit(PaneEvent::SshConnected(next));
-                        }
-                        // 子进程快到回填之前就退了:先挂着,回填完成后再报
-                        // (`PtySlot::note_exit`)—— 退出永远排在回填之后
-                        if let Some(code) = exit.and_then(|code| pane.pty.note_exit(code)) {
-                            pane.emit_exit(code, cx);
-                        }
-                    })
-                    .is_err()
-                {
+                let Ok(exited) = this.update(cx, |pane, cx| {
+                    pane.drain_term_events(cx);
+                    pane.arm_sync_release(cx);
+                    if output {
+                        // 接管前等基底首屏画完要看它(见 `ssh_takeover::first_screen_step`)
+                        pane.last_output_at = Some(Instant::now());
+                        pane.note_output();
+                        pane.purge_cleared_scrollback();
+                    }
+                    if let Some(next) = ssh_connected {
+                        pane.emit_quick_ssh(next, cx);
+                    }
+                    // 子进程快到回填之前就退了:先挂着,回填完成后再报
+                    // (`PtySlot::note_exit`)—— 退出永远排在回填之后
+                    let code = match (&mut pane.base, exit) {
+                        (PaneBase::Pty(slot), Some(code)) => slot.note_exit(code),
+                        _ => None,
+                    };
+                    code.is_some_and(|code| pane.report_base_exit(DeferredExit::Pty(code), cx))
+                }) else {
                     return;
-                }
+                };
                 // 重绘交给全局节拍器:多个 pane 一起刷屏也只出一帧,窗口在后台
                 // 时还会自动降到 5fps。后台/不可见 pane 跳过节拍器只记脏标记,
                 // 避免非激活项目、后台面板、未激活 tab 或停在文档页签时的刷屏持续唤醒 GPUI。
-                if exit.is_none() {
+                if !exited {
                     cx.update(|cx| request_redraw_if_visible(this.clone(), pty_id, cx));
                 }
                 cx.background_executor().timer(DRAIN_PERIOD).await;
@@ -765,7 +852,9 @@ impl TerminalPane {
         Self {
             pty_id,
             emulator,
-            pty: PtySlot::starting(),
+            base,
+            base_gate,
+            takeover: None,
             _spawn: spawn,
             spawn_waiters: Vec::new(),
             focus,
@@ -806,6 +895,11 @@ impl TerminalPane {
             quick_ssh_watching,
             _quick_ssh_poll: None,
             ssh_activity,
+            signal: tx,
+            next_link_id,
+            base_ready_at: None,
+            last_output_at: None,
+            osc_title: None,
         }
     }
 
@@ -877,13 +971,26 @@ impl TerminalPane {
     }
 
     /// grid 尺寸变了:停稳后再下发给 PTY,时机见 [`PTY_RESIZE_SETTLE`]。
+    ///
+    /// 接管期间基底与叠加层一起下(见 [`mt_app_core::ssh_takeover`] 的路由表)。
     fn schedule_pty_resize(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
-        // 会话还在后台起:`PtySlot` 只记最新一次、回填时补下发,本来就不会逐列下发;
-        // 直接交给它,回填拿到的就是此刻的真实尺寸
-        if self.pty.phase() != PtyPhase::Running {
+        // 会话还在后台起 / 内置 SSH 还在建连:只记最新一次、就绪时补下发,本来就不会逐列下发;
+        // 直接交给它,就绪时拿到的就是此刻的真实尺寸
+        let base_running = self.base_ready();
+        if !base_running {
+            self.resize_base(rows, cols);
+        }
+        let overlay_running = match self.takeover.as_mut() {
+            Some(takeover) if takeover.slot.link.phase() == LinkPhase::Running => true,
+            Some(takeover) => {
+                let _ = takeover.slot.link.resize(rows, cols);
+                false
+            }
+            None => false,
+        };
+        if !base_running && !overlay_running {
             self.pending_pty_size = None;
             self._pty_resize_timer = None;
-            self.apply_pty_resize(rows, cols);
             return;
         }
         self.pending_pty_size = Some((rows, cols));
@@ -911,16 +1018,77 @@ impl TerminalPane {
 
     /// 真正下发 resize。只有**真实下发**的 resize 才开 AI 感知的重绘冷却窗口:
     /// 同尺寸的 resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃。
+    ///
+    /// 接管期间基底照下(本地 ConPTY 与终端保持同尺寸,接管结束时快照按当前尺寸 reflow,
+    /// 两边才对得上),叠加层一起下。
     fn apply_pty_resize(&mut self, rows: u16, cols: u16) {
         // 子进程已经退出:PTY 那头没人收 resize。退出条占掉两行时 grid 照改(内容挤进回滚),
         // 不必再去碰 ConPTY,也不必给已撤出轮询的 pane 开 AI 重绘冷却
-        if self.exited {
-            return;
+        let mut resized = !self.exited && self.resize_base(rows, cols);
+        if let Some(takeover) = self.takeover.as_mut() {
+            match takeover.slot.link.resize(rows, cols) {
+                Ok(true) => resized = true,
+                Ok(false) => {}
+                Err(err) => tracing::warn!("[pane {}] SSH resize 失败: {err}", self.pty_id),
+            }
         }
-        match self.pty.resize(rows, cols) {
-            Ok(true) => self.ai.perception().note_resize(self.pty_id),
-            Ok(false) => {}
-            Err(err) => tracing::warn!("[pane {}] resize 失败: {err:#}", self.pty_id),
+        if resized {
+            self.ai.perception().note_resize(self.pty_id);
+        }
+    }
+
+    /// 给基底下 resize(还没就绪的只记下来),返回是否真的下发了。
+    fn resize_base(&mut self, rows: u16, cols: u16) -> bool {
+        let result = match &mut self.base {
+            PaneBase::Pty(slot) => slot.resize(rows, cols).map_err(|err| format!("{err:#}")),
+            PaneBase::Shell(slot) => slot.link.resize(rows, cols),
+        };
+        match result {
+            Ok(resized) => resized,
+            Err(err) => {
+                tracing::warn!("[pane {}] resize 失败: {err}", self.pty_id);
+                false
+            }
+        }
+    }
+
+    /// 基底就绪了吗(本地 PTY 已回填 / 内置 SSH 已开好 shell;退出了也算 —— 与 `PtySlot` 同口径)。
+    fn base_ready(&self) -> bool {
+        match &self.base {
+            PaneBase::Pty(slot) => slot.phase() == PtyPhase::Running,
+            PaneBase::Shell(slot) => slot.link.phase() == LinkPhase::Running,
+        }
+    }
+
+    /// 基底还在起(本地 PTY 后台在起 / 内置 SSH 在建连)。
+    fn base_starting(&self) -> bool {
+        match &self.base {
+            PaneBase::Pty(slot) => slot.phase() == PtyPhase::Starting,
+            PaneBase::Shell(slot) => slot.link.phase() == LinkPhase::Connecting,
+        }
+    }
+
+    /// 基底此刻的状态(接管准入 / 等首屏用),见 [`BaseState`]。
+    fn base_state(&self) -> BaseState {
+        match &self.base {
+            PaneBase::Pty(slot) => match slot.phase() {
+                PtyPhase::Starting => BaseState::Starting,
+                PtyPhase::Running if !self.exited => BaseState::Running,
+                _ => BaseState::Dead,
+            },
+            PaneBase::Shell(slot) => match slot.link.phase() {
+                LinkPhase::Connecting => BaseState::Connecting,
+                LinkPhase::Running if !self.exited => BaseState::Running,
+                _ => BaseState::Dead,
+            },
+        }
+    }
+
+    /// 还没被 `shutdown` 收掉(关 pane 时要收尾)。
+    fn base_is_live(&self) -> bool {
+        match &self.base {
+            PaneBase::Pty(slot) => slot.is_live(),
+            PaneBase::Shell(slot) => !slot.closed,
         }
     }
 
@@ -936,11 +1104,15 @@ impl TerminalPane {
             session,
             resume_cwd,
         } = outcome;
+        let PaneBase::Pty(slot) = &mut self.base else {
+            // 只有本地 PTY 基底才有这条后台任务;会话(若有)随之丢弃 = kill
+            return;
+        };
         let exit = match session {
             Ok(session) => {
                 let wsl = session.wsl_override().cloned();
                 let child_pid = session.process_id();
-                let filled = match self.pty.backfill(session) {
+                let filled = match slot.backfill(session) {
                     Ok(filled) => filled,
                     Err(session) => {
                         // `PtySession::drop`:先 kill 子进程,再把 master 丢到后台销毁
@@ -949,6 +1121,7 @@ impl TerminalPane {
                     }
                 };
                 self.child_pid = child_pid;
+                self.base_ready_at = Some(Instant::now());
                 if self.quick_ssh_watching.load(Ordering::Relaxed) {
                     self.quick_ssh.lock().on_pty_ready(Instant::now());
                 }
@@ -976,7 +1149,7 @@ impl TerminalPane {
                 let msg = format!("{err:#}");
                 tracing::error!("[pane {}] PTY 启动失败: {msg}", self.pty_id);
                 // 已关闭的 pane 不必再画错误
-                if !self.pty.fail() {
+                if !slot.fail() {
                     return;
                 }
                 self.spawn_error = Some(msg);
@@ -984,6 +1157,10 @@ impl TerminalPane {
                 self.disarm_quick_ssh(cx);
                 self.settle_spawn_waiters(false);
                 cx.emit(PaneEvent::SpawnFailed);
+                // 正等着它画首屏的接管作罢(起都没起来,没东西可接管)
+                if self.takeover.is_some() {
+                    self.drop_takeover();
+                }
                 None
             }
         };
@@ -992,9 +1169,19 @@ impl TerminalPane {
             cx.emit(PaneEvent::ResumeCwd(found));
         }
         if let Some(code) = exit {
-            self.emit_exit(code, cx);
+            self.report_base_exit(DeferredExit::Pty(code), cx);
         }
         cx.notify();
+    }
+
+    /// 让终端子视图重画:只给视图实体标脏(与在它的 update 里 `cx.notify()` 等价),
+    /// **不借用**视图。
+    ///
+    /// ⚠️ 别写回 `self.view.update(cx, |_, cx| cx.notify())`:按键 / 粘贴经
+    /// `TerminalView::on_input` 回调进 [`Self::write`] 时视图正被借用着,同实体嵌套
+    /// update 当场 panic —— 内置 SSH 建连中按 Ctrl+C 取消 → 收场 / 退出 → 刷视图,E2E 实测崩过。
+    fn notify_view(&self, cx: &mut App) {
+        cx.notify(self.view.entity_id());
     }
 
     /// 子进程退出:退出条 + 上报。只从「回填之后」的路径进来(见 `PtySlot::note_exit`)。
@@ -1005,7 +1192,7 @@ impl TerminalPane {
         self.disarm_quick_ssh(cx);
         cx.emit(PaneEvent::Exited(code));
         // 同步刷新终端子视图,确保进程退出前同一批输出的最后几行必刷出而不被节拍/缓存吞掉
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         // 退出是一次性事件:不进节拍器,当场画完收工
         cx.notify();
     }
@@ -1049,11 +1236,20 @@ impl TerminalPane {
             });
             (ai_alive, shell)
         };
+        // 接管中收 Ctrl+L 的是远端的登录 shell(与远程项目同理);叠加会话 / 内置 SSH 基底还在
+        // 建连(或接管还在等首屏)时,这一下会落进认证提示的行编辑器 / 预输入,只清回看。
+        // 本地 PTY 还在起时照旧发(排进队列,回填时冲刷)
+        let (remote, receiver_ready) = match self.takeover_state() {
+            None => (self.remote, !self.base_connecting()),
+            Some(TakeoverState::Waiting) => (self.remote, false),
+            Some(TakeoverState::Connecting) => (true, false),
+            Some(TakeoverState::Running) => (true, true),
+        };
         let plan = clear_buffer_plan(
             self.dead_since.is_some(),
-            ai_alive,
+            ai_alive || !receiver_ready,
             self.in_alt_screen(),
-            self.remote,
+            remote,
             shell,
         );
         match plan {
@@ -1068,7 +1264,7 @@ impl TerminalPane {
         }
         // 回看没了,滚动条与「回到底部」浮钮都要跟着变
         self.unseen_output = false;
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1093,7 +1289,7 @@ impl TerminalPane {
     /// 回看浮钮状态未变时不惊动外壳,让 gpui-fast 直接拼接 `TerminalView`。
     pub(crate) fn notify_redraw(&mut self, cx: &mut Context<Self>) {
         self.dirty_while_hidden = false;
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         let scrolled = self
             .emulator
             .with_term(|term| term.grid().display_offset() > 0);
@@ -1114,7 +1310,7 @@ impl TerminalPane {
     /// 确保首帧即绘出最新内容并同步「回到底部」浮钮(防止保留模式与 view 缓存停在旧帧)。
     pub(crate) fn flush_hidden_redraw(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.dirty_while_hidden) {
-            self.view.update(cx, |_, cx| cx.notify());
+            self.notify_view(cx);
             cx.notify();
         }
     }
@@ -1126,7 +1322,7 @@ impl TerminalPane {
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
         self.unseen_output = false;
         window.focus(&self.focus, cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1190,13 +1386,19 @@ impl TerminalPane {
     /// 所以这是个等待口而不是同步查询:已定局则接收端立刻就绪;还在起就排队,
     /// 定局时统一答复;pane 在定局前没了,sender 随之丢弃,接收端拿到 `Canceled`
     /// —— 调用方按失败算。
+    ///
+    /// 内置 SSH 基底:建连中(可能正等用户在终端里答密码)算「还在起」,开好 shell 算起来了,
+    /// 建连失败 / 取消算没起来。
     pub fn spawn_settled(&mut self) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        match self.pty.phase() {
-            PtyPhase::Starting => self.spawn_waiters.push(tx),
-            phase => {
-                let _ = tx.send(phase == PtyPhase::Running);
-            }
+        if self.base_starting() {
+            self.spawn_waiters.push(tx);
+        } else {
+            let alive = match &self.base {
+                PaneBase::Pty(slot) => slot.phase() == PtyPhase::Running,
+                PaneBase::Shell(slot) => slot.link.phase() == LinkPhase::Running,
+            };
+            let _ = tx.send(alive);
         }
         rx
     }
@@ -1283,7 +1485,7 @@ impl TerminalPane {
         self.search_bar = Some(bar);
         // 开合动画(点按钮与 Ctrl+F 都走这里)
         self.search_reveal.show(cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1309,7 +1511,7 @@ impl TerminalPane {
         self.search_exit = Some(bar);
         self.search_reveal.hide(cx);
         window.focus(&self.focus, cx);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1320,9 +1522,27 @@ impl TerminalPane {
     ///
     /// PTY 还在后台起时字节进队列,回填时按到达顺序冲刷(旁路照旧**当场**跑,
     /// AI 输入识别看到的时刻不变);起失败 / 已关闭时静默丢弃(与此前没有 PTY 时同)。
+    ///
+    /// 内置 SSH(基底或接管层)按 [`mt_app_core::shell_link`] 的口径:建连期间在读行就只喂
+    /// 行编辑器、**不过任何旁路**(里面可能是密码);没在读行时 Ctrl+C 取消建连、其余进预输入
+    /// (就绪时冲刷,那时才过旁路);在跑时先过旁路再写会话。接管期间写入一律给叠加层。
     pub fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        match ssh_takeover::route(self.takeover_state()).input {
+            Sink::Overlay => self.write_overlay(bytes, cx),
+            Sink::Base | Sink::Discard => self.write_base(bytes, cx),
+        }
+    }
+
+    fn write_base(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if let PaneBase::Shell(slot) = &mut self.base {
+            let feed = slot.link.feed(bytes);
+            self.apply_feed(LinkRole::Base, bytes, feed, cx);
+            return;
+        }
         self.observe_user_write(bytes, cx);
-        if let Err(err) = self.pty.write(bytes) {
+        if let PaneBase::Pty(slot) = &mut self.base
+            && let Err(err) = slot.write(bytes)
+        {
             tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
@@ -1334,6 +1554,9 @@ impl TerminalPane {
     /// PTY 还在后台起时,「写入 + 注册」作为**一个**队列元素排队,回填冲刷时整体交给
     /// 那个原子方法,前后的写入插不进它中间(见 [`crate::pty_slot`])。
     /// 起失败 / 已关闭时静默不做。
+    ///
+    /// 基底是内置 SSH(远程项目 pane)时没有 PTY 的自动填充:命令照普通写入,远端那个 ssh
+    /// 的密码提示由用户自己答。
     pub fn write_ssh_command(
         &mut self,
         line: &[u8],
@@ -1344,8 +1567,15 @@ impl TerminalPane {
             self.write(line, cx);
             return;
         };
+        if !matches!(self.base, PaneBase::Pty(_)) || self.takeover.is_some() {
+            drop(password);
+            self.write(line, cx);
+            return;
+        }
         self.observe_user_write(line, cx);
-        if let Err(err) = self.pty.write_then_arm_ssh_autofill(line, password) {
+        if let PaneBase::Pty(slot) = &mut self.base
+            && let Err(err) = slot.write_then_arm_ssh_autofill(line, password)
+        {
             tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
     }
@@ -1355,20 +1585,20 @@ impl TerminalPane {
     /// 必须在写入 `ssh …\r` **之前**调用,确保 reader 线程从首个字节就能看见命令回显与
     /// 随后的 SSH 输出;若此前该 pane 正连着别的 VPS,会先对外清掉旧的已连接标记。
     pub fn arm_quick_ssh(&mut self, conn_name: String, command: &str, cx: &mut Context<Self>) {
-        let pty_running = self.pty.phase() == PtyPhase::Running;
+        let pty_running = self.base_ready();
         let outcome = self
             .quick_ssh
             .lock()
             .arm(conn_name, command, pty_running, Instant::now());
         self.quick_ssh_watching.store(true, Ordering::Relaxed);
         if let QuickSshOutcome::Changed(next) = outcome {
-            cx.emit(PaneEvent::SshConnected(next));
+            self.emit_quick_ssh(next, cx);
         }
         self._quick_ssh_poll = Some(cx.spawn(async move |pane, cx| {
             loop {
                 let state = pane.update(cx, |pane: &mut TerminalPane, _cx| {
                     let interval = pane.quick_ssh.lock().poll_interval();
-                    let starting = pane.pty.phase() == PtyPhase::Starting;
+                    let starting = pane.base_starting();
                     (interval, pane.child_pid, starting)
                 });
                 let Ok((Some(interval), _, _)) = state else {
@@ -1378,7 +1608,7 @@ impl TerminalPane {
 
                 let snap = pane.update(cx, |pane: &mut TerminalPane, _cx| {
                     let active = pane.quick_ssh.lock().is_active();
-                    let starting = pane.pty.phase() == PtyPhase::Starting;
+                    let starting = pane.base_starting();
                     (active, pane.child_pid, starting)
                 });
                 let Ok((true, child_pid, starting)) = snap else {
@@ -1406,7 +1636,7 @@ impl TerminalPane {
                     };
                     pane.quick_ssh_watching.store(active, Ordering::Relaxed);
                     if let QuickSshOutcome::Changed(next) = outcome {
-                        cx.emit(PaneEvent::SshConnected(next));
+                        pane.emit_quick_ssh(next, cx);
                     }
                     active
                 });
@@ -1423,13 +1653,22 @@ impl TerminalPane {
         self._quick_ssh_poll = None;
         let outcome = self.quick_ssh.lock().reset();
         if let QuickSshOutcome::Changed(next) = outcome {
+            self.emit_quick_ssh(next, cx);
+        }
+    }
+
+    /// 系统 OpenSSH 回退那套(`quick_ssh`)报来的「SSH 已连接」变化。接管期间那颗灯归接管层
+    /// (按会话生命周期报),这边的变化不发;接管结束时会按它的当前值补发一次。
+    fn emit_quick_ssh(&mut self, next: Option<String>, cx: &mut Context<Self>) {
+        if self.takeover.is_none() {
             cx.emit(PaneEvent::SshConnected(next));
         }
     }
 
     /// 用户写入交给 PTY **之前**的旁路:AI 输入识别、`UserInput` 事件、AI 任务标记。
     fn observe_user_write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        if self.quick_ssh_watching.load(Ordering::Relaxed) {
+        // 接管期间敲的字给的是叠加会话,不是回退那条 ssh.exe
+        if self.takeover.is_none() && self.quick_ssh_watching.load(Ordering::Relaxed) {
             self.quick_ssh.lock().on_user_input(bytes, Instant::now());
         }
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
@@ -1630,7 +1869,7 @@ impl TerminalPane {
         self.flash_line(line, cx);
         // 闪烁那一行没变时 `set_flash` 不 notify(同一条标记 300ms 内连跳两次),
         // 回看位置却可能刚被滚过 —— 标脏子视图与外壳
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
         true
     }
@@ -1671,9 +1910,15 @@ impl TerminalPane {
     /// 从运行中的任务里丢掉自己的 `Task` 是在给自己拆脚手架;下次排窗口时
     /// 句柄自然被新任务顶掉。
     fn note_osc_title(&mut self, title: Option<String>, cx: &mut Context<Self>) {
-        if title.is_some() && self.quick_ssh_watching.load(Ordering::Relaxed) {
+        // 接管期间的标题是叠加会话的,与回退那条 ssh.exe 无关
+        if title.is_some()
+            && self.takeover.is_none()
+            && self.quick_ssh_watching.load(Ordering::Relaxed)
+        {
             self.quick_ssh.lock().on_osc_title(Instant::now());
         }
+        // 接管开始时存一份、结束时还原的就是它
+        self.osc_title.clone_from(&title);
         let armed = self.pending_osc_title.is_some();
         self.pending_osc_title = Some(title);
         if armed {
@@ -1749,9 +1994,24 @@ impl TerminalPane {
     /// 回填前也可能走到这里:reader 线程在后台 spawn 一返回就开始交输出,唤醒循环
     /// 可能抢在回填之前处理到 shell 的开场查询 —— 应答与用户输入进同一条队列,
     /// 相对顺序不变。
+    ///
+    /// 应答给提问的那一方(路由表见 [`mt_app_core::ssh_takeover`]):接管在跑时给叠加会话,
+    /// 建连中丢弃(屏上只有本地画的提示,谁都没提问),等首屏时屏幕还归基底、照给基底。
+    /// 内置 SSH 链路还没就绪时一律丢弃。
     fn write_raw(&mut self, bytes: &[u8]) {
-        if let Err(err) = self.pty.write_reply(bytes) {
-            tracing::error!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
+        let result = match ssh_takeover::route(self.takeover_state()).reply {
+            Sink::Base => match &mut self.base {
+                PaneBase::Pty(slot) => slot.write_reply(bytes).map_err(|err| format!("{err:#}")),
+                PaneBase::Shell(slot) => slot.link.write(bytes),
+            },
+            Sink::Overlay => match self.takeover.as_ref() {
+                Some(takeover) => takeover.slot.link.write(bytes),
+                None => Ok(()),
+            },
+            Sink::Discard => Ok(()),
+        };
+        if let Err(err) = result {
+            tracing::error!("[pane {}] 写 PTY 失败: {err}", self.pty_id);
         }
     }
 
@@ -1814,7 +2074,7 @@ impl TerminalPane {
     /// 缓存(`terminal_area::cached_terminal`),不 notify 就要等下一次输出才重画。
     pub fn set_scrollback(&mut self, lines: usize, cx: &mut Context<Self>) {
         self.emulator.set_scrollback(lines);
-        self.view.update(cx, |_, cx| cx.notify());
+        self.notify_view(cx);
         cx.notify();
     }
 
@@ -1829,11 +2089,20 @@ impl TerminalPane {
     /// `finish_spawn` 退回丢弃(= kill),不会双开也不会漏关。**这里不丢 `_spawn`**
     /// —— 关 pane 可能正好发生在那条任务自己回填时派发的事件里,从运行中的任务里
     /// 丢掉自己的句柄是在给自己拆脚手架;实体释放时它随字段一起走。
+    ///
+    /// 内置 SSH(基底或接管层):中止建连 / 关会话(`ShellSession` 的 Drop = close,不留连接)。
+    /// 接管层不还原屏幕 —— 终端马上就没了。
     pub fn shutdown(&mut self) {
-        if let Some(mut pty) = self.pty.close()
-            && let Err(err) = pty.kill()
-        {
-            tracing::warn!("[pane {}] kill 失败: {err:#}", self.pty_id);
+        self.drop_takeover();
+        match &mut self.base {
+            PaneBase::Pty(slot) => {
+                if let Some(mut pty) = slot.close()
+                    && let Err(err) = pty.kill()
+                {
+                    tracing::warn!("[pane {}] kill 失败: {err:#}", self.pty_id);
+                }
+            }
+            PaneBase::Shell(slot) => slot.close(),
         }
         self.settle_spawn_waiters(false);
         self.quick_ssh_watching.store(false, Ordering::Relaxed);
@@ -1862,9 +2131,9 @@ impl TerminalPane {
 impl Drop for TerminalPane {
     fn drop(&mut self) {
         // pane 实体被丢弃(项目移除 / 应用退出)时同样要回收 —— 否则后端留一个
-        // 谁也看不见、谁也杀不掉的孤儿子进程。还在后台起的也算:`_spawn` 随字段
-        // 一起丢弃,后台已产出的会话随之被丢弃(= kill)。
-        if self.pty.is_live() {
+        // 谁也看不见、谁也杀不掉的孤儿子进程(或一条没人关的 SSH 连接)。还在后台起的也算:
+        // `_spawn` 随字段一起丢弃,后台已产出的会话随之被丢弃(= kill)。
+        if self.base_is_live() || self.takeover.is_some() {
             self.shutdown();
         }
         // shutdown 走过就已经摘干净了;这一条兜住「PTY 起失败的 pane 被丢弃」
@@ -2399,9 +2668,13 @@ pub(crate) fn ssh_connect_target(
 /// [`crate::pane_actions::is_ai_alive`]);全屏程序看终端此刻是不是 alt screen。
 ///
 /// 新终端走 `AppStore::new_terminal`:锚点是右键的那个 pane,于是落在同一分组、被激活并
-/// 拿到焦点,shell 用项目默认的。随后照常 [`connect_ssh`] —— 那边写的是 pane 的写入队列,
-/// PTY 还在后台起时整条 `ssh …\r`(连同密码自动填充的注册)排着,回填时才交给新 PTY;
-/// PTY 起不来就随之丢弃。与 AI 启动器、启动恢复写续接命令同一条时序(见 [`crate::pty_slot`])。
+/// 拿到焦点,shell 用项目默认的。随后照常 [`connect_ssh`]:
+///
+/// - 内置客户端:接管要等新终端的本地 PTY 回填、首屏提示符画完再开始(否则快照是空屏,而
+///   conhost 的屏幕模型里有提示符,断开回来就对不上),见 [`TerminalPane::request_takeover`];
+/// - 系统 OpenSSH 回退:写的是 pane 的写入队列,PTY 还在后台起时整条 `ssh …\r`(连同密码自动
+///   填充的注册)排着,回填时才交给新 PTY;PTY 起不来就随之丢弃。与 AI 启动器、启动恢复写续接
+///   命令同一条时序(见 [`crate::pty_slot`])。
 pub(crate) fn connect_ssh_from_menu(
     pty_id: u32,
     conn: SshConnection,
@@ -2452,9 +2725,20 @@ pub(crate) fn connect_ssh_from_menu(
     }
 }
 
-/// 在指定终端里连 SSH:写入 `ssh` 命令并回车,有密码则**写完再**注册自动填充。
+/// 在指定终端里连 SSH。两条路,按连接的「终端使用系统 OpenSSH」(`use_system_ssh`)分:
 ///
-/// 私钥那一步(`mt_pty::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
+/// - **内置客户端**(默认):**接管**这个终端([`TerminalPane::request_takeover`])—— 本地
+///   shell 挂起(不杀、不给它发任何字节,输出关闸丢弃),终端交给一条内置 SSH 会话;主机密钥 /
+///   密码 / OTP / 私钥口令在终端里问;断开后屏幕还原成接管前的样子,远端内容留在回看里。
+///   新开的终端要等它的本地 PTY 回填、首屏提示符画完再接。「SSH 已连接」灯按会话生命周期报,
+///   不走进程树轮询;
+/// - **系统 OpenSSH**(回退,行为与引入内置客户端之前一字不变):写入 `ssh` 命令并回车,
+///   有密码则**写完再**注册自动填充。
+///
+/// 已经在接管中的终端两条路都不接:提示「先断开」,不嵌套。内置 SSH 的远程 pane 还在建连
+/// (口令提示可能正等着)时也不接 —— 回退那条路写进去的 `ssh …\r` 会被当成口令。
+///
+/// 回退那条路的私钥那一步(`mt_pty::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
 /// OpenSSH 的 `UNPROTECTED PRIVATE KEY FILE` 拒绝)是**阻塞文件 IO**,丢后台;
 /// 失败**回退原始路径**让 ssh 自己报错(原版 `console.error` 后照走)。
 ///
@@ -2466,6 +2750,40 @@ pub(crate) fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window,
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
+    if terminal.read(cx).in_ssh_takeover() {
+        toast_for_pty(
+            pty_id,
+            ToastKind::Info,
+            t("terminal", "sshAlreadyConnected").to_string(),
+            cx,
+        );
+        return;
+    }
+    if !conn.use_system_ssh {
+        let admitted = terminal.update(cx, |pane, cx| pane.request_takeover(conn, cx));
+        let refused = match admitted {
+            // 把键盘还给终端:接下来的认证提示就在这里答
+            Ok(()) => {
+                terminal.update(cx, |pane, cx| pane.focus(window, cx));
+                return;
+            }
+            Err(Admission::AlreadyConnected) => t("terminal", "sshAlreadyConnected"),
+            Err(_) => t("terminal", "sshTakeoverUnavailable"),
+        };
+        toast_for_pty(pty_id, ToastKind::Info, refused.to_string(), cx);
+        return;
+    }
+    // 回退那条路(下面一字未改)只多挡一种新情形:内置 SSH 的远程 pane 还在建连,
+    // 这时写进去的 `ssh …\r` 会落进它的口令提示
+    if terminal.read(cx).base_connecting() {
+        toast_for_pty(
+            pty_id,
+            ToastKind::Info,
+            t("terminal", "sshTakeoverUnavailable").to_string(),
+            cx,
+        );
+        return;
+    }
     // 已存密码是 `mt-secret` 信封,交给 autofill 前在这里解开;解不开就提示并不填
     // (终端里照常出现密码提示,用户手输即可)。
     let password = match conn.password.as_deref().filter(|p| !p.is_empty()) {
@@ -2716,7 +3034,8 @@ impl TerminalPane {
     /// 2. 复制 / 粘贴 / 全选;
     /// 3. 查找…(与 Ctrl+F 同一个 [`Self::open_search`]);
     /// 4. 清除缓冲 / 将缓冲保存为文件…;
-    /// 5. 会话分支段(有才出)与 SSH 连接(恒在)—— 与此前一致。
+    /// 5. 会话分支段(有才出)与 SSH 连接(恒在)—— 与此前一致;右键「SSH 连接」接管中
+    ///    另有「断开 SSH」(见 [`Self::disconnect_takeover`])。
     ///
     /// 置灰:没有选区时「复制」灰(原版 `disabled: !hasSelection`);缓冲里一个可见字都
     /// 没有时「全选」「保存」灰。各项动作都在菜单关掉之后跑,不借着本 pane,所以一律经
@@ -2807,6 +3126,18 @@ impl TerminalPane {
             AppStore::global(cx),
             self.pty_id,
         ));
+        // 右键「SSH 连接」接管中(含还在等首屏 / 建连):断开它、回到接管前的终端
+        if self.in_ssh_takeover() {
+            let this_disconnect = this.clone();
+            let focus_disconnect = self.focus.clone();
+            entries.push(menu::item(
+                t("terminal", "sshDisconnect"),
+                move |window, cx| {
+                    let _ = this_disconnect.update(cx, |pane, cx| pane.disconnect_takeover(cx));
+                    window.focus(&focus_disconnect, cx);
+                },
+            ));
+        }
         entries
     }
 }
@@ -3017,6 +3348,7 @@ mod tests {
             password: None,
             identity_file: None,
             group: group.map(str::to_string),
+            use_system_ssh: false,
             extra: Default::default(),
         }
     }

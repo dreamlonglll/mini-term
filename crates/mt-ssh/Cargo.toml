@@ -52,7 +52,10 @@ ring = "0.17"
 # ssh_key::private::RsaKeypair -> ssh_key::PrivateKey, 再交给 russh 认证。
 # 版本精确锁 =0.7.0-rc.10 与 russh 0.61 内部锁定一致, 否则 PrivateKey 跨 crate 版本
 # 类型不可互换(同 rand_core 多版本陷阱)。
-ssh-key = { version = "=0.7.0-rc.10", default-features = false, features = ["rsa", "alloc"] }
+# `tdes`:终端 shell 在终端里问口令解开带口令私钥(key_unlock.rs)时,PuTTYgen 导出的旧格式、
+# `openssl genrsa -des3` 之类用的是 DES-EDE3-CBC;AES-CBC 已由 russh 开的 `encryption` 带上。
+# 只多编一个 `des`(两份 Cargo.lock 里本来就有它,不改锁文件)。
+ssh-key = { version = "=0.7.0-rc.10", default-features = false, features = ["rsa", "alloc", "tdes"] }
 # 解析 PKCS#1 RSA。版本须与 ssh-key 0.7.0-rc.10 内部锁定的 rsa 一致(=0.10.0-rc.18),
 # 否则 RsaKeypair::try_from(&rsa::RsaPrivateKey) 因类型来自不同 crate 版本而编译失败。
 # 用默认 features(std + encoding, 后者含 pkcs1 DER 解码); rsa 没有 `pem` feature
@@ -66,6 +69,11 @@ rsa = "=0.10.0-rc.18"
 # aws-lc,russh 仍单一 0.61.x)。它是 russh 官方 examples/sftp_client.rs 钦定的配套库。
 # 无需开任何 feature:async-trait 仅 server 端用得到,client 不需要。
 russh-sftp = "2.3.0"
+# 传统 PEM 加密私钥(`Proc-Type: 4,ENCRYPTED`)的口令派生:OpenSSL `EVP_BytesToKey` 用 MD5
+# (key_unlock.rs)。不是新依赖:russh 自己就依赖它 —— 根工作区锁在 0.8.1(russh 0.61.2)、
+# sidecars 工作区锁在 0.7.0(russh 0.61.0)。版本写成区间,两个工作区都直接复用已锁的那一份、
+# 不多拉一个版本;只用到两版都有的 `md5::compute` 与 `Digest.0`。
+md5 = ">=0.7, <0.9"
 # 池与 SFTP 需要的 tokio 面:rt(spawn reaper/后台 disconnect)、sync(Mutex)、
 # time(interval/timeout)、fs + io-util(SFTP 传输用 tokio::fs 流式读写本地文件,task 06-09)、
 # net(自己 lookup_host 后逐地址限时连 TCP;ssh-agent 的命名管道 / Unix socket)。
@@ -81,7 +89,8 @@ dirs.workspace = true
 # 单测里的 #[tokio::test] 需要 macros;SSH 公钥 fixture 用 32 字节常量直接构造,
 # 无需 rand 依赖(避开 rand_core 多版本 CryptoRng trait 路径冲突,见
 # spec/backend/rand-core-version-alignment.md)。
-tokio = { version = "1", features = ["macros", "rt"] }
+# rt-multi-thread:终端 shell 的端到端测试照生产(mt-remote 的共享多线程运行时)起多线程运行时。
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 
 # 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
 # (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。

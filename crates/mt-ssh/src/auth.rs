@@ -14,6 +14,12 @@
 //!   ([`AuthRound::WithoutKeys`]);
 //! - 认证途中会话结束:服务器断开 / 不再给方法算认证失败,还没被拒过就断网算网络错误
 //!   (见 [`classify_loss`])。
+//!
+//! 终端 shell(`shell.rs`)带交互提示器([`AuthPlan::interaction`])时多做三件事,顺序不变:
+//! 带口令的连接私钥不在 ssh-agent 里就在终端里问口令解开(`key_unlock.rs`);存的密码静默试过
+//! 之后在终端里问密码(最多 [`NUMBER_OF_PASSWORD_PROMPTS`] 次);keyboard-interactive 的问询照
+//! 服务器给的回显标志逐条问用户(见 [`interactive_secrets`])。没有提示器时(会话池、「测试连接」、
+//! 三个 sidecar)走的分支与引入提示器之前一字不变。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -29,6 +35,8 @@ use russh::{MethodKind, MethodSet};
 // rustfmt 的 2021 与 2024 两种口径对它俩的先后排法相反。
 use russh::keys::agent::client::{AgentClient, AgentStream};
 
+use crate::interact::{self, Interaction};
+use crate::key_unlock::{self, Unlock};
 use crate::known_hosts::MtClient;
 use crate::pool::AgentSource;
 use crate::target::{IdentitySpec, ResolvedHost};
@@ -58,6 +66,14 @@ const AGENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// keyboard-interactive 最多应答几轮问询(PAM 通常一轮「Password:」就有结论),
 /// 防服务器无限追问。
 const MAX_KEYBOARD_INTERACTIVE_ROUNDS: usize = 4;
+
+/// 终端里最多问几次密码(OpenSSH `NumberOfPasswordPrompts` 的默认值)。keyboard-interactive 的
+/// 重试与私钥口令同样以它为上限。
+pub(crate) const NUMBER_OF_PASSWORD_PROMPTS: usize = 3;
+
+/// 终端 shell 的 keyboard-interactive 一次尝试里最多应答几轮问询(密码 + 动态口令之类要两三轮),
+/// 防服务器无限追问。
+const MAX_INTERACTIVE_KEYBOARD_ROUNDS: usize = 16;
 
 /// 等 russh 会话任务收尾(拿到断开原因)的上限。
 const SESSION_END_GRACE: Duration = Duration::from_millis(500);
@@ -103,6 +119,9 @@ pub(crate) struct ClientNotes {
     pub(crate) rejection: Mutex<Option<String>>,
     /// 会话结束原因。
     pub(crate) ended: Mutex<Option<SessionEnd>>,
+    /// 会话因 IO 错误结束时的错误种类(对端关了连接 / 连接被重置……),与 `ended` 同时记下。
+    /// 只有终端 shell 读它,把「连接断了」说得像 OpenSSH 那样具体;池的报错只用 `ended`。
+    pub(crate) ended_io: Mutex<Option<std::io::ErrorKind>>,
     /// 认证成功时用上的方法,只由 [`authenticate_host`] 在成功返回前写。
     pub(crate) authenticated: Mutex<Option<AuthMethodUsed>>,
 }
@@ -114,6 +133,10 @@ impl ClientNotes {
 
     pub(crate) fn ended(&self) -> Option<SessionEnd> {
         self.ended.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub(crate) fn ended_io(&self) -> Option<std::io::ErrorKind> {
+        self.ended_io.lock().ok().and_then(|slot| *slot)
     }
 
     /// 记下认证成功用的方法。走旁路而不是改 [`authenticate_host`] 的返回值:池的正式建连
@@ -229,8 +252,6 @@ fn encrypted_public_key(text: &str, path: &Path) -> Option<PublicKey> {
 ///
 /// 抽成接受 `&str`、不碰文件系统的纯函数,便于单测直接喂 PEM 字符串。
 pub(crate) fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<PrivateKey>, String> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-
     const BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
     const END: &str = "-----END RSA PRIVATE KEY-----";
 
@@ -263,12 +284,19 @@ pub(crate) fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<PrivateKey>, Strin
             .decode(b64.as_bytes())
             .map_err(|e| format!("invalid base64 in PKCS#1 RSA PEM: {e}"))?
     };
+    pkcs1_der_to_private_key(&der).map(Some)
+}
 
-    let rsa_key = rsa::RsaPrivateKey::from_pkcs1_der(&der)
+/// PKCS#1 RSA 私钥的 DER → `ssh_key::PrivateKey`。[`try_parse_pkcs1_rsa`] 与解开传统 PEM
+/// 加密私钥(`key_unlock.rs`)共用。
+pub(crate) fn pkcs1_der_to_private_key(der: &[u8]) -> Result<PrivateKey, String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+
+    let rsa_key = rsa::RsaPrivateKey::from_pkcs1_der(der)
         .map_err(|e| format!("invalid PKCS#1 RSA private key: {e}"))?;
     let keypair = russh::keys::ssh_key::private::RsaKeypair::try_from(&rsa_key)
         .map_err(|e| format!("cannot convert RSA key into ssh-key form: {e}"))?;
-    Ok(Some(PrivateKey::from(keypair)))
+    Ok(PrivateKey::from(keypair))
 }
 
 // ============================================================================
@@ -575,6 +603,9 @@ pub(crate) struct AuthPlan<'a> {
     pub(crate) label: String,
     pub(crate) password: &'a PasswordInput,
     pub(crate) round: AuthRound,
+    /// 终端 shell 的交互提示器(私钥口令、密码、keyboard-interactive 在终端里问用户)。
+    /// 会话池 / 「测试连接」/ sidecar 为 `None`:认证与引入它之前一字不变。
+    pub(crate) interaction: Option<&'a Interaction>,
 }
 
 /// 认证失败的分类。
@@ -589,6 +620,8 @@ pub(crate) enum AuthError {
     /// (见 [`AuthRound::WithoutKeys`])。`message` 是不重连时的报错,`notes` 是第一轮的
     /// 逐方法结果。调用方不重连就按 [`AuthError::Rejected`] 处理。
     RetryWithoutKeys { message: String, notes: Vec<String> },
+    /// 用户在终端里取消了某个提问(只有带交互提示器时才会出现)。
+    Cancelled(String),
 }
 
 /// 每种方法的尝试结果,全部失败时拼成报错。
@@ -784,57 +817,106 @@ fn assemble_candidates(
 }
 
 /// 读一个私钥文件变成候选;读不了只记原因。
+///
+/// 带交互提示器(终端 shell)时,带口令且不在 ssh-agent 里的私钥(含带口令的 PuTTY PPK)在终端
+/// 里问口令解开,见 [`unlock_candidate`];只有用户取消时返回 `Err`。
 async fn file_candidate(
     path: &Path,
     label: String,
     agent: &mut AgentSession,
     report: &mut AuthReport,
-) -> Option<KeyCandidate> {
+    interaction: Option<&Interaction>,
+) -> Result<Option<KeyCandidate>, AuthError> {
     match load_identity(path) {
-        KeyLoad::Loaded(key) => Some(KeyCandidate {
+        KeyLoad::Loaded(key) => Ok(Some(KeyCandidate {
             label,
             source: KeySource::Local(key),
-        }),
+        })),
         KeyLoad::Encrypted { public } => {
             if let Some(public) = public {
                 agent.ensure_connected().await;
                 if agent.holds(&public) {
-                    return Some(KeyCandidate {
+                    return Ok(Some(KeyCandidate {
                         label: format!("{label} (signed by ssh-agent)"),
                         source: KeySource::Agent(public),
-                    });
+                    }));
                 }
+            }
+            if let Some(interaction) = interaction {
+                return unlock_candidate(path, label, interaction, report).await;
             }
             report.note(format!(
                 "{label}: encrypted with a passphrase and not loaded in ssh-agent (passphrase-protected \
                  keys are only usable through ssh-agent: run `ssh-add` on it){}",
                 agent.unavailable_note()
             ));
-            None
+            Ok(None)
         }
         KeyLoad::PublicOnly { public } => {
             agent.ensure_connected().await;
             if agent.holds(&public) {
-                return Some(KeyCandidate {
+                return Ok(Some(KeyCandidate {
                     label: format!("{label} (public key, signed by ssh-agent)"),
                     source: KeySource::Agent(public),
-                });
+                }));
             }
             report.note(format!(
                 "{label}: is a public key, and ssh-agent does not hold the matching private key (a \
                  public key file is only usable through ssh-agent){}",
                 agent.unavailable_note()
             ));
-            None
+            Ok(None)
         }
         KeyLoad::NotFound => {
             report.note(format!("{label}: file not found"));
-            None
+            Ok(None)
         }
         KeyLoad::Failed(reason) => {
+            // 带口令的 PPK 不带口令解不了、被 `load_identity` 归为失败(池那边的报错照旧);
+            // 终端里可以问口令。
+            if let Some(interaction) = interaction {
+                if key_unlock::is_encrypted_ppk_file(path) {
+                    return unlock_candidate(path, label, interaction, report).await;
+                }
+            }
             report.note(format!("{label}: cannot load ({reason})"));
-            None
+            Ok(None)
         }
+    }
+}
+
+/// 终端 shell:带口令的连接私钥在终端里问口令解开(最多 [`NUMBER_OF_PASSWORD_PROMPTS`] 次,
+/// 空口令 = 跳过这把 key)。解不开只记原因、照常试别的方法;用户取消返回 `Err`。
+async fn unlock_candidate(
+    path: &Path,
+    label: String,
+    interaction: &Interaction,
+    report: &mut AuthReport,
+) -> Result<Option<KeyCandidate>, AuthError> {
+    match key_unlock::unlock_with_prompts(path, interaction).await {
+        Unlock::Key(key) => Ok(Some(KeyCandidate {
+            label,
+            source: KeySource::Local(Arc::new(*key)),
+        })),
+        Unlock::Skipped => {
+            report.note(format!(
+                "{label}: encrypted with a passphrase; skipped (no passphrase entered)"
+            ));
+            Ok(None)
+        }
+        Unlock::WrongPassphrase => {
+            report.note(format!(
+                "{label}: incorrect passphrase ({NUMBER_OF_PASSWORD_PROMPTS} attempts)"
+            ));
+            Ok(None)
+        }
+        Unlock::Unsupported(reason) => {
+            report.note(format!("{label}: cannot decrypt ({reason})"));
+            Ok(None)
+        }
+        Unlock::Cancelled => Err(AuthError::Cancelled(format!(
+            "{label}: entering the passphrase was cancelled"
+        ))),
     }
 }
 
@@ -865,17 +947,19 @@ async fn collect_candidates(
     plan: &AuthPlan<'_>,
     agent: &mut AgentSession,
     report: &mut AuthReport,
-) -> Vec<KeyCandidate> {
+) -> Result<Vec<KeyCandidate>, AuthError> {
     let mut explicit = None;
     if let Some(spec) = &plan.host.identity {
         let label = describe_identity(spec);
         match &spec.path {
-            Ok(path) => explicit = file_candidate(path, label, agent, report).await,
+            Ok(path) => {
+                explicit = file_candidate(path, label, agent, report, plan.interaction).await?
+            }
             Err(reason) => report.note(format!("{label}: {reason}")),
         }
     }
     let agent_keys = agent_candidates(agent, report).await;
-    assemble_candidates(explicit, agent_keys)
+    Ok(assemble_candidates(explicit, agent_keys))
 }
 
 /// 本次连接里服务器偏好的 RSA 签名哈希(查一次缓存起来)。服务器没发 server-sig-algs
@@ -981,7 +1065,8 @@ fn step_of(result: Result<AuthResult, String>) -> Step {
 
 /// 第一轮在公钥阶段被服务器断开 / 拒绝到无路可走,而配置的密码还没轮到:换成
 /// [`AuthError::RetryWithoutKeys`],让调用方重连一次只试密码。服务器一开始就不收密码类
-/// 方法、或已经是重连后的那一轮时原样返回。
+/// 方法、或已经是重连后的那一轮时原样返回。带交互提示器(终端 shell)时没存密码也算有密码可试
+/// —— 用户可以在终端里输入。
 fn offer_retry_without_keys(
     error: AuthError,
     plan: &AuthPlan<'_>,
@@ -990,11 +1075,13 @@ fn offer_retry_without_keys(
 ) -> AuthError {
     let password_accepted = initial_methods.contains(&MethodKind::Password)
         || initial_methods.contains(&MethodKind::KeyboardInteractive);
+    let password_available =
+        matches!(plan.password, PasswordInput::Available(_)) || plan.interaction.is_some();
     match error {
         AuthError::Rejected(message)
             if password_accepted
                 && matches!(plan.round, AuthRound::First)
-                && matches!(plan.password, PasswordInput::Available(_)) =>
+                && password_available =>
         {
             AuthError::RetryWithoutKeys {
                 message,
@@ -1046,19 +1133,24 @@ pub(crate) async fn authenticate_host(
         Step::Rejected(methods) => methods,
         Step::Ended => {
             let ended = wait_session_end(handle, notes).await;
-            return Err(classify_loss(&mut report, None, ended));
+            let error = classify_loss(&mut report, None, ended);
+            return Err(interactive_loss(error, plan.interaction));
         }
     };
     let mut methods = initial_methods.clone();
     report.server_methods = Some(method_names(&methods));
 
-    // 2) 公钥。
+    // 2) 公钥。终端 shell 没存密码时用户也能在终端里输,同样给密码留出次数。
+    let password_prompt = plan.interaction.is_some()
+        && (methods.contains(&MethodKind::Password)
+            || methods.contains(&MethodKind::KeyboardInteractive));
     let cap = match plan.password {
         PasswordInput::Available(_) => MAX_PUBLICKEY_ATTEMPTS_WITH_PASSWORD,
+        _ if password_prompt => MAX_PUBLICKEY_ATTEMPTS_WITH_PASSWORD,
         _ => MAX_PUBLICKEY_ATTEMPTS,
     };
     if offer_keys && methods.contains(&MethodKind::PublicKey) {
-        let candidates = collect_candidates(plan, agent, &mut report).await;
+        let candidates = collect_candidates(plan, agent, &mut report).await?;
         let total = candidates.len();
         let mut rsa_hash_cache: Option<Option<HashAlg>> = None;
         for (index, candidate) in candidates.into_iter().enumerate() {
@@ -1139,18 +1231,26 @@ pub(crate) async fn authenticate_host(
                 Step::Ended => {
                     let ended = wait_session_end(handle, notes).await;
                     let error = classify_loss(&mut report, Some(&candidate.label), ended);
-                    return Err(offer_retry_without_keys(
-                        error,
-                        plan,
-                        &initial_methods,
-                        &report,
-                    ));
+                    let error = offer_retry_without_keys(error, plan, &initial_methods, &report);
+                    return Err(interactive_loss(error, plan.interaction));
                 }
             }
         }
     }
 
     // 3) 密码:password 方法,再 keyboard-interactive(有的服务器只开后者)。
+    if let Some(interaction) = plan.interaction {
+        return interactive_secrets(
+            handle,
+            plan,
+            &mut methods,
+            &mut report,
+            notes,
+            tracker,
+            interaction,
+        )
+        .await;
+    }
     match plan.password {
         PasswordInput::NotConfigured => {
             if methods.contains(&MethodKind::Password)
@@ -1284,11 +1384,311 @@ async fn keyboard_interactive(
 }
 
 // ============================================================================
+// 终端 shell:在终端里问密码 / keyboard-interactive
+// ============================================================================
+
+/// 终端 shell 的密码阶段(顺序同池:password 方法,再 keyboard-interactive):
+///
+/// - `password`:存了密码先静默用它;失败或没存就在终端里问 `{user}@{host}'s password: `
+///   (不回显),最多 [`NUMBER_OF_PASSWORD_PROMPTS`] 次(OpenSSH `NumberOfPasswordPrompts`),
+///   两次之间提示 `Permission denied, please try again.`;
+/// - `keyboard-interactive`:见 [`interactive_keyboard_attempt`],失败后照 OpenSSH 重来,同样最多
+///   [`NUMBER_OF_PASSWORD_PROMPTS`] 次(服务器一个问询都没发过就不再重来)。
+///
+/// 用户取消 → [`AuthError::Cancelled`];等用户期间服务器断开 → 网络错误并写明可能是
+/// LoginGraceTime 到点了(见 [`lost_while_waiting`])。
+async fn interactive_secrets(
+    handle: &mut Handle<MtClient>,
+    plan: &AuthPlan<'_>,
+    methods: &mut MethodSet,
+    report: &mut AuthReport,
+    notes: &ClientNotes,
+    tracker: &StageTracker,
+    interaction: &Interaction,
+) -> Result<(), AuthError> {
+    let user = plan.host.user.as_str();
+    let mut stored = match plan.password {
+        PasswordInput::Available(password) => Some(password.as_str()),
+        PasswordInput::Unavailable(reason) => {
+            report.note(format!("password: stored password unavailable ({reason})"));
+            None
+        }
+        PasswordInput::NotConfigured => None,
+    };
+
+    if methods.contains(&MethodKind::Password) {
+        if let Some(password) = stored {
+            tracker.set_detail("waiting for: password");
+            let result = handle
+                .authenticate_password(user, password)
+                .await
+                .map_err(|e| e.to_string());
+            match step_of(result) {
+                Step::Success => {
+                    notes.note_authenticated(AuthMethodUsed::Password);
+                    return Ok(());
+                }
+                Step::Rejected(remaining) => {
+                    report.rejected_any = true;
+                    report.note("password: stored password rejected by server");
+                    *methods = remaining;
+                }
+                Step::Ended => {
+                    let ended = wait_session_end(handle, notes).await;
+                    let error = classify_loss(report, Some("password"), ended);
+                    return Err(interactive_loss(error, Some(interaction)));
+                }
+            }
+        }
+        let prompt = format!("{user}@{}'s password: ", plan.host.host_name);
+        let mut entered = 0;
+        while entered < NUMBER_OF_PASSWORD_PROMPTS && methods.contains(&MethodKind::Password) {
+            if entered > 0 {
+                interaction.notice("Permission denied, please try again.\r\n");
+            }
+            let Some(password) = interaction.read_line(prompt.clone(), false).await else {
+                return Err(cancelled(plan));
+            };
+            if handle.is_closed() {
+                return Err(lost_while_waiting(handle, notes, report, interaction).await);
+            }
+            entered += 1;
+            tracker.set_detail("waiting for: password");
+            let result = handle
+                .authenticate_password(user, password)
+                .await
+                .map_err(|e| e.to_string());
+            match step_of(result) {
+                Step::Success => {
+                    notes.note_authenticated(AuthMethodUsed::Password);
+                    return Ok(());
+                }
+                Step::Rejected(remaining) => {
+                    report.rejected_any = true;
+                    *methods = remaining;
+                }
+                Step::Ended => {
+                    let ended = wait_session_end(handle, notes).await;
+                    let error = classify_loss(report, Some("password"), ended);
+                    return Err(interactive_loss(error, Some(interaction)));
+                }
+            }
+        }
+        if entered > 0 {
+            report.note(format!(
+                "password: rejected by server ({entered} entered in the terminal)"
+            ));
+        }
+    }
+
+    // keyboard-interactive:答过题的尝试才计入上限;存的密码只静默用一次,加上它最多多一轮。
+    let mut answered = 0;
+    let mut attempts = 0;
+    while methods.contains(&MethodKind::KeyboardInteractive)
+        && answered < NUMBER_OF_PASSWORD_PROMPTS
+        && attempts <= NUMBER_OF_PASSWORD_PROMPTS
+    {
+        attempts += 1;
+        tracker.set_detail("waiting for: keyboard-interactive");
+        match interactive_keyboard_attempt(handle, plan, interaction, &mut stored).await {
+            KbdAttempt::Success => {
+                notes.note_authenticated(AuthMethodUsed::KeyboardInteractive);
+                return Ok(());
+            }
+            KbdAttempt::Rejected {
+                remaining,
+                prompted,
+                asked,
+            } => {
+                report.rejected_any = true;
+                *methods = remaining;
+                answered += usize::from(prompted);
+                if !asked {
+                    break;
+                }
+            }
+            KbdAttempt::TooManyRounds => {
+                report.rejected_any = true;
+                report.note(format!(
+                    "keyboard-interactive: gave up after {MAX_INTERACTIVE_KEYBOARD_ROUNDS} rounds \
+                     of prompts in one attempt"
+                ));
+                return Err(AuthError::Rejected(report.render()));
+            }
+            KbdAttempt::Ended => {
+                let ended = wait_session_end(handle, notes).await;
+                let error = classify_loss(report, Some("keyboard-interactive"), ended);
+                return Err(interactive_loss(error, Some(interaction)));
+            }
+            KbdAttempt::Cancelled => return Err(cancelled(plan)),
+            KbdAttempt::LostWhileWaiting => {
+                return Err(lost_while_waiting(handle, notes, report, interaction).await);
+            }
+        }
+    }
+    if attempts > 0 {
+        report.note("keyboard-interactive: rejected by server");
+    }
+    Err(AuthError::Rejected(report.render()))
+}
+
+/// 一次 keyboard-interactive 尝试的结论(终端 shell)。
+enum KbdAttempt {
+    Success,
+    /// 被服务器拒绝。`prompted`:这次有没有在终端里问过用户;`asked`:服务器有没有发过问询。
+    Rejected {
+        remaining: MethodSet,
+        prompted: bool,
+        asked: bool,
+    },
+    TooManyRounds,
+    /// 没有回复,含义同 [`Step::Ended`]。
+    Ended,
+    Cancelled,
+    /// 在终端里等用户期间会话就结束了。
+    LostWhileWaiting,
+}
+
+/// 终端 shell 的一次 keyboard-interactive:服务器给的标题 / 说明先原样(净化控制字符后)显示,
+/// 每个问询照服务器给的回显标志在终端里问用户,提示前缀 `({user}@{host}) `(OpenSSH 8.2 起
+/// 同样如此)。存了密码且这一轮只有一个不回显的问询时,先静默用存的密码答一次。
+async fn interactive_keyboard_attempt(
+    handle: &mut Handle<MtClient>,
+    plan: &AuthPlan<'_>,
+    interaction: &Interaction,
+    stored: &mut Option<&str>,
+) -> KbdAttempt {
+    let user = plan.host.user.as_str();
+    let mut state = match handle
+        .authenticate_keyboard_interactive_start(user, None)
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => return KbdAttempt::Ended,
+    };
+    let (mut rounds, mut prompted, mut asked) = (0, false, false);
+    loop {
+        match state {
+            KeyboardInteractiveAuthResponse::Success => return KbdAttempt::Success,
+            KeyboardInteractiveAuthResponse::Failure {
+                remaining_methods, ..
+            } => {
+                return if remaining_methods.is_empty() {
+                    KbdAttempt::Ended
+                } else {
+                    KbdAttempt::Rejected {
+                        remaining: remaining_methods,
+                        prompted,
+                        asked,
+                    }
+                };
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                asked = true;
+                rounds += 1;
+                if rounds > MAX_INTERACTIVE_KEYBOARD_ROUNDS {
+                    return KbdAttempt::TooManyRounds;
+                }
+                for text in [&name, &instructions] {
+                    if !text.is_empty() {
+                        interaction.notice(interact::line_text(text));
+                    }
+                }
+                let silent = match prompts.as_slice() {
+                    [only] if !only.echo => stored.take(),
+                    _ => None,
+                };
+                let answers = match silent {
+                    Some(password) => vec![password.to_string()],
+                    None => {
+                        let mut answers = Vec::with_capacity(prompts.len());
+                        for prompt in &prompts {
+                            let shown = format!(
+                                "({user}@{}) {}",
+                                plan.host.host_name,
+                                interact::terminal_safe(&prompt.prompt)
+                            );
+                            let Some(answer) = interaction.read_line(shown, prompt.echo).await
+                            else {
+                                return KbdAttempt::Cancelled;
+                            };
+                            prompted = true;
+                            answers.push(answer);
+                        }
+                        if prompted && handle.is_closed() {
+                            return KbdAttempt::LostWhileWaiting;
+                        }
+                        answers
+                    }
+                };
+                state = match handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                {
+                    Ok(state) => state,
+                    Err(_) => return KbdAttempt::Ended,
+                };
+            }
+        }
+    }
+}
+
+fn cancelled(plan: &AuthPlan<'_>) -> AuthError {
+    AuthError::Cancelled(format!("authentication on {} was cancelled", plan.label))
+}
+
+/// 等用户输入期间服务器断开了连接时附在报错后面的说明。
+fn login_grace_hint(waited: Duration) -> String {
+    format!(
+        " (the server probably dropped the connection because its login grace time ran out while \
+         mini-term waited {} for input in the terminal; sshd's LoginGraceTime is 120s by default; \
+         reconnect to try again)",
+        crate::transport::fmt_duration(waited)
+    )
+}
+
+/// 终端里等用户期间会话就结束了(服务器多半是 LoginGraceTime 到点断开):不管之前有没有方法被
+/// 拒过,都不是认证失败 —— 按网络错误报,写明等了多久。
+async fn lost_while_waiting(
+    handle: &mut Handle<MtClient>,
+    notes: &ClientNotes,
+    report: &AuthReport,
+    interaction: &Interaction,
+) -> AuthError {
+    let why = wait_session_end(handle, notes).await.map_or_else(
+        || "the connection was closed".to_string(),
+        |end| end.to_string(),
+    );
+    let waited = interaction.waited().unwrap_or_default();
+    AuthError::Transport(format!(
+        "{}{}",
+        report.render_connection_lost(&why),
+        login_grace_hint(waited)
+    ))
+}
+
+/// 带交互提示器时,「还没被拒过就断了连接」的报错后面补上 LoginGraceTime 的说明(之前在终端里
+/// 等过用户才补;首见主机的提问在 russh 会话任务里等,断开要到认证的第一个请求才发现)。没有
+/// 提示器时原样返回。
+fn interactive_loss(error: AuthError, interaction: Option<&Interaction>) -> AuthError {
+    match (error, interaction.and_then(Interaction::waited)) {
+        (AuthError::Transport(message), Some(waited)) => {
+            AuthError::Transport(format!("{message}{}", login_grace_hint(waited)))
+        }
+        (error, _) => error,
+    }
+}
+
+// ============================================================================
 // tests
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -1560,7 +1960,7 @@ v9aDxRcrMAaNVKMzZbmEjucR5L+VMM5njNnS4=
     // 废弃密钥**,只用于验证 PKCS#1 PEM 能被 try_parse_pkcs1_rsa 解析,不对应任何
     // 真实主机/账号,无任何安全意义。
 
-    const PKCS1_RSA_FIXTURE: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+    pub(crate) const PKCS1_RSA_FIXTURE: &str = r#"-----BEGIN RSA PRIVATE KEY-----
 MIIEowIBAAKCAQEAlsXj/txeglED7/6iFd1ic1U6NygRpptNLQ5AxqEBHFgRLOxa
 v5oTe1JQCIz4AcUiBM1d8DCRhFgdrUCz8O/gc7R3d0CjlWmcrw9VTe/OsndWeexz
 WQWduN7dqBR53jNmVw1+638mc6hXq2wNvDpohVJVK7WkpyGIfTJ6Pu/RE0JIpLjj
@@ -1742,6 +2142,7 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
             label: "u@h:22".into(),
             password,
             round,
+            interaction: None,
         }
     }
 

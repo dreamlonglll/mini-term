@@ -119,6 +119,7 @@ fn connection(id: &str, host: &str, port: u16, user: &str) -> SshConnection {
         password: None,
         identity_file: None,
         group: None,
+        use_system_ssh: false,
         extra: Default::default(),
     }
 }

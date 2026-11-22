@@ -159,6 +159,7 @@ fn revoked_permission_stops_deployment_before_runtime_assets_or_network() {
         password: None,
         identity_file: None,
         group: None,
+        use_system_ssh: false,
         extra: Default::default(),
     };
     let error = ensure_helper(&connection, &|| Err("remote_git_disabled".into())).unwrap_err();
