@@ -102,6 +102,11 @@ impl KillOnDrop {
     pub(crate) fn kill(&self) {
         self.0.kill();
     }
+
+    /// 已从对端读到的字节数(终端 shell 的 keepalive 据此判断服务器还在不在,见 `shell.rs`)。
+    pub(crate) fn bytes_read(&self) -> u64 {
+        self.0.bytes_read()
+    }
 }
 
 impl Drop for KillOnDrop {

@@ -1194,6 +1194,7 @@ dependencies = [
  "base64",
  "dirs",
  "futures",
+ "md5",
  "mt-core",
  "mt-secret",
  "ring",
