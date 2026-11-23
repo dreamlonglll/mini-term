@@ -43,8 +43,9 @@ use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Div, Entity, FontWeight, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderOnce,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, Task, UniformListScrollHandle,
-    Window, div, point, prelude::FluentBuilder, px, relative, uniform_list,
+    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement, Styled, Task,
+    UniformListScrollHandle, Window, div, point, prelude::FluentBuilder, px, relative,
+    uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::Scrollbar;
@@ -297,6 +298,8 @@ pub struct UsagePanel {
     log_columns_anchor: Option<Point<Pixels>>,
     /// 请求日志虚拟列表滚动句柄。
     logs_scroll_handle: UniformListScrollHandle,
+    /// 概览「按项目」定高滚动区的句柄：滚轮监听靠它的 `max_offset` 判断内容是否真溢出。
+    by_project_scroll: ScrollHandle,
     tweens: Tweens,
     /// 主体入场(原版 `.usage-fade-in`)。只在首次从加载态进 Ready 时播一次轻度上浮,
     /// 自动刷新或从空范围切回时不再整屏跳动。
@@ -419,6 +422,7 @@ impl UsagePanel {
             log_columns,
             log_columns_anchor: None,
             logs_scroll_handle: UniformListScrollHandle::new(),
+            by_project_scroll: ScrollHandle::new(),
             tweens: Tweens::zeroed(),
             // 首帧就是 Skeleton/PricingLoading,建成「已跑完」的,
             // 等真进了 Ready 再 restart
@@ -2159,7 +2163,13 @@ impl UsagePanel {
             },
         )
         .size_full()
-        .track_scroll(&self.logs_scroll_handle);
+        .track_scroll(&self.logs_scroll_handle)
+        // gpui 的滚动容器只挪自己、从不截停滚轮事件，外层 `usage-body` 会跟着一起滚。
+        // 同一元素上 `on_scroll` 先于内置滚动监听注册、冒泡倒序调用，所以列表先滚完再在这里截停。
+        // 不满一屏时表体不需要滚动，不截，免得鼠标停在表上滚不动页面
+        .when(scrollable, |el| {
+            el.on_scroll(|_, _, cx| cx.stop_propagation())
+        });
 
         let truncated = (stats.total_calls as usize) > count;
 
@@ -2366,6 +2376,17 @@ impl UsagePanel {
                             .id("usage-by-project")
                             .max_h(px(216.0))
                             .overflow_y_scroll()
+                            .track_scroll(&self.by_project_scroll)
+                            // 同请求日志表体：真溢出时截停滚轮，免得外层 `usage-body` 跟着滚；
+                            // 项目少、没撑满定高时放行，鼠标停在这里照样滚页面
+                            .on_scroll({
+                                let handle = self.by_project_scroll.clone();
+                                move |_, _, cx| {
+                                    if handle.max_offset().y > px(0.0) {
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            })
                             .px(px(6.0))
                             .mx(px(-6.0))
                             .child(project_rows),
