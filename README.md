@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.5-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -61,9 +61,9 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。外链一律走同一道闸（禁 `@import`，指向包外的引用全拒）。点「更多皮肤」直达仓库 [`theme/`](theme/) 皮肤库（现有 Blue Hour 蓝调时分、雨光、暮紫鎏金等五款深色，Morning Mist 晨雾、晨曦云庭、澄空清吟等五款浅色，共十款），挑一份下载后导入即用；想自己做一份，字段说明在 [`docs/theme-pack-example/`](docs/theme-pack-example/) |
 | **手机端支持** | 手机上实时看桌面 AI 会话的对话镜像：GFM 表格与代码块一键复制，连续的工具调用折叠成「工具调用 N 次」（读写了哪些文件、跑了什么命令），底部显示「AI 工作中 / 等你处理」，系统注入噪声自动滤掉；可直接给 AI 发指令、点选作答它的提问；首页「历史」标签按项目浏览本机历史会话，点「继续对话」由桌面端在后台新开终端续接（已在运行的会话直接进入实时镜像）。同一中转支持接入**多台桌面端**（各台电脑可自定义设备名，独立绑定一部手机、互不干扰），手机端顶部可随时在多台已配对电脑间切换，也支持按 `/?desktop=<id>` 分别收藏书签或多标签并行打开。<br />**前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
 | **远程通知** | 人不在电脑前也不漏：AI 任务完成、或停下来等你批权限 / 填表单 / 因 API 错误中断时，推送到手机。「设置 → AI → 远程通知」里多选渠道：**Bark**（直接粘贴 App 里的推送地址即可）、**Telegram** 机器人、**通用 Webhook**（JSON 模板，ntfy / Server酱 / 企业微信 / 飞书 / 钉钉 / Gotify / Discord 都能接），每个渠道可一键测试发送。配了移动端中转时通知附带手机端链接，点开直接进入该会话的对话镜像；推送只含项目名、AI 名与终端名，凭据加密保存 |
-| **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok / Antigravity CLI 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
+| **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok / Antigravity CLI 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图；**趋势图可点**：多日视图点某天下钻到当天按小时，再点某小时把下方明细聚焦到该小时，面包屑逐级返回；趋势图下方「请求日志」逐条列出每次调用的时间、应用、供应商、模型、成本、输入 / 输出 / 缓存 token、缓存命中率与估算速度，列可显隐，点行查看所属会话。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **历史会话** | 会话面板读取 Claude / Codex / Grok / pi / oh-my-pi / Antigravity CLI 的历史记录，右键续接或复制恢复命令；右键「删除会话」直接删除磁盘上的原始记录（oh-my-pi 与 Antigravity CLI 不支持删除），确认框列出每条路径，能确认正在运行的会话会被拦下。Claude / Codex / Antigravity CLI 覆盖本机、WSL 与 SSH 远程，Grok / pi / oh-my-pi 只覆盖本机；平铺列表单击即查看，可按标题与 agent 过滤 |
-| **SSH支持** | **SSH 远程项目** — 服务器上的目录直接添加成项目（项目列表底部「添加远程项目」，还没有 SSH 连接时在弹窗里就地新建）：文件树经 SFTP 懒加载，终端经内置 SSH 客户端直连并自动落到项目目录，断线后覆盖层一键重连，远程机器上的 Claude / Codex / Antigravity CLI 历史会话也能读出正文。远程缓存键掺入连接 id，两台服务器上的同名路径不会串数据；连接管理弹窗按分组归类，连接可拖拽排序 / 换组、一键复制，密码加密保存，表单就地校验，「测试连接」用当前填的值试连并逐种认证方式给出结果；终端右键「SSH 连接」弹出可搜索的**快速连接面板**（每行带 `user@host:port` 与认证方式，分组可折叠，↑↓ 选、↵ 直连），选中后**内置 SSH 客户端接管当前终端**：本地 shell 挂起，断开后还原接管前的屏幕，首见主机密钥、密码、OTP 与私钥口令都在终端里问并等你输入，接管中右键「断开 SSH」；需要 `~/.ssh/config`、`ProxyJump` 或默认私钥的连接勾选「终端使用系统 OpenSSH 客户端」即回到 ssh.exe；内置 SSH 连接依次试连接里配的私钥、ssh-agent、已存密码，私钥读不了时回落到已存密码；`~/.ssh` 里只读写 `known_hosts`，不读 `~/.ssh/config`、不碰默认私钥 <br /><br />**WSL 支持** — `\\wsl$\<distro>\<path>` 直接当项目根，自动改用 `wsl.exe --cd` 启动，`pwd` 真的落在 WSL 里而不是 `C:\Windows`；Windows 下还能直接读 WSL 发行版内的 Claude / Codex / Antigravity CLI 会话历史<br /><br />**供Agent调用** 通过内置Skill，允许AI通过SSH远程执行服务器命令。 项目右键「关联 SSH」勾选连接即按项目启用，也可整组关联（组内后加的连接自动生效）；AI 调用后终端组标题栏「查找」左边出现 **SSH 按钮**，点开悬浮框实时查看 AI 发出的命令原文、服务器原样输出与退出码（上传 / 下载显示路径与字节数） |
+| **SSH支持** | **SSH 远程项目** — 服务器上的目录直接添加成项目（项目列表底部「添加远程项目」，还没有 SSH 连接时在弹窗里就地新建）：文件树经 SFTP 懒加载，终端经内置 SSH 客户端直连并自动落到项目目录，断线后覆盖层一键重连，远程机器上的 Claude / Codex / Antigravity CLI 历史会话也能读出正文。远程缓存键掺入连接 id，两台服务器上的同名路径不会串数据；连接管理弹窗按分组归类，连接可拖拽排序 / 换组、一键复制，密码加密保存，表单就地校验，「测试连接」用当前填的值试连并逐种认证方式给出结果；终端右键「SSH 连接」弹出可搜索的**快速连接面板**（每行带 `user@host:port` 与认证方式，分组可折叠，↑↓ 选、↵ 直连；终端进入 AI 会话后不出这一项），选中后**内置 SSH 客户端接管当前终端**：本地 shell 挂起，断开后还原接管前的屏幕，首见主机密钥、密码、OTP 与私钥口令都在终端里问并等你输入，接管中右键「断开 SSH」；需要 `~/.ssh/config`、`ProxyJump` 或默认私钥的连接勾选「终端使用系统 OpenSSH 客户端」即回到 ssh.exe；内置 SSH 连接依次试连接里配的私钥、ssh-agent、已存密码，私钥读不了时回落到已存密码；`~/.ssh` 里只读写 `known_hosts`，不读 `~/.ssh/config`、不碰默认私钥 <br /><br />**WSL 支持** — `\\wsl$\<distro>\<path>` 直接当项目根，自动改用 `wsl.exe --cd` 启动，`pwd` 真的落在 WSL 里而不是 `C:\Windows`；Windows 下还能直接读 WSL 发行版内的 Claude / Codex / Antigravity CLI 会话历史<br /><br />**供Agent调用** 通过内置Skill，允许AI通过SSH远程执行服务器命令。 项目右键「关联 SSH」勾选连接即按项目启用，也可整组关联（组内后加的连接自动生效）；AI 调用后终端组标题栏「查找」左边出现 **SSH 按钮**，点开悬浮框实时查看 AI 发出的命令原文、服务器原样输出与退出码（上传 / 下载显示路径与字节数） |
 | **Markdown 预览** | 文件树点开 `.md` 即按块虚拟化渲染（长文档滚动不重排整篇）：```` ```mermaid ```` 围栏纯 Rust 渲染成图表（不依赖浏览器 / Node，跟随亮暗主题，出错退回代码块；点击图表整窗放大，滚轮缩放、拖动平移）、本地与网络图片、GFM 表格、链接按四类处置（外链先确认、锚点滚到标题、本地文件开新页签），行内代码按主题强调色显示（橙字深底）；顶层标题两条以上时左侧出**目录栏**，点击跳到章节、当前章节随滚动高亮，工具栏「目录」开合所有页签共用、跨启动记住 |
 | **HTML 预览** | 本地 `.html` 用系统 WebView（Windows 为 WebView2）真渲染，CSS 与脚本照跑、效果与浏览器一致，相对路径的样式 / 脚本 / 图片按项目目录加载，改完源码未保存也能切预览看效果；外链先确认再交浏览器，链到本地文件作为新页签打开，页面脚本读不到项目里的其它文件。WebView 不可用或 Linux 上回落简版渲染 |
 | **PDF 预览** | 文件树点开本地 `.pdf` 直接在页签里看，用系统 WebView 自带的阅读器显示（Windows 为 WebView2 内置的 Edge 阅读器），书签目录、页码跳转、搜索、缩放现成可用；文件在盘上被改写后自动重载，工具栏一键「使用默认工具打开」；页面只拿得到这份文档本身。WebView 不可用、Linux 或远程 PDF 时给出打开 / 下载提示 |
@@ -112,7 +112,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **4075 个 Rust 测试**（47 个测试目标） |
+| 测试 | **4103 个 Rust 测试**（47 个测试目标） |
 
 ---
 
