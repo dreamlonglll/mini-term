@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -91,10 +91,11 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存）；启动时配置只读一次、备份挪到后台，首帧出得更快 |
 | **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面；终端刷屏只重绘终端自己，闲置的分屏终端直接复用上一帧，窗口最小化时渲染整个停掉、一帧不画；终端重绘帧率可在「系统 → 性能」里调（前台 10~240、默认 30，失焦 1~60、默认 5），高刷屏想更顺就调高，笔记本想省电就调低，改完即时生效 |
 | **新版 ConPTY** | Windows 下随包附带 Windows Terminal 1.24 的 `conpty.dll` + `OpenConsole.exe` 并在启动时预载，绕开老版本系统 conhost 的宽字符列宽、换行回绕、resize 丢行等已知缺陷；怀疑显示问题出在它身上时，设环境变量 `MT_DISABLE_PORTABLE_CONPTY=1` 即回落系统 ConPTY |
-| **添加项目即打开** | 弹窗、分组右键、拖目录进列表、SSH 远程、Worktree 设为项目——任何一条入口添加完直接切过去并开好第一个终端，不必再面对空态页点一次「新建终端」 |
+| **添加项目即打开** | 弹窗、分组右键、拖目录进列表、SSH 远程、新建 Worktree——任何一条入口添加完直接切过去并开好第一个终端，不必再面对空态页点一次「新建终端」 |
+| **Worktree 子项目** | 本地仓库的 worktree 自动挂到主项目下作子项目：终端里 `git worktree add` 或 AI 新建后自动出现在列表里，外部删除后自动移除，手动移除过的不会再被加回来。主项目与它的 worktree 收进同一个带树形连线的分组框，子项直接以分支名显示；主项目行上的计数徽标一键折叠整组，折叠后子项的 AI 状态汇总到主项目行上，不会漏看 |
 | **项目行悬停预览** | 悬停 250ms 弹出该项目正在运行的 AI Session 终端区 |
 | **设置面板分组** | 侧栏两级菜单：终端、外观、AI、系统，每页只剩一屏，不用滚半页找开关 |
-| **界面动效** | 全部动画走方向性位移或裁剪窗展开，不做淡入闪烁：活动栏大面板（用量统计 / 设置 / SSH / 移动端）从窗口顶边整块向下滑入、关闭时向上收回，中栏开合与右侧工作区同步推拉（零白底空洞、零逐帧重排），其余弹窗、菜单、浮层、悬停卡从触发它的控件长出来并反向收回；切 tab 左右推、切面板上下推、最大化从原格子展开并原路收回，关 tab / 关分屏时邻居推入或扩张到位且只 resize 一次；折叠、分段控件、开关都有过渡。「设置 → 终端 → 启用动画」一个开关管全部动画，系统关掉窗口动画时转场照常保留 |
+| **界面动效** | 全部动画走方向性位移或裁剪窗展开，不做淡入闪烁：活动栏大面板（用量统计 / 设置 / SSH / 移动端）从窗口顶边整块向下滑入、关闭时向上收回，中栏开合与右侧工作区同步推拉（零白底空洞、零逐帧重排），其余弹窗、菜单、浮层、悬停卡从触发它的控件长出来并反向收回；切 tab 左右推、切面板上下推、最大化从原格子展开并原路收回，关 tab / 关分屏时邻居推入或扩张到位且只 resize 一次；项目分组、worktree 分组与文件树目录按高度展开收起，半路反向从当前进度掉头；分段控件、开关都有过渡。「设置 → 终端 → 启用动画」一个开关管全部动画，系统关掉窗口动画时转场照常保留 |
 
 ---
 
@@ -112,7 +113,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **4103 个 Rust 测试**（47 个测试目标） |
+| 测试 | **4119 个 Rust 测试**（47 个测试目标） |
 
 ---
 

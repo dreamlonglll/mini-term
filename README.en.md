@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.14.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.14.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -89,10 +89,11 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache); the config is read only once at startup and its backup moved to the background, so the first frame arrives sooner |
 | **Flood-proof UI** | PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so `cat`-ing a huge file can't drag the interface down; terminal output repaints only the terminal itself, idle split panes reuse their previous frame, and a minimized window stops rendering entirely; the terminal redraw rate is adjustable under System → Performance (focused 10–240, default 30; unfocused 1–60, default 5) — raise it for smoother output on high-refresh displays or lower it to save battery, effective immediately |
 | **Newer ConPTY** | On Windows the package ships Windows Terminal 1.24's `conpty.dll` + `OpenConsole.exe` and preloads them at startup, sidestepping known bugs in older system conhost builds (wide-character widths, line wrapping, lines lost on resize); if you suspect a display issue comes from it, set the environment variable `MT_DISABLE_PORTABLE_CONPTY=1` to fall back to the system ConPTY |
-| **Adding a project opens it** | Every entry point — the dialog, a group's right-click menu, dropping a folder onto the list, SSH remote, "add worktree as project" — switches to the new project and opens its first terminal, instead of leaving you on an empty state to click "New terminal" once more |
+| **Adding a project opens it** | Every entry point — the dialog, a group's right-click menu, dropping a folder onto the list, SSH remote, creating a worktree — switches to the new project and opens its first terminal, instead of leaving you on an empty state to click "New terminal" once more |
+| **Worktree sub-projects** | Worktrees of a local repository are mounted beneath the main project automatically: one created with `git worktree add` in a terminal or by an AI shows up in the list on its own, one removed externally disappears, and one you removed by hand is not added back. The main project and its worktrees share one bordered cluster with tree connectors, and children are labeled by branch name; a count badge on the main project row folds the whole cluster, and while folded the children's AI status is summarized on the main project row so nothing slips by |
 | **Hover preview for project rows** | Hover for 250ms to pop up a preview of the project's running AI session terminal area |
 | **Grouped settings panel** | A two-level sidebar: Terminal, Appearance, AI, System — every page fits on one screen instead of scrolling half a page to find a toggle |
-| **Interface motion** | Every animation is a directional slide or a clip-window reveal, never a fade-in flash: the four large activity-bar sheets (Usage stats / Settings / SSH / Mobile) slide smoothly down from the top edge and retract back up, the middle sidebar pushes and pulls inline in sync with the workspace (no blank flash, no per-frame terminal reflow), and other dialogs, menus, popovers and hover cards grow out of the control that opened them and retract the same way; tabs push left / right, panels up / down, maximize grows from the original cell and restores along the same path, and closing a tab or split pushes / grows the neighbour into place with a single resize; folds, segmented controls and toggles all transition. One switch — Settings → Terminal → Enable animations — governs every animation, and transitions keep playing when the system turns window animations off |
+| **Interface motion** | Every animation is a directional slide or a clip-window reveal, never a fade-in flash: the four large activity-bar sheets (Usage stats / Settings / SSH / Mobile) slide smoothly down from the top edge and retract back up, the middle sidebar pushes and pulls inline in sync with the workspace (no blank flash, no per-frame terminal reflow), and other dialogs, menus, popovers and hover cards grow out of the control that opened them and retract the same way; tabs push left / right, panels up / down, maximize grows from the original cell and restores along the same path, and closing a tab or split pushes / grows the neighbour into place with a single resize; project groups, worktree clusters and file-tree folders expand and collapse by height, turning around from their current progress when reversed mid-way; segmented controls and toggles transition too. One switch — Settings → Terminal → Enable animations — governs every animation, and transitions keep playing when the system turns window animations off |
 
 ---
 
@@ -110,7 +111,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **4,103 Rust tests** (47 test targets) |
+| Tests | **4,119 Rust tests** (47 test targets) |
 
 ---
 
