@@ -295,8 +295,12 @@ use mt_i18n::{
 /// 1937 → 1958：用量统计下半区改 Tab（默认「请求日志」+「排行概览」），新增页签、列显隐、
 /// 表格列名 / 速度估算说明、请求明细空态 / 截断提示 / hover 提示
 /// （`usageStats.{tabs.*,columns.*,requestLogs.*}` 共 21 条）。
+/// 1958 → 1961：请求日志新增「缓存命中率」列 —— 列名、表头口径说明、单元格分子分母提示
+/// （`usageStats.{columns.cacheHitRate,columns.cacheHitRateTip,requestLogs.hitRateTip}`）。
+/// 1961 → 1969：趋势图点柱下钻到当天 / 聚焦小时 —— 两条操作提示、三条柱子悬停提示、
+/// 面包屑返回、底部「仅某小时」标签与取消（`usageStats.drill.*` 共 8 条）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1958;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1969;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

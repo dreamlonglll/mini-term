@@ -269,6 +269,14 @@ pub struct UsagePanel {
     _calendar_sub: Option<gpui::Subscription>,
     /// 用 `Rc` 共享给 `uniform_list` 虚拟滚动闭包，避免每帧深拷贝数千条请求日志。
     stats: Option<Rc<UsageStatsPayload>>,
+    /// 底部明细(请求日志 / 排行概览)用的那份快照:聚焦某小时时是该小时的单独查询,
+    /// 否则与 [`Self::stats`] 同一份。两者在查询完成时**一起**落位 —— 聚焦切换期间
+    /// 底部保持上一次的结果,不会先闪一下整天的数据。
+    bottom_stats: Option<Rc<UsageStatsPayload>>,
+    /// 趋势图下钻到的本地日历日(多日视图点某天)。临时状态,不落盘;换范围即清。
+    drill_day: Option<chrono::NaiveDate>,
+    /// 小时视图里聚焦的小时(0..=23):只影响底部明细。临时状态,不落盘。
+    focus_hour: Option<u32>,
     error: Option<String>,
     /// backfill(账本首建全量同步)进度;非 backfill 期间为 None。
     progress: Option<(usize, usize)>,
@@ -397,6 +405,9 @@ impl UsagePanel {
             calendar: None,
             _calendar_sub: None,
             stats: None,
+            bottom_stats: None,
+            drill_day: None,
+            focus_hour: None,
             error: None,
             progress: None,
             pricing: HashMap::new(),
@@ -545,14 +556,33 @@ impl UsagePanel {
 
         let dir = self.app_data_dir.clone();
         let agents = self.scope.filter();
-        let range = self.range;
         let project = self.effective_project(cx);
         let pricing = self.pricing.clone();
         let now = chrono::Local::now();
-        let since = range_since_ms(range, &self.custom_from, now);
-        let until = range_until_ms(range, &self.custom_from, &self.custom_to, now);
-        // 与补桶(`fill_buckets`)同一个判据,否则同日 custom 查回日桶、轴却按小时补
-        let hourly = bucket_hourly(range, &self.custom_from, &self.custom_to, now);
+        // 分桶粒度与补桶(`fill_buckets` / `fill_window_hours`)同一个判据,否则同日
+        // custom 查回日桶、轴却按小时补;下钻日的窗口见 `query_window`
+        let main = query_window(
+            self.range,
+            &self.custom_from,
+            &self.custom_to,
+            self.drill_day,
+            now,
+        );
+        // 聚焦某小时:底部明细单独查该小时(KPI 与趋势图仍是整窗)
+        let focus = self.focus_hour.and_then(|hour| {
+            hourly_chart_day(
+                self.range,
+                &self.custom_from,
+                &self.custom_to,
+                self.drill_day,
+                now,
+            )
+            .map(|day| hour_window(day, hour, main, now))
+        });
+        if focus.is_none() {
+            self.focus_hour = None;
+        }
+        let focus_pricing = focus.map(|_| pricing.clone());
         let tz_offset = tz_offset_minutes(now);
         let tz_name = iana_time_zone::get_timezone().ok();
 
@@ -560,9 +590,25 @@ impl UsagePanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    usage_ledger_query(
-                        &dir, agents, since, until, project, tz_offset, tz_name, hourly, pricing,
-                    )
+                    let stats = usage_ledger_query(
+                        &dir,
+                        agents,
+                        main.since,
+                        main.until,
+                        project.clone(),
+                        tz_offset,
+                        tz_name.clone(),
+                        main.hourly,
+                        pricing,
+                    )?;
+                    let detail = match (focus, focus_pricing) {
+                        (Some(w), Some(pricing)) => Some(usage_ledger_query(
+                            &dir, agents, w.since, w.until, project, tz_offset, tz_name, w.hourly,
+                            pricing,
+                        )?),
+                        _ => None,
+                    };
+                    Ok::<_, String>((stats, detail))
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -570,9 +616,12 @@ impl UsagePanel {
                     return;
                 }
                 match result {
-                    Ok(stats) => {
+                    Ok((stats, detail)) => {
                         this.tweens.retarget(&stats, Instant::now());
-                        this.stats = Some(Rc::new(stats));
+                        let stats = Rc::new(stats);
+                        this.bottom_stats =
+                            Some(detail.map_or_else(|| Rc::clone(&stats), Rc::new));
+                        this.stats = Some(stats);
                         this.error = None;
                     }
                     Err(err) => this.error = Some(err),
@@ -666,11 +715,51 @@ impl UsagePanel {
 
     fn set_range(&mut self, range: UsageRange, cx: &mut Context<Self>) {
         if self.range == range {
+            // 再点一次当前范围 = 退出下钻 / 聚焦,回到该范围的总览
+            self.set_drill(None, None, cx);
             return;
         }
         self.range = range;
+        self.reset_drill();
         self.save_prefs(cx);
         self.query(cx);
+    }
+
+    // ── 趋势图下钻 ────────────────────────────────────────
+
+    /// 换窗口(范围 / 自选起止)时清掉下钻与聚焦:下钻日可能已不在新窗口里。
+    /// 调用方紧接着会 `query`。
+    fn reset_drill(&mut self) {
+        self.drill_day = None;
+        self.focus_hour = None;
+    }
+
+    /// 改下钻日 / 聚焦小时并重查。明细列表回到顶部 —— 换了一批数据,
+    /// 停在原来的滚动位置没有意义。
+    fn set_drill(
+        &mut self,
+        day: Option<chrono::NaiveDate>,
+        hour: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drill_day == day && self.focus_hour == hour {
+            return;
+        }
+        self.drill_day = day;
+        self.focus_hour = hour;
+        self.logs_scroll_handle
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+        self.query(cx);
+    }
+
+    /// 点趋势图的一根柱子:日期桶 → 下钻到那天;小时桶 → 聚焦该小时,再点取消。
+    fn click_bucket(&mut self, label: &str, cx: &mut Context<Self>) {
+        if let Some(hour) = parse_hour_label(label) {
+            let next = (self.focus_hour != Some(hour)).then_some(hour);
+            self.set_drill(self.drill_day, next, cx);
+        } else if let Some(day) = parse_local_date(label) {
+            self.set_drill(Some(day), None, cx);
+        }
     }
 
     fn set_project_scope(&mut self, path: Option<String>, cx: &mut Context<Self>) {
@@ -714,6 +803,7 @@ impl UsagePanel {
         } else {
             self.custom_to = next;
         }
+        self.reset_drill();
         self.save_prefs(cx);
         self.query(cx);
     }
@@ -750,6 +840,7 @@ impl UsagePanel {
             self.custom_to = next.clone();
         }
         state.update(cx, |s, cx| s.set_value(next, window, cx));
+        self.reset_drill();
         self.save_prefs(cx);
         self.query(cx);
     }
@@ -910,6 +1001,11 @@ impl UsagePanel {
 /// 区块卡片壳(`UsageStatsModal.tsx:99-109`):
 /// `border-[--border-subtle] rounded-md bg-[--bg-elevated]/40 px-4 py-3.5` + 竖条标题。
 fn section(title: impl Into<String>, body: impl IntoElement) -> Div {
+    section_with_title_row(ui::section_title(title.into()), body)
+}
+
+/// [`section`] 的标题行可加料版(趋势图的标题行右侧挂下钻面包屑)。
+fn section_with_title_row(title_row: Div, body: impl IntoElement) -> Div {
     div()
         .border_1()
         .border_color(ui::border_subtle())
@@ -917,7 +1013,7 @@ fn section(title: impl Into<String>, body: impl IntoElement) -> Div {
         .bg(ui::with_alpha(ui::bg_elevated(), 0.4))
         .px(px(16.0))
         .py(px(14.0))
-        .child(ui::section_title(title.into()))
+        .child(title_row)
         .child(body)
 }
 
@@ -1773,14 +1869,23 @@ impl UsagePanel {
         }
         main = main.child(token_row);
 
-        // --- 趋势图 ---
-        main = main.child(section(
-            t("usageStats", "dailyActivity"),
-            self.render_chart(&stats, cx),
+        // --- 趋势图(标题右侧是下钻面包屑 / 操作提示) ---
+        let crumbs = self.render_drill_crumbs(&stats, cx);
+        let chart = self.render_chart(&stats, cx);
+        main = main.child(section_with_title_row(
+            ui::section_title(t("usageStats", "dailyActivity"))
+                .child(div().flex_1())
+                .child(crumbs),
+            chart,
         ));
 
         // --- 下半区 Tab：请求日志（默认）| 排行概览 ---
-        main = main.child(self.render_detail_tabs(&stats, window, cx));
+        // 聚焦某小时时换成该小时的那份快照(KPI 与趋势图仍是整窗)
+        let bottom = self
+            .bottom_stats
+            .clone()
+            .unwrap_or_else(|| Rc::clone(&stats));
+        main = main.child(self.render_detail_tabs(&bottom, window, cx));
 
         // 入场:轻度 18px 上浮入位(只挪绘制位置、不改排版与滚动范围),跑完直接不挂包装层
         let p = self.fade_in.drive(window);
@@ -1883,6 +1988,37 @@ impl UsagePanel {
                 None,
                 cx,
             ))
+            // 聚焦某小时时:下方两个 Tab 都只看该小时,标签整颗可点即取消
+            .when_some(self.focus_hour, |el, hour| {
+                el.child(
+                    div()
+                        .id("usage-focus-chip")
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .mb(px(6.0))
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(99.0))
+                        .bg(ui::accent_subtle())
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::accent())
+                        .cursor_pointer()
+                        .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.24)))
+                        .tooltip(|window, cx| {
+                            Tooltip::new(t("usageStats", "drill.clearFocus")).build(window, cx)
+                        })
+                        .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
+                            this.set_drill(this.drill_day, None, cx);
+                        }))
+                        .child(tr!(
+                            "usageStats",
+                            "drill.focusChip",
+                            span = format_hour_span(hour)
+                        ))
+                        .child(div().text_size(ui::font_px(10.0)).child("✕")),
+                )
+            })
             .child(div().flex_1())
             .when(active == UsageTab::RequestLogs, |el| {
                 el.child(self.render_columns_button(cx))
@@ -2312,6 +2448,80 @@ impl UsagePanel {
     /// 几何(曲线采样 / 刻度取值 / 标签稀释)全在 [`mt_ui::chart`],**这里只负责
     /// 摆文本和挂 hover**:轴标签是普通 `div`(自绘元素画字要自己 shape,而字号
     /// 字族是壳的主题量),hover 列是盖在画布上的透明格子。
+    /// 趋势图标题右侧:没下钻时是一句操作提示;下钻 / 聚焦后是面包屑
+    /// `近30天 › 2026-11-22 › 10:00–11:00`,前面几段可点、逐级返回,末段是当前所在。
+    fn render_drill_crumbs(&self, stats: &UsageStatsPayload, cx: &mut Context<Self>) -> Div {
+        let row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(ui::font_px(11.0))
+            .text_color(ui::text_muted());
+        if self.drill_day.is_none() && self.focus_hour.is_none() {
+            if stats.daily.is_empty() {
+                return row;
+            }
+            let hourly = hourly_chart_day(
+                self.range,
+                &self.custom_from,
+                &self.custom_to,
+                None,
+                chrono::Local::now(),
+            )
+            .is_some();
+            return row.child(t(
+                "usageStats",
+                if hourly {
+                    "drill.hintHour"
+                } else {
+                    "drill.hintDay"
+                },
+            ));
+        }
+
+        let link = |id: &'static str, label: String| {
+            let tip = tr!("usageStats", "drill.backTo", target = label.clone());
+            div()
+                .id(id)
+                .cursor_pointer()
+                .text_color(ui::text_secondary())
+                .hover(|el| el.text_color(ui::accent()))
+                .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                .child(label)
+        };
+        let current = |label: String, color: gpui::Hsla| {
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(color)
+                .child(label)
+        };
+        let sep = || div().text_color(ui::border_strong()).child("›");
+
+        let mut row = row.child(
+            link("usage-crumb-range", self.range.label().to_string()).on_click(cx.listener(
+                |this: &mut Self, _, _window, cx| this.set_drill(None, None, cx),
+            )),
+        );
+        if let Some(day) = self.drill_day {
+            row = row.child(sep());
+            row = if self.focus_hour.is_some() {
+                row.child(
+                    link("usage-crumb-day", format_drill_day(day)).on_click(cx.listener(
+                        move |this: &mut Self, _, _window, cx| this.set_drill(Some(day), None, cx),
+                    )),
+                )
+            } else {
+                row.child(current(format_drill_day(day), ui::text_primary()))
+            };
+        }
+        if let Some(hour) = self.focus_hour {
+            row = row
+                .child(sep())
+                .child(current(format_hour_span(hour), ui::accent()));
+        }
+        row
+    }
+
     fn render_chart(&mut self, stats: &UsageStatsPayload, cx: &mut Context<Self>) -> AnyElement {
         let now = chrono::Local::now();
         if stats.daily.is_empty() {
@@ -2325,13 +2535,27 @@ impl UsagePanel {
                 .child(t("usageStats", "noDailyData"))
                 .into_any_element();
         }
-        let buckets = fill_buckets(
-            &stats.daily,
-            self.range,
-            &self.custom_from,
-            &self.custom_to,
-            now,
-        );
+        let buckets = match self.drill_day {
+            // 下钻日:按查询窗口补小时桶(与自选范围的交集、今天只补到当前小时)
+            Some(_) => fill_window_hours(
+                &stats.daily,
+                query_window(
+                    self.range,
+                    &self.custom_from,
+                    &self.custom_to,
+                    self.drill_day,
+                    now,
+                ),
+                now,
+            ),
+            None => fill_buckets(
+                &stats.daily,
+                self.range,
+                &self.custom_from,
+                &self.custom_to,
+                now,
+            ),
+        };
         if buckets.len() == 1 {
             let d = &buckets[0];
             return div()
@@ -2396,20 +2620,43 @@ impl UsagePanel {
         };
 
         // hover 列:盖在画布上的透明格子,一格一个桶(原版是 recharts 的
-        // Tooltip + cursor,这里保留 M/Q 批就有的「整列淡底 + 六行详情」)
+        // Tooltip + cursor,这里保留 M/Q 批就有的「整列淡底 + 六行详情」)。
+        // 有数据的格子可点:日期桶下钻到那天,小时桶聚焦 / 取消聚焦那个小时
+        let focus_label = self.focus_hour.map(|h| format!("{h:02}:00"));
         let mut hover_row = div().absolute().inset_0().flex();
         for d in &buckets {
-            let tip = ChartTip::from(d);
+            let clickable = d.calls > 0;
+            let focused = focus_label.as_deref() == Some(d.date.as_str());
+            let hint = clickable.then(|| match parse_hour_label(&d.date) {
+                Some(_) if focused => t("usageStats", "drill.clickHourAgain"),
+                Some(_) => t("usageStats", "drill.clickHour"),
+                None => t("usageStats", "drill.clickDay"),
+            });
+            let tip = ChartTip::from(d).with_hint(hint);
+            let label = d.date.clone();
             hover_row = hover_row.child(
                 div()
                     .id(SharedString::from(format!("bar-{}", d.date)))
                     .flex_1()
                     .min_w(px(1.0))
                     .h_full()
+                    // 聚焦的那一小时常驻一层淡 accent(低 alpha 的 accent 不洗曲线)
+                    .when(focused, |el| el.bg(ui::with_alpha(ui::accent(), 0.14)))
                     // 与改造前同一档淡底(`--border-subtle`)。⚠️ 这层盖在画布
                     // **之上**,别顺手 `with_alpha` 加浓 —— 那个函数是**赋值**
                     // 不是乘,给 0.5 会直接变成半透明白把曲线洗掉
-                    .hover(|el| el.bg(ui::border_subtle()))
+                    .hover(move |el| {
+                        el.bg(if focused {
+                            ui::with_alpha(ui::accent(), 0.2)
+                        } else {
+                            ui::border_subtle()
+                        })
+                    })
+                    .when(clickable, |el| {
+                        el.cursor_pointer().on_click(cx.listener(
+                            move |this: &mut Self, _, _window, cx| this.click_bucket(&label, cx),
+                        ))
+                    })
                     // 图表 hover 详情是「扫过去看数」的交互,不是「停下来问这
                     // 是什么键」——全仓那档 1200ms 会让人以为图表没反应,横向扫
                     // 过多个桶时每格还要重新等满。所以**刻意**不挂
@@ -2739,6 +2986,13 @@ fn request_log_col_box(
             .flex()
             .justify_end()
             .overflow_hidden(),
+        // 表头「缓存命中率」+ `?` 徽标约 72px,数值最宽 `100.00%`
+        RequestLogColumn::CacheHitRate => div()
+            .flex_none()
+            .w(px(84.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
         RequestLogColumn::Speed => div()
             .flex_none()
             .w(px(94.0))
@@ -2748,7 +3002,39 @@ fn request_log_col_box(
     }
 }
 
-/// 请求日志固定表头。「速度」列右侧附 `?` 徽标说明估算口径；整组悬停即出提示。
+/// 表头列名 + 右侧 `?` 徽标；整组悬停即出口径说明。
+fn header_label_with_help(
+    id: &'static str,
+    label: &'static str,
+    tip_key: &'static str,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_end()
+        .gap(px(4.0))
+        .cursor_default()
+        .tooltip(move |window, cx| Tooltip::new(t("usageStats", tip_key)).build(window, cx))
+        .child(label)
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .w(px(13.0))
+                .h(px(13.0))
+                .rounded_full()
+                .border_1()
+                .border_color(ui::border_strong())
+                .text_size(ui::font_px(9.0))
+                .text_color(ui::text_muted())
+                .child("?"),
+        )
+}
+
+/// 请求日志固定表头。「缓存命中率」「速度」两列右侧附 `?` 徽标说明计算 / 估算口径。
 fn render_request_log_header(
     columns: &[RequestLogColumn],
     same_day: bool,
@@ -2773,33 +3059,16 @@ fn render_request_log_header(
     for &col in columns {
         let cell = request_log_col_box(col, same_day, columns);
         let cell = match col {
-            RequestLogColumn::Speed => cell.child(
-                div()
-                    .id("usage-log-speed-help")
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(4.0))
-                    .cursor_default()
-                    .tooltip(|window, cx| {
-                        Tooltip::new(t("usageStats", "columns.speedTip")).build(window, cx)
-                    })
-                    .child(col.label())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(13.0))
-                            .h(px(13.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(ui::border_strong())
-                            .text_size(ui::font_px(9.0))
-                            .text_color(ui::text_muted())
-                            .child("?"),
-                    ),
-            ),
+            RequestLogColumn::Speed => cell.child(header_label_with_help(
+                "usage-log-speed-help",
+                col.label(),
+                "columns.speedTip",
+            )),
+            RequestLogColumn::CacheHitRate => cell.child(header_label_with_help(
+                "usage-log-hit-rate-help",
+                col.label(),
+                "columns.cacheHitRateTip",
+            )),
             _ => cell.child(div().truncate().child(col.label())),
         };
         row = row.child(cell);
@@ -3026,6 +3295,41 @@ fn render_request_log_row(
                     )
                 }
             }
+            RequestLogColumn::CacheHitRate => {
+                match format_cache_hit_rate(
+                    item.input_tokens,
+                    item.cache_read_tokens,
+                    item.cache_write_tokens,
+                ) {
+                    None => cell.child(div().text_color(ui::text_muted()).child("—")),
+                    Some(rate) => {
+                        let total = item
+                            .input_tokens
+                            .saturating_add(item.cache_read_tokens)
+                            .saturating_add(item.cache_write_tokens);
+                        let tip = tr!(
+                            "usageStats",
+                            "requestLogs.hitRateTip",
+                            read = format_count(item.cache_read_tokens),
+                            total = format_count(total)
+                        );
+                        cell.child(
+                            div()
+                                .id(SharedString::from(format!("usage-log-{ix}-hit-rate")))
+                                .truncate()
+                                .text_color(if item.cache_read_tokens > 0 {
+                                    ui::text_secondary()
+                                } else {
+                                    ui::text_muted()
+                                })
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .child(rate),
+                        )
+                    }
+                }
+            }
             RequestLogColumn::Speed => {
                 let speed = format_estimated_speed(item.output_tokens, item.duration_ms);
                 match (speed, item.duration_ms) {
@@ -3177,11 +3481,19 @@ fn dropdown(id: &'static str, label: String, max_w: gpui::Pixels) -> Stateful<Di
 struct ChartTip {
     date: String,
     rows: Vec<(gpui::Hsla, String, String)>,
+    /// 末尾一行操作提示(可点的柱子才有:下钻 / 聚焦 / 取消聚焦)。
+    hint: Option<&'static str>,
 }
 
 impl ChartTip {
+    fn with_hint(mut self, hint: Option<&'static str>) -> Self {
+        self.hint = hint;
+        self
+    }
+
     fn from(d: &DailyStat) -> Self {
         Self {
+            hint: None,
             date: d.date.clone(),
             rows: vec![
                 (
@@ -3257,6 +3569,18 @@ impl ChartTip {
                             .text_color(ui::text_primary())
                             .child(value.clone()),
                     ),
+            );
+        }
+        if let Some(hint) = self.hint {
+            el = el.child(
+                div()
+                    .mt(px(6.0))
+                    .pt(px(5.0))
+                    .border_t_1()
+                    .border_color(ui::border_subtle())
+                    .text_size(ui::font_px(10.0))
+                    .text_color(ui::text_muted())
+                    .child(hint),
             );
         }
         el

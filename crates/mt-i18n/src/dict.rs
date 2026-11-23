@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1958;
+pub const ZH_ENTRY_COUNT: usize = 1969;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1958;
+pub const EN_ENTRY_COUNT: usize = 1969;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3980,6 +3980,8 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("callsCount", "{count} 次调用"),
     ("columns.app", "应用"),
     ("columns.button", "显示列"),
+    ("columns.cacheHitRate", "缓存命中率"),
+    ("columns.cacheHitRateTip", "缓存命中 ÷（新增输入 + 缓存命中 + 缓存写），四舍五入到 0.01%；未全部命中不显示 100.00%，有命中不显示 0.00%"),
     ("columns.cacheRead", "缓存命中"),
     ("columns.cacheWrite", "缓存写"),
     ("columns.cost", "成本"),
@@ -3993,6 +3995,14 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("columns.speedTip", "按本地会话日志时间戳估算（含首字等待时间），仅在输出 ≥ 200 tokens 时展示"),
     ("columns.time", "时间"),
     ("dailyActivity", "使用趋势"),
+    ("drill.backTo", "返回{target}"),
+    ("drill.clearFocus", "取消小时聚焦"),
+    ("drill.clickDay", "点击查看当天按小时明细"),
+    ("drill.clickHour", "点击聚焦该小时明细"),
+    ("drill.clickHourAgain", "再次点击取消聚焦"),
+    ("drill.focusChip", "仅 {span}"),
+    ("drill.hintDay", "点击柱子查看当天按小时明细"),
+    ("drill.hintHour", "点击柱子聚焦该小时的下方明细"),
     ("empty", "所选范围内没有 AI 会话"),
     ("kpi.cacheHit", "缓存命中"),
     ("kpi.calls", "调用数"),
@@ -4018,6 +4028,7 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("requestLogs.clickToPreview", "点击查看所属会话"),
     ("requestLogs.durationTip", "估算耗时 {secs}s · 输出 {tokens} tokens"),
     ("requestLogs.empty", "暂无请求记录"),
+    ("requestLogs.hitRateTip", "缓存命中 {read} / 输入合计 {total} tokens"),
     ("requestLogs.reasoningTip", "含思考 {reasoning} tokens"),
     ("requestLogs.truncated", "仅展示最近 {shown} 条，共 {total} 条请求"),
     ("retry", "重试"),
@@ -4051,6 +4062,8 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("callsCount", "{count} calls"),
     ("columns.app", "App"),
     ("columns.button", "Columns"),
+    ("columns.cacheHitRate", "Hit rate"),
+    ("columns.cacheHitRateTip", "Cache hit ÷ (new input + cache hit + cache write), rounded to 0.01%; never shows 100.00% unless fully cached, nor 0.00% when any cache was hit"),
     ("columns.cacheRead", "Cache hit"),
     ("columns.cacheWrite", "Cache write"),
     ("columns.cost", "Cost"),
@@ -4064,6 +4077,14 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("columns.speedTip", "Estimated from local session log timestamps (includes TTFT wait); shown only when output ≥ 200 tokens"),
     ("columns.time", "Time"),
     ("dailyActivity", "Usage trend"),
+    ("drill.backTo", "Back to {target}"),
+    ("drill.clearFocus", "Clear hour focus"),
+    ("drill.clickDay", "Click to view hourly breakdown"),
+    ("drill.clickHour", "Click to focus this hour"),
+    ("drill.clickHourAgain", "Click again to clear focus"),
+    ("drill.focusChip", "Only {span}"),
+    ("drill.hintDay", "Click a bar to drill into that day by hour"),
+    ("drill.hintHour", "Click a bar to focus the details below on that hour"),
     ("empty", "No AI sessions in the selected range"),
     ("kpi.cacheHit", "Cache hit"),
     ("kpi.calls", "Calls"),
@@ -4089,6 +4110,7 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("requestLogs.clickToPreview", "Click to preview session"),
     ("requestLogs.durationTip", "Est. {secs}s · {tokens} output tokens"),
     ("requestLogs.empty", "No requests"),
+    ("requestLogs.hitRateTip", "{read} cached / {total} total input tokens"),
     ("requestLogs.reasoningTip", "Includes {reasoning} reasoning tokens"),
     ("requestLogs.truncated", "Showing latest {shown} of {total} requests"),
     ("retry", "Retry"),

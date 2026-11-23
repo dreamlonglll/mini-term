@@ -381,6 +381,141 @@ pub fn fill_buckets(
     out
 }
 
+// ─── 趋势图下钻 ──────────────────────────────────────────────
+//
+// 两级:多日视图点某天 → **下钻**到该日的小时视图(KPI / 趋势图 / 底部明细整体换窗);
+// 小时视图(下钻后 / 今天 / 同日自选)点某小时 → **聚焦**,只把底部明细换成该小时。
+// 下钻与聚焦都是临时状态,不落盘。
+
+/// 一次账本查询的窗口:起点、上界(含)、是否按小时分桶。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryWindow {
+    pub since: i64,
+    pub until: Option<i64>,
+    pub hourly: bool,
+}
+
+/// 主查询(KPI + 趋势图)的窗口。没下钻时就是所选范围;下钻到某天时是
+/// **那一天与所选范围的交集**、按小时分桶 —— 自选 `11-01 09:30` 起时下钻 11-01
+/// 只看 09:30 之后,与多日视图里那根柱子同口径。
+pub fn query_window(
+    range: UsageRange,
+    custom_from: &str,
+    custom_to: &str,
+    drill_day: Option<chrono::NaiveDate>,
+    now: chrono::DateTime<chrono::Local>,
+) -> QueryWindow {
+    let since = range_since_ms(range, custom_from, now);
+    let until = range_until_ms(range, custom_from, custom_to, now);
+    match drill_day {
+        None => QueryWindow {
+            since,
+            until,
+            hourly: bucket_hourly(range, custom_from, custom_to, now),
+        },
+        Some(day) => {
+            let fallback = now.timestamp_millis();
+            let day_start = midnight_ms(day, fallback);
+            let day_end = midnight_ms(day + chrono::Duration::days(1), fallback) - 1;
+            QueryWindow {
+                since: day_start.max(since),
+                until: Some(until.map_or(day_end, |u| u.min(day_end))),
+                hourly: true,
+            }
+        }
+    }
+}
+
+/// 小时视图对应的本地日历日:下钻日 / 今天 / 同日自选那一天;多日视图 `None`。
+pub fn hourly_chart_day(
+    range: UsageRange,
+    custom_from: &str,
+    custom_to: &str,
+    drill_day: Option<chrono::NaiveDate>,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<chrono::NaiveDate> {
+    if drill_day.is_some() {
+        return drill_day;
+    }
+    match range {
+        UsageRange::Today => Some(now.date_naive()),
+        UsageRange::Custom if bucket_hourly(range, custom_from, custom_to, now) => {
+            Some(custom_chart_window(custom_from, custom_to, now).0.date())
+        }
+        _ => None,
+    }
+}
+
+/// 聚焦某小时的明细窗口:`[HH:00:00.000, 下一小时 - 1ms]`,再与主查询窗口取交集
+/// (同日自选 09:30 起时,09 点那格只含 09:30 之后 —— 与柱子同口径)。
+/// 账本按单条请求时间戳判窗,所以这就是该小时那根柱子的精确成员。
+pub fn hour_window(
+    day: chrono::NaiveDate,
+    hour: u32,
+    main: QueryWindow,
+    now: chrono::DateTime<chrono::Local>,
+) -> QueryWindow {
+    let fallback = now.timestamp_millis();
+    let start = day.and_time(chrono::NaiveTime::MIN) + chrono::Duration::hours(i64::from(hour));
+    let start_ms = local_ms(start, fallback);
+    let end_ms = local_ms(start + chrono::Duration::hours(1), fallback) - 1;
+    QueryWindow {
+        since: start_ms.max(main.since),
+        until: Some(main.until.map_or(end_ms, |u| u.min(end_ms))),
+        hourly: true,
+    }
+}
+
+/// 下钻视图的补桶:从窗口起点所在小时补到终点所在小时(终点不超过现在 ——
+/// 下钻到今天时补到当前小时,与「今天」视图一致)。
+pub fn fill_window_hours(
+    daily: &[DailyStat],
+    window: QueryWindow,
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<DailyStat> {
+    use chrono::Timelike;
+    let map: HashMap<&str, &DailyStat> = daily.iter().map(|d| (d.date.as_str(), d)).collect();
+    let start = local_datetime(window.since, now);
+    let end_ms = window
+        .until
+        .unwrap_or(i64::MAX)
+        .min(now.timestamp_millis())
+        .max(window.since);
+    let end = local_datetime(end_ms, now);
+    let last = if end.date() == start.date() { end.hour() } else { 23 };
+    (start.hour()..=last.max(start.hour()))
+        .map(|h| {
+            let key = format!("{h:02}:00");
+            match map.get(key.as_str()) {
+                Some(d) => (*d).clone(),
+                None => DailyStat {
+                    date: key,
+                    ..Default::default()
+                },
+            }
+        })
+        .collect()
+}
+
+/// 小时桶标签 `HH:00` → 小时(0..=23)。日期桶 / 形态不符返回 `None`。
+pub fn parse_hour_label(label: &str) -> Option<u32> {
+    let (h, m) = label.split_once(':')?;
+    if h.len() != 2 || m != "00" || !h.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    h.parse::<u32>().ok().filter(|h| *h < 24)
+}
+
+/// 聚焦小时的展示串:`10:00–11:00`(23 点为 `23:00–24:00`)。
+pub fn format_hour_span(hour: u32) -> String {
+    format!("{hour:02}:00–{:02}:00", hour + 1)
+}
+
+/// 下钻日的展示串:`2026-11-22`。
+pub fn format_drill_day(day: chrono::NaiveDate) -> String {
+    day.format("%Y-%m-%d").to_string()
+}
+
 // ─── 展示格式 ────────────────────────────────────────────────
 
 /// 金额:统一两位小数 + 千分位;微额显示 `<$0.01`(不四舍五入成 `$0.00` 假象)。
@@ -458,6 +593,27 @@ pub fn cache_hit_rate(input: u64, cache_read: u64, cache_write: u64) -> Option<f
         return None;
     }
     Some(cache_read as f64 / denom as f64 * 100.0)
+}
+
+/// 请求日志「缓存命中率」列的展示串：与 [`cache_hit_rate`] 同一公式（账本里三项已是
+/// 互斥口径，Codex 的 `cached_input_tokens` 已从 input 扣出），**整数运算**四舍五入到
+/// 0.01%，不经 f64。两端收口：没全命中的请求不进成 `100.00%`（收在 `99.99%`），
+/// 有命中的请求不舍成 `0.00%`（抬到 `0.01%`）。分母 0 → `None`。
+pub fn format_cache_hit_rate(input: u64, cache_read: u64, cache_write: u64) -> Option<String> {
+    let denom = u128::from(input) + u128::from(cache_read) + u128::from(cache_write);
+    if denom == 0 {
+        return None;
+    }
+    let read = u128::from(cache_read);
+    // 万分点(0.01%)四舍五入:floor(read * 10000 / denom + 0.5)
+    let mut bp = (read * 20_000 + denom) / (denom * 2);
+    if read < denom {
+        bp = bp.min(9_999);
+    }
+    if read > 0 {
+        bp = bp.max(1);
+    }
+    Some(format!("{}.{:02}%", bp / 100, bp % 100))
 }
 
 /// 模型展示短名:通用规则推导,不维护映射表(新模型零改动)。
@@ -551,12 +707,13 @@ pub enum RequestLogColumn {
     Output,
     CacheRead,
     CacheWrite,
+    CacheHitRate,
     Speed,
 }
 
 impl RequestLogColumn {
     /// 全部可选列的固定展示顺序。
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Time,
         Self::App,
         Self::Provider,
@@ -567,11 +724,15 @@ impl RequestLogColumn {
         Self::Output,
         Self::CacheRead,
         Self::CacheWrite,
+        Self::CacheHitRate,
         Self::Speed,
     ];
 
-    /// 默认可见的 9 列（项目与缓存写可在列菜单中按需勾选）。
-    pub const DEFAULT: [Self; 9] = [
+    /// 默认可见的 10 列（项目与缓存写可在列菜单中按需勾选）。
+    ///
+    /// 改默认列集只影响「没自定义过」的用户：自定义过的列集原样落盘、按白名单还原，
+    /// 新列要自己在列菜单里勾上。
+    pub const DEFAULT: [Self; 10] = [
         Self::Time,
         Self::App,
         Self::Provider,
@@ -580,6 +741,7 @@ impl RequestLogColumn {
         Self::NewInput,
         Self::Output,
         Self::CacheRead,
+        Self::CacheHitRate,
         Self::Speed,
     ];
 
@@ -596,6 +758,7 @@ impl RequestLogColumn {
             Self::Output => "output",
             Self::CacheRead => "cacheRead",
             Self::CacheWrite => "cacheWrite",
+            Self::CacheHitRate => "cacheHitRate",
             Self::Speed => "speed",
         }
     }
@@ -612,6 +775,7 @@ impl RequestLogColumn {
             Self::Output => t("usageStats", "columns.output"),
             Self::CacheRead => t("usageStats", "columns.cacheRead"),
             Self::CacheWrite => t("usageStats", "columns.cacheWrite"),
+            Self::CacheHitRate => t("usageStats", "columns.cacheHitRate"),
             Self::Speed => t("usageStats", "columns.speed"),
         }
     }
@@ -795,6 +959,32 @@ mod tests {
         assert_eq!(cache_hit_rate(0, 0, 0), None);
         let r = cache_hit_rate(25, 75, 0).unwrap();
         assert!((r - 75.0).abs() < 1e-9);
+    }
+
+    /// 表格命中率:整数四舍五入到 0.01%,两端收口(没全命中不进成 100%、有命中不舍成 0%)。
+    #[test]
+    fn 表格缓存命中率两位小数且两端收口() {
+        assert_eq!(format_cache_hit_rate(0, 0, 0), None, "分母 0 无值");
+        assert_eq!(format_cache_hit_rate(25, 75, 0).as_deref(), Some("75.00%"));
+        assert_eq!(format_cache_hit_rate(100, 0, 0).as_deref(), Some("0.00%"));
+        assert_eq!(format_cache_hit_rate(0, 500, 0).as_deref(), Some("100.00%"));
+        // 缓存写计入分母:1000 / (200 + 1000 + 300)
+        assert_eq!(format_cache_hit_rate(200, 1_000, 300).as_deref(), Some("66.67%"));
+        // 四舍五入:1/3 → 33.33%,2/3 → 66.67%,1/8 = 12.5% 精确
+        assert_eq!(format_cache_hit_rate(2, 1, 0).as_deref(), Some("33.33%"));
+        assert_eq!(format_cache_hit_rate(1, 2, 0).as_deref(), Some("66.67%"));
+        assert_eq!(format_cache_hit_rate(7, 1, 0).as_deref(), Some("12.50%"));
+        // 半数进位:1/16 = 6.25%、1/32 = 3.125% → 3.13%
+        assert_eq!(format_cache_hit_rate(31, 1, 0).as_deref(), Some("3.13%"));
+        // 99.996% 不进成 100.00%
+        assert_eq!(format_cache_hit_rate(4, 99_996, 0).as_deref(), Some("99.99%"));
+        // 0.004% 不舍成 0.00%
+        assert_eq!(format_cache_hit_rate(99_996, 4, 0).as_deref(), Some("0.01%"));
+        // 大数不溢出
+        assert_eq!(
+            format_cache_hit_rate(u64::MAX, u64::MAX, 0).as_deref(),
+            Some("50.00%")
+        );
     }
 
     #[test]
@@ -1128,6 +1318,152 @@ mod tests {
 
         // 完全没数据时不补(原版 `daily.length === 0` 直接返回空)
         assert!(fill_buckets(&[], UsageRange::Days7, "", "", now).is_empty());
+    }
+
+    fn local(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> i64 {
+        chrono::Local
+            .with_ymd_and_hms(y, m, d, h, min, s)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// 下钻到某天:窗口是那一整天、按小时分桶;没下钻时与原查询参数一字不差。
+    #[test]
+    fn 下钻窗口是那一整天且按小时() {
+        let now = at(2026, 8, 18);
+        let plain = query_window(UsageRange::Days30, "", "", None, now);
+        assert_eq!(plain.since, range_since_ms(UsageRange::Days30, "", now));
+        assert_eq!(plain.until, None);
+        assert!(!plain.hourly);
+
+        let w = query_window(UsageRange::Days30, "", "", Some(day(2026, 8, 10)), now);
+        assert!(w.hourly);
+        assert_eq!(w.since, local(2026, 8, 10, 0, 0, 0));
+        assert_eq!(w.until, Some(local(2026, 8, 11, 0, 0, 0) - 1), "含当天最后 1ms");
+    }
+
+    /// 下钻窗口与自选范围取交集:柱子只算 09:30 之后,下钻后也只能看 09:30 之后。
+    #[test]
+    fn 下钻窗口与自选范围取交集() {
+        let now = at(2026, 8, 18);
+        let (from, to) = ("2026-08-10 09:30:00", "2026-08-12 18:00:00");
+        let first = query_window(UsageRange::Custom, from, to, Some(day(2026, 8, 10)), now);
+        assert_eq!(first.since, local(2026, 8, 10, 9, 30, 0));
+        assert_eq!(first.until, Some(local(2026, 8, 11, 0, 0, 0) - 1));
+        let last = query_window(UsageRange::Custom, from, to, Some(day(2026, 8, 12)), now);
+        assert_eq!(last.since, local(2026, 8, 12, 0, 0, 0));
+        assert_eq!(last.until, Some(local(2026, 8, 12, 18, 0, 0) + 999));
+    }
+
+    /// 小时视图对应哪一天:下钻日 > 今天 > 同日自选;多日视图没有。
+    #[test]
+    fn 小时视图对应的日历日() {
+        let now = at(2026, 8, 18);
+        let d = day(2026, 8, 10);
+        assert_eq!(hourly_chart_day(UsageRange::Days7, "", "", Some(d), now), Some(d));
+        assert_eq!(hourly_chart_day(UsageRange::Days7, "", "", None, now), None);
+        assert_eq!(
+            hourly_chart_day(UsageRange::Today, "", "", None, now),
+            Some(now.date_naive())
+        );
+        assert_eq!(
+            hourly_chart_day(
+                UsageRange::Custom,
+                "2026-08-12 09:00:00",
+                "2026-08-12 18:00:00",
+                None,
+                now
+            ),
+            Some(day(2026, 8, 12))
+        );
+        assert_eq!(
+            hourly_chart_day(UsageRange::Custom, "2026-08-01", "2026-08-10", None, now),
+            None,
+            "跨日自选是多日视图"
+        );
+    }
+
+    /// 聚焦小时 = 该小时整段(含最后 1ms),再与主窗口取交集。
+    #[test]
+    fn 聚焦小时窗口精确到毫秒并与主窗口取交集() {
+        let now = at(2026, 8, 18);
+        let main = query_window(UsageRange::Days30, "", "", Some(day(2026, 8, 10)), now);
+        let w = hour_window(day(2026, 8, 10), 10, main, now);
+        assert_eq!(w.since, local(2026, 8, 10, 10, 0, 0));
+        assert_eq!(w.until, Some(local(2026, 8, 10, 11, 0, 0) - 1));
+
+        // 23 点跨到次日 00:00 前 1ms
+        let w = hour_window(day(2026, 8, 10), 23, main, now);
+        assert_eq!(w.until, Some(local(2026, 8, 11, 0, 0, 0) - 1));
+
+        // 同日自选 09:30 起:09 点那格从 09:30 起算
+        let custom = query_window(
+            UsageRange::Custom,
+            "2026-08-12 09:30:00",
+            "2026-08-12 18:00:00",
+            None,
+            now,
+        );
+        let w = hour_window(day(2026, 8, 12), 9, custom, now);
+        assert_eq!(w.since, local(2026, 8, 12, 9, 30, 0));
+        assert_eq!(w.until, Some(local(2026, 8, 12, 10, 0, 0) - 1));
+
+        // 今天视图(无上界):上界就是该小时末
+        let today = query_window(UsageRange::Today, "", "", None, now);
+        let w = hour_window(now.date_naive(), 15, today, now);
+        assert_eq!(w.until, Some(local(2026, 8, 18, 16, 0, 0) - 1));
+    }
+
+    /// 下钻视图补桶:过去的日子补满 24 小时;今天补到当前小时;自选交集从起点小时补。
+    #[test]
+    fn 下钻视图按窗口补小时桶() {
+        let now = at(2026, 8, 18); // 15:30
+        let hourly = vec![DailyStat {
+            date: "10:00".into(),
+            cost: 2.0,
+            ..Default::default()
+        }];
+        let past = query_window(UsageRange::Days30, "", "", Some(day(2026, 8, 10)), now);
+        let filled = fill_window_hours(&hourly, past, now);
+        assert_eq!(filled.len(), 24);
+        assert_eq!(filled.first().unwrap().date, "00:00");
+        assert_eq!(filled.last().unwrap().date, "23:00");
+        assert_eq!(filled[10].cost, 2.0);
+
+        let today = query_window(UsageRange::Days30, "", "", Some(now.date_naive()), now);
+        let filled = fill_window_hours(&hourly, today, now);
+        assert_eq!(filled.len(), 16, "0..=15 点");
+
+        let custom = query_window(
+            UsageRange::Custom,
+            "2026-08-10 09:30:00",
+            "2026-08-12 18:00:00",
+            Some(day(2026, 8, 10)),
+            now,
+        );
+        let keys: Vec<String> = fill_window_hours(&hourly, custom, now)
+            .into_iter()
+            .map(|d| d.date)
+            .collect();
+        assert_eq!(keys.first().map(String::as_str), Some("09:00"));
+        assert_eq!(keys.last().map(String::as_str), Some("23:00"));
+    }
+
+    #[test]
+    fn 小时桶标签解析与区间展示() {
+        assert_eq!(parse_hour_label("00:00"), Some(0));
+        assert_eq!(parse_hour_label("23:00"), Some(23));
+        assert_eq!(parse_hour_label("24:00"), None);
+        assert_eq!(parse_hour_label("2026-08-10"), None, "日期桶不是小时");
+        assert_eq!(parse_hour_label("9:00"), None);
+        assert_eq!(parse_hour_label("09:30"), None);
+        assert_eq!(format_hour_span(9), "09:00–10:00");
+        assert_eq!(format_hour_span(23), "23:00–24:00");
+        assert_eq!(format_drill_day(day(2026, 11, 2)), "2026-11-02");
     }
 
     #[test]
