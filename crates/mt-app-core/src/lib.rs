@@ -15,6 +15,7 @@ pub mod kitty_graphics;
 pub mod layout_writer;
 pub mod line_input;
 pub mod markers;
+pub mod osc7501;
 pub mod output_gate;
 pub mod persist;
 pub mod project_tree;

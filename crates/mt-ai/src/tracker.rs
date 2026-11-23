@@ -254,6 +254,13 @@ pub struct SessionTracker {
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     /// 要连按两次 Ctrl+D 才退出的 agent(agy)上一次 Ctrl+D 的时刻(见 [`DOUBLE_CTRLD_WINDOW`])
     last_ctrld: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// 最近一次由用户触发退出的时刻（`/exit` / `/quit` / 双击 Ctrl+D / 双击 Ctrl+C）。
+    ///
+    /// agy 退出瞬间会再吐一到两次 OSC 7501 `state=idle`（实测 1.5.14 约 100ms 内），
+    /// 若拿 `state=idle` 扶正 `ai_sessions` 会让 10s 退出兜底永远触发不了。记录退出时刻
+    /// 后，窗口内的 `state=idle` 不再扶正会话；强活体事件（working / blocked / done / error）
+    /// 与重新启动会立即清掉本记录。
+    last_exit: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
     pending_submits: Arc<Mutex<HashMap<u32, Vec<UserSubmit>>>>,
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -280,6 +287,7 @@ impl SessionTracker {
             input_states: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_ctrld: Arc::new(Mutex::new(HashMap::new())),
+            last_exit: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
             last_output: Arc::new(Mutex::new(HashMap::new())),
@@ -299,6 +307,7 @@ impl SessionTracker {
         self.input_states.lock().remove(&pane_id);
         self.last_ctrlc.lock().remove(&pane_id);
         self.last_ctrld.lock().remove(&pane_id);
+        self.last_exit.lock().remove(&pane_id);
         self.last_enter.lock().remove(&pane_id);
         self.pending_submits.lock().remove(&pane_id);
         self.last_output.lock().remove(&pane_id);
@@ -357,6 +366,7 @@ impl SessionTracker {
     /// 双击 Ctrl+C 只是打断并不退出）的自愈路径。已标记时幂等 no-op，
     /// 不重置 ai_started（对话镜像按它过滤旧记录，中途重置会错绑）。
     pub fn mark_ai_session(&self, pane_id: u32, agent: &str) {
+        self.last_exit.lock().remove(&pane_id);
         let mut sessions = self.ai_sessions.lock();
         if !sessions.contains_key(&pane_id) {
             sessions.insert(pane_id, agent.to_string());
@@ -364,6 +374,14 @@ impl SessionTracker {
                 .lock()
                 .insert(pane_id, SystemTime::now());
         }
+    }
+
+    /// 该 pane 最近 `within` 内是否刚由用户触发过退出（`/exit` / 双击 Ctrl+D / 双击 Ctrl+C）。
+    pub fn recently_exited(&self, pane_id: u32, within: Duration) -> bool {
+        self.last_exit
+            .lock()
+            .get(&pane_id)
+            .is_some_and(|t| t.elapsed() < within)
     }
 
     /// 清除 pane 的 AI 会话标记及相关输入痕迹。
@@ -377,6 +395,7 @@ impl SessionTracker {
         self.ai_started.lock().remove(&pane_id);
         self.last_ctrlc.lock().remove(&pane_id);
         self.last_ctrld.lock().remove(&pane_id);
+        self.last_exit.lock().remove(&pane_id);
         self.last_enter.lock().remove(&pane_id);
         self.turn_armed.lock().remove(&pane_id);
     }
@@ -660,6 +679,7 @@ impl SessionTracker {
             }
         }
         if let Some(agent) = enter_ai {
+            self.last_exit.lock().remove(&pane_id);
             self.ai_sessions
                 .lock()
                 .insert(pane_id, agent.to_string());
@@ -668,6 +688,7 @@ impl SessionTracker {
                 .insert(pane_id, SystemTime::now());
         } else if exit_ai {
             self.clear_ai_session(pane_id);
+            self.last_exit.lock().insert(pane_id, Instant::now());
         }
     }
 }

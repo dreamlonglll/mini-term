@@ -532,3 +532,52 @@ fn 表格单元格折行网址穿过真_pty_完整识别() {
 
     let _ = pty.kill();
 }
+
+/// OSC 7501（Program Status Protocol）穿过真 PTY：探测查询产出 PtyWrite 应答，
+/// 权限 / 提问阻塞与工作 / 完成状态均从输出流完整解析且不污染屏幕。
+#[test]
+fn osc7501_穿过真_pty_完整解析() {
+    announce_conpty_backend();
+    let (mut pty, emulator) = spawn_shell(TermSize::new(100, 30));
+    let ready = pump_until(&emulator, &pty, Duration::from_secs(20), |e| {
+        e.visible_lines().iter().any(|l| !l.trim().is_empty())
+    });
+    assert!(ready, "shell 20s 内没有任何输出");
+
+    const END_MARK: &str = "MT_OSC7501_9281";
+    #[cfg(windows)]
+    let command = "[Console]::Out.Write(\"$([char]27)]7501;?$([char]7)$([char]27)]7501;state=blocked:kind=permission:app=antigravity:msg=VHJ1c3Q=$([char]7)$([char]27)]7501;state=blocked:kind=question:app=antigravity:msg=UHJvY2VlZD8=$([char]7)$([char]27)]7501;state=done:app=antigravity$([char]27)\\MT_OSC7501_\" + (9000 + 281) + \"`r`n\")\r";
+    #[cfg(not(windows))]
+    let command = "printf '\\033]7501;?\\007\\033]7501;state=blocked:kind=permission:app=antigravity:msg=VHJ1c3Q=\\007\\033]7501;state=blocked:kind=question:app=antigravity:msg=UHJvY2VlZD8=\\007\\033]7501;state=done:app=antigravity\\033\\\\MT_OSC7501_%d\\n' $((9000 + 281))\r";
+    pty.write(command.as_bytes()).expect("写 PTY 失败");
+
+    let mut statuses = Vec::new();
+    let mut saw_query_reply = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        for event in emulator.events().drain() {
+            if let Event::PtyWrite(text) = event {
+                if text == "\x1b]7501;?\x07" {
+                    saw_query_reply = true;
+                }
+                pty.write_reply(text.as_bytes()).expect("写 PTY 失败");
+            }
+        }
+        statuses.extend(emulator.drain_program_statuses());
+        if lines_with(&emulator, END_MARK) > 0 && statuses.len() >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(saw_query_reply, "OSC 7501 探测查询应触发 PtyWrite 应答");
+    assert_eq!(statuses.len(), 3, "实测状态列表: {statuses:?}");
+    assert_eq!(statuses[0].state, mt_terminal::ProgramState::Blocked);
+    assert_eq!(statuses[0].kind, Some(mt_terminal::BlockedKind::Permission));
+    assert_eq!(statuses[0].app.as_deref(), Some("antigravity"));
+    assert_eq!(statuses[1].state, mt_terminal::ProgramState::Blocked);
+    assert_eq!(statuses[1].kind, Some(mt_terminal::BlockedKind::Question));
+    assert_eq!(statuses[2].state, mt_terminal::ProgramState::Done);
+
+    let _ = pty.kill();
+}

@@ -296,12 +296,14 @@ pub(crate) fn stall_settle_target(
     })
 }
 
-/// pane 当前绑定的 agent(hook 上报的会话身份)退出时**不发** SessionEnd(agy)。
-/// 没有身份(从没收到带 session_id 的事件)按「发」算,不插手。
+/// pane 当前绑定的 agent(hook 上报的会话身份，或 OSC 7501 上报的 agent)退出时**不发**
+/// SessionEnd(agy)。没有身份按「发」算,不插手。
 fn pane_agent_lacks_session_end(hook_state: &HookState, pty_id: u32) -> bool {
-    hook_state
+    let agent = hook_state
         .session_of(pty_id)
-        .is_some_and(|s| !crate::hook_server::agent_sends_session_end(s.agent.as_deref()))
+        .and_then(|s| s.agent)
+        .or_else(|| hook_state.agent_of(pty_id));
+    agent.is_some_and(|a| !crate::hook_server::agent_sends_session_end(Some(&a)))
 }
 
 /// 「没有 SessionEnd 的 agent 已经退出」兜底的纯判定部分(`timeout` 同
@@ -352,7 +354,10 @@ fn settle_exited_ai(
     if !exit_settle_due(hook_state, tracker, pty_id, timeout) {
         return;
     }
-    let agent = hook_state.session_of(pty_id).and_then(|s| s.agent);
+    let agent = hook_state
+        .session_of(pty_id)
+        .and_then(|s| s.agent)
+        .or_else(|| hook_state.agent_of(pty_id));
     hook_state.remove(pty_id);
     emitter.emit_if_changed(pty_id, "idle", Some(STALL_EXIT_CAUSE), None);
     tracing::info!(
@@ -1128,5 +1133,42 @@ mod tests {
             vec![change("ai-working", None), change("ai-idle", None)]
         );
         assert!(mgr.is_turn_armed(1), "hook pane 的闩原样留着,monitor 不取");
+    }
+
+    /// 仅靠 OSC 7501（未开 hook / WSL / SSH，没有 hook `session_id`）的 agy pane，
+    /// 退出后同样受 10s 退出兜底覆盖，不会永久卡在 ai-idle。
+    #[test]
+    fn osc_only_agy_pane_settles_to_idle_after_exit() {
+        let (emitter, seen) = collecting_emitter();
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+
+        mgr.track_input(1, "agy\r");
+        crate::hook_server::observe_osc_status(
+            &hooks,
+            &emitter,
+            &mgr,
+            1,
+            crate::hook_server::OscStatus {
+                state: crate::hook_server::OscProgramState::Done,
+                kind: None,
+                app: Some("antigravity".into()),
+                id: None,
+                msg: None,
+            },
+        );
+        assert!(hooks.session_of(1).is_none(), "OSC 不伪造 session_id");
+        assert_eq!(hooks.agent_of(1).as_deref(), Some("agy"));
+
+        mgr.track_input(1, "/exit\r");
+        assert!(exit_settle_due(&hooks, &mgr, 1, ELAPSED));
+        settle_exited_ai(&hooks, &mgr, &emitter, 1, ELAPSED);
+
+        assert!(!hooks.is_hook_enabled(1));
+        assert!(hooks.agent_of(1).is_none());
+        assert_eq!(
+            seen.lock().last().cloned(),
+            Some(change("idle", Some(STALL_EXIT_CAUSE)))
+        );
     }
 }

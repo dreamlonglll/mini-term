@@ -824,6 +824,12 @@ impl OutputSink {
         let pty_id = self.pty_id;
         // 直接推进状态机,没有 IPC、没有批缓冲、没有序列化。
         self.emulator.advance(bytes);
+        // OSC 7501 程序状态上报（如 agy 的权限确认 / 提问等待黄灯）：无新事件时单次原子读即返回空。
+        for status in self.emulator.drain_program_statuses() {
+            self.ai
+                .perception()
+                .observe_osc_status(pty_id, map_osc_status(status));
+        }
         // AI 感知的输出旁路(命令 echo 回扫 + 输出活跃度)
         self.ai.perception().observe_output(pty_id, bytes);
         // Git 面板的输出旁路(外部跑了 git 命令 → 刷新变更与仓库元信息)。
@@ -845,6 +851,30 @@ impl OutputSink {
             }
         }
         let _ = self.signal.unbounded_send(PaneSignal::Output);
+    }
+}
+
+fn map_osc_status(status: mt_terminal::ProgramStatus) -> mt_ai::OscStatus {
+    let state = match status.state {
+        mt_terminal::ProgramState::Idle => mt_ai::OscProgramState::Idle,
+        mt_terminal::ProgramState::Working => mt_ai::OscProgramState::Working,
+        mt_terminal::ProgramState::Blocked => mt_ai::OscProgramState::Blocked,
+        mt_terminal::ProgramState::Done => mt_ai::OscProgramState::Done,
+        mt_terminal::ProgramState::Error => mt_ai::OscProgramState::Error,
+        mt_terminal::ProgramState::Clear => mt_ai::OscProgramState::Clear,
+    };
+    let kind = status.kind.map(|k| match k {
+        mt_terminal::BlockedKind::Permission => mt_ai::OscBlockedKind::Permission,
+        mt_terminal::BlockedKind::Question => mt_ai::OscBlockedKind::Question,
+        mt_terminal::BlockedKind::Auth => mt_ai::OscBlockedKind::Auth,
+        mt_terminal::BlockedKind::Other => mt_ai::OscBlockedKind::Other,
+    });
+    mt_ai::OscStatus {
+        state,
+        kind,
+        app: status.app,
+        id: status.id,
+        msg: status.msg,
     }
 }
 

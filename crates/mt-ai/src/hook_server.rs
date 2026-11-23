@@ -113,6 +113,44 @@ pub struct HookSessionId {
     pub session_id: String,
 }
 
+/// 终端内带内状态上报（OSC 7501 Program Status Protocol）的核心状态值。
+///
+/// 定义在 `mt-ai` 以保持本 crate 不依赖 `mt-terminal`；宿主在输出旁路做一层零开销映射。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscProgramState {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+    Clear,
+}
+
+/// OSC 7501 `state=blocked` 时的阻塞细分类型（`kind=`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscBlockedKind {
+    Permission,
+    Question,
+    Auth,
+    Other,
+}
+
+/// 一条从 PTY 输出流解析出的 OSC 7501 程序状态上报。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OscStatus {
+    pub state: OscProgramState,
+    pub kind: Option<OscBlockedKind>,
+    pub app: Option<String>,
+    pub id: Option<String>,
+    pub msg: Option<String>,
+}
+
+/// 用户触发退出（`/exit` / 双击 Ctrl+D / 双击 Ctrl+C）后屏蔽 `state=idle` 的窗口：
+/// agy 进程退出瞬间会在约 100ms 内再吐一次 `state=idle`（1.5.14 实测），若用它扶正
+/// 会话或刷新 `last_hook_time`，10s 退出兜底就会被挡住。强活体状态（working/blocked/
+/// done/error）不受本窗口限制，立刻扶正。
+const EXIT_IDLE_IGNORE_WINDOW: Duration = Duration::from_secs(3);
+
 /// 合并在单把锁下的全部按 PTY 索引的 hook 状态表。
 ///
 /// 此前 8 张表各自持一把 `Arc<Mutex<...>>`，跨表读写（`update` / `remove` / `purge` /
@@ -142,6 +180,16 @@ struct HookTables {
     /// agy:主会话以 `Stop(fullyIdle=false)` 收尾、正等子代理收尾的 pane → 那次 Stop 的
     /// terminationReason。主会话再有任何事件即清除
     agy_deferred_stop: HashMap<u32, Option<String>>,
+    /// 最近一次权威状态来源（HTTP hook 或 OSC 7501）报出的规范 agent 标识（如 `"agy"`）。
+    ///
+    /// 仅靠 OSC 7501（未开 hook / WSL / SSH）时没有 `session_id`、不进 `last_session`，
+    /// 靠这张表让 `monitor::pane_agent_lacks_session_end` 认出它是 `agy`，退出后 10s 兜底
+    /// 才能干净收成 `idle`。
+    last_agent: HashMap<u32, String>,
+    /// OSC 7501 最近一次已发射的 `blocked(kind, msg)` 指纹：单次弹窗内 TUI 重绘/按键导航
+    /// 重发同一条 `blocked` 时去重，避免用户每按一次方向键就重复响提示音；一旦离开
+    /// `blocked`（任何非 blocked 状态更新 / HTTP hook / 打断）或换了 `kind`/`msg` 立刻放行。
+    last_osc_blocked: HashMap<u32, (OscBlockedKind, Option<String>)>,
 }
 
 impl HookTables {
@@ -154,6 +202,7 @@ impl HookTables {
         self.hook_enabled.insert(pty_id);
         self.last_hook_time.insert(pty_id, Instant::now());
         self.last_hook_status.insert(pty_id, status);
+        self.last_osc_blocked.remove(&pty_id);
     }
 
     fn remove_pty(&mut self, pty_id: u32) {
@@ -163,6 +212,8 @@ impl HookTables {
         self.last_session.remove(&pty_id);
         self.agy_subagents.remove(&pty_id);
         self.agy_deferred_stop.remove(&pty_id);
+        self.last_agent.remove(&pty_id);
+        self.last_osc_blocked.remove(&pty_id);
     }
 }
 
@@ -170,6 +221,9 @@ impl HookTables {
 #[derive(Clone)]
 pub struct HookState {
     tables: Arc<Mutex<HookTables>>,
+    /// 串行化权威状态入口（HTTP hook / OSC 7501 / 用户打断），防止同一 pane 的状态表更新
+    /// 与 `StatusEmitter` 发射顺序在并发下交错撕裂。
+    dispatch_lock: Arc<Mutex<()>>,
     port: Arc<Mutex<u16>>,
     /// 保存运行中的 server 句柄，供运行时停止以及 `with_server_lock` 与启停串行化
     server: Arc<Mutex<Option<Arc<ServerHandle>>>>,
@@ -185,6 +239,7 @@ impl HookState {
     pub fn new() -> Self {
         Self {
             tables: Arc::new(Mutex::new(HookTables::default())),
+            dispatch_lock: Arc::new(Mutex::new(())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -216,6 +271,11 @@ impl HookState {
     /// 当前会话身份;从未收到带 session_id 的事件时返回 None
     pub fn session_of(&self, pty_id: u32) -> Option<HookSessionId> {
         self.tables.lock().last_session.get(&pty_id).cloned()
+    }
+
+    /// 最近一次权威状态入口（HTTP hook / OSC 7501）报出的 agent 名；未上报过返回 None。
+    pub(crate) fn agent_of(&self, pty_id: u32) -> Option<String> {
+        self.tables.lock().last_agent.get(&pty_id).cloned()
     }
 
     /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)。
@@ -763,6 +823,7 @@ pub fn note_user_interrupt(
     pty_id: u32,
     agent: Option<String>,
 ) {
+    let _dispatch_guard = hook_state.dispatch_lock.lock();
     let settled = {
         let mut tables = hook_state.tables.lock();
         if tables.should_settle_interrupt(pty_id) {
@@ -777,6 +838,163 @@ pub fn note_user_interrupt(
     }
     emitter.emit_if_changed(pty_id, "ai-idle", Some("Interrupt"), agent);
     tracing::info!("[hook-server] pty_id={} 用户打断 -> ai-idle", pty_id);
+}
+
+/// 消费一条从 PTY 字节流解析出来的 OSC 7501（Program Status Protocol）状态上报。
+///
+/// 当前仅处理 Antigravity CLI（`app=antigravity` / `agy`）：
+/// - 补齐其 `hooks.json` 缺失的权限确认黄灯（`state=blocked:kind=permission` → `PermissionRequest`）
+///   与提问等待黄灯（`state=blocked:kind=question` → `Elicitation`）；
+/// - 未开 hook / WSL / SSH 远程场景下同样获得精确状态与完成播报，与已有 HTTP hook 共用同一
+///   `HookState` + `StatusEmitter` 去重表，双向并发到达时绝不双播完成。
+/// - 非 `agy` 的程序（普通 CLI 如 `brew` / `terraform`，或已有完善自有 hook 的其他 AI CLI）
+///   在此拦截，不污染状态机。
+pub fn observe_osc_status(
+    hook_state: &HookState,
+    emitter: &StatusEmitter,
+    tracker: &SessionTracker,
+    pty_id: u32,
+    status: OscStatus,
+) {
+    let Some(kind) = status.app.as_deref().and_then(AgentKind::parse) else {
+        return;
+    };
+    if kind != AgentKind::Agy {
+        return;
+    }
+
+    // 层次化子任务（带非空 id）的 done / idle / working 不改主会话状态，防止子任务收尾
+    // 误报主会话完成；但 blocked 确需人工处理，无论是否带 id 一律点灯。
+    if status.id.is_some() && status.state != OscProgramState::Blocked {
+        return;
+    }
+
+    let _dispatch_guard = hook_state.dispatch_lock.lock();
+    let agy_key = AgentKind::Agy.key();
+
+    match status.state {
+        OscProgramState::Blocked => {
+            let blocked_kind = status.kind.unwrap_or(OscBlockedKind::Other);
+            let cause = match blocked_kind {
+                OscBlockedKind::Question => "Elicitation",
+                OscBlockedKind::Permission | OscBlockedKind::Auth | OscBlockedKind::Other => {
+                    "PermissionRequest"
+                }
+            };
+            let fingerprint = (blocked_kind, status.msg);
+            {
+                let mut tables = hook_state.tables.lock();
+                if tables.last_osc_blocked.get(&pty_id) == Some(&fingerprint) {
+                    return;
+                }
+                tables.update(pty_id, "ai-idle".to_string());
+                tables.last_agent.insert(pty_id, agy_key.to_string());
+                tables.agy_deferred_stop.remove(&pty_id);
+                tables.last_osc_blocked.insert(pty_id, fingerprint);
+            }
+            tracker.mark_ai_session(pty_id, agy_key);
+            emitter.emit_if_changed(pty_id, "ai-idle", Some(cause), Some(agy_key.to_string()));
+            tracing::info!(
+                "[osc7501] pty_id={} agent=agy state=blocked kind={:?} -> ai-idle cause={}",
+                pty_id,
+                blocked_kind,
+                cause
+            );
+        }
+        OscProgramState::Working => {
+            {
+                let mut tables = hook_state.tables.lock();
+                tables.update(pty_id, "ai-working".to_string());
+                tables.last_agent.insert(pty_id, agy_key.to_string());
+                tables.agy_deferred_stop.remove(&pty_id);
+            }
+            tracker.mark_ai_session(pty_id, agy_key);
+            emitter.emit_if_changed(
+                pty_id,
+                "ai-working",
+                Some("OscWorking"),
+                Some(agy_key.to_string()),
+            );
+            tracing::info!(
+                "[osc7501] pty_id={} agent=agy state=working -> ai-working",
+                pty_id
+            );
+        }
+        OscProgramState::Done => {
+            {
+                let mut tables = hook_state.tables.lock();
+                // HTTP hook `Stop(fullyIdle=false)` 已明确延后完成等子代理收尾时，
+                // 不让伴随的 OSC `state=done` 抢跑清空延后标记。
+                if tables.agy_deferred_stop.contains_key(&pty_id) {
+                    return;
+                }
+                tables.update(pty_id, "ai-idle".to_string());
+                tables.last_agent.insert(pty_id, agy_key.to_string());
+            }
+            tracker.mark_ai_session(pty_id, agy_key);
+            emitter.emit_if_changed(pty_id, "ai-idle", Some("Stop"), Some(agy_key.to_string()));
+            tracing::info!(
+                "[osc7501] pty_id={} agent=agy state=done -> ai-idle cause=Stop",
+                pty_id
+            );
+        }
+        OscProgramState::Error => {
+            {
+                let mut tables = hook_state.tables.lock();
+                tables.update(pty_id, "ai-idle".to_string());
+                tables.last_agent.insert(pty_id, agy_key.to_string());
+                tables.agy_deferred_stop.remove(&pty_id);
+            }
+            tracker.mark_ai_session(pty_id, agy_key);
+            emitter.emit_if_changed(
+                pty_id,
+                "ai-idle",
+                Some("StopFailure"),
+                Some(agy_key.to_string()),
+            );
+            tracing::info!(
+                "[osc7501] pty_id={} agent=agy state=error -> ai-idle cause=StopFailure",
+                pty_id
+            );
+        }
+        OscProgramState::Idle => {
+            // agy 退出瞬间（/exit、双击 Ctrl+D）会再发一次 state=idle：窗口内忽略，
+            // 既不扶正已被清掉的会话标记，也不重置静默计时，让 10s 退出兜底正常落回 idle。
+            if tracker.recently_exited(pty_id, EXIT_IDLE_IGNORE_WINDOW) {
+                tracing::debug!(
+                    "[osc7501] pty_id={} agent=agy 退出窗口内忽略 state=idle",
+                    pty_id
+                );
+                return;
+            }
+            {
+                let mut tables = hook_state.tables.lock();
+                if tables.agy_deferred_stop.contains_key(&pty_id) {
+                    return;
+                }
+                tables.update(pty_id, "ai-idle".to_string());
+                tables.last_agent.insert(pty_id, agy_key.to_string());
+            }
+            tracker.mark_ai_session(pty_id, agy_key);
+            emitter.emit_if_changed(
+                pty_id,
+                "ai-idle",
+                Some("OscIdle"),
+                Some(agy_key.to_string()),
+            );
+        }
+        OscProgramState::Clear => {
+            // 进程明确清空状态且输入检测已判退出时，直接收尾回 idle，不必再等 10s 兜底。
+            if !tracker.is_ai_session(pty_id) && hook_state.is_hook_enabled(pty_id) {
+                hook_state.remove(pty_id);
+                emitter.emit_if_changed(pty_id, "idle", Some("SessionEnd"), None);
+                tracing::info!(
+                    "[osc7501] pty_id={} agent=agy state=clear(已退出) -> idle",
+                    pty_id
+                );
+            }
+        }
+    }
 }
 
 // ─── 基于标准库 TcpListener 的轻量 HTTP/1.x 服务端 ───────────────────────────
@@ -841,9 +1059,6 @@ struct ServerContext {
     hook_state: HookState,
     emitter: StatusEmitter,
     tracker: SessionTracker,
-    /// 串行化事件处理，避免并发连接在同一 pane 的多步状态变更间交错。
-    /// 慢速 TCP 读/写全在锁外并发进行，不会互相阻塞。
-    dispatch_lock: Mutex<()>,
     read_timeout: Duration,
     write_timeout: Duration,
 }
@@ -1341,8 +1556,8 @@ fn handle_connection(stream: TcpStream, ctx: &ServerContext) {
     send_http_response(&mut reader.get_mut().stream, 200, "OK", "OK");
     drop(reader);
 
-    // 串行处理事件，确保跨表状态与去重发射顺序一致
-    let _dispatch_guard = ctx.dispatch_lock.lock();
+    // 串行处理事件，确保与 OSC 7501 / 打断之间的跨表状态与去重发射顺序一致
+    let _dispatch_guard = ctx.hook_state.dispatch_lock.lock();
     handle_hook_payload(payload, &ctx.hook_state, &ctx.emitter, &ctx.tracker);
 }
 
@@ -1398,6 +1613,13 @@ fn handle_hook_payload(
             route_agy_event("Stop", reason.as_deref(), None, None)
         {
             tracker.mark_ai_session(pty_id, AgentKind::Agy.key());
+            if let Some(agent) = payload.agent.as_deref().filter(|a| !a.is_empty()) {
+                hook_state
+                    .tables
+                    .lock()
+                    .last_agent
+                    .insert(pty_id, agent.to_string());
+            }
             hook_state.update(pty_id, status.to_string());
             emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
             tracing::info!(
@@ -1511,6 +1733,13 @@ fn handle_hook_payload(
                 pty_id,
                 payload.agent.as_deref().unwrap_or(AgentKind::Claude.key()),
             );
+            if let Some(agent) = payload.agent.as_deref().filter(|a| !a.is_empty()) {
+                hook_state
+                    .tables
+                    .lock()
+                    .last_agent
+                    .insert(pty_id, agent.to_string());
+            }
             hook_state.update(pty_id, status.to_string());
 
             // 通知上层（与 monitor 共享同一份去重表）。cause 带
@@ -1568,7 +1797,6 @@ fn start_hook_server_on_listener(
         hook_state: hook_state.clone(),
         emitter,
         tracker,
-        dispatch_lock: Mutex::new(()),
         read_timeout,
         write_timeout,
     });
@@ -2868,5 +3096,305 @@ mod tests {
         assert_eq!(state.get_port(), 0);
         let rebound = TcpListener::bind(("127.0.0.1", port));
         assert!(rebound.is_ok(), "stop 后端口应立即释放，实际: {rebound:?}");
+    }
+
+    // ---- OSC 7501（Program Status Protocol，agy 权限/提问黄灯） ----
+
+    fn osc(
+        state: OscProgramState,
+        kind: Option<OscBlockedKind>,
+        app: Option<&str>,
+        id: Option<&str>,
+        msg: Option<&str>,
+    ) -> OscStatus {
+        OscStatus {
+            state,
+            kind,
+            app: app.map(str::to_string),
+            id: id.map(str::to_string),
+            msg: msg.map(str::to_string),
+        }
+    }
+
+    /// agy 权限弹窗与提问弹窗分别映射为 PermissionRequest / Elicitation 黄灯，
+    /// 恢复工作（working）时熄灭黄灯，完成（done）报 Stop，出错（error）报 StopFailure。
+    #[test]
+    fn agy_osc7501_maps_permission_question_working_done_and_error() {
+        let state = HookState::new();
+        let tracker = SessionTracker::new();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>, Option<String>)>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
+            seen_cb.lock().push((c.status, c.cause, c.agent));
+        }));
+
+        // 1. 权限确认框 -> PermissionRequest 黄灯
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(
+                OscProgramState::Blocked,
+                Some(OscBlockedKind::Permission),
+                Some("antigravity"),
+                None,
+                Some("VHJ1c3Q="),
+            ),
+        );
+        // 2. 同条弹窗重绘/导航再发一遍相同 blocked -> 去重不重复响铃
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(
+                OscProgramState::Blocked,
+                Some(OscBlockedKind::Permission),
+                Some("antigravity"),
+                None,
+                Some("VHJ1c3Q="),
+            ),
+        );
+        // 3. 用户批准后恢复 working -> 熄灭黄灯
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(OscProgramState::Working, None, Some("antigravity"), None, None),
+        );
+        // 4. 提问框 -> Elicitation 黄灯
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(
+                OscProgramState::Blocked,
+                Some(OscBlockedKind::Question),
+                Some("antigravity"),
+                None,
+                Some("UHJvY2VlZD8="),
+            ),
+        );
+        // 5. 多题提问切到下一题（msg 变化）-> 再次触发 Elicitation
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(
+                OscProgramState::Blocked,
+                Some(OscBlockedKind::Question),
+                Some("antigravity"),
+                None,
+                Some("TmV4dD8="),
+            ),
+        );
+        // 6. 作答后继续干活再完成 -> Stop
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(OscProgramState::Working, None, Some("antigravity"), None, None),
+        );
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(OscProgramState::Done, None, Some("antigravity"), None, None),
+        );
+        // 7. 紧接着 HTTP hook 的 Stop 到达 -> 与 OSC done 同为 ("ai-idle", Some("Stop"))，绝不双播完成
+        handle_hook_payload(
+            payload(serde_json::json!({
+                "pty_id": 7,
+                "event": "Stop",
+                "agent": "agy",
+                "session_id": "conv-1",
+                "termination_reason": "NO_TOOL_CALL",
+                "fully_idle": true,
+                "has_user_input": true
+            })),
+            &state,
+            &emitter,
+            &tracker,
+        );
+        // 8. 回合出错 -> StopFailure 黄灯
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            7,
+            osc(OscProgramState::Error, None, Some("antigravity"), None, None),
+        );
+
+        let events = seen.lock().clone();
+        assert_eq!(
+            events,
+            vec![
+                ("ai-idle".into(), Some("PermissionRequest".into()), Some("agy".into())),
+                ("ai-working".into(), Some("OscWorking".into()), Some("agy".into())),
+                ("ai-idle".into(), Some("Elicitation".into()), Some("agy".into())),
+                ("ai-idle".into(), Some("Elicitation".into()), Some("agy".into())),
+                ("ai-working".into(), Some("OscWorking".into()), Some("agy".into())),
+                ("ai-idle".into(), Some("Stop".into()), Some("agy".into())),
+                ("ai-idle".into(), Some("StopFailure".into()), Some("agy".into())),
+            ]
+        );
+        assert!(tracker.is_ai_session(7));
+        assert_eq!(state.agent_of(7).as_deref(), Some("agy"));
+    }
+
+    /// 非 agy 程序（普通 CLI 或别家 agent）以及子任务非 blocked 状态一律忽略；
+    /// 子任务 blocked（确需人工批准）仍点灯。
+    #[test]
+    fn osc7501_ignores_non_agy_apps_and_subtask_non_blocked() {
+        let state = HookState::new();
+        let tracker = SessionTracker::new();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
+            seen_cb.lock().push((c.status, c.cause));
+        }));
+
+        for app in [None, Some("brew"), Some("terraform"), Some("claude"), Some("codex")] {
+            observe_osc_status(
+                &state,
+                &emitter,
+                &tracker,
+                3,
+                osc(OscProgramState::Blocked, Some(OscBlockedKind::Permission), app, None, None),
+            );
+        }
+        // 子任务 done 不得误报主会话完成
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            3,
+            osc(OscProgramState::Done, None, Some("antigravity"), Some("sub/1"), None),
+        );
+        assert!(seen.lock().is_empty());
+        assert!(!state.is_hook_enabled(3));
+
+        // 子任务 blocked 仍点灯
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            3,
+            osc(
+                OscProgramState::Blocked,
+                Some(OscBlockedKind::Permission),
+                Some("antigravity"),
+                Some("sub/1"),
+                Some("cA=="),
+            ),
+        );
+        assert_eq!(
+            seen.lock().clone(),
+            vec![("ai-idle".into(), Some("PermissionRequest".into()))]
+        );
+    }
+
+    /// `/exit` 退出瞬间 agy 再吐出的 `state=idle` 不得复活已被清掉的 AI 会话标记；
+    /// 随后发 `state=clear` 直接回落 idle；而正常启动时的 `state=idle` 正常扶正会话。
+    #[test]
+    fn agy_osc7501_exit_ignores_trailing_idle_and_honors_clear() {
+        let state = HookState::new();
+        let tracker = SessionTracker::new();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
+            seen_cb.lock().push((c.status, c.cause));
+        }));
+
+        // 别名启动（输入检测未认出）发 state=idle -> 扶正会话
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            9,
+            osc(OscProgramState::Idle, None, Some("antigravity"), None, None),
+        );
+        assert!(tracker.is_ai_session(9));
+        assert_eq!(state.get_status(9).as_deref(), Some("ai-idle"));
+
+        // 用户敲 /exit -> 输入检测清会话并记退出时刻
+        tracker.track_input(9, "/exit\r");
+        assert!(!tracker.is_ai_session(9));
+
+        // agy 临死前 100ms 内再发 state=idle -> 忽略，不复活会话
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            9,
+            osc(OscProgramState::Idle, None, Some("antigravity"), None, None),
+        );
+        assert!(!tracker.is_ai_session(9), "退出窗口内的 state=idle 不得复活会话");
+
+        // 若进程发了 state=clear -> 立即清状态回落 idle
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            9,
+            osc(OscProgramState::Clear, None, Some("antigravity"), None, None),
+        );
+        assert!(!state.is_hook_enabled(9));
+        assert_eq!(
+            seen.lock().last().cloned(),
+            Some(("idle".into(), Some("SessionEnd".into())))
+        );
+    }
+
+    /// HTTP hook `Stop(fullyIdle=false)` 正在等子代理收尾时，伴随的 OSC `done`/`idle`
+    /// 不得抢跑清掉延后标记或提前报完成；一旦 `blocked` 或子代理收尾再按正常流程推进。
+    #[test]
+    fn agy_osc7501_done_does_not_preempt_deferred_stop() {
+        let state = HookState::new();
+        let tracker = SessionTracker::new();
+        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
+            seen_cb.lock().push((c.status, c.cause));
+        }));
+
+        // 主会话开工 + 登记后台子代理 + 主会话 Stop(fullyIdle=false) 挂起延后完成
+        state.update(11, "ai-working".to_string());
+        state.agy_subagent_active(11, "sub-1");
+        state.agy_defer_stop(11, Some("END_TURN".to_string()));
+        emitter.emit_if_changed(11, "ai-working", Some("PreInvocation"), Some("agy".into()));
+
+        // OSC 7501 伴随 state=done / state=idle 到达 -> 不得抢跑报 Stop
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            11,
+            osc(OscProgramState::Done, None, Some("antigravity"), None, None),
+        );
+        observe_osc_status(
+            &state,
+            &emitter,
+            &tracker,
+            11,
+            osc(OscProgramState::Idle, None, Some("antigravity"), None, None),
+        );
+        assert_eq!(state.get_status(11).as_deref(), Some("ai-working"));
+        assert_eq!(
+            seen.lock().clone(),
+            vec![("ai-working".into(), Some("PreInvocation".into()))]
+        );
+
+        // 子代理收尾时仍能取出此前延后的完成原因
+        assert_eq!(
+            state.agy_subagent_settled(11, "sub-1"),
+            Some(Some("END_TURN".to_string()))
+        );
     }
 }

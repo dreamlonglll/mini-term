@@ -127,8 +127,8 @@ mod workspace;
 
 // 下沉到非 GPUI 应用域核心 crate(`mt-app-core`)的模块，在壳层原路径再导出以保持调用点稳定。
 pub(crate) use mt_app_core::{
-    ai, cli, file_ops, focus_nav, kitty_graphics, markers, persist, project_tree, pty_slot,
-    session_branch, shell_ops, ssh_conn, startup_trace, tree,
+    ai, cli, file_ops, focus_nav, kitty_graphics, markers, osc7501, persist, project_tree,
+    pty_slot, session_branch, shell_ops, ssh_conn, startup_trace, tree,
 };
 
 use std::path::PathBuf;

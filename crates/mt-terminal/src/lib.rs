@@ -42,9 +42,11 @@ use std::time::{Duration, Instant};
 pub mod buffer;
 pub mod kitty;
 pub mod links;
+pub mod osc7501;
 mod takeover;
 pub mod width;
 
+pub use osc7501::{BlockedKind, ProgramState, ProgramStatus};
 pub use takeover::TakeoverSnapshot;
 use width::{Scratch, WidthOverride};
 
@@ -125,6 +127,8 @@ pub struct TerminalEmulator {
     cursor_settle: Mutex<CursorSettle>,
     /// Kitty 图形。`None` = 开关关着(缺省),字节不经过它。见 [`kitty`]。
     kitty: Option<kitty::Kitty>,
+    /// OSC 7501（Program Status Protocol）只读流式扫描器与探测应答。
+    osc7501: osc7501::Osc7501,
     /// ConPTY 的 win32-input-mode(`CSI ? 9001h/l`)是否已由应用开启。
     /// 键盘编码要据它决定发 WSI 记录还是传统字节,见 [`Self::win32_input_mode`]。
     win32_input: AtomicBool,
@@ -304,12 +308,13 @@ impl TerminalEmulator {
                 vte: Processor::new(),
                 cluster: Scratch::default(),
             }),
-            events,
+            events: events.clone(),
             scrollback: AtomicUsize::new(scrollback),
             cursor_floor: Mutex::new(None),
             generation: AtomicU64::new(0),
             cursor_settle: Mutex::new(cursor_settle),
             kitty: None,
+            osc7501: osc7501::Osc7501::new(events),
             win32_input: AtomicBool::new(false),
             win32_input_allowed: cfg!(windows)
                 && !matches!(
@@ -387,6 +392,8 @@ impl TerminalEmulator {
         if self.kitty.is_some() && bytes.is_empty() {
             return;
         }
+        // OSC 7501 只读扫描(在 kitty 摘掉大图 payload 之后、term 锁之外,零字节复制)
+        self.osc7501.scan(bytes);
         let mut term = self.term.lock();
         // 持着 term 锁记账:读的人持锁看到的代数与内容必然同步
         self.generation.fetch_add(1, Ordering::Relaxed);
@@ -517,6 +524,11 @@ impl TerminalEmulator {
 
     pub fn events(&self) -> &EventQueue {
         &self.events
+    }
+
+    /// 取出本批输出中解析出的 OSC 7501 程序状态上报。无新事件时单次原子读即返回空。
+    pub fn drain_program_statuses(&self) -> Vec<ProgramStatus> {
+        self.osc7501.drain()
     }
 
     /// 当前 grid 尺寸。渲染层每帧按可用像素算出目标尺寸,与这里比对后才决定

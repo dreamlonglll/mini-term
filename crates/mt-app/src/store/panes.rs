@@ -953,12 +953,17 @@ impl AppStore {
             ("MINITERM_PTY_ID".to_string(), pty_id.to_string()),
         ];
         // 告诉 pi 这里能发 Kitty 图形。默认关闭,口径见 `kitty_graphics` 模块注释
+        let is_remote_project = project.ssh_connection_id.is_some();
+        let is_wsl = crate::kitty_graphics::is_wsl_launch(&cwd, &shell.command);
         env.extend(crate::kitty_graphics::protocol_env(
             crate::kitty_graphics::active(),
-            project.ssh_connection_id.is_some(),
-            crate::kitty_graphics::is_wsl_launch(&cwd, &shell.command),
+            is_remote_project,
+            is_wsl,
             std::env::var_os("PI_IMAGE_PROTOCOL").as_deref(),
         ));
+        // Windows 回落系统 ConPTY 时兜底开启 agy 的 OSC 7501 上报（便携 ConPTY 与非 Windows
+        // 靠标准 `ESC ] 7501 ; ? ST` 握手自动开启，不注入环境变量；见 `osc7501` 模块注释）
+        env.extend(crate::osc7501::agy_env_fallback(is_remote_project, is_wsl));
         let hook_port = self.ai.hook_port();
         if hook_port > 0 {
             env.push(("MINITERM_HOOK_PORT".to_string(), hook_port.to_string()));

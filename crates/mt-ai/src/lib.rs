@@ -73,7 +73,9 @@ mod util;
 
 pub use agent::{AgentKind, AgentSpec, CwdBucket};
 pub use detect::{AI_COMMANDS, interactive_ai_command_name, is_interactive_ai_command};
-pub use hook_server::{HookState, HookStatusInfo, is_attention_cause};
+pub use hook_server::{
+    HookState, HookStatusInfo, OscBlockedKind, OscProgramState, OscStatus, is_attention_cause,
+};
 pub use monitor::{SessionIdentity, StatusChange, StatusEmitter, StatusSink};
 pub use perception::AiPerception;
 pub use sessions::{AiSession, AiSessionMessage, LineageEdge, agent_has_session_log};
