@@ -1835,7 +1835,8 @@ impl FileTree {
                     .flatten()
                     .flatten(),
             });
-            let descend = expanded || (include_closing && entry.is_dir && self.folds.is_closing(&key));
+            let descend =
+                expanded || (include_closing && entry.is_dir && self.folds.is_closing(&key));
             if descend {
                 self.rows_with_closing(
                     project_id,

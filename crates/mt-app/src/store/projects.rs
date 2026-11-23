@@ -22,7 +22,10 @@ use super::{AppStore, ProjectState, StoreEvent};
 pub fn worktree_dismiss_key(connection_id: Option<&str>, path: &str) -> String {
     match connection_id {
         None => format!("local:{}", mt_core::path_key::windows_eq_key(path)),
-        Some(conn) => format!("ssh:{conn}:{}", mt_core::path_key::posix_trim_trailing(path)),
+        Some(conn) => format!(
+            "ssh:{conn}:{}",
+            mt_core::path_key::posix_trim_trailing(path)
+        ),
     }
 }
 
@@ -960,7 +963,9 @@ mod tests {
     }
 
     #[gpui::test]
-    fn 手动移除记录worktree忽略键并在重加或磁盘消失后清理(cx: &mut gpui::TestAppContext) {
+    fn 手动移除记录worktree忽略键并在重加或磁盘消失后清理(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(crate::toast::init);
         let config = AppConfig {
             projects: vec![

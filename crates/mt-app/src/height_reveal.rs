@@ -184,7 +184,10 @@ impl HeightReveal {
     /// [`Self::is_mounted`],连它都不挂)。动画中自动要下一帧。
     pub fn render(&self, child: impl IntoElement, window: &Window) -> AnyElement {
         let mode = self.mode();
-        if matches!(mode, RevealMode::Clipped { .. } | RevealMode::MeasuringClose) {
+        if matches!(
+            mode,
+            RevealMode::Clipped { .. } | RevealMode::MeasuringClose
+        ) {
             window.request_animation_frame();
         }
         if mode == RevealMode::Hidden {

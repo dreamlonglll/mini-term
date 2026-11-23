@@ -651,8 +651,7 @@ pub fn worktree_descendants(projects: &[ProjectConfig], parent_id: &str) -> Vec<
         out: &mut Vec<String>,
     ) {
         for p in projects {
-            if p.parent_project_id.as_deref() == Some(parent)
-                && !seen.iter().any(|id| id == &p.id)
+            if p.parent_project_id.as_deref() == Some(parent) && !seen.iter().any(|id| id == &p.id)
             {
                 seen.push(p.id.clone());
                 out.push(p.id.clone());
@@ -794,9 +793,8 @@ pub fn compute_cluster_roles(
                     false
                 };
                 let is_last_sibling = !has_next_at_depth(*depth);
-                let ancestor_continues = ((root_depth + 1)..*depth)
-                    .map(has_next_at_depth)
-                    .collect();
+                let ancestor_continues =
+                    ((root_depth + 1)..*depth).map(has_next_at_depth).collect();
                 roles.push(Some(ProjectClusterRole::Child {
                     root_parent_id: root_id.clone(),
                     root_depth: *root_depth,
@@ -1560,7 +1558,8 @@ mod tests {
 
         // 默认展开
         let empty = HashSet::new();
-        let ordered = filter_collapsed_worktrees(get_ordered_tree(&config), &config.projects, &empty);
+        let ordered =
+            filter_collapsed_worktrees(get_ordered_tree(&config), &config.projects, &empty);
         assert_eq!(
             ordered.iter().map(|i| i.id()).collect::<Vec<_>>(),
             vec!["solo", "p", "wt1", "wt2", "after"]

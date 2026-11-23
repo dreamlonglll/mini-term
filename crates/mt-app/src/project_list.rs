@@ -468,10 +468,7 @@ fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
             "worktreeBadgeTitle",
             branch = branch.clone()
         ))
-        .child(
-            VectorIcon::new(ICON_BRANCH, px(10.0))
-                .ink(ui::text_muted()),
-        )
+        .child(VectorIcon::new(ICON_BRANCH, px(10.0)).ink(ui::text_muted()))
         .child(div().min_w(px(0.0)).truncate().child(branch))
 }
 
@@ -2150,11 +2147,9 @@ impl ProjectList {
                 }
             }
             "right" if !event.keystroke.modifiers.modified() => {
-                let has_children = !project_tree::worktree_descendants(
-                    self.store.read(cx).projects(),
-                    id,
-                )
-                .is_empty();
+                let has_children =
+                    !project_tree::worktree_descendants(self.store.read(cx).projects(), id)
+                        .is_empty();
                 if has_children && self.collapsed_worktrees.contains(id) {
                     cx.stop_propagation();
                     self.toggle_worktree_collapse(id, cx);
@@ -2581,12 +2576,7 @@ impl ProjectList {
 
     /// 安排一次去抖后的 worktree 自动同步（`.git/worktrees` 监听唤醒或慢 checkout 重试用）。
     /// 替换句柄自动取消前一次计时，连发事件合并为一趟；到期后同时触发新增发现、失效清理与分支徽章重探。
-    fn schedule_worktree_sync(
-        &mut self,
-        delay: Duration,
-        retry_count: u8,
-        cx: &mut Context<Self>,
-    ) {
+    fn schedule_worktree_sync(&mut self, delay: Duration, retry_count: u8, cx: &mut Context<Self>) {
         self._worktree_sync_debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |this: &mut ProjectList, cx| {
@@ -2660,7 +2650,9 @@ impl ProjectList {
                         any_pending_invalid = true;
                     }
                     let root = info.git_dir.to_string_lossy().to_string();
-                    desired.entry(info.git_dir.clone()).or_insert_with(|| root.clone());
+                    desired
+                        .entry(info.git_dir.clone())
+                        .or_insert_with(|| root.clone());
                     if info.worktrees_dir_exists {
                         desired
                             .entry(info.git_dir.join("worktrees"))
@@ -2702,11 +2694,7 @@ impl ProjectList {
 
                 // 遇到刚起跑还在 `initializing` 中的大仓库 checkout，补最多 2 趟短重试
                 if any_pending_invalid && retry_count < 2 {
-                    this.schedule_worktree_sync(
-                        Duration::from_millis(1500),
-                        retry_count + 1,
-                        cx,
-                    );
+                    this.schedule_worktree_sync(Duration::from_millis(1500), retry_count + 1, cx);
                 }
             });
         })
@@ -3323,11 +3311,8 @@ impl ProjectList {
             } else {
                 project_tree::get_ordered_tree_with_open_groups(store_ref.config(), &closing_groups)
             };
-            let filtered = project_tree::filter_collapsed_worktrees(
-                base,
-                store_ref.projects(),
-                &effective_wt,
-            );
+            let filtered =
+                project_tree::filter_collapsed_worktrees(base, store_ref.projects(), &effective_wt);
             (filtered, effective_wt)
         } else {
             (ordered, self.collapsed_worktrees.clone())
@@ -3342,21 +3327,24 @@ impl ProjectList {
         let active_clusters: HashSet<String> = active
             .as_deref()
             .and_then(|active_id| {
-                render_ordered.iter().zip(roles.iter()).find_map(|(item, role)| {
-                    let OrderedItem::Project { id, .. } = item else {
-                        return None;
-                    };
-                    if id != active_id {
-                        return None;
-                    }
-                    match role.as_ref()? {
-                        ProjectClusterRole::ExpandedParent { .. } => Some(id.clone()),
-                        ProjectClusterRole::Child { root_parent_id, .. } => {
-                            Some(root_parent_id.clone())
+                render_ordered
+                    .iter()
+                    .zip(roles.iter())
+                    .find_map(|(item, role)| {
+                        let OrderedItem::Project { id, .. } = item else {
+                            return None;
+                        };
+                        if id != active_id {
+                            return None;
                         }
-                        _ => None,
-                    }
-                })
+                        match role.as_ref()? {
+                            ProjectClusterRole::ExpandedParent { .. } => Some(id.clone()),
+                            ProjectClusterRole::Child { root_parent_id, .. } => {
+                                Some(root_parent_id.clone())
+                            }
+                            _ => None,
+                        }
+                    })
             })
             .into_iter()
             .collect();
@@ -3879,11 +3867,9 @@ impl ProjectList {
     ) -> gpui::Stateful<gpui::Div> {
         let id_toggle = parent_id.to_string();
         let chevron_key = format!("wt:{parent_id}");
-        let turns = self.chevrons.value_open(
-            &chevron_key,
-            !collapsed,
-            crate::fold_motion::OPEN_TURNS,
-        );
+        let turns =
+            self.chevrons
+                .value_open(&chevron_key, !collapsed, crate::fold_motion::OPEN_TURNS);
         let highlight = collapsed && summary.contains_active;
         let fg = if highlight {
             ui::accent()
@@ -4102,7 +4088,10 @@ impl ProjectList {
     ) -> gpui::Stateful<gpui::Div> {
         let raw_indent = project_indent(row.depth, row.parent_group_id.is_some());
         let (pl, pr) = if in_expanded_cluster {
-            ((raw_indent - CLUSTER_INSET).max(0.0), (10.0 - CLUSTER_INSET).max(0.0))
+            (
+                (raw_indent - CLUSTER_INSET).max(0.0),
+                (10.0 - CLUSTER_INSET).max(0.0),
+            )
         } else {
             (raw_indent, 10.0)
         };
@@ -4218,9 +4207,10 @@ impl ProjectList {
                 })
                 // 领位换成轻量的矢量分支图标（不再重复父项目的大号技术栈图标）
                 .child(VectorIcon::new(ICON_BRANCH, px(12.0)).ink(branch_icon_color))
-                .children((!row.ai_vendors.is_empty()).then(|| {
-                    ai_vendor_icons_sized(&row.ai_vendors, CHILD_AI_ICON_SIZE, -2.0)
-                }))
+                .children(
+                    (!row.ai_vendors.is_empty())
+                        .then(|| ai_vendor_icons_sized(&row.ai_vendors, CHILD_AI_ICON_SIZE, -2.0)),
+                )
                 .child(self.child_row_label(editing.as_ref(), display, is_active))
                 // 远程子 worktree 正常态继承父项目连接，仅断链时单独标红提示
                 .children(
@@ -4298,7 +4288,8 @@ impl ProjectList {
         let ai_vendors = row.ai_vendors.clone();
         let worktree_branch = row.worktree_branch.clone();
         let remote = row.remote.clone();
-        let is_expanded_parent = matches!(row.cluster_role, ProjectClusterRole::ExpandedParent { .. });
+        let is_expanded_parent =
+            matches!(row.cluster_role, ProjectClusterRole::ExpandedParent { .. });
         // 箭头与胶囊状态认**真实折叠态**而非渲染外框态：收起动画最后一程时外框仍是
         // ExpandedParent（连着正在滑合的底抽屉），但箭头必须同步从 ▾ 转回 ▸
         let toggle_info = match row.cluster_role {
@@ -4870,7 +4861,10 @@ mod tests {
             structural,
         };
         // 首次建 `.git/worktrees` 与在里面建/删具体条目都命中
-        assert!(is_worktree_watch_event(&ev(r"D:\repo\.git\worktrees", true)));
+        assert!(is_worktree_watch_event(&ev(
+            r"D:\repo\.git\worktrees",
+            true
+        )));
         assert!(is_worktree_watch_event(&ev(
             r"D:\repo\.git\worktrees\feat-a",
             true
@@ -4896,7 +4890,10 @@ mod tests {
             // 已存在（甚至已脱离父项目）的 worktree 不应重复添加
             project("existing-detached", r"d:/git/repo-old/", None),
         ];
-        let dismissed = vec![crate::store::worktree_dismiss_key(None, r"D:\Git\repo-skip")];
+        let dismissed = vec![crate::store::worktree_dismiss_key(
+            None,
+            r"D:\Git\repo-skip",
+        )];
         let scanned = vec![
             (
                 "p1".into(),

@@ -204,7 +204,9 @@ pub fn open_confirm_remove_project(
                         });
                         return true;
                     }
-                    store.update(cx, |store, cx| store.remove_project_by_user(&project_id, cx));
+                    store.update(cx, |store, cx| {
+                        store.remove_project_by_user(&project_id, cx)
+                    });
                     true
                 })
         },

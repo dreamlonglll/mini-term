@@ -671,8 +671,8 @@ pub fn open(
         let new_branch = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("worktree", "newBranchPlaceholder"))
         });
-        let wt_path = cx
-            .new(|cx| InputState::new(window, cx).placeholder(t("worktree", "pathPlaceholder")));
+        let wt_path =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t("worktree", "pathPlaceholder")));
         let sub_branch = cx.subscribe_in(
             &new_branch,
             window,
@@ -855,9 +855,7 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
                         .with_path(path.clone())
                         .list_worktrees()
                         .map_err(|err| git_ui::error_text(&err));
-                    if !is_remote
-                        && let Ok(ref list) = result
-                    {
+                    if !is_remote && let Ok(ref list) = result {
                         let main_path = list
                             .iter()
                             .find(|w| w.is_main)
@@ -1079,7 +1077,9 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
     // 默认路径建议 + 占位预览（值 / 占位未变化时直接 return，不会自激）
     sync_path_suggestion(state, &groups, window, cx);
 
-    root = root.child(render_create_section(state, &groups, multi_repo, window, cx));
+    root = root.child(render_create_section(
+        state, &groups, multi_repo, window, cx,
+    ));
     root.into_any_element()
 }
 
@@ -1114,12 +1114,11 @@ fn sync_create_mode_and_focus(
         if !branches_ready {
             return;
         }
-        let switch_new = !s.mode_touched
-            && s.mode == Mode::Existing
-            && s.options(groups, &selected).is_empty();
+        let switch_new =
+            !s.mode_touched && s.mode == Mode::Existing && s.options(groups, &selected).is_empty();
         let next_mode = if switch_new { Mode::New } else { s.mode };
-        let focus = (next_mode == Mode::New && !s.auto_focused_on_open)
-            .then(|| s.new_branch.clone());
+        let focus =
+            (next_mode == Mode::New && !s.auto_focused_on_open).then(|| s.new_branch.clone());
         (switch_new, focus)
     };
     if should_switch_new || focus_target.is_some() {
@@ -1877,8 +1876,12 @@ fn render_create_section(
     };
     let current_path = s.wt_path.read(cx).value().to_string();
     let creating = s.creating;
-    let can_create =
-        can_create_worktree(creating, !selected.is_empty(), &current_branch, &current_path);
+    let can_create = can_create_worktree(
+        creating,
+        !selected.is_empty(),
+        &current_branch,
+        &current_path,
+    );
     let switch_after_create = s.switch_after_create;
     let state_for_check = state.clone();
     let state_for_create = state.clone();
