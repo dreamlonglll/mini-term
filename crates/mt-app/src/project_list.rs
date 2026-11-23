@@ -53,9 +53,13 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
+use futures::StreamExt as _;
+use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
     ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
@@ -68,7 +72,7 @@ use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_project::project_kind::{ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, ProjectKind};
 use mt_ui::icons::vector::VectorIcon;
-use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, TechIcon};
+use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, StatusDot, TechIcon};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::dnd::{
@@ -76,11 +80,12 @@ use crate::dnd::{
 };
 use crate::focus_nav::{self, RowNav};
 use crate::fs_ops;
+use crate::git::ui::{ICON_BRANCH, ICON_WORKTREE};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::modal;
 use crate::pane_preview::{self, MiniLayout};
-use crate::project_tree::{self, MAX_DEPTH, OrderedItem};
+use crate::project_tree::{self, MAX_DEPTH, OrderedItem, ProjectClusterRole};
 use crate::store::{AppStore, StoreEvent};
 use crate::tree::StatusLight;
 use crate::ui;
@@ -88,11 +93,27 @@ use crate::ui;
 /// AI 品牌图标尺寸(`ProjectList.tsx:144` 的 `AI_ICON_SIZE`)。
 const AI_ICON_SIZE: f32 = 14.0;
 
-/// worktree 徽章最多显示多宽(原版 `max-w-[100px] truncate`)。
-const WORKTREE_BADGE_MAX_W: f32 = 100.0;
+/// worktree 子项行上的 AI 品牌图标尺寸（随 12px 紧凑字号略收一档）。
+const CHILD_AI_ICON_SIZE: f32 = 12.5;
+
+/// 独立（已脱离父项目）worktree 徽章最多显示多宽。
+const WORKTREE_BADGE_MAX_W: f32 = 112.0;
 
 /// 远程连接名徽章最多多宽(原版 `max-w-[80px] truncate`)。
 const REMOTE_BADGE_MAX_W: f32 = 80.0;
+
+/// worktree 簇微容器的外边距、描边宽与圆角。
+/// 父项目行扣掉 `CLUSTER_INSET` 的左右内边距，使图标、文字与上下独立项目像素级垂直对齐。
+const CLUSTER_MARGIN_X: f32 = 4.0;
+const CLUSTER_BORDER_W: f32 = 1.0;
+const CLUSTER_INSET: f32 = CLUSTER_MARGIN_X + CLUSTER_BORDER_W;
+const CLUSTER_RADIUS: f32 = 6.0;
+const CLUSTER_INNER_RADIUS: f32 = 5.0;
+
+/// worktree 子项树形连线水平弯臂宽、弯臂与子项胶囊的留白、多层嵌套时的单层步进。
+const CHILD_ELBOW_W: f32 = 10.0;
+const CHILD_ELBOW_GAP: f32 = 2.0;
+const CHILD_NEST_STEP: f32 = 14.0;
 
 /// SSH 远程项目的领位图标 —— lucide 的 `Server`(原版 `<Server size={14}/>`)。
 ///
@@ -402,18 +423,18 @@ fn done_tag(frame: DoneTagFrame, settled: bool, text_w: &Rc<Cell<f32>>) -> AnyEl
 }
 
 /// 行上的 AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
-/// 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px。
-fn ai_vendor_icons(vendors: &[Option<AiVendor>]) -> gpui::Div {
+/// 负边距抵掉行内 gap,与领位图标只留 2px;图标之间同样 2px。
+fn ai_vendor_icons_sized(vendors: &[Option<AiVendor>], size: f32, tight_ml: f32) -> gpui::Div {
     let mut stack = div()
         .flex()
         .items_center()
         .flex_shrink_0()
-        .ml(px(-4.0))
+        .ml(px(tight_ml))
         .gap(px(2.0));
     for vendor in vendors {
         stack = stack.child(
             BrandIcon::new(*vendor)
-                .size(px(AI_ICON_SIZE))
+                .size(px(size))
                 // 固定 text-secondary 上下文:单色品牌图标不随
                 // 选中行的 accent 变色(与 tab 上观感一致)
                 .color(ui::text_secondary()),
@@ -422,16 +443,24 @@ fn ai_vendor_icons(vendors: &[Option<AiVendor>]) -> gpui::Div {
     stack
 }
 
-/// worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)。
+fn ai_vendor_icons(vendors: &[Option<AiVendor>]) -> gpui::Div {
+    ai_vendor_icons_sized(vendors, AI_ICON_SIZE, -4.0)
+}
+
+/// 独立（已脱离父项目）worktree 行的行尾分支徽章:使用矢量 `ICON_BRANCH` 取代文本字符 `⎇`。
 fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(format!("worktree-{id}")))
         .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(3.0))
         .min_w(px(0.0))
         .max_w(px(WORKTREE_BADGE_MAX_W))
-        .px(px(3.0))
-        .rounded(px(3.0))
-        .text_size(ui::font_px(9.75))
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .text_size(ui::font_px(10.0))
         .text_color(ui::text_muted())
         .bg(ui::border_subtle())
         .tip(tr!(
@@ -439,8 +468,255 @@ fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
             "worktreeBadgeTitle",
             branch = branch.clone()
         ))
-        .truncate()
-        .child(format!("⎇ {branch}"))
+        .child(
+            VectorIcon::new(ICON_BRANCH, px(10.0))
+                .ink(ui::text_muted()),
+        )
+        .child(div().min_w(px(0.0)).truncate().child(branch))
+}
+
+/// 折叠态 worktree 父项目胶囊上的聚合状态：确保收起子项后不漏掉 AI 完成 / 待处理 / 报错 / SSH。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CollapsedWorktreeSummary {
+    /// 任意折叠子项有未读完成标（且非当前活动项目）。
+    has_done: bool,
+    /// 折叠子项里的最高状态灯档位。
+    light: StatusLight,
+    /// 折叠子项里是否存在右键 SSH 已连接终端。
+    has_ssh: bool,
+    /// 当前活动项目是否正藏在这批折叠子项里。
+    contains_active: bool,
+}
+
+/// 折叠胶囊内附带的小状态指示器（仅在有需要提醒的状态时出现）。
+fn collapsed_worktree_indicator(summary: &CollapsedWorktreeSummary) -> Option<AnyElement> {
+    if summary.light >= StatusLight::Attention {
+        return Some(
+            StatusDot::new(ui::status_kind(summary.light))
+                .size(px(8.5))
+                .color(ui::status_color(summary.light))
+                .contrast(ui::bg_elevated())
+                .into_any_element(),
+        );
+    }
+    if summary.has_done {
+        return Some(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(ui::color_success())
+                .into_any_element(),
+        );
+    }
+    if summary.light != StatusLight::Idle {
+        return Some(
+            StatusDot::new(ui::status_kind(summary.light))
+                .size(px(8.5))
+                .color(ui::status_color(summary.light))
+                .contrast(ui::bg_elevated())
+                .into_any_element(),
+        );
+    }
+    if summary.has_ssh {
+        return Some(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(ui::color_info())
+                .into_any_element(),
+        );
+    }
+    None
+}
+
+/// B1 分支优先子项的展示文案拆分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildDisplayLabel {
+    /// 主文字（分支名 / 用户自定义名 / 去前缀目录名）。
+    primary: String,
+    /// 次要副文（用户手动改名后附带的分支名，或需求描述）。
+    secondary: Option<String>,
+    /// 主文字是否直接就是 Git 分支名。
+    primary_is_branch: bool,
+}
+
+/// 取路径末段目录名（兼容 Windows `\` 与 POSIX `/`）。
+fn path_basename(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(idx) => &trimmed[idx + 1..],
+        None => trimmed,
+    }
+}
+
+/// 剥掉子项目目录名里与父项目重复的前缀（如 `mini-term` 下的 `mini-term-plugin` → `plugin`）。
+/// 匹配不区分 ASCII 大小写、支持 `-` / `_` / `.` / 空格分隔符；剩余为空或无匹配则原样返回。
+fn strip_parent_prefix(name: &str, parent_name: Option<&str>) -> String {
+    let Some(parent) = parent_name.filter(|p| !p.is_empty()) else {
+        return name.to_string();
+    };
+    let mut name_chars = name.chars();
+    let mut matched = true;
+    for pc in parent.chars() {
+        match name_chars.next() {
+            Some(nc) if nc.eq_ignore_ascii_case(&pc) => {}
+            _ => {
+                matched = false;
+                break;
+            }
+        }
+    }
+    if matched
+        && let Some(sep) = name_chars.next()
+        && matches!(sep, '-' | '_' | '.' | ' ')
+    {
+        let rest = name_chars.as_str().trim();
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// B1 分支优先口径：
+/// - 用户手动重命名过（`name != 目录末段`）→ 尊重自定义名为主文字，分支名退作次要副文；
+/// - 未重命名且探测到 Git 分支 → 直接以分支名为主文字（告别 100px 截断胶囊）；
+/// - 未重命名且无分支（游离 HEAD / 远程 / 探测中）→ 剥掉重复父项目前缀后显示。
+fn resolve_child_display_label(
+    name: &str,
+    path: &str,
+    parent_name: Option<&str>,
+    worktree_branch: Option<&str>,
+    description: Option<&str>,
+) -> ChildDisplayLabel {
+    let folder = path_basename(path);
+    let is_custom_name = !folder.is_empty() && name != folder;
+    if is_custom_name {
+        let secondary = match (worktree_branch, description) {
+            (Some(branch), Some(desc)) => Some(format!("{branch} · {desc}")),
+            (Some(branch), None) => Some(branch.to_string()),
+            (None, Some(desc)) => Some(desc.to_string()),
+            (None, None) => None,
+        };
+        ChildDisplayLabel {
+            primary: name.to_string(),
+            secondary,
+            primary_is_branch: false,
+        }
+    } else if let Some(branch) = worktree_branch {
+        ChildDisplayLabel {
+            primary: branch.to_string(),
+            secondary: description.map(str::to_string),
+            primary_is_branch: true,
+        }
+    } else {
+        ChildDisplayLabel {
+            primary: strip_parent_prefix(name, parent_name),
+            secondary: description.map(str::to_string),
+            primary_is_branch: false,
+        }
+    }
+}
+
+/// worktree 子项行的悬停提示：同时交代分支 / 目录名与完整路径。
+fn child_tooltip_text(
+    name: &str,
+    path: &str,
+    worktree_branch: Option<&str>,
+    display: &ChildDisplayLabel,
+) -> String {
+    match worktree_branch {
+        Some(branch) if name != branch => format!("{name} · {branch}\n{path}"),
+        Some(branch) => format!("{branch}\n{path}"),
+        None if display.primary != name => format!("{name}\n{path}"),
+        None => path.to_string(),
+    }
+}
+
+/// 微容器内第 `level` 层（0 = 直接子项）树形竖轨相对微容器内左缘的 x 坐标。
+/// 对齐父项目领位图标（14px）的水平中心：`parent_inner_pl + 2(竖条) + 6(gap) + 7(半图标)`。
+fn cluster_rail_x(root_depth: usize, in_group: bool, level: usize) -> f32 {
+    let parent_indent = project_indent(root_depth, in_group);
+    let base = (parent_indent - CLUSTER_INSET).max(0.0) + 15.0;
+    base + level as f32 * CHILD_NEST_STEP
+}
+
+/// 微容器子项左侧的树形连线层（`├─` / `╰─` + 多层祖先贯通竖线）。
+/// 挂在子项外层 `relative()` 上，竖线从 `top_0()` 贯通到 `bottom_0()`，相邻子项无缝衔接。
+fn child_tree_connectors(
+    root_depth: usize,
+    in_group: bool,
+    rel_depth: usize,
+    is_last_sibling: bool,
+    ancestor_continues: &[bool],
+    is_active: bool,
+) -> Vec<AnyElement> {
+    let trunk_color = ui::with_alpha(ui::text_muted(), 0.42);
+    let arm_color = if is_active {
+        ui::with_alpha(ui::accent(), 0.85)
+    } else {
+        trunk_color
+    };
+    let mut parts: Vec<AnyElement> = Vec::with_capacity(ancestor_continues.len() + 2);
+    for (level, &continues) in ancestor_continues.iter().enumerate() {
+        if continues {
+            let x = cluster_rail_x(root_depth, in_group, level);
+            parts.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(trunk_color)
+                    .into_any_element(),
+            );
+        }
+    }
+    let rail_x = cluster_rail_x(root_depth, in_group, rel_depth.saturating_sub(1));
+    if is_last_sibling {
+        // 末位兄弟：圆角 L 弯折 `╰─`，从顶沿垂到行中线再优雅向右折出
+        parts.push(
+            div()
+                .absolute()
+                .left(px(rail_x))
+                .top_0()
+                .h(gpui::relative(0.5))
+                .w(px(CHILD_ELBOW_W))
+                .border_l_1()
+                .border_b_1()
+                .rounded_bl(px(5.0))
+                .border_color(arm_color)
+                .into_any_element(),
+        );
+    } else {
+        // 非末位兄弟：全高竖干 + 中线水平支臂（互不重叠，半透明色下无叠加发亮）
+        parts.push(
+            div()
+                .absolute()
+                .left(px(rail_x))
+                .top_0()
+                .bottom_0()
+                .w(px(1.0))
+                .bg(trunk_color)
+                .into_any_element(),
+        );
+        parts.push(
+            div()
+                .absolute()
+                .left(px(rail_x + 1.0))
+                .top(gpui::relative(0.5))
+                .w(px(CHILD_ELBOW_W - 1.0))
+                .h(px(1.0))
+                .bg(arm_color)
+                .into_any_element(),
+        );
+    }
+    parts
 }
 
 /// 远程徽章:连接名(断链时「断链」两字 + error 配色)。
@@ -678,6 +954,56 @@ fn find_stale_worktree_projects(
         .collect()
 }
 
+/// `.git` / `.git/worktrees` 监听事件过滤：只放行 `worktrees` 目录自身或直接子项的结构变化
+/// （创建 / 删除 / 改名），过滤掉 `index` / `HEAD` 改写与 Windows 非递归监听里子目录内容修改带来的噪声。
+fn is_worktree_watch_event(change: &mt_project::watch::FsChange) -> bool {
+    if !change.structural {
+        return false;
+    }
+    let name = change.path.file_name().and_then(|n| n.to_str());
+    let parent_name = change
+        .path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    name == Some("worktrees") || parent_name == Some("worktrees")
+}
+
+/// 根据后台扫出的本地主仓库 worktree 清单，算出本轮要自动新增的 `(parent_project_id, wt_path)`：
+/// - 父项目必须仍存活于当前 `projects`；
+/// - 已作为项目存在（含独立或已脱离父项目的）不重复添加；
+/// - 用户主动从项目列表移除过的（在 `dismissed` 中）跳过；
+/// - 同路径只排一条（按 `windows_eq_key` 去重）。
+fn plan_auto_added_worktrees(
+    projects: &[ProjectConfig],
+    dismissed: &[String],
+    scanned: &[(String, mt_project::git::LocalRepoWorktrees)],
+) -> Vec<(String, String)> {
+    let alive_parents: HashSet<&str> = projects.iter().map(|p| p.id.as_str()).collect();
+    let mut existing: HashSet<String> = projects
+        .iter()
+        .filter(|p| p.ssh_connection_id.is_none())
+        .map(|p| mt_core::path_key::windows_eq_key(&p.path))
+        .collect();
+    let dismissed_set: HashSet<&str> = dismissed.iter().map(String::as_str).collect();
+
+    let mut out = Vec::new();
+    for (parent_id, info) in scanned {
+        if !alive_parents.contains(parent_id.as_str()) {
+            continue;
+        }
+        for wt_path in &info.linked_paths {
+            let eq_key = mt_core::path_key::windows_eq_key(wt_path);
+            let dismiss_key = crate::store::worktree_dismiss_key(None, wt_path);
+            if dismissed_set.contains(dismiss_key.as_str()) || !existing.insert(eq_key) {
+                continue;
+            }
+            out.push((parent_id.clone(), wt_path.clone()));
+        }
+    }
+    out
+}
+
 /// 一行要画的东西。渲染前先从 store 抠出来 —— `store.read(cx)` 的借用
 /// 活不过 `cx.listener`,一行 6 个字段用元组已经读不清了。
 #[derive(Clone)]
@@ -709,6 +1035,14 @@ struct Row {
     parent_group_id: Option<String>,
     /// worktree 子项目:位置由父项目派生,**不作为落点**(自身仍可拖走 = 脱离父项目)。
     is_child: bool,
+    /// 父项目名（仅 worktree 子项目有值，用于游离 HEAD 等无分支名时剥除重复前缀）。
+    parent_name: Option<String>,
+    /// 本行在 worktree 视觉簇里的角色（独立 / 折叠父 / 展开父 / 簇内子项）。
+    cluster_role: ProjectClusterRole,
+    /// 所属簇内是否存在当前活动项目（给展开微容器外框叠一层微弱 accent 提示）。
+    cluster_has_active: bool,
+    /// 折叠态父项目的子项聚合状态（仅 `CollapsedParent` 有意义）。
+    collapsed_summary: CollapsedWorktreeSummary,
     /// 行上的 AI 品牌堆叠(去重 + 字母序,见 [`ai_vendor_stack`])。
     ai_vendors: Vec<Option<AiVendor>>,
     /// 项目路径是某仓库的 linked worktree → `⎇ 分支名` 徽章。
@@ -1409,12 +1743,28 @@ pub struct ProjectList {
     /// 中栏收着期间 store 变过(本视图那时不渲染,完成标表没跟上)。下一次 `render`
     /// 按「隔了一阵才再画」对齐完成标表,不补播进出场(见 [`Self::sync_done_tags`])。
     done_tags_stale: bool,
-    /// 分组行的折叠箭头:只让刚点(或回车 / 空格翻)的那一行转(见 `fold_motion`)。
+    /// 分组行与 worktree 簇的折叠箭头:只让刚点(或回车 / 空格翻)的那一行转(见 `fold_motion`)。
     chevrons: crate::fold_motion::FlipTweens,
+    /// 分组(`grp:{id}`)与 worktree 簇(`wt:{id}`)的高度裁剪展开 / 收起动画(仅在飞期间存活)。
+    folds: crate::height_reveal::FoldReveals,
+    /// 已折叠收起 worktree 子项的父项目 id 集合（默认展开）。
+    collapsed_worktrees: HashSet<String>,
     /// 行列表那个滚动容器的句柄(滚动偏移也住在这里)。揭示靠它把目标行滚进可视区。
     rows_scroll: ScrollHandle,
     /// 等着滚进可视区的项目,由 [`Self::reveal`] 登记、接下来的 `render` 兑现。
     pending_reveal: Option<PendingReveal>,
+    /// 监听本地主仓库的 `.git` 与 `.git/worktrees` 目录，外部/终端增删 worktree 时实时同步。
+    worktree_watcher: Arc<mt_project::watch::FsWatcher>,
+    /// 当前挂着监听的目录集合（增量增删，避免重复注册）。
+    watched_worktree_dirs: HashSet<PathBuf>,
+    /// 上一次自动同步 worktree 用的本地非子项目路径清单。
+    worktree_sync_key: String,
+    /// 本轮同步代次号（丢弃过期后台扫描结果）。
+    worktree_sync_gen: u64,
+    /// `.git/worktrees` 变更防抖 / 慢 checkout 重试任务（替换即取消旧计时）。
+    _worktree_sync_debounce: Option<Task<()>>,
+    /// 监听事件唤醒任务。
+    _worktree_watch_task: Task<()>,
 }
 
 /// 一次揭示的兑现进度(见 `render` 里兑现那一段)。
@@ -1446,21 +1796,45 @@ impl ProjectList {
             if !event.touches_project_probes() {
                 return;
             }
-            // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章
+            // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章与本地主仓库 worktree
             this.probe_worktrees(false, cx);
+            this.sync_worktrees(false, 0, cx);
             // 技术栈探测(原版 `useProjectKinds` 那个 effect):列表变了就补探,
             // 缓存失效(`removeDirKind`)后同样由这条重跑补上
             this.ensure_project_kinds(cx);
-            // 窗口重新聚焦:分支切换与 `git worktree remove` 都发生在窗外,
-            // 回来时既重探徽章也做一次失效清理(原版 `onFocusChanged` 同款)
+            // 窗口重新聚焦:分支切换与外部 `git worktree add/remove` 都可能发生在窗外,
+            // 回来时重探徽章、同步新增 worktree 并清理已失效子项目
             let focused = this.store.read(cx).window_focused();
             if focused && !this.was_focused {
                 this.probe_worktrees(true, cx);
+                this.sync_worktrees(true, 0, cx);
                 this.reconcile_worktrees(cx);
             }
             this.was_focused = focused;
         })
         .detach();
+        let (wt_tx, mut wt_rx) = mpsc::unbounded::<()>();
+        let worktree_watcher = Arc::new(mt_project::watch::FsWatcher::with_label(
+            "worktrees",
+            move |change| {
+                if is_worktree_watch_event(&change) {
+                    let _ = wt_tx.unbounded_send(());
+                }
+            },
+        ));
+        let worktree_watch_task = cx.spawn(async move |this, cx| {
+            while wt_rx.next().await.is_some() {
+                while wt_rx.try_recv().is_ok() {}
+                if this
+                    .update(cx, |list: &mut ProjectList, cx| {
+                        list.schedule_worktree_sync(Duration::from_millis(400), 0, cx);
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
         let mut this = Self {
             store,
             dragging: None,
@@ -1480,11 +1854,21 @@ impl ProjectList {
             done_tags: HashMap::new(),
             done_tags_stale: false,
             chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
+            folds: crate::height_reveal::FoldReveals::new(mt_ui::motion::SECTION_TOGGLE)
+                .with_max_height(640.0),
+            collapsed_worktrees: HashSet::new(),
             rows_scroll: ScrollHandle::new(),
             pending_reveal: None,
-            };
+            worktree_watcher,
+            watched_worktree_dirs: HashSet::new(),
+            worktree_sync_key: String::new(),
+            worktree_sync_gen: 0,
+            _worktree_sync_debounce: None,
+            _worktree_watch_task: worktree_watch_task,
+        };
         // 挂载时先探一次(原版两个 effect 都在挂载时跑一遍)
         this.probe_worktrees(true, cx);
+        this.sync_worktrees(true, 0, cx);
         this.reconcile_worktrees(cx);
         this.ensure_project_kinds(cx);
         this
@@ -1541,13 +1925,59 @@ impl ProjectList {
             .update(cx, |store, cx| store.ensure_dir_kinds(paths, cx));
     }
 
-    /// 揭示的视图半边(入口是自由函数 [`reveal`]):先把挡路的折叠分组展开,
+    /// 当前侧栏可见的展平列表：在 `get_ordered_tree` 基础上裁掉折叠着的 worktree 子项。
+    /// 渲染、揭示行号、焦点同步、完成标同步与键盘导航共用同一份结果。
+    fn visible_ordered(&self, store: &AppStore) -> Vec<OrderedItem> {
+        let ordered = project_tree::get_ordered_tree(store.config());
+        project_tree::filter_collapsed_worktrees(
+            ordered,
+            store.projects(),
+            &self.collapsed_worktrees,
+        )
+    }
+
+    /// 折叠 / 展开分组，同步触发箭头旋转与高度裁剪动画。
+    fn toggle_group_with_anim(&mut self, id: &str, collapsed: bool, cx: &mut Context<Self>) {
+        // 翻之前折着 = 翻完展开
+        let next_open = collapsed;
+        self.chevrons
+            .flip_open(id, next_open, crate::fold_motion::OPEN_TURNS);
+        self.folds.flip_open(format!("grp:{id}"), next_open);
+        self.close_preview(cx);
+        self.store
+            .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
+    }
+
+    /// 折叠 / 展开某个父项目下挂的 worktree 子项，同步触发箭头旋转与微容器高度抽屉动画。
+    fn toggle_worktree_collapse(&mut self, parent_id: &str, cx: &mut Context<Self>) {
+        let was_collapsed = self.collapsed_worktrees.contains(parent_id);
+        if was_collapsed {
+            self.collapsed_worktrees.remove(parent_id);
+        } else {
+            self.collapsed_worktrees.insert(parent_id.to_string());
+        }
+        let key = format!("wt:{parent_id}");
+        self.chevrons
+            .flip_open(key.clone(), was_collapsed, crate::fold_motion::OPEN_TURNS);
+        self.folds.flip_open(key, was_collapsed);
+        self.close_preview(cx);
+        cx.notify();
+    }
+
+    /// 揭示的视图半边(入口是自由函数 [`reveal`]):先把挡路的折叠分组与折叠 worktree 簇展开,
     /// 再登记滚动。滚动不能当场算 —— 刚展开的行还没铺出来,要等下一次 `render`
     /// 拿新的展平表定行号(见 `render` 里兑现那一段)。
     fn reveal(&mut self, project_id: String, cx: &mut Context<Self>) {
         self.store.update(cx, |store, cx| {
             store.expand_groups_to_project(&project_id, cx)
         });
+        let ancestors =
+            project_tree::worktree_ancestors(self.store.read(cx).projects(), &project_id);
+        for ancestor in ancestors {
+            self.collapsed_worktrees.remove(&ancestor);
+        }
+        // 揭示需要立即扁平定行号滚动，清掉在飞折叠补间直接到位
+        self.folds.clear();
         // 列表要滚了,悬停缩略图的锚点随之失效(与滚轮那条同一个理由)
         self.close_preview(cx);
         self.pending_reveal = Some(PendingReveal {
@@ -1694,6 +2124,42 @@ impl ProjectList {
                     cx,
                 );
             }
+            "left" if !event.keystroke.modifiers.modified() => {
+                let (has_children, parent_id) = {
+                    let store = self.store.read(cx);
+                    (
+                        !project_tree::worktree_descendants(store.projects(), id).is_empty(),
+                        store.project(id).and_then(|p| p.parent_project_id.clone()),
+                    )
+                };
+                if has_children && !self.collapsed_worktrees.contains(id) {
+                    cx.stop_propagation();
+                    self.toggle_worktree_collapse(id, cx);
+                } else if let Some(parent_id) = parent_id
+                    && let Some(focus) = self.row_focus.get(&parent_id).cloned()
+                {
+                    cx.stop_propagation();
+                    self.folds.clear();
+                    let ordered = self.visible_ordered(self.store.read(cx));
+                    self.close_preview(cx);
+                    window.focus(&focus, cx);
+                    if let Some(ix) = reveal_row_index(&ordered, &parent_id) {
+                        self.rows_scroll.scroll_to_item(ix);
+                    }
+                    cx.notify();
+                }
+            }
+            "right" if !event.keystroke.modifiers.modified() => {
+                let has_children = !project_tree::worktree_descendants(
+                    self.store.read(cx).projects(),
+                    id,
+                )
+                .is_empty();
+                if has_children && self.collapsed_worktrees.contains(id) {
+                    cx.stop_propagation();
+                    self.toggle_worktree_collapse(id, cx);
+                }
+            }
             key => self.on_row_nav_key(event, key, id, window, cx),
         }
     }
@@ -1713,13 +2179,19 @@ impl ProjectList {
         if self.editing.is_some() {
             return;
         }
+        let plain = !event.keystroke.modifiers.modified();
         match event.keystroke.key.as_str() {
             "enter" | "space" => {
                 cx.stop_propagation();
-                self.chevrons
-                    .flip_open(id, collapsed, crate::fold_motion::OPEN_TURNS);
-                self.store
-                    .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
+                self.toggle_group_with_anim(id, collapsed, cx);
+            }
+            "left" if plain && !collapsed => {
+                cx.stop_propagation();
+                self.toggle_group_with_anim(id, false, cx);
+            }
+            "right" if plain && collapsed => {
+                cx.stop_propagation();
+                self.toggle_group_with_anim(id, true, cx);
             }
             key => self.on_row_nav_key(event, key, id, window, cx),
         }
@@ -1756,7 +2228,7 @@ impl ProjectList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ordered = project_tree::get_ordered_tree(self.store.read(cx).config());
+        let ordered = self.visible_ordered(self.store.read(cx));
         let ids: Vec<&str> = ordered.iter().map(ordered_item_id).collect();
         let depths: Vec<usize> = ordered
             .iter()
@@ -1773,6 +2245,7 @@ impl ProjectList {
         let Some(focus) = self.row_focus.get(ids[target]).cloned() else {
             return;
         };
+        self.folds.clear();
         self.close_preview(cx);
         window.focus(&focus, cx);
         self.rows_scroll.scroll_to_item(target);
@@ -2106,6 +2579,140 @@ impl ProjectList {
         .detach();
     }
 
+    /// 安排一次去抖后的 worktree 自动同步（`.git/worktrees` 监听唤醒或慢 checkout 重试用）。
+    /// 替换句柄自动取消前一次计时，连发事件合并为一趟；到期后同时触发新增发现、失效清理与分支徽章重探。
+    fn schedule_worktree_sync(
+        &mut self,
+        delay: Duration,
+        retry_count: u8,
+        cx: &mut Context<Self>,
+    ) {
+        self._worktree_sync_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+                this._worktree_sync_debounce = None;
+                this.sync_worktrees(true, retry_count, cx);
+                this.reconcile_worktrees(cx);
+                this.probe_worktrees(true, cx);
+            });
+        }));
+    }
+
+    /// 自动识别本地主仓库下的 linked worktree 并添加为子项目，同时维护 `.git` / `.git/worktrees`
+    /// 的非递归监听集合（只盯本地非子项目，不扫远程与 UNC，也不把兄弟 worktree 误挂到 worktree 之下）。
+    fn sync_worktrees(&mut self, force: bool, retry_count: u8, cx: &mut Context<Self>) {
+        let candidates: Vec<(String, String)> = self
+            .store
+            .read(cx)
+            .projects()
+            .iter()
+            .filter(|p| {
+                p.ssh_connection_id.is_none()
+                    && p.parent_project_id.is_none()
+                    && !is_unc_path(&p.path)
+            })
+            .map(|p| (p.id.clone(), p.path.clone()))
+            .collect();
+        let mut key = String::new();
+        for (id, path) in &candidates {
+            key.push_str(id);
+            key.push('\t');
+            key.push_str(path);
+            key.push('\n');
+        }
+        if !force && key == self.worktree_sync_key {
+            return;
+        }
+        self.worktree_sync_key = key;
+        self.worktree_sync_gen = self.worktree_sync_gen.wrapping_add(1);
+        let sync_gen = self.worktree_sync_gen;
+        if candidates.is_empty() {
+            for dir in self.watched_worktree_dirs.drain() {
+                self.worktree_watcher.unwatch(&dir);
+            }
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let paths: Vec<PathBuf> = candidates.iter().map(|(_, p)| PathBuf::from(p)).collect();
+            let (all_reachable, results) = cx
+                .background_executor()
+                .spawn(async move {
+                    let all_reachable = paths.iter().all(|p| p.is_dir());
+                    let results = mt_project::git::discover_local_repo_worktrees(&paths);
+                    (all_reachable, results)
+                })
+                .await;
+            let scanned: Vec<(String, mt_project::git::LocalRepoWorktrees)> = candidates
+                .into_iter()
+                .zip(results)
+                .filter_map(|((id, _), info)| info.map(|info| (id, info)))
+                .collect();
+            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+                if this.worktree_sync_gen != sync_gen {
+                    return;
+                }
+                // 增量同步 `.git` 与 `.git/worktrees` 监听目录：只有主仓库挂监听，非 git 项目零开销
+                let mut desired: HashMap<PathBuf, String> = HashMap::new();
+                let mut any_pending_invalid = false;
+                let mut live_local_keys: HashSet<String> = HashSet::new();
+                for (_, info) in &scanned {
+                    if info.has_pending_invalid {
+                        any_pending_invalid = true;
+                    }
+                    let root = info.git_dir.to_string_lossy().to_string();
+                    desired.entry(info.git_dir.clone()).or_insert_with(|| root.clone());
+                    if info.worktrees_dir_exists {
+                        desired
+                            .entry(info.git_dir.join("worktrees"))
+                            .or_insert_with(|| root);
+                    }
+                    for wt_path in &info.linked_paths {
+                        live_local_keys.insert(crate::store::worktree_dismiss_key(None, wt_path));
+                    }
+                }
+                let to_remove: Vec<PathBuf> = this
+                    .watched_worktree_dirs
+                    .iter()
+                    .filter(|dir| !desired.contains_key(*dir))
+                    .cloned()
+                    .collect();
+                for dir in to_remove {
+                    this.watched_worktree_dirs.remove(&dir);
+                    this.worktree_watcher.unwatch(&dir);
+                }
+                for (dir, root) in desired {
+                    if this.watched_worktree_dirs.insert(dir.clone()) {
+                        this.worktree_watcher.watch(&dir, &root);
+                    }
+                }
+
+                this.store.update(cx, |store, cx| {
+                    if all_reachable {
+                        store.prune_local_dismissed_worktrees(&live_local_keys, cx);
+                    }
+                    let to_add = plan_auto_added_worktrees(
+                        store.projects(),
+                        &store.config().dismissed_worktrees,
+                        &scanned,
+                    );
+                    for (parent_id, wt_path) in to_add {
+                        store.add_project_at(Path::new(&wt_path), Some(&parent_id), cx);
+                    }
+                });
+
+                // 遇到刚起跑还在 `initializing` 中的大仓库 checkout，补最多 2 趟短重试
+                if any_pending_invalid && retry_count < 2 {
+                    this.schedule_worktree_sync(
+                        Duration::from_millis(1500),
+                        retry_count + 1,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// `on_drag_move` 的落点判定。`allow_inside` 只有分组行为真。
     ///
     /// 见 [`crate::dnd`] 模块注释第 2 条:这个回调会打给**每一个**注册者,
@@ -2366,7 +2973,27 @@ impl Render for ProjectList {
 
         let ordered = {
             let store = self.store.read(cx);
-            project_tree::get_ordered_tree(store.config())
+            // 父项目名下的 worktree 全部删空后清掉旧折叠记录，避免日后再建 worktree 时莫名保持折叠
+            if !self.collapsed_worktrees.is_empty() {
+                let projects = store.projects();
+                self.collapsed_worktrees
+                    .retain(|pid| !project_tree::worktree_descendants(projects, pid).is_empty());
+            }
+            // 同步分组与 worktree 簇的在飞折叠动画：播完或被外部改了状态即摘除恢复扁平
+            let tree = store.config().project_tree.as_deref().unwrap_or(&[]);
+            let projects = store.projects();
+            let collapsed_wt = &self.collapsed_worktrees;
+            self.folds.sync(|key| {
+                if let Some(gid) = key.strip_prefix("grp:") {
+                    project_tree::find_group_in_tree(tree, gid).map(|g| !g.collapsed)
+                } else if let Some(pid) = key.strip_prefix("wt:") {
+                    (!project_tree::worktree_descendants(projects, pid).is_empty())
+                        .then(|| !collapsed_wt.contains(pid))
+                } else {
+                    None
+                }
+            });
+            self.visible_ordered(store)
         };
         // 揭示在这里兑现:此刻的展平表已含 `reveal` 刚展开的分组,行号与这一帧铺出来
         // 的子元素一一对应。目标已不是活动项目(中栏收着时登记、展开前又被别处切走)
@@ -2394,7 +3021,7 @@ impl Render for ProjectList {
         self.sync_done_tags(&ordered, window, cx);
         self.chevrons.drive(window);
         let preview = self.render_preview(window, cx);
-        let list = self.render_rows(ordered, dragging.as_deref(), drag_active, cx);
+        let list = self.render_rows(ordered, dragging.as_deref(), drag_active, window, cx);
         let footer = self.render_footer(cx);
         let header = self.render_list_header(cx);
 
@@ -2540,15 +3167,7 @@ impl ProjectList {
                         if this.editing.is_some() {
                             return;
                         }
-                        // 点之前折着 = 点完展开:箭头从右指转到下指
-                        this.chevrons.flip_open(
-                            id_toggle.clone(),
-                            collapsed,
-                            crate::fold_motion::OPEN_TURNS,
-                        );
-                        this.store.update(cx, |store, cx| {
-                            store.toggle_group_collapse(&id_toggle, cx)
-                        });
+                        this.toggle_group_with_anim(&id_toggle, collapsed, cx);
                     }))
                     // Esc 放弃重命名。输入框自己不吃 Escape(`clean_on_escape` 没开,
                     // 它 `cx.propagate()`),所以在承载它的这一层收
@@ -2664,11 +3283,14 @@ impl ProjectList {
     }
 
     /// 列表本体:`get_ordered_tree` 展平出来的分组行 / 项目行逐条铺开。
+    /// 静止时 1:1 扁平输出（不破坏 `scroll_to_item` 行号）；仅刚翻态仍在飞的分组与
+    /// worktree 簇由 [`Self::render_ordered_slice`] 临时包进 `HeightReveal` 裁剪窗。
     fn render_rows(
         &self,
         ordered: Vec<OrderedItem>,
         dragging: Option<&str>,
         drag_active: bool,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let store_ref = self.store.read(cx);
@@ -2680,19 +3302,80 @@ impl ProjectList {
             .project_tree
             .clone()
             .unwrap_or_default();
-        let mut list = div()
-            .id("project-list-rows")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            // 滚动偏移交给句柄持有,揭示才滚得动它(见模块注释「揭示」)
-            .track_scroll(&self.rows_scroll)
-            // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
-            .on_scroll(cx.listener(|this, _event: &ScrollEvent, _window, cx| {
-                this.close_preview(cx);
-            }));
-        for item in ordered {
+
+        // 若有分组或 worktree 簇正在播「收起最后一程」，把它临时留在渲染表里供 HeightReveal 裁到 0
+        let (render_ordered, effective_collapsed_wt) = if self.folds.is_animating() {
+            let mut closing_groups = HashSet::new();
+            let mut closing_wt = HashSet::new();
+            for key in self.folds.closing_keys() {
+                if let Some(gid) = key.strip_prefix("grp:") {
+                    closing_groups.insert(gid.to_string());
+                } else if let Some(pid) = key.strip_prefix("wt:") {
+                    closing_wt.insert(pid.to_string());
+                }
+            }
+            let mut effective_wt = self.collapsed_worktrees.clone();
+            for pid in &closing_wt {
+                effective_wt.remove(pid);
+            }
+            let base = if closing_groups.is_empty() {
+                project_tree::get_ordered_tree(store_ref.config())
+            } else {
+                project_tree::get_ordered_tree_with_open_groups(store_ref.config(), &closing_groups)
+            };
+            let filtered = project_tree::filter_collapsed_worktrees(
+                base,
+                store_ref.projects(),
+                &effective_wt,
+            );
+            (filtered, effective_wt)
+        } else {
+            (ordered, self.collapsed_worktrees.clone())
+        };
+
+        let roles = project_tree::compute_cluster_roles(
+            &render_ordered,
+            store_ref.projects(),
+            &effective_collapsed_wt,
+        );
+        // 活动项目落在某个展开微容器内（父项目或其任意可见子项）→ 给该微容器外框叠微弱 accent
+        let active_clusters: HashSet<String> = active
+            .as_deref()
+            .and_then(|active_id| {
+                render_ordered.iter().zip(roles.iter()).find_map(|(item, role)| {
+                    let OrderedItem::Project { id, .. } = item else {
+                        return None;
+                    };
+                    if id != active_id {
+                        return None;
+                    }
+                    match role.as_ref()? {
+                        ProjectClusterRole::ExpandedParent { .. } => Some(id.clone()),
+                        ProjectClusterRole::Child { root_parent_id, .. } => {
+                            Some(root_parent_id.clone())
+                        }
+                        _ => None,
+                    }
+                })
+            })
+            .into_iter()
+            .collect();
+
+        enum PreparedRow {
+            Group(GroupRow),
+            Project { row: Box<Row>, is_active: bool },
+        }
+        impl PreparedRow {
+            fn depth(&self) -> usize {
+                match self {
+                    Self::Group(g) => g.depth,
+                    Self::Project { row, .. } => row.depth,
+                }
+            }
+        }
+
+        let mut prepared: Vec<PreparedRow> = Vec::with_capacity(render_ordered.len());
+        for (item, role) in render_ordered.into_iter().zip(roles) {
             match item {
                 OrderedItem::Group {
                     id,
@@ -2702,14 +3385,13 @@ impl ProjectList {
                     depth,
                     ..
                 } => {
-                    let row = GroupRow {
+                    prepared.push(PreparedRow::Group(GroupRow {
                         id,
                         name,
                         collapsed,
                         count,
                         depth,
-                    };
-                    list = list.child(self.render_group(row, dragging, drag_active, cx));
+                    }));
                 }
                 OrderedItem::Project {
                     id,
@@ -2735,6 +3417,40 @@ impl ProjectList {
                     // 探测缓存:`None` = 还没探完 / 已探但认不出,两种都走通用图标
                     let detected_kind = store.dir_kind(&p.path).flatten();
                     let remote = remote_badge(p, store.ssh_connections());
+                    let parent_name = p
+                        .parent_project_id
+                        .as_deref()
+                        .and_then(|pid| store.project(pid))
+                        .map(|parent| parent.name.clone());
+                    let cluster_role = role.unwrap_or(ProjectClusterRole::Standalone);
+                    let cluster_has_active = match &cluster_role {
+                        ProjectClusterRole::ExpandedParent { .. } => active_clusters.contains(&id),
+                        ProjectClusterRole::Child { root_parent_id, .. } => {
+                            active_clusters.contains(root_parent_id)
+                        }
+                        _ => false,
+                    };
+                    let collapsed_summary = if self.collapsed_worktrees.contains(&id) {
+                        let mut summary = CollapsedWorktreeSummary::default();
+                        for desc_id in project_tree::worktree_descendants(store.projects(), &id) {
+                            let is_desc_active = active.as_deref() == Some(desc_id.as_str());
+                            if is_desc_active {
+                                summary.contains_active = true;
+                            }
+                            if let Some(st) = store.project_state(&desc_id) {
+                                summary.light = summary.light.max(st.highest_light());
+                                if shows_done_tag(st.needs_attention, is_desc_active) {
+                                    summary.has_done = true;
+                                }
+                                if st.ssh_connected().is_some() {
+                                    summary.has_ssh = true;
+                                }
+                            }
+                        }
+                        summary
+                    } else {
+                        CollapsedWorktreeSummary::default()
+                    };
                     let row = Row {
                         id: p.id.clone(),
                         name: p.name.clone(),
@@ -2749,6 +3465,10 @@ impl ProjectList {
                         depth,
                         parent_group_id,
                         is_child,
+                        parent_name,
+                        cluster_role,
+                        cluster_has_active,
+                        collapsed_summary,
                         ai_vendors,
                         // 远程项目的路径是远端 POSIX 路径,本机 worktree 探测与它无关
                         worktree_branch: if remote.is_some() {
@@ -2759,19 +3479,159 @@ impl ProjectList {
                         remote,
                     };
                     let is_active = active.as_deref() == Some(row.id.as_str());
-                    list = list.child(self.render_project(
-                        row,
+                    prepared.push(PreparedRow::Project {
+                        row: Box::new(row),
                         is_active,
-                        dragging,
-                        drag_active,
-                        &tree_snapshot,
-                        cx,
-                    ));
+                    });
                 }
             }
         }
 
-        list
+        #[allow(clippy::too_many_arguments)]
+        fn build_slice(
+            this: &ProjectList,
+            items: &[PreparedRow],
+            dragging: Option<&str>,
+            drag_active: bool,
+            tree_snapshot: &[ProjectTreeItem],
+            in_animated_tray: bool,
+            window: &Window,
+            cx: &mut Context<ProjectList>,
+        ) -> Vec<AnyElement> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < items.len() {
+                match &items[i] {
+                    PreparedRow::Group(group) => {
+                        out.push(this.render_group(group.clone(), dragging, drag_active, cx));
+                        let key = format!("grp:{}", group.id);
+                        if let Some(fold) = this.folds.get(&key) {
+                            let depth = group.depth;
+                            let mut j = i + 1;
+                            while j < items.len() && items[j].depth() > depth {
+                                j += 1;
+                            }
+                            if j > i + 1 {
+                                let children = build_slice(
+                                    this,
+                                    &items[i + 1..j],
+                                    dragging,
+                                    drag_active,
+                                    tree_snapshot,
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                                let col = div().flex().flex_col().children(children);
+                                out.push(fold.render(col, window));
+                            }
+                            i = j;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    PreparedRow::Project { row, is_active } => {
+                        let wt_key = format!("wt:{}", row.id);
+                        if !row.is_child
+                            && let Some(fold) = this.folds.get(&wt_key)
+                        {
+                            let mut j = i + 1;
+                            while j < items.len()
+                                && matches!(
+                                    &items[j],
+                                    PreparedRow::Project { row: child, .. } if child.is_child
+                                )
+                            {
+                                j += 1;
+                            }
+                            out.push(this.render_project(
+                                (**row).clone(),
+                                *is_active,
+                                false,
+                                dragging,
+                                drag_active,
+                                tree_snapshot,
+                                cx,
+                            ));
+                            if j > i + 1 {
+                                let child_elems = build_slice(
+                                    this,
+                                    &items[i + 1..j],
+                                    dragging,
+                                    drag_active,
+                                    tree_snapshot,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                                let cluster_bg = ui::with_alpha(ui::border_subtle(), 0.78);
+                                let cluster_border = if row.cluster_has_active {
+                                    ui::with_alpha(ui::accent(), 0.28)
+                                } else {
+                                    ui::border_default()
+                                };
+                                // 微容器底部外框包在 HeightReveal 之外：收起 / 展开时圆角底边
+                                // 像物理抽屉一样平滑上下滑动，不会被裁剪窗削平
+                                let tray_inner =
+                                    div().flex().flex_col().pb(px(3.0)).children(child_elems);
+                                out.push(
+                                    div()
+                                        .mx(px(CLUSTER_MARGIN_X))
+                                        .mb(px(3.0))
+                                        .rounded_b(px(CLUSTER_RADIUS))
+                                        .border_l_1()
+                                        .border_r_1()
+                                        .border_b_1()
+                                        .border_color(cluster_border)
+                                        .bg(cluster_bg)
+                                        .overflow_hidden()
+                                        .child(fold.render(tray_inner, window))
+                                        .into_any_element(),
+                                );
+                            }
+                            i = j;
+                            continue;
+                        }
+                        out.push(this.render_project(
+                            (**row).clone(),
+                            *is_active,
+                            in_animated_tray,
+                            dragging,
+                            drag_active,
+                            tree_snapshot,
+                            cx,
+                        ));
+                        i += 1;
+                    }
+                }
+            }
+            out
+        }
+
+        let elements = build_slice(
+            self,
+            &prepared,
+            dragging,
+            drag_active,
+            &tree_snapshot,
+            false,
+            window,
+            cx,
+        );
+
+        div()
+            .id("project-list-rows")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll()
+            // 滚动偏移交给句柄持有,揭示才滚得动它(见模块注释「揭示」)
+            .track_scroll(&self.rows_scroll)
+            // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
+            .on_scroll(cx.listener(|this, _event: &ScrollEvent, _window, cx| {
+                this.close_preview(cx);
+            }))
+            .children(elements)
     }
 
     /// 栏头:只有 "PROJECTS" 文本 + 空白右键菜单(原版没有 `+` 按钮)。
@@ -2970,21 +3830,138 @@ impl ProjectList {
             .child("✕")
     }
 
-    /// 项目行的**交互挂载**:焦点 / 键盘 / 悬停 / 拖放 / 点击 / 右键菜单 + 行样式。
-    /// 行里的内容(图标、名字、徽章、状态灯……)由 [`Self::render_project`] 往里塞。
-    fn project_row_shell(
+    /// worktree 子项行的名字位（B1 分支优先）：编辑态换成内联输入框，否则主文 + 可选浅色副文。
+    fn child_row_label(
+        &self,
+        editing: Option<&Entity<InputState>>,
+        display: ChildDisplayLabel,
+        is_active: bool,
+    ) -> AnyElement {
+        match editing {
+            Some(input) => self.rename_input(input, 12.0),
+            None => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .when(is_active, |el| el.font_weight(FontWeight::MEDIUM))
+                        .child(display.primary),
+                )
+                .when_some(display.secondary, |el, sec| {
+                    el.child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_size(ui::font_px(10.0))
+                            .text_color(ui::text_muted())
+                            .truncate()
+                            .child(sec),
+                    )
+                })
+                .into_any_element(),
+        }
+    }
+
+    /// 父项目行上的 worktree 折叠切换胶囊：`[⑂ N (聚合状态点) ▾/▸]`。
+    /// 点击只切折叠态，不切换活动项目、不起拖拽。
+    fn worktree_toggle_chip(
+        &self,
+        parent_id: &str,
+        count: usize,
+        collapsed: bool,
+        summary: &CollapsedWorktreeSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id_toggle = parent_id.to_string();
+        let chevron_key = format!("wt:{parent_id}");
+        let turns = self.chevrons.value_open(
+            &chevron_key,
+            !collapsed,
+            crate::fold_motion::OPEN_TURNS,
+        );
+        let highlight = collapsed && summary.contains_active;
+        let fg = if highlight {
+            ui::accent()
+        } else if collapsed {
+            ui::text_secondary()
+        } else {
+            ui::text_muted()
+        };
+        let bg = if highlight {
+            ui::accent_subtle()
+        } else if collapsed {
+            ui::border_default()
+        } else {
+            ui::border_subtle()
+        };
+        let tip = if collapsed {
+            tr!("projectList", "worktreeToggleExpand", count = count)
+        } else {
+            tr!("projectList", "worktreeToggleCollapse", count = count)
+        };
+        let indicator = collapsed
+            .then(|| collapsed_worktree_indicator(summary))
+            .flatten();
+
+        div()
+            .id(SharedString::from(format!("wt-toggle-{parent_id}")))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(3.0))
+            .h(px(18.0))
+            .px(px(5.0))
+            .rounded(px(4.0))
+            .bg(bg)
+            .when(highlight, |el| {
+                el.border_1()
+                    .border_color(ui::with_alpha(ui::accent(), 0.38))
+            })
+            .cursor_pointer()
+            .text_size(ui::font_px(10.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(fg)
+            .hover(|el| el.bg(ui::border_strong()).text_color(ui::text_primary()))
+            .tip(tip)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_worktree_collapse(&id_toggle, cx);
+            }))
+            .child(VectorIcon::new(ICON_WORKTREE, px(10.0)).ink(fg))
+            .child(count.to_string())
+            .children(indicator)
+            .child(
+                div()
+                    .w(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(ui::font_px(8.5))
+                    .child(crate::fold_motion::fold_glyph(turns)),
+            )
+    }
+
+    /// 项目行共用的交互挂载（焦点 / 键盘 / 悬停 / 拖放 / 点击 / 右键菜单 / 路径 tooltip），
+    /// 样式壳由调用方（常规行 vs worktree 子项行）各自定制。
+    fn project_row_interactions(
         &self,
         row: &Row,
-        is_active: bool,
+        tooltip: String,
         dragging: Option<&str>,
         tree: &[ProjectTreeItem],
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let id = row.id.clone();
-        let path = row.path.clone();
         let kind = row.kind;
         let is_child = row.is_child;
-        let indent = project_indent(row.depth, row.parent_group_id.is_some());
         let is_source = dragging == Some(id.as_str());
         let id_click = id.clone();
         let id_move = id.clone();
@@ -2997,7 +3974,7 @@ impl ProjectList {
         let tree_for_menu: Vec<ProjectTreeItem> = tree.to_vec();
         let this = cx.entity();
         let focus = self.row_focus.get(id.as_str()).cloned();
-        // 编辑中的那一行:行本身的点击/按键让给输入框(输入框本体在 `project_row_label`)
+        // 编辑中的那一行:行本身的点击/按键让给输入框
         let is_editing = self
             .editing
             .as_ref()
@@ -3012,27 +3989,12 @@ impl ProjectList {
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 this.on_project_key(event, &id_key, window, cx);
             }))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .pl(px(indent))
-            .pr(px(10.0))
-            .py(px(6.0))
-            .rounded(px(3.0))
             .cursor_pointer()
-            .text_size(ui::font_px(13.0))
             .when(is_source, |el| el.opacity(0.4))
-            .when(is_active, |el| {
-                el.bg(ui::accent_subtle()).text_color(ui::accent())
-            })
-            .when(!is_active, |el| {
-                el.text_color(ui::text_secondary())
-                    .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-            })
             // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
             // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
             // 原生 tooltip 会盖住那张卡。这里同款条件挂
-            .when(row.ai_vendors.is_empty(), |el| el.tip(path.clone()))
+            .when(row.ai_vendors.is_empty(), |el| el.tip(tooltip))
             // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
             // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
             // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行
@@ -3128,16 +4090,200 @@ impl ProjectList {
             )
     }
 
+    /// 常规项目行（独立项目、折叠父项目、展开微容器头部）的样式壳。
+    fn project_row_shell(
+        &self,
+        row: &Row,
+        is_active: bool,
+        in_expanded_cluster: bool,
+        dragging: Option<&str>,
+        tree: &[ProjectTreeItem],
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let raw_indent = project_indent(row.depth, row.parent_group_id.is_some());
+        let (pl, pr) = if in_expanded_cluster {
+            ((raw_indent - CLUSTER_INSET).max(0.0), (10.0 - CLUSTER_INSET).max(0.0))
+        } else {
+            (raw_indent, 10.0)
+        };
+        self.project_row_interactions(row, row.path.clone(), dragging, tree, cx)
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(pl))
+            .pr(px(pr))
+            .py(px(6.0))
+            .when(in_expanded_cluster, |el| {
+                el.rounded_t(px(CLUSTER_INNER_RADIUS))
+                    .border_b_1()
+                    .border_color(ui::border_subtle())
+            })
+            .when(!in_expanded_cluster, |el| el.rounded(px(3.0)))
+            .text_size(ui::font_px(13.0))
+            .when(is_active, |el| {
+                el.bg(ui::accent_subtle()).text_color(ui::accent())
+            })
+            .when(!is_active, |el| {
+                el.text_color(ui::text_secondary())
+                    .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_project(
         &self,
         row: Row,
         is_active: bool,
+        in_animated_tray: bool,
         dragging: Option<&str>,
         drag_active: bool,
         tree: &[ProjectTreeItem],
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let cluster_bg = ui::with_alpha(ui::border_subtle(), 0.78);
+        let cluster_border = if row.cluster_has_active {
+            ui::with_alpha(ui::accent(), 0.28)
+        } else {
+            ui::border_default()
+        };
+
+        // ── 展开微容器内的 worktree 子项行（方案 B1 + C） ─────────
+        if let ProjectClusterRole::Child {
+            root_depth,
+            rel_depth,
+            is_last_sibling,
+            is_last_in_cluster,
+            ref ancestor_continues,
+            ..
+        } = row.cluster_role
+        {
+            let hovered = self.hovered.as_deref() == Some(row.id.as_str());
+            let show_done_tag = shows_done_tag(row.needs_attention, is_active);
+            let done_tag = self.done_tags.get(row.id.as_str());
+            let editing = self
+                .editing
+                .as_ref()
+                .filter(|e| !e.is_group && e.id == row.id)
+                .map(|e| e.input.clone());
+            let display = resolve_child_display_label(
+                &row.name,
+                &row.path,
+                row.parent_name.as_deref(),
+                row.worktree_branch.as_deref(),
+                row.description.as_deref(),
+            );
+            let tooltip = child_tooltip_text(
+                &row.name,
+                &row.path,
+                row.worktree_branch.as_deref(),
+                &display,
+            );
+            let in_group = row.parent_group_id.is_some();
+            let own_rail_x = cluster_rail_x(root_depth, in_group, rel_depth.saturating_sub(1));
+            let gutter_w = own_rail_x + CHILD_ELBOW_W + CHILD_ELBOW_GAP;
+            let connectors = child_tree_connectors(
+                root_depth,
+                in_group,
+                rel_depth,
+                is_last_sibling,
+                ancestor_continues,
+                is_active,
+            );
+            let branch_icon_color = if is_active {
+                ui::accent()
+            } else if hovered {
+                ui::text_secondary()
+            } else {
+                ui::text_muted()
+            };
+
+            let pill = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .px(px(6.0))
+                .py(px(3.5))
+                .rounded(px(4.0))
+                .text_size(ui::font_px(12.0))
+                .when(is_active, |el| {
+                    el.bg(ui::accent_subtle()).text_color(ui::accent())
+                })
+                .when(!is_active && hovered, |el| {
+                    el.bg(ui::border_subtle()).text_color(ui::text_primary())
+                })
+                .when(!is_active && !hovered, |el| {
+                    el.text_color(ui::text_secondary())
+                })
+                // 领位换成轻量的矢量分支图标（不再重复父项目的大号技术栈图标）
+                .child(VectorIcon::new(ICON_BRANCH, px(12.0)).ink(branch_icon_color))
+                .children((!row.ai_vendors.is_empty()).then(|| {
+                    ai_vendor_icons_sized(&row.ai_vendors, CHILD_AI_ICON_SIZE, -2.0)
+                }))
+                .child(self.child_row_label(editing.as_ref(), display, is_active))
+                // 远程子 worktree 正常态继承父项目连接，仅断链时单独标红提示
+                .children(
+                    row.remote
+                        .clone()
+                        .filter(|r| r.broken)
+                        .map(|remote| remote_badge_chip(&row.id, remote)),
+                )
+                .children(row_status_mark(
+                    &row.id,
+                    show_done_tag,
+                    done_tag,
+                    row.light,
+                    row.ssh_connected.as_deref(),
+                ))
+                .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
+
+            let row_el = self
+                .project_row_interactions(&row, tooltip, dragging, tree, cx)
+                .relative()
+                .flex()
+                .items_center()
+                .pl(px(gutter_w))
+                .pr(px(4.0))
+                .py(px(1.5))
+                .children(connectors)
+                .child(pill);
+
+            return div()
+                .relative()
+                .when(!in_animated_tray, |el| {
+                    el.mx(px(CLUSTER_MARGIN_X))
+                        .border_l_1()
+                        .border_r_1()
+                        .border_color(cluster_border)
+                        .bg(cluster_bg)
+                        .when(is_last_in_cluster, |el| {
+                            el.pb(px(3.0))
+                                .mb(px(3.0))
+                                .rounded_b(px(CLUSTER_RADIUS))
+                                .border_b_1()
+                        })
+                })
+                .when(hovered, |el| {
+                    let this = cx.entity();
+                    el.child(
+                        canvas(
+                            move |bounds, _window, cx| {
+                                this.update(cx, |list: &mut ProjectList, _cx| {
+                                    list.hover_rect = Some(bounds);
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                })
+                .child(row_el)
+                .into_any_element();
+        }
+
+        // ── 独立项目 / 折叠父项目 / 展开微容器头部 ──────────────
         let Row {
             ref id,
             light,
@@ -3152,6 +4298,16 @@ impl ProjectList {
         let ai_vendors = row.ai_vendors.clone();
         let worktree_branch = row.worktree_branch.clone();
         let remote = row.remote.clone();
+        let is_expanded_parent = matches!(row.cluster_role, ProjectClusterRole::ExpandedParent { .. });
+        // 箭头与胶囊状态认**真实折叠态**而非渲染外框态：收起动画最后一程时外框仍是
+        // ExpandedParent（连着正在滑合的底抽屉），但箭头必须同步从 ▾ 转回 ▸
+        let toggle_info = match row.cluster_role {
+            ProjectClusterRole::ExpandedParent { child_count }
+            | ProjectClusterRole::CollapsedParent { child_count } => {
+                Some((child_count, self.collapsed_worktrees.contains(id)))
+            }
+            _ => None,
+        };
         // 行尾的 ✕ 只在**这一行**被悬停时出现(原版 `hidden group-hover:inline`)。
         // 走 view state 而不是 `group_hover` + 透明度:透明的按钮仍然吃点击,
         // 而这个按钮的动作是「移除项目」,看不见还能点中是实打实的事故。
@@ -3168,7 +4324,7 @@ impl ProjectList {
             .map(|e| e.input.clone());
 
         let row_el = self
-            .project_row_shell(&row, is_active, dragging, tree, cx)
+            .project_row_shell(&row, is_active, is_expanded_parent, dragging, tree, cx)
             // 行首那道 accent 竖条(原版 `w-0.5 h-4 rounded-full`)。
             // ⚠️ 原版只在选中时才渲染这个 span,于是选中的一瞬整行内容右移
             // 10px;这里**恒占位**、未选中时透明,视觉一致但不抖。
@@ -3191,11 +4347,14 @@ impl ProjectList {
             // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
             .children((!ai_vendors.is_empty()).then(|| ai_vendor_icons(&ai_vendors)))
             .child(self.project_row_label(editing.as_ref(), name, description))
-            // worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)
+            // 独立（已脱离父项目或单独加入）linked worktree 的矢量分支徽章
             .children(worktree_branch.map(|branch| worktree_badge_chip(&row.id, branch)))
             // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
-            // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
+            // 挂有 worktree 的父项目：可折叠计数胶囊 `[⑂ N ▾/▸]`
+            .children(toggle_info.map(|(count, collapsed)| {
+                self.worktree_toggle_chip(&row.id, count, collapsed, &row.collapsed_summary, cx)
+            }))
             // 完成标 / AI 状态灯 / 右键 SSH 已连接灯三选一,**均无时都不画**
             .children(row_status_mark(
                 id,
@@ -3209,6 +4368,16 @@ impl ProjectList {
 
         div()
             .relative()
+            .when(is_expanded_parent, |el| {
+                el.mx(px(CLUSTER_MARGIN_X))
+                    .mt(px(3.0))
+                    .rounded_t(px(CLUSTER_RADIUS))
+                    .border_t_1()
+                    .border_l_1()
+                    .border_r_1()
+                    .border_color(cluster_border)
+                    .bg(cluster_bg)
+            })
             // 被悬停的那一行挂一块 canvas 量矩形 —— 缩略图的锚点要它。
             // **只给悬停中的那一行挂**:每行常驻一块的话,一屏几十个项目就是
             // 几十个白量的元素
@@ -3692,6 +4861,75 @@ mod tests {
         assert!(find_stale_worktree_projects(&projects, &alive).is_empty());
     }
 
+    #[test]
+    fn worktree监听过滤只放行worktrees结构变化() {
+        let ev = |path: &str, structural: bool| mt_project::watch::FsChange {
+            project_path: r"D:\repo\.git".into(),
+            path: PathBuf::from(path),
+            kind: String::new(),
+            structural,
+        };
+        // 首次建 `.git/worktrees` 与在里面建/删具体条目都命中
+        assert!(is_worktree_watch_event(&ev(r"D:\repo\.git\worktrees", true)));
+        assert!(is_worktree_watch_event(&ev(
+            r"D:\repo\.git\worktrees\feat-a",
+            true
+        )));
+        // Windows 非递归监听因子目录内 index/HEAD 写入上报的 Modify（structural=false）必须丢弃
+        assert!(!is_worktree_watch_event(&ev(
+            r"D:\repo\.git\worktrees\feat-a",
+            false
+        )));
+        assert!(!is_worktree_watch_event(&ev(
+            r"D:\repo\.git\worktrees",
+            false
+        )));
+        // `.git` 下无关文件（index / HEAD / FETCH_HEAD）结构变化也忽略
+        assert!(!is_worktree_watch_event(&ev(r"D:\repo\.git\HEAD", true)));
+        assert!(!is_worktree_watch_event(&ev(r"D:\repo\.git\index", true)));
+    }
+
+    #[test]
+    fn 自动发现worktree跳过已存在和手动移除项并去重() {
+        let projects = vec![
+            project("p1", r"D:\Git\repo", None),
+            // 已存在（甚至已脱离父项目）的 worktree 不应重复添加
+            project("existing-detached", r"d:/git/repo-old/", None),
+        ];
+        let dismissed = vec![crate::store::worktree_dismiss_key(None, r"D:\Git\repo-skip")];
+        let scanned = vec![
+            (
+                "p1".into(),
+                mt_project::git::LocalRepoWorktrees {
+                    git_dir: PathBuf::from(r"D:\Git\repo\.git"),
+                    worktrees_dir_exists: true,
+                    linked_paths: vec![
+                        r"D:\Git\repo-old".into(),
+                        r"D:\Git\repo-skip".into(),
+                        r"D:\Git\repo-new".into(),
+                        r"d:/git/repo-new/".into(),
+                    ],
+                    has_pending_invalid: false,
+                },
+            ),
+            // 父项目在扫描期间被删掉 → 跳过
+            (
+                "gone-parent".into(),
+                mt_project::git::LocalRepoWorktrees {
+                    git_dir: PathBuf::from(r"D:\Git\gone\.git"),
+                    worktrees_dir_exists: true,
+                    linked_paths: vec![r"D:\Git\gone-wt".into()],
+                    has_pending_invalid: false,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            plan_auto_added_worktrees(&projects, &dismissed, &scanned),
+            vec![("p1".to_string(), r"D:\Git\repo-new".to_string())]
+        );
+    }
+
     // ─── 揭示 ───────────────────────────────────────────────
 
     fn tree_group(id: &str, collapsed: bool, children: Vec<ProjectTreeItem>) -> ProjectTreeItem {
@@ -3784,5 +5022,101 @@ mod tests {
         assert_eq!(reveal_row_index(&after, "父"), Some(4));
         assert_eq!(reveal_row_index(&after, "wt"), Some(5));
         assert_eq!(reveal_row_index(&after, "外"), Some(0));
+    }
+
+    // ─── B1 + C：worktree 子项文案、提示与树轨坐标 ────────────
+
+    #[test]
+    fn worktree子项默认分支优先_重命名后尊重自定义名() {
+        // 默认目录名 + 探测到分支 → 主文直接显示分支名
+        let d = resolve_child_display_label(
+            "mini-term-plugin",
+            r"D:\Git\mini-term-plugin",
+            Some("mini-term"),
+            Some("feat/plugin-system"),
+            None,
+        );
+        assert_eq!(
+            d,
+            ChildDisplayLabel {
+                primary: "feat/plugin-system".into(),
+                secondary: None,
+                primary_is_branch: true,
+            }
+        );
+
+        // 用户手动 F2 重命名 → 自定义名作主文，分支名作浅色副文
+        let renamed = resolve_child_display_label(
+            "插件系统重构",
+            r"D:\Git\mini-term-plugin",
+            Some("mini-term"),
+            Some("feat/plugin-system"),
+            Some("一期"),
+        );
+        assert_eq!(
+            renamed,
+            ChildDisplayLabel {
+                primary: "插件系统重构".into(),
+                secondary: Some("feat/plugin-system · 一期".into()),
+                primary_is_branch: false,
+            }
+        );
+
+        // 游离 HEAD（无分支）→ 剥掉与父项目重复的前缀
+        let detached = resolve_child_display_label(
+            "mini-term-plugin-agents",
+            r"D:\Git\mini-term-plugin-agents",
+            Some("mini-term"),
+            None,
+            None,
+        );
+        assert_eq!(
+            detached,
+            ChildDisplayLabel {
+                primary: "plugin-agents".into(),
+                secondary: None,
+                primary_is_branch: false,
+            }
+        );
+
+        // 游离 HEAD 但目录名不含父项目前缀 → 原样显示
+        let plain = resolve_child_display_label(
+            "hotfix-v2",
+            "/srv/worktrees/hotfix-v2",
+            Some("mini-term"),
+            None,
+            None,
+        );
+        assert_eq!(plain.primary, "hotfix-v2");
+    }
+
+    #[test]
+    fn worktree子项悬停提示交代目录与分支() {
+        let display = resolve_child_display_label(
+            "mini-term-plugin",
+            r"D:\Git\mini-term-plugin",
+            Some("mini-term"),
+            Some("feat/plugin-system"),
+            None,
+        );
+        assert_eq!(
+            child_tooltip_text(
+                "mini-term-plugin",
+                r"D:\Git\mini-term-plugin",
+                Some("feat/plugin-system"),
+                &display
+            ),
+            "mini-term-plugin · feat/plugin-system\nD:\\Git\\mini-term-plugin"
+        );
+    }
+
+    #[test]
+    fn 树轨坐标对齐父项目领位图标水平中心() {
+        // 顶层父项目：indent=10，微容器内左缘在 x=5，内左垫 5 + 竖条 2 + gap 6 + 半图标 7 = 20（全局 x=25）
+        assert_eq!(cluster_rail_x(0, false, 0), 20.0);
+        // 组内父项目(depth=1)：indent=16，微容器内左垫 11 + 15 = 26（全局 x=31）
+        assert_eq!(cluster_rail_x(1, true, 0), 26.0);
+        // 嵌套孙项向右步进一个 CHILD_NEST_STEP
+        assert_eq!(cluster_rail_x(0, false, 1), 20.0 + CHILD_NEST_STEP);
     }
 }

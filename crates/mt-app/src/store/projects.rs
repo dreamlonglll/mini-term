@@ -17,6 +17,15 @@ use super::events::StoreChanged;
 use super::pure::{forget_recent_project, remove_from_tree, touch_recent_project};
 use super::{AppStore, ProjectState, StoreEvent};
 
+/// `AppConfig::dismissed_worktrees` 的归一键：本地走 Windows 语义归一、远程按连接 + POSIX 去尾斜杠，
+/// 两端带前缀不撞车。
+pub fn worktree_dismiss_key(connection_id: Option<&str>, path: &str) -> String {
+    match connection_id {
+        None => format!("local:{}", mt_core::path_key::windows_eq_key(path)),
+        Some(conn) => format!("ssh:{conn}:{}", mt_core::path_key::posix_trim_trailing(path)),
+    }
+}
+
 /// Removing a parent also affects the recovery entry of its nested projects.
 fn removal_source_pending<'a>(
     config: &'a AppConfig,
@@ -294,6 +303,36 @@ impl AppStore {
         }
     }
 
+    pub fn is_worktree_dismissed(&self, connection_id: Option<&str>, path: &str) -> bool {
+        let key = worktree_dismiss_key(connection_id, path);
+        self.config.dismissed_worktrees.iter().any(|k| k == &key)
+    }
+
+    /// 清除某个 worktree 路径的忽略标记（手动重新添加项目、通过管理弹窗新建或删除 worktree 时调）。
+    pub fn clear_dismissed_worktree(&mut self, connection_id: Option<&str>, path: &str) -> bool {
+        let key = worktree_dismiss_key(connection_id, path);
+        let before = self.config.dismissed_worktrees.len();
+        self.config.dismissed_worktrees.retain(|k| k != &key);
+        self.config.dismissed_worktrees.len() != before
+    }
+
+    /// 本地全量 worktree 扫描完成且全部候选项目根目录均可达时调用：
+    /// 清理已不在磁盘上的本地忽略条目（保留仍存活的本地条目与全部远程条目），
+    /// 这样某条 worktree 在磁盘上删除后，日后在同路径新建的新 worktree 仍可自动识别。
+    pub fn prune_local_dismissed_worktrees(
+        &mut self,
+        live_local_keys: &HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.config.dismissed_worktrees.len();
+        self.config
+            .dismissed_worktrees
+            .retain(|k| !k.starts_with("local:") || live_local_keys.contains(k));
+        if self.config.dismissed_worktrees.len() != before {
+            self.save_config_soon(cx);
+        }
+    }
+
     pub fn add_git_worktree_project(
         &mut self,
         name: String,
@@ -302,8 +341,13 @@ impl AppStore {
         parent: Option<String>,
         cx: &mut Context<Self>,
     ) -> String {
+        let cleared = self.clear_dismissed_worktree(connection_id.as_deref(), &path);
         if let Some(existing) = self.find_project_by_backend_path(connection_id.as_deref(), &path) {
-            return existing.id.clone();
+            let id = existing.id.clone();
+            if cleared {
+                self.save_config_soon(cx);
+            }
+            return id;
         }
         let Some(connection_id) = connection_id else {
             return self.add_project_at(Path::new(&path), parent.as_deref(), cx);
@@ -354,7 +398,11 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> String {
         let path_str = path.to_string_lossy().to_string();
+        let cleared = self.clear_dismissed_worktree(None, &path_str);
         if let Some(existing) = self.find_project_by_path(&path_str).map(|p| p.id.clone()) {
+            if cleared {
+                self.save_config_soon(cx);
+            }
             return existing;
         }
         let name = path
@@ -571,6 +619,24 @@ impl AppStore {
         self.save_config_soon(cx);
         cx.emit(StoreEvent::ProjectTreeChanged);
         cx.changed(StoreEvent::ProjectsChanged);
+    }
+
+    /// 用户主动在项目列表中确认移除项目：照常删项目，并在确实移除后将路径记入
+    /// `dismissed_worktrees`，防止仍在磁盘上的 linked worktree 随后被自动扫描重新加回。
+    pub fn remove_project_by_user(&mut self, id: &str, cx: &mut Context<Self>) {
+        let target = self
+            .project(id)
+            .map(|p| (p.ssh_connection_id.clone(), p.path.clone()));
+        self.remove_project(id, cx);
+        if self.project(id).is_none()
+            && let Some((conn_id, path)) = target
+        {
+            let key = worktree_dismiss_key(conn_id.as_deref(), &path);
+            if !self.config.dismissed_worktrees.iter().any(|k| k == &key) {
+                self.config.dismissed_worktrees.push(key);
+                self.save_config_soon(cx);
+            }
+        }
     }
 
     // === 项目分组(`store.ts:1266-1313` 的五个 action) ===
@@ -889,6 +955,60 @@ mod tests {
                 ));
                 store.remove_project("source", cx);
                 assert!(store.project("source").is_none());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn 手动移除记录worktree忽略键并在重加或磁盘消失后清理(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::toast::init);
+        let config = AppConfig {
+            projects: vec![
+                ProjectConfig::new("root", "repo", r"D:\Git\repo"),
+                ProjectConfig {
+                    parent_project_id: Some("root".into()),
+                    ..ProjectConfig::new("wt1", "repo-wt1", r"D:\Git\repo-wt1")
+                },
+                ProjectConfig {
+                    ssh_connection_id: Some("ssh1".into()),
+                    parent_project_id: Some("remote-root".into()),
+                    ..ProjectConfig::new("rwt", "rwt", "/srv/repo-wt")
+                },
+            ],
+            ..Default::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                // 用户手动移除本地与远程 worktree → 均记入忽略表
+                store.remove_project_by_user("wt1", cx);
+                store.remove_project_by_user("rwt", cx);
+                assert!(store.is_worktree_dismissed(None, r"d:/git/repo-wt1/"));
+                assert!(store.is_worktree_dismissed(Some("ssh1"), "/srv/repo-wt/"));
+                assert!(!store.is_worktree_dismissed(Some("ssh2"), "/srv/repo-wt"));
+
+                // 本地全量扫描时：仍存活的本地忽略条目保留，远程条目不动
+                let live: HashSet<String> = [worktree_dismiss_key(None, r"D:\Git\repo-wt1")]
+                    .into_iter()
+                    .collect();
+                store.prune_local_dismissed_worktrees(&live, cx);
+                assert!(store.is_worktree_dismissed(None, r"D:\Git\repo-wt1"));
+                assert!(store.is_worktree_dismissed(Some("ssh1"), "/srv/repo-wt"));
+
+                // 当本地 worktree 从磁盘消失后，本地忽略条目被自动清理，远程仍保留
+                store.prune_local_dismissed_worktrees(&HashSet::new(), cx);
+                assert!(!store.is_worktree_dismissed(None, r"D:\Git\repo-wt1"));
+                assert!(store.is_worktree_dismissed(Some("ssh1"), "/srv/repo-wt"));
+
+                // 手动重新添加远程 worktree 后，对应忽略键立刻清除
+                store.add_git_worktree_project(
+                    "rwt".into(),
+                    "/srv/repo-wt".into(),
+                    Some("ssh1".into()),
+                    None,
+                    cx,
+                );
+                assert!(!store.is_worktree_dismissed(Some("ssh1"), "/srv/repo-wt"));
             })
         });
     }

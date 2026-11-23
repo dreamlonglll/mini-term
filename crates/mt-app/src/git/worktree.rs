@@ -34,9 +34,9 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, prelude::FluentBuilder as _, px,
+    Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::ProjectConfig;
 use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
@@ -303,7 +303,110 @@ struct RepoGroup {
     main_path: String,
     context: GitContext,
     worktrees: Vec<WorktreeInfo>,
+    /// 主仓库根下是否已存在 `.worktrees` 目录（后台探测，仅用于智能默认路径习惯）。
+    has_dot_worktrees: bool,
     error: Option<String>,
+}
+
+/// 单个仓库新建 worktree 的目标目录模板。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathTemplate {
+    /// 目标父目录（例如 `D:\Git\mini-term\.worktrees` 或 `D:\Git`）。
+    parent_dir: String,
+    /// 目录名前是否加 `<仓库名>-` 前缀：
+    /// 放在仓库内部子目录（如 `.worktrees/`）时不重复仓库名，直接 `<分支>`；
+    /// 放在仓库外部（同级目录或外部目录）时用 `<仓库名>-<分支>` 避免撞名。
+    prefix_repo_name: bool,
+}
+
+impl PathTemplate {
+    fn format_dir(&self, context: &GitContext, repo_name: &str, leaf: &str) -> String {
+        let child = if self.prefix_repo_name {
+            format!("{repo_name}-{leaf}")
+        } else {
+            leaf.to_string()
+        };
+        context_join_path(context, &self.parent_dir, &child)
+    }
+}
+
+/// 按仓库已有的 worktree 存放习惯推断新 worktree 的默认目录模板：
+/// 1. 若已有有效 linked worktree 落在主仓库内部子目录（如 `<main>/.worktrees/<x>`），
+///    或主仓库根下已存在 `.worktrees/` 目录 → 优先沿用该内部子目录（`.worktrees` 优先），不加仓库名前缀；
+/// 2. 否则若已有有效 linked worktree 落在仓库外部目录 → 沿用出现最多的那个外部父目录，加 `<仓库名>-` 前缀；
+/// 3. 都没有 → 回落经典同级目录 `<parent(main)>/<仓库名>-<分支>`。
+fn infer_worktree_path_template(group: &RepoGroup) -> Option<PathTemplate> {
+    let remote = group.context.is_remote();
+    let main_key = path_key(remote, &group.main_path);
+
+    let mut inside_counts: Vec<(String, String, usize)> = Vec::new();
+    let mut outside_counts: Vec<(String, String, usize)> = Vec::new();
+
+    for wt in &group.worktrees {
+        if wt.is_main || !wt.is_valid {
+            continue;
+        }
+        let parent = context_parent_dir(&group.context, &wt.path);
+        if parent.is_empty() {
+            continue;
+        }
+        let pkey = path_key(remote, parent);
+        if pkey == main_key {
+            continue;
+        }
+        let bucket = if backend_path_within(&group.context, parent, &group.main_path) {
+            &mut inside_counts
+        } else {
+            &mut outside_counts
+        };
+        if let Some(entry) = bucket.iter_mut().find(|(k, _, _)| *k == pkey) {
+            entry.2 += 1;
+        } else {
+            bucket.push((pkey, parent.to_string(), 1));
+        }
+    }
+
+    if !inside_counts.is_empty() {
+        let dot_wt_key = path_key(
+            remote,
+            &context_join_path(&group.context, &group.main_path, ".worktrees"),
+        );
+        if let Some((_, dir, _)) = inside_counts.iter().find(|(k, _, _)| *k == dot_wt_key) {
+            return Some(PathTemplate {
+                parent_dir: dir.clone(),
+                prefix_repo_name: false,
+            });
+        }
+        if let Some((_, dir, _)) = inside_counts.iter().max_by_key(|(_, _, count)| *count) {
+            return Some(PathTemplate {
+                parent_dir: dir.clone(),
+                prefix_repo_name: false,
+            });
+        }
+    }
+
+    if group.has_dot_worktrees {
+        return Some(PathTemplate {
+            parent_dir: context_join_path(&group.context, &group.main_path, ".worktrees"),
+            prefix_repo_name: false,
+        });
+    }
+
+    if let Some((_, dir, _)) = outside_counts.iter().max_by_key(|(_, _, count)| *count) {
+        return Some(PathTemplate {
+            parent_dir: dir.clone(),
+            prefix_repo_name: true,
+        });
+    }
+
+    let parent = context_parent_dir(&group.context, &group.main_path);
+    if parent.is_empty() {
+        return None;
+    }
+    Some(PathTemplate {
+        parent_dir: parent.to_string(),
+        prefix_repo_name: true,
+    })
 }
 
 /// 把逐仓库的 `list_worktrees` 结果归并成组。
@@ -331,6 +434,7 @@ fn merge_groups(
                     main_path,
                     context,
                     worktrees,
+                    has_dot_worktrees: false,
                     error: None,
                 });
             }
@@ -346,6 +450,7 @@ fn merge_groups(
                     main_path: path,
                     context,
                     worktrees: Vec::new(),
+                    has_dot_worktrees: false,
                     error: Some(err),
                 });
             }
@@ -375,8 +480,20 @@ struct WorktreeModal {
     selected_keys: Vec<String>,
     /// 各组的分支(按组键),同样共享。
     branches_by_repo: HashMap<String, Rc<Vec<BranchInfo>>>,
+    /// 正在异步拉取分支的组键（避免拉取未返回前把「加载中」误判成「没有可用分支」）。
+    branches_loading: HashSet<String>,
     /// 两个下拉的选项(见 [`OptionsCache`])。
     options_cache: RefCell<Option<OptionsCache>>,
+    /// 「新建 worktree」区域是否展开（默认收起，优先清爽浏览与管理已有 worktree）。
+    create_open: bool,
+    /// 「新建 worktree」展开 / 收起高度裁剪动画。
+    create_reveal: crate::height_reveal::HeightReveal,
+    /// 「新建 worktree」标题栏折叠箭头补间。
+    create_chevron: crate::fold_motion::FlipTweens,
+    /// 用户是否手动切换过「检出现有分支 / 新建分支」；未手切且可用现有分支为空时自动切到「新建分支」。
+    mode_touched: bool,
+    /// 本次展开「新建 worktree」后是否已为新分支输入框自动聚焦过。
+    auto_focused_on_open: bool,
     mode: Mode,
     /// 「已有分支 / 新分支」段控件的滑动选中块(见 `segment_slider`)。
     mode_slider: crate::segment_slider::IndicatorSlider,
@@ -386,13 +503,18 @@ struct WorktreeModal {
     wt_path: Entity<InputState>,
     /// 用户手改过路径之后就不再跟随建议。
     path_edited: bool,
-    add_as_project: bool,
+    /// 上一次自动写入 `wt_path` 的建议路径（用于在 `InputEvent::Change` 里无竞态区分自动填入与手动编辑）。
+    last_suggested_path: String,
+    /// 上一次写入 `wt_path` 的占位预览文案（值一致不重复 `set_placeholder`）。
+    last_path_placeholder: String,
+    switch_after_create: bool,
     creating: bool,
     create_error: Option<String>,
     /// 逐仓库的创建错误(部分失败时留在弹窗里)。
     create_results: Vec<(String, String)>,
     pruning_key: Option<String>,
     on_changed: Rc<dyn Fn(&mut App)>,
+    _subs: Vec<Subscription>,
 }
 
 /// 「检出现有分支」/「新分支起点」下拉的选项缓存。
@@ -545,34 +667,91 @@ pub fn open(
             .is_some_and(|project| project.ssh_connection_id.as_deref() == context.connection_id())
     });
     let root_name = context_base_name(&context, &repo_path).to_string();
-    let state = cx.new(|cx| WorktreeModal {
-        store,
-        repo_path: repo_path.clone(),
-        context,
-        discover_repos,
-        project_id,
-        groups: None,
-        load_error: None,
-        selected_keys: Vec::new(),
-        branches_by_repo: HashMap::new(),
-        options_cache: RefCell::new(None),
-        mode: Mode::Existing,
-        mode_slider: crate::segment_slider::IndicatorSlider::new(),
-        sel_branch: String::new(),
-        base_branch: String::new(),
-        new_branch: cx.new(|cx| {
+    let state = cx.new(|cx| {
+        let new_branch = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("worktree", "newBranchPlaceholder"))
-        }),
-        wt_path: cx
-            .new(|cx| InputState::new(window, cx).placeholder(t("worktree", "pathPlaceholder"))),
-        path_edited: false,
-        // 默认勾选(`GitWorktreeModal.tsx:198`)
-        add_as_project: true,
-        creating: false,
-        create_error: None,
-        create_results: Vec::new(),
-        pruning_key: None,
-        on_changed: Rc::new(on_changed),
+        });
+        let wt_path = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t("worktree", "pathPlaceholder")));
+        let sub_branch = cx.subscribe_in(
+            &new_branch,
+            window,
+            |this: &mut WorktreeModal, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    this.create_error = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    let Some(groups) = this.groups.clone() else {
+                        return;
+                    };
+                    let entity = cx.entity();
+                    window.defer(cx, move |window, cx| {
+                        create(&entity, &groups, window, cx);
+                    });
+                }
+                _ => {}
+            },
+        );
+        let sub_path = cx.subscribe_in(
+            &wt_path,
+            window,
+            |this: &mut WorktreeModal, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let cur = input.read(cx).value().to_string();
+                    if cur != this.last_suggested_path {
+                        this.path_edited = true;
+                    }
+                    this.create_error = None;
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    let Some(groups) = this.groups.clone() else {
+                        return;
+                    };
+                    let entity = cx.entity();
+                    window.defer(cx, move |window, cx| {
+                        create(&entity, &groups, window, cx);
+                    });
+                }
+                _ => {}
+            },
+        );
+        WorktreeModal {
+            store,
+            repo_path: repo_path.clone(),
+            context,
+            discover_repos,
+            project_id,
+            groups: None,
+            load_error: None,
+            selected_keys: Vec::new(),
+            branches_by_repo: HashMap::new(),
+            branches_loading: HashSet::new(),
+            options_cache: RefCell::new(None),
+            create_open: false,
+            create_reveal: crate::height_reveal::HeightReveal::new(false),
+            create_chevron: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
+            mode_touched: false,
+            auto_focused_on_open: false,
+            mode: Mode::Existing,
+            mode_slider: crate::segment_slider::IndicatorSlider::new(),
+            sel_branch: String::new(),
+            base_branch: String::new(),
+            new_branch,
+            wt_path,
+            path_edited: false,
+            last_suggested_path: String::new(),
+            last_path_placeholder: t("worktree", "pathPlaceholder").to_string(),
+            // 默认勾选：创建完自动切到新项目（worktree 本身无论是否勾选都会自动添加为项目）
+            switch_after_create: true,
+            creating: false,
+            create_error: None,
+            create_results: Vec::new(),
+            pruning_key: None,
+            on_changed: Rc::new(on_changed),
+            _subs: vec![sub_branch, sub_path],
+        }
     });
 
     load(&state, cx);
@@ -587,6 +766,57 @@ pub fn open(
             ))
             .w(px(600.0))
             .child(body)
+    });
+}
+
+/// 将弹窗加载到的有效 linked worktree 自动同步为项目（覆盖远程 SSH 仓库与多仓库父目录项目；
+/// 已存在或被用户手动移除忽略的路径跳过）。
+fn sync_loaded_worktrees_to_projects(
+    store: &Entity<AppStore>,
+    groups: &[RepoGroup],
+    parent_hint: Option<&str>,
+    cx: &mut App,
+) {
+    let mut to_add: Vec<(String, String, Option<String>, Option<String>)> = Vec::new();
+    {
+        let store_ref = store.read(cx);
+        for group in groups {
+            if group.error.is_some() {
+                continue;
+            }
+            let conn_id = group.context.connection_id();
+            let parent = store_ref
+                .find_project_by_backend_path(conn_id, &group.main_path)
+                .map(|p| p.id.clone())
+                .or_else(|| parent_hint.map(str::to_string));
+            for wt in &group.worktrees {
+                if wt.is_main || !wt.is_valid {
+                    continue;
+                }
+                if store_ref
+                    .find_project_by_backend_path(conn_id, &wt.path)
+                    .is_some()
+                    || store_ref.is_worktree_dismissed(conn_id, &wt.path)
+                {
+                    continue;
+                }
+                let name = context_base_name(&group.context, &wt.path).to_string();
+                to_add.push((
+                    name,
+                    wt.path.clone(),
+                    conn_id.map(str::to_string),
+                    parent.clone(),
+                ));
+            }
+        }
+    }
+    if to_add.is_empty() {
+        return;
+    }
+    store.update(cx, |store, cx| {
+        for (name, path, conn_id, parent) in to_add {
+            store.add_git_worktree_project(name, path, conn_id, parent, cx);
+        }
     });
 }
 
@@ -616,49 +846,77 @@ fn load(state: &Entity<WorktreeModal>, cx: &mut App) {
             } else {
                 vec![repo_for_task.path().to_string()]
             };
-            Ok(paths
+            let is_remote = repo_for_task.is_remote();
+            let mut dot_worktrees_keys: HashSet<String> = HashSet::new();
+            let items = paths
                 .into_iter()
                 .map(|path| {
                     let result = repo_for_task
                         .with_path(path.clone())
                         .list_worktrees()
                         .map_err(|err| git_ui::error_text(&err));
+                    if !is_remote
+                        && let Ok(ref list) = result
+                    {
+                        let main_path = list
+                            .iter()
+                            .find(|w| w.is_main)
+                            .map(|w| w.path.as_str())
+                            .unwrap_or(path.as_str());
+                        if std::path::Path::new(main_path).join(".worktrees").is_dir() {
+                            dot_worktrees_keys.insert(path_key(false, main_path));
+                        }
+                    }
                     (path, result)
                 })
-                .collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            Ok((items, dot_worktrees_keys))
         })
         .await;
 
-        state.update(cx, |s: &mut WorktreeModal, cx| {
-            match loaded {
-                Err(err) => {
-                    s.groups = Some(Rc::default());
-                    s.load_error = Some(err);
-                }
-                Ok(items) => {
-                    // 单仓库时沿用旧行为:加载失败即整体报错,不显示空壳分组
-                    if !s.discover_repos
-                        && items.len() == 1
-                        && let Some((_, Err(err))) = items.first()
-                    {
-                        s.groups = Some(Rc::default());
-                        s.load_error = Some(err.clone());
-                        cx.notify();
-                        return;
-                    }
-                    let groups = merge_groups(&context, items);
-                    // 勾选保留:剔除消失的键;只剩一个可用仓库时自动勾上
-                    s.selected_keys
-                        .retain(|k| groups.iter().any(|g| &g.key == k));
-                    if s.selected_keys.is_empty() && groups.len() == 1 && groups[0].error.is_none()
-                    {
-                        s.selected_keys = vec![groups[0].key.clone()];
-                    }
-                    s.groups = Some(Rc::new(groups));
-                }
+        let synced = state.update(cx, |s: &mut WorktreeModal, cx| match loaded {
+            Err(err) => {
+                s.groups = Some(Rc::default());
+                s.load_error = Some(err);
+                cx.notify();
+                None
             }
-            cx.notify();
+            Ok((items, dot_worktrees_keys)) => {
+                // 单仓库时沿用旧行为:加载失败即整体报错,不显示空壳分组
+                if !s.discover_repos
+                    && items.len() == 1
+                    && let Some((_, Err(err))) = items.first()
+                {
+                    s.groups = Some(Rc::default());
+                    s.load_error = Some(err.clone());
+                    cx.notify();
+                    return None;
+                }
+                let mut groups = merge_groups(&context, items);
+                for g in &mut groups {
+                    if !g.context.is_remote()
+                        && dot_worktrees_keys.contains(&path_key(false, &g.main_path))
+                    {
+                        g.has_dot_worktrees = true;
+                    }
+                }
+                let groups = Rc::new(groups);
+                // 勾选保留:剔除消失的键;只剩一个可用仓库时自动勾上
+                s.selected_keys
+                    .retain(|k| groups.iter().any(|g| &g.key == k));
+                if s.selected_keys.is_empty() && groups.len() == 1 && groups[0].error.is_none() {
+                    s.selected_keys = vec![groups[0].key.clone()];
+                }
+                s.groups = Some(groups.clone());
+                cx.notify();
+                Some((s.store.clone(), groups, s.project_id.clone()))
+            }
         });
+        if let Some((store, groups, parent_hint)) = synced {
+            cx.update(|cx| {
+                sync_loaded_worktrees_to_projects(&store, &groups, parent_hint.as_deref(), cx);
+            });
+        }
     })
     .detach();
 }
@@ -668,32 +926,36 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
     let pending: Vec<(String, GitContext)> = {
         let s = state.read(cx);
         let Some(groups) = &s.groups else {
-            return Vec::new().into_iter().collect();
+            return;
         };
         groups
             .iter()
             .filter(|g| s.selected_keys.contains(&g.key))
-            .filter(|g| !s.branches_by_repo.contains_key(&g.key))
+            .filter(|g| {
+                !s.branches_by_repo.contains_key(&g.key) && !s.branches_loading.contains(&g.key)
+            })
             .map(|g| (g.key.clone(), g.context.clone()))
             .collect()
     };
     for (key, context) in pending {
         let state = state.clone();
-        // 先占位,避免同一帧内重复排队
+        // 先登记 loading，避免同一帧内重复排队，同时不污染 branches_by_repo
         state.update(cx, |s, _| {
-            s.branches_by_repo.insert(key.clone(), Rc::default());
+            s.branches_loading.insert(key.clone());
         });
         cx.spawn(async move |cx| {
             let execution = context.clone();
             let result =
                 mt_remote::run_git_on(&execution, move || context.get_repo_branches()).await;
             state.update(cx, |s: &mut WorktreeModal, cx| {
+                s.branches_loading.remove(&key);
                 match result {
                     Ok(list) => {
                         s.branches_by_repo.insert(key, Rc::new(list));
                     }
                     Err(err) => {
                         tracing::warn!("[git] 取分支失败: {err:#}");
+                        s.branches_by_repo.insert(key, Rc::default());
                         s.create_error = Some(git_ui::error_text(&err));
                     }
                 }
@@ -717,6 +979,7 @@ fn hint_line(text: impl Into<SharedString>) -> AnyElement {
 
 fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App) -> AnyElement {
     ensure_branches(state, cx);
+    state.read(cx).create_chevron.drive(window);
     let s = state.read(cx);
     let mut root = div().flex().flex_col().gap(px(8.0));
 
@@ -781,47 +1044,146 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
         );
     }
 
-    // 「已是项目」:每行都要按路径找项目,先一次建好表(同一路径取最先的那个项目,与逐行
-    // `find` 同一口径),不再每行把全部项目扫一遍、每次比较都现算两个归一键
-    let projects = backend_project_ids(
-        state.read(cx).store.read(cx).projects(),
-        &state.read(cx).context,
-    );
+    // 路径 → 项目 id + 当前激活项目 id，用于整行点击切换与「当前」高亮
+    let (projects, active_project_id) = {
+        let s = state.read(cx);
+        let store = s.store.read(cx);
+        (
+            backend_project_ids(store.projects(), &s.context),
+            store.active_project_id.clone(),
+        )
+    };
+    let mut list = div()
+        .id("worktree-list-scroll")
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .max_h(px(300.0))
+        .overflow_y_scroll();
     for index in 0..groups.len() {
-        root = root.child(render_group(
-            state, &groups, index, multi_repo, &projects, cx,
+        list = list.child(render_group(
+            state,
+            &groups,
+            index,
+            multi_repo,
+            &projects,
+            active_project_id.as_deref(),
+            cx,
         ));
     }
+    root = root.child(list);
 
-    // 默认路径建议(`GitWorktreeModal.tsx:289-303` 那个 effect 的对应物)。
-    // 放在这里是因为它要 `&mut Window` 去写输入框,而这里正是每帧重跑的地方 ——
-    // 值一致就直接 return,不会自激。
+    // 展开新建区且分支列表就绪后：没有可检出的现有分支时自动切到「新建分支」并聚焦分支输入框
+    sync_create_mode_and_focus(state, &groups, window, cx);
+
+    // 默认路径建议 + 占位预览（值 / 占位未变化时直接 return，不会自激）
     sync_path_suggestion(state, &groups, window, cx);
 
-    root = root.child(render_create_section(state, &groups, multi_repo, cx));
+    root = root.child(render_create_section(state, &groups, multi_repo, window, cx));
     root.into_any_element()
 }
 
-/// 默认路径建议:
-///
-/// - 未勾选 → 清空;
-/// - 多选 → `repo_path`(此时输入框语义是「父目录」);
-/// - 单选 → `parentDir(mainPath) + <仓库名>-<分支>`(**仓库同级**)。
-///
-/// `path_edited` 为真(用户手改过 / 用过「浏览…」)之后**不再跟随**。
-/// 分支为空时 `sanitize_branch_for_dir` 回落 `"worktree"` —— 原版就是这样,
-/// 选分支之前先给一个 `<仓库名>-worktree` 的建议。
+/// 创建按钮启用条件（按钮禁用态与 `create()` 入口共用同一判据）。
+fn can_create_worktree(creating: bool, has_selected: bool, branch: &str, path: &str) -> bool {
+    !creating && has_selected && !branch.trim().is_empty() && !path.trim().is_empty()
+}
+
+/// 展开「新建 worktree」区后，若用户未手动切过模式且可用现有分支为空，
+/// 自动切到「新建分支」；停在「新建分支」且本次展开尚未聚焦过时自动聚焦分支输入框。
+fn sync_create_mode_and_focus(
+    state: &Entity<WorktreeModal>,
+    groups: &Rc<Vec<RepoGroup>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (should_switch_new, focus_target) = {
+        let s = state.read(cx);
+        if !s.create_open {
+            return;
+        }
+        let selected: Vec<&RepoGroup> = groups
+            .iter()
+            .filter(|g| s.selected_keys.contains(&g.key))
+            .collect();
+        if selected.is_empty() {
+            return;
+        }
+        let branches_ready = selected
+            .iter()
+            .all(|g| s.branches_by_repo.contains_key(&g.key));
+        if !branches_ready {
+            return;
+        }
+        let switch_new = !s.mode_touched
+            && s.mode == Mode::Existing
+            && s.options(groups, &selected).is_empty();
+        let next_mode = if switch_new { Mode::New } else { s.mode };
+        let focus = (next_mode == Mode::New && !s.auto_focused_on_open)
+            .then(|| s.new_branch.clone());
+        (switch_new, focus)
+    };
+    if should_switch_new || focus_target.is_some() {
+        state.update(cx, |s, cx| {
+            if should_switch_new {
+                s.mode = Mode::New;
+            }
+            if focus_target.is_some() {
+                s.auto_focused_on_open = true;
+            }
+            cx.notify();
+        });
+    }
+    if let Some(input) = focus_target {
+        autofocus(&input, window, cx);
+    }
+}
+
+/// 计算路径输入框的「自动建议值」与「灰色占位预览」：
+/// - 未勾选 → 建议清空，占位为通用路径提示；
+/// - 单选 → 按 [`infer_worktree_path_template`] 推断习惯目录；分支为空时不填假路径，
+///   仅在 placeholder 预览 `<模板>/<分支名>`，填入分支后再写入真实建议路径；
+/// - 多选 → 建议 `repo_path`（语义为父目录），占位为父目录提示。
+fn compute_path_suggestion(
+    selected: &[&RepoGroup],
+    branch: &str,
+    repo_path: &str,
+) -> (Option<String>, String) {
+    match selected.len() {
+        0 => (
+            Some(String::new()),
+            t("worktree", "pathPlaceholder").to_string(),
+        ),
+        1 => {
+            let g = selected[0];
+            let Some(tpl) = infer_worktree_path_template(g) else {
+                return (None, t("worktree", "pathPlaceholder").to_string());
+            };
+            let placeholder =
+                tpl.format_dir(&g.context, &g.name, t("worktree", "branchDirPlaceholder"));
+            let suggested = if branch.trim().is_empty() {
+                Some(String::new())
+            } else {
+                Some(tpl.format_dir(&g.context, &g.name, &sanitize_branch_for_dir(branch)))
+            };
+            (suggested, placeholder)
+        }
+        _ => (
+            Some(repo_path.to_string()),
+            t("worktree", "parentPathPlaceholder").to_string(),
+        ),
+    }
+}
+
+/// 同步路径输入框的智能默认建议与占位预览。
+/// `path_edited` 为真（用户手改过或用过「浏览…」）之后不再覆盖输入值，但仍保持占位预览准确。
 fn sync_path_suggestion(
     state: &Entity<WorktreeModal>,
     groups: &[RepoGroup],
     window: &mut Window,
     cx: &mut App,
 ) {
-    let want = {
+    let (want, placeholder, path_edited, placeholder_changed, input) = {
         let s = state.read(cx);
-        if s.path_edited {
-            return;
-        }
         let selected: Vec<&RepoGroup> = groups
             .iter()
             .filter(|g| s.selected_keys.contains(&g.key))
@@ -830,33 +1192,45 @@ fn sync_path_suggestion(
             Mode::Existing => s.sel_branch.clone(),
             Mode::New => s.new_branch.read(cx).value().trim().to_string(),
         };
-        match selected.len() {
-            0 => String::new(),
-            1 => {
-                let g = selected[0];
-                let parent = context_parent_dir(&g.context, &g.main_path);
-                if parent.is_empty() {
-                    return;
-                }
-                context_join_path(
-                    &g.context,
-                    parent,
-                    &format!("{}-{}", g.name, sanitize_branch_for_dir(&branch)),
-                )
-            }
-            _ => s.repo_path.clone(),
-        }
+        let (want, placeholder) = compute_path_suggestion(&selected, &branch, &s.repo_path);
+        let placeholder_changed = placeholder != s.last_path_placeholder;
+        (
+            want,
+            placeholder,
+            s.path_edited,
+            placeholder_changed,
+            s.wt_path.clone(),
+        )
     };
-    let input = state.read(cx).wt_path.clone();
+    if placeholder_changed {
+        let next_placeholder = placeholder.clone();
+        state.update(cx, |s, _| {
+            s.last_path_placeholder = next_placeholder;
+        });
+        input.update(cx, |st, cx| st.set_placeholder(placeholder, window, cx));
+    }
+    if path_edited {
+        return;
+    }
+    let Some(want) = want else {
+        return;
+    };
     if input.read(cx).value() == want.as_str() {
         return;
     }
+    let suggested = want.clone();
+    state.update(cx, |s, _| {
+        s.last_suggested_path = suggested;
+    });
     input.update(cx, |st, cx| st.set_value(want, window, cx));
 }
 
 /// 勾选变化时要清掉的表单状态(`toggleRepo` / `toggleAll`)。
 fn reset_form_on_selection(s: &mut WorktreeModal) {
     s.path_edited = false;
+    s.last_suggested_path.clear();
+    s.mode_touched = false;
+    s.auto_focused_on_open = false;
     s.sel_branch.clear();
     s.base_branch.clear();
     s.create_error = None;
@@ -887,6 +1261,7 @@ fn render_group(
     index: usize,
     multi_repo: bool,
     projects: &HashMap<String, String>,
+    active_project_id: Option<&str>,
     cx: &mut App,
 ) -> AnyElement {
     let group = &groups[index];
@@ -969,7 +1344,15 @@ fn render_group(
 
     let mut rows = div().flex().flex_col().gap(px(2.0)).p(px(4.0));
     for idx in 0..group.worktrees.len() {
-        rows = rows.child(render_worktree_row(state, groups, index, idx, projects, cx));
+        rows = rows.child(render_worktree_row(
+            state,
+            groups,
+            index,
+            idx,
+            projects,
+            active_project_id,
+            cx,
+        ));
     }
     block = block.child(rows);
 
@@ -1000,26 +1383,40 @@ fn render_group(
 }
 
 /// 第 `group_index` 组的第 `idx` 个 worktree。项目只匹配同 backend。
+/// 整行点击直接切换到对应项目（当前项目常驻高亮不可点）；右侧仅保留紧凑图标按钮。
 fn render_worktree_row(
     state: &Entity<WorktreeModal>,
     groups: &Rc<Vec<RepoGroup>>,
     group_index: usize,
     idx: usize,
     projects: &HashMap<String, String>,
+    active_project_id: Option<&str>,
     cx: &mut App,
 ) -> AnyElement {
     let s = state.read(cx);
     let group = &groups[group_index];
     let wt = &group.worktrees[idx];
-    // 「已是项目」:订阅 config.projects,增删项目即时反映(表每帧按眼下的项目建)
     let existing_project = projects
         .get(&path_key(group.context.is_remote(), &wt.path))
         .cloned();
-    let is_project = existing_project.is_some();
+    let is_current = existing_project
+        .as_deref()
+        .is_some_and(|id| active_project_id == Some(id));
+    let switch_target = (wt.is_valid && !is_current)
+        .then_some(existing_project)
+        .flatten();
+    let store_for_switch = s.store.clone();
 
-    // 胶囊全走共用的语义胶囊:分支 = 本地分支色(带分支图标)、失效 = 错误、
-    // 锁定 = 警告、已是项目 = accent、主仓库 = 中性
+    // 胶囊全走共用的语义胶囊:当前 = accent、主仓库 = 中性、分支 = 本地分支色(带分支图标)、
+    // 失效 = 错误、锁定 = 警告（worktree 自动同步为项目，不再展示「已是项目」标记）
     let mut badges = div().flex().items_center().gap(px(4.0)).min_w_0();
+    if is_current {
+        badges = badges.child(git_ui::pill_on(
+            t("worktree", "current"),
+            ui::accent(),
+            git_ui::ground_with(ui::accent_subtle()),
+        ));
+    }
     if wt.is_main {
         badges = badges.child(git_ui::pill(t("worktree", "mainRepo"), ui::text_muted()));
     }
@@ -1036,13 +1433,11 @@ fn render_worktree_row(
     if wt.is_locked {
         badges = badges.child(git_ui::pill(t("worktree", "locked"), ui::color_warning()));
     }
-    if is_project {
-        badges = badges.child(git_ui::pill(t("worktree", "isProject"), ui::accent()));
-    }
 
-    let mut actions = div().flex().items_center().gap(px(4.0)).flex_none();
+    // 右侧紧凑图标按钮（均内置 stop_propagation，不会冒泡误触整行切换）
+    let mut actions = div().flex().items_center().gap(px(2.0)).flex_none();
     if wt.is_valid {
-        // 「在终端中打开」
+        let can_open_terminal = s.project_id.is_some();
         let (store, path, name, branch) = (
             s.store.clone(),
             wt.path.clone(),
@@ -1052,85 +1447,43 @@ fn render_worktree_row(
         let project_id = s.project_id.clone();
         let terminal_context = group.context.clone();
         actions = actions.child(
-            git_ui::action_button(
+            git_ui::icon_button(
                 SharedString::from(format!("wt-open-{}-{idx}", group.key)),
+                git_ui::ICON_TERMINAL,
                 t("worktree", "openTerminal"),
-                ButtonKind::Ghost,
-                true,
+                can_open_terminal,
             )
-            .on_click(move |_: &ClickEvent, window, cx| {
-                let Some(project_id) = project_id.clone() else {
-                    return;
-                };
-                let title = format!("⎇ {}", branch.clone().unwrap_or_else(|| name.clone()));
-                let path = path.clone();
-                let opened = store.update(cx, |store, cx| {
-                    if !store.project(&project_id).is_some_and(|project| {
-                        project.ssh_connection_id.as_deref() == terminal_context.connection_id()
-                    }) {
-                        return false;
-                    }
-                    let pane = store.new_terminal_with_cwd(
-                        &project_id,
-                        None,
-                        None,
-                        Some(path),
-                        window,
-                        cx,
-                    );
-                    if let Some(pane) = pane.as_ref() {
-                        store.rename_pane(&project_id, pane, &title, cx);
-                    }
-                    pane.is_some()
-                });
-                crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
-                if opened {
-                    crate::workbench_area::activate_terminal_page(window, cx);
-                }
-            }),
-        );
-
-        // 「设为项目 / 切换过去」
-        let (store, path) = (s.store.clone(), wt.path.clone());
-        let main_path = group.main_path.clone();
-        let parent_hint = s.project_id.clone();
-        let context = group.context.clone();
-        let project_name = context_base_name(&context, &path).to_string();
-        actions = actions.child(
-            git_ui::action_button(
-                SharedString::from(format!("wt-project-{}-{idx}", group.key)),
-                if is_project {
-                    t("worktree", "switchToProject")
-                } else {
-                    t("worktree", "addAsProject")
-                },
-                ButtonKind::Ghost,
-                true,
-            )
-            .on_click(move |_: &ClickEvent, window, cx| {
-                let path = path.clone();
-                store.update(cx, |store, cx| {
-                    let id = match &existing_project {
-                        Some(id) => id.clone(),
-                        None => {
-                            let parent = store
-                                .find_project_by_backend_path(context.connection_id(), &main_path)
-                                .map(|p| p.id.clone())
-                                .or_else(|| parent_hint.clone());
-                            store.add_git_worktree_project(
-                                project_name.clone(),
-                                path.clone(),
-                                context.connection_id().map(str::to_string),
-                                parent,
-                                cx,
-                            )
-                        }
+            .when(can_open_terminal, |el| {
+                el.on_click(move |_: &ClickEvent, window, cx| {
+                    let Some(project_id) = project_id.clone() else {
+                        return;
                     };
-                    // 「切到项目」与「添加为项目」同一颗钮:前者是既有项目,有终端就
-                    // 只切;后者是新项目,顺手开首个终端
-                    store.open_added_project(&id, window, cx);
-                });
-                crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
+                    let title = format!("⎇ {}", branch.clone().unwrap_or_else(|| name.clone()));
+                    let path = path.clone();
+                    let opened = store.update(cx, |store, cx| {
+                        if !store.project(&project_id).is_some_and(|project| {
+                            project.ssh_connection_id.as_deref() == terminal_context.connection_id()
+                        }) {
+                            return false;
+                        }
+                        let pane = store.new_terminal_with_cwd(
+                            &project_id,
+                            None,
+                            None,
+                            Some(path),
+                            window,
+                            cx,
+                        );
+                        if let Some(pane) = pane.as_ref() {
+                            store.rename_pane(&project_id, pane, &title, cx);
+                        }
+                        pane.is_some()
+                    });
+                    crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
+                    if opened {
+                        crate::workbench_area::activate_terminal_page(window, cx);
+                    }
+                })
             }),
         );
 
@@ -1138,10 +1491,10 @@ fn render_worktree_row(
         if !wt.is_main {
             let (state_for_remove, groups_for_remove) = (state.clone(), groups.clone());
             actions = actions.child(
-                git_ui::action_button(
+                git_ui::danger_icon_button(
                     SharedString::from(format!("wt-remove-{}-{idx}", group.key)),
+                    git_ui::ICON_TRASH,
                     t("worktree", "remove"),
-                    ButtonKind::Danger,
                     true,
                 )
                 .on_click(move |_: &ClickEvent, window, cx| {
@@ -1158,15 +1511,30 @@ fn render_worktree_row(
         }
     }
 
-    // 两行:名字 + 胶囊 / 弱化的路径。行首是 worktree 图标,悬停薄纱底(与列表行同口径)
+    // 两行:名字 + 胶囊 / 弱化的路径。行首是 worktree 图标；当前行 accent 底 + 左侧 2px 竖条，
+    // 其余已关联项目整行可点切换。
     div()
+        .id(SharedString::from(format!("wt-row-{}-{idx}", group.key)))
+        .relative()
         .flex()
         .items_center()
         .gap(px(8.0))
         .px(px(8.0))
         .py(px(6.0))
         .rounded(px(4.0))
-        .hover(|el| el.bg(git_ui::hover_bg()))
+        .when(is_current, |el| {
+            el.bg(ui::accent_subtle()).child(git_ui::selection_bar())
+        })
+        .when_some(switch_target, |el, target_project_id| {
+            el.cursor_pointer()
+                .hover(|el| el.bg(git_ui::hover_bg()))
+                .on_click(move |_: &ClickEvent, window, cx| {
+                    store_for_switch.update(cx, |store, cx| {
+                        store.open_added_project(&target_project_id, window, cx);
+                    });
+                    crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
+                })
+        })
         .child(git_ui::icon(
             if wt.is_main {
                 git_ui::ICON_REPO
@@ -1176,6 +1544,8 @@ fn render_worktree_row(
             git_ui::ICON_SIZE,
             if wt.is_main {
                 ui::color_folder()
+            } else if is_current {
+                ui::accent()
             } else {
                 ui::text_muted()
             },
@@ -1216,11 +1586,12 @@ fn render_worktree_row(
         .into_any_element()
 }
 
-/// 新建 worktree 那一段。
+/// 新建 worktree 折叠区（默认收起，点击触发条平滑高度展开）。
 fn render_create_section(
     state: &Entity<WorktreeModal>,
     groups: &Rc<Vec<RepoGroup>>,
     multi_repo: bool,
+    window: &Window,
     cx: &mut App,
 ) -> AnyElement {
     let s = state.read(cx);
@@ -1229,25 +1600,39 @@ fn render_create_section(
         .filter(|g| s.selected_keys.contains(&g.key))
         .collect();
     let multi_target = selected.len() > 1;
+    let create_open = s.create_open;
+    let turns = s
+        .create_chevron
+        .value_open("create", create_open, crate::fold_motion::OPEN_TURNS);
 
     let mut section = div()
-        .mt(px(8.0))
-        .pt(px(12.0))
+        .mt(px(4.0))
+        .pt(px(8.0))
         .border_t_1()
         .border_color(ui::border_subtle())
         .flex()
-        .flex_col()
-        .gap(px(8.0));
+        .flex_col();
 
-    // 标题行 + 模式段控件
-    let mut head = div()
+    // 折叠触发条：+ 新建 worktree [已选 N] …… ▸/▾
+    let state_for_toggle = state.clone();
+    let mut trigger = div()
+        .id("worktree-create-toggle")
         .flex()
         .items_center()
         .gap(px(8.0))
+        .h(px(32.0))
+        .px(px(8.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .hover(|el| el.bg(git_ui::hover_bg()))
         .child(git_ui::icon(
             git_ui::ICON_PLUS,
             git_ui::ICON_SIZE,
-            ui::text_muted(),
+            if create_open {
+                ui::accent()
+            } else {
+                ui::text_secondary()
+            },
         ))
         .child(
             div()
@@ -1257,7 +1642,7 @@ fn render_create_section(
                 .child(t("worktree", "createTitle")),
         );
     if multi_repo {
-        head = head.child(git_ui::pill(
+        trigger = trigger.child(git_ui::pill(
             tr!(
                 "worktree",
                 "selectedCount",
@@ -1266,13 +1651,48 @@ fn render_create_section(
             ui::accent(),
         ));
     }
-    // 选中底色是一块滑动的绝对定位块(见 `segment_slider`):两段宽度随文字变,先量再滑
+    trigger = trigger
+        .child(div().ml_auto().child(git_ui::chevron(turns)))
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            state_for_toggle.update(cx, |s, cx| {
+                let next = !s.create_open;
+                s.create_open = next;
+                s.create_reveal.set_open(next);
+                s.create_chevron
+                    .flip_open("create", next, crate::fold_motion::OPEN_TURNS);
+                if next {
+                    s.auto_focused_on_open = false;
+                }
+                cx.notify();
+            });
+        });
+    section = section.child(trigger);
+
+    if !s.create_reveal.is_mounted() {
+        return section.into_any_element();
+    }
+
+    // 展开的表单体（留出 2~3px 边距避免聚焦环被 HeightReveal 裁剪容器切边）
+    let mut form = div()
+        .pt(px(8.0))
+        .pb(px(3.0))
+        .px(px(2.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0));
+
+    if selected.is_empty() {
+        form = form.child(hint_line(t("worktree", "selectRepoHint")));
+        return section
+            .child(s.create_reveal.render(form, window))
+            .into_any_element();
+    }
+
+    // 模式切换段控件（选中底色是一块滑动的绝对定位块，见 `segment_slider`）
     let slider = s.mode_slider.clone();
     let active_ix = usize::from(s.mode == Mode::New);
     let own_bg = !slider.ready(active_ix);
-    let mut seg = git_ui::segmented()
-        .ml_auto()
-        .child(git_ui::segmented_slider(&slider, active_ix));
+    let mut seg = git_ui::segmented().child(git_ui::segmented_slider(&slider, active_ix));
     for (ix, (mode, label)) in [
         (Mode::Existing, t("worktree", "modeExisting")),
         (Mode::New, t("worktree", "modeNew")),
@@ -1290,43 +1710,42 @@ fn render_create_section(
         seg = seg.child(segment.on_click(
             move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                 let input = state_for_mode.update(cx, |s, cx| {
+                    s.mode_touched = true;
                     s.mode = mode;
+                    s.create_error = None;
+                    if matches!(mode, Mode::New) {
+                        s.auto_focused_on_open = true;
+                    }
                     cx.notify();
                     matches!(mode, Mode::New).then(|| s.new_branch.clone())
                 });
                 // 切到「新建」就该能直接敲分支名,不必再点一下输入框
-                // (「已有」那侧是下拉选择,没有可聚焦的输入框)
                 if let Some(input) = input {
                     autofocus(&input, window, cx);
                 }
             },
         ));
     }
-    section = section.child(head.child(seg));
+    form = form.child(div().flex().items_center().child(seg));
 
-    // 模式区
-    if selected.is_empty() {
-        section = section.child(hint_line(t("worktree", "selectRepoHint")));
-        return section.into_any_element();
-    }
-
+    // 分支区
     let branches_ready = selected
         .iter()
         .all(|g| s.branches_by_repo.contains_key(&g.key));
     match s.mode {
         Mode::Existing => {
             if !branches_ready {
-                section = section.child(git_ui::loading_state(t("worktree", "loading")));
+                form = form.child(git_ui::loading_state(t("worktree", "loading")));
             } else {
                 let options = s.options(groups, &selected);
                 if options.is_empty() {
-                    section = section.child(hint_line(if multi_target {
+                    form = form.child(hint_line(if multi_target {
                         t("worktree", "noCommonBranch")
                     } else {
                         t("worktree", "noBranchAvailable")
                     }));
                 } else {
-                    section = section.child(dropdown(
+                    form = form.child(dropdown(
                         state,
                         "worktree-branch",
                         if s.sel_branch.is_empty() {
@@ -1335,14 +1754,18 @@ fn render_create_section(
                             s.sel_branch.clone()
                         },
                         options,
-                        |s, value| s.sel_branch = value,
+                        true,
+                        |s, value| {
+                            s.sel_branch = value;
+                            s.create_error = None;
+                        },
                     ));
                 }
             }
         }
         Mode::New => {
             let options = s.options(groups, &selected);
-            section = section.child(
+            form = form.child(
                 div()
                     .flex()
                     .gap(px(6.0))
@@ -1356,12 +1779,14 @@ fn render_create_section(
                             s.base_branch.clone()
                         },
                         options,
+                        false,
                         |s, value| {
                             s.base_branch = if value == t("worktree", "baseHead") {
                                 String::new()
                             } else {
                                 value
-                            }
+                            };
+                            s.create_error = None;
                         },
                     )),
             );
@@ -1370,7 +1795,7 @@ fn render_create_section(
 
     // 路径行
     let state_for_browse = state.clone();
-    section = section.child(
+    form = form.child(
         div()
             .flex()
             .gap(px(6.0))
@@ -1393,6 +1818,7 @@ fn render_create_section(
                             move |path, window, cx| {
                                 state.update(cx, |s, cx| {
                                     s.path_edited = true;
+                                    s.create_error = None;
                                     s.wt_path.update(cx, |input, cx| {
                                         input.set_value(path.clone(), window, cx)
                                     });
@@ -1423,6 +1849,7 @@ fn render_create_section(
                             let _ = cx.update(|window, cx| {
                                 state.update(cx, |s, cx| {
                                     s.path_edited = true;
+                                    s.create_error = None;
                                     let input = s.wt_path.clone();
                                     input.update(cx, |state, cx| {
                                         state.set_value(text.clone(), window, cx)
@@ -1436,61 +1863,75 @@ fn render_create_section(
             ),
     );
 
-    // 「创建后添加为项目并切换过去」
-    let add_as_project = s.add_as_project;
-    let state_for_check = state.clone();
-    section = section.child(
-        git_ui::check_row(
-            "worktree-add-project",
-            add_as_project,
-            t("worktree", "addAsProjectAfterCreate"),
-            false,
-        )
-        .on_click(move |_: &ClickEvent, _window, cx| {
-            state_for_check.update(cx, |s, cx| {
-                s.add_as_project = !s.add_as_project;
-                cx.notify();
-            });
-        }),
-    );
-
     if let Some(err) = &s.create_error {
-        section = section.child(git_ui::error_block(err.clone()));
+        form = form.child(git_ui::error_block(err.clone()));
     }
     for (target, err) in &s.create_results {
-        section = section.child(git_ui::error_block(format!("{target}: {err}")));
+        form = form.child(git_ui::error_block(format!("{target}: {err}")));
     }
 
+    // 合并底栏行：左「创建后切换到该项目」勾选框 + 右主按钮「创建」（实时校验禁用态）
+    let current_branch = match s.mode {
+        Mode::Existing => s.sel_branch.as_str().to_string(),
+        Mode::New => s.new_branch.read(cx).value().to_string(),
+    };
+    let current_path = s.wt_path.read(cx).value().to_string();
     let creating = s.creating;
+    let can_create =
+        can_create_worktree(creating, !selected.is_empty(), &current_branch, &current_path);
+    let switch_after_create = s.switch_after_create;
+    let state_for_check = state.clone();
     let state_for_create = state.clone();
     let groups_for_create = groups.clone();
-    section = section.child(
-        div().flex().justify_end().child(
-            git_ui::action_button(
-                "worktree-create",
-                if creating {
-                    t("worktree", "creating").to_string()
-                } else if multi_target {
-                    tr!(
-                        "worktree",
-                        "createMulti",
-                        count = selected.len().to_string()
-                    )
-                } else {
-                    t("worktree", "create").to_string()
-                },
-                ButtonKind::Primary,
-                !creating,
+    form = form.child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(8.0))
+            .pt(px(2.0))
+            .child(
+                git_ui::check_row(
+                    "worktree-switch-project",
+                    switch_after_create,
+                    t("worktree", "switchAfterCreate"),
+                    false,
+                )
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    state_for_check.update(cx, |s, cx| {
+                        s.switch_after_create = !s.switch_after_create;
+                        cx.notify();
+                    });
+                }),
             )
-            .when(!creating, |el| {
-                el.on_click(move |_: &ClickEvent, window, cx| {
-                    create(&state_for_create, &groups_for_create, window, cx);
-                })
-            }),
-        ),
+            .child(
+                git_ui::action_button(
+                    "worktree-create",
+                    if creating {
+                        t("worktree", "creating").to_string()
+                    } else if multi_target {
+                        tr!(
+                            "worktree",
+                            "createMulti",
+                            count = selected.len().to_string()
+                        )
+                    } else {
+                        t("worktree", "create").to_string()
+                    },
+                    ButtonKind::Primary,
+                    can_create,
+                )
+                .when(can_create, |el| {
+                    el.on_click(move |_: &ClickEvent, window, cx| {
+                        create(&state_for_create, &groups_for_create, window, cx);
+                    })
+                }),
+            ),
     );
 
-    section.into_any_element()
+    section
+        .child(s.create_reveal.render(form, window))
+        .into_any_element()
 }
 
 /// 一个走 [`menu`] 的下拉选择器(替原版的 `<select>`)。
@@ -1499,6 +1940,7 @@ fn dropdown(
     id: &'static str,
     current: String,
     options: Rc<Vec<String>>,
+    full_width: bool,
     apply: fn(&mut WorktreeModal, String),
 ) -> AnyElement {
     let state = state.clone();
@@ -1510,8 +1952,8 @@ fn dropdown(
         .gap(px(6.0))
         .h(px(30.0))
         .px(px(8.0))
-        .w(px(180.0))
-        .flex_none()
+        .when(full_width, |el| el.w_full())
+        .when(!full_width, |el| el.w(px(180.0)).flex_none())
         .rounded(px(4.0))
         .border_1()
         .border_color(ui::border_default())
@@ -1548,24 +1990,18 @@ fn dropdown(
 // ─── 创建 / 删除 / 清理 ───────────────────────────────────────
 
 fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Window, cx: &mut App) {
-    let (branch, targets, create_branch, base, add_as_project) = {
+    let (branch, targets, create_branch, base, switch_after_create) = {
         let s = state.read(cx);
         let branch = match s.mode {
             Mode::Existing => s.sel_branch.clone(),
             Mode::New => s.new_branch.read(cx).value().trim().to_string(),
         };
-        if branch.is_empty() || s.creating {
-            return;
-        }
         let raw_path = s.wt_path.read(cx).value().trim().to_string();
-        if raw_path.is_empty() {
-            return;
-        }
         let selected: Vec<&RepoGroup> = groups
             .iter()
             .filter(|g| s.selected_keys.contains(&g.key))
             .collect();
-        if selected.is_empty() {
+        if !can_create_worktree(s.creating, !selected.is_empty(), &branch, &raw_path) {
             return;
         }
         let targets: Vec<(GitContext, String)> = if selected.len() == 1 {
@@ -1595,7 +2031,7 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
             } else {
                 None
             },
-            s.add_as_project,
+            s.switch_after_create,
         )
     };
     let mut guards = Vec::with_capacity(targets.len());
@@ -1621,17 +2057,18 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
     let state = state.clone();
     window
         .spawn(cx, async move |cx| {
-            let mut results: Vec<(String, anyhow::Result<()>)> = Vec::new();
+            let mut results: Vec<(GitContext, String, anyhow::Result<()>)> = Vec::new();
             for (context, target) in targets {
                 let (branch, base) = (branch.clone(), base.clone());
                 let target_for_task = target.clone();
+                let repo_ctx = context.clone();
                 let execution = context.clone();
                 let result = mt_remote::run_git_on(&execution, move || {
                     // ⚠️ add_worktree 是 120s 阻塞 CLI
                     context.add_worktree(&target_for_task, &branch, create_branch, base.as_deref())
                 })
                 .await;
-                results.push((target, result.map(|_| ())));
+                results.push((repo_ctx, target, result.map(|_| ())));
             }
             drop(guards);
 
@@ -1642,6 +2079,7 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
                 on_changed(cx);
                 state.update(cx, |s, cx| {
                     s.branches_by_repo.clear();
+                    s.branches_loading.clear();
                     s.creating = false;
                     cx.notify();
                 });
@@ -1649,7 +2087,7 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
                 let store = state.read(cx).store.clone();
                 let failures: Vec<(String, String)> = results
                     .iter()
-                    .filter_map(|(target, result)| {
+                    .filter_map(|(_, target, result)| {
                         result.as_ref().err().map(|error| {
                             (
                                 target.clone(),
@@ -1658,31 +2096,33 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
                         })
                     })
                     .collect();
-                let successes: Vec<String> = results
+                let successes: Vec<(GitContext, String)> = results
                     .iter()
-                    .filter(|(_, r)| r.is_ok())
-                    .map(|(t, _)| t.clone())
+                    .filter(|(_, _, r)| r.is_ok())
+                    .map(|(ctx, t, _)| (ctx.clone(), t.clone()))
                     .collect();
 
+                // 新增的 worktree 始终自动添加为项目（优先挂到对应主仓库项目下，否则回落到来源项目）
                 let mut first_new: Option<String> = None;
-                if add_as_project && !successes.is_empty() {
+                if !successes.is_empty() {
                     let store = state.read(cx).store.clone();
                     let parent_hint = state.read(cx).project_id.clone();
-                    let context = state.read(cx).context.clone();
                     store.update(cx, |store, cx| {
-                        for target in &successes {
-                            let id = store
-                                .find_project_by_backend_path(context.connection_id(), target)
+                        for (repo_ctx, target) in &successes {
+                            let parent = store
+                                .find_project_by_backend_path(
+                                    repo_ctx.connection_id(),
+                                    repo_ctx.path(),
+                                )
                                 .map(|p| p.id.clone())
-                                .unwrap_or_else(|| {
-                                    store.add_git_worktree_project(
-                                        context_base_name(&context, target).to_string(),
-                                        target.clone(),
-                                        context.connection_id().map(str::to_string),
-                                        parent_hint.clone(),
-                                        cx,
-                                    )
-                                });
+                                .or_else(|| parent_hint.clone());
+                            let id = store.add_git_worktree_project(
+                                context_base_name(repo_ctx, target).to_string(),
+                                target.clone(),
+                                repo_ctx.connection_id().map(str::to_string),
+                                parent,
+                                cx,
+                            );
                             if first_new.is_none() {
                                 first_new = Some(id);
                             }
@@ -1702,17 +2142,22 @@ fn create(state: &Entity<WorktreeModal>, groups: &[RepoGroup], window: &mut Wind
                 }
 
                 match first_new {
-                    Some(id) if add_as_project => {
+                    Some(id) if switch_after_create => {
                         let store = state.read(cx).store.clone();
                         store.update(cx, |store, cx| store.open_added_project(&id, window, cx));
                         crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
                     }
                     _ => {
                         state.update(cx, |s, cx| {
-                            let input = s.new_branch.clone();
-                            input.update(cx, |st, cx| st.set_value("", window, cx));
+                            let new_branch = s.new_branch.clone();
+                            let wt_path = s.wt_path.clone();
                             s.sel_branch.clear();
                             s.path_edited = false;
+                            s.last_suggested_path.clear();
+                            s.mode_touched = false;
+                            s.auto_focused_on_open = false;
+                            new_branch.update(cx, |st, cx| st.set_value("", window, cx));
+                            wt_path.update(cx, |st, cx| st.set_value("", window, cx));
                             cx.notify();
                         });
                         load(&state, cx);
@@ -1974,9 +2419,10 @@ fn remove_worktree(
     window
         .spawn(cx, async move |cx| {
             let execution = context.clone();
+            let wt_path_for_task = wt_path.clone();
             let result = mt_remote::run_git_on(&execution, move || {
                 // ⚠️ 60s 阻塞 CLI
-                context.remove_worktree(&wt_path, force)
+                context.remove_worktree(&wt_path_for_task, force)
             })
             .await;
             drop(guard);
@@ -1984,10 +2430,15 @@ fn remove_worktree(
                 cx.refresh_windows();
                 match result {
                     Ok(_) => {
-                        // ② 成功之后才删项目(不留断链项目)
-                        if let Some(id) = project_id {
-                            store.update(cx, |store, cx| store.remove_project(&id, cx));
-                        }
+                        // ② 成功之后才删项目(不留断链项目)，并清除同路径的旧忽略标记
+                        store.update(cx, |store, cx| {
+                            if store.clear_dismissed_worktree(execution.connection_id(), &wt_path) {
+                                store.save_config_now();
+                            }
+                            if let Some(id) = project_id {
+                                store.remove_project(&id, cx);
+                            }
+                        });
                         crate::prompt::close_guarded(kind::GIT_WORKTREE_REMOVE, window, cx);
                         let on_changed = state.read(cx).on_changed.clone();
                         on_changed(cx);
@@ -2112,13 +2563,20 @@ fn prune(state: &Entity<WorktreeModal>, group: &RepoGroup, cx: &mut App) {
                     let missing = confirmed_missing_paths(&context, &invalid, Ok(&still_there));
                     let store = state.read(cx).store.clone();
                     store.update(cx, |store, cx| {
+                        let mut cleared = false;
                         for path in missing {
+                            if store.clear_dismissed_worktree(context.connection_id(), path) {
+                                cleared = true;
+                            }
                             let id = store
                                 .find_project_by_backend_path(context.connection_id(), path)
                                 .map(|p| p.id.clone());
                             if let Some(id) = id {
                                 store.remove_project(&id, cx);
                             }
+                        }
+                        if cleared {
+                            store.save_config_now();
                         }
                     });
                 }
@@ -2630,5 +3088,183 @@ mod tests {
             Some("p1")
         );
         assert!(!ids.contains_key(&windows_eq_key("D:/Git/Other")));
+    }
+
+    fn make_group(
+        context: GitContext,
+        main_path: &str,
+        worktrees: Vec<WorktreeInfo>,
+        has_dot_worktrees: bool,
+    ) -> RepoGroup {
+        RepoGroup {
+            key: context.key(),
+            name: context_base_name(&context, main_path).to_string(),
+            main_path: main_path.to_string(),
+            context,
+            worktrees,
+            has_dot_worktrees,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn 智能默认路径按仓库存放习惯推断() {
+        let ctx = GitContext::local(r"D:\Git\mini-term");
+        let main_wt = wt("mini-term", r"D:\Git\mini-term", true, Some("main"));
+
+        // 1. 已有 .worktrees 下的有效 worktree → 沿用且不加仓库名前缀
+        let g = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![
+                main_wt.clone(),
+                wt(
+                    "worktree-ui",
+                    r"D:\Git\mini-term\.worktrees\worktree-ui",
+                    false,
+                    Some("feat/worktree-list-ui"),
+                ),
+            ],
+            false,
+        );
+        let tpl = infer_worktree_path_template(&g).unwrap();
+        assert_eq!(tpl.parent_dir, r"D:\Git\mini-term\.worktrees");
+        assert!(!tpl.prefix_repo_name);
+        assert_eq!(
+            tpl.format_dir(&g.context, &g.name, "feat-a"),
+            r"D:\Git\mini-term\.worktrees\feat-a"
+        );
+
+        // 2. .worktrees 与其他仓库内子目录并存时优先 .worktrees
+        let g_prefer = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![
+                main_wt.clone(),
+                wt("a", r"D:\Git\mini-term\wts\a", false, Some("a")),
+                wt("b", r"D:\Git\mini-term\wts\b", false, Some("b")),
+                wt("c", r"D:\Git\mini-term\.worktrees\c", false, Some("c")),
+            ],
+            false,
+        );
+        assert_eq!(
+            infer_worktree_path_template(&g_prefer).unwrap().parent_dir,
+            r"D:\Git\mini-term\.worktrees"
+        );
+
+        // 3. 无有效 linked worktree，但磁盘存在 .worktrees 目录 → 走 .worktrees/<分支>
+        let mut invalid_wt = wt("dead", r"D:\Other\mini-term-dead", false, Some("dead"));
+        invalid_wt.is_valid = false;
+        let g_dot = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![main_wt.clone(), invalid_wt.clone()],
+            true,
+        );
+        let tpl_dot = infer_worktree_path_template(&g_dot).unwrap();
+        assert_eq!(tpl_dot.parent_dir, r"D:\Git\mini-term\.worktrees");
+        assert!(!tpl_dot.prefix_repo_name);
+
+        // 4. 已有外部 worktree → 沿用出现最多的外部父目录并加 <仓库名>- 前缀
+        let g_ext = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![
+                main_wt.clone(),
+                wt("mini-term-a", r"E:\WT\mini-term-a", false, Some("a")),
+                wt("mini-term-b", r"E:\WT\mini-term-b", false, Some("b")),
+                wt("mini-term-c", r"D:\Git\mini-term-c", false, Some("c")),
+            ],
+            false,
+        );
+        let tpl_ext = infer_worktree_path_template(&g_ext).unwrap();
+        assert_eq!(tpl_ext.parent_dir, r"E:\WT");
+        assert!(tpl_ext.prefix_repo_name);
+        assert_eq!(
+            tpl_ext.format_dir(&g_ext.context, &g_ext.name, "feat-x"),
+            r"E:\WT\mini-term-feat-x"
+        );
+
+        // 5. 无历史且无 .worktrees → 回落经典同级目录
+        let g_fallback = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![main_wt, invalid_wt],
+            false,
+        );
+        let tpl_fb = infer_worktree_path_template(&g_fallback).unwrap();
+        assert_eq!(tpl_fb.parent_dir, r"D:\Git");
+        assert!(tpl_fb.prefix_repo_name);
+
+        // 6. 远端 POSIX 仓库同样按习惯推断
+        let rctx = remote_context("ssh1").with_path("/srv/app");
+        let g_remote = make_group(
+            rctx,
+            "/srv/app",
+            vec![
+                wt("app", "/srv/app", true, Some("main")),
+                wt("ui", "/srv/app/.worktrees/ui", false, Some("ui")),
+            ],
+            false,
+        );
+        let tpl_r = infer_worktree_path_template(&g_remote).unwrap();
+        assert_eq!(
+            tpl_r.format_dir(&g_remote.context, &g_remote.name, "dev"),
+            "/srv/app/.worktrees/dev"
+        );
+    }
+
+    #[test]
+    fn 空分支不填假路径并生成占位预览() {
+        let ctx = GitContext::local(r"D:\Git\mini-term");
+        let g1 = make_group(
+            ctx.clone(),
+            r"D:\Git\mini-term",
+            vec![wt("mini-term", r"D:\Git\mini-term", true, Some("main"))],
+            true,
+        );
+        let g2 = make_group(
+            GitContext::local(r"D:\Git\other"),
+            r"D:\Git\other",
+            vec![wt("other", r"D:\Git\other", true, Some("main"))],
+            false,
+        );
+
+        // 单选 + 空分支：不填假 -worktree，只在 placeholder 给预览
+        let (val, ph) = compute_path_suggestion(&[&g1], "   ", r"D:\Git\mini-term");
+        assert_eq!(val.as_deref(), Some(""));
+        assert_eq!(
+            ph,
+            format!(
+                r"D:\Git\mini-term\.worktrees\{}",
+                t("worktree", "branchDirPlaceholder")
+            )
+        );
+
+        // 单选 + 非空分支：给出真实建议路径
+        let (val, _) = compute_path_suggestion(&[&g1], "feat/new-ui", r"D:\Git\mini-term");
+        assert_eq!(
+            val.as_deref(),
+            Some(r"D:\Git\mini-term\.worktrees\feat-new-ui")
+        );
+
+        // 多选：语义变为父目录
+        let (val, ph) = compute_path_suggestion(&[&g1, &g2], "", r"D:\Git");
+        assert_eq!(val.as_deref(), Some(r"D:\Git"));
+        assert_eq!(ph, t("worktree", "parentPathPlaceholder"));
+
+        // 未勾选：清空
+        let (val, ph) = compute_path_suggestion(&[], "feat", r"D:\Git");
+        assert_eq!(val.as_deref(), Some(""));
+        assert_eq!(ph, t("worktree", "pathPlaceholder"));
+    }
+
+    #[test]
+    fn 创建按钮启用条件实时校验() {
+        assert!(can_create_worktree(false, true, "feat", r"D:\wt"));
+        assert!(!can_create_worktree(true, true, "feat", r"D:\wt"));
+        assert!(!can_create_worktree(false, false, "feat", r"D:\wt"));
+        assert!(!can_create_worktree(false, true, "  ", r"D:\wt"));
+        assert!(!can_create_worktree(false, true, "feat", "  "));
     }
 }

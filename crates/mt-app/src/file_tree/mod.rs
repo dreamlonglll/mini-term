@@ -277,6 +277,10 @@ pub struct FileTree {
     store: Entity<AppStore>,
     /// 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`),按目录路径索引。
     chevrons: crate::fold_motion::FlipTweens,
+    /// 目录展开 / 收起的高度裁剪动画(仅在飞期间存活，静止时保持行列表 1:1 扁平)。
+    folds: crate::height_reveal::FoldReveals,
+    /// 首次点开还没缓存内容的目录：等异步 `load_dir` 回填那一帧再从 0 起播展开动画。
+    pending_expand_anim: HashSet<PathBuf>,
     /// 已列出的目录 → 子项。
     entries: HashMap<PathBuf, Vec<FileEntry>>,
     /// 正在列的目录(防重复排队)。
@@ -559,6 +563,9 @@ impl FileTree {
             watcher,
             watched: HashSet::new(),
             chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
+            folds: crate::height_reveal::FoldReveals::new(mt_ui::motion::SECTION_TOGGLE)
+                .with_max_height(640.0),
+            pending_expand_anim: HashSet::new(),
             current_project: None,
             source_signature: None,
             source_generation: 0,
@@ -863,6 +870,8 @@ impl FileTree {
         }
         self.entries.clear();
         self.chevrons.clear();
+        self.folds.clear();
+        self.pending_expand_anim.clear();
         self.loading.clear();
         self.dir_request_ids.clear();
         self.pending_reload.clear();
@@ -1146,9 +1155,20 @@ impl FileTree {
                             tree.store
                                 .update(cx, |store, cx| store.ensure_dir_kinds(probe, cx));
                         }
+                        let non_empty = !entries.is_empty();
+                        let dir_key = dir.to_string_lossy().to_string();
+                        let animate_now = tree.pending_expand_anim.remove(&dir)
+                            && non_empty
+                            && tree.current_project.as_deref().is_some_and(|pid| {
+                                tree.store.read(cx).is_dir_expanded(pid, &dir_key)
+                            });
                         tree.entries.insert(dir, entries);
+                        if animate_now {
+                            tree.folds.flip_open(dir_key, true);
+                        }
                     }
                     Err(err) => {
+                        tree.pending_expand_anim.remove(&dir);
                         tracing::warn!("[files] 列目录失败: {err:#}");
                         if is_root {
                             tree.root_error = Some(format!("{err:#}"));
@@ -1347,6 +1367,7 @@ impl FileTree {
             return;
         };
         let path = rows[target].path.clone();
+        self.folds.clear();
         if let Some(focus) = self.row_focus.get(&path) {
             window.focus(focus, cx);
         }
@@ -1596,8 +1617,14 @@ impl FileTree {
         let collapsed = self
             .store
             .update(cx, |store, cx| store.collapse_all_dirs(&project_id, cx));
+        self.pending_expand_anim.clear();
         for key in collapsed {
-            let path = PathBuf::from(key);
+            let path = PathBuf::from(&key);
+            self.chevrons
+                .flip_open(key.clone(), false, crate::fold_motion::OPEN_TURNS);
+            if self.entries.get(&path).is_some_and(|v| !v.is_empty()) {
+                self.folds.flip_open(key, false);
+            }
             if root.as_deref() == Some(path.as_path()) || self.chain_owner.contains_key(&path) {
                 continue;
             }
@@ -1616,21 +1643,37 @@ impl FileTree {
         };
         let key = path.to_string_lossy().to_string();
         let expanded = self.store.read(cx).is_dir_expanded(&project_id, &key);
+        let next_open = !expanded;
         self.chevrons
-            .flip_open(key.clone(), !expanded, crate::fold_motion::OPEN_TURNS);
+            .flip_open(key.clone(), next_open, crate::fold_motion::OPEN_TURNS);
         self.store.update(cx, |store, cx| {
-            store.set_dir_expanded(&project_id, &key, !expanded, cx)
+            store.set_dir_expanded(&project_id, &key, next_open, cx)
         });
-        if !expanded {
+        if next_open {
+            if let Some(cached) = self.entries.get(&path) {
+                self.pending_expand_anim.remove(&path);
+                if !cached.is_empty() {
+                    self.folds.flip_open(key, true);
+                }
+            } else {
+                // 首次点开冷目录：等 `load_dir` 回填后再起播，避免远程/慢盘在空内容上空跑动画
+                self.pending_expand_anim.insert(path.clone());
+            }
             if let Some(root) = self.project_root(cx) {
                 self.load_dir(root, path.clone(), cx);
             }
-        } else if self.chain_owner.contains_key(&path) {
-            // 压缩链上的目录**折叠了也要继续监听**:链的成立与否只看内容,
-            // 不看展开状态(原版 `watchActive = expanded || chainPaths !== undefined`)
         } else {
-            self.watched.remove(&path);
-            self.watcher.unwatch(&path);
+            self.pending_expand_anim.remove(&path);
+            if self.entries.get(&path).is_some_and(|v| !v.is_empty()) {
+                self.folds.flip_open(key, false);
+            }
+            if self.chain_owner.contains_key(&path) {
+                // 压缩链上的目录**折叠了也要继续监听**:链的成立与否只看内容,
+                // 不看展开状态(原版 `watchActive = expanded || chainPaths !== undefined`)
+            } else {
+                self.watched.remove(&path);
+                self.watcher.unwatch(&path);
+            }
         }
         cx.notify();
     }
@@ -1752,6 +1795,20 @@ impl FileTree {
         cx: &App,
         out: &mut Vec<Row>,
     ) {
+        self.rows_with_closing(project_id, root, dir, depth, false, cx, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rows_with_closing(
+        &self,
+        project_id: &str,
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        include_closing: bool,
+        cx: &App,
+        out: &mut Vec<Row>,
+    ) {
         let Some(entries) = self.entries.get(dir) else {
             return;
         };
@@ -1778,10 +1835,54 @@ impl FileTree {
                     .flatten()
                     .flatten(),
             });
-            if expanded {
-                self.rows(project_id, root, &entry.path, depth + 1, cx, out);
+            let descend = expanded || (include_closing && entry.is_dir && self.folds.is_closing(&key));
+            if descend {
+                self.rows_with_closing(
+                    project_id,
+                    root,
+                    &entry.path,
+                    depth + 1,
+                    include_closing,
+                    cx,
+                    out,
+                );
             }
         }
+    }
+
+    /// 把含收起最后一程在内的行切片递归组装成元素：仅正在播折叠动画的目录子切片
+    /// 包进 [`crate::height_reveal::HeightReveal`]，其余保持扁平。
+    fn render_row_slice(
+        &self,
+        rows: &[Row],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            let row = &rows[i];
+            out.push(self.render_row(row.clone(), cx));
+            if row.is_dir {
+                let key = row.path.to_string_lossy();
+                if let Some(fold) = self.folds.get(key.as_ref()) {
+                    let depth = row.depth;
+                    let mut j = i + 1;
+                    while j < rows.len() && rows[j].depth > depth {
+                        j += 1;
+                    }
+                    if j > i + 1 {
+                        let children = self.render_row_slice(&rows[i + 1..j], window, cx);
+                        let col = div().flex().flex_col().children(children);
+                        out.push(fold.render(col, window));
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
     }
 }
 
@@ -2444,6 +2545,22 @@ impl Render for FileTree {
             }
         }
 
+        // 同步目录在飞折叠动画：播完、缓存没了或被外部强行改展开态即摘除恢复扁平
+        {
+            let store = self.store.read(cx);
+            let entries = &self.entries;
+            self.folds.sync(|key| {
+                entries
+                    .get(Path::new(key))
+                    .is_some_and(|v| !v.is_empty())
+                    .then(|| store.is_dir_expanded(&project_id, key))
+            });
+        }
+        if self.pending_scroll.is_some() {
+            // 定位/键盘滚动要求列表直接子元素与行号 1:1 对应，清掉在飞动画
+            self.folds.clear();
+        }
+
         let mut rows = Vec::new();
         self.rows(&project_id, &root, &root, 0, cx, &mut rows);
         // 行焦点句柄按**当前可见行**补齐并回收(折叠掉的行不必留着句柄)。
@@ -2561,8 +2678,14 @@ impl Render for FileTree {
             .overflow_y_scroll()
             // 键盘移动与定位靠它把目标行滚进可视区(子元素下标 = 行号)
             .track_scroll(&self.list_scroll);
-        for row in rows {
-            list = list.child(self.render_row(row, cx));
+        if self.folds.is_animating() {
+            let mut anim_rows = Vec::new();
+            self.rows_with_closing(&project_id, &root, &root, 0, true, cx, &mut anim_rows);
+            list = list.children(self.render_row_slice(&anim_rows, window, cx));
+        } else {
+            for row in rows {
+                list = list.child(self.render_row(row, cx));
+            }
         }
         let background_target = root.clone();
         let background_drop_id = "background".to_string();

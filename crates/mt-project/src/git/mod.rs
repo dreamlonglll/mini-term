@@ -174,8 +174,9 @@ pub use log_walk::{
 use status::*;
 pub use status::{get_changes_status, get_git_status};
 pub use worktree::{
-    WorktreeInfo, WorktreeRemoveError, add_worktree, get_worktree_branches, list_worktrees,
-    prune_worktrees, remove_worktree,
+    LocalRepoWorktrees, WorktreeInfo, WorktreeRemoveError, add_worktree,
+    discover_local_repo_worktrees, get_worktree_branches, inspect_local_main_repo_worktrees,
+    list_worktrees, prune_worktrees, remove_worktree,
 };
 
 // 编辑器 gutter 变更标记 / 注解(blame)的后端见 blame / line_diff 的模块注释

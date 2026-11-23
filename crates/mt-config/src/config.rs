@@ -330,6 +330,12 @@ pub struct AppConfig {
     /// (`hotkeys::Overrides::parse`,认不出的丢弃并记日志)。认不出的条目**原样留在表里**、
     /// 不回写删掉 —— 与 `config.db` 的前向兼容同一口径:新版本加的快捷键 id,旧版本读到
     /// 不认识,不能顺手抹掉。跨平台不换算:存的就是这台机器上绑的键位串。
+    /// 用户手动从项目列表移除过的 worktree 路径键（`local:<windows_eq_key>` /
+    /// `ssh:<conn_id>:<posix_path>`）。自动发现新增 worktree 时跳过这些路径，避免
+    /// 用户主动移除的项目反复复活；对应 worktree 从磁盘消失或手动重新添加时自动清理。
+    /// 空 Vec 时序列化跳过，保持旧版配置兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_worktrees: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hotkey_overrides: BTreeMap<String, String>,
 }
@@ -1006,6 +1012,7 @@ impl Default for AppConfig {
             usage_log_columns: None,
             command_library: CommandLibrary::default(),
             remote_notify: RemoteNotifyConfig::default(),
+            dismissed_worktrees: vec![],
             hotkey_overrides: BTreeMap::new(),
         }
     }

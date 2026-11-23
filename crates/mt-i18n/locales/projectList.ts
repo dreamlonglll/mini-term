@@ -16,6 +16,8 @@ export const projectList = {
     chooseDirDialogTitle: "选择项目目录",
     remoteBadgeTitle: "远程项目 · {summary}",
     worktreeBadgeTitle: "Git worktree · 分支 {branch}",
+    worktreeToggleCollapse: "折叠 {count} 个 worktree",
+    worktreeToggleExpand: "展开 {count} 个 worktree",
     remoteBrokenBadge: "断链",
     preview: {
       notStarted: "未启动",
@@ -94,6 +96,8 @@ export const projectList = {
     chooseDirDialogTitle: "Choose project directory",
     remoteBadgeTitle: "Remote project · {summary}",
     worktreeBadgeTitle: "Git worktree · branch {branch}",
+    worktreeToggleCollapse: "Collapse {count} worktree(s)",
+    worktreeToggleExpand: "Expand {count} worktree(s)",
     remoteBrokenBadge: "broken",
     preview: {
       notStarted: "Not started",

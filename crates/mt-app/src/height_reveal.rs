@@ -39,6 +39,7 @@
 //! (`request_animation_frame` 通知的是当前视图)。
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -53,6 +54,9 @@ use mt_ui::motion::{SECTION_TOGGLE, TransitionSpec, ValueTween};
 pub enum RevealMode {
     /// 收起且静止:整块不进树。
     Hidden,
+    /// 收起动画的首帧且自然高度还没量出来:先按自然高度铺满(`t=0` 本就是全高,零闪烁)
+    /// 并挂遮罩拦鼠标,等 prepaint 探针量出高度后从下一帧起平滑裁到 0。
+    MeasuringClose,
     /// 动画中:外壳定高 `height`(像素)、裁掉多出的部分。`closing` = 正在收(内容不再接鼠标)。
     Clipped { height: f32, closing: bool },
     /// 展开且静止:外壳不设高度,内容按自然高度排。
@@ -68,6 +72,9 @@ pub fn reveal_mode(open: bool, running: bool, progress: f32, natural: f32) -> Re
             RevealMode::Hidden
         };
     }
+    if !open && natural <= 0.0 {
+        return RevealMode::MeasuringClose;
+    }
     RevealMode::Clipped {
         height: natural.max(0.0) * progress.clamp(0.0, 1.0),
         closing: !open,
@@ -82,6 +89,9 @@ pub struct HeightReveal {
     tween: ValueTween,
     /// 上一帧量到的内容自然高度(像素;0 = 还没量过)。探针在 prepaint 里写。
     natural: Rc<Cell<f32>>,
+    /// 动画行程高度上限(像素;`None` = 不封顶)。给超大目录用:几百行文件自然高几千像素,
+    /// 不封顶的话收起前半程全在视口外空跑、看着卡住。
+    max_height: Option<f32>,
 }
 
 fn target_of(open: bool) -> f32 {
@@ -99,7 +109,14 @@ impl HeightReveal {
             spec,
             tween: ValueTween::settled(target_of(open), spec),
             natural: Rc::new(Cell::new(0.0)),
+            max_height: None,
         }
+    }
+
+    /// 给动画裁剪高度设上限(像素)。展开到位进入 `Natural` 后仍按真实自然高度排,不截断内容。
+    pub fn with_max_height(mut self, max_height: f32) -> Self {
+        self.max_height = Some(max_height.max(1.0));
+        self
     }
 
     /// 目标是展开吗。
@@ -133,6 +150,14 @@ impl HeightReveal {
         (h > 0.0).then_some(h)
     }
 
+    fn effective_natural(&self) -> f32 {
+        let h = self.natural.get();
+        match self.max_height {
+            Some(cap) if h > cap => cap,
+            _ => h,
+        }
+    }
+
     /// 这一帧的画法(见 [`reveal_mode`])。
     pub fn mode(&self) -> RevealMode {
         let now = Instant::now();
@@ -140,7 +165,7 @@ impl HeightReveal {
             self.is_open(),
             self.tween.running_at(now),
             self.tween.value_at(now),
-            self.natural.get(),
+            self.effective_natural(),
         )
     }
 
@@ -149,6 +174,7 @@ impl HeightReveal {
     pub fn shown_height(&self, fallback: f32) -> f32 {
         match self.mode() {
             RevealMode::Hidden => 0.0,
+            RevealMode::MeasuringClose => self.natural_height().unwrap_or(fallback),
             RevealMode::Clipped { height, .. } => height,
             RevealMode::Natural => self.natural_height().unwrap_or(fallback),
         }
@@ -158,7 +184,7 @@ impl HeightReveal {
     /// [`Self::is_mounted`],连它都不挂)。动画中自动要下一帧。
     pub fn render(&self, child: impl IntoElement, window: &Window) -> AnyElement {
         let mode = self.mode();
-        if matches!(mode, RevealMode::Clipped { .. }) {
+        if matches!(mode, RevealMode::Clipped { .. } | RevealMode::MeasuringClose) {
             window.request_animation_frame();
         }
         if mode == RevealMode::Hidden {
@@ -202,6 +228,14 @@ impl HeightReveal {
                     el.child(div().absolute().inset_0().occlude())
                 }))
                 .into_any_element(),
+            RevealMode::MeasuringClose => div()
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(inner.child(div().absolute().inset_0().occlude()))
+                .into_any_element(),
             _ => div()
                 .w_full()
                 .flex_none()
@@ -210,6 +244,103 @@ impl HeightReveal {
                 .child(inner)
                 .into_any_element(),
         }
+    }
+}
+
+/// 按 key 管理的「仅动画期间存活」的折叠高度补间表。
+///
+/// 给需要保持静态扁平子元素序的滚动列表用（项目列表、文件树）：
+/// - 静止时表里**不留条目**：列表直接子元素 1:1 扁平排布，`ScrollHandle::scroll_to_item`
+///   下标恒准确，也不常驻几十个每帧量尺寸的 canvas 探针；
+/// - 仅刚翻态、仍在飞的分组 / worktree 簇 / 目录套一层 [`HeightReveal`] 裁剪窗；
+/// - 半路反向原地掉头（沿用已量出的自然高与当前进度）；播完即在下一帧 [`Self::sync`] 摘除。
+#[derive(Debug)]
+pub struct FoldReveals {
+    spec: TransitionSpec,
+    max_height: Option<f32>,
+    entries: HashMap<String, HeightReveal>,
+}
+
+impl FoldReveals {
+    pub fn new(spec: TransitionSpec) -> Self {
+        Self {
+            spec,
+            max_height: None,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// 为每条动画设最大行程高度（像素），防止数百行的超大目录在视口外空跑大半程。
+    pub fn with_max_height(mut self, max_height: f32) -> Self {
+        self.max_height = Some(max_height.max(1.0));
+        self
+    }
+
+    /// 交互翻态：`key` 刚翻到 `open`。
+    pub fn flip_open(&mut self, key: impl Into<String>, open: bool) {
+        let key = key.into();
+        let now = Instant::now();
+        self.entries
+            .retain(|k, r| *k == key || r.tween.running_at(now));
+        match self.entries.get_mut(&key) {
+            Some(reveal) if reveal.tween.running_at(now) => {
+                if open && reveal.natural.get() <= 0.0 && !reveal.is_open() {
+                    // 收起首帧还没量完高度就立刻点回展开：画面此刻本就全开着，直接撤掉动画零闪烁
+                    self.entries.remove(&key);
+                } else {
+                    reveal.set_open(open);
+                }
+            }
+            _ => {
+                let mut reveal = HeightReveal::with_spec(!open, self.spec);
+                if let Some(cap) = self.max_height {
+                    reveal = reveal.with_max_height(cap);
+                }
+                reveal.set_open(open);
+                if reveal.tween.running_at(now) {
+                    self.entries.insert(key, reveal);
+                } else {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// 清空全部在飞动画（换项目 / 强制滚动定位）。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// 每帧 render 开头清理：摘掉已播完、节点消失、或目标与真实状态 `is_open` 脱节的条目。
+    pub fn sync(&mut self, mut is_open: impl FnMut(&str) -> Option<bool>) {
+        let now = Instant::now();
+        self.entries.retain(|key, reveal| {
+            reveal.tween.running_at(now) && is_open(key) == Some(reveal.is_open())
+        });
+    }
+
+    /// 取出 `key` 此刻正在跑的补间。
+    pub fn get(&self, key: &str) -> Option<&HeightReveal> {
+        self.entries.get(key).filter(|r| r.is_running())
+    }
+
+    /// `key` 此刻是否正在「收起最后一程」（真实状态已折叠，仍需挂着子项收完）。
+    pub fn is_closing(&self, key: &str) -> bool {
+        self.get(key).is_some_and(|r| !r.is_open())
+    }
+
+    /// 是否有任意条目正在播动画。
+    pub fn is_animating(&self) -> bool {
+        self.entries.values().any(|r| r.is_running())
+    }
+
+    /// 所有此刻正在「收起最后一程」的 key（供调用方构造临时展开集合）。
+    pub fn closing_keys(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|(_, r)| r.is_running() && !r.is_open())
+            .map(|(k, _)| k.as_str())
+            .collect()
     }
 }
 
@@ -288,5 +419,40 @@ mod tests {
         assert_eq!(reveal.shown_height(36.0), 80.0);
         reveal.natural.set(0.0);
         assert_eq!(reveal.shown_height(36.0), 36.0);
+    }
+
+    #[test]
+    fn 收起首帧未量高度时先按自然高铺满不闪黑() {
+        assert_eq!(
+            reveal_mode(false, true, 0.99, 0.0),
+            RevealMode::MeasuringClose
+        );
+        // 高度上限只钳动画行程，不影响静止 Natural
+        let capped = HeightReveal::new(true).with_max_height(200.0);
+        capped.natural.set(1200.0);
+        assert_eq!(capped.mode(), RevealMode::Natural);
+        assert_eq!(capped.effective_natural(), 200.0);
+    }
+
+    #[test]
+    fn fold_reveals_按状态同步并支持首帧反向取消() {
+        let mut folds = FoldReveals::new(SECTION_TOGGLE).with_max_height(400.0);
+        assert!(!folds.is_animating());
+
+        folds.flip_open("g1", false);
+        if mt_ui::motion::animations_enabled() {
+            assert!(folds.is_animating());
+            assert!(folds.is_closing("g1"));
+            assert_eq!(folds.closing_keys(), vec!["g1"]);
+            // 未量出自然高度前立刻点回展开 → 直接取消，零闪烁
+            folds.flip_open("g1", true);
+            assert!(!folds.is_animating());
+
+            // 正常展开并被外部强行改状态 → sync 自动摘除
+            folds.flip_open("g2", true);
+            assert!(folds.is_animating());
+            folds.sync(|key| (key == "g2").then_some(false));
+            assert!(!folds.is_animating());
+        }
     }
 }

@@ -299,8 +299,13 @@ use mt_i18n::{
 /// （`usageStats.{columns.cacheHitRate,columns.cacheHitRateTip,requestLogs.hitRateTip}`）。
 /// 1961 → 1969：趋势图点柱下钻到当天 / 聚焦小时 —— 两条操作提示、三条柱子悬停提示、
 /// 面包屑返回、底部「仅某小时」标签与取消（`usageStats.drill.*` 共 8 条）。
+/// 1969 → 1971：项目列表 worktree 簇折叠切换胶囊的两条悬停提示
+/// （`projectList.{worktreeToggleCollapse,worktreeToggleExpand}`）。
+/// 1971 → 1970：worktree 自动识别添加为项目，worktree 管理弹窗下线「设为项目」/「已是项目」/
+/// 「切换到项目」（改为整行点击切换），新增「当前」标与路径分支占位符，更新开终端图标提示
+/// （移除 `worktree.{isProject,addAsProject,switchToProject}`，换入 `worktree.{current,branchDirPlaceholder,switchAfterCreate}`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1969;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1970;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

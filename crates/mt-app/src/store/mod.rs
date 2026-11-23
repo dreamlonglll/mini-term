@@ -78,6 +78,7 @@ use layout_writer::LayoutWriter;
 
 pub use events::{ConfigSection, StoreEvent};
 pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH};
+pub use projects::worktree_dismiss_key;
 pub use ssh::SshSaveError;
 
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,

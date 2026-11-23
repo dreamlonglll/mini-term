@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1969;
+pub const ZH_ENTRY_COUNT: usize = 1970;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1969;
+pub const EN_ENTRY_COUNT: usize = 1970;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2538,6 +2538,8 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("removeConfirm.messageSuffix", "」吗？此操作仅从列表中移除，不会删除文件。"),
     ("removeConfirm.title", "移除项目"),
     ("worktreeBadgeTitle", "Git worktree · 分支 {branch}"),
+    ("worktreeToggleCollapse", "折叠 {count} 个 worktree"),
+    ("worktreeToggleExpand", "展开 {count} 个 worktree"),
 ];
 #[rustfmt::skip]
 static PROJECT_LIST_EN: &[(&str, &str)] = &[
@@ -2605,6 +2607,8 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("removeConfirm.messageSuffix", "”? This only removes it from the list and won't delete any files."),
     ("removeConfirm.title", "Remove Project"),
     ("worktreeBadgeTitle", "Git worktree · branch {branch}"),
+    ("worktreeToggleCollapse", "Collapse {count} worktree(s)"),
+    ("worktreeToggleExpand", "Expand {count} worktree(s)"),
 ];
 
 #[rustfmt::skip]
@@ -4134,10 +4138,9 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static WORKTREE_ZH: &[(&str, &str)] = &[
-    ("addAsProject", "设为项目"),
-    ("addAsProjectAfterCreate", "创建后添加为项目并切换过去"),
     ("baseBranchTitle", "新分支的起点（缺省为当前 HEAD）"),
     ("baseHead", "基于 HEAD"),
+    ("branchDirPlaceholder", "<分支名>"),
     ("browse", "浏览…"),
     ("cancel", "取消"),
     ("clearAll", "取消全选"),
@@ -4145,9 +4148,9 @@ static WORKTREE_ZH: &[(&str, &str)] = &[
     ("createMulti", "创建 {count} 个"),
     ("createTitle", "新建 worktree"),
     ("creating", "创建中…"),
+    ("current", "当前"),
     ("forceRemove", "强制删除（丢弃未提交的改动）"),
     ("invalid", "失效"),
-    ("isProject", "已是项目"),
     ("loading", "加载中…"),
     ("locked", "锁定"),
     ("mainRepo", "主仓库"),
@@ -4157,7 +4160,7 @@ static WORKTREE_ZH: &[(&str, &str)] = &[
     ("noBranchAvailable", "没有可检出的本地分支（均已被某个工作区持有），可切换到「新建分支」"),
     ("noCommonBranch", "所选仓库没有共同的可检出分支，可切换到「新建分支」"),
     ("noRepoFound", "该目录及其子目录下没有找到 Git 仓库"),
-    ("openTerminal", "开终端"),
+    ("openTerminal", "在当前项目开终端"),
     ("parentPathPlaceholder", "父目录（各仓库建到 <仓库名>-<分支> 子目录）"),
     ("pathPlaceholder", "worktree 目录（必须是不存在的新路径）"),
     ("prune", "清理失效条目"),
@@ -4176,15 +4179,14 @@ static WORKTREE_ZH: &[(&str, &str)] = &[
     ("selectBranch", "选择分支…"),
     ("selectRepoHint", "请先勾选要新建 worktree 的仓库"),
     ("selectedCount", "已勾选 {count} 个"),
-    ("switchToProject", "切换到项目"),
+    ("switchAfterCreate", "创建后切换到该项目"),
     ("title", "Worktree 管理 — {name}"),
 ];
 #[rustfmt::skip]
 static WORKTREE_EN: &[(&str, &str)] = &[
-    ("addAsProject", "Add as project"),
-    ("addAsProjectAfterCreate", "Add as project and switch after creation"),
     ("baseBranchTitle", "Starting point of the new branch (defaults to HEAD)"),
     ("baseHead", "From HEAD"),
+    ("branchDirPlaceholder", "<branch>"),
     ("browse", "Browse…"),
     ("cancel", "Cancel"),
     ("clearAll", "Clear"),
@@ -4192,9 +4194,9 @@ static WORKTREE_EN: &[(&str, &str)] = &[
     ("createMulti", "Create {count}"),
     ("createTitle", "New worktree"),
     ("creating", "Creating..."),
+    ("current", "current"),
     ("forceRemove", "Force remove (discard uncommitted changes)"),
     ("invalid", "stale"),
-    ("isProject", "project"),
     ("loading", "Loading..."),
     ("locked", "locked"),
     ("mainRepo", "main"),
@@ -4204,7 +4206,7 @@ static WORKTREE_EN: &[(&str, &str)] = &[
     ("noBranchAvailable", "No local branch available (all checked out elsewhere) — try \"New branch\""),
     ("noCommonBranch", "The selected repositories share no available branch — try \"New branch\""),
     ("noRepoFound", "No Git repository found in this directory or its subdirectories"),
-    ("openTerminal", "Terminal"),
+    ("openTerminal", "Open terminal in current project"),
     ("parentPathPlaceholder", "Parent directory (each repo gets a <repo>-<branch> subdir)"),
     ("pathPlaceholder", "Worktree directory (must be a new path)"),
     ("prune", "Prune stale entries"),
@@ -4223,7 +4225,7 @@ static WORKTREE_EN: &[(&str, &str)] = &[
     ("selectBranch", "Select branch…"),
     ("selectRepoHint", "Check at least one repository first"),
     ("selectedCount", "{count} selected"),
-    ("switchToProject", "Switch to project"),
+    ("switchAfterCreate", "Switch to project after creation"),
     ("title", "Worktrees — {name}"),
 ];
 

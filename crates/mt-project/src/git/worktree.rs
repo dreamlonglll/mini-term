@@ -377,3 +377,142 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
         })
         .collect()
 }
+
+/// 某个本地主仓库的 linked worktree 快照（用于自动发现新增 worktree 与挂 `.git/worktrees` 监听）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRepoWorktrees {
+    /// 主仓库的 `.git` 目录（已去尾斜杠、统一本机分隔符，供 `FsWatcher` 挂非递归监听）。
+    pub git_dir: PathBuf,
+    /// `<git_dir>/worktrees` 此刻是否存在（在后台判好，避免主线程做同步 stat）。
+    pub worktrees_dir_exists: bool,
+    /// 主仓库下全部有效 linked worktree 的规范化路径（排除主仓库自身与失效条目，去重）。
+    pub linked_paths: Vec<String>,
+    /// 是否存在刚建好 / 仍在 `initializing` 锁中、尚未通过校验的条目（调用方可做短重试）。
+    pub has_pending_invalid: bool,
+}
+
+/// 检查一条刚创建但尚未通过 `validate()` 的 worktree 元数据是否处于初始化中：
+/// git 在 `git worktree add` checkout 期间会先写 `locked` 文件内容 `"initializing"`，
+/// 或是元目录刚建好不到几秒。只对这类条目置 `has_pending_invalid`，避免对陈旧失效条目空重试。
+fn is_initializing_worktree(git_dir: &Path, wt_name: &str, wt: &git2::Worktree) -> bool {
+    if let Ok(git2::WorktreeLockStatus::Locked(Some(reason))) = wt.is_locked()
+        && reason.trim().eq_ignore_ascii_case("initializing")
+    {
+        return true;
+    }
+    let meta_dir = git_dir.join("worktrees").join(wt_name);
+    std::fs::metadata(&meta_dir)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+        .is_some_and(|age| age < Duration::from_secs(5))
+}
+
+/// 探测单个本地路径是否为主 Git 仓库并返回其有效 linked worktree 清单。
+///
+/// - UNC 路径（WSL / 网络共享）、非仓库目录或**本身就是 linked worktree** 的路径返回 `None`
+///   （不把兄弟 worktree 误挂到某个 worktree 之下）；
+/// - `Repository::open` 不向上爬父目录，只认项目根自身是仓库的情况（零递归扫盘开销）。
+pub fn inspect_local_main_repo_worktrees(repo_path: &Path) -> Option<LocalRepoWorktrees> {
+    if repo_path.to_string_lossy().starts_with(r"\\") {
+        return None;
+    }
+    let repo = Repository::open(repo_path).ok()?;
+    if repo.is_worktree() {
+        return None;
+    }
+    let git_dir = PathBuf::from(display_path(repo.path()));
+    let worktrees_dir_exists = git_dir.join("worktrees").is_dir();
+    let main_key = mt_core::path_key::windows_eq_key(&repo_path.to_string_lossy());
+    let workdir_key = repo
+        .workdir()
+        .map(|w| mt_core::path_key::windows_eq_key(&w.to_string_lossy()));
+
+    let mut seen_keys = HashSet::new();
+    let mut linked_paths = Vec::new();
+    let mut has_pending_invalid = false;
+
+    if let Ok(names) = repo.worktrees() {
+        for wt_name in names.iter().flatten() {
+            let Ok(wt) = repo.find_worktree(wt_name) else {
+                continue;
+            };
+            let wt_path = wt.path().to_path_buf();
+            if wt_path.is_dir() && wt.validate().is_ok() {
+                let norm = display_path(&wt_path);
+                if norm.is_empty() {
+                    continue;
+                }
+                let key = mt_core::path_key::windows_eq_key(&norm);
+                if key == main_key || workdir_key.as_deref() == Some(key.as_str()) {
+                    continue;
+                }
+                if seen_keys.insert(key) {
+                    linked_paths.push(norm);
+                }
+            } else if is_initializing_worktree(&git_dir, wt_name, &wt) {
+                has_pending_invalid = true;
+            }
+        }
+    }
+
+    Some(LocalRepoWorktrees {
+        git_dir,
+        worktrees_dir_exists,
+        linked_paths,
+        has_pending_invalid,
+    })
+}
+
+/// 批量探测本地主仓库的 linked worktree 清单（供后台线程一次性跑完，避免逐项切线程）。
+pub fn discover_local_repo_worktrees(paths: &[PathBuf]) -> Vec<Option<LocalRepoWorktrees>> {
+    paths
+        .iter()
+        .map(|p| inspect_local_main_repo_worktrees(p))
+        .collect()
+}
+
+#[cfg(test)]
+mod local_discover_tests {
+    use super::*;
+    use crate::git::test_support::init_repo_with_file;
+
+    #[test]
+    fn 主仓库探测返回有效_worktree_而子_worktree_与非仓库返回_none() {
+        let repo = init_repo_with_file("local-wt-discover", "a.txt", "hello\n");
+
+        // 还没有 worktree 时：识别为主仓库、linked_paths 为空
+        let before = inspect_local_main_repo_worktrees(&repo).expect("应识别为主仓库");
+        assert!(before.linked_paths.is_empty());
+        assert!(!before.worktrees_dir_exists);
+
+        // 新增一条 linked worktree
+        let wt_dir = repo.parent().unwrap().join(format!(
+            "{}-wt-feat",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        add_worktree(&repo, &wt_dir.to_string_lossy(), "feat/auto", true, None)
+            .expect("add_worktree");
+
+        let after = inspect_local_main_repo_worktrees(&repo).expect("应识别为主仓库");
+        assert!(after.worktrees_dir_exists);
+        assert_eq!(after.linked_paths.len(), 1);
+        assert_eq!(
+            mt_core::path_key::windows_eq_key(&after.linked_paths[0]),
+            mt_core::path_key::windows_eq_key(&wt_dir.to_string_lossy())
+        );
+
+        // 对 linked worktree 自身调用必须返回 None（不把兄弟 worktree 误挂到它下面）
+        assert!(inspect_local_main_repo_worktrees(&wt_dir).is_none());
+        // 非 git 目录与 UNC 路径返回 None
+        assert!(inspect_local_main_repo_worktrees(repo.parent().unwrap()).is_none());
+        assert!(inspect_local_main_repo_worktrees(Path::new(r"\\wsl$\Ubuntu\repo")).is_none());
+
+        // 删除目录制造失效 worktree：linked_paths 不再包含它
+        let _ = std::fs::remove_dir_all(&wt_dir);
+        let stale = inspect_local_main_repo_worktrees(&repo).expect("主仓库仍在");
+        assert!(stale.linked_paths.is_empty());
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}

@@ -17,6 +17,8 @@
 //! 磁盘格式(`config.projectTree`)一个字都不改:这里只读写
 //! [`mt_config::ProjectTreeItem`],它的 `#[serde(untagged)]` 布局与装机版互读互写。
 
+use std::collections::HashSet;
+
 use mt_config::{AppConfig, ProjectConfig, ProjectGroup, ProjectTreeItem};
 
 /// 分组嵌套上限(含项目那一层)。与 `projectTree.ts:3` 同值。
@@ -383,6 +385,15 @@ impl OrderedItem {
 /// - 收尾兜底判据必须是「在不在完整树里」而**不是**「有没有被 push 过」——
 ///   折叠组里的项目一个都没 push,拿 `pushed` 判会让它们统统跑到列表底部去。
 pub fn get_ordered_tree(config: &AppConfig) -> Vec<OrderedItem> {
+    get_ordered_tree_with_open_groups(config, &HashSet::new())
+}
+
+/// 同 [`get_ordered_tree`]，但把 `force_open_groups` 里的折叠分组临时视作展开
+/// （分组自身的 `OrderedItem::Group.collapsed` 仍保留真实值，供分组收起动画画最后一程）。
+pub fn get_ordered_tree_with_open_groups(
+    config: &AppConfig,
+    force_open_groups: &HashSet<String>,
+) -> Vec<OrderedItem> {
     let mut result: Vec<OrderedItem> = Vec::new();
     let mut pushed: Vec<String> = Vec::new();
 
@@ -442,6 +453,7 @@ pub fn get_ordered_tree(config: &AppConfig) -> Vec<OrderedItem> {
         depth: usize,
         parent_group_id: Option<&str>,
         config: &AppConfig,
+        force_open_groups: &HashSet<String>,
         children_by_parent: &[(String, Vec<String>)],
         pushed: &mut Vec<String>,
         result: &mut Vec<OrderedItem>,
@@ -457,12 +469,13 @@ pub fn get_ordered_tree(config: &AppConfig) -> Vec<OrderedItem> {
                         depth,
                         parent_group_id: parent_group_id.map(str::to_string),
                     });
-                    if !group.collapsed {
+                    if !group.collapsed || force_open_groups.contains(&group.id) {
                         walk(
                             &group.children,
                             depth + 1,
                             Some(&group.id),
                             config,
+                            force_open_groups,
                             children_by_parent,
                             pushed,
                             result,
@@ -493,6 +506,7 @@ pub fn get_ordered_tree(config: &AppConfig) -> Vec<OrderedItem> {
         0,
         None,
         config,
+        force_open_groups,
         &children_by_parent,
         &mut pushed,
         &mut result,
@@ -603,6 +617,199 @@ pub fn collapsed_ancestors(config: &AppConfig, project_id: &str) -> Vec<String> 
             _ => return Vec::new(),
         }
     }
+}
+
+// ─── Worktree 项目簇：后代查询、折叠过滤与树轨拓扑 ──────────
+
+/// 某项目沿 `parent_project_id` 往上的全部存活祖先项目 id（父在前、祖父在后，带环路保护）。
+/// 父项目不在 `projects` 里的孤儿返回空。
+pub fn worktree_ancestors(projects: &[ProjectConfig], project_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen: Vec<&str> = vec![project_id];
+    let mut current = project_id;
+    while let Some(parent) = projects
+        .iter()
+        .find(|p| p.id == current)
+        .and_then(|p| p.parent_project_id.as_deref())
+    {
+        if seen.contains(&parent) || !projects.iter().any(|p| p.id == parent) {
+            break;
+        }
+        out.push(parent.to_string());
+        seen.push(parent);
+        current = parent;
+    }
+    out
+}
+
+/// 某项目下挂的全部 worktree 后代项目 id（深度优先，保持 `projects` 原序，带环路保护）。
+pub fn worktree_descendants(projects: &[ProjectConfig], parent_id: &str) -> Vec<String> {
+    fn walk(
+        projects: &[ProjectConfig],
+        parent: &str,
+        seen: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        for p in projects {
+            if p.parent_project_id.as_deref() == Some(parent)
+                && !seen.iter().any(|id| id == &p.id)
+            {
+                seen.push(p.id.clone());
+                out.push(p.id.clone());
+                walk(projects, &p.id, seen, out);
+            }
+        }
+    }
+    let mut seen = vec![parent_id.to_string()];
+    let mut out = Vec::new();
+    walk(projects, parent_id, &mut seen, &mut out);
+    out
+}
+
+/// 在 [`get_ordered_tree`] 展平结果基础上，裁掉落在已折叠父项目（`collapsed_worktrees`）
+/// 之下的 worktree 后代行。父项目与分组行本身原样保留。
+pub fn filter_collapsed_worktrees(
+    ordered: Vec<OrderedItem>,
+    projects: &[ProjectConfig],
+    collapsed_worktrees: &HashSet<String>,
+) -> Vec<OrderedItem> {
+    if collapsed_worktrees.is_empty() {
+        return ordered;
+    }
+    ordered
+        .into_iter()
+        .filter(|item| match item {
+            OrderedItem::Group { .. } => true,
+            OrderedItem::Project {
+                id, is_child: true, ..
+            } => !worktree_ancestors(projects, id)
+                .iter()
+                .any(|anc| collapsed_worktrees.contains(anc)),
+            OrderedItem::Project { .. } => true,
+        })
+        .collect()
+}
+
+/// 一行项目在 worktree 视觉簇里的角色。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectClusterRole {
+    /// 普通独立项目（无 worktree 子项，自身也不是子项）。
+    Standalone,
+    /// 挂有 worktree 但当前折叠收起的父项目。
+    CollapsedParent { child_count: usize },
+    /// 挂有 worktree 且当前展开的父项目（微容器头部）。
+    ExpandedParent { child_count: usize },
+    /// 展开微容器里的 worktree 子项目。
+    Child {
+        /// 所属簇头（最顶层父项目）的 id。
+        root_parent_id: String,
+        /// 所属簇头的缩进层级（用于把树轨对齐到父项目领位图标中心）。
+        root_depth: usize,
+        /// 相对簇头的嵌套层数（直接子项 = 1，孙项 = 2…）。
+        rel_depth: usize,
+        /// 这一层上是不是最后一个兄弟（决定画 `╰─` 还是 `├─`）。
+        is_last_sibling: bool,
+        /// 是不是整个微容器的最后一行（决定闭合底边框与底部圆角）。
+        is_last_in_cluster: bool,
+        /// 多层嵌套时，哪些祖先层在下方还有兄弟需要延续竖线（长度 = `rel_depth - 1`）。
+        ancestor_continues: Vec<bool>,
+    },
+}
+
+/// 为当前可见展平表计算每行的 worktree 视觉簇角色（与 `ordered` 等长，分组行对应 `None`）。
+pub fn compute_cluster_roles(
+    ordered: &[OrderedItem],
+    projects: &[ProjectConfig],
+    collapsed_worktrees: &HashSet<String>,
+) -> Vec<Option<ProjectClusterRole>> {
+    let mut roles: Vec<Option<ProjectClusterRole>> = Vec::with_capacity(ordered.len());
+    // 当前正在展开的簇头 `(root_parent_id, root_depth)`。
+    let mut current_root: Option<(String, usize)> = None;
+
+    for (i, item) in ordered.iter().enumerate() {
+        match item {
+            OrderedItem::Group { .. } => {
+                current_root = None;
+                roles.push(None);
+            }
+            OrderedItem::Project {
+                id,
+                depth,
+                is_child: false,
+                ..
+            } => {
+                let child_count = worktree_descendants(projects, id).len();
+                if child_count == 0 {
+                    current_root = None;
+                    roles.push(Some(ProjectClusterRole::Standalone));
+                } else if collapsed_worktrees.contains(id) {
+                    current_root = None;
+                    roles.push(Some(ProjectClusterRole::CollapsedParent { child_count }));
+                } else {
+                    let has_visible_child = matches!(
+                        ordered.get(i + 1),
+                        Some(OrderedItem::Project { is_child: true, .. })
+                    );
+                    if has_visible_child {
+                        current_root = Some((id.clone(), *depth));
+                        roles.push(Some(ProjectClusterRole::ExpandedParent { child_count }));
+                    } else {
+                        current_root = None;
+                        roles.push(Some(ProjectClusterRole::CollapsedParent { child_count }));
+                    }
+                }
+            }
+            OrderedItem::Project {
+                depth,
+                is_child: true,
+                ..
+            } => {
+                let Some((root_id, root_depth)) = current_root.as_ref() else {
+                    roles.push(Some(ProjectClusterRole::Standalone));
+                    continue;
+                };
+                let rel_depth = depth.saturating_sub(*root_depth).max(1);
+                let is_last_in_cluster = !matches!(
+                    ordered.get(i + 1),
+                    Some(OrderedItem::Project { is_child: true, .. })
+                );
+                let has_next_at_depth = |target_depth: usize| -> bool {
+                    for next in &ordered[i + 1..] {
+                        match next {
+                            OrderedItem::Project {
+                                depth: nd,
+                                is_child: true,
+                                ..
+                            } => {
+                                if *nd == target_depth {
+                                    return true;
+                                }
+                                if *nd < target_depth {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                    false
+                };
+                let is_last_sibling = !has_next_at_depth(*depth);
+                let ancestor_continues = ((root_depth + 1)..*depth)
+                    .map(has_next_at_depth)
+                    .collect();
+                roles.push(Some(ProjectClusterRole::Child {
+                    root_parent_id: root_id.clone(),
+                    root_depth: *root_depth,
+                    rel_depth,
+                    is_last_sibling,
+                    is_last_in_cluster,
+                    ancestor_continues,
+                }));
+            }
+        }
+    }
+
+    roles
 }
 
 #[cfg(test)]
@@ -1310,5 +1517,179 @@ mod tests {
         // 反过来也读得回来(装机版写的那份进得来)
         let back: Vec<ProjectTreeItem> = serde_json::from_str(&json).expect("反序列化");
         assert_eq!(dump(&back), "proj-1,group-1[proj-2]");
+    }
+
+    // ─── Worktree 项目簇：后代、折叠过滤与树轨拓扑 ────────────
+
+    #[test]
+    fn worktree祖先与后代查询含多层与防环() {
+        let projects = vec![
+            project_cfg("p", None),
+            project_cfg("c1", Some("p")),
+            project_cfg("g1", Some("c1")),
+            project_cfg("c2", Some("p")),
+            project_cfg("orphan", Some("missing")),
+            project_cfg("cyc_a", Some("cyc_b")),
+            project_cfg("cyc_b", Some("cyc_a")),
+        ];
+        assert_eq!(worktree_descendants(&projects, "p"), vec!["c1", "g1", "c2"]);
+        assert_eq!(worktree_descendants(&projects, "c1"), vec!["g1"]);
+        assert!(worktree_descendants(&projects, "c2").is_empty());
+
+        assert_eq!(worktree_ancestors(&projects, "g1"), vec!["c1", "p"]);
+        assert_eq!(worktree_ancestors(&projects, "c1"), vec!["p"]);
+        assert!(worktree_ancestors(&projects, "p").is_empty());
+        assert!(worktree_ancestors(&projects, "orphan").is_empty());
+        // 互指不死循环
+        assert_eq!(worktree_ancestors(&projects, "cyc_a"), vec!["cyc_b"]);
+        assert_eq!(worktree_descendants(&projects, "cyc_a"), vec!["cyc_b"]);
+    }
+
+    #[test]
+    fn 折叠父项目裁剪全部worktree后代并切换角色() {
+        let config = config_with(
+            vec![
+                project_cfg("solo", None),
+                project_cfg("p", None),
+                project_cfg("wt1", Some("p")),
+                project_cfg("wt2", Some("p")),
+                project_cfg("after", None),
+            ],
+            Some(vec![proj("solo"), proj("p"), proj("after")]),
+        );
+
+        // 默认展开
+        let empty = HashSet::new();
+        let ordered = filter_collapsed_worktrees(get_ordered_tree(&config), &config.projects, &empty);
+        assert_eq!(
+            ordered.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["solo", "p", "wt1", "wt2", "after"]
+        );
+        let roles = compute_cluster_roles(&ordered, &config.projects, &empty);
+        assert_eq!(
+            roles,
+            vec![
+                Some(ProjectClusterRole::Standalone),
+                Some(ProjectClusterRole::ExpandedParent { child_count: 2 }),
+                Some(ProjectClusterRole::Child {
+                    root_parent_id: "p".into(),
+                    root_depth: 0,
+                    rel_depth: 1,
+                    is_last_sibling: false,
+                    is_last_in_cluster: false,
+                    ancestor_continues: vec![],
+                }),
+                Some(ProjectClusterRole::Child {
+                    root_parent_id: "p".into(),
+                    root_depth: 0,
+                    rel_depth: 1,
+                    is_last_sibling: true,
+                    is_last_in_cluster: true,
+                    ancestor_continues: vec![],
+                }),
+                Some(ProjectClusterRole::Standalone),
+            ]
+        );
+
+        // 折叠父项目后，后代裁掉、角色切为 CollapsedParent
+        let collapsed: HashSet<String> = ["p".to_string()].into_iter().collect();
+        let visible =
+            filter_collapsed_worktrees(get_ordered_tree(&config), &config.projects, &collapsed);
+        assert_eq!(
+            visible.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["solo", "p", "after"]
+        );
+        let collapsed_roles = compute_cluster_roles(&visible, &config.projects, &collapsed);
+        assert_eq!(
+            collapsed_roles,
+            vec![
+                Some(ProjectClusterRole::Standalone),
+                Some(ProjectClusterRole::CollapsedParent { child_count: 2 }),
+                Some(ProjectClusterRole::Standalone),
+            ]
+        );
+    }
+
+    #[test]
+    fn 组内父项目与多层嵌套子项的树轨拓扑正确() {
+        let config = config_with(
+            vec![
+                project_cfg("p", None),
+                project_cfg("c1", Some("p")),
+                project_cfg("gc", Some("c1")),
+                project_cfg("c2", Some("p")),
+            ],
+            Some(vec![group("g1", vec![proj("p")])]),
+        );
+        let empty = HashSet::new();
+        let ordered = get_ordered_tree(&config);
+        let roles = compute_cluster_roles(&ordered, &config.projects, &empty);
+        assert_eq!(roles[0], None); // g1
+        assert_eq!(
+            roles[1],
+            Some(ProjectClusterRole::ExpandedParent { child_count: 3 })
+        );
+        assert_eq!(
+            roles[2],
+            Some(ProjectClusterRole::Child {
+                root_parent_id: "p".into(),
+                root_depth: 1,
+                rel_depth: 1,
+                is_last_sibling: false,
+                is_last_in_cluster: false,
+                ancestor_continues: vec![],
+            })
+        );
+        assert_eq!(
+            roles[3],
+            Some(ProjectClusterRole::Child {
+                root_parent_id: "p".into(),
+                root_depth: 1,
+                rel_depth: 2,
+                is_last_sibling: true,
+                is_last_in_cluster: false,
+                ancestor_continues: vec![true],
+            })
+        );
+        assert_eq!(
+            roles[4],
+            Some(ProjectClusterRole::Child {
+                root_parent_id: "p".into(),
+                root_depth: 1,
+                rel_depth: 1,
+                is_last_sibling: true,
+                is_last_in_cluster: true,
+                ancestor_continues: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn 临时展开集合让折叠组保留收起态标志同时输出子项() {
+        let mut tree = vec![group("g1", vec![proj("p1"), group("g2", vec![proj("p2")])])];
+        if let ProjectTreeItem::Group(g) = &mut tree[0] {
+            g.collapsed = true;
+            if let ProjectTreeItem::Group(inner) = &mut g.children[1] {
+                inner.collapsed = true;
+            }
+        }
+        let config = config_with(
+            vec![project_cfg("p1", None), project_cfg("p2", None)],
+            Some(tree),
+        );
+        let force: HashSet<String> = ["g1".to_string()].into_iter().collect();
+        let ordered = get_ordered_tree_with_open_groups(&config, &force);
+        // g1 临时展开输出 p1 与 g2，但 g1 自身仍标记 collapsed=true，且内部折叠的 g2 不展开
+        assert_eq!(
+            ordered.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["g1", "p1", "g2"]
+        );
+        assert!(matches!(
+            ordered[0],
+            OrderedItem::Group {
+                collapsed: true,
+                ..
+            }
+        ));
     }
 }

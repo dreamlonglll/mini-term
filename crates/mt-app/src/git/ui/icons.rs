@@ -252,6 +252,8 @@ pub const ICON_TRASH: &[Shape] = &[
     path("M10 11v6"),
     path("M14 11v6"),
 ];
+/// 终端(`terminal`):Worktree 行里「在当前项目开终端」图标按钮。
+pub const ICON_TERMINAL: &[Shape] = &[path("m4 17 6-6-6-6"), path("M12 19h8")];
 
 // ─── 方向 ─────────────────────────────────────────────────────
 
@@ -298,6 +300,7 @@ const ALL_ICONS: &[&[Shape]] = &[
     ICON_STASH,
     ICON_DIFF,
     ICON_TRASH,
+    ICON_TERMINAL,
     ICON_CHEVRON_DOWN,
     ICON_CHEVRON_RIGHT,
     ICON_CHEVRON_LEFT,
