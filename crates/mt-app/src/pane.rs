@@ -2852,6 +2852,33 @@ fn allows_local_menu(mode: TermMode, shift: bool, alt: bool, control: bool) -> b
     prefers_local_handling(mode, MouseMods::new(shift, alt, control))
 }
 
+/// 终端右键菜单里 SSH 段的显隐计划,见 [`ssh_menu_plan`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SshMenuPlan {
+    /// 「SSH 连接」悬停面板入口。
+    connect: bool,
+    /// 「断开 SSH」(右键接管中)。
+    disconnect: bool,
+}
+
+impl SshMenuPlan {
+    fn is_empty(self) -> bool {
+        !self.connect && !self.disconnect
+    }
+}
+
+/// 终端右键菜单里 SSH 段要出哪些项。
+///
+/// 检测到终端正处于 AI 会话中(`ai_alive`,口径同 [`crate::pane_actions::is_ai_alive`])时,
+/// 不出「SSH 连接」;退出 AI 回到普通 shell 后恢复。若终端正处于右键「SSH 连接」接管中
+/// (`in_ssh_takeover`),即便远端里进了 AI,「断开 SSH」仍保留,免得失去断开出口。
+fn ssh_menu_plan(ai_alive: bool, in_ssh_takeover: bool) -> SshMenuPlan {
+    SshMenuPlan {
+        connect: !ai_alive,
+        disconnect: in_ssh_takeover,
+    }
+}
+
 /// 把 grid 绝对行 `line` 滚到**视口顶部**所需的 `Scroll::Delta`。
 ///
 /// `display_offset` 是「往回看多少行」,屏幕行 `row = line + display_offset`,
@@ -3034,7 +3061,8 @@ impl TerminalPane {
     /// 2. 复制 / 粘贴 / 全选;
     /// 3. 查找…(与 Ctrl+F 同一个 [`Self::open_search`]);
     /// 4. 清除缓冲 / 将缓冲保存为文件…;
-    /// 5. 会话分支段(有才出)与 SSH 连接(恒在)—— 与此前一致;右键「SSH 连接」接管中
+    /// 5. 会话分支段(有才出)与 SSH 段:未进入 AI 会话时出「SSH 连接」(一条连接都没有时
+    ///    面板是带「新建连接」的空态卡),检测到终端进入 AI 后隐藏;右键「SSH 连接」接管中
     ///    另有「断开 SSH」(见 [`Self::disconnect_takeover`])。
     ///
     /// 置灰:没有选区时「复制」灰(原版 `disabled: !hasSelection`);缓冲里一个可见字都
@@ -3119,24 +3147,36 @@ impl TerminalPane {
         // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
         // 右键都找得到),显隐口径与项的实现都是同一份
         entries.extend(branch_entries_for_pty(self.pty_id, cx));
-        // SSH 段:**恒在**,悬停展开快速连接面板(一条连接都没有时
-        // 面板是带「新建连接」的空态卡,见 `ssh_quick_connect`)
-        entries.push(menu::separator());
-        entries.push(crate::ssh_quick_connect::menu_entry(
-            AppStore::global(cx),
-            self.pty_id,
-        ));
-        // 右键「SSH 连接」接管中(含还在等首屏 / 建连):断开它、回到接管前的终端
-        if self.in_ssh_takeover() {
-            let this_disconnect = this.clone();
-            let focus_disconnect = self.focus.clone();
-            entries.push(menu::item(
-                t("terminal", "sshDisconnect"),
-                move |window, cx| {
-                    let _ = this_disconnect.update(cx, |pane, cx| pane.disconnect_takeover(cx));
-                    window.focus(&focus_disconnect, cx);
-                },
-            ));
+        // SSH 段:终端进入 AI 会话后不出「SSH 连接」;非 AI 时恒出(一条连接都没有时
+        // 面板是带「新建连接」的空态卡,见 `ssh_quick_connect`)。右键接管中另出「断开 SSH」。
+        let store = AppStore::global(cx);
+        let ai_alive = {
+            let s = store.read(cx);
+            s.pane_of_pty(self.pty_id)
+                .and_then(|(pid, pane_id)| s.project_state(&pid)?.pane(&pane_id))
+                .is_some_and(|p| crate::pane_actions::is_ai_alive(p.status))
+        };
+        let ssh_menu = ssh_menu_plan(ai_alive, self.in_ssh_takeover());
+        if !ssh_menu.is_empty() {
+            entries.push(menu::separator());
+            if ssh_menu.connect {
+                entries.push(crate::ssh_quick_connect::menu_entry(
+                    store.clone(),
+                    self.pty_id,
+                ));
+            }
+            // 右键「SSH 连接」接管中(含还在等首屏 / 建连):断开它、回到接管前的终端
+            if ssh_menu.disconnect {
+                let this_disconnect = this.clone();
+                let focus_disconnect = self.focus.clone();
+                entries.push(menu::item(
+                    t("terminal", "sshDisconnect"),
+                    move |window, cx| {
+                        let _ = this_disconnect.update(cx, |pane, cx| pane.disconnect_takeover(cx));
+                        window.focus(&focus_disconnect, cx);
+                    },
+                ));
+            }
         }
         entries
     }
@@ -3414,6 +3454,54 @@ mod tests {
                 "force={force} ai={ai} alt={alt}"
             );
         }
+    }
+
+    /// 终端右键 SSH 段:检测到进入 AI 后隐藏「SSH 连接」;接管中即便远端进了 AI 仍留「断开 SSH」。
+    #[test]
+    fn 终端进入_ai_后右键不出_ssh_连接() {
+        // 普通终端:只出「SSH 连接」
+        let normal = ssh_menu_plan(false, false);
+        assert_eq!(
+            normal,
+            SshMenuPlan {
+                connect: true,
+                disconnect: false,
+            }
+        );
+        assert!(!normal.is_empty());
+
+        // 右键接管中且未进 AI:两项都出
+        let takeover = ssh_menu_plan(false, true);
+        assert_eq!(
+            takeover,
+            SshMenuPlan {
+                connect: true,
+                disconnect: true,
+            }
+        );
+        assert!(!takeover.is_empty());
+
+        // 检测到进入 AI(未接管):整段不出,不留多余分隔线
+        let in_ai = ssh_menu_plan(true, false);
+        assert_eq!(
+            in_ai,
+            SshMenuPlan {
+                connect: false,
+                disconnect: false,
+            }
+        );
+        assert!(in_ai.is_empty());
+
+        // 右键接管中在远端进了 AI:隐藏「SSH 连接」,保留「断开 SSH」
+        let takeover_in_ai = ssh_menu_plan(true, true);
+        assert_eq!(
+            takeover_in_ai,
+            SshMenuPlan {
+                connect: false,
+                disconnect: true,
+            }
+        );
+        assert!(!takeover_in_ai.is_empty());
     }
 
     /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。
