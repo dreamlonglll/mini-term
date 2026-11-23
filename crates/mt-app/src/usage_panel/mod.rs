@@ -41,21 +41,23 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Div, Entity, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderOnce, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, Task, Window, div, point, prelude::FluentBuilder,
-    px, relative,
+    AnyElement, App, AppContext as _, Context, Div, Entity, FontWeight, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderOnce,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Task, UniformListScrollHandle,
+    Window, div, point, prelude::FluentBuilder, px, relative, uniform_list,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::scroll::Scrollbar;
 use mt_core::path_key::windows_eq_key;
 use mt_ui::icons::usage_glyphs::{
-    ICON_BOLT, ICON_CHAT, ICON_PULSE, ICON_REFRESH, ICON_STACK, ICON_WALLET,
+    ICON_BOLT, ICON_CHAT, ICON_COLUMNS, ICON_PULSE, ICON_REFRESH, ICON_STACK, ICON_WALLET,
 };
 use mt_ui::icons::vector::{Shape, VectorIcon};
+use mt_ui::icons::{AiVendor, BrandIcon};
 use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 use mt_usage::{
-    AgentFilter, DailyStat, ModelPrice, SyncEvent, TopSessionStat, UsageStatsPayload,
-    ledger_db_path, spawn_usage_ledger_sync, usage_ledger_query,
+    AgentFilter, DailyStat, ModelPrice, RequestLogStat, SyncEvent, TopSessionStat,
+    UsageStatsPayload, ledger_db_path, spawn_usage_ledger_sync, usage_ledger_query,
 };
 
 use crate::i18n::{t, tr};
@@ -179,6 +181,12 @@ const AUTO_REFRESH_OPTIONS: [u32; 5] = [0, 5, 10, 30, 60];
 const DATE_INPUT_WIDTH: f32 = 220.0;
 /// 项目下拉菜单与触发框之间的缝(与日历浮层贴触发钮的手感同一档)。
 const PROJECT_MENU_GAP: gpui::Pixels = px(4.0);
+/// 列显隐菜单与触发钮之间的缝。
+const COLUMNS_MENU_GAP: gpui::Pixels = px(4.0);
+/// 请求日志表格单行高度（uniform_list 要求等高）。
+const REQUEST_LOG_ROW_HEIGHT: f32 = 34.0;
+/// 请求日志表格可视区最多自然撑开到这么多行，超过后在表体内虚拟滚动。
+const REQUEST_LOG_MAX_VISIBLE_ROWS: usize = 12;
 /// 项目下拉菜单的高度上限。项目多的机器上这个菜单能长到顶满整屏 ——
 /// 它是**挂在弹窗里的下拉**,不是右键菜单,长过弹窗本身就不像一件东西了。
 /// 280 ≈ 10 项(行高 25 + 面板 padding 8),再多滚轮翻。
@@ -259,7 +267,8 @@ pub struct UsagePanel {
     calendar: Option<Entity<crate::date_picker::DatePicker>>,
     /// 上面那个浮层的事件订阅。与浮层同生共死,换浮层时一起换掉。
     _calendar_sub: Option<gpui::Subscription>,
-    stats: Option<UsageStatsPayload>,
+    /// 用 `Rc` 共享给 `uniform_list` 虚拟滚动闭包，避免每帧深拷贝数千条请求日志。
+    stats: Option<Rc<UsageStatsPayload>>,
     error: Option<String>,
     /// backfill(账本首建全量同步)进度;非 backfill 期间为 None。
     progress: Option<(usize, usize)>,
@@ -272,6 +281,14 @@ pub struct UsagePanel {
     syncing: bool,
     /// 抽屉是否展开。实体常驻,定时器必须靠它闸住。
     visible: bool,
+    /// 趋势图下方详情区的当前 Tab（默认「请求日志」）。
+    active_tab: UsageTab,
+    /// 「请求日志」表格当前可见列（过白名单、按固定列序）。
+    log_columns: Vec<RequestLogColumn>,
+    /// 列显隐按钮左下角坐标（canvas 量出，供下一次点开菜单定位；量完刻意不 notify）。
+    log_columns_anchor: Option<Point<Pixels>>,
+    /// 请求日志虚拟列表滚动句柄。
+    logs_scroll_handle: UniformListScrollHandle,
     tweens: Tweens,
     /// 主体入场(原版 `.usage-fade-in`)。只在首次从加载态进 Ready 时播一次轻度上浮,
     /// 自动刷新或从空范围切回时不再整屏跳动。
@@ -325,7 +342,7 @@ impl UsagePanel {
         let now = chrono::Local::now();
         // 偏好读盘:一律过白名单/正则,认不出回默认(**不写回、不报错**)。
         // custom 起止读进来就改写成规范形态 —— 存量值只有日期,补上时刻再回显
-        let (scope, range, project_scope, auto_refresh, custom_from, custom_to) = {
+        let (scope, range, project_scope, auto_refresh, custom_from, custom_to, log_columns) = {
             let config = store.read(cx).config();
             let date = |v: &Option<String>, edge: Edge| -> String {
                 v.as_deref()
@@ -343,6 +360,7 @@ impl UsagePanel {
                     .unwrap_or(5),
                 date(&config.usage_custom_from, Edge::From),
                 date(&config.usage_custom_to, Edge::To),
+                resolve_log_columns(config.usage_log_columns.as_deref()),
             )
         };
 
@@ -386,6 +404,10 @@ impl UsagePanel {
             pricing_error: None,
             syncing: false,
             visible: true,
+            active_tab: UsageTab::RequestLogs,
+            log_columns,
+            log_columns_anchor: None,
+            logs_scroll_handle: UniformListScrollHandle::new(),
             tweens: Tweens::zeroed(),
             // 首帧就是 Skeleton/PricingLoading,建成「已跑完」的,
             // 等真进了 Ready 再 restart
@@ -441,6 +463,7 @@ impl UsagePanel {
             auto_refresh: self.auto_refresh,
             custom_from: self.custom_from.clone(),
             custom_to: self.custom_to.clone(),
+            log_columns: serialize_log_columns(&self.log_columns),
         };
         self.store.update(cx, |store, cx| store.set_usage_prefs(prefs, cx));
     }
@@ -549,7 +572,7 @@ impl UsagePanel {
                 match result {
                     Ok(stats) => {
                         this.tweens.retarget(&stats, Instant::now());
-                        this.stats = Some(stats);
+                        this.stats = Some(Rc::new(stats));
                         this.error = None;
                     }
                     Err(err) => this.error = Some(err),
@@ -784,21 +807,68 @@ impl UsagePanel {
         self.load_pricing(true, cx);
     }
 
-    // ── Top 会话预览 ──────────────────────────────────────
+    // ── 下半区 Tab 与请求日志列显隐 ───────────────────────
+
+    fn set_active_tab(&mut self, tab: UsageTab, cx: &mut Context<Self>) {
+        if self.active_tab == tab {
+            return;
+        }
+        self.active_tab = tab;
+        cx.notify();
+    }
+
+    fn toggle_log_column(&mut self, col: RequestLogColumn, cx: &mut Context<Self>) {
+        let next = toggle_log_column(&self.log_columns, col);
+        if next == self.log_columns {
+            return;
+        }
+        self.log_columns = next;
+        self.save_prefs(cx);
+        cx.notify();
+    }
+
+    fn reset_log_columns(&mut self, cx: &mut Context<Self>) {
+        let default = RequestLogColumn::DEFAULT.to_vec();
+        if self.log_columns == default {
+            return;
+        }
+        self.log_columns = default;
+        self.save_prefs(cx);
+        cx.notify();
+    }
+
+    // ── 会话正文预览（Top 会话 / 请求日志行共用） ─────────
 
     fn open_preview(&mut self, session: &TopSessionStat, cx: &mut Context<Self>) {
-        // `UsageTopSessionStat → AiSession` 的字段对应照抄
-        // `UsageStatsModal.tsx:385-393`:只认接了历史正文读取的几家(codex / grok),
+        self.open_preview_for(
+            &session.agent,
+            session.session_id.clone(),
+            session.project_path.clone(),
+            &session.title,
+            cx,
+        );
+    }
+
+    fn open_preview_for(
+        &mut self,
+        agent: &str,
+        session_id: String,
+        project_path: String,
+        raw_title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // `UsageTopSessionStat / RequestLogStat → AiSession` 的字段对应照抄
+        // `UsageStatsModal.tsx:385-393`:只认接了历史正文读取的几家(codex / grok / agy),
         // 其余按 claude
-        let session_type = mt_ai::AgentKind::parse(&session.agent)
+        let session_type = mt_ai::AgentKind::parse(agent)
             .filter(|k| k.spec().history)
             .unwrap_or(mt_ai::AgentKind::Claude)
             .key()
             .to_string();
-        let title = if session.title.is_empty() {
+        let title = if raw_title.trim().is_empty() {
             t("usageStats", "untitled").to_string()
         } else {
-            session.title.clone()
+            raw_title.to_string()
         };
         self.preview = Some(Preview {
             title,
@@ -806,8 +876,6 @@ impl UsagePanel {
             error: None,
             messages: Vec::new(),
         });
-        let session_id = session.session_id.clone();
-        let project_path = session.project_path.clone();
         self._preview_task = Some(cx.spawn(async move |this, cx| {
             // 正文可能几 MB,雷打不动丢后台。账本只收本机来源 → wsl_distro 恒 None
             let result = cx
@@ -1594,8 +1662,7 @@ impl UsagePanel {
             )
     }
 
-    /// 主体:KPI 五格 + Token 副行 + 趋势图 + 三卡同行 + Top 会话 + 三段计数排行。
-    /// 主体(`UsageStatsModal.tsx:300` 那层 `space-y-4 usage-fade-in`)。
+    /// 主体:KPI 五格 + Token 副行 + 趋势图 + 下半区 Tab(默认「请求日志」/「排行概览」)。
     ///
     /// 整块内容装在**一个** `main` 容器里而不是直接挂到 `body` 上,就是为了给
     /// `.usage-fade-in` 一个落点:淡入是整块一起淡,不是逐个区块各淡各的。
@@ -1711,6 +1778,307 @@ impl UsagePanel {
             t("usageStats", "dailyActivity"),
             self.render_chart(&stats, cx),
         ));
+
+        // --- 下半区 Tab：请求日志（默认）| 排行概览 ---
+        main = main.child(self.render_detail_tabs(&stats, window, cx));
+
+        // 入场:轻度 18px 上浮入位(只挪绘制位置、不改排版与滚动范围),跑完直接不挂包装层
+        let p = self.fade_in.drive(window);
+        let offset = entry_offset(p);
+        body.child(if offset <= 0.0 {
+            main.into_any_element()
+        } else {
+            crate::motion_kit::shifted(main, 0.0, offset).into_any_element()
+        })
+    }
+
+    /// 趋势图下方的 Tab 区块：「请求日志」|「排行概览」。
+    fn render_detail_tabs(
+        &mut self,
+        stats: &Rc<UsageStatsPayload>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let active = self.active_tab;
+        let tab_btn = |id: &'static str,
+                       tab: UsageTab,
+                       label: &'static str,
+                       badge: Option<String>,
+                       cx: &mut Context<Self>| {
+            let is_active = active == tab;
+            div()
+                .id(id)
+                .relative()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(2.0))
+                .pb(px(8.0))
+                .pt(px(2.0))
+                .cursor_pointer()
+                .text_size(ui::font_px(13.0))
+                .when(is_active, |el| {
+                    el.font_weight(FontWeight::MEDIUM)
+                        .text_color(ui::text_primary())
+                })
+                .when(!is_active, |el| {
+                    el.text_color(ui::text_muted())
+                        .hover(|el| el.text_color(ui::text_secondary()))
+                })
+                .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
+                    this.set_active_tab(tab, cx);
+                }))
+                .child(label.to_string())
+                .when_some(badge, |el, count| {
+                    el.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(99.0))
+                            .text_size(ui::font_px(10.0))
+                            .bg(if is_active {
+                                ui::accent_subtle()
+                            } else {
+                                ui::bg_elevated()
+                            })
+                            .text_color(if is_active {
+                                ui::accent()
+                            } else {
+                                ui::text_muted()
+                            })
+                            .child(count),
+                    )
+                })
+                .when(is_active, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .h(px(2.0))
+                            .rounded(px(1.0))
+                            .bg(ui::accent()),
+                    )
+                })
+        };
+
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(18.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(tab_btn(
+                "usage-tab-request-logs",
+                UsageTab::RequestLogs,
+                t("usageStats", "tabs.requestLogs"),
+                Some(format_count(stats.total_calls)),
+                cx,
+            ))
+            .child(tab_btn(
+                "usage-tab-overview",
+                UsageTab::Overview,
+                t("usageStats", "tabs.overview"),
+                None,
+                cx,
+            ))
+            .child(div().flex_1())
+            .when(active == UsageTab::RequestLogs, |el| {
+                el.child(self.render_columns_button(cx))
+            });
+
+        let content: AnyElement = match active {
+            UsageTab::RequestLogs => self.render_request_logs(stats, cx).into_any_element(),
+            UsageTab::Overview => self.render_overview_tab(stats, window, cx).into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(header)
+            .child(content)
+    }
+
+    /// 请求日志右上角「显示列」按钮（点击弹出勾选菜单 + 恢复默认）。
+    fn render_columns_button(&mut self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let entity = cx.entity();
+        let current = self.log_columns.clone();
+        let measure_entity = cx.entity();
+        let measure = gpui::canvas(
+            move |bounds: gpui::Bounds<Pixels>, _window, cx| {
+                measure_entity.update(cx, |this: &mut Self, _cx| {
+                    this.log_columns_anchor =
+                        Some(point(bounds.origin.x, bounds.bottom() + COLUMNS_MENU_GAP));
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+        let anchor = self.log_columns_anchor;
+
+        div()
+            .id("usage-log-columns-btn")
+            .relative()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(26.0))
+            .h(px(26.0))
+            .mb(px(4.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(ui::border_subtle())
+            .bg(ui::bg_base())
+            .cursor_pointer()
+            .hover(|el| el.border_color(ui::accent()).bg(ui::bg_elevated()))
+            .tooltip(|window, cx| {
+                Tooltip::new(t("usageStats", "columns.button")).build(window, cx)
+            })
+            .child(measure)
+            .child(VectorIcon::new(ICON_COLUMNS, px(14.0)).ink(ui::text_secondary()))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    let mut entries: Vec<menu::MenuEntry> = RequestLogColumn::ALL
+                        .into_iter()
+                        .map(|col| {
+                            let on = current.contains(&col);
+                            let label = format!("{}{}", check_mark(on), col.label());
+                            let entity = entity.clone();
+                            menu::item(label, move |_window, cx: &mut App| {
+                                entity.update(cx, |this, cx| this.toggle_log_column(col, cx));
+                            })
+                        })
+                        .collect();
+                    entries.push(menu::separator());
+                    let reset_entity = entity.clone();
+                    entries.push(menu::item(
+                        format!("{}{}", check_mark(false), t("usageStats", "columns.reset")),
+                        move |_window, cx: &mut App| {
+                            reset_entity.update(cx, |this, cx| this.reset_log_columns(cx));
+                        },
+                    ));
+                    menu::show(anchor.unwrap_or(event.position), entries, window, cx);
+                },
+            )
+    }
+
+    /// 「请求日志」Tab：固定表头 + `uniform_list` 虚拟滚动数据行（不展示首字与状态码）。
+    fn render_request_logs(
+        &mut self,
+        stats: &Rc<UsageStatsPayload>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let card = div()
+            .border_1()
+            .border_color(ui::border_subtle())
+            .rounded(px(6.0))
+            .bg(ui::with_alpha(ui::bg_elevated(), 0.4))
+            .overflow_hidden();
+
+        if stats.request_logs.is_empty() {
+            return card.child(
+                div()
+                    .py(px(40.0))
+                    .flex()
+                    .justify_center()
+                    .text_size(ui::font_px(13.0))
+                    .text_color(ui::text_muted())
+                    .child(t("usageStats", "requestLogs.empty")),
+            );
+        }
+
+        let columns = self.log_columns.clone();
+        let same_day = logs_span_single_day(&stats.request_logs);
+        let count = stats.request_logs.len();
+        let scrollable = count > REQUEST_LOG_MAX_VISIBLE_ROWS;
+        let header = render_request_log_header(&columns, same_day, scrollable);
+
+        let visible_rows = count.clamp(1, REQUEST_LOG_MAX_VISIBLE_ROWS);
+        let list_height = visible_rows as f32 * REQUEST_LOG_ROW_HEIGHT;
+        let payload = Rc::clone(stats);
+        let entity = cx.entity();
+        let cols_for_rows = columns;
+
+        let list = uniform_list(
+            "usage-request-logs-list",
+            count,
+            move |range, _window, _cx: &mut App| {
+                range
+                    .map(|ix| match payload.request_logs.get(ix) {
+                        Some(item) => render_request_log_row(
+                            ix,
+                            item,
+                            &cols_for_rows,
+                            same_day,
+                            scrollable,
+                            &entity,
+                        )
+                        .into_any_element(),
+                        None => div().h(px(REQUEST_LOG_ROW_HEIGHT)).into_any_element(),
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .size_full()
+        .track_scroll(&self.logs_scroll_handle);
+
+        let truncated = (stats.total_calls as usize) > count;
+
+        card.child(header)
+            .child(
+                div()
+                    .relative()
+                    .h(px(list_height))
+                    .child(list)
+                    .when(scrollable, |el| {
+                        // 滚动条套一层 absolute 四边贴 0 的壳(同 `file_viewer::preview` / `ssh_activity`)
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .child(
+                                    Scrollbar::vertical(&self.logs_scroll_handle)
+                                        .id("usage-request-logs-scrollbar"),
+                                ),
+                        )
+                    }),
+            )
+            .when(truncated, |el| {
+                el.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(7.0))
+                        .border_t_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::bg_overlay(), 0.25))
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_muted())
+                        .text_center()
+                        .child(tr!(
+                            "usageStats",
+                            "requestLogs.truncated",
+                            shown = format_count(count as u64),
+                            total = format_count(stats.total_calls)
+                        )),
+                )
+            })
+    }
+
+    /// 「排行概览」Tab：完整保留原有的三卡同行（项目 / 模型 / 供应商）+ Top 会话 + 工具排行。
+    fn render_overview_tab(
+        &mut self,
+        stats: &UsageStatsPayload,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut out = div().flex().flex_col().gap(px(14.0));
 
         // --- 三卡同行:项目 | 模型 | 供应商 ---
         let entity = cx.entity();
@@ -1850,7 +2218,7 @@ impl UsagePanel {
             }
         }
 
-        main = main.child(
+        out = out.child(
             div()
                 .flex()
                 .items_start()
@@ -1883,9 +2251,9 @@ impl UsagePanel {
         );
 
         // --- Top 会话 ---
-        main = main.child(section(
+        out = out.child(section(
             t("usageStats", "topSessions"),
-            self.render_top_sessions(&stats, cx),
+            self.render_top_sessions(stats, cx),
         ));
 
         // --- 工具 / Shell / MCP 计数排行 ---
@@ -1917,21 +2285,13 @@ impl UsagePanel {
                     false,
                 ));
             }
-            main = main.child(section(title, rows));
+            out = out.child(section(title, rows));
         }
 
         // 本帧读完排行条,把界面上已经没有的行丢掉(等价于 DOM 元素被卸载)
         self.rank_bars.sweep();
         self.rank_bars.drive(window);
-
-        // 入场:轻度 18px 上浮入位(只挪绘制位置、不改排版与滚动范围),跑完直接不挂包装层
-        let p = self.fade_in.drive(window);
-        let offset = entry_offset(p);
-        body.child(if offset <= 0.0 {
-            main.into_any_element()
-        } else {
-            crate::motion_kit::shifted(main, 0.0, offset).into_any_element()
-        })
+        out
     }
 
     /// 趋势图(`DailyChart.tsx`)。**补空桶**是第一优先(后端快照稀疏,不补
@@ -2318,6 +2678,382 @@ impl UsagePanel {
             .child(body)
             .into_any_element()
     }
+}
+
+/// 请求日志表格的表头与数据行共用列容器，保证每一列在固定宽度与弹性列上像素级对齐。
+///
+/// 当「模型」列被用户隐藏时放开「供应商」列的 `max_w` 上限（两者都隐藏时放开「项目」列），
+/// 避免右半区数值列左缩而在表格右侧留下大片空白。
+fn request_log_col_box(
+    col: RequestLogColumn,
+    same_day: bool,
+    columns: &[RequestLogColumn],
+) -> Div {
+    let has_model = columns.contains(&RequestLogColumn::Model);
+    let has_provider = columns.contains(&RequestLogColumn::Provider);
+    match col {
+        RequestLogColumn::Time => div()
+            .flex_none()
+            .w(px(if same_day { 66.0 } else { 108.0 }))
+            .overflow_hidden(),
+        RequestLogColumn::App => div().flex_none().w(px(102.0)).overflow_hidden(),
+        RequestLogColumn::Provider => div()
+            .flex_1()
+            .min_w(px(80.0))
+            .when(has_model, |el| el.max_w(px(200.0)))
+            .overflow_hidden(),
+        RequestLogColumn::Model => div().flex_1().min_w(px(110.0)).overflow_hidden(),
+        RequestLogColumn::Project => div()
+            .when(has_model || has_provider, |el| el.flex_none().w(px(104.0)))
+            .when(!has_model && !has_provider, |el| {
+                el.flex_1().min_w(px(104.0))
+            })
+            .overflow_hidden(),
+        RequestLogColumn::Cost => div()
+            .flex_none()
+            .w(px(64.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+        RequestLogColumn::NewInput => div()
+            .flex_none()
+            .w(px(68.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+        RequestLogColumn::Output => div()
+            .flex_none()
+            .w(px(64.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+        RequestLogColumn::CacheRead => div()
+            .flex_none()
+            .w(px(70.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+        RequestLogColumn::CacheWrite => div()
+            .flex_none()
+            .w(px(68.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+        RequestLogColumn::Speed => div()
+            .flex_none()
+            .w(px(94.0))
+            .flex()
+            .justify_end()
+            .overflow_hidden(),
+    }
+}
+
+/// 请求日志固定表头。「速度」列右侧附 `?` 徽标说明估算口径；整组悬停即出提示。
+fn render_request_log_header(
+    columns: &[RequestLogColumn],
+    same_day: bool,
+    scrollable: bool,
+) -> Div {
+    let pad_right = if scrollable { 22.0 } else { 12.0 };
+    let mut row = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .pl(px(12.0))
+        .pr(px(pad_right))
+        .py(px(8.0))
+        .bg(ui::with_alpha(ui::bg_overlay(), 0.45))
+        .border_b_1()
+        .border_color(ui::border_subtle())
+        .text_size(ui::font_px(11.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(ui::text_muted());
+
+    for &col in columns {
+        let cell = request_log_col_box(col, same_day, columns);
+        let cell = match col {
+            RequestLogColumn::Speed => cell.child(
+                div()
+                    .id("usage-log-speed-help")
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(4.0))
+                    .cursor_default()
+                    .tooltip(|window, cx| {
+                        Tooltip::new(t("usageStats", "columns.speedTip")).build(window, cx)
+                    })
+                    .child(col.label())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(13.0))
+                            .h(px(13.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(ui::border_strong())
+                            .text_size(ui::font_px(9.0))
+                            .text_color(ui::text_muted())
+                            .child("?"),
+                    ),
+            ),
+            _ => cell.child(div().truncate().child(col.label())),
+        };
+        row = row.child(cell);
+    }
+    row
+}
+
+/// 请求日志单行（等高，供 `uniform_list` 虚拟滚动渲染；点击打开所属会话正文预览）。
+fn render_request_log_row(
+    ix: usize,
+    item: &RequestLogStat,
+    columns: &[RequestLogColumn],
+    same_day: bool,
+    scrollable: bool,
+    entity: &Entity<UsagePanel>,
+) -> Stateful<Div> {
+    let agent = item.agent.clone();
+    let session_id = item.session_id.clone();
+    let project_path = item.project_path.clone();
+    let session_title = item.session_title.clone();
+    let entity = entity.clone();
+    let pad_right = if scrollable { 22.0 } else { 12.0 };
+
+    let mut row = div()
+        .id(SharedString::from(format!("usage-log-row-{ix}")))
+        .w_full()
+        .h(px(REQUEST_LOG_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .pl(px(12.0))
+        .pr(px(pad_right))
+        .border_b_1()
+        .border_color(ui::border_subtle())
+        .text_size(ui::font_px(12.0))
+        .text_color(ui::text_secondary())
+        .cursor_pointer()
+        .hover(|el| el.bg(ui::border_subtle()))
+        .on_click(move |_, _window, cx| {
+            let session_id = session_id.clone();
+            let project_path = project_path.clone();
+            entity.update(cx, |this, cx| {
+                this.open_preview_for(&agent, session_id, project_path, &session_title, cx);
+            });
+        });
+
+    for &col in columns {
+        let cell = request_log_col_box(col, same_day, columns);
+        let cell = match col {
+            RequestLogColumn::Time => {
+                let tip = format!(
+                    "{} · {}",
+                    format_full_timestamp(item.timestamp_ms),
+                    t("usageStats", "requestLogs.clickToPreview")
+                );
+                cell.child(
+                    div()
+                        .id(SharedString::from(format!("usage-log-{ix}-time")))
+                        .truncate()
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_muted())
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .child(format_request_time(item.timestamp_ms, same_day)),
+                )
+            }
+            RequestLogColumn::App => cell.child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        BrandIcon::new(AiVendor::from_session_type(&item.agent))
+                            .size(px(13.0))
+                            // VectorIcon 自己画,不继承 text_color(浅色主题下缺省白会隐身)
+                            .color(ui::text_secondary()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_color(ui::text_primary())
+                            .child(agent_display_label(&item.agent)),
+                    ),
+            ),
+            RequestLogColumn::Provider => {
+                if item.provider.is_empty() {
+                    cell.child(
+                        div()
+                            .truncate()
+                            .text_color(ui::text_muted())
+                            .child(t("usageStats", "unknownProvider")),
+                    )
+                } else {
+                    let provider = item.provider.clone();
+                    cell.child(
+                        div()
+                            .id(SharedString::from(format!("usage-log-{ix}-provider")))
+                            .w_full()
+                            .truncate()
+                            .text_color(ui::text_secondary())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(provider.clone()).build(window, cx)
+                            })
+                            .child(item.provider.clone()),
+                    )
+                }
+            }
+            RequestLogColumn::Model => {
+                if item.model.is_empty() {
+                    cell.child(
+                        div()
+                            .truncate()
+                            .text_color(ui::text_muted())
+                            .child(t("usageStats", "unknownModel")),
+                    )
+                } else {
+                    let model = item.model.clone();
+                    cell.child(
+                        div()
+                            .id(SharedString::from(format!("usage-log-{ix}-model")))
+                            .w_full()
+                            .truncate()
+                            .text_color(ui::text_primary())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(model.clone()).build(window, cx)
+                            })
+                            .child(item.model.clone()),
+                    )
+                }
+            }
+            RequestLogColumn::Project => {
+                if item.project_name.is_empty() {
+                    cell.child(div().text_color(ui::text_muted()).child("—"))
+                } else {
+                    let tip = if item.project_path.is_empty() {
+                        item.project_name.clone()
+                    } else {
+                        item.project_path.clone()
+                    };
+                    cell.child(
+                        div()
+                            .id(SharedString::from(format!("usage-log-{ix}-project")))
+                            .w_full()
+                            .truncate()
+                            .text_color(ui::text_secondary())
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tip.clone()).build(window, cx)
+                            })
+                            .child(item.project_name.clone()),
+                    )
+                }
+            }
+            RequestLogColumn::Cost => cell.child(
+                div()
+                    .truncate()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if item.cost > 0.0 {
+                        ui::text_primary()
+                    } else {
+                        ui::text_muted()
+                    })
+                    .child(format_cost(item.cost)),
+            ),
+            RequestLogColumn::NewInput => cell.child(
+                div()
+                    .truncate()
+                    .text_color(if item.input_tokens > 0 {
+                        ui::text_secondary()
+                    } else {
+                        ui::text_muted()
+                    })
+                    .child(format_table_tokens(item.input_tokens)),
+            ),
+            RequestLogColumn::Output => {
+                let text = format_table_tokens(item.output_tokens);
+                let color = if item.output_tokens > 0 {
+                    ui::text_secondary()
+                } else {
+                    ui::text_muted()
+                };
+                if item.reasoning_tokens > 0 {
+                    let tip = tr!(
+                        "usageStats",
+                        "requestLogs.reasoningTip",
+                        reasoning = format_count(item.reasoning_tokens)
+                    );
+                    cell.child(
+                        div()
+                            .id(SharedString::from(format!("usage-log-{ix}-output")))
+                            .truncate()
+                            .text_color(color)
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tip.clone()).build(window, cx)
+                            })
+                            .child(text),
+                    )
+                } else {
+                    cell.child(div().truncate().text_color(color).child(text))
+                }
+            }
+            RequestLogColumn::CacheRead => {
+                if item.cache_read_tokens == 0 {
+                    cell.child(div().text_color(ui::text_muted()).child("—"))
+                } else {
+                    cell.child(
+                        div()
+                            .truncate()
+                            .text_color(ui::text_secondary())
+                            .child(format_table_tokens(item.cache_read_tokens)),
+                    )
+                }
+            }
+            RequestLogColumn::CacheWrite => {
+                if item.cache_write_tokens == 0 {
+                    cell.child(div().text_color(ui::text_muted()).child("—"))
+                } else {
+                    cell.child(
+                        div()
+                            .truncate()
+                            .text_color(ui::text_secondary())
+                            .child(format_table_tokens(item.cache_write_tokens)),
+                    )
+                }
+            }
+            RequestLogColumn::Speed => {
+                let speed = format_estimated_speed(item.output_tokens, item.duration_ms);
+                match (speed, item.duration_ms) {
+                    (Some(label), Some(ms)) => {
+                        let tip = tr!(
+                            "usageStats",
+                            "requestLogs.durationTip",
+                            secs = format!("{:.1}", ms as f64 / 1000.0),
+                            tokens = format_count(item.output_tokens)
+                        );
+                        cell.child(
+                            div()
+                                .id(SharedString::from(format!("usage-log-{ix}-speed")))
+                                .truncate()
+                                .text_color(ui::text_secondary())
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tip.clone()).build(window, cx)
+                                })
+                                .child(label),
+                        )
+                    }
+                    _ => cell.child(div().text_color(ui::text_muted()).child("—")),
+                }
+            }
+        };
+        row = row.child(cell);
+    }
+    row
 }
 
 /// 排行/Top 会话的空态。

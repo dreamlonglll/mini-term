@@ -308,6 +308,10 @@ pub struct AppConfig {
     /// custom range 截止(含这一整秒)`"YYYY-MM-DD HH:MM:SS"`,形态同上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_custom_to: Option<String>,
+    /// 用量面板「请求日志」表格的可见列 key 列表。`None` = 使用默认列集；
+    /// 读取端过白名单，认不出的值忽略、空集回落默认（不写回、不报错）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_log_columns: Option<Vec<String>>,
     /// 命令库(issue #81):全局一份常用命令,终端控制条的「命令」浮层按分组列出,
     /// 点一下写进当前焦点终端并回车。**不按项目 / 连接绑定** —— 一条部署命令在
     /// 哪台机器上都是同一句。空库序列化跳过,旧配置缺字段按空库读。
@@ -999,6 +1003,7 @@ impl Default for AppConfig {
             usage_auto_refresh: None,
             usage_custom_from: None,
             usage_custom_to: None,
+            usage_log_columns: None,
             command_library: CommandLibrary::default(),
             remote_notify: RemoteNotifyConfig::default(),
             hotkey_overrides: BTreeMap::new(),
@@ -2456,6 +2461,7 @@ mod tests {
         assert!(config.usage_auto_refresh.is_none());
         assert!(config.usage_custom_from.is_none());
         assert!(config.usage_custom_to.is_none());
+        assert!(config.usage_log_columns.is_none());
         let json = serde_json::to_string(&config).unwrap();
         assert!(
             !json.contains("usage"),

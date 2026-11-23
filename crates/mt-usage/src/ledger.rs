@@ -34,9 +34,11 @@ use super::{
 /// JSONL 再生，空 sync_state 自动触发 backfill，无需逐版本迁移脚本）。
 /// v3：新增 tool_events 表（工具/Shell/MCP 排行，设计 §2.2）。
 /// v4：turns / tool_events 新增 `eff_ts_ms` 并建索引，时间窗过滤改走索引（见 SCHEMA
-/// 注释）。v3 → v4 是唯一的就地迁移（加列 + 一次回填，见 `migrate_v3_to_v4`）：删表
-/// 重建要把全部 JSONL 重解析一遍，只为加一列不值得。
-const SCHEMA_VERSION: i64 = 4;
+/// 注释）。v3 → v4 是就地迁移（加列 + 一次回填，见 `migrate_v3_to_v4`）。
+/// v5：turns 新增 `duration_ms`（日志时间戳估算耗时，供「请求日志」速度列使用）。
+/// v4 → v5 走就地加列 + 清空 `sync_state`（见 `migrate_v4_to_v5`）：不 DROP `turns`，
+/// 从而保住 agy 已被上下文压缩重写的旧调用记录，同时后台自动重扫为存量文件补填 `duration_ms`。
+const SCHEMA_VERSION: i64 = 5;
 
 /// 账本 schema（设计 §1）。成本不落库：定价会更新，查询时按前端传入的定价表现算。
 /// turns 主键为 (session_id, request_id)：每会话各存自己的份，fork/subagent 复制的
@@ -77,6 +79,7 @@ CREATE TABLE IF NOT EXISTS turns (
   cache_write    INTEGER NOT NULL DEFAULT 0,
   cache_write_1h INTEGER NOT NULL DEFAULT 0,
   eff_ts_ms      INTEGER,
+  duration_ms    INTEGER,
   PRIMARY KEY (session_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_turns_sid_eff ON turns(session_id, eff_ts_ms);
@@ -109,7 +112,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 const TURNS_IN_WINDOW_SQL: &str = "
 SELECT t.session_id, t.ts_ms, t.model,
        t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
-       s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id
+       s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id, t.duration_ms
 FROM sessions s CROSS JOIN turns t ON t.session_id = s.session_id
 WHERE t.eff_ts_ms >= ?1 AND t.eff_ts_ms <= ?2
   AND (?3 IS NULL OR s.agent = ?3)
@@ -313,8 +316,10 @@ impl Ledger {
     }
 
     /// 版本不匹配（新库 / 旧库 / 别的版本写过的库）时持写锁迁移：
-    /// - v3：就地加列回填（`migrate_v3_to_v4`），sync_state 保留，不触发 backfill；
-    ///   万一失败（表结构不是预期的 v3）退回删表重建；
+    /// - v3：先就地跑 `migrate_v3_to_v4`，再跑 `migrate_v4_to_v5`；
+    /// - v4：就地加 `duration_ms` 列并清 `sync_state` 触发增量补算（不 DROP `turns`，
+    ///   从而保住 agy 已被上下文压缩重写的历史调用记录）；
+    /// - 万一就地迁移失败（表结构不是预期形态）退回删表重建；
     /// - 其余：删表重建，空 sync_state 触发 backfill。
     ///
     /// IMMEDIATE 事务先取写锁再复读版本：并发打开（查询命令 vs 后台同步）
@@ -326,16 +331,25 @@ impl Ledger {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
-        let migrated_in_place = version == 3 && {
+        let migrated_in_place = matches!(version, 3 | 4) && {
             // 放在 savepoint 里：失败只回滚这一段，外层事务照常走删表重建
             let sp = tx.savepoint()?;
-            match migrate_v3_to_v4(&sp) {
+            let step = (|| -> rusqlite::Result<()> {
+                if version == 3 {
+                    migrate_v3_to_v4(&sp)?;
+                }
+                migrate_v4_to_v5(&sp)?;
+                Ok(())
+            })();
+            match step {
                 Ok(()) => {
                     sp.commit()?;
                     true
                 }
                 Err(e) => {
-                    tracing::warn!("[usage_stats] 账本 v3→v4 就地迁移失败，改为重建: {e}");
+                    tracing::warn!(
+                        "[usage_stats] 账本 v{version}→v{SCHEMA_VERSION} 就地迁移失败，改为重建: {e}"
+                    );
                     false
                 }
             }
@@ -419,14 +433,14 @@ impl Ledger {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO turns(session_id, request_id, message_id, ts_ms, model,
                                    input, output, reasoning, cache_read, cache_write, cache_write_1h,
-                                   eff_ts_ms)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                                   eff_ts_ms, duration_ms)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(session_id, request_id) DO UPDATE SET
                    message_id = excluded.message_id, ts_ms = excluded.ts_ms,
                    model = excluded.model, input = excluded.input, output = excluded.output,
                    reasoning = excluded.reasoning, cache_read = excluded.cache_read,
                    cache_write = excluded.cache_write, cache_write_1h = excluded.cache_write_1h,
-                   eff_ts_ms = excluded.eff_ts_ms",
+                   eff_ts_ms = excluded.eff_ts_ms, duration_ms = excluded.duration_ms",
             )?;
             for (i, t) in s.turns.iter().enumerate() {
                 // turn 身份规则（设计 §1.1）：会话内 Claude 按 message id、无 id /
@@ -457,6 +471,7 @@ impl Ledger {
                     t.usage.cache_write_1h as i64,
                     // 有效时刻：缺时间戳回退会话 mtime（会话行在本事务开头刚写入）
                     t.timestamp_ms.unwrap_or(s.mtime_ms),
+                    t.duration_ms.map(|d| d as i64),
                 ])?;
             }
         }
@@ -542,6 +557,9 @@ impl Ledger {
                     cache_write: row.get::<_, i64>(7)? as u64,
                     cache_write_1h: row.get::<_, i64>(8)? as u64,
                 },
+                duration_ms: row
+                    .get::<_, Option<i64>>(15)?
+                    .and_then(|d| u64::try_from(d).ok()),
             });
         }
         drop(rows);
@@ -606,6 +624,19 @@ fn migrate_v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
            (SELECT s.mtime_ms FROM sessions s WHERE s.session_id = tool_events.session_id));
          DROP INDEX IF EXISTS idx_turns_ts;
          DROP INDEX IF EXISTS idx_tool_events_ts;",
+    )
+}
+
+/// v4 → v5 就地迁移：turns 加 `duration_ms` 列（存日志时间戳估算耗时），并清空
+/// `sync_state` 触发后台重扫，为仍在磁盘上的会话补齐估算耗时。
+///
+/// 刻意**不 DROP `turns`**：agy 的 transcript 上下文压缩时会整份重写、旧步骤从磁盘
+/// 消失，就地加列能把已入账的旧 agy 行原样保住，重扫时对仍存在的行按主键 UPSERT
+/// 补填 `duration_ms`，已压缩消失的旧行保持 `duration_ms = NULL`。
+fn migrate_v4_to_v5(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE turns ADD COLUMN duration_ms INTEGER;
+         DELETE FROM sync_state;",
     )
 }
 
@@ -1550,6 +1581,16 @@ mod tests {
     const LEGACY_TURNS_SQL: &str = "
         SELECT t.session_id, t.ts_ms, t.model,
                t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
+               s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id, t.duration_ms
+        FROM turns t JOIN sessions s ON s.session_id = t.session_id
+        WHERE COALESCE(t.ts_ms, s.mtime_ms) >= ?1
+          AND COALESCE(t.ts_ms, s.mtime_ms) <= ?2
+          AND (?3 IS NULL OR s.agent = ?3)
+        ORDER BY t.session_id, t.rowid";
+    /// v3 库尚无 `duration_ms` 列，迁移前查询对照用。
+    const LEGACY_V3_TURNS_SQL: &str = "
+        SELECT t.session_id, t.ts_ms, t.model,
+               t.input, t.output, t.reasoning, t.cache_read, t.cache_write, t.cache_write_1h,
                s.agent, s.cwd, s.title, s.provider, s.mtime_ms, t.message_id
         FROM turns t JOIN sessions s ON s.session_id = t.session_id
         WHERE COALESCE(t.ts_ms, s.mtime_ms) >= ?1
@@ -1693,7 +1734,7 @@ mod tests {
         // 改前:旧查询跑在旧库上
         let before = {
             let conn = Connection::open(&db).unwrap();
-            all_window_rows(&conn, LEGACY_TURNS_SQL, LEGACY_TOOL_EVENTS_SQL, t0, t1)
+            all_window_rows(&conn, LEGACY_V3_TURNS_SQL, LEGACY_TOOL_EVENTS_SQL, t0, t1)
         };
 
         let ledger = Ledger::open(&db).unwrap();
@@ -1703,8 +1744,8 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert!(
-            !ledger.sync_state_empty().unwrap(),
-            "就地迁移保留 sync_state,不触发全量 backfill"
+            ledger.sync_state_empty().unwrap(),
+            "升到 v5 清空 sync_state 触发补算 duration_ms，但存量 turns 行原样保留"
         );
         for table in ["turns", "tool_events"] {
             let off: i64 = ledger
@@ -1744,10 +1785,76 @@ mod tests {
             t0,
             t1,
         );
-        assert_eq!(after, before, "迁移后的查询结果必须与迁移前逐行一致");
+        // v5 多出的第 16 列 duration_ms 对旧行均为 NULL，前 15 列与工具事件须逐行一致
+        let after_without_dur: Vec<(RawRows, RawRows)> = after
+            .into_iter()
+            .map(|(turns, tools)| {
+                let trimmed = turns
+                    .into_iter()
+                    .map(|mut r| {
+                        assert_eq!(r.pop(), Some(rusqlite::types::Value::Null));
+                        r
+                    })
+                    .collect();
+                (trimmed, tools)
+            })
+            .collect();
+        assert_eq!(
+            after_without_dur, before,
+            "迁移后的查询结果必须与迁移前逐行一致"
+        );
         drop(ledger);
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&src_root).ok();
+    }
+
+    /// v4 → v5 就地迁移：不 DROP turns（保住 agy 压缩掉的历史行），只加 duration_ms 列并
+    /// 清空 sync_state 触发后台补算。
+    #[test]
+    fn v4_ledger_migrates_in_place_preserving_existing_turns() {
+        let root = temp_root("v4tov5");
+        let db = root.join("usage.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                   session_id TEXT PRIMARY KEY, agent TEXT NOT NULL, cwd TEXT, title TEXT,
+                   provider TEXT, file_path TEXT NOT NULL, mtime_ms INTEGER NOT NULL);
+                 CREATE TABLE turns (
+                   session_id TEXT NOT NULL, request_id TEXT NOT NULL, message_id TEXT,
+                   ts_ms INTEGER, model TEXT, input INTEGER NOT NULL DEFAULT 0,
+                   output INTEGER NOT NULL DEFAULT 0, reasoning INTEGER NOT NULL DEFAULT 0,
+                   cache_read INTEGER NOT NULL DEFAULT 0, cache_write INTEGER NOT NULL DEFAULT 0,
+                   cache_write_1h INTEGER NOT NULL DEFAULT 0, eff_ts_ms INTEGER,
+                   PRIMARY KEY (session_id, request_id));
+                 CREATE INDEX idx_turns_sid_eff ON turns(session_id, eff_ts_ms);
+                 CREATE TABLE tool_events (
+                   session_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+                   name TEXT NOT NULL, ts_ms INTEGER, dedup_key TEXT, eff_ts_ms INTEGER,
+                   PRIMARY KEY (session_id, seq));
+                 CREATE INDEX idx_tool_events_sid_eff ON tool_events(session_id, eff_ts_ms);
+                 CREATE TABLE sync_state (
+                   file_path TEXT PRIMARY KEY, mtime_ms INTEGER NOT NULL, size INTEGER NOT NULL);
+                 INSERT INTO sessions VALUES('agy-old', 'agy', 'D:\\p', '旧会话', NULL, 'p', 1000);
+                 INSERT INTO turns VALUES('agy-old', 'agy:1@t', 'agy:1@t#m#10/0/20', 1000, 'gemini-4-neon-xhigh', 10, 20, 0, 0, 0, 0, 1000);
+                 INSERT INTO sync_state VALUES('p', 1000, 100);
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let ledger = Ledger::open(&db).expect("v4 账本就地迁移必须成功");
+        let version: i64 = ledger
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(ledger.sync_state_empty().unwrap(), "清 sync_state 触发重扫补算耗时");
+        let sessions = ledger.query_sessions(AgentFilter::Agy, 0, None).unwrap();
+        assert_eq!(sessions.len(), 1, "已入账的 agy 旧行必须完整保留");
+        assert_eq!(sessions[0].turns.len(), 1);
+        assert_eq!(sessions[0].turns[0].duration_ms, None);
+        drop(ledger);
+        fs::remove_dir_all(&root).ok();
     }
 
     /// 标着 v3 但表结构不对(就地迁移会失败):退回删表重建,不能把账本卡死在打不开。

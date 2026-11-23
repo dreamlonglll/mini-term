@@ -51,8 +51,8 @@ pub(crate) fn strip_date_suffix(name: &str) -> Option<&str> {
     }
 }
 
-/// Gemini 的思考档位后缀（Gemini API 的 thinking level 取值）。
-const GEMINI_THINKING_TIERS: [&str; 4] = ["minimal", "low", "medium", "high"];
+/// Gemini 的思考档位后缀（Gemini API / agy 的 thinking level 取值）。
+const GEMINI_THINKING_TIERS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 
 /// 剥 Gemini 模型名尾部的思考档位(`gemini-3-8-flash-high` → `gemini-3-8-flash`)。
 ///
@@ -264,7 +264,7 @@ mod tests {
             ("gemini-3.1-pro-preview-high", 9e-6),
             ("claude-opus-4-8", 5e-6),
         ]);
-        for tier in ["minimal", "low", "medium", "high"] {
+        for tier in ["minimal", "low", "medium", "high", "xhigh"] {
             let p = t.resolve(&format!("gemini-3.8-flash-{tier}")).unwrap();
             assert_eq!(p.input, 0.75e-6, "{tier}");
         }

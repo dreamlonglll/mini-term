@@ -32,6 +32,20 @@ impl UsageTotals {
     }
 }
 
+/// 单次请求日志时间戳估算耗时的合法区间（ms）。
+///
+/// 下限 200ms：挡住秒级日志同秒落盘（delta=0）或极短抖动造成的虚假超高 tok/s；
+/// 上限 10 分钟：超出通常包含进程休眠、长工具等待或用户停顿，不再当作模型生成耗时。
+const MIN_ESTIMATED_DURATION_MS: i64 = 200;
+const MAX_ESTIMATED_DURATION_MS: i64 = 600_000;
+
+/// 把日志时间戳差值收口到可信的估算耗时区间；越界返回 `None`（界面显示 `—`）。
+pub(crate) fn clamp_estimated_duration_ms(delta_ms: i64) -> Option<u64> {
+    (MIN_ESTIMATED_DURATION_MS..=MAX_ESTIMATED_DURATION_MS)
+        .contains(&delta_ms)
+        .then_some(delta_ms as u64)
+}
+
 /// 一次 assistant API 调用（统计粒度）。
 #[derive(Debug, Clone)]
 pub struct Turn {
@@ -40,6 +54,8 @@ pub struct Turn {
     pub model: Option<String>,
     pub timestamp_ms: Option<i64>,
     pub usage: UsageTotals,
+    /// 按本地会话日志时间戳估算的请求耗时（ms，含等待首字）；无法可靠估算时为 `None`。
+    pub duration_ms: Option<u64>,
 }
 
 /// 单次工具调用记录（统计粒度，设计 §2.2 工具/Shell/MCP 排行）。
@@ -309,11 +325,23 @@ fn claude_title_from_user_line(obj: &serde_json::Value) -> Option<String> {
 fn claude_turns_from_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
 ) -> (Vec<Turn>, Vec<ToolUse>, Option<String>, Option<String>) {
+    /// 同 message.id 跨多行流式落盘的时间边界，用于估算单次请求耗时。
+    struct ClaudeTiming {
+        /// 紧邻其前的 `user`（用户输入或 tool_result）时刻；作为本轮请求起点。
+        anchor_ts: Option<i64>,
+        /// 同 message.id 首次落盘时刻（缺 anchor 时的兜底起点）。
+        first_ts: Option<i64>,
+        /// 同 message.id 末次落盘时刻（流式结束近似值）。
+        end_ts: Option<i64>,
+    }
+
     let mut turns: Vec<Turn> = Vec::new();
+    let mut timings: Vec<ClaudeTiming> = Vec::new();
     let mut tool_uses: Vec<ToolUse> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut cwd: Option<String> = None;
     let mut title: Option<String> = None;
+    let mut last_trigger_ts: Option<i64> = None;
 
     for line in lines {
         let obj: serde_json::Value = match serde_json::from_str(line) {
@@ -325,6 +353,13 @@ fn claude_turns_from_lines<'a>(
         }
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("user") => {
+                if let Some(ts) = obj
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(parse_rfc3339_ms)
+                {
+                    last_trigger_ts = Some(ts);
+                }
                 if title.is_none() {
                     title = claude_title_from_user_line(&obj);
                 }
@@ -373,6 +408,11 @@ fn claude_turns_from_lines<'a>(
                 if let Some(ref mid) = id {
                     if let Some(&idx) = by_id.get(mid) {
                         let existing = &mut turns[idx];
+                        if let Some(ts) = timestamp_ms {
+                            let timing = &mut timings[idx];
+                            timing.first_ts = Some(timing.first_ts.map_or(ts, |prev| prev.min(ts)));
+                            timing.end_ts = Some(timing.end_ts.map_or(ts, |prev| prev.max(ts)));
+                        }
                         if usage.total() > existing.usage.total() {
                             existing.usage = usage;
                             if model.is_some() {
@@ -388,15 +428,28 @@ fn claude_turns_from_lines<'a>(
                     }
                     by_id.insert(mid.clone(), turns.len());
                 }
+                timings.push(ClaudeTiming {
+                    anchor_ts: last_trigger_ts.take(),
+                    first_ts: timestamp_ms,
+                    end_ts: timestamp_ms,
+                });
                 turns.push(Turn {
                     message_id: id,
                     model,
                     timestamp_ms,
                     usage,
+                    duration_ms: None,
                 });
             }
             _ => {}
         }
+    }
+    for (turn, timing) in turns.iter_mut().zip(timings.iter()) {
+        let start = timing.anchor_ts.or(timing.first_ts);
+        turn.duration_ms = match (start, timing.end_ts) {
+            (Some(s), Some(e)) => clamp_estimated_duration_ms(e - s),
+            _ => None,
+        };
     }
     // 计费门槛：任一计费维度 > 0 才计入。全 0 行（流式中间快照未被同 id 覆盖、
     // 本地占位等）不是一次计费调用，计入会虚增 calls（Codex 侧解析时已同门槛）
@@ -523,6 +576,8 @@ pub(crate) fn parse_codex_session(
     // 血缘复制簇的滚动簇尾：起于最后一个 session_meta 时刻，随被丢弃的复制行推进
     let mut lineage_cluster_end: Option<i64> = None;
     let mut meta_count = 0usize;
+    // 上一条触发模型推理的事件时刻（用户输入 / 工具输出 / turn_context），用于估算本轮耗时
+    let mut last_trigger_ts: Option<i64> = None;
 
     for line in &lines {
         let obj: serde_json::Value = match serde_json::from_str(line) {
@@ -559,6 +614,9 @@ pub(crate) fn parse_codex_session(
                 }
             }
             Some("turn_context") => {
+                if line_ts.is_some() {
+                    last_trigger_ts = line_ts;
+                }
                 // model 每回合记录且一个会话可跨多模型：随行更新，后续 token_count 用当前值
                 if let Some(m) = obj.pointer("/payload/model").and_then(|v| v.as_str()) {
                     model = Some(m.to_string());
@@ -580,6 +638,14 @@ pub(crate) fn parse_codex_session(
                 // fork 复制的行原样保留 call_id → 聚合层按 call_id 去重,
                 // 无需血缘时间窗截断
                 let payload_type = obj.pointer("/payload/type").and_then(|t| t.as_str());
+                if matches!(
+                    payload_type,
+                    Some("function_call_output") | Some("custom_tool_call_output")
+                ) && line_ts.is_some()
+                {
+                    // 并发工具回传逐条推进到最后一条完成时刻，正好卡在下一次模型调用起点
+                    last_trigger_ts = line_ts;
+                }
                 if matches!(payload_type, Some("function_call") | Some("custom_tool_call")) {
                     if let Some(name) = obj.pointer("/payload/name").and_then(|v| v.as_str()) {
                         let call_id = obj
@@ -600,6 +666,9 @@ pub(crate) fn parse_codex_session(
             Some("event_msg") => {
                 let payload_type = obj.pointer("/payload/type").and_then(|t| t.as_str());
                 if payload_type == Some("user_message") {
+                    if line_ts.is_some() {
+                        last_trigger_ts = line_ts;
+                    }
                     // 首选标题来源：真正的用户回合(比 response_item 干净)，只取首条
                     if title.is_none() {
                         if let Some(msg) = obj.pointer("/payload/message").and_then(|v| v.as_str()) {
@@ -666,6 +735,10 @@ pub(crate) fn parse_codex_session(
                 {
                     continue;
                 }
+                let duration_ms = match (last_trigger_ts.take(), line_ts) {
+                    (Some(start), Some(end)) => clamp_estimated_duration_ms(end - start),
+                    _ => None,
+                };
                 turns.push(Turn {
                     // Codex rollout 无消息 id:重复计费已在上方按血缘前缀与相邻
                     // 重复处理,不再合成内容指纹参与聚合层去重(内容指纹会把
@@ -674,6 +747,7 @@ pub(crate) fn parse_codex_session(
                     model: model.clone(),
                     timestamp_ms: line_ts,
                     usage,
+                    duration_ms,
                 });
             }
             _ => {}
@@ -785,37 +859,70 @@ pub(crate) fn parse_grok_session(session_dir: &Path) -> Option<ParsedSession> {
         .map(str::to_string);
 
     let mut turns: Vec<Turn> = Vec::new();
+    // 单步纯文本回合的耗时估算：记录上一次用户消息落盘时刻；
+    // 若其间穿插了工具调用则本回合含工具执行耗时，不再估算速度。
+    let mut last_user_ts: Option<i64> = None;
+    let mut saw_tool_since_user = false;
     for line in &lines {
-        let Some((prompt_id, usage, ts)) = grok_turn_completed(line) else {
-            continue;
-        };
-        // 去重键:fork 会把父会话的 updates 整段复制进新会话目录,同一个回合
-        // 因此会在两个文件里各出现一次。prompt_id 是回合的唯一标识,叠上模型名
-        // 后逐条唯一,交给聚合层的跨会话 message_id 去重(与 Claude 同一条路)。
-        let mut push = |model: Option<String>, usage: &serde_json::Value| {
-            let totals = usage_from_grok(usage);
-            if totals.total() == 0 {
-                return; // 无计费的回合(纯本地/取消)不占 calls
-            }
-            let message_id = prompt_id.as_ref().map(|p| match &model {
-                Some(m) => format!("{p}#{m}"),
-                None => p.clone(),
-            });
-            turns.push(Turn {
-                message_id,
-                model,
-                timestamp_ms: ts,
-                usage: totals,
-            });
-        };
-
-        match usage.get("modelUsage").and_then(|m| m.as_object()) {
-            Some(rows) if !rows.is_empty() => {
-                for (model, row) in rows {
-                    push(Some(model.clone()), row);
+        if let Some((prompt_id, usage, ts)) = grok_turn_completed(line) {
+            let model_rows = usage
+                .get("modelUsage")
+                .and_then(|m| m.as_object())
+                .filter(|m| !m.is_empty());
+            // 仅在无工具穿插且单模型回合时估算耗时（多模型共享同一总耗时无法准确分摊）
+            let single_model = model_rows.is_none_or(|m| m.len() == 1);
+            let turn_duration_ms = if !saw_tool_since_user && single_model {
+                match (last_user_ts, ts) {
+                    (Some(start), Some(end)) => clamp_estimated_duration_ms(end - start),
+                    _ => None,
                 }
+            } else {
+                None
+            };
+            last_user_ts = None;
+            saw_tool_since_user = false;
+
+            // 去重键:fork 会把父会话的 updates 整段复制进新会话目录,同一个回合
+            // 因此会在两个文件里各出现一次。prompt_id 是回合的唯一标识,叠上模型名
+            // 后逐条唯一,交给聚合层的跨会话 message_id 去重(与 Claude 同一条路)。
+            let mut push = |model: Option<String>, usage: &serde_json::Value| {
+                let totals = usage_from_grok(usage);
+                if totals.total() == 0 {
+                    return; // 无计费的回合(纯本地/取消)不占 calls
+                }
+                let message_id = prompt_id.as_ref().map(|p| match &model {
+                    Some(m) => format!("{p}#{m}"),
+                    None => p.clone(),
+                });
+                turns.push(Turn {
+                    message_id,
+                    model,
+                    timestamp_ms: ts,
+                    usage: totals,
+                    duration_ms: turn_duration_ms,
+                });
+            };
+
+            match model_rows {
+                Some(rows) => {
+                    for (model, row) in rows {
+                        push(Some(model.clone()), row);
+                    }
+                }
+                None => push(default_model.clone(), &usage),
             }
-            _ => push(default_model.clone(), &usage),
+            continue;
+        }
+        // 廉价预筛：只在命中关键事件名时才解析 JSON
+        if line.contains("\"user_message_chunk\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(secs) = v.get("timestamp").and_then(|t| t.as_i64())
+            {
+                last_user_ts = Some(secs * 1000);
+                saw_tool_since_user = false;
+            }
+        } else if line.contains("\"tool_call\"") || line.contains("\"tool_call_update\"") {
+            saw_tool_since_user = true;
         }
     }
 
@@ -925,27 +1032,60 @@ fn agy_native_cwd(path: &str) -> String {
 /// `transcript_full.jsonl`(用量)。子代理会话同样走这里,项目归属用它自己的工作区。
 ///
 /// 工作区可能有多个,账本的会话行只有一个 cwd 列 —— 取第一个。
+///
+/// 耗时估算：实测 agy 的 `PLANNER_RESPONSE.created_at` 是该步模型请求的发起时刻，
+/// 若本步带 `tool_calls`，紧随其后的首条 `GENERIC` 工具步的 `created_at` 即模型
+/// 输出完毕并开始调工具的时刻（遇 `USER_INPUT` / 下一条 `PLANNER_RESPONSE` /
+/// `ERROR_MESSAGE` 即停，绝不跨回合或吃进用户等待时间）。纯文本收尾步无结束时间戳，
+/// `duration_ms` 留 `None`。
 pub(crate) fn parse_agy_session(
     conv: &AgyConversation,
     transcript: &Path,
 ) -> Option<ParsedSession> {
     let lines = read_lines(transcript)?;
-    let turns = lines
+    // 坏行 / 写到一半的末行解析不出来,跳过即可:下一轮文件指纹一变就会重读
+    let steps: Vec<AgyStep> = lines
         .iter()
-        // 坏行 / 写到一半的末行解析不出来,跳过即可:下一轮文件指纹一变就会重读
         .filter_map(|line| parse_agy_step(line))
-        .filter(|step| step.kind == AgyStepKind::PlannerResponse)
-        .filter_map(|step| {
-            let usage = usage_from_agy(&step);
+        .collect();
+    let turns = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.kind == AgyStepKind::PlannerResponse)
+        .filter_map(|(i, step)| {
+            let usage = usage_from_agy(step);
             // 计费门槛与别家相同:全 0 不是一次计费调用
             if usage.total() == 0 {
                 return None;
             }
+            let timestamp_ms = step.created_at.as_deref().and_then(parse_rfc3339_ms);
+            let duration_ms = if !step.tool_calls.is_empty() {
+                timestamp_ms.and_then(|start| {
+                    for next in &steps[i + 1..] {
+                        match next.kind {
+                            AgyStepKind::Generic => {
+                                if next.step_index > step.step_index {
+                                    let end = next.created_at.as_deref().and_then(parse_rfc3339_ms)?;
+                                    return clamp_estimated_duration_ms(end - start);
+                                }
+                            }
+                            AgyStepKind::PlannerResponse
+                            | AgyStepKind::UserInput
+                            | AgyStepKind::ErrorMessage => break,
+                            _ => {}
+                        }
+                    }
+                    None
+                })
+            } else {
+                None
+            };
             Some(Turn {
-                message_id: Some(agy_message_id(&step)),
+                message_id: Some(agy_message_id(step)),
                 model: step.model.clone().filter(|m| !m.trim().is_empty()),
-                timestamp_ms: step.created_at.as_deref().and_then(parse_rfc3339_ms),
+                timestamp_ms,
                 usage,
+                duration_ms,
             })
         })
         .collect();
@@ -1521,5 +1661,89 @@ mod tests {
         assert_eq!(pb.turns[0].usage.input, 20);
         // 不再合成内容指纹,不参与聚合层去重
         assert!(pa.turns.iter().all(|t| t.message_id.is_none()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn duration_estimation_covers_claude_codex_grok_and_agy() {
+        // 1. Claude: user 时刻 → 同 message.id 末行时刻; 无 user 时退化为同 id 首末行差
+        let claude = [
+            r#"{"type":"user","timestamp":"2026-08-01T10:00:00.000Z","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:02.000Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":50}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:06.500Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":350}}}"#,
+            // 紧随其后没有新 user 行,但同 message.id 跨 1.2s 流式落盘 → 用首末差兜底
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:01:00.000Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:01:01.200Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":220}}}"#,
+        ];
+        let (ct, _, _, _) = claude_turns_from_lines(claude.iter().copied());
+        assert_eq!(ct.len(), 2);
+        assert_eq!(ct[0].duration_ms, Some(6500));
+        assert_eq!(ct[1].duration_ms, Some(1200));
+
+        // 2. Codex: 触发事件(user_message / function_call_output) → token_count 排除工具耗时
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-dur-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let codex_file = root.join("rollout-dur.jsonl");
+        std::fs::write(
+            &codex_file,
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-08-01T10:00:00.000Z","payload":{"id":"s-dur","cwd":"/p"}}"#, "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:01.000Z","payload":{"type":"user_message","message":"run"}}"#, "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:05.250Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":260}}}}"#, "\n",
+                // 工具跑了 20 秒,结束后 3.5 秒模型返回下一轮
+                r#"{"type":"response_item","timestamp":"2026-08-01T10:00:25.000Z","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#, "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:28.500Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":300}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let codex = parse_codex_session(&codex_file, &HashMap::new()).unwrap();
+        assert_eq!(codex.turns.len(), 2);
+        assert_eq!(codex.turns[0].duration_ms, Some(4250));
+        assert_eq!(codex.turns[1].duration_ms, Some(3500));
+
+        // 3. Agy: PLANNER_RESPONSE(含 tool_calls) 发起时刻 → 紧随 GENERIC 开始时刻;
+        //    无 tool_calls 或后接 USER_INPUT 不得把用户停顿算进去
+        let agy_lines = vec![
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-23T03:37:23Z","content":"hi"}"#.to_string(),
+            agy_plan(1, "2026-11-23T03:37:23Z", 1000, 0, 455),
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-23T03:37:30Z","content":"ok"}"#.to_string(),
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-23T03:37:31Z","model":"gemini-4-neon-xhigh","input_tokens":500,"cache_read_tokens":1000,"output_tokens":300,"content":"done"}"#.to_string(),
+            r#"{"step_index":4,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-23T03:40:00Z","content":"next"}"#.to_string(),
+        ];
+        let agy_path = agy_transcript_fixture("dur", &agy_lines);
+        let agy = parse_agy_session(&agy_conv("conv-dur", &["d:/p"], None), &agy_path).unwrap();
+        assert_eq!(agy.turns.len(), 2);
+        assert_eq!(agy.turns[0].duration_ms, Some(7000));
+        assert_eq!(agy.turns[1].duration_ms, None, "无 tool_calls 的收尾步不拿用户下次发言凑耗时");
+        fs::remove_dir_all(agy_path.parent().unwrap()).ok();
+
+        // 4. Grok: 纯文本单模型回合估算耗时; 含 tool_call 的回合置 None
+        let grok_updates = concat!(
+            r#"{"timestamp":1785000000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}}}"#, "\n",
+            r#"{"timestamp":1785000004,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#, "\n",
+            r#"{"timestamp":1785000010,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run"}}}}"#, "\n",
+            r#"{"timestamp":1785000012,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"bash"}}}"#, "\n",
+            r#"{"timestamp":1785000030,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p2","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#, "\n",
+        );
+        let grok_dir = grok_session_fixture("dur", grok_updates, GROK_SUMMARY);
+        let grok = parse_grok_session(&grok_dir).unwrap();
+        assert_eq!(grok.turns.len(), 2);
+        assert_eq!(grok.turns[0].duration_ms, Some(4000));
+        assert_eq!(grok.turns[1].duration_ms, None, "穿插工具执行的整轮不估算速度");
+        fs::remove_dir_all(grok_dir.parent().unwrap()).ok();
+        fs::remove_dir_all(&root).ok();
+
+        // 边界区间检查
+        assert_eq!(clamp_estimated_duration_ms(0), None);
+        assert_eq!(clamp_estimated_duration_ms(199), None);
+        assert_eq!(clamp_estimated_duration_ms(200), Some(200));
+        assert_eq!(clamp_estimated_duration_ms(600_000), Some(600_000));
+        assert_eq!(clamp_estimated_duration_ms(600_001), None);
     }
 }

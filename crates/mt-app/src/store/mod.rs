@@ -315,6 +315,8 @@ pub struct UsagePrefs {
     pub auto_refresh: u32,
     pub custom_from: String,
     pub custom_to: String,
+    /// 「请求日志」可见列 key 列表;`None` = 沿用默认列集。
+    pub log_columns: Option<Vec<String>>,
 }
 
 /// 一次「关联 SSH」保存的结果(`SshAssocModal.tsx::handleSave` 收尾那一段

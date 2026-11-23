@@ -151,7 +151,32 @@ pub const ICON_REFRESH: &[Shape] = &[
     ),
 ];
 
-/// 全部六枚(遍历/演示用)。
+/// 列显隐（表格三列方框）：`<rect x="2" y="3" width="12" height="10" rx="1.5"/>` + 两条竖分隔线。
+pub const ICON_COLUMNS: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        KPI_STROKE,
+        Geom::Rect {
+            x: u(2.0),
+            y: u(3.0),
+            w: u(12.0),
+            h: u(10.0),
+            round: u(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        KPI_STROKE,
+        Geom::Polyline(&[(u(6.0), u(3.0)), (u(6.0), u(13.0))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        KPI_STROKE,
+        Geom::Polyline(&[(u(10.0), u(3.0)), (u(10.0), u(13.0))]),
+    ),
+];
+
+/// 全部七枚(遍历/演示用)。
 pub const ALL_USAGE_GLYPHS: &[&[Shape]] = &[
     ICON_WALLET,
     ICON_STACK,
@@ -159,6 +184,7 @@ pub const ALL_USAGE_GLYPHS: &[&[Shape]] = &[
     ICON_CHAT,
     ICON_BOLT,
     ICON_REFRESH,
+    ICON_COLUMNS,
 ];
 
 /// 所有形状表(单测遍历用)。

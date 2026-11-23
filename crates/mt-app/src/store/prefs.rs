@@ -43,7 +43,7 @@ impl AppStore {
 
     // === 用量面板偏好 ===
 
-    /// 六个偏好**一把写** —— 六个 setter 各自触发一次 500ms 去抖没有意义。
+    /// 用量面板偏好**一把写** —— 多个 setter 各自触发一次 500ms 去抖没有意义。
     pub fn set_usage_prefs(&mut self, prefs: UsagePrefs, cx: &mut Context<Self>) {
         self.config.usage_scope = Some(prefs.scope);
         self.config.usage_range = Some(prefs.range);
@@ -51,6 +51,7 @@ impl AppStore {
         self.config.usage_auto_refresh = Some(prefs.auto_refresh);
         self.config.usage_custom_from = Some(prefs.custom_from);
         self.config.usage_custom_to = Some(prefs.custom_to);
+        self.config.usage_log_columns = prefs.log_columns;
         self.save_config_soon(cx);
     }
 

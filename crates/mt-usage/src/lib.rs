@@ -32,8 +32,8 @@ pub mod pricing;
 pub mod turns;
 
 pub use aggregate::{
-    Aggregator, CountStat, DailyStat, ModelStat, ProjectStat, ProviderStat, TopSessionStat,
-    UsageStatsPayload,
+    Aggregator, CountStat, DailyStat, ModelStat, ProjectStat, ProviderStat, RequestLogStat,
+    TopSessionStat, UsageStatsPayload,
 };
 pub use ledger::{
     ledger_db_path, spawn_usage_ledger_sync, usage_ledger_query, usage_ledger_sync, SyncEvent,

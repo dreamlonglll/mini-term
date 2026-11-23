@@ -292,8 +292,11 @@ use mt_i18n::{
 /// 已在接管中 / 终端接不了两条提示、建连失败 / 取消 / 断线三条 toast
 /// （`terminal.{sshDisconnect,sshAlreadyConnected,sshTakeoverUnavailable,sshConnectFailed,
 /// sshConnectCancelled,sshConnectionLost}`）。
+/// 1937 → 1958：用量统计下半区改 Tab（默认「请求日志」+「排行概览」），新增页签、列显隐、
+/// 表格列名 / 速度估算说明、请求明细空态 / 截断提示 / hover 提示
+/// （`usageStats.{tabs.*,columns.*,requestLogs.*}` 共 21 条）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1937;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1958;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -529,6 +529,231 @@ pub fn bar_ratios_or(primary: &[f64], fallback: &[f64]) -> Vec<f32> {
     }
 }
 
+// ─── 下半区 Tab 与请求日志表格 ───────────────────────────────
+
+/// 趋势图下方的详情页签（默认展示请求日志）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageTab {
+    RequestLogs,
+    Overview,
+}
+
+/// 请求日志表格列（不含首字与状态码）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestLogColumn {
+    Time,
+    App,
+    Provider,
+    Model,
+    Project,
+    Cost,
+    NewInput,
+    Output,
+    CacheRead,
+    CacheWrite,
+    Speed,
+}
+
+impl RequestLogColumn {
+    /// 全部可选列的固定展示顺序。
+    pub const ALL: [Self; 11] = [
+        Self::Time,
+        Self::App,
+        Self::Provider,
+        Self::Model,
+        Self::Project,
+        Self::Cost,
+        Self::NewInput,
+        Self::Output,
+        Self::CacheRead,
+        Self::CacheWrite,
+        Self::Speed,
+    ];
+
+    /// 默认可见的 9 列（项目与缓存写可在列菜单中按需勾选）。
+    pub const DEFAULT: [Self; 9] = [
+        Self::Time,
+        Self::App,
+        Self::Provider,
+        Self::Model,
+        Self::Cost,
+        Self::NewInput,
+        Self::Output,
+        Self::CacheRead,
+        Self::Speed,
+    ];
+
+    /// 稳定标识（持久化 key + 元素 id + i18n 键后段）。
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::App => "app",
+            Self::Provider => "provider",
+            Self::Model => "model",
+            Self::Project => "project",
+            Self::Cost => "cost",
+            Self::NewInput => "newInput",
+            Self::Output => "output",
+            Self::CacheRead => "cacheRead",
+            Self::CacheWrite => "cacheWrite",
+            Self::Speed => "speed",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Time => t("usageStats", "columns.time"),
+            Self::App => t("usageStats", "columns.app"),
+            Self::Provider => t("usageStats", "columns.provider"),
+            Self::Model => t("usageStats", "columns.model"),
+            Self::Project => t("usageStats", "columns.project"),
+            Self::Cost => t("usageStats", "columns.cost"),
+            Self::NewInput => t("usageStats", "columns.newInput"),
+            Self::Output => t("usageStats", "columns.output"),
+            Self::CacheRead => t("usageStats", "columns.cacheRead"),
+            Self::CacheWrite => t("usageStats", "columns.cacheWrite"),
+            Self::Speed => t("usageStats", "columns.speed"),
+        }
+    }
+}
+
+/// 读盘列配置 → 有序合法列集（过白名单、按 `ALL` 保序、空或 `None` 回落默认）。
+pub fn resolve_log_columns(saved: Option<&[String]>) -> Vec<RequestLogColumn> {
+    let Some(keys) = saved else {
+        return RequestLogColumn::DEFAULT.to_vec();
+    };
+    let cols: Vec<RequestLogColumn> = RequestLogColumn::ALL
+        .into_iter()
+        .filter(|c| keys.iter().any(|k| k == c.key()))
+        .collect();
+    if cols.is_empty() {
+        RequestLogColumn::DEFAULT.to_vec()
+    } else {
+        cols
+    }
+}
+
+/// 切换一列的显隐（保持 `ALL` 固定顺序；至少保留 1 列，避免把表格点成空白）。
+pub fn toggle_log_column(
+    current: &[RequestLogColumn],
+    target: RequestLogColumn,
+) -> Vec<RequestLogColumn> {
+    let present = current.contains(&target);
+    if present && current.len() <= 1 {
+        return current.to_vec();
+    }
+    RequestLogColumn::ALL
+        .into_iter()
+        .filter(|c| if *c == target { !present } else { current.contains(c) })
+        .collect()
+}
+
+/// 落盘列配置：与默认列集完全一致时返回 `None`（不写冗余配置键）。
+pub fn serialize_log_columns(current: &[RequestLogColumn]) -> Option<Vec<String>> {
+    if current == RequestLogColumn::DEFAULT {
+        None
+    } else {
+        Some(current.iter().map(|c| c.key().to_string()).collect())
+    }
+}
+
+/// 表格内 token 数格式：`< 10,000` 显示千分位精确值（如 `3,978`），
+/// `≥ 10,000` 缩写成 K/M/B（`< 100` 留 1 位小数如 `10.3K`、`69.9K`，`≥ 100` 取整如 `203K`）。
+pub fn format_table_tokens(v: u64) -> String {
+    if v < 10_000 {
+        return format_count(v);
+    }
+    let f = v as f64;
+    for (unit, suffix) in [(1e9, "B"), (1e6, "M"), (1e3, "K")] {
+        if f >= unit {
+            let scaled = f / unit;
+            return if scaled >= 100.0 {
+                format!("{}{suffix}", scaled.round() as u64)
+            } else {
+                format!("{scaled:.1}{suffix}")
+            };
+        }
+    }
+    format_count(v)
+}
+
+/// 日志估算速度的最低输出门槛（过短回复被首字延迟主导，估算值严重失真）。
+pub const SPEED_MIN_OUTPUT_TOKENS: u64 = 200;
+const SPEED_MAX_TPS: f64 = 5_000.0;
+
+/// 按估算耗时计算近似生成速度（tok/s）；不足门槛或越界返回 `None`。
+pub fn estimate_speed_tps(output_tokens: u64, duration_ms: Option<u64>) -> Option<u64> {
+    if output_tokens < SPEED_MIN_OUTPUT_TOKENS {
+        return None;
+    }
+    let ms = duration_ms.filter(|&d| d > 0)?;
+    let tps = output_tokens as f64 / (ms as f64 / 1000.0);
+    if (1.0..=SPEED_MAX_TPS).contains(&tps) {
+        Some(tps.round() as u64)
+    } else {
+        None
+    }
+}
+
+/// 估算速度展示串（如 `≈ 143 tok/s`）。
+pub fn format_estimated_speed(output_tokens: u64, duration_ms: Option<u64>) -> Option<String> {
+    estimate_speed_tps(output_tokens, duration_ms).map(|tps| format!("≈ {tps} tok/s"))
+}
+
+/// 判断一批请求日志是否全部落在同一个本地日历日（决定时间列只显示 `HH:MM:SS` 还是带 `MM-DD`）。
+pub fn logs_span_single_day(logs: &[mt_usage::RequestLogStat]) -> bool {
+    use chrono::TimeZone;
+    let mut day: Option<chrono::NaiveDate> = None;
+    for item in logs {
+        let Some(dt) = chrono::Local.timestamp_millis_opt(item.timestamp_ms).single() else {
+            return false;
+        };
+        let d = dt.date_naive();
+        match day {
+            None => day = Some(d),
+            Some(prev) if prev != d => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// 请求时间列展示串：同日 `HH:MM:SS`，跨日 `MM-DD HH:MM:SS`。
+pub fn format_request_time(ts_ms: i64, same_day: bool) -> String {
+    use chrono::TimeZone;
+    let Some(dt) = chrono::Local.timestamp_millis_opt(ts_ms).single() else {
+        return "—".to_string();
+    };
+    if same_day {
+        dt.format("%H:%M:%S").to_string()
+    } else {
+        dt.format("%m-%d %H:%M:%S").to_string()
+    }
+}
+
+/// 请求完整本地时间（tooltip 用）：`YYYY-MM-DD HH:MM:SS`。
+pub fn format_full_timestamp(ts_ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map_or_else(|| "—".to_string(), |dt| dt.format(DATETIME_FMT).to_string())
+}
+
+/// 请求日志「应用」列的简短展示名（专有名词不进字典）。
+pub fn agent_display_label(agent: &str) -> &'static str {
+    match mt_ai::AgentKind::parse(agent) {
+        Some(mt_ai::AgentKind::Claude) => "Claude",
+        Some(mt_ai::AgentKind::Codex) => "Codex",
+        Some(mt_ai::AgentKind::Grok) => "Grok",
+        Some(mt_ai::AgentKind::Agy) => "Antigravity",
+        Some(mt_ai::AgentKind::Pi) => "pi",
+        Some(mt_ai::AgentKind::Omp) => "oh-my-pi",
+        Some(mt_ai::AgentKind::OpenCode) => "OpenCode",
+        None => "Unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,5 +1128,61 @@ mod tests {
 
         // 完全没数据时不补(原版 `daily.length === 0` 直接返回空)
         assert!(fill_buckets(&[], UsageRange::Days7, "", "", now).is_empty());
+    }
+
+    #[test]
+    fn 表格_token_格式小值千分位大值缩写() {
+        assert_eq!(format_table_tokens(0), "0");
+        assert_eq!(format_table_tokens(904), "904");
+        assert_eq!(format_table_tokens(3_978), "3,978");
+        assert_eq!(format_table_tokens(9_999), "9,999");
+        assert_eq!(format_table_tokens(10_300), "10.3K");
+        assert_eq!(format_table_tokens(69_900), "69.9K");
+        assert_eq!(format_table_tokens(111_000), "111K");
+        assert_eq!(format_table_tokens(203_000), "203K");
+        assert_eq!(format_table_tokens(1_520_000), "1.5M");
+        assert_eq!(format_table_tokens(125_000_000), "125M");
+    }
+
+    #[test]
+    fn 估算速度卡最低输出门槛与合法上界() {
+        assert_eq!(estimate_speed_tps(199, Some(2_000)), None, "低于 200 输出不估算");
+        assert_eq!(estimate_speed_tps(200, None), None);
+        assert_eq!(estimate_speed_tps(200, Some(0)), None);
+        assert_eq!(estimate_speed_tps(1_430, Some(10_000)), Some(143));
+        assert_eq!(
+            format_estimated_speed(1_430, Some(10_000)).as_deref(),
+            Some("≈ 143 tok/s")
+        );
+        // 极端超高速度直接过滤
+        assert_eq!(estimate_speed_tps(50_000, Some(1_000)), None);
+    }
+
+    #[test]
+    fn 请求日志列配置过白名单且至少保留一列() {
+        assert_eq!(resolve_log_columns(None), RequestLogColumn::DEFAULT);
+        assert_eq!(
+            resolve_log_columns(Some(&["bogus".into()])),
+            RequestLogColumn::DEFAULT,
+            "全是非法键时回落默认"
+        );
+        // 逆序存盘也要按固定表序还原
+        let resolved = resolve_log_columns(Some(&["speed".into(), "time".into(), "project".into()]));
+        assert_eq!(
+            resolved,
+            vec![
+                RequestLogColumn::Time,
+                RequestLogColumn::Project,
+                RequestLogColumn::Speed
+            ]
+        );
+        // 切换只剩最后一列时拒绝移除
+        let single = vec![RequestLogColumn::Time];
+        assert_eq!(toggle_log_column(&single, RequestLogColumn::Time), single);
+        // 默认列集不落盘（None）
+        assert_eq!(serialize_log_columns(&RequestLogColumn::DEFAULT), None);
+        let toggled = toggle_log_column(&RequestLogColumn::DEFAULT, RequestLogColumn::Project);
+        assert!(toggled.contains(&RequestLogColumn::Project));
+        assert!(serialize_log_columns(&toggled).is_some());
     }
 }

@@ -73,6 +73,45 @@ pub struct CountStat {
     pub count: u64,
 }
 
+/// 单次 API 请求明细（用量面板「请求日志」Tab 逐行展示）。
+///
+/// 由 [`Aggregator::add_session`] 在同一遍去重、时间窗终判与计价时顺带产出，
+/// 与顶层 KPI（`total_calls` / `total_cost`）共享完全一致的口径。
+#[derive(Debug, Clone, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogStat {
+    /// 有效时间戳（epoch ms；turn 缺失时间戳时已回落所属会话 mtime）
+    pub timestamp_ms: i64,
+    /// agent 标识：`"claude" | "codex" | "grok" | "agy"`
+    pub agent: String,
+    /// 所属会话 id（用于点行预览对应会话正文）
+    pub session_id: String,
+    /// 所属项目真实 cwd
+    pub project_path: String,
+    /// 所属项目展示名
+    pub project_name: String,
+    /// 会话标题（用于预览页标题）
+    pub session_title: String,
+    /// 供应商 host（扫描层由 `ProviderResolver` 解析）
+    pub provider: String,
+    /// 原始模型名（保留版本与思考档位，如 `gemini-4-neon-xhigh`；空串 = 未知模型）
+    pub model: String,
+    /// 本次请求估算成本（USD）
+    pub cost: f64,
+    /// 新增输入 tokens（不含缓存读/写）
+    pub input_tokens: u64,
+    /// 输出 tokens（含思考 tokens，展示口径与 KPI 一致）
+    pub output_tokens: u64,
+    /// 思考 tokens（单独记录供 hover 明细展示；Claude / agy 日志不单列，记 0）
+    pub reasoning_tokens: u64,
+    /// 缓存命中（cache_read）tokens
+    pub cache_read_tokens: u64,
+    /// 缓存写入（cache_write）tokens
+    pub cache_write_tokens: u64,
+    /// 本地会话日志时间戳估算耗时（ms，含等待首字）；不可靠估算时为 `None`
+    pub duration_ms: Option<u64>,
+}
+
 /// 聚合快照（serde camelCase，`src/types.ts` 手写镜像）。
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +135,8 @@ pub struct UsageStatsPayload {
     pub by_tool: Vec<CountStat>,
     pub by_shell: Vec<CountStat>,
     pub by_mcp: Vec<CountStat>,
+    /// 按时间倒序的逐条请求明细（上限 [`MAX_REQUEST_LOGS`]，真实总数以 `total_calls` 为准）
+    pub request_logs: Vec<RequestLogStat>,
 }
 
 /// 项目排行上限：设计合同(2026-08-01 §2.2)定为前 8
@@ -103,6 +144,8 @@ const TOP_PROJECTS: usize = 8;
 const TOP_SESSIONS: usize = 10;
 /// 工具/Shell/MCP 排行上限：设计合同 §2.2「各前 10」
 const TOP_TOOLS: usize = 10;
+/// 请求日志单次快照的条数保护上限（覆盖绝大多数范围，防「近 6 个月」极端量级占内存）
+pub const MAX_REQUEST_LOGS: usize = 10_000;
 
 #[derive(Default)]
 struct BucketAcc {
@@ -155,6 +198,8 @@ pub struct Aggregator {
     tools: HashMap<String, u64>,
     shells: HashMap<String, u64>,
     mcps: HashMap<String, u64>,
+    /// 去重且落窗的逐条请求明细（按发现序先攒着，snapshot 时按时间倒序截断）
+    request_logs: Vec<RequestLogStat>,
 }
 
 fn project_name(cwd: &str) -> String {
@@ -204,6 +249,7 @@ impl Aggregator {
             tools: HashMap::new(),
             shells: HashMap::new(),
             mcps: HashMap::new(),
+            request_logs: Vec::new(),
         }
     }
 
@@ -220,11 +266,19 @@ impl Aggregator {
     }
 
     pub fn add_session(&mut self, s: &ParsedSession, pricing: &PricingTable) {
+        let cwd = s.cwd.clone().unwrap_or_default();
+        let proj_name = if cwd.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            project_name(&cwd)
+        };
+        let provider = s.provider.clone().unwrap_or_default();
+        let title = s.title.clone().unwrap_or_default();
         let mut acc = SessionAcc {
             session_id: s.session_id.clone(),
             agent: s.agent,
-            cwd: s.cwd.clone().unwrap_or_default(),
-            title: s.title.clone().unwrap_or_default(),
+            cwd: cwd.clone(),
+            title: title.clone(),
             first_ts_ms: i64::MAX,
             cost: 0.0,
             calls: 0,
@@ -257,6 +311,29 @@ impl Aggregator {
             self.totals.add(&turn.usage);
             self.total_cost += cost;
             self.total_calls += 1;
+
+            self.request_logs.push(RequestLogStat {
+                timestamp_ms: ts,
+                agent: s.agent.to_string(),
+                session_id: s.session_id.clone(),
+                project_path: cwd.clone(),
+                project_name: proj_name.clone(),
+                session_title: title.clone(),
+                provider: provider.clone(),
+                model: turn
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string(),
+                cost,
+                input_tokens: turn.usage.input,
+                output_tokens: turn.usage.output + turn.usage.reasoning,
+                reasoning_tokens: turn.usage.reasoning,
+                cache_read_tokens: turn.usage.cache_read,
+                cache_write_tokens: turn.usage.cache_write,
+                duration_ms: turn.duration_ms,
+            });
 
             // 时段分桶：本地时区(getTimezoneOffset 语义为 UTC−local，故 local = ts − offset)。
             // 有 IANA 时区时按该记录自身时刻求偏移(DST 边界两侧各用各的)，
@@ -465,6 +542,16 @@ impl Aggregator {
             v
         };
 
+        // 请求明细：按有效时刻倒序（最新在前），同毫秒按 session_id / 模型确定排序，截到上限
+        let mut request_logs = self.request_logs.clone();
+        request_logs.sort_by(|a, b| {
+            b.timestamp_ms
+                .cmp(&a.timestamp_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        request_logs.truncate(MAX_REQUEST_LOGS);
+
         UsageStatsPayload {
             total_cost: self.total_cost,
             total_calls: self.total_calls,
@@ -481,6 +568,7 @@ impl Aggregator {
             by_tool: count_rank(&self.tools),
             by_shell: count_rank(&self.shells),
             by_mcp: count_rank(&self.mcps),
+            request_logs,
         }
     }
 }
@@ -516,6 +604,7 @@ mod tests {
                 output,
                 ..Default::default()
             },
+            duration_ms: None,
         }
     }
 
@@ -685,6 +774,7 @@ mod tests {
             model: None,
             timestamp_ms: None,
             usage: UsageTotals { input: 1, output: 1, ..Default::default() },
+            duration_ms: None,
         });
         agg.add_session(&s, &p);
         assert_eq!(agg.snapshot().total_calls, 1);
@@ -780,6 +870,7 @@ mod tests {
             model: Some("claude-opus-4-8-20260115".into()),
             timestamp_ms: Some(DAY),
             usage: UsageTotals { input: 10, output: 50, ..Default::default() },
+            duration_ms: None,
         });
         // 无模型 turn 归入空 key（前端翻译展示）
         s.turns.push(Turn {
@@ -787,6 +878,7 @@ mod tests {
             model: None,
             timestamp_ms: Some(DAY),
             usage: UsageTotals { input: 1, output: 1, ..Default::default() },
+            duration_ms: None,
         });
         agg.add_session(&s, &p);
         let snap = agg.snapshot();
@@ -794,5 +886,43 @@ mod tests {
         assert_eq!(snap.by_model[0].model, "claude-opus-4-8");
         assert_eq!(snap.by_model[0].calls, 2);
         assert_eq!(snap.by_model[1].model, "");
+    }
+
+    #[test]
+    fn request_logs_deduped_sorted_desc_and_match_total_calls() {
+        let mut agg = Aggregator::new(DAY, None, 0, None, false);
+        let p = pricing();
+        let mut t1 = turn(Some("m1"), DAY + 1_000, 300);
+        t1.model = Some("claude-opus-4-8-20260115".into());
+        t1.usage.cache_read = 500;
+        t1.usage.cache_write = 120;
+        t1.usage.reasoning = 40;
+        t1.duration_ms = Some(4_000);
+        let t2 = turn(Some("m2"), DAY + 9_000, 120);
+        let out_of_window = turn(Some("m0"), DAY - 10, 50);
+
+        agg.add_session(&session("s1", "/work/alpha", vec![out_of_window, t1.clone(), t2]), &p);
+        // fork 复制了同一条 m1：不得在 request_logs 里重复出现
+        agg.add_session(&session("s2", "/work/alpha", vec![t1]), &p);
+
+        let snap = agg.snapshot();
+        assert_eq!(snap.total_calls, 2);
+        assert_eq!(snap.request_logs.len(), 2, "请求日志条数必须与 total_calls 一致");
+        // 按时间倒序：m2 在前，m1 在后
+        assert_eq!(snap.request_logs[0].timestamp_ms, DAY + 9_000);
+        assert_eq!(snap.request_logs[1].timestamp_ms, DAY + 1_000);
+        // 保留原始模型名、供应商、估算耗时与互斥 token 维度
+        let r = &snap.request_logs[1];
+        assert_eq!(r.agent, "claude");
+        assert_eq!(r.session_id, "s1");
+        assert_eq!(r.project_name, "alpha");
+        assert_eq!(r.provider, "api.anthropic.com");
+        assert_eq!(r.model, "claude-opus-4-8-20260115");
+        assert_eq!(r.input_tokens, 10);
+        assert_eq!(r.output_tokens, 340, "output_tokens 含 reasoning 与 KPI 同口径");
+        assert_eq!(r.reasoning_tokens, 40);
+        assert_eq!(r.cache_read_tokens, 500);
+        assert_eq!(r.cache_write_tokens, 120);
+        assert_eq!(r.duration_ms, Some(4_000));
     }
 }
