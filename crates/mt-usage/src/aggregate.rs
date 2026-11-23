@@ -901,13 +901,20 @@ mod tests {
         let t2 = turn(Some("m2"), DAY + 9_000, 120);
         let out_of_window = turn(Some("m0"), DAY - 10, 50);
 
-        agg.add_session(&session("s1", "/work/alpha", vec![out_of_window, t1.clone(), t2]), &p);
+        agg.add_session(
+            &session("s1", "/work/alpha", vec![out_of_window, t1.clone(), t2]),
+            &p,
+        );
         // fork 复制了同一条 m1：不得在 request_logs 里重复出现
         agg.add_session(&session("s2", "/work/alpha", vec![t1]), &p);
 
         let snap = agg.snapshot();
         assert_eq!(snap.total_calls, 2);
-        assert_eq!(snap.request_logs.len(), 2, "请求日志条数必须与 total_calls 一致");
+        assert_eq!(
+            snap.request_logs.len(),
+            2,
+            "请求日志条数必须与 total_calls 一致"
+        );
         // 按时间倒序：m2 在前，m1 在后
         assert_eq!(snap.request_logs[0].timestamp_ms, DAY + 9_000);
         assert_eq!(snap.request_logs[1].timestamp_ms, DAY + 1_000);
@@ -919,7 +926,10 @@ mod tests {
         assert_eq!(r.provider, "api.anthropic.com");
         assert_eq!(r.model, "claude-opus-4-8-20260115");
         assert_eq!(r.input_tokens, 10);
-        assert_eq!(r.output_tokens, 340, "output_tokens 含 reasoning 与 KPI 同口径");
+        assert_eq!(
+            r.output_tokens, 340,
+            "output_tokens 含 reasoning 与 KPI 同口径"
+        );
         assert_eq!(r.reasoning_tokens, 40);
         assert_eq!(r.cache_read_tokens, 500);
         assert_eq!(r.cache_write_tokens, 120);

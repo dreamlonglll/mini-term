@@ -331,29 +331,30 @@ impl Ledger {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
-        let migrated_in_place = matches!(version, 3 | 4) && {
-            // 放在 savepoint 里：失败只回滚这一段，外层事务照常走删表重建
-            let sp = tx.savepoint()?;
-            let step = (|| -> rusqlite::Result<()> {
-                if version == 3 {
-                    migrate_v3_to_v4(&sp)?;
+        let migrated_in_place = matches!(version, 3 | 4)
+            && {
+                // 放在 savepoint 里：失败只回滚这一段，外层事务照常走删表重建
+                let sp = tx.savepoint()?;
+                let step = (|| -> rusqlite::Result<()> {
+                    if version == 3 {
+                        migrate_v3_to_v4(&sp)?;
+                    }
+                    migrate_v4_to_v5(&sp)?;
+                    Ok(())
+                })();
+                match step {
+                    Ok(()) => {
+                        sp.commit()?;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[usage_stats] 账本 v{version}→v{SCHEMA_VERSION} 就地迁移失败，改为重建: {e}"
+                        );
+                        false
+                    }
                 }
-                migrate_v4_to_v5(&sp)?;
-                Ok(())
-            })();
-            match step {
-                Ok(()) => {
-                    sp.commit()?;
-                    true
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[usage_stats] 账本 v{version}→v{SCHEMA_VERSION} 就地迁移失败，改为重建: {e}"
-                    );
-                    false
-                }
-            }
-        };
+            };
         if !migrated_in_place {
             tx.execute_batch(
                 "DROP TABLE IF EXISTS turns; DROP TABLE IF EXISTS sessions;
@@ -1848,7 +1849,10 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert!(ledger.sync_state_empty().unwrap(), "清 sync_state 触发重扫补算耗时");
+        assert!(
+            ledger.sync_state_empty().unwrap(),
+            "清 sync_state 触发重扫补算耗时"
+        );
         let sessions = ledger.query_sessions(AgentFilter::Agy, 0, None).unwrap();
         assert_eq!(sessions.len(), 1, "已入账的 agy 旧行必须完整保留");
         assert_eq!(sessions[0].turns.len(), 1);

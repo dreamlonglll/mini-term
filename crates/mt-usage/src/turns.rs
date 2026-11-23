@@ -1065,7 +1065,8 @@ pub(crate) fn parse_agy_session(
                         match next.kind {
                             AgyStepKind::Generic => {
                                 if next.step_index > step.step_index {
-                                    let end = next.created_at.as_deref().and_then(parse_rfc3339_ms)?;
+                                    let end =
+                                        next.created_at.as_deref().and_then(parse_rfc3339_ms)?;
                                     return clamp_estimated_duration_ms(end - start);
                                 }
                             }
@@ -1720,22 +1721,33 @@ mod tests {
         let agy = parse_agy_session(&agy_conv("conv-dur", &["d:/p"], None), &agy_path).unwrap();
         assert_eq!(agy.turns.len(), 2);
         assert_eq!(agy.turns[0].duration_ms, Some(7000));
-        assert_eq!(agy.turns[1].duration_ms, None, "无 tool_calls 的收尾步不拿用户下次发言凑耗时");
+        assert_eq!(
+            agy.turns[1].duration_ms, None,
+            "无 tool_calls 的收尾步不拿用户下次发言凑耗时"
+        );
         fs::remove_dir_all(agy_path.parent().unwrap()).ok();
 
         // 4. Grok: 纯文本单模型回合估算耗时; 含 tool_call 的回合置 None
         let grok_updates = concat!(
-            r#"{"timestamp":1785000000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}}}"#, "\n",
-            r#"{"timestamp":1785000004,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#, "\n",
-            r#"{"timestamp":1785000010,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run"}}}}"#, "\n",
-            r#"{"timestamp":1785000012,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"bash"}}}"#, "\n",
-            r#"{"timestamp":1785000030,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p2","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#, "\n",
+            r#"{"timestamp":1785000000,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"}}}}"#,
+            "\n",
+            r#"{"timestamp":1785000004,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#,
+            "\n",
+            r#"{"timestamp":1785000010,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run"}}}}"#,
+            "\n",
+            r#"{"timestamp":1785000012,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"bash"}}}"#,
+            "\n",
+            r#"{"timestamp":1785000030,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p2","usage":{"inputTokens":50,"outputTokens":250,"totalTokens":300}}}}"#,
+            "\n",
         );
         let grok_dir = grok_session_fixture("dur", grok_updates, GROK_SUMMARY);
         let grok = parse_grok_session(&grok_dir).unwrap();
         assert_eq!(grok.turns.len(), 2);
         assert_eq!(grok.turns[0].duration_ms, Some(4000));
-        assert_eq!(grok.turns[1].duration_ms, None, "穿插工具执行的整轮不估算速度");
+        assert_eq!(
+            grok.turns[1].duration_ms, None,
+            "穿插工具执行的整轮不估算速度"
+        );
         fs::remove_dir_all(grok_dir.parent().unwrap()).ok();
         fs::remove_dir_all(&root).ok();
 

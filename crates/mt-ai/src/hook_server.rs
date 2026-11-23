@@ -3122,7 +3122,9 @@ mod tests {
     fn agy_osc7501_maps_permission_question_working_done_and_error() {
         let state = HookState::new();
         let tracker = SessionTracker::new();
-        let seen = Arc::new(Mutex::new(Vec::<(String, Option<String>, Option<String>)>::new()));
+        let seen = Arc::new(Mutex::new(
+            Vec::<(String, Option<String>, Option<String>)>::new(),
+        ));
         let seen_cb = Arc::clone(&seen);
         let emitter = StatusEmitter::new(Arc::new(move |c: crate::monitor::StatusChange| {
             seen_cb.lock().push((c.status, c.cause, c.agent));
@@ -3162,7 +3164,13 @@ mod tests {
             &emitter,
             &tracker,
             7,
-            osc(OscProgramState::Working, None, Some("antigravity"), None, None),
+            osc(
+                OscProgramState::Working,
+                None,
+                Some("antigravity"),
+                None,
+                None,
+            ),
         );
         // 4. 提问框 -> Elicitation 黄灯
         observe_osc_status(
@@ -3198,7 +3206,13 @@ mod tests {
             &emitter,
             &tracker,
             7,
-            osc(OscProgramState::Working, None, Some("antigravity"), None, None),
+            osc(
+                OscProgramState::Working,
+                None,
+                Some("antigravity"),
+                None,
+                None,
+            ),
         );
         observe_osc_status(
             &state,
@@ -3228,20 +3242,50 @@ mod tests {
             &emitter,
             &tracker,
             7,
-            osc(OscProgramState::Error, None, Some("antigravity"), None, None),
+            osc(
+                OscProgramState::Error,
+                None,
+                Some("antigravity"),
+                None,
+                None,
+            ),
         );
 
         let events = seen.lock().clone();
         assert_eq!(
             events,
             vec![
-                ("ai-idle".into(), Some("PermissionRequest".into()), Some("agy".into())),
-                ("ai-working".into(), Some("OscWorking".into()), Some("agy".into())),
-                ("ai-idle".into(), Some("Elicitation".into()), Some("agy".into())),
-                ("ai-idle".into(), Some("Elicitation".into()), Some("agy".into())),
-                ("ai-working".into(), Some("OscWorking".into()), Some("agy".into())),
+                (
+                    "ai-idle".into(),
+                    Some("PermissionRequest".into()),
+                    Some("agy".into())
+                ),
+                (
+                    "ai-working".into(),
+                    Some("OscWorking".into()),
+                    Some("agy".into())
+                ),
+                (
+                    "ai-idle".into(),
+                    Some("Elicitation".into()),
+                    Some("agy".into())
+                ),
+                (
+                    "ai-idle".into(),
+                    Some("Elicitation".into()),
+                    Some("agy".into())
+                ),
+                (
+                    "ai-working".into(),
+                    Some("OscWorking".into()),
+                    Some("agy".into())
+                ),
                 ("ai-idle".into(), Some("Stop".into()), Some("agy".into())),
-                ("ai-idle".into(), Some("StopFailure".into()), Some("agy".into())),
+                (
+                    "ai-idle".into(),
+                    Some("StopFailure".into()),
+                    Some("agy".into())
+                ),
             ]
         );
         assert!(tracker.is_ai_session(7));
@@ -3260,13 +3304,25 @@ mod tests {
             seen_cb.lock().push((c.status, c.cause));
         }));
 
-        for app in [None, Some("brew"), Some("terraform"), Some("claude"), Some("codex")] {
+        for app in [
+            None,
+            Some("brew"),
+            Some("terraform"),
+            Some("claude"),
+            Some("codex"),
+        ] {
             observe_osc_status(
                 &state,
                 &emitter,
                 &tracker,
                 3,
-                osc(OscProgramState::Blocked, Some(OscBlockedKind::Permission), app, None, None),
+                osc(
+                    OscProgramState::Blocked,
+                    Some(OscBlockedKind::Permission),
+                    app,
+                    None,
+                    None,
+                ),
             );
         }
         // 子任务 done 不得误报主会话完成
@@ -3275,7 +3331,13 @@ mod tests {
             &emitter,
             &tracker,
             3,
-            osc(OscProgramState::Done, None, Some("antigravity"), Some("sub/1"), None),
+            osc(
+                OscProgramState::Done,
+                None,
+                Some("antigravity"),
+                Some("sub/1"),
+                None,
+            ),
         );
         assert!(seen.lock().is_empty());
         assert!(!state.is_hook_enabled(3));
@@ -3335,7 +3397,10 @@ mod tests {
             9,
             osc(OscProgramState::Idle, None, Some("antigravity"), None, None),
         );
-        assert!(!tracker.is_ai_session(9), "退出窗口内的 state=idle 不得复活会话");
+        assert!(
+            !tracker.is_ai_session(9),
+            "退出窗口内的 state=idle 不得复活会话"
+        );
 
         // 若进程发了 state=clear -> 立即清状态回落 idle
         observe_osc_status(
@@ -3343,7 +3408,13 @@ mod tests {
             &emitter,
             &tracker,
             9,
-            osc(OscProgramState::Clear, None, Some("antigravity"), None, None),
+            osc(
+                OscProgramState::Clear,
+                None,
+                Some("antigravity"),
+                None,
+                None,
+            ),
         );
         assert!(!state.is_hook_enabled(9));
         assert_eq!(

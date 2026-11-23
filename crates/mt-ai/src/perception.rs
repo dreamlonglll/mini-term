@@ -105,13 +105,7 @@ impl AiPerception {
 
     /// 终端从 PTY 输出中解析出的 OSC 7501 状态上报（如 agy 的权限确认 / 提问等待）。
     pub fn observe_osc_status(&self, pane_id: u32, status: hook_server::OscStatus) {
-        hook_server::observe_osc_status(
-            &self.hooks,
-            &self.emitter,
-            &self.tracker,
-            pane_id,
-            status,
-        );
+        hook_server::observe_osc_status(&self.hooks, &self.emitter, &self.tracker, pane_id, status);
     }
 
     /// PTY 尺寸变化:打开重绘冷却窗口,别把 TUI 的重绘当成 AI 活跃。

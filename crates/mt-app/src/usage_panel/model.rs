@@ -482,7 +482,11 @@ pub fn fill_window_hours(
         .min(now.timestamp_millis())
         .max(window.since);
     let end = local_datetime(end_ms, now);
-    let last = if end.date() == start.date() { end.hour() } else { 23 };
+    let last = if end.date() == start.date() {
+        end.hour()
+    } else {
+        23
+    };
     (start.hour()..=last.max(start.hour()))
         .map(|h| {
             let key = format!("{h:02}:00");
@@ -808,7 +812,13 @@ pub fn toggle_log_column(
     }
     RequestLogColumn::ALL
         .into_iter()
-        .filter(|c| if *c == target { !present } else { current.contains(c) })
+        .filter(|c| {
+            if *c == target {
+                !present
+            } else {
+                current.contains(c)
+            }
+        })
         .collect()
 }
 
@@ -869,7 +879,10 @@ pub fn logs_span_single_day(logs: &[mt_usage::RequestLogStat]) -> bool {
     use chrono::TimeZone;
     let mut day: Option<chrono::NaiveDate> = None;
     for item in logs {
-        let Some(dt) = chrono::Local.timestamp_millis_opt(item.timestamp_ms).single() else {
+        let Some(dt) = chrono::Local
+            .timestamp_millis_opt(item.timestamp_ms)
+            .single()
+        else {
             return false;
         };
         let d = dt.date_naive();
@@ -969,7 +982,10 @@ mod tests {
         assert_eq!(format_cache_hit_rate(100, 0, 0).as_deref(), Some("0.00%"));
         assert_eq!(format_cache_hit_rate(0, 500, 0).as_deref(), Some("100.00%"));
         // 缓存写计入分母:1000 / (200 + 1000 + 300)
-        assert_eq!(format_cache_hit_rate(200, 1_000, 300).as_deref(), Some("66.67%"));
+        assert_eq!(
+            format_cache_hit_rate(200, 1_000, 300).as_deref(),
+            Some("66.67%")
+        );
         // 四舍五入:1/3 → 33.33%,2/3 → 66.67%,1/8 = 12.5% 精确
         assert_eq!(format_cache_hit_rate(2, 1, 0).as_deref(), Some("33.33%"));
         assert_eq!(format_cache_hit_rate(1, 2, 0).as_deref(), Some("66.67%"));
@@ -977,9 +993,15 @@ mod tests {
         // 半数进位:1/16 = 6.25%、1/32 = 3.125% → 3.13%
         assert_eq!(format_cache_hit_rate(31, 1, 0).as_deref(), Some("3.13%"));
         // 99.996% 不进成 100.00%
-        assert_eq!(format_cache_hit_rate(4, 99_996, 0).as_deref(), Some("99.99%"));
+        assert_eq!(
+            format_cache_hit_rate(4, 99_996, 0).as_deref(),
+            Some("99.99%")
+        );
         // 0.004% 不舍成 0.00%
-        assert_eq!(format_cache_hit_rate(99_996, 4, 0).as_deref(), Some("0.01%"));
+        assert_eq!(
+            format_cache_hit_rate(99_996, 4, 0).as_deref(),
+            Some("0.01%")
+        );
         // 大数不溢出
         assert_eq!(
             format_cache_hit_rate(u64::MAX, u64::MAX, 0).as_deref(),
@@ -1343,7 +1365,11 @@ mod tests {
         let w = query_window(UsageRange::Days30, "", "", Some(day(2026, 8, 10)), now);
         assert!(w.hourly);
         assert_eq!(w.since, local(2026, 8, 10, 0, 0, 0));
-        assert_eq!(w.until, Some(local(2026, 8, 11, 0, 0, 0) - 1), "含当天最后 1ms");
+        assert_eq!(
+            w.until,
+            Some(local(2026, 8, 11, 0, 0, 0) - 1),
+            "含当天最后 1ms"
+        );
     }
 
     /// 下钻窗口与自选范围取交集:柱子只算 09:30 之后,下钻后也只能看 09:30 之后。
@@ -1364,7 +1390,10 @@ mod tests {
     fn 小时视图对应的日历日() {
         let now = at(2026, 8, 18);
         let d = day(2026, 8, 10);
-        assert_eq!(hourly_chart_day(UsageRange::Days7, "", "", Some(d), now), Some(d));
+        assert_eq!(
+            hourly_chart_day(UsageRange::Days7, "", "", Some(d), now),
+            Some(d)
+        );
         assert_eq!(hourly_chart_day(UsageRange::Days7, "", "", None, now), None);
         assert_eq!(
             hourly_chart_day(UsageRange::Today, "", "", None, now),
@@ -1482,7 +1511,11 @@ mod tests {
 
     #[test]
     fn 估算速度卡最低输出门槛与合法上界() {
-        assert_eq!(estimate_speed_tps(199, Some(2_000)), None, "低于 200 输出不估算");
+        assert_eq!(
+            estimate_speed_tps(199, Some(2_000)),
+            None,
+            "低于 200 输出不估算"
+        );
         assert_eq!(estimate_speed_tps(200, None), None);
         assert_eq!(estimate_speed_tps(200, Some(0)), None);
         assert_eq!(estimate_speed_tps(1_430, Some(10_000)), Some(143));
@@ -1503,7 +1536,8 @@ mod tests {
             "全是非法键时回落默认"
         );
         // 逆序存盘也要按固定表序还原
-        let resolved = resolve_log_columns(Some(&["speed".into(), "time".into(), "project".into()]));
+        let resolved =
+            resolve_log_columns(Some(&["speed".into(), "time".into(), "project".into()]));
         assert_eq!(
             resolved,
             vec![

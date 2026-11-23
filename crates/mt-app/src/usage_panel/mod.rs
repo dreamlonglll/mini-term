@@ -619,8 +619,7 @@ impl UsagePanel {
                     Ok((stats, detail)) => {
                         this.tweens.retarget(&stats, Instant::now());
                         let stats = Rc::new(stats);
-                        this.bottom_stats =
-                            Some(detail.map_or_else(|| Rc::clone(&stats), Rc::new));
+                        this.bottom_stats = Some(detail.map_or_else(|| Rc::clone(&stats), Rc::new));
                         this.stats = Some(stats);
                         this.error = None;
                     }
@@ -2026,7 +2025,9 @@ impl UsagePanel {
 
         let content: AnyElement = match active {
             UsageTab::RequestLogs => self.render_request_logs(stats, cx).into_any_element(),
-            UsageTab::Overview => self.render_overview_tab(stats, window, cx).into_any_element(),
+            UsageTab::Overview => self
+                .render_overview_tab(stats, window, cx)
+                .into_any_element(),
         };
 
         div()
@@ -2070,9 +2071,7 @@ impl UsagePanel {
             .bg(ui::bg_base())
             .cursor_pointer()
             .hover(|el| el.border_color(ui::accent()).bg(ui::bg_elevated()))
-            .tooltip(|window, cx| {
-                Tooltip::new(t("usageStats", "columns.button")).build(window, cx)
-            })
+            .tooltip(|window, cx| Tooltip::new(t("usageStats", "columns.button")).build(window, cx))
             .child(measure)
             .child(VectorIcon::new(ICON_COLUMNS, px(14.0)).ink(ui::text_secondary()))
             .on_mouse_down(
@@ -2498,9 +2497,9 @@ impl UsagePanel {
         let sep = || div().text_color(ui::border_strong()).child("›");
 
         let mut row = row.child(
-            link("usage-crumb-range", self.range.label().to_string()).on_click(cx.listener(
-                |this: &mut Self, _, _window, cx| this.set_drill(None, None, cx),
-            )),
+            link("usage-crumb-range", self.range.label().to_string()).on_click(
+                cx.listener(|this: &mut Self, _, _window, cx| this.set_drill(None, None, cx)),
+            ),
         );
         if let Some(day) = self.drill_day {
             row = row.child(sep());
@@ -2931,11 +2930,7 @@ impl UsagePanel {
 ///
 /// 当「模型」列被用户隐藏时放开「供应商」列的 `max_w` 上限（两者都隐藏时放开「项目」列），
 /// 避免右半区数值列左缩而在表格右侧留下大片空白。
-fn request_log_col_box(
-    col: RequestLogColumn,
-    same_day: bool,
-    columns: &[RequestLogColumn],
-) -> Div {
+fn request_log_col_box(col: RequestLogColumn, same_day: bool, columns: &[RequestLogColumn]) -> Div {
     let has_model = columns.contains(&RequestLogColumn::Model);
     let has_provider = columns.contains(&RequestLogColumn::Provider);
     match col {
@@ -3216,9 +3211,7 @@ fn render_request_log_row(
                             .w_full()
                             .truncate()
                             .text_color(ui::text_secondary())
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(tip.clone()).build(window, cx)
-                            })
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                             .child(item.project_name.clone()),
                     )
                 }
@@ -3262,9 +3255,7 @@ fn render_request_log_row(
                             .id(SharedString::from(format!("usage-log-{ix}-output")))
                             .truncate()
                             .text_color(color)
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(tip.clone()).build(window, cx)
-                            })
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                             .child(text),
                     )
                 } else {
