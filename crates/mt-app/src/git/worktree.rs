@@ -3110,20 +3110,31 @@ mod tests {
         }
     }
 
+    /// 本机路径夹具：Windows 上原样返回，其它平台把 `D:\a\b` 换成 `/D/a/b`。
+    /// 本地仓库按 `MAIN_SEPARATOR` 拼路径，断言须随平台走（CI 里 mt-app 单测只在 Linux 跑）。
+    fn native(path: &str) -> String {
+        if cfg!(windows) {
+            path.to_string()
+        } else {
+            format!("/{}", path.replacen(':', "", 1).replace('\\', "/"))
+        }
+    }
+
     #[test]
     fn 智能默认路径按仓库存放习惯推断() {
-        let ctx = GitContext::local(r"D:\Git\mini-term");
-        let main_wt = wt("mini-term", r"D:\Git\mini-term", true, Some("main"));
+        let main = native(r"D:\Git\mini-term");
+        let ctx = GitContext::local(main.clone());
+        let main_wt = wt("mini-term", &main, true, Some("main"));
 
         // 1. 已有 .worktrees 下的有效 worktree → 沿用且不加仓库名前缀
         let g = make_group(
             ctx.clone(),
-            r"D:\Git\mini-term",
+            &main,
             vec![
                 main_wt.clone(),
                 wt(
                     "worktree-ui",
-                    r"D:\Git\mini-term\.worktrees\worktree-ui",
+                    &native(r"D:\Git\mini-term\.worktrees\worktree-ui"),
                     false,
                     Some("feat/worktree-list-ui"),
                 ),
@@ -3131,72 +3142,88 @@ mod tests {
             false,
         );
         let tpl = infer_worktree_path_template(&g).unwrap();
-        assert_eq!(tpl.parent_dir, r"D:\Git\mini-term\.worktrees");
+        assert_eq!(tpl.parent_dir, native(r"D:\Git\mini-term\.worktrees"));
         assert!(!tpl.prefix_repo_name);
         assert_eq!(
             tpl.format_dir(&g.context, &g.name, "feat-a"),
-            r"D:\Git\mini-term\.worktrees\feat-a"
+            native(r"D:\Git\mini-term\.worktrees\feat-a")
         );
 
         // 2. .worktrees 与其他仓库内子目录并存时优先 .worktrees
         let g_prefer = make_group(
             ctx.clone(),
-            r"D:\Git\mini-term",
+            &main,
             vec![
                 main_wt.clone(),
-                wt("a", r"D:\Git\mini-term\wts\a", false, Some("a")),
-                wt("b", r"D:\Git\mini-term\wts\b", false, Some("b")),
-                wt("c", r"D:\Git\mini-term\.worktrees\c", false, Some("c")),
+                wt("a", &native(r"D:\Git\mini-term\wts\a"), false, Some("a")),
+                wt("b", &native(r"D:\Git\mini-term\wts\b"), false, Some("b")),
+                wt(
+                    "c",
+                    &native(r"D:\Git\mini-term\.worktrees\c"),
+                    false,
+                    Some("c"),
+                ),
             ],
             false,
         );
         assert_eq!(
             infer_worktree_path_template(&g_prefer).unwrap().parent_dir,
-            r"D:\Git\mini-term\.worktrees"
+            native(r"D:\Git\mini-term\.worktrees")
         );
 
         // 3. 无有效 linked worktree，但磁盘存在 .worktrees 目录 → 走 .worktrees/<分支>
-        let mut invalid_wt = wt("dead", r"D:\Other\mini-term-dead", false, Some("dead"));
+        let dead = native(r"D:\Other\mini-term-dead");
+        let mut invalid_wt = wt("dead", &dead, false, Some("dead"));
         invalid_wt.is_valid = false;
         let g_dot = make_group(
             ctx.clone(),
-            r"D:\Git\mini-term",
+            &main,
             vec![main_wt.clone(), invalid_wt.clone()],
             true,
         );
         let tpl_dot = infer_worktree_path_template(&g_dot).unwrap();
-        assert_eq!(tpl_dot.parent_dir, r"D:\Git\mini-term\.worktrees");
+        assert_eq!(tpl_dot.parent_dir, native(r"D:\Git\mini-term\.worktrees"));
         assert!(!tpl_dot.prefix_repo_name);
 
         // 4. 已有外部 worktree → 沿用出现最多的外部父目录并加 <仓库名>- 前缀
         let g_ext = make_group(
             ctx.clone(),
-            r"D:\Git\mini-term",
+            &main,
             vec![
                 main_wt.clone(),
-                wt("mini-term-a", r"E:\WT\mini-term-a", false, Some("a")),
-                wt("mini-term-b", r"E:\WT\mini-term-b", false, Some("b")),
-                wt("mini-term-c", r"D:\Git\mini-term-c", false, Some("c")),
+                wt(
+                    "mini-term-a",
+                    &native(r"E:\WT\mini-term-a"),
+                    false,
+                    Some("a"),
+                ),
+                wt(
+                    "mini-term-b",
+                    &native(r"E:\WT\mini-term-b"),
+                    false,
+                    Some("b"),
+                ),
+                wt(
+                    "mini-term-c",
+                    &native(r"D:\Git\mini-term-c"),
+                    false,
+                    Some("c"),
+                ),
             ],
             false,
         );
         let tpl_ext = infer_worktree_path_template(&g_ext).unwrap();
-        assert_eq!(tpl_ext.parent_dir, r"E:\WT");
+        assert_eq!(tpl_ext.parent_dir, native(r"E:\WT"));
         assert!(tpl_ext.prefix_repo_name);
         assert_eq!(
             tpl_ext.format_dir(&g_ext.context, &g_ext.name, "feat-x"),
-            r"E:\WT\mini-term-feat-x"
+            native(r"E:\WT\mini-term-feat-x")
         );
 
         // 5. 无历史且无 .worktrees → 回落经典同级目录
-        let g_fallback = make_group(
-            ctx.clone(),
-            r"D:\Git\mini-term",
-            vec![main_wt, invalid_wt],
-            false,
-        );
+        let g_fallback = make_group(ctx.clone(), &main, vec![main_wt, invalid_wt], false);
         let tpl_fb = infer_worktree_path_template(&g_fallback).unwrap();
-        assert_eq!(tpl_fb.parent_dir, r"D:\Git");
+        assert_eq!(tpl_fb.parent_dir, native(r"D:\Git"));
         assert!(tpl_fb.prefix_repo_name);
 
         // 6. 远端 POSIX 仓库同样按习惯推断
@@ -3219,41 +3246,38 @@ mod tests {
 
     #[test]
     fn 空分支不填假路径并生成占位预览() {
-        let ctx = GitContext::local(r"D:\Git\mini-term");
+        let main = native(r"D:\Git\mini-term");
+        let other = native(r"D:\Git\other");
         let g1 = make_group(
-            ctx.clone(),
-            r"D:\Git\mini-term",
-            vec![wt("mini-term", r"D:\Git\mini-term", true, Some("main"))],
+            GitContext::local(main.clone()),
+            &main,
+            vec![wt("mini-term", &main, true, Some("main"))],
             true,
         );
         let g2 = make_group(
-            GitContext::local(r"D:\Git\other"),
-            r"D:\Git\other",
-            vec![wt("other", r"D:\Git\other", true, Some("main"))],
+            GitContext::local(other.clone()),
+            &other,
+            vec![wt("other", &other, true, Some("main"))],
             false,
         );
 
         // 单选 + 空分支：不填假 -worktree，只在 placeholder 给预览
-        let (val, ph) = compute_path_suggestion(&[&g1], "   ", r"D:\Git\mini-term");
+        let (val, ph) = compute_path_suggestion(&[&g1], "   ", &main);
         assert_eq!(val.as_deref(), Some(""));
-        assert_eq!(
-            ph,
-            format!(
-                r"D:\Git\mini-term\.worktrees\{}",
-                t("worktree", "branchDirPlaceholder")
-            )
-        );
+        let dot_worktrees = native(r"D:\Git\mini-term\.worktrees");
+        let sep = std::path::MAIN_SEPARATOR;
+        let placeholder = t("worktree", "branchDirPlaceholder");
+        assert_eq!(ph, format!("{dot_worktrees}{sep}{placeholder}"));
 
         // 单选 + 非空分支：给出真实建议路径
-        let (val, _) = compute_path_suggestion(&[&g1], "feat/new-ui", r"D:\Git\mini-term");
-        assert_eq!(
-            val.as_deref(),
-            Some(r"D:\Git\mini-term\.worktrees\feat-new-ui")
-        );
+        let (val, _) = compute_path_suggestion(&[&g1], "feat/new-ui", &main);
+        let expected = native(r"D:\Git\mini-term\.worktrees\feat-new-ui");
+        assert_eq!(val.as_deref(), Some(expected.as_str()));
 
         // 多选：语义变为父目录
-        let (val, ph) = compute_path_suggestion(&[&g1, &g2], "", r"D:\Git");
-        assert_eq!(val.as_deref(), Some(r"D:\Git"));
+        let git = native(r"D:\Git");
+        let (val, ph) = compute_path_suggestion(&[&g1, &g2], "", &git);
+        assert_eq!(val.as_deref(), Some(git.as_str()));
         assert_eq!(ph, t("worktree", "parentPathPlaceholder"));
 
         // 未勾选：清空

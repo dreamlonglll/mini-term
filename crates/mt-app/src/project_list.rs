@@ -4854,33 +4854,27 @@ mod tests {
 
     #[test]
     fn worktree监听过滤只放行worktrees结构变化() {
-        let ev = |path: &str, structural: bool| mt_project::watch::FsChange {
-            project_path: r"D:\repo\.git".into(),
-            path: PathBuf::from(path),
+        // 按本机分隔符拼路径：`D:\repo\.git` 在 Linux 上只是一个文件名，测不到父子关系
+        let git_dir = PathBuf::from("repo").join(".git");
+        let worktrees = git_dir.join("worktrees");
+        let ev = |path: PathBuf, structural: bool| mt_project::watch::FsChange {
+            project_path: git_dir.to_string_lossy().to_string(),
+            path,
             kind: String::new(),
             structural,
         };
         // 首次建 `.git/worktrees` 与在里面建/删具体条目都命中
-        assert!(is_worktree_watch_event(&ev(
-            r"D:\repo\.git\worktrees",
-            true
-        )));
-        assert!(is_worktree_watch_event(&ev(
-            r"D:\repo\.git\worktrees\feat-a",
-            true
-        )));
+        assert!(is_worktree_watch_event(&ev(worktrees.clone(), true)));
+        assert!(is_worktree_watch_event(&ev(worktrees.join("feat-a"), true)));
         // Windows 非递归监听因子目录内 index/HEAD 写入上报的 Modify（structural=false）必须丢弃
         assert!(!is_worktree_watch_event(&ev(
-            r"D:\repo\.git\worktrees\feat-a",
+            worktrees.join("feat-a"),
             false
         )));
-        assert!(!is_worktree_watch_event(&ev(
-            r"D:\repo\.git\worktrees",
-            false
-        )));
+        assert!(!is_worktree_watch_event(&ev(worktrees.clone(), false)));
         // `.git` 下无关文件（index / HEAD / FETCH_HEAD）结构变化也忽略
-        assert!(!is_worktree_watch_event(&ev(r"D:\repo\.git\HEAD", true)));
-        assert!(!is_worktree_watch_event(&ev(r"D:\repo\.git\index", true)));
+        assert!(!is_worktree_watch_event(&ev(git_dir.join("HEAD"), true)));
+        assert!(!is_worktree_watch_event(&ev(git_dir.join("index"), true)));
     }
 
     #[test]
