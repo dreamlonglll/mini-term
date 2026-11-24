@@ -23,6 +23,12 @@ pub const GIT_DETAIL_DEFAULT_WIDTH: f64 = 480.0;
 /// 提交详情栏拖到最窄 / 最宽(拖拽与读库都钳在这里)。
 pub const GIT_DETAIL_MIN_WIDTH: f64 = 320.0;
 pub const GIT_DETAIL_MAX_WIDTH: f64 = 960.0;
+/// 右侧抽屉拖到最窄(`RightDrawer.tsx:8`;拖拽与读库都钳在这里)。
+///
+/// **没有固定上限**(issue #107 用户要求;原版 `RightDrawer.tsx:9` 钳在 720):最宽只受
+/// 窗口限制,由抽屉层按当时的视口再钳(`workspace::drawer_max_width`)。落盘值不封顶 ——
+/// 窗口临时变窄时只在显示上收进窗口,窗口放回来宽度跟着回来。
+pub const RIGHT_DRAWER_MIN_WIDTH: f64 = 240.0;
 
 impl AppStore {
     /// 移动端发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
@@ -216,10 +222,13 @@ impl AppStore {
 
     // === 右侧抽屉宽度 ===
 
-    /// 抽屉宽度。缺省 **340**(`App.tsx:541` 的 `?? 340`),钳在 240~720
-    /// (`RightDrawer.tsx:8-9`)。
+    /// 抽屉宽度。缺省 **340**(`App.tsx:541` 的 `?? 340`),不窄于
+    /// [`RIGHT_DRAWER_MIN_WIDTH`];上限不在这里钳,见该常量注释。
     pub fn right_drawer_width(&self) -> f64 {
-        self.config.right_drawer_width.unwrap_or(340.0).clamp(240.0, 720.0)
+        self.config
+            .right_drawer_width
+            .unwrap_or(340.0)
+            .max(RIGHT_DRAWER_MIN_WIDTH)
     }
 
     // === Git 「更改」区的视图模式 ===
@@ -261,7 +270,7 @@ impl AppStore {
     }
 
     pub fn set_right_drawer_width(&mut self, width: f64, cx: &mut Context<Self>) {
-        let width = width.clamp(240.0, 720.0);
+        let width = width.max(RIGHT_DRAWER_MIN_WIDTH);
         if self.config.right_drawer_width == Some(width) {
             return;
         }

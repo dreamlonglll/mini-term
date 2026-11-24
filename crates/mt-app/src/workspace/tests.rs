@@ -125,3 +125,44 @@ fn 详情栏宽度让一让但有底() {
     );
     assert_eq!(detail_layer_width(420.0, 700.0, 360.0), GIT_DETAIL_FLOOR_W);
 }
+
+/// 左缘拖拽:往左 = 变宽、往右 = 变窄,按住不放时来回拖都以按下那一刻为基准;
+/// 钳到上下限后鼠标接着动不报变化(不白画整窗帧)。issue #107 的场景:1080 宽的窗口、
+/// 抽屉停在旧上限 720 —— 往右拖窄必须走得通,往左也能接着拖宽(上限只剩窗口)。
+#[test]
+fn 左缘拖拽两个方向都能改宽且钳住后不报变化() {
+    let (min, max) = (store::RIGHT_DRAWER_MIN_WIDTH, drawer_max_width(1080.0));
+    let mut drag = DrawerDrag::new(px(360.0), 720.0);
+
+    // 往右拖进抽屉里 = 变窄
+    assert!(drag.track(px(460.0), min, max));
+    assert_eq!(drag.width, 620.0);
+
+    // 往左越过旧上限 720 接着变宽
+    assert!(drag.track(px(200.0), min, max));
+    assert_eq!(drag.width, 880.0);
+
+    // 往左拖过头钳到窗口上限(左侧活动栏边上),再往左不报变化
+    assert!(drag.track(px(0.0), min, max));
+    assert_eq!(drag.width, max);
+    assert!(!drag.track(px(-50.0), min, max));
+
+    // 往右拖过头钳到下限,再往右不报变化
+    assert!(drag.track(px(2000.0), min, max));
+    assert_eq!(drag.width, min);
+    assert!(!drag.track(px(2100.0), min, max));
+}
+
+/// 抽屉没有固定上限:最宽到左侧活动栏边上;窗口窄到放不下下限时按下限给。
+#[test]
+fn 抽屉上限只受窗口限制() {
+    assert_eq!(
+        drawer_max_width(1080.0),
+        1080.0 - activity_bar::WIDTH as f64
+    );
+    assert_eq!(
+        drawer_max_width(3840.0),
+        3840.0 - activity_bar::WIDTH as f64
+    );
+    assert_eq!(drawer_max_width(200.0), store::RIGHT_DRAWER_MIN_WIDTH);
+}

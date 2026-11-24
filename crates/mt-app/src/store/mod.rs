@@ -77,7 +77,7 @@ use config_writer::ConfigWriter;
 use layout_writer::LayoutWriter;
 
 pub use events::{ConfigSection, StoreEvent};
-pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH};
+pub use layout::{GIT_DETAIL_MAX_WIDTH, GIT_DETAIL_MIN_WIDTH, RIGHT_DRAWER_MIN_WIDTH};
 pub use projects::worktree_dismiss_key;
 pub use ssh::SshSaveError;
 

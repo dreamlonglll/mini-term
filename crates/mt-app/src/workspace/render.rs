@@ -410,6 +410,7 @@ impl Workspace {
             let drawer_open = self.right_drawer.is_some();
             let leaving = !drawer_open;
             let width = drawer_width as f32;
+            let dragging = self.drawer_drag.is_some();
             let drawer_progress = self.drawer_presence.drive(window);
             let panel_view = |panel: DrawerPanel| -> gpui::AnyElement {
                 match panel {
@@ -487,6 +488,8 @@ impl Workspace {
                             .w(px(6.0))
                             .cursor_col_resize()
                             .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                            // 拖拽中鼠标离开手柄也保持高亮
+                            .when(dragging, |el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(
@@ -495,11 +498,10 @@ impl Workspace {
                                           _window,
                                           cx| {
                                         cx.stop_propagation();
-                                        this.drawer_drag = Some(DrawerDrag {
-                                            start_x: event.position.x,
-                                            start_width: drawer_width,
-                                            width: drawer_width,
-                                        });
+                                        this.drawer_drag =
+                                            Some(DrawerDrag::new(event.position.x, drawer_width));
+                                        // 重画一次,挂上窗口级的拖拽监听(`edge_drag_listener`)
+                                        cx.notify();
                                     },
                                 ),
                             ),
@@ -739,8 +741,15 @@ impl Render for Workspace {
         let (frost_wanted, frost_alpha) = self.sync_frost_snapshot(window, cx);
 
         let store_for_columns = self.store.clone();
-        // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)
-        let drawer_width = self.drawer_drag.map(|d| d.width).unwrap_or(drawer_width);
+        let viewport_w = f32::from(window.viewport_size().width);
+        // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)。
+        // 宽度没有固定上限,按此刻的窗口收一收:落盘值比窗口还宽时(窗口后来变窄了)
+        // 左缘手柄照样留在窗口里
+        let drawer_width = self
+            .drawer_drag
+            .map(|d| d.width)
+            .unwrap_or(drawer_width)
+            .min(drawer_max_width(viewport_w));
         let now = std::time::Instant::now();
         // 抽屉退场播完后回收旧面板与提交详情栏引用
         if self.right_drawer.is_none() && !self.drawer_presence.mounted_at(now) {
@@ -789,7 +798,6 @@ impl Render for Workspace {
         // 页签区放回原宽,退场动画里的抽屉照旧从页签区上方滑走。页签区所在那一栏的宽按
         // 视口减边条与中栏估(中栏宽是落盘的那份,拖分隔条时差几像素无妨 —— 只拿来兜
         // 「至少留多宽」那条底)
-        let viewport_w = f32::from(window.viewport_size().width);
         let middle_target_w = middle_target_width(columns[0], viewport_w);
         let (middle_in_layout, middle_content, middle_track, occupied_middle_w) =
             self.render_middle_column(&middle, middle_target_w, middle_visible, window, cx);
@@ -999,68 +1007,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_resize_split_up))
             .on_action(cx.listener(Self::on_resize_split_down))
             .on_action(cx.listener(Self::on_reopen_closed_terminal))
-            // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
-            // —— 等价于原版往 document 上挂 mousemove/mouseup
-            .when(self.drawer_drag.is_some(), |el| {
-                el.on_mouse_move(cx.listener(
-                    |this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
-                        if let Some(drag) = this.drawer_drag.as_mut() {
-                            let delta = f32::from(drag.start_x - event.position.x) as f64;
-                            let width = (drag.start_width + delta).clamp(240.0, 720.0);
-                            // 宽度真变了才重画:钳到上下限之后鼠标接着动,每一下都是一次
-                            // 白画的整窗帧
-                            if width != drag.width {
-                                drag.width = width;
-                                cx.notify();
-                            }
-                        }
-                    },
-                ))
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(
-                        |this: &mut Self, _event: &gpui::MouseUpEvent, _window, cx| {
-                            let Some(drag) = this.drawer_drag.take() else {
-                                return;
-                            };
-                            this.store.update(cx, |store, cx| {
-                                store.set_right_drawer_width(drag.width, cx)
-                            });
-                            cx.notify();
-                        },
-                    ),
-                )
-            })
-            // 提交详情栏左缘的拖拽:同一套,栏也贴在右侧(抽屉左边),往左拖 = 变宽
-            .when(self.detail_drag.is_some(), |el| {
-                el.on_mouse_move(cx.listener(
-                    |this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
-                        if let Some(drag) = this.detail_drag.as_mut() {
-                            let delta = f32::from(drag.start_x - event.position.x) as f64;
-                            let width = (drag.start_width + delta)
-                                .clamp(store::GIT_DETAIL_MIN_WIDTH, store::GIT_DETAIL_MAX_WIDTH);
-                            // 同上:钳住之后不再每次移动都整窗重画
-                            if width != drag.width {
-                                drag.width = width;
-                                cx.notify();
-                            }
-                        }
-                    },
-                ))
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(
-                        |this: &mut Self, _event: &gpui::MouseUpEvent, _window, cx| {
-                            let Some(drag) = this.detail_drag.take() else {
-                                return;
-                            };
-                            this.store
-                                .update(cx, |store, cx| store.set_git_detail_width(drag.width, cx));
-                            cx.notify();
-                        },
-                    ),
-                )
-            })
+            // 抽屉 / 提交详情栏左缘拖拽:拖拽期间鼠标会划出手柄、划进抽屉或终端,
+            // 移动 / 松手走窗口级监听 —— 等价于原版往 document 上挂 mousemove/mouseup。
+            // 不能挂成根节点的 on_mouse_move / on_mouse_up,见 `edge_drag_listener` 注释
+            .when(
+                self.drawer_drag.is_some() || self.detail_drag.is_some(),
+                |el| el.child(edge_drag_listener(cx.weak_entity())),
+            )
             // ⚠️ 标题栏**不套** [`cached_panel`]:它靠 `.window_control_area(..)`
             // 在 paint 期登记拖拽区与三键的 hitbox,而 `window_control_hitboxes`
             // 不在 `PaintIndex` 里、`reuse_paint` 不搬它,每帧还被 `Frame::clear`

@@ -184,8 +184,30 @@ struct DrawerDrag {
     start_x: gpui::Pixels,
     /// 按下时的宽度。
     start_width: f64,
-    /// 当前宽度(已钳到可拖范围:抽屉 240..720,详情栏见 `store::GIT_DETAIL_*_WIDTH`)。
+    /// 当前宽度(已钳到可拖范围:抽屉见 [`drawer_max_width`],详情栏见
+    /// `store::GIT_DETAIL_*_WIDTH`)。
     width: f64,
+}
+
+impl DrawerDrag {
+    fn new(start_x: gpui::Pixels, width: f64) -> Self {
+        Self {
+            start_x,
+            start_width: width,
+            width,
+        }
+    }
+
+    /// 鼠标移到窗口横坐标 `x`。手柄在左缘:往左拖 = 变宽,钳到 `min..=max`。
+    /// 宽度真变了才返回 `true` —— 钳住之后鼠标接着动,每一下都是一次白画的整窗帧。
+    fn track(&mut self, x: gpui::Pixels, min: f64, max: f64) -> bool {
+        let width = (self.start_width + f32::from(self.start_x - x) as f64).clamp(min, max);
+        if width == self.width {
+            return false;
+        }
+        self.width = width;
+        true
+    }
 }
 
 /// 提交详情栏左边至少给终端留多宽(Activity Bar 44 + 一截能看清的终端)。窗口窄时
@@ -196,6 +218,13 @@ const GIT_DETAIL_FLOOR_W: f32 = 260.0;
 /// 抽屉挤占页签区时,页签区至少留这么宽;窗口太窄、抽屉连同详情栏放不下时,多出来的
 /// 那截照旧盖在页签区上(与详情栏「宁可压住,也别挤成一条缝」同一取舍)。
 const SQUEEZE_MIN_DOC_W: f32 = 320.0;
+
+/// 右抽屉此刻最宽能有多宽。没有固定上限(见 `store::RIGHT_DRAWER_MIN_WIDTH` 注释),只受
+/// 窗口限制:最宽拖到左侧活动栏边上 —— 活动栏照旧露着(开合抽屉、切面板的入口在那里),
+/// 抽屉左缘的拖拽手柄也始终在窗口里、拖得回来。窗口窄到连下限都放不下时按下限给。
+fn drawer_max_width(viewport_w: f32) -> f64 {
+    ((viewport_w - activity_bar::WIDTH) as f64).max(store::RIGHT_DRAWER_MIN_WIDTH)
+}
 
 /// 提交详情栏的宽:想要的宽(拖过 / 落盘的)先给窗口左侧留出 [`GIT_DETAIL_TERMINAL_ROOM`],
 /// 但不窄于 [`GIT_DETAIL_FLOOR_W`]。
@@ -869,6 +898,54 @@ impl Workspace {
             )
     }
 
+    /// 抽屉 / 提交详情栏左缘拖拽中鼠标移动(由 [`edge_drag_listener`] 转进来)。
+    /// `viewport_w` 是此刻的窗口宽,抽屉的上限随它走(见 [`drawer_max_width`])。
+    fn edge_drag_move(
+        &mut self,
+        event: &gpui::MouseMoveEvent,
+        viewport_w: f32,
+        cx: &mut Context<Self>,
+    ) {
+        // 左键没按着还在拖 = 松手丢了(拖到窗外抬起、拖拽中切走窗口),按松手收尾
+        if !event.dragging() {
+            self.edge_drag_end(cx);
+            return;
+        }
+        let x = event.position.x;
+        let drawer = self.drawer_drag.as_mut().is_some_and(|drag| {
+            drag.track(
+                x,
+                store::RIGHT_DRAWER_MIN_WIDTH,
+                drawer_max_width(viewport_w),
+            )
+        });
+        let detail = self.detail_drag.as_mut().is_some_and(|drag| {
+            drag.track(x, store::GIT_DETAIL_MIN_WIDTH, store::GIT_DETAIL_MAX_WIDTH)
+        });
+        if drawer || detail {
+            cx.notify();
+        }
+    }
+
+    /// 抽屉 / 提交详情栏左缘拖拽松手:宽度落盘(拖拽期间宽度自持,与原版
+    /// `RightDrawer` 的 `onResizeEnd` 同)。
+    fn edge_drag_end(&mut self, cx: &mut Context<Self>) {
+        let drawer = self.drawer_drag.take();
+        let detail = self.detail_drag.take();
+        if drawer.is_none() && detail.is_none() {
+            return;
+        }
+        self.store.update(cx, |store, cx| {
+            if let Some(drag) = drawer {
+                store.set_right_drawer_width(drag.width, cx);
+            }
+            if let Some(drag) = detail {
+                store.set_git_detail_width(drag.width, cx);
+            }
+        });
+        cx.notify();
+    }
+
     /// 提交详情栏此刻的宽:拖拽中按拖的,否则按落盘的;窗口窄时让一让(见
     /// [`detail_layer_width`])。
     fn detail_width(&self, drawer_width: f32, window: &Window, cx: &App) -> f32 {
@@ -901,6 +978,7 @@ impl Workspace {
         interactive: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let dragging = self.detail_drag.is_some();
         div()
             .id("git-detail-layer")
             .absolute()
@@ -938,6 +1016,8 @@ impl Workspace {
                                 .w(px(6.0))
                                 .cursor_col_resize()
                                 .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                                // 拖拽中鼠标离开手柄也保持高亮
+                                .when(dragging, |el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
                                 .on_mouse_down(
                                     gpui::MouseButton::Left,
                                     cx.listener(
@@ -946,11 +1026,12 @@ impl Workspace {
                                               _window,
                                               cx| {
                                             cx.stop_propagation();
-                                            this.detail_drag = Some(DrawerDrag {
-                                                start_x: event.position.x,
-                                                start_width: width as f64,
-                                                width: width as f64,
-                                            });
+                                            this.detail_drag = Some(DrawerDrag::new(
+                                                event.position.x,
+                                                width as f64,
+                                            ));
+                                            // 重画一次,挂上窗口级的拖拽监听(`edge_drag_listener`)
+                                            cx.notify();
                                         },
                                     ),
                                 ),
@@ -1190,6 +1271,39 @@ pub(crate) fn text_selection_release_guard() -> impl IntoElement {
             window.on_mouse_event(|event: &gpui::MouseMoveEvent, phase, window, cx| {
                 if phase.capture() && event.pressed_button != Some(gpui::MouseButton::Left) {
                     gpui_base::TextSelection::end(window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// 抽屉 / 提交详情栏左缘拖拽期间的窗口级鼠标监听(只在拖拽中挂)。
+///
+/// ⚠️ 不能挂成根节点的 `on_mouse_move` / `on_mouse_up`:那两个只在根节点**被悬停**时触发,
+/// 而开着的抽屉与详情栏都 `.occlude()`。往窄拖鼠标必然进到抽屉里,根节点算不上悬停,一下
+/// 移动都收不到(宽度已在上限时整个拖不动,issue #107);在抽屉里松手同样收不到,拖拽态挂着
+/// 不散,之后鼠标一出抽屉就不按键也跟着改宽。这里走 `window.on_mouse_event`(每帧注册、
+/// 随帧清掉,不判悬停),挂捕获相,不怕途经的元素停止冒泡(同 `git::diff::selection` 的
+/// `drag_listener`)。松手丢了的兜底在 [`Workspace::edge_drag_move`]。
+fn edge_drag_listener(this: gpui::WeakEntity<Workspace>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            // 拖出手柄后光标仍是左右拉伸形,不随途经的元素变
+            window.set_window_cursor_style(gpui::CursorStyle::ResizeColumn);
+            let moved = this.clone();
+            window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                if phase.capture() {
+                    let viewport_w = f32::from(window.viewport_size().width);
+                    let _ = moved.update(cx, |this, cx| this.edge_drag_move(event, viewport_w, cx));
+                }
+            });
+            let released = this.clone();
+            window.on_mouse_event(move |event: &gpui::MouseUpEvent, phase, _window, cx| {
+                if phase.capture() && event.button == gpui::MouseButton::Left {
+                    let _ = released.update(cx, |this, cx| this.edge_drag_end(cx));
                 }
             });
         },
