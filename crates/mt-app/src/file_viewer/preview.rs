@@ -98,21 +98,27 @@ fn render_md_cell(
     _window: &mut Window,
     _cx: &mut App,
 ) -> gpui::AnyElement {
+    let id = gpui::SharedString::from(format!("md-tbl-{seg_ix}-{row_ix}-{col_ix}"));
     if is_plain_cell(cell) {
         // 外层刻意与 TextView 那条路同形(它的最外层也是 `div().size_full()`,
         // 见 `text/text_view.rs` 的 `request_layout`)—— 两类格子混在同一张表里,
-        // 盒模型差一点就是一行高矮不齐
+        // 盒模型差一点就是一行高矮不齐。
+        //
+        // 文字用 `SelectableText` 而不是裸字符串:TextView 构造即可选,裸字符串
+        // 不接窗口级选区 —— 同一张表里纯文字的列选不中、带行内 code 的列选得中。
+        // 它与 TextView 共用 gpui-base 的窗口级选区(复制、选区底色同源),每格
+        // 自成一段选区,与 TextView「在哪格起拖只选那格」同一口径;排版同为
+        // `StyledText` 吃继承的 text_style,与原先逐像素一致。它不自己设光标,
+        // 这里补 I-beam 与 TextView 格子对齐
         return div()
             .size_full()
-            .child(gpui::SharedString::from(cell.to_string()))
+            .cursor_text()
+            .child(gpui_base::SelectableText::new(id, cell.to_string()))
             .into_any_element();
     }
-    TextView::markdown(
-        gpui::SharedString::from(format!("md-tbl-{seg_ix}-{row_ix}-{col_ix}")),
-        cell.to_string(),
-    )
-    .style(style.clone())
-    .into_any_element()
+    TextView::markdown(id, cell.to_string())
+        .style(style.clone())
+        .into_any_element()
 }
 
 /// 自绘一张表。样式逐条对照 `.md-preview table`(styles.css:889-910):
