@@ -19,6 +19,34 @@ export const projectList = {
     worktreeToggleCollapse: "折叠 {count} 个 worktree",
     worktreeToggleExpand: "展开 {count} 个 worktree",
     remoteBrokenBadge: "断链",
+    header: {
+      filterTip: "按名称、分支或状态筛选项目（列表聚焦时按 /）",
+      collapseAll: "全部折叠",
+      expandAll: "全部展开",
+      addTip: "添加项目或新建分组",
+    },
+    filter: {
+      placeholder: "过滤项目、分支或分组…",
+      clear: "清除筛选",
+      all: "全部",
+      aiActive: "AI 活跃",
+      remote: "远程",
+      empty: "没有匹配的项目",
+    },
+    empty: {
+      title: "还没有项目",
+      hint: "将文件夹拖入此处，或从下方添加本地 / 远程项目",
+    },
+    group: {
+      emptyHint: "拖入项目到此分组",
+      addTip: "向此分组添加项目或子组",
+      moreTip: "分组操作",
+      collapsedActiveTip: "包含当前活动项目",
+    },
+    row: {
+      moreTip: "更多操作",
+    },
+    dropToRootEnd: "释放以移至顶层末尾",
     preview: {
       notStarted: "未启动",
       disconnected: "已断开",
@@ -99,6 +127,34 @@ export const projectList = {
     worktreeToggleCollapse: "Collapse {count} worktree(s)",
     worktreeToggleExpand: "Expand {count} worktree(s)",
     remoteBrokenBadge: "broken",
+    header: {
+      filterTip: "Filter by name, branch, or status (press / when focused)",
+      collapseAll: "Collapse all",
+      expandAll: "Expand all",
+      addTip: "Add project or new group",
+    },
+    filter: {
+      placeholder: "Filter projects, branches, or groups…",
+      clear: "Clear filter",
+      all: "All",
+      aiActive: "AI Active",
+      remote: "Remote",
+      empty: "No matching projects",
+    },
+    empty: {
+      title: "No projects yet",
+      hint: "Drag folders here, or add a local or remote project below",
+    },
+    group: {
+      emptyHint: "Drop projects into this group",
+      addTip: "Add project or subgroup here",
+      moreTip: "Group actions",
+      collapsedActiveTip: "Contains active project",
+    },
+    row: {
+      moreTip: "More actions",
+    },
+    dropToRootEnd: "Drop to move to top level",
     preview: {
       notStarted: "Not started",
       disconnected: "Disconnected",

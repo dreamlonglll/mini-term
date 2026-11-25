@@ -305,8 +305,11 @@ use mt_i18n::{
 /// 「切换到项目」（改为整行点击切换），新增「当前」标与路径分支占位符，更新开终端图标提示
 /// （移除 `worktree.{isProject,addAsProject,switchToProject}`，换入 `worktree.{current,branchDirPlaceholder,switchAfterCreate}`）。
 /// 1970 → 1971：文件树头部「定位当前文件」钮的悬停提示（`fileTree.header.locateActive`）。
+/// 1971 → 1989：项目块 UI 与交互升级 —— 栏头工具按钮提示（`projectList.header.*` 4 条）、
+/// 行内筛选条（`projectList.filter.*` 6 条）、空列表引导卡（`projectList.empty.*` 2 条）、
+/// 分组占位与操作提示（`projectList.group.*` 4 条）、行尾更多按钮与底部拖放区（`projectList.{row.moreTip,dropToRootEnd}` 2 条）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1971;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1989;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

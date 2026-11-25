@@ -175,6 +175,12 @@ pub type MenuHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 /// `clone().into_any_element()`。
 pub type SubmenuRender = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
 
+/// 菜单项左侧的领位图标构造器。
+///
+/// 菜单打开期间每次重绘都会调一遍,里面只画轻量的图标元素(如 `FileIcon` /
+/// `VectorIcon`),不要建状态或做重活。
+pub type MenuIcon = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+
 /// 菜单里的一条。与 `contextMenu.ts` 的 `MenuEntry` 一一对应。
 pub enum MenuEntry {
     Item(MenuItem),
@@ -189,6 +195,8 @@ pub enum MenuEntry {
 /// 一个可点的菜单项。
 pub struct MenuItem {
     label: SharedString,
+    /// 标题左侧的领位图标(可选)。未设时不占槽宽,维持既有纯文本菜单的紧凑版式。
+    icon: Option<MenuIcon>,
     /// 标题下面那行弱化的补充说明(路径/出处一类),**只展示不参与匹配**。
     ///
     /// 原版没有这一行 —— 它是给「光看标题分不出是哪一个」的列表补出处用的:
@@ -211,6 +219,7 @@ impl MenuItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
+            icon: None,
             detail: None,
             shortcut: None,
             danger: false,
@@ -219,6 +228,18 @@ impl MenuItem {
             submenu_element: None,
             on_click: None,
         }
+    }
+
+    /// 标题左侧挂一枚领位图标(每帧重绘调用,见 [`MenuIcon`])。
+    ///
+    /// 同一层菜单里只要有任意一项带图标,其余普通项会自动留出同等左槽宽以保持文字
+    /// 左缘对齐;全层都没图标时不占任何额外宽度。
+    pub fn icon(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.icon = Some(Rc::new(render));
+        self
     }
 
     pub fn on_click(mut self, f: impl Fn(&mut Window, &mut App) + 'static) -> Self {
@@ -724,6 +745,20 @@ fn split_check(label: &str) -> Option<(bool, &str)> {
     label.strip_prefix(CHECK_OFF).map(|rest| (false, rest))
 }
 
+/// 领位图标槽宽(居中容纳 13-14px 的行内图标)。
+const ICON_SLOT_WIDTH: Pixels = px(14.0);
+
+/// 这一层菜单里有没有任意条目带了领位图标。
+///
+/// 只要同层有一项带图标,整层普通项都会留出同等左槽宽,避免文字左缘参差不齐;
+/// 全层都没图标时返回 `false`,不占任何额外宽度。
+fn level_has_icons(entries: &[MenuEntry]) -> bool {
+    entries.iter().any(|entry| match entry {
+        MenuEntry::Item(item) => item.icon.is_some(),
+        _ => false,
+    })
+}
+
 /// 乘性改 alpha(与 `ui::alpha` 同语义,那个是私有的)。
 fn with_alpha(color: Hsla, a: f32) -> Hsla {
     Hsla {
@@ -734,10 +769,16 @@ fn with_alpha(color: Hsla, a: f32) -> Hsla {
 
 // ─── 渲染 ─────────────────────────────────────────────────────
 
-/// 菜单项左侧:标题(+ 副标题)。勾选项的前缀摘进定宽槽([`check_slot_width`]),
-/// 副标题跟着标题文字对齐 —— 调用方给副标题垫的全角空格(对齐用的)一并摘掉。
-/// 有副标题时左侧变成两行一列;快捷键仍按整块垂直居中(行上的 `items_center`)。
-fn render_label(label: &SharedString, detail: Option<&str>) -> gpui::Div {
+/// 菜单项左侧:可选勾选槽 + 可选领位图标槽 + 标题(+ 副标题)。
+/// 勾选项的前缀摘进定宽槽([`check_slot_width`]),副标题跟着标题文字对齐 ——
+/// 调用方给副标题垫的全角空格(对齐用的)一并摘掉。有副标题时文本侧变成两行一列;
+/// 快捷键仍按整块垂直居中(行上的 `items_center`)。
+fn render_label(
+    label: &SharedString,
+    detail: Option<&str>,
+    icon: Option<AnyElement>,
+    reserve_icon_slot: bool,
+) -> gpui::Div {
     let (check, text) = match split_check(label) {
         Some((on, rest)) => (Some(on), SharedString::from(rest.to_string())),
         None => (None, label.clone()),
@@ -761,6 +802,26 @@ fn render_label(label: &SharedString, detail: Option<&str>) -> gpui::Div {
             ),
         None => div().child(text),
     };
+    let body = if reserve_icon_slot || icon.is_some() {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(ICON_SLOT_WIDTH)
+                    .h(ICON_SLOT_WIDTH)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .children(icon),
+            )
+            .child(column)
+    } else {
+        column
+    };
     match check {
         Some(on) => div()
             .flex()
@@ -772,8 +833,8 @@ fn render_label(label: &SharedString, detail: Option<&str>) -> gpui::Div {
                     .w(check_slot_width())
                     .when(on, |el| el.child("✓")),
             )
-            .child(column),
-        None => column,
+            .child(body),
+        None => body,
     }
 }
 
@@ -1015,6 +1076,7 @@ impl ContextMenu {
             // occlude 一挡,遮罩就收不到这一下了
             .when(live, |el| el.occlude());
 
+        let reserve_icon_slot = level_has_icons(entries);
         let mut list = div().flex().flex_col();
         for (index, entry) in entries.iter().enumerate() {
             match entry {
@@ -1043,7 +1105,7 @@ impl ContextMenu {
                         item,
                         (&ancestors, index),
                         (&open_path, active.as_deref()),
-                        (progress, live),
+                        (progress, live, reserve_icon_slot),
                         window,
                         cx,
                     ));
@@ -1138,7 +1200,7 @@ impl ContextMenu {
         item: &MenuItem,
         (ancestors, index): (&[usize], usize),
         (open_path, active): (&[usize], Option<&[usize]>),
-        (panel_progress, interactive): (f32, bool),
+        (panel_progress, interactive, reserve_icon_slot): (f32, bool, bool),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1146,6 +1208,7 @@ impl ContextMenu {
         let disabled = item.disabled;
         let danger = item.danger;
         let handler = item.on_click.clone();
+        let icon = item.icon.as_ref().map(|render| render(window, cx));
         // 键盘选中项:原版靠 `:focus-visible`,而它与 `:hover` 共用同一条样式规则
         // (`styles.css:653-657`),所以这里画的底色与 hover 完全一致
         let key_active = !disabled && is_active_item(active, ancestors, index);
@@ -1209,7 +1272,12 @@ impl ContextMenu {
                     }
                 }))
             })
-            .child(render_label(&item.label, item.detail.as_deref()));
+            .child(render_label(
+                &item.label,
+                item.detail.as_deref(),
+                icon,
+                reserve_icon_slot,
+            ));
 
         if let Some(shortcut) = item.shortcut.clone() {
             row = row.child(
@@ -1842,5 +1910,27 @@ mod tests {
                 .submenu(vec![separator()])
                 .is_actionable()
         );
+    }
+
+    /// 领位图标槽按层判定:同层有任意项带图标才预留左槽,纯文本菜单不占额外宽度,
+    /// 且挂图标不影响可点性与子菜单语义。
+    #[test]
+    fn 同层有图标才预留图标槽() {
+        assert!(!level_has_icons(&[]));
+        let plain = vec![
+            MenuEntry::Header("组".into()),
+            item("a", |_, _| {}),
+            separator(),
+        ];
+        assert!(!level_has_icons(&plain));
+
+        let with_icon = MenuItem::new("添加本地项目")
+            .icon(|_, _| div().into_any_element())
+            .on_click(|_, _| {});
+        assert!(with_icon.is_actionable());
+        assert!(!with_icon.has_submenu());
+
+        let mixed = vec![item("plain", |_, _| {}), separator(), with_icon.into()];
+        assert!(level_has_icons(&mixed));
     }
 }

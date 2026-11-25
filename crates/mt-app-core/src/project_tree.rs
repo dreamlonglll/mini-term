@@ -218,6 +218,84 @@ pub fn count_projects_in_group(group: &ProjectGroup) -> usize {
         .sum()
 }
 
+/// 树里是否包含任意分组。
+pub fn has_any_group(tree: &[ProjectTreeItem]) -> bool {
+    tree.iter().any(|item| matches!(item, ProjectTreeItem::Group(_)))
+}
+
+/// 树里是否存在至少一个处于展开态的分组（递归检查子组）。
+pub fn has_any_expanded_group(tree: &[ProjectTreeItem]) -> bool {
+    for item in tree {
+        if let ProjectTreeItem::Group(group) = item
+            && (!group.collapsed || has_any_expanded_group(&group.children))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 批量设置树中全部分组的折叠态，返回实际发生状态切换的分组 id 列表（外层在前）。
+pub fn set_all_groups_collapsed(tree: &mut [ProjectTreeItem], collapsed: bool) -> Vec<String> {
+    fn walk(items: &mut [ProjectTreeItem], collapsed: bool, changed: &mut Vec<String>) {
+        for item in items {
+            if let ProjectTreeItem::Group(group) = item {
+                if group.collapsed != collapsed {
+                    group.collapsed = collapsed;
+                    changed.push(group.id.clone());
+                }
+                walk(&mut group.children, collapsed, changed);
+            }
+        }
+    }
+    let mut changed = Vec::new();
+    walk(tree, collapsed, &mut changed);
+    changed
+}
+
+/// 收集某个分组下的全部存活项目 id（递归包含嵌套子组中的项目，以及它们各自下挂的
+/// worktree 后代项目），去重并保持树顺序。给折叠分组聚合状态指示器用。
+pub fn group_descendant_project_ids(
+    tree: &[ProjectTreeItem],
+    projects: &[ProjectConfig],
+    group_id: &str,
+) -> Vec<String> {
+    let Some(group) = find_group_in_tree(tree, group_id) else {
+        return Vec::new();
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    fn walk(
+        items: &[ProjectTreeItem],
+        projects: &[ProjectConfig],
+        seen: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for item in items {
+            match item {
+                ProjectTreeItem::Group(g) => walk(&g.children, projects, seen, out),
+                ProjectTreeItem::ProjectId(id) => {
+                    if !projects.iter().any(|p| &p.id == id) {
+                        continue;
+                    }
+                    if seen.insert(id.clone()) {
+                        out.push(id.clone());
+                    }
+                    for desc in worktree_descendants(projects, id) {
+                        if seen.insert(desc.clone()) {
+                            out.push(desc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    walk(&group.children, projects, &mut seen, &mut out);
+    out
+}
+
 /// 节点在**它自己那一层**里的下标(before/after 落点要拿它算插入位)。
 pub fn index_in_parent(
     tree: &[ProjectTreeItem],
@@ -808,6 +886,228 @@ pub fn compute_cluster_roles(
     }
 
     roles
+}
+
+// ─── 行内过滤展平（临时全展开，不改动原树折叠态） ────────────
+
+/// 按状态条件与关键词过滤项目树，返回剪枝后的展平列表。
+///
+/// 语义要点：
+/// - **以全展开视角遍历**：折叠分组与折叠 worktree 簇若包含命中项会自动呈现，但不改写
+///   配置里的 `collapsed`；
+/// - `status_ok(project_id)`：项目是否满足状态芯片筛选（如「全部」「AI 活跃」「远程」）；
+/// - `text_active` + `project_text_match` / `group_text_match`：
+///   - 分组名命中关键词时，该分组下所有满足 `status_ok` 的项目均视为命中；
+///   - 父项目命中时，连同旗下满足 `status_ok` 的 worktree 后代一并保留；
+///   - 仅 worktree 子项目命中时，保留其祖先父项目作为上下文头，仅挂命中的子项；
+/// - 不含任何保留项目的分组整组裁掉；保留的分组行 `collapsed` 恒为 `false`，`count` 为
+///   当前过滤结果中该分组保留的项目总数（含子组与保留的 worktree）。
+pub fn filter_ordered_tree(
+    config: &AppConfig,
+    status_ok: &dyn Fn(&str) -> bool,
+    text_active: bool,
+    project_text_match: &dyn Fn(&str) -> bool,
+    group_text_match: &dyn Fn(&str) -> bool,
+) -> Vec<OrderedItem> {
+    let children_by_parent: Vec<(String, Vec<String>)> = {
+        let mut map: Vec<(String, Vec<String>)> = Vec::new();
+        for p in &config.projects {
+            let Some(parent) = p.parent_project_id.as_ref() else {
+                continue;
+            };
+            match map.iter_mut().find(|(k, _)| k == parent) {
+                Some((_, list)) => list.push(p.id.clone()),
+                None => map.push((parent.clone(), vec![p.id.clone()])),
+            }
+        }
+        map
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    fn filter_project_subtree(
+        id: &str,
+        depth: usize,
+        parent_group_id: Option<&str>,
+        is_child: bool,
+        inherited_text_hit: bool,
+        children_by_parent: &[(String, Vec<String>)],
+        status_ok: &dyn Fn(&str) -> bool,
+        text_active: bool,
+        project_text_match: &dyn Fn(&str) -> bool,
+        seen: &mut HashSet<String>,
+    ) -> (Vec<OrderedItem>, usize) {
+        if !seen.insert(id.to_string()) {
+            return (Vec::new(), 0);
+        }
+        let own_text_hit = !text_active || inherited_text_hit || project_text_match(id);
+        let self_matched = status_ok(id) && own_text_hit;
+        // 父项目本身已因文本命中（且非仅因状态未命中）→ 子项继承文本命中（仍受 status_ok 约束）
+        let child_inherit_text = inherited_text_hit || (self_matched && text_active);
+
+        let mut child_rows = Vec::new();
+        let mut child_count = 0usize;
+        if let Some((_, children)) = children_by_parent.iter().find(|(k, _)| k == id) {
+            for child in children {
+                let (rows, cnt) = filter_project_subtree(
+                    child,
+                    depth + 1,
+                    parent_group_id,
+                    true,
+                    child_inherit_text,
+                    children_by_parent,
+                    status_ok,
+                    text_active,
+                    project_text_match,
+                    seen,
+                );
+                child_rows.extend(rows);
+                child_count += cnt;
+            }
+        }
+
+        if !self_matched && child_count == 0 {
+            return (Vec::new(), 0);
+        }
+
+        let mut out = Vec::with_capacity(1 + child_rows.len());
+        out.push(OrderedItem::Project {
+            id: id.to_string(),
+            depth,
+            parent_group_id: parent_group_id.map(str::to_string),
+            is_child,
+        });
+        out.extend(child_rows);
+        (out, 1 + child_count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        items: &[ProjectTreeItem],
+        depth: usize,
+        parent_group_id: Option<&str>,
+        inherited_group_hit: bool,
+        config: &AppConfig,
+        children_by_parent: &[(String, Vec<String>)],
+        status_ok: &dyn Fn(&str) -> bool,
+        text_active: bool,
+        project_text_match: &dyn Fn(&str) -> bool,
+        group_text_match: &dyn Fn(&str) -> bool,
+        seen: &mut HashSet<String>,
+    ) -> (Vec<OrderedItem>, usize) {
+        let mut out = Vec::new();
+        let mut total_projects = 0usize;
+
+        for item in items {
+            match item {
+                ProjectTreeItem::Group(group) => {
+                    let group_hit =
+                        inherited_group_hit || (text_active && group_text_match(&group.id));
+                    let (child_rows, kept) = walk(
+                        &group.children,
+                        depth + 1,
+                        Some(&group.id),
+                        group_hit,
+                        config,
+                        children_by_parent,
+                        status_ok,
+                        text_active,
+                        project_text_match,
+                        group_text_match,
+                        seen,
+                    );
+                    if kept > 0 {
+                        out.push(OrderedItem::Group {
+                            id: group.id.clone(),
+                            name: group.name.clone(),
+                            collapsed: false,
+                            count: kept,
+                            depth,
+                            parent_group_id: parent_group_id.map(str::to_string),
+                        });
+                        out.extend(child_rows);
+                        total_projects += kept;
+                    }
+                }
+                ProjectTreeItem::ProjectId(id) => {
+                    if !config.projects.iter().any(|p| &p.id == id) {
+                        continue;
+                    }
+                    let (rows, kept) = filter_project_subtree(
+                        id,
+                        depth,
+                        parent_group_id,
+                        false,
+                        inherited_group_hit,
+                        children_by_parent,
+                        status_ok,
+                        text_active,
+                        project_text_match,
+                        seen,
+                    );
+                    out.extend(rows);
+                    total_projects += kept;
+                }
+            }
+        }
+        (out, total_projects)
+    }
+
+    let empty: Vec<ProjectTreeItem> = Vec::new();
+    let tree = config.project_tree.as_ref().unwrap_or(&empty);
+    let mut seen: HashSet<String> = HashSet::new();
+    let (mut result, _) = walk(
+        tree,
+        0,
+        None,
+        false,
+        config,
+        &children_by_parent,
+        status_ok,
+        text_active,
+        project_text_match,
+        group_text_match,
+        &mut seen,
+    );
+
+    // 与 get_ordered_tree 同口径兜底：不在树中且无存活父项目的顶层孤儿项目
+    let mut in_tree: HashSet<String> = HashSet::new();
+    fn collect_ids(items: &[ProjectTreeItem], out: &mut HashSet<String>) {
+        for item in items {
+            match item {
+                ProjectTreeItem::Group(g) => collect_ids(&g.children, out),
+                ProjectTreeItem::ProjectId(id) => {
+                    out.insert(id.clone());
+                }
+            }
+        }
+    }
+    collect_ids(tree, &mut in_tree);
+
+    for p in &config.projects {
+        if seen.contains(&p.id) || in_tree.contains(&p.id) {
+            continue;
+        }
+        if let Some(parent) = p.parent_project_id.as_ref()
+            && config.projects.iter().any(|q| &q.id == parent)
+        {
+            continue;
+        }
+        let (rows, _) = filter_project_subtree(
+            &p.id,
+            0,
+            None,
+            false,
+            false,
+            &children_by_parent,
+            status_ok,
+            text_active,
+            project_text_match,
+            &mut seen,
+        );
+        result.extend(rows);
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -1690,5 +1990,125 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ─── 分组批量折展、后代收集与行内过滤 ────────────────────
+
+    #[test]
+    fn 全折全展批量设置并只返回真实变动的分组() {
+        let mut tree = vec![
+            group("g1", vec![proj("p1"), collapsed_group("g2", vec![proj("p2")])]),
+            collapsed_group("g3", vec![]),
+        ];
+        assert!(has_any_group(&tree));
+        assert!(has_any_expanded_group(&tree));
+
+        let changed = set_all_groups_collapsed(&mut tree, true);
+        assert_eq!(changed, vec!["g1"]);
+        assert!(!has_any_expanded_group(&tree));
+
+        // 再次全折：无变化
+        assert!(set_all_groups_collapsed(&mut tree, true).is_empty());
+
+        // 全展：三个都变
+        let changed = set_all_groups_collapsed(&mut tree, false);
+        assert_eq!(changed, vec!["g1", "g2", "g3"]);
+        assert!(has_any_expanded_group(&tree));
+    }
+
+    #[test]
+    fn 分组后代项目收集递归含子组与worktree并跳僵尸() {
+        let tree = vec![group(
+            "g1",
+            vec![
+                proj("p1"),
+                proj("僵尸"),
+                group("g2", vec![proj("p2")]),
+            ],
+        )];
+        let projects = vec![
+            project_cfg("p1", None),
+            project_cfg("wt1", Some("p1")),
+            project_cfg("wt1_sub", Some("wt1")),
+            project_cfg("p2", None),
+            project_cfg("wt2", Some("p2")),
+        ];
+        assert_eq!(
+            group_descendant_project_ids(&tree, &projects, "g1"),
+            vec!["p1", "wt1", "wt1_sub", "p2", "wt2"]
+        );
+        assert_eq!(
+            group_descendant_project_ids(&tree, &projects, "g2"),
+            vec!["p2", "wt2"]
+        );
+        assert!(group_descendant_project_ids(&tree, &projects, "不存在").is_empty());
+    }
+
+    #[test]
+    fn 行内过滤临时展开折叠组并正确裁剪空组与worktree() {
+        let tree = vec![
+            collapsed_group(
+                "g_work",
+                vec![proj("p_main"), proj("p_other")],
+            ),
+            group("g_empty", vec![proj("p_miss")]),
+            proj("p_solo"),
+        ];
+        let projects = vec![
+            project_cfg("p_main", None),
+            project_cfg("wt_hit", Some("p_main")),
+            project_cfg("wt_miss", Some("p_main")),
+            project_cfg("p_other", None),
+            project_cfg("p_miss", None),
+            project_cfg("p_solo", None),
+        ];
+        let config = config_with(projects, Some(tree));
+
+        // 1) 仅 worktree 子项命中：带出折叠的 g_work 与父项目 p_main，仅挂 wt_hit；裁掉 g_empty 与 p_solo
+        let filtered = filter_ordered_tree(
+            &config,
+            &|_| true,
+            true,
+            &|id| id == "wt_hit",
+            &|_| false,
+        );
+        assert_eq!(
+            filtered.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["g_work", "p_main", "wt_hit"]
+        );
+        assert!(matches!(
+            filtered[0],
+            OrderedItem::Group {
+                collapsed: false,
+                count: 2,
+                ..
+            }
+        ));
+
+        // 2) 分组名命中 + 状态过滤：保留该组所有满足状态的项目及其 worktree
+        let by_group = filter_ordered_tree(
+            &config,
+            &|id| id == "p_other" || id == "wt_hit",
+            true,
+            &|_| false,
+            &|gid| gid == "g_work",
+        );
+        assert_eq!(
+            by_group.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["g_work", "p_main", "wt_hit", "p_other"]
+        );
+
+        // 3) 纯状态过滤（无关键词）：仅父项目满足状态，不带出未满足状态的子项
+        let by_status = filter_ordered_tree(
+            &config,
+            &|id| id == "p_main" || id == "p_solo",
+            false,
+            &|_| false,
+            &|_| false,
+        );
+        assert_eq!(
+            by_status.iter().map(|i| i.id()).collect::<Vec<_>>(),
+            vec!["g_work", "p_main", "p_solo"]
+        );
     }
 }

@@ -754,6 +754,47 @@ impl AppStore {
         cx.changed(StoreEvent::ProjectTreeChanged);
     }
 
+    /// 显式设置单个分组的折叠态（幂等，状态未变时不落盘不通知）。
+    /// 给拖放悬停自动展开（spring-loaded group）使用。
+    pub fn set_group_collapsed(
+        &mut self,
+        group_id: &str,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return false;
+        };
+        let Some(group) = project_tree::find_group_in_tree_mut(tree, group_id) else {
+            return false;
+        };
+        if group.collapsed == collapsed {
+            return false;
+        }
+        group.collapsed = collapsed;
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::ProjectTreeChanged);
+        true
+    }
+
+    /// 批量折叠或展开全部分组（栏头一键全部折叠 / 展开），返回实际发生状态变化的分组 id。
+    pub fn set_all_groups_collapsed(
+        &mut self,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return Vec::new();
+        };
+        let changed = project_tree::set_all_groups_collapsed(tree, collapsed);
+        if changed.is_empty() {
+            return changed;
+        }
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::ProjectTreeChanged);
+        changed
+    }
+
     /// 揭示项目:把挡着它那一行的**折叠分组**逐层展开(worktree 子项目按父项目的
     /// 位置算,判据见 [`project_tree::collapsed_ancestors`])。与 [`Self::toggle_group_collapse`]
     /// 同一条路:改 `projectTree` 里的 `collapsed`、防抖落盘、发 `ProjectTreeChanged`;

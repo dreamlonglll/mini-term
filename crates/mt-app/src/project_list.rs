@@ -61,16 +61,17 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, ScrollEvent,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, HighlightStyle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    ScrollEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, Subscription, Task,
+    Window, anchored, canvas, deferred, div, prelude::FluentBuilder, px,
 };
 use gpui::{Global, ScrollHandle};
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_project::project_kind::{ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, ProjectKind};
+use mt_project::search::find_substring_char_ranges;
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{AiVendor, BrandIcon, FileIcon, StatusDot, TechIcon};
 use mt_ui::tooltip::TooltipExt as _;
@@ -87,33 +88,214 @@ use crate::modal;
 use crate::pane_preview::{self, MiniLayout};
 use crate::project_tree::{self, MAX_DEPTH, OrderedItem, ProjectClusterRole};
 use crate::store::{AppStore, StoreEvent};
+use crate::terminal_area::{SwitchClick, SwitchClickGuard, click_count, click_position};
 use crate::tree::StatusLight;
 use crate::ui;
 
-/// AI 品牌图标尺寸(`ProjectList.tsx:144` 的 `AI_ICON_SIZE`)。
-const AI_ICON_SIZE: f32 = 14.0;
+/// 右侧 AI 活跃胶囊里的品牌图标尺寸。
+const AI_ICON_SIZE: f32 = 12.5;
 
-/// worktree 子项行上的 AI 品牌图标尺寸（随 12px 紧凑字号略收一档）。
-const CHILD_AI_ICON_SIZE: f32 = 12.5;
+/// worktree 子项行上的 AI 品牌图标尺寸。
+const CHILD_AI_ICON_SIZE: f32 = 11.5;
 
 /// 独立（已脱离父项目）worktree 徽章最多显示多宽。
-const WORKTREE_BADGE_MAX_W: f32 = 112.0;
+const WORKTREE_BADGE_MAX_W: f32 = 104.0;
 
-/// 远程连接名徽章最多多宽(原版 `max-w-[80px] truncate`)。
-const REMOTE_BADGE_MAX_W: f32 = 80.0;
+/// 远程连接名徽章最多多宽。
+const REMOTE_BADGE_MAX_W: f32 = 76.0;
+
+/// 统一水平呼吸留白（独立行 / 分组行 / worktree 微容器共用，保证整栏左右缘垂直对齐）。
+const ROW_MARGIN_X: f32 = 6.0;
+
+/// 分组嵌套的逐层水平步进。
+const INDENT_STEP: f32 = 16.0;
+
+/// 第 0 层分组折叠箭头的水平中心：`ROW_MARGIN_X(6) + pl(6) + half_chevron(6)`。
+/// 组内每层引导竖线按 `GROUP_GUIDE_BASE_X + level * INDENT_STEP` 精确对齐箭头中心。
+const GROUP_GUIDE_BASE_X: f32 = 18.0;
+
+/// 常规行内左侧 padding（为绝对定位 2.5px 状态微轨留出呼吸感）。
+const ROW_INNER_PL: f32 = 10.0;
 
 /// worktree 簇微容器的外边距、描边宽与圆角。
-/// 父项目行扣掉 `CLUSTER_INSET` 的左右内边距，使图标、文字与上下独立项目像素级垂直对齐。
-const CLUSTER_MARGIN_X: f32 = 4.0;
 const CLUSTER_BORDER_W: f32 = 1.0;
-const CLUSTER_INSET: f32 = CLUSTER_MARGIN_X + CLUSTER_BORDER_W;
-const CLUSTER_RADIUS: f32 = 6.0;
-const CLUSTER_INNER_RADIUS: f32 = 5.0;
+const CLUSTER_RADIUS: f32 = 7.0;
+const CLUSTER_INNER_RADIUS: f32 = 6.0;
 
 /// worktree 子项树形连线水平弯臂宽、弯臂与子项胶囊的留白、多层嵌套时的单层步进。
 const CHILD_ELBOW_W: f32 = 10.0;
 const CHILD_ELBOW_GAP: f32 = 2.0;
 const CHILD_NEST_STEP: f32 = 14.0;
+
+/// 拖放悬停在折叠分组上自动展开的停留时长（ms）。
+const SPRING_OPEN_DELAY_MS: u64 = 550;
+
+/// 单位方框（16×16 viewBox）换算。
+const fn u16_norm(v: f32) -> f32 {
+    v / 16.0
+}
+const ICON_STROKE_16: f32 = 1.35 / 16.0;
+
+/// 放大镜（行内筛选开关与搜索框前缀）。
+const ICON_SEARCH: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (u16_norm(7.0), u16_norm(7.0)),
+            r: u16_norm(4.2),
+        },
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(10.2), u16_norm(10.2)),
+            (u16_norm(13.8), u16_norm(13.8)),
+        ]),
+    ),
+];
+
+/// 加号（栏头新建菜单 & 分组行快捷添加）。
+const ICON_PLUS: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(8.0), u16_norm(3.0)),
+            (u16_norm(8.0), u16_norm(13.0)),
+        ]),
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(3.0), u16_norm(8.0)),
+            (u16_norm(13.0), u16_norm(8.0)),
+        ]),
+    ),
+];
+
+/// 水平三点 `···`（行尾悬浮更多操作按钮）。
+const ICON_MORE: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::fill(
+        mt_ui::icons::vector::Ink::Current,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (u16_norm(3.5), u16_norm(8.0)),
+            r: u16_norm(1.2),
+        },
+    ),
+    mt_ui::icons::vector::Shape::fill(
+        mt_ui::icons::vector::Ink::Current,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (u16_norm(8.0), u16_norm(8.0)),
+            r: u16_norm(1.2),
+        },
+    ),
+    mt_ui::icons::vector::Shape::fill(
+        mt_ui::icons::vector::Ink::Current,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (u16_norm(12.5), u16_norm(8.0)),
+            r: u16_norm(1.2),
+        },
+    ),
+];
+
+/// 全部折叠（叠框减号，与 FileTree 头部同家族）。
+const ICON_COLLAPSE_ALL: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Rect {
+            x: u16_norm(1.8),
+            y: u16_norm(4.5),
+            w: u16_norm(9.7),
+            h: u16_norm(9.7),
+            round: u16_norm(1.2),
+        },
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(4.5), u16_norm(4.5)),
+            (u16_norm(4.5), u16_norm(1.8)),
+            (u16_norm(14.2), u16_norm(1.8)),
+            (u16_norm(14.2), u16_norm(11.5)),
+            (u16_norm(11.5), u16_norm(11.5)),
+        ]),
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(4.2), u16_norm(9.35)),
+            (u16_norm(9.1), u16_norm(9.35)),
+        ]),
+    ),
+];
+
+/// 全部展开（叠框加号）。
+const ICON_EXPAND_ALL: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Rect {
+            x: u16_norm(1.8),
+            y: u16_norm(4.5),
+            w: u16_norm(9.7),
+            h: u16_norm(9.7),
+            round: u16_norm(1.2),
+        },
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(4.5), u16_norm(4.5)),
+            (u16_norm(4.5), u16_norm(1.8)),
+            (u16_norm(14.2), u16_norm(1.8)),
+            (u16_norm(14.2), u16_norm(11.5)),
+            (u16_norm(11.5), u16_norm(11.5)),
+        ]),
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(4.2), u16_norm(9.35)),
+            (u16_norm(9.1), u16_norm(9.35)),
+        ]),
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(6.65), u16_norm(6.9)),
+            (u16_norm(6.65), u16_norm(11.8)),
+        ]),
+    ),
+];
+
+/// 小叉（筛选框清空按钮）。
+const ICON_CLOSE_SM: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(4.0), u16_norm(4.0)),
+            (u16_norm(12.0), u16_norm(12.0)),
+        ]),
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        ICON_STROKE_16,
+        mt_ui::icons::vector::Geom::Polyline(&[
+            (u16_norm(12.0), u16_norm(4.0)),
+            (u16_norm(4.0), u16_norm(12.0)),
+        ]),
+    ),
+];
 
 /// SSH 远程项目的领位图标 —— lucide 的 `Server`(原版 `<Server size={14}/>`)。
 ///
@@ -422,29 +604,94 @@ fn done_tag(frame: DoneTagFrame, settled: bool, text_w: &Rc<Cell<f32>>) -> AnyEl
         .into_any_element()
 }
 
-/// 行上的 AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
-/// 负边距抵掉行内 gap,与领位图标只留 2px;图标之间同样 2px。
-fn ai_vendor_icons_sized(vendors: &[Option<AiVendor>], size: f32, tight_ml: f32) -> gpui::Div {
-    let mut stack = div()
+/// 侧栏行内状态筛选档位。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProjectFilterMode {
+    #[default]
+    All,
+    /// 存在运行中 / 待审批 / 已完成未读的 AI 活跃项目。
+    AiActive,
+    /// SSH 远程项目。
+    Remote,
+}
+
+/// 项目是否属于「AI 活跃」筛选集合（工作 / 等你处理 / 未读完成 / 出错）。
+fn is_ai_active_project(light: StatusLight, needs_attention: bool, is_active: bool) -> bool {
+    shows_done_tag(needs_attention, is_active)
+        || matches!(
+            light,
+            StatusLight::AiWorking | StatusLight::Attention | StatusLight::Error
+        )
+}
+
+/// 带关键词高亮与省略号截断的单行文本：空查询直接返回纯文本，有查询走 `StyledText`。
+fn highlighted_text(text: String, query_lower: &str) -> AnyElement {
+    if query_lower.is_empty() {
+        return div().min_w(px(0.0)).truncate().child(text).into_any_element();
+    }
+    let ranges = find_substring_char_ranges(&text, query_lower);
+    if ranges.is_empty() {
+        return div().min_w(px(0.0)).truncate().child(text).into_any_element();
+    }
+    let style = HighlightStyle {
+        color: Some(ui::accent()),
+        font_weight: Some(FontWeight::SEMIBOLD),
+        ..Default::default()
+    };
+    let highlights: Vec<_> = ranges
+        .iter()
+        .filter_map(|&(start, end)| crate::git::branches::char_range_to_bytes(&text, start, end))
+        .map(|range| (range, style))
+        .collect();
+    div()
+        .min_w(px(0.0))
+        .truncate()
+        .child(StyledText::new(text).with_highlights(highlights))
+        .into_any_element()
+}
+
+/// 右侧整合式 AI 活跃胶囊：将 AI 品牌图标组与状态灯合成一枚精致微胶囊，
+/// 让左侧项目名在整栏严格垂直对齐，同时一眼看清「哪家 AI + 当前进度」。
+fn ai_activity_pill(
+    vendors: &[Option<AiVendor>],
+    icon_size: f32,
+    light: StatusLight,
+    include_light: bool,
+) -> gpui::Div {
+    let pill_bg = match light {
+        StatusLight::Error => ui::with_alpha(ui::color_error(), 0.12),
+        StatusLight::Attention => ui::with_alpha(ui::color_attention(), 0.14),
+        StatusLight::AiWorking => ui::with_alpha(ui::color_ai_working(), 0.12),
+        _ => ui::with_alpha(ui::bg_elevated(), 0.85),
+    };
+    let pill_border = match light {
+        StatusLight::Error => ui::with_alpha(ui::color_error(), 0.28),
+        StatusLight::Attention => ui::with_alpha(ui::color_attention(), 0.30),
+        StatusLight::AiWorking => ui::with_alpha(ui::color_ai_working(), 0.25),
+        _ => ui::border_subtle(),
+    };
+    let mut pill = div()
+        .flex_shrink_0()
         .flex()
         .items_center()
-        .flex_shrink_0()
-        .ml(px(tight_ml))
-        .gap(px(2.0));
+        .gap(px(3.0))
+        .px(px(5.0))
+        .py(px(1.5))
+        .rounded_full()
+        .bg(pill_bg)
+        .border_1()
+        .border_color(pill_border);
     for vendor in vendors {
-        stack = stack.child(
+        pill = pill.child(
             BrandIcon::new(*vendor)
-                .size(px(size))
-                // 固定 text-secondary 上下文:单色品牌图标不随
-                // 选中行的 accent 变色(与 tab 上观感一致)
+                .size(px(icon_size))
                 .color(ui::text_secondary()),
         );
     }
-    stack
-}
-
-fn ai_vendor_icons(vendors: &[Option<AiVendor>]) -> gpui::Div {
-    ai_vendor_icons_sized(vendors, AI_ICON_SIZE, -4.0)
+    if include_light && light != StatusLight::Idle {
+        pill = pill.child(ui::status_dot(light));
+    }
+    pill
 }
 
 /// 独立（已脱离父项目）worktree 行的行尾分支徽章:使用矢量 `ICON_BRANCH` 取代文本字符 `⎇`。
@@ -472,9 +719,10 @@ fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
         .child(div().min_w(px(0.0)).truncate().child(branch))
 }
 
-/// 折叠态 worktree 父项目胶囊上的聚合状态：确保收起子项后不漏掉 AI 完成 / 待处理 / 报错 / SSH。
+/// 折叠态容器（worktree 父项目胶囊 / 折叠分组行）的聚合状态：
+/// 确保收起子项后不漏掉 AI 完成 / 待处理 / 报错 / SSH / 活动项目。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CollapsedWorktreeSummary {
+struct CollapsedSummary {
     /// 任意折叠子项有未读完成标（且非当前活动项目）。
     has_done: bool,
     /// 折叠子项里的最高状态灯档位。
@@ -485,8 +733,8 @@ struct CollapsedWorktreeSummary {
     contains_active: bool,
 }
 
-/// 折叠胶囊内附带的小状态指示器（仅在有需要提醒的状态时出现）。
-fn collapsed_worktree_indicator(summary: &CollapsedWorktreeSummary) -> Option<AnyElement> {
+/// 折叠胶囊 / 折叠分组行上附带的小状态指示器（仅在有需要提醒的状态时出现）。
+fn collapsed_status_indicator(summary: &CollapsedSummary) -> Option<AnyElement> {
     if summary.light >= StatusLight::Attention {
         return Some(
             StatusDot::new(ui::status_kind(summary.light))
@@ -528,6 +776,37 @@ fn collapsed_worktree_indicator(summary: &CollapsedWorktreeSummary) -> Option<An
         );
     }
     None
+}
+
+/// 列表行（分组行 / 独立项目 / Worktree 微容器）的左外边距：
+/// 顶层 `ROW_MARGIN_X(6)`，每进一层分组步进 `INDENT_STEP(16)`。
+fn row_left_margin(group_depth: usize) -> f32 {
+    ROW_MARGIN_X + group_depth as f32 * INDENT_STEP
+}
+
+/// 组内第 `level` 层（0 起）纵向分组引导线的 x 坐标（对齐该层分组折叠箭头中心）。
+fn group_guide_x(level: usize) -> f32 {
+    GROUP_GUIDE_BASE_X + level as f32 * INDENT_STEP
+}
+
+/// 在行外层 `relative()` 左侧绘制 `0..group_depth` 条极细分组引导竖线。
+fn group_guide_lines(group_depth: usize) -> Vec<AnyElement> {
+    if group_depth == 0 {
+        return Vec::new();
+    }
+    let color = ui::with_alpha(ui::border_strong(), 0.55);
+    (0..group_depth)
+        .map(|level| {
+            div()
+                .absolute()
+                .left(px(group_guide_x(level)))
+                .top_0()
+                .bottom_0()
+                .w(px(1.0))
+                .bg(color)
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// B1 分支优先子项的展示文案拆分。
@@ -635,18 +914,15 @@ fn child_tooltip_text(
 }
 
 /// 微容器内第 `level` 层（0 = 直接子项）树形竖轨相对微容器内左缘的 x 坐标。
-/// 对齐父项目领位图标（14px）的水平中心：`parent_inner_pl + 2(竖条) + 6(gap) + 7(半图标)`。
-fn cluster_rail_x(root_depth: usize, in_group: bool, level: usize) -> f32 {
-    let parent_indent = project_indent(root_depth, in_group);
-    let base = (parent_indent - CLUSTER_INSET).max(0.0) + 15.0;
-    base + level as f32 * CHILD_NEST_STEP
+/// 微容器本身已按分组深度完成 `row_left_margin` 缩进，内部父行内距 `(ROW_INNER_PL - CLUSTER_BORDER_W) = 9`，
+/// 故父项目 14px 领位图标中心恒落在 `9 + 7 = 16`。
+fn cluster_rail_x(level: usize) -> f32 {
+    (ROW_INNER_PL - CLUSTER_BORDER_W) + 7.0 + level as f32 * CHILD_NEST_STEP
 }
 
 /// 微容器子项左侧的树形连线层（`├─` / `╰─` + 多层祖先贯通竖线）。
 /// 挂在子项外层 `relative()` 上，竖线从 `top_0()` 贯通到 `bottom_0()`，相邻子项无缝衔接。
 fn child_tree_connectors(
-    root_depth: usize,
-    in_group: bool,
     rel_depth: usize,
     is_last_sibling: bool,
     ancestor_continues: &[bool],
@@ -661,7 +937,7 @@ fn child_tree_connectors(
     let mut parts: Vec<AnyElement> = Vec::with_capacity(ancestor_continues.len() + 2);
     for (level, &continues) in ancestor_continues.iter().enumerate() {
         if continues {
-            let x = cluster_rail_x(root_depth, in_group, level);
+            let x = cluster_rail_x(level);
             parts.push(
                 div()
                     .absolute()
@@ -674,7 +950,7 @@ fn child_tree_connectors(
             );
         }
     }
-    let rail_x = cluster_rail_x(root_depth, in_group, rel_depth.saturating_sub(1));
+    let rail_x = cluster_rail_x(rel_depth.saturating_sub(1));
     if is_last_sibling {
         // 末位兄弟：圆角 L 弯折 `╰─`，从顶沿垂到行中线再优雅向右折出
         parts.push(
@@ -716,12 +992,15 @@ fn child_tree_connectors(
     parts
 }
 
-/// 远程徽章:连接名(断链时「断链」两字 + error 配色)。
+/// 远程徽章:连接名(正常态柔润 info 配色，断链时「断链」两字 + error 配色)。
 fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div> {
     let (fg, bg) = if remote.broken {
-        (ui::color_error(), ui::with_alpha(ui::color_error(), 0.15))
+        (ui::color_error(), ui::with_alpha(ui::color_error(), 0.14))
     } else {
-        (ui::text_muted(), ui::border_subtle())
+        (
+            ui::with_alpha(ui::color_info(), 0.92),
+            ui::with_alpha(ui::color_info(), 0.11),
+        )
     };
     let tip: SharedString = if remote.broken {
         t("projectList", "remoteBrokenTitle").into()
@@ -738,10 +1017,11 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
         .flex_shrink_0()
         .min_w(px(0.0))
         .max_w(px(REMOTE_BADGE_MAX_W))
-        .px(px(3.0))
-        .rounded(px(3.0))
-        .font_family("monospace")
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
         .text_size(ui::font_px(9.75))
+        .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
         .bg(bg)
         .tip(tip)
@@ -753,47 +1033,55 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
         })
 }
 
-/// 完成标 / AI 状态灯 / 右键 SSH 已连接灯三选一,**均无时都不画**。
+/// 行尾右侧状态区（AI 活跃胶囊 / 完成标 / 裸状态灯 / 右键 SSH 已连接灯）。
 ///
 /// 优先级严格保持 **AI 状态优先**:完成标 > AI/错误/待处理灯(`StatusLight != Idle`) >
 /// 右键「SSH 连接」已连接灯(`◉`)。
-///
-/// 完成标退场期间(`tag` 还在、`show_done_tag` 已经 false)照旧只画标:收回去之后才轮到灯。
-fn row_status_mark(
+/// 有 AI 品牌图标时将其与状态灯合进精致的「AI 活跃胶囊」；完成标退场期间优先保标。
+fn row_right_status(
     id: &str,
+    ai_vendors: &[Option<AiVendor>],
+    icon_size: f32,
     show_done_tag: bool,
     tag: Option<&DoneTagAnim>,
     light: StatusLight,
     ssh_connected: Option<&str>,
-) -> Option<AnyElement> {
+) -> Vec<AnyElement> {
+    let mut parts: Vec<AnyElement> = Vec::with_capacity(2);
+    let has_done = tag.is_some() || show_done_tag;
+    if !ai_vendors.is_empty() {
+        parts.push(ai_activity_pill(ai_vendors, icon_size, light, !has_done).into_any_element());
+    }
     if let Some(tag) = tag {
         let settled = tag.leaving.is_none() && !tag.transition.running();
-        Some(done_tag(tag.frame(), settled, &tag.text_w))
+        parts.push(done_tag(tag.frame(), settled, &tag.text_w));
     } else if show_done_tag {
-        // 表由 `render` 前置段维护,理论上不会落到这;万一没赶上按已就位画
         let frame = DoneTagFrame {
             open: 1.0,
             scale: 1.0,
         };
-        Some(done_tag(frame, true, &Rc::new(Cell::new(0.0))))
-    } else if light != StatusLight::Idle {
-        Some(ui::status_dot(light).into_any_element())
-    } else {
-        ssh_connected.map(|conn_name| {
-            div()
-                .id(SharedString::from(format!("ssh-dot-{id}")))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .tip(tr!(
-                    "panels",
-                    "statusDot.sshConnectedWith",
-                    name = conn_name.to_string()
-                ))
-                .child(ui::ssh_connected_dot())
-                .into_any_element()
-        })
+        parts.push(done_tag(frame, true, &Rc::new(Cell::new(0.0))));
+    } else if ai_vendors.is_empty() {
+        if light != StatusLight::Idle {
+            parts.push(ui::status_dot(light).into_any_element());
+        } else if let Some(conn_name) = ssh_connected {
+            parts.push(
+                div()
+                    .id(SharedString::from(format!("ssh-dot-{id}")))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .tip(tr!(
+                        "panels",
+                        "statusDot.sshConnectedWith",
+                        name = conn_name.to_string()
+                    ))
+                    .child(ui::ssh_connected_dot())
+                    .into_any_element(),
+            );
+        }
     }
+    parts
 }
 
 /// 外部拖拽的三态提示框:盖住整栏。
@@ -847,17 +1135,6 @@ fn resolve_project_kind(
         Some("none") => None,
         Some(other) => ProjectKind::from_str(other),
         None => detected,
-    }
-}
-
-/// 项目行的左内边距。原版这两条公式**不能合并**(`ProjectList.tsx:660-666` 有
-/// 踩坑记录):组内项目要对齐父级分组那个倒三角的位置;顶层项目及其 worktree
-/// 子项目以 10px 为基准每层 +16 —— 共用组内公式会把顶层子项目的相对缩进压到 6px。
-fn project_indent(depth: usize, in_group: bool) -> f32 {
-    if in_group {
-        depth.saturating_sub(1) as f32 * 16.0 + 16.0
-    } else {
-        10.0 + depth as f32 * 16.0
     }
 }
 
@@ -1039,7 +1316,9 @@ struct Row {
     /// 所属簇内是否存在当前活动项目（给展开微容器外框叠一层微弱 accent 提示）。
     cluster_has_active: bool,
     /// 折叠态父项目的子项聚合状态（仅 `CollapsedParent` 有意义）。
-    collapsed_summary: CollapsedWorktreeSummary,
+    collapsed_summary: CollapsedSummary,
+    /// 所属祖先分组层数（0 = 顶层；非零 = 左侧绘制的分组引导竖线条数与外框缩进层数）。
+    group_depth: usize,
     /// 行上的 AI 品牌堆叠(去重 + 字母序,见 [`ai_vendor_stack`])。
     ai_vendors: Vec<Option<AiVendor>>,
     /// 项目路径是某仓库的 linked worktree → `⎇ 分支名` 徽章。
@@ -1055,9 +1334,11 @@ struct GroupRow {
     id: String,
     name: String,
     collapsed: bool,
-    /// 递归含子组的项目数(行尾括号里那个数)。
+    /// 递归含子组的项目数(行尾胶囊里那个数)。
     count: usize,
     depth: usize,
+    /// 折叠态时组内全部后代项目的聚合状态（展开态为空默认值）。
+    collapsed_summary: CollapsedSummary,
 }
 
 /// 落点指示。对应原版那个 `useState<DropIndicator>` —— 由 `on_drag_move` 写、
@@ -1621,22 +1902,116 @@ fn group_menu(
     entries
 }
 
-/// 「新建分组」入口(列表标题栏空白右键)。底部那条 `+` 按钮是 C 批的事。
-fn new_group_menu(store: &Entity<AppStore>) -> Vec<MenuEntry> {
-    let store = store.clone();
-    vec![menu::item(t("projectList", "newGroup"), move |window, cx| {
+/// 「添加本地项目」领位图标（与原底栏按钮同款目录图标 + `--color-file`）。
+fn icon_add_local(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    FileIcon::folder(false)
+        .size(px(14.0))
+        .color(ui::color_file())
+        .into_any_element()
+}
+
+/// 「添加远程项目」领位图标（与原底栏按钮同款服务器图标 + `--color-info`）。
+fn icon_add_remote(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    VectorIcon::new(SERVER, px(14.0))
+        .ink(ui::color_info())
+        .into_any_element()
+}
+
+/// 「新建分组 / 新建子组」领位图标（与原底栏按钮同款容器图标 + `--color-folder`）。
+fn icon_new_group(_window: &mut Window, _cx: &mut App) -> AnyElement {
+    VectorIcon::new(dnd::BOXES_SHAPES, px(13.0))
+        .ink(ui::color_folder())
+        .into_any_element()
+}
+
+/// 栏头 `+` / 空白右键的统一新建菜单：添加本地项目 / 添加远程项目 / 新建分组。
+/// 每项都写明动作并保留与原底栏按钮一致的领位图标（规避 issue #83 裸「SSH」歧义）。
+fn add_menu(store: &Entity<AppStore>) -> Vec<MenuEntry> {
+    let store_local = store.clone();
+    let store_remote = store.clone();
+    let store_group = store.clone();
+    vec![
+        MenuItem::new(t("projectList", "addProject"))
+            .icon(icon_add_local)
+            .on_click(move |window, cx| {
+                modal::open_add_project(store_local.clone(), window, cx);
+            })
+            .into(),
+        MenuItem::new(t("projectList", "addRemoteProject"))
+            .icon(icon_add_remote)
+            .on_click(move |window, cx| {
+                crate::remote_project::open(store_remote.clone(), None, window, cx);
+            })
+            .into(),
+        menu::separator(),
+        MenuItem::new(t("projectList", "newGroup"))
+            .icon(icon_new_group)
+            .on_click(move |window, cx| {
+                let store = store_group.clone();
+                crate::prompt::show_prompt(
+                    t("projectList", "newGroup"),
+                    t("projectList", "newGroupPlaceholder"),
+                    "",
+                    move |value, _window, cx| {
+                        store.update(cx, |store, cx| store.create_group(&value, None, cx));
+                    },
+                    window,
+                    cx,
+                );
+            })
+            .into(),
+    ]
+}
+
+/// 分组行 hover `+` 快捷菜单：直接向该分组添加本地/远程项目或新建子组。
+fn group_add_menu(store: &Entity<AppStore>, group_id: &str, depth: usize) -> Vec<MenuEntry> {
+    let mut entries: Vec<MenuEntry> = vec![
+        {
+            let store = store.clone();
+            let id = group_id.to_string();
+            MenuItem::new(t("projectList", "addProject"))
+                .icon(icon_add_local)
+                .on_click(move |window, cx| {
+                    modal::open_add_project_into(store.clone(), Some(id.clone()), window, cx);
+                })
+                .into()
+        },
+        {
+            let store = store.clone();
+            let id = group_id.to_string();
+            MenuItem::new(t("projectList", "addRemoteProject"))
+                .icon(icon_add_remote)
+                .on_click(move |window, cx| {
+                    crate::remote_project::open(store.clone(), Some(id.clone()), window, cx);
+                })
+                .into()
+        },
+    ];
+    if depth + 1 < MAX_DEPTH {
+        entries.push(menu::separator());
         let store = store.clone();
-        crate::prompt::show_prompt(
-            t("projectList", "newGroup"),
-            t("projectList", "newGroupPlaceholder"),
-            "",
-            move |value, _window, cx| {
-                store.update(cx, |store, cx| store.create_group(&value, None, cx));
-            },
-            window,
-            cx,
+        let id = group_id.to_string();
+        entries.push(
+            MenuItem::new(t("projectList", "menu.newSubgroup"))
+                .icon(icon_new_group)
+                .on_click(move |window, cx| {
+                    let store = store.clone();
+                    let id = id.clone();
+                    crate::prompt::show_prompt(
+                        t("projectList", "newSubgroup"),
+                        t("projectList", "newSubgroupPlaceholder"),
+                        "",
+                        move |value, _window, cx| {
+                            store.update(cx, |store, cx| store.create_group(&value, Some(&id), cx));
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .into(),
         );
-    })]
+    }
+    entries
 }
 
 // ─── 揭示(见模块注释) ────────────────────────────────────────
@@ -1706,8 +2081,30 @@ pub struct ProjectList {
     external: Option<ExternalDrag>,
     /// 正在行内重命名的那一行。
     editing: Option<Editing>,
-    /// 鼠标停在哪一行 —— 行尾的 ✕ 只在 hover 时出现(原版 `hidden group-hover:inline`)。
+    /// 鼠标停在哪一行 —— 行尾悬浮操作胶囊与预览卡的锚点靠它。
     hovered: Option<String>,
+    /// 鼠标当前是否停在行尾悬浮操作浮层 / 折叠胶囊上：停在按钮上时不弹 520px 大预览卡。
+    hover_on_action: bool,
+    /// 单击切换、双击已激活行重命名的连点守卫（防切过来紧接一下误触重命名）。
+    row_click: SwitchClickGuard,
+    /// 拖放到列表底部弹性空白区的落点高亮态。
+    drop_to_root_end: bool,
+    /// 拖拽悬停在折叠分组上准备 550ms 自动展开的目标分组 id。
+    spring_open_group: Option<String>,
+    /// 折叠分组自动展开计时器（离开或丢弃即取消）。
+    _spring_open_task: Option<Task<()>>,
+    /// 行内筛选条是否展开。
+    filter_open: bool,
+    /// 行内筛选条的高度裁剪展开 / 收起动画。
+    filter_reveal: crate::height_reveal::HeightReveal,
+    /// 行内状态筛选档位（全部 / AI 活跃 / 远程）。
+    filter_mode: ProjectFilterMode,
+    /// 行内筛选输入框状态（首次展开时懒建）。
+    filter_input: Option<Entity<InputState>>,
+    /// 行内筛选输入框事件订阅。
+    _filter_sub: Option<Subscription>,
+    /// 打开筛选条后在下一帧聚焦输入框。
+    pending_filter_focus: bool,
     /// 项目路径 → worktree 分支名。批量探测的结果,见 [`Self::probe_worktrees`]。
     worktree_branches: HashMap<String, String>,
     /// 上次探测用的路径清单(拼成一条),变了才重探。
@@ -1839,6 +2236,17 @@ impl ProjectList {
             external: None,
             editing: None,
             hovered: None,
+            hover_on_action: false,
+            row_click: SwitchClickGuard::default(),
+            drop_to_root_end: false,
+            spring_open_group: None,
+            _spring_open_task: None,
+            filter_open: false,
+            filter_reveal: crate::height_reveal::HeightReveal::new(false),
+            filter_mode: ProjectFilterMode::All,
+            filter_input: None,
+            _filter_sub: None,
+            pending_filter_focus: false,
             worktree_branches: HashMap::new(),
             probe_key: String::new(),
             kinds_key: String::new(),
@@ -1922,15 +2330,274 @@ impl ProjectList {
             .update(cx, |store, cx| store.ensure_dir_kinds(paths, cx));
     }
 
-    /// 当前侧栏可见的展平列表：在 `get_ordered_tree` 基础上裁掉折叠着的 worktree 子项。
+    /// 当前行内筛选框的规范化（trim + lowercase）查询词。
+    fn filter_query_lower(&self, cx: &App) -> String {
+        self.filter_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_lowercase())
+            .unwrap_or_default()
+    }
+
+    /// 行内筛选是否正在生效（有状态芯片过滤或非空关键词）。
+    fn is_filtering(&self, cx: &App) -> bool {
+        self.filter_mode != ProjectFilterMode::All || !self.filter_query_lower(cx).is_empty()
+    }
+
+    /// 懒建行内筛选输入框并订阅变更与回车事件。
+    fn ensure_filter_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = self.filter_input.as_ref() {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t("projectList", "filter.placeholder"))
+        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut Self, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => {
+                    this.folds.clear();
+                    this.close_preview(cx);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.activate_first_filtered_project(cx);
+                }
+                _ => {}
+            },
+        );
+        self.filter_input = Some(input.clone());
+        self._filter_sub = Some(sub);
+        input
+    }
+
+    /// 打开并聚焦行内筛选条。
+    fn open_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_filter_input(window, cx);
+        self.filter_open = true;
+        self.filter_reveal.set_open(true);
+        self.pending_filter_focus = true;
+        self.close_preview(cx);
+        cx.notify();
+    }
+
+    /// 清空筛选条件（保持筛选条开合状态不变）。
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_mode = ProjectFilterMode::All;
+        if let Some(input) = self.filter_input.clone() {
+            input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+        }
+        self.close_preview(cx);
+        cx.notify();
+    }
+
+    /// 收起行内筛选条；`clear = true` 时一并清空关键词与状态筛选。
+    fn close_filter(&mut self, clear: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if clear {
+            self.filter_mode = ProjectFilterMode::All;
+            if let Some(input) = self.filter_input.clone() {
+                input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+            }
+        }
+        self.filter_open = false;
+        self.filter_reveal.set_open(false);
+        self.pending_filter_focus = false;
+        self.close_preview(cx);
+        cx.notify();
+    }
+
+    /// 栏头放大镜点击：开着就收起并清条件，关着就展开并聚焦。
+    fn toggle_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.filter_open {
+            self.close_filter(true, window, cx);
+        } else {
+            self.open_filter(window, cx);
+        }
+    }
+
+    /// 筛选框按回车：激活当前过滤结果里的第一个项目。
+    fn activate_first_filtered_project(&mut self, cx: &mut Context<Self>) {
+        let first_id = {
+            let ordered = self.visible_ordered(self.store.read(cx), cx);
+            ordered.into_iter().find_map(|item| match item {
+                OrderedItem::Project { id, .. } => Some(id),
+                OrderedItem::Group { .. } => None,
+            })
+        };
+        if let Some(id) = first_id {
+            self.store
+                .update(cx, |store, cx| store.set_active_project(&id, cx));
+        }
+    }
+
+    /// 筛选框按 `↓`：把焦点移入列表首行并滚进可视区。
+    fn focus_first_visible_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let first_id = {
+            let ordered = self.visible_ordered(self.store.read(cx), cx);
+            ordered.first().map(|item| ordered_item_id(item).to_string())
+        };
+        if let Some(id) = first_id
+            && let Some(focus) = self.row_focus.get(&id).cloned()
+        {
+            self.folds.clear();
+            self.close_preview(cx);
+            window.focus(&focus, cx);
+            self.rows_scroll.scroll_to_item(0);
+            cx.notify();
+        }
+    }
+
+    /// 当前侧栏可见的展平列表：
+    /// - 常规态：在 `get_ordered_tree` 基础上裁掉折叠着的 worktree 子项；
+    /// - 筛选态：以临时全展开视角按状态芯片与关键词剪枝，绝不改写原树折叠态。
+    ///
     /// 渲染、揭示行号、焦点同步、完成标同步与键盘导航共用同一份结果。
-    fn visible_ordered(&self, store: &AppStore) -> Vec<OrderedItem> {
-        let ordered = project_tree::get_ordered_tree(store.config());
-        project_tree::filter_collapsed_worktrees(
-            ordered,
-            store.projects(),
-            &self.collapsed_worktrees,
+    fn visible_ordered(&self, store: &AppStore, cx: &App) -> Vec<OrderedItem> {
+        let query_lower = self.filter_query_lower(cx);
+        let text_active = !query_lower.is_empty();
+        if self.filter_mode == ProjectFilterMode::All && !text_active {
+            let ordered = project_tree::get_ordered_tree(store.config());
+            return project_tree::filter_collapsed_worktrees(
+                ordered,
+                store.projects(),
+                &self.collapsed_worktrees,
+            );
+        }
+        let active_id = store.active_project_id.as_deref();
+        let mode = self.filter_mode;
+        let status_ok = |pid: &str| -> bool {
+            let Some(p) = store.project(pid) else {
+                return false;
+            };
+            match mode {
+                ProjectFilterMode::All => true,
+                ProjectFilterMode::Remote => crate::ssh_conn::is_remote_project(p),
+                ProjectFilterMode::AiActive => {
+                    let st = store.project_state(pid);
+                    let light = st.map(|s| s.highest_light()).unwrap_or_default();
+                    let needs = st.map(|s| s.needs_attention).unwrap_or(false);
+                    is_ai_active_project(light, needs, active_id == Some(pid))
+                }
+            }
+        };
+        let project_text_match = |pid: &str| -> bool {
+            let Some(p) = store.project(pid) else {
+                return false;
+            };
+            if p.name.to_lowercase().contains(&query_lower) {
+                return true;
+            }
+            if p.description
+                .as_deref()
+                .is_some_and(|d| d.to_lowercase().contains(&query_lower))
+            {
+                return true;
+            }
+            if p.ssh_connection_id.is_none()
+                && self
+                    .worktree_branches
+                    .get(&p.path)
+                    .is_some_and(|b| b.to_lowercase().contains(&query_lower))
+            {
+                return true;
+            }
+            if let Some(conn) = crate::ssh_conn::remote_connection(p, store.ssh_connections())
+                && conn.name.to_lowercase().contains(&query_lower)
+            {
+                return true;
+            }
+            false
+        };
+        let tree = store.config().project_tree.as_deref().unwrap_or(&[]);
+        let group_text_match = |gid: &str| -> bool {
+            project_tree::find_group_in_tree(tree, gid)
+                .is_some_and(|g| g.name.to_lowercase().contains(&query_lower))
+        };
+        project_tree::filter_ordered_tree(
+            store.config(),
+            &status_ok,
+            text_active,
+            &project_text_match,
+            &group_text_match,
         )
+    }
+
+    /// 栏头「全部折叠 / 全部展开」的当前方向：`true` = 存在任意展开分组或展开 worktree 簇
+    /// （点一下全部折叠），`false` = 已全折（点一下全部展开）。
+    fn any_foldable_expanded(&self, store: &AppStore) -> (bool, bool) {
+        let tree = store.config().project_tree.as_deref().unwrap_or(&[]);
+        let has_group = project_tree::has_any_group(tree);
+        let wt_parents: Vec<&str> = store
+            .projects()
+            .iter()
+            .filter(|p| {
+                p.parent_project_id.is_none()
+                    && !project_tree::worktree_descendants(store.projects(), &p.id).is_empty()
+            })
+            .map(|p| p.id.as_str())
+            .collect();
+        let has_any = has_group || !wt_parents.is_empty();
+        if !has_any {
+            return (false, false);
+        }
+        let any_expanded = project_tree::has_any_expanded_group(tree)
+            || wt_parents
+                .iter()
+                .any(|pid| !self.collapsed_worktrees.contains(*pid));
+        (true, any_expanded)
+    }
+
+    /// 一键全部折叠或全部展开（同步驱动全部分组与 worktree 簇的箭头与抽屉动画）。
+    fn toggle_all_folds(&mut self, cx: &mut Context<Self>) {
+        let (has_any, any_expanded) = self.any_foldable_expanded(self.store.read(cx));
+        if !has_any {
+            return;
+        }
+        let next_collapsed = any_expanded;
+        let next_open = !next_collapsed;
+
+        // 1. 全部 worktree 父项目
+        let wt_parents: Vec<String> = {
+            let store = self.store.read(cx);
+            store
+                .projects()
+                .iter()
+                .filter(|p| {
+                    p.parent_project_id.is_none()
+                        && !project_tree::worktree_descendants(store.projects(), &p.id).is_empty()
+                })
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        for pid in wt_parents {
+            let changed = if next_collapsed {
+                self.collapsed_worktrees.insert(pid.clone())
+            } else {
+                self.collapsed_worktrees.remove(&pid)
+            };
+            if changed {
+                let key = format!("wt:{pid}");
+                self.chevrons
+                    .flip_open(key.clone(), next_open, crate::fold_motion::OPEN_TURNS);
+                self.folds.flip_open(key, next_open);
+            }
+        }
+
+        // 2. 全部分组
+        let changed_groups = self
+            .store
+            .update(cx, |store, cx| store.set_all_groups_collapsed(next_collapsed, cx));
+        for gid in changed_groups {
+            self.chevrons
+                .flip_open(gid.clone(), next_open, crate::fold_motion::OPEN_TURNS);
+            self.folds.flip_open(format!("grp:{gid}"), next_open);
+        }
+        self.close_preview(cx);
+        cx.notify();
     }
 
     /// 折叠 / 展开分组，同步触发箭头旋转与高度裁剪动画。
@@ -1964,6 +2631,7 @@ impl ProjectList {
     /// 揭示的视图半边(入口是自由函数 [`reveal`]):先把挡路的折叠分组与折叠 worktree 簇展开,
     /// 再登记滚动。滚动不能当场算 —— 刚展开的行还没铺出来,要等下一次 `render`
     /// 拿新的展平表定行号(见 `render` 里兑现那一段)。
+    /// 若当前行内筛选把目标项目滤掉了，自动清空并收起筛选条以确保目标可见。
     fn reveal(&mut self, project_id: String, cx: &mut Context<Self>) {
         self.store.update(cx, |store, cx| {
             store.expand_groups_to_project(&project_id, cx)
@@ -1972,6 +2640,18 @@ impl ProjectList {
             project_tree::worktree_ancestors(self.store.read(cx).projects(), &project_id);
         for ancestor in ancestors {
             self.collapsed_worktrees.remove(&ancestor);
+        }
+        if self.is_filtering(cx) {
+            let visible = self.visible_ordered(self.store.read(cx), cx);
+            if reveal_row_index(&visible, &project_id).is_none() {
+                self.filter_mode = ProjectFilterMode::All;
+                // 不拿 window 也能在 render 前清掉：直接放弃筛选输入框实例，下次打开再懒建
+                self.filter_input = None;
+                self._filter_sub = None;
+                self.filter_open = false;
+                self.filter_reveal.jump(false);
+                self.pending_filter_focus = false;
+            }
         }
         // 揭示需要立即扁平定行号滚动，清掉在飞折叠补间直接到位
         self.folds.clear();
@@ -2121,45 +2801,43 @@ impl ProjectList {
                     cx,
                 );
             }
+            "/" if !event.keystroke.modifiers.modified() => {
+                cx.stop_propagation();
+                self.open_filter(window, cx);
+            }
+            "escape" if self.filter_open || self.is_filtering(cx) => {
+                cx.stop_propagation();
+                self.close_filter(true, window, cx);
+            }
             "left" if !event.keystroke.modifiers.modified() => {
-                let (has_children, parent_id) = {
-                    let store = self.store.read(cx);
-                    (
-                        !project_tree::worktree_descendants(store.projects(), id).is_empty(),
-                        store.project(id).and_then(|p| p.parent_project_id.clone()),
-                    )
-                };
-                if has_children && !self.collapsed_worktrees.contains(id) {
+                let has_children =
+                    !project_tree::worktree_descendants(self.store.read(cx).projects(), id)
+                        .is_empty();
+                if has_children && !self.collapsed_worktrees.contains(id) && !self.is_filtering(cx) {
                     cx.stop_propagation();
                     self.toggle_worktree_collapse(id, cx);
-                } else if let Some(parent_id) = parent_id
-                    && let Some(focus) = self.row_focus.get(&parent_id).cloned()
-                {
+                } else {
                     cx.stop_propagation();
-                    self.folds.clear();
-                    let ordered = self.visible_ordered(self.store.read(cx));
-                    self.close_preview(cx);
-                    window.focus(&focus, cx);
-                    if let Some(ix) = reveal_row_index(&ordered, &parent_id) {
-                        self.rows_scroll.scroll_to_item(ix);
-                    }
-                    cx.notify();
+                    self.move_row_focus(id, RowNav::Parent, window, cx);
                 }
             }
             "right" if !event.keystroke.modifiers.modified() => {
                 let has_children =
                     !project_tree::worktree_descendants(self.store.read(cx).projects(), id)
                         .is_empty();
-                if has_children && self.collapsed_worktrees.contains(id) {
+                if has_children && self.collapsed_worktrees.contains(id) && !self.is_filtering(cx) {
                     cx.stop_propagation();
                     self.toggle_worktree_collapse(id, cx);
+                } else if has_children {
+                    cx.stop_propagation();
+                    self.move_row_focus(id, RowNav::FirstChild, window, cx);
                 }
             }
             key => self.on_row_nav_key(event, key, id, window, cx),
         }
     }
 
-    /// 分组行按键(原版只有 Enter/Space 折叠 + F2 改名,**没有 Delete**——
+    /// 分组行按键(Enter/Space 折叠 + ←/→ 折展或跳父/首子行 + / 开筛选 + F2 改名,**没有 Delete**——
     /// 删组是不可逆的结构变更,只留在右键菜单里并带确认)。
     ///
     /// `collapsed` 是这一行眼下的折叠态(翻过去之后箭头转到哪靠它)。
@@ -2178,15 +2856,33 @@ impl ProjectList {
         match event.keystroke.key.as_str() {
             "enter" | "space" => {
                 cx.stop_propagation();
-                self.toggle_group_with_anim(id, collapsed, cx);
+                if !self.is_filtering(cx) {
+                    self.toggle_group_with_anim(id, collapsed, cx);
+                }
             }
-            "left" if plain && !collapsed => {
+            "/" if plain => {
                 cx.stop_propagation();
-                self.toggle_group_with_anim(id, false, cx);
+                self.open_filter(window, cx);
             }
-            "right" if plain && collapsed => {
+            "escape" if self.filter_open || self.is_filtering(cx) => {
                 cx.stop_propagation();
-                self.toggle_group_with_anim(id, true, cx);
+                self.close_filter(true, window, cx);
+            }
+            "left" if plain => {
+                cx.stop_propagation();
+                if !collapsed && !self.is_filtering(cx) {
+                    self.toggle_group_with_anim(id, false, cx);
+                } else {
+                    self.move_row_focus(id, RowNav::Parent, window, cx);
+                }
+            }
+            "right" if plain => {
+                cx.stop_propagation();
+                if collapsed && !self.is_filtering(cx) {
+                    self.toggle_group_with_anim(id, true, cx);
+                } else {
+                    self.move_row_focus(id, RowNav::FirstChild, window, cx);
+                }
             }
             key => self.on_row_nav_key(event, key, id, window, cx),
         }
@@ -2223,7 +2919,7 @@ impl ProjectList {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let ordered = self.visible_ordered(self.store.read(cx));
+        let ordered = self.visible_ordered(self.store.read(cx), cx);
         let ids: Vec<&str> = ordered.iter().map(ordered_item_id).collect();
         let depths: Vec<usize> = ordered
             .iter()
@@ -2397,7 +3093,7 @@ impl ProjectList {
         anchor: Option<Bounds<Pixels>>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.hovered.as_deref() != Some(project_id) {
+        if self.hover_on_action || self.hovered.as_deref() != Some(project_id) {
             return false;
         }
         let Some(anchor) = anchor else {
@@ -2701,6 +3397,125 @@ impl ProjectList {
         .detach();
     }
 
+    /// 取消在飞的「折叠分组悬停自动展开」计时。
+    fn cancel_spring_open(&mut self) {
+        self.spring_open_group = None;
+        self._spring_open_task = None;
+    }
+
+    /// 拖放悬停在折叠分组 `Inside` 区域 550ms 后自动展开（spring-loaded group），方便精准放入指定顺序。
+    fn schedule_spring_open(&mut self, group_id: String, cx: &mut Context<Self>) {
+        if self.spring_open_group.as_deref() == Some(group_id.as_str()) {
+            return;
+        }
+        self.spring_open_group = Some(group_id.clone());
+        self._spring_open_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(SPRING_OPEN_DELAY_MS))
+                .await;
+            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+                if !cx.has_active_drag() {
+                    this.cancel_spring_open();
+                    return;
+                }
+                let still_inside = this.drop_indicator.as_ref().is_some_and(|ind| {
+                    ind.id == group_id && ind.position == DropPosition::Inside && !ind.forbidden
+                });
+                this.cancel_spring_open();
+                if still_inside {
+                    let changed = this
+                        .store
+                        .update(cx, |store, cx| store.set_group_collapsed(&group_id, false, cx));
+                    if changed {
+                        this.chevrons
+                            .flip_open(&group_id, true, crate::fold_motion::OPEN_TURNS);
+                        this.folds.flip_open(format!("grp:{group_id}"), true);
+                        cx.notify();
+                    }
+                }
+            });
+        }));
+    }
+
+    /// 拖放到空分组占位提示区：强制以 `DropPosition::Inside` 命中该分组。
+    fn on_empty_group_drag_move(
+        &mut self,
+        event: &DragMoveEvent<DragProjectItem>,
+        group_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let dragged = event.drag(cx).clone();
+        if !event.bounds.contains(&event.event.position) {
+            if self
+                .drop_indicator
+                .as_ref()
+                .is_some_and(|d| d.id == group_id && d.position == DropPosition::Inside)
+            {
+                self.drop_indicator = None;
+                cx.notify();
+            }
+            return;
+        }
+        if dragged.id == group_id {
+            return;
+        }
+        let forbidden = {
+            let store = self.store.read(cx);
+            let empty: Vec<ProjectTreeItem> = Vec::new();
+            let tree = store.config().project_tree.as_ref().unwrap_or(&empty);
+            let dragged_item = if dragged.is_group {
+                project_tree::find_group_in_tree(tree, &dragged.id)
+                    .map(|g| ProjectTreeItem::Group(g.clone()))
+            } else {
+                Some(ProjectTreeItem::ProjectId(dragged.id.clone()))
+            };
+            dragged_item.is_some_and(|item| !project_tree::can_drop(tree, group_id, &item))
+        };
+        let next = DropIndicator {
+            id: group_id.to_string(),
+            position: DropPosition::Inside,
+            forbidden,
+        };
+        if self.drop_indicator.as_ref() != Some(&next) {
+            self.drop_indicator = Some(next);
+            self.drop_to_root_end = false;
+            cx.notify();
+        }
+    }
+
+    /// 拖放到列表底部弹性空白区：悬停高亮，松手直接移至顶层末尾。
+    fn on_bottom_zone_drag_move(
+        &mut self,
+        event: &DragMoveEvent<DragProjectItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = event.bounds.contains(&event.event.position);
+        if hit {
+            self.cancel_spring_open();
+            let changed = !self.drop_to_root_end || self.drop_indicator.is_some();
+            self.drop_to_root_end = true;
+            self.drop_indicator = None;
+            if changed {
+                cx.notify();
+            }
+        } else if self.drop_to_root_end {
+            self.drop_to_root_end = false;
+            cx.notify();
+        }
+    }
+
+    /// 底部空白区落地：将项目 / 分组 / worktree 子项目移到顶层末尾。
+    fn on_bottom_zone_drop(&mut self, dragged: &DragProjectItem, cx: &mut Context<Self>) {
+        self.drop_to_root_end = false;
+        self.drop_indicator = None;
+        self.dragging = None;
+        self.cancel_spring_open();
+        cx.notify();
+        self.store.update(cx, |store, cx| {
+            store.move_item(&dragged.id, None, None, cx);
+        });
+    }
+
     /// `on_drag_move` 的落点判定。`allow_inside` 只有分组行为真。
     ///
     /// 见 [`crate::dnd`] 模块注释第 2 条:这个回调会打给**每一个**注册者,
@@ -2717,6 +3532,9 @@ impl ProjectList {
             // 鼠标不在这一行上:只收自己那一份指示,别人的留给别人清
             if self.drop_indicator.as_ref().is_some_and(|d| d.id == row_id) {
                 self.drop_indicator = None;
+                if self.spring_open_group.as_deref() == Some(row_id) {
+                    self.cancel_spring_open();
+                }
                 cx.notify();
             }
             return;
@@ -2725,13 +3543,14 @@ impl ProjectList {
             // 拖到自己身上不给任何指示(原版 `handleMouseMoveOver` 开头那道 return)
             if self.drop_indicator.as_ref().is_some_and(|d| d.id == row_id) {
                 self.drop_indicator = None;
+                self.cancel_spring_open();
                 cx.notify();
             }
             return;
         }
 
         let position = dnd::drop_position(ratio, allow_inside);
-        let forbidden = {
+        let (forbidden, target_collapsed_group) = {
             let store = self.store.read(cx);
             let empty: Vec<ProjectTreeItem> = Vec::new();
             let tree = store.config().project_tree.as_ref().unwrap_or(&empty);
@@ -2742,7 +3561,7 @@ impl ProjectList {
             } else {
                 Some(ProjectTreeItem::ProjectId(dragged.id.clone()))
             };
-            match dragged_item {
+            let forbidden = match dragged_item {
                 None => false,
                 Some(item) => match position {
                     DropPosition::Inside => !project_tree::can_drop(tree, row_id, &item),
@@ -2750,15 +3569,27 @@ impl ProjectList {
                     _ if dragged.is_group => !project_tree::can_drop_at(tree, row_id, &item),
                     _ => false,
                 },
-            }
+            };
+            let collapsed_group = allow_inside
+                && position == DropPosition::Inside
+                && !forbidden
+                && project_tree::find_group_in_tree(tree, row_id).is_some_and(|g| g.collapsed);
+            (forbidden, collapsed_group)
         };
+
+        if target_collapsed_group {
+            self.schedule_spring_open(row_id.to_string(), cx);
+        } else if self.spring_open_group.as_deref() == Some(row_id) {
+            self.cancel_spring_open();
+        }
 
         let next = DropIndicator {
             id: row_id.to_string(),
             position,
             forbidden,
         };
-        if self.drop_indicator.as_ref() != Some(&next) {
+        if self.drop_indicator.as_ref() != Some(&next) || self.drop_to_root_end {
+            self.drop_to_root_end = false;
             self.drop_indicator = Some(next);
             cx.notify();
         }
@@ -2768,7 +3599,9 @@ impl ProjectList {
     /// gpui 的 `on_drop` 不带坐标,这是硬约束。
     fn on_row_drop(&mut self, dragged: &DragProjectItem, row_id: &str, cx: &mut Context<Self>) {
         let indicator = self.drop_indicator.take();
+        self.drop_to_root_end = false;
         self.dragging = None;
+        self.cancel_spring_open();
         cx.notify();
         let Some(indicator) = indicator else {
             return;
@@ -2911,25 +3744,47 @@ impl ProjectList {
         .detach();
     }
 
-    /// 落点指示线。2px accent 横线,before 贴上沿、after 贴下沿;
-    /// **非法落点不画线**(原版 `renderDropLine` 遇 forbidden 直接 return null)。
-    fn drop_line(&self, id: &str, position: DropPosition, active: bool) -> Option<AnyElement> {
+    /// 落点指示线：左侧 6px 实心圆点 + 2px accent 横线，左缘按目标 `group_depth` 对齐，
+    /// 一眼看清松手后落进组内还是组外。**非法落点不画线**。
+    fn drop_line(
+        &self,
+        id: &str,
+        position: DropPosition,
+        group_depth: usize,
+        active: bool,
+    ) -> Option<AnyElement> {
         let indicator = self.drop_indicator.as_ref()?;
         if !active || indicator.id != id || indicator.position != position || indicator.forbidden {
             return None;
         }
+        let left_x = row_left_margin(group_depth);
         Some(
             div()
                 .absolute()
-                .left(px(4.0))
-                .right(px(4.0))
-                .h(px(2.0))
-                .rounded_full()
-                .bg(ui::accent())
+                .left(px(left_x))
+                .right(px(ROW_MARGIN_X))
+                .h(px(6.0))
+                .flex()
+                .items_center()
                 .map(|el| match position {
-                    DropPosition::Before => el.top(px(-1.0)),
-                    _ => el.bottom(px(-1.0)),
+                    DropPosition::Before => el.top(px(-3.0)),
+                    _ => el.bottom(px(-3.0)),
                 })
+                .child(
+                    div()
+                        .w(px(6.0))
+                        .h(px(6.0))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(ui::accent()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(2.0))
+                        .rounded_r_full()
+                        .bg(ui::accent()),
+                )
                 .into_any_element(),
         )
     }
@@ -2945,6 +3800,15 @@ impl Render for ProjectList {
                 focus.dispatch_action(&SelectAll, window, cx);
             });
         }
+        // 打开行内筛选条后在下一帧把焦点交到输入框。
+        if self.pending_filter_focus
+            && let Some(input) = self.filter_input.clone()
+        {
+            self.pending_filter_focus = false;
+            window.on_next_frame(move |window, cx| {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            });
+        }
         // 拖拽中断(松手在窗外 / 被别人吃掉)后 gpui 会清 active_drag 并重画:
         // 借这一帧把残留的 view state 一并清掉(**不 notify** —— 正在渲染,
         // 再触发一次重画就是死循环)。高亮另外还与 `drag_active` 与门,
@@ -2953,13 +3817,17 @@ impl Render for ProjectList {
         if !drag_active {
             self.dragging = None;
             self.drop_indicator = None;
+            self.drop_to_root_end = false;
+            self.cancel_spring_open();
             // 这一份不清的话,下次拖同一批路径会命中缓存、沿用过期的三态结论
             self.external = None;
         }
         let dragging = self.dragging.clone();
         let external = self.external.as_ref().map(|e| e.kind);
+        let filtering = self.is_filtering(cx);
+        let query_lower = self.filter_query_lower(cx);
 
-        let ordered = {
+        let (ordered, total_projects, has_any_tree_item) = {
             let store = self.store.read(cx);
             // 父项目名下的 worktree 全部删空后清掉旧折叠记录，避免日后再建 worktree 时莫名保持折叠
             if !self.collapsed_worktrees.is_empty() {
@@ -2981,16 +3849,24 @@ impl Render for ProjectList {
                     None
                 }
             });
-            self.visible_ordered(store)
+            let total = projects.len();
+            let has_tree_item = total > 0 || project_tree::has_any_group(tree);
+            (self.visible_ordered(store, cx), total, has_tree_item)
         };
+        if total_projects == 0 && (self.filter_open || self.filter_mode != ProjectFilterMode::All) {
+            self.filter_open = false;
+            self.filter_mode = ProjectFilterMode::All;
+            self.filter_reveal.jump(false);
+            self.pending_filter_focus = false;
+        }
+        let matched_projects = ordered
+            .iter()
+            .filter(|item| matches!(item, OrderedItem::Project { .. }))
+            .count();
+
         // 揭示在这里兑现:此刻的展平表已含 `reveal` 刚展开的分组,行号与这一帧铺出来
         // 的子元素一一对应。目标已不是活动项目(中栏收着时登记、展开前又被别处切走)
         // 就作罢 —— 揭示的语义是「让你看见当前项目」。
-        //
-        // 兑现两帧:gpui 拿**上一帧**画出来的视口矩形与滚动轴来算这次滚动,中栏刚展开
-        // 时那份是旧的(收着期间窗口改过高),开机就收着的话句柄连一次都没画过、全是
-        // 缺省值,这一次会被当成「不可滚」直接丢掉。下一帧按刚画出来的矩形再算一遍;
-        // 第一次已经算对时第二次是空操作(完整可见就不动)
         if let Some(reveal) = self.pending_reveal.take() {
             let still_active = self.store.read(cx).active_project_id.as_deref()
                 == Some(reveal.project_id.as_str());
@@ -3009,9 +3885,28 @@ impl Render for ProjectList {
         self.sync_done_tags(&ordered, window, cx);
         self.chevrons.drive(window);
         let preview = self.render_preview(window, cx);
-        let list = self.render_rows(ordered, dragging.as_deref(), drag_active, window, cx);
-        let footer = self.render_footer(cx);
-        let header = self.render_list_header(cx);
+        let header = self.render_list_header(total_projects, matched_projects, filtering, cx);
+        let filter_bar = self
+            .filter_reveal
+            .is_mounted()
+            .then(|| self.filter_reveal.render(self.render_filter_bar(cx), window));
+
+        let body: AnyElement = if !has_any_tree_item {
+            self.render_empty_state(cx).into_any_element()
+        } else if filtering && ordered.is_empty() {
+            self.render_filter_empty_state(cx).into_any_element()
+        } else {
+            self.render_rows(
+                ordered,
+                dragging.as_deref(),
+                drag_active,
+                filtering,
+                &query_lower,
+                window,
+                cx,
+            )
+            .into_any_element()
+        };
 
         div()
             .id("project-list")
@@ -3031,8 +3926,8 @@ impl Render for ProjectList {
                 this.on_external_drop(paths.paths().to_vec(), window, cx);
             }))
             .child(header)
-            .child(list)
-            .child(footer)
+            .children(filter_bar)
+            .child(body)
             // 悬停缩略图。`deferred(priority 1)` 画在所有常规内容之上,
             // 卡本身不带 `.id()` → 无 hitbox → 等价原版的 pointer-events-none
             .children(preview)
@@ -3043,11 +3938,63 @@ impl Render for ProjectList {
 }
 
 impl ProjectList {
+    /// 行尾悬浮操作按钮的单颗小壳（20×20，供项目行 `···` 与分组行 `+`/`···` 共用）。
+    fn floating_icon_button(
+        &self,
+        id: impl Into<SharedString>,
+        icon: &'static [mt_ui::icons::vector::Shape],
+        tip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id.into())
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_color(ui::text_muted())
+            .hover(|el| el.bg(ui::border_strong()).text_color(ui::text_primary()))
+            .tip(tip)
+            .on_hover(cx.listener(|this, entered: &bool, _window, cx| {
+                this.hover_on_action = *entered;
+                if *entered {
+                    this.close_preview(cx);
+                }
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(VectorIcon::new(icon, px(12.0)).ink(ui::text_secondary()))
+    }
+
+    /// 零抖动悬浮动作胶囊外壳（绝对定位贴行右缘，不推挤主内容）。
+    fn floating_action_bar(&self) -> gpui::Div {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(2.0))
+            .p(px(1.5))
+            .rounded(px(5.0))
+            .bg(ui::bg_elevated())
+            .border_1()
+            .border_color(ui::border_default())
+            .shadow_sm()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_group(
         &self,
         row: GroupRow,
+        is_first_row: bool,
         dragging: Option<&str>,
         drag_active: bool,
+        filtering: bool,
+        query_lower: &str,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let GroupRow {
@@ -3056,6 +4003,7 @@ impl ProjectList {
             collapsed,
             count,
             depth,
+            ref collapsed_summary,
         } = row.clone();
         let inside_target = drag_active
             && self
@@ -3065,6 +4013,7 @@ impl ProjectList {
         let forbidden =
             inside_target && self.drop_indicator.as_ref().is_some_and(|d| d.forbidden);
         let is_source = dragging == Some(id.as_str());
+        let hovered = self.hovered.as_deref() == Some(id.as_str());
 
         let id_toggle = id.clone();
         let id_move = id.clone();
@@ -3072,10 +4021,16 @@ impl ProjectList {
         let id_drag = id.clone();
         let id_key = id.clone();
         let id_focus = id.clone();
+        let id_hover = id.clone();
+        let id_empty_move = id.clone();
+        let id_empty_drop = id.clone();
+        let id_add_btn = id.clone();
         let name_drag = name.clone();
         let row_menu = row.clone();
+        let row_more_menu = row.clone();
         let this = cx.entity();
         let focus = self.row_focus.get(id.as_str()).cloned();
+        let is_focused = focus.as_ref().is_some_and(|f| f.is_focused(window));
         // 编辑中的那一行:名字换成内联输入框,行本身的点击/按键让给它
         let editing = self
             .editing
@@ -3083,137 +4038,331 @@ impl ProjectList {
             .filter(|e| e.is_group && e.id == id)
             .map(|e| e.input.clone());
 
-        div()
+        let collapsed_active = collapsed && !filtering && collapsed_summary.contains_active;
+        let collapsed_ind = (collapsed && !filtering)
+            .then(|| collapsed_status_indicator(collapsed_summary))
+            .flatten();
+        let guides = group_guide_lines(depth);
+        let ml = row_left_margin(depth);
+
+        let border_color = if forbidden {
+            ui::color_error()
+        } else if inside_target {
+            ui::accent()
+        } else if is_focused && editing.is_none() {
+            ui::with_alpha(ui::accent(), 0.58)
+        } else if collapsed_active {
+            ui::with_alpha(ui::accent(), 0.28)
+        } else {
+            ui::with_alpha(ui::border_default(), 0.0)
+        };
+
+        let show_actions = hovered && editing.is_none() && !drag_active;
+        let show_empty_hint = !collapsed && count == 0 && !filtering;
+
+        let group_bar = div()
+            .id(SharedString::from(format!("group-{id}")))
             .relative()
+            // 分组行同样可 Tab 可聚焦(原版 `tabIndex={0}` + `role=treeitem`)
+            .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                this.on_group_key(event, &id_key, collapsed, window, cx);
+            }))
+            .on_hover(cx.listener(move |this, entered: &bool, _window, cx| {
+                let mine = this.hovered.as_deref() == Some(id_hover.as_str());
+                if *entered {
+                    if mine {
+                        return;
+                    }
+                    this.hovered = Some(id_hover.clone());
+                    this.close_preview(cx);
+                } else {
+                    if !mine {
+                        return;
+                    }
+                    this.hovered = None;
+                    this.hover_on_action = false;
+                }
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                    this.close_preview(cx);
+                    if this.editing.is_none()
+                        && let Some(focus) = this.row_focus.get(id_focus.as_str())
+                    {
+                        window.focus(focus, cx);
+                    }
+                }),
+            )
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .ml(px(ml))
+            .mr(px(ROW_MARGIN_X))
+            .when(!is_first_row, |el| el.mt(px(4.0)))
+            .my(px(1.0))
+            .pl(px(6.0))
+            .pr(px(8.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(border_color)
+            .when(forbidden || inside_target, |el| el.border_dashed())
+            .cursor_pointer()
+            .text_size(ui::font_px(11.5))
+            .text_color(if collapsed_active {
+                ui::text_primary()
+            } else {
+                ui::text_secondary()
+            })
+            .when(is_source, |el| el.opacity(0.4))
+            .when(inside_target && !forbidden, |el| el.bg(ui::accent_subtle()))
+            .when(!inside_target && collapsed_active, |el| {
+                el.bg(ui::with_alpha(ui::accent(), 0.06))
+            })
+            .when(!inside_target, |el| {
+                el.hover(|el| {
+                    el.bg(ui::with_alpha(ui::text_primary(), 0.045))
+                        .text_color(ui::text_primary())
+                })
+            })
+            .when(!filtering, |el| {
+                let id_drag_payload = id_drag.clone();
+                let id_move = id_move.clone();
+                let id_drop = id_drop.clone();
+                el.on_drag(
+                    DragProjectItem {
+                        id: id_drag_payload,
+                        is_group: true,
+                    },
+                    move |item, _offset, _window, cx| {
+                        let id = item.id.clone();
+                        this.update(cx, |this: &mut ProjectList, _cx| {
+                            this.dragging = Some(id);
+                        });
+                        dnd::preview(name_drag.clone(), PreviewIcon::Group, cx)
+                    },
+                )
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
+                        // 分组行是容器:allow_inside = true
+                        this.on_row_drag_move(event, &id_move, true, cx);
+                    },
+                ))
+                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
+                    this.on_row_drop(item, &id_drop, cx);
+                }))
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                // 编辑态与过滤态里点分组不切换真实折叠状态
+                if this.editing.is_some() || this.is_filtering(cx) {
+                    return;
+                }
+                this.toggle_group_with_anim(&id_toggle, collapsed, cx);
+            }))
+            // Esc 放弃重命名。输入框自己不吃 Escape(`clean_on_escape` 没开,
+            // 它 `cx.propagate()`),所以在承载它的这一层收
+            .when(editing.is_some(), |el| {
+                el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_rename(cx);
+                    }
+                }))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let entries = group_menu(&cx.entity(), &this.store, &row_menu);
+                    menu::show(event.position, entries, window, cx);
+                }),
+            )
+            // 折叠箭头：矢量实心三角，平滑旋转
             .child(
                 div()
-                    .id(SharedString::from(format!("group-{id}")))
-                    // 分组行同样可 Tab 可聚焦(原版 `tabIndex={0}` + `role=treeitem`)
-                    .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        this.on_group_key(event, &id_key, collapsed, window, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                            this.close_preview(cx);
-                            if this.editing.is_none()
-                                && let Some(focus) = this.row_focus.get(id_focus.as_str())
-                            {
-                                window.focus(focus, cx);
-                            }
-                        }),
-                    )
+                    .w(px(12.0))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .pl(px(depth as f32 * 16.0))
-                    .pr(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(3.0))
-                    .cursor_pointer()
-                    .text_size(ui::font_px(11.4))
+                    .justify_center()
+                    .text_size(ui::font_px(9.5))
                     .text_color(ui::text_muted())
-                    .when(is_source, |el| el.opacity(0.4))
-                    .when(forbidden, |el| {
-                        el.border_1().border_dashed().border_color(ui::color_error())
-                    })
-                    .when(inside_target && !forbidden, |el| {
-                        el.bg(ui::accent_subtle())
-                            .border_1()
-                            .border_dashed()
-                            .border_color(ui::accent())
-                    })
-                    .when(!inside_target, |el| {
-                        el.hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-                    })
-                    .on_drag(
-                        DragProjectItem {
-                            id: id_drag.clone(),
-                            is_group: true,
-                        },
-                        move |item, _offset, _window, cx| {
-                            let id = item.id.clone();
-                            this.update(cx, |this: &mut ProjectList, _cx| {
-                                this.dragging = Some(id);
-                            });
-                            dnd::preview(name_drag.clone(), PreviewIcon::Group, cx)
-                        },
-                    )
-                    .on_drag_move(cx.listener(
-                        move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
-                            // 分组行是容器:allow_inside = true
-                            this.on_row_drag_move(event, &id_move, true, cx);
-                        },
-                    ))
-                    .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                        this.on_row_drop(item, &id_drop, cx);
-                    }))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        // 编辑态里点自己不该顺带折叠(原版行的 onKeyDown 整体 return
-                        // 是同一个道理:这一行的交互全让给输入框)
-                        if this.editing.is_some() {
-                            return;
-                        }
-                        this.toggle_group_with_anim(&id_toggle, collapsed, cx);
-                    }))
-                    // Esc 放弃重命名。输入框自己不吃 Escape(`clean_on_escape` 没开,
-                    // 它 `cx.propagate()`),所以在承载它的这一层收
-                    .when(editing.is_some(), |el| {
-                        el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                            if event.keystroke.key == "escape" {
-                                cx.stop_propagation();
-                                this.cancel_rename(cx);
-                            }
-                        }))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            let entries = group_menu(&cx.entity(), &this.store, &row_menu);
-                            menu::show(event.position, entries, window, cx);
-                        }),
-                    )
-                    // 折叠箭头。原版是一个恒定的 ▾ 加 `rotate(-90deg)`;这里是同大小同位置的
-                    // 矢量三角(颜色随行的字色),只让刚翻的那一行转过去(见 `fold_motion`)
-                    .child(
-                        div()
-                            .w(px(12.0))
-                            .flex_shrink_0()
-                            .text_size(ui::font_px(9.75))
-                            .child(crate::fold_motion::fold_glyph(self.chevrons.value_open(
-                                &id,
-                                !collapsed,
-                                crate::fold_motion::OPEN_TURNS,
-                            ))),
-                    )
-                    // 「分组 = 空间」:容器图标,着主题文件夹色
-                    .child(
-                        VectorIcon::new(dnd::BOXES_SHAPES, px(13.0))
-                            .ink(ui::color_folder()),
-                    )
-                    .map(|el| match &editing {
-                        // 组名输入框比项目行小一档(原版 `text-sm` vs `text-base`)
-                        Some(input) => el.child(self.rename_input(input, 11.4)),
-                        None => el.child(
-                            div()
-                                .flex_1()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(name),
-                        ),
-                    })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_size(ui::font_px(9.75))
-                            .text_color(ui::text_muted())
-                            .child(format!("({count})")),
-                    ),
+                    .child(crate::fold_motion::fold_glyph(self.chevrons.value_open(
+                        &id,
+                        !collapsed || filtering,
+                        crate::fold_motion::OPEN_TURNS,
+                    ))),
             )
-            .children(self.drop_line(&id_drag, DropPosition::Before, drag_active))
-            .children(self.drop_line(&id_drag, DropPosition::After, drag_active))
+            // 「分组 = 空间」:容器图标,着主题文件夹色
+            .child(VectorIcon::new(dnd::BOXES_SHAPES, px(13.0)).ink(ui::color_folder()))
+            .map(|el| match &editing {
+                Some(input) => el.child(self.rename_input(input, 11.5)),
+                None => el.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(highlighted_text(name, query_lower)),
+                ),
+            })
+            // 折叠态聚合指示器（不漏掉折叠组里的活动项目 / AI 待办 / 完工 / 报错）
+            .when(collapsed_active, |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("group-active-dot-{id}")))
+                        .w(px(5.0))
+                        .h(px(5.0))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(ui::accent())
+                        .tip(t("projectList", "group.collapsedActiveTip")),
+                )
+            })
+            .children(collapsed_ind)
+            // 右侧计数胶囊（替代老式 `(3)` 括号文本）
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(18.0))
+                    .h(px(16.0))
+                    .px(px(5.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if collapsed_active {
+                        ui::accent_subtle()
+                    } else {
+                        ui::border_subtle()
+                    })
+                    .text_size(ui::font_px(10.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if collapsed_active {
+                        ui::accent()
+                    } else if count == 0 {
+                        ui::with_alpha(ui::text_muted(), 0.7)
+                    } else {
+                        ui::text_muted()
+                    })
+                    .child(count.to_string()),
+            )
+            // 零抖动悬浮动作胶囊：`[+]` 添加到此分组 + `[···]` 分组菜单
+            .when(show_actions, |el| {
+                let row_more = row_more_menu.clone();
+                el.child(
+                    div()
+                        .absolute()
+                        .right(px(4.0))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .child(
+                            self.floating_action_bar()
+                                .child(
+                                    self.floating_icon_button(
+                                        format!("group-add-{id}"),
+                                        ICON_PLUS,
+                                        t("projectList", "group.addTip"),
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            let entries =
+                                                group_add_menu(&this.store, &id_add_btn, depth);
+                                            menu::show(
+                                                click_position(event, window),
+                                                entries,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    self.floating_icon_button(
+                                        format!("group-more-{id}"),
+                                        ICON_MORE,
+                                        t("projectList", "group.moreTip"),
+                                        cx,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            let entries = group_menu(
+                                                &cx.entity(),
+                                                &this.store,
+                                                &row_more,
+                                            );
+                                            menu::show(
+                                                click_position(event, window),
+                                                entries,
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                ),
+                        ),
+                )
+            });
+
+        // 空分组展开提示条：挂在同一外层 div 内，保持滚动列表直接子元素 1:1 下标，不破坏 scroll_to_item
+        let empty_hint = show_empty_hint.then(|| {
+            let child_ml = row_left_margin(depth + 1);
+            let child_guides = group_guide_lines(depth + 1);
+            div()
+                .id(SharedString::from(format!("group-empty-{id}")))
+                .relative()
+                .py(px(2.0))
+                .children(child_guides)
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
+                        this.on_empty_group_drag_move(event, &id_empty_move, cx);
+                    },
+                ))
+                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
+                    this.on_row_drop(item, &id_empty_drop, cx);
+                }))
+                .child(
+                    div()
+                        .ml(px(child_ml))
+                        .mr(px(ROW_MARGIN_X))
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .rounded(px(5.0))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(if inside_target && !forbidden {
+                            ui::accent()
+                        } else {
+                            ui::border_subtle()
+                        })
+                        .when(inside_target && !forbidden, |el| el.bg(ui::accent_subtle()))
+                        .text_size(ui::font_px(10.5))
+                        .text_color(if inside_target && !forbidden {
+                            ui::accent()
+                        } else {
+                            ui::with_alpha(ui::text_muted(), 0.78)
+                        })
+                        .child(t("projectList", "group.emptyHint")),
+                )
+        });
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .children(guides)
+            .child(group_bar)
+            .children(empty_hint)
+            .children(self.drop_line(&id_drag, DropPosition::Before, depth, drag_active))
+            .children(self.drop_line(&id_drag, DropPosition::After, depth, drag_active))
             .into_any_element()
     }
 
@@ -3270,14 +4419,42 @@ impl ProjectList {
         }
     }
 
+    /// 汇总一批后代项目 id 的折叠聚合状态（供折叠分组行与折叠 worktree 父项目共用）。
+    fn summarize_projects(
+        store: &AppStore,
+        active: Option<&str>,
+        ids: &[String],
+    ) -> CollapsedSummary {
+        let mut summary = CollapsedSummary::default();
+        for desc_id in ids {
+            let is_desc_active = active == Some(desc_id.as_str());
+            if is_desc_active {
+                summary.contains_active = true;
+            }
+            if let Some(st) = store.project_state(desc_id) {
+                summary.light = summary.light.max(st.highest_light());
+                if shows_done_tag(st.needs_attention, is_desc_active) {
+                    summary.has_done = true;
+                }
+                if st.ssh_connected().is_some() {
+                    summary.has_ssh = true;
+                }
+            }
+        }
+        summary
+    }
+
     /// 列表本体:`get_ordered_tree` 展平出来的分组行 / 项目行逐条铺开。
     /// 静止时 1:1 扁平输出（不破坏 `scroll_to_item` 行号）；仅刚翻态仍在飞的分组与
-    /// worktree 簇由 [`Self::render_ordered_slice`] 临时包进 `HeightReveal` 裁剪窗。
+    /// worktree 簇临时包进 `HeightReveal` 裁剪窗；尾部附带弹性空白区（右键 / 顶层末尾拖放）。
+    #[allow(clippy::too_many_arguments)]
     fn render_rows(
         &self,
         ordered: Vec<OrderedItem>,
         dragging: Option<&str>,
         drag_active: bool,
+        filtering: bool,
+        query_lower: &str,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3292,7 +4469,7 @@ impl ProjectList {
             .unwrap_or_default();
 
         // 若有分组或 worktree 簇正在播「收起最后一程」，把它临时留在渲染表里供 HeightReveal 裁到 0
-        let (render_ordered, effective_collapsed_wt) = if self.folds.is_animating() {
+        let (render_ordered, effective_collapsed_wt) = if !filtering && self.folds.is_animating() {
             let mut closing_groups = HashSet::new();
             let mut closing_wt = HashSet::new();
             for key in self.folds.closing_keys() {
@@ -3314,6 +4491,8 @@ impl ProjectList {
             let filtered =
                 project_tree::filter_collapsed_worktrees(base, store_ref.projects(), &effective_wt);
             (filtered, effective_wt)
+        } else if filtering {
+            (ordered, HashSet::new())
         } else {
             (ordered, self.collapsed_worktrees.clone())
         };
@@ -3373,12 +4552,23 @@ impl ProjectList {
                     depth,
                     ..
                 } => {
+                    let collapsed_summary = if collapsed && !filtering {
+                        let desc_ids = project_tree::group_descendant_project_ids(
+                            &tree_snapshot,
+                            store_ref.projects(),
+                            &id,
+                        );
+                        Self::summarize_projects(store_ref, active.as_deref(), &desc_ids)
+                    } else {
+                        CollapsedSummary::default()
+                    };
                     prepared.push(PreparedRow::Group(GroupRow {
                         id,
                         name,
                         collapsed,
                         count,
                         depth,
+                        collapsed_summary,
                     }));
                 }
                 OrderedItem::Project {
@@ -3418,26 +4608,20 @@ impl ProjectList {
                         }
                         _ => false,
                     };
-                    let collapsed_summary = if self.collapsed_worktrees.contains(&id) {
-                        let mut summary = CollapsedWorktreeSummary::default();
-                        for desc_id in project_tree::worktree_descendants(store.projects(), &id) {
-                            let is_desc_active = active.as_deref() == Some(desc_id.as_str());
-                            if is_desc_active {
-                                summary.contains_active = true;
-                            }
-                            if let Some(st) = store.project_state(&desc_id) {
-                                summary.light = summary.light.max(st.highest_light());
-                                if shows_done_tag(st.needs_attention, is_desc_active) {
-                                    summary.has_done = true;
-                                }
-                                if st.ssh_connected().is_some() {
-                                    summary.has_ssh = true;
-                                }
-                            }
+                    let group_depth = if parent_group_id.is_some() {
+                        match &cluster_role {
+                            ProjectClusterRole::Child { root_depth, .. } => *root_depth,
+                            _ => depth,
                         }
-                        summary
                     } else {
-                        CollapsedWorktreeSummary::default()
+                        0
+                    };
+                    let collapsed_summary = if !filtering && self.collapsed_worktrees.contains(&id)
+                    {
+                        let desc_ids = project_tree::worktree_descendants(store.projects(), &id);
+                        Self::summarize_projects(store, active.as_deref(), &desc_ids)
+                    } else {
+                        CollapsedSummary::default()
                     };
                     let row = Row {
                         id: p.id.clone(),
@@ -3457,6 +4641,7 @@ impl ProjectList {
                         cluster_role,
                         cluster_has_active,
                         collapsed_summary,
+                        group_depth,
                         ai_vendors,
                         // 远程项目的路径是远端 POSIX 路径,本机 worktree 探测与它无关
                         worktree_branch: if remote.is_some() {
@@ -3479,8 +4664,11 @@ impl ProjectList {
         fn build_slice(
             this: &ProjectList,
             items: &[PreparedRow],
+            slice_offset: usize,
             dragging: Option<&str>,
             drag_active: bool,
+            filtering: bool,
+            query_lower: &str,
             tree_snapshot: &[ProjectTreeItem],
             in_animated_tray: bool,
             window: &Window,
@@ -3489,11 +4677,23 @@ impl ProjectList {
             let mut out = Vec::new();
             let mut i = 0;
             while i < items.len() {
+                let global_index = slice_offset + i;
                 match &items[i] {
                     PreparedRow::Group(group) => {
-                        out.push(this.render_group(group.clone(), dragging, drag_active, cx));
+                        out.push(this.render_group(
+                            group.clone(),
+                            global_index == 0,
+                            dragging,
+                            drag_active,
+                            filtering,
+                            query_lower,
+                            window,
+                            cx,
+                        ));
                         let key = format!("grp:{}", group.id);
-                        if let Some(fold) = this.folds.get(&key) {
+                        if !filtering
+                            && let Some(fold) = this.folds.get(&key)
+                        {
                             let depth = group.depth;
                             let mut j = i + 1;
                             while j < items.len() && items[j].depth() > depth {
@@ -3503,8 +4703,11 @@ impl ProjectList {
                                 let children = build_slice(
                                     this,
                                     &items[i + 1..j],
+                                    slice_offset + i + 1,
                                     dragging,
                                     drag_active,
+                                    filtering,
+                                    query_lower,
                                     tree_snapshot,
                                     false,
                                     window,
@@ -3520,7 +4723,8 @@ impl ProjectList {
                     }
                     PreparedRow::Project { row, is_active } => {
                         let wt_key = format!("wt:{}", row.id);
-                        if !row.is_child
+                        if !filtering
+                            && !row.is_child
                             && let Some(fold) = this.folds.get(&wt_key)
                         {
                             let mut j = i + 1;
@@ -3538,15 +4742,21 @@ impl ProjectList {
                                 false,
                                 dragging,
                                 drag_active,
+                                filtering,
+                                query_lower,
                                 tree_snapshot,
+                                window,
                                 cx,
                             ));
                             if j > i + 1 {
                                 let child_elems = build_slice(
                                     this,
                                     &items[i + 1..j],
+                                    slice_offset + i + 1,
                                     dragging,
                                     drag_active,
+                                    filtering,
+                                    query_lower,
                                     tree_snapshot,
                                     true,
                                     window,
@@ -3558,22 +4768,30 @@ impl ProjectList {
                                 } else {
                                     ui::border_default()
                                 };
+                                let ml = row_left_margin(row.group_depth);
+                                let guides = group_guide_lines(row.group_depth);
                                 // 微容器底部外框包在 HeightReveal 之外：收起 / 展开时圆角底边
                                 // 像物理抽屉一样平滑上下滑动，不会被裁剪窗削平
                                 let tray_inner =
                                     div().flex().flex_col().pb(px(3.0)).children(child_elems);
                                 out.push(
                                     div()
-                                        .mx(px(CLUSTER_MARGIN_X))
-                                        .mb(px(3.0))
-                                        .rounded_b(px(CLUSTER_RADIUS))
-                                        .border_l_1()
-                                        .border_r_1()
-                                        .border_b_1()
-                                        .border_color(cluster_border)
-                                        .bg(cluster_bg)
-                                        .overflow_hidden()
-                                        .child(fold.render(tray_inner, window))
+                                        .relative()
+                                        .children(guides)
+                                        .child(
+                                            div()
+                                                .ml(px(ml))
+                                                .mr(px(ROW_MARGIN_X))
+                                                .mb(px(3.0))
+                                                .rounded_b(px(CLUSTER_RADIUS))
+                                                .border_l_1()
+                                                .border_r_1()
+                                                .border_b_1()
+                                                .border_color(cluster_border)
+                                                .bg(cluster_bg)
+                                                .overflow_hidden()
+                                                .child(fold.render(tray_inner, window)),
+                                        )
                                         .into_any_element(),
                                 );
                             }
@@ -3586,7 +4804,10 @@ impl ProjectList {
                             in_animated_tray,
                             dragging,
                             drag_active,
+                            filtering,
+                            query_lower,
                             tree_snapshot,
+                            window,
                             cx,
                         ));
                         i += 1;
@@ -3599,19 +4820,25 @@ impl ProjectList {
         let elements = build_slice(
             self,
             &prepared,
+            0,
             dragging,
             drag_active,
+            filtering,
+            query_lower,
             &tree_snapshot,
             false,
             window,
             cx,
         );
 
+        let bottom_zone = (!filtering).then(|| self.render_bottom_drop_zone(drag_active, cx));
+
         div()
             .id("project-list-rows")
             .flex()
             .flex_col()
             .flex_1()
+            .py(px(4.0))
             .overflow_y_scroll()
             // 滚动偏移交给句柄持有,揭示才滚得动它(见模块注释「揭示」)
             .track_scroll(&self.rows_scroll)
@@ -3620,210 +4847,666 @@ impl ProjectList {
                 this.close_preview(cx);
             }))
             .children(elements)
+            .children(bottom_zone)
     }
 
-    /// 栏头:只有 "PROJECTS" 文本 + 空白右键菜单(原版没有 `+` 按钮)。
-    fn render_list_header(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    /// 列表尾部弹性空白区：支持空白处右键新建，也作为把深层分组或 worktree 子项
+    /// 拖回顶层末尾的兜底落点（排在最后一位，不改变前面任何行的 `scroll_to_item` 下标）。
+    fn render_bottom_drop_zone(
+        &self,
+        drag_active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let active_target = drag_active && self.drop_to_root_end;
+        div()
+            .id("project-list-bottom-zone")
+            .flex_1()
+            .min_h(px(44.0))
+            .px(px(ROW_MARGIN_X))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .justify_start()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.close_preview(cx);
+                    let entries = add_menu(&this.store);
+                    menu::show(event.position, entries, window, cx);
+                }),
+            )
+            .on_drag_move(cx.listener(
+                |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
+                    this.on_bottom_zone_drag_move(event, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, item: &DragProjectItem, _window, cx| {
+                this.on_bottom_zone_drop(item, cx);
+            }))
+            .when(active_target, |el| {
+                el.child(
+                    div()
+                        .h(px(28.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(ui::accent())
+                        .bg(ui::accent_subtle())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(ui::font_px(10.5))
+                        .text_color(ui::accent())
+                        .child(t("projectList", "dropToRootEnd")),
+                )
+            })
+    }
+
+    /// 顶部栏头（严格保持 `ui::PANEL_HEADER_H = 30px`，与右侧工作台页签条底边线齐平）：
+    /// 左侧标题 + 轻量计数胶囊，右侧精炼工具按钮组（筛选 / 全部折叠展开 / `+` 添加菜单）。
+    fn render_list_header(
+        &self,
+        total_projects: usize,
+        matched_projects: usize,
+        filtering: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (has_foldable, any_expanded) = self.any_foldable_expanded(self.store.read(cx));
+        let filter_active = self.filter_open || filtering;
+
+        let header_btn = |id: &'static str, active: bool| {
+            div()
+                .id(id)
+                .w(px(22.0))
+                .h(px(22.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .when(active, |el| el.bg(ui::accent_subtle()))
+                .hover(|el| el.bg(ui::border_subtle()))
+        };
+
+        let count_text = if filtering {
+            format!("{matched_projects}/{total_projects}")
+        } else {
+            total_projects.to_string()
+        };
+
         div()
             .id("project-list-header")
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(6.0))
             .px(px(10.0))
             // 高度与右侧工作台页签条对齐(见 `ui::PANEL_HEADER_H`),不靠内衬凑
             .h(px(ui::PANEL_HEADER_H))
             .flex_none()
             .border_b_1()
             .border_color(ui::border_subtle())
-            // 标题栏空白右键 = 新建分组(原版 `ProjectList.tsx:1069-1074`)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    let entries = new_group_menu(&this.store);
+                    let entries = add_menu(&this.store);
                     menu::show(event.position, entries, window, cx);
                 }),
             )
-            // 原版头部只有 "PROJECTS" 文本 + 空白右键菜单,没有 `+` 按钮
-            // (添加项目在底部按钮条)
             .child(
                 div()
-                    .text_size(ui::font_px(11.0))
-                    .text_color(ui::text_muted())
-                    .child(t("panels", "projects")),
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .min_w(px(0.0))
+                    .child(
+                        div()
+                            .text_size(ui::font_px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(ui::text_muted())
+                            .child(t("panels", "projects")),
+                    )
+                    .when(total_projects > 0, |el| {
+                        el.child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(0.5))
+                                .rounded_full()
+                                .bg(if filtering {
+                                    ui::accent_subtle()
+                                } else {
+                                    ui::border_subtle()
+                                })
+                                .text_size(ui::font_px(9.5))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if filtering {
+                                    ui::accent()
+                                } else {
+                                    ui::text_muted()
+                                })
+                                .child(count_text),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .gap(px(2.0))
+                    .when(total_projects > 0, |el| {
+                        el.child(
+                            header_btn("project-header-filter", filter_active)
+                                .tip(t("projectList", "header.filterTip"))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.toggle_filter(window, cx);
+                                }))
+                                .child(
+                                    VectorIcon::new(ICON_SEARCH, px(12.5)).ink(if filter_active {
+                                        ui::accent()
+                                    } else {
+                                        ui::text_muted()
+                                    }),
+                                ),
+                        )
+                    })
+                    .when(has_foldable && !filtering, |el| {
+                        let (icon, tip) = if any_expanded {
+                            (ICON_COLLAPSE_ALL, t("projectList", "header.collapseAll"))
+                        } else {
+                            (ICON_EXPAND_ALL, t("projectList", "header.expandAll"))
+                        };
+                        el.child(
+                            header_btn("project-header-fold-all", false)
+                                .tip(tip)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.toggle_all_folds(cx);
+                                }))
+                                .child(VectorIcon::new(icon, px(12.5)).ink(ui::text_muted())),
+                        )
+                    })
+                    .child(
+                        header_btn("project-header-add", false)
+                            .tip(t("projectList", "header.addTip"))
+                            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.close_preview(cx);
+                                let entries = add_menu(&this.store);
+                                menu::show(click_position(event, window), entries, window, cx);
+                            }))
+                            .child(VectorIcon::new(ICON_PLUS, px(13.0)).ink(ui::text_muted())),
+                    ),
             )
     }
 
-    /// 底部按钮条:添加本地项目 / 添加远程项目 / 新建分组。
-    ///
-    /// 原版(`ProjectList.tsx:1087-1113`)是「+ 添加项目 / SSH / +」:后两颗要悬停才
-    /// 说得清自己是干什么的,issue #83 的用户就把「SSH」当成了「添加 SSH 连接」。
-    /// 现在每颗都写明动作,领位图标与它建出来的那种行同一枚(文件夹 / 服务器 /
-    /// 分组容器),悬停提示再补一句细节。中栏拖窄放不下一行就**折行**而不是截断 ——
-    /// 截成「添加本…」又回到了要靠猜的老路。
-    fn render_footer(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let dashed_button = |id: &'static str, icon: AnyElement, label: &'static str| {
+    /// 原地行内筛选条（经 `HeightReveal` 从栏头下方平滑展开）：
+    /// 紧凑搜索框（支持 `Esc` 收起、`↓` 进入首行、`Enter` 切首项目）+ 状态快捷芯片。
+    fn render_filter_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (ai_active_count, remote_count) = {
+            let store = self.store.read(cx);
+            let active_id = store.active_project_id.as_deref();
+            let mut ai_cnt = 0usize;
+            let mut rem_cnt = 0usize;
+            for p in store.projects() {
+                if crate::ssh_conn::is_remote_project(p) {
+                    rem_cnt += 1;
+                }
+                let st = store.project_state(&p.id);
+                let light = st.map(|s| s.highest_light()).unwrap_or_default();
+                let needs = st.map(|s| s.needs_attention).unwrap_or(false);
+                if is_ai_active_project(light, needs, active_id == Some(p.id.as_str())) {
+                    ai_cnt += 1;
+                }
+            }
+            (ai_cnt, rem_cnt)
+        };
+        let has_query = !self.filter_query_lower(cx).is_empty();
+        let mode = self.filter_mode;
+
+        let chip = |id: &'static str, label: String, selected: bool| {
             div()
                 .id(id)
-                // 按自然宽度起步、平分剩余空间;一行放不下就整颗挪到下一行(见上)
-                .flex_grow_1()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .py(px(8.0))
-                .rounded(px(6.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded_full()
                 .border_1()
-                .border_dashed()
-                .border_color(ui::border_default())
+                .border_color(if selected {
+                    ui::with_alpha(ui::accent(), 0.35)
+                } else {
+                    ui::with_alpha(ui::border_default(), 0.0)
+                })
+                .bg(if selected {
+                    ui::accent_subtle()
+                } else {
+                    ui::border_subtle()
+                })
                 .cursor_pointer()
-                .text_size(ui::font_px(11.4))
-                .text_color(ui::text_muted())
-                .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-                .child(icon)
-                .child(div().whitespace_nowrap().child(label))
+                .text_size(ui::font_px(10.0))
+                .font_weight(if selected {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .text_color(if selected {
+                    ui::accent()
+                } else {
+                    ui::text_muted()
+                })
+                .hover(|el| {
+                    el.bg(if selected {
+                        ui::accent_subtle()
+                    } else {
+                        ui::border_default()
+                    })
+                    .text_color(if selected {
+                        ui::accent()
+                    } else {
+                        ui::text_primary()
+                    })
+                })
+                .child(label)
         };
-        let store_for_add = self.store.clone();
+
+        let ai_label = if ai_active_count > 0 {
+            format!("{} · {ai_active_count}", t("projectList", "filter.aiActive"))
+        } else {
+            t("projectList", "filter.aiActive").to_string()
+        };
+        let remote_label = format!("{} · {remote_count}", t("projectList", "filter.remote"));
+
         div()
             .flex()
-            .flex_wrap()
-            .flex_none()
-            .gap(px(6.0))
-            .p(px(8.0))
+            .flex_col()
+            .gap(px(5.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .bg(ui::with_alpha(ui::bg_base(), 0.35))
+            // 捕获相先于 Input 处理 Esc（清空并收起）与 ↓（焦点跳到列表首行）
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let plain = !event.keystroke.modifiers.modified();
+                match event.keystroke.key.as_str() {
+                    "escape" => {
+                        cx.stop_propagation();
+                        this.close_filter(true, window, cx);
+                    }
+                    "down" if plain => {
+                        cx.stop_propagation();
+                        this.focus_first_visible_row(window, cx);
+                    }
+                    _ => {}
+                }
+            }))
             .child(
-                dashed_button(
-                    "add-project",
-                    FileIcon::folder(false)
-                        .size(px(14.0))
-                        .color(ui::color_file())
-                        .into_any_element(),
-                    t("projectList", "addProject"),
-                )
-                .tip(t("projectList", "addProjectTip"))
-                .on_click(move |_event, window, cx| {
-                    modal::open_add_project(store_for_add.clone(), window, cx);
+                div()
+                    .h(px(24.0))
+                    .px(px(6.0))
+                    .rounded(px(5.0))
+                    .bg(ui::bg_base())
+                    .border_1()
+                    .border_color(ui::border_default())
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(VectorIcon::new(ICON_SEARCH, px(11.5)).ink(ui::text_muted()))
+                    .when_some(self.filter_input.as_ref(), |el, input| {
+                        el.child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .text_size(ui::font_px(11.5))
+                                .text_color(ui::text_primary())
+                                .child(Input::new(input).appearance(false)),
+                        )
+                    })
+                    .when(has_query, |el| {
+                        el.child(
+                            div()
+                                .id("project-filter-clear-query")
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.0))
+                                .cursor_pointer()
+                                .hover(|el| el.bg(ui::border_subtle()))
+                                .tip(t("projectList", "filter.clear"))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    if let Some(input) = this.filter_input.clone() {
+                                        input.update(cx, |state, cx| {
+                                            state.set_value(String::new(), window, cx);
+                                            state.focus(window, cx);
+                                        });
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(
+                                    VectorIcon::new(ICON_CLOSE_SM, px(10.0)).ink(ui::text_muted()),
+                                ),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .child(
+                        chip(
+                            "project-filter-all",
+                            t("projectList", "filter.all").to_string(),
+                            mode == ProjectFilterMode::All,
+                        )
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.filter_mode = ProjectFilterMode::All;
+                            this.folds.clear();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        chip(
+                            "project-filter-ai",
+                            ai_label,
+                            mode == ProjectFilterMode::AiActive,
+                        )
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.filter_mode = if this.filter_mode == ProjectFilterMode::AiActive {
+                                ProjectFilterMode::All
+                            } else {
+                                ProjectFilterMode::AiActive
+                            };
+                            this.folds.clear();
+                            cx.notify();
+                        })),
+                    )
+                    .when(remote_count > 0, |el| {
+                        el.child(
+                            chip(
+                                "project-filter-remote",
+                                remote_label,
+                                mode == ProjectFilterMode::Remote,
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.filter_mode = if this.filter_mode == ProjectFilterMode::Remote
+                                {
+                                    ProjectFilterMode::All
+                                } else {
+                                    ProjectFilterMode::Remote
+                                };
+                                this.folds.clear();
+                                cx.notify();
+                            })),
+                        )
+                    }),
+            )
+    }
+
+    /// 零项目时的空态引导卡片：清晰交代拖放文件夹与添加本地 / 远程项目入口。
+    fn render_empty_state(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let store_local = self.store.clone();
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .p(px(12.0))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let entries = add_menu(&this.store);
+                    menu::show(event.position, entries, window, cx);
                 }),
             )
             .child(
-                dashed_button(
-                    "add-remote-project",
-                    VectorIcon::new(SERVER, px(14.0))
-                        .ink(ui::color_info())
-                        .into_any_element(),
-                    t("projectList", "addRemoteProject"),
-                )
-                .tip(t("projectList", "addRemoteProjectTip"))
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    crate::remote_project::open(this.store.clone(), None, window, cx);
-                })),
-            )
-            .child(
-                dashed_button(
-                    "new-group",
-                    VectorIcon::new(dnd::BOXES_SHAPES, px(13.0))
-                        .ink(ui::color_folder())
-                        .into_any_element(),
-                    t("projectList", "newGroup"),
-                )
-                .tip(t("projectList", "newGroupTip"))
-                .on_click(cx.listener(|this, _event, window, cx| {
-                    let store = this.store.clone();
-                    crate::prompt::show_prompt(
-                        t("projectList", "newGroup"),
-                        t("projectList", "newGroupPlaceholder"),
-                        "",
-                        move |value, _window, cx| {
-                            store.update(cx, |store, cx| store.create_group(&value, None, cx));
-                        },
-                        window,
-                        cx,
-                    );
-                })),
+                div()
+                    .w_full()
+                    .max_w(px(260.0))
+                    .p(px(16.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_dashed()
+                    .border_color(ui::border_default())
+                    .bg(ui::with_alpha(ui::bg_elevated(), 0.42))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .w(px(34.0))
+                            .h(px(34.0))
+                            .rounded(px(8.0))
+                            .bg(ui::accent_subtle())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(FileIcon::folder(false).size(px(18.0)).color(ui::accent())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(
+                                div()
+                                    .text_size(ui::font_px(12.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ui::text_primary())
+                                    .child(t("projectList", "empty.title")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui::font_px(11.0))
+                                    .text_color(ui::text_muted())
+                                    .text_center()
+                                    .child(t("projectList", "empty.hint")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .pt(px(2.0))
+                            .child(
+                                div()
+                                    .id("empty-add-local")
+                                    .w_full()
+                                    .py(px(6.0))
+                                    .px(px(10.0))
+                                    .rounded(px(6.0))
+                                    .bg(ui::accent())
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(6.0))
+                                    .text_size(ui::font_px(11.5))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(ui::bg_base())
+                                    .hover(|el| el.opacity(0.9))
+                                    .tip(t("projectList", "addProjectTip"))
+                                    .on_click(move |_event, window, cx| {
+                                        modal::open_add_project(store_local.clone(), window, cx);
+                                    })
+                                    .child(
+                                        FileIcon::folder(false)
+                                            .size(px(13.0))
+                                            .color(ui::bg_base()),
+                                    )
+                                    .child(t("projectList", "addProject")),
+                            )
+                            .child(
+                                div()
+                                    .id("empty-add-remote")
+                                    .w_full()
+                                    .py(px(5.5))
+                                    .px(px(10.0))
+                                    .rounded(px(6.0))
+                                    .border_1()
+                                    .border_color(ui::border_default())
+                                    .bg(ui::bg_surface())
+                                    .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap(px(6.0))
+                                    .text_size(ui::font_px(11.5))
+                                    .text_color(ui::text_secondary())
+                                    .hover(|el| {
+                                        el.border_color(ui::accent()).text_color(ui::accent())
+                                    })
+                                    .tip(t("projectList", "addRemoteProjectTip"))
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        crate::remote_project::open(
+                                            this.store.clone(),
+                                            None,
+                                            window,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(VectorIcon::new(SERVER, px(13.0)).ink(ui::color_info()))
+                                    .child(t("projectList", "addRemoteProject")),
+                            ),
+                    ),
             )
     }
 
-    /// 项目行的名字位:编辑态换成内联输入框,否则是「名字 + 描述」。
+    /// 筛选无匹配时的轻空态 + 一键清除筛选按钮。
+    fn render_filter_empty_state(&self, cx: &mut Context<Self>) -> gpui::Div {
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(8.0))
+            .p(px(16.0))
+            .child(
+                div()
+                    .text_size(ui::font_px(11.5))
+                    .text_color(ui::text_muted())
+                    .child(t("projectList", "filter.empty")),
+            )
+            .child(
+                div()
+                    .id("project-filter-empty-clear")
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .rounded(px(5.0))
+                    .border_1()
+                    .border_color(ui::border_default())
+                    .cursor_pointer()
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::text_secondary())
+                    .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.clear_filter(window, cx);
+                    }))
+                    .child(t("projectList", "filter.clear")),
+            )
+    }
+
+    /// 项目行的名字位:编辑态换成内联输入框；否则主行（支持关键词高亮与激活加粗），
+    /// 若设置了需求描述则自然折为紧凑副行，不与项目名抢水平空间。
     fn project_row_label(
         &self,
         editing: Option<&Entity<InputState>>,
         name: String,
         description: Option<String>,
+        is_active: bool,
+        query_lower: &str,
     ) -> AnyElement {
         match editing {
             Some(input) => self.rename_input(input, 13.0),
-            None => {
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
-                    .child(div().min_w(px(0.0)).truncate().child(name))
-                    .when_some(description, |el, desc| {
-                        el.child(
-                            div()
-                                .min_w(px(0.0))
-                                .text_size(ui::font_px(9.75))
-                                .text_color(ui::text_muted())
-                                .truncate()
-                                .child(desc),
-                        )
-                    })
-                .into_any_element()
-            }
+            None => div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .when(is_active, |el| el.font_weight(FontWeight::MEDIUM))
+                        .child(highlighted_text(name, query_lower)),
+                )
+                .when_some(description, |el, desc| {
+                    el.child(
+                        div()
+                            .min_w(px(0.0))
+                            .text_size(ui::font_px(10.5))
+                            .text_color(ui::text_muted())
+                            .child(highlighted_text(desc, query_lower)),
+                    )
+                })
+                .into_any_element(),
         }
     }
 
-    /// 行尾的移除按钮:弹确认框(不可逆,布局与展开目录一起没)。
-    fn project_remove_button(
+    /// 项目行与 worktree 子项行共用的零抖动悬浮「···」更多操作按钮。
+    /// 绝对定位贴在行右缘，不推挤状态灯 / 胶囊 / 标题；点击直接弹出完整右键菜单。
+    fn project_more_overlay(
         &self,
-        id: &str,
+        row: &Row,
+        tree: &[ProjectTreeItem],
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let id_remove = id.to_string();
+    ) -> gpui::Div {
+        let row_for_menu = row.clone();
+        let tree_for_menu = tree.to_vec();
         div()
-            .id(SharedString::from(format!("project-remove-{id}")))
-            .w(px(16.0))
-            .h(px(16.0))
-            .flex_shrink_0()
+            .absolute()
+            .right(px(4.0))
+            .top_0()
+            .bottom_0()
             .flex()
             .items_center()
-            .justify_center()
-            .rounded(px(3.0))
-            .text_size(ui::font_px(11.4))
-            .text_color(ui::text_muted())
-            .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                cx.stop_propagation();
-                let Some((name, path)) = this
-                    .store
-                    .read(cx)
-                    .project(&id_remove)
-                    .map(|p| (p.name.clone(), p.path.clone()))
-                else {
-                    return;
-                };
-                modal::open_confirm_remove_project(
-                    this.store.clone(),
-                    id_remove.clone(),
-                    name,
-                    path,
-                    window,
-                    cx,
-                );
-            }))
-            .child("✕")
+            .child(
+                self.floating_action_bar().child(
+                    self.floating_icon_button(
+                        format!("project-more-{}", row.id),
+                        ICON_MORE,
+                        t("projectList", "row.moreTip"),
+                        cx,
+                    )
+                    .on_click(cx.listener(
+                        move |this, event: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.close_preview(cx);
+                            let entries = project_menu(
+                                &cx.entity(),
+                                &this.store,
+                                &row_for_menu,
+                                &tree_for_menu,
+                                cx,
+                            );
+                            menu::show(click_position(event, window), entries, window, cx);
+                        },
+                    )),
+                ),
+            )
     }
 
-    /// worktree 子项行的名字位（B1 分支优先）：编辑态换成内联输入框，否则主文 + 可选浅色副文。
+    /// worktree 子项行的名字位（B1 分支优先）：编辑态换成内联输入框，否则主文 + 可选浅色副文，
+    /// 均支持行内搜索关键词高亮。
     fn child_row_label(
         &self,
         editing: Option<&Entity<InputState>>,
         display: ChildDisplayLabel,
         is_active: bool,
+        query_lower: &str,
     ) -> AnyElement {
         match editing {
             Some(input) => self.rename_input(input, 12.0),
@@ -3837,9 +5520,8 @@ impl ProjectList {
                 .child(
                     div()
                         .min_w(px(0.0))
-                        .truncate()
                         .when(is_active, |el| el.font_weight(FontWeight::MEDIUM))
-                        .child(display.primary),
+                        .child(highlighted_text(display.primary, query_lower)),
                 )
                 .when_some(display.secondary, |el, sec| {
                     el.child(
@@ -3847,8 +5529,7 @@ impl ProjectList {
                             .min_w(px(0.0))
                             .text_size(ui::font_px(10.0))
                             .text_color(ui::text_muted())
-                            .truncate()
-                            .child(sec),
+                            .child(highlighted_text(sec, query_lower)),
                     )
                 })
                 .into_any_element(),
@@ -3856,13 +5537,13 @@ impl ProjectList {
     }
 
     /// 父项目行上的 worktree 折叠切换胶囊：`[⑂ N (聚合状态点) ▾/▸]`。
-    /// 点击只切折叠态，不切换活动项目、不起拖拽。
+    /// 点击只切折叠态，不切换活动项目、不起拖拽；悬停时抑制 520px 大预览卡。
     fn worktree_toggle_chip(
         &self,
         parent_id: &str,
         count: usize,
         collapsed: bool,
-        summary: &CollapsedWorktreeSummary,
+        summary: &CollapsedSummary,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let id_toggle = parent_id.to_string();
@@ -3891,7 +5572,7 @@ impl ProjectList {
             tr!("projectList", "worktreeToggleCollapse", count = count)
         };
         let indicator = collapsed
-            .then(|| collapsed_worktree_indicator(summary))
+            .then(|| collapsed_status_indicator(summary))
             .flatten();
 
         div()
@@ -3914,6 +5595,12 @@ impl ProjectList {
             .text_color(fg)
             .hover(|el| el.bg(ui::border_strong()).text_color(ui::text_primary()))
             .tip(tip)
+            .on_hover(cx.listener(|this, entered: &bool, _window, cx| {
+                this.hover_on_action = *entered;
+                if *entered {
+                    this.close_preview(cx);
+                }
+            }))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -3935,13 +5622,16 @@ impl ProjectList {
             )
     }
 
-    /// 项目行共用的交互挂载（焦点 / 键盘 / 悬停 / 拖放 / 点击 / 右键菜单 / 路径 tooltip），
+    /// 项目行共用的交互挂载（焦点 / 键盘 / 悬停 / 拖放 / 单击切换+双击改名 / 右键菜单 / 路径 tooltip），
     /// 样式壳由调用方（常规行 vs worktree 子项行）各自定制。
+    #[allow(clippy::too_many_arguments)]
     fn project_row_interactions(
         &self,
         row: &Row,
+        is_active: bool,
         tooltip: String,
         dragging: Option<&str>,
+        filtering: bool,
         tree: &[ProjectTreeItem],
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -3950,6 +5640,7 @@ impl ProjectList {
         let is_child = row.is_child;
         let is_source = dragging == Some(id.as_str());
         let id_click = id.clone();
+        let name_click = row.name.clone();
         let id_move = id.clone();
         let id_drop = id.clone();
         let id_key = id.clone();
@@ -3977,14 +5668,10 @@ impl ProjectList {
             }))
             .cursor_pointer()
             .when(is_source, |el| el.opacity(0.4))
-            // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
-            // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
-            // 原生 tooltip 会盖住那张卡。这里同款条件挂
+            // 绝对路径挂 tooltip：有 AI 会话时路径改由缩略图卡头显示,原生 tooltip 会盖住那张卡
             .when(row.ai_vendors.is_empty(), |el| el.tip(tooltip))
-            // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
-            // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
-            // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行
-            // 抹掉(鼠标沿列表纵扫时预览再也弹不出来)
+            // 悬停记到 view state 上 —— 悬浮动作胶囊显隐与缩略图计时都要它。
+            // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」
             .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
                 let mine = this.hovered.as_deref() == Some(id_hover.as_str());
                 if *hovered {
@@ -3992,48 +5679,52 @@ impl ProjectList {
                         return;
                     }
                     this.hovered = Some(id_hover.clone());
+                    this.hover_on_action = false;
                     this.schedule_preview(id_hover.clone(), cx);
                 } else {
                     if !mine {
                         return;
                     }
                     this.hovered = None;
+                    this.hover_on_action = false;
                     // 移出即关(原版 onMouseLeave 的 closePreview)
                     this.close_preview(cx);
                 }
                 cx.notify();
             }))
-            .on_drag(
-                DragProjectItem {
-                    id: id.clone(),
-                    is_group: false,
-                },
-                move |item, _offset, _window, cx| {
-                    let id = item.id.clone();
-                    this.update(cx, |this: &mut ProjectList, _cx| {
-                        this.dragging = Some(id);
-                    });
-                    dnd::preview(name_drag.clone(), PreviewIcon::Project(kind), cx)
-                },
-            )
-            // worktree 子项目**不作为落点**(位置是从父项目派生的),
-            // 但自身可以被拖走 = 脱离父项目 —— 所以只摘 drop 那半边
-            .when(!is_child, |el| {
+            // 筛选激活时禁拖放，防止在残缺视图里拖乱真实树序
+            .when(!filtering, |el| {
+                let id_drag = id.clone();
                 let id_move = id_move.clone();
                 let id_drop = id_drop.clone();
-                el.on_drag_move(cx.listener(
-                    move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
-                        // 项目不是容器:allow_inside = false,只有 before/after
-                        this.on_row_drag_move(event, &id_move, false, cx);
+                el.on_drag(
+                    DragProjectItem {
+                        id: id_drag,
+                        is_group: false,
                     },
-                ))
-                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                    this.on_row_drop(item, &id_drop, cx);
-                }))
+                    move |item, _offset, _window, cx| {
+                        let id = item.id.clone();
+                        this.update(cx, |this: &mut ProjectList, _cx| {
+                            this.dragging = Some(id);
+                        });
+                        dnd::preview(name_drag.clone(), PreviewIcon::Project(kind), cx)
+                    },
+                )
+                // worktree 子项目**不作为落点**(位置是从父项目派生的),
+                // 但自身可以被拖走 = 脱离父项目 —— 所以只摘 drop 那半边
+                .when(!is_child, |el| {
+                    el.on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
+                            // 项目不是容器:allow_inside = false,只有 before/after
+                            this.on_row_drag_move(event, &id_move, false, cx);
+                        },
+                    ))
+                    .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
+                        this.on_row_drop(item, &id_drop, cx);
+                    }))
+                })
             })
-            // 按下即收缩略图(原版 onMouseDown 的第一句),顺带把行焦点
-            // 收过来 —— 浏览器点 `tabIndex=0` 的元素就会聚焦,原版的
-            // 「点完项目按 Delete 能删」正是靠这一条
+            // 按下即收缩略图并把行焦点收过来
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -4045,13 +5736,22 @@ impl ProjectList {
                     }
                 }),
             )
-            .on_click(cx.listener(move |this, _event, _window, cx| {
-                // 编辑态里点自己不切项目(交互全让给输入框)
+            // 单击切换，双击已激活项目智能进入行内重命名（切过来的紧邻第二下不误触）
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 if this.editing.is_some() {
                     return;
                 }
-                this.store
-                    .update(cx, |store, cx| store.set_active_project(&id_click, cx));
+                let count = click_count(event);
+                match this.row_click.click(&id_click, is_active, count) {
+                    SwitchClick::Switch => {
+                        this.store
+                            .update(cx, |store, cx| store.set_active_project(&id_click, cx));
+                    }
+                    SwitchClick::Rename => {
+                        this.start_rename(id_click.clone(), false, &name_click, window, cx);
+                    }
+                    SwitchClick::Ignore => {}
+                }
             }))
             // Esc 放弃重命名(见分组行上的同一条注释)
             .when(is_editing, |el| {
@@ -4062,8 +5762,7 @@ impl ProjectList {
                     }
                 }))
             })
-            // 右键菜单(`ProjectList.tsx` 的 onContextMenu),开菜单前先
-            // 收掉悬停缩略图(原版第一句就是 `closePreview()`)
+            // 右键菜单,开菜单前先收掉悬停缩略图
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4077,44 +5776,77 @@ impl ProjectList {
     }
 
     /// 常规项目行（独立项目、折叠父项目、展开微容器头部）的样式壳。
+    /// 恒保留 `border_1()`（透明/柔边/聚焦环），确保状态切换零 1px 抖动。
+    #[allow(clippy::too_many_arguments)]
     fn project_row_shell(
         &self,
         row: &Row,
         is_active: bool,
+        is_focused: bool,
         in_expanded_cluster: bool,
+        show_done_tag: bool,
         dragging: Option<&str>,
+        filtering: bool,
         tree: &[ProjectTreeItem],
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let raw_indent = project_indent(row.depth, row.parent_group_id.is_some());
         let (pl, pr) = if in_expanded_cluster {
-            (
-                (raw_indent - CLUSTER_INSET).max(0.0),
-                (10.0 - CLUSTER_INSET).max(0.0),
-            )
+            (ROW_INNER_PL - CLUSTER_BORDER_W, 8.0 - CLUSTER_BORDER_W)
         } else {
-            (raw_indent, 10.0)
+            (ROW_INNER_PL, 8.0)
         };
-        self.project_row_interactions(row, row.path.clone(), dragging, tree, cx)
+        let row_tint = if is_active {
+            Some(ui::accent_subtle())
+        } else if row.light == StatusLight::Attention {
+            Some(ui::with_alpha(ui::color_attention(), 0.07))
+        } else if show_done_tag {
+            Some(ui::with_alpha(ui::color_success(), 0.055))
+        } else {
+            None
+        };
+        let border_color = if is_focused {
+            ui::with_alpha(ui::accent(), if is_active { 0.48 } else { 0.60 })
+        } else if is_active && !in_expanded_cluster {
+            ui::with_alpha(ui::accent(), 0.22)
+        } else {
+            ui::with_alpha(ui::accent(), 0.0)
+        };
+        let text_color = if is_active || row.light >= StatusLight::Attention || show_done_tag {
+            ui::text_primary()
+        } else {
+            ui::text_secondary()
+        };
+
+        self.project_row_interactions(row, is_active, row.path.clone(), dragging, filtering, tree, cx)
+            .relative()
             .flex()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(7.0))
             .pl(px(pl))
             .pr(px(pr))
-            .py(px(6.0))
+            .py(px(5.5))
             .when(in_expanded_cluster, |el| {
                 el.rounded_t(px(CLUSTER_INNER_RADIUS))
                     .border_b_1()
-                    .border_color(ui::border_subtle())
+                    .border_color(if is_focused {
+                        ui::with_alpha(ui::accent(), 0.55)
+                    } else {
+                        ui::border_subtle()
+                    })
             })
-            .when(!in_expanded_cluster, |el| el.rounded(px(3.0)))
+            .when(!in_expanded_cluster, |el| {
+                el.rounded(px(6.0))
+                    .border_1()
+                    .border_color(border_color)
+            })
             .text_size(ui::font_px(13.0))
-            .when(is_active, |el| {
-                el.bg(ui::accent_subtle()).text_color(ui::accent())
-            })
+            .text_color(text_color)
+            .when_some(row_tint, |el, bg| el.bg(bg))
             .when(!is_active, |el| {
-                el.text_color(ui::text_secondary())
-                    .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+                el.hover(|el| {
+                    el.bg(ui::with_alpha(ui::text_primary(), 0.045))
+                        .text_color(ui::text_primary())
+                })
             })
     }
 
@@ -4126,7 +5858,10 @@ impl ProjectList {
         in_animated_tray: bool,
         dragging: Option<&str>,
         drag_active: bool,
+        filtering: bool,
+        query_lower: &str,
         tree: &[ProjectTreeItem],
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let cluster_bg = ui::with_alpha(ui::border_subtle(), 0.78);
@@ -4135,10 +5870,13 @@ impl ProjectList {
         } else {
             ui::border_default()
         };
+        let is_focused = self
+            .row_focus
+            .get(row.id.as_str())
+            .is_some_and(|f| f.is_focused(window));
 
-        // ── 展开微容器内的 worktree 子项行（方案 B1 + C） ─────────
+        // ── 展开微容器内的 worktree 子项行（方案 B1 + C 精修） ─────────
         if let ProjectClusterRole::Child {
-            root_depth,
             rel_depth,
             is_last_sibling,
             is_last_in_cluster,
@@ -4167,12 +5905,9 @@ impl ProjectList {
                 row.worktree_branch.as_deref(),
                 &display,
             );
-            let in_group = row.parent_group_id.is_some();
-            let own_rail_x = cluster_rail_x(root_depth, in_group, rel_depth.saturating_sub(1));
+            let own_rail_x = cluster_rail_x(rel_depth.saturating_sub(1));
             let gutter_w = own_rail_x + CHILD_ELBOW_W + CHILD_ELBOW_GAP;
             let connectors = child_tree_connectors(
-                root_depth,
-                in_group,
                 rel_depth,
                 is_last_sibling,
                 ancestor_continues,
@@ -4185,8 +5920,28 @@ impl ProjectList {
             } else {
                 ui::text_muted()
             };
+            let child_tint = if is_active {
+                Some(ui::accent_subtle())
+            } else if hovered {
+                Some(ui::with_alpha(ui::text_primary(), 0.045))
+            } else if row.light == StatusLight::Attention {
+                Some(ui::with_alpha(ui::color_attention(), 0.07))
+            } else if show_done_tag {
+                Some(ui::with_alpha(ui::color_success(), 0.055))
+            } else {
+                None
+            };
+            let child_border = if is_focused && editing.is_none() {
+                ui::with_alpha(ui::accent(), 0.58)
+            } else if is_active {
+                ui::with_alpha(ui::accent(), 0.22)
+            } else {
+                ui::with_alpha(ui::accent(), 0.0)
+            };
+            let show_more = hovered && editing.is_none() && !drag_active;
 
             let pill = div()
+                .relative()
                 .flex_1()
                 .min_w(px(0.0))
                 .flex()
@@ -4194,24 +5949,19 @@ impl ProjectList {
                 .gap(px(5.0))
                 .px(px(6.0))
                 .py(px(3.5))
-                .rounded(px(4.0))
+                .rounded(px(5.0))
+                .border_1()
+                .border_color(child_border)
                 .text_size(ui::font_px(12.0))
-                .when(is_active, |el| {
-                    el.bg(ui::accent_subtle()).text_color(ui::accent())
+                .text_color(if is_active || hovered || row.light >= StatusLight::Attention || show_done_tag {
+                    ui::text_primary()
+                } else {
+                    ui::text_secondary()
                 })
-                .when(!is_active && hovered, |el| {
-                    el.bg(ui::border_subtle()).text_color(ui::text_primary())
-                })
-                .when(!is_active && !hovered, |el| {
-                    el.text_color(ui::text_secondary())
-                })
+                .when_some(child_tint, |el, bg| el.bg(bg))
                 // 领位换成轻量的矢量分支图标（不再重复父项目的大号技术栈图标）
                 .child(VectorIcon::new(ICON_BRANCH, px(12.0)).ink(branch_icon_color))
-                .children(
-                    (!row.ai_vendors.is_empty())
-                        .then(|| ai_vendor_icons_sized(&row.ai_vendors, CHILD_AI_ICON_SIZE, -2.0)),
-                )
-                .child(self.child_row_label(editing.as_ref(), display, is_active))
+                .child(self.child_row_label(editing.as_ref(), display, is_active, query_lower))
                 // 远程子 worktree 正常态继承父项目连接，仅断链时单独标红提示
                 .children(
                     row.remote
@@ -4219,17 +5969,20 @@ impl ProjectList {
                         .filter(|r| r.broken)
                         .map(|remote| remote_badge_chip(&row.id, remote)),
                 )
-                .children(row_status_mark(
+                .children(row_right_status(
                     &row.id,
+                    &row.ai_vendors,
+                    CHILD_AI_ICON_SIZE,
                     show_done_tag,
                     done_tag,
                     row.light,
                     row.ssh_connected.as_deref(),
                 ))
-                .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
+                // 零抖动悬浮「···」操作胶囊
+                .when(show_more, |el| el.child(self.project_more_overlay(&row, tree, cx)));
 
             let row_el = self
-                .project_row_interactions(&row, tooltip, dragging, tree, cx)
+                .project_row_interactions(&row, is_active, tooltip, dragging, filtering, tree, cx)
                 .relative()
                 .flex()
                 .items_center()
@@ -4239,21 +5992,16 @@ impl ProjectList {
                 .children(connectors)
                 .child(pill);
 
+            let ml = row_left_margin(row.group_depth);
+            let guides = if !in_animated_tray {
+                group_guide_lines(row.group_depth)
+            } else {
+                Vec::new()
+            };
+
             return div()
                 .relative()
-                .when(!in_animated_tray, |el| {
-                    el.mx(px(CLUSTER_MARGIN_X))
-                        .border_l_1()
-                        .border_r_1()
-                        .border_color(cluster_border)
-                        .bg(cluster_bg)
-                        .when(is_last_in_cluster, |el| {
-                            el.pb(px(3.0))
-                                .mb(px(3.0))
-                                .rounded_b(px(CLUSTER_RADIUS))
-                                .border_b_1()
-                        })
-                })
+                .children(guides)
                 .when(hovered, |el| {
                     let this = cx.entity();
                     el.child(
@@ -4269,7 +6017,28 @@ impl ProjectList {
                         .size_full(),
                     )
                 })
-                .child(row_el)
+                .map(|el| {
+                    if in_animated_tray {
+                        el.child(row_el)
+                    } else {
+                        el.child(
+                            div()
+                                .ml(px(ml))
+                                .mr(px(ROW_MARGIN_X))
+                                .border_l_1()
+                                .border_r_1()
+                                .border_color(cluster_border)
+                                .bg(cluster_bg)
+                                .when(is_last_in_cluster, |el| {
+                                    el.pb(px(3.0))
+                                        .mb(px(3.0))
+                                        .rounded_b(px(CLUSTER_RADIUS))
+                                        .border_b_1()
+                                })
+                                .child(row_el),
+                        )
+                    }
+                })
                 .into_any_element();
         }
 
@@ -4280,6 +6049,7 @@ impl ProjectList {
             needs_attention,
             kind,
             is_child,
+            group_depth,
             ..
         } = row;
         let name = row.name.clone();
@@ -4294,84 +6064,104 @@ impl ProjectList {
         // ExpandedParent（连着正在滑合的底抽屉），但箭头必须同步从 ▾ 转回 ▸
         let toggle_info = match row.cluster_role {
             ProjectClusterRole::ExpandedParent { child_count }
-            | ProjectClusterRole::CollapsedParent { child_count } => {
+            | ProjectClusterRole::CollapsedParent { child_count }
+                if !filtering =>
+            {
                 Some((child_count, self.collapsed_worktrees.contains(id)))
             }
             _ => None,
         };
-        // 行尾的 ✕ 只在**这一行**被悬停时出现(原版 `hidden group-hover:inline`)。
-        // 走 view state 而不是 `group_hover` + 透明度:透明的按钮仍然吃点击,
-        // 而这个按钮的动作是「移除项目」,看不见还能点中是实打实的事故。
         let hovered = self.hovered.as_deref() == Some(id.as_str());
-        // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
-        // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
+        // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯
         let show_done_tag = shows_done_tag(needs_attention, is_active);
-        // 进出场状态。表由 `render` 前置段维护(退场期间标还在、`show_done_tag` 已是 false)
         let done_tag = self.done_tags.get(id.as_str());
         let editing = self
             .editing
             .as_ref()
             .filter(|e| !e.is_group && e.id == *id)
             .map(|e| e.input.clone());
+        let show_more = hovered && editing.is_none() && !drag_active;
+
+        // 左侧 2.5×14px 圆头语义微轨（绝对定位，不推挤图标与文字）
+        let rail_color = if is_active {
+            Some(ui::accent())
+        } else if light == StatusLight::Error {
+            Some(ui::color_error())
+        } else if light == StatusLight::Attention {
+            Some(ui::color_attention())
+        } else if show_done_tag {
+            Some(ui::color_success())
+        } else {
+            None
+        };
 
         let row_el = self
-            .project_row_shell(&row, is_active, is_expanded_parent, dragging, tree, cx)
-            // 行首那道 accent 竖条(原版 `w-0.5 h-4 rounded-full`)。
-            // ⚠️ 原版只在选中时才渲染这个 span,于是选中的一瞬整行内容右移
-            // 10px;这里**恒占位**、未选中时透明,视觉一致但不抖。
-            .child(
-                div()
-                    .w(px(2.0))
-                    .h(px(16.0))
-                    .flex_shrink_0()
-                    .rounded_full()
-                    .bg(if is_active {
-                        ui::accent()
-                    } else {
-                        ui::with_alpha(ui::accent(), 0.0)
-                    }),
+            .project_row_shell(
+                &row,
+                is_active,
+                is_focused && editing.is_none(),
+                is_expanded_parent,
+                show_done_tag,
+                dragging,
+                filtering,
+                tree,
+                cx,
             )
-            // 领位是**项目身份图标**,每行都有、缩进才对得齐
-            // (SSH 远程 > 技术栈 > 通用,原版同序)
+            .when_some(rail_color, |el, color| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(if is_expanded_parent { 2.0 } else { 2.5 }))
+                        .top_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .w(px(2.5))
+                                .h(px(14.0))
+                                .rounded_full()
+                                .bg(color),
+                        ),
+                )
+            })
+            // 领位是**项目身份图标**,每行都有、项目名左缘严格垂直对齐
             .child(project_icon(kind, remote.clone()))
-            // AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
-            // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
-            .children((!ai_vendors.is_empty()).then(|| ai_vendor_icons(&ai_vendors)))
-            .child(self.project_row_label(editing.as_ref(), name, description))
+            .child(self.project_row_label(
+                editing.as_ref(),
+                name,
+                description,
+                is_active,
+                query_lower,
+            ))
             // 独立（已脱离父项目或单独加入）linked worktree 的矢量分支徽章
             .children(worktree_branch.map(|branch| worktree_badge_chip(&row.id, branch)))
-            // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
+            // 远程徽章:连接名(柔润 info 配色，断链时 error 配色)
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
             // 挂有 worktree 的父项目：可折叠计数胶囊 `[⑂ N ▾/▸]`
             .children(toggle_info.map(|(count, collapsed)| {
                 self.worktree_toggle_chip(&row.id, count, collapsed, &row.collapsed_summary, cx)
             }))
-            // 完成标 / AI 状态灯 / 右键 SSH 已连接灯三选一,**均无时都不画**
-            .children(row_status_mark(
+            // 右侧状态区（AI 活跃胶囊 / 完成标 / 状态灯 / SSH 已连接灯）
+            .children(row_right_status(
                 id,
+                &ai_vendors,
+                AI_ICON_SIZE,
                 show_done_tag,
                 done_tag,
                 light,
                 ssh_connected.as_deref(),
             ))
-            // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
-            .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
+            // 零抖动悬浮「···」操作胶囊（替代直接外露会引发整行左跳的 ✕）
+            .when(show_more, |el| el.child(self.project_more_overlay(&row, tree, cx)));
+
+        let ml = row_left_margin(group_depth);
+        let guides = group_guide_lines(group_depth);
 
         div()
             .relative()
-            .when(is_expanded_parent, |el| {
-                el.mx(px(CLUSTER_MARGIN_X))
-                    .mt(px(3.0))
-                    .rounded_t(px(CLUSTER_RADIUS))
-                    .border_t_1()
-                    .border_l_1()
-                    .border_r_1()
-                    .border_color(cluster_border)
-                    .bg(cluster_bg)
-            })
-            // 被悬停的那一行挂一块 canvas 量矩形 —— 缩略图的锚点要它。
-            // **只给悬停中的那一行挂**:每行常驻一块的话,一屏几十个项目就是
-            // 几十个白量的元素
+            .children(guides)
+            // 被悬停的那一行挂一块 canvas 量矩形 —— 缩略图的锚点要它
             .when(hovered, |el| {
                 let this = cx.entity();
                 el.child(
@@ -4387,11 +6177,31 @@ impl ProjectList {
                     .size_full(),
                 )
             })
-            .child(row_el)
+            .child(
+                div()
+                    .ml(px(ml))
+                    .mr(px(ROW_MARGIN_X))
+                    .when(is_expanded_parent, |el| {
+                        el.mt(px(3.0))
+                            .rounded_t(px(CLUSTER_RADIUS))
+                            .border_t_1()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(cluster_border)
+                            .bg(cluster_bg)
+                    })
+                    .when(!is_expanded_parent, |el| el.my(px(1.0)))
+                    .child(row_el),
+            )
             // 子项目不是落点,指示线自然也不该出现在它上下
-            .when(!is_child, |el| {
-                el.children(self.drop_line(&row.id, DropPosition::Before, drag_active))
-                    .children(self.drop_line(&row.id, DropPosition::After, drag_active))
+            .when(!is_child && !filtering, |el| {
+                el.children(self.drop_line(&row.id, DropPosition::Before, group_depth, drag_active))
+                    .children(self.drop_line(
+                        &row.id,
+                        DropPosition::After,
+                        group_depth,
+                        drag_active,
+                    ))
             })
             .into_any_element()
     }
@@ -4709,39 +6519,61 @@ mod tests {
         );
     }
 
-    // ─── 缩进(`ProjectList.tsx:660-666` 的两条公式) ─────────
+    // ─── 统一外边距、分组引导线与 AI 活跃判定 ────────────────
 
-    /// 两条公式不能合并:组内项目对齐父级分组的倒三角区域,
-    /// 顶层项目及其 worktree 子项目以 10px 为基准每层 +16。
+    /// 普通行 / 分组行 / Worktree 微容器共用 `row_left_margin`，
+    /// 且第 g 层分组引导线恰好落在第 g 层分组折叠箭头水平中心，并与下层胶囊保持 4px 呼吸缝。
     #[test]
-    fn 项目缩进两条公式各走各的() {
-        // 顶层项目
-        assert_eq!(project_indent(0, false), 10.0);
-        // 顶层项目的 worktree 子项目:10 + 16
-        assert_eq!(project_indent(1, false), 26.0);
-        // 一级分组里的项目
-        assert_eq!(project_indent(1, true), 16.0);
-        // 二级分组里的项目
-        assert_eq!(project_indent(2, true), 32.0);
-        // 组内项目的 worktree 子项目
-        assert_eq!(project_indent(3, true), 48.0);
-    }
+    fn 统一外边距与分组引导线精确对齐() {
+        assert_eq!(row_left_margin(0), 6.0);
+        assert_eq!(row_left_margin(1), 22.0);
+        assert_eq!(row_left_margin(2), 38.0);
+        assert_eq!(row_left_margin(3), 54.0);
 
-    /// 组内公式**不能**拿来算顶层:那会把顶层 worktree 子项目的相对缩进压到 6px。
-    #[test]
-    fn 组内公式不适用于顶层() {
-        let 顶层子项目 = project_indent(1, false);
-        let 若误用组内公式 = project_indent(1, true);
-        assert_eq!(顶层子项目 - project_indent(0, false), 16.0);
-        assert_eq!(若误用组内公式 - project_indent(0, false), 6.0);
-    }
-
-    /// 分组行缩进就是 `depth * 16`(B.2),与项目行的两条公式都不同。
-    #[test]
-    fn 分组行缩进按层数() {
-        for depth in 0..3usize {
-            assert_eq!(depth as f32 * 16.0, (depth * 16) as f32);
+        for level in 0..3usize {
+            let guide_x = group_guide_x(level);
+            // 对应层级分组的箭头中心：row_left_margin(level) + pl(6) + half_chevron(6)
+            assert_eq!(guide_x, row_left_margin(level) + 12.0);
+            // 下一层行左缘在引导线右侧留出 4px 呼吸缝
+            assert_eq!(row_left_margin(level + 1) - guide_x, 4.0);
         }
+    }
+
+    #[test]
+    fn 新增矢量图标均在单位方框内() {
+        for (name, shapes) in [
+            ("ICON_SEARCH", ICON_SEARCH),
+            ("ICON_PLUS", ICON_PLUS),
+            ("ICON_MORE", ICON_MORE),
+            ("ICON_COLLAPSE_ALL", ICON_COLLAPSE_ALL),
+            ("ICON_EXPAND_ALL", ICON_EXPAND_ALL),
+            ("ICON_CLOSE_SM", ICON_CLOSE_SM),
+        ] {
+            let mut pts_count = 0usize;
+            for shape in shapes {
+                let (pts, _) = shape.geom.points();
+                for (x, y) in pts {
+                    assert!(
+                        (-0.001..=1.001).contains(&x) && (-0.001..=1.001).contains(&y),
+                        "{name} 越界点 ({x}, {y})"
+                    );
+                    pts_count += 1;
+                }
+            }
+            assert!(pts_count > 0, "{name} 不应为空图形");
+        }
+    }
+
+    #[test]
+    fn ai活跃筛选命中工作待审批报错及未读完成() {
+        assert!(!is_ai_active_project(StatusLight::Idle, false, false));
+        assert!(!is_ai_active_project(StatusLight::AiIdle, false, false));
+        assert!(is_ai_active_project(StatusLight::AiWorking, false, false));
+        assert!(is_ai_active_project(StatusLight::Attention, false, false));
+        assert!(is_ai_active_project(StatusLight::Error, false, false));
+        assert!(is_ai_active_project(StatusLight::AiIdle, true, false));
+        // 正看着的项目不算未读完成
+        assert!(!is_ai_active_project(StatusLight::AiIdle, true, true));
     }
 
     // ─── AI 品牌堆叠(C.4) ───────────────────────────────────
@@ -5103,11 +6935,9 @@ mod tests {
 
     #[test]
     fn 树轨坐标对齐父项目领位图标水平中心() {
-        // 顶层父项目：indent=10，微容器内左缘在 x=5，内左垫 5 + 竖条 2 + gap 6 + 半图标 7 = 20（全局 x=25）
-        assert_eq!(cluster_rail_x(0, false, 0), 20.0);
-        // 组内父项目(depth=1)：indent=16，微容器内左垫 11 + 15 = 26（全局 x=31）
-        assert_eq!(cluster_rail_x(1, true, 0), 26.0);
+        // 微容器内父行 pl = ROW_INNER_PL(10) - CLUSTER_BORDER_W(1) = 9，14px 图标中心 = 9 + 7 = 16
+        assert_eq!(cluster_rail_x(0), 16.0);
         // 嵌套孙项向右步进一个 CHILD_NEST_STEP
-        assert_eq!(cluster_rail_x(0, false, 1), 20.0 + CHILD_NEST_STEP);
+        assert_eq!(cluster_rail_x(1), 16.0 + CHILD_NEST_STEP);
     }
 }
