@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1970;
+pub const ZH_ENTRY_COUNT: usize = 1971;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1970;
+pub const EN_ENTRY_COUNT: usize = 1971;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -399,6 +399,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("empty.selectProject", "选择一个项目"),
     ("header.collapseAll", "全部折叠"),
     ("header.editorFallback", "编辑器"),
+    ("header.locateActive", "定位当前文件"),
     ("header.openWithEditor", "使用{editor}打开"),
     ("header.refresh", "刷新"),
     ("header.searchTitle", "搜索文件 ({shortcut})"),
@@ -499,6 +500,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("empty.selectProject", "Select a project"),
     ("header.collapseAll", "Collapse All"),
     ("header.editorFallback", "Editor"),
+    ("header.locateActive", "Locate Current File"),
     ("header.openWithEditor", "Open with {editor}"),
     ("header.refresh", "Refresh"),
     ("header.searchTitle", "Search Files ({shortcut})"),

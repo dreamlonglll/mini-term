@@ -304,8 +304,9 @@ use mt_i18n::{
 /// 1971 → 1970：worktree 自动识别添加为项目，worktree 管理弹窗下线「设为项目」/「已是项目」/
 /// 「切换到项目」（改为整行点击切换），新增「当前」标与路径分支占位符，更新开终端图标提示
 /// （移除 `worktree.{isProject,addAsProject,switchToProject}`，换入 `worktree.{current,branchDirPlaceholder,switchAfterCreate}`）。
+/// 1970 → 1971：文件树头部「定位当前文件」钮的悬停提示（`fileTree.header.locateActive`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1970;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1971;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

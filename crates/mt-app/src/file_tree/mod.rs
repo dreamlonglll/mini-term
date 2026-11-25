@@ -1461,6 +1461,18 @@ impl FileTree {
             .map(|path| tree_path_key(&path, remote))
     }
 
+    /// 头部「定位当前文件」钮:取工作区此刻停着的文件页签,走与页签右键同一条定位。
+    /// 路径在点击这一刻现取 —— 不用 render 时记下的比较键(那是归一化过的,不是原路径)。
+    fn reveal_active_file(&mut self, cx: &mut Context<Self>) {
+        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
+            return;
+        };
+        let Some(path) = crate::workbench_area::active_file_path(&project_id, cx) else {
+            return;
+        };
+        self.begin_reveal(&project_id, path, cx);
+    }
+
     /// 开始一次定位。目标不在项目根内的当场就地提示;否则从根往下走,走不动的地方
     /// 等列目录回来再走(见 [`Self::advance_reveal`])。
     fn begin_reveal(&mut self, project_id: &str, path: PathBuf, cx: &mut Context<Self>) {
@@ -2375,6 +2387,47 @@ const COLLAPSE_ALL_SHAPES: &[Shape] = &[
     ),
 ];
 
+/// 定位当前文件:准星 —— 圆环 + 四向短刻度 + 实心圆心(JetBrains「Select Opened File」
+/// 那枚的同一个意象)。按 16 格画:圆心 (8,8) 半径 4.5,刻度从 1.5 伸到圆环上,
+/// 圆心点半径 1.3;线宽与放大镜一致。
+const LOCATE_SHAPES: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Circle {
+            c: (0.5, 0.5),
+            r: 0.28125,
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[(0.5, 0.09375), (0.5, 0.21875)]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[(0.5, 0.78125), (0.5, 0.90625)]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[(0.09375, 0.5), (0.21875, 0.5)]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.0875,
+        Geom::Polyline(&[(0.78125, 0.5), (0.90625, 0.5)]),
+    ),
+    Shape::fill(
+        Ink::Current,
+        Geom::Circle {
+            c: (0.5, 0.5),
+            r: 0.08125,
+        },
+    ),
+];
+
 /// 编辑器选择器的下拉箭头(原版 8×8 的 `M1.5 3L4 5.5L6.5 3`)。
 const CARET_SHAPES: &[Shape] = &[Shape::line(
     Ink::Current,
@@ -2441,12 +2494,29 @@ impl Render for FileTree {
 
         if project_name.is_some() {
             let store_for_search = self.store.clone();
+            // 定位当前文件:与文件页签右键「在文件树中定位」同一条路(`begin_reveal`)。
+            // 只在工作区停在文件页签上时出现(终端页 / diff 页签上不画)。`active_file`
+            // 在 render 开头刚刷新过,换页签时 `observe_workbench` 会 notify,显隐跟得上。
+            // 远程项目也给:定位只走文件树自己的缓存与列目录,本地 / 远程同一条路
+            let has_active_file = self.active_file.is_some();
             header = header.child(
                 div()
                     .flex()
                     .items_center()
                     .flex_none()
                     .gap(px(4.0))
+                    .when(has_active_file, |el| {
+                        el.child(
+                            header_button("file-tree-locate")
+                                .tip(t("fileTree", "header.locateActive"))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.reveal_active_file(cx);
+                                }))
+                                .child(
+                                    VectorIcon::new(LOCATE_SHAPES, px(13.0)).ink(ui::text_muted()),
+                                ),
+                        )
+                    })
                     .when(!is_remote, |el| {
                         el.child(
                             // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
