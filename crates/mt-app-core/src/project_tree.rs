@@ -220,7 +220,8 @@ pub fn count_projects_in_group(group: &ProjectGroup) -> usize {
 
 /// 树里是否包含任意分组。
 pub fn has_any_group(tree: &[ProjectTreeItem]) -> bool {
-    tree.iter().any(|item| matches!(item, ProjectTreeItem::Group(_)))
+    tree.iter()
+        .any(|item| matches!(item, ProjectTreeItem::Group(_)))
 }
 
 /// 树里是否存在至少一个处于展开态的分组（递归检查子组）。
@@ -1997,7 +1998,10 @@ mod tests {
     #[test]
     fn 全折全展批量设置并只返回真实变动的分组() {
         let mut tree = vec![
-            group("g1", vec![proj("p1"), collapsed_group("g2", vec![proj("p2")])]),
+            group(
+                "g1",
+                vec![proj("p1"), collapsed_group("g2", vec![proj("p2")])],
+            ),
             collapsed_group("g3", vec![]),
         ];
         assert!(has_any_group(&tree));
@@ -2020,11 +2024,7 @@ mod tests {
     fn 分组后代项目收集递归含子组与worktree并跳僵尸() {
         let tree = vec![group(
             "g1",
-            vec![
-                proj("p1"),
-                proj("僵尸"),
-                group("g2", vec![proj("p2")]),
-            ],
+            vec![proj("p1"), proj("僵尸"), group("g2", vec![proj("p2")])],
         )];
         let projects = vec![
             project_cfg("p1", None),
@@ -2047,10 +2047,7 @@ mod tests {
     #[test]
     fn 行内过滤临时展开折叠组并正确裁剪空组与worktree() {
         let tree = vec![
-            collapsed_group(
-                "g_work",
-                vec![proj("p_main"), proj("p_other")],
-            ),
+            collapsed_group("g_work", vec![proj("p_main"), proj("p_other")]),
             group("g_empty", vec![proj("p_miss")]),
             proj("p_solo"),
         ];
@@ -2065,13 +2062,8 @@ mod tests {
         let config = config_with(projects, Some(tree));
 
         // 1) 仅 worktree 子项命中：带出折叠的 g_work 与父项目 p_main，仅挂 wt_hit；裁掉 g_empty 与 p_solo
-        let filtered = filter_ordered_tree(
-            &config,
-            &|_| true,
-            true,
-            &|id| id == "wt_hit",
-            &|_| false,
-        );
+        let filtered =
+            filter_ordered_tree(&config, &|_| true, true, &|id| id == "wt_hit", &|_| false);
         assert_eq!(
             filtered.iter().map(|i| i.id()).collect::<Vec<_>>(),
             vec!["g_work", "p_main", "wt_hit"]

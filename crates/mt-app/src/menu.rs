@@ -234,10 +234,7 @@ impl MenuItem {
     ///
     /// 同一层菜单里只要有任意一项带图标,其余普通项会自动留出同等左槽宽以保持文字
     /// 左缘对齐;全层都没图标时不占任何额外宽度。
-    pub fn icon(
-        mut self,
-        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
-    ) -> Self {
+    pub fn icon(mut self, render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static) -> Self {
         self.icon = Some(Rc::new(render));
         self
     }

@@ -627,11 +627,19 @@ fn is_ai_active_project(light: StatusLight, needs_attention: bool, is_active: bo
 /// 带关键词高亮与省略号截断的单行文本：空查询直接返回纯文本，有查询走 `StyledText`。
 fn highlighted_text(text: String, query_lower: &str) -> AnyElement {
     if query_lower.is_empty() {
-        return div().min_w(px(0.0)).truncate().child(text).into_any_element();
+        return div()
+            .min_w(px(0.0))
+            .truncate()
+            .child(text)
+            .into_any_element();
     }
     let ranges = find_substring_char_ranges(&text, query_lower);
     if ranges.is_empty() {
-        return div().min_w(px(0.0)).truncate().child(text).into_any_element();
+        return div()
+            .min_w(px(0.0))
+            .truncate()
+            .child(text)
+            .into_any_element();
     }
     let style = HighlightStyle {
         color: Some(ui::accent()),
@@ -2438,7 +2446,9 @@ impl ProjectList {
     fn focus_first_visible_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let first_id = {
             let ordered = self.visible_ordered(self.store.read(cx), cx);
-            ordered.first().map(|item| ordered_item_id(item).to_string())
+            ordered
+                .first()
+                .map(|item| ordered_item_id(item).to_string())
         };
         if let Some(id) = first_id
             && let Some(focus) = self.row_focus.get(&id).cloned()
@@ -2588,9 +2598,9 @@ impl ProjectList {
         }
 
         // 2. 全部分组
-        let changed_groups = self
-            .store
-            .update(cx, |store, cx| store.set_all_groups_collapsed(next_collapsed, cx));
+        let changed_groups = self.store.update(cx, |store, cx| {
+            store.set_all_groups_collapsed(next_collapsed, cx)
+        });
         for gid in changed_groups {
             self.chevrons
                 .flip_open(gid.clone(), next_open, crate::fold_motion::OPEN_TURNS);
@@ -2813,7 +2823,8 @@ impl ProjectList {
                 let has_children =
                     !project_tree::worktree_descendants(self.store.read(cx).projects(), id)
                         .is_empty();
-                if has_children && !self.collapsed_worktrees.contains(id) && !self.is_filtering(cx) {
+                if has_children && !self.collapsed_worktrees.contains(id) && !self.is_filtering(cx)
+                {
                     cx.stop_propagation();
                     self.toggle_worktree_collapse(id, cx);
                 } else {
@@ -3423,9 +3434,9 @@ impl ProjectList {
                 });
                 this.cancel_spring_open();
                 if still_inside {
-                    let changed = this
-                        .store
-                        .update(cx, |store, cx| store.set_group_collapsed(&group_id, false, cx));
+                    let changed = this.store.update(cx, |store, cx| {
+                        store.set_group_collapsed(&group_id, false, cx)
+                    });
                     if changed {
                         this.chevrons
                             .flip_open(&group_id, true, crate::fold_motion::OPEN_TURNS);
@@ -3778,13 +3789,7 @@ impl ProjectList {
                         .rounded_full()
                         .bg(ui::accent()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .h(px(2.0))
-                        .rounded_r_full()
-                        .bg(ui::accent()),
-                )
+                .child(div().flex_1().h(px(2.0)).rounded_r_full().bg(ui::accent()))
                 .into_any_element(),
         )
     }
@@ -3886,10 +3891,10 @@ impl Render for ProjectList {
         self.chevrons.drive(window);
         let preview = self.render_preview(window, cx);
         let header = self.render_list_header(total_projects, matched_projects, filtering, cx);
-        let filter_bar = self
-            .filter_reveal
-            .is_mounted()
-            .then(|| self.filter_reveal.render(self.render_filter_bar(cx), window));
+        let filter_bar = self.filter_reveal.is_mounted().then(|| {
+            self.filter_reveal
+                .render(self.render_filter_bar(cx), window)
+        });
 
         let body: AnyElement = if !has_any_tree_item {
             self.render_empty_state(cx).into_any_element()
@@ -4010,8 +4015,7 @@ impl ProjectList {
                 .drop_indicator
                 .as_ref()
                 .is_some_and(|d| d.id == id && d.position == DropPosition::Inside);
-        let forbidden =
-            inside_target && self.drop_indicator.as_ref().is_some_and(|d| d.forbidden);
+        let forbidden = inside_target && self.drop_indicator.as_ref().is_some_and(|d| d.forbidden);
         let is_source = dragging == Some(id.as_str());
         let hovered = self.hovered.as_deref() == Some(id.as_str());
 
@@ -4151,9 +4155,11 @@ impl ProjectList {
                         this.on_row_drag_move(event, &id_move, true, cx);
                     },
                 ))
-                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                    this.on_row_drop(item, &id_drop, cx);
-                }))
+                .on_drop(cx.listener(
+                    move |this, item: &DragProjectItem, _window, cx| {
+                        this.on_row_drop(item, &id_drop, cx);
+                    },
+                ))
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
                 // gpui 在 Enter / Space 的 KeyUp 上给焦点元素合成一次 click;
@@ -4300,11 +4306,8 @@ impl ProjectList {
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
                                             cx.stop_propagation();
-                                            let entries = group_menu(
-                                                &cx.entity(),
-                                                &this.store,
-                                                &row_more,
-                                            );
+                                            let entries =
+                                                group_menu(&cx.entity(), &this.store, &row_more);
                                             menu::show(
                                                 click_position(event, window),
                                                 entries,
@@ -4332,9 +4335,11 @@ impl ProjectList {
                         this.on_empty_group_drag_move(event, &id_empty_move, cx);
                     },
                 ))
-                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                    this.on_row_drop(item, &id_empty_drop, cx);
-                }))
+                .on_drop(
+                    cx.listener(move |this, item: &DragProjectItem, _window, cx| {
+                        this.on_row_drop(item, &id_empty_drop, cx);
+                    }),
+                )
                 .child(
                     div()
                         .ml(px(child_ml))
@@ -4697,9 +4702,7 @@ impl ProjectList {
                             cx,
                         ));
                         let key = format!("grp:{}", group.id);
-                        if !filtering
-                            && let Some(fold) = this.folds.get(&key)
-                        {
+                        if !filtering && let Some(fold) = this.folds.get(&key) {
                             let depth = group.depth;
                             let mut j = i + 1;
                             while j < items.len() && items[j].depth() > depth {
@@ -5010,13 +5013,13 @@ impl ProjectList {
                                 .on_click(cx.listener(|this, _event, window, cx| {
                                     this.toggle_filter(window, cx);
                                 }))
-                                .child(
-                                    VectorIcon::new(ICON_SEARCH, px(12.5)).ink(if filter_active {
+                                .child(VectorIcon::new(ICON_SEARCH, px(12.5)).ink(
+                                    if filter_active {
                                         ui::accent()
                                     } else {
                                         ui::text_muted()
-                                    }),
-                                ),
+                                    },
+                                )),
                         )
                     })
                     .when(has_foldable && !filtering, |el| {
@@ -5117,7 +5120,10 @@ impl ProjectList {
         };
 
         let ai_label = if ai_active_count > 0 {
-            format!("{} · {ai_active_count}", t("projectList", "filter.aiActive"))
+            format!(
+                "{} · {ai_active_count}",
+                t("projectList", "filter.aiActive")
+            )
         } else {
             t("projectList", "filter.aiActive").to_string()
         };
@@ -5210,11 +5216,13 @@ impl ProjectList {
                             t("projectList", "filter.all").to_string(),
                             mode == ProjectFilterMode::All,
                         )
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.filter_mode = ProjectFilterMode::All;
-                            this.folds.clear();
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.filter_mode = ProjectFilterMode::All;
+                                this.folds.clear();
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         chip(
@@ -5222,15 +5230,18 @@ impl ProjectList {
                             ai_label,
                             mode == ProjectFilterMode::AiActive,
                         )
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.filter_mode = if this.filter_mode == ProjectFilterMode::AiActive {
-                                ProjectFilterMode::All
-                            } else {
-                                ProjectFilterMode::AiActive
-                            };
-                            this.folds.clear();
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this, _event, _window, cx| {
+                                this.filter_mode =
+                                    if this.filter_mode == ProjectFilterMode::AiActive {
+                                        ProjectFilterMode::All
+                                    } else {
+                                        ProjectFilterMode::AiActive
+                                    };
+                                this.folds.clear();
+                                cx.notify();
+                            },
+                        )),
                     )
                     .when(remote_count > 0, |el| {
                         el.child(
@@ -5239,16 +5250,18 @@ impl ProjectList {
                                 remote_label,
                                 mode == ProjectFilterMode::Remote,
                             )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.filter_mode = if this.filter_mode == ProjectFilterMode::Remote
-                                {
-                                    ProjectFilterMode::All
-                                } else {
-                                    ProjectFilterMode::Remote
-                                };
-                                this.folds.clear();
-                                cx.notify();
-                            })),
+                            .on_click(cx.listener(
+                                |this, _event, _window, cx| {
+                                    this.filter_mode =
+                                        if this.filter_mode == ProjectFilterMode::Remote {
+                                            ProjectFilterMode::All
+                                        } else {
+                                            ProjectFilterMode::Remote
+                                        };
+                                    this.folds.clear();
+                                    cx.notify();
+                                },
+                            )),
                         )
                     }),
             )
@@ -5347,9 +5360,7 @@ impl ProjectList {
                                         modal::open_add_project(store_local.clone(), window, cx);
                                     })
                                     .child(
-                                        FileIcon::folder(false)
-                                            .size(px(13.0))
-                                            .color(ui::bg_base()),
+                                        FileIcon::folder(false).size(px(13.0)).color(ui::bg_base()),
                                     )
                                     .child(t("projectList", "addProject")),
                             )
@@ -5725,9 +5736,11 @@ impl ProjectList {
                             this.on_row_drag_move(event, &id_move, false, cx);
                         },
                     ))
-                    .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                        this.on_row_drop(item, &id_drop, cx);
-                    }))
+                    .on_drop(cx.listener(
+                        move |this, item: &DragProjectItem, _window, cx| {
+                            this.on_row_drop(item, &id_drop, cx);
+                        },
+                    ))
                 })
             })
             // 按下即收缩略图并把行焦点收过来
@@ -5823,37 +5836,43 @@ impl ProjectList {
             ui::text_secondary()
         };
 
-        self.project_row_interactions(row, is_active, row.path.clone(), dragging, filtering, tree, cx)
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(7.0))
-            .pl(px(pl))
-            .pr(px(pr))
-            .py(px(5.5))
-            .when(in_expanded_cluster, |el| {
-                el.rounded_t(px(CLUSTER_INNER_RADIUS))
-                    .border_b_1()
-                    .border_color(if is_focused {
-                        ui::with_alpha(ui::accent(), 0.55)
-                    } else {
-                        ui::border_subtle()
-                    })
-            })
-            .when(!in_expanded_cluster, |el| {
-                el.rounded(px(6.0))
-                    .border_1()
-                    .border_color(border_color)
-            })
-            .text_size(ui::font_px(13.0))
-            .text_color(text_color)
-            .when_some(row_tint, |el, bg| el.bg(bg))
-            .when(!is_active, |el| {
-                el.hover(|el| {
-                    el.bg(ui::with_alpha(ui::text_primary(), 0.045))
-                        .text_color(ui::text_primary())
+        self.project_row_interactions(
+            row,
+            is_active,
+            row.path.clone(),
+            dragging,
+            filtering,
+            tree,
+            cx,
+        )
+        .relative()
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .pl(px(pl))
+        .pr(px(pr))
+        .py(px(5.5))
+        .when(in_expanded_cluster, |el| {
+            el.rounded_t(px(CLUSTER_INNER_RADIUS))
+                .border_b_1()
+                .border_color(if is_focused {
+                    ui::with_alpha(ui::accent(), 0.55)
+                } else {
+                    ui::border_subtle()
                 })
+        })
+        .when(!in_expanded_cluster, |el| {
+            el.rounded(px(6.0)).border_1().border_color(border_color)
+        })
+        .text_size(ui::font_px(13.0))
+        .text_color(text_color)
+        .when_some(row_tint, |el, bg| el.bg(bg))
+        .when(!is_active, |el| {
+            el.hover(|el| {
+                el.bg(ui::with_alpha(ui::text_primary(), 0.045))
+                    .text_color(ui::text_primary())
             })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5913,12 +5932,8 @@ impl ProjectList {
             );
             let own_rail_x = cluster_rail_x(rel_depth.saturating_sub(1));
             let gutter_w = own_rail_x + CHILD_ELBOW_W + CHILD_ELBOW_GAP;
-            let connectors = child_tree_connectors(
-                rel_depth,
-                is_last_sibling,
-                ancestor_continues,
-                is_active,
-            );
+            let connectors =
+                child_tree_connectors(rel_depth, is_last_sibling, ancestor_continues, is_active);
             let branch_icon_color = if is_active {
                 ui::accent()
             } else if hovered {
@@ -5959,11 +5974,14 @@ impl ProjectList {
                 .border_1()
                 .border_color(child_border)
                 .text_size(ui::font_px(12.0))
-                .text_color(if is_active || hovered || row.light >= StatusLight::Attention || show_done_tag {
-                    ui::text_primary()
-                } else {
-                    ui::text_secondary()
-                })
+                .text_color(
+                    if is_active || hovered || row.light >= StatusLight::Attention || show_done_tag
+                    {
+                        ui::text_primary()
+                    } else {
+                        ui::text_secondary()
+                    },
+                )
                 .when_some(child_tint, |el, bg| el.bg(bg))
                 // 领位换成轻量的矢量分支图标（不再重复父项目的大号技术栈图标）
                 .child(VectorIcon::new(ICON_BRANCH, px(12.0)).ink(branch_icon_color))
@@ -5985,7 +6003,9 @@ impl ProjectList {
                     row.ssh_connected.as_deref(),
                 ))
                 // 零抖动悬浮「···」操作胶囊
-                .when(show_more, |el| el.child(self.project_more_overlay(&row, tree, cx)));
+                .when(show_more, |el| {
+                    el.child(self.project_more_overlay(&row, tree, cx))
+                });
 
             let row_el = self
                 .project_row_interactions(&row, is_active, tooltip, dragging, filtering, tree, cx)
@@ -6122,13 +6142,7 @@ impl ProjectList {
                         .bottom_0()
                         .flex()
                         .items_center()
-                        .child(
-                            div()
-                                .w(px(2.5))
-                                .h(px(14.0))
-                                .rounded_full()
-                                .bg(color),
-                        ),
+                        .child(div().w(px(2.5)).h(px(14.0)).rounded_full().bg(color)),
                 )
             })
             // 领位是**项目身份图标**,每行都有、项目名左缘严格垂直对齐
@@ -6159,7 +6173,9 @@ impl ProjectList {
                 ssh_connected.as_deref(),
             ))
             // 零抖动悬浮「···」操作胶囊（替代直接外露会引发整行左跳的 ✕）
-            .when(show_more, |el| el.child(self.project_more_overlay(&row, tree, cx)));
+            .when(show_more, |el| {
+                el.child(self.project_more_overlay(&row, tree, cx))
+            });
 
         let ml = row_left_margin(group_depth);
         let guides = group_guide_lines(group_depth);
