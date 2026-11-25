@@ -50,6 +50,27 @@ fn 切过来那一下凑成的双击不改名() {
     assert_eq!(guard.click("c", true, 2), SwitchClick::Rename);
 }
 
+/// 停在 a 上快速双击 b,第一下被拖拽起手吃掉(手抖过 2px)、没凑成 click:第二下单独
+/// 到达、计数却是 2。b 还不是激活的,只能切过去,不能弹 b 的改名框。
+#[test]
+fn 双击前一下丢了时未激活的条目只切换不改名() {
+    let mut guard = SwitchClickGuard::default();
+    // 之前在 a 上单击过(a 是激活的)
+    assert_eq!(guard.click("a", true, 1), SwitchClick::Switch);
+    // b 的第一下被拖拽吃掉,第二下以 count=2 到达
+    assert_eq!(guard.click("b", false, 2), SwitchClick::Switch);
+    // 同一串连点的第三下:b 已激活,但前一下单击不是落在激活的 b 上 → 不改名
+    assert_eq!(guard.click("b", true, 3), SwitchClick::Ignore);
+    // 双击计数是窗口级的:单击 a 后紧接着点到 b,b 那一下也可能是 count=2
+    assert_eq!(guard.click("a", true, 1), SwitchClick::Switch);
+    assert_eq!(guard.click("b", false, 2), SwitchClick::Switch);
+    // 已激活的条目,前一下单击落在别的条目上:不改名
+    assert_eq!(guard.click("b", true, 2), SwitchClick::Ignore);
+    // 正常双击激活的 b 仍改名
+    assert_eq!(guard.click("b", true, 1), SwitchClick::Switch);
+    assert_eq!(guard.click("b", true, 2), SwitchClick::Rename);
+}
+
 /// 存的百分比正常时按它切,和为 1。
 #[test]
 fn 比例按存的百分比换算() {

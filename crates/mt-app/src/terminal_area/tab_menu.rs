@@ -121,11 +121,16 @@ pub(super) fn maximize_menu_state(
 /// 组装一个 tab 的右键菜单。`label` 是它当前的显示名(重命名的默认值)。
 /// `pub(crate)`:终端列表竖条([`crate::terminals_panel`])的行右键与 tab 右键
 /// **必须同一份菜单** —— 同一个 pane 在两处的操作面不该有差异。
+///
+/// `is_active` = 它是所在分组当前激活的 tab。重命名只给当前 tab(与双击改名同一口径,
+/// 见 [`super::SwitchClickGuard`]):右键别的 tab 时这一项置灰而不是抽掉 —— 菜单条目
+/// 固定,肌肉记忆才稳。其余各项照旧作用于右键的那个 tab。
 pub(crate) fn tab_menu(
     store: &Entity<AppStore>,
     project_id: &str,
     pane_id: &str,
     label: &str,
+    is_active: bool,
     cx: &App,
 ) -> Vec<MenuEntry> {
     let pane_state = store
@@ -177,6 +182,7 @@ pub(crate) fn tab_menu(
                 let label = label.to_string();
                 MenuItem::new(t("paneGroup", "rename"))
                     .shortcut(crate::hotkeys::hotkey_label("renamePane"))
+                    .disabled(!is_active)
                     .on_click(move |window, cx| {
                         // 复用既有的重命名对话框(双击 tab 走的也是它)
                         modal::open_rename_pane(

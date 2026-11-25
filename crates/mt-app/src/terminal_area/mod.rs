@@ -432,28 +432,35 @@ pub(crate) enum SwitchClick {
     Ignore,
 }
 
-/// 记着上一次单击切过来的是哪个条目,好认出「切过去后顺手又点了一下」。
+/// 记着上一次单击落在哪个条目上、那时它是不是激活的,好认出哪一对点击才是「双击改名」。
 ///
-/// gpui 的双击是两次单击按时间窗合成的(`click_count` 依次 1、2),第一下已经把条目
-/// 切过来了:切完紧接着再点一下标题,不该被当成双击弹出改名。只有前一下落在**本来
-/// 就激活**的条目上,这一对点击才算双击改名。
+/// gpui 的双击是两次按下按时间窗合成的(`click_count` 依次 1、2),**计数是窗口级的,
+/// 不管两下是不是落在同一个元素上、前一下有没有凑成 click**。改名只认一种:双击的前一下
+/// 也点在这个条目上、且那时它**本来就激活**。其余都不改名:
+/// - 前一下是把它切过来的那一下:切完顺手又点一下标题 → [`SwitchClick::Ignore`];
+/// - 前一下没凑成 click —— 条目可拖,手一抖(gpui 起拖阈值 2px)第一下就被拖拽吃掉,
+///   第二下单独到达、计数却是 2:此刻它还不是激活的 → 当单击切过去(此前这里判成改名,
+///   在 A 上快速双击 B 偶尔弹出 B 的改名框);已是激活的 → `Ignore`。
 #[derive(Default)]
 pub(crate) struct SwitchClickGuard {
-    switched_to: Option<String>,
+    /// 上一次单击(`count == 1`)点在哪个条目上、点之前它是不是激活的
+    last_single: Option<(String, bool)>,
 }
 
 impl SwitchClickGuard {
     /// 点在 `id` 上(`was_active` = 点之前它就是激活的那个)。
     pub(crate) fn click(&mut self, id: &str, was_active: bool, count: usize) -> SwitchClick {
-        if count >= 2 {
-            return if self.switched_to.as_deref() == Some(id) {
-                SwitchClick::Ignore
-            } else {
-                SwitchClick::Rename
-            };
+        if count <= 1 {
+            self.last_single = Some((id.to_string(), was_active));
+            return SwitchClick::Switch;
         }
-        self.switched_to = (!was_active).then(|| id.to_string());
-        SwitchClick::Switch
+        if !was_active {
+            return SwitchClick::Switch;
+        }
+        match &self.last_single {
+            Some((last, true)) if last == id => SwitchClick::Rename,
+            _ => SwitchClick::Ignore,
+        }
     }
 }
 

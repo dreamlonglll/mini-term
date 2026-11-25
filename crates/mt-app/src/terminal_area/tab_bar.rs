@@ -544,8 +544,14 @@ impl TerminalArea {
                         cx.stop_propagation();
                         // 开菜单前先收缩略图(原版 onContextMenu 第一句)
                         this.close_tab_preview(cx);
-                        let entries =
-                            tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
+                        let entries = tab_menu(
+                            &this.store,
+                            &pid_menu,
+                            &pane_id_menu,
+                            &label_menu,
+                            is_active,
+                            cx,
+                        );
                         menu::show(event.position, entries, window, cx);
                     }),
                 )

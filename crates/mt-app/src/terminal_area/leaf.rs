@@ -519,8 +519,14 @@ impl TerminalArea {
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             this.close_tab_preview(cx);
-                            let entries =
-                                tab_menu(&this.store, &pid_menu, &pane_menu, &label_menu, cx);
+                            let entries = tab_menu(
+                                &this.store,
+                                &pid_menu,
+                                &pane_menu,
+                                &label_menu,
+                                is_active,
+                                cx,
+                            );
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
