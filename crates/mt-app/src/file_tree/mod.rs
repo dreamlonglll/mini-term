@@ -85,6 +85,29 @@
 //! 「重命名」「删除」同一条路、同一份可用性判断([`menu::row_key_action_available`])。
 //! **F2 不在行上绑**:它是全局 action,由 `main.rs` 按「谁拿着焦点」分流到
 //! [`FileTree::rename_focused_row`](与项目列表同一个做法)。
+//!
+//! # 速搜(type-to-select)
+//!
+//! 行拿着焦点时直接敲字母 / 数字(还有 `.` `_` `-`;**中文走输入法**,组字中的那段带下划线
+//! 画在速搜条上,上屏才算数)就开始速搜。字从文本输入处理器进(`impl EntityInputHandler
+//! for FileTree`,焦点在树上才登记),行按键只管控制键 —— 理由见那个 impl 的注释。
+//! 只搜**当前可见的行**(折叠着的目录不翻),大小写不敏感的子串命中,焦点跳到
+//! 从当前行起第一个命中的行,各命中行的命中片段高亮;面板底部从下沿升起一条速搜条,
+//! 显示敲进去的字与「第几个 / 共几个」,一个都不中时整条转红。查询与跳行的算法在
+//! [`mt_app_core::speed_search`]。速搜开着时:
+//!
+//! - Backspace 退一个字,退空即收起;Esc 收起;↑ / ↓ 在命中行间跳(到头绕回),
+//!   Home / End 跳第一个 / 最后一个命中的;
+//! - Enter / Space 照常开文件 / 折叠展开,同时收起速搜;← / → 照常,速搜不收(展开出来的
+//!   新行一并参与命中);
+//! - 鼠标点进列表、切项目、定位当前文件、全部折叠都收起;**焦点离开文件树**(点终端、
+//!   弹出重命名 / 删除确认框……)也收起 —— 行列表容器挂了一个焦点句柄当所有行的祖先,
+//!   订阅它的 focus-out。
+//!
+//! 焦点怎么进文件树:点行(**单击文件只开预览、焦点留在树上**,双击 / Enter 才把焦点交给
+//! 文件页,见 [`FileTree::open_file`]);或点列表空白处 —— 焦点落在列表容器上(不是 tab
+//! 停靠点),这时敲字从顶上开始速搜,↓ / Home 进第一行、↑ / End 进最后一行
+//! ([`FileTree::on_list_key`])。拿着焦点的行描一圈 accent 细边。
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -128,6 +151,7 @@ mod recycle;
 mod tests;
 
 use mt_app_core::file_tree_git_refresh as git_refresh;
+use mt_app_core::speed_search::{self, Seek, SpeedSearch};
 
 use git_refresh::{GitRefreshPlan, RepoSigs};
 
@@ -149,10 +173,25 @@ struct DropTarget {
 struct GlobalFileTree(Entity<FileTree>);
 impl Global for GlobalFileTree {}
 
+/// 行列表容器的焦点句柄([`FileTree::list_focus`])单独存一份全局:问「焦点在不在文件树上」
+/// 不必读实体 —— 问的一方可能正在文件树自己的 update 里(单击行 → 开文件 → 文件页判焦点),
+/// 读实体会 double-lease。
+struct GlobalFileTreeFocus(gpui::FocusHandle);
+impl Global for GlobalFileTreeFocus {}
+
 /// 安装文件管理器的统一操作入口。文件页中的远程二进制/超限提示通过它复用
 /// 现有下载冲突检查、下载目录设置和 busy ownership，不另建一套下载流程。
 pub fn install(tree: Entity<FileTree>, cx: &mut App) {
+    let focus = tree.read(cx).list_focus.clone();
+    cx.set_global(GlobalFileTreeFocus(focus));
     cx.set_global(GlobalFileTree(tree));
+}
+
+/// 键盘焦点此刻在文件树(某一行)上吗。文件树单击打开的文件页据此不抢焦点
+/// (见 `FileViewer::on_activated_quietly`)。
+pub fn has_focus(window: &Window, cx: &App) -> bool {
+    cx.try_global::<GlobalFileTreeFocus>()
+        .is_some_and(|global| global.0.contains_focused(window, cx))
 }
 
 fn show_download_context_changed(project_id: &str, cx: &mut App) {
@@ -273,6 +312,19 @@ struct PendingScroll {
 /// 定位失败的就地提示挂多久。一行灰字,看一眼就够,不必去点掉。
 const NOTICE_TTL: Duration = Duration::from_secs(5);
 
+/// 底部速搜条上画的那一份。速搜收起后查询词当场清掉(行上的高亮随之消失),退场那几帧
+/// 速搜条照画最后这一份,不会缩回去的时候变成空条。
+#[derive(Clone, Debug, Default)]
+struct SpeedBarView {
+    query: String,
+    /// 输入法正在组的字(还没上屏),画在查询词后面、带下划线。
+    preedit: String,
+    /// 拿着焦点的行在命中行里排第几(从 1 数);它不命中时为 `None`。
+    ordinal: Option<usize>,
+    /// 当前可见行里命中的总数。0 = 一个都不中,整条转红。
+    total: usize,
+}
+
 pub struct FileTree {
     store: Entity<AppStore>,
     /// 目录行的折叠箭头:只让刚点的那一行转(见 `fold_motion`),按目录路径索引。
@@ -360,6 +412,25 @@ pub struct FileTree {
     /// 上一帧画的「工作区当前文件」的比较键([`tree_path_key`]);停在终端页 / diff 页签上
     /// 为 `None`。工作区通知时拿现值与它比,变了才重画(见模块注释「当前文件」)。
     active_file: Option<String>,
+    /// 速搜的查询词(见模块注释「速搜」)。
+    speed: SpeedSearch,
+    /// 输入法正在组、还没上屏的字(见 `impl EntityInputHandler for FileTree`)。组字期间
+    /// 速搜条就升起来、把它画在查询词后面;上屏才并进查询词、才跳行。
+    speed_preedit: Option<String>,
+    /// 底部速搜条的进退场(高度裁剪,从面板下沿升起 / 沉回)。
+    speed_bar: crate::height_reveal::HeightReveal,
+    /// 速搜条上画的那一份,见 [`SpeedBarView`]。
+    speed_bar_view: SpeedBarView,
+    /// 速搜条升起播完后还要再补滚几帧(见 render 里「速搜条这一帧」那段)。
+    speed_scroll_settle: u8,
+    /// 行列表容器的焦点句柄:所有行句柄的祖先。点列表空白处焦点落在它上面(敲字从顶上
+    /// 开始速搜,见 [`Self::on_list_key`]);订阅它的 focus-in / out 收起速搜、重画焦点描边。
+    /// 不是 tab 停靠点。
+    list_focus: gpui::FocusHandle,
+    /// 对 [`Self::list_focus`] 的 focus-in / out 订阅。要 `Window` 才订得上,首帧 render 时补。
+    _list_focus_subs: Vec<Subscription>,
+    /// 这一帧拿着焦点的行(画焦点描边用),render 开头按行焦点句柄现取。
+    focused_row: Option<PathBuf>,
     _workbench_sub: Option<Subscription>,
     _fs_task: Task<()>,
     _git_task: Task<()>,
@@ -596,6 +667,14 @@ impl FileTree {
             notice: None,
             _notice_task: None,
             active_file: None,
+            speed: SpeedSearch::default(),
+            speed_preedit: None,
+            speed_bar: crate::height_reveal::HeightReveal::new(false),
+            speed_bar_view: SpeedBarView::default(),
+            speed_scroll_settle: 0,
+            list_focus: cx.focus_handle(),
+            _list_focus_subs: Vec::new(),
+            focused_row: None,
             _workbench_sub: None,
             _fs_task: fs_task,
             _git_task: git_task,
@@ -904,6 +983,10 @@ impl FileTree {
         self.reveal = None;
         self.pending_scroll = None;
         self.notice = None;
+        // 速搜同理。换了一整块上下文,条直接收掉不播(`HeightReveal` 的口径)
+        self.speed.clear();
+        self.speed_preedit = None;
+        self.speed_bar.jump(false);
         self.remote_broken = broken;
         // 授权关闭的远程项目完全不订阅 Git 输出旁路。
         git_watch::set_enabled_for(git_watch::Subscriber::FileTree, git_enabled);
@@ -1296,6 +1379,9 @@ impl FileTree {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.on_speed_key(event, Some(path), window, cx) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let plain = !event.keystroke.modifiers.modified();
         match key {
@@ -1366,13 +1452,164 @@ impl FileTree {
         let Some(target) = focus_nav::row_nav_target(&depths, current, nav) else {
             return;
         };
-        let path = rows[target].path.clone();
+        self.focus_row_at(&rows, target, window, cx);
+    }
+
+    /// 把焦点当场交给第 `target` 行并把它滚进可视区(键盘移动与速搜共用)。
+    ///
+    /// 列表子元素与行号 1:1 才滚得准,所以先清掉在飞的折叠动画。那一行这一拍才出现、
+    /// 还没画过(没有焦点句柄)时,交给下一帧兑现(`pending_scroll`,与定位同一条路)。
+    fn focus_row_at(
+        &mut self,
+        rows: &[Row],
+        target: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = rows.get(target).map(|row| row.path.clone()) else {
+            return;
+        };
         self.folds.clear();
         if let Some(focus) = self.row_focus.get(&path) {
             window.focus(focus, cx);
+            self.list_scroll.scroll_to_item(target);
+        } else {
+            self.pending_scroll = Some(PendingScroll {
+                path,
+                focus: true,
+                recheck: true,
+            });
         }
-        self.list_scroll.scroll_to_item(target);
         cx.notify();
+    }
+
+    // ─── 速搜(见模块注释「速搜」) ─────────────────────────────
+
+    /// 行按键先过这一道。返回 `true` = 这一键由速搜吃掉了,[`Self::on_row_key`] 不再往下走。
+    /// `path` 是拿着焦点的行;`None` = 焦点在列表容器本身(点了空白处),从顶上找起。
+    ///
+    /// 只认不带 Ctrl / Alt / Win(macOS 的 Cmd)/ Fn 的按法 —— Shift 放行(大写字母、`_`);
+    /// Alt+← / → 这类全局键、Ctrl+C 之类的组合键原样放过去。
+    fn on_speed_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        path: Option<&Path>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let keystroke = &event.keystroke;
+        let modifiers = &keystroke.modifiers;
+        let typing =
+            !modifiers.control && !modifiers.alt && !modifiers.platform && !modifiers.function;
+        let plain = !modifiers.modified();
+        let active = self.speed.is_active();
+        let seek = match keystroke.key.as_str() {
+            "escape" if active => {
+                cx.stop_propagation();
+                self.close_speed_search(cx);
+                return true;
+            }
+            "backspace" if active && typing => {
+                cx.stop_propagation();
+                if self.speed.pop() {
+                    self.speed_seek(path, Seek::From, window, cx);
+                } else {
+                    self.sync_speed_bar();
+                    cx.notify();
+                }
+                return true;
+            }
+            // 照常开文件 / 折叠展开,只是顺手收起速搜
+            "enter" | "space" if active => {
+                self.close_speed_search(cx);
+                return false;
+            }
+            "up" if active && plain => Seek::Prev,
+            "down" if active && plain => Seek::Next,
+            "home" if active && plain => Seek::First,
+            "end" if active && plain => Seek::Last,
+            // 可打印的字**不在这里取**:它们随后经文本输入处理器进来(WM_CHAR / 输入法上屏,
+            // 见 `impl EntityInputHandler for FileTree`),这里也取就记两遍
+            _ => return false,
+        };
+        cx.stop_propagation();
+        self.speed_seek(path, seek, window, cx);
+        true
+    }
+
+    /// 按查询词在当前可见行里找该跳到的那一行([`speed_search::seek`]),跳过去。
+    /// 一个都不中就原地不动(速搜条转红);总要重画一次:条上的字与行上的高亮都变了。
+    fn speed_seek(
+        &mut self,
+        from: Option<&Path>,
+        seek: Seek,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rows = self.visible_rows(cx);
+        let hits = speed_search::hits(
+            rows.iter().map(|row| row.name.as_str()),
+            self.speed.query_lower(),
+        );
+        let current = from.and_then(|from| rows.iter().position(|row| row.path == from));
+        match speed_search::seek(&hits, current, seek) {
+            Some(target) if Some(target) != current => self.focus_row_at(&rows, target, window, cx),
+            _ => cx.notify(),
+        }
+    }
+
+    /// 焦点在列表容器本身(点了空白处,还没落到哪一行)时的按键。行上的键冒泡上来的
+    /// 不管 —— 那由 [`Self::on_row_key`] 处理过了。敲字从顶上开始速搜;↓ / Home 进第一行、
+    /// ↑ / End 进最后一行,之后就是行上的那一套。
+    fn on_list_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.list_focus.is_focused(window) || self.operation_context(cx).is_none() {
+            return;
+        }
+        if self.on_speed_key(event, None, window, cx) {
+            return;
+        }
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let rows = self.visible_rows(cx);
+        let Some(last) = rows.len().checked_sub(1) else {
+            return;
+        };
+        let target = match event.keystroke.key.as_str() {
+            "down" | "home" => 0,
+            "up" | "end" => last,
+            _ => return,
+        };
+        cx.stop_propagation();
+        self.focus_row_at(&rows, target, window, cx);
+    }
+
+    /// 收起速搜(播沉回去的退场),连同没上屏的组字。没在速搜时什么都不做。
+    fn close_speed_search(&mut self, cx: &mut Context<Self>) {
+        let had_preedit = self.speed_preedit.take().is_some();
+        if self.speed.clear() || had_preedit {
+            self.speed_bar.set_open(false);
+            cx.notify();
+        }
+    }
+
+    /// 速搜条的开合跟着「有查询词或正在组字」走。
+    fn sync_speed_bar(&mut self) {
+        self.speed_bar
+            .set_open(self.speed.is_active() || self.speed_preedit.is_some());
+    }
+
+    /// 眼下拿着焦点的行(焦点在列表容器本身或不在文件树上时为 `None`)。
+    fn focused_row_path(&self, window: &Window) -> Option<PathBuf> {
+        self.row_focus
+            .iter()
+            .find(|(_, focus)| focus.is_focused(window))
+            .map(|(path, _)| path.clone())
     }
 
     /// 行上的 F2 / Delete:与右键菜单「重命名」「删除」同一个函数(含确认框与
@@ -1478,6 +1715,7 @@ impl FileTree {
     fn begin_reveal(&mut self, project_id: &str, path: PathBuf, cx: &mut Context<Self>) {
         self.reveal = None;
         self.pending_scroll = None;
+        self.close_speed_search(cx);
         let Some(root) = self.project_root(cx) else {
             return;
         };
@@ -1625,6 +1863,7 @@ impl FileTree {
         let Some(project_id) = self.current_project.clone() else {
             return;
         };
+        self.close_speed_search(cx);
         let root = self.project_root(cx);
         let collapsed = self
             .store
@@ -1698,8 +1937,16 @@ impl FileTree {
     /// AA 批之前 GPUI 侧的双击调编辑器是预览器缺位时的临时替身,现在撤掉:
     /// 留着的话双击会先开预览器再拉起编辑器(gpui 的双击是两个 click 事件,
     /// click_count 依次为 1、2),两个窗口一起冒出来。
+    ///
+    /// 焦点:**单击**走 [`Self::open_file_quietly`],焦点留在树上;行上按 Enter / Space 与
+    /// 双击的第二下走这里,焦点交给文件页(IDE 里同一套:单击看、双击 / 回车进去改)。
     fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         crate::workbench_area::open_active_file(self.store.clone(), path, None, window, cx);
+    }
+
+    /// 单击文件行:开 / 切到文件页签,但不抢焦点(见 [`Self::open_file`])。
+    fn open_file_quietly(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        crate::workbench_area::open_active_file_quietly(self.store.clone(), path, window, cx);
     }
 
     /// 展开某个目录并(重)列它。新建文件/文件夹之后要用:原版是
@@ -2445,6 +2692,23 @@ impl Render for FileTree {
         if !cx.has_active_drag() {
             self.drop_target = None;
         }
+        // 焦点离开文件树(行列表容器及其所有行)即收起速搜;进出都重画一次(焦点行的描边
+        // 要跟着亮灭)。订阅要 `Window`,首帧补上
+        if self._list_focus_subs.is_empty() {
+            self._list_focus_subs = vec![
+                cx.on_focus_out(
+                    &self.list_focus,
+                    window,
+                    |this: &mut Self, _event, _window, cx| {
+                        this.close_speed_search(cx);
+                        cx.notify();
+                    },
+                ),
+                cx.on_focus_in(&self.list_focus, window, |_this: &mut Self, _window, cx| {
+                    cx.notify();
+                }),
+            ];
+        }
         let project_name = self.store.read(cx).active_project().map(|p| p.name.clone());
         let editors: Vec<String> = self
             .store
@@ -2741,8 +3005,64 @@ impl Render for FileTree {
                 .child(body);
         }
 
+        // 拿着焦点的那一行(焦点描边;速搜条的「第几个」)
+        let focused = rows.iter().position(|row| {
+            self.row_focus
+                .get(&row.path)
+                .is_some_and(|focus| focus.is_focused(window))
+        });
+        self.focused_row = focused.map(|ix| rows[ix].path.clone());
+
+        // 速搜条这一帧画的那一份:命中总数与拿着焦点的行排第几。收起后不再刷新,
+        // 退场那几帧照画最后一份(见 `SpeedBarView`)
+        if self.speed.is_active() || self.speed_preedit.is_some() {
+            let hits = speed_search::hits(
+                rows.iter().map(|row| row.name.as_str()),
+                self.speed.query_lower(),
+            );
+            let (ordinal, total) = speed_search::ordinal(&hits, focused);
+            self.speed_bar_view = SpeedBarView {
+                query: self.speed.query().to_string(),
+                preedit: self.speed_preedit.clone().unwrap_or_default(),
+                ordinal,
+                total,
+            };
+            // 条升起时列表视口逐帧变矮,而 gpui 的 `scroll_to_item` 按**上一帧**的视口算:
+            // 刚跳到、贴着底边的那一行会被升起的条挤出可视区。所以升起期间每帧把拿着焦点的
+            // 行再滚一次(已在视口内就不动),播完再补两帧(第二帧拿到的才是最终视口)。
+            // 在飞的折叠动画期间子元素与行号不 1:1,不滚
+            if self.speed_bar.is_running() {
+                self.speed_scroll_settle = 2;
+            }
+            if self.speed_scroll_settle > 0 && !self.folds.is_animating() {
+                if !self.speed_bar.is_running() {
+                    self.speed_scroll_settle -= 1;
+                    window.request_animation_frame();
+                }
+                if let Some(ix) = focused {
+                    self.list_scroll.scroll_to_item(ix);
+                }
+            }
+        } else {
+            self.speed_scroll_settle = 0;
+        }
+
         let mut list = div()
             .id("file-tree-list")
+            // 所有行焦点句柄的祖先(见模块注释「速搜」)。不设 tab_index,不是 tab 停靠点。
+            // 点列表空白处焦点落在它上面(gpui 给可聚焦元素自动挂的「按下即聚焦」;点在行上
+            // 时行自己先聚焦并 prevent 过,轮不到它),这时敲字从顶上开始速搜
+            .track_focus(&self.list_focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.on_list_key(event, window, cx);
+            }))
+            // 鼠标点进来 = 换了一种走法,速搜收起(点在行上时行自己也收过一次,无妨)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
+                    this.close_speed_search(cx);
+                }),
+            )
             .flex()
             .flex_col()
             .flex_1()
@@ -2839,11 +3159,40 @@ impl Render for FileTree {
                 }),
         );
 
+        // 文本输入处理器(速搜的字从这里进,见 `impl EntityInputHandler for FileTree`):
+        // 焦点在文件树上(某一行或列表容器)才登记。`handle_input` 只认传进去的句柄正是
+        // 当前焦点,而焦点在哪一行要到绘制时才定,所以在 paint 阶段现取。登记了它,
+        // 焦点在树上时输入法才开得起来(gpui 没有输入处理器就把 IME 摘掉)
+        let input_handler = {
+            let entity = cx.entity();
+            let list_focus = self.list_focus.clone();
+            gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, cx| {
+                    if list_focus.contains_focused(window, cx)
+                        && let Some(focused) = window.focused(cx)
+                    {
+                        window.handle_input(
+                            &focused,
+                            gpui::ElementInputHandler::new(bounds, entity),
+                            cx,
+                        );
+                    }
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
+
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(ui::bg_surface())
+            .child(input_handler)
             .child(header)
             // 有旧内容时的刷新失败:一条细提示挂在列表**上方**,内容照旧留着
             .when_some(self.root_error.clone(), |el, _err| {
@@ -2880,6 +3229,10 @@ impl Render for FileTree {
                 )
             })
             .child(list)
+            // 速搜条:贴在面板底部,高度裁剪从下沿升起 / 沉回(退场期间也挂着)
+            .when(self.speed_bar.is_mounted(), |el| {
+                el.child(self.speed_bar.render(self.render_speed_bar(), window))
+            })
     }
 }
 
@@ -2992,6 +3345,116 @@ impl FileTree {
         picker.into_any_element()
     }
 
+    /// 底部速搜条:放大镜 + 敲进去的字(输入法组字中的那段带下划线接在后面)+ 操作提示 +
+    /// 「第几个 / 共几个」。一个都不中时整条转红、计数换成「无匹配」;只在组字、还没有
+    /// 查询词时不计数也不转红。窄栏里提示先让位(它 `flex_1` 从 0 起算),查询词其次
+    /// (截断带省略号),计数始终在。
+    fn render_speed_bar(&self) -> gpui::Div {
+        let view = &self.speed_bar_view;
+        let has_query = !view.query.is_empty();
+        let miss = has_query && view.total == 0;
+        let tone = if miss {
+            ui::color_error()
+        } else {
+            ui::accent()
+        };
+        let count: Option<SharedString> = if !has_query {
+            None
+        } else if miss {
+            Some(t("fileTree", "speedSearch.noMatch").into())
+        } else {
+            Some(match view.ordinal {
+                Some(n) => format!("{n}/{}", view.total).into(),
+                None => format!("–/{}", view.total).into(),
+            })
+        };
+        // 查询词 + 组字串拼成一段文字,组字那段画下划线(一段 StyledText,截断才有省略号)
+        let typed = format!("{}{}", view.query, view.preedit);
+        let preedit_style = gpui::HighlightStyle {
+            color: Some(ui::text_secondary()),
+            underline: Some(gpui::UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(ui::text_secondary()),
+                wavy: false,
+            }),
+            ..Default::default()
+        };
+        let preedit_range = (!view.preedit.is_empty()).then_some(view.query.len()..typed.len());
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .h(px(34.0))
+            .px(px(12.0))
+            .border_t_1()
+            .border_color(ui::with_alpha(tone, 0.45))
+            .bg(ui::with_alpha(tone, 0.10))
+            .child(VectorIcon::new(SEARCH_SHAPES, px(14.0)).ink(tone))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::font_px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(if miss {
+                        ui::color_error()
+                    } else {
+                        ui::text_primary()
+                    })
+                    .child(
+                        gpui::StyledText::new(typed)
+                            .with_highlights(preedit_range.map(|range| (range, preedit_style))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::font_px(10.5))
+                    .text_color(ui::text_muted())
+                    .child(t("fileTree", "speedSearch.hint")),
+            )
+            .when_some(count, |el, count| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(ui::font_px(11.5))
+                        .text_color(if miss {
+                            ui::color_error()
+                        } else {
+                            ui::text_secondary()
+                        })
+                        .child(count),
+                )
+            })
+    }
+
+    /// 行名。速搜开着且这一行命中时,命中那一段涂 accent 粗体 + 淡 accent 底;**一段**
+    /// 文字带高亮区间,不逐段发元素 —— 逐段的话长名字只能被硬裁,截断处没有省略号
+    /// (与分支列表的命中高亮同一个做法)。
+    fn render_row_name(&self, name: String) -> AnyElement {
+        let label = div().flex_1().truncate();
+        let range = self
+            .speed
+            .is_active()
+            .then(|| speed_search::match_range(&name, self.speed.query_lower()))
+            .flatten()
+            .and_then(|(start, end)| crate::git::branches::char_range_to_bytes(&name, start, end));
+        let Some(range) = range else {
+            return label.child(name).into_any_element();
+        };
+        let style = gpui::HighlightStyle {
+            color: Some(ui::accent()),
+            font_weight: Some(gpui::FontWeight::BOLD),
+            background_color: Some(ui::with_alpha(ui::accent(), 0.18)),
+            ..Default::default()
+        };
+        label
+            .child(gpui::StyledText::new(name).with_highlights([(range, style)]))
+            .into_any_element()
+    }
+
     fn render_row(&self, row: Row, cx: &mut Context<Self>) -> AnyElement {
         let path = row.path.clone();
         let is_dir = row.is_dir;
@@ -3066,9 +3529,13 @@ impl FileTree {
         let move_id = row_drop_id.clone();
         let move_target = entry_target.clone();
         let move_drop_target = entry_target;
+        // 键盘焦点在这一行:描一圈 accent 细边(与项目列表的焦点行同一套语言)。画在绝对定位的
+        // 叠层上,不占行的尺寸 —— 焦点挪来挪去,行不跟着胖瘦
+        let is_focused = self.focused_row.as_ref() == Some(&row.path);
 
         div()
             .id(SharedString::from(format!("fs-{}", row.path.display())))
+            .relative()
             // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}` + `role=treeitem`)
             .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
             .on_key_down(
@@ -3084,10 +3551,14 @@ impl FileTree {
                 cx.listener({
                     let path = row.path.clone();
                     move |this, _event: &MouseDownEvent, window, cx| {
+                        // 鼠标点行 = 换了一种走法,速搜收起(IDE 里同一口径)
+                        this.close_speed_search(cx);
                         // 浏览器点 `tabIndex=0` 的行就会聚焦,←→ 折叠展开靠这一条才够得着
                         if let Some(focus) = this.row_focus.get(&path) {
                             window.focus(focus, cx);
                         }
+                        // 焦点描边跟到这一行(行间换焦点不触发列表的 focus-in / out)
+                        cx.notify();
                     }
                 }),
             )
@@ -3115,11 +3586,20 @@ impl FileTree {
                     if this.operation_context(cx).as_ref() != click_context.as_ref() {
                         return;
                     }
+                    // gpui 给拿着焦点的元素在 Enter / Space 的 KeyUp 上合成一次 click(「键盘激活」)。
+                    // 这两个键 KeyDown 时已经在 `on_row_key` 里处理过了,再认这一下目录就被
+                    // 折叠又展开(E2E 抓到的:目录行按 Enter / Space 看着没反应),所以只认鼠标
+                    if event.is_keyboard() {
+                        return;
+                    }
                     if is_dir {
                         this.toggle_dir(path.clone(), cx);
                     } else if event.click_count() <= 1 {
-                        // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
-                        // 见 `open_file` 的注释
+                        // 单击开预览器,焦点留在树上(↑↓ / 速搜接着用);
+                        // 双击的第二个事件(click_count == 2)把焦点交给文件页,与行上按 Enter
+                        // 同一条路(见 `open_file` 的注释)
+                        this.open_file_quietly(path.clone(), window, cx);
+                    } else if event.click_count() == 2 {
                         this.open_file(path.clone(), window, cx);
                     }
                 }),
@@ -3242,7 +3722,7 @@ impl FileTree {
                     }),
             )
             .child(icon)
-            .child(div().flex_1().truncate().child(row.name))
+            .child(self.render_row_name(row.name))
             // git 状态字母。目录那枚是**汇总**来的,画淡一档以示区别(原版 opacity-70)
             .when_some(git_badge, |el, (label, rolled_up)| {
                 el.child(
@@ -3259,6 +3739,145 @@ impl FileTree {
                         .child(label),
                 )
             })
+            .when(is_focused, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(ui::with_alpha(ui::accent(), 0.75)),
+                )
+            })
             .into_any_element()
     }
+}
+
+/// 速搜的文本入口。文件树没有可编辑的文档,照终端的做法(`mt_ui::terminal::ime`)把
+/// **输入法正在组的那段**当作文档:长度就是它的 UTF-16 长度,marked range 永远是整段,
+/// 光标停在段尾;上屏(`replace_text_in_range`)才并进查询词。
+///
+/// 英文直敲同样走这里:Windows 的消息循环对每个按键都先 `TranslateMessage`,行上的
+/// key-down 处理完之后照样来一条 WM_CHAR,落到 `replace_text_in_range` —— 所以行按键
+/// 只管控制键,可打印的字一律在这里收([`SpeedSearch::push_text`] 只收字母 / 数字 /
+/// `. _ -`,空格这类由 WM_CHAR 带进来的会被丢掉)。组字期间 Windows 把按键整个让给
+/// 输入法(问的就是 `marked_text_range`),Backspace / Esc 不会漏到行上。
+impl gpui::EntityInputHandler for FileTree {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let units: Vec<u16> = self
+            .speed_preedit
+            .as_deref()
+            .unwrap_or_default()
+            .encode_utf16()
+            .collect();
+        let start = range.start.min(units.len());
+        let end = range.end.clamp(start, units.len());
+        if (start..end) != range {
+            *adjusted_range = Some(start..end);
+        }
+        Some(String::from_utf16_lossy(&units[start..end]))
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::UTF16Selection> {
+        // 没在组字时也给 `Some(0..0)`:给 None 有的输入法会认定这里不收字,连候选框都不弹
+        let len = preedit_len_utf16(self.speed_preedit.as_deref());
+        Some(gpui::UTF16Selection {
+            range: len..len,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.speed_preedit
+            .as_deref()
+            .map(|preedit| 0..preedit_len_utf16(Some(preedit)))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.speed_preedit.take().is_some() {
+            self.sync_speed_bar();
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let had_preedit = self.speed_preedit.take().is_some();
+        if self.speed.push_text(text) {
+            self.sync_speed_bar();
+            let from = self.focused_row_path(window);
+            self.speed_seek(from.as_deref(), Seek::From, window, cx);
+        } else if had_preedit {
+            // 组字被取消 / 上屏的全是不收的字(标点):收回组字那段
+            self.sync_speed_bar();
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.speed_preedit = (!new_text.is_empty()).then(|| new_text.to_string());
+        self.sync_speed_bar();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        element_bounds: gpui::Bounds<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        // 候选框贴着速搜条里那段字的起点:条在面板最底下、高 34,左内边距 12 + 放大镜 14 +
+        // 间距 8。组字一开始条就在升起,按升到位的位置给(元素边界是整个面板)
+        Some(gpui::Bounds::new(
+            gpui::point(
+                element_bounds.left() + px(34.0),
+                element_bounds.bottom() - px(27.0),
+            ),
+            gpui::size(px(1.0), px(20.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
+fn preedit_len_utf16(preedit: Option<&str>) -> usize {
+    preedit.map_or(0, |text| text.encode_utf16().count())
 }

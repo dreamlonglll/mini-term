@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1989;
+pub const ZH_ENTRY_COUNT: usize = 1991;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1989;
+pub const EN_ENTRY_COUNT: usize = 1991;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -450,6 +450,8 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("remote.refreshTitle", "刷新（重新读取远程根 .gitignore）"),
     ("reveal.notFound", "文件树里找不到该文件：它可能在不显示的目录里，或已被移动、删除"),
     ("reveal.outsideRoot", "该文件不在项目根目录内，文件树里没有它"),
+    ("speedSearch.hint", "↑↓ 切换 · Esc 退出"),
+    ("speedSearch.noMatch", "无匹配"),
     ("upload.chooseFilesTitle", "选择要上传的文件"),
     ("upload.chooseFolderTitle", "选择要上传的文件夹"),
 ];
@@ -551,6 +553,8 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("remote.refreshTitle", "Refresh (re-reads the remote root .gitignore)"),
     ("reveal.notFound", "Couldn't find this file in the file tree: it may be in a hidden folder, or it was moved or deleted"),
     ("reveal.outsideRoot", "This file is outside the project root, so it isn't in the file tree"),
+    ("speedSearch.hint", "↑↓ Next · Esc Close"),
+    ("speedSearch.noMatch", "No matches"),
     ("upload.chooseFilesTitle", "Choose Files to Upload"),
     ("upload.chooseFolderTitle", "Choose a Folder to Upload"),
 ];

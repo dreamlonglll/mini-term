@@ -480,6 +480,11 @@ pub struct FileViewer {
     watched: Option<PathBuf>,
 
     focus: FocusHandle,
+    /// 这一页是文件树**单击**打开 / 切过来的(见 [`Self::on_activated_quietly`]):焦点交接
+    /// (激活、内容落位、远程刷新失败)遇到焦点此刻在文件树上就让路,不抢。下一次正常激活
+    /// 清掉。只在「焦点在文件树上」时才起作用,所以留着也不碍事 —— 用户点进编辑器之后
+    /// 外部改动重建编辑器,焦点照旧交回编辑器。
+    yield_focus_to_tree: bool,
     _fs_task: Task<()>,
     _editor_sub: Option<Subscription>,
 
@@ -568,6 +573,7 @@ impl FileViewer {
             watcher,
             watched: None,
             focus: cx.focus_handle(),
+            yield_focus_to_tree: false,
             _fs_task: fs_task,
             _editor_sub: None,
             gutter: GitGutter::default(),
@@ -1034,6 +1040,24 @@ impl FileViewer {
     /// 页签重新激活时，干净的远程文档后台重读一次；内容未变时保留编辑器实体，
     /// 脏草稿只做连接身份检查，外部变化继续由保存前基线比较兜底。
     pub fn on_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.yield_focus_to_tree = false;
+        self.activate(window, cx);
+    }
+
+    /// 文件树单击打开 / 切到这一页:与 [`Self::on_activated`] 做同样的事,只是焦点在文件树
+    /// 上时不抢(之后内容落位那一下也不抢),键盘留给文件树接着用(↑↓、速搜)。
+    pub fn on_activated_quietly(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.yield_focus_to_tree = true;
+        self.activate(window, cx);
+    }
+
+    /// 新建出来、还没激活的页签先挂上「让着文件树」:内容是异步读的,置位要赶在
+    /// 读完之前(随后排的 [`Self::on_activated_quietly`] 会再置一次)。
+    pub fn hold_focus_for_tree(&mut self) {
+        self.yield_focus_to_tree = true;
+    }
+
+    fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.validate_remote_source(cx);
         // 本地文档:切回来时查一次 HEAD 指纹(别处提交 / 切过分支,标记与注解要跟上)
         self.git_on_activated(cx);
@@ -1371,10 +1395,12 @@ impl FileViewer {
     /// 打开 / 换文件后把焦点放到该放的地方:能编辑就进编辑器,
     /// 否则留在容器上(Ctrl+S / Esc 挂在容器的 `on_key_down` 上,
     /// 焦点不在这条链上就收不到键)。
+    /// 文件树单击打开的那一页,焦点此刻在文件树上时也让路(见 [`Self::yield_focus_to_tree`])。
     fn can_take_async_focus(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         crate::workbench_area::is_viewer_active(cx.entity_id(), cx)
             && !crate::dialog_host::has_open(window, cx)
             && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
+            && !(self.yield_focus_to_tree && crate::file_tree::has_focus(window, cx))
     }
 
     /// 切「预览 / 源码」。`animate` = 用户点的段控件:滑块滑过去,Markdown 的内容左右推

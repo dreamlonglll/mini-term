@@ -73,6 +73,10 @@ export const fileTree = {
       outsideRoot: "该文件不在项目根目录内，文件树里没有它",
       notFound: "文件树里找不到该文件：它可能在不显示的目录里，或已被移动、删除",
     },
+    speedSearch: {
+      hint: "↑↓ 切换 · Esc 退出",
+      noMatch: "无匹配",
+    },
     empty: {
       selectProject: "选择一个项目",
       loading: "加载中...",
@@ -198,6 +202,10 @@ export const fileTree = {
     reveal: {
       outsideRoot: "This file is outside the project root, so it isn't in the file tree",
       notFound: "Couldn't find this file in the file tree: it may be in a hidden folder, or it was moved or deleted",
+    },
+    speedSearch: {
+      hint: "↑↓ Next · Esc Close",
+      noMatch: "No matches",
     },
     empty: {
       selectProject: "Select a project",

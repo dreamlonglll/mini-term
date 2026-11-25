@@ -24,6 +24,7 @@ pub mod quick_ssh;
 pub mod session_branch;
 pub mod shell_link;
 pub mod shell_ops;
+pub mod speed_search;
 pub mod ssh_activity;
 pub mod ssh_conn;
 pub mod ssh_takeover;

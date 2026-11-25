@@ -235,6 +235,17 @@ impl TabContent {
             }),
         }
     }
+
+    /// 同 [`Self::activate_later`],只是文件页签走「不抢文件树焦点」那条
+    /// ([`FileViewer::on_activated_quietly`])。diff 页签没有这一说,照常激活。
+    fn activate_later_quietly(&self, window: &mut Window, cx: &mut App) {
+        match self.clone() {
+            TabContent::File(document) => window.defer(cx, move |window, cx| {
+                document.update(cx, |document, cx| document.on_activated_quietly(window, cx));
+            }),
+            TabContent::Diff(_) => self.activate_later(window, cx),
+        }
+    }
 }
 
 struct DocumentTab {
@@ -539,6 +550,29 @@ pub fn open_active_file(
     window: &mut Window,
     cx: &mut App,
 ) {
+    open_active_file_with(store, path, highlight, true, window, cx);
+}
+
+/// 文件树**单击**文件:与 [`open_active_file`] 一样开 / 切到它的页签,只是不抢焦点 ——
+/// 焦点留在文件树上,↑↓ 与速搜接着用。双击 / 行上按 Enter 仍走 [`open_active_file`]
+/// 把焦点交给文件页。
+pub fn open_active_file_quietly(
+    store: Entity<AppStore>,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    open_active_file_with(store, path, None, false, window, cx);
+}
+
+fn open_active_file_with(
+    store: Entity<AppStore>,
+    path: PathBuf,
+    highlight: Option<LineTarget>,
+    take_focus: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let snapshot = {
         let store = store.read(cx);
         let Some(project) = store.active_project() else {
@@ -579,7 +613,7 @@ pub fn open_active_file(
         return;
     };
     area.update(cx, |area, cx| {
-        area.open_document(source, highlight, window, cx)
+        area.open_document(source, highlight, take_focus, window, cx)
     });
 }
 
@@ -589,7 +623,9 @@ pub fn open_document_source(source: DocumentSource, window: &mut Window, cx: &mu
     let Some(area) = global(cx) else {
         return;
     };
-    area.update(cx, |area, cx| area.open_document(source, None, window, cx));
+    area.update(cx, |area, cx| {
+        area.open_document(source, None, true, window, cx)
+    });
 }
 
 /// 文件页内部的 Ctrl/Cmd+W 入口。延迟执行前先快照是哪个页签实体，避免用户在
@@ -881,6 +917,10 @@ pub struct WorkbenchArea {
     projects: HashMap<String, ProjectDocuments>,
     last_rendered_project: Option<String>,
     last_rendered_page: Option<WorkbenchPage>,
+    /// 文件树单击开 / 切过来的那一页(见 [`open_active_file_quietly`])。render 发现换了页
+    /// 会再激活一次新页(见 [`Self::render`] 里 `page_changed` 那段),换到的正是它时那次
+    /// 激活也得静默,不然焦点照样被文件页抢走。每次 render 开头取走,不跨帧留着。
+    quiet_page: Option<TabKey>,
     /// 页签条的横向滚动位置。**全项目共用一份**：切项目时页签整条重建，
     /// 上一个项目的偏移留着也无意义，切完那一帧的 `scroll_to_item` 会把活动页
     /// 拉回视野。只跟**文档页签**那段滚动区走，常驻终端页在滚动区之外。
@@ -953,6 +993,7 @@ impl WorkbenchArea {
             projects: HashMap::new(),
             last_rendered_project: None,
             last_rendered_page: None,
+            quiet_page: None,
             tab_scroll: ScrollHandle::new(),
             tabs_hovered: false,
             tab_drag: None,
@@ -1042,19 +1083,24 @@ impl WorkbenchArea {
         &mut self,
         source: DocumentSource,
         highlight: Option<LineTarget>,
+        take_focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_document_at(source, highlight, None, window, cx);
+        self.open_document_at(source, highlight, None, take_focus, window, cx);
     }
 
     /// [`Self::open_document`] 的完整版:新建的页签插在页签条第 `insert_at` 个(超出就落在
     /// 末尾;`None` = 末尾)。重开已关闭的页签用它插回原位置。
+    ///
+    /// `take_focus = false` 是文件树单击那一路([`open_active_file_quietly`]):页签照常开 /
+    /// 切过去,焦点在文件树上就留在那儿(见 `FileViewer::on_activated_quietly`)。
     fn open_document_at(
         &mut self,
         source: DocumentSource,
         highlight: Option<LineTarget>,
         insert_at: Option<usize>,
+        take_focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1064,6 +1110,8 @@ impl WorkbenchArea {
             DocumentSource::Local { path, .. } => Some(path.clone()),
             DocumentSource::Remote { .. } => None,
         };
+        // 换页后 render 那次激活也要静默(见 `quiet_page`);正常打开清掉上一趟留的
+        self.quiet_page = (!take_focus).then(|| key.clone());
         let project = self.projects.entry(project_id).or_default();
         project.note_recent(local_path.as_deref());
         if let Some(index) = project.index_of(&key) {
@@ -1072,7 +1120,11 @@ impl WorkbenchArea {
                 window.defer(cx, move |window, cx| {
                     document.update(cx, |document, cx| {
                         document.reveal_line(highlight, window, cx);
-                        document.on_activated(window, cx);
+                        if take_focus {
+                            document.on_activated(window, cx);
+                        } else {
+                            document.on_activated_quietly(window, cx);
+                        }
                     });
                 });
             }
@@ -1084,6 +1136,10 @@ impl WorkbenchArea {
         let document = cx.new(|cx| FileViewer::new_document(source, highlight, window, cx));
         cx.observe(&document, |_this, _document, cx| cx.notify())
             .detach();
+        if !take_focus {
+            document.update(cx, |document, _cx| document.hold_focus_for_tree());
+        }
+        let quiet_document = (!take_focus).then(|| document.clone());
         let content = TabContent::File(document);
         let index = insert_at.map_or(project.tabs.len(), |index| index.min(project.tabs.len()));
         project.tabs.insert(
@@ -1097,7 +1153,12 @@ impl WorkbenchArea {
             },
         );
         project.active = WorkbenchPage::Tab(key);
-        content.activate_later(window, cx);
+        match quiet_document {
+            Some(document) => window.defer(cx, move |window, cx| {
+                document.update(cx, |document, cx| document.on_activated_quietly(window, cx));
+            }),
+            None => content.activate_later(window, cx),
+        }
         cx.notify();
     }
 
@@ -1908,7 +1969,7 @@ impl WorkbenchArea {
         } else {
             found.line.map(LineTarget::line)
         };
-        self.open_document_at(source, highlight, Some(found.index), window, cx);
+        self.open_document_at(source, highlight, Some(found.index), true, window, cx);
     }
 
     /// 页签条右端的一行就地提示,[`NOTICE_TTL`] 后自己收(不弹框、不推 toast:重开是在
@@ -2216,6 +2277,8 @@ impl Render for WorkbenchArea {
             return div().size_full().child(self.terminal_area.clone());
         };
 
+        // 文件树单击带来的换页(见 `quiet_page`):只认这一帧,取走即作废
+        let quiet_page = self.quiet_page.take();
         let page_changed = self.last_rendered_project.as_deref() != Some(project_id.as_str())
             || self.last_rendered_page.as_ref() != Some(&active);
         if page_changed {
@@ -2246,7 +2309,11 @@ impl Render for WorkbenchArea {
                 }
                 WorkbenchPage::Tab(key) => {
                     if let Some(tab) = tabs.iter().find(|tab| &tab.key == key) {
-                        tab.content.activate_later(window, cx);
+                        if quiet_page.as_ref() == Some(key) {
+                            tab.content.activate_later_quietly(window, cx);
+                        } else {
+                            tab.content.activate_later(window, cx);
+                        }
                     }
                 }
             }

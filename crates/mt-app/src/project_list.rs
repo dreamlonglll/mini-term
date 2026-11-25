@@ -4155,7 +4155,13 @@ impl ProjectList {
                     this.on_row_drop(item, &id_drop, cx);
                 }))
             })
-            .on_click(cx.listener(move |this, _event, _window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+                // gpui 在 Enter / Space 的 KeyUp 上给焦点元素合成一次 click;
+                // KeyDown 时 `on_group_key` 已经折叠 / 展开过,再认就翻回去,
+                // 所以只认鼠标(文件树目录行同一个坑)
+                if event.is_keyboard() {
+                    return;
+                }
                 // 编辑态与过滤态里点分组不切换真实折叠状态
                 if this.editing.is_some() || this.is_filtering(cx) {
                     return;
