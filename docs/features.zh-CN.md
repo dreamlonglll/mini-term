@@ -264,7 +264,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **4119 个 Rust 测试**（47 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **4115 个 Rust 测试**（47 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -419,7 +419,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（47 个测试目标、4119 例）
+# 全工作区 Rust 测试（47 个测试目标、4115 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
