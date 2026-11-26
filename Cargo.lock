@@ -5418,7 +5418,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ai"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -5435,7 +5435,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5494,7 +5494,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app-core"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5517,7 +5517,7 @@ dependencies = [
 
 [[package]]
 name = "mt-config"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -5541,7 +5541,7 @@ dependencies = [
 
 [[package]]
 name = "mt-extensions"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -5552,7 +5552,7 @@ dependencies = [
 
 [[package]]
 name = "mt-git-helper"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "mt-core",
@@ -5563,14 +5563,14 @@ dependencies = [
 
 [[package]]
 name = "mt-i18n"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "mt-layout"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "mt-config",
@@ -5583,7 +5583,7 @@ dependencies = [
 
 [[package]]
 name = "mt-project"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5605,7 +5605,7 @@ dependencies = [
 
 [[package]]
 name = "mt-pty"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "mt-core",
@@ -5617,7 +5617,7 @@ dependencies = [
 
 [[package]]
 name = "mt-relay"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -5645,7 +5645,7 @@ dependencies = [
 
 [[package]]
 name = "mt-remote"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "mt-ai",
@@ -5699,7 +5699,7 @@ dependencies = [
 
 [[package]]
 name = "mt-syntax-pack"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "mt-syntax-pack-abi",
  "tree-sitter",
@@ -5724,11 +5724,11 @@ dependencies = [
 
 [[package]]
 name = "mt-syntax-pack-abi"
-version = "1.14.7"
+version = "1.14.8-pre"
 
 [[package]]
 name = "mt-terminal"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "alacritty_terminal",
  "base64 0.22.1",
@@ -5742,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "mt-theme-packs"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "anyhow",
  "serde",
@@ -5753,7 +5753,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ui"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -5771,7 +5771,7 @@ dependencies = [
 
 [[package]]
 name = "mt-usage"
-version = "1.14.7"
+version = "1.14.8-pre"
 dependencies = [
  "chrono",
  "chrono-tz",
