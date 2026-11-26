@@ -144,6 +144,13 @@ pub(super) fn branches_stale_after_discovery(
     before != after || (empty && !loading)
 }
 
+/// 远程 Git helper 刚装好时要不要重新发现仓库:只有远程项目、且面板正停在一条错误上
+/// (发现仓库 / 取分支失败 —— 缺 helper 时就是这样)。本地项目不走 helper;没在报错的
+/// 面板数据是好的,不必为别的平台的 helper 白扫一遍。
+pub(super) fn needs_retry_after_helper_installed(local: bool, has_error: bool) -> bool {
+    !local && has_error
+}
+
 /// detached HEAD 的显示名是带括号的短 hash(`"(1a2b3c4)"`)。
 pub(super) fn is_detached_label(label: &str) -> bool {
     label.starts_with('(') && label.ends_with(')')

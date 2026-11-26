@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 2056;
+pub const ZH_ENTRY_COUNT: usize = 2057;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 2056;
+pub const EN_ENTRY_COUNT: usize = 2057;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1564,6 +1564,7 @@ static GIT_HISTORY_ZH: &[(&str, &str)] = &[
     ("repositoryBlocked", "仓库 {repo} 暂停写入：来源项目「{projects}」有结果未知的操作。请前往来源项目核对或阅读风险提示后放弃核对；本次操作未发送。"),
     ("requestCancelled", "项目或请求上下文已失效，尚未发送的请求未执行。"),
     ("requestFailed", "远端 Git 请求失败，请检查下方详细信息。"),
+    ("retryDiscovery", "重试"),
     ("selectProject", "选择一个项目"),
     ("selectRepo", "选择仓库"),
     ("serviceBusy", "远端 Git 请求队列已满，请稍后重试。"),
@@ -1670,6 +1671,7 @@ static GIT_HISTORY_EN: &[(&str, &str)] = &[
     ("repositoryBlocked", "Writes to {repo} are blocked by unknown operations from project(s) “{projects}”. Verify or explicitly abandon verification in the source project. This operation was not sent."),
     ("requestCancelled", "The project or request context expired. Requests not yet sent were not executed."),
     ("requestFailed", "The remote Git request failed. See the diagnostic details below."),
+    ("retryDiscovery", "Retry"),
     ("selectProject", "Select a project"),
     ("selectRepo", "Select repository"),
     ("serviceBusy", "The remote Git request queue is full. Try again shortly."),

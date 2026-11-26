@@ -58,8 +58,38 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// 部署触发的下载失败后,这段时间内同一扩展不再自动重下(见模块注释)。
 const AUTO_RETRY_COOLDOWN: Duration = Duration::from_secs(10 * 60);
-/// 进度通知的最小间隔(设置页与 toast 的刷新节拍)。
-const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 下载进度报不报:界面(设置页一行、toast)只显示整数百分比,所以**百分比变了才报**,
+/// 一次下载至多 101 条。不按时间节流 —— 按时间节流只报窗口里的第一块,数据随后停住
+/// (卡在半路等 [`STALL_TIMEOUT`])时最后那一截永远报不出去,界面停在一个偏小的数上。
+#[derive(Default)]
+struct ProgressGate {
+    reported: Option<u8>,
+}
+
+impl ProgressGate {
+    /// 收到 `received / total` 字节时要不要报;要报就返回该报的百分比。
+    fn check(&mut self, received: u64, total: u64) -> Option<u8> {
+        let percent = JobState::Downloading { received, total }.percent();
+        if self.reported == Some(percent) {
+            return None;
+        }
+        self.reported = Some(percent);
+        Some(percent)
+    }
+}
+
+/// 后来的调用方加入一个已在跑的任务:它要推 toast、而发起那一方不推(设置页 / 升级自愈先
+/// 点的)时,任务改按它的来源推进度与结局 —— 否则从提示条 / 部署那一侧看,下载失败了也
+/// 没有任何原因。两边都推或都不推就照旧。返回是否改了。
+fn adopt_origin(current: &mut Origin, incoming: Origin) -> bool {
+    if incoming.toasts() && !current.toasts() {
+        *current = incoming;
+        true
+    } else {
+        false
+    }
+}
 
 /// 谁要的这次下载。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,6 +349,13 @@ pub fn ensure(id: ComponentId, origin: Origin) -> EnsureReceiver {
         let mut jobs = lock(&service.jobs);
         if let Some(job) = jobs.get_mut(&id) {
             job.waiters.push(sender);
+            // 改按后来者的来源推 toast 时,当场补一条眼下的进度(结局由 finish_job 照新来源推)
+            let adopted = adopt_origin(&mut job.origin, origin);
+            let percent = job.state.percent();
+            drop(jobs);
+            if adopted {
+                emit(ServiceEvent::AutoProgress(id, percent));
+            }
             return receiver;
         }
         jobs.insert(
@@ -434,19 +471,15 @@ fn download_and_install(id: ComponentId) -> Result<(), DownloadError> {
         .new_download_path(id)
         .map_err(DownloadError::Extension)?;
     let total = component.size;
-    let mut last: Option<Instant> = None;
-    let mut last_percent = 0u8;
+    let mut gate = ProgressGate::default();
     let progress = move |received: u64| {
-        if last.is_some_and(|at| at.elapsed() < PROGRESS_INTERVAL) && received < total {
+        let Some(percent) = gate.check(received, total) else {
             return;
-        }
-        last = Some(Instant::now());
-        let state = JobState::Downloading { received, total };
-        if let Some(origin) = set_job_state(id, state) {
+        };
+        // 来源每次现读:任务跑到一半可能被后加入的提示条 / 部署改成推 toast(见 adopt_origin)
+        if let Some(origin) = set_job_state(id, JobState::Downloading { received, total }) {
             emit(ServiceEvent::Changed);
-            let percent = state.percent();
-            if origin.toasts() && percent != last_percent {
-                last_percent = percent;
+            if origin.toasts() {
                 emit(ServiceEvent::AutoProgress(id, percent));
             }
         }
@@ -667,8 +700,22 @@ pub fn format_size(bytes: u64) -> String {
 
 // ─── 接线(UI 线程) ──────────────────────────────────────────
 
-/// 设置页观察的那个实体:后台状态一变就 `notify` 它。
+/// 设置页观察的那个实体:后台状态一变就 `notify` 它;某个扩展刚装好(下载或离线导入,不论
+/// 谁发起)时另发一条 [`ExtensionInstalled`],要跟着重试的视图订阅它(Git 面板)。
 pub struct ExtensionsHub;
+
+/// 一个扩展刚装好。
+#[derive(Clone, Copy, Debug)]
+pub struct ExtensionInstalled(pub ComponentId);
+
+impl ExtensionInstalled {
+    /// 装好的是不是远程 Git helper(任一服务器平台)。
+    pub fn is_git_helper(self) -> bool {
+        self.0.kind() == ComponentKind::GitHelper
+    }
+}
+
+impl gpui::EventEmitter<ExtensionInstalled> for ExtensionsHub {}
 
 struct GlobalHub(Entity<ExtensionsHub>);
 impl Global for GlobalHub {}
@@ -746,13 +793,20 @@ fn dispatch(batch: Vec<ServiceEvent>, hub: &Entity<ExtensionsHub>, cx: &mut App)
     for event in batch {
         match event {
             ServiceEvent::Changed => changed = true,
-            // SSH 工具装好了:把现存 SKILL.md 改指到这份 CLI(启动校正那时它还不在、跳过了;
-            // 「关联 SSH」在 CLI 缺失时只存了范围的那种也靠这一次补上)
-            ServiceEvent::Installed(ComponentId::SshTools) => {
-                let store = AppStore::global(cx);
-                store.read(cx).reconcile_ssh_skills_in_background(cx);
+            ServiceEvent::Installed(id) => {
+                let installed = ExtensionInstalled(id);
+                if id == ComponentId::SshTools {
+                    // SSH 工具装好了:把现存 SKILL.md 改指到这份 CLI(启动校正那时它还不在、
+                    // 跳过了;「关联 SSH」在 CLI 缺失时只存了范围的那种也靠这一次补上)
+                    let store = AppStore::global(cx);
+                    store.read(cx).reconcile_ssh_skills_in_background(cx);
+                } else if installed.is_git_helper() {
+                    // 远程项目缺 helper 时文件树的 git 标记取不到(失败按空表落),装好了当场
+                    // 重取一遍;Git 面板自己订阅下面这条事件,停在失败上的会重新发现仓库
+                    crate::git::watch::request_refresh(crate::git::watch::Subscriber::FileTree);
+                }
+                hub.update(cx, |_, cx| cx.emit(installed));
             }
-            ServiceEvent::Installed(_) => {}
             ServiceEvent::AutoProgress(id, percent) => {
                 progress.retain(|(other, _)| *other != id);
                 progress.push((id, percent));
@@ -887,6 +941,56 @@ mod tests {
         assert_eq!(JobState::Verifying.percent(), 100);
     }
 
+    /// 百分比变了才报;一阵密集的块之后数据停住(卡在半路等停滞超时),最后报出去的就是
+    /// 眼下收到的那份 —— 旧的按 200ms 节流只报窗口里的第一块,E2E 里收到 9.6% 时界面
+    /// 一直停在 0%。
+    #[test]
+    fn 进度按百分比变化上报_停住时不丢最后一截() {
+        let total = 2_730_836;
+        let mut gate = ProgressGate::default();
+        assert_eq!(gate.check(16_384, total), Some(0), "第一块总要报");
+        assert_eq!(gate.check(20_000, total), None, "同一个百分比不重复报");
+        let mut last = Some(0);
+        let mut reports = 1;
+        let mut received = 20_000;
+        while received < 262_144 {
+            received = (received + 16_384).min(262_144);
+            if let Some(percent) = gate.check(received, total) {
+                last = Some(percent);
+                reports += 1;
+            }
+        }
+        assert_eq!(last, Some(9), "停住前的最后一截报出去了");
+        assert_eq!(reports, 10, "0..=9 各一条");
+        assert_eq!(gate.check(total, total), Some(100));
+        assert_eq!(gate.check(total, total), None);
+    }
+
+    /// 加入已在跑的任务:后来者要推 toast、发起方不推时改按后来者;其余照旧。
+    #[test]
+    fn 加入任务时按需改推_toast() {
+        let mut origin = Origin::User;
+        assert!(adopt_origin(&mut origin, Origin::SyntaxBanner));
+        assert_eq!(origin, Origin::SyntaxBanner, "设置页先点、提示条后点");
+        let mut origin = Origin::SelfHeal;
+        assert!(adopt_origin(&mut origin, Origin::Deploy));
+        assert_eq!(origin, Origin::Deploy);
+        let mut origin = Origin::SelfHeal;
+        assert!(adopt_origin(&mut origin, Origin::EnableSshTools));
+        assert_eq!(origin, Origin::EnableSshTools);
+        // 发起方本来就推:不换(进度 / 结局 toast 已经在推了)
+        let mut origin = Origin::SyntaxBanner;
+        assert!(!adopt_origin(&mut origin, Origin::Deploy));
+        assert_eq!(origin, Origin::SyntaxBanner);
+        // 后来者不推:不换
+        let mut origin = Origin::Deploy;
+        assert!(!adopt_origin(&mut origin, Origin::User));
+        assert_eq!(origin, Origin::Deploy);
+        let mut origin = Origin::User;
+        assert!(!adopt_origin(&mut origin, Origin::SelfHeal));
+        assert_eq!(origin, Origin::User);
+    }
+
     /// 起一个只答一次的环回 HTTP 服务,返回地址。
     fn serve_once(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read as _, Write as _};
@@ -930,8 +1034,22 @@ mod tests {
         response.extend_from_slice(body);
         let (url, server) = serve_once(response);
         let path = temp_file("ok");
-        fetch(url, path.clone(), body.len() as u64).unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        futures::executor::block_on(crate::http::run_async(fetch_to_file(
+            url,
+            path.clone(),
+            body.len() as u64,
+            move |received| lock(&sink).push(received),
+        )))
+        .expect("共享运行时调用应成功")
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(
+            lock(&seen).last(),
+            Some(&(body.len() as u64)),
+            "每块都交给进度回调"
+        );
         let _ = std::fs::remove_file(&path);
         server.join().unwrap();
     }

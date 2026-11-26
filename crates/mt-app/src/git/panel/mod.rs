@@ -604,6 +604,18 @@ impl GitPanel {
                 }
             }),
         );
+        // 远程 Git helper 刚装好(设置页下载 / 离线导入 / 部署补齐,不论谁发起):停在失败上的
+        // 重来一次(见 `on_git_helper_installed`)。单测里没装配扩展服务,没有 hub 就不订
+        if let Some(hub) = crate::extensions::hub(cx) {
+            subs.push(cx.subscribe(
+                &hub,
+                |this: &mut Self, _, event: &crate::extensions::ExtensionInstalled, cx| {
+                    if event.is_git_helper() {
+                        this.on_git_helper_installed(cx);
+                    }
+                },
+            ));
+        }
         // 最小化 / 整个被挡住:节拍暂停(监听照记),恢复呈现时补比一次签名
         subs.push(cx.observe_window_visibility(
             window,
@@ -1043,6 +1055,20 @@ impl GitPanel {
         .detach();
     }
 
+    /// 远程 Git helper 刚装好:发现仓库 / 取分支若正停在失败上(多半就是缺它 —— 错误文案也让
+    /// 用户「装好后重试」),重来一次 ↻ 那一整轮。收着或窗口不可见时只记下,打开时走换项目
+    /// 那条路重新发现(「收着不扫盘」那道闸照旧)。本地项目、没在报错的不动。
+    fn on_git_helper_installed(&mut self, cx: &mut Context<Self>) {
+        if !needs_retry_after_helper_installed(self.local_project(), self.load_error.is_some()) {
+            return;
+        }
+        if self.visible && self.window_visible {
+            self.refresh_all(cx);
+        } else {
+            self.stale = true;
+        }
+    }
+
     fn repo_discovery_failed(&mut self, err: &anyhow::Error, cx: &mut Context<Self>) {
         tracing::warn!("[git] 发现仓库失败: {err:#}");
         if !self.local_project() {
@@ -1470,6 +1496,19 @@ impl Render for GitPanel {
         }
         if let Some(error) = &self.load_error {
             root = root.child(git_ui::error_block(error.clone()));
+            // 带 ↻ 的仓库栏只在发现到仓库时才画:发现那一步本身失败了(远端缺 helper、通道
+            // 起不来…)就在错误下面给一个重试入口,否则只能重启或换项目
+            if self.repos.is_empty() {
+                root = root.child(
+                    div().flex().px(px(10.0)).pt(px(6.0)).child(
+                        crate::prompt::footer_button(
+                            "git-retry-discovery",
+                            t("gitHistory", "retryDiscovery"),
+                        )
+                        .on_click(cx.listener(|this, _, _window, cx| this.refresh_all(cx))),
+                    ),
+                );
+            }
         }
         if let Some(recovery) = self.recovery_controls(cx) {
             root = root.child(recovery);
