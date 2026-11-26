@@ -16,14 +16,15 @@ use futures_util::{SinkExt, StreamExt};
 use mt_ai::AgentKind;
 use mt_core::path_key::windows_eq_key;
 use mt_relay_protocol::{
-    CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason, MirrorMessage,
-    MobileHistorySession, MobileLauncher, MobilePane, MobileProject, PROTOCOL_VERSION,
-    RelayToDesktop, StartSessionFailReason,
+    AssistFailReason, CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason,
+    MirrorMessage, MobileHistorySession, MobileLauncher, MobilePane, MobileProject,
+    PROTOCOL_VERSION, RelayToDesktop, StartSessionFailReason, TerminalKey,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::assist;
 use crate::host::{AiLauncher, RelayEvents, RelayHost};
 use crate::mirror::{
     self, CodexPeers, HeuristicScope, MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, history_slice,
@@ -35,6 +36,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 镜像会话文件轮询间隔。
 const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 终端视图快照轮询间隔（只查 `AtomicU64` 代数，有变化才锁 grid 推送）。
+const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// 移动端指令:正文写进 PTY 之后、单独补写提交回车之前的间隔。
 ///
@@ -416,12 +420,16 @@ pub struct MobileRelayManager {
     paired: Mutex<Option<bool>>,
     /// 项目结构的最新快照(上层 store 经 update_sessions 喂入,后端据此组装增量)
     sessions: Mutex<Vec<MobileProject>>,
-    /// pane → 项目路径(镜像订阅时解析会话文件用)
+    /// pane → 项目路径(镜像订阅与输入辅助定位用)
     pane_paths: Mutex<HashMap<String, String>>,
-    /// pane → PTY id(移动端指令写穿目标)
+    /// pane → 是否属于 SSH 远程项目(本地文件/技能扫描需拒绝远程项目)
+    pane_is_ssh: Mutex<HashMap<String, bool>>,
+    /// pane → PTY id(移动端指令写穿与终端视图快照目标)
     pane_ptys: Mutex<HashMap<String, u32>>,
     /// 已订阅镜像的 pane 集合
     mirror_subs: Mutex<HashMap<String, MirrorSub>>,
+    /// 已订阅终端屏幕快照流的 pane 集合
+    terminal_subs: Mutex<HashMap<String, watch::Sender<bool>>>,
     /// 历史会话只读预览的单槽分页缓存(断线清空)
     history_preview_cache: Mutex<Option<HistoryPreviewCache>>,
     /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
@@ -454,8 +462,10 @@ impl MobileRelayManager {
             paired: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
             pane_paths: Mutex::new(HashMap::new()),
+            pane_is_ssh: Mutex::new(HashMap::new()),
             pane_ptys: Mutex::new(HashMap::new()),
             mirror_subs: Mutex::new(HashMap::new()),
+            terminal_subs: Mutex::new(HashMap::new()),
             history_preview_cache: Mutex::new(None),
             recent_mobile_cmds: Mutex::new(HashMap::new()),
             command_tail: Mutex::new(None),
@@ -554,10 +564,13 @@ impl MobileRelayManager {
     /// 更新 pane→路径映射;被订阅镜像的 pane 消失时通知移动端并撤销订阅。
     pub fn update_sessions(&self, projects: Vec<SyncProject>) {
         let mut pane_paths: HashMap<String, String> = HashMap::new();
+        let mut pane_is_ssh: HashMap<String, bool> = HashMap::new();
         let mut pane_ptys: HashMap<String, u32> = HashMap::new();
         for p in &projects {
+            let is_ssh = p.ssh_connection_id.is_some();
             for pane in &p.panes {
                 pane_paths.insert(pane.pane_id.clone(), p.path.clone());
+                pane_is_ssh.insert(pane.pane_id.clone(), is_ssh);
                 if let Some(pty_id) = pane.pty_id {
                     pane_ptys.insert(pane.pane_id.clone(), pty_id);
                 }
@@ -565,19 +578,29 @@ impl MobileRelayManager {
         }
         *self.pane_ptys.lock() = pane_ptys;
 
-        // 订阅中的 pane 已不在活跃集合(pane 关闭/AI 会话结束)→ PaneClosed
-        let gone: Vec<String> = {
+        // 订阅中（对话镜像或终端视图）的 pane 已不在活跃集合 → 撤订并通知 PaneClosed
+        let mut gone_set: HashSet<String> = {
             let subs = self.mirror_subs.lock();
             subs.keys()
                 .filter(|id| !pane_paths.contains_key(*id))
                 .cloned()
                 .collect()
         };
-        for pane_id in gone {
+        {
+            let term_subs = self.terminal_subs.lock();
+            for id in term_subs.keys() {
+                if !pane_paths.contains_key(id) {
+                    gone_set.insert(id.clone());
+                }
+            }
+        }
+        for pane_id in gone_set {
             self.unsubscribe_pane(&pane_id);
+            self.unsubscribe_terminal(&pane_id);
             let _ = self.send(DesktopToRelay::PaneClosed { pane_id });
         }
         *self.pane_paths.lock() = pane_paths;
+        *self.pane_is_ssh.lock() = pane_is_ssh;
 
         let next: Vec<MobileProject> = projects
             .into_iter()
@@ -656,7 +679,14 @@ impl MobileRelayManager {
         }
     }
 
-    /// 撤销全部镜像订阅并清空历史预览缓存(与中转断线时调用;移动端重连后会重新订阅)。
+    /// 撤销单个终端屏幕快照订阅(幂等)。
+    fn unsubscribe_terminal(&self, pane_id: &str) {
+        if let Some(cancel_tx) = self.terminal_subs.lock().remove(pane_id) {
+            let _ = cancel_tx.send(true);
+        }
+    }
+
+    /// 撤销全部镜像与终端订阅并清空历史预览缓存(与中转断线时调用;移动端重连后会重新订阅)。
     fn clear_mirror_subs(&self) {
         *self.history_preview_cache.lock() = None;
         let subs: Vec<MirrorSub> = self
@@ -667,6 +697,15 @@ impl MobileRelayManager {
             .collect();
         for sub in subs {
             let _ = sub.cancel_tx.send(true);
+        }
+        let term_subs: Vec<watch::Sender<bool>> = self
+            .terminal_subs
+            .lock()
+            .drain()
+            .map(|(_, tx)| tx)
+            .collect();
+        for cancel_tx in term_subs {
+            let _ = cancel_tx.send(true);
         }
     }
 
@@ -1039,6 +1078,8 @@ impl MobileRelayManager {
             projects,
             launchers,
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         });
     }
 
@@ -1101,6 +1142,22 @@ impl MobileRelayManager {
         });
         self.spawn(async move {
             mirror_task(manager, job, cancel_rx).await;
+        });
+    }
+
+    /// 建立终端屏幕快照订阅：仅允许订阅当前活跃 AI 会话集合内的 pane（守住 ADR 0002）。
+    /// 重复订阅先撤旧再建新，保证手机切换/重连后立即收到最新首屏快照。
+    fn subscribe_terminal(self: &Arc<Self>, pane_id: String) {
+        self.unsubscribe_terminal(&pane_id);
+        if !self.pane_paths.lock().contains_key(&pane_id) {
+            let _ = self.send(DesktopToRelay::PaneClosed { pane_id });
+            return;
+        }
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.terminal_subs.lock().insert(pane_id.clone(), cancel_tx);
+        let manager = Arc::clone(self);
+        self.spawn(async move {
+            terminal_screen_task(manager, pane_id, cancel_rx).await;
         });
     }
 }
@@ -1411,6 +1468,26 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             agent,
             session_id,
         }) => handle_resume_ai_session(manager, request_id, project_id, agent, session_id),
+        // 终端视图订阅/退订/应急按键
+        Ok(RelayToDesktop::SubscribeTerminal { pane_id }) => manager.subscribe_terminal(pane_id),
+        Ok(RelayToDesktop::UnsubscribeTerminal { pane_id }) => {
+            manager.unsubscribe_terminal(&pane_id);
+        }
+        Ok(RelayToDesktop::SendTerminalKey {
+            pane_id,
+            command_id,
+            key,
+        }) => handle_send_terminal_key(manager, pane_id, command_id, key),
+        // 输入辅助：@ 文件补全、/ 技能补全
+        Ok(RelayToDesktop::RequestProjectFiles {
+            request_id,
+            pane_id,
+            query,
+        }) => handle_request_project_files(manager, request_id, pane_id, query),
+        Ok(RelayToDesktop::RequestProjectSkills {
+            request_id,
+            pane_id,
+        }) => handle_request_project_skills(manager, request_id, pane_id),
         Ok(_) => {}
         Err(_) => tracing::warn!("[mobile-relay] unparseable relay message (ignored)"),
     }
@@ -1997,6 +2074,212 @@ fn try_answer_question(
         .map_err(|_| CommandFailReason::WriteFailed)?;
     rt.parser.mark_answered(seq);
     Ok(answer.label)
+}
+
+/// 终端视图快照轮询任务：每 [`TERMINAL_POLL_INTERVAL`] 查一次目标 PTY 的无锁画面代数，
+/// 仅当 `(pty_id, generation)` 发生变化时才提取快照并推送 [`DesktopToRelay::TerminalScreen`]。
+async fn terminal_screen_task(
+    manager: Arc<MobileRelayManager>,
+    pane_id: String,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let mut last_sent: Option<(u32, u64)> = None;
+    loop {
+        if let Some(pty_id) = manager.pane_ptys.lock().get(&pane_id).copied()
+            && let Some(generation) = manager.host.terminal_generation(pty_id)
+            && last_sent != Some((pty_id, generation))
+            && let Some(screen) = manager.host.terminal_screen(pty_id)
+        {
+            last_sent = Some((pty_id, screen.generation));
+            let _ = manager.send(DesktopToRelay::TerminalScreen {
+                pane_id: pane_id.clone(),
+                cols: screen.cols,
+                rows: screen.rows,
+                cursor_row: screen.cursor_row,
+                cursor_col: screen.cursor_col,
+                cursor_visible: screen.cursor_visible,
+                alt_screen: screen.alt_screen,
+                lines: screen.lines,
+            });
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(TERMINAL_POLL_INTERVAL) => {}
+            _ = cancel_rx.changed() => return,
+        }
+    }
+}
+
+/// 移动端终端应急按键：校验目标 pane 在活跃 AI 集合且存在活 PTY，按当前 `APP_CURSOR` 模式
+/// 编码成传统字节，交宿主按终端输入协议（win32-input-mode）定稿后立即写入 PTY，
+/// 复用 [`DesktopToRelay::CommandReceipt`] 回执。
+fn handle_send_terminal_key(
+    manager: &Arc<MobileRelayManager>,
+    pane_id: String,
+    command_id: String,
+    key: TerminalKey,
+) {
+    let result = match manager.pane_ptys.lock().get(&pane_id).copied() {
+        Some(pty_id) => {
+            let app_cursor = manager.host.app_cursor_mode(pty_id);
+            let bytes = assist::encode_terminal_key(key, app_cursor);
+            manager
+                .host
+                .write_terminal_key(pty_id, bytes.to_string())
+                .map_err(|_| CommandFailReason::WriteFailed)
+        }
+        None => Err(CommandFailReason::PaneNotFound),
+    };
+    manager.send_command_receipt(pane_id, command_id, result);
+}
+
+/// 移动端 `@` 文件补全：校验 pane 归属且非 SSH 远程项目后，在阻塞线程池扫描相对路径。
+fn handle_request_project_files(
+    manager: &Arc<MobileRelayManager>,
+    request_id: String,
+    pane_id: String,
+    query: String,
+) {
+    let Some(project_path) = manager.pane_paths.lock().get(&pane_id).cloned() else {
+        let _ = manager.send(DesktopToRelay::ProjectFiles {
+            request_id,
+            pane_id,
+            ok: false,
+            files: Vec::new(),
+            truncated: false,
+            reason: Some(AssistFailReason::PaneNotFound),
+        });
+        return;
+    };
+    if manager
+        .pane_is_ssh
+        .lock()
+        .get(&pane_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        let _ = manager.send(DesktopToRelay::ProjectFiles {
+            request_id,
+            pane_id,
+            ok: false,
+            files: Vec::new(),
+            truncated: false,
+            reason: Some(AssistFailReason::NotSupported),
+        });
+        return;
+    }
+
+    let mgr = Arc::clone(manager);
+    manager.spawn(async move {
+        let res = tokio::task::spawn_blocking(move || {
+            assist::search_project_files(Path::new(&project_path), &query)
+        })
+        .await
+        .map_err(|_| AssistFailReason::ReadFailed)
+        .and_then(|r| r);
+
+        match res {
+            Ok((files, truncated)) => {
+                let _ = mgr.send(DesktopToRelay::ProjectFiles {
+                    request_id,
+                    pane_id,
+                    ok: true,
+                    files,
+                    truncated,
+                    reason: None,
+                });
+            }
+            Err(reason) => {
+                let _ = mgr.send(DesktopToRelay::ProjectFiles {
+                    request_id,
+                    pane_id,
+                    ok: false,
+                    files: Vec::new(),
+                    truncated: false,
+                    reason: Some(reason),
+                });
+            }
+        }
+    });
+}
+
+/// 移动端 `/` 技能补全：按目标 pane 的项目路径与当前 AI agent 扫描本地 Skills / Commands。
+fn handle_request_project_skills(
+    manager: &Arc<MobileRelayManager>,
+    request_id: String,
+    pane_id: String,
+) {
+    let Some(project_path) = manager.pane_paths.lock().get(&pane_id).cloned() else {
+        let _ = manager.send(DesktopToRelay::ProjectSkills {
+            request_id,
+            pane_id,
+            ok: false,
+            prefix: String::new(),
+            skills: Vec::new(),
+            reason: Some(AssistFailReason::PaneNotFound),
+        });
+        return;
+    };
+    if manager
+        .pane_is_ssh
+        .lock()
+        .get(&pane_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        let _ = manager.send(DesktopToRelay::ProjectSkills {
+            request_id,
+            pane_id,
+            ok: false,
+            prefix: String::new(),
+            skills: Vec::new(),
+            reason: Some(AssistFailReason::NotSupported),
+        });
+        return;
+    }
+
+    let pty_id = manager.pane_ptys.lock().get(&pane_id).copied();
+    let tracker_agent = pty_id.and_then(|id| manager.host.ai_session_agent(id));
+    let hook_agent = pty_id
+        .and_then(|id| manager.known_session(id))
+        .and_then(|s| s.agent);
+    // Codex 的 SessionStart hook 会被误推断成 claude-code，输入检测已识别为 codex 时以其为准
+    let agent = if tracker_agent.as_deref().and_then(AgentKind::parse) == Some(AgentKind::Codex) {
+        tracker_agent
+    } else {
+        hook_agent.or(tracker_agent)
+    };
+
+    let mgr = Arc::clone(manager);
+    manager.spawn(async move {
+        let res = tokio::task::spawn_blocking(move || {
+            assist::scan_project_skills(Path::new(&project_path), agent.as_deref())
+        })
+        .await;
+
+        match res {
+            Ok((prefix, skills)) => {
+                let _ = mgr.send(DesktopToRelay::ProjectSkills {
+                    request_id,
+                    pane_id,
+                    ok: true,
+                    prefix,
+                    skills,
+                    reason: None,
+                });
+            }
+            Err(_) => {
+                let _ = mgr.send(DesktopToRelay::ProjectSkills {
+                    request_id,
+                    pane_id,
+                    ok: false,
+                    prefix: String::new(),
+                    skills: Vec::new(),
+                    reason: Some(AssistFailReason::ReadFailed),
+                });
+            }
+        }
+    });
 }
 
 /// 镜像轮询任务:解析 pane 应镜像的最新会话文件,增量读取新行推送;
@@ -3973,5 +4256,285 @@ mod tests {
             }
             other => panic!("pane-2 应走启发式并排除已认领会话: {other:?}"),
         }
+    }
+
+    // ── 终端视图快照、应急按键与输入辅助 ──
+
+    #[derive(Default)]
+    struct TerminalAssistTestHost {
+        app_cursor: Mutex<bool>,
+        writes: Mutex<Vec<(u32, String)>>,
+        /// 经 `write_terminal_key` 进来的应急按键(宿主据此按输入协议定稿编码)
+        key_writes: Mutex<Vec<(u32, String)>>,
+        screen: Mutex<Option<crate::host::HostTerminalScreen>>,
+        agent: Mutex<Option<String>>,
+    }
+
+    impl RelayHost for TerminalAssistTestHost {
+        fn launchers(&self) -> Vec<AiLauncher> {
+            Vec::new()
+        }
+        fn project(&self, _project_id: &str) -> Option<RelayProject> {
+            None
+        }
+        fn write_pty(&self, pty_id: u32, data: String) -> Result<(), String> {
+            self.writes.lock().push((pty_id, data));
+            Ok(())
+        }
+        fn hook_session(&self, _pty_id: u32) -> Option<HookSessionId> {
+            None
+        }
+        fn ai_session_agent(&self, _pty_id: u32) -> Option<String> {
+            self.agent.lock().clone()
+        }
+        fn ai_session_started_at(&self, _pty_id: u32) -> Option<SystemTime> {
+            None
+        }
+        fn terminal_generation(&self, _pty_id: u32) -> Option<u64> {
+            self.screen.lock().as_ref().map(|s| s.generation)
+        }
+        fn terminal_screen(&self, _pty_id: u32) -> Option<crate::host::HostTerminalScreen> {
+            self.screen.lock().clone()
+        }
+        fn app_cursor_mode(&self, _pty_id: u32) -> bool {
+            *self.app_cursor.lock()
+        }
+        fn write_terminal_key(&self, pty_id: u32, legacy: String) -> Result<(), String> {
+            self.key_writes.lock().push((pty_id, legacy.clone()));
+            self.write_pty(pty_id, legacy)
+        }
+    }
+
+    #[test]
+    fn terminal_key_and_assist_enforce_active_ai_pane_and_ssh_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-relay-term-assist-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".codex/skills/ship")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(
+            dir.join(".codex/skills/ship/SKILL.md"),
+            "---\nname: ship\ndescription: Ship release\n---\n",
+        )
+        .unwrap();
+
+        let host = Arc::new(TerminalAssistTestHost::default());
+        *host.agent.lock() = Some("codex".into());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let manager = Arc::new(MobileRelayManager::with_runtime(
+            host.clone(),
+            Arc::new(NoopRelayHost),
+            rt.handle().clone(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *manager.outbound.lock() = Some(tx);
+
+        manager.update_sessions(vec![
+            SyncProject {
+                project_id: "p-local".into(),
+                name: "local".into(),
+                path: dir.to_string_lossy().into_owned(),
+                ssh_connection_id: None,
+                group_path: vec![],
+                panes: vec![SyncPane {
+                    pane_id: "pane-local".into(),
+                    title: "Codex".into(),
+                    status: "ai-idle".into(),
+                    pty_id: Some(42),
+                    needs_attention: false,
+                }],
+            },
+            SyncProject {
+                project_id: "p-ssh".into(),
+                name: "remote".into(),
+                path: "/srv/app".into(),
+                ssh_connection_id: Some("conn-1".into()),
+                group_path: vec![],
+                panes: vec![SyncPane {
+                    pane_id: "pane-ssh".into(),
+                    title: "Remote AI".into(),
+                    status: "ai-working".into(),
+                    pty_id: Some(43),
+                    needs_attention: false,
+                }],
+            },
+        ]);
+        // 丢弃 SessionsDelta
+        let _ = rx.try_recv();
+
+        // 1. 应急按键：遵守 app_cursor_mode，且未知 pane 返回 PaneNotFound
+        handle_send_terminal_key(&manager, "pane-local".into(), "k1".into(), TerminalKey::Up);
+        *host.app_cursor.lock() = true;
+        handle_send_terminal_key(&manager, "pane-local".into(), "k2".into(), TerminalKey::Up);
+        handle_send_terminal_key(&manager, "pane-missing".into(), "k3".into(), TerminalKey::Escape);
+
+        assert_eq!(
+            *host.writes.lock(),
+            vec![(42, "\x1b[A".into()), (42, "\x1bOA".into())]
+        );
+        // 应急按键必须走 `write_terminal_key`(宿主在那儿处理 win32-input-mode),不直接 write_pty
+        assert_eq!(*host.key_writes.lock(), *host.writes.lock());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::CommandReceipt {
+                pane_id: "pane-local".into(),
+                command_id: "k1".into(),
+                ok: true,
+                reason: None,
+            }
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::CommandReceipt {
+                pane_id: "pane-local".into(),
+                command_id: "k2".into(),
+                ok: true,
+                reason: None,
+            }
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::CommandReceipt {
+                pane_id: "pane-missing".into(),
+                command_id: "k3".into(),
+                ok: false,
+                reason: Some(CommandFailReason::PaneNotFound),
+            }
+        );
+
+        // 2. 订阅不存在 / 裸 shell 的 pane 直接回 PaneClosed
+        manager.subscribe_terminal("bare-shell".into());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::PaneClosed {
+                pane_id: "bare-shell".into(),
+            }
+        );
+
+        // 3. SSH 远程项目拒绝文件与技能扫描（NotSupported），不存在的 pane 返回 PaneNotFound
+        handle_request_project_files(&manager, "f-ssh".into(), "pane-ssh".into(), "".into());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::ProjectFiles {
+                request_id: "f-ssh".into(),
+                pane_id: "pane-ssh".into(),
+                ok: false,
+                files: vec![],
+                truncated: false,
+                reason: Some(AssistFailReason::NotSupported),
+            }
+        );
+        handle_request_project_skills(&manager, "s-gone".into(), "pane-gone".into());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            DesktopToRelay::ProjectSkills {
+                request_id: "s-gone".into(),
+                pane_id: "pane-gone".into(),
+                ok: false,
+                prefix: String::new(),
+                skills: vec![],
+                reason: Some(AssistFailReason::PaneNotFound),
+            }
+        );
+
+        // 4. 本地项目文件补全与 Codex 技能扫描正常返回（含 "$" 前缀）
+        handle_request_project_files(&manager, "f-ok".into(), "pane-local".into(), "main".into());
+        handle_request_project_skills(&manager, "s-ok".into(), "pane-local".into());
+
+        rt.block_on(async {
+            let mut got_files = false;
+            let mut got_skills = false;
+            for _ in 0..2 {
+                let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match msg {
+                    DesktopToRelay::ProjectFiles {
+                        request_id,
+                        ok,
+                        files,
+                        ..
+                    } => {
+                        assert_eq!(request_id, "f-ok");
+                        assert!(ok);
+                        assert_eq!(files.len(), 1);
+                        assert_eq!(files[0].path, "src/main.rs");
+                        got_files = true;
+                    }
+                    DesktopToRelay::ProjectSkills {
+                        request_id,
+                        ok,
+                        prefix,
+                        skills,
+                        ..
+                    } => {
+                        assert_eq!(request_id, "s-ok");
+                        assert!(ok);
+                        assert_eq!(prefix, "$");
+                        assert!(skills.iter().any(|s| s.name == "ship" && s.source == "project"));
+                        got_skills = true;
+                    }
+                    other => panic!("unexpected message: {other:?}"),
+                }
+            }
+            assert!(got_files && got_skills);
+
+            // 5. 终端订阅推首屏快照，并在 pane 消失时撤订且发 PaneClosed
+            *host.screen.lock() = Some(crate::host::HostTerminalScreen {
+                generation: 5,
+                cols: 80,
+                rows: 24,
+                cursor_row: 0,
+                cursor_col: 2,
+                cursor_visible: true,
+                alt_screen: false,
+                lines: vec![crate::host::TerminalLine {
+                    spans: vec![crate::host::TerminalSpan {
+                        text: "$ ".into(),
+                        ..Default::default()
+                    }],
+                    wrapped: false,
+                }],
+            });
+            manager.subscribe_terminal("pane-local".into());
+            let screen_msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                screen_msg,
+                DesktopToRelay::TerminalScreen {
+                    ref pane_id,
+                    cols: 80,
+                    rows: 24,
+                    ..
+                } if pane_id == "pane-local"
+            ));
+
+            manager.update_sessions(vec![]);
+            let closed = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                closed,
+                DesktopToRelay::PaneClosed {
+                    pane_id: "pane-local".into(),
+                }
+            );
+            assert!(manager.terminal_subs.lock().is_empty());
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,8 +4,11 @@ import type {
   MobileMirrorHistory,
   MobileMirrorSnapshot,
   MobilePaneClosed,
+  MobileTerminalScreen,
+  TerminalKey,
 } from '../protocol';
-import { type MirrorState, useRelayStore } from './store';
+import { resetAssistState } from './assist';
+import { type MirrorState, type MirrorViewMode, useRelayStore } from './store';
 import { sendToRelay } from './transport';
 
 export type MirrorIncomingMessage =
@@ -13,10 +16,19 @@ export type MirrorIncomingMessage =
   | MobileMirrorAppend
   | MobileMirrorHistory
   | MobilePaneClosed
-  | MobileCommandReceipt;
+  | MobileCommandReceipt
+  | MobileTerminalScreen;
+
+/**
+ * 追踪发出的终端应急按键 commandId：允许高频连点（不占单槽 pendingCommandId），
+ * 成功时静默消费回执，仅失败时在输入区提示。
+ */
+const pendingTerminalKeyIds = new Set<string>();
 
 /** 进入某 pane 的对话镜像:登记视图状态并向桌面端订阅。 */
 export function openMirror(paneId: string, title: string) {
+  pendingTerminalKeyIds.clear();
+  resetAssistState();
   useRelayStore.setState({
     mirror: {
       paneId,
@@ -30,6 +42,9 @@ export function openMirror(paneId: string, title: string) {
       pendingAnswer: null,
       answeredProgress: {},
       receipt: null,
+      viewMode: 'chat',
+      terminalScreen: null,
+      terminalLoaded: false,
     },
   });
   sendToRelay({ type: 'subscribePane', paneId });
@@ -113,10 +128,56 @@ export function clearCommandReceipt() {
   }
 }
 
-/** 退出镜像返回列表:退订并清空视图状态。 */
+/** 在对话视图与终端视图之间切换，按需订阅 / 退订终端屏幕快照流。 */
+export function setMirrorViewMode(mode: MirrorViewMode) {
+  const { mirror, supportsTerminalView } = useRelayStore.getState();
+  if (!mirror) return;
+  if (mode === 'terminal' && !supportsTerminalView) return;
+  if (mirror.viewMode === mode) return;
+
+  if (mode === 'terminal') {
+    useRelayStore.setState({
+      mirror: {
+        ...mirror,
+        viewMode: 'terminal',
+        terminalLoaded: mirror.terminalScreen !== null,
+      },
+    });
+    if (!mirror.closed) {
+      sendToRelay({ type: 'subscribeTerminal', paneId: mirror.paneId });
+    }
+  } else {
+    sendToRelay({ type: 'unsubscribeTerminal', paneId: mirror.paneId });
+    useRelayStore.setState({
+      mirror: { ...mirror, viewMode: 'chat' },
+    });
+  }
+}
+
+/** 向当前活跃 AI pane 发送应急特殊按键（不阻塞连点，失败时经 receipt 提示）。 */
+export function sendTerminalKey(key: TerminalKey): boolean {
+  const mirror = mirrorReady();
+  if (!mirror) return false;
+  const commandId = crypto.randomUUID();
+  if (pendingTerminalKeyIds.size > 64) {
+    pendingTerminalKeyIds.clear();
+  }
+  pendingTerminalKeyIds.add(commandId);
+  sendToRelay({ type: 'sendTerminalKey', paneId: mirror.paneId, commandId, key });
+  return true;
+}
+
+/** 退出镜像返回列表:退订(含终端快照流)并清空视图与补全状态。 */
 export function closeMirror() {
   const { mirror } = useRelayStore.getState();
-  if (mirror) sendToRelay({ type: 'unsubscribePane', paneId: mirror.paneId });
+  if (mirror) {
+    if (mirror.viewMode === 'terminal') {
+      sendToRelay({ type: 'unsubscribeTerminal', paneId: mirror.paneId });
+    }
+    sendToRelay({ type: 'unsubscribePane', paneId: mirror.paneId });
+  }
+  pendingTerminalKeyIds.clear();
+  resetAssistState();
   useRelayStore.setState({ mirror: null });
 }
 
@@ -167,7 +228,33 @@ export function handleMirrorMessage(msg: MirrorIncomingMessage) {
     case 'paneClosed':
       useRelayStore.setState({ mirror: { ...mirror, closed: true } });
       break;
+    case 'terminalScreen':
+      useRelayStore.setState({
+        mirror: {
+          ...mirror,
+          terminalLoaded: true,
+          terminalScreen: {
+            cols: msg.cols,
+            rows: msg.rows,
+            cursorRow: msg.cursorRow,
+            cursorCol: msg.cursorCol,
+            cursorVisible: msg.cursorVisible,
+            altScreen: msg.altScreen,
+            lines: msg.lines ?? [],
+          },
+        },
+      });
+      break;
     case 'commandReceipt': {
+      // 终端应急按键回执：成功静默消费，仅失败时弹出提示，绝不干扰手输命令单槽
+      if (pendingTerminalKeyIds.delete(msg.commandId)) {
+        if (!msg.ok) {
+          useRelayStore.setState({
+            mirror: { ...mirror, receipt: { ok: false, reason: msg.reason } },
+          });
+        }
+        return;
+      }
       if (mirror.pendingCommandId !== null && mirror.pendingCommandId !== msg.commandId) return;
       // 点选作答成功:本地推进该卡片的作答进度(见 answeredProgress 注释)
       const answeredProgress = { ...mirror.answeredProgress };

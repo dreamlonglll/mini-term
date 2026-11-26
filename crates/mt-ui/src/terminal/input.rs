@@ -272,7 +272,10 @@ fn win32_input_bytes_inner(keystroke: &Keystroke) -> Option<Vec<u8>> {
 /// 按传统字节查表而不是按键名,`Esc` / `Ctrl+[` / `Shift+Esc` / `Ctrl+Alt+[` 这些
 /// 同字节的键才不会漏。VK / Sc 按美式布局写死,其他布局上读控制台记录的程序看到的
 /// VK 可能与实际键位不符。
-fn held_prefix_record(legacy: &[u8]) -> Option<&'static [u8]> {
+///
+/// 移动端应急按键(`mt-app::mobile_relay` 的 `terminal_key_payload`)也查这张表:
+/// 它拿到的就是传统字节,开着 win32-input-mode 时同样要换成记录,全仓只此一份。
+pub fn held_prefix_record(legacy: &[u8]) -> Option<&'static [u8]> {
     let record: &'static [u8] = match legacy {
         // VK_ESCAPE / Sc 0x01 / Uc ESC / 无修饰。
         b"\x1b" => b"\x1b[27;1;27;1;0;1_",

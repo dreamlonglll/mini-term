@@ -29,6 +29,11 @@ import {
   wsUrl,
 } from './auth';
 import {
+  failPendingAssistOffline,
+  handleAssistMessage,
+  resetAssistState,
+} from './assist';
+import {
   clearHistoryListTimer,
   clearHistoryPreviewTimer,
   failPendingHistoryOffline,
@@ -103,6 +108,7 @@ function teardownSocket() {
 function clearInFlightUiState() {
   clearHistoryListTimer();
   clearHistoryPreviewTimer();
+  resetAssistState();
   finishStart(null);
   resetDesktopSessionState();
 }
@@ -301,29 +307,42 @@ function connect(auth: {
           patch.savedDesktops = updateSavedDesktopName(activeDesktopId, nextName ?? undefined);
         }
         useRelayStore.setState(patch);
-        // 桌面端在等待期间掉线:在途的发起 / 历史拉取再也不会有下文,立刻给出原因而不是等超时
+        // 桌面端在等待期间掉线:在途的发起 / 历史 / 补全再也不会有下文,立刻给出原因而不是等超时
         if (!msg.desktopOnline) {
           if (useRelayStore.getState().starting) finishStart('desktopOffline');
           failPendingHistoryOffline();
+          failPendingAssistOffline();
         }
         break;
       }
       case 'sessionsSnapshot': {
         const supportsHistory = msg.supportsHistory === true;
+        const supportsTerminalView = msg.supportsTerminalView === true;
+        const supportsInputAssist = msg.supportsInputAssist === true;
         useRelayStore.setState((prev) => ({
           projects: msg.projects,
           launchers: msg.launchers ?? [],
           supportsHistory,
+          supportsTerminalView,
+          supportsInputAssist,
           // 旧桌面端不支持历史:避免停在不可用的历史 tab
           homeTab: supportsHistory ? prev.homeTab : 'active',
+          // 若重连到了不支持终端视图的旧桌面端，自动回退回对话视图
+          mirror:
+            prev.mirror && !supportsTerminalView && prev.mirror.viewMode === 'terminal'
+              ? { ...prev.mirror, viewMode: 'chat' }
+              : prev.mirror,
         }));
         snapshotReady = true;
-        // 全量快照 = 桌面端刚连上中转(或应本连接的握手请求回发):它那边的镜像订阅
-        // 此时是空的(断线即撤),正在看的会话要重新订阅一次,桌面端会回发镜像快照。
+        // 全量快照 = 桌面端刚连上中转(或应本连接的握手请求回发):它那边的镜像与终端订阅
+        // 此时是空的(断线即撤),正在看的会话要重新订阅一次,桌面端会回发最新快照。
         // 要在 onProjectsChanged 之前做:那里可能为刚发起的会话 openMirror,那次自带订阅
         const { mirror } = useRelayStore.getState();
         if (mirror && !mirror.closed) {
           sendToRelay({ type: 'subscribePane', paneId: mirror.paneId });
+          if (supportsTerminalView && mirror.viewMode === 'terminal') {
+            sendToRelay({ type: 'subscribeTerminal', paneId: mirror.paneId });
+          }
         }
         resyncPendingHistory(supportsHistory);
         onProjectsChanged();
@@ -359,7 +378,12 @@ function connect(auth: {
       case 'mirrorHistory':
       case 'paneClosed':
       case 'commandReceipt':
+      case 'terminalScreen':
         handleMirrorMessage(msg);
+        break;
+      case 'projectFiles':
+      case 'projectSkills':
+        handleAssistMessage(msg);
         break;
       case 'startSessionReceipt':
         handleStartSessionReceipt(msg);

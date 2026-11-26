@@ -1,16 +1,29 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   clearCommandReceipt,
   closeMirror,
   loadOlderMirror,
+  requestProjectFiles,
+  requestProjectSkills,
   sendMobileCommand,
+  setMirrorViewMode,
+  useAssistStore,
   useRelayStore,
 } from './relay';
 import { useT } from './i18n';
 import { RenameSheet } from './RenameSheet';
 import { isAtBottom, MirrorRowList, MirrorSkeleton } from './MirrorContent';
+import { TerminalView } from './TerminalView';
 import { buildMirrorRows, hasActiveQuestion, type MirrorRow } from './mirrorRows';
-import type { MirrorMessage } from './protocol';
+import type { MirrorMessage, MobileSkillItem } from './protocol';
 
 /** 镜像页尾部的状态指示:working = AI 工作中;attention = 等你处理;answer = 等你作答上方提问 */
 type Indicator = 'working' | 'attention' | 'answer';
@@ -78,18 +91,120 @@ const ActivityIndicator = memo(function ActivityIndicator({ kind }: { kind: Indi
   );
 });
 
-/** 镜像底部的指令输入区:桌面离线/会话结束置灰;发送后展示回执。 */
+interface AssistTrigger {
+  kind: 'file' | 'skill';
+  start: number;
+  end: number;
+  query: string;
+}
+
+/**
+ * 解析输入框当前光标处是否处于 `@文件` 或 `/技能`（含 Codex `$技能`）补全上下文。
+ * 触发符必须在字符串开头或空白字符之后，避免在邮箱 / URL 中间误弹。
+ */
+function detectAssistTrigger(text: string, caret: number): AssistTrigger | null {
+  const safeCaret = Math.max(0, Math.min(caret, text.length));
+  let start = safeCaret;
+  while (start > 0 && !/\s/.test(text[start - 1])) {
+    start -= 1;
+  }
+  if (start >= safeCaret) return null;
+  const token = text.slice(start, safeCaret);
+  const head = token[0];
+  if (head === '@') {
+    return { kind: 'file', start, end: safeCaret, query: token.slice(1) };
+  }
+  if (head === '/' || head === '$') {
+    return { kind: 'skill', start, end: safeCaret, query: token.slice(1) };
+  }
+  return null;
+}
+
+function filterSkills(skills: MobileSkillItem[], query: string): MobileSkillItem[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return skills;
+  const scored: Array<{ rank: number; item: MobileSkillItem }> = [];
+  for (const item of skills) {
+    const name = item.name.toLowerCase();
+    const desc = (item.description ?? '').toLowerCase();
+    if (name.startsWith(q)) {
+      scored.push({ rank: 0, item });
+    } else if (name.includes(q)) {
+      scored.push({ rank: 1, item });
+    } else if (desc.includes(q)) {
+      scored.push({ rank: 2, item });
+    }
+  }
+  scored.sort((a, b) => a.rank - b.rank || a.item.name.localeCompare(b.item.name));
+  return scored.map((s) => s.item);
+}
+
+/** 镜像底部的指令输入区:支持 `@` 文件引用与 `/` 技能补全；桌面离线/会话结束置灰。 */
 const CommandComposer = memo(function CommandComposer() {
   const t = useT();
-  // 细粒度订阅:只关心开关与发送回执,AI 每秒推新消息时不打扰正在输入的输入框
+  // 细粒度订阅:只关心开关、paneId、输入辅助能力与发送回执,AI 推新消息时不打扰正在输入的输入框
+  const paneId = useRelayStore((s) => s.mirror?.paneId ?? '');
   const mirrorAvailable = useRelayStore((s) => s.mirror !== null && !s.mirror.closed);
   const receipt = useRelayStore((s) => s.mirror?.receipt ?? null);
   const sending = useRelayStore((s) => s.mirror?.pendingCommandId != null);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  const supportsInputAssist = useRelayStore((s) => s.supportsInputAssist);
+
+  const filesState = useAssistStore((s) => s.files);
+  const skillsState = useAssistStore((s) => s.skills);
+
   const [text, setText] = useState('');
+  const [caret, setCaret] = useState(0);
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const disabled = !mirrorAvailable || desktopOnline === false;
+
+  const rawTrigger = useMemo(
+    () => (supportsInputAssist && !disabled ? detectAssistTrigger(text, caret) : null),
+    [supportsInputAssist, disabled, text, caret],
+  );
+  const triggerKey = rawTrigger
+    ? `${rawTrigger.kind}:${rawTrigger.start}:${rawTrigger.query}`
+    : null;
+  const trigger = rawTrigger && triggerKey !== dismissedKey ? rawTrigger : null;
+
+  // 切出触发词或清空文本时重置手动关闭记录
+  useEffect(() => {
+    if (!rawTrigger && dismissedKey !== null) {
+      setDismissedKey(null);
+    }
+  }, [rawTrigger, dismissedKey]);
+
+  // 触发 `@` 文件检索（150ms 防抖）或 `/` 技能加载（按 pane 缓存）
+  useEffect(() => {
+    if (!trigger || !paneId) return;
+    setActiveIndex(0);
+    if (trigger.kind === 'file') {
+      const timer = setTimeout(() => {
+        requestProjectFiles(paneId, trigger.query);
+      }, 150);
+      return () => clearTimeout(timer);
+    }
+    requestProjectSkills(paneId);
+  }, [trigger?.kind, trigger?.query, paneId]);
+
+  const matchedSkills = useMemo(() => {
+    if (!trigger || trigger.kind !== 'skill') return [];
+    if (!skillsState || skillsState.paneId !== paneId) return [];
+    return filterSkills(skillsState.skills, trigger.query);
+  }, [trigger, skillsState, paneId]);
+
+  const fileItems =
+    trigger?.kind === 'file' && filesState && filesState.paneId === paneId ? filesState.files : [];
+  const candidateCount = trigger?.kind === 'file' ? fileItems.length : matchedSkills.length;
+
+  useEffect(() => {
+    if (activeIndex >= candidateCount && candidateCount > 0) {
+      setActiveIndex(0);
+    }
+  }, [activeIndex, candidateCount]);
 
   // 回执短暂展示后自动清除
   useEffect(() => {
@@ -98,8 +213,7 @@ const CommandComposer = memo(function CommandComposer() {
     return () => clearTimeout(timer);
   }, [receipt]);
 
-  // 输入框随内容自增高（最多 6 行）。rows=1 固定高度时，稍长一点的指令就只能
-  // 从一条缝里往外看，改完更是无从复核。
+  // 输入框随内容自增高（最多 6 行）
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
@@ -108,9 +222,58 @@ const CommandComposer = memo(function CommandComposer() {
     el.style.height = `${Math.min(el.scrollHeight, line * 6 + 16)}px`;
   }, [text]);
 
+  const applyReplacement = useCallback((start: number, end: number, inserted: string) => {
+    setText((prev) => prev.slice(0, start) + inserted + prev.slice(end));
+    const nextCaret = start + inserted.length;
+    setCaret(nextCaret);
+    setDismissedKey(null);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(nextCaret, nextCaret);
+    });
+  }, []);
+
+  const pickFile = useCallback(
+    (path: string) => {
+      if (!trigger) return;
+      const formatted = /\s/.test(path) ? `@"${path}" ` : `@${path} `;
+      applyReplacement(trigger.start, trigger.end, formatted);
+    },
+    [trigger, applyReplacement],
+  );
+
+  const pickSkill = useCallback(
+    (skill: MobileSkillItem) => {
+      if (!trigger) return;
+      const prefix = skillsState?.paneId === paneId && skillsState.prefix ? skillsState.prefix : '/';
+      applyReplacement(trigger.start, trigger.end, `${prefix}${skill.name} `);
+    },
+    [trigger, skillsState, paneId, applyReplacement],
+  );
+
+  /** 手机虚拟键盘免切符号页：一键在光标处插入 `@` 或 `/` 并立即呼出补全浮层。 */
+  const insertTriggerChar = useCallback(
+    (ch: '@' | '/') => {
+      if (disabled) return;
+      const el = inputRef.current;
+      const start = el?.selectionStart ?? text.length;
+      const end = el?.selectionEnd ?? text.length;
+      const needSpace = start > 0 && !/\s/.test(text[start - 1]);
+      const inserted = needSpace ? ` ${ch}` : ch;
+      applyReplacement(start, end, inserted);
+    },
+    [disabled, text, applyReplacement],
+  );
+
   const submit = () => {
     if (disabled || sending) return;
-    if (sendMobileCommand(text)) setText('');
+    if (sendMobileCommand(text)) {
+      setText('');
+      setCaret(0);
+      setDismissedKey(null);
+    }
   };
 
   let notice: { text: string; ok: boolean } | null = null;
@@ -120,8 +283,103 @@ const CommandComposer = memo(function CommandComposer() {
       : { text: t(`mirror.receiptFail.${receipt.reason ?? 'writeFailed'}`), ok: false };
   }
 
+  const assistLoading =
+    trigger?.kind === 'file'
+      ? !filesState || filesState.paneId !== paneId || filesState.loading
+      : !skillsState || skillsState.paneId !== paneId || skillsState.loading;
+  const assistError =
+    trigger?.kind === 'file'
+      ? filesState?.paneId === paneId
+        ? filesState.error
+        : null
+      : skillsState?.paneId === paneId
+        ? skillsState.error
+        : null;
+  const skillPrefix =
+    skillsState?.paneId === paneId && skillsState.prefix ? skillsState.prefix : '/';
+
   return (
     <div className="composer">
+      {trigger && (
+        <div className="assist-popover" role="listbox">
+          <div className="assist-head">
+            <span className="assist-title">
+              {trigger.kind === 'file'
+                ? t('mirror.assist.filesTitle')
+                : t('mirror.assist.skillsTitle')}
+            </span>
+            {trigger.kind === 'file' && filesState?.paneId === paneId && filesState.truncated && (
+              <span className="assist-badge">{t('mirror.assist.truncated')}</span>
+            )}
+            <button
+              type="button"
+              className="assist-close"
+              aria-label={t('mirror.assist.close')}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => setDismissedKey(triggerKey)}
+            >
+              ×
+            </button>
+          </div>
+          <div className="assist-list">
+            {assistError ? (
+              <div className="assist-empty">{t(`mirror.assist.error.${assistError}`)}</div>
+            ) : trigger.kind === 'file' ? (
+              fileItems.length === 0 ? (
+                <div className="assist-empty">
+                  {assistLoading ? t('mirror.assist.loading') : t('mirror.assist.noFiles')}
+                </div>
+              ) : (
+                fileItems.map((item, idx) => (
+                  <button
+                    key={item.path}
+                    type="button"
+                    role="option"
+                    aria-selected={idx === activeIndex}
+                    className={`assist-item${idx === activeIndex ? ' is-active' : ''}`}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => pickFile(item.path)}
+                  >
+                    <span className="assist-item-main">{item.path}</span>
+                  </button>
+                ))
+              )
+            ) : matchedSkills.length === 0 ? (
+              <div className="assist-empty">
+                {assistLoading ? t('mirror.assist.loading') : t('mirror.assist.noSkills')}
+              </div>
+            ) : (
+              matchedSkills.map((skill, idx) => (
+                <button
+                  key={`${skill.source ?? ''}:${skill.name}`}
+                  type="button"
+                  role="option"
+                  aria-selected={idx === activeIndex}
+                  className={`assist-item${idx === activeIndex ? ' is-active' : ''}`}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pickSkill(skill)}
+                >
+                  <div className="assist-item-top">
+                    <span className="assist-item-main">
+                      {skillPrefix}
+                      {skill.name}
+                    </span>
+                    {skill.source && (
+                      <span className="assist-source">
+                        {skill.source === 'project'
+                          ? t('mirror.assist.sourceProject')
+                          : t('mirror.assist.sourceUser')}
+                      </span>
+                    )}
+                  </div>
+                  {skill.description && <span className="assist-item-desc">{skill.description}</span>}
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
       {notice && (
         <div className={`composer-receipt ${notice.ok ? 'ok' : 'fail'}`}>{notice.text}</div>
       )}
@@ -129,6 +387,32 @@ const CommandComposer = memo(function CommandComposer() {
         <div className="composer-hint">{t('mirror.offlineCannotSend')}</div>
       )}
       <div className="composer-row">
+        {supportsInputAssist && (
+          <div className="composer-assist-btns">
+            <button
+              type="button"
+              className={`composer-assist-btn${trigger?.kind === 'file' ? ' is-active' : ''}`}
+              disabled={disabled}
+              title={t('mirror.assist.filesTitle')}
+              aria-label={t('mirror.assist.filesTitle')}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => insertTriggerChar('@')}
+            >
+              @
+            </button>
+            <button
+              type="button"
+              className={`composer-assist-btn${trigger?.kind === 'skill' ? ' is-active' : ''}`}
+              disabled={disabled}
+              title={t('mirror.assist.skillsTitle')}
+              aria-label={t('mirror.assist.skillsTitle')}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => insertTriggerChar('/')}
+            >
+              /
+            </button>
+          </div>
+        )}
         <textarea
           ref={inputRef}
           className="composer-input"
@@ -136,8 +420,44 @@ const CommandComposer = memo(function CommandComposer() {
           rows={1}
           placeholder={t('mirror.inputPlaceholder')}
           disabled={disabled}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            setText(e.target.value);
+            setCaret(e.target.selectionStart ?? e.target.value.length);
+          }}
+          onClick={(e) => setCaret(e.currentTarget.selectionStart ?? text.length)}
+          onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? text.length)}
           onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing) return;
+            if (trigger) {
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                setDismissedKey(triggerKey);
+                return;
+              }
+              if (candidateCount > 0) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setActiveIndex((prev) => (prev + 1) % candidateCount);
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setActiveIndex((prev) => (prev - 1 + candidateCount) % candidateCount);
+                  return;
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+                  e.preventDefault();
+                  if (trigger.kind === 'file') {
+                    const item = fileItems[activeIndex];
+                    if (item) pickFile(item.path);
+                  } else {
+                    const skill = matchedSkills[activeIndex];
+                    if (skill) pickSkill(skill);
+                  }
+                  return;
+                }
+              }
+            }
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
               submit();
@@ -173,6 +493,8 @@ export function MirrorView() {
   const loaded = useRelayStore((s) => s.mirror?.loaded ?? false);
   const loadingOlder = useRelayStore((s) => s.mirror?.loadingOlder ?? false);
   const messages = useRelayStore((s) => s.mirror?.messages ?? EMPTY_MESSAGES);
+  const viewMode = useRelayStore((s) => s.mirror?.viewMode ?? 'chat');
+  const supportsTerminalView = useRelayStore((s) => s.supportsTerminalView);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const activity = useRelayStore(selectActivity);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -310,6 +632,28 @@ export function MirrorView() {
         >
           {title}
         </button>
+        {supportsTerminalView && (
+          <div className="mirror-mode-switch" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === 'chat'}
+              className={`mirror-mode-btn${viewMode === 'chat' ? ' is-active' : ''}`}
+              onClick={() => setMirrorViewMode('chat')}
+            >
+              {t('mirror.view.chat')}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={viewMode === 'terminal'}
+              className={`mirror-mode-btn${viewMode === 'terminal' ? ' is-active' : ''}`}
+              onClick={() => setMirrorViewMode('terminal')}
+            >
+              {t('mirror.view.terminal')}
+            </button>
+          </div>
+        )}
       </div>
 
       {renaming && (
@@ -331,31 +675,35 @@ export function MirrorView() {
         </div>
       )}
 
-      <div className="mirror-scroll" ref={scrollRef} onScroll={onScroll}>
-        {hasMore && (
-          <button
-            className="mirror-load-older"
-            onClick={requestOlder}
-            disabled={loadingOlder}
-          >
-            {loadingOlder ? t('mirror.loading') : t('mirror.loadOlder')}
-          </button>
-        )}
-        {!loaded ? (
-          // 骨架屏而不是一行「加载中…」：首屏要拉整段会话记录，纯文字会让人以为卡住了
-          <MirrorSkeleton label={t('mirror.loading')} />
-        ) : rows.length === 0 ? (
-          <div className="mirror-empty">{t('mirror.empty')}</div>
-        ) : (
-          <MirrorRowList
-            rows={rows}
-            expandedTools={expandedTools}
-            onToggleTools={toggleTools}
-            onUserResize={syncStick}
-          />
-        )}
-        {indicator && <ActivityIndicator key={indicator} kind={indicator} />}
-      </div>
+      {viewMode === 'terminal' ? (
+        <TerminalView />
+      ) : (
+        <div className="mirror-scroll" ref={scrollRef} onScroll={onScroll}>
+          {hasMore && (
+            <button
+              className="mirror-load-older"
+              onClick={requestOlder}
+              disabled={loadingOlder}
+            >
+              {loadingOlder ? t('mirror.loading') : t('mirror.loadOlder')}
+            </button>
+          )}
+          {!loaded ? (
+            // 骨架屏而不是一行「加载中…」：首屏要拉整段会话记录，纯文字会让人以为卡住了
+            <MirrorSkeleton label={t('mirror.loading')} />
+          ) : rows.length === 0 ? (
+            <div className="mirror-empty">{t('mirror.empty')}</div>
+          ) : (
+            <MirrorRowList
+              rows={rows}
+              expandedTools={expandedTools}
+              onToggleTools={toggleTools}
+              onUserResize={syncStick}
+            />
+          )}
+          {indicator && <ActivityIndicator key={indicator} kind={indicator} />}
+        </div>
+      )}
 
       <CommandComposer />
     </div>

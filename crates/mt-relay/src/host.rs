@@ -21,6 +21,20 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 pub use mt_ai::hook_server::HookSessionId;
+pub use mt_relay_protocol::{TerminalLine, TerminalSpan};
+
+/// 桌面端当前终端屏幕的只读切面（供移动端终端视图按需推送）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostTerminalScreen {
+    pub generation: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+    pub cursor_visible: bool,
+    pub alt_screen: bool,
+    pub lines: Vec<TerminalLine>,
+}
 
 use crate::relay::{
     MobileRelayStatusPayload, RenamePanePayload, ResumeSessionPayload, StartSessionPayload,
@@ -92,6 +106,32 @@ pub trait RelayHost: Send + Sync + 'static {
     /// 用于历史列表标出「运行中」,以及继续对话时直接复用现成 pane 不重复开 tab。
     fn live_session_pane(&self, _session_id: &str) -> Option<String> {
         None
+    }
+
+    /// 目标 PTY 的终端画面代数（每次 VT 输出变更递增）；无变化时跳过锁 grid。
+    fn terminal_generation(&self, _pty_id: u32) -> Option<u64> {
+        None
+    }
+
+    /// 提取目标 PTY 当前只读终端屏幕快照（含有限回滚历史）；绝不触发 resize。
+    fn terminal_screen(&self, _pty_id: u32) -> Option<HostTerminalScreen> {
+        None
+    }
+
+    /// 目标 PTY 此刻是否开着应用光标键模式（DECCKM / `APP_CURSOR`）。
+    /// 移动端终端应急按键的方向键与 Home/End 据此决定编码序列。
+    fn app_cursor_mode(&self, _pty_id: u32) -> bool {
+        false
+    }
+
+    /// 写入一个移动端终端应急按键。`legacy` 是 [`crate::assist::encode_terminal_key`]
+    /// 给出的**传统字节**;宿主可按该终端此刻的输入协议改写编码后再写穿,语义同
+    /// [`Self::write_pty`]。
+    ///
+    /// 默认原样写入。Windows 本地 ConPTY 开着 win32-input-mode 时,conhost 会把裸 `ESC`
+    /// 挂到下一键(Esc 丢失、下一键变成 Alt+键),桌面实现须换成与键盘同一张表的按键记录。
+    fn write_terminal_key(&self, pty_id: u32, legacy: String) -> Result<(), String> {
+        self.write_pty(pty_id, legacy)
     }
 }
 

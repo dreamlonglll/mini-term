@@ -62,12 +62,16 @@
 //!
 //! [`MobileLauncher`]: mt_relay_protocol::MobileLauncher
 
+pub mod assist;
 pub mod host;
 pub mod mirror;
 pub mod relay;
 mod util;
 
-pub use host::{AiLauncher, HookSessionId, NoopRelayHost, RelayEvents, RelayHost, RelayProject};
+pub use host::{
+    AiLauncher, HookSessionId, HostTerminalScreen, NoopRelayHost, RelayEvents, RelayHost,
+    RelayProject, TerminalLine, TerminalSpan,
+};
 pub use mirror::{
     MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, agent_has_session_log, history_slice,
 };

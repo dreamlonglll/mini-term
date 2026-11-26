@@ -210,6 +210,12 @@ pub struct AppConfig {
     /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
     #[serde(default = "default_true")]
     pub smart_copy_paste: bool,
+    /// 允许终端内程序经 OSC 52（含 tmux / screen DCS 透传）写入本机剪贴板。默认开启。
+    #[serde(default = "default_true")]
+    pub osc52_write: bool,
+    /// 允许终端内程序经 OSC 52 主动读取本机剪贴板。安全起见默认关闭，需用户显式开启。
+    #[serde(default)]
+    pub osc52_read: bool,
     /// 拖选按住不动自动复制的静止时长(秒)。`None` = UI 层默认 1s。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_auto_copy_secs: Option<f64>,
@@ -985,6 +991,8 @@ impl Default for AppConfig {
             hook_hint_shown: false,
             ignored_update_version: None,
             smart_copy_paste: true,
+            osc52_write: true,
+            osc52_read: false,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
             tray_max_projects: None,
@@ -2227,6 +2235,33 @@ mod tests {
         assert!(json.contains(r#""longPasteAiOnly":false"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.long_paste_ai_only, "显式 false 不许被默认值盖掉");
+    }
+
+    /// OSC 52 剪贴板权限:写入默认开、读取默认关;老库缺键按新默认,显式切换能完整往返。
+    #[test]
+    fn osc52_权限默认允许写禁止读且显式值能往返() {
+        let def = AppConfig::default();
+        assert!(def.osc52_write);
+        assert!(!def.osc52_read);
+
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(missing.osc52_write, "老库缺键时默认允许 OSC 52 写入");
+        assert!(!missing.osc52_read, "老库缺键时默认禁止 OSC 52 读取");
+
+        let custom = AppConfig {
+            osc52_write: false,
+            osc52_read: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&custom).unwrap();
+        assert!(json.contains(r#""osc52Write":false"#), "{json}");
+        assert!(json.contains(r#""osc52Read":true"#), "{json}");
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.osc52_write);
+        assert!(parsed.osc52_read);
     }
 
     /// Markdown 目录栏开合:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。

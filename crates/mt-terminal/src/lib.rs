@@ -32,7 +32,7 @@
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -42,11 +42,14 @@ use std::time::{Duration, Instant};
 pub mod buffer;
 pub mod kitty;
 pub mod links;
+pub mod osc52;
 pub mod osc7501;
+pub mod screen;
 mod takeover;
 pub mod width;
 
 pub use osc7501::{BlockedKind, ProgramState, ProgramStatus};
+pub use screen::{ScreenLine, ScreenSnapshot, ScreenSpan};
 pub use takeover::TakeoverSnapshot;
 use width::{Scratch, WidthOverride};
 
@@ -127,6 +130,8 @@ pub struct TerminalEmulator {
     cursor_settle: Mutex<CursorSettle>,
     /// Kitty 图形。`None` = 开关关着(缺省),字节不经过它。见 [`kitty`]。
     kitty: Option<kitty::Kitty>,
+    /// OSC 52（tmux / screen DCS 透传）流式解包器。
+    osc52: osc52::Osc52Passthrough,
     /// OSC 7501（Program Status Protocol）只读流式扫描器与探测应答。
     osc7501: osc7501::Osc7501,
     /// ConPTY 的 win32-input-mode(`CSI ? 9001h/l`)是否已由应用开启。
@@ -283,6 +288,21 @@ fn cursor_row(term: &Term<EventQueue>) -> i32 {
     term.grid().cursor.point.line.0 + term.history_size() as i32
 }
 
+/// 本 crate 唯一的 `term::Config` 构造口径。**建终端与每次 `set_options` 都必须走它**:
+/// `set_options` 是整份替换,漏一个字段就悄悄回落到 alacritty 默认值。
+///
+/// `osc52` 放到 `CopyPaste`:alacritty 默认 `OnlyCopy` 会在 `Term::clipboard_load`
+/// 里直接吞掉裸 `ESC ] 52 ; c ; ?` 查询,连 `Event::ClipboardLoad` 都不发,宿主的
+/// `osc52Read` 开关对最常见的标准形态形同虚设。读 / 写放行与否统一由宿主配置闸
+/// (`osc52Write` / `osc52Read`,见 mt-app `drain_term_events`)把关,这里只负责把事件交出去。
+pub(crate) fn term_config(scrollback: usize) -> Config {
+    Config {
+        scrolling_history: scrollback,
+        osc52: Osc52::CopyPaste,
+        ..Config::default()
+    }
+}
+
 impl TerminalEmulator {
     /// 用 alacritty 的默认回滚行数(10000 行)建一个。
     pub fn new(size: TermSize) -> Self {
@@ -296,11 +316,7 @@ impl TerminalEmulator {
     /// 不喂的话新终端照样只留 1 万行。
     pub fn with_scrollback(size: TermSize, scrollback: usize) -> Self {
         let events = EventQueue::default();
-        let config = Config {
-            scrolling_history: scrollback,
-            ..Config::default()
-        };
-        let term = Term::new(config, &size, events.clone());
+        let term = Term::new(term_config(scrollback), &size, events.clone());
         let cursor_settle = CursorSettle::new(cursor_cell(&term), Instant::now());
         Self {
             term: Arc::new(Mutex::new(term)),
@@ -314,6 +330,7 @@ impl TerminalEmulator {
             generation: AtomicU64::new(0),
             cursor_settle: Mutex::new(cursor_settle),
             kitty: None,
+            osc52: osc52::Osc52Passthrough::new(events.clone()),
             osc7501: osc7501::Osc7501::new(events),
             win32_input: AtomicBool::new(false),
             win32_input_allowed: cfg!(windows)
@@ -363,12 +380,8 @@ impl TerminalEmulator {
         if self.scrollback.swap(scrollback, Ordering::Relaxed) == scrollback {
             return;
         }
-        let config = Config {
-            scrolling_history: scrollback,
-            ..Config::default()
-        };
         let mut term = self.term.lock();
-        term.set_options(config);
+        term.set_options(term_config(scrollback));
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -392,7 +405,14 @@ impl TerminalEmulator {
         if self.kitty.is_some() && bytes.is_empty() {
             return;
         }
-        // OSC 7501 只读扫描(在 kitty 摘掉大图 payload 之后、term 锁之外,零字节复制)
+        // OSC 52 DCS 透传精准摘除（tmux / screen 包裹的 OSC 52 由本模块独自解包派发，
+        // 避免 vte 提前跳出 DCS 造成重复派发或 ST 结尾丢失；快路径零分配借用原切片）
+        let osc52_filtered = self.osc52.filter(bytes);
+        let bytes = osc52_filtered.as_ref();
+        if bytes.is_empty() {
+            return;
+        }
+        // OSC 7501 只读扫描(在 kitty / osc52 摘掉自身序列之后、term 锁之外,零字节复制)
         self.osc7501.scan(bytes);
         let mut term = self.term.lock();
         // 持着 term 锁记账:读的人持锁看到的代数与内容必然同步

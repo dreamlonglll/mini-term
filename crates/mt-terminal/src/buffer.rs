@@ -27,7 +27,7 @@
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, TermMode};
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use std::sync::atomic::Ordering;
 
@@ -104,14 +104,8 @@ impl TerminalEmulator {
         self.generation.fetch_add(1, Ordering::Relaxed);
         if term.mode().contains(TermMode::ALT_SCREEN) {
             let scrollback = self.scrollback();
-            term.set_options(Config {
-                scrolling_history: 0,
-                ..Config::default()
-            });
-            term.set_options(Config {
-                scrolling_history: scrollback,
-                ..Config::default()
-            });
+            term.set_options(crate::term_config(0));
+            term.set_options(crate::term_config(scrollback));
         } else {
             term.clear_screen(ClearMode::Saved);
         }

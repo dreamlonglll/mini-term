@@ -13,6 +13,25 @@
   --color-success: #4caf78;
   --color-error: #e05c5c;
   --color-attention: #e0a93c;
+  /* 移动端终端视图 ANSI 16 色调色板 */
+  --term-bg: #121212;
+  --term-fg: #e6e4e0;
+  --ansi-0: #2b2b2b;
+  --ansi-1: #e06c75;
+  --ansi-2: #7ec699;
+  --ansi-3: #e5c07b;
+  --ansi-4: #61afef;
+  --ansi-5: #c678dd;
+  --ansi-6: #56b6c2;
+  --ansi-7: #d8d6d2;
+  --ansi-8: #6b6b6b;
+  --ansi-9: #f28b92;
+  --ansi-10: #98e0b0;
+  --ansi-11: #f2d394;
+  --ansi-12: #82c4ff;
+  --ansi-13: #da9bf0;
+  --ansi-14: #76d4df;
+  --ansi-15: #ffffff;
 }
 
 * {
@@ -2011,4 +2030,400 @@ body {
   .activity-dots > span:nth-child(3) {
     animation-delay: 0.6s;
   }
+}
+
+/* ===== 镜像页头部：对话 / 终端 双视图切换 ===== */
+
+.mirror-mode-switch {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 2px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  gap: 2px;
+}
+
+.mirror-mode-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mirror-mode-btn.is-active {
+  background: rgba(74, 158, 255, 0.2);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ===== 移动端实时终端视图 ===== */
+
+.term-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--term-bg);
+}
+
+.term-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.term-mode-group {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.term-mode-btn {
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.term-mode-btn.is-active {
+  border-color: rgba(74, 158, 255, 0.55);
+  background: rgba(74, 158, 255, 0.14);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.term-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.term-meta {
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.term-font-group {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.term-font-btn {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.term-font-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.term-viewport-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.term-viewport {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 16px;
+  background: var(--term-bg);
+  color: var(--term-fg);
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  line-height: 1.42;
+  -webkit-overflow-scrolling: touch;
+  overflow-anchor: none;
+}
+
+.term-viewport.is-reflow {
+  overflow-x: hidden;
+}
+
+.term-viewport.is-reflow .term-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.term-viewport.is-grid {
+  overflow-x: auto;
+}
+
+.term-viewport.is-grid .term-content {
+  width: max-content;
+  min-width: 100%;
+}
+
+.term-viewport.is-grid .term-line {
+  white-space: pre;
+}
+
+.term-placeholder {
+  text-align: center;
+  color: var(--text-muted);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  padding: 40px 16px;
+}
+
+.term-cursor {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 2px;
+}
+
+.term-jump-bottom {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: rgba(35, 35, 35, 0.92);
+  color: var(--text-primary);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+}
+
+/* 底部应急特殊按键栏 */
+.term-keybar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-subtle);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  flex-shrink: 0;
+}
+
+.term-keybar::-webkit-scrollbar {
+  display: none;
+}
+
+.term-key-btn {
+  flex-shrink: 0;
+  min-width: 38px;
+  min-height: 32px;
+  padding: 4px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
+}
+
+.term-key-btn.is-accent {
+  border-color: rgba(74, 158, 255, 0.5);
+  color: var(--accent);
+}
+
+.term-key-btn.is-danger {
+  border-color: rgba(224, 92, 92, 0.5);
+  color: var(--color-error);
+}
+
+.term-key-btn:active:not(:disabled),
+.term-key-btn.is-flash {
+  background: rgba(74, 158, 255, 0.28);
+  border-color: var(--accent);
+}
+
+.term-key-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* ===== 输入区 @ 文件引用 / 技能补全 ===== */
+
+.composer {
+  position: relative;
+}
+
+.composer-assist-btns {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  align-self: flex-end;
+  padding-bottom: 2px;
+}
+
+.composer-assist-btn {
+  width: 34px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.composer-assist-btn.is-active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(74, 158, 255, 0.14);
+}
+
+.composer-assist-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.assist-popover {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% + 6px);
+  z-index: 25;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.assist-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px 7px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-elevated);
+}
+
+.assist-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  flex: 1;
+}
+
+.assist-badge {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.assist-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.assist-list {
+  max-height: 240px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.assist-empty {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.assist-item {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 12px;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.assist-item:last-child {
+  border-bottom: none;
+}
+
+.assist-item.is-active,
+.assist-item:active {
+  background: rgba(74, 158, 255, 0.16);
+}
+
+.assist-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.assist-item-main {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.assist-source {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+
+.assist-item-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

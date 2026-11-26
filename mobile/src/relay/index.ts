@@ -17,8 +17,10 @@ export {
   type HistoryPreviewState,
   type HomeTab,
   type MirrorState,
+  type MirrorViewMode,
   type Phase,
   type StartSessionState,
+  type TerminalScreenData,
   clearStartError,
   findLivePaneForHistory,
   setHomeTab,
@@ -33,7 +35,17 @@ export {
   openMirror,
   renamePane,
   sendMobileCommand,
+  sendTerminalKey,
+  setMirrorViewMode,
 } from './mirror';
+export {
+  type FilesAssistState,
+  type SkillsAssistState,
+  requestProjectFiles,
+  requestProjectSkills,
+  resetAssistState,
+  useAssistStore,
+} from './assist';
 export {
   closeHistoryPreview,
   closeProjectHistory,

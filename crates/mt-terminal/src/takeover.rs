@@ -468,8 +468,9 @@ impl TerminalEmulator {
     }
 
     /// 接管两头的收尾:代数 +1(持着 term 锁记,口径同 `advance`)、⚑ 的光标水位作废、
-    /// OSC 7501 扫描器复位、光标停稳追踪记一笔。
+    /// OSC 52 / OSC 7501 扫描器复位、光标停稳追踪记一笔。
     fn finish_takeover_transition(&self, term: &Term<EventQueue>) {
+        self.osc52.reset();
         self.osc7501.reset();
         self.generation.fetch_add(1, Ordering::Relaxed);
         *self.cursor_floor.lock() = None;

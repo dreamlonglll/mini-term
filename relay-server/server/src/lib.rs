@@ -29,8 +29,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Extension, Router};
 use mt_relay_protocol::{
-    CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason, MobileRejectReason,
-    MobileToRelay, RelayToDesktop, RelayToMobile, StartSessionFailReason, PROTOCOL_VERSION,
+    AssistFailReason, CommandFailReason, DesktopRejectReason, DesktopToRelay, HistoryFailReason,
+    MobileRejectReason, MobileToRelay, RelayToDesktop, RelayToMobile, StartSessionFailReason,
+    PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Notify};
@@ -292,6 +293,8 @@ struct DesktopRoom {
     /// 移动端当前订阅的镜像 pane 集合;未订阅 pane 的镜像消息在路由层丢弃。
     /// 只存 pane id(元数据),不缓存镜像内容。
     subscriptions: HashSet<String>,
+    /// 移动端当前订阅的终端屏幕 pane 集合;仅切入终端视图时按需订阅,未订阅一律丢弃。
+    terminal_subscriptions: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -872,6 +875,8 @@ fn handle_desktop_message(
             projects,
             launchers,
             supports_history,
+            supports_terminal_view,
+            supports_input_assist,
         } => {
             if let Some(mobile) = inner
                 .rooms
@@ -882,6 +887,8 @@ fn handle_desktop_message(
                     projects,
                     launchers,
                     supports_history,
+                    supports_terminal_view,
+                    supports_input_assist,
                 });
             }
         }
@@ -944,10 +951,12 @@ fn handle_desktop_message(
                 }
             }
         }
-        // pane 关闭:转发并清掉订阅(后续同 pane 消息不再路由)
+        // pane 关闭:转发并清掉镜像与终端两类订阅(后续同 pane 消息不再路由)
         DesktopToRelay::PaneClosed { pane_id } => {
             if let Some(room) = inner.rooms.get_mut(desktop_id) {
-                if room.subscriptions.remove(&pane_id) {
+                let had_mirror = room.subscriptions.remove(&pane_id);
+                let had_term = room.terminal_subscriptions.remove(&pane_id);
+                if had_mirror || had_term {
                     if let Some(mobile) = room.mobile.as_ref() {
                         mobile.send_json(&RelayToMobile::PaneClosed { pane_id });
                     }
@@ -1037,6 +1046,81 @@ fn handle_desktop_message(
                     ok,
                     messages,
                     has_more,
+                    reason,
+                });
+            }
+        }
+        // 终端屏幕快照:仅路由给已订阅该 pane 终端视图的移动端,未订阅一律丢弃,中转不缓存
+        DesktopToRelay::TerminalScreen {
+            pane_id,
+            cols,
+            rows,
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+            alt_screen,
+            lines,
+        } => {
+            if let Some(room) = inner.rooms.get(desktop_id) {
+                if room.terminal_subscriptions.contains(&pane_id) {
+                    if let Some(mobile) = room.mobile.as_ref() {
+                        mobile.send_json(&RelayToMobile::TerminalScreen {
+                            pane_id,
+                            cols,
+                            rows,
+                            cursor_row,
+                            cursor_col,
+                            cursor_visible,
+                            alt_screen,
+                            lines,
+                        });
+                    }
+                }
+            }
+        }
+        // 输入辅助(`@` 文件列表 / `/` 技能列表):原样转发给在线移动端,不落盘不缓存
+        DesktopToRelay::ProjectFiles {
+            request_id,
+            pane_id,
+            ok,
+            files,
+            truncated,
+            reason,
+        } => {
+            if let Some(mobile) = inner
+                .rooms
+                .get(desktop_id)
+                .and_then(|room| room.mobile.as_ref())
+            {
+                mobile.send_json(&RelayToMobile::ProjectFiles {
+                    request_id,
+                    pane_id,
+                    ok,
+                    files,
+                    truncated,
+                    reason,
+                });
+            }
+        }
+        DesktopToRelay::ProjectSkills {
+            request_id,
+            pane_id,
+            ok,
+            prefix,
+            skills,
+            reason,
+        } => {
+            if let Some(mobile) = inner
+                .rooms
+                .get(desktop_id)
+                .and_then(|room| room.mobile.as_ref())
+            {
+                mobile.send_json(&RelayToMobile::ProjectSkills {
+                    request_id,
+                    pane_id,
+                    ok,
+                    prefix,
+                    skills,
                     reason,
                 });
             }
@@ -1561,6 +1645,83 @@ fn handle_mobile_message(
                 None
             }
         }
+        // 终端视图按需订阅 / 退订
+        MobileToRelay::SubscribeTerminal { pane_id } => {
+            room.terminal_subscriptions.insert(pane_id.clone());
+            Some(RelayToDesktop::SubscribeTerminal { pane_id })
+        }
+        MobileToRelay::UnsubscribeTerminal { pane_id } => {
+            room.terminal_subscriptions.remove(&pane_id);
+            Some(RelayToDesktop::UnsubscribeTerminal { pane_id })
+        }
+        // 应急特殊按键:桌面离线即拒,回执复用 CommandReceipt
+        MobileToRelay::SendTerminalKey {
+            pane_id,
+            command_id,
+            key,
+        } => {
+            if room.desktop.is_some() {
+                Some(RelayToDesktop::SendTerminalKey {
+                    pane_id,
+                    command_id,
+                    key,
+                })
+            } else {
+                reject_command_offline(room, "terminal key", pane_id, command_id);
+                None
+            }
+        }
+        // 输入辅助(`@` 文件 / `/` 技能):桌面离线直接路由层返回失败,不让移动端空等
+        MobileToRelay::RequestProjectFiles {
+            request_id,
+            pane_id,
+            query,
+        } => {
+            if room.desktop.is_some() {
+                Some(RelayToDesktop::RequestProjectFiles {
+                    request_id,
+                    pane_id,
+                    query,
+                })
+            } else {
+                tracing::warn!("[relay] request project files rejected: desktop offline");
+                if let Some(mobile) = room.mobile.as_ref() {
+                    mobile.send_json(&RelayToMobile::ProjectFiles {
+                        request_id,
+                        pane_id,
+                        ok: false,
+                        files: Vec::new(),
+                        truncated: false,
+                        reason: Some(AssistFailReason::DesktopOffline),
+                    });
+                }
+                None
+            }
+        }
+        MobileToRelay::RequestProjectSkills {
+            request_id,
+            pane_id,
+        } => {
+            if room.desktop.is_some() {
+                Some(RelayToDesktop::RequestProjectSkills {
+                    request_id,
+                    pane_id,
+                })
+            } else {
+                tracing::warn!("[relay] request project skills rejected: desktop offline");
+                if let Some(mobile) = room.mobile.as_ref() {
+                    mobile.send_json(&RelayToMobile::ProjectSkills {
+                        request_id,
+                        pane_id,
+                        ok: false,
+                        prefix: String::new(),
+                        skills: Vec::new(),
+                        reason: Some(AssistFailReason::DesktopOffline),
+                    });
+                }
+                None
+            }
+        }
     };
     if let (Some(msg), Some(desktop)) = (forward, room.desktop.as_ref()) {
         desktop.send_json(&msg);
@@ -1597,9 +1758,13 @@ fn reject_command_offline(room: &DesktopRoom, what: &str, pane_id: String, comma
 /// 清空移动端订阅并逐一通知所属桌面端退订(移动端断线/被顶替/被吊销时调用)。
 fn drop_subscriptions(room: &mut DesktopRoom) {
     let panes: Vec<String> = room.subscriptions.drain().collect();
+    let term_panes: Vec<String> = room.terminal_subscriptions.drain().collect();
     if let Some(desktop) = room.desktop.as_ref() {
         for pane_id in panes {
             desktop.send_json(&RelayToDesktop::UnsubscribePane { pane_id });
+        }
+        for pane_id in term_panes {
+            desktop.send_json(&RelayToDesktop::UnsubscribeTerminal { pane_id });
         }
     }
 }

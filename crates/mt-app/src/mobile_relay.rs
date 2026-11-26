@@ -50,7 +50,10 @@ use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, WeakEntity, Window};
 use mt_config::{AiLauncher, AppConfig, ProjectConfig};
-use mt_relay::host::{HookSessionId, RelayEvents, RelayHost, RelayProject};
+use mt_relay::host::{
+    HookSessionId, HostTerminalScreen, RelayEvents, RelayHost, RelayProject, TerminalLine,
+    TerminalSpan,
+};
 use mt_relay::{
     DesktopIdentity, MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload,
     ResumeSessionPayload, StartSessionFailReason, StartSessionPayload, SyncPane, SyncProject,
@@ -115,12 +118,45 @@ struct HostMirror {
     pane_sessions: HashMap<u32, HookSessionId>,
 }
 
+/// 移动端终端视图主屏额外附带的最大回滚历史行数。
+const MOBILE_TERMINAL_HISTORY_LINES: usize = 120;
+
 /// 该 PTY 的终端此刻开没开 bracketed paste —— 与桌面端粘贴(`paste_to_bytes`)
 /// 同一判据。镜像里还没有它(刚建的 pane 等下一轮刷新)按没开处理。
 /// 句柄先取出再读模式位:不持着镜像锁去等终端锁(reader 线程推进 grid 时持它)。
 fn bracketed_paste_of(mirror: &Mutex<HostMirror>, pty_id: u32) -> bool {
     let emulator = mirror.lock().emulators.get(&pty_id).cloned();
     emulator.is_some_and(|e| e.mode().contains(TermMode::BRACKETED_PASTE))
+}
+
+/// 该 PTY 的终端此刻是否开着应用光标键模式（DECCKM / `APP_CURSOR`）。
+fn app_cursor_mode_of(mirror: &Mutex<HostMirror>, pty_id: u32) -> bool {
+    let emulator = mirror.lock().emulators.get(&pty_id).cloned();
+    emulator.is_some_and(|e| e.mode().contains(TermMode::APP_CURSOR))
+}
+
+/// 该 PTY 的终端此刻是否开着 win32-input-mode(Windows 本地 ConPTY 发过 `CSI ? 9001h`)——
+/// 与桌面键盘(`mt-ui` `TerminalView` 按键编码)同一判据。SSH 接管期间模拟器会关掉它。
+fn win32_input_mode_of(mirror: &Mutex<HostMirror>, pty_id: u32) -> bool {
+    let emulator = mirror.lock().emulators.get(&pty_id).cloned();
+    emulator.is_some_and(|e| e.win32_input_mode())
+}
+
+/// 移动端应急按键最终写进 PTY 的字节。
+///
+/// 开着 win32-input-mode 时,conhost 收到过按键记录后就不再冲掉写入末尾的不完整序列:
+/// 裸 `ESC` 会挂到下一键(实测 Esc 后接 ↵ 到程序手里成了 `ESC CR`,即 Alt+Enter)。
+/// 这类前缀与桌面键盘一样查 [`mt_ui::terminal::held_prefix_record`] 换成按键记录;
+/// 输入旁路认得记录(`mt-ai` tracker 把 Esc 记录还原成裸 Esc),打断 / 清行语义不变。
+/// 其余键(完整的 CSI / SS3 序列与控制字符)原样放行。
+fn terminal_key_payload(legacy: String, win32_input: bool) -> String {
+    if !win32_input {
+        return legacy;
+    }
+    match mt_ui::terminal::held_prefix_record(legacy.as_bytes()) {
+        Some(record) => String::from_utf8_lossy(record).into_owned(),
+        None => legacy,
+    }
 }
 
 /// 从项目的全部 pane 中提取活跃 AI 会话身份映射:
@@ -214,6 +250,13 @@ impl RelayHost for HostImpl {
             .map_err(|_| "relay pump closed".to_string())
     }
 
+    /// 编码定稿见 [`terminal_key_payload`];模式位在这里(tokio 线程)读,与
+    /// [`Self::app_cursor_mode`] 同一时机 —— 只碰镜像里的模拟器 `Arc`,不碰实体。
+    fn write_terminal_key(&self, pty_id: u32, legacy: String) -> Result<(), String> {
+        let data = terminal_key_payload(legacy, win32_input_mode_of(&self.mirror, pty_id));
+        self.write_pty(pty_id, data)
+    }
+
     /// 移动端指令据此决定正文包不包 `ESC[200~ … ESC[201~`(mt-relay 那边先写正文、
     /// 隔一拍再单独写回车)。在 tokio 线程上调:只碰镜像里的 `Arc` 句柄,不碰实体。
     fn bracketed_paste(&self, pty_id: u32) -> bool {
@@ -245,6 +288,48 @@ impl RelayHost for HostImpl {
 
     fn live_session_pane(&self, session_id: &str) -> Option<String> {
         self.mirror.lock().live_sessions.get(session_id).cloned()
+    }
+
+    fn terminal_generation(&self, pty_id: u32) -> Option<u64> {
+        let emulator = self.mirror.lock().emulators.get(&pty_id).cloned()?;
+        Some(emulator.generation())
+    }
+
+    fn terminal_screen(&self, pty_id: u32) -> Option<HostTerminalScreen> {
+        let emulator = self.mirror.lock().emulators.get(&pty_id).cloned()?;
+        let snap = emulator.screen_snapshot(MOBILE_TERMINAL_HISTORY_LINES);
+        Some(HostTerminalScreen {
+            generation: snap.generation,
+            cols: snap.cols,
+            rows: snap.rows,
+            cursor_row: snap.cursor_row,
+            cursor_col: snap.cursor_col,
+            cursor_visible: snap.cursor_visible,
+            alt_screen: snap.alt_screen,
+            lines: snap
+                .lines
+                .into_iter()
+                .map(|line| TerminalLine {
+                    wrapped: line.wrapped,
+                    spans: line
+                        .spans
+                        .into_iter()
+                        .map(|span| TerminalSpan {
+                            text: span.text,
+                            fg: span.fg,
+                            bg: span.bg,
+                            bold: span.bold,
+                            dim: span.dim,
+                            inverse: span.inverse,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    }
+
+    fn app_cursor_mode(&self, pty_id: u32) -> bool {
+        app_cursor_mode_of(&self.mirror, pty_id)
     }
 }
 
@@ -1273,6 +1358,52 @@ mod tests {
         emulator.advance(b"\x1b[?2004l");
         assert!(!bracketed_paste_of(&mirror, 7));
         assert!(!bracketed_paste_of(&mirror, 8));
+    }
+
+    #[test]
+    fn 移动端终端方向键跟随应用光标模式位() {
+        let emulator = Arc::new(TerminalEmulator::new(mt_terminal::TermSize::new(80, 24)));
+        let mirror = Mutex::new(HostMirror::default());
+        mirror.lock().emulators.insert(9, emulator.clone());
+        assert!(!app_cursor_mode_of(&mirror, 9));
+        emulator.advance(b"\x1b[?1h");
+        assert!(app_cursor_mode_of(&mirror, 9));
+        emulator.advance(b"\x1b[?1l");
+        assert!(!app_cursor_mode_of(&mirror, 9));
+        assert!(!app_cursor_mode_of(&mirror, 10));
+    }
+
+    /// E2E 实测:ConPTY 开着 win32-input-mode 时裸 ESC 被 conhost 挂起,
+    /// 手机端 Esc 丢失、下一键变 Alt+键。开着时换成与桌面键盘同一条 Esc 记录。
+    #[test]
+    fn 移动端应急_esc_在_win32_input_mode_下换成按键记录() {
+        // 与 mt-ui 键盘编码、mt-ai tracker 的 WSI_ESCAPE 逐字一致
+        assert_eq!(
+            terminal_key_payload("\x1b".into(), true),
+            "\x1b[27;1;27;1;0;1_"
+        );
+        assert_eq!(terminal_key_payload("\x1b".into(), false), "\x1b");
+        // 其余 16 个键都是完整序列或控制字符,conhost 不挂起:开不开都原样
+        for legacy in [
+            "\x03", "\t", "\x1b[Z", "\x1b[A", "\x1bOA", "\x1b[D", "\x1b[C", "\r", " ", "\x7f",
+            "\x04", "\x15", "\x1b[H", "\x1bOF", "\x1b[5~", "\x1b[6~",
+        ] {
+            assert_eq!(terminal_key_payload(legacy.into(), true), legacy, "{legacy:?}");
+        }
+    }
+
+    #[test]
+    fn 移动端应急按键的_win32_input_mode_跟随模拟器() {
+        let emulator = Arc::new(TerminalEmulator::new(mt_terminal::TermSize::new(80, 24)));
+        let mirror = Mutex::new(HostMirror::default());
+        mirror.lock().emulators.insert(9, emulator.clone());
+        assert!(!win32_input_mode_of(&mirror, 9));
+        emulator.advance(b"\x1b[?9001h");
+        // 模拟器自己按平台 / `MT_DISABLE_WIN32_INPUT_MODE` 门控,这里只钉「读的就是它」
+        assert_eq!(win32_input_mode_of(&mirror, 9), emulator.win32_input_mode());
+        emulator.advance(b"\x1b[?9001l");
+        assert!(!win32_input_mode_of(&mirror, 9));
+        assert!(!win32_input_mode_of(&mirror, 10));
     }
 
     // ── relayHttpBase 四种前缀 ──────────────────────────────

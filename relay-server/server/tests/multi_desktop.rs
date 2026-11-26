@@ -186,6 +186,8 @@ async fn multiple_desktops_coexist_and_route_traffic_independently() {
             }],
             launchers: vec![],
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         },
     )
     .await;
@@ -203,6 +205,8 @@ async fn multiple_desktops_coexist_and_route_traffic_independently() {
             }],
             launchers: vec![],
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         },
     )
     .await;

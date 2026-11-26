@@ -313,6 +313,8 @@ impl SettingsView {
     pub(super) fn render_clipboard_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let config = self.store.read(cx).config();
         let smart = config.smart_copy_paste;
+        let osc52_write = config.osc52_write;
+        let osc52_read = config.osc52_read;
         let long_paste = config.long_paste_to_file;
         let long_paste_ai_only = config.long_paste_ai_only;
 
@@ -337,6 +339,35 @@ impl SettingsView {
                         "clipboard.autoCopyDwellDesc",
                         &self.num_dwell,
                         false,
+                    )),
+            )
+            .child(
+                section("clipboard.osc52Section")
+                    .child(toggle_row(
+                        "clip-osc52-write",
+                        "clipboard.osc52WriteTitle",
+                        "clipboard.osc52WriteDesc",
+                        osc52_write,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.osc52_write = next, cx)
+                            });
+                        },
+                        cx,
+                    ))
+                    .child(toggle_row(
+                        "clip-osc52-read",
+                        "clipboard.osc52ReadTitle",
+                        "clipboard.osc52ReadDesc",
+                        osc52_read,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.osc52_read = next, cx)
+                            });
+                        },
+                        cx,
                     )),
             )
             .child(

@@ -10,7 +10,21 @@ import type {
   MobileProject,
   MobileRejectReason,
   StartSessionFailReason,
+  TerminalLine,
 } from '../protocol';
+
+export type MirrorViewMode = 'chat' | 'terminal';
+
+/** 当前活跃 AI pane 的实时终端屏幕快照数据 */
+export interface TerminalScreenData {
+  cols: number;
+  rows: number;
+  cursorRow: number;
+  cursorCol: number;
+  cursorVisible: boolean;
+  altScreen: boolean;
+  lines: TerminalLine[];
+}
 
 export type Phase =
   | 'idle' // 无配对码也无凭证:提示去桌面端扫码
@@ -48,6 +62,12 @@ export interface MirrorState {
   answeredProgress: Record<number, number>;
   /** 最近一次指令回执(短暂展示后由 UI 清除) */
   receipt: { ok: boolean; reason?: CommandFailReason } | null;
+  /** 当前展示的子视图：对话镜像 / 终端画面 */
+  viewMode: MirrorViewMode;
+  /** 最近一帧终端屏幕快照；null = 尚未收到 */
+  terminalScreen: TerminalScreenData | null;
+  /** 是否已收到过至少一帧终端屏幕快照 */
+  terminalLoaded: boolean;
 }
 
 /** 发起/恢复会话的进行态(一次只允许一个,防连点)。 */
@@ -104,6 +124,10 @@ export interface RelayStore {
   desktopOnline: boolean | null;
   /** 桌面端是否支持历史会话展示与继续对话(旧桌面端为 false) */
   supportsHistory: boolean;
+  /** 桌面端是否支持终端视图与应急按键(旧桌面端 / 旧中转为 false) */
+  supportsTerminalView: boolean;
+  /** 桌面端是否支持 @ 文件引用与 / 技能补全(旧桌面端 / 旧中转为 false) */
+  supportsInputAssist: boolean;
   /** 首页分段标签:活跃会话 / 历史会话 */
   homeTab: HomeTab;
   /** 项目列表(全部项目,含没有活跃会话的;来自桌面端快照/增量) */
@@ -130,6 +154,8 @@ export const useRelayStore = create<RelayStore>(() => ({
   savedDesktops: [],
   desktopOnline: null,
   supportsHistory: false,
+  supportsTerminalView: false,
+  supportsInputAssist: false,
   homeTab: 'active',
   projects: [],
   launchers: [],
@@ -145,6 +171,8 @@ export function resetDesktopSessionState() {
   useRelayStore.setState({
     desktopOnline: null,
     supportsHistory: false,
+    supportsTerminalView: false,
+    supportsInputAssist: false,
     homeTab: 'active',
     projects: [],
     launchers: [],

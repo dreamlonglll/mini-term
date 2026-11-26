@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1991;
+pub const ZH_ENTRY_COUNT: usize = 1996;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1991;
+pub const EN_ENTRY_COUNT: usize = 1996;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3028,6 +3028,11 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("clipboard.longPasteDesc", "粘贴的文本超过下方阈值时，保存到临时 .txt 并改为粘贴带引号的文件路径，避免 AI 工具被超长粘贴卡住。默认只在 AI 会话里这样做，见下一项"),
     ("clipboard.longPasteFooter", "关闭后超长文本将直接粘贴 · 任一阈值命中即触发转存 · 临时文件保存在系统 temp 目录，24 小时后自动清理"),
     ("clipboard.longPasteTitle", "粘贴时超长文本转临时文件"),
+    ("clipboard.osc52ReadDesc", "安全起见默认关闭：开启后终端内程序（含远程主机）可主动查询并读取本机剪贴板文本，请仅在可信环境下开启"),
+    ("clipboard.osc52ReadTitle", "允许终端读取本机剪贴板"),
+    ("clipboard.osc52Section", "终端剪贴板 (OSC 52)"),
+    ("clipboard.osc52WriteDesc", "允许远程 SSH、tmux、screen 或全屏 TUI 程序通过 OSC 52 直接将内容复制到本机剪贴板（空内容与超大载荷会被自动忽略）"),
+    ("clipboard.osc52WriteTitle", "允许终端写入本机剪贴板"),
     ("clipboard.remotePaste", "远程粘贴"),
     ("clipboard.remotePasteDir", "远程项目上传目录"),
     ("clipboard.remotePasteDirDesc", "在 SSH 远程项目的终端里粘贴图片 / 超长文本时，文件会先传到远端这个目录，再粘贴远端路径"),
@@ -3338,6 +3343,11 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("clipboard.longPasteDesc", "When pasted text exceeds the thresholds below, save it to a temp .txt and paste the quoted file path instead, so AI tools don't choke on huge pastes. By default this only happens inside AI sessions (see the next option)"),
     ("clipboard.longPasteFooter", "When off, long pastes go through directly · Hitting either threshold triggers saving · Temp files live in the system temp dir and are cleaned up after 24 hours"),
     ("clipboard.longPasteTitle", "Save long pastes to a temp file"),
+    ("clipboard.osc52ReadDesc", "Off by default for security: when enabled, programs inside the terminal (including remote hosts) can query and read your local clipboard text; only enable in trusted environments"),
+    ("clipboard.osc52ReadTitle", "Allow terminal to read local clipboard"),
+    ("clipboard.osc52Section", "Terminal clipboard (OSC 52)"),
+    ("clipboard.osc52WriteDesc", "Allow SSH, tmux, screen, or full-screen TUI apps to copy text into the local clipboard via OSC 52 (empty and oversized payloads are ignored)"),
+    ("clipboard.osc52WriteTitle", "Allow terminal to write local clipboard"),
     ("clipboard.remotePaste", "Remote paste"),
     ("clipboard.remotePasteDir", "Upload directory for remote projects"),
     ("clipboard.remotePasteDirDesc", "When pasting images / long text into an SSH remote project's terminal, the file is uploaded to this directory first and the remote path is pasted instead"),

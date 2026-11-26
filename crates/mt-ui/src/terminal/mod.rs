@@ -32,7 +32,8 @@ pub use element::{
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{
-    ScrollbackKey, is_text_input_key, keystroke_to_bytes, paste_to_bytes, scrollback_key,
+    ScrollbackKey, held_prefix_record, is_text_input_key, keystroke_to_bytes, paste_to_bytes,
+    scrollback_key,
 };
 pub use links::{
     FileLink, FileLinks, LINK_HINT_DELAY, LinkHintLabel, OpenFileLink, OpenUrlLink,

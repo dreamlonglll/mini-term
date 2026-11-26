@@ -104,6 +104,61 @@ export interface MobileAnswerQuestion {
   optionIndex: number;
 }
 
+/** 移动端可在终端视图下发送的应急特殊按键白名单 */
+export type TerminalKey =
+  | 'escape'
+  | 'ctrlC'
+  | 'ctrlD'
+  | 'ctrlU'
+  | 'tab'
+  | 'shiftTab'
+  | 'enter'
+  | 'backspace'
+  | 'space'
+  | 'up'
+  | 'down'
+  | 'left'
+  | 'right'
+  | 'home'
+  | 'end'
+  | 'pageUp'
+  | 'pageDown';
+
+/** 切入终端视图：按需订阅活跃 AI pane 的实时终端屏幕快照 */
+export interface MobileSubscribeTerminal {
+  type: 'subscribeTerminal';
+  paneId: string;
+}
+
+/** 退出终端视图：退订终端屏幕快照流 */
+export interface MobileUnsubscribeTerminal {
+  type: 'unsubscribeTerminal';
+  paneId: string;
+}
+
+/** 在终端视图下发送应急特殊按键（回执复用 commandReceipt） */
+export interface MobileSendTerminalKey {
+  type: 'sendTerminalKey';
+  paneId: string;
+  commandId: string;
+  key: TerminalKey;
+}
+
+/** 输入框 `@` 文件引用补全请求 */
+export interface MobileRequestProjectFiles {
+  type: 'requestProjectFiles';
+  requestId: string;
+  paneId: string;
+  query: string;
+}
+
+/** 输入框 `/` 技能补全请求 */
+export interface MobileRequestProjectSkills {
+  type: 'requestProjectSkills';
+  requestId: string;
+  paneId: string;
+}
+
 export type MobileToRelay =
   | MobileHello
   | MobileSubscribePane
@@ -115,7 +170,12 @@ export type MobileToRelay =
   | MobileStartAiSession
   | MobileRequestSessionHistory
   | MobileRequestSessionContent
-  | MobileResumeAiSession;
+  | MobileResumeAiSession
+  | MobileSubscribeTerminal
+  | MobileUnsubscribeTerminal
+  | MobileSendTerminalKey
+  | MobileRequestProjectFiles
+  | MobileRequestProjectSkills;
 
 // ── 中转 → 移动端 ──
 
@@ -195,6 +255,10 @@ export interface MobileSessionsSnapshot {
   launchers: MobileLauncher[];
   /** 桌面端是否支持「历史会话展示与继续对话」(旧桌面端缺省 false) */
   supportsHistory?: boolean;
+  /** 桌面端是否支持「终端视图与应急按键」(旧桌面端 / 旧中转缺省 false) */
+  supportsTerminalView?: boolean;
+  /** 桌面端是否支持「@ 文件引用与 / 技能补全」(旧桌面端 / 旧中转缺省 false) */
+  supportsInputAssist?: boolean;
 }
 
 export interface MobileSessionsDelta {
@@ -348,6 +412,73 @@ export interface MobileSessionContent {
   reason?: HistoryFailReason;
 }
 
+// ── 终端视图与输入辅助 ──
+
+export type AssistFailReason =
+  | 'desktopOffline'
+  | 'paneNotFound'
+  | 'notSupported'
+  | 'readFailed';
+
+export interface TerminalSpan {
+  text: string;
+  /** `"ansi:0"`..`"ansi:15"` 或 `"#rrggbb"`；省略表示默认前景色 */
+  fg?: string;
+  /** `"ansi:0"`..`"ansi:15"` 或 `"#rrggbb"`；省略表示默认背景色 */
+  bg?: string;
+  bold?: boolean;
+  dim?: boolean;
+  inverse?: boolean;
+}
+
+export interface TerminalLine {
+  spans?: TerminalSpan[];
+  /** 本行是否为上一行的软换行续行（文本重排模式据此合并自然段） */
+  wrapped?: boolean;
+}
+
+export interface MobileTerminalScreen {
+  type: 'terminalScreen';
+  paneId: string;
+  cols: number;
+  rows: number;
+  cursorRow: number;
+  cursorCol: number;
+  cursorVisible: boolean;
+  altScreen: boolean;
+  lines?: TerminalLine[];
+}
+
+export interface MobileProjectFile {
+  path: string;
+}
+
+export interface MobileProjectFiles {
+  type: 'projectFiles';
+  requestId: string;
+  paneId: string;
+  ok: boolean;
+  files?: MobileProjectFile[];
+  truncated?: boolean;
+  reason?: AssistFailReason;
+}
+
+export interface MobileSkillItem {
+  name: string;
+  description?: string;
+  source?: string;
+}
+
+export interface MobileProjectSkills {
+  type: 'projectSkills';
+  requestId: string;
+  paneId: string;
+  ok: boolean;
+  prefix?: string;
+  skills?: MobileSkillItem[];
+  reason?: AssistFailReason;
+}
+
 export type RelayToMobile =
   | MobileHelloAck
   | MobileHelloReject
@@ -362,4 +493,7 @@ export type RelayToMobile =
   | MobileCommandReceipt
   | MobileStartSessionReceipt
   | MobileSessionHistory
-  | MobileSessionContent;
+  | MobileSessionContent
+  | MobileTerminalScreen
+  | MobileProjectFiles
+  | MobileProjectSkills;

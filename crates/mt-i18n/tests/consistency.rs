@@ -308,8 +308,10 @@ use mt_i18n::{
 /// 1971 → 1989：项目块 UI 与交互升级 —— 栏头工具按钮提示（`projectList.header.*` 4 条）、
 /// 行内筛选条（`projectList.filter.*` 6 条）、空列表引导卡（`projectList.empty.*` 2 条）、
 /// 分组占位与操作提示（`projectList.group.*` 4 条）、行尾更多按钮与底部拖放区（`projectList.{row.moreTip,dropToRootEnd}` 2 条）。
+/// 1991 → 1996：设置页复制粘贴新增终端剪贴板 (OSC 52) 读写权限分组
+/// （`settings.clipboard.{osc52Section,osc52WriteTitle,osc52WriteDesc,osc52ReadTitle,osc52ReadDesc}`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1991;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1996;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

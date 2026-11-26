@@ -1948,12 +1948,22 @@ impl TerminalPane {
                 // 这些是终端自己的应答,不是用户键入:直接写,不走 AI 输入旁路
                 TermEvent::PtyWrite(text) => self.write_raw(text.as_bytes()),
                 TermEvent::ClipboardStore(_, text) => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    let allow_write = AppStore::global(cx).read(cx).config().osc52_write;
+                    if allow_write && mt_terminal::osc52::allow_clipboard_store(&text) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
                 }
                 TermEvent::ClipboardLoad(_, format) => {
-                    let text = cx.read_from_clipboard().and_then(|it| it.text());
-                    let payload = format(text.as_deref().unwrap_or(""));
-                    self.write_raw(payload.as_bytes());
+                    // 安全边界:默认禁止远端/终端程序读取本机剪贴板,避免静默窃取密码或令牌
+                    let allow_read = AppStore::global(cx).read(cx).config().osc52_read;
+                    if allow_read {
+                        let text = cx.read_from_clipboard().and_then(|it| it.text());
+                        let text = text.as_deref().unwrap_or("");
+                        if mt_terminal::osc52::allow_clipboard_load(text) {
+                            let payload = format(text);
+                            self.write_raw(payload.as_bytes());
+                        }
+                    }
                 }
                 // index 不止 0..16:256/257/258 是前景/背景/光标,而且 OSC 4 改过的
                 // 调色板要优先于主题 —— 两件事都在 `terminal_color_rgb` 里。

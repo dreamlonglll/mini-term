@@ -421,3 +421,261 @@ async fn mobile_disconnect_auto_unsubscribes_on_desktop() {
         })
     );
 }
+
+#[tokio::test]
+async fn terminal_view_and_input_assist_route_and_clean_up_on_disconnect() {
+    use mt_relay_protocol::{
+        AssistFailReason, CommandFailReason, MobileProjectFile, MobileSkillItem, TerminalKey,
+        TerminalLine, TerminalSpan,
+    };
+
+    let addr = spawn_relay().await;
+    let (mut desktop, mut mobile) = paired_pair(addr).await;
+
+    // 订阅 pane-1 的终端视图 → 转发桌面端
+    send_json(
+        &mut mobile,
+        &MobileToRelay::SubscribeTerminal {
+            pane_id: "pane-1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::SubscribeTerminal {
+            pane_id: "pane-1".into(),
+        })
+    );
+
+    // 同连接顺序先推未订阅的 pane-other（路由层丢弃），再推已订阅的 pane-1（完整送达移动端）
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::TerminalScreen {
+            pane_id: "pane-other".into(),
+            cols: 80,
+            rows: 24,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            alt_screen: false,
+            lines: vec![],
+        },
+    )
+    .await;
+    let screen = DesktopToRelay::TerminalScreen {
+        pane_id: "pane-1".into(),
+        cols: 80,
+        rows: 24,
+        cursor_row: 1,
+        cursor_col: 5,
+        cursor_visible: true,
+        alt_screen: false,
+        lines: vec![TerminalLine {
+            spans: vec![TerminalSpan {
+                text: "Allow? [y/n]".into(),
+                ..Default::default()
+            }],
+            wrapped: false,
+        }],
+    };
+    send_json(&mut desktop, &screen).await;
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::TerminalScreen { pane_id, cols: 80, rows: 24, lines, .. })
+            if pane_id == "pane-1" && lines.len() == 1 && lines[0].spans[0].text == "Allow? [y/n]"
+    ));
+
+    // 发送应急特殊按键 → 转发给桌面端
+    send_json(
+        &mut mobile,
+        &MobileToRelay::SendTerminalKey {
+            pane_id: "pane-1".into(),
+            command_id: "key-1".into(),
+            key: TerminalKey::Escape,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::SendTerminalKey {
+            pane_id: "pane-1".into(),
+            command_id: "key-1".into(),
+            key: TerminalKey::Escape,
+        })
+    );
+
+    // @ 文件请求 / / 技能请求端到端转发
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestProjectFiles {
+            request_id: "req-f".into(),
+            pane_id: "pane-1".into(),
+            query: "main".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::RequestProjectFiles {
+            request_id: "req-f".into(),
+            pane_id: "pane-1".into(),
+            query: "main".into(),
+        })
+    );
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::ProjectFiles {
+            request_id: "req-f".into(),
+            pane_id: "pane-1".into(),
+            ok: true,
+            files: vec![MobileProjectFile {
+                path: "src/main.rs".into(),
+            }],
+            truncated: false,
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::ProjectFiles { request_id, ok: true, files, .. })
+            if request_id == "req-f" && files.len() == 1 && files[0].path == "src/main.rs"
+    ));
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestProjectSkills {
+            request_id: "req-s".into(),
+            pane_id: "pane-1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::RequestProjectSkills {
+            request_id: "req-s".into(),
+            pane_id: "pane-1".into(),
+        })
+    );
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::ProjectSkills {
+            request_id: "req-s".into(),
+            pane_id: "pane-1".into(),
+            ok: true,
+            prefix: "/".into(),
+            skills: vec![MobileSkillItem {
+                name: "commit".into(),
+                description: "Create a commit".into(),
+                source: "project".into(),
+            }],
+            reason: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::ProjectSkills { request_id, ok: true, prefix, skills, .. })
+            if request_id == "req-s" && prefix == "/" && skills.len() == 1
+    ));
+
+    // 桌面端掉线后，按键与输入辅助均在路由层立即返回 DesktopOffline
+    desktop.close(None).await.unwrap();
+    drop(desktop);
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::Presence {
+            desktop_online: false,
+            ..
+        })
+    ));
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::SendTerminalKey {
+            pane_id: "pane-1".into(),
+            command_id: "key-2".into(),
+            key: TerminalKey::CtrlC,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::CommandReceipt {
+            pane_id: "pane-1".into(),
+            command_id: "key-2".into(),
+            ok: false,
+            reason: Some(CommandFailReason::DesktopOffline),
+        })
+    );
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestProjectFiles {
+            request_id: "req-f2".into(),
+            pane_id: "pane-1".into(),
+            query: String::new(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::ProjectFiles {
+            request_id: "req-f2".into(),
+            pane_id: "pane-1".into(),
+            ok: false,
+            files: vec![],
+            truncated: false,
+            reason: Some(AssistFailReason::DesktopOffline),
+        })
+    );
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::RequestProjectSkills {
+            request_id: "req-s2".into(),
+            pane_id: "pane-1".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::ProjectSkills {
+            request_id: "req-s2".into(),
+            pane_id: "pane-1".into(),
+            ok: false,
+            prefix: String::new(),
+            skills: vec![],
+            reason: Some(AssistFailReason::DesktopOffline),
+        })
+    );
+}
+
+#[tokio::test]
+async fn mobile_disconnect_auto_unsubscribes_terminal_on_desktop() {
+    let addr = spawn_relay().await;
+    let (mut desktop, mut mobile) = paired_pair(addr).await;
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::SubscribeTerminal {
+            pane_id: "pane-9".into(),
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::SubscribeTerminal {
+            pane_id: "pane-9".into(),
+        })
+    );
+
+    mobile.close(None).await.unwrap();
+    drop(mobile);
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::UnsubscribeTerminal {
+            pane_id: "pane-9".into(),
+        })
+    );
+}

@@ -272,6 +272,8 @@ async fn snapshot_and_delta_are_routed_to_mobile() {
             projects: sample_projects(),
             launchers: sample_launchers(),
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         },
     )
     .await;
@@ -281,6 +283,8 @@ async fn snapshot_and_delta_are_routed_to_mobile() {
             projects: sample_projects(),
             launchers: sample_launchers(),
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         })
     );
 
@@ -314,6 +318,8 @@ async fn sessions_messages_without_mobile_are_dropped() {
             projects: sample_projects(),
             launchers: sample_launchers(),
             supports_history: false,
+            supports_terminal_view: false,
+            supports_input_assist: false,
         },
     )
     .await;

@@ -132,6 +132,95 @@ pub enum HistoryFailReason {
     ReadFailed,
 }
 
+/// 移动端输入辅助（`@` 文件引用 / `/` 技能补全）失败的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssistFailReason {
+    /// 桌面端离线:中转在路由层直接拒绝
+    DesktopOffline,
+    /// 目标 pane 已关闭或不在活跃 AI 会话集合内
+    PaneNotFound,
+    /// 目标项目不支持本机扫描（如 SSH 远程项目）
+    NotSupported,
+    /// 桌面端读取目录失败
+    ReadFailed,
+}
+
+/// 终端画面里的单个样式片段。默认色与常规样式省略，控制 JSON 体积。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSpan {
+    pub text: String,
+    /// 前景色：`"ansi:0"`..`"ansi:15"`（由移动端按亮暗主题映射）或 `"#rrggbb"`；默认色省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    /// 背景色：同 `fg`；默认色省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inverse: bool,
+}
+
+/// 终端画面中的一行。`wrapped` 表示本行是上一行的软换行续行（供移动端重排拼接自然段）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalLine {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<TerminalSpan>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wrapped: bool,
+}
+
+/// 移动端可在终端视图下向活跃 AI pane 发送的应急特殊按键白名单。
+/// 桌面端按目标终端当前 `TermMode`（如 `APP_CURSOR`）编码为对应字节写入 PTY。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalKey {
+    Escape,
+    CtrlC,
+    CtrlD,
+    CtrlU,
+    Tab,
+    ShiftTab,
+    Enter,
+    Backspace,
+    Space,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+/// 移动端 `@` 文件补全返回的一条项目内相对路径（绝不携带文件内容）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileProjectFile {
+    /// 相对项目根的 POSIX 风格路径（如 `src/main.rs`）
+    pub path: String,
+}
+
+/// 移动端 `/` 技能补全返回的一条可用 Skill 摘要（绝不携带完整正文）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileSkillItem {
+    /// 技能标识名（如 `commit` / `tdd`）
+    pub name: String,
+    /// 单行简述（截断上限由桌面端把关）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// 来源标记：`"project"` | `"user"`
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+}
+
 /// 桌面端握手被拒绝的原因(中转 → 桌面端)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +329,12 @@ pub enum DesktopToRelay {
         /// 新 PWA 据此隐藏历史入口,避免对旧桌面端发请求后空等。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         supports_history: bool,
+        /// 桌面端是否支持「终端视图与应急按键」(旧桌面端 / 旧中转缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_terminal_view: bool,
+        /// 桌面端是否支持「@ 文件引用与 / 技能补全」(旧桌面端 / 旧中转缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_input_assist: bool,
     },
     /// 活跃 AI 会话结构增量:整项目 upsert + 项目移除。
     SessionsDelta {
@@ -307,6 +402,43 @@ pub enum DesktopToRelay {
         has_more: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<HistoryFailReason>,
+    },
+    /// 活跃 AI pane 的终端屏幕快照（仅移动端切入终端视图并订阅后按需推送）。
+    TerminalScreen {
+        pane_id: String,
+        cols: u16,
+        rows: u16,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
+        alt_screen: bool,
+        #[serde(default)]
+        lines: Vec<TerminalLine>,
+    },
+    /// 项目内文件引用候选列表响应（仅相对路径，不含正文）。
+    ProjectFiles {
+        request_id: String,
+        pane_id: String,
+        ok: bool,
+        #[serde(default)]
+        files: Vec<MobileProjectFile>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AssistFailReason>,
+    },
+    /// 当前 AI 会话可用技能列表响应（仅名称与简短描述，不含全文）。
+    ProjectSkills {
+        request_id: String,
+        pane_id: String,
+        ok: bool,
+        /// 插入草稿时使用的前缀（Claude/Grok/pi/omp/agy 为 `"/"`，Codex 为 `"$"`）
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        skills: Vec<MobileSkillItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AssistFailReason>,
     },
 }
 
@@ -396,6 +528,28 @@ pub enum RelayToDesktop {
         agent: String,
         session_id: String,
     },
+    /// 移动端切入终端视图：订阅指定活跃 AI pane 的终端屏幕快照流。
+    SubscribeTerminal { pane_id: String },
+    /// 移动端退出终端视图或断线时由中转代发：退订终端屏幕快照流。
+    UnsubscribeTerminal { pane_id: String },
+    /// 移动端在终端视图下发送应急特殊按键（回执复用 CommandReceipt）。
+    SendTerminalKey {
+        pane_id: String,
+        command_id: String,
+        key: TerminalKey,
+    },
+    /// 移动端输入框 `@` 补全：按查询词检索目标 pane 所属项目的文件相对路径。
+    RequestProjectFiles {
+        request_id: String,
+        pane_id: String,
+        #[serde(default)]
+        query: String,
+    },
+    /// 移动端输入框 `/` 补全：列出目标 pane 所属项目与当前 agent 的可用技能。
+    RequestProjectSkills {
+        request_id: String,
+        pane_id: String,
+    },
 }
 
 /// 移动端 → 中转
@@ -469,6 +623,28 @@ pub enum MobileToRelay {
         agent: String,
         session_id: String,
     },
+    /// 切入终端视图：按需订阅活跃 AI pane 的实时终端屏幕快照。
+    SubscribeTerminal { pane_id: String },
+    /// 退出终端视图：停止推送终端屏幕快照。
+    UnsubscribeTerminal { pane_id: String },
+    /// 发送应急特殊按键（Esc / Ctrl+C / 方向键 / Tab / Shift+Tab 等），回执复用 CommandReceipt。
+    SendTerminalKey {
+        pane_id: String,
+        command_id: String,
+        key: TerminalKey,
+    },
+    /// 输入框 `@` 文件引用补全请求。
+    RequestProjectFiles {
+        request_id: String,
+        pane_id: String,
+        #[serde(default)]
+        query: String,
+    },
+    /// 输入框 `/` 技能补全请求。
+    RequestProjectSkills {
+        request_id: String,
+        pane_id: String,
+    },
 }
 
 /// 中转 → 移动端
@@ -506,6 +682,12 @@ pub enum RelayToMobile {
         /// 桌面端是否支持「历史会话展示与继续对话」(旧桌面端缺省 false)。
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         supports_history: bool,
+        /// 桌面端是否支持「终端视图与应急按键」(旧桌面端 / 旧中转缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_terminal_view: bool,
+        /// 桌面端是否支持「@ 文件引用与 / 技能补全」(旧桌面端 / 旧中转缺省 false)。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_input_assist: bool,
     },
     /// 活跃 AI 会话结构增量(转发自桌面端)。
     SessionsDelta {
@@ -570,6 +752,42 @@ pub enum RelayToMobile {
         has_more: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<HistoryFailReason>,
+    },
+    /// 活跃 AI pane 的实时终端屏幕快照（转发自桌面端，仅已订阅终端视图时路由）。
+    TerminalScreen {
+        pane_id: String,
+        cols: u16,
+        rows: u16,
+        cursor_row: u16,
+        cursor_col: u16,
+        cursor_visible: bool,
+        alt_screen: bool,
+        #[serde(default)]
+        lines: Vec<TerminalLine>,
+    },
+    /// `@` 文件补全响应（转发自桌面端，或桌面离线时中转直接拒绝）。
+    ProjectFiles {
+        request_id: String,
+        pane_id: String,
+        ok: bool,
+        #[serde(default)]
+        files: Vec<MobileProjectFile>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AssistFailReason>,
+    },
+    /// `/` 技能补全响应（转发自桌面端，或桌面离线时中转直接拒绝）。
+    ProjectSkills {
+        request_id: String,
+        pane_id: String,
+        ok: bool,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        skills: Vec<MobileSkillItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AssistFailReason>,
     },
 }
 
@@ -830,6 +1048,8 @@ mod tests {
                 name: "Claude".into(),
             }],
             supports_history: true,
+            supports_terminal_view: true,
+            supports_input_assist: true,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
@@ -839,7 +1059,9 @@ mod tests {
                 && json.contains(r#""canStartSession":true"#)
                 && json.contains(r#""groupPath":["工作","后端"]"#)
                 && json.contains(r#""launchers":[{"id":"l1","name":"Claude"}]"#)
-                && json.contains(r#""supportsHistory":true"#),
+                && json.contains(r#""supportsHistory":true"#)
+                && json.contains(r#""supportsTerminalView":true"#)
+                && json.contains(r#""supportsInputAssist":true"#),
             "serde camelCase 对齐被破坏: {json}"
         );
         // 启动器只下发 id 与展示名:命令/shell 绝不出现在 wire 上
@@ -861,15 +1083,19 @@ mod tests {
             projects: vec![empty.clone()],
             launchers: vec![],
             supports_history: false,
+            supports_terminal_view: false,
+            supports_input_assist: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""panes":[]"#) && json.contains(r#""canStartSession":false"#), "{json}");
-        // 顶层项目不占 wire:空 groupPath 与 false supportsHistory 整个字段省略
+        // 顶层项目不占 wire:空 groupPath 与 false 能力位整个字段省略
         assert!(!json.contains("groupPath"), "{json}");
         assert!(!json.contains("supportsHistory"), "{json}");
+        assert!(!json.contains("supportsTerminalView"), "{json}");
+        assert!(!json.contains("supportsInputAssist"), "{json}");
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), msg);
 
-        // 旧桌面端发来的不带 supportsHistory 的快照按 false 解析
+        // 旧桌面端发来的不带新能力位的快照按 false 解析
         let legacy = r#"{"type":"sessionsSnapshot","projects":[],"launchers":[]}"#;
         assert_eq!(
             serde_json::from_str::<DesktopToRelay>(legacy).unwrap(),
@@ -877,6 +1103,8 @@ mod tests {
                 projects: vec![],
                 launchers: vec![],
                 supports_history: false,
+                supports_terminal_view: false,
+                supports_input_assist: false,
             }
         );
     }
@@ -1416,5 +1644,136 @@ mod tests {
         let legacy = r#"{"paneId":"p1","title":"claude","status":"ai-idle"}"#;
         let pane: MobilePane = serde_json::from_str(legacy).unwrap();
         assert!(!pane.needs_attention);
+    }
+
+    #[test]
+    fn terminal_view_and_input_assist_messages_round_trip() {
+        let sub = MobileToRelay::SubscribeTerminal {
+            pane_id: "pane-1".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&sub).unwrap(),
+            r#"{"type":"subscribeTerminal","paneId":"pane-1"}"#
+        );
+        let unsub = RelayToDesktop::UnsubscribeTerminal {
+            pane_id: "pane-1".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&unsub).unwrap(),
+            r#"{"type":"unsubscribeTerminal","paneId":"pane-1"}"#
+        );
+
+        let key = MobileToRelay::SendTerminalKey {
+            pane_id: "pane-1".into(),
+            command_id: "k-1".into(),
+            key: TerminalKey::ShiftTab,
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(
+            json.contains(r#""type":"sendTerminalKey""#)
+                && json.contains(r#""commandId":"k-1""#)
+                && json.contains(r#""key":"shiftTab""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), key);
+
+        let screen = DesktopToRelay::TerminalScreen {
+            pane_id: "pane-1".into(),
+            cols: 120,
+            rows: 36,
+            cursor_row: 12,
+            cursor_col: 4,
+            cursor_visible: true,
+            alt_screen: false,
+            lines: vec![
+                TerminalLine {
+                    spans: vec![TerminalSpan {
+                        text: "$ cargo test".into(),
+                        fg: Some("ansi:2".into()),
+                        bg: None,
+                        bold: true,
+                        dim: false,
+                        inverse: false,
+                    }],
+                    wrapped: false,
+                },
+                TerminalLine {
+                    spans: vec![TerminalSpan {
+                        text: "continued".into(),
+                        ..Default::default()
+                    }],
+                    wrapped: true,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&screen).unwrap();
+        assert!(
+            json.contains(r#""type":"terminalScreen""#)
+                && json.contains(r#""cursorRow":12"#)
+                && json.contains(r#""cursorCol":4"#)
+                && json.contains(r#""cursorVisible":true"#)
+                && json.contains(r#""altScreen":false"#)
+                && json.contains(r#""wrapped":true"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), screen);
+
+        let req_files = MobileToRelay::RequestProjectFiles {
+            request_id: "f-1".into(),
+            pane_id: "pane-1".into(),
+            query: "src/app".into(),
+        };
+        let json = serde_json::to_string(&req_files).unwrap();
+        assert!(json.contains(r#""type":"requestProjectFiles""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<MobileToRelay>(&json).unwrap(),
+            req_files
+        );
+
+        let res_files = RelayToMobile::ProjectFiles {
+            request_id: "f-1".into(),
+            pane_id: "pane-1".into(),
+            ok: true,
+            files: vec![MobileProjectFile {
+                path: "src/App.tsx".into(),
+            }],
+            truncated: true,
+            reason: None,
+        };
+        let json = serde_json::to_string(&res_files).unwrap();
+        assert!(
+            json.contains(r#""type":"projectFiles""#)
+                && json.contains(r#""truncated":true"#)
+                && !json.contains("reason"),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<RelayToMobile>(&json).unwrap(),
+            res_files
+        );
+
+        let res_skills = DesktopToRelay::ProjectSkills {
+            request_id: "s-1".into(),
+            pane_id: "pane-1".into(),
+            ok: true,
+            prefix: "$".into(),
+            skills: vec![MobileSkillItem {
+                name: "tdd".into(),
+                description: "Test-driven development".into(),
+                source: "user".into(),
+            }],
+            reason: None,
+        };
+        let json = serde_json::to_string(&res_skills).unwrap();
+        assert!(
+            json.contains(r#""type":"projectSkills""#)
+                && json.contains(r#""prefix":"$""#)
+                && json.contains(r#""name":"tdd""#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(&json).unwrap(),
+            res_skills
+        );
     }
 }
