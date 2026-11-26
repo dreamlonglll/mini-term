@@ -387,7 +387,7 @@ fn scan_skills_with_home(
         if !dir.is_dir() {
             continue;
         }
-        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let key = mt_core::path::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         if !seen_dirs.insert(key) {
             continue;
         }
