@@ -55,6 +55,7 @@ mod date_picker;
 mod dialog_host;
 mod dnd;
 mod env_vars;
+mod extensions;
 mod file_tree;
 mod file_viewer;
 mod first_run;
@@ -110,6 +111,7 @@ mod ssh_process;
 mod ssh_quick_connect;
 mod store;
 mod syntax_languages;
+mod syntax_pack;
 mod tab_expansion;
 mod terminal_area;
 mod terminal_links;
@@ -345,9 +347,12 @@ fn main() {
     app.run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);
-        // 文件编辑器的补充语言包(C# 等五种补高亮查询 + PHP / Kotlin / Lua … 新增)。
+        // 文件编辑器的内置补充语言(XML / INI / 批处理)。
         // 只是往注册表放字符串,毫秒级;必须早于任何文件页签建出来。
         syntax_languages::register();
+        // 语法高亮扩展包(C++ / PHP / C# / Kotlin … 16 种,按需下载的动态库):后台找库、
+        // 核哈希、加载,回主线程注册。不在就是纯文本,不报错;先打开的编辑器到位后重新套语言。
+        syntax_pack::init(cx);
         // 预览器里的图片要靠它取字节:gpui 默认装 `NullHttpClient`(什么都发不出),
         // 而富文本渲染器把图片一律画成 `img(SharedUri)` —— 本地图片走 `file://`
         // (md / html 源里的相对路径在渲染前被改写成绝对 file URL),网络图片走共享异步
@@ -477,6 +482,11 @@ fn main() {
         // 事件泵要拿 store,所以排在 `set_global` 之后。绑不上只记日志,功能整体关闭。
         ssh_activity::start(cx);
 
+        // 按需扩展(远程 Git helper 等):同步下载源、起事件泵、给 mt-remote 注入缺 helper 时的
+        // 补齐器,并在后台清掉不属于当前清单的旧版本。要读配置里的下载源,排在 store 之后;
+        // 必须早于任何托管 Git 部署(远程项目的 Git 面板要等首帧之后才会动)
+        extensions::init(cx);
+
         // 用户改过的快捷键压在默认键位之上(默认键位上面 `bind_keys` 已绑好;机制见
         // `hotkeys::apply_overrides`)。必须赶在窗口开出来之前:首帧的菜单提示、首启引导的
         // 键帽读的就是此刻生效的那份。读不懂 / 认不出的条目丢弃,只记日志
@@ -603,8 +613,9 @@ fn main() {
         startup_trace::mark("setup exit (window opened)");
 
         // 项目里的 SKILL.md 对齐当前模板 / 令牌 / CLI 位置:后台跑一次,只进日志,
-        // 不拦启动(dev 实例由注册器自己跳过)。
-        store.read(cx).reconcile_ssh_skills_in_background(cx);
+        // 不拦启动(dev 实例由注册器自己跳过)。本机没有 mt-ssh-cli(从随包 sidecar 的旧版本
+        // 升级上来)时先后台下载 ssh-tools 扩展,装好后再校正(升级自愈,见该函数注释)。
+        store.read(cx).heal_ssh_tools_on_startup(cx);
 
         // 帧剖析叠层(度量工具)。挂在窗口建好之后:叠层状态住在 `Window` 上,
         // 不是 App 级的。`MT_FRAME_OVERLAY` 没设时这一行什么都不做。

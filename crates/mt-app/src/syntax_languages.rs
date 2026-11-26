@@ -1,21 +1,28 @@
-//! 文件编辑器语法高亮的补充语言包。
+//! 文件编辑器语法高亮的补充语言包(内置的那三种)+ nvim 口径查询的改写器。
 //!
-//! gpui-component 的 `tree-sitter-languages` feature 给了 30 种语言,但其中
-//! C# / Swift / CMake / Proto / GraphQL 五种**只挂了解析器、高亮查询是空串**
-//! (`highlighter/languages.rs` 里 `(tree_sitter_c_sharp::LANGUAGE, "", "", "")`),
-//! 打开 .cs 文件整篇是纯文本色;PHP / Kotlin / Lua / PowerShell / XML 这些常见类型
-//! 组件库根本没有。
+//! # 按需扩展阶段 C 之后的分工
 //!
-//! 出口只有一个:[`register`],启动时调一次,往 `LanguageRegistry` 单例里
-//! (a) 用带高亮查询的配置**覆盖**上面五种;(b) **追加**九种主流语言。注册表按
-//! 名字查找,`InputState::code_editor(name)` 那条路一字不改;[`crate::file_viewer::language_for`]
-//! 负责扩展名 → 名字。
+//! 体积大的语法挪进了语法包动态库(`crates/mt-syntax-pack`,宿主侧 [`crate::syntax_pack`]):
+//! 原先这里补的 C# / Swift / CMake / Proto / GraphQL / Kotlin / PowerShell / Dart / Groovy
+//! 连同 `assets/syntax/*.scm` 都搬过去了。这里只剩:
+//!
+//! - 三个小语法 XML / INI / 批处理([`register`],启动时调一次);
+//! - 查询改写器 [`zed_captures`] + [`demote_catch_alls`]:语法包表里带 `ZED_REWRITE` 标志的
+//!   语言(就是从这里搬走的那九种)注册前由 [`crate::syntax_pack`] 调它们改写 ——
+//!   **改写代码留在宿主**,语法包只带查询原文。
+//!
+//! 下文「高亮查询从哪来」「挑选口径」等说明对搬走的那九种同样适用(它们的查询文件现在在
+//! `crates/mt-syntax-pack/queries/`)。
+//!
+//! 注册表按名字查找,`InputState::code_editor(name)` 那条路一字不改;
+//! [`crate::file_viewer::language_for`] 负责扩展名 → 名字。
 //!
 //! # 高亮查询从哪来
 //!
 //! 优先用语法 crate 自带的 `HIGHLIGHTS_QUERY`(与解析器同版本发布,节点名必定对得上);
 //! crate 没带的(C# / Swift / Proto / GraphQL)从 Zed 的语言扩展或 nvim-treesitter 抄一份
-//! 进 `assets/syntax/`,文件头注明来源与许可证(都是 Apache-2.0 / MIT),GPL 的一律不碰;
+//! 进 `assets/syntax/`(现已随语言挪到 `crates/mt-syntax-pack/queries/`),文件头注明来源与
+//! 许可证(都是 Apache-2.0 / MIT),GPL 的一律不碰;
 //! Groovy 那份是拿 Java 的查询拼的(见文件头)。
 //!
 //! # 捕获名要翻译成 Zed 的那套
@@ -114,71 +121,19 @@ impl Pack {
     }
 }
 
-/// 全部语言包。名字与组件库内建重名的(csharp / swift / cmake / proto / graphql)
-/// 是覆盖,其余是追加。
+/// 内置的语言包(都是追加,组件库没有这三种)。
+///
+/// php / lua 曾在这里补过:gpui-component 0.6 起内置(lua 仍内置;php 现在在语法包)。
+/// kotlin 组件库内置的那份 highlights.scm 在 kotlin-sg 0.4.1 上**编不过**
+/// (`Invalid node type "!is"`),所以语法包里的 kotlin 用 crate 自带的 nvim 派生查询
+/// (kotlin-sg 是 fwcd 那份语法的 crates.io 发布版;tree-sitter-grammars 的 kotlin-ng 是
+/// 重写过的语法,节点名不同,nvim / Zed / Helix 三家的查询都对不上它,没处抄)。
 const PACKS: &[Pack] = &[
-    // ---- 组件库有解析器、缺高亮查询的五种 ----
-    Pack::plain(
-        "csharp",
-        tree_sitter_c_sharp::LANGUAGE,
-        include_str!("../assets/syntax/csharp.scm"),
-    ),
-    Pack::plain(
-        "swift",
-        tree_sitter_swift::LANGUAGE,
-        include_str!("../assets/syntax/swift.scm"),
-    ),
-    Pack::plain(
-        "cmake",
-        tree_sitter_cmake::LANGUAGE,
-        tree_sitter_cmake::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "proto",
-        tree_sitter_proto::LANGUAGE,
-        include_str!("../assets/syntax/proto.scm"),
-    ),
-    Pack::plain(
-        "graphql",
-        tree_sitter_graphql::LANGUAGE,
-        include_str!("../assets/syntax/graphql.scm"),
-    ),
-    // ---- 新增(只收主流类型,冷门语言不进来,见模块注释「挑选口径」)----
-    // php / lua 曾在这里补过:gpui-component 0.6 起内置(php 带 HTML 注入、lua 带
-    // injections + locals),不再覆盖 —— 再引 tree-sitter-lua 会与组件库那份版本
-    // 不同、C 符号重定义链接失败。
-    //
-    // kotlin 0.6 也内置了,但它那份 highlights.scm 在自己拉的 kotlin-sg 0.4.1 上
-    // **编不过**(`Invalid node type "!is"`),组件库只 warn 后静默退成纯文本 ——
-    // 这里继续用 crate 自带的 nvim 派生查询覆盖(kotlin-sg 是 fwcd 那份语法的
-    // crates.io 发布版;tree-sitter-grammars 的 kotlin-ng 是重写过的语法,节点名
-    // 不同,nvim / Zed / Helix 三家的查询都对不上它,没处抄)。
-    Pack::plain(
-        "kotlin",
-        tree_sitter_kotlin_sg::LANGUAGE,
-        tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY,
-    ),
-    Pack::plain(
-        "powershell",
-        tree_sitter_powershell::LANGUAGE,
-        tree_sitter_powershell::HIGHLIGHTS_QUERY,
-    ),
     // csproj / xaml / plist / svg 这一大家子都是它
     Pack::plain(
         "xml",
         tree_sitter_xml::LANGUAGE_XML,
         tree_sitter_xml::XML_HIGHLIGHT_QUERY,
-    ),
-    Pack::plain(
-        "dart",
-        tree_sitter_dart::LANGUAGE,
-        tree_sitter_dart::HIGHLIGHTS_QUERY,
-    ),
-    // 主要为 build.gradle / Jenkinsfile
-    Pack::plain(
-        "groovy",
-        tree_sitter_groovy::LANGUAGE,
-        include_str!("../assets/syntax/groovy.scm"),
     ),
     // .ini / .cfg / .conf / .editorconfig / .gitconfig / .properties 都是 key=value
     Pack::plain(
@@ -542,7 +497,7 @@ fn is_catch_all(item: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -667,9 +622,10 @@ mod tests {
         }
     }
 
-    /// 某段代码在某语言下的颜色,与主题里某个捕获名的颜色对账。
+    /// 某段代码在某语言下的颜色,与主题里某个捕获名的颜色对账。语法包的端到端用例
+    /// (`syntax_pack::tests`)也用它。
     #[track_caller]
-    fn assert_colored_as(lang: &str, code: &str, needle: &str, capture: &str) {
+    pub(crate) fn assert_colored_as(lang: &str, code: &str, needle: &str, capture: &str) {
         use gpui_component::highlighter::{HighlightTheme, SyntaxHighlighter};
         register();
         let mut highlighter = SyntaxHighlighter::new(lang);
@@ -692,31 +648,7 @@ mod tests {
         );
     }
 
-    /// C# 是这次的由头:方法名 function 色、关键字 keyword 色、字符串 string 色。
-    /// 顺带验「同一节点先到的名字赢」这条组件库规则下 Zed 的查询(兜底
-    /// `(identifier) @variable` 在最前)仍然对。
-    #[test]
-    fn csharp_端到端上色() {
-        let code =
-            "using System;\nclass Program { static void Main() { Console.WriteLine(\"hi\"); } }";
-        assert_colored_as("csharp", code, "Main", "function");
-        assert_colored_as("csharp", code, "WriteLine", "function");
-        assert_colored_as("csharp", code, "class", "keyword");
-        assert_colored_as("csharp", code, "\"hi\"", "string");
-        assert_colored_as("csharp", code, "Program", "type");
-    }
-
-    /// crate 自带的 nvim 风格查询经捕获名翻译后能上色:`this` 是 variable.special
-    /// (`(this_expression) @variable.builtin` 翻过来的),关键字 / 类型 / 字符串各归各。
-    /// 同时也是「组件库内置 kotlin 查询编不过、我们的覆盖仍然生效」的对账。
-    #[test]
-    fn kotlin_捕获名翻译后上色() {
-        let code = "class A { fun f(xs: List<Int>) = this.g(xs, \"s\") }";
-        assert_colored_as("kotlin", code, "this", "variable.special");
-        assert_colored_as("kotlin", code, "fun", "keyword");
-        assert_colored_as("kotlin", code, "List", "type");
-        assert_colored_as("kotlin", code, "\"s\"", "string");
-    }
+    // C# / Kotlin / CMake 的端到端上色用例随语言一起挪到了 `syntax_pack::tests`。
 
     /// XML 的属性值:引号记号删掉之前,开闭引号两个 punctuation 捕获被组件库连成一段、
     /// 盖掉整个 `(AttValue) @string`,csproj 里的 `Sdk="Microsoft.NET.Sdk"` 是黑的。
@@ -727,14 +659,6 @@ mod tests {
         assert_colored_as("xml", code, "Project", "tag");
         assert_colored_as("xml", code, "Sdk", "property");
         assert_colored_as("xml", code, "<!-- c -->", "comment");
-    }
-
-    /// CMake 是组件库「有解析器没查询」的五种之一,补上后命令名 / 字符串有颜色。
-    #[test]
-    fn cmake_补上查询后上色() {
-        let code = "set(MY_FLAG ON)\nmessage(STATUS \"x\")";
-        assert_colored_as("cmake", code, "set", "function");
-        assert_colored_as("cmake", code, "\"x\"", "string");
     }
 
     #[test]

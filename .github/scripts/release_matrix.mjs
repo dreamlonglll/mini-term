@@ -11,15 +11,19 @@
 // aarch64,Intel 与 Windows 安装包同一套叫 x64);Windows / Linux 的资产名写死在
 // release.yml 各自的组装步骤里。
 //
+// `extPlatform` 是按需扩展的桌面平台键(扩展清单 extensions.json 的 `platform` 字段、离线
+// 扩展包 `Mini-Term_<版本>_<extPlatform>-extensions.zip` 的那一段),取值与
+// scripts/pack-extensions.mjs 的 PLATFORMS 一一对应。
+//
 // 结果写进 $GITHUB_OUTPUT 的 include=<json>;没有该环境变量(本地试跑)只打印。
 
 import { appendFileSync } from 'node:fs';
 
 const ALL = [
-  { key: 'windows', platform: 'windows-latest', target: 'x86_64-pc-windows-msvc' },
-  { key: 'macos-arm64', platform: 'macos-latest', target: 'aarch64-apple-darwin', arch: 'aarch64' },
-  { key: 'macos-x64', platform: 'macos-15-intel', target: 'x86_64-apple-darwin', arch: 'x64' },
-  { key: 'linux', platform: 'ubuntu-22.04', target: 'x86_64-unknown-linux-gnu' },
+  { key: 'windows', platform: 'windows-latest', target: 'x86_64-pc-windows-msvc', extPlatform: 'windows-x64' },
+  { key: 'macos-arm64', platform: 'macos-latest', target: 'aarch64-apple-darwin', arch: 'aarch64', extPlatform: 'macos-arm64' },
+  { key: 'macos-x64', platform: 'macos-15-intel', target: 'x86_64-apple-darwin', arch: 'x64', extPlatform: 'macos-x64' },
+  { key: 'linux', platform: 'ubuntu-22.04', target: 'x86_64-unknown-linux-gnu', extPlatform: 'linux-x64' },
 ];
 
 function planMatrix(eventName, platforms) {

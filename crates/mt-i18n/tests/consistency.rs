@@ -310,8 +310,20 @@ use mt_i18n::{
 /// 分组占位与操作提示（`projectList.group.*` 4 条）、行尾更多按钮与底部拖放区（`projectList.{row.moreTip,dropToRootEnd}` 2 条）。
 /// 1991 → 1996：设置页复制粘贴新增终端剪贴板 (OSC 52) 读写权限分组
 /// （`settings.clipboard.{osc52Section,osc52WriteTitle,osc52WriteDesc,osc52ReadTitle,osc52ReadDesc}`）。
+/// 1996 → 2055：按需扩展（阶段 A，远程 Git helper 不再随包）—— 设置页新分页
+/// （`settings.menu.extensions`）与页内说明 / 清单三态 / 四个服务器平台名 / 三类扩展的名称与用途 /
+/// 体积 / 七种状态 / 按钮 / 离线包导入结果 / 下载源 / 十一种失败原因 / 下载提示 toast
+/// （`settings.extensions.*` 56 条），托管 Git 部署缺 helper 的两条指路
+/// （`gitHistory.{helperMissing,helperMissingNoReason}`）；`gitHistory.{deploymentFailed,
+/// protocolMismatch,enableHelperPathHint}` 把「随包资源」改成本机扩展，条数不变。
+/// 2055 → 2057：按需扩展阶段 B（SSH 工具 sidecar 不再随包）—— 「关联 SSH」时 ssh-tools 扩展
+/// 下载失败的两条说明（`sshAssoc.{cliMissingError,cliMissingSavedNote}`）。
+/// 2057 → 2061：按需扩展阶段 C（语法包）—— 文件预览的语法包下载提示条
+/// （`fileViewer.{syntaxPackHint,syntaxPackDownload,syntaxPackDownloading,syntaxPackDismiss}`）。
+/// 2061 → 2062：Git 面板发现仓库失败（没有仓库栏、也就没有 ↻）时的重试按钮
+/// （`gitHistory.retryDiscovery`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1996;
+const EXPECTED_ENTRIES_PER_LANG: usize = 2062;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

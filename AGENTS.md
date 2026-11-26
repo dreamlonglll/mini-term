@@ -8,13 +8,13 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 - **UI/渲染**: [gpui-fast](https://crates.io/crates/gpui-fast) 0.1.17（Longbridge 维护的 GPUI 分支，crates.io 版；根 Cargo.toml 里以 `gpui` 为别名引用，窗口/文字后端在 `gpui-fast-platform`）+ gpui-component 0.10.0（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
-- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉六家 AI 工具里的 hook 注册，升级不摘）+ macOS dmg + Linux deb/tar.gz。各桌面发布包还随附 `remote-git-helpers/<platform>/mt-git-helper` 四平台资源：`linux-x86_64` / `linux-aarch64`（musl 静态构建）、`macos-x86_64` / `macos-aarch64`；按 SSH 服务器平台选择，不按桌面平台选择，缺失资源明确报错且不回落本机 Git。目标与打包范围不表示已完成所有平台或服务器环境验证
+- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + `miniterm-hook` + portable-conpty + 扩展清单 `extensions.json`，全部「与 exe 同目录」；`mt-ssh-cli` / `mt-ssh-mcp` 与大语法动态库 `mt-syntax-pack` 不再随包，改为按需扩展 `ssh-tools` / `syntax-pack`；调试符号 `mini_term.pdb` 另作单独的 zip 资产，不进安装包；卸载时摘掉六家 AI 工具里的 hook 注册、删掉按需扩展目录，升级都不动）+ macOS dmg + Linux deb/tar.gz（同样带 `extensions.json`）。远端 Git helper **不再随包**，改为按需扩展（见下文「按需扩展」）：四平台 `linux-x86_64` / `linux-aarch64`（musl 静态构建）、`macos-x86_64` / `macos-aarch64` 各是一个发布资产 `mt-ext_git-helper-<platform>_<哈希>.zip`，另有每个桌面平台一个离线扩展包 `Mini-Term_<版本>_<平台键>-extensions.zip`；按 SSH 服务器平台选择，不按桌面平台选择，本机缺失时先下载、下载不成明确报错且不回落本机 Git。目标与打包范围不表示已完成所有平台或服务器环境验证
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
 
 ## 开发命令
 
 ```bash
-# 首次/换版本后：构建三个 sidecar 并连同便携 ConPTY 就位到 target/debug/
+# 首次/换版本后：构建三个 sidecar、语法包动态库并连同便携 ConPTY 就位到 target/debug/
 node scripts/stage-sidecars.mjs
 
 # 启动开发实例（⚠️ 与装机版并跑时必须隔离数据目录）
@@ -50,10 +50,11 @@ node tools/pi-ext-realrun.mjs
 tools/promo/build.sh
 ```
 
-- **便携 ConPTY**（Windows）：`main()` 在建 gpui 平台层之前调 `mt_pty::conpty::initialize_default()`，从 exe 同目录的 `portable-conpty\` 预载 Windows Terminal 1.24 的 conpty.dll，PTY 宿主于是是 `portable-conpty\x64\OpenConsole.exe` 而不是系统 `conhost.exe`。dev 实例的这个目录由上面的 `stage-sidecars.mjs` 就位到 `target/debug/`；没就位就回落系统 ConPTY——看日志里的 `[conpty-bootstrap] backend=portable|system` 一行。⚠️ 该脚本不认 `CARGO_TARGET_DIR`：给构建另设了 target 目录时，要把 `target/debug/portable-conpty/`（连同三个 sidecar）复制到那个目录的 `debug/` 下，否则 dev 实例跑的是系统 conhost。`MT_DISABLE_PORTABLE_CONPTY=1` 跳过预载，用于开 / 关对比与排障
+- **便携 ConPTY**（Windows）：`main()` 在建 gpui 平台层之前调 `mt_pty::conpty::initialize_default()`，从 exe 同目录的 `portable-conpty\` 预载 Windows Terminal 1.24 的 conpty.dll，PTY 宿主于是是 `portable-conpty\x64\OpenConsole.exe` 而不是系统 `conhost.exe`。dev 实例的这个目录由上面的 `stage-sidecars.mjs` 就位到 `target/debug/`；没就位就回落系统 ConPTY——看日志里的 `[conpty-bootstrap] backend=portable|system` 一行。⚠️ 该脚本对 sidecar 与便携 ConPTY 不认 `CARGO_TARGET_DIR`：给构建另设了 target 目录时，要把 `target/debug/portable-conpty/`（连同三个 sidecar）复制到那个目录的 `debug/` 下，否则 dev 实例跑的是系统 conhost（脚本顺带编的 `mt-syntax-pack` 动态库走根 workspace 的 `cargo build`，认 `CARGO_TARGET_DIR`，直接落在该目录的 `debug/` 下）。`MT_DISABLE_PORTABLE_CONPTY=1` 跳过预载，用于开 / 关对比与排障
 - 工具链由根目录 `rust-toolchain.toml` 钉死（channel + clippy/rustfmt），CI 按同一文件安装，本地 clippy 与 CI 同版本。新机器 / 新 checkout 先跑一次无参 `rustup toolchain install`（新版 rustup 已弃用「缺工具链时自动安装」）；升级工具链只改该文件的 `channel` 一处。
 - ⚠️ **禁跑 `cargo fmt`**：本仓 HEAD 非 rustfmt-clean，全仓 fmt 会重排几十个文件淹没 diff。
 - ⚠️ GPUI dev 实例运行中时，`cargo build -p mt-app` / `cargo run -p mt-app` 会卡在「无法替换 target/debug/mini-term.exe」——先关实例，或给这次构建另设 `CARGO_TARGET_DIR`。`cargo test`（含 `-p mt-app` 与 `--workspace`）不受影响：mt-app 没有集成测试，只编单测 harness（`target/debug/deps/mini_term-<hash>.exe`），不产出也不替换 `mini-term.exe`。
+- **远端 Git helper 的 dev 就位**：dev / 源码构建没有扩展清单，不提供下载。要在 dev 实例里用托管 Git，按 `docs/features.zh-CN.md`「远端 Git helper：源码构建」把 helper 就位到 `target/debug/remote-git-helpers/<平台>/mt-git-helper`（exe 旁旧布局，与 exe 同信任等级）或设 `MT_REMOTE_GIT_HELPERS_DIR`；要测下载 / 离线导入链路，用 `scripts/pack-extensions.mjs` 打一份产物，`MT_EXTENSIONS_MANIFEST=<extensions.json>` 指给 dev 实例、设置页把下载源指向本地 HTTP 服务。同样不认 `CARGO_TARGET_DIR`（见上一条）
 - ⚠️ **别给 mt-app 加 `tests/` 目录**：包里只要有集成测试，`cargo test` 就会先把该包的 bin 编出来（给测试提供 `CARGO_BIN_EXE_*`），上面那条文件锁就又回来了。不需要 GPUI 的端到端测试放进对应的下层 crate（PTY → VT → grid 冒烟在 `crates/mt-terminal/tests/terminal_smoke.rs`）。
 
 ## 架构说明
@@ -63,7 +64,7 @@ tools/promo/build.sh
 | 目录 | 说明 |
 |------|------|
 | `crates/` | 主工作区（根 Cargo.toml，members = crates/*） |
-| `sidecars/` | sidecar 二进制独立工作区（miniterm-hook / mt-ssh-mcp / mt-ssh-cli）。版本号自成语义——daemon 换代靠它判断，**不跟随主程序发版**，故不并入根 workspace。产物由 `scripts/stage-sidecars.mjs` 就位到主程序 exe 同目录 |
+| `sidecars/` | sidecar 二进制独立工作区（miniterm-hook / mt-ssh-mcp / mt-ssh-cli）。版本号自成语义——daemon 换代靠它判断，**不跟随主程序发版**，故不并入根 workspace。dev 下产物由 `scripts/stage-sidecars.mjs` 就位到主程序 exe 同目录（没有扩展清单时 exe 旁旧布局可信）；发布包里只有 `miniterm-hook` 随包，`mt-ssh-cli` / `mt-ssh-mcp` 是按需扩展 `ssh-tools`（见「按需扩展」） |
 | `relay-server/` | 移动端中转服务（axum），其 `protocol` crate 被 `mt-relay` 跨工作区 path 依赖 |
 | `mobile/` | 移动端 PWA（React + TS + Vite），产物由中转托管 |
 
@@ -80,12 +81,15 @@ tools/promo/build.sh
 | `mt-project` | 文件树、目录监听、搜索、Git（git2，vendored-openssl 必须保留）、外部编辑器、WSL 发行版枚举、技术栈探测与 `ProjectKind` 枚举（`project_kind`；枚举与 mt-ui 的徽标形状表同由 `crates/mt-ui/tools/gen_tech_icons.mjs` 生成，禁止手改） |
 | `mt-git-helper` | 无 GPUI 的远端 Git helper：经 SSH stdio 处理版本化 Git 协议，复用 `mt-project::git` 核心，在服务器执行仓库读写操作；不提供监听端口或操作系统沙箱 |
 | `mt-config` | 配置持久化(`config.db`,rusqlite)。主题包文件层再导出自 `mt-theme-packs`(`mt_config::ThemePacks` 原路径不变,目录口径 `themes_dir` 留在这里)。不依赖 gpui。`config.json` 已退化成给 sidecar 读的 SSH 投影(见下节);界面布局另见 `mt-layout` |
+| `mt-extensions` | 按需扩展的本机侧（见下文「按需扩展」）：清单 `extensions.json` 解析（schema 1）、扩展根目录、`locate`（exe 旁旧布局〔仅无有效清单时〕→ helper 开发根目录 → 已装扩展）、校验安装（zip 与逐文件 sha256 + 字节数、内容寻址目录原子落位、unix 0755）、删除、启动 GC、离线包导入。**不联网**（下载那一跳在 mt-app 的 `extensions.rs`，口径同 mt-usage 的 `models_dev`），不依赖 gpui / mt-config，依赖表只许 serde/serde_json/sha2/zip/dirs（`tests/layers.test.cjs` 守着）。进程级视图 `mt_extensions::global()` 由 mt-app（扩展下载与 `syntax_pack`）、mt-remote（helper 部署）与 mt-ai（`ssh_registry` 找 mt-ssh-cli）共用 |
+| `mt-syntax-pack-abi` | 语法高亮扩展包与宿主共用的零依赖 `#![no_std]` C ABI 与 16 语言白名单（`mt_syntax_pack_entry` / `PackTable` / `LanguageEntry` / `flags::ZED_REWRITE`）；`tests/layers.test.cjs` 守门零依赖 |
+| `mt-syntax-pack` | 语法高亮扩展包（`cdylib` + 测试用 `rlib`）：把 16 种大体积 tree-sitter 语法（约 31.5 MB DLL / 2.86 MB zip）拆出主程序，经 `mt_syntax_pack_entry` 导出静态表给宿主加载；`mt-app` 只许在 `[dev-dependencies]` 链它做单测，生产依赖（normal / build）由 `tests/layers.test.cjs` 禁止 |
 | `mt-theme-packs` | 外置主题包的文件层：`themes/` 目录的列举 / 导入(zip + manifest sha256 校验) / 删除 / 资源读取。自 mt-config 拆出，好让 mt-ui 不经 mt-config 连带依赖 rusqlite；依赖表只许 anyhow/serde/serde_json/sha2/zip |
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
 | `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连只看连接配置本身（`target.rs`）。⚠️ `~/.ssh` 里**只碰 `known_hosts`**：不读 `~/.ssh/config`（不认别名 / ProxyJump）、不试默认私钥 `~/.ssh/id_*`（用户明确要求，曾加过又撤回，别加回来）。`auth.rs` 依次试连接私钥 / ssh-agent / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开。终端里的交互式 shell 在 `shell.rs`（`open_shell` → `ShellSession`）：每个终端独占一条连接、开 pty + `shell` / `exec`，首见主机的 yes/no/指纹、密码、keyboard-interactive、私钥口令经 `ShellPrompt` 通道交给宿主在终端里问（`interact.rs` / `key_unlock.rs`，等用户的时间不计入建连超时）；建连 + 认证与会话池共用 `connect.rs`，池 / 「测试连接」/ sidecar 不带提示器，行为不变 |
-| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署、项目级授权校验（默认拒绝，绑定 SSH 端点与远端根目录，变化即重新授权）、托管 SSH Git 会话与身份失效；写结果未知时阻止后续写入，支持原通道 barrier/proof 核对及通道丢失后的只读快照，两条路径均须用户明确确认且重核快照有效性后恢复，不自动重放写操作，不将丢失原通道后的确认视为旧进程已退出。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。终端内置 SSH 的宿主层在 `terminal_shell.rs`：`open_terminal_shell` 当场把 `mt_ssh::open_shell` spawn 到共享运行时（返回的 `OpeningShell` drop 即中止建连），提示通道包成不含 tokio 类型的 `TerminalPrompts` / `PromptReply`（mt-app 不直接依赖 tokio / mt-ssh），远程 pane 与右键接管的 shell 请求（`remote_shell_request` / `login_shell_request`，TERM=xterm-256color，env 只带 `COLORTERM` 与本机有的 `LANG`）；系统 OpenSSH 回退仍是 `prepare_remote_launch`。不依赖 gpui |
+| `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。managed Git 负责平台匹配的 helper 部署（本机 helper 经 `mt_extensions::locate` 找；找不到是类型化的 `REMOTE_GIT_HELPER_MISSING`，在部署 deadline 之外调 mt-app 注入的 `set_helper_provisioner` 下载后自动重试一次，`missing_helper()` 解出缺的平台）、项目级授权校验（默认拒绝，绑定 SSH 端点与远端根目录，变化即重新授权）、托管 SSH Git 会话与身份失效；写结果未知时阻止后续写入，支持原通道 barrier/proof 核对及通道丢失后的只读快照，两条路径均须用户明确确认且重核快照有效性后恢复，不自动重放写操作，不将丢失原通道后的确认视为旧进程已退出。自持小 tokio 运行时，保留同步阻塞核心入口；托管 Git 的阻塞调用经异步 `run_git` 入口交给自有执行器，调用方只 await。终端内置 SSH 的宿主层在 `terminal_shell.rs`：`open_terminal_shell` 当场把 `mt_ssh::open_shell` spawn 到共享运行时（返回的 `OpeningShell` drop 即中止建连），提示通道包成不含 tokio 类型的 `TerminalPrompts` / `PromptReply`（mt-app 不直接依赖 tokio / mt-ssh），远程 pane 与右键接管的 shell 请求（`remote_shell_request` / `login_shell_request`，TERM=xterm-256color，env 只带 `COLORTERM` 与本机有的 `LANG`）；系统 OpenSSH 回退仍是 `prepare_remote_launch`。不依赖 gpui |
 | `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价；models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路（`models_dev.rs`，拉网那一跳由 mt-app 的 `pricing.rs` 注入） |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
@@ -154,6 +158,7 @@ shell 就绪时才过旁路冲刷）。⚠️ `begin_takeover` 会关掉 win32-i
 | `usage.db` | 用量账本（可从 JSONL 再生） | `mt-usage` |
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
 | `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic 连同 backtrace 与模块基址、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件。backtrace 要解析成函数名 + 行号，把 release 资产里同版本的 `Mini-Term_<版本>_x64-pdb.zip` 解压到安装目录（`mini_term.pdb` 与 exe 同目录） | 主程序（`mt-app::logfile`） |
+| `extensions/` | **仅 dev 隔离实例**（设了 `MT_APP_DATA_DIR`）的按需扩展目录。装机版的扩展目录**不在这里**：在 `dirs::data_local_dir()/com.mini-term.app/extensions`（Windows 是 `%LOCALAPPDATA%`，Local 不是 Roaming —— 几十 MB 二进制不该进漫游配置），见下文「按需扩展」 | 主程序（`mt-extensions`） |
 
 ⚠️ **config.db 前向兼容**：预览版与正式版会来回装、共用同一个库，所以旧版本**只删自己认识的键**，不认识的 settings 键、项目/连接行里不认识的字段（`extra`）、读不懂的键与行都原样留着（口径见 `mt-config/src/db.rs` 模块注释）。由此两条硬规矩：**删 `AppConfig` 字段时把键名加进 `db.rs` 的 `RETIRED_KEYS`**（否则库里旧值永远留着）；**下线的键名永不复用**。
 
@@ -182,6 +187,18 @@ shell 就绪时才过旁路冲刷）。⚠️ `begin_takeover` 会关掉 win32-i
 - **远程通知凭据同一套**（issue #87）：`remoteNotify` 的 Bark 设备 key / Telegram bot token / Webhook URL 与中转密钥同口径（同一迁移时机与兜底封存，空串不封存）；封存点 `AppStore::set_remote_notify_secret`，解封点 `remote_notify::build_request`（发送那一刻）与设置页回填（`settings::pages_remote_notify`）。发送走 mt-app 的 `remote_notify.rs`（判据复用 `notify::DoneTracker`，`AlertPlan.remote`），reqwest 错误一律 `without_url()`——token 就在 URL 里
 - **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
 - `mt-secret` 的依赖表只许有 mt-core / ring / base64 / serde / serde_json / zeroize，Windows 另加 DPAPI 用的 windows-sys（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
+
+### 按需扩展（`mt-extensions` + `mt-app::extensions`）
+
+主包瘦身：远程 Git helper（阶段 A）、SSH 工具 sidecar `mt-ssh-cli` + `mt-ssh-mcp`（阶段 B，扩展 id `ssh-tools`）、语法高亮扩展包（阶段 C，扩展 id `syntax-pack`）由官方 CI 构建、与主程序**同版本**绑定，按需下载到本机。要点（细节见 `crates/mt-extensions/src/lib.rs`、`crates/mt-app/src/extensions.rs` 与 `crates/mt-app/src/syntax_pack.rs` 的模块注释）：
+
+- **信任模型（定稿，别改）**：扩展清单 `extensions.json` 与 exe 同目录（macOS `Contents/MacOS/`、deb `/usr/lib/mini-term/`），同一安装器写入，信任等级**等同 exe**。任何来源（GitHub / 用户配的镜像 / 离线包）一律先按清单校验 zip 的 sha256 + 字节数，再解包、再逐文件校验 sha256 + 字节数，镜像不可信也无妨。不签名、不在编译期嵌哈希（CI 里桌面与 helper 并行编译，编译期拿不到 helper 哈希）。没有清单（dev / 源码构建）= 不提供下载与离线导入；`MT_EXTENSIONS_MANIFEST=<路径>` 给 dev / 测试指定一份。
+- **查找顺序**（`Extensions::locate`）：① exe 同目录旧布局（`remote-git-helpers/<target>/mt-git-helper`、`mt-ssh-cli[.exe]` / `mt-ssh-mcp[.exe]`、语法包动态库 `mt_syntax_pack.dll` / `libmt_syntax_pack.{dylib,so}` 平铺 exe 旁）—— 视同可信、不校验清单，是 dev（stage 脚本）与源码构建的路径，**只在本机没有有效清单时认**（清单缺失 / 过新 / 读不懂）；有效清单在场（正式安装包，或 dev 用 `MT_EXTENSIONS_MANIFEST` 模拟）时一律不认，tar.gz 解压覆盖旧版目录留下的旧 helper / sidecar / 语法包压不住下载的那份 → ②（仅 helper）`MT_REMOTE_GIT_HELPERS_DIR`（显式设的环境变量，照认）→ ③ 本机已装扩展。在场却坏掉的那一层**不会**落到下一层去用别的二进制。NSIS 安装时顺手删掉安装目录里旧版本留下的 `remote-git-helpers/`、`mt-ssh-cli.exe`、`mt-ssh-mcp.exe`（不留过期副本）。
+- **存放**：`{root}/<id>/<zip sha256 前 16 位>/<文件>`，`{root}` = `MT_APP_DATA_DIR` 非空时 `{它}/extensions`，否则 `dirs::data_local_dir()/com.mini-term.app/extensions`。下载暂存 `{root}/.downloads/`、解包暂存 `{root}/<id>/.tmp-<随机>/`，全部校验通过后 rename（目录在 = 装好了；解包写出的文件 mtime = 安装时刻，SKILL.md 校正靠它，见下）。内容寻址是为了 Windows 上不覆盖运行中的 exe（mt-ssh-cli 的 daemon 工作目录就是它的版本目录）。启动后台 GC：每个**已知** id 留当前清单那份 + **最近装的一份其它版本**（按版本目录里文件的最新 mtime；当前清单里没这个 id 就只留最近一份），其余版本目录与未知 id 删掉，删不掉（被占用）留到下次；删除一律先 rename 成同级 `.trash-<随机>` 再删（`store.rs::discard`），Windows 上目录里有运行中的 daemon 或已加载的 DLL 时 rename 失败 → 整个原样留着，不会删成只剩半截；**没有清单时 GC 什么都不删**。多留一份是为了预览版 / 正式版共用数据目录来回切换时不必每次重下。NSIS 真卸载删 `%LOCALAPPDATA%\com.mini-term.app\extensions`（删前纳入清场），升级不删、不清场扩展目录。
+- **资产**：每个扩展一个 zip，资产名内容寻址 `mt-ext_<id>_<zip sha256 前 12 位>.zip`；每个桌面平台一个离线扩展包 `Mini-Term_<版本>_<平台键>-extensions.zip`（平台键 `windows-x64` / `macos-arm64` / `macos-x64` / `linux-x64`）。打包脚本 `scripts/pack-extensions.mjs`（零 npm 依赖、产物逐字节可复现）；它与 mt-extensions 安装代码的口径由 `crates/mt-extensions/tests/fixtures/` 夹具两头对账（`tests/packExtensions.test.cjs` + `crates/mt-extensions/tests/fixtures.rs`）。CI 里 helper 扩展 zip 只在 remote-git-helpers 作业打一次、只由 upload-helper-extensions 作业传一次；`ssh-tools` 与 `syntax-pack` 是桌面平台相关的：build-desktop 把 `mt-syntax-pack` 编到 `staging/desktop/syntax-pack/`（不进安装包与 Unix tar），package-release 每行把本平台的两个 sidecar 与语法包动态库分别打成扩展并上传（内容寻址，四行不撞名），再生成清单与离线包（见 `release.yml` 文件头）。deb 的 Depends 仍按 mt-ssh-cli / mt-ssh-mcp 算（下载后在本机跑）。
+- **下载**（`mt-app::extensions`）：只在用户的显式动作里 —— 设置 →「扩展」点下载 / 全部下载，发起托管 Git 部署（缺 helper 时 mt-remote 在部署 deadline 之外调注入的补齐器，下载有 toast 进度，成功后自动重试一次部署；部署触发的失败 10 分钟内不再自动重下），「关联 SSH」保存时本机没有 mt-ssh-cli（`Origin::EnableSshTools`，toast 进度、无冷却；首次启用下载不成整步失败，更新范围下载不成则范围照存、SKILL.md 不动），或在文件预览里打开语法包里的语言时点顶部提示条的「下载」（`Origin::SyntaxBanner`，toast 进度、无冷却，直接 await oneshot）。**唯一的非显式下载**是 SSH 工具的升级自愈（`Origin::SelfHeal`）：启动时有本地项目启用了 SSH 工具而本机没有 mt-ssh-cli → 后台下载，失败只记日志 + 设置页标原因、不推 toast。共享 HTTP 客户端流式写盘，累计超过清单 size 立刻断，连接 15s、60s 无数据判失败，同一扩展并发 `ensure` 去重（结果经 oneshot 交回，GPUI 任务里直接 await）。地址模板是配置键 `extensionsDownloadUrl`（空 = 默认 GitHub release，代码里不内置任何第三方代理）。
+- **SSH 工具（`ssh-tools`）**：`mt_ai::ssh_registry` 经 `locate` 找 mt-ssh-cli，找不到就**绝不写** SKILL.md（`enable` 报错、启动校正跳过）。CLI 换版本 = 换内容寻址目录，SKILL.md 里的绝对路径靠启动校正收敛：旧目录被 GC 多留一份时「引用的 CLI 不在」不触发，收敛只靠「本机 CLI 的 mtime 严格更新」—— 解包文件的 mtime 是安装时刻，新装的那份更新，所以会改指；两个实例来回切时只朝较晚装的一方收敛，不来回改写。`ssh-tools` 装好（下载或离线导入，不论谁发起）后 mt-app 再跑一次校正。daemon 换代与路径无关：IPC 端点（Windows 命名管道按用户 SID、Unix socket 在 `$XDG_RUNTIME_DIR` 或 config.json 同目录）不随 exe 位置变，版本握手只换代更旧的 daemon；旧版本 daemon 在旧目录里跑时 GC 删不掉它（留到下次）。旧版 `.mcp.json` 里指向安装目录 `mt-ssh-mcp` 的历史注册不额外处理（启用 / 停用时本来就会摘除本 server 的条目）。
+- **语法高亮扩展包（`syntax-pack`）**：主程序保留 26 种高频 / 小体积语法（gpui-component 显式开启的 22 种 feature + 常驻 `json` + `syntax_languages.rs` 的 `xml` / `ini` / `batch`），16 种大体积语法挪进 `mt-syntax-pack`（原 gpui-component 的 `cpp` / `elixir` / `php` / `ruby` / `scala` / `sql` / `zig` 7 种 + 原 `syntax_languages.rs` 的 `csharp` / `swift` / `cmake` / `proto` / `graphql` / `kotlin` / `powershell` / `dart` / `groovy` 9 种，后 9 种带 `flags::ZED_REWRITE` 交宿主重映射 query）。16 个语法 crate 均未定义 `TREE_SITTER_REUSE_ALLOCATOR`，外部扫描器直接走 C 运行时 `malloc`/`free`，tree-sitter 运行时只在宿主保留一份。宿主 `mt-app::syntax_pack` 启动时在后台 `locate`：来自扩展目录的动态库加载前经 `ring` 重算整文件 sha256 + 字节数，`libloading` 加载（Windows `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`，Unix `RTLD_NOW | RTLD_LOCAL`），调 `mt_syntax_pack_entry` 后按 ABI 版本 / 结构体大小 / UTF-8 / `mt_syntax_pack_abi::LANGUAGES` 白名单 / tree-sitter ABI 区间逐项核验，通过后 `mem::forget` 驻留进程（不卸载，避免 tree-sitter 静态指针悬空；Windows 上已加载的旧版 DLL 删不掉会留到下次启动 GC），再在主线程批量注册主名与别名并刷新 `watch_editor` 登记的已开编辑器与窗口。下载或离线导入（或删除把 `Failed` 复位回 `Missing`）后由 `extensions::dispatch` 调 `syntax_pack::on_extensions_changed` 热加载；缺包打开这 16 种语言按纯文本显示，有有效清单时在文件预览顶部出提示条（`render_syntax_pack_banner`），「关闭」只对本次会话生效。
 
 ### 布局持久化（`layout.db`，非 `config.json`）
 

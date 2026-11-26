@@ -1378,6 +1378,22 @@ pub fn error_text_for_store(err: &anyhow::Error, store: &Entity<AppStore>, cx: &
 /// Git 界面里唯一的一份(历史区、贮藏弹窗、更改区都用它)。
 pub fn error_text(err: &anyhow::Error) -> String {
     if let Some(failure) = err.downcast_ref::<mt_remote::GitFailure>() {
+        // 本机缺这个服务器平台的 helper(部署时已尝试按需下载,没成):按类型化的 code 认,
+        // 指去「设置 → 扩展」
+        if let Some(missing) = mt_remote::missing_helper(failure) {
+            let platform = crate::extensions::platform_label(missing.target);
+            let reason = missing.detail.trim();
+            return if reason.is_empty() {
+                crate::i18n::tr!("gitHistory", "helperMissingNoReason", platform = platform)
+            } else {
+                crate::i18n::tr!(
+                    "gitHistory",
+                    "helperMissing",
+                    platform = platform,
+                    reason = reason
+                )
+            };
+        }
         let (key, detail) = match failure {
             mt_remote::GitFailure::OutcomeUnknown { message } => ("verifyWriteFailed", message),
             mt_remote::GitFailure::RepositoryBlocked {

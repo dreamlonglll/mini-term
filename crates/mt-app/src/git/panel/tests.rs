@@ -262,6 +262,16 @@ fn 发现仓库后不作废在途的分支快照() {
     assert!(branches_stale_after_discovery("D:/a", "D:/b", false, true));
 }
 
+/// 远程 Git helper 装好之后:只有停在错误上的远程项目面板重新发现仓库(E2E:装好了面板
+/// 也恢复不了,只能重启);本地项目、没报错的面板不动。
+#[test]
+fn helper_装好后只重试报错的远程面板() {
+    assert!(needs_retry_after_helper_installed(false, true));
+    assert!(!needs_retry_after_helper_installed(false, false), "没报错");
+    assert!(!needs_retry_after_helper_installed(true, true), "本地项目");
+    assert!(!needs_retry_after_helper_installed(true, false));
+}
+
 fn sig(refs: u64, index: u64) -> RepoSignature {
     RepoSignature { refs, index }
 }

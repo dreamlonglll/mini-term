@@ -43,10 +43,35 @@ const DIRECT_ALLOWLISTS = [
     source: 'AGENTS.md crate 表 mt-theme-packs 行 + 其 Cargo.toml(mt-ui 依赖它,一重 mt-ui 就跟着重编)',
   },
   {
+    crate: 'mt-extensions',
+    allow: ['serde', 'serde_json', 'sha2', 'zip', 'dirs'],
+    rule: 'mt-extensions 只许依赖 serde / serde_json / sha2 / zip / dirs',
+    source: 'AGENTS.md crate 表 mt-extensions 行 + crates/mt-extensions/Cargo.toml(不联网;mt-remote / mt-app 都依赖它)',
+  },
+  {
     crate: 'mt-i18n',
     allow: ['serde'],
     rule: 'mt-i18n 零第三方依赖,只许有可选的 serde',
     source: 'crates/mt-i18n/Cargo.toml「唯一(且可选)的依赖」+ src/lib.rs「零第三方依赖」',
+  },
+  {
+    crate: 'mt-syntax-pack-abi',
+    allow: [],
+    rule: 'mt-syntax-pack-abi 必须保持零依赖(宿主与语法包 cdylib 两头都依赖它)',
+    source: 'AGENTS.md crate 表 mt-syntax-pack-abi 行 + crates/mt-syntax-pack-abi/Cargo.toml',
+  },
+];
+
+/**
+ * 生产依赖闭包禁区:只沿 `crate` 的 normal / build 依赖展开(不含 `crate` 自己的
+ * `[dev-dependencies]`),用于允许单测直接链测试替身或 rlib,但绝不让其进主程序产物。
+ */
+const PROD_CLOSURE_BANS = [
+  {
+    crate: 'mt-app',
+    ban: ['mt-syntax-pack'],
+    rule: 'mt-app 的生产依赖(normal / build)不许引入 mt-syntax-pack(只许在 dev-dependencies 用于单测,否则约 31 MB 大语法又编回主程序 exe)',
+    source: 'AGENTS.md crate 表 mt-syntax-pack 行 + crates/mt-syntax-pack/Cargo.toml',
   },
 ];
 
@@ -75,6 +100,12 @@ const CLOSURE_BANS = [
     ban: ['gpui-pre', 'gpui-fast'],
     rule: 'mt-remote 不许依赖 gpui',
     source: 'AGENTS.md crate 表 mt-remote 行「不依赖 gpui」+ crates/mt-remote/Cargo.toml',
+  },
+  {
+    crate: 'mt-extensions',
+    ban: ['gpui-pre', 'gpui-fast', 'mt-config', 'zed-reqwest', 'reqwest', 'tokio'],
+    rule: 'mt-extensions 不许依赖 gpui / mt-config / HTTP 客户端 / tokio(下载那一跳由 mt-app 注入)',
+    source: 'AGENTS.md crate 表 mt-extensions 行「不联网、不依赖 gpui / mt-config」',
   },
   {
     crate: 'mt-app-core',
@@ -141,10 +172,10 @@ function buildGraph(meta) {
   }
 
   /** 从 rootId 出发的依赖闭包,返回 Map<id, 父 id>(用于还原依赖链)。 */
-  function closure(rootId) {
+  function closure(rootId, rootKinds = new Set(['normal', 'build', 'dev'])) {
     const parent = new Map();
     const queue = [];
-    for (const d of edges(rootId, new Set(['normal', 'build', 'dev']))) {
+    for (const d of edges(rootId, rootKinds)) {
       if (!parent.has(d.pkg)) {
         parent.set(d.pkg, rootId);
         queue.push(d.pkg);
@@ -162,6 +193,11 @@ function buildGraph(meta) {
     return parent;
   }
 
+  /** 只沿 normal / build 依赖展开的生产依赖闭包(不含 rootId 自己的 dev-dependencies)。 */
+  function prodClosure(rootId) {
+    return closure(rootId, new Set(['normal', 'build']));
+  }
+
   function chain(parent, rootId, id) {
     const names = [nameOf(id)];
     let cur = parent.get(id);
@@ -173,7 +209,7 @@ function buildGraph(meta) {
     return names.reverse().join(' → ');
   }
 
-  return { pkgById, members, memberIdByName, nameOf, edges, closure, chain };
+  return { pkgById, members, memberIdByName, nameOf, edges, closure, prodClosure, chain };
 }
 
 function requireMember(graph, crate) {
@@ -227,6 +263,27 @@ function checkClosureBans(graph, rules) {
       if (!r.ban.includes(dep)) continue;
       out.push(
         `${r.crate} 引入了 ${dep}(依赖链 ${graph.chain(parent, id, depId)})。` +
+          `违反规则:${r.rule}。来源:${r.source}`,
+      );
+    }
+  }
+  return out;
+}
+
+function checkProdClosureBans(graph, rules) {
+  const out = [];
+  for (const r of rules) {
+    const { id, error } = requireMember(graph, r.crate);
+    if (error) {
+      out.push(error);
+      continue;
+    }
+    const parent = graph.prodClosure(id);
+    for (const depId of parent.keys()) {
+      const dep = graph.nameOf(depId);
+      if (!r.ban.includes(dep)) continue;
+      out.push(
+        `${r.crate} 的生产依赖引入了 ${dep}(依赖链 ${graph.chain(parent, id, depId)})。` +
           `违反规则:${r.rule}。来源:${r.source}`,
       );
     }
@@ -338,6 +395,10 @@ test('分层:禁区里的包不进依赖闭包', () => {
   assertClean(checkClosureBans(root(), CLOSURE_BANS));
 });
 
+test('分层:禁区里的包不进生产依赖闭包', () => {
+  assertClean(checkProdClosureBans(root(), PROD_CLOSURE_BANS));
+});
+
 test('分层:与 sidecar 共用的 mt-ssh 只依赖 mt-core / mt-secret', () => {
   assertClean(checkMemberAllowlists(root(), MEMBER_ALLOWLISTS));
 });
@@ -431,4 +492,29 @@ test('分层:判定逻辑能抓到构造的违规', () => {
     checkDirectAllowlists(ok, DIRECT_ALLOWLISTS.slice(1, 2)),
     [],
   );
+
+  // 生产依赖禁区:dev-dependencies 允许,normal / build 依赖拦下
+  const prodBase = {
+    packages: [pkg('mt-app'), pkg('mt-syntax-pack')],
+    workspace_members: ['mt-app 0.1.0', 'mt-syntax-pack 0.1.0'],
+    resolve: {
+      nodes: [
+        { id: 'mt-app 0.1.0', deps: [dep('mt-syntax-pack', 'dev')] },
+        { id: 'mt-syntax-pack 0.1.0', deps: [] },
+      ],
+    },
+  };
+  assert.deepEqual(checkProdClosureBans(buildGraph(prodBase), PROD_CLOSURE_BANS), []);
+  const prodViolation = buildGraph({
+    ...prodBase,
+    resolve: {
+      nodes: [
+        { id: 'mt-app 0.1.0', deps: [dep('mt-syntax-pack', null)] },
+        { id: 'mt-syntax-pack 0.1.0', deps: [] },
+      ],
+    },
+  });
+  const prodHits = checkProdClosureBans(prodViolation, PROD_CLOSURE_BANS);
+  assert.equal(prodHits.length, 1, prodHits.join('\n'));
+  assert.match(prodHits[0], /mt-app 的生产依赖引入了 mt-syntax-pack/);
 });

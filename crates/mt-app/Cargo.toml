@@ -25,16 +25,43 @@ frame-profiler = ["gpui/profiler"]
 [dependencies]
 gpui.workspace = true
 gpui_platform.workspace = true
-# `tree-sitter-languages` 是文件预览器(`file_viewer/`)语法高亮的唯一来源:
-# 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
-# (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
-# 与原版 CodeMirror `@codemirror/language-data` 的覆盖面同量级。
-# 代价是 30 个带 `cc` build script 的 tree-sitter 语言 crate 的首次编译时间 ——
-# 一次性成本,换的是「内置编辑器与装机版观感一致」这条产品目标。
+# 组件库的逐语言 tree-sitter feature 是文件预览器(`file_viewer/`)语法高亮的内置来源:
+# 一个都不开时 gpui-component 的 `Language` 枚举**只有 Json**
+# (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本。
+#
+# **只开常用的这 22 种**(按需扩展阶段 C,替换原来的 `tree-sitter-languages` 总开关):
+# 体积大的 cpp / elixir / php / ruby / scala / sql / zig 连同原 syntax_languages 补的
+# C# / Swift / CMake / Proto / GraphQL / Kotlin / PowerShell / Dart / Groovy 挪进了语法包
+# 动态库(`crates/mt-syntax-pack`,扩展 `syntax-pack` 按需下载,宿主侧见 `syntax_pack.rs`)。
+# ⚠️ 别再开回 `tree-sitter-languages` 或上面那几种:开了就把挪走的语法又编回 exe,
+# 而且语法包里的同名语言会覆盖它们,白白多一份体积。
 #
 # **写在这里而不是根 `Cargo.toml`**:workspace 依赖允许成员 crate 在
 # `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
-gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+gpui-component = { workspace = true, features = [
+    "tree-sitter-astro",
+    "tree-sitter-bash",
+    "tree-sitter-c",
+    "tree-sitter-css",
+    "tree-sitter-diff",
+    "tree-sitter-ejs",
+    "tree-sitter-erb",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-jsdoc",
+    "tree-sitter-lua",
+    "tree-sitter-make",
+    "tree-sitter-markdown",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-svelte",
+    "tree-sitter-toml",
+    "tree-sitter-tsx",
+    "tree-sitter-typescript",
+    "tree-sitter-yaml",
+] }
 # 组件库的图标资产源,挂在 `main.rs` 的 `application().with_assets(..)` 上。
 # 不挂的话上游组件里所有 `Icon::new(IconName::..)` / `svg()` 都取不到字节 ——
 # 画出来是**空白**,而且编译期毫无提示(这条前提此前拖着全仓十来处「只能自绘」的记档)。
@@ -45,35 +72,26 @@ gpui-kit-assets.workspace = true
 # 净新增 crate = 0。
 gpui-base.workspace = true
 # ---- 语法高亮补充语言包(`syntax_languages.rs`)----
-# 组件库那 30 余种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
-# 打开 .cs 整篇纯文本色;PowerShell / XML / Dart 这些常见类型它根本没有
-# (PHP / Lua 自 0.6 起组件库内置且带查询,不再由这里补;Kotlin 内置的查询是坏的,仍补)。
-# 下面分两组:
-#  1. 已在依赖树里的五个(gpui-component 拉进来的),这里只是为了拿解析器常量与
-#     `HIGHLIGHTS_QUERY`,版本号与 Cargo.lock 里的一致,净新增 crate = 0;
-#  2. 新增语法 crate,每个都是一份 `cc` 编译的 parser.c(与组件库那 30 个同一代价),
-#     版本全钉在 tree-sitter-language 0.1 / ABI 14~15,与树里的 tree-sitter 0.25 相容。
-#     **只收主流类型**(冷门语言不值这份体积);**禁止**引依赖老版 `tree-sitter = "0.2x"`
-#     的语法 crate(dockerfile / fish / scss / vue / vim / json5 都是):会把第二份
-#     tree-sitter 运行时链进来,C 符号重定义。
-# 挑选口径见 syntax_languages.rs 模块注释;高亮查询 crate 没带的放 assets/syntax/。
-tree-sitter-c-sharp = "0.23"
-tree-sitter-swift = "0.7"
-tree-sitter-cmake = "0.7"
-tree-sitter-proto = "0.2"
-tree-sitter-graphql = "0.1"
-# kotlin:组件库 0.6 内置的那份查询编不过(见 syntax_languages.rs),仍由这里覆盖;
-# 版本与组件库拉的同一个,净新增 crate = 0。
-tree-sitter-kotlin-sg = "0.4"
-tree-sitter-powershell = "0.26"
+# 只剩三个小语法(XML / INI / 批处理,各几百 KB 内)内置;C# / Swift / CMake / Proto /
+# GraphQL / Kotlin / PowerShell / Dart / Groovy 连同查询挪进了语法包(`crates/mt-syntax-pack`)。
+# 每个语法 crate 都是一份 `cc` 编译的 parser.c,版本全钉在 tree-sitter-language 0.1 /
+# ABI 14~15,与树里的 tree-sitter 相容。**禁止**引依赖老版 `tree-sitter = "0.2x"`
+# 的语法 crate(dockerfile / fish / scss / vue / vim / json5 都是):会把第二份
+# tree-sitter 运行时链进来,C 符号重定义。挑选口径见 syntax_languages.rs 模块注释。
 tree-sitter-xml = "0.7"
-tree-sitter-dart = "0.2"
-tree-sitter-groovy = "0.1"
 tree-sitter-ini = "1.4"
 tree-sitter-batch = "0.11"
-# 语法 crate 导出的 `LANGUAGE` 是这个类型(`LanguageFn`),表里要写它的名字;
-# 已在树里(每个语法 crate 都依赖它),零新增。
+# 语法 crate 导出的 `LANGUAGE` 是这个类型(`LanguageFn`),表里要写它的名字;语法包表里的
+# 裸函数指针也经 `LanguageFn::from_raw` 包回去。已在树里,零新增。
 tree-sitter-language = "0.1"
+# 语法包加载器(`syntax_pack.rs`)要核 `Language::abi_version()` 落在
+# `MIN_COMPATIBLE_LANGUAGE_VERSION..=LANGUAGE_VERSION` 里,得能叫出这个 crate 的名字。
+# 与组件库用的同一份(已在树里),零新增。
+tree-sitter = "0.26"
+# 语法包的表结构 / 版本 / 语言清单(零依赖)。
+mt-syntax-pack-abi = { path = "../mt-syntax-pack-abi" }
+# 加载语法包动态库。Cargo.lock 里已有(0.8.9,gpui 的图形栈带进来),零新增。
+libloading = "0.8"
 # 远程 Markdown 与 gpui-component 使用同一份 GFM AST 解析器做 URL 清洗，
 # 避免行级扫描漏掉跨行资源目标或误判代码围栏。该 crate 已由
 # gpui-component 锁定在依赖树中，不会新增第三方包。
@@ -102,6 +120,8 @@ mt-config.workspace = true
 # 界面布局(三栏比例 / 分屏树 / 窗口几何)的持久化。
 mt-layout.workspace = true
 mt-i18n.workspace = true
+# 按需扩展的本机侧(清单 / 查找 / 校验安装 / GC / 离线导入);下载那一跳在 `extensions.rs`。
+mt-extensions.workspace = true
 mt-project.workspace = true
 mt-ai.workspace = true
 mt-usage.workspace = true
@@ -161,9 +181,9 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
-# 语言包单测要亲手 `Query::new` 把每份高亮查询编一遍:组件库那条路编不过只会
-# `tracing::warn` 后静默退成纯文本,编译期与测试期都无感。已在树里,零新增。
-tree-sitter = "0.26"
+# 语法包单测(`syntax_pack.rs`)不经动态库,直接链接语法包的 rlib、走同一张表注册,
+# 端到端验 C# / Kotlin / CMake 上色与改写后的查询能编译。只进测试,不进 exe。
+mt-syntax-pack = { path = "../mt-syntax-pack" }
 # 端到端验颜色要喂 `SyntaxHighlighter::update(&Rope)`;版本钉死跟组件库一致。
 ropey = "=2.0.0-beta.1"
 

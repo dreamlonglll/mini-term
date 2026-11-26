@@ -1,5 +1,5 @@
-//! 设置面板:两级侧栏 + 12 个分页。逐页对照 `src/components/SettingsModal.tsx`
-//! (「环境变量」「远程通知」两页是 GPUI 版新增的,原版没有)。
+//! 设置面板:两级侧栏 + 13 个分页。逐页对照 `src/components/SettingsModal.tsx`
+//! (「环境变量」「远程通知」「扩展」三页是 GPUI 版新增的,原版没有)。
 //!
 //! ```text
 //! ┌──────────────┬────────────────────────────────────────┐
@@ -58,6 +58,7 @@
 //! | `pages_ai` | ai-notification / ai-hook |
 //! | `pages_remote_notify` | remote-notify(Bark / Telegram / Webhook 远程通知,发送在 `crate::remote_notify`) |
 //! | `pages_system` | system / editor / about |
+//! | `pages_extensions` | extensions(按需扩展:远程 Git helper 等的下载 / 删除 / 离线导入 / 下载源;状态与下载在 `crate::extensions`) |
 //! | `pages_shortcuts` | shortcuts(键位表、录制改键、冲突与就地提示;键位逻辑在 `crate::hotkeys`) |
 //! | `widgets` | 页/节骨架、设置行原语与零碎视图件 |
 //!
@@ -95,6 +96,7 @@ use crate::update_check::ReleaseInfo;
 mod pages_ai;
 mod pages_appearance;
 mod pages_env_vars;
+mod pages_extensions;
 mod pages_remote_notify;
 mod pages_shortcuts;
 mod pages_system;
@@ -102,6 +104,7 @@ mod pages_terminal;
 mod widgets;
 
 use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
+use pages_extensions::ExtensionsNotice;
 use pages_remote_notify::RemoteNotifyForm;
 use pages_shortcuts::ShortcutsState;
 
@@ -126,6 +129,8 @@ pub enum SettingsPage {
     AiHook,
     System,
     Editor,
+    /// 按需扩展(远程 Git helper 等)。GPUI 版新增,原版没有这一页。
+    Extensions,
     Shortcuts,
     About,
 }
@@ -144,6 +149,7 @@ impl SettingsPage {
             Self::AiHook => "ai-hook",
             Self::System => "system",
             Self::Editor => "editor",
+            Self::Extensions => "extensions",
             Self::Shortcuts => "shortcuts",
             Self::About => "about",
         }
@@ -162,6 +168,7 @@ impl SettingsPage {
             Self::AiHook => "menu.aiHook",
             Self::System => "menu.general",
             Self::Editor => "menu.editor",
+            Self::Extensions => "menu.extensions",
             Self::Shortcuts => "menu.shortcuts",
             Self::About => "menu.about",
         }
@@ -199,7 +206,11 @@ const MENU_GROUPS: &[(&str, &[SettingsPage])] = &[
     ),
     (
         "menu.groupSystem",
-        &[SettingsPage::System, SettingsPage::Editor],
+        &[
+            SettingsPage::System,
+            SettingsPage::Editor,
+            SettingsPage::Extensions,
+        ],
     ),
     ("", &[SettingsPage::Shortcuts, SettingsPage::About]),
 ];
@@ -217,6 +228,7 @@ pub const ALL_PAGES: &[SettingsPage] = &[
     SettingsPage::AiHook,
     SettingsPage::System,
     SettingsPage::Editor,
+    SettingsPage::Extensions,
     SettingsPage::Shortcuts,
     SettingsPage::About,
 ];
@@ -310,6 +322,8 @@ enum TextField {
     UiFontFamily,
     TerminalFontFamily,
     TerminalCjkFontFamily,
+    /// 扩展下载地址模板(扩展页)。不合规的不落盘,页上就地标红。
+    ExtensionsDownloadUrl,
 }
 
 /// 远程粘贴目录的归一(`SettingsModal.tsx:657-663`)。
@@ -452,6 +466,16 @@ pub struct SettingsView {
 
     // ── shortcuts 页:录制改键(见 `pages_shortcuts`)──
     shortcuts: ShortcutsState,
+
+    // ── extensions 页 ──
+    txt_extensions_url: Entity<InputState>,
+    /// 导入结果 / 删除失败等页内提示。
+    ext_notice: Option<ExtensionsNotice>,
+    /// 删除 / 导入在后台跑着(两颗按钮置灰)。
+    ext_busy: bool,
+    /// 这次打开设置后扩展页的状态重 stat 过没有。
+    ext_refreshed: bool,
+    _ext_job: Option<Task<()>>,
 
     // ── system 页:本地下载目录 ──
     download_dir_busy: bool,
@@ -698,6 +722,12 @@ impl SettingsView {
                 .placeholder(TERMINAL_CJK_FONT_PLACEHOLDER)
                 .default_value(config.terminal_cjk_font_family.clone().unwrap_or_default())
         });
+        let txt_extensions_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                // placeholder 就是默认地址本身(留空 = 用它)
+                .placeholder(crate::extensions::DEFAULT_DOWNLOAD_TEMPLATE)
+                .default_value(config.extensions_download_url.clone().unwrap_or_default())
+        });
         let remote = RemoteNotifyForm::new(&config.remote_notify, window, cx);
 
         widgets::clear_knobs();
@@ -753,6 +783,11 @@ impl SettingsView {
             sound_warning: false,
             remote,
             shortcuts: ShortcutsState::default(),
+            txt_extensions_url,
+            ext_notice: None,
+            ext_busy: false,
+            ext_refreshed: false,
+            _ext_job: None,
             download_dir_busy: false,
             download_dir_error: None,
             download_dir_validation_key: None,
@@ -790,6 +825,11 @@ impl SettingsView {
                     }
                 },
             ));
+        }
+
+        // 扩展页的状态在后台线程里变(下载进度 / 装好 / 失败),由下载服务的事件泵 notify 这个实体
+        if let Some(hub) = crate::extensions::hub(cx) {
+            this._subs.push(cx.observe(&hub, |_, _, cx| cx.notify()));
         }
 
         this.init_env_rows(&config.terminal_env_vars, window, cx);
@@ -842,7 +882,7 @@ impl SettingsView {
     }
 
     /// 文本草稿行,同 [`Self::number_inputs`]。
-    fn text_inputs(&self) -> [(Entity<InputState>, TextField); 4] {
+    fn text_inputs(&self) -> [(Entity<InputState>, TextField); 5] {
         [
             (self.txt_remote_paste_dir.clone(), TextField::RemotePasteDir),
             (self.txt_ui_font.clone(), TextField::UiFontFamily),
@@ -853,6 +893,10 @@ impl SettingsView {
             (
                 self.txt_terminal_cjk_font.clone(),
                 TextField::TerminalCjkFontFamily,
+            ),
+            (
+                self.txt_extensions_url.clone(),
+                TextField::ExtensionsDownloadUrl,
             ),
         ]
     }
@@ -966,6 +1010,16 @@ impl SettingsView {
                 let next = Some(draft.clone()).filter(|s| !s.trim().is_empty());
                 self.store
                     .update(cx, |store, cx| store.set_terminal_cjk_font_family(next, cx));
+            }
+            // 空串 = 默认地址;不合规的不落盘,输入框留着原文、页上标红(见扩展页)
+            TextField::ExtensionsDownloadUrl => {
+                let trimmed = draft.trim().to_string();
+                if trimmed.is_empty() || crate::extensions::is_valid_template(&trimmed) {
+                    let next = Some(trimmed.clone()).filter(|s| !s.is_empty());
+                    self.store
+                        .update(cx, |store, cx| store.set_extensions_download_url(next, cx));
+                    return trimmed;
+                }
             }
         }
         draft
@@ -1237,6 +1291,7 @@ impl SettingsView {
             SettingsPage::AiHook => self.render_hook_page(cx),
             SettingsPage::System => self.render_system_page(cx),
             SettingsPage::Editor => self.render_editor_page(cx),
+            SettingsPage::Extensions => self.render_extensions_page(cx),
             SettingsPage::Shortcuts => self.render_shortcuts_page(cx),
             SettingsPage::About => self.render_about_page(cx),
         }
@@ -1279,6 +1334,7 @@ mod tests {
                 "ai-hook",
                 "system",
                 "editor",
+                "extensions",
                 "shortcuts",
                 "about",
             ]

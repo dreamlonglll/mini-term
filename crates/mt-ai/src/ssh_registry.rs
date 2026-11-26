@@ -56,23 +56,41 @@ const MCP_SERVER_NAME: &str = "mini-term-ssh";
 
 // ─── 二进制 / 路径解析 ───
 
-/// 获取 `mt-ssh-cli` sidecar 二进制的绝对路径(与主程序同目录的兄弟 bin)。
+/// 本机 `mt-ssh-cli` 的绝对路径;**找不到(或不是常规文件)就是 `Err`** —— 调用方据此绝不写
+/// 引用不存在 CLI 的 SKILL.md。
 ///
-/// dev 下 `stage-sidecars.mjs` 把 sidecar 裸名就位到根 `target/debug`
-/// (与 `mini-term.exe` 同目录),与发布包布局一致。
+/// 阶段 B 起 CLI 不再随安装包平铺 exe 旁,而是按需扩展 `ssh-tools`(与 `mt-ssh-mcp` 一起),
+/// 经 [`mt_extensions::Extensions::locate`] 找:正式安装包(有清单)= 本机扩展目录里内容寻址的
+/// 那份(`{扩展根}/ssh-tools/<哈希>/mt-ssh-cli[.exe]`,换版本就换目录 —— 启动校正据此改指);
+/// dev / 源码构建(没有清单)= exe 旁的旧布局(`stage-sidecars.mjs` 就位到 `target/debug`)。
 fn ssh_cli_binary_path() -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "无法获取程序所在目录".to_string())?;
+    locate_ssh_cli().ok_or_else(|| "找不到 mt-ssh-cli(SSH 工具扩展未安装)".to_string())
+}
 
-    let bin_name = if cfg!(windows) {
-        "mt-ssh-cli.exe"
-    } else {
-        "mt-ssh-cli"
+/// [`ssh_cli_binary_path`] 的 `Option` 版:在场且是常规文件才算。
+fn locate_ssh_cli() -> Option<String> {
+    let located = match mt_extensions::global().locate(
+        mt_extensions::ComponentId::SshTools,
+        mt_extensions::SSH_CLI_FILE,
+        None,
+    ) {
+        Ok(located) => located?,
+        Err(e) => {
+            tracing::warn!("[ssh_skill] 查找 mt-ssh-cli 失败: {e}");
+            return None;
+        }
     };
+    located
+        .path
+        .is_file()
+        .then(|| located.path.to_string_lossy().into_owned())
+}
 
-    Ok(dir.join(bin_name).to_string_lossy().to_string())
+/// 本机有没有可用的 `mt-ssh-cli`(启用 SSH 工具前判要不要先下载 `ssh-tools` 扩展;只 stat)。
+///
+/// **阻塞**(几次 stat),调用方放后台。
+pub fn ssh_cli_available() -> bool {
+    locate_ssh_cli().is_some()
 }
 
 /// 校验并规整项目目录路径。要求传入的是一个已存在的目录。
@@ -833,6 +851,8 @@ pub fn reconcile_skill_files_on_startup(
     if targets.is_empty() || registry_scope(projection_dir) == RegistryScope::IsolatedInstance {
         return 0;
     }
+    // 本机 CLI 不在(ssh-tools 扩展还没装 / 被删了)时什么都不改:把 SKILL.md 改指到一个不存在的
+    // CLI 只会更糟。宿主(mt-app)在 CLI 装好之后会再调一次本函数。
     let binary_path = match ssh_cli_binary_path() {
         Ok(path) => path,
         Err(e) => {
@@ -840,11 +860,6 @@ pub fn reconcile_skill_files_on_startup(
             return 0;
         }
     };
-    if !Path::new(&binary_path).is_file() {
-        // 指向一个不存在的 CLI 只会更糟 —— 安装不完整时宁可不改。
-        tracing::warn!("[ssh_skill] 启动校正跳过:找不到 {binary_path}");
-        return 0;
-    }
     reconcile_with_binary(targets, &binary_path)
 }
 
@@ -2001,6 +2016,37 @@ mod tests {
             rewrite_reason(&pointing_at_older, "tok", true, &newer, unknown),
             None
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 阶段 B:CLI 是按需扩展,换版本 = 换内容寻址目录(`{扩展根}/ssh-tools/<哈希>/`),而 GC 会
+    /// 多留一份其它版本 —— 旧目录还在,「引用的 CLI 不在」那条不触发,收敛只靠 mtime 那条。解包写
+    /// 出来的文件 mtime 就是安装时刻(mt-extensions 有单测钉住),新版本装得晚 → 改指过去;旧版本
+    /// 实例(预览版 / 正式版共用数据目录来回切)再启动时引用的那份比它的新 → 不动,不来回改写。
+    #[test]
+    fn reconcile_follows_content_addressed_version_dirs_without_ping_pong() {
+        let dir = unique_test_dir("reconcile-version-dirs");
+        let root = dir.join("extensions").join("ssh-tools");
+        std::fs::create_dir_all(root.join("aaaaaaaaaaaaaaaa")).unwrap();
+        std::fs::create_dir_all(root.join("bbbbbbbbbbbbbbbb")).unwrap();
+        let old = fake_binary(&root.join("aaaaaaaaaaaaaaaa"), "mt-ssh-cli");
+        let new = fake_binary(&root.join("bbbbbbbbbbbbbbbb"), "mt-ssh-cli");
+        set_modified(&old, 1_700_000_000);
+        set_modified(&new, 1_700_000_600);
+        write_skill_files(&dir, &old, "tok").unwrap();
+
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &new), 3);
+        for (path, with_allowed_tools) in skill_paths(&dir) {
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                render_skill_md(&new, "tok", with_allowed_tools)
+            );
+        }
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &old), 0);
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &new), 0);
+        // 旧目录被 GC 删掉之后,旧版本实例启动时照「引用的 CLI 不在」改指回它自己那份
+        std::fs::remove_dir_all(root.join("bbbbbbbbbbbbbbbb")).unwrap();
+        assert_eq!(reconcile_with_binary(&[target(&dir, "tok")], &old), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

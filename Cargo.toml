@@ -143,6 +143,9 @@ mt-config = { path = "crates/mt-config" }
 # mt-config 等上层 crate —— 它同时被三个 sidecar 二进制(miniterm-hook /
 # mt-ssh-mcp / mt-ssh-cli)与 mt-ssh 链接,加一层就把整套上层依赖拖进小二进制。
 mt-core = { path = "crates/mt-core" }
+# 按需扩展的本机侧(清单解析 / 查找 / 校验安装 / GC / 离线导入,不联网、不依赖 gpui)。
+# mt-remote(helper 部署)与 mt-app(扩展服务 + 设置页)依赖它。
+mt-extensions = { path = "crates/mt-extensions" }
 mt-i18n = { path = "crates/mt-i18n" }
 # 界面布局持久化(layout.db)。从 config.json 里搬出来的理由见该 crate 的模块注释:
 # 布局是交互频次的数据,不该每改一次就把整份配置连同 .bak 重写一遍。

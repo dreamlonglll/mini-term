@@ -145,7 +145,7 @@ Requires Rust >= 1.95 (the repo-root `rust-toolchain.toml` pins 1.98.1, which ru
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
 
-node scripts/stage-sidecars.mjs      # build the three sidecars and stage them (plus portable ConPTY) into target/debug/
+node scripts/stage-sidecars.mjs      # build the three sidecars, the syntax-pack library, and stage them (plus portable ConPTY) into target/debug/
 cargo run -p mt-app                  # dev
 cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 ```
@@ -154,7 +154,7 @@ cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 
 ### Remote Git helper
 
-SSH projects can use the existing Git panel for changes, diffs, commit history, branches, stash and worktrees. **Remote Git starts unauthorized for each SSH project.** Opening Git for the first time asks for confirmation; use that project's context menu to enable or revoke permission, not a global Settings toggle. Only after consent does Mini-Term upload and start the bundled helper matched to the server platform. It uploads over SFTP to the SSH user's `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`, verifies the content, and runs it over the existing SSH connection. After cancellation, enable it again from the project's context menu without repeated automatic prompts. Permission is bound to that project's SSH endpoint and remote root; changing either requires confirmation again, and newly created worktree projects do not inherit permission.
+SSH projects can use the existing Git panel for changes, diffs, commit history, branches, stash and worktrees. **Remote Git starts unauthorized for each SSH project.** Opening Git for the first time asks for confirmation; use that project's context menu to enable or revoke permission, not a global Settings toggle. Only after consent does Mini-Term upload and start the helper matched to the server platform (helpers no longer ship in the installer: a missing one is first downloaded as an [on-demand extension](docs/features.md#on-demand-extensions), or imported from the offline bundle in Settings → Extensions). It uploads over SFTP to the SSH user's `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`, verifies the content, and runs it over the existing SSH connection. After cancellation, enable it again from the project's context menu without repeated automatic prompts. Permission is bound to that project's SSH endpoint and remote root; changing either requires confirmation again, and newly created worktree projects do not inherit permission.
 
 The server needs Git and permission to execute programs in its user cache; no Rust, root access or new listening port is required. Linux helpers use static musl builds to avoid depending on the server's glibc version. Target platforms are Linux x86_64/aarch64 and macOS x86_64/arm64; **this does not mean every platform or server environment has been verified on real machines**. Missing matching assets or unsupported platforms produce an explicit error, never a fallback to local Git.
 

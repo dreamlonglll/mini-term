@@ -32,6 +32,9 @@ serde_json.workspace = true
 anyhow.workspace = true
 # Immutable remote helper cache identity and upload integrity verification.
 sha2.workspace = true
+# 本机 helper 资源的查找(exe 旁旧布局 → `MT_REMOTE_GIT_HELPERS_DIR` → 按需下载的扩展目录)。
+# 不联网、不依赖 gpui;下载那一跳由 mt-app 经 `set_helper_provisioner` 注入。
+mt-extensions.workspace = true
 # 本 crate 自持的 tokio 边界:russh / russh-sftp 的 IO 要 tokio driver,
 # gpui 的执行器喂不动。工作区里已有这一行(mt-relay 用同一份 feature 集)。
 #

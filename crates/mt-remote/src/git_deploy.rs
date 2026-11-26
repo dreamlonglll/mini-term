@@ -1,20 +1,108 @@
 //! Versioned, bounded helper deployment on the application's authenticated SSH pool.
+//!
+//! # 本机 helper 从哪来(按需扩展,阶段 A)
+//!
+//! helper 不再随安装包分发,查找走 [`mt_extensions::Extensions::locate`]:① exe 旁旧布局
+//! `remote-git-helpers/<target>/mt-git-helper`(dev 的 stage 脚本 / 源码构建,与 exe 同信任
+//! 等级)→ ② `MT_REMOTE_GIT_HELPERS_DIR` 开发根目录 → ③ 按需下载装好的扩展。在场却坏掉的
+//! 那一层**不会**落到下一层去用别的二进制。三层都没有 = [`DeployError::HelperMissing`]
+//! (类型化,不是人话):`git_service::connect_transport` 认出它后在**部署 deadline 之外**
+//! 调宿主注入的 [`set_helper_provisioner`] 下载该平台的扩展,成功后自动重试一次部署;
+//! 仍不行就以 [`REMOTE_GIT_HELPER_MISSING`] 报给界面,[`missing_helper`] 解出缺的平台。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use mt_config::SshConnection;
+use mt_extensions::{ComponentId, Extensions, GIT_HELPER_FILE};
+use mt_git_helper::GitFailure;
 use mt_ssh::{CachedSession, SftpHandle, SftpNodeKind, SshPool, run_bounded_exec_on_session};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::git::{quote_posix, validate_absolute_path};
 use crate::{acquire_session, connection_fingerprint, lock, state};
+
+/// 本机缺某个服务器平台的 helper 时,[`GitFailure::Service`] 用的 code。message 的形状是
+/// `"<target>\n<原因>"`,由 [`missing_helper`] 解开 —— 调用方按 code 认,不匹配人话。
+pub const REMOTE_GIT_HELPER_MISSING: &str = "remote_git_helper_missing";
+
+/// [`missing_helper`] 解出来的东西。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MissingHelper<'a> {
+    /// 服务器平台键:`linux-x86_64` / `linux-aarch64` / `macos-x86_64` / `macos-aarch64`。
+    pub target: &'static str,
+    /// 自动补齐为什么没成(宿主下载器给的原因;没注入下载器时为空)。
+    pub detail: &'a str,
+}
+
+/// 这个失败是不是「本机缺 helper」,缺的是哪个服务器平台。
+pub fn missing_helper(failure: &GitFailure) -> Option<MissingHelper<'_>> {
+    let GitFailure::Service { code, message } = failure else {
+        return None;
+    };
+    if code != REMOTE_GIT_HELPER_MISSING {
+        return None;
+    }
+    let (target, detail) = message.split_once('\n').unwrap_or((message.as_str(), ""));
+    let target = ComponentId::git_helper(target)?.helper_target()?;
+    Some(MissingHelper { target, detail })
+}
+
+pub(super) fn missing_helper_failure(target: &'static str, detail: &str) -> GitFailure {
+    GitFailure::service(REMOTE_GIT_HELPER_MISSING, format!("{target}\n{detail}"))
+}
+
+/// 宿主注入的 helper 补齐器:收服务器平台键,**阻塞**到该平台的扩展装好(`Ok`)或确定装不上
+/// (`Err(原因)`)为止。在 Git 执行器线程上、部署 deadline 之外调用。
+type Provisioner = dyn Fn(&'static str) -> Result<(), String> + Send + Sync;
+static PROVISIONER: OnceLock<Box<Provisioner>> = OnceLock::new();
+
+/// 注入 helper 补齐器(mt-app 启动时调一次,下载那一跳在它那边:扩展服务 + 共享 HTTP 客户端)。
+/// 返回 `false` = 已经注入过(先到先得)。没注入时缺 helper 直接报 [`REMOTE_GIT_HELPER_MISSING`]。
+pub fn set_helper_provisioner(
+    provisioner: impl Fn(&'static str) -> Result<(), String> + Send + Sync + 'static,
+) -> bool {
+    PROVISIONER.set(Box::new(provisioner)).is_ok()
+}
+
+pub(super) fn provision_helper(target: &'static str) -> Result<(), String> {
+    match PROVISIONER.get() {
+        Some(provisioner) => provisioner(target),
+        None => Err(String::new()),
+    }
+}
+
+/// 部署失败的两类:缺本机 helper(可补齐后重试)与其它一切(原样报)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DeployError {
+    HelperMissing { target: &'static str },
+    Failed(String),
+}
+
+impl From<String> for DeployError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl fmt::Display for DeployError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HelperMissing { target } => write!(
+                f,
+                "no local remote Git helper for {target}; download the extension in Settings → Extensions"
+            ),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
 
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(120);
 const FINISH_GRACE: Duration = Duration::from_secs(10);
@@ -42,7 +130,7 @@ fn deployment_lock(connection: &SshConnection) -> Arc<DeploymentLock> {
 pub(super) fn ensure_helper(
     connection: &SshConnection,
     check: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<String, String> {
+) -> Result<String, DeployError> {
     check()?;
     let runtime = state().runtime()?;
     runtime.block_on(async {
@@ -65,10 +153,10 @@ pub(super) fn ensure_helper(
         })
         .await
         .unwrap_or_else(|_| {
-            Err(format!(
+            Err(DeployError::Failed(format!(
                 "remote Git helper deployment timed out ({}s); no Git request was sent",
                 DEPLOY_TIMEOUT.as_secs(),
-            ))
+            )))
         })
     })
 }
@@ -79,7 +167,7 @@ async fn deploy(
     session: &Arc<CachedSession>,
     deadline: Instant,
     check: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<String, String> {
+) -> Result<String, DeployError> {
     check()?;
     let platform = exec_checked(
         connection,
@@ -92,15 +180,22 @@ async fn deploy(
     .await?;
     let target = parse_target(&platform)?;
     let (asset, digest) = tokio::task::spawn_blocking(move || {
-        let executable = std::env::current_exe()
-            .map_err(|e| format!("locating remote Git helper assets: {e}"))?;
         let root = std::env::var_os(ASSET_ROOT_ENV).map(PathBuf::from);
-        let asset = select_asset(&executable, root.as_deref(), target)?;
-        let digest = hash_asset(&asset)?;
-        Ok::<_, String>((asset, digest))
+        let selected = select_asset(mt_extensions::global(), root.as_deref(), target)?;
+        let digest = hash_asset(&selected.path)?;
+        // 扩展目录里的那份顺手对一遍清单(旧布局 / 开发根目录没有期望值,与 exe 同信任等级)
+        if let Some(expected) = &selected.expected_sha256
+            && *expected != digest
+        {
+            return Err(DeployError::Failed(format!(
+                "installed remote Git helper extension for {target} does not match the extension manifest; \
+                 delete it in Settings → Extensions and download it again"
+            )));
+        }
+        Ok::<_, DeployError>((selected.path, digest))
     })
     .await
-    .map_err(|e| format!("reading remote Git helper asset: {e}"))??;
+    .map_err(|e| DeployError::Failed(format!("reading remote Git helper asset: {e}")))??;
     let sftp = Arc::new(
         SftpHandle::open_on_session(session.clone(), EXEC_TIMEOUT)
             .await
@@ -173,16 +268,16 @@ async fn deploy(
         {
             Ok(Ok(())) => partial.armed = false,
             _ => {
-                return Err(format!(
+                return Err(DeployError::Failed(format!(
                     "{}; remote helper partial cleanup unconfirmed: '{}'",
                     result.err().unwrap_or_else(|| "helper deployed".into()),
                     partial.path
-                ));
+                )));
             }
         }
     }
     // Dropping the last SFTP reference closes its channel and releases its session lease.
-    result
+    result.map_err(DeployError::Failed)
 }
 
 struct PartialCleanup {
@@ -373,41 +468,44 @@ fn parse_target(platform: &str) -> Result<&'static str, String> {
     }
 }
 
+/// 选中的本机 helper。`expected_sha256` 只在来自扩展目录时有(清单里登记的哈希)。
+#[derive(Debug, PartialEq, Eq)]
+struct SelectedAsset {
+    path: PathBuf,
+    expected_sha256: Option<String>,
+}
+
+/// 按 [`Extensions::locate`] 的顺序找 `target` 的 helper(见模块注释)。三层都没有 =
+/// [`DeployError::HelperMissing`];找到的那个不合规(符号链接 / 空 / 超限)= 报错,
+/// **不**落到下一层去用别的二进制。
 fn select_asset(
-    executable: &Path,
+    extensions: &Extensions,
     configured: Option<&Path>,
-    target: &str,
-) -> Result<PathBuf, String> {
-    let parent = executable
-        .parent()
-        .ok_or("application executable has no resource directory")?;
-    let bundled = parent
-        .join("remote-git-helpers")
-        .join(target)
-        .join("mt-git-helper");
-    let asset = match std::fs::symlink_metadata(&bundled) {
-        Ok(_) => bundled,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => configured
-            .map(|root| root.join(target).join("mt-git-helper"))
-            .unwrap_or(bundled),
-        Err(error) => {
-            return Err(format!(
-                "inspecting remote Git helper asset '{}': {error}",
-                bundled.display()
-            ));
-        }
-    };
-    let metadata = std::fs::symlink_metadata(&asset).map_err(|error| format!(
-        "remote Git helper asset for {target} is unavailable at '{}': {error}; install a build containing remote-git-helpers/{target}/mt-git-helper",
-        asset.display(),
-    ))?;
+    target: &'static str,
+) -> Result<SelectedAsset, DeployError> {
+    let id = ComponentId::git_helper(target)
+        .ok_or_else(|| format!("remote Git helper does not support server platform {target}"))?;
+    let located = extensions
+        .locate(id, GIT_HELPER_FILE, configured)
+        .map_err(|error| format!("inspecting remote Git helper asset for {target}: {error}"))?
+        .ok_or(DeployError::HelperMissing { target })?;
+    let asset = located.path;
+    let metadata = std::fs::symlink_metadata(&asset).map_err(|error| {
+        format!(
+            "remote Git helper asset for {target} is unavailable at '{}': {error}",
+            asset.display(),
+        )
+    })?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_ASSET_BYTES {
-        return Err(format!(
+        return Err(DeployError::Failed(format!(
             "remote Git helper asset '{}' must be a nonempty regular file of at most {MAX_ASSET_BYTES} bytes",
             asset.display()
-        ));
+        )));
     }
-    Ok(asset)
+    Ok(SelectedAsset {
+        path: asset,
+        expected_sha256: located.expected.map(|(sha256, _)| sha256),
+    })
 }
 
 fn hash_asset(path: &Path) -> Result<String, String> {

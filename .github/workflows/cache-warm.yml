@@ -261,6 +261,7 @@ jobs:
         if: steps.rust-cache.outputs.cache-hit != 'true'
         run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
-      - name: Build GPUI app
+      # 与 release.yml 的 build-desktop 同一条命令(含语法包 cdylib),缓存才对得上
+      - name: Build GPUI app (+ syntax pack)
         if: steps.rust-cache.outputs.cache-hit != 'true'
-        run: cargo build --locked --release --package mt-app
+        run: cargo build --locked --release --package mt-app --package mt-syntax-pack
