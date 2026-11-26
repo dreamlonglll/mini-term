@@ -115,9 +115,11 @@ pub use files::*;
 pub use git::RemoteGitClient;
 pub use git_context::GitContext;
 pub use git_service::{
-    RemoteGitOfflineAbandonConfirmation, RemoteGitOperationKind, RemoteGitRecoveryBlocker,
-    RemoteGitRecoveryConsent, RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace,
-    remote_git_source_change_guard, run_git, run_git_on, set_project_git_permission,
+    MissingHelper, REMOTE_GIT_HELPER_MISSING, RemoteGitOfflineAbandonConfirmation,
+    RemoteGitOperationKind, RemoteGitRecoveryBlocker, RemoteGitRecoveryConsent,
+    RemoteGitRecoverySnapshot, RemoteGitUnknownWrite, RemoteGitWorkspace, missing_helper,
+    remote_git_source_change_guard, run_git, run_git_on, set_helper_provisioner,
+    set_project_git_permission,
 };
 pub use mt_git_helper::GitFailure;
 // 「测试连接」结果里的类型(mt-app 不直接依赖 mt-ssh,经这里取)
@@ -368,6 +370,18 @@ where
     AbortOnDrop(handle.spawn(fut))
         .await
         .map_err(|err| format!("共享异步任务执行失败: {err}"))
+}
+
+/// 给一段 future 加时限:到点返回 `None`(那段 future 随之被丢弃)。
+///
+/// 给不直接依赖 `tokio` 的上层(mt-app 的扩展下载:连接 15s、卡住 60s 无数据判失败)取
+/// tokio 计时器用。⚠️ 只能在共享运行时上的任务里 await —— 例如 [`run_on_shared_runtime`]
+/// 包着的那段 future 内部;计时器要 tokio 的 time 驱动,别的执行器上一 poll 就 panic。
+pub async fn timeout_on_shared_runtime<F>(duration: Duration, fut: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout(duration, fut).await.ok()
 }
 
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。

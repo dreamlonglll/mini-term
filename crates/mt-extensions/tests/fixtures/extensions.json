@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "appVersion": "0.0.0-fixture",
+  "tag": "v0.0.0-fixture",
+  "platform": "windows-x64",
+  "offlineBundle": "Mini-Term_0.0.0-fixture_windows-x64-extensions.zip",
+  "components": [
+    {
+      "id": "git-helper-linux-aarch64",
+      "asset": "mt-ext_git-helper-linux-aarch64_87451bd2808e.zip",
+      "sha256": "87451bd2808ec3a8fe85496379afafcb7cf5b31e720981bfecba6ac6d68c984e",
+      "size": 189,
+      "files": [
+        {
+          "name": "mt-git-helper",
+          "sha256": "933de76036426c21a863ec40f9c680a4c5a9d5e1ada5070f3d637e14b74d432a",
+          "size": 66,
+          "executable": true
+        }
+      ]
+    },
+    {
+      "id": "git-helper-linux-x86_64",
+      "asset": "mt-ext_git-helper-linux-x86_64_796db0ca3bc2.zip",
+      "sha256": "796db0ca3bc2a9ca4243de3c64457b04f78c8bae642dde387e4f716a915a609f",
+      "size": 233,
+      "files": [
+        {
+          "name": "mt-git-helper",
+          "sha256": "18591dc4ba0a38494a99875e44aff617187b5016e687373c1ec905616165665c",
+          "size": 5248,
+          "executable": true
+        }
+      ]
+    }
+  ]
+}

@@ -94,6 +94,8 @@ fn 映射出来的语言名注册表全都认得() {
     // 全部可能的返回值(从源码 match 臂里扫出来)逐个去注册表查一遍
     use gpui_component::highlighter::LanguageRegistry;
     crate::syntax_languages::register();
+    // C++ / C# / Kotlin … 在语法包里:单测不经动态库,直接注册 rlib 里同一张表
+    crate::syntax_pack::register_bundled_for_tests();
     let registry = LanguageRegistry::singleton();
     let source = include_str!("file_kind.rs");
     let body = source

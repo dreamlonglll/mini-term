@@ -71,6 +71,19 @@ for (const name of SIDECARS) {
   }
 }
 
+// 语法高亮扩展包(按需扩展阶段 C,crates/mt-syntax-pack):dev 顺带编出来。它是根工作区的
+// cdylib,cargo 自己就把 mt_syntax_pack.dll / libmt_syntax_pack.{so,dylib} 落在
+// <target>/debug/ —— 与 dev 的 mini-term 同目录,即 exe 旁旧布局(可信,不核哈希),不用拷;
+// cargo 认 CARGO_TARGET_DIR,另设了 target 目录时也落在那个目录的 debug/ 下(这点与
+// sidecar 不同)。CI(--release)不在这里编:build-desktop 单独
+// `cargo build --locked --release -p mt-syntax-pack`,package-release 把它打成
+// syntax-pack 扩展,安装包里不带。
+if (!release) {
+  const packArgs = ['build', '--locked', '-p', 'mt-syntax-pack'];
+  console.log(`[stage-sidecars] cargo ${packArgs.join(' ')}`);
+  execFileSync('cargo', packArgs, { stdio: 'inherit' });
+}
+
 if (triple.includes('windows')) {
   if (triple !== WINDOWS_X64_TARGET) {
     throw new Error(

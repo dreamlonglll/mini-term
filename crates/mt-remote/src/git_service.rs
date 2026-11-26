@@ -18,6 +18,10 @@ use super::{GitContext, RemoteGitClient, connection_fingerprint, lock, state};
 #[path = "git_deploy.rs"]
 mod deploy;
 
+pub use deploy::{
+    MissingHelper, REMOTE_GIT_HELPER_MISSING, missing_helper, set_helper_provisioner,
+};
+
 const QUEUE_CAPACITY: usize = 32;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 static WORKSPACES: LazyLock<Mutex<Vec<Weak<WorkspaceInner>>>> = LazyLock::new(Default::default);
@@ -745,10 +749,12 @@ fn unknown_failure(code: &str) -> GitFailure {
 }
 fn connect_transport(lease: &WorkspaceLease) -> Result<Box<dyn WorkspaceTransport>, GitFailure> {
     lease.check()?;
-    let helper = deploy::ensure_helper(&lease.inner.connection, &|| {
-        lease.check().map_err(|e| e.to_string())
-    })
-    .map_err(|e| failure("remote_git_deployment_failed", e))?;
+    let check = || lease.check().map_err(|e| e.to_string());
+    let helper = deploy_with_provisioning(
+        || deploy::ensure_helper(&lease.inner.connection, &check),
+        deploy::provision_helper,
+        || lease.check(),
+    )?;
     lease.check()?;
     let client = RemoteGitClient::connect(&lease.inner.connection, &helper, &lease.inner.root)
         .map_err(|e| {
@@ -761,6 +767,34 @@ fn connect_transport(lease: &WorkspaceLease) -> Result<Box<dyn WorkspaceTranspor
         })?;
     lease.check()?;
     Ok(Box::new(client))
+}
+
+/// 部署 helper;本机缺这个服务器平台的 helper 时先补齐再重试**一次**。
+///
+/// `deploy` 每次都带着自己的部署 deadline 返回,`provision`(下载扩展,有进度、可能很慢)
+/// 夹在两次之间 —— 也就是在 deadline **之外**。补不齐 / 重试仍缺都报类型化的
+/// [`deploy::REMOTE_GIT_HELPER_MISSING`],界面据此指去「设置 → 扩展」;其余失败照旧是
+/// `remote_git_deployment_failed`。补齐期间权限被撤销:`check` 拦下,不再重试。
+fn deploy_with_provisioning(
+    deploy: impl Fn() -> Result<String, deploy::DeployError>,
+    provision: impl FnOnce(&'static str) -> Result<(), String>,
+    check: impl Fn() -> Result<(), GitFailure>,
+) -> Result<String, GitFailure> {
+    match deploy() {
+        Err(deploy::DeployError::HelperMissing { target }) => {
+            provision(target).map_err(|detail| deploy::missing_helper_failure(target, &detail))?;
+            check()?;
+            deploy().map_err(deploy_failure)
+        }
+        result => result.map_err(deploy_failure),
+    }
+}
+
+fn deploy_failure(error: deploy::DeployError) -> GitFailure {
+    match error {
+        deploy::DeployError::HelperMissing { target } => deploy::missing_helper_failure(target, ""),
+        deploy::DeployError::Failed(error) => failure("remote_git_deployment_failed", error),
+    }
 }
 
 fn slot_active(slot: &WorkspaceClient, owner: &Arc<WorkspaceInner>) -> bool {

@@ -3143,37 +3143,24 @@ dependencies = [
  "tree-sitter-astro-next",
  "tree-sitter-bash",
  "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-cmake",
- "tree-sitter-cpp",
  "tree-sitter-css",
  "tree-sitter-diff",
- "tree-sitter-elixir",
  "tree-sitter-embedded-template",
  "tree-sitter-go",
- "tree-sitter-graphql",
  "tree-sitter-html",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-jsdoc",
  "tree-sitter-json",
- "tree-sitter-kotlin-sg",
  "tree-sitter-lua",
  "tree-sitter-make",
  "tree-sitter-md",
- "tree-sitter-php",
- "tree-sitter-proto",
  "tree-sitter-python",
- "tree-sitter-ruby",
  "tree-sitter-rust",
- "tree-sitter-scala",
- "tree-sitter-sequel",
  "tree-sitter-svelte-next",
- "tree-sitter-swift",
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
- "tree-sitter-zig",
  "unicode-segmentation",
  "unicode-width",
  "uuid",
@@ -5436,6 +5423,7 @@ dependencies = [
  "chrono",
  "dirs 6.0.0",
  "mt-core",
+ "mt-extensions",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -5462,12 +5450,14 @@ dependencies = [
  "iana-time-zone",
  "image",
  "lb-wry",
+ "libloading",
  "markdown",
  "mermaid-rs-renderer",
  "mt-ai",
  "mt-app-core",
  "mt-config",
  "mt-core",
+ "mt-extensions",
  "mt-i18n",
  "mt-layout",
  "mt-project",
@@ -5475,6 +5465,8 @@ dependencies = [
  "mt-relay",
  "mt-remote",
  "mt-secret",
+ "mt-syntax-pack",
+ "mt-syntax-pack-abi",
  "mt-terminal",
  "mt-ui",
  "mt-usage",
@@ -5489,17 +5481,8 @@ dependencies = [
  "trash",
  "tree-sitter",
  "tree-sitter-batch",
- "tree-sitter-c-sharp",
- "tree-sitter-cmake",
- "tree-sitter-dart",
- "tree-sitter-graphql",
- "tree-sitter-groovy",
  "tree-sitter-ini",
- "tree-sitter-kotlin-sg",
  "tree-sitter-language",
- "tree-sitter-powershell",
- "tree-sitter-proto",
- "tree-sitter-swift",
  "tree-sitter-xml",
  "unicode-segmentation",
  "webview2-com",
@@ -5554,6 +5537,17 @@ dependencies = [
  "dirs 6.0.0",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "mt-extensions"
+version = "1.14.7"
+dependencies = [
+ "dirs 6.0.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "zip",
 ]
 
 [[package]]
@@ -5657,6 +5651,7 @@ dependencies = [
  "mt-app-core",
  "mt-config",
  "mt-core",
+ "mt-extensions",
  "mt-git-helper",
  "mt-project",
  "mt-pty",
@@ -5700,6 +5695,35 @@ dependencies = [
  "ssh-key",
  "tokio",
 ]
+
+[[package]]
+name = "mt-syntax-pack"
+version = "1.14.7"
+dependencies = [
+ "mt-syntax-pack-abi",
+ "tree-sitter",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cmake",
+ "tree-sitter-cpp",
+ "tree-sitter-dart",
+ "tree-sitter-elixir",
+ "tree-sitter-graphql",
+ "tree-sitter-groovy",
+ "tree-sitter-kotlin-sg",
+ "tree-sitter-language",
+ "tree-sitter-php",
+ "tree-sitter-powershell",
+ "tree-sitter-proto",
+ "tree-sitter-ruby",
+ "tree-sitter-scala",
+ "tree-sitter-sequel",
+ "tree-sitter-swift",
+ "tree-sitter-zig",
+]
+
+[[package]]
+name = "mt-syntax-pack-abi"
+version = "1.14.7"
 
 [[package]]
 name = "mt-terminal"

@@ -490,6 +490,24 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 
+    // === 按需扩展(设置 →「扩展」页)===
+
+    /// 扩展下载地址模板:`None` / 空串 = 默认的 GitHub release 地址(不写进库)。合不合规由
+    /// 设置页判过(`extensions::is_valid_template`),这里只归一。顺手同步给下载服务 ——
+    /// 后台的部署补齐拿不到 store,读的是那边的副本。
+    pub fn set_extensions_download_url(&mut self, url: Option<String>, cx: &mut Context<Self>) {
+        let next = url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        if self.config.extensions_download_url == next {
+            return;
+        }
+        self.config.extensions_download_url = next.clone();
+        crate::extensions::set_download_template(next);
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
+    }
+
     // === 快捷键(设置 →「快捷键」页)===
 
     /// 改一组快捷键:`Some(键位串)` = 改成它,`None` = 解绑;与默认键位相同的从覆盖表里删掉

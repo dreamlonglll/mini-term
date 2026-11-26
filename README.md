@@ -147,7 +147,7 @@ xattr -cr /Applications/Mini-Term.app
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
 
-node scripts/stage-sidecars.mjs      # 构建三个 sidecar 并连同便携 ConPTY 就位到 target/debug/
+node scripts/stage-sidecars.mjs      # 构建三个 sidecar、语法包动态库并连同便携 ConPTY 就位到 target/debug/
 cargo run -p mt-app                  # 开发
 cargo build --release -p mt-app      # 产物 target/release/mini-term(.exe)
 ```
@@ -156,7 +156,7 @@ cargo build --release -p mt-app      # 产物 target/release/mini-term(.exe)
 
 ### 远端 Git helper
 
-SSH 项目可在原有 Git 面板中查看更改、diff、提交历史，并管理分支、贮藏和 Worktree。**每个 SSH 项目的远端 Git 默认未授权**；首次打开 Git 时先请求确认，也可在项目右键菜单中启用或撤销授权，不设全局设置开关。只有同意后才会经 SFTP 上传并启动匹配服务器平台的随包 helper，放入 SSH 用户的 `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`，校验内容后通过现有 SSH 连接运行。取消后可从项目右键菜单再次启用，不反复自动弹窗。授权绑定该项目的 SSH 端点与远端根目录，任一变化都须重新确认；新建的 Worktree 项目不继承授权。
+SSH 项目可在原有 Git 面板中查看更改、diff、提交历史，并管理分支、贮藏和 Worktree。**每个 SSH 项目的远端 Git 默认未授权**；首次打开 Git 时先请求确认，也可在项目右键菜单中启用或撤销授权，不设全局设置开关。只有同意后才会经 SFTP 上传并启动匹配服务器平台的 helper（helper 不再随安装包分发，本机还没有时先作为[按需扩展](docs/features.zh-CN.md#按需扩展)下载，也可在「设置 → 扩展」导入离线扩展包），放入 SSH 用户的 `~/.cache/mini-term/git-helper/<sha256>/mt-git-helper`，校验内容后通过现有 SSH 连接运行。取消后可从项目右键菜单再次启用，不反复自动弹窗。授权绑定该项目的 SSH 端点与远端根目录，任一变化都须重新确认；新建的 Worktree 项目不继承授权。
 
 服务器只需安装 Git，并允许在用户缓存目录执行程序；无需 Rust、root 权限或新增监听端口。Linux helper 使用 musl 静态构建，避免依赖服务器的 glibc 版本；目标平台包括 Linux x86_64/aarch64 与 macOS x86_64/arm64，**不代表这些平台及所有服务器环境均已通过真机验证**。缺少匹配资源或平台不支持时会明确报错，不回落本机 Git。
 

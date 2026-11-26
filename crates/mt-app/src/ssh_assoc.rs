@@ -216,6 +216,14 @@ fn outcome_alert(outcome: &SshAssocOutcome, project_name: &str) -> (SharedString
     } else {
         message
     };
+    // 更新范围时 SSH 工具扩展没下载成:范围已存,SKILL.md 没动 —— 说清楚,并指去设置页
+    let message = match &outcome.cli_missing {
+        Some(reason) => format!(
+            "{message}\n\n{}",
+            tr!("sshAssoc", "cliMissingSavedNote", reason = reason.clone())
+        ),
+        None => message,
+    };
     (title.into(), message.into())
 }
 
@@ -706,8 +714,22 @@ mod tests {
             group_count: 0,
             project_token: None,
             registry_skipped: false,
+            cli_missing: None,
             message: String::new(),
         }
+    }
+
+    /// 更新范围时 SSH 工具扩展没装上:正文末尾补一句(带原因),正常结果不带。
+    #[test]
+    fn cli_missing_note_carries_the_reason() {
+        let plain = outcome_alert(&outcome(true, true, 1, 2), "P").1.to_string();
+        let missing = SshAssocOutcome {
+            cli_missing: Some("HTTP 404".into()),
+            ..outcome(true, true, 1, 2)
+        };
+        let message = outcome_alert(&missing, "P").1.to_string();
+        assert!(message.starts_with(&plain), "{message}");
+        assert!(message.contains("HTTP 404"), "{message}");
     }
 
     /// dev 实例:三档提示都在正文末尾补上「只存进本实例配置」的说明;正常实例不带。

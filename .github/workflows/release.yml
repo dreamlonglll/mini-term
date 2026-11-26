@@ -5,7 +5,7 @@ name: Build & Release
 #   —— 镜像自带 / choco / 官方便携包直下,见「Build NSIS installer」步骤的注释;
 #   身份对齐旧 Tauri NSIS —— HKCU Uninstall\Mini-Term 键 + 读旧 InstallLocation,
 #   老用户原地升级:装过就先弹框告知、再跑旧版卸载器,不是文件覆盖写;
-#   包内平铺 exe + 三个 sidecar + portable-conpty/,
+#   包内平铺 exe + miniterm-hook + portable-conpty/ + 扩展清单 extensions.json,
 #   运行时全部按「与 exe 同目录」定位)+ 调试符号 zip(mini_term.pdb,单独资产,
 #   不进安装包,见「Package debug symbols」步骤)
 # - macOS arm64 + x64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
@@ -17,12 +17,30 @@ name: Build & Release
 #   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号;
 #   deb 的 Depends 由 dpkg-shlibdeps 在构建时按二进制实际链接的库算出)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
-#   该目录收集 —— 目录布局即最终包布局
-# - 每个桌面安装包都带齐 Linux x64/arm64 与 macOS x64/arm64 四种远端 Git helper;
-#   build-desktop 与 remote-git-helpers 并行编译,全部就绪后再由 package-release
-#   统一组装并跑 stage-git-helpers --verify-all(拒绝缺失或动态链接的 Linux helper)。
-#   手动补建即使只选一个桌面平台也不缩减 helper 矩阵;任一 helper 构建 / 兼容性冒烟
-#   失败同样阻止打包与 publish。
+#   该目录收集 —— 目录布局即最终包布局(按需扩展的那几个除外,见下)
+# - 远端 Git helper(Linux x64/arm64 musl 静态、macOS x64/arm64)**不再随安装包**,改成按需
+#   扩展(设计见 crates/mt-extensions 的 crate 注释):
+#   · remote-git-helpers 作业编出四个 helper,并**只在那里**用 scripts/pack-extensions.mjs
+#     打成内容寻址的扩展 zip(`mt-ext_<id>_<zip sha256 前 12 位>.zip`)+ 描述片段,作为
+#     artifact 交出去 —— 各桌面行下载的是同一份,哈希一致;
+#   · upload-helper-extensions 作业把四个 helper 扩展 zip **只上传一次**(别让四个桌面矩阵行
+#     并发 --clobber 同名资产;内容寻址 = 同名即同内容,补建时 --clobber 也无害);
+#   · package-release 每行生成本平台的扩展清单 extensions.json(随包放在 exe 同目录,与 exe
+#     同一信任等级:运行时下载 / 离线导入的扩展一律按它校验 sha256 + 字节数),打本平台的
+#     离线扩展包 `Mini-Term_<版本>_<extPlatform>-extensions.zip`(清单引用的全部扩展 zip 原样
+#     store + 一份清单副本)随安装包一起上传。
+#   · SSH 工具 sidecar(mt-ssh-cli + mt-ssh-mcp,阶段 B)同样不再随包:build-desktop 照旧编出
+#     它们(deb 的 dpkg-shlibdeps 照算它们的依赖 —— 下载后要在本机跑),package-release 每行把
+#     本平台的两个二进制 `pack` 成 `ssh-tools` 扩展进清单与离线包,并由**该行自己**上传那个 zip
+#     (平台相关、内容寻址,四行的资产名不会撞)。miniterm-hook 照旧随包。
+#   · 语法高亮扩展包(mt-syntax-pack 动态库,阶段 C)同样不再随包:build-desktop 与 mt-app 一起编
+#     出 cdylib 放进 `staging/desktop/syntax-pack/`(不落在 exe 旁、不进安装包),package-release
+#     每行把本平台的动态库 `pack` 成 `syntax-pack` 扩展进清单与离线包,并由该行自己上传那个 zip。
+#   build-desktop 与 remote-git-helpers 仍并行编译(编译期拿不到 helper 哈希,所以是清单文件
+#   而不是编译期嵌哈希);package-release 仍跑 stage-git-helpers --verify-all(拒绝缺失或
+#   动态链接的 Linux helper,校验不放松,只是不再拷进包)。手动补建即使只选一个桌面平台也不
+#   缩减 helper 矩阵 —— helper 重编后字节可能变,内容寻址让新旧清单各自引用的资产都留在
+#   release 上;任一 helper 构建 / 兼容性冒烟失败同样阻止打包与 publish。
 # - release 壳由 create-release 先建成 **draft**(prerelease 按 tag 含 `-` 自动标),
 #   各平台只向其上传产物,避免并行抢建 release;全部平台构建成功后 publish 作业
 #   算出 SHA256SUMS.txt 一并上传,再把 draft 转正。匿名请求看不到 draft ——
@@ -66,8 +84,8 @@ on:
         default: 'macos-x64'
         type: string
 
-# 默认只读。要写 release 的 create-release / package-release / publish 各自提到 contents: write;
-# build-desktop 与 remote-git-helpers 只编产物、不碰 release,保持最小只读权限
+# 默认只读。要写 release 的 create-release / upload-helper-extensions / package-release / publish
+# 各自提到 contents: write;build-desktop 与 remote-git-helpers 只编产物、不碰 release,保持最小只读权限
 permissions:
   contents: read
 
@@ -253,6 +271,65 @@ jobs:
           path: helper-assets/
           if-no-files-found: error
           retention-days: 7
+      # 打包脚本只用 Node 内置的 zlib / crypto / fs;钉一个大版本,zip 的字节(deflate 输出)
+      # 不随 runner 镜像自带的 Node 漂
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+      # 按需扩展:校验过的 helper 打成内容寻址的扩展 zip + 描述片段(`<id>.fragment.json`)。
+      # **只在这里打一次**:各桌面行的 package-release 下载同一份,清单里的哈希因此处处一致
+      - name: Pack helper extension
+        shell: bash
+        env:
+          HELPER_TARGET: ${{ matrix.target }}
+        run: |
+          node scripts/pack-extensions.mjs pack --id "git-helper-$HELPER_TARGET" \
+            --exe "helper-assets/$HELPER_TARGET/mt-git-helper" --out-dir helper-extension
+          ls -la helper-extension
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-extension-${{ matrix.target }}
+          path: helper-extension/
+          if-no-files-found: error
+          retention-days: 7
+
+  # 四个 helper 扩展 zip 上传进 release:**只在这一个作业里传一次**(理由见文件头)。资产名内容
+  # 寻址,手动补建时 helper 重编出不同字节就是新名字,旧清单引用的旧资产照样留着。
+  # 不检出代码:只下载 artifact、用 gh 直传(GH_REPO 指定仓库),token 只在上传那一步的 env 里
+  upload-helper-extensions:
+    needs: [create-release, remote-git-helpers]
+    # 与 package-release 同一手法:显式 !cancelled() 放行手动补建时 skipped 的 create-release;
+    # 四个 helper 必须全绿(矩阵作业的 result 只有全部成功才是 success)
+    if: >-
+      !cancelled() &&
+      needs.remote-git-helpers.result == 'success' &&
+      (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download helper extensions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: helper-extension-*
+          path: helper-extensions
+          merge-multiple: true
+
+      - name: Upload helper extensions to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s nullglob
+          files=(helper-extensions/mt-ext_git-helper-*.zip)
+          if [ "${#files[@]}" -ne 4 ]; then
+            echo "::error::应有 4 个 helper 扩展 zip,实际 ${#files[@]}: ${files[*]}"
+            exit 1
+          fi
+          printf 'upload: %s\n' "${files[@]}"
+          gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
 
   # 编译阶段:与 remote-git-helpers 完全并行(编译 mt-app 与 sidecars 本身不依赖 helper 二进制),
   # 完成后将本平台可执行文件与打包前置元数据上传为临时 artifact,交给 package-release 统一组装。
@@ -329,8 +406,10 @@ jobs:
       - name: Build & stage sidecars (+ portable ConPTY on Windows)
         run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
-      - name: Build GPUI app
-        run: cargo build --locked --release --package mt-app
+      # 语法高亮扩展包(按需扩展阶段 C,crates/mt-syntax-pack 的 cdylib)与主程序同一次构建:
+      # 不进安装包,package-release 把它打成 syntax-pack 扩展。
+      - name: Build GPUI app (+ syntax pack)
+        run: cargo build --locked --release --package mt-app --package mt-syntax-pack
 
       # ── Linux 运行时依赖(Depends)前置计算 ──
       # dpkg-shlibdeps 必须对着构建期实际链接的那套系统库(/var/lib/dpkg/info/*.shlibs)
@@ -386,6 +465,11 @@ jobs:
           }
           if (-not (Test-Path 'target/release/portable-conpty')) { throw '缺少构建产物: target/release/portable-conpty' }
           Copy-Item -Path 'target/release/portable-conpty' -Destination 'staging/desktop/portable-conpty' -Recurse -Force
+          # 语法包放子目录:package-release 还原后它在 target/release/syntax-pack/,不在 exe 旁
+          # (exe 旁 = 旧布局,不该进任何包)
+          New-Item -ItemType Directory -Force staging/desktop/syntax-pack | Out-Null
+          if (-not (Test-Path 'target/release/mt_syntax_pack.dll')) { throw '缺少构建产物: target/release/mt_syntax_pack.dll' }
+          Copy-Item -Path 'target/release/mt_syntax_pack.dll' -Destination 'staging/desktop/syntax-pack/' -Force
 
       # macOS / Linux 用 tar 归档再上传:actions/upload-artifact 的 zip 封装不保留 Unix 可执行权限位,
       # tar 完整保留 0755 权限与元数据,交由 upload-artifact 单次压缩传输。
@@ -399,6 +483,14 @@ jobs:
           done
           tar -C target/release -cf staging/desktop/desktop-build.tar \
             mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp
+          # 语法包(.dylib / .so,不需要可执行位)单独放子目录,不进上面的 tar —— 还原后不落在 exe 旁
+          mkdir -p staging/desktop/syntax-pack
+          case "$RUNNER_OS" in
+            macOS) PACK_LIB=libmt_syntax_pack.dylib ;;
+            *) PACK_LIB=libmt_syntax_pack.so ;;
+          esac
+          test -f "target/release/$PACK_LIB" || { echo "::error::缺少构建产物: target/release/$PACK_LIB"; exit 1; }
+          cp "target/release/$PACK_LIB" staging/desktop/syntax-pack/
 
       - name: Upload desktop build artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -408,7 +500,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # 打包上传阶段:汇合桌面编译产物与全部 4 平台远端 Git helper,校验后按平台组装并上传到 release。
+  # 打包上传阶段:汇合桌面编译产物与全部 4 平台远端 Git helper,校验 helper、生成本平台的扩展清单
+  # 与离线扩展包,按平台组装并上传到 release(helper 本身不进安装包,见文件头)。
   # 无需 Rust 工具链、rust-cache 或 Linux 编译期 apt 依赖,失败时 Re-run failed jobs 也不重编桌面。
   package-release:
     needs: [create-release, plan, remote-git-helpers, build-desktop]
@@ -468,18 +561,81 @@ jobs:
             test -x "target/release/$name" || { echo "::error::解包后缺少可执行产物: target/release/$name"; exit 1; }
           done
 
+      # 原始 helper 只用来校验,放 staging/ 而不是 target/release/:后者是包的布局,helper 不再进包
       - name: Download remote Git helper assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: remote-git-helper-*
-          path: target/release/remote-git-helpers
+          path: staging/remote-git-helpers
           merge-multiple: true
 
       # Required for every desktop matrix row, including Windows. The validator
       # reads binary headers itself (no host file/readelf dependency), rejects
       # dynamic Linux helpers and fails if any of the four assets is missing.
+      # 校验不放松:helper 改成按需扩展后照跑,只是不再拷进包。
       - name: Require all remote Git helper resources before packaging
-        run: node scripts/stage-git-helpers.mjs --verify-all --output target/release/remote-git-helpers
+        run: node scripts/stage-git-helpers.mjs --verify-all --output staging/remote-git-helpers
+
+      # remote-git-helpers 作业打好的四个 helper 扩展 zip + 描述片段(各行下载同一份,哈希一致)
+      - name: Download helper extensions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: helper-extension-*
+          path: staging/extensions
+          merge-multiple: true
+
+      # 按需扩展阶段 B:本平台的 mt-ssh-cli + mt-ssh-mcp(build-desktop 编出、上面恢复进
+      # target/release/)打成 `ssh-tools` 扩展 zip + 片段,放进 staging/extensions,由下一步收进清单
+      # 与离线包。平台相关、内容寻址 —— 四个矩阵行的资产名各不相同,所以由**本行自己**上传(见最后
+      # 一步),不像 helper 那样集中传。两个二进制不再进安装包(miniterm-hook 照旧随包);deb 的
+      # Depends 仍把它们算进去(build-desktop 的 dpkg-shlibdeps 那一步):下载后要在本机跑,
+      # 依赖照样要。Windows 上同样走 Git Bash
+      - name: Pack SSH tools extension
+        shell: bash
+        run: |
+          EXE=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
+          node scripts/pack-extensions.mjs pack --id ssh-tools \
+            --exe "target/release/mt-ssh-cli$EXE" --exe "target/release/mt-ssh-mcp$EXE" \
+            --out-dir staging/extensions
+          ls -la staging/extensions
+
+      # 本平台的语法包 → syntax-pack 扩展 zip + 片段(平台相关,每行自己打)。build-desktop 把库放在
+      # staging/desktop/syntax-pack/;Windows 的还原步骤把整个 staging/desktop 挪成了 target/release,
+      # 所以两处都找。Windows 上同样走 Git Bash
+      - name: Pack syntax-pack extension
+        shell: bash
+        run: |
+          PACK_LIB=""
+          for dir in staging/desktop/syntax-pack target/release/syntax-pack; do
+            for name in mt_syntax_pack.dll libmt_syntax_pack.dylib libmt_syntax_pack.so; do
+              if [ -f "$dir/$name" ]; then PACK_LIB="$dir/$name"; fi
+            done
+          done
+          test -n "$PACK_LIB" || { echo "::error::找不到语法包构建产物(syntax-pack/)"; exit 1; }
+          mkdir -p staging/extensions
+          node scripts/pack-extensions.mjs pack --id syntax-pack --file "$PACK_LIB" --out-dir staging/extensions
+
+      # 本平台的扩展清单 extensions.json(写进 target/release/,下面各平台的组装步骤把它与 exe
+      # 放在同一目录)+ 离线扩展包。`manifest --assets` 逐个核对片段引用的 zip 在场、字节数与
+      # sha256 对得上;`bundle` 再核一遍。平台相关的 ssh-tools(上一步)/ 阶段 C 的 syntax-pack
+      # 由本作业各行自己 `pack` 进 staging/extensions 再进清单。Windows 上同样走 Git Bash
+      - name: Generate extension manifest and offline bundle
+        shell: bash
+        env:
+          EXT_PLATFORM: ${{ matrix.extPlatform }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          BUNDLE="Mini-Term_${VERSION}_${EXT_PLATFORM}-extensions.zip"
+          mkdir -p dist
+          node scripts/pack-extensions.mjs manifest --platform "$EXT_PLATFORM" \
+            --app-version "$VERSION" --tag "$RELEASE_TAG" --offline-bundle "$BUNDLE" \
+            --fragments staging/extensions --assets staging/extensions \
+            --out target/release/extensions.json
+          node scripts/pack-extensions.mjs bundle --manifest target/release/extensions.json \
+            --assets staging/extensions --out "dist/$BUNDLE"
+          cat target/release/extensions.json
+          ls -la dist
 
       - name: Build NSIS installer (Windows)
         if: matrix.platform == 'windows-latest'
@@ -571,10 +727,12 @@ jobs:
           VERSION="${TAG#v}"
           APP="dist/Mini-Term.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          # mt-ssh-cli / mt-ssh-mcp 不再随包(按需扩展 ssh-tools,见「Pack SSH tools extension」)
+          for name in mini-term miniterm-hook; do
             cp "target/release/$name" "$APP/Contents/MacOS/"
           done
-          cp -R target/release/remote-git-helpers "$APP/Contents/MacOS/"
+          # 扩展清单与 exe 同目录(Contents/MacOS/);远端 Git helper / SSH 工具不再随包(按需下载)
+          cp target/release/extensions.json "$APP/Contents/MacOS/"
           mkdir -p icon.iconset
           for size in 16 32 128 256 512; do
             sips -z "$size" "$size" docs/icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
@@ -634,10 +792,14 @@ jobs:
           DEB_VERSION="${VERSION//-/\~}"
           STAGE="dist/mini-term"
           mkdir -p "$STAGE"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          # mt-ssh-cli / mt-ssh-mcp 不再随包(按需扩展 ssh-tools,见「Pack SSH tools extension」)
+          for name in mini-term miniterm-hook; do
             cp "target/release/$name" "$STAGE/"
           done
-          cp -R target/release/remote-git-helpers "$STAGE/"
+          # 扩展清单与 exe 同目录;远端 Git helper / SSH 工具不再随包(按需下载)。解压覆盖旧版目录
+          # 时旧版留下的 remote-git-helpers/、mt-ssh-cli、mt-ssh-mcp 不碍事:有效清单在场时 exe 旁
+          # 旧布局一律不认(mt-extensions 的 locate),只是占点磁盘,用户可以自己删
+          cp target/release/extensions.json "$STAGE/"
           # ⚠️ 打包目录仍叫 `mini-term`(解压出来就是可执行文件名),只有**资产名**
           # 用 `Mini-Term_…` —— Linux 大小写敏感,上传的 glob 抓不到这个暂存目录
           tar -C dist -czf "dist/Mini-Term_${VERSION}_amd64.tar.gz" mini-term
@@ -646,10 +808,13 @@ jobs:
           PKG="dist/deb/mini-term_${DEB_VERSION}_amd64"
           mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/lib/mini-term" \
             "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/512x512/apps"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          # mt-ssh-cli / mt-ssh-mcp 不再随包(按需扩展 ssh-tools);Depends 照样算它们的依赖
+          for name in mini-term miniterm-hook; do
             cp "target/release/$name" "$PKG/usr/lib/mini-term/"
           done
-          cp -R target/release/remote-git-helpers "$PKG/usr/lib/mini-term/"
+          # 扩展清单与 exe 同目录(/usr/lib/mini-term/);远端 Git helper / SSH 工具不再随包(按需
+          # 下载)。dpkg 升级时会删掉旧版包里有、新版没有的 remote-git-helpers/ 与两个 SSH sidecar
+          cp target/release/extensions.json "$PKG/usr/lib/mini-term/"
           # ── 运行时依赖(Depends)──
           # 由 build-desktop 在构建期同一共享库上下文里经 dpkg-shlibdeps + t64 兼容补齐后产出,
           # 这里原样读取写入 DEBIAN/control。
@@ -690,8 +855,10 @@ jobs:
       # 用 gh 直传(找得到 draft),只上传文件、不碰 notes / draft / prerelease。
       # release 不存在时 gh 直接报错,不会像 action-gh-release 那样顺手新建一个。
       # --clobber:手动补建选了已有产物的平台时覆盖同名文件(与之前的覆盖语义一致)。
-      # 每个平台只产出下面五类里的一两类(Windows 是安装包 + 调试符号 zip),
-      # nullglob 让没匹配到的模式直接消失
+      # 每个平台只产出下面几类里的几类(Windows 是安装包 + 调试符号 zip + 离线扩展包 + 本平台的
+      # ssh-tools 扩展 zip;离线扩展包与 ssh-tools 扩展每个平台各一个),nullglob 让没匹配到的模式
+      # 直接消失。helper 扩展 zip 不在这里传(只由 upload-helper-extensions 传一次);ssh-tools 是
+      # 平台相关、内容寻址的,四行的资产名不会撞,由本行自己传
       - name: Upload bundles to release
         shell: bash
         env:
@@ -699,11 +866,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           shopt -s nullglob
-          files=(dist/Mini-Term_*-setup.exe dist/Mini-Term_*-pdb.zip dist/Mini-Term_*.dmg dist/Mini-Term_*.tar.gz dist/Mini-Term_*.deb)
+          files=(dist/Mini-Term_*-setup.exe dist/Mini-Term_*-pdb.zip dist/Mini-Term_*-extensions.zip dist/Mini-Term_*.dmg dist/Mini-Term_*.tar.gz dist/Mini-Term_*.deb)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "::error::dist/ 下没有可上传的产物"
             exit 1
           fi
+          # 本平台清单引用的 ssh-tools 扩展 zip:必须恰好一个(清单里有、release 上没有,客户端就下不到)
+          tools=(staging/extensions/mt-ext_ssh-tools_*.zip)
+          if [ "${#tools[@]}" -ne 1 ]; then
+            echo "::error::应有 1 个 ssh-tools 扩展 zip,实际 ${#tools[@]}: ${tools[*]}"
+            exit 1
+          fi
+          files+=("${tools[@]}")
+          # 本平台的语法包扩展 zip(平台相关、内容寻址,由本行自己传;按需扩展阶段 C)
+          syntax=(staging/extensions/mt-ext_syntax-pack_*.zip)
+          if [ "${#syntax[@]}" -ne 1 ]; then
+            echo "::error::staging/extensions 下语法包扩展 zip 应恰好 1 个,实际 ${#syntax[@]}"
+            exit 1
+          fi
+          files+=("${syntax[@]}")
           printf 'upload: %s\n' "${files[@]}"
           gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
 
@@ -713,12 +894,14 @@ jobs:
   # 不改 draft / prerelease —— 已发布的版本不能被改回 draft,还在 draft 的也不由补建来转正。
   # 校验:下载全部资产后 `sha256sum -c SHA256SUMS.txt`(或 --ignore-missing 只验下载的那个)
   publish:
-    needs: [create-release, remote-git-helpers, build-desktop, package-release]
+    needs: [create-release, remote-git-helpers, upload-helper-extensions, build-desktop, package-release]
     # 与 package-release 同一手法:显式 !cancelled() 才能把 skipped 的 create-release 放行;
-    # 矩阵作业的 result 只有全部成功才是 success,必须等 helper / 编译 / 打包全绿才转正
+    # 矩阵作业的 result 只有全部成功才是 success,必须等 helper / helper 扩展上传 / 编译 / 打包
+    # 全绿才转正 —— 清单引用的 helper 扩展资产没传上去,装好的客户端就下载不到
     if: >-
       !cancelled() &&
       needs.remote-git-helpers.result == 'success' &&
+      needs.upload-helper-extensions.result == 'success' &&
       needs.build-desktop.result == 'success' &&
       needs.package-release.result == 'success' &&
       (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')

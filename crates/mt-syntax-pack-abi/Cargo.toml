@@ -1,0 +1,13 @@
+[package]
+name = "mt-syntax-pack-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "mini-term 语法高亮扩展包(mt-syntax-pack cdylib)与宿主之间的 C ABI:表结构、版本、导出符号名、语言清单"
+
+# ⚠️ **零依赖**,保持这样:宿主(mt-app)与语法包(cdylib)两头都依赖本 crate,
+# 它多一个依赖就是两头各多一份;语言函数的类型 `RawLanguageFn` 与
+# `tree_sitter_language::LanguageFn::into_raw` 的返回类型逐字一致,所以连
+# tree-sitter-language 都不需要。
+[dependencies]

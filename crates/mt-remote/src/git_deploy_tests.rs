@@ -49,45 +49,72 @@ fn platform_probe_selects_only_supported_exact_targets() {
     }
 }
 
+/// exe 在 `fixture.0` 下(旧布局 `remote-git-helpers/` 与它同级),扩展根目录在 `extensions/`。
+fn extensions(fixture: &Assets, manifest: mt_extensions::ManifestState) -> Extensions {
+    Extensions::new(
+        Some(fixture.0.clone()),
+        Some(fixture.0.join("extensions")),
+        manifest,
+    )
+}
+
+fn no_manifest(fixture: &Assets) -> Extensions {
+    extensions(fixture, mt_extensions::ManifestState::Missing)
+}
+
+fn selected(path: PathBuf) -> SelectedAsset {
+    SelectedAsset {
+        path,
+        expected_sha256: None,
+    }
+}
+
 #[test]
 fn bundled_assets_take_precedence_over_explicit_development_root() {
     let fixture = Assets::new();
     let bundled = fixture.asset("remote-git-helpers", "linux-x86_64", b"bundled");
     fixture.asset("development", "linux-x86_64", b"development");
-    let executable = fixture.0.join("mini-term");
-    let selected = select_asset(
-        &executable,
+    let selection = select_asset(
+        &no_manifest(&fixture),
         Some(&fixture.0.join("development")),
         "linux-x86_64",
     )
     .unwrap();
-    assert_eq!(selected, bundled);
+    assert_eq!(selection, selected(bundled));
 }
 
 #[test]
 fn explicit_resource_root_is_used_only_if_bundle_is_absent() {
     let fixture = Assets::new();
     let development = fixture.asset("development", "linux-aarch64", b"configured");
-    let executable = fixture.0.join("mini-term");
     assert_eq!(
         select_asset(
-            &executable,
+            &no_manifest(&fixture),
             Some(&fixture.0.join("development")),
             "linux-aarch64"
         )
         .unwrap(),
-        development
+        selected(development)
     );
-    let error = select_asset(&executable, None, "linux-aarch64").unwrap_err();
-    assert!(error.contains("linux-aarch64"));
-    assert!(error.contains("unavailable"));
+    // 三层都没有:类型化的「缺 helper」,带服务器平台键 —— 不是一句要匹配的人话
+    assert_eq!(
+        select_asset(&no_manifest(&fixture), None, "linux-aarch64").unwrap_err(),
+        DeployError::HelperMissing {
+            target: "linux-aarch64"
+        }
+    );
 }
 
 #[test]
 fn missing_architecture_never_uses_another_binary() {
     let fixture = Assets::new();
     fixture.asset("remote-git-helpers", "macos-aarch64", b"host-only");
-    assert!(select_asset(&fixture.0.join("mini-term"), None, "linux-x86_64").is_err());
+    assert_eq!(
+        select_asset(&no_manifest(&fixture), None, "linux-x86_64").unwrap_err(),
+        DeployError::HelperMissing {
+            target: "linux-x86_64"
+        }
+    );
 }
 
 #[test]
@@ -95,14 +122,14 @@ fn invalid_bundled_asset_never_silently_uses_development_asset() {
     let fixture = Assets::new();
     fixture.asset("remote-git-helpers", "linux-x86_64", b"");
     fixture.asset("development", "linux-x86_64", b"valid");
-    assert!(
+    assert!(matches!(
         select_asset(
-            &fixture.0.join("mini-term"),
+            &no_manifest(&fixture),
             Some(&fixture.0.join("development")),
             "linux-x86_64"
-        )
-        .is_err()
-    );
+        ),
+        Err(DeployError::Failed(_))
+    ));
 }
 
 #[cfg(unix)]
@@ -115,7 +142,86 @@ fn helper_asset_symlinks_are_rejected() {
         .join("remote-git-helpers/linux-x86_64/mt-git-helper");
     std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real, &bundled).unwrap();
-    assert!(select_asset(&fixture.0.join("mini-term"), None, "linux-x86_64").is_err());
+    assert!(matches!(
+        select_asset(&no_manifest(&fixture), None, "linux-x86_64"),
+        Err(DeployError::Failed(_))
+    ));
+}
+
+/// 按需下载装好的扩展是第三层,带着清单里的期望哈希(部署时核对)。
+#[test]
+fn installed_extension_is_the_last_layer_and_carries_the_manifest_digest() {
+    use sha2::Digest as _;
+    let fixture = Assets::new();
+    let bytes = b"\x7fELF installed helper";
+    let digest: String = Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let zip_sha = "ab".repeat(32);
+    let manifest = mt_extensions::parse_manifest(&format!(
+        r#"{{"schema":1,"appVersion":"1.15.0","tag":"v1.15.0","platform":"linux-x64","components":[
+            {{"id":"git-helper-linux-x86_64","asset":"mt-ext_git-helper-linux-x86_64_{}.zip",
+              "sha256":"{zip_sha}","size":100,
+              "files":[{{"name":"mt-git-helper","sha256":"{digest}","size":{},"executable":true}}]}}]}}"#,
+        &zip_sha[..12],
+        bytes.len()
+    ))
+    .unwrap();
+    let installed = fixture.asset(
+        &format!("extensions/git-helper-linux-x86_64/{}", &zip_sha[..16]),
+        "",
+        bytes,
+    );
+    let extensions = extensions(&fixture, mt_extensions::ManifestState::Loaded(manifest));
+    assert_eq!(
+        select_asset(&extensions, None, "linux-x86_64").unwrap(),
+        SelectedAsset {
+            path: installed.clone(),
+            expected_sha256: Some(digest.clone()),
+        }
+    );
+    // 有效清单在场(正式安装包)时 exe 旁旧布局一律不认:tar.gz 覆盖解压留下的旧 helper 压不住
+    // 下载的那份(mt-extensions 的 locate 口径,HANDOFF 1.2 修订)
+    let bundled = fixture.asset("remote-git-helpers", "linux-x86_64", b"bundled");
+    assert_eq!(
+        select_asset(&extensions, None, "linux-x86_64").unwrap(),
+        SelectedAsset {
+            path: installed,
+            expected_sha256: Some(digest),
+        }
+    );
+    // 没有清单(dev / 源码构建)时同一份旧布局照用
+    assert_eq!(
+        select_asset(&no_manifest(&fixture), None, "linux-x86_64").unwrap(),
+        selected(bundled)
+    );
+}
+
+#[test]
+fn missing_helper_failures_round_trip_without_parsing_prose() {
+    let failure = missing_helper_failure("macos-aarch64", "download failed: timeout");
+    assert_eq!(
+        missing_helper(&failure),
+        Some(MissingHelper {
+            target: "macos-aarch64",
+            detail: "download failed: timeout",
+        })
+    );
+    // 没有原因(没注入下载器)也认
+    let bare = missing_helper_failure("linux-x86_64", "");
+    assert_eq!(
+        missing_helper(&bare).map(|m| m.target),
+        Some("linux-x86_64")
+    );
+    // 别的 code、不认识的平台、别的失败类型一律不是
+    for other in [
+        GitFailure::service("remote_git_deployment_failed", "linux-x86_64\nx"),
+        GitFailure::service(REMOTE_GIT_HELPER_MISSING, "windows-x64\nx"),
+        GitFailure::from("remote_git_helper_missing"),
+    ] {
+        assert_eq!(missing_helper(&other), None, "{other}");
+    }
 }
 
 #[test]
@@ -163,5 +269,5 @@ fn revoked_permission_stops_deployment_before_runtime_assets_or_network() {
         extra: Default::default(),
     };
     let error = ensure_helper(&connection, &|| Err("remote_git_disabled".into())).unwrap_err();
-    assert_eq!(error, "remote_git_disabled");
+    assert_eq!(error, DeployError::Failed("remote_git_disabled".into()));
 }

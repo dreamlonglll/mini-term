@@ -32,6 +32,10 @@ uuid.workspace = true
 # 红线「mt-core 不带 rusqlite」不受影响 —— 三个 sidecar 不依赖本 crate。
 rusqlite.workspace = true
 tracing.workspace = true
+# `ssh_registry` 找 mt-ssh-cli:不再随安装包平铺 exe 旁,改成按需扩展 `ssh-tools`(阶段 B),
+# 经 `mt_extensions::global().locate` 找。mt-extensions 不联网、依赖表只有 serde / serde_json /
+# sha2 / zip / dirs(工作区现有),净新增 crate = 0。
+mt-extensions.workspace = true
 
 # 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层
 # (mt-pty / mt-secret / mt-project / mt-app),这里只调它们的安全接口。

@@ -1,0 +1,44 @@
+[package]
+name = "mt-syntax-pack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "mini-term 语法高亮扩展包:大语法的 tree-sitter 解析器 + 高亮查询,编成动态库按需下载"
+
+# cdylib 是发布形态(扩展 `syntax-pack` 里的那个文件);rlib 只给测试用:mt-app 的单测
+# (dev-dependency)直接链接本 crate、走与动态库同一张表(`table()`)注册,端到端验
+# C# / Kotlin / CMake 的上色,不必在测试里 LoadLibrary。主程序的正常依赖里**没有**本 crate
+# (那样就白挪了),由 `tests/layers.test.cjs` 的生产依赖闭包禁区守着。
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# 版本全部与 Cargo.lock 里 gpui-component / 原 mt-app 用的那份一致(同一份源码,不新增 crate)。
+# 语法 crate 只依赖 tree-sitter-language(纯 Rust 小 crate),不依赖 tree-sitter 运行时 ——
+# 运行时只在宿主里有一份,见 mt-syntax-pack-abi 的模块注释。
+# **禁止**引依赖老版 `tree-sitter = "0.2x"` 的语法 crate(原因见 mt-app `syntax_languages.rs`)。
+[dependencies]
+mt-syntax-pack-abi = { path = "../mt-syntax-pack-abi" }
+tree-sitter-language = "0.1"
+# ---- 来自 gpui-component 0.10.0 的七种 ----
+tree-sitter-cpp = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-php = "0.24"
+tree-sitter-ruby = "0.23"
+tree-sitter-scala = "0.23"
+tree-sitter-sequel = "0.3"
+tree-sitter-zig = "1.1"
+# ---- 来自 mt-app syntax_languages.rs 的九种 ----
+tree-sitter-c-sharp = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-cmake = "0.7"
+tree-sitter-proto = "0.2"
+tree-sitter-graphql = "0.1"
+tree-sitter-kotlin-sg = "0.4"
+tree-sitter-powershell = "0.26"
+tree-sitter-dart = "0.2"
+tree-sitter-groovy = "0.1"
+
+[dev-dependencies]
+# 单测亲手 `Query::new` 把每份查询编一遍。只进测试,不进动态库(运行时在宿主)。
+tree-sitter = "0.26"

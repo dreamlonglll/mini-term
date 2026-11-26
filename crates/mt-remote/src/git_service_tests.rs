@@ -1528,3 +1528,121 @@ fn unknown_metadata_retains_operation_kind_not_commit_message_payload() {
         .abandon_recovery(workspace.prepare_offline_abandon().unwrap())
         .unwrap();
 }
+
+// ─── 缺 helper:部署 deadline 之外补齐,再重试一次 ─────────────────────────
+
+/// 部署结果按队列依次吐出;记下部署与补齐各被调了几次。
+struct ScriptedDeploy {
+    results: Mutex<VecDeque<Result<String, deploy::DeployError>>>,
+    deploys: AtomicU64,
+}
+
+impl ScriptedDeploy {
+    fn new(results: Vec<Result<String, deploy::DeployError>>) -> Self {
+        Self {
+            results: Mutex::new(results.into()),
+            deploys: AtomicU64::new(0),
+        }
+    }
+    fn next(&self) -> Result<String, deploy::DeployError> {
+        self.deploys.fetch_add(1, Ordering::SeqCst);
+        lock(&self.results)
+            .pop_front()
+            .expect("deployment called more often than scripted")
+    }
+}
+
+fn missing(target: &'static str) -> Result<String, deploy::DeployError> {
+    Err(deploy::DeployError::HelperMissing { target })
+}
+
+#[test]
+fn missing_helper_is_provisioned_then_deployment_retried_once() {
+    let script = ScriptedDeploy::new(vec![missing("linux-x86_64"), Ok("/helper".into())]);
+    let provisioned = Mutex::new(Vec::new());
+    let helper = deploy_with_provisioning(
+        || script.next(),
+        |target| {
+            lock(&provisioned).push(target);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(helper, "/helper");
+    assert_eq!(*lock(&provisioned), ["linux-x86_64"]);
+    assert_eq!(script.deploys.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn failed_provisioning_reports_the_typed_missing_helper() {
+    let script = ScriptedDeploy::new(vec![missing("macos-aarch64")]);
+    let error = deploy_with_provisioning(
+        || script.next(),
+        |_| Err("download timed out".into()),
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_helper(&error),
+        Some(MissingHelper {
+            target: "macos-aarch64",
+            detail: "download timed out",
+        })
+    );
+    assert_eq!(script.deploys.load(Ordering::SeqCst), 1, "补不齐就不再部署");
+}
+
+#[test]
+fn retry_happens_only_once_and_never_loops_provisioning() {
+    let script = ScriptedDeploy::new(vec![missing("linux-aarch64"), missing("linux-aarch64")]);
+    let provisions = AtomicU64::new(0);
+    let error = deploy_with_provisioning(
+        || script.next(),
+        |_| {
+            provisions.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_helper(&error).map(|m| m.target),
+        Some("linux-aarch64")
+    );
+    assert_eq!(provisions.load(Ordering::SeqCst), 1);
+    assert_eq!(script.deploys.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn other_deployment_failures_are_not_provisioned() {
+    let script = ScriptedDeploy::new(vec![Err(deploy::DeployError::Failed("exit 73".into()))]);
+    let error = deploy_with_provisioning(
+        || script.next(),
+        |_| panic!("only a missing local helper is provisioned"),
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, GitFailure::Service { code, message }
+            if code == "remote_git_deployment_failed" && message == "exit 73"),
+        "{error}"
+    );
+    assert_eq!(missing_helper(&error), None);
+}
+
+#[test]
+fn revocation_during_provisioning_stops_the_retry() {
+    let script = ScriptedDeploy::new(vec![missing("linux-x86_64")]);
+    let error = deploy_with_provisioning(
+        || script.next(),
+        |_| Ok(()),
+        || Err(service_error("remote_git_disabled")),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().starts_with("remote_git_disabled"),
+        "{error}"
+    );
+    assert_eq!(script.deploys.load(Ordering::SeqCst), 1);
+}

@@ -205,6 +205,11 @@ pub struct AppConfig {
     /// `None` = 没忽略过任何版本(不写进库)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_update_version: Option<String>,
+    /// 按需扩展的下载地址模板(设置 →「扩展」),含 `{tag}` 与 `{asset}` 两个占位符,如 GitHub
+    /// 代理或内网镜像。`None` = 默认的 GitHub release 地址(`mt-app::extensions` 里那一份,
+    /// 不写进库);下载回来的东西一律按随包清单校验,镜像不可信也无妨。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions_download_url: Option<String>,
     /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
     /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
     /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
@@ -984,6 +989,7 @@ impl Default for AppConfig {
             hook_enabled: false,
             hook_hint_shown: false,
             ignored_update_version: None,
+            extensions_download_url: None,
             smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
@@ -2117,6 +2123,35 @@ mod tests {
         assert_eq!(json["ignoredUpdateVersion"], serde_json::json!("v1.13.33"));
         let back: AppConfig = serde_json::from_value(json).unwrap();
         assert_eq!(back.ignored_update_version.as_deref(), Some("v1.13.33"));
+    }
+
+    /// 扩展下载地址模板:老库没这个键按默认地址读,`None` 不写进 JSON;
+    /// 置位后键名是 `extensionsDownloadUrl`,能往返。
+    #[test]
+    fn extensions_download_url_缺省为空且能往返() {
+        assert_eq!(AppConfig::default().extensions_download_url, None);
+        let legacy: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.extensions_download_url, None);
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("extensionsDownloadUrl").is_none(), "None 不写进库");
+
+        let mirror = AppConfig {
+            extensions_download_url: Some("https://mirror.example/{tag}/{asset}".into()),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_value(&mirror).unwrap();
+        assert_eq!(
+            json["extensionsDownloadUrl"],
+            serde_json::json!("https://mirror.example/{tag}/{asset}")
+        );
+        let back: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.extensions_download_url.as_deref(),
+            Some("https://mirror.example/{tag}/{asset}")
+        );
     }
 
     /// 快捷键覆盖表:老库没这个键读出空表(键位与改动前一样),空表不写进 JSON;

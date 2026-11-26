@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use gpui::{App, Context, Task};
 use mt_config::{ProjectConfig, SshConnection};
 
+use crate::i18n::tr;
 use crate::tree::{PaneState, PaneStatus};
 
 use super::events::StoreChanged;
@@ -493,24 +494,65 @@ impl AppStore {
                     silent,
                     was_enabled,
                 } => {
-                    let dir = project_dir.clone();
-                    let token = existing_token.clone();
+                    // 阶段 B:mt-ssh-cli 是按需扩展 ssh-tools。本机没有就先下载(进度推 toast,
+                    // 不阻塞主线程:oneshot 在这个前台任务里 await)。dev 隔离实例不写 SKILL.md,
+                    // 用不着 CLI。下载不成:首次启用整步失败(什么都不存,弹窗留着可重试);
+                    // 更新范围则范围照存、SKILL.md 不动(理由见 `SshAssocOutcome::cli_missing`)。
+                    // 无论哪条路都**绝不**写引用不存在 CLI 的 SKILL.md(注册器自己也再拦一道)
                     let projection = projection_dir.clone();
-                    let res = cx
+                    let needs_cli = cx
                         .background_executor()
                         .spawn(async move {
-                            mt_ai::ssh_registry::enable(&dir, token.as_deref(), &projection)
+                            mt_ai::ssh_registry::projection_reaches_sidecar(&projection)
+                                && !mt_ai::ssh_registry::ssh_cli_available()
                         })
-                        .await?;
+                        .await;
+                    let mut cli_missing = None;
+                    if needs_cli {
+                        let fetched = crate::extensions::ensure(
+                            mt_extensions::ComponentId::SshTools,
+                            crate::extensions::Origin::EnableSshTools,
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(crate::extensions::task_vanished()));
+                        if let Err(error) = fetched {
+                            let reason = crate::extensions::describe(&error);
+                            if !was_enabled {
+                                return Err(tr!("sshAssoc", "cliMissingError", reason = reason));
+                            }
+                            cli_missing = Some(reason);
+                        }
+                    }
+                    let res = if cli_missing.is_some() {
+                        mt_ai::ssh_registry::EnableResult {
+                            message: "SSH 工具扩展没装上:只更新了范围,SKILL.md 未改动".to_string(),
+                            project_token: existing_token
+                                .clone()
+                                .map(|token| token.trim().to_string())
+                                .filter(|token| !token.is_empty())
+                                .unwrap_or_default(),
+                            registry_skipped: false,
+                        }
+                    } else {
+                        let dir = project_dir.clone();
+                        let token = existing_token.clone();
+                        let projection = projection_dir.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                mt_ai::ssh_registry::enable(&dir, token.as_deref(), &projection)
+                            })
+                            .await?
+                    };
                     SshAssocOutcome {
                         enabled: true,
                         was_enabled,
-                        silent: silent && !res.registry_skipped,
+                        silent: silent && !res.registry_skipped && cli_missing.is_none(),
                         scope_len,
                         total_len,
                         group_count: groups.len(),
-                        project_token: Some(res.project_token),
+                        project_token: Some(res.project_token).filter(|token| !token.is_empty()),
                         registry_skipped: res.registry_skipped,
+                        cli_missing,
                         message: res.message,
                     }
                 }
@@ -530,6 +572,7 @@ impl AppStore {
                         group_count: 0,
                         project_token: None,
                         registry_skipped: res.registry_skipped,
+                        cli_missing: None,
                         message: res.message,
                     }
                 }
@@ -558,15 +601,50 @@ impl AppStore {
             .unwrap_or_default()
     }
 
-    /// 启动时校正项目里的 SKILL.md(模板升级 / 令牌漂移 / CLI 换了位置):后台跑一次,
-    /// 结果只进日志,不拦启动。
+    /// 启动时的 SSH 工具自愈 + SKILL.md 校正(main.rs 调一次)。
     ///
-    /// 只看开启了「关联 SSH」且带令牌的**本地**项目 —— 远程 SSH 项目的目录在远端,
-    /// 本机没有它的 SKILL.md。判据与写法全在
-    /// [`mt_ai::ssh_registry::reconcile_skill_files_on_startup`](dev 实例它自己跳过)。
-    pub fn reconcile_ssh_skills_in_background(&self, cx: &App) {
-        let targets: Vec<mt_ai::ssh_registry::SkillReconcileTarget> = self
-            .config
+    /// 有项目启用了 SSH 工具、本机却没有 `mt-ssh-cli`(从随包 sidecar 的旧版本升级上来,或用户
+    /// 在设置里删了 `ssh-tools` 扩展)→ 后台下载 `ssh-tools`(**唯一的非显式下载**,
+    /// [`crate::extensions::Origin::SelfHeal`]:进度只在设置页、失败只记日志 + 设置页标原因,
+    /// 不推 toast)。这时**不**跑校正 —— CLI 不在时不能把 SKILL.md 改指过去;装好后
+    /// `extensions` 的 `Installed` 事件会再调 [`Self::reconcile_ssh_skills_in_background`]。
+    /// CLI 在就直接校正。
+    pub fn heal_ssh_tools_on_startup(&self, cx: &App) {
+        if self.ssh_reconcile_targets().is_empty() {
+            return;
+        }
+        let store = AppStore::global(cx).downgrade();
+        let task = cx.background_executor().spawn(async move {
+            if mt_ai::ssh_registry::ssh_cli_available() {
+                return true;
+            }
+            let id = mt_extensions::ComponentId::SshTools;
+            if crate::extensions::extensions().component(id).is_none() {
+                tracing::warn!(
+                    "[ssh_skill] 有项目启用了 SSH 工具但本机没有 mt-ssh-cli,且本构建的扩展清单里没有 \
+                     ssh-tools(dev / 源码构建请先跑 stage-sidecars.mjs):跳过自愈与启动校正"
+                );
+                return false;
+            }
+            tracing::info!("[ssh_skill] 有项目启用了 SSH 工具但本机没有 mt-ssh-cli:后台下载 ssh-tools");
+            // 结果不在这里等:装好后 Installed 事件触发校正;失败由下载服务记日志、设置页标原因
+            drop(crate::extensions::ensure(
+                id,
+                crate::extensions::Origin::SelfHeal,
+            ));
+            false
+        });
+        cx.spawn(async move |cx| {
+            if task.await {
+                let _ = store.update(cx, |store, cx| store.reconcile_ssh_skills_in_background(cx));
+            }
+        })
+        .detach();
+    }
+
+    /// 启动校正的对象:开启了「关联 SSH」且带令牌的**本地**项目。
+    fn ssh_reconcile_targets(&self) -> Vec<mt_ai::ssh_registry::SkillReconcileTarget> {
+        self.config
             .projects
             .iter()
             .filter(|project| {
@@ -579,7 +657,19 @@ impl AppStore {
                     project_token: token.to_string(),
                 })
             })
-            .collect();
+            .collect()
+    }
+
+    /// 校正项目里的 SKILL.md(模板升级 / 令牌漂移 / CLI 换了位置):后台跑一次,
+    /// 结果只进日志,不拦启动。启动时经 [`Self::heal_ssh_tools_on_startup`] 调;`ssh-tools`
+    /// 扩展装好(下载 / 离线导入)后再调一次。
+    ///
+    /// 只看开启了「关联 SSH」且带令牌的**本地**项目 —— 远程 SSH 项目的目录在远端,
+    /// 本机没有它的 SKILL.md。判据与写法全在
+    /// [`mt_ai::ssh_registry::reconcile_skill_files_on_startup`](dev 实例它自己跳过;本机 CLI
+    /// 不在时它也什么都不改)。
+    pub fn reconcile_ssh_skills_in_background(&self, cx: &App) {
+        let targets = self.ssh_reconcile_targets();
         if targets.is_empty() {
             return;
         }

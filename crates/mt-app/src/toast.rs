@@ -466,6 +466,51 @@ pub fn push_settings_hint(title: String, message: String, page: SettingsPage, cx
     );
 }
 
+/// 推一条可**原地更新**的提示(扩展下载的进度 → 结果):`key` 相同且还没消失的那条直接换
+/// 标题 / 正文 / kind 并重新计时,否则新推一条。`key` 是合成的占位项目 id(不跳项目、不随关
+/// 项目清理),点击打开设置并直达 `page`。悬停暂停照旧。
+pub fn push_keyed(
+    key: &str,
+    kind: ToastKind,
+    title: String,
+    message: String,
+    page: SettingsPage,
+    cx: &mut App,
+) {
+    layer(cx).update(cx, |layer, cx| {
+        let live = layer
+            .queue
+            .items
+            .iter_mut()
+            .find(|item| item.project_id == key);
+        if let Some(item) = live {
+            item.kind = kind;
+            item.project_name = title;
+            item.message = Some(message);
+            let id = item.id;
+            // 悬停中(定时器已丢)的那条别重新计时:移开时 `pause(false)` 会补上
+            if layer.timers.contains_key(&id) {
+                layer.arm(id, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let item = ToastItem {
+            id: 0,
+            project_id: key.to_string(),
+            project_name: title,
+            kind,
+            message: Some(message),
+            action: ToastAction::OpenSettings(page),
+        };
+        let Some(id) = layer.queue.push(item, false) else {
+            return;
+        };
+        layer.arm(id, cx);
+        cx.notify();
+    });
+}
+
 /// 推一条幂等的自定义提示。只压掉仍存活的“同项目 + 同 kind + 同正文”，用于
 /// 可重复触发的后台 reconcile；不同错误正文仍可并存。
 pub fn push_message_deduped(

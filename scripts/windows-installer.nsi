@@ -14,9 +14,16 @@
 ; 按下开始后第一件事是清场:安装目录下有 mini-term 在跑就先问一句,同意后请它正常
 ; 退出、5 秒没退再强杀;别处的实例(dev 构建、其它副本)一概不碰。详见 CloseRunning。
 ;
-; 包内布局 = 运行时布局:mini-term.exe + 三个 sidecar + portable-conpty\ 全部
-; 平铺 $INSTDIR,与便携解压、target\<profile>\ 开发布局同构(「与 exe 同目录」
-; 定位铁律)。用户数据在 AppData 下,卸载不碰。
+; 包内布局 = 运行时布局:mini-term.exe + miniterm-hook.exe + portable-conpty\ + 扩展清单
+; extensions.json 全部平铺 $INSTDIR,与便携解压、target\<profile>\ 开发布局同构(「与 exe
+; 同目录」定位铁律)。用户数据在 AppData 下,卸载不碰。
+;
+; 按需扩展(远程 Git helper、mt-ssh-cli / mt-ssh-mcp):不再随包,运行时按 extensions.json 校验
+; 后下载到 $LOCALAPPDATA\com.mini-term.app\extensions\(Local 不是 Roaming)。安装时先删掉安装
+; 目录里旧版本留下的 remote-git-helpers\ 与两个 SSH sidecar(有效清单在场时 exe 旁旧布局本就
+; 不认,删掉免得留一份过期副本)。真卸载(非 /UPGRADE)时连扩展目录一起删,删之前把它纳入清场
+; (mt-ssh-cli 的 daemon 跑在那里);升级不删、也不去清场扩展目录 —— 旧版本 daemon 留在原来的
+; 内容寻址目录里接着跑,新版本 CLI 靠版本握手换代(只换代更旧的),闲 10 分钟自己退出。
 ;
 ; 真卸载时顺带摘掉 mini-term 写进六家 AI 工具(Claude / Codex / Grok / oh-my-pi / pi /
 ; Antigravity CLI)配置里的 hook 注册(`mini-term.exe --unregister-hooks`),升级时不摘 ——
@@ -61,6 +68,9 @@ Unicode true
 
 !define PRODUCT_NAME "Mini-Term"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
+; 按需扩展的本机目录(见文件头;与 mt-extensions 的 `default_root` 同一口径)。$LOCALAPPDATA
+; 运行时展开(用户级安装 = 当前用户的 Local)。dev 实例用 MT_APP_DATA_DIR 隔离的扩展目录不归它管
+!define EXTENSIONS_DIR "$LOCALAPPDATA\com.mini-term.app\extensions"
 
 ; 已装旧版的现场(.onInit 探到,Section 用):空串 = 没装过,走全新安装。
 Var OldUninstaller
@@ -69,6 +79,8 @@ Var OldVersion
 Var UninstStatus
 ; CloseRunning 的入参:要清场的目录,`|` 分隔(Windows 路径里不会出现 `|`)。
 Var KillDirs
+; 卸载器:这次是不是新安装器发起的升级(带 /UPGRADE)。"1" = 升级,"0" = 真卸载。
+Var IsUpgrade
 
 Name "${PRODUCT_NAME}"
 OutFile "${OUT_FILE}"
@@ -139,6 +151,10 @@ LangString MSG_UNREG_HOOKS_FAIL ${LANG_ENGLISH} "Some hook entries could not be 
 LangString MSG_UNREG_HOOKS_FAIL ${LANG_SIMPCHINESE} "部分 hook 注册未能移除(结果:$1),可手动删掉对应配置文件里含 miniterm-hook 的条目。"
 LangString MSG_UNREG_HOOKS_KEEP ${LANG_ENGLISH} "Upgrading: AI tool hook entries are kept."
 LangString MSG_UNREG_HOOKS_KEEP ${LANG_SIMPCHINESE} "升级安装:保留 AI 工具的 hook 注册。"
+
+; 真卸载时删按需下载的扩展的进度行(见 Section "Uninstall")。
+LangString MSG_REMOVE_EXTENSIONS ${LANG_ENGLISH} "Removing downloaded extensions (${EXTENSIONS_DIR}) ..."
+LangString MSG_REMOVE_EXTENSIONS ${LANG_SIMPCHINESE} "正在删除按需下载的扩展(${EXTENSIONS_DIR})..."
 
 ; ── 关闭安装目录下运行中的实例 ───────────────────────────────────────
 ;
@@ -274,21 +290,24 @@ Section "$(SEC_MAIN_NAME)" SecMain
   Call CloseRunning
   !insertmacro UNINSTALL_OLD
 
+  ; 旧版本(1.14.x 及之前)随包的远端 Git helper:旧卸载器正常会删掉它,卸载失败、用户选了
+  ; 「直接覆盖」时它还在 —— exe 旁的旧布局优先于按需下载的扩展且不校验清单,留着就会把新
+  ; 版本下载的 helper 压住(协议不匹配)。所以无条件再删一次
+  RMDir /r "$INSTDIR\remote-git-helpers"
+  ; 同理,旧版本随包的 SSH 工具 sidecar(阶段 B 起是按需扩展 ssh-tools):旧卸载器正常会删,
+  ; 没删掉时这里补删。在 CloseRunning 之后,装在这里的旧 daemon 已被清场。有效清单在场时
+  ; exe 旁旧布局本来就不认,删它只是不留一份过期副本;项目里旧 SKILL.md 指向这里的路径在新版
+  ; 启动后由启动校正改指到下载的那份
+  Delete "$INSTDIR\mt-ssh-cli.exe"
+  Delete "$INSTDIR\mt-ssh-mcp.exe"
+
   SetOutPath "$INSTDIR"
   File "${SOURCE_DIR}\mini-term.exe"
   File "${SOURCE_DIR}\miniterm-hook.exe"
-  File "${SOURCE_DIR}\mt-ssh-cli.exe"
-  File "${SOURCE_DIR}\mt-ssh-mcp.exe"
-  ; Explicit required files: a partial helper directory must never compile into
-  ; a publishable installer. release.yml validates all four binary formats too.
-  SetOutPath "$INSTDIR\remote-git-helpers\linux-x86_64"
-  File "${SOURCE_DIR}\remote-git-helpers\linux-x86_64\mt-git-helper"
-  SetOutPath "$INSTDIR\remote-git-helpers\linux-aarch64"
-  File "${SOURCE_DIR}\remote-git-helpers\linux-aarch64\mt-git-helper"
-  SetOutPath "$INSTDIR\remote-git-helpers\macos-aarch64"
-  File "${SOURCE_DIR}\remote-git-helpers\macos-aarch64\mt-git-helper"
-  SetOutPath "$INSTDIR\remote-git-helpers\macos-x86_64"
-  File "${SOURCE_DIR}\remote-git-helpers\macos-x86_64\mt-git-helper"
+  ; 按需扩展的清单(release.yml 的 package-release 生成):与 exe 同一信任等级,运行时下载 /
+  ; 离线导入的扩展一律按它校验。远端 Git helper 与 mt-ssh-cli / mt-ssh-mcp 不再随包(按需
+  ; 下载,见文件头)
+  File "${SOURCE_DIR}\extensions.json"
   SetOutPath "$INSTDIR\portable-conpty"
   File /r "${SOURCE_DIR}\portable-conpty\*"
   SetOutPath "$INSTDIR"
@@ -363,8 +382,24 @@ Function .onInit
 FunctionEnd
 
 Section "Uninstall"
-  ; 升级时由新安装器以 /S /UPGRADE 调起:那边已经清过场,这里多半什么都探不到
+  ; 先认出这次是不是升级(新安装器调旧卸载器时带 /UPGRADE,理由见 UNINSTALL_OLD):升级不摘
+  ; hook、不删扩展目录
+  ${un.GetParameters} $0
+  ClearErrors
+  ${un.GetOptions} $0 "/UPGRADE" $1
+  ${If} ${Errors}
+    StrCpy $IsUpgrade "0"
+  ${Else}
+    StrCpy $IsUpgrade "1"
+  ${EndIf}
+
+  ; 升级时由新安装器以 /S /UPGRADE 调起:那边已经清过场,这里多半什么都探不到。
+  ; 真卸载还要删扩展目录,先把那里运行中的 sidecar 一并清掉(阶段 B 起 mt-ssh-cli 的 daemon
+  ; 跑在扩展目录里;升级不删扩展目录,也就不去动它们)
   StrCpy $KillDirs "$INSTDIR"
+  ${If} $IsUpgrade == "0"
+    StrCpy $KillDirs "$INSTDIR|${EXTENSIONS_DIR}"
+  ${EndIf}
   Call un.CloseRunning
 
   ; 摘掉 mini-term 写进 AI 工具配置的 hook 注册。必须排在删 exe 之前(靠主程序自己
@@ -375,10 +410,7 @@ Section "Uninstall"
   ;   都去跑一个不存在的 exe;安装器发起的静默调用一律带 /UPGRADE,不会走到这里。
   ; - nsExec 起的子进程 stdout 接到详情列表(每家一行 ASCII);30 秒超时强杀兜底,
   ;   摘失败只提示、不中断卸载。
-  ${un.GetParameters} $0
-  ClearErrors
-  ${un.GetOptions} $0 "/UPGRADE" $1
-  ${If} ${Errors}
+  ${If} $IsUpgrade == "0"
     ${If} ${FileExists} "$INSTDIR\mini-term.exe"
       DetailPrint "$(MSG_UNREG_HOOKS)"
       nsExec::ExecToLog /TIMEOUT=30000 '"$INSTDIR\mini-term.exe" --unregister-hooks'
@@ -393,9 +425,12 @@ Section "Uninstall"
 
   Delete "$INSTDIR\mini-term.exe"
   Delete "$INSTDIR\miniterm-hook.exe"
+  ; 1.14.x 及之前随包的 SSH 工具 sidecar(本版本是按需扩展,在扩展目录里;旧目录没卸干净时还在)
   Delete "$INSTDIR\mt-ssh-cli.exe"
   Delete "$INSTDIR\mt-ssh-mcp.exe"
+  Delete "$INSTDIR\extensions.json"
   RMDir /r "$INSTDIR\portable-conpty"
+  ; 1.14.x 及之前随包的远端 Git helper(本版本不再带;旧目录没卸干净时还在)
   RMDir /r "$INSTDIR\remote-git-helpers"
   Delete "$INSTDIR\uninstall.exe"
   ; 只删空目录:用户自选目录里若有别的东西,不动。
@@ -404,4 +439,11 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"
   DeleteRegKey HKCU "${UNINST_KEY}"
+
+  ; 按需下载的扩展:真卸载才删。升级保留 —— 目录内容寻址,新版本启动后自己 GC 掉不属于它
+  ; 清单的那几份。配置与数据在 Roaming 下,照旧不碰
+  ${If} $IsUpgrade == "0"
+    DetailPrint "$(MSG_REMOVE_EXTENSIONS)"
+    RMDir /r "${EXTENSIONS_DIR}"
+  ${EndIf}
 SectionEnd

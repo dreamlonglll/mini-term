@@ -849,6 +849,8 @@ impl FileViewer {
                 }
             });
             self._editor_sub = Some(sub);
+            // 语法包语言而语法包还没到位:到位后重新套一次语言(见 `syntax_pack`)
+            crate::syntax_pack::watch_editor(lang, &editor);
             self.editor = Some(editor);
             // 本地文档去取 HEAD 版本(标记 / 注解的基准)
             self.git_on_editor_installed(cx);
@@ -943,6 +945,9 @@ impl FileViewer {
                         state.set_soft_wrap(new_wrap, window, cx);
                     }
                 });
+                if old_lang != new_lang {
+                    crate::syntax_pack::watch_editor(new_lang, &editor);
+                }
             }
         }
         // 建在旧路径上的 WebView 作废,下一帧按新路径重建;Linux 没有 WebView 预览,
@@ -1798,7 +1803,66 @@ impl FileViewer {
             )
     }
 
-    /// 顶部状态条：保存错误、本地/远程外部修改和连接身份失效。
+    /// 「<语言> 的语法高亮需要下载语法高亮扩展包(约 X MB)[下载] [关闭]」。只在源码编辑器
+    /// 在场、语言属于语法包、本机确实没有语法包、清单里有它(能下载)、本次会话没关过时出。
+    fn render_syntax_pack_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.editor.as_ref()?;
+        if crate::syntax_pack::banner_dismissed() {
+            return None;
+        }
+        let language = crate::syntax_pack::missing_language(language_for(&self.file_name()))?;
+        let size = crate::syntax_pack::download_size()?;
+        let action = if crate::syntax_pack::download_requested() {
+            div()
+                .child(t("fileViewer", "syntaxPackDownloading"))
+                .into_any_element()
+        } else {
+            div()
+                .id("file-viewer-syntax-pack-download")
+                .cursor_pointer()
+                .hover(|el| el.text_color(ui::text_primary()))
+                .child(t("fileViewer", "syntaxPackDownload"))
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    crate::syntax_pack::request_download(cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(16.0))
+                .py(px(6.0))
+                .border_b_1()
+                .border_color(ui::border_subtle())
+                .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::color_warning())
+                .child(div().flex_1().min_w_0().truncate().child(tr!(
+                    "fileViewer",
+                    "syntaxPackHint",
+                    lang = language.display_name,
+                    size = size
+                )))
+                .child(action)
+                .child(
+                    div()
+                        .id("file-viewer-syntax-pack-dismiss")
+                        .cursor_pointer()
+                        .hover(|el| el.text_color(ui::text_primary()))
+                        .child(t("fileViewer", "syntaxPackDismiss"))
+                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                            crate::syntax_pack::dismiss_banner();
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 顶部状态条：Git 注解提示、语法包下载提示、保存错误、本地/远程外部修改和连接身份失效。
     fn render_banners(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -1806,6 +1870,8 @@ impl FileViewer {
             .flex_none()
             // Git 注解没能显示(过大 / 失败)
             .children(self.render_annotate_notice(cx))
+            // 语法包语言而语法包没装:提示下载(按需扩展阶段 C)
+            .children(self.render_syntax_pack_banner(cx))
             .when(self.doc.remote_source_invalid(), |el| {
                 el.child(
                     div()

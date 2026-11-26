@@ -1,0 +1,24 @@
+[package]
+name = "mt-extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "mini-term 按需扩展的本机侧:清单解析、存放目录、查找、安装校验、删除、GC 与离线导入"
+
+# ⚠️ 依赖表保持这一级(tests/layers.test.cjs 守着):**不联网**(下载那一跳由 mt-app 注入,
+# 口径同 mt-usage 的 models_dev),不依赖 gpui / mt-config —— mt-remote 与 mt-app 都依赖本
+# crate,阶段 B 还要进 mt-ai,这里一重就连带一片重编。
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# 扩展 zip 与其中每个文件的 sha256 + 字节数校验。
+sha2.workspace = true
+# 扩展根目录:Windows 落 %LOCALAPPDATA%(Local,不是 Roaming —— 几十 MB 二进制不该进漫游配置)。
+dirs.workspace = true
+# 只读扩展 zip(deflate)。版本与 mt-theme-packs 同一份,依赖树里不多一个 zip。
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+# 本 crate 没有 unsafe,也不该有:要碰系统调用就放进已经带 unsafe 的封装层。
+[lints.rust]
+unsafe_code = "forbid"

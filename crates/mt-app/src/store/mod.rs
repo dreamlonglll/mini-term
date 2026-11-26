@@ -342,6 +342,10 @@ pub struct SshAssocOutcome {
     /// 关联只存进本实例配置(见 `mt_ai::ssh_registry::projection_reaches_sidecar`)。
     /// 为 true 时提示框补一句说明,且不走静默。
     pub registry_skipped: bool,
+    /// 更新范围(之前已启用)时本机没有 mt-ssh-cli、`ssh-tools` 扩展又没下载成:范围照存
+    /// (安全边界永远以用户最新的选择为准),SKILL.md 一个没动;这里是本地化的失败原因,
+    /// 提示框据此补一句、且不走静默。首次启用遇到同样的情况是整步失败(`Err`),不会到这里。
+    pub cli_missing: Option<String>,
     /// 注册器返回的中文提示(与装机版一字不差,不走 mt-i18n)。
     /// ⚠️ **当前没有读者**,与原版一致:`EnableSshToolsResult` 也带 `message`,
     /// 而 `SshAssocModal.tsx` 只取 `projectToken` —— 提示文案是弹窗自己按
