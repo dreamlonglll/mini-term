@@ -697,10 +697,7 @@ impl SshActivityView {
     ) -> impl IntoElement {
         let (width, max_h) = self.popover_limits();
         let height = self.box_height(max_h, window);
-        let idle_bg = {
-            let base = ui::bg_terminal();
-            ui::with_alpha(base, base.a * IDLE_BG_ALPHA)
-        };
+        let idle_bg = ui::with_alpha(ui::bg_terminal(), IDLE_BG_ALPHA);
         // 量悬浮框顶边(最终矩形的,开合动画里不动):最大高要扣掉它上面的查找条,
         // 不能伸出 pane 底边
         let this = cx.entity();

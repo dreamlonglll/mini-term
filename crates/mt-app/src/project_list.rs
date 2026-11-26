@@ -797,12 +797,28 @@ fn group_guide_x(level: usize) -> f32 {
     GROUP_GUIDE_BASE_X + level as f32 * INDENT_STEP
 }
 
+/// 分组引导竖线颜色：基于 `border_strong` 按比例减淡，保证明暗内置主题与外置主题包下都柔和清晰。
+fn group_guide_color() -> gpui::Hsla {
+    ui::with_alpha(ui::border_strong(), 0.55)
+}
+
+/// 展开态 worktree 簇微容器的底色与边框色（静态渲染与折叠抽屉共用）。
+fn cluster_surface_colors(cluster_has_active: bool) -> (gpui::Hsla, gpui::Hsla) {
+    let bg = ui::with_alpha(ui::border_subtle(), 0.78);
+    let border = if cluster_has_active {
+        ui::with_alpha(ui::accent(), 0.28)
+    } else {
+        ui::border_default()
+    };
+    (bg, border)
+}
+
 /// 在行外层 `relative()` 左侧绘制 `0..group_depth` 条极细分组引导竖线。
 fn group_guide_lines(group_depth: usize) -> Vec<AnyElement> {
     if group_depth == 0 {
         return Vec::new();
     }
-    let color = ui::with_alpha(ui::border_strong(), 0.55);
+    let color = group_guide_color();
     (0..group_depth)
         .map(|level| {
             div()
@@ -4771,12 +4787,8 @@ impl ProjectList {
                                     window,
                                     cx,
                                 );
-                                let cluster_bg = ui::with_alpha(ui::border_subtle(), 0.78);
-                                let cluster_border = if row.cluster_has_active {
-                                    ui::with_alpha(ui::accent(), 0.28)
-                                } else {
-                                    ui::border_default()
-                                };
+                                let (cluster_bg, cluster_border) =
+                                    cluster_surface_colors(row.cluster_has_active);
                                 let ml = row_left_margin(row.group_depth);
                                 let guides = group_guide_lines(row.group_depth);
                                 // 微容器底部外框包在 HeightReveal 之外：收起 / 展开时圆角底边
@@ -5889,12 +5901,7 @@ impl ProjectList {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cluster_bg = ui::with_alpha(ui::border_subtle(), 0.78);
-        let cluster_border = if row.cluster_has_active {
-            ui::with_alpha(ui::accent(), 0.28)
-        } else {
-            ui::border_default()
-        };
+        let (cluster_bg, cluster_border) = cluster_surface_colors(row.cluster_has_active);
         let is_focused = self
             .row_focus
             .get(row.id.as_str())
@@ -6961,5 +6968,63 @@ mod tests {
         assert_eq!(cluster_rail_x(0), 16.0);
         // 嵌套孙项向右步进一个 CHILD_NEST_STEP
         assert_eq!(cluster_rail_x(1), 16.0 + CHILD_NEST_STEP);
+    }
+
+    /// 回归 #108：worktree 簇微容器底色与分组引导线在内置浅/暗两套主题下都必须
+    /// 跟随主题、按原透明度乘性缩放，不能把 `border_subtle`/`border_strong` 拉成
+    /// 实黑块或刺眼白块。
+    #[test]
+    fn 微容器底色与分组引导线跟随内置明暗主题() {
+        struct ResetPalette;
+        impl Drop for ResetPalette {
+            fn drop(&mut self) {
+                ui::set_palette(ui::Palette::dark());
+            }
+        }
+        let _reset = ResetPalette;
+
+        let blend_over = |fg: gpui::Hsla, bg: gpui::Hsla| {
+            let fg = gpui::Rgba::from(fg);
+            let bg = gpui::Rgba::from(bg);
+            let a = fg.a;
+            let mix = |f: f32, b: f32| f * a + b * (1.0 - a);
+            let r = mix(fg.r, bg.r);
+            let g = mix(fg.g, bg.g);
+            let b = mix(fg.b, bg.b);
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+
+        ui::set_palette(ui::Palette::light());
+        let (light_bg, _) = cluster_surface_colors(false);
+        let light_luma = blend_over(light_bg, ui::bg_surface());
+        assert!(
+            light_luma > 0.85,
+            "浅色主题下微容器底色叠加侧栏后应保持浅灰，实际亮度 {light_luma:.3} ({light_bg:?})"
+        );
+        let light_guide = group_guide_color();
+        assert!(
+            light_guide.a < 0.15,
+            "浅色主题下分组引导线应为低透明度细线，实际 alpha={}",
+            light_guide.a
+        );
+
+        ui::set_palette(ui::Palette::dark());
+        let (dark_bg, _) = cluster_surface_colors(false);
+        let dark_luma = blend_over(dark_bg, ui::bg_surface());
+        assert!(
+            dark_luma < 0.15,
+            "暗色主题下微容器底色叠加侧栏后应保持深色，实际亮度 {dark_luma:.3} ({dark_bg:?})"
+        );
+        let dark_guide = group_guide_color();
+        assert!(
+            dark_guide.a < 0.15,
+            "暗色主题下分组引导线应为低透明度细线，实际 alpha={}",
+            dark_guide.a
+        );
+
+        assert!(
+            (light_luma - dark_luma).abs() > 0.7,
+            "浅色与暗色主题的微容器合成底色必须明显区分"
+        );
     }
 }

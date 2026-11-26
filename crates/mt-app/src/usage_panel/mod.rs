@@ -2662,9 +2662,8 @@ impl UsagePanel {
                     .h_full()
                     // 聚焦的那一小时常驻一层淡 accent(低 alpha 的 accent 不洗曲线)
                     .when(focused, |el| el.bg(ui::with_alpha(ui::accent(), 0.14)))
-                    // 与改造前同一档淡底(`--border-subtle`)。⚠️ 这层盖在画布
-                    // **之上**,别顺手 `with_alpha` 加浓 —— 那个函数是**赋值**
-                    // 不是乘,给 0.5 会直接变成半透明白把曲线洗掉
+                    // 与改造前同一档淡底(`--border-subtle`)。这层盖在画布
+                    // **之上**,保持原透明度即可,避免把曲线洗淡
                     .hover(move |el| {
                         el.bg(if focused {
                             ui::with_alpha(ui::accent(), 0.2)

@@ -488,11 +488,12 @@ pub fn color_attention() -> Hsla {
 }
 
 /// 乘性改 alpha 的公开入口(`bg-[var(--x)]/30` 那种写法的对应物)。
+///
+/// 必须在原色 `color.a` 上按比例缩放而不是直接覆写：内置明暗调色板的
+/// `border_*` 底色是纯黑 / 纯白带极低透明度（0.05..0.15），直接覆写会把它
+/// 拉成刺眼的深黑块或亮白块。
 pub fn with_alpha(color: Hsla, a: f32) -> Hsla {
-    Hsla {
-        a: a.clamp(0.0, 1.0),
-        ..color
-    }
+    alpha(color, a)
 }
 /// `--color-folder`
 pub fn color_folder() -> Hsla {
@@ -1319,5 +1320,33 @@ mod tests {
             highlight_runs("abc", &[(1, 99)]),
             vec![("a".into(), false), ("bc".into(), true)]
         );
+    }
+
+    /// `with_alpha` 必须乘性缩放原色的 `a`，而不是直接覆写：内置明暗调色板的
+    /// `border_*` 底色是纯黑/纯白带极低 alpha，覆写会把它拉成黑块/白块（#108）。
+    #[test]
+    fn with_alpha_按原透明度乘性缩放() {
+        let opaque = rgb8(0xc8, 0x80, 0x5a);
+        assert!((with_alpha(opaque, 0.3).a - 0.3).abs() < 1e-6);
+
+        let light_subtle = Palette::light().border_subtle;
+        let scaled_light = with_alpha(light_subtle, 0.78);
+        assert!(
+            (scaled_light.a - light_subtle.a * 0.78).abs() < 1e-6,
+            "浅色 border_subtle 缩放后应保留低透明度，实际 {}",
+            scaled_light.a
+        );
+
+        let dark_subtle = Palette::dark().border_subtle;
+        let scaled_dark = with_alpha(dark_subtle, 0.78);
+        assert!(
+            (scaled_dark.a - dark_subtle.a * 0.78).abs() < 1e-6,
+            "暗色 border_subtle 缩放后应保留低透明度，实际 {}",
+            scaled_dark.a
+        );
+
+        assert_eq!(with_alpha(light_subtle, 0.0).a, 0.0);
+        assert_eq!(with_alpha(light_subtle, -1.0).a, 0.0);
+        assert_eq!(with_alpha(opaque, 2.0).a, 1.0);
     }
 }
