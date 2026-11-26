@@ -204,6 +204,24 @@ jobs:
           node .github/scripts/check_changed_clippy.mjs \
             "$base" /tmp/clippy-messages.jsonl
 
+      # 两个独立工作区同样吃根 clippy.toml(disallowed-methods 等),同步纳入变更行 clippy 门禁
+      - name: Clippy sidecars & relay-server (changed lines)
+        shell: bash
+        run: |
+          base="${{ steps.diff-base.outputs.sha }}"
+          for ws in sidecars relay-server; do
+            messages="/tmp/clippy-${ws}.jsonl"
+            set +e
+            cargo clippy --locked --no-deps --manifest-path "${ws}/Cargo.toml" --all-targets --message-format=json \
+              | tee "$messages"
+            clippy_status=${PIPESTATUS[0]}
+            set -e
+            if [ "$clippy_status" -ne 0 ]; then
+              exit "$clippy_status"
+            fi
+            node .github/scripts/check_changed_clippy.mjs "$base" "$messages" "$ws"
+          done
+
       - name: Cargo test
         run: cargo test --locked --workspace
 
@@ -305,6 +323,22 @@ jobs:
           fi
           node .github/scripts/check_changed_clippy.mjs "$base" "$messages"
 
+      # 覆盖 sidecars/src/ipc.rs、daemon_spawn.rs 等 cfg(windows) 代码
+      - name: Clippy sidecars (changed lines)
+        shell: bash
+        run: |
+          base="${{ steps.diff-base.outputs.sha }}"
+          messages="$RUNNER_TEMP/clippy-sidecars.jsonl"
+          set +e
+          cargo clippy --locked --no-deps --manifest-path sidecars/Cargo.toml --all-targets --message-format=json \
+            | tee "$messages"
+          clippy_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$clippy_status" -ne 0 ]; then
+            exit "$clippy_status"
+          fi
+          node .github/scripts/check_changed_clippy.mjs "$base" "$messages" sidecars
+
       # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析、
       # mt-project 的 Windows 路径用例等。名单 = 工作区里全部不依赖 gpui 的 crate,
       # 由脚本从 cargo metadata 现算(2026-09 时是 mt-ai mt-config mt-core mt-i18n
@@ -321,3 +355,33 @@ jobs:
       # 命名管道 ACL(仅当前用户可连)等 sidecar 的 Windows 专属用例
       - name: Sidecar test
         run: cargo test --locked --manifest-path sidecars/Cargo.toml
+
+  # RustSec 漏洞审计:覆盖主工作区、sidecars 与 relay-server 三份 Cargo.lock。
+  # 与 Rust workspace 并行运行不拉长总耗时;默认只拦截真实安全漏洞(RUSTSEC 告警/unmaintained
+  # 仅打印提醒,不阻断发版)。
+  audit:
+    name: Cargo audit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust (rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustc -vV
+
+      - name: Install cargo-audit
+        shell: bash
+        run: cargo install --locked cargo-audit
+
+      - name: Audit lockfiles
+        shell: bash
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file sidecars/Cargo.lock
+          cargo audit --file relay-server/Cargo.lock

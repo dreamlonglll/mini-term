@@ -235,3 +235,55 @@ fn 白名单大小写不敏感() {
     assert_eq!(mime_for("Makefile"), None);
     assert_eq!(mime_for("a.json"), None);
 }
+
+#[test]
+fn 真实路径复核拦截非白名单目标与项目外路径() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("mt-webview-serve-{}-{nanos}", std::process::id()));
+    let proj = base.join("proj");
+    let outside = base.join("outside.css");
+    std::fs::create_dir_all(&proj).unwrap();
+    let ok_css = proj.join("app.css");
+    let secret_env = proj.join(".env");
+    std::fs::write(&ok_css, b"body{}").unwrap();
+    std::fs::write(&secret_env, b"SECRET=1").unwrap();
+    std::fs::write(&outside, b"body{}").unwrap();
+
+    let proj_canon = mt_core::path::canonicalize(&proj).unwrap();
+    let ok_canon = mt_core::path::canonicalize(&ok_css).unwrap();
+
+    assert_eq!(
+        resolve_served_file(&ok_css, Some(&proj_canon)),
+        Ok((ok_canon, "text/css"))
+    );
+    assert_eq!(
+        resolve_served_file(&secret_env, Some(&proj_canon)),
+        Err(403)
+    );
+    assert_eq!(resolve_served_file(&outside, Some(&proj_canon)), Err(403));
+    assert_eq!(resolve_served_file(&ok_css, None), Err(403));
+    assert_eq!(
+        resolve_served_file(&proj.join("missing.css"), Some(&proj_canon)),
+        Err(404)
+    );
+
+    // 项目内符号链接 `evil.html -> .env`:请求名在白名单内,但真实目标不在白名单,必须 403
+    let link = proj.join("evil.html");
+    #[cfg(unix)]
+    let link_created = std::os::unix::fs::symlink(&secret_env, &link).is_ok();
+    #[cfg(windows)]
+    let link_created = std::os::windows::fs::symlink_file(&secret_env, &link).is_ok();
+    if link_created {
+        assert_eq!(
+            resolve_served_file(&link, Some(&proj_canon)),
+            Err(403),
+            "指向 .env 的 .html 符号链接必须被拒绝"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&base);
+}

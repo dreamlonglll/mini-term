@@ -244,6 +244,31 @@ pub(super) fn plan_request(
     Plan::File(path)
 }
 
+/// 打开前复核磁盘真实路径:规范化后仍在项目根内,且**真实文件名**同样落在网页资源
+/// 白名单里(拦截项目内 `evil.html -> .env` 这类符号链接绕过 `plan_request` 的扩展名校验)。
+pub(super) fn resolve_served_file(
+    path: &Path,
+    root: Option<&Path>,
+) -> Result<(PathBuf, &'static str), u16> {
+    let Some(root) = root else {
+        return Err(403);
+    };
+    let Ok(real) = mt_core::path::canonicalize(path) else {
+        return Err(404);
+    };
+    if !real.starts_with(root) {
+        return Err(403);
+    }
+    let Some(mime) = real
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(mime_for)
+    else {
+        return Err(403);
+    };
+    Ok((real, mime))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 pub(super) use imp::PreviewWebView;
 
@@ -483,21 +508,12 @@ mod imp {
     }
 
     fn read_file(path: &Path, root: Option<&Path>) -> Response<Vec<u8>> {
-        let Some(root) = root else {
-            return response(403, None, Vec::new());
+        let (real, mime) = match super::resolve_served_file(path, root) {
+            Ok(resolved) => resolved,
+            Err(status) => return response(status, None, Vec::new()),
         };
-        let Ok(real) = mt_core::path::canonicalize(path) else {
-            return response(404, None, Vec::new());
-        };
-        if !real.starts_with(root) {
-            return response(403, None, Vec::new());
-        }
-        let mime = real
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(super::mime_for);
         match std::fs::read(&real) {
-            Ok(bytes) => response(200, mime, bytes),
+            Ok(bytes) => response(200, Some(mime), bytes),
             Err(_) => response(404, None, Vec::new()),
         }
     }
@@ -636,7 +652,7 @@ mod imp {
         }
 
         /// WebView 里被拦下的导航 / 新窗口请求。同源的本地文件作为页签打开,
-        /// 其余交给 Markdown 预览那套链接处置(外链弹确认、mailto 这类交系统)。
+        /// 其余交给 Markdown 预览那套链接处置(外链与 mailto/tel 均弹确认后交系统)。
         fn on_webview_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
             let href = match super::same_origin_rel(url) {
                 Some(rel) => {

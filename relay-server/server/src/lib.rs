@@ -38,6 +38,13 @@ use tokio::sync::{mpsc, Notify};
 /// 握手超时:连上后必须在此时限内送达 hello,否则直接断开。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 服务端心跳发包周期:保活穿过反代 / NAT,并主动探测已静默断连的对端
+/// (尤其是浏览器 PWA 无法自行发送 RFC 6455 Ping 控制帧,需由服务端发起 Ping)。
+pub const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 服务端读空闲超时:超过此时长未收到对端任何有效帧(含 Pong)即断开,释放连接名额与房间槽位。
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// 一次性配对码有效期。
 const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -404,6 +411,10 @@ pub struct RelayState {
     inner: Arc<Mutex<Inner>>,
     generation_counter: Arc<AtomicU64>,
     code_ttl: Duration,
+    /// 服务端心跳周期(定时向已握手连接发 Ping)
+    ping_interval: Duration,
+    /// 服务端读空闲超时(超过此时长未收到任何帧即断开)
+    idle_timeout: Duration,
     /// 桌面端共享密钥(部署方经 `MT_RELAY_DESKTOP_KEY` 配置)。
     /// `None` = 未配置 → fail-closed,拒绝一切桌面连接。
     desktop_key: Option<Arc<String>>,
@@ -426,10 +437,19 @@ impl RelayState {
             inner: Arc::new(Mutex::new(Inner::default())),
             generation_counter: Arc::new(AtomicU64::new(0)),
             code_ttl,
+            ping_interval: DEFAULT_PING_INTERVAL,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             desktop_key: None,
             limits: Arc::new(RelayLimits::default()),
             conns: Arc::new(Mutex::new(ConnCounts::default())),
         }
+    }
+
+    /// 覆盖服务端心跳周期与读空闲超时(测试用;零时长按 1ms 钳位)。
+    pub fn with_heartbeat(mut self, ping_interval: Duration, idle_timeout: Duration) -> Self {
+        self.ping_interval = ping_interval.max(Duration::from_millis(1));
+        self.idle_timeout = idle_timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// 覆盖连接数 / 出站队列上限(默认值见 [`RelayLimits::default`])。
@@ -740,13 +760,52 @@ async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
         return;
     }
 
-    // ── 消息循环 ──
+    // ── 消息循环(含服务端心跳与空闲超时探测) ──
+    let mut ping_ticker = tokio::time::interval(state.ping_interval);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 消费首次立即触发的 tick,等满一个周期再发第一帧 Ping
+    ping_ticker.tick().await;
+    let mut last_seen = tokio::time::Instant::now();
+
     loop {
+        let idle_deadline = last_seen + state.idle_timeout;
         tokio::select! {
             // 出站队列溢出(慢消费者):断开,注销后由桌面端重连自愈
             _ = overflow.notified() => {
                 log_overflow("desktop", generation);
                 break;
+            }
+            // 读空闲超时:对端静默断连(NAT 半开等),主动断开释放名额与房间槽位
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::warn!(
+                    "[relay] desktop idle timeout ({:?}, desktop {desktop_id}, gen {generation}), disconnecting",
+                    state.idle_timeout
+                );
+                break;
+            }
+            // 定时发 Ping 保活并探测对端存活;发送本身亦受 idle_deadline 约束防写缓冲卡死
+            _ = ping_ticker.tick() => {
+                match tokio::time::timeout_at(
+                    idle_deadline,
+                    send_or_overflow(
+                        &mut socket,
+                        Message::Ping(Default::default()),
+                        &overflow,
+                        "desktop",
+                        generation,
+                    ),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            "[relay] desktop ping send timed out (desktop {desktop_id}, gen {generation}), disconnecting"
+                        );
+                        break;
+                    }
+                }
             }
             out = rx.recv() => match out {
                 // 槽位持有者(顶替我们的新连接/未来的路由方)让我们发帧;Close 帧发完即退出
@@ -769,13 +828,17 @@ async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    last_seen = tokio::time::Instant::now();
                     match serde_json::from_str::<DesktopToRelay>(&text) {
                         Ok(msg) => handle_desktop_message(&state, &desktop_id, generation, msg),
                         Err(_) => tracing::warn!("[relay] desktop sent unparseable message (ignored)"),
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => {
+                    // Pong / Ping / Binary 均证明对端仍存活
+                    last_seen = tokio::time::Instant::now();
+                }
                 Some(Err(_)) => break,
             },
         }
@@ -1233,13 +1296,51 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
         }
     }
 
-    // ── 消息循环 ──
+    // ── 消息循环(含服务端心跳与空闲超时探测) ──
+    let mut ping_ticker = tokio::time::interval(state.ping_interval);
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_ticker.tick().await;
+    let mut last_seen = tokio::time::Instant::now();
+
     loop {
+        let idle_deadline = last_seen + state.idle_timeout;
         tokio::select! {
             // 出站队列溢出(弱网 / 后台挂起的手机):断开,重连后握手 + 快照自愈
             _ = overflow.notified() => {
                 log_overflow("mobile", generation);
                 break;
+            }
+            // 读空闲超时:手机切后台挂死 / 断网无 FIN 时主动断开,释放订阅与名额
+            _ = tokio::time::sleep_until(idle_deadline) => {
+                tracing::warn!(
+                    "[relay] mobile idle timeout ({:?}, desktop {desktop_id}, gen {generation}), disconnecting",
+                    state.idle_timeout
+                );
+                break;
+            }
+            // 定时发 Ping 保活并探测存活(浏览器自动回 Pong)
+            _ = ping_ticker.tick() => {
+                match tokio::time::timeout_at(
+                    idle_deadline,
+                    send_or_overflow(
+                        &mut socket,
+                        Message::Ping(Default::default()),
+                        &overflow,
+                        "mobile",
+                        generation,
+                    ),
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(_) => {
+                        tracing::warn!(
+                            "[relay] mobile ping send timed out (desktop {desktop_id}, gen {generation}), disconnecting"
+                        );
+                        break;
+                    }
+                }
             }
             out = rx.recv() => match out {
                 Some(frame) => {
@@ -1261,13 +1362,17 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
             },
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
+                    last_seen = tokio::time::Instant::now();
                     match serde_json::from_str::<MobileToRelay>(&text) {
                         Ok(msg) => handle_mobile_message(&state, &desktop_id, generation, msg),
                         Err(_) => tracing::warn!("[relay] mobile sent unparseable message (ignored)"),
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => {
+                    // Pong / Ping / Binary 均证明对端仍存活
+                    last_seen = tokio::time::Instant::now();
+                }
                 Some(Err(_)) => break,
             },
         }

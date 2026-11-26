@@ -1,13 +1,24 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 
-const [base, messagesPath] = process.argv.slice(2);
+const [base, messagesPath, workspacePrefix = ""] = process.argv.slice(2);
 if (!base || !messagesPath) {
-  console.error("usage: check_changed_clippy.mjs <base-sha> <cargo-jsonl>");
+  console.error(
+    "usage: check_changed_clippy.mjs <base-sha> <cargo-jsonl> [workspace-prefix]",
+  );
   process.exit(2);
 }
 
-const normalize = (path) => path.replaceAll("\\", "/").replace(/^\.\//, "");
+const normalize = (filePath) => filePath.replaceAll("\\", "/").replace(/^\.\//, "");
+const normalizedPrefix = workspacePrefix
+  ? normalize(workspacePrefix).replace(/\/+$/, "")
+  : "";
+const resolveSpanPath = (fileName) => {
+  const clean = normalize(fileName);
+  if (!normalizedPrefix || path.posix.isAbsolute(clean)) return clean;
+  return path.posix.normalize(`${normalizedPrefix}/${clean}`);
+};
 
 const diff = spawnSync(
   "git",
@@ -41,7 +52,7 @@ function warningTouchesChangedLine(message) {
   return (message.spans ?? [])
     .filter((span) => span.is_primary)
     .some((span) => {
-      const ranges = changedRanges.get(normalize(span.file_name)) ?? [];
+      const ranges = changedRanges.get(resolveSpanPath(span.file_name)) ?? [];
       return ranges.some(
         (range) => span.line_start <= range.end && range.start <= span.line_end,
       );
@@ -65,7 +76,7 @@ for (const line of fs.readFileSync(messagesPath, "utf8").split("\n")) {
     const primary = (record.message.spans ?? []).find((span) => span.is_primary);
     const key = [
       record.message.code?.code ?? "",
-      primary ? normalize(primary.file_name) : "",
+      primary ? resolveSpanPath(primary.file_name) : "",
       primary?.line_start ?? 0,
       record.message.message,
     ].join("\0");

@@ -689,6 +689,27 @@ fn 链接按原版四条口径分类() {
         classify_link(cur, "mailto:a@b.c"),
         LinkAction::Scheme("mailto:a@b.c".into())
     );
+    assert_eq!(
+        classify_link(cur, "TEL:+8613800138000"),
+        LinkAction::Scheme("TEL:+8613800138000".into())
+    );
+    // 非白名单协议一律忽略,防止本地 Markdown 触发任意系统协议处理器 / SMB 外连
+    for denied in [
+        "file:///C:/Windows/System32/calc.exe",
+        "file://attacker/share/payload.exe",
+        "smb://attacker/share",
+        "search-ms:query=test",
+        "ms-msdt:/id",
+        "javascript:alert(1)",
+        "vscode://file/C:/a.txt",
+        "data:text/html,hi",
+    ] {
+        assert_eq!(
+            classify_link(cur, denied),
+            LinkAction::Ignore,
+            "非白名单协议必须忽略: {denied}"
+        );
+    }
     // 盘符不是协议
     assert_eq!(
         classify_link(cur, r"C:\tmp\a.md"),

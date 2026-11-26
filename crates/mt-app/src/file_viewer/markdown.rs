@@ -590,11 +590,11 @@ pub(super) enum LinkAction {
     External(String),
     /// 文档内锚点(`#标题`):滚到对应标题所在的块
     Anchor(String),
-    /// mailto: / tel: 这类其它协议:直接交给系统
+    /// mailto: / tel: 白名单协议:弹确认后交给系统
     Scheme(String),
     /// 本地文件:已按当前文件所在目录解析成绝对路径(正斜杠)
     Local(String),
-    /// 空 href / 解析不出目标
+    /// 空 href / 不在白名单的协议 / 解析不出目标
     Ignore,
 }
 
@@ -610,8 +610,13 @@ pub(super) fn classify_link(current_file: &str, href: &str) -> LinkAction {
     if let Some(id) = href.strip_prefix('#') {
         return LinkAction::Anchor(percent_decode(id));
     }
-    if has_url_scheme(href) {
+    if lower.starts_with("mailto:") || lower.starts_with("tel:") {
         return LinkAction::Scheme(href.to_string());
+    }
+    // 其余任意协议(file://、smb://、search-ms:、ms-msdt:、javascript: 等)一律拒绝,
+    // 不得交由系统协议处理器打开,也不得落进本地路径解析。
+    if has_url_scheme(href) {
+        return LinkAction::Ignore;
     }
     match resolve_local_href(current_file, href) {
         Some(path) => LinkAction::Local(path),

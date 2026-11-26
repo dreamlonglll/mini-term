@@ -653,11 +653,11 @@ impl FileViewer {
     }
 
     /// 原版 `handleLinkClick` 的四条处置(分类在 [`classify_link`]):
-    /// 外链弹确认再开浏览器;锚点滚到标题所在的块;其它协议直接交给系统;
+    /// 外链与白名单协议(mailto:/tel:)弹确认再交系统;锚点滚到标题所在的块;
     /// 本地文件作为页签打开(本地来源先验文件在不在,远程交给页签自己报错)。
     pub(super) fn follow_link(&mut self, href: &str, window: &mut Window, cx: &mut Context<Self>) {
         match classify_link(&self.current_path.to_string_lossy(), href) {
-            LinkAction::External(url) => {
+            LinkAction::External(url) | LinkAction::Scheme(url) => {
                 let open = url.clone();
                 Confirm::new(t("externalLink", "openConfirm"), url).open(
                     move |_window, cx| cx.open_url(&open),
@@ -666,7 +666,6 @@ impl FileViewer {
                 );
             }
             LinkAction::Anchor(id) => self.scroll_to_anchor(&id, cx),
-            LinkAction::Scheme(url) => cx.open_url(&url),
             LinkAction::Local(target) => {
                 // 解析结果是正斜杠的;本地来源按组件重拼成平台分隔符,页头显示的
                 // 路径才与从文件树打开的一致(页签去重本身不看分隔符)

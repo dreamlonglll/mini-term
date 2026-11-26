@@ -37,6 +37,9 @@ const ENDED_SESSIONS_CAP: usize = 8;
 const ACTIVE_SESSIONS_CAP: usize = 8;
 /// 每个 pane 记多少个在跑的 agy 子代理会话(正常是个位数;上限只防灌假 id)
 const AGY_SUBAGENTS_CAP: usize = 64;
+/// 最多同时追踪多少个不同 `pty_id` 的 hook 状态(正常桌面同时开数十个终端已属极高;
+/// 封顶防同机无鉴权进程往表里灌大量虚假 `pty_id` 造成永久内存增长)
+const MAX_TRACKED_PTYS: usize = 512;
 /// 单个 hook 请求 body 的字节上限。真实 payload 只有几百字节（各家 CLI 发的都是
 /// 一小段 JSON），1 MiB 已宽出三个数量级；超限直接 413，不进 JSON 解析。
 const MAX_HOOK_BODY_BYTES: usize = 1024 * 1024;
@@ -193,6 +196,33 @@ struct HookTables {
 }
 
 impl HookTables {
+    fn tracks_pty(&self, pty_id: u32) -> bool {
+        self.last_hook_time.contains_key(&pty_id)
+            || self.hook_enabled.contains(&pty_id)
+            || self.last_session.contains_key(&pty_id)
+            || self.ended_sessions.contains_key(&pty_id)
+            || self.active_sessions.contains_key(&pty_id)
+            || self.agy_subagents.contains_key(&pty_id)
+            || self.agy_deferred_stop.contains_key(&pty_id)
+            || self.last_agent.contains_key(&pty_id)
+    }
+
+    fn tracked_pty_upper_bound(&self) -> usize {
+        self.last_hook_time
+            .len()
+            .max(self.hook_enabled.len())
+            .max(self.last_session.len())
+            .max(self.ended_sessions.len())
+            .max(self.active_sessions.len())
+            .max(self.agy_subagents.len())
+            .max(self.agy_deferred_stop.len())
+            .max(self.last_agent.len())
+    }
+
+    fn accepts_pty(&self, pty_id: u32) -> bool {
+        self.tracks_pty(pty_id) || self.tracked_pty_upper_bound() < MAX_TRACKED_PTYS
+    }
+
     fn should_settle_interrupt(&self, pty_id: u32) -> bool {
         self.hook_enabled.contains(&pty_id)
             && self.last_hook_status.get(&pty_id).map(String::as_str) == Some("ai-working")
@@ -243,6 +273,11 @@ impl HookState {
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 该 `pty_id` 是否允许写入 hook 表(已追踪或尚未触达总容量上限)。
+    fn accepts_pty(&self, pty_id: u32) -> bool {
+        self.tables.lock().accepts_pty(pty_id)
     }
 
     /// 检查指定 PTY 是否已启用 hook（曾经收到过 hook 事件）
@@ -1213,10 +1248,45 @@ enum LineRead {
 enum RequestError {
     EmptyConnection,
     TimedOut,
+    Forbidden,
     MethodNotAllowed,
     NotFound,
     PayloadTooLarge,
     BadRequest,
+}
+
+/// 校验 HTTP `Host` 头是否为本机回环地址(`127.0.0.1` / `localhost` / `[::1]`,可选合法端口)。
+/// 阻断外部网页借助 DNS Rebinding 指向本机 hook 端口;对所有本机 CLI / Bun fetch 100% 兼容。
+fn is_loopback_host(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let (host, port) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some((addr, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            s => match s.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return false,
+            },
+        };
+        (format!("[{addr}]"), port)
+    } else if let Some((h, p)) = trimmed.split_once(':') {
+        (h.to_string(), Some(p))
+    } else {
+        (trimmed.to_string(), None)
+    };
+    if let Some(port) = port
+        && (port.is_empty()
+            || !port.bytes().all(|b| b.is_ascii_digit())
+            || port.parse::<u16>().is_err())
+    {
+        return false;
+    }
+    host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]"
 }
 
 fn is_timeout_error(err: &io::Error) -> bool {
@@ -1398,7 +1468,18 @@ fn read_hook_request_body(reader: &mut BufReader<DeadlineStream>) -> Result<Stri
         }
         let value = value.trim();
 
-        if name.eq_ignore_ascii_case("content-length") {
+        if name.eq_ignore_ascii_case("host") {
+            if !is_loopback_host(value) {
+                return Err(RequestError::Forbidden);
+            }
+        } else if name.eq_ignore_ascii_case("origin") {
+            // 浏览器跨站 POST(含 mode: "no-cors" / <form>)都会带 Origin;
+            // sidecar 与 omp/pi 扩展均不发 Origin,直接拦截即可阻断跨站 CSRF。
+            return Err(RequestError::Forbidden);
+        } else if name.eq_ignore_ascii_case("sec-fetch-site") && !value.eq_ignore_ascii_case("none")
+        {
+            return Err(RequestError::Forbidden);
+        } else if name.eq_ignore_ascii_case("content-length") {
             if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(RequestError::BadRequest);
             }
@@ -1500,6 +1581,11 @@ fn handle_connection(stream: TcpStream, ctx: &ServerContext) {
             tracing::debug!("[hook-server] 连接读取超时，已主动断开");
             return;
         }
+        Err(RequestError::Forbidden) => {
+            tracing::warn!("[hook-server] 拒绝非本机或浏览器跨站请求");
+            send_http_response(&mut reader.get_mut().stream, 403, "Forbidden", "Forbidden");
+            return;
+        }
         Err(RequestError::MethodNotAllowed) => {
             send_http_response(
                 &mut reader.get_mut().stream,
@@ -1577,6 +1663,14 @@ fn handle_hook_payload(
     let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) else {
         return;
     };
+    if !hook_state.accepts_pty(pty_id) {
+        tracing::warn!(
+            "[hook-server] 已追踪 PTY 数达上限 ({})，已忽略未知 pty_id={}",
+            MAX_TRACKED_PTYS,
+            pty_id
+        );
+        return;
+    }
 
     let route = route_event(event, &payload);
     if let EventRoute::Subagent { settled } = route {
@@ -3467,5 +3561,120 @@ mod tests {
             state.agy_subagent_settled(11, "sub-1"),
             Some(Some("END_TURN".to_string()))
         );
+    }
+
+    /// 跨站防护:拒绝带 `Origin`、非 `none` `Sec-Fetch-Site` 或非回环 `Host`(DNS Rebinding)
+    /// 的请求;合法回环 `Host`(`127.0.0.1` / `localhost` / `[::1]`,带或不带端口)照常放行。
+    #[test]
+    fn http_server_blocks_cross_origin_and_dns_rebinding_requests() {
+        let srv = TestHookServer::start(Duration::from_secs(2));
+        let body = r#"{"pty_id":55,"event":"UserPromptSubmit","agent":"claude-code"}"#;
+
+        for bad_headers in [
+            "Host: 127.0.0.1\r\nOrigin: https://evil.example\r\n",
+            "Host: 127.0.0.1\r\nOrigin: null\r\n",
+            "Host: 127.0.0.1\r\nSec-Fetch-Site: cross-site\r\n",
+            "Host: 127.0.0.1\r\nSec-Fetch-Site: same-origin\r\n",
+            "Host: evil.example:23456\r\n",
+            "Host: 127.0.0.1.evil.example\r\n",
+            "Host: 127.0.0.1:notaport\r\n",
+            "Host: [::1]extra\r\n",
+        ] {
+            let req = format!(
+                "POST /hook HTTP/1.1\r\n{bad_headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let resp = srv.send_raw(req.as_bytes());
+            assert!(
+                resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                "应拒绝恶意请求头 {bad_headers:?}，实际: {resp:?}"
+            );
+        }
+        assert!(!srv.state.is_hook_enabled(55));
+
+        for ok_host in [
+            format!("127.0.0.1:{}", srv.port),
+            format!("localhost:{}", srv.port),
+            "LOCALHOST".to_string(),
+            format!("[::1]:{}", srv.port),
+            "[::1]".to_string(),
+        ] {
+            let req = format!(
+                "POST /hook HTTP/1.1\r\nHost: {ok_host}\r\nSec-Fetch-Site: none\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let resp = srv.send_raw(req.as_bytes());
+            assert!(
+                resp.starts_with("HTTP/1.1 200 OK\r\n"),
+                "合法回环 Host {ok_host:?} 应放行，实际: {resp:?}"
+            );
+        }
+        srv.wait_for_status(55, "ai-working");
+    }
+
+    /// 未知 `pty_id` 灌入达上限后不再扩张状态表,避免无鉴权端口被无限撑爆内存;
+    /// 已追踪的 `pty_id` 仍可正常更新,且 `purge` 释放槽位后可接纳新 `pty_id`。
+    #[test]
+    fn hook_tables_cap_distinct_pty_ids_and_recover_after_purge() {
+        let state = HookState::new();
+        let tracker = SessionTracker::new();
+        let emitter = StatusEmitter::new(Arc::new(|_: crate::monitor::StatusChange| {}));
+
+        for id in 1..=(MAX_TRACKED_PTYS as u32) {
+            handle_hook_payload(
+                payload(serde_json::json!({
+                    "pty_id": id,
+                    "event": "UserPromptSubmit",
+                    "agent": "claude-code"
+                })),
+                &state,
+                &emitter,
+                &tracker,
+            );
+        }
+        assert!(state.is_hook_enabled(1));
+        assert!(state.is_hook_enabled(MAX_TRACKED_PTYS as u32));
+
+        // 满额后的未知 pty_id 直接丢弃,既不进 HookTables 也不污染 tracker
+        let overflow_id = (MAX_TRACKED_PTYS as u32) + 1;
+        handle_hook_payload(
+            payload(serde_json::json!({
+                "pty_id": overflow_id,
+                "event": "UserPromptSubmit",
+                "agent": "claude-code"
+            })),
+            &state,
+            &emitter,
+            &tracker,
+        );
+        assert!(!state.is_hook_enabled(overflow_id));
+        assert!(!tracker.is_ai_session(overflow_id));
+
+        // 已在追踪中的 pty_id 仍可正常推进状态
+        handle_hook_payload(
+            payload(serde_json::json!({
+                "pty_id": 1,
+                "event": "Stop",
+                "agent": "claude-code"
+            })),
+            &state,
+            &emitter,
+            &tracker,
+        );
+        assert_eq!(state.get_status(1).as_deref(), Some("ai-idle"));
+
+        // 释放一个槽位后可重新接纳新 pty_id
+        state.purge(1);
+        handle_hook_payload(
+            payload(serde_json::json!({
+                "pty_id": overflow_id,
+                "event": "UserPromptSubmit",
+                "agent": "claude-code"
+            })),
+            &state,
+            &emitter,
+            &tracker,
+        );
+        assert!(state.is_hook_enabled(overflow_id));
     }
 }
