@@ -4375,7 +4375,12 @@ mod tests {
         handle_send_terminal_key(&manager, "pane-local".into(), "k1".into(), TerminalKey::Up);
         *host.app_cursor.lock() = true;
         handle_send_terminal_key(&manager, "pane-local".into(), "k2".into(), TerminalKey::Up);
-        handle_send_terminal_key(&manager, "pane-missing".into(), "k3".into(), TerminalKey::Escape);
+        handle_send_terminal_key(
+            &manager,
+            "pane-missing".into(),
+            "k3".into(),
+            TerminalKey::Escape,
+        );
 
         assert_eq!(
             *host.writes.lock(),
@@ -4481,7 +4486,11 @@ mod tests {
                         assert_eq!(request_id, "s-ok");
                         assert!(ok);
                         assert_eq!(prefix, "$");
-                        assert!(skills.iter().any(|s| s.name == "ship" && s.source == "project"));
+                        assert!(
+                            skills
+                                .iter()
+                                .any(|s| s.name == "ship" && s.source == "project")
+                        );
                         got_skills = true;
                     }
                     other => panic!("unexpected message: {other:?}"),

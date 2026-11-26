@@ -535,9 +535,8 @@ fn parse_osc52_body(body: &[u8], term: Terminator) -> Option<Event> {
             Terminator::Bel => "\x07",
             Terminator::St => "\x1b\\",
         };
-        let formatter: Arc<dyn Fn(&str) -> String + Send + Sync> = Arc::new(move |text| {
-            format!("\x1b]52;{reply_sel};{}{suffix}", STANDARD.encode(text))
-        });
+        let formatter: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(move |text| format!("\x1b]52;{reply_sel};{}{suffix}", STANDARD.encode(text)));
         return Some(Event::ClipboardLoad(clipboard_type, formatter));
     }
 
@@ -725,7 +724,11 @@ mod tests {
         emu.advance(b"\x1bPtmux;\x1b\x1b]0;my-title\x07\x1b\\ok");
         assert_eq!(emu.visible_lines()[0], "ok");
         let events = emu.events().drain();
-        assert!(events.iter().any(|e| matches!(e, Event::Title(t) if t == "my-title")));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Title(t) if t == "my-title"))
+        );
     }
 
     #[test]
@@ -787,10 +790,16 @@ mod tests {
     fn bare_osc52_query_survives_set_options_paths() {
         let emu = TerminalEmulator::new(TermSize::new(80, 24));
         emu.set_scrollback(500);
-        assert!(load_reply(&emu, b"\x1b]52;c;?\x07").is_some(), "set_scrollback 之后");
+        assert!(
+            load_reply(&emu, b"\x1b]52;c;?\x07").is_some(),
+            "set_scrollback 之后"
+        );
 
         emu.advance(b"\x1b[?1049h");
         emu.clear_scrollback();
-        assert!(load_reply(&emu, b"\x1b]52;c;?\x07").is_some(), "备用屏 clear_scrollback 之后");
+        assert!(
+            load_reply(&emu, b"\x1b]52;c;?\x07").is_some(),
+            "备用屏 clear_scrollback 之后"
+        );
     }
 }

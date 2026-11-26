@@ -397,9 +397,11 @@ fn scan_skills_with_home(
     let mut list: Vec<MobileSkillItem> = by_name.into_values().collect();
     list.sort_by(|a, b| {
         let rank = |s: &str| if s == "project" { 0u8 } else { 1u8 };
-        rank(&a.source)
-            .cmp(&rank(&b.source))
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        rank(&a.source).cmp(&rank(&b.source)).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
     list
 }
@@ -465,7 +467,9 @@ fn parse_skill_file(
     let (fm_name, fm_desc, body) = parse_frontmatter(&header);
     let raw_name = fm_name.unwrap_or_else(|| fallback_name.to_string());
     let name = sanitize_skill_name(&raw_name)?;
-    let desc_raw = fm_desc.or_else(|| first_non_empty_line(body)).unwrap_or_default();
+    let desc_raw = fm_desc
+        .or_else(|| first_non_empty_line(body))
+        .unwrap_or_default();
     let description = truncate_single_line(&desc_raw, MAX_DESC_CHARS);
     Some(MobileSkillItem {
         name,

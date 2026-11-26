@@ -207,8 +207,7 @@ impl TerminalEmulator {
                 }
                 let has_bg = cell.bg != Color::Named(NamedColor::Background)
                     || cell.flags.contains(Flags::INVERSE);
-                let has_text = cell.c != ' '
-                    || cell.zerowidth().is_some_and(|zw| !zw.is_empty());
+                let has_text = cell.c != ' ' || cell.zerowidth().is_some_and(|zw| !zw.is_empty());
                 if has_text || has_bg {
                     last_kept = Some(col);
                     break;

@@ -26,8 +26,8 @@
 
 use alacritty_terminal::grid::Dimensions as _;
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as _};
 use std::sync::atomic::Ordering;
 

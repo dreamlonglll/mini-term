@@ -546,10 +546,7 @@ pub enum RelayToDesktop {
         query: String,
     },
     /// 移动端输入框 `/` 补全：列出目标 pane 所属项目与当前 agent 的可用技能。
-    RequestProjectSkills {
-        request_id: String,
-        pane_id: String,
-    },
+    RequestProjectSkills { request_id: String, pane_id: String },
 }
 
 /// 移动端 → 中转
@@ -641,10 +638,7 @@ pub enum MobileToRelay {
         query: String,
     },
     /// 输入框 `/` 技能补全请求。
-    RequestProjectSkills {
-        request_id: String,
-        pane_id: String,
-    },
+    RequestProjectSkills { request_id: String, pane_id: String },
 }
 
 /// 中转 → 移动端
@@ -1716,7 +1710,10 @@ mod tests {
                 && json.contains(r#""wrapped":true"#),
             "{json}"
         );
-        assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), screen);
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(&json).unwrap(),
+            screen
+        );
 
         let req_files = MobileToRelay::RequestProjectFiles {
             request_id: "f-1".into(),

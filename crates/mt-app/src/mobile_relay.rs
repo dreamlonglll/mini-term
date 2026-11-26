@@ -1388,7 +1388,11 @@ mod tests {
             "\x03", "\t", "\x1b[Z", "\x1b[A", "\x1bOA", "\x1b[D", "\x1b[C", "\r", " ", "\x7f",
             "\x04", "\x15", "\x1b[H", "\x1bOF", "\x1b[5~", "\x1b[6~",
         ] {
-            assert_eq!(terminal_key_payload(legacy.into(), true), legacy, "{legacy:?}");
+            assert_eq!(
+                terminal_key_payload(legacy.into(), true),
+                legacy,
+                "{legacy:?}"
+            );
         }
     }
 
