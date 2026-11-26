@@ -40,11 +40,7 @@ export const projectList = {
     group: {
       emptyHint: "拖入项目到此分组",
       addTip: "向此分组添加项目或子组",
-      moreTip: "分组操作",
       collapsedActiveTip: "包含当前活动项目",
-    },
-    row: {
-      moreTip: "更多操作",
     },
     dropToRootEnd: "释放以移至顶层末尾",
     preview: {
@@ -148,11 +144,7 @@ export const projectList = {
     group: {
       emptyHint: "Drop projects into this group",
       addTip: "Add project or subgroup here",
-      moreTip: "Group actions",
       collapsedActiveTip: "Contains active project",
-    },
-    row: {
-      moreTip: "More actions",
     },
     dropToRootEnd: "Drop to move to top level",
     preview: {

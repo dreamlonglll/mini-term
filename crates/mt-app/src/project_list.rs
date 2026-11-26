@@ -176,31 +176,6 @@ const ICON_PLUS: &[mt_ui::icons::vector::Shape] = &[
     ),
 ];
 
-/// 水平三点 `···`（行尾悬浮更多操作按钮）。
-const ICON_MORE: &[mt_ui::icons::vector::Shape] = &[
-    mt_ui::icons::vector::Shape::fill(
-        mt_ui::icons::vector::Ink::Current,
-        mt_ui::icons::vector::Geom::Circle {
-            c: (u16_norm(3.5), u16_norm(8.0)),
-            r: u16_norm(1.2),
-        },
-    ),
-    mt_ui::icons::vector::Shape::fill(
-        mt_ui::icons::vector::Ink::Current,
-        mt_ui::icons::vector::Geom::Circle {
-            c: (u16_norm(8.0), u16_norm(8.0)),
-            r: u16_norm(1.2),
-        },
-    ),
-    mt_ui::icons::vector::Shape::fill(
-        mt_ui::icons::vector::Ink::Current,
-        mt_ui::icons::vector::Geom::Circle {
-            c: (u16_norm(12.5), u16_norm(8.0)),
-            r: u16_norm(1.2),
-        },
-    ),
-];
-
 /// 全部折叠（叠框减号，与 FileTree 头部同家族）。
 const ICON_COLLAPSE_ALL: &[mt_ui::icons::vector::Shape] = &[
     mt_ui::icons::vector::Shape::line(
@@ -802,15 +777,57 @@ fn group_guide_color() -> gpui::Hsla {
     ui::with_alpha(ui::border_strong(), 0.55)
 }
 
+/// 判断当前调色板是否为暗色外观：前景主字色亮度高于窗口底色即视为暗色，
+/// 对内置明暗两套与全部外置皮肤（含低透明背景图皮肤）都成立。
+fn is_dark_palette() -> bool {
+    ui::text_primary().l > ui::bg_base().l
+}
+
 /// 展开态 worktree 簇微容器的底色与边框色（静态渲染与折叠抽屉共用）。
+///
+/// 避免未选中的微容器呈现“被选中 / 抬高”的视觉权重：
+/// - 底色走**极淡下凹**方向（始终略暗于侧栏 `bg_surface`），不再使用与 hover / 选中
+///   同向提亮且在外置皮肤下不透明度偏实的 `border_subtle`；
+/// - 未含活动项时的边框基于 `text_primary` 极低透明度，避免外置皮肤里实色 `border_default`
+///   （`line`, α=1）拉出扎眼的实线框；簇内含活动项时切柔和 `accent` 细边。
 fn cluster_surface_colors(cluster_has_active: bool) -> (gpui::Hsla, gpui::Hsla) {
-    let bg = ui::with_alpha(ui::border_subtle(), 0.78);
-    let border = if cluster_has_active {
-        ui::with_alpha(ui::accent(), 0.28)
+    let dark = is_dark_palette();
+    let surface = ui::bg_surface();
+    let bg = if dark {
+        let doc = ui::bg_document();
+        if doc.l < surface.l {
+            ui::with_alpha(doc, 0.48)
+        } else {
+            ui::with_alpha(gpui::black(), 0.14 * surface.a)
+        }
     } else {
-        ui::border_default()
+        ui::with_alpha(ui::text_primary(), 0.025 * surface.a.max(0.6))
+    };
+    let border = if cluster_has_active {
+        ui::with_alpha(ui::accent(), 0.22)
+    } else {
+        ui::with_alpha(ui::text_primary(), if dark { 0.065 } else { 0.075 })
     };
     (bg, border)
+}
+
+/// 父项目行 worktree 折叠计数胶囊的常驻底色与悬停底色。
+/// 基于 `text_primary` 极低透明度，避免外置皮肤下 `border_subtle` / `border_default`（实色 `line`）
+/// 把小胶囊染成偏实的亮块。
+fn worktree_toggle_chip_colors(highlight: bool, collapsed: bool) -> (gpui::Hsla, gpui::Hsla) {
+    let bg = if highlight {
+        ui::accent_subtle()
+    } else if collapsed {
+        ui::with_alpha(ui::text_primary(), 0.09)
+    } else {
+        ui::with_alpha(ui::text_primary(), 0.055)
+    };
+    let hover_bg = if highlight {
+        ui::with_alpha(ui::accent(), 0.24)
+    } else {
+        ui::with_alpha(ui::text_primary(), 0.14)
+    };
+    (bg, hover_bg)
 }
 
 /// 在行外层 `relative()` 左侧绘制 `0..group_depth` 条极细分组引导竖线。
@@ -938,10 +955,10 @@ fn child_tooltip_text(
 }
 
 /// 微容器内第 `level` 层（0 = 直接子项）树形竖轨相对微容器内左缘的 x 坐标。
-/// 微容器本身已按分组深度完成 `row_left_margin` 缩进，内部父行内距 `(ROW_INNER_PL - CLUSTER_BORDER_W) = 9`，
-/// 故父项目 14px 领位图标中心恒落在 `9 + 7 = 16`。
+/// 微容器本身已按分组深度完成 `row_left_margin` 缩进，内部父行带 1px 透明内框 + `pl(ROW_INNER_PL - CLUSTER_BORDER_W) = 9`，
+/// 领位图标左缘落在 `1 + 9 = 10`（与普通项目行完全齐平），14px 图标中心恒落在 `10 + 7 = 17`。
 fn cluster_rail_x(level: usize) -> f32 {
-    (ROW_INNER_PL - CLUSTER_BORDER_W) + 7.0 + level as f32 * CHILD_NEST_STEP
+    ROW_INNER_PL + 7.0 + level as f32 * CHILD_NEST_STEP
 }
 
 /// 微容器子项左侧的树形连线层（`├─` / `╰─` + 多层祖先贯通竖线）。
@@ -3959,7 +3976,7 @@ impl Render for ProjectList {
 }
 
 impl ProjectList {
-    /// 行尾悬浮操作按钮的单颗小壳（20×20，供项目行 `···` 与分组行 `+`/`···` 共用）。
+    /// 分组行尾悬浮操作按钮的单颗小壳（20×20，供分组行 `+` 快捷添加使用）。
     fn floating_icon_button(
         &self,
         id: impl Into<SharedString>,
@@ -4047,7 +4064,6 @@ impl ProjectList {
         let id_add_btn = id.clone();
         let name_drag = name.clone();
         let row_menu = row.clone();
-        let row_more_menu = row.clone();
         let this = cx.entity();
         let focus = self.row_focus.get(id.as_str()).cloned();
         let is_focused = focus.as_ref().is_some_and(|f| f.is_focused(window));
@@ -4278,9 +4294,8 @@ impl ProjectList {
                     })
                     .child(count.to_string()),
             )
-            // 零抖动悬浮动作胶囊：`[+]` 添加到此分组 + `[···]` 分组菜单
+            // 零抖动悬浮动作胶囊：`[+]` 添加到此分组
             .when(show_actions, |el| {
-                let row_more = row_more_menu.clone();
                 el.child(
                     div()
                         .absolute()
@@ -4290,49 +4305,27 @@ impl ProjectList {
                         .flex()
                         .items_center()
                         .child(
-                            self.floating_action_bar()
-                                .child(
-                                    self.floating_icon_button(
-                                        format!("group-add-{id}"),
-                                        ICON_PLUS,
-                                        t("projectList", "group.addTip"),
-                                        cx,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            let entries =
-                                                group_add_menu(&this.store, &id_add_btn, depth);
-                                            menu::show(
-                                                click_position(event, window),
-                                                entries,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
+                            self.floating_action_bar().child(
+                                self.floating_icon_button(
+                                    format!("group-add-{id}"),
+                                    ICON_PLUS,
+                                    t("projectList", "group.addTip"),
+                                    cx,
                                 )
-                                .child(
-                                    self.floating_icon_button(
-                                        format!("group-more-{id}"),
-                                        ICON_MORE,
-                                        t("projectList", "group.moreTip"),
-                                        cx,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            cx.stop_propagation();
-                                            let entries =
-                                                group_menu(&cx.entity(), &this.store, &row_more);
-                                            menu::show(
-                                                click_position(event, window),
-                                                entries,
-                                                window,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                ),
+                                .on_click(cx.listener(
+                                    move |this, event: &ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        let entries =
+                                            group_add_menu(&this.store, &id_add_btn, depth);
+                                        menu::show(
+                                            click_position(event, window),
+                                            entries,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            ),
                         ),
                 )
             });
@@ -5485,49 +5478,6 @@ impl ProjectList {
         }
     }
 
-    /// 项目行与 worktree 子项行共用的零抖动悬浮「···」更多操作按钮。
-    /// 绝对定位贴在行右缘，不推挤状态灯 / 胶囊 / 标题；点击直接弹出完整右键菜单。
-    fn project_more_overlay(
-        &self,
-        row: &Row,
-        tree: &[ProjectTreeItem],
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let row_for_menu = row.clone();
-        let tree_for_menu = tree.to_vec();
-        div()
-            .absolute()
-            .right(px(4.0))
-            .top_0()
-            .bottom_0()
-            .flex()
-            .items_center()
-            .child(
-                self.floating_action_bar().child(
-                    self.floating_icon_button(
-                        format!("project-more-{}", row.id),
-                        ICON_MORE,
-                        t("projectList", "row.moreTip"),
-                        cx,
-                    )
-                    .on_click(cx.listener(
-                        move |this, event: &ClickEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.close_preview(cx);
-                            let entries = project_menu(
-                                &cx.entity(),
-                                &this.store,
-                                &row_for_menu,
-                                &tree_for_menu,
-                                cx,
-                            );
-                            menu::show(click_position(event, window), entries, window, cx);
-                        },
-                    )),
-                ),
-            )
-    }
-
     /// worktree 子项行的名字位（B1 分支优先）：编辑态换成内联输入框，否则主文 + 可选浅色副文，
     /// 均支持行内搜索关键词高亮。
     fn child_row_label(
@@ -5588,13 +5538,7 @@ impl ProjectList {
         } else {
             ui::text_muted()
         };
-        let bg = if highlight {
-            ui::accent_subtle()
-        } else if collapsed {
-            ui::border_default()
-        } else {
-            ui::border_subtle()
-        };
+        let (bg, hover_bg) = worktree_toggle_chip_colors(highlight, collapsed);
         let tip = if collapsed {
             tr!("projectList", "worktreeToggleExpand", count = count)
         } else {
@@ -5622,7 +5566,7 @@ impl ProjectList {
             .text_size(ui::font_px(10.0))
             .font_weight(FontWeight::MEDIUM)
             .text_color(fg)
-            .hover(|el| el.bg(ui::border_strong()).text_color(ui::text_primary()))
+            .hover(move |el| el.bg(hover_bg).text_color(ui::text_primary()))
             .tip(tip)
             .on_hover(cx.listener(|this, entered: &bool, _window, cx| {
                 this.hover_on_action = *entered;
@@ -5863,19 +5807,16 @@ impl ProjectList {
         .gap(px(7.0))
         .pl(px(pl))
         .pr(px(pr))
-        .py(px(5.5))
-        .when(in_expanded_cluster, |el| {
-            el.rounded_t(px(CLUSTER_INNER_RADIUS))
-                .border_b_1()
-                .border_color(if is_focused {
-                    ui::with_alpha(ui::accent(), 0.55)
-                } else {
-                    ui::border_subtle()
-                })
-        })
-        .when(!in_expanded_cluster, |el| {
-            el.rounded(px(6.0)).border_1().border_color(border_color)
-        })
+        .py(px(if in_expanded_cluster { 5.0 } else { 5.5 }))
+        // 微容器内父行不再画底部硬分隔线：透明 1px 内框保证与普通项目行左右像素级对齐，
+        // 树形竖轨直接从父图标下方自然承接，键盘聚焦时则完整浮现四边聚焦环
+        .rounded(px(if in_expanded_cluster {
+            CLUSTER_INNER_RADIUS
+        } else {
+            6.0
+        }))
+        .border_1()
+        .border_color(border_color)
         .text_size(ui::font_px(13.0))
         .text_color(text_color)
         .when_some(row_tint, |el, bg| el.bg(bg))
@@ -5966,7 +5907,6 @@ impl ProjectList {
             } else {
                 ui::with_alpha(ui::accent(), 0.0)
             };
-            let show_more = hovered && editing.is_none() && !drag_active;
 
             let pill = div()
                 .relative()
@@ -6008,11 +5948,7 @@ impl ProjectList {
                     done_tag,
                     row.light,
                     row.ssh_connected.as_deref(),
-                ))
-                // 零抖动悬浮「···」操作胶囊
-                .when(show_more, |el| {
-                    el.child(self.project_more_overlay(&row, tree, cx))
-                });
+                ));
 
             let row_el = self
                 .project_row_interactions(&row, is_active, tooltip, dragging, filtering, tree, cx)
@@ -6113,7 +6049,6 @@ impl ProjectList {
             .as_ref()
             .filter(|e| !e.is_group && e.id == *id)
             .map(|e| e.input.clone());
-        let show_more = hovered && editing.is_none() && !drag_active;
 
         // 左侧 2.5×14px 圆头语义微轨（绝对定位，不推挤图标与文字）
         let rail_color = if is_active {
@@ -6178,11 +6113,7 @@ impl ProjectList {
                 done_tag,
                 light,
                 ssh_connected.as_deref(),
-            ))
-            // 零抖动悬浮「···」操作胶囊（替代直接外露会引发整行左跳的 ✕）
-            .when(show_more, |el| {
-                el.child(self.project_more_overlay(&row, tree, cx))
-            });
+            ));
 
         let ml = row_left_margin(group_depth);
         let guides = group_guide_lines(group_depth);
@@ -6573,7 +6504,6 @@ mod tests {
         for (name, shapes) in [
             ("ICON_SEARCH", ICON_SEARCH),
             ("ICON_PLUS", ICON_PLUS),
-            ("ICON_MORE", ICON_MORE),
             ("ICON_COLLAPSE_ALL", ICON_COLLAPSE_ALL),
             ("ICON_EXPAND_ALL", ICON_EXPAND_ALL),
             ("ICON_CLOSE_SM", ICON_CLOSE_SM),
@@ -6964,15 +6894,15 @@ mod tests {
 
     #[test]
     fn 树轨坐标对齐父项目领位图标水平中心() {
-        // 微容器内父行 pl = ROW_INNER_PL(10) - CLUSTER_BORDER_W(1) = 9，14px 图标中心 = 9 + 7 = 16
-        assert_eq!(cluster_rail_x(0), 16.0);
+        // 微容器内父行 1px 透明内框 + pl(ROW_INNER_PL(10) - CLUSTER_BORDER_W(1)) = 10，
+        // 14px 图标中心落在 10 + 7 = 17（与独立项目行完全齐平）
+        assert_eq!(cluster_rail_x(0), 17.0);
         // 嵌套孙项向右步进一个 CHILD_NEST_STEP
-        assert_eq!(cluster_rail_x(1), 16.0 + CHILD_NEST_STEP);
+        assert_eq!(cluster_rail_x(1), 17.0 + CHILD_NEST_STEP);
     }
 
     /// 回归 #108：worktree 簇微容器底色与分组引导线在内置浅/暗两套主题下都必须
-    /// 跟随主题、按原透明度乘性缩放，不能把 `border_subtle`/`border_strong` 拉成
-    /// 实黑块或刺眼白块。
+    /// 跟随主题、保持极淡下凹底色与轻细边，不能拉成实黑块、刺眼白块或高亮选中块。
     #[test]
     fn 微容器底色与分组引导线跟随内置明暗主题() {
         struct ResetPalette;
@@ -6993,13 +6923,23 @@ mod tests {
             let b = mix(fg.b, bg.b);
             0.2126 * r + 0.7152 * g + 0.0722 * b
         };
+        let solid_luma = |c: gpui::Hsla| {
+            let rgba = gpui::Rgba::from(c);
+            0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
+        };
 
         ui::set_palette(ui::Palette::light());
-        let (light_bg, _) = cluster_surface_colors(false);
+        let (light_bg, light_border) = cluster_surface_colors(false);
+        let light_surface_luma = solid_luma(ui::bg_surface());
         let light_luma = blend_over(light_bg, ui::bg_surface());
         assert!(
-            light_luma > 0.85,
-            "浅色主题下微容器底色叠加侧栏后应保持浅灰，实际亮度 {light_luma:.3} ({light_bg:?})"
+            light_luma > 0.85 && light_luma < light_surface_luma,
+            "浅色主题下微容器底色应略暗于侧栏并保持极浅灰，实际亮度 {light_luma:.3} vs 侧栏 {light_surface_luma:.3}"
+        );
+        assert!(
+            light_border.a < 0.10,
+            "浅色主题下未激活微容器边框应为极淡细边，实际 alpha={}",
+            light_border.a
         );
         let light_guide = group_guide_color();
         assert!(
@@ -7009,11 +6949,17 @@ mod tests {
         );
 
         ui::set_palette(ui::Palette::dark());
-        let (dark_bg, _) = cluster_surface_colors(false);
+        let (dark_bg, dark_border) = cluster_surface_colors(false);
+        let dark_surface_luma = solid_luma(ui::bg_surface());
         let dark_luma = blend_over(dark_bg, ui::bg_surface());
         assert!(
-            dark_luma < 0.15,
-            "暗色主题下微容器底色叠加侧栏后应保持深色，实际亮度 {dark_luma:.3} ({dark_bg:?})"
+            dark_luma < 0.15 && dark_luma < dark_surface_luma,
+            "暗色主题下微容器底色应略暗于侧栏呈轻凹感，实际亮度 {dark_luma:.3} vs 侧栏 {dark_surface_luma:.3}"
+        );
+        assert!(
+            dark_border.a < 0.10,
+            "暗色主题下未激活微容器边框应为极淡细边，实际 alpha={}",
+            dark_border.a
         );
         let dark_guide = group_guide_color();
         assert!(
@@ -7026,5 +6972,123 @@ mod tests {
             (light_luma - dark_luma).abs() > 0.7,
             "浅色与暗色主题的微容器合成底色必须明显区分"
         );
+    }
+
+    /// 外置主题包里的 `line`（即 `border_default`）通常是 α=1 的实色，此前把
+    /// `border_subtle` / `border_default` 直接拿来做微容器底色与边框，会把整个
+    /// worktree 簇涂成比侧栏还亮的“选中块”。这里同时覆盖暗色/浅色/低透明/底面同色皮肤。
+    #[test]
+    fn 外置皮肤下微容器保持下凹轻底与柔和细边不呈选中态() {
+        struct ResetPalette;
+        impl Drop for ResetPalette {
+            fn drop(&mut self) {
+                ui::set_palette(ui::Palette::dark());
+            }
+        }
+        let _reset = ResetPalette;
+
+        let blend_over = |fg: gpui::Hsla, bg: gpui::Hsla| {
+            let fg = gpui::Rgba::from(fg);
+            let bg = gpui::Rgba::from(bg);
+            let a = fg.a;
+            let mix = |f: f32, b: f32| f * a + b * (1.0 - a);
+            let r = mix(fg.r, bg.r);
+            let g = mix(fg.g, bg.g);
+            let b = mix(fg.b, bg.b);
+            0.2126 * r + 0.7152 * g + 0.0722 * b
+        };
+        let solid_luma = |c: gpui::Hsla| {
+            let rgba = gpui::Rgba::from(c);
+            0.2126 * rgba.r + 0.7152 * rgba.g + 0.0722 * rgba.b
+        };
+
+        let cases = [
+            // 暗色皮肤（仿「霜蓝听雪」：实色亮蓝灰 line）
+            (
+                "dark-frost",
+                r##"{
+                  "id": "frost", "name": "Frost", "appearance": "dark",
+                  "colors": {
+                    "background": "#17273a", "panel": "#20334b", "panelAlt": "#293e58",
+                    "accent": "#9bd8f4", "text": "#e5eef8", "muted": "#bdcce1", "line": "#45617f"
+                  },
+                  "effects": { "surfaceOpacity": 0.9 }
+                }"##,
+            ),
+            // 暗色边界：background 与 panel 同色时仍应轻微下凹，绝不反亮
+            (
+                "dark-flat",
+                r##"{
+                  "id": "flat", "name": "Flat", "appearance": "dark",
+                  "colors": {
+                    "background": "#1e293b", "panel": "#1e293b", "panelAlt": "#273549",
+                    "accent": "#60a5fa", "text": "#e2e8f0", "muted": "#94a3b8", "line": "#475569"
+                  }
+                }"##,
+            ),
+            // 浅色皮肤（仿「银灰机能」：实色灰蓝 line）
+            (
+                "light-silver",
+                r##"{
+                  "id": "silver", "name": "Silver", "appearance": "light",
+                  "colors": {
+                    "background": "#f2f4f7", "panel": "#e7ebf0", "panelAlt": "#dce7ef",
+                    "accent": "#005477", "text": "#222a35", "muted": "#435166", "line": "#a7b4c5"
+                  },
+                  "effects": { "surfaceOpacity": 0.92 }
+                }"##,
+            ),
+            // 低透明浅色皮肤（仿「morning-mist」：surfaceOpacity = 0.2）
+            (
+                "light-mist",
+                r##"{
+                  "id": "mist", "name": "Mist", "appearance": "light",
+                  "colors": {
+                    "background": "#f6f3f9", "panel": "#eee9f4", "panelAlt": "#e4ddee",
+                    "accent": "#813412", "text": "#261e33", "muted": "#524861", "line": "#d5cce1"
+                  },
+                  "effects": { "surfaceOpacity": 0.2 }
+                }"##,
+            ),
+        ];
+
+        for (label, json) in cases {
+            let def = mt_ui::theme_bridge::parse_theme_pack(label, json).unwrap();
+            let applied = mt_ui::theme_bridge::resolve_theme_pack(&def, None);
+            ui::set_palette(ui::Palette::from_pack(&applied));
+
+            let (idle_bg, idle_border) = cluster_surface_colors(false);
+            let (_, active_border) = cluster_surface_colors(true);
+            let surface_luma = solid_luma(ui::bg_surface());
+            let blended_luma = blend_over(idle_bg, ui::bg_surface());
+
+            assert!(
+                blended_luma < surface_luma,
+                "{label}: 微容器底色不应比侧栏更亮（避免选中错觉），实际 {blended_luma:.4} vs 侧栏 {surface_luma:.4}"
+            );
+            assert!(
+                surface_luma - blended_luma < 0.06,
+                "{label}: 微容器下凹幅度应克制柔和，实际差值 {:.4}",
+                surface_luma - blended_luma
+            );
+            assert!(
+                idle_border.a < 0.10,
+                "{label}: 未激活微容器边框应为极淡细边而非实线，实际 alpha={}",
+                idle_border.a
+            );
+            assert!(
+                (active_border.h - ui::accent().h).abs() < 1e-3 && active_border.a <= 0.25,
+                "{label}: 含活动项时边框应切柔和 accent，实际 {active_border:?}"
+            );
+
+            let (expanded_chip_bg, _) = worktree_toggle_chip_colors(false, false);
+            let (collapsed_chip_bg, _) = worktree_toggle_chip_colors(false, true);
+            assert!(
+                expanded_chip_bg.a < 0.10 && collapsed_chip_bg.a < 0.12,
+                "{label}: 折叠计数胶囊底色应保持低透明，实际 expanded={} collapsed={}",
+                expanded_chip_bg.a,
+                collapsed_chip_bg.a
+            );
+        }
     }
 }

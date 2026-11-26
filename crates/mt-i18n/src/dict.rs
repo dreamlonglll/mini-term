@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 2062;
+pub const ZH_ENTRY_COUNT: usize = 2060;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 2062;
+pub const EN_ENTRY_COUNT: usize = 2060;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -2517,7 +2517,6 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("group.addTip", "向此分组添加项目或子组"),
     ("group.collapsedActiveTip", "包含当前活动项目"),
     ("group.emptyHint", "拖入项目到此分组"),
-    ("group.moreTip", "分组操作"),
     ("header.addTip", "添加项目或新建分组"),
     ("header.collapseAll", "全部折叠"),
     ("header.expandAll", "全部展开"),
@@ -2574,7 +2573,6 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("removeConfirm.messagePrefix", "确定要移除项目「"),
     ("removeConfirm.messageSuffix", "」吗？此操作仅从列表中移除，不会删除文件。"),
     ("removeConfirm.title", "移除项目"),
-    ("row.moreTip", "更多操作"),
     ("worktreeBadgeTitle", "Git worktree · 分支 {branch}"),
     ("worktreeToggleCollapse", "折叠 {count} 个 worktree"),
     ("worktreeToggleExpand", "展开 {count} 个 worktree"),
@@ -2604,7 +2602,6 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("group.addTip", "Add project or subgroup here"),
     ("group.collapsedActiveTip", "Contains active project"),
     ("group.emptyHint", "Drop projects into this group"),
-    ("group.moreTip", "Group actions"),
     ("header.addTip", "Add project or new group"),
     ("header.collapseAll", "Collapse all"),
     ("header.expandAll", "Expand all"),
@@ -2661,7 +2658,6 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("removeConfirm.messagePrefix", "Remove project “"),
     ("removeConfirm.messageSuffix", "”? This only removes it from the list and won't delete any files."),
     ("removeConfirm.title", "Remove Project"),
-    ("row.moreTip", "More actions"),
     ("worktreeBadgeTitle", "Git worktree · branch {branch}"),
     ("worktreeToggleCollapse", "Collapse {count} worktree(s)"),
     ("worktreeToggleExpand", "Expand {count} worktree(s)"),
