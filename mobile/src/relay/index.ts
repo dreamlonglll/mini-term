@@ -12,6 +12,8 @@
  */
 export { type SavedDesktop } from './auth';
 export {
+  type CommandReceiptView,
+  type CommandUnknownCause,
   type HistoryError,
   type HistoryListState,
   type HistoryPreviewState,
@@ -23,6 +25,8 @@ export {
   type TerminalScreenData,
   clearStartError,
   findLivePaneForHistory,
+  selectKeepMainView,
+  selectLinkDown,
   setHomeTab,
   useRelayStore,
 } from './store';
@@ -58,6 +62,7 @@ export { resumeAiSession, startAiSession } from './session';
 export {
   refreshSessions,
   removeSavedDesktop,
+  retryConnectionNow,
   startRelay,
   switchDesktop,
 } from './connection';

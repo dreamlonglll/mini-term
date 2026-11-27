@@ -266,6 +266,57 @@ body {
   padding: 24px;
 }
 
+/* ── 链路横幅:同一台桌面端重连 / 刷新期间挂在主视图顶部,不卸载下面的列表与镜像 ── */
+
+.link-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(224, 169, 60, 0.12);
+  border-bottom: 1px solid rgba(224, 169, 60, 0.4);
+  color: var(--color-attention);
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.link-banner.is-offline {
+  background: rgba(224, 92, 92, 0.12);
+  border-bottom-color: rgba(224, 92, 92, 0.4);
+  color: var(--color-error);
+}
+
+.link-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.link-banner-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pullSpin 0.8s linear infinite;
+}
+
+.link-banner-retry {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.link-banner-retry:active {
+  opacity: 0.7;
+}
+
 .status-screen {
   text-align: center;
   max-width: 320px;
@@ -418,6 +469,16 @@ body {
   color: var(--accent);
 }
 
+/* 重连中改名发不出去 */
+.pane-rename:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.pane-rename:disabled:active {
+  color: var(--text-muted);
+}
+
 .pane-chevron {
   color: var(--text-muted);
   font-size: 18px;
@@ -565,6 +626,11 @@ body {
 
 .rename-confirm:active {
   opacity: 0.85;
+}
+
+.rename-confirm:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .mirror-closed {
@@ -1266,6 +1332,12 @@ body {
 
 .composer-receipt.fail {
   color: var(--color-error);
+}
+
+/* 结果未知:不是失败(可能已写入),用提醒色而不是错误红 */
+.composer-receipt.unknown {
+  color: var(--color-attention);
+  line-height: 1.5;
 }
 
 .composer-hint {
@@ -2013,7 +2085,8 @@ body {
 
   /* 例外：下拉刷新的 spinner 是「正在刷新」的唯一反馈，停住就等于假装卡死。
      放慢而不是取消 —— 小幅匀速旋转不属于 reduced-motion 要消除的那类动效。 */
-  .pull-indicator .spinner {
+  .pull-indicator .spinner,
+  .link-banner-spinner {
     animation-duration: 2.4s;
   }
 

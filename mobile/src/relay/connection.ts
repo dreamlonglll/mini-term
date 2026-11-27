@@ -40,7 +40,14 @@ import {
   handleHistoryMessage,
   resyncPendingHistory,
 } from './history';
-import { closeMirror, handleMirrorMessage, openMirror } from './mirror';
+import {
+  closeMirror,
+  failPendingCommandDesktopOffline,
+  failPendingCommandOnLinkLost,
+  handleMirrorMessage,
+  openMirror,
+  resetCommandSlotAfterReconnect,
+} from './mirror';
 import { finishStart, handleStartSessionReceipt, onProjectsChanged } from './session';
 import { findPane, resetDesktopSessionState, setPhase, useRelayStore } from './store';
 import { registerTransportSender, sendToRelay } from './transport';
@@ -93,6 +100,17 @@ registerTransportSender((msg) => {
   }
 });
 
+/**
+ * 这条连接没了(断线,或主动断开重连)。挂在它上面、等回执的请求不会从新连接回来:
+ * - 在途指令置为「结果未知」(不自动重发,指令可能已执行);
+ * - 在途的 @ / / 补全收敛,免得重连后浮层一直转圈、技能列表因「加载中」不再重拉。
+ * 历史列表 / 预览不在这里收:收到新连接的快照后会用同一 requestId 补发(resyncPendingHistory)。
+ */
+function handleLinkLost() {
+  failPendingCommandOnLinkLost();
+  failPendingAssistOffline();
+}
+
 function teardownSocket() {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -102,6 +120,7 @@ function teardownSocket() {
     ws.onclose = null;
     ws.close();
     ws = null;
+    handleLinkLost();
   }
 }
 
@@ -241,12 +260,20 @@ function connect(auth: {
         setActiveDesktopId(desktopId);
         syncDesktopUrl(desktopId);
         const saved = savedDesktops.find((d) => d.desktopId === desktopId);
+        // 手上的视图数据属于另一台桌面端(理论上切机都会先清,这里兜底):别把两台混着显示
+        const prevEstablished = useRelayStore.getState().establishedDesktopId;
+        if (prevEstablished !== null && prevEstablished !== desktopId) {
+          clearInFlightUiState();
+        }
+        // 新连接:旧连接上在途指令的回执不会再来,单槽复位(此前断线时已置为结果未知)
+        resetCommandSlotAfterReconnect();
         useRelayStore.setState({
           currentDesktopId: desktopId,
           currentDesktopName: authoritativeName
             ? (msg.desktopName?.trim() || null)
             : (msg.desktopName ?? saved?.desktopName ?? null),
           savedDesktops,
+          establishedDesktopId: desktopId,
         });
         setPhase('connected');
         // 断线前在看的镜像不在这里重订阅:桌面端在线时中转会请它回发结构快照,
@@ -255,6 +282,9 @@ function connect(auth: {
       }
       case 'helloReject': {
         stopped = true;
+        // 握手被拒(凭证失效 / 配对码作废 / 版本不符)走全屏状态页:旧视图数据不再保留,
+        // 否则重连期间保活主视图的判定会认它、返回手势也会去关看不见的视图
+        clearInFlightUiState();
         if (msg.reason === 'invalidCredential') {
           if (auth.fromLegacy) {
             clearLegacyCredential();
@@ -307,11 +337,13 @@ function connect(auth: {
           patch.savedDesktops = updateSavedDesktopName(activeDesktopId, nextName ?? undefined);
         }
         useRelayStore.setState(patch);
-        // 桌面端在等待期间掉线:在途的发起 / 历史 / 补全再也不会有下文,立刻给出原因而不是等超时
+        // 桌面端在等待期间掉线:在途的发起 / 历史 / 补全再也不会有下文,立刻给出原因而不是等超时;
+        // 在途指令可能已写入也可能没有,置为「结果未知」
         if (!msg.desktopOnline) {
           if (useRelayStore.getState().starting) finishStart('desktopOffline');
           failPendingHistoryOffline();
           failPendingAssistOffline();
+          failPendingCommandDesktopOffline();
         }
         break;
       }
@@ -399,14 +431,19 @@ function connect(auth: {
     clearTimeout(handshakeTimer);
     if (ws !== socket) return; // 已被新连接取代
     ws = null;
+    handleLinkLost();
     if (stopped) return;
     const { desktopId, credential } = currentReconnectAuth();
     if (!credential) {
       // 配对失败且没有凭证可回退
-      if (!handshakeDone) setPhase('idle');
+      if (!handshakeDone) {
+        useRelayStore.setState({ establishedDesktopId: null });
+        setPhase('idle');
+      }
       return;
     }
     reconnectAttempt += 1;
+    // 首次连上之后的重连:主视图保持挂载(App 按 establishedDesktopId 判),只在顶部挂横幅
     setPhase('reconnecting');
     reconnectTimer = setTimeout(
       () =>
@@ -488,6 +525,8 @@ export function removeSavedDesktop(desktopId: string) {
  *
  * 协议里没有「请求全量快照」这条消息,而握手成功后桌面端本来就会推一份完整
  * sessionsSnapshot —— 重连即是最直接的「重新对齐」,且复用了已经跑熟的那条路径。
+ * 同一台桌面端的刷新期间主视图保持挂载(见 store 的 establishedDesktopId),
+ * 列表的刷新指示器、镜像页的草稿与阅读位置都不会因为这次重连被卸载。
  *
  * 返回 false = 当前没有凭证,刷新无从谈起(未配对)。
  */
@@ -495,6 +534,21 @@ export function refreshSessions(): boolean {
   const { desktopId, credential } = currentReconnectAuth();
   if (!credential) return false;
   reconnectAttempt = 0;
+  connect({ credential, targetDesktopId: desktopId ?? undefined });
+  return true;
+}
+
+/**
+ * 重连横幅上的「立即重试」:不等退避到点,马上再连一次(握手进行中则重来一次)。
+ * 返回 false = 当前不在重连 / 已停用自动重连 / 没有凭证。
+ */
+export function retryConnectionNow(): boolean {
+  if (stopped) return false;
+  const { phase } = useRelayStore.getState();
+  if (phase !== 'reconnecting' && phase !== 'connecting') return false;
+  const { desktopId, credential } = currentReconnectAuth();
+  if (!credential) return false;
+  // 不复位 reconnectAttempt:这次再失败仍按退避走,界面也继续是「重新连接中」
   connect({ credential, targetDesktopId: desktopId ?? undefined });
   return true;
 }
@@ -635,5 +689,21 @@ document.addEventListener('visibilitychange', () => {
   reconnectNowIfWaiting();
 });
 
-// 网络恢复(切 Wi-Fi / 蜂窝、出电梯):在退避等待里就别等到点了
-window.addEventListener('online', reconnectNowIfWaiting);
+/** 已连接状态下经历过一次断网(浏览器未必因此报 close,连接可能已是死的)。 */
+let wentOfflineWhileConnected = false;
+
+window.addEventListener('offline', () => {
+  if (useRelayStore.getState().phase === 'connected') wentOfflineWhileConnected = true;
+});
+
+// 网络恢复(切 Wi-Fi / 蜂窝、出电梯):在退避等待里就别等到点了;断网期间一直显示
+// 「已连接」的,连接多半已死却没报 close(同回前台的口径),直接重连对齐一次
+window.addEventListener('online', () => {
+  const stale = wentOfflineWhileConnected;
+  wentOfflineWhileConnected = false;
+  if (stale && !stopped && useRelayStore.getState().phase === 'connected') {
+    refreshSessions();
+    return;
+  }
+  reconnectNowIfWaiting();
+});

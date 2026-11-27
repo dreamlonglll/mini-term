@@ -182,8 +182,10 @@ export const QuestionCard = memo(function QuestionCard({
     interactive ? (s.mirror?.answeredProgress[msg.seq] ?? 0) : 0,
   );
   const desktopOnline = useRelayStore((s) => (interactive ? s.desktopOnline : true));
+  // 重连中作答发不出去:置灰,别让人以为点上了
+  const linkUp = useRelayStore((s) => (interactive ? s.phase === 'connected' : true));
   const chosen = marker?.labels ?? [];
-  const canAnswer = interactive && mirrorOpen && desktopOnline !== false;
+  const canAnswer = interactive && mirrorOpen && desktopOnline !== false && linkUp;
   const time = formatMessageTime(msg.timestamp);
   const items = msg.questions ?? [];
   const questionId = msg.questionId ?? '';

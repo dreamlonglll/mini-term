@@ -10,6 +10,7 @@ export const start = {
     starting: "正在「{project}」启动会话…",
     disabled: {
       offline: "桌面端离线，无法新建会话",
+      reconnecting: "正在重新连接，暂时无法新建会话",
       noLaunchers: "请先在桌面端配置启动器",
       starting: "正在启动会话…",
     },
@@ -35,6 +36,7 @@ export const start = {
     starting: "Starting a session in “{project}”…",
     disabled: {
       offline: "Desktop offline — can't start a session",
+      reconnecting: "Reconnecting — can't start a session right now",
       noLaunchers: "Configure a launcher on the desktop first",
       starting: "Starting a session…",
     },

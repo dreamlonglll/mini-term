@@ -5,6 +5,12 @@ export const pair = {
     pairing: "配对中…",
     connecting: "连接中…",
     reconnecting: "重连中…",
+    link: {
+      reconnecting: "正在重新连接…",
+      syncing: "正在同步最新状态…",
+      offline: "网络已断开，恢复后将自动重连",
+      retry: "立即重试",
+    },
     revoked: "配对已失效，请重新扫码",
     revokedHint: "新设备完成了配对，或桌面端重置了配对。请在桌面端重新生成二维码。",
     rejected: {
@@ -31,6 +37,12 @@ export const pair = {
     pairing: "Pairing…",
     connecting: "Connecting…",
     reconnecting: "Reconnecting…",
+    link: {
+      reconnecting: "Reconnecting…",
+      syncing: "Syncing latest state…",
+      offline: "You're offline — will reconnect automatically",
+      retry: "Retry now",
+    },
     revoked: "Pairing revoked — please scan again",
     revokedHint: "Another device completed pairing, or the desktop reset pairing. Generate a new QR code on the desktop.",
     rejected: {

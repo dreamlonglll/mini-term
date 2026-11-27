@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { type RefObject, useEffect, useRef, useState } from 'react';
 import {
   clearStartError,
   openMirror,
   openProjectHistory,
   refreshSessions,
+  selectLinkDown,
   setHomeTab,
   useRelayStore,
 } from './relay';
@@ -12,6 +13,18 @@ import { StartSessionSheet } from './StartSessionSheet';
 import { RenameSheet } from './RenameSheet';
 import { HistoryProjects } from './HistoryView';
 import type { MobilePane } from './protocol';
+import {
+  PULL_TRIGGER,
+  type PullAxis,
+  classifyPullGesture,
+  isAtScrollTop,
+  pullDistance,
+} from './pullGesture';
+
+/** 刷新指示器至少转这么久(握手 + 快照常在几百毫秒内完成,一闪而过像没刷) */
+const REFRESH_MIN_MS = 600;
+/** 迟迟连不上时指示器最多转这么久,之后交给顶部的重连横幅 */
+const REFRESH_MAX_MS = 10_000;
 
 const STATUS_CLASS: Record<string, string> = {
   'ai-working': 'dot-working',
@@ -33,6 +46,8 @@ function statusKey(status: string): string {
 function PaneRow({ pane }: { pane: MobilePane }) {
   const t = useT();
   const [renaming, setRenaming] = useState(false);
+  // 重连中改名发不出去(renamePane 会拒),入口一并置灰;进镜像不受影响,重连后自动订阅
+  const linkDown = useRelayStore(selectLinkDown);
   // 黄灯(提问待答/等待授权)展示优先于常规状态:用户此刻该做的事比 AI 在不在跑重要
   const attention = pane.needsAttention === true;
   return (
@@ -53,6 +68,7 @@ function PaneRow({ pane }: { pane: MobilePane }) {
           className="pane-rename"
           aria-label={t('sessions.rename.action')}
           title={t('sessions.rename.action')}
+          disabled={linkDown}
           onClick={() => setRenaming(true)}
         >
           ✎
@@ -69,8 +85,11 @@ function PaneRow({ pane }: { pane: MobilePane }) {
   );
 }
 
-/** 活跃 / 历史会话首页:桌面端离线时置灰不可交互。 */
-export function SessionList() {
+/**
+ * 活跃 / 历史会话首页:桌面端离线时置灰不可交互。
+ * `scrollRef` 是真正的滚动容器(App 的 `.app-main.list-mode`):列表本身不滚动。
+ */
+export function SessionList({ scrollRef }: { scrollRef: RefObject<HTMLElement | null> }) {
   const t = useT();
   const projects = useRelayStore((s) => s.projects);
   const launchers = useRelayStore((s) => s.launchers);
@@ -79,63 +98,92 @@ export function SessionList() {
   const homeTab = useRelayStore((s) => s.homeTab);
   const starting = useRelayStore((s) => s.starting);
   const startError = useRelayStore((s) => s.startError);
+  const phase = useRelayStore((s) => s.phase);
+  const linkDown = phase !== 'connected';
   const [sheetOpen, setSheetOpen] = useState(false);
   const offline = desktopOnline === false;
 
   // ── 下拉刷新 ──
   // 列表本身是实时同步的，但「怀疑它卡住了」时用户需要一个能自己动手的动作。
+  // 刷新 = 同一台桌面端重连一次;重连期间本组件保持挂载(App 按 establishedDesktopId 判),
+  // 指示器一直转到重新连上为止。
   const [pull, setPull] = useState(0);
   const [pulling, setPulling] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const pullStart = useRef<number | null>(null);
-  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const PULL_TRIGGER = 64;
+  /** 这次手势的起点;null = 没在跟踪(没在顶部起手 / 已判定放弃) */
+  const gesture = useRef<{ x: number; y: number; axis: PullAxis; pull: number } | null>(null);
+  const refreshStartedAt = useRef(0);
 
   useEffect(() => {
-    return () => {
-      if (refreshTimer.current !== null) {
-        clearTimeout(refreshTimer.current);
-      }
-    };
-  }, []);
+    if (!refreshing) return;
+    if (phase === 'connected') {
+      const wait = Math.max(0, REFRESH_MIN_MS - (Date.now() - refreshStartedAt.current));
+      const timer = setTimeout(() => setRefreshing(false), wait);
+      return () => clearTimeout(timer);
+    }
+    const cap = setTimeout(
+      () => setRefreshing(false),
+      Math.max(0, REFRESH_MAX_MS - (Date.now() - refreshStartedAt.current)),
+    );
+    return () => clearTimeout(cap);
+  }, [refreshing, phase]);
+
+  const resetPull = () => {
+    gesture.current = null;
+    setPulling(false);
+    setPull(0);
+  };
+
+  /** 滚动容器此刻是否在顶部;拿不到容器时按不在顶部处理(宁可不刷也别误刷) */
+  const scrollerAtTop = () => {
+    const scroller = scrollRef.current;
+    return scroller !== null && isAtScrollTop(scroller.scrollTop);
+  };
 
   const onTouchStart = (e: React.TouchEvent) => {
     // 只在真正滚到顶时才接管手势，否则会和正常滚动打架
-    const scroller = e.currentTarget.parentElement;
-    if (scroller && scroller.scrollTop > 0) return;
-    if (refreshing) return;
-    pullStart.current = e.touches[0].clientY;
-    setPulling(true);
+    if (refreshing || e.touches.length !== 1 || !scrollerAtTop()) {
+      gesture.current = null;
+      return;
+    }
+    const touch = e.touches[0];
+    gesture.current = { x: touch.clientX, y: touch.clientY, axis: 'pending', pull: 0 };
   };
 
   const onTouchMove = (e: React.TouchEvent) => {
-    if (pullStart.current === null) return;
-    const delta = e.touches[0].clientY - pullStart.current;
-    if (delta <= 0) {
-      setPull(0);
+    const g = gesture.current;
+    if (!g) return;
+    // 第二根手指落下(捏合)或列表已经离开顶部(起手后内容被滚动):放弃这次下拉
+    if (e.touches.length !== 1 || !scrollerAtTop()) {
+      resetPull();
       return;
     }
-    // 阻尼：越拉越沉，避免手指一滑就整屏位移
-    setPull(Math.min(delta * 0.5, PULL_TRIGGER + 20));
+    const touch = e.touches[0];
+    const dx = touch.clientX - g.x;
+    const dy = touch.clientY - g.y;
+    if (g.axis === 'pending') {
+      g.axis = classifyPullGesture(dx, dy);
+      if (g.axis === 'pending') return;
+      if (g.axis === 'abandon') {
+        // 横滑 / 往上滚:这次手势不是下拉刷新,松手前都不再接管
+        resetPull();
+        return;
+      }
+      setPulling(true);
+    }
+    g.pull = pullDistance(dy);
+    setPull(g.pull);
   };
 
   const onTouchEnd = () => {
-    if (pullStart.current === null) return;
-    const shouldRefresh = pull >= PULL_TRIGGER;
-    pullStart.current = null;
-    setPulling(false);
-    setPull(0);
+    const g = gesture.current;
+    if (!g) return;
+    const shouldRefresh = g.axis === 'pull' && g.pull >= PULL_TRIGGER;
+    resetPull();
     if (!shouldRefresh) return;
     if (!refreshSessions()) return;
+    refreshStartedAt.current = Date.now();
     setRefreshing(true);
-    // 重连握手 + 全量快照通常在 1s 内；这里只是指示器的收尾，不是真等待
-    if (refreshTimer.current !== null) {
-      clearTimeout(refreshTimer.current);
-    }
-    refreshTimer.current = setTimeout(() => {
-      refreshTimer.current = null;
-      setRefreshing(false);
-    }, 1200);
   };
 
   // 失败提示展示 6s 后自动消失(超时文案偏长,给足阅读时间)
@@ -152,11 +200,16 @@ export function SessionList() {
   // + 按钮不可用的原因,按优先级取第一条;null = 可用
   const disabledReason = offline
     ? 'offline'
-    : launchers.length === 0
-      ? 'noLaunchers'
-      : starting
-        ? 'starting'
-        : null;
+    : linkDown
+      ? 'reconnecting'
+      : launchers.length === 0
+        ? 'noLaunchers'
+        : starting
+          ? 'starting'
+          : null;
+  // 按钮旁的说明:重连中顶部已有横幅、启动中有进行态横幅,不再重复
+  const showFabHint =
+    disabledReason !== null && disabledReason !== 'starting' && disabledReason !== 'reconnecting';
 
   return (
     <div className="session-list">
@@ -236,7 +289,7 @@ export function SessionList() {
                   <button
                     type="button"
                     className="project-history-btn"
-                    disabled={offline}
+                    disabled={offline || linkDown}
                     onClick={() => openProjectHistory(project.projectId, project.name)}
                   >
                     {t('history.entry')} ›
@@ -260,9 +313,7 @@ export function SessionList() {
       >
         +
       </button>
-      {disabledReason && disabledReason !== 'starting' && (
-        <div className="fab-hint">{t(`start.disabled.${disabledReason}`)}</div>
-      )}
+      {showFabHint && <div className="fab-hint">{t(`start.disabled.${disabledReason}`)}</div>}
 
       {sheetOpen && <StartSessionSheet onClose={() => setSheetOpen(false)} />}
     </div>

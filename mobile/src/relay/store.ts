@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { SavedDesktop } from './auth';
+import type { CommandSlot } from './commandSlot';
 import type {
-  CommandFailReason,
   HistoryFailReason,
   MirrorMessage,
   MobileHistorySession,
@@ -12,6 +12,8 @@ import type {
   StartSessionFailReason,
   TerminalLine,
 } from '../protocol';
+
+export type { CommandReceiptView, CommandUnknownCause } from './commandSlot';
 
 export type MirrorViewMode = 'chat' | 'terminal';
 
@@ -35,12 +37,18 @@ export type Phase =
   | 'revoked' // 配对被顶替/重置
   | 'rejected'; // 握手被拒(带 reason)
 
-/** 对话镜像视图状态(一次只镜像一个 pane)。 */
-export interface MirrorState {
+/**
+ * 对话镜像视图状态(一次只镜像一个 pane)。
+ *
+ * 指令单槽(pendingCommandId / pendingAnswer / unsettled / receipt)的状态机见 `commandSlot.ts`。
+ * answeredProgress(卡片 seq → 已答题数)在回执 ok 即推进:已作答标记要等下一轮镜像轮询才回流,
+ * 这 ~1s 里按钮不该复活可再点。这是提交防抖不是乐观渲染——选中项的展示仍以回流的标记为准。
+ */
+export interface MirrorState extends CommandSlot {
   paneId: string;
   /** 该 pane 的展示名(从列表带入) */
   title: string;
-  /** 已加载的消息,按 seq 升序 */
+  /** 已加载的消息,按 seq 升序(重订阅快照与已有消息的合并规则见 `mirrorMerge.ts`) */
   messages: MirrorMessage[];
   /** 是否还有更早历史可分页 */
   hasMore: boolean;
@@ -50,18 +58,6 @@ export interface MirrorState {
   loadingOlder: boolean;
   /** 目标 pane 已关闭/AI 会话已结束 */
   closed: boolean;
-  /** 等待回执中的指令 id;null = 没有在途指令 */
-  pendingCommandId: string | null;
-  /** 在途的点选作答(commandId 与 pendingCommandId 同值,额外记住卡片 seq) */
-  pendingAnswer: { commandId: string; seq: number } | null;
-  /**
-   * 各提问卡片已成功注入的作答数(卡片 seq → 已答题数)。回执 ok 即推进:
-   * 已作答标记要等下一轮镜像轮询才回流,这 ~1s 里按钮不该复活可再点。
-   * 这是提交防抖不是乐观渲染——选中项的展示仍以回流的标记为准。
-   */
-  answeredProgress: Record<number, number>;
-  /** 最近一次指令回执(短暂展示后由 UI 清除) */
-  receipt: { ok: boolean; reason?: CommandFailReason } | null;
   /** 当前展示的子视图：对话镜像 / 终端画面 */
   viewMode: MirrorViewMode;
   /** 最近一帧终端屏幕快照；null = 尚未收到 */
@@ -118,6 +114,13 @@ export interface RelayStore {
   currentDesktopId: string | null;
   /** 当前桌面端展示名(来自中转或本地缓存;null = 未命名) */
   currentDesktopName: string | null;
+  /**
+   * 本页面已与哪台桌面端握手成功过、手上的列表 / 镜像等视图数据属于它;null = 还没有。
+   * 同一台桌面端断线重连 / 下拉刷新 / 回前台重连期间据此保持主视图挂载(只在顶部挂
+   * 重连横幅),不整屏换成「连接中」;首次连接、配对、切换桌面端、凭证失效 / 被吊销时清空,
+   * 那些场景照旧走全屏状态页。
+   */
+  establishedDesktopId: string | null;
   /** 本机已配对保存的全部桌面端(供顶栏多设备切换器展示) */
   savedDesktops: SavedDesktop[];
   /** 桌面端在线状态;null = 尚未收到 presence */
@@ -151,6 +154,7 @@ export const useRelayStore = create<RelayStore>(() => ({
   rejectReason: null,
   currentDesktopId: null,
   currentDesktopName: null,
+  establishedDesktopId: null,
   savedDesktops: [],
   desktopOnline: null,
   supportsHistory: false,
@@ -169,6 +173,7 @@ export const useRelayStore = create<RelayStore>(() => ({
 /** 切换桌面端或解除绑定时清空上一台电脑的运行态视图数据。 */
 export function resetDesktopSessionState() {
   useRelayStore.setState({
+    establishedDesktopId: null,
     desktopOnline: null,
     supportsHistory: false,
     supportsTerminalView: false,
@@ -186,6 +191,24 @@ export function resetDesktopSessionState() {
 
 export function setPhase(phase: Phase, rejectReason: MobileRejectReason | null = null) {
   useRelayStore.setState({ phase, rejectReason });
+}
+
+/**
+ * 与中转的链路此刻不通(重连 / 刷新握手中)。主视图在这期间可能仍挂着旧数据
+ * (见 `establishedDesktopId`),要发消息的按钮据此置灰:发不出去就别让人点,
+ * 更不能让人以为发出去了。
+ */
+export function selectLinkDown(s: RelayStore): boolean {
+  return s.phase !== 'connected';
+}
+
+/** 同一台桌面端断线重连 / 刷新期间保留主视图:握手进行中且手上的数据属于当前这台。 */
+export function selectKeepMainView(s: RelayStore): boolean {
+  return (
+    (s.phase === 'connecting' || s.phase === 'reconnecting') &&
+    s.establishedDesktopId !== null &&
+    s.establishedDesktopId === s.currentDesktopId
+  );
 }
 
 export function setHomeTab(tab: HomeTab) {
