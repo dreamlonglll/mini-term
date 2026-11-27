@@ -981,6 +981,9 @@ mod tests {
         // 往回滚超过顶:夹到 0
         assert_eq!(reveal_scroll_y(-10.0, (60.0, 90.0), view, 400.0), Some(0.0));
         // 视口还没排过版(高度 0):不动
-        assert_eq!(reveal_scroll_y(0.0, (470.0, 500.0), (0.0, 0.0), 400.0), None);
+        assert_eq!(
+            reveal_scroll_y(0.0, (470.0, 500.0), (0.0, 0.0), 400.0),
+            None
+        );
     }
 }
