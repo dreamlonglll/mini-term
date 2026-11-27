@@ -193,7 +193,7 @@ impl LegacyPem {
             "AES-128-CBC" => Cipher::Aes128Cbc,
             "AES-192-CBC" => Cipher::Aes192Cbc,
             "AES-256-CBC" => Cipher::Aes256Cbc,
-            "DES-EDE3-CBC" => Cipher::TDesCbc,
+            "DES-EDE3-CBC" => Cipher::TdesCbc,
             other => return Err(format!("unsupported PEM encryption {other}")),
         };
         let iv = hex_decode(iv_hex.trim())

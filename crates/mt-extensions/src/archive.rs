@@ -44,7 +44,10 @@ pub(crate) fn extract_component(
         let mut entry = archive
             .by_index(index)
             .map_err(|e| ExtensionError::integrity(format!("{asset}: entry #{index}: {e}")))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|e| ExtensionError::integrity(format!("{asset}: entry #{index} name: {e}")))?
+            .into_owned();
         require_regular(&entry, asset, &name)?;
         let Some(spec) = component.file(&name) else {
             return Err(ExtensionError::integrity(format!(

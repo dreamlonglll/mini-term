@@ -357,16 +357,21 @@ impl server::Handler for Fake {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        key: &PublicKey,
+        key: server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
-        if self.accepts(key) {
+        if self.accepts(key.public_key) {
             Ok(Auth::Accept)
         } else {
             Ok(self.reject())
         }
     }
 
-    async fn auth_publickey(&mut self, user: &str, key: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        key: server::VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        let key = key.public_key;
         self.log(format!("publickey {user} {}", fingerprint(key)));
         if self.accepts(key) {
             Ok(Auth::Accept)
@@ -415,9 +420,11 @@ impl server::Handler for Fake {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(

@@ -435,7 +435,11 @@ impl ConfigDb {
     /// 与 config.json 时代「覆写前留一代 .bak」是同一份保险。
     pub fn backup_to(&self, path: &Path) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("配置库锁中毒"))?;
-        conn.backup(rusqlite::MAIN_DB, path, None)
+        conn.backup(
+            rusqlite::MAIN_DB,
+            path,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
             .with_context(|| format!("备份配置库到 {} 失败", path.display()))?;
         Ok(())
     }

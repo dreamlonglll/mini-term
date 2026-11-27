@@ -868,8 +868,9 @@ impl server::Handler for SshHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.shared
             .stats
             .channel_opens
@@ -880,7 +881,8 @@ impl server::Handler for SshHandler {
             }
         }
         self.channels.insert(channel.id(), channel);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn subsystem_request(

@@ -479,6 +479,8 @@ pub(crate) fn preferred_algorithms(host_keys: Option<Vec<Algorithm>>) -> russh::
     kex_order.extend(extensions);
     russh::Preferred {
         kex: Cow::Owned(kex_order),
+        // 不支持 @cert-authority 主机证书校验，显式保持为空（不向对端通告 *-cert 算法）。
+        host_key_certificates: Cow::Borrowed(&[]),
         key: match host_keys {
             Some(order) => Cow::Owned(order),
             None => base.key.clone(),

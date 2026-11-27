@@ -83,14 +83,16 @@ impl server::Handler for FakeHandler {
     async fn channel_open_session(
         &mut self,
         _channel: russh::Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.state.channel_opens.fetch_add(1, Ordering::SeqCst);
         if self.hang_channel_open {
             // 卡住整条 session 的消息循环:客户端的 channel-open 永远等不到确认。
             std::future::pending::<()>().await;
         }
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn exec_request(

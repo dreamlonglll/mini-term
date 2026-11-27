@@ -103,6 +103,20 @@ struct Handler {
     input: Vec<u8>,
 }
 
+impl Handler {
+    /// russh 0.65 removes the channel on server-initiated `close()`, so the peer's
+    /// RFC 4254 `CHANNEL_CLOSE` reply does not invoke `Handler::channel_close`.
+    fn close_channel(
+        &self,
+        session: &mut server::Session,
+        channel: ChannelId,
+    ) -> Result<(), russh::Error> {
+        session.close(channel)?;
+        self.counts.closed.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 fn hello(version: u32) -> Vec<u8> {
     mt_git_helper::encode_frame(&Hello {
         protocol_version: version,
@@ -142,10 +156,12 @@ impl server::Handler for Handler {
     async fn channel_open_session(
         &mut self,
         _channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
         _session: &mut server::Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         self.counts.channels.fetch_add(1, Ordering::SeqCst);
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn exec_request(
@@ -161,7 +177,7 @@ impl server::Handler for Handler {
                 session.extended_data(channel, 1, b"helper cannot start".to_vec())?;
                 session.exit_status_request(channel, 23)?;
                 session.eof(channel)?;
-                session.close(channel)?;
+                self.close_channel(session, channel)?;
             }
             Startup::Hello | Startup::WrongVersion => {
                 session.channel_success(channel)?;
@@ -350,12 +366,13 @@ impl server::Handler for Handler {
                 let _ = handle.exit_status_request(channel, 0).await;
                 let _ = handle.eof(channel).await;
                 let _ = handle.close(channel).await;
+                counts.closed.fetch_add(1, Ordering::SeqCst);
             });
         } else {
             self.counts.finished.fetch_add(1, Ordering::SeqCst);
             session.exit_status_request(channel, 0)?;
             session.eof(channel)?;
-            session.close(channel)?;
+            self.close_channel(session, channel)?;
         }
         Ok(())
     }

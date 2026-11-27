@@ -16,7 +16,7 @@
 
 use rmcp::{
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -254,7 +254,7 @@ impl SshMcp {
             McpError::internal_error(format!("failed to serialize SSH connections: {e}"), None)
         })?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// 通过已保存的 SSH 连接在远程主机上执行一条命令。
@@ -316,7 +316,7 @@ impl SshMcp {
         let json = serde_json::to_string(&exec_result).map_err(|e| {
             McpError::internal_error(format!("failed to serialize ssh_exec result: {e}"), None)
         })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     /// 通过已保存的 SSH 连接,把**本地**文件上传到**远程**主机(SFTP)。
@@ -411,16 +411,16 @@ impl SshMcp {
         let json = serde_json::to_string(&result).map_err(|e| {
             McpError::internal_error(format!("failed to serialize transfer result: {e}"), None)
         })?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for SshMcp {
-    fn get_info(&self) -> ServerInfo {
-        // ServerInfo 是 #[non_exhaustive],不能用结构体字面量构造;
+    fn get_info(&self) -> ServerConfig {
+        // ServerConfig 是 #[non_exhaustive],不能用结构体字面量构造;
         // 从 Default 起手再逐字段赋值。
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::from_build_env();
         info.instructions = Some(

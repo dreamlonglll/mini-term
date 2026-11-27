@@ -42,7 +42,9 @@ name = "mt-sidecars"
 # 一次调用一条连接、NDJSON start / out / end;见 docs/specs/ssh-activity-overlay-v1.md 与
 # src/activity_feed.rs)。只是抄送:没有这个变量时行为与 0.4.12 一字不差,有它时 stdout /
 # stderr / 退出码也不变,收尾最多多等 500ms。daemon、IPC 协议、mt-ssh-mcp 都不变。
-version = "0.4.13"
+# 0.4.14:升级共享 SSH 底层 russh 0.65(修 RUSTSEC-2026-0492/0493/0495)与 rsa 0.10 正式版,
+# 同步升级 rmcp 3(修 RUSTSEC-2026-0462);升版本号让常驻 daemon 自动换代到含安全修复的新版。
+version = "0.4.14"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 
@@ -78,7 +80,7 @@ path = "src/bin/mt-ssh-cli.rs"
 
 [dependencies]
 mt-core = { path = "../crates/mt-core" }
-# SSH 持久会话池 + SFTP 传输原语(russh 0.61 + ring 后端、ssh-key/rsa 精确锁、
+# SSH 持久会话池 + SFTP 传输原语(russh 0.65 + ring 后端、ssh-key/rsa 版本对齐、
 # russh-sftp)。task 07-05-ssh-remote-projects PR1 抽到共享 crate mt-ssh,
 # 主程序与 sidecar 共用;russh 类型(如 ChannelMsg)经 `mt_ssh::russh` 再导出取用,
 # 保证与池同一 crate 版本。依赖版本锁的完整说明见 ../crates/mt-ssh/Cargo.toml。
@@ -87,7 +89,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 # mt-ssh-mcp 的 MCP server 实现：官方 rmcp stdio server。
-rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
 # mt-ssh-cli 的参数解析：clap derive（用法错误信息对 agent 可读性好，--help 即文档）。
 clap = { version = "4", features = ["derive"] }
 # CLI ↔ daemon IPC 帧的 stdout/stderr 分片编码（保二进制安全）。

@@ -591,9 +591,19 @@ impl Handler for MtClient {
     /// 英文类别仍认得出来),后面保留给远程项目界面看的中文细节。
     async fn check_server_key(
         &mut self,
-        server_pubkey: &russh::keys::ssh_key::PublicKey,
+        server_pubkey: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let name = self.known_hosts_name.clone();
+        let server_pubkey = match server_pubkey {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => {
+                return Ok(self.reject(format!(
+                    "host key verification failed: {name} offered a host key certificate, which \
+                     is not supported: 主机密钥校验失败:{name} 返回了主机证书,当前内置 SSH \
+                     客户端不支持主机证书校验,拒绝连接"
+                )));
+            }
+        };
         let path = self.known_hosts_path.display().to_string();
         let raw = match read_known_hosts(&self.known_hosts_path) {
             Ok(raw) => raw,
@@ -1168,7 +1178,9 @@ mod tests {
         let mut client = test_client(path.clone());
 
         let accepted = client
-            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(
+                test_pubkey_from_bytes(KEY_BYTES_A),
+            ))
             .await
             .unwrap();
         assert!(!accepted, "known_hosts 读不了时不得放行");
@@ -1192,7 +1204,10 @@ mod tests {
         .unwrap();
         let mut client = test_client(path.clone());
 
-        assert!(!client.check_server_key(&pub_a).await.unwrap());
+        assert!(!client
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(pub_a))
+            .await
+            .unwrap());
         let reason = rejection_of(&client);
         assert!(
             reason.starts_with("host key verification failed: "),
@@ -1215,7 +1230,9 @@ mod tests {
         let mut client = test_client(path.clone());
 
         let accepted = client
-            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(
+                test_pubkey_from_bytes(KEY_BYTES_A),
+            ))
             .await
             .unwrap();
         assert!(!accepted);
@@ -1243,7 +1260,10 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         let mut client = test_client(path.clone());
 
-        assert!(!client.check_server_key(&pub_a).await.unwrap());
+        assert!(!client
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(pub_a))
+            .await
+            .unwrap());
         let reason = rejection_of(&client);
         assert!(
             reason.starts_with("host key verification failed: "),
@@ -1266,7 +1286,10 @@ mod tests {
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
         let mut client = test_client(path.clone());
 
-        assert!(client.check_server_key(&pub_key).await.unwrap());
+        assert!(client
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(pub_key.clone()))
+            .await
+            .unwrap());
         assert!(client.notes.rejection.lock().unwrap().is_none());
         let raw = read_known_hosts(&path).unwrap();
         assert_eq!(
@@ -1285,7 +1308,9 @@ mod tests {
         let mut client = test_client(blocker.join("known_hosts"));
 
         let accepted = client
-            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
+            .check_server_key(&russh::keys::PublicKeyOrCertificate::from(
+                test_pubkey_from_bytes(KEY_BYTES_A),
+            ))
             .await
             .unwrap();
         assert!(!accepted, "写不进 known_hosts 时不得放行");

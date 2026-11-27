@@ -556,7 +556,12 @@ impl Extensions {
             let entry = archive.by_index_raw(index).map_err(|e| {
                 ExtensionError::integrity(format!("offline bundle entry #{index}: {e}"))
             })?;
-            let name = entry.name().to_owned();
+            let name = entry
+                .name()
+                .map_err(|e| {
+                    ExtensionError::integrity(format!("offline bundle entry #{index} name: {e}"))
+                })?
+                .into_owned();
             if !is_enclosed_entry_name(&name) {
                 return Err(ExtensionError::integrity(format!(
                     "offline bundle entry {name:?} escapes the archive"

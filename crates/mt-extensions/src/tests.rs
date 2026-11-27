@@ -93,6 +93,9 @@ fn patch_first_mode(zip: &mut [u8], mode: u32) {
         .windows(4)
         .position(|window| window == [0x50, 0x4b, 0x01, 0x02])
         .expect("central directory header");
+    // version_made_by 高字节设为 3 (Unix):zip 9 起 System::Dos 只认低 8 位 DOS 属性,
+    // 不把高 16 位当 unix_mode 解读(Windows 上 ZipWriter 默认写 System::Dos)。
+    zip[at + 5] = 3;
     zip[at + 38..at + 42].copy_from_slice(&(mode << 16).to_le_bytes());
 }
 

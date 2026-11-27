@@ -292,7 +292,7 @@ pub(crate) fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<PrivateKey>, Strin
 pub(crate) fn pkcs1_der_to_private_key(der: &[u8]) -> Result<PrivateKey, String> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
 
-    let rsa_key = rsa::RsaPrivateKey::from_pkcs1_der(der)
+    let rsa_key = rsa::PrivateKey::from_pkcs1_der(der)
         .map_err(|e| format!("invalid PKCS#1 RSA private key: {e}"))?;
     let keypair = russh::keys::ssh_key::private::RsaKeypair::try_from(&rsa_key)
         .map_err(|e| format!("cannot convert RSA key into ssh-key form: {e}"))?;

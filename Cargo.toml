@@ -128,7 +128,7 @@ tracing-subscriber = "0.3"
 # ⚠️ 这一行**不影响三个 sidecar 二进制**:它们只依赖 mt-core / mt-ssh
 # (见 sidecars/Cargo.toml),不依赖上面三个 crate。红线只有「绝不让 mt-core
 # 依赖任何带 rusqlite 的 crate」。
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 # ---------------------------------------------------------------------------
 # 工作区内部
