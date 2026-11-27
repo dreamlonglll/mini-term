@@ -272,17 +272,18 @@ export interface MobileSessionsDelta {
 /** agent 提问的一个选项 */
 export interface MirrorQuestionOption {
   label: string;
-  description?: string;
+  /** 中转总会带上这个键(Rust 侧 `#[serde(default)]` 不 skip),没有简述时为空串 */
+  description: string;
 }
 
 /** agent 提问的一道题(一次提问可含多题,TUI 逐题推进) */
 export interface MirrorQuestionItem {
   question: string;
-  /** 短标签(如「作答方式」),可为空 */
-  header?: string;
+  /** 短标签(如「作答方式」);中转总会带上这个键,没有时为空串 */
+  header: string;
   options: MirrorQuestionOption[];
-  /** 多选题:v1 只展示不可点选 */
-  multiSelect?: boolean;
+  /** 多选题:v1 只展示不可点选(中转总会带上这个键) */
+  multiSelect: boolean;
 }
 
 /** 镜像中的一条消息。seq 在一次绑定内从 0 连续递增,分页以此为锚 */
@@ -446,7 +447,8 @@ export interface MobileTerminalScreen {
   cursorCol: number;
   cursorVisible: boolean;
   altScreen: boolean;
-  lines?: TerminalLine[];
+  /** 中转总会带上这个键(空屏为空数组) */
+  lines: TerminalLine[];
 }
 
 export interface MobileProjectFile {
@@ -458,7 +460,8 @@ export interface MobileProjectFiles {
   requestId: string;
   paneId: string;
   ok: boolean;
-  files?: MobileProjectFile[];
+  /** 中转总会带上这个键(失败时为空数组) */
+  files: MobileProjectFile[];
   truncated?: boolean;
   reason?: AssistFailReason;
 }
@@ -474,8 +477,10 @@ export interface MobileProjectSkills {
   requestId: string;
   paneId: string;
   ok: boolean;
-  prefix?: string;
-  skills?: MobileSkillItem[];
+  /** 技能命令前缀(`/` 或 Codex 的 `$`);中转总会带上这个键,失败时为空串 */
+  prefix: string;
+  /** 中转总会带上这个键(失败时为空数组) */
+  skills: MobileSkillItem[];
   reason?: AssistFailReason;
 }
 
