@@ -4698,7 +4698,11 @@ mod tests {
         let same = screen_fingerprint(&base);
         assert_eq!(same, screen_fingerprint(&screen_with(9, "$ ls", 4)));
         assert_ne!(same, screen_fingerprint(&screen_with(1, "$ ls -l", 4)));
-        assert_ne!(same, screen_fingerprint(&screen_with(1, "$ ls", 5)), "光标挪了");
+        assert_ne!(
+            same,
+            screen_fingerprint(&screen_with(1, "$ ls", 5)),
+            "光标挪了"
+        );
         let mut bold = base.clone();
         bold.lines[0].spans[0].bold = true;
         assert_ne!(same, screen_fingerprint(&bold), "样式变了");

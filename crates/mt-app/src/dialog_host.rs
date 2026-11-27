@@ -1615,11 +1615,16 @@ mod tests {
             Some(open),
             Some(closing),
         ];
-        let at = [t0, t0 + OVERLAY_IN.duration / 2, t0 + OVERLAY_OUT.duration * 2];
+        let at = [
+            t0,
+            t0 + OVERLAY_IN.duration / 2,
+            t0 + OVERLAY_OUT.duration * 2,
+        ];
         let looks = |p: &Presence, now| (p.target_open(), p.value_at(now), p.running_at(now));
         for current in states {
             for now in at {
-                for (target, has_image) in [(false, false), (false, true), (true, false), (true, true)]
+                for (target, has_image) in
+                    [(false, false), (false, true), (true, false), (true, true)]
                 {
                     let mut stepped =
                         current.unwrap_or_else(|| Presence::hidden(OVERLAY_IN, OVERLAY_OUT));

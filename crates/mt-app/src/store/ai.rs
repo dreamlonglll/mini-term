@@ -1265,7 +1265,11 @@ mod tests {
         }
         assert_eq!(send("ai-idle", "Stop", cx), 1, "回合做完要发");
         assert_eq!(send("ai-idle", "Stop", cx), 0, "同一回合重复的 Stop 不该发");
-        assert_eq!(send("ai-working", "UserPromptSubmit", cx), 1, "重新开工要发");
+        assert_eq!(
+            send("ai-working", "UserPromptSubmit", cx),
+            1,
+            "重新开工要发"
+        );
         cx.update(|cx| {
             let store = store.read(cx);
             let pane = store.project_state("p").unwrap().all_panes()[0];
