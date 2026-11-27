@@ -116,7 +116,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **4209 个 Rust 测试**（54 个测试目标） |
+| 测试 | **4253 个 Rust 测试**（54 个测试目标） |
 
 ---
 
