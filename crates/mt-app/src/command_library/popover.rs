@@ -99,6 +99,10 @@ fn reveal_scroll_y(
     (view_top, view_bottom): (f32, f32),
     max_scroll: f32,
 ) -> Option<f32> {
+    // 视口还没排过版(高度 0):量不准,不动
+    if view_bottom <= view_top {
+        return None;
+    }
     let target = if row_top < view_top || row_bottom - row_top > view_bottom - view_top {
         offset_y + (view_top - row_top)
     } else if row_bottom > view_bottom {
@@ -975,9 +979,8 @@ mod tests {
         // 内容不够一屏(max 0):怎么都滚不动
         assert_eq!(reveal_scroll_y(0.0, (470.0, 500.0), view, 0.0), None);
         // 往回滚超过顶:夹到 0
-        assert_eq!(
-            reveal_scroll_y(-10.0, (60.0, 90.0), view, 400.0),
-            Some(0.0)
-        );
+        assert_eq!(reveal_scroll_y(-10.0, (60.0, 90.0), view, 400.0), Some(0.0));
+        // 视口还没排过版(高度 0):不动
+        assert_eq!(reveal_scroll_y(0.0, (470.0, 500.0), (0.0, 0.0), 400.0), None);
     }
 }

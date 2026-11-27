@@ -1440,7 +1440,10 @@ mod tests {
             settings_esc(Terminal, false, false, true),
             SettingsEsc::CloseDialog
         );
-        assert_eq!(settings_esc(Font, true, true, true), SettingsEsc::CloseDialog);
+        assert_eq!(
+            settings_esc(Font, true, true, true),
+            SettingsEsc::CloseDialog
+        );
     }
 
     /// 切页方向跟导航的竖排次序:往下面那页切新页从底边进(`> 0`),往上切从顶上进。

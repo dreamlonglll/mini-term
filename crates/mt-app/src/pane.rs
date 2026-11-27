@@ -3278,9 +3278,8 @@ impl Render for TerminalPane {
         // 建 pane 时手上没有,第一次画的时候补上;监听跑在绘制期,`emit` 是延后派发的,
         // store 在本轮绘制之后才收到
         if self._focus_in_sub.is_none() {
-            self._focus_in_sub = Some(cx.on_focus_in(&self.focus, window, |_, _, cx| {
-                cx.emit(PaneEvent::Focused)
-            }));
+            self._focus_in_sub =
+                Some(cx.on_focus_in(&self.focus, window, |_, _, cx| cx.emit(PaneEvent::Focused)));
         }
         // 双保险兜底:若某条切回可见的路径未在切换事件期提前调 `flush_hidden_redraw`,
         // 首次重新渲染外壳时显式在下一帧标脏内部 `TerminalView`(外壳本身此刻正在重跑

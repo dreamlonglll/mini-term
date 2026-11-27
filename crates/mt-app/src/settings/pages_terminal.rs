@@ -99,19 +99,23 @@ impl SettingsView {
                                     SharedString::from(format!("shell-del-yes-{idx}")),
                                     t("settings", "common.confirmDelete"),
                                 )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.confirm_shell_delete(idx, window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.confirm_shell_delete(idx, window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 ui::ghost_button(
                                     SharedString::from(format!("shell-del-no-{idx}")),
                                     t("settings", "common.cancel"),
                                 )
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.shell_pending_delete = None;
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        this.shell_pending_delete = None;
+                                        cx.notify();
+                                    },
+                                )),
                             )
                     } else {
                         div()
@@ -122,29 +126,33 @@ impl SettingsView {
                                     SharedString::from(format!("shell-edit-{idx}")),
                                     t("settings", "common.edit"),
                                 )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let shell = this
-                                        .store
-                                        .read(cx)
-                                        .config()
-                                        .available_shells
-                                        .get(idx)
-                                        .cloned();
-                                    this.shell_pending_delete = None;
-                                    this.shell_editing = Some(Some(idx));
-                                    this.fill_shell_form(shell.as_ref(), window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        let shell = this
+                                            .store
+                                            .read(cx)
+                                            .config()
+                                            .available_shells
+                                            .get(idx)
+                                            .cloned();
+                                        this.shell_pending_delete = None;
+                                        this.shell_editing = Some(Some(idx));
+                                        this.fill_shell_form(shell.as_ref(), window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 ui::danger_button(
                                     SharedString::from(format!("shell-del-{idx}")),
                                     t("settings", "common.delete"),
                                 )
-                                .on_click(cx.listener(move |this, _, _window, cx| {
-                                    // 第一下只进确认态(换一行点 = 确认态挪到那一行)
-                                    this.shell_pending_delete = Some((idx, shell_name.clone()));
-                                    cx.notify();
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, _window, cx| {
+                                        // 第一下只进确认态(换一行点 = 确认态挪到那一行)
+                                        this.shell_pending_delete = Some((idx, shell_name.clone()));
+                                        cx.notify();
+                                    },
+                                )),
                             )
                     }),
             );

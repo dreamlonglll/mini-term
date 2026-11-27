@@ -1007,12 +1007,14 @@ fn render_draft_form(
                     }),
             )
             .child(
-                ui::ghost_button("launcher-cancel", t("mobileRelay", "launchers.cancel")).on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        close_draft(&state, window, cx);
-                    }
-                }),
+                ui::ghost_button("launcher-cancel", t("mobileRelay", "launchers.cancel")).on_click(
+                    {
+                        let state = state.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            close_draft(&state, window, cx);
+                        }
+                    },
+                ),
             ),
     )
 }
