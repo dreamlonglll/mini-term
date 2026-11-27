@@ -602,7 +602,9 @@ fn render_endpoint_section(
                 .mt(px(12.0))
                 .child(field_label(t("mobileRelay", "keyLabel"))),
         )
-        .child(Input::new(&key_input))
+        // 密钥框打码,带「显示明文」切换钮(gpui-component 0.10 的 `mask_toggle` 是点一下
+        // 切换,不是按住才显示,见 `input.rs::render_toggle_mask_button`)
+        .child(Input::new(&key_input).mask_toggle())
         .child(
             div()
                 .mt(px(4.0))

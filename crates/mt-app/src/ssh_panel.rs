@@ -1161,6 +1161,9 @@ fn text_field(
 /// 整串再改,按住看不方便。(2026-09-19 补记:原先还记着「它画 `IconName::Eye`,
 /// 0.5.1 不带 svg 资产、本仓没注册 `AssetSource` → 空白」,入口挂上
 /// `gpui_kit_assets::Assets` 后这条作废;交互语义这条仍是决定性的。)
+/// (2026-11 补记:gpui-component 0.10 的 `mask_toggle` 已改成点击切换 ——
+/// `input.rs::render_toggle_mask_button` 的 `on_click → toggle_masked` —— 移动端密钥框与
+/// 远程通知凭据框直接用它;这里的自绘按钮与表单的 `reveal_password` 态绑在一起,不动。)
 fn toggle_password_reveal(
     state: &Entity<SshPanel>,
     password: &Entity<InputState>,
