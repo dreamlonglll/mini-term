@@ -1,4 +1,5 @@
 import { useT } from './i18n';
+import { useBackLayer } from './navigation';
 import {
   type SavedDesktop,
   removeSavedDesktop,
@@ -63,6 +64,8 @@ export function DesktopSheet({ onClose }: { onClose: () => void }) {
   const t = useT();
   const currentDesktopId = useRelayStore((s) => s.currentDesktopId);
   const savedDesktops = useRelayStore((s) => s.savedDesktops);
+  // 返回手势先关弹层
+  useBackLayer(true, onClose);
 
   const handleSelect = (desktop: SavedDesktop) => {
     switchDesktop(desktop.desktopId);

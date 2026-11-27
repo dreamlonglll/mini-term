@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { renamePane, useRelayStore } from './relay';
 import { useT } from './i18n';
+import { useBackLayer } from './navigation';
 
 /**
  * 重命名会话的弹层。
@@ -22,6 +23,8 @@ export function RenameSheet({
   const [value, setValue] = useState(current);
   // 弹层开着时链路断了 / 桌面端掉线:改名发不出去,确定按钮置灰,弹层留着等恢复
   const canSend = useRelayStore((s) => s.phase === 'connected' && s.desktopOnline !== false);
+  // 返回手势先关弹层(不提交)
+  useBackLayer(true, onClose);
 
   const submit = () => {
     // 没发出去就别关:关了等于告诉用户「改好了」
