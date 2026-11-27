@@ -76,9 +76,10 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable as _,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::input::{InputEvent, InputState};
 use mt_ai::hook_registry::HookRegistrationInfo;
@@ -385,6 +386,37 @@ pub fn tray_children_visible(tray_enabled: bool) -> bool {
 /// `None` = 表单没打开;`Some(None)` = 新增;`Some(Some(i))` = 编辑第 i 行。
 type Editing = Option<Option<usize>>;
 
+/// 面板里按 Esc(弹窗的 `Cancel`)这一下退哪一层。由里往外一次退一层,最外一层才关面板:
+/// 二级表单(编辑 / 新建 shell、编辑器)里有没保存的内容,一下 Esc 连面板一起丢太重。
+///
+/// **只看当前这一页**:表单是按页挂着的,别的页上留着一份没收的表单时,在这一页按 Esc
+/// 去收一份看不见的表单等于「按了没反应」—— 那份照旧留着,回到那一页还在。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsEsc {
+    /// 删除 shell 的就地二次确认挂着:撤掉确认(与命令库的行内删除确认同一口径)。
+    CancelShellDelete,
+    /// 收起 shell 表单,退回列表。
+    CloseShellForm,
+    /// 收起编辑器表单,退回列表。
+    CloseEditorForm,
+    /// 关面板。
+    CloseDialog,
+}
+
+fn settings_esc(
+    page: SettingsPage,
+    shell_delete_pending: bool,
+    shell_form_open: bool,
+    editor_form_open: bool,
+) -> SettingsEsc {
+    match page {
+        SettingsPage::Terminal if shell_delete_pending => SettingsEsc::CancelShellDelete,
+        SettingsPage::Terminal if shell_form_open => SettingsEsc::CloseShellForm,
+        SettingsPage::Editor if editor_form_open => SettingsEsc::CloseEditorForm,
+        _ => SettingsEsc::CloseDialog,
+    }
+}
+
 pub struct SettingsView {
     store: Entity<AppStore>,
     page: SettingsPage,
@@ -404,6 +436,10 @@ pub struct SettingsView {
 
     // ── terminal 页:shell 列表 ──
     shell_editing: Editing,
+    /// 删除的就地二次确认:点了「删除」的那一行 `(行号, shell 名)`,该行的按钮换成
+    /// 「确认删除 / 取消」,再点一下才真删(见 `pages_terminal`)。记名字是为了确认那一刻核对
+    /// 行号还指着同一个 shell(名字不保证唯一,所以两样都记)。
+    shell_pending_delete: Option<(usize, String)>,
     shell_name: Entity<InputState>,
     shell_command: Entity<InputState>,
     shell_args: Entity<InputState>,
@@ -619,6 +655,15 @@ pub fn open_settings(
                 .close_button(false)
                 // 改了半天设置、误点遮罩就没了 —— 面板里还有编辑中的表单
                 .overlay_closable(false)
+                // Esc 由里往外一次退一层(删除确认 → 编辑 / 新建表单 → 关面板,见
+                // [`settings_esc`])。焦点在表单输入框里也走得到这里:输入框的 `Escape`
+                // 以 `cx.propagate()` 收尾,gpui 接着派发弹窗的 `Cancel`
+                .on_cancel({
+                    let view = view.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        view.update(cx, |view, cx| view.handle_escape(window, cx))
+                    }
+                })
                 .child(
                     div()
                         .w_full()
@@ -742,6 +787,7 @@ impl SettingsView {
             nav_slider: IndicatorSlider::new(),
             lang_slider: IndicatorSlider::new(),
             shell_editing: None,
+            shell_pending_delete: None,
             shell_name: ph(cx, window, t("settings", "terminal.newNamePlaceholder")),
             shell_command: ph(cx, window, t("settings", "terminal.newCommandPlaceholder")),
             shell_args: ph(cx, window, t("settings", "terminal.newArgsPlaceholder")),
@@ -1040,12 +1086,73 @@ impl SettingsView {
     fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         if page != self.page {
             self.leave_shortcuts_page(cx);
+            // 删除确认是就地的:人离开了那一页,确认态不跟着留(回来看到的是普通的「删除」)
+            self.shell_pending_delete = None;
             // 出场层停在旧页离开时的位置;新页从顶上看起(同一个滚动容器换了内容,
             // 沿用旧页的偏移没有意义)
             self.exit_scroll.set_offset(self.page_scroll.offset());
             self.page_scroll.set_offset(gpui::Point::default());
         }
         self.page = page;
+        cx.notify();
+    }
+
+    /// 弹窗的 `Cancel`(Esc)落到面板上:按 [`settings_esc`] 退一层。返回 `true` = 这一下关面板。
+    fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match settings_esc(
+            self.page,
+            self.shell_pending_delete.is_some(),
+            self.shell_editing.is_some(),
+            self.editor_editing.is_some(),
+        ) {
+            SettingsEsc::CancelShellDelete => {
+                self.shell_pending_delete = None;
+                cx.notify();
+                false
+            }
+            SettingsEsc::CloseShellForm => {
+                self.close_shell_form(window, cx);
+                false
+            }
+            SettingsEsc::CloseEditorForm => {
+                self.close_editor_form(window, cx);
+                false
+            }
+            SettingsEsc::CloseDialog => true,
+        }
+    }
+
+    /// 键盘焦点若在 `inputs` 里,交回面板根(`self.focus`)。表单收起之前调:框一不画,焦点就
+    /// 悬空在它身上 —— 悬空时按键从窗口根派发,↑/↓ 切页与 Esc 关面板一个都收不到。
+    fn reclaim_focus_from(
+        &self,
+        inputs: &[&Entity<InputState>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let in_form = inputs
+            .iter()
+            .any(|input| input.read(cx).focus_handle(cx).is_focused(window));
+        if in_form {
+            window.focus(&self.focus, cx);
+        }
+    }
+
+    /// 收起 shell 表单、退回列表(「取消」与 Esc 共用)。
+    fn close_shell_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reclaim_focus_from(
+            &[&self.shell_name, &self.shell_command, &self.shell_args],
+            window,
+            cx,
+        );
+        self.shell_editing = None;
+        cx.notify();
+    }
+
+    /// 收起编辑器表单、退回列表(「取消」与 Esc 共用)。
+    fn close_editor_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reclaim_focus_from(&[&self.editor_name, &self.editor_command], window, cx);
+        self.editor_editing = None;
         cx.notify();
     }
 }
@@ -1301,6 +1408,40 @@ impl SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Esc 由里往外一次退一层:删除确认 → 表单 → 关面板;只看当前这一页挂着的。
+    #[test]
+    fn esc先退表单再关面板() {
+        use SettingsPage::{Editor, Font, Terminal};
+        assert_eq!(
+            settings_esc(Terminal, false, false, false),
+            SettingsEsc::CloseDialog
+        );
+        assert_eq!(
+            settings_esc(Terminal, false, true, false),
+            SettingsEsc::CloseShellForm,
+            "shell 表单开着:只退回列表"
+        );
+        assert_eq!(
+            settings_esc(Terminal, true, true, false),
+            SettingsEsc::CancelShellDelete,
+            "删除确认最先撤(同命令库)"
+        );
+        assert_eq!(
+            settings_esc(Editor, false, false, true),
+            SettingsEsc::CloseEditorForm
+        );
+        // 别的页上留着的表单 / 确认态不归这一下 Esc 管
+        assert_eq!(
+            settings_esc(Editor, true, true, false),
+            SettingsEsc::CloseDialog
+        );
+        assert_eq!(
+            settings_esc(Terminal, false, false, true),
+            SettingsEsc::CloseDialog
+        );
+        assert_eq!(settings_esc(Font, true, true, true), SettingsEsc::CloseDialog);
+    }
 
     /// 切页方向跟导航的竖排次序:往下面那页切新页从底边进(`> 0`),往上切从顶上进。
     #[test]
