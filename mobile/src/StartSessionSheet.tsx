@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState } from 'react';
 import { startAiSession, useRelayStore } from './relay';
 import { useT } from './i18n';
+import { useBackLayer } from './navigation';
 import type { MobileProject } from './protocol';
 import { buildProjectTree, countProjects, type ProjectTreeNode } from './projectTree';
 
@@ -21,6 +22,9 @@ export function StartSessionSheet({ onClose }: { onClose: () => void }) {
   const launchers = useRelayStore((s) => s.launchers);
   const [picked, setPicked] = useState<MobileProject | null>(null);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set<string>());
+  // 返回手势:在「选启动器」一步先退回「选项目」,再按一次关掉弹层
+  useBackLayer(true, onClose);
+  useBackLayer(picked !== null, () => setPicked(null));
 
   const tree = useMemo(() => buildProjectTree(projects), [projects]);
 

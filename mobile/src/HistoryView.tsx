@@ -18,6 +18,7 @@ import {
   openProjectHistory,
   refreshProjectHistory,
   resumeAiSession,
+  selectLinkDown,
   useRelayStore,
 } from './relay';
 import { useT } from './i18n';
@@ -53,8 +54,10 @@ export function HistoryProjects() {
   const t = useT();
   const projects = useRelayStore((s) => s.projects);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  // 重连中拉不了历史(请求发不出去,会被当成离线报错),入口置灰
+  const linkDown = useRelayStore(selectLinkDown);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set<string>());
-  const offline = desktopOnline === false;
+  const offline = desktopOnline === false || linkDown;
 
   const tree = useMemo(() => buildProjectTree(projects), [projects]);
 
@@ -145,7 +148,9 @@ const HistorySessionRow = memo(function HistorySessionRow({
   });
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const starting = useRelayStore((s) => s.starting !== null);
-  const offline = desktopOnline === false;
+  const linkDown = useRelayStore(selectLinkDown);
+  // 重连中与离线同口径:预览 / 恢复的请求都发不出去
+  const offline = desktopOnline === false || linkDown;
   const isLive = liveDot !== null;
   const timeText = formatRelativeTime(session.timestamp, t);
   const canAct = isLive || (session.canResume && !offline && !starting);
@@ -191,8 +196,11 @@ export function HistoryListView() {
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const starting = useRelayStore((s) => s.starting);
   const startError = useRelayStore((s) => s.startError);
+  const linkDown = useRelayStore(selectLinkDown);
   const [query, setQuery] = useState('');
   const offline = desktopOnline === false;
+  // 刷新 / 重试要发请求:离线或重连中都发不出去(在途请求重连后会自动补发)
+  const cannotRequest = offline || linkDown;
 
   useEffect(() => {
     if (!startError) return;
@@ -227,7 +235,7 @@ export function HistoryListView() {
         <button
           type="button"
           className="history-refresh-btn"
-          disabled={offline || historyList.loading}
+          disabled={cannotRequest || historyList.loading}
           onClick={refreshProjectHistory}
         >
           {t('history.refresh')}
@@ -271,7 +279,7 @@ export function HistoryListView() {
             <button
               type="button"
               className="history-retry-btn"
-              disabled={offline}
+              disabled={cannotRequest}
               onClick={refreshProjectHistory}
             >
               {t('history.retry')}
@@ -311,12 +319,15 @@ export function HistoryPreviewView() {
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const starting = useRelayStore((s) => s.starting);
   const startError = useRelayStore((s) => s.startError);
+  const linkDown = useRelayStore(selectLinkDown);
   const scrollRef = useRef<HTMLDivElement>(null);
   const historyAnchor = useRef<{ head: MirrorMessage; height: number } | null>(null);
   const scrolledInitial = useRef(false);
   const rowsCache = useRef<MirrorRow[]>([]);
   const [expandedTools, setExpandedTools] = useState<ReadonlySet<number>>(() => new Set());
   const offline = desktopOnline === false;
+  // 重试 / 继续对话要发请求:离线或重连中都发不出去
+  const cannotRequest = offline || linkDown;
 
   useEffect(() => {
     if (!startError) return;
@@ -389,7 +400,7 @@ export function HistoryPreviewView() {
   if (!preview) return null;
 
   const canResume = preview.session.canResume;
-  const actionDisabled = hasLivePane ? false : !canResume || offline || starting !== null;
+  const actionDisabled = hasLivePane ? false : !canResume || cannotRequest || starting !== null;
 
   return (
     <div className="mirror-view">
@@ -442,7 +453,7 @@ export function HistoryPreviewView() {
             <button
               type="button"
               className="history-retry-btn"
-              disabled={offline}
+              disabled={cannotRequest}
               onClick={() =>
                 openHistoryPreview(preview.projectId, preview.projectName, preview.session)
               }

@@ -161,10 +161,14 @@ export function clearLegacyCredential() {
   }
 }
 
-/** 清掉 URL hash(配对码 / 深链读过即清,避免刷新重放)。 */
+/**
+ * 清掉 URL hash(配对码 / 深链读过即清,避免刷新重放)。
+ * 保留 history.state:那里有返回手势用的层级标记(见 navigation.ts),清成 null 会让
+ * 这条记录在返回时被当成脚注跳转之类的外来记录。
+ */
 export function clearHash() {
   try {
-    history.replaceState(null, '', window.location.pathname + window.location.search);
+    history.replaceState(history.state, '', window.location.pathname + window.location.search);
   } catch {
     /* ignore */
   }
@@ -186,7 +190,8 @@ export function syncDesktopUrl(desktopId: string | null) {
     }
     const qs = params.toString();
     const next = `${window.location.pathname}${qs ? `?${qs}` : ''}`;
-    history.replaceState(null, '', next);
+    // 保留 history.state(返回手势的层级标记,同 clearHash)
+    history.replaceState(history.state, '', next);
   } catch {
     /* ignore */
   }

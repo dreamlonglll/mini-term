@@ -48,7 +48,13 @@ export const mirror = {
       writeFailed: "发送失败：终端写入失败",
       questionNotPending: "作答失败：该提问已被处理或已失效",
     },
+    receiptUnknown: {
+      timeout: "结果未知：等待回执超时。指令可能已写入桌面终端，请在对话里确认，不会自动重发",
+      disconnected: "结果未知：发送后连接中断。指令可能已写入桌面终端，请在对话里确认，不会自动重发",
+      desktopOffline: "结果未知：发送后桌面端掉线。指令可能已写入桌面终端，请在对话里确认，不会自动重发",
+    },
     offlineCannotSend: "桌面端离线，暂时无法发送指令",
+    linkDownCannotSend: "正在重新连接，暂时无法发送指令",
     view: {
       chat: "对话",
       terminal: "终端",
@@ -131,7 +137,13 @@ export const mirror = {
       writeFailed: "Failed: terminal write error",
       questionNotPending: "Failed: this question was already handled or expired",
     },
+    receiptUnknown: {
+      timeout: "Result unknown: no receipt in time. The command may already be in the desktop terminal — check the conversation; it won't be resent automatically",
+      disconnected: "Result unknown: the connection dropped after sending. The command may already be in the desktop terminal — check the conversation; it won't be resent automatically",
+      desktopOffline: "Result unknown: the desktop went offline after sending. The command may already be in the desktop terminal — check the conversation; it won't be resent automatically",
+    },
     offlineCannotSend: "Desktop offline — commands cannot be sent right now",
+    linkDownCannotSend: "Reconnecting — commands cannot be sent right now",
     view: {
       chat: "Chat",
       terminal: "Terminal",

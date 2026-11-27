@@ -1,9 +1,12 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from './App';
+import { initNavigation } from './navigation';
 import { startRelay } from './relay';
 import './styles.css';
 
+// 先给首条历史记录打上根标记,再启动连接(startRelay 清 hash 时会保留这个标记)
+initNavigation();
 startRelay();
 
 // 外壳缓存(public/sw.js):打开页面不等网络。只在生产构建注册 —— 开发服务器的

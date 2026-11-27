@@ -13,11 +13,13 @@ import {
   loadOlderMirror,
   requestProjectFiles,
   requestProjectSkills,
+  selectLinkDown,
   sendMobileCommand,
   setMirrorViewMode,
   useAssistStore,
   useRelayStore,
 } from './relay';
+import { draftAfterReceipt } from './relay/commandSlot';
 import { useT } from './i18n';
 import { RenameSheet } from './RenameSheet';
 import { isAtBottom, MirrorRowList, MirrorSkeleton } from './MirrorContent';
@@ -149,6 +151,8 @@ const CommandComposer = memo(function CommandComposer() {
   const sending = useRelayStore((s) => s.mirror?.pendingCommandId != null);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const supportsInputAssist = useRelayStore((s) => s.supportsInputAssist);
+  // 与中转的链路在重连:输入框照常可写(草稿不丢、键盘不收起),只是发不出去
+  const linkDown = useRelayStore(selectLinkDown);
 
   const filesState = useAssistStore((s) => s.files);
   const skillsState = useAssistStore((s) => s.skills);
@@ -158,12 +162,16 @@ const CommandComposer = memo(function CommandComposer() {
   const [dismissedKey, setDismissedKey] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  /** 最近一次发出去、还没等到落定的指令:回执对上它才决定草稿去留 */
+  const inflight = useRef<{ commandId: string; text: string } | null>(null);
 
   const disabled = !mirrorAvailable || desktopOnline === false;
+  const sendBlocked = disabled || linkDown || sending;
+  const assistEnabled = supportsInputAssist && !disabled && !linkDown;
 
   const rawTrigger = useMemo(
-    () => (supportsInputAssist && !disabled ? detectAssistTrigger(text, caret) : null),
-    [supportsInputAssist, disabled, text, caret],
+    () => (assistEnabled ? detectAssistTrigger(text, caret) : null),
+    [assistEnabled, text, caret],
   );
   const triggerKey = rawTrigger
     ? `${rawTrigger.kind}:${rawTrigger.start}:${rawTrigger.query}`
@@ -206,12 +214,27 @@ const CommandComposer = memo(function CommandComposer() {
     }
   }, [activeIndex, candidateCount]);
 
-  // 回执短暂展示后自动清除
+  // 回执短暂展示后自动清除;「结果未知」要用户回头确认,留得最久
   useEffect(() => {
     if (!receipt) return;
-    const timer = setTimeout(clearCommandReceipt, receipt.ok ? 2500 : 5000);
+    const ms = receipt.status === 'ok' ? 2500 : receipt.status === 'failed' ? 5000 : 9000;
+    const timer = setTimeout(clearCommandReceipt, ms);
     return () => clearTimeout(timer);
   }, [receipt]);
+
+  // 指令落定:草稿只在确定写入成功、且用户这期间没改过时才清;失败 / 结果未知原样留在
+  // 输入框里,用户检查后可手动重发(结果未知可能已执行,绝不自动重发)
+  useEffect(() => {
+    const sent = inflight.current;
+    if (!receipt || !sent || receipt.commandId !== sent.commandId) return;
+    inflight.current = null;
+    const next = draftAfterReceipt(text, sent.text, receipt.status);
+    if (next !== text) {
+      setText(next);
+      setCaret(0);
+      setDismissedKey(null);
+    }
+  }, [receipt, text]);
 
   // 输入框随内容自增高（最多 6 行）
   useEffect(() => {
@@ -256,7 +279,7 @@ const CommandComposer = memo(function CommandComposer() {
   /** 手机虚拟键盘免切符号页：一键在光标处插入 `@` 或 `/` 并立即呼出补全浮层。 */
   const insertTriggerChar = useCallback(
     (ch: '@' | '/') => {
-      if (disabled) return;
+      if (!assistEnabled) return;
       const el = inputRef.current;
       const start = el?.selectionStart ?? text.length;
       const end = el?.selectionEnd ?? text.length;
@@ -264,23 +287,29 @@ const CommandComposer = memo(function CommandComposer() {
       const inserted = needSpace ? ` ${ch}` : ch;
       applyReplacement(start, end, inserted);
     },
-    [disabled, text, applyReplacement],
+    [assistEnabled, text, applyReplacement],
   );
 
+  // 发出去之前不清空输入框:等回执说写进去了才清(见上面的落定 effect)
   const submit = () => {
-    if (disabled || sending) return;
-    if (sendMobileCommand(text)) {
-      setText('');
-      setCaret(0);
-      setDismissedKey(null);
-    }
+    if (sendBlocked) return;
+    const commandId = sendMobileCommand(text);
+    if (commandId) inflight.current = { commandId, text };
   };
 
-  let notice: { text: string; ok: boolean } | null = null;
+  let notice: { text: string; tone: 'ok' | 'fail' | 'unknown' } | null = null;
   if (receipt) {
-    notice = receipt.ok
-      ? { text: t('mirror.receiptOk'), ok: true }
-      : { text: t(`mirror.receiptFail.${receipt.reason ?? 'writeFailed'}`), ok: false };
+    switch (receipt.status) {
+      case 'ok':
+        notice = { text: t('mirror.receiptOk'), tone: 'ok' };
+        break;
+      case 'failed':
+        notice = { text: t(`mirror.receiptFail.${receipt.reason ?? 'writeFailed'}`), tone: 'fail' };
+        break;
+      case 'unknown':
+        notice = { text: t(`mirror.receiptUnknown.${receipt.cause}`), tone: 'unknown' };
+        break;
+    }
   }
 
   const assistLoading =
@@ -381,10 +410,15 @@ const CommandComposer = memo(function CommandComposer() {
       )}
 
       {notice && (
-        <div className={`composer-receipt ${notice.ok ? 'ok' : 'fail'}`}>{notice.text}</div>
+        <div className={`composer-receipt ${notice.tone}`} role="status">
+          {notice.text}
+        </div>
       )}
       {disabled && desktopOnline === false && (
         <div className="composer-hint">{t('mirror.offlineCannotSend')}</div>
+      )}
+      {!disabled && linkDown && (
+        <div className="composer-hint">{t('mirror.linkDownCannotSend')}</div>
       )}
       <div className="composer-row">
         {supportsInputAssist && (
@@ -392,7 +426,7 @@ const CommandComposer = memo(function CommandComposer() {
             <button
               type="button"
               className={`composer-assist-btn${trigger?.kind === 'file' ? ' is-active' : ''}`}
-              disabled={disabled}
+              disabled={!assistEnabled}
               title={t('mirror.assist.filesTitle')}
               aria-label={t('mirror.assist.filesTitle')}
               onMouseDown={(e) => e.preventDefault()}
@@ -403,7 +437,7 @@ const CommandComposer = memo(function CommandComposer() {
             <button
               type="button"
               className={`composer-assist-btn${trigger?.kind === 'skill' ? ' is-active' : ''}`}
-              disabled={disabled}
+              disabled={!assistEnabled}
               title={t('mirror.assist.skillsTitle')}
               aria-label={t('mirror.assist.skillsTitle')}
               onMouseDown={(e) => e.preventDefault()}
@@ -466,7 +500,7 @@ const CommandComposer = memo(function CommandComposer() {
         />
         <button
           className="composer-send"
-          disabled={disabled || sending || !text.trim()}
+          disabled={sendBlocked || !text.trim()}
           onClick={submit}
         >
           {sending ? t('mirror.sending') : t('mirror.send')}
@@ -496,6 +530,7 @@ export function MirrorView() {
   const viewMode = useRelayStore((s) => s.mirror?.viewMode ?? 'chat');
   const supportsTerminalView = useRelayStore((s) => s.supportsTerminalView);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  const linkDown = useRelayStore(selectLinkDown);
   const activity = useRelayStore(selectActivity);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -552,7 +587,8 @@ export function MirrorView() {
   /** 上滑到顶 / 点「加载更早」:先记下锚点再发请求,插入后据此保持阅读位置 */
   const requestOlder = useCallback(() => {
     const el = scrollRef.current;
-    const m = useRelayStore.getState().mirror;
+    const { mirror: m, phase } = useRelayStore.getState();
+    if (phase !== 'connected') return;
     if (!el || !m || !m.hasMore || m.loadingOlder || m.messages.length === 0) return;
     historyAnchor.current = { head: m.messages[0], height: el.scrollHeight };
     loadOlderMirror();
@@ -623,10 +659,10 @@ export function MirrorView() {
         <button className="mirror-back" onClick={closeMirror}>
           ‹ {t('mirror.back')}
         </button>
-        {/* 标题即改名入口。会话已结束/桌面端离线时改不动:pane 没了或消息送不到 */}
+        {/* 标题即改名入口。会话已结束/桌面端离线/重连中时改不动:pane 没了或消息送不到 */}
         <button
           className="mirror-title"
-          disabled={closed || desktopOnline === false}
+          disabled={closed || desktopOnline === false || linkDown}
           title={t('sessions.rename.action')}
           onClick={() => setRenaming(true)}
         >
@@ -683,7 +719,7 @@ export function MirrorView() {
             <button
               className="mirror-load-older"
               onClick={requestOlder}
-              disabled={loadingOlder}
+              disabled={loadingOlder || linkDown}
             >
               {loadingOlder ? t('mirror.loading') : t('mirror.loadOlder')}
             </button>

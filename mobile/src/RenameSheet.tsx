@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { renamePane } from './relay';
+import { renamePane, useRelayStore } from './relay';
 import { useT } from './i18n';
+import { useBackLayer } from './navigation';
 
 /**
  * 重命名会话的弹层。
@@ -20,9 +21,14 @@ export function RenameSheet({
 }) {
   const t = useT();
   const [value, setValue] = useState(current);
+  // 弹层开着时链路断了 / 桌面端掉线:改名发不出去,确定按钮置灰,弹层留着等恢复
+  const canSend = useRelayStore((s) => s.phase === 'connected' && s.desktopOnline !== false);
+  // 返回手势先关弹层(不提交)
+  useBackLayer(true, onClose);
 
   const submit = () => {
-    renamePane(paneId, value);
+    // 没发出去就别关:关了等于告诉用户「改好了」
+    if (!renamePane(paneId, value)) return;
     onClose();
   };
 
@@ -48,8 +54,10 @@ export function RenameSheet({
               if (e.key === 'Enter') submit();
             }}
           />
-          <div className="rename-hint">{t('sessions.rename.hint')}</div>
-          <button className="rename-confirm" onClick={submit}>
+          <div className="rename-hint">
+            {t(canSend ? 'sessions.rename.hint' : 'sessions.rename.unavailable')}
+          </div>
+          <button className="rename-confirm" disabled={!canSend} onClick={submit}>
             {t('sessions.rename.confirm')}
           </button>
         </div>

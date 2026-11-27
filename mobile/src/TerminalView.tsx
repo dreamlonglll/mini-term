@@ -10,7 +10,12 @@ import {
   useState,
 } from 'react';
 import { useT } from './i18n';
-import { sendTerminalKey, type TerminalScreenData, useRelayStore } from './relay';
+import {
+  selectLinkDown,
+  sendTerminalKey,
+  type TerminalScreenData,
+  useRelayStore,
+} from './relay';
 import type { TerminalKey, TerminalLine, TerminalSpan } from './protocol';
 
 type TermRenderMode = 'reflow' | 'grid';
@@ -335,6 +340,7 @@ export const TerminalView = memo(function TerminalView() {
   const loaded = useRelayStore((s) => s.mirror?.terminalLoaded ?? false);
   const closed = useRelayStore((s) => s.mirror?.closed ?? false);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  const linkDown = useRelayStore(selectLinkDown);
 
   const [mode, setMode] = useState<TermRenderMode>(loadSavedMode);
   const [fontSize, setFontSize] = useState<number>(loadSavedFontSize);
@@ -345,7 +351,8 @@ export const TerminalView = memo(function TerminalView() {
   const stickToBottom = useRef(true);
   const keyFlashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const keysDisabled = closed || desktopOnline === false;
+  // 重连中按键发不出去(sendTerminalKey 也会拒),按钮一并置灰,不给「按下去了」的闪烁反馈
+  const keysDisabled = closed || desktopOnline === false || linkDown;
 
   const updateMode = useCallback((next: TermRenderMode) => {
     setMode(next);
