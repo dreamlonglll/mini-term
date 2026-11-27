@@ -21,11 +21,11 @@ use mt_relay_protocol::{
     PROTOCOL_VERSION, RelayToDesktop, StartSessionFailReason, TerminalKey,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::assist;
-use crate::host::{AiLauncher, RelayEvents, RelayHost};
+use crate::host::{AiLauncher, HostTerminalScreen, RelayEvents, RelayHost};
 use crate::mirror::{
     self, CodexPeers, HeuristicScope, MIRROR_PAGE_SIZE, MirrorAgent, MirrorParser, history_slice,
 };
@@ -37,8 +37,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 镜像会话文件轮询间隔。
 const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 终端视图快照轮询间隔（只查 `AtomicU64` 代数，有变化才锁 grid 推送）。
+/// 终端视图快照轮询间隔的最快档（只查 `AtomicU64` 代数，有变化才锁 grid 推送）。
+/// 画面持续在变时按 [`TerminalPacer`] 逐级放慢到 [`TERMINAL_POLL_STEADY`] /
+/// [`TERMINAL_POLL_SLOWEST`]。
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// 画面连续 [`TERMINAL_BACKOFF_ROUNDS`] 轮都在变之后降到的第二档。
+const TERMINAL_POLL_STEADY: Duration = Duration::from_millis(400);
+/// 最慢一档:画面一直在变时手机端看到新画面的最坏延迟,不超过 1s。
+const TERMINAL_POLL_SLOWEST: Duration = Duration::from_millis(800);
+/// 连续推了这么多轮新画面才降一档(最快档 5 轮 ≈ 1s,第二档 5 轮 ≈ 2s)。
+const TERMINAL_BACKOFF_ROUNDS: u32 = 5;
 
 /// 移动端指令:正文写进 PTY 之后、单独补写提交回车之前的间隔。
 ///
@@ -240,6 +248,13 @@ struct MirrorSub {
     runtime: Arc<Mutex<Option<MirrorRuntime>>>,
 }
 
+/// 一个被订阅 pane 的终端视图推送:取消句柄 + 「回最快档」的催促(见
+/// [`MobileRelayManager::kick_terminal`])。
+struct TerminalSub {
+    cancel_tx: watch::Sender<bool>,
+    kick: Arc<Notify>,
+}
+
 /// 异步任务(连接循环 + 镜像轮询)的落脚处。
 ///
 /// Tauri 时代这些任务跑在 `tauri::async_runtime::spawn`(Tauri 自带的全局 tokio
@@ -429,7 +444,7 @@ pub struct MobileRelayManager {
     /// 已订阅镜像的 pane 集合
     mirror_subs: Mutex<HashMap<String, MirrorSub>>,
     /// 已订阅终端屏幕快照流的 pane 集合
-    terminal_subs: Mutex<HashMap<String, watch::Sender<bool>>>,
+    terminal_subs: Mutex<HashMap<String, TerminalSub>>,
     /// 历史会话只读预览的单槽分页缓存(断线清空)
     history_preview_cache: Mutex<Option<HistoryPreviewCache>>,
     /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
@@ -681,8 +696,16 @@ impl MobileRelayManager {
 
     /// 撤销单个终端屏幕快照订阅(幂等)。
     fn unsubscribe_terminal(&self, pane_id: &str) {
-        if let Some(cancel_tx) = self.terminal_subs.lock().remove(pane_id) {
-            let _ = cancel_tx.send(true);
+        if let Some(sub) = self.terminal_subs.lock().remove(pane_id) {
+            let _ = sub.cancel_tx.send(true);
+        }
+    }
+
+    /// 移动端刚对这个 pane 有过操作(按键 / 指令 / 点选作答):它的终端推送回最快档并当场
+    /// 查一轮,回显不吃慢档的延迟(见 [`TerminalPacer`])。没订阅终端视图就什么都不做。
+    fn kick_terminal(&self, pane_id: &str) {
+        if let Some(sub) = self.terminal_subs.lock().get(pane_id) {
+            sub.kick.notify_one();
         }
     }
 
@@ -698,14 +721,14 @@ impl MobileRelayManager {
         for sub in subs {
             let _ = sub.cancel_tx.send(true);
         }
-        let term_subs: Vec<watch::Sender<bool>> = self
+        let term_subs: Vec<TerminalSub> = self
             .terminal_subs
             .lock()
             .drain()
-            .map(|(_, tx)| tx)
+            .map(|(_, sub)| sub)
             .collect();
-        for cancel_tx in term_subs {
-            let _ = cancel_tx.send(true);
+        for sub in term_subs {
+            let _ = sub.cancel_tx.send(true);
         }
     }
 
@@ -1154,10 +1177,17 @@ impl MobileRelayManager {
             return;
         }
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.terminal_subs.lock().insert(pane_id.clone(), cancel_tx);
+        let kick = Arc::new(Notify::new());
+        self.terminal_subs.lock().insert(
+            pane_id.clone(),
+            TerminalSub {
+                cancel_tx,
+                kick: kick.clone(),
+            },
+        );
         let manager = Arc::clone(self);
         self.spawn(async move {
-            terminal_screen_task(manager, pane_id, cancel_rx).await;
+            terminal_screen_task(manager, pane_id, kick, cancel_rx).await;
         });
     }
 }
@@ -1981,6 +2011,7 @@ fn handle_mobile_command(
         let result = task_manager.write_mobile_command(&pane_id, &text).await;
         if result.is_ok() {
             task_manager.record_mobile_cmd(&pane_id, &text);
+            task_manager.kick_terminal(&pane_id);
         }
         task_manager.send_command_receipt(pane_id, command_id, result);
         let _ = done_tx.send(());
@@ -2024,6 +2055,7 @@ fn handle_answer_question(
     if let Ok(label) = &result {
         // 登记选中项:作答回流的 questionAnswered 标记按 labels 对账改标 "mobile"
         manager.record_mobile_cmd(&pane_id, label);
+        manager.kick_terminal(&pane_id);
     }
     manager.send_command_receipt(pane_id, command_id, result.map(|_| ()));
 }
@@ -2076,21 +2108,24 @@ fn try_answer_question(
     Ok(answer.label)
 }
 
-/// 终端视图快照轮询任务：每 [`TERMINAL_POLL_INTERVAL`] 查一次目标 PTY 的无锁画面代数，
-/// 仅当 `(pty_id, generation)` 发生变化时才提取快照并推送 [`DesktopToRelay::TerminalScreen`]。
+/// 终端视图快照轮询任务：按 [`TerminalPacer`] 定的节拍查目标 PTY 的无锁画面代数，
+/// 代数变了才提取快照，内容也变了才推送 [`DesktopToRelay::TerminalScreen`]。
 async fn terminal_screen_task(
     manager: Arc<MobileRelayManager>,
     pane_id: String,
+    kick: Arc<Notify>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut last_sent: Option<(u32, u64)> = None;
+    let mut pacer = TerminalPacer::default();
     loop {
+        let mut pushed = false;
         if let Some(pty_id) = manager.pane_ptys.lock().get(&pane_id).copied()
             && let Some(generation) = manager.host.terminal_generation(pty_id)
-            && last_sent != Some((pty_id, generation))
+            && pacer.is_new(pty_id, generation)
             && let Some(screen) = manager.host.terminal_screen(pty_id)
+            && pacer.admit(pty_id, screen.generation, screen_fingerprint(&screen))
         {
-            last_sent = Some((pty_id, screen.generation));
+            pushed = true;
             let _ = manager.send(DesktopToRelay::TerminalScreen {
                 pane_id: pane_id.clone(),
                 cols: screen.cols,
@@ -2103,11 +2138,96 @@ async fn terminal_screen_task(
             });
         }
 
+        let wait = pacer.next_interval(pushed);
         tokio::select! {
-            _ = tokio::time::sleep(TERMINAL_POLL_INTERVAL) => {}
+            _ = tokio::time::sleep(wait) => {}
+            _ = kick.notified() => pacer.kick(),
             _ = cancel_rx.changed() => return,
         }
     }
+}
+
+/// 终端视图推送的节拍与去重(纯状态机,单测钉它)。三道闸:
+///
+/// - **代数没变不取快照**:代数是无锁读的 `AtomicU64`;取快照要锁 grid,与 reader 线程抢锁;
+/// - **内容没变不发**:代数每推进一批字节就 +1,可只改窗口标题、响铃、模式位、光标原地重定位
+///   这类输出画面逐字不变。照发等于把整屏连同最多 120 行回滚原样再传一遍(每帧数十 KB),
+///   所以按内容指纹([`screen_fingerprint`])比,与上次推出去的相同就不发;
+/// - **一直在变就放慢**:AI 干活时 TUI 的转圈与计时每一轮都在变,按 200ms 推就是每秒 5 整屏。
+///   连续推满 [`TERMINAL_BACKOFF_ROUNDS`] 轮降一档(200 → 400 → 800ms),手机端看到新画面的
+///   最坏延迟停在 800ms(上限 1s 以内)。任何一轮查下来没有新画面、或移动端对这个 pane 有操作
+///   ([`MobileRelayManager::kick_terminal`]),当场回到最快档 —— 回显与收尾那一屏不吃慢档的延迟。
+#[derive(Debug, Default)]
+struct TerminalPacer {
+    /// 上次看过的 `(pty, 画面代数)`:没变就不取快照
+    seen: Option<(u32, u64)>,
+    /// 上次推出去的那一屏的内容指纹
+    sent: Option<u64>,
+    /// 连续几轮都推了新画面
+    streak: u32,
+}
+
+impl TerminalPacer {
+    /// 这个 `(pty, 代数)` 还没看过(值得锁 grid 取一份快照)。
+    fn is_new(&self, pty_id: u32, generation: u64) -> bool {
+        self.seen != Some((pty_id, generation))
+    }
+
+    /// 取到快照之后定夺发不发:内容与上次推出去的相同就不发。
+    fn admit(&mut self, pty_id: u32, generation: u64, fingerprint: u64) -> bool {
+        self.seen = Some((pty_id, generation));
+        if self.sent == Some(fingerprint) {
+            return false;
+        }
+        self.sent = Some(fingerprint);
+        true
+    }
+
+    /// 一轮查完(`pushed` = 这一轮推了新画面),返回下一轮之前该等多久。
+    fn next_interval(&mut self, pushed: bool) -> Duration {
+        self.streak = if pushed {
+            self.streak.saturating_add(1)
+        } else {
+            0
+        };
+        match self.streak / TERMINAL_BACKOFF_ROUNDS {
+            0 => TERMINAL_POLL_INTERVAL,
+            1 => TERMINAL_POLL_STEADY,
+            _ => TERMINAL_POLL_SLOWEST,
+        }
+    }
+
+    /// 移动端刚对这个 pane 有过操作:回最快档。
+    fn kick(&mut self) {
+        self.streak = 0;
+    }
+}
+
+/// 一屏终端快照的内容指纹:尺寸、光标、备用屏标志与逐行逐段的文字和样式,不含代数。
+fn screen_fingerprint(screen: &HostTerminalScreen) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (
+        screen.cols,
+        screen.rows,
+        screen.cursor_row,
+        screen.cursor_col,
+        screen.cursor_visible,
+        screen.alt_screen,
+    )
+        .hash(&mut hasher);
+    screen.lines.len().hash(&mut hasher);
+    for line in &screen.lines {
+        line.wrapped.hash(&mut hasher);
+        line.spans.len().hash(&mut hasher);
+        for span in &line.spans {
+            span.text.hash(&mut hasher);
+            span.fg.hash(&mut hasher);
+            span.bg.hash(&mut hasher);
+            (span.bold, span.dim, span.inverse).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 /// 移动端终端应急按键：校验目标 pane 在活跃 AI 集合且存在活 PTY，按当前 `APP_CURSOR` 模式
@@ -2130,6 +2250,9 @@ fn handle_send_terminal_key(
         }
         None => Err(CommandFailReason::PaneNotFound),
     };
+    if result.is_ok() {
+        manager.kick_terminal(&pane_id);
+    }
     manager.send_command_receipt(pane_id, command_id, result);
 }
 
@@ -4545,5 +4668,159 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 终端视图推送的节拍与去重 ──
+
+    fn screen_with(generation: u64, text: &str, cursor_col: u16) -> HostTerminalScreen {
+        HostTerminalScreen {
+            generation,
+            cols: 80,
+            rows: 24,
+            cursor_row: 0,
+            cursor_col,
+            cursor_visible: true,
+            alt_screen: false,
+            lines: vec![crate::host::TerminalLine {
+                spans: vec![crate::host::TerminalSpan {
+                    text: text.into(),
+                    ..Default::default()
+                }],
+                wrapped: false,
+            }],
+        }
+    }
+
+    /// 指纹只认画面内容:代数不同、内容相同 → 同一个;文字、光标、样式、软换行任何一样变了 → 不同。
+    #[test]
+    fn terminal_fingerprint_tracks_content_not_generation() {
+        let base = screen_with(1, "$ ls", 4);
+        let same = screen_fingerprint(&base);
+        assert_eq!(same, screen_fingerprint(&screen_with(9, "$ ls", 4)));
+        assert_ne!(same, screen_fingerprint(&screen_with(1, "$ ls -l", 4)));
+        assert_ne!(same, screen_fingerprint(&screen_with(1, "$ ls", 5)), "光标挪了");
+        let mut bold = base.clone();
+        bold.lines[0].spans[0].bold = true;
+        assert_ne!(same, screen_fingerprint(&bold), "样式变了");
+        let mut colored = base.clone();
+        colored.lines[0].spans[0].fg = Some("ansi:1".into());
+        assert_ne!(same, screen_fingerprint(&colored), "颜色变了");
+        let mut wrapped = base.clone();
+        wrapped.lines[0].wrapped = true;
+        assert_ne!(same, screen_fingerprint(&wrapped), "软换行标志变了");
+        let mut alt = base.clone();
+        alt.alt_screen = true;
+        assert_ne!(same, screen_fingerprint(&alt), "切到备用屏");
+        let mut longer = base;
+        longer.lines.push(crate::host::TerminalLine::default());
+        assert_ne!(same, screen_fingerprint(&longer), "多了一行空行");
+    }
+
+    /// 代数没变不取快照、内容没变不发;一直在变时 5 轮最快档 → 5 轮第二档 → 最慢档,
+    /// 一轮没新画面或移动端操作就回最快档。最慢档不超过 1s(手机端延迟上限)。
+    #[test]
+    fn terminal_pacer_dedups_and_backs_off_while_streaming() {
+        let mut pacer = TerminalPacer::default();
+        assert!(pacer.is_new(1, 10));
+        assert!(pacer.admit(1, 10, 111), "首屏必发");
+        assert!(!pacer.is_new(1, 10), "代数没变不取快照");
+        assert!(pacer.is_new(1, 11));
+        assert!(!pacer.admit(1, 11, 111), "代数变了但画面逐字相同:不发");
+        assert!(!pacer.is_new(1, 11));
+        assert!(pacer.is_new(2, 11), "换了 PTY 重看");
+
+        let mut pacer = TerminalPacer::default();
+        let waits: Vec<Duration> = (0..12u64)
+            .map(|round| {
+                assert!(pacer.admit(1, round, round));
+                pacer.next_interval(true)
+            })
+            .collect();
+        assert_eq!(waits[..4], [TERMINAL_POLL_INTERVAL; 4]);
+        assert_eq!(waits[4..9], [TERMINAL_POLL_STEADY; 5]);
+        assert_eq!(waits[9..], [TERMINAL_POLL_SLOWEST; 3]);
+        assert!(TERMINAL_POLL_SLOWEST < Duration::from_secs(1));
+
+        assert_eq!(
+            pacer.next_interval(false),
+            TERMINAL_POLL_INTERVAL,
+            "一轮没新画面:回最快档"
+        );
+        for _ in 0..12 {
+            pacer.next_interval(true);
+        }
+        pacer.kick();
+        assert_eq!(
+            pacer.next_interval(true),
+            TERMINAL_POLL_INTERVAL,
+            "移动端操作:回最快档"
+        );
+    }
+
+    /// 端到端:订阅推首屏;只推进了代数(窗口标题 / 响铃这类输出)那一屏不推;画面真变了才推。
+    #[test]
+    fn terminal_view_skips_frames_with_identical_content() {
+        let host = Arc::new(TerminalAssistTestHost::default());
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let manager = Arc::new(MobileRelayManager::with_runtime(
+            host.clone(),
+            Arc::new(NoopRelayHost),
+            rt.handle().clone(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *manager.outbound.lock() = Some(tx);
+        manager.update_sessions(vec![SyncProject {
+            project_id: "p".into(),
+            name: "p".into(),
+            path: r"D:\proj".into(),
+            ssh_connection_id: None,
+            group_path: vec![],
+            panes: vec![SyncPane {
+                pane_id: "pane".into(),
+                title: "Codex".into(),
+                status: "ai-working".into(),
+                pty_id: Some(42),
+                needs_attention: false,
+            }],
+        }]);
+        // 丢弃 SessionsDelta
+        let _ = rx.try_recv();
+
+        *host.screen.lock() = Some(screen_with(1, "$ ", 2));
+        rt.block_on(async {
+            manager.subscribe_terminal("pane".into());
+            let first = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(first, DesktopToRelay::TerminalScreen { .. }));
+
+            *host.screen.lock() = Some(screen_with(2, "$ ", 2));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(700), rx.recv())
+                    .await
+                    .is_err(),
+                "画面逐字相同不该再推"
+            );
+
+            *host.screen.lock() = Some(screen_with(3, "$ ls", 4));
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                DesktopToRelay::TerminalScreen {
+                    cursor_col, lines, ..
+                } => {
+                    assert_eq!(cursor_col, 4);
+                    assert_eq!(lines[0].spans[0].text, "$ ls");
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        });
     }
 }
