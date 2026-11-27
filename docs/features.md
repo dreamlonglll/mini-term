@@ -320,7 +320,7 @@ cargo run -p mt-app
 cargo build --release -p mt-app
 ```
 
-> Hook reporting and the portable ConPTY locate sidecars and resources **next to the exe** — the release bundles ship them all. For the full experience when running from source, run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
+> Release bundles ship `miniterm-hook`, the portable ConPTY runtime (Windows), and the `extensions.json` manifest next to the exe (remote Git helpers, SSH tools and the large syntax pack are downloaded as [on-demand extensions](#on-demand-extensions) below). Source builds ship no manifest and load sidecars, the dev syntax-pack library and portable ConPTY next to the exe — run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
 
 #### On-demand extensions
 

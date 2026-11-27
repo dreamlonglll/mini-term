@@ -265,7 +265,7 @@ jobs:
               python3 scripts/smoke-git-helper-old-glibc.py \
                 "/workspace/helper-assets/$HELPER_TARGET/mt-git-helper"
             '
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: remote-git-helper-${{ matrix.target }}
           path: helper-assets/
@@ -287,7 +287,7 @@ jobs:
           node scripts/pack-extensions.mjs pack --id "git-helper-$HELPER_TARGET" \
             --exe "helper-assets/$HELPER_TARGET/mt-git-helper" --out-dir helper-extension
           ls -la helper-extension
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: helper-extension-${{ matrix.target }}
           path: helper-extension/
@@ -310,7 +310,7 @@ jobs:
       contents: write
     steps:
       - name: Download helper extensions
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: helper-extension-*
           path: helper-extensions
@@ -493,7 +493,7 @@ jobs:
           cp "target/release/$PACK_LIB" staging/desktop/syntax-pack/
 
       - name: Upload desktop build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: desktop-build-${{ matrix.key }}
           path: staging/desktop/
@@ -538,7 +538,7 @@ jobs:
           node-version: 22
 
       - name: Download desktop build artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: desktop-build-${{ matrix.key }}
           path: staging/desktop
@@ -563,7 +563,7 @@ jobs:
 
       # 原始 helper 只用来校验,放 staging/ 而不是 target/release/:后者是包的布局,helper 不再进包
       - name: Download remote Git helper assets
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: remote-git-helper-*
           path: staging/remote-git-helpers
@@ -578,7 +578,7 @@ jobs:
 
       # remote-git-helpers 作业打好的四个 helper 扩展 zip + 描述片段(各行下载同一份,哈希一致)
       - name: Download helper extensions
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: helper-extension-*
           path: staging/extensions

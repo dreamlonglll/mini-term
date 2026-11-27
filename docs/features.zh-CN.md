@@ -320,7 +320,7 @@ cargo run -p mt-app
 cargo build --release -p mt-app
 ```
 
-> hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布包已带齐；源码运行要完整体验，先跑一次 `stage-sidecars.mjs`（release 构建对应 `--release`，就位到 `target/release/`）。
+> 发布包内已随附 `miniterm-hook`、便携 ConPTY（Windows）与扩展清单 `extensions.json`（远端 Git helper、SSH 工具与大体积语法包改为下文[按需扩展](#按需扩展)下载）；源码构建不带扩展清单，按「与 exe 同目录」定位 sidecar、语法包与便携 ConPTY，要完整体验请先跑一次 `stage-sidecars.mjs`（release 构建对应 `--release`，就位到 `target/release/`）。
 
 #### 按需扩展
 
