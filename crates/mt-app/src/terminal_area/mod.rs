@@ -174,6 +174,9 @@ pub struct TerminalArea {
     tab_card: pane_preview::HoverCard<String>,
     /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄等于 `clearTimeout`**。
     _tab_preview_task: Option<Task<()>>,
+    /// 页签图标槽里 ai-working 那颗转圈灯的独立小视图(见 [`crate::spin_dot`]):
+    /// 转圈的低频泵只 notify 它们,不再每 100ms 把整个终端区重建一遍。
+    spin_dots: crate::spin_dot::SpinDots,
 
     // ─── pane 拖拽(v0.14.0 / 原版 PR #49)───────────────────────
     //
@@ -306,6 +309,7 @@ impl TerminalArea {
             tab_rects: HashMap::new(),
             tab_card: pane_preview::HoverCard::default(),
             _tab_preview_task: None,
+            spin_dots: Default::default(),
             pane_drag: None,
             pane_drop: None,
             tab_drop: None,
@@ -533,6 +537,8 @@ impl Render for TerminalArea {
         // 上一帧的那份先留一个引用计数:关分屏后邻居扩张要比对「哪些叶子没了」
         self.fx.borrow_mut().begin_frame();
         self.render_gen += 1;
+        // 转圈灯新一轮登记(顺手回收上一轮没画到的,见 `crate::spin_dot`)
+        self.spin_dots.begin();
         // 整块换场播完即自动摘除出场层
         if self
             .area_swap

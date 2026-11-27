@@ -290,9 +290,13 @@ pub(super) fn tab_label(
 /// 标题绝不横跳。展开态 chip 与折叠标题条共用。
 ///
 /// `contrast` 给挖空语义的笔画(fish 的眼睛)用,传图标所在容器的底色。
+///
+/// `status` 是调用方画好的状态灯(`light != Idle` 时必给):ai-working 那颗要挂进
+/// 宿主的 [`crate::spin_dot::SpinDots`],转圈的低频泵才只 notify 它、不连带整个终端区。
 pub(super) fn tab_icon_slot(
     pane_id: &str,
     light: StatusLight,
+    status: Option<AnyElement>,
     ssh_connected: Option<&str>,
     shell_name: &str,
     is_active: bool,
@@ -323,8 +327,7 @@ pub(super) fn tab_icon_slot(
             },
         )
         .child(if light != StatusLight::Idle {
-            // 动画相位来自进程级墙钟,不带逐元素状态,所以不需要 id
-            ui::status_dot(light).into_any_element()
+            status.unwrap_or_else(|| ui::status_dot(light).into_any_element())
         } else if show_ssh {
             ui::ssh_connected_dot().into_any_element()
         } else {
@@ -369,6 +372,17 @@ impl TerminalArea {
         dragging: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        // 图标槽里的状态灯先画好(要可变借 `cx` 建转圈灯小视图,下面 store 一直借着 `*cx`)
+        let mut status_dots: Vec<Option<AnyElement>> = panes
+            .iter()
+            .map(|p| {
+                let light = p.light();
+                (light != StatusLight::Idle).then(|| {
+                    self.spin_dots
+                        .dot(format!("tab:{}", p.id), light, px(11.0), cx)
+                })
+            })
+            .collect();
         // 借的是 `*cx` 不是 `self`,所以下面补焦点句柄那段照样能改 self
         let store = self.store.read(cx);
         let unseen: Vec<bool> = panes
@@ -685,6 +699,7 @@ impl TerminalArea {
                 .child(tab_icon_slot(
                     &pane.id,
                     pane.light(),
+                    status_dots.get_mut(idx).and_then(Option::take),
                     pane.ssh_connected.as_deref(),
                     &pane.shell_name,
                     is_active,

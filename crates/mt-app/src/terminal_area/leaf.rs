@@ -450,6 +450,11 @@ impl TerminalArea {
         {
             let is_active = pane_id == active_id;
             let focus = self.tab_focus.get(&pane_id).cloned();
+            // ai-working 那颗挂成转圈灯小视图(见 `crate::spin_dot`),其余档位内联
+            let status = (light != StatusLight::Idle).then(|| {
+                self.spin_dots
+                    .dot(format!("bar:{pane_id}"), light, px(11.0), cx)
+            });
             let (pid_click, pane_click) = (pid.clone(), pane_id.clone());
             let (pid_key, pane_key) = (pid.clone(), pane_id.clone());
             // 右键菜单的「重命名」只预填主段(理由见展开态 tab 的同一处注释)
@@ -541,6 +546,7 @@ impl TerminalArea {
                     .child(tab_icon_slot(
                         &pane_id,
                         light,
+                        status,
                         ssh_connected.as_deref(),
                         &shell_name,
                         is_active,
