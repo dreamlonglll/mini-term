@@ -21,6 +21,7 @@ pub mod persist;
 pub mod project_tree;
 pub mod pty_slot;
 pub mod quick_ssh;
+pub mod row_window;
 pub mod session_branch;
 pub mod shell_link;
 pub mod shell_ops;

@@ -61,6 +61,16 @@
 //! 从 store 读的**全部**东西的指纹(清单在那个函数的注释里),变了才 notify。
 //! ⚠️ render 里新读了 store 的什么,必须同步进那份清单,否则界面会不跟着刷。
 //!
+//! # 窗口化铺行
+//!
+//! 整树拍平成行之后**只给可视区附近的行建元素**,屏外连续的行折成一段等高空白
+//! ([`FileTree::render_rows_windowed`],算法在 [`mt_app_core::row_window`])。展开态落盘、
+//! 越积越多,上千行的树不窗口化时每一帧(折叠动画的每一帧、悬停换行、点行聚焦、滚轮)
+//! 都要把全部行重建、排版、绘制一遍 —— 「点开文件夹卡 0.2s」就是 220ms 的展开动画被拖成
+//! 每帧几十毫秒、只剩五六帧。前提是各行同高(建出来的第一行上挂探针量,见 [`RowProbe`])。
+//! 列表子元素因此**不再与行号一一对应**:键盘移动、速搜与定位按「行顶 = 行号 × 行高」
+//! 改滚动偏移([`FileTree::scroll_row_into_view`]),拿着焦点的行在屏外也照建。
+//!
 //! # 当前文件:高亮与定位
 //!
 //! 工作区停在文件页签上时,树里那个文件的行铺一层 `accent_subtle` 底、文件名转 accent 色
@@ -109,9 +119,11 @@
 //! 停靠点),这时敲字从顶上开始速搜,↓ / Home 进第一行、↑ / End 进最后一行
 //! ([`FileTree::on_list_key`])。拿着焦点的行描一圈 accent 细边。
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -151,6 +163,7 @@ mod recycle;
 mod tests;
 
 use mt_app_core::file_tree_git_refresh as git_refresh;
+use mt_app_core::row_window::{self, RowLayout, Slot};
 use mt_app_core::speed_search::{self, Seek, SpeedSearch};
 
 use git_refresh::{GitRefreshPlan, RepoSigs};
@@ -398,9 +411,13 @@ pub struct FileTree {
     /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点后 Enter/Space
     /// 与 ←→ 才有落点,见 [`Self::on_row_key`]。
     row_focus: HashMap<PathBuf, gpui::FocusHandle>,
-    /// 行列表的滚动句柄:键盘移动与定位靠它把目标行滚进可视区。列表的子元素就是
-    /// 按序铺开的行(最后多一块空白落点),下标即行号。
+    /// 行列表的滚动句柄。列表是窗口化铺的(见 [`Self::render_rows_windowed`]):子元素是
+    /// 可视区附近的行与屏外折成的空白段(最后多一块空白落点),**下标不是行号**;键盘移动
+    /// 与定位按「行顶 = 行号 × 行高」改它的偏移([`Self::scroll_row_into_view`])。
     list_scroll: ScrollHandle,
+    /// 上一帧量到的行高(px;0 = 还没量过)。各行同高,窗口化铺行靠它把屏外的行折成等高
+    /// 空白;由建出来的第一行上的探针在 prepaint 时写(见 [`RowProbe`])。
+    row_height: Rc<Cell<f32>>,
     /// 走到一半的「在文件树中定位」。
     reveal: Option<RevealRequest>,
     /// 等着在下一帧兑现的滚动(与交焦点),见 render 里兑现那一段。
@@ -662,6 +679,7 @@ impl FileTree {
             remote_broken: false,
             row_focus: HashMap::new(),
             list_scroll: ScrollHandle::new(),
+            row_height: Rc::new(Cell::new(0.0)),
             reveal: None,
             pending_scroll: None,
             notice: None,
@@ -1457,7 +1475,7 @@ impl FileTree {
 
     /// 把焦点当场交给第 `target` 行并把它滚进可视区(键盘移动与速搜共用)。
     ///
-    /// 列表子元素与行号 1:1 才滚得准,所以先清掉在飞的折叠动画。那一行这一拍才出现、
+    /// 行顶 = 行号 × 行高只在静止时成立,所以先清掉在飞的折叠动画。那一行这一拍才出现、
     /// 还没画过(没有焦点句柄)时,交给下一帧兑现(`pending_scroll`,与定位同一条路)。
     fn focus_row_at(
         &mut self,
@@ -1472,7 +1490,7 @@ impl FileTree {
         self.folds.clear();
         if let Some(focus) = self.row_focus.get(&path) {
             window.focus(focus, cx);
-            self.list_scroll.scroll_to_item(target);
+            self.scroll_row_into_view(target);
         } else {
             self.pending_scroll = Some(PendingScroll {
                 path,
@@ -2054,9 +2072,11 @@ impl FileTree {
         cx: &App,
         out: &mut Vec<Row>,
     ) {
-        self.rows_with_closing(project_id, root, dir, depth, false, cx, out);
+        self.rows_with_closing(project_id, root, dir, depth, None, cx, out);
     }
 
+    /// 同 [`Self::rows`],`closing_at` 给了时把那一刻还在「收起最后一程」的目录子树也拍进来
+    /// (折叠动画要挂着它们收完)。
     #[allow(clippy::too_many_arguments)]
     fn rows_with_closing(
         &self,
@@ -2064,7 +2084,7 @@ impl FileTree {
         root: &Path,
         dir: &Path,
         depth: usize,
-        include_closing: bool,
+        closing_at: Option<Instant>,
         cx: &App,
         out: &mut Vec<Row>,
     ) {
@@ -2094,15 +2114,16 @@ impl FileTree {
                     .flatten()
                     .flatten(),
             });
-            let descend =
-                expanded || (include_closing && entry.is_dir && self.folds.is_closing(&key));
+            let descend = expanded
+                || closing_at
+                    .is_some_and(|now| entry.is_dir && self.folds.is_closing_at(&key, now));
             if descend {
                 self.rows_with_closing(
                     project_id,
                     root,
                     &entry.path,
                     depth + 1,
-                    include_closing,
+                    closing_at,
                     cx,
                     out,
                 );
@@ -2110,11 +2131,15 @@ impl FileTree {
         }
     }
 
-    /// 把含收起最后一程在内的行切片递归组装成元素：仅正在播折叠动画的目录子切片
-    /// 包进 [`crate::height_reveal::HeightReveal`]，其余保持扁平。
+    /// 把含收起最后一程在内的行切片**逐行全建**成元素：仅正在播折叠动画的目录子切片
+    /// 包进 [`crate::height_reveal::HeightReveal`]，其余保持扁平。几何还不知道、没法
+    /// 窗口化的那一帧才走这里(见 [`Self::render_rows_windowed`])。`probe` 挂在建出来的
+    /// 第一行上。
     fn render_row_slice(
         &self,
         rows: &[Row],
+        probe: &mut Option<RowProbe>,
+        now: Instant,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -2122,19 +2147,20 @@ impl FileTree {
         let mut i = 0;
         while i < rows.len() {
             let row = &rows[i];
-            out.push(self.render_row(row.clone(), cx));
+            out.push(self.render_row(row.clone(), probe.take(), cx));
             if row.is_dir {
                 let key = row.path.to_string_lossy();
-                if let Some(fold) = self.folds.get(key.as_ref()) {
+                if let Some(fold) = self.folds.get_at(key.as_ref(), now) {
                     let depth = row.depth;
                     let mut j = i + 1;
                     while j < rows.len() && rows[j].depth > depth {
                         j += 1;
                     }
                     if j > i + 1 {
-                        let children = self.render_row_slice(&rows[i + 1..j], window, cx);
+                        let children =
+                            self.render_row_slice(&rows[i + 1..j], probe, now, window, cx);
                         let col = div().flex().flex_col().children(children);
-                        out.push(fold.render(col, window));
+                        out.push(fold.render_at(col, window, now));
                     }
                     i = j;
                     continue;
@@ -2143,6 +2169,215 @@ impl FileTree {
             i += 1;
         }
         out
+    }
+
+    // ─── 窗口化铺行(见 `mt_app_core::row_window`) ─────────────────
+
+    /// 窗口化铺行要的几何(都是上一帧量到的):行高、滚过去的距离、视口高。任一项还不知道
+    /// 就是 `None` —— 这一帧逐行全建(首帧、列表还没排过版、中栏刚打开)。
+    fn row_geometry(&self) -> Option<RowGeometry> {
+        let row_height = self.row_height.get();
+        let viewport = f32::from(self.list_scroll.bounds().size.height);
+        (row_height > 0.0 && viewport > 0.0).then(|| RowGeometry {
+            row_height,
+            scroll_top: -f32::from(self.list_scroll.offset().y),
+            viewport,
+        })
+    }
+
+    /// 把**静止**列表(没有在飞的折叠动画:调用方先清掉)的第 `ix` 行滚进可视区,滚动量取
+    /// 最少的那一边。窗口化之后列表子元素不再与行号一一对应(屏外是空白段),所以不走
+    /// `scroll_to_item`,按「行顶 = 行号 × 行高」直接改偏移;几何还不知道的那一帧是逐行
+    /// 全建的,照旧交给 `scroll_to_item`。
+    fn scroll_row_into_view(&self, ix: usize) {
+        let Some(geometry) = self.row_geometry() else {
+            self.list_scroll.scroll_to_item(ix);
+            return;
+        };
+        if let Some(top) = row_window::reveal_scroll_top(
+            ix,
+            geometry.row_height,
+            geometry.scroll_top,
+            geometry.viewport,
+        ) {
+            let offset = self.list_scroll.offset();
+            self.list_scroll.set_offset(gpui::point(offset.x, px(-top)));
+        }
+    }
+
+    /// 窗口化铺行:只给可视区(上下各多带一段)里的行建元素,屏外连续的行折成一段等高空白,
+    /// 整块在屏外的折叠窗同样只占一段空白。总高与逐行全建时一致,滚动范围、各行位置都不变。
+    ///
+    /// 不窗口化时任何一帧都要把**全部**行重建、排版、绘制一遍:展开态落盘、越积越多,
+    /// 几百上千行的树在折叠动画的每一帧、悬停换行、点行聚焦时都按总行数付钱。
+    fn render_rows_windowed(
+        &self,
+        rows: &[Row],
+        geometry: RowGeometry,
+        now: Instant,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let depths: Vec<usize> = rows.iter().map(|row| row.depth).collect();
+        let mut folds = TreeFolds {
+            rows,
+            folds: &self.folds,
+            now,
+        };
+        let layout = RowLayout::measure(&depths, geometry.row_height, &mut folds);
+        // gpui 会在 prepaint 里把越界的偏移钳回来(内容变矮:收起、删行):按钳过的位置铺,
+        // 免得这一帧铺的区间落在内容外面、整屏空白
+        let max_top = (layout.height() + LIST_TAIL_MIN_HEIGHT - geometry.viewport).max(0.0);
+        let scroll_top = geometry.scroll_top.clamp(0.0, max_top);
+        let overscan = (geometry.viewport * 0.5).max(MIN_OVERSCAN);
+        let top = scroll_top - overscan;
+        let bottom = scroll_top + geometry.viewport + overscan;
+        // 拿着焦点的行在屏外也照建:不建的话焦点路径断掉,列表会收到一次失焦(速搜随之收起)
+        let keep = self
+            .focused_row
+            .as_ref()
+            .and_then(|path| rows.iter().position(|row| &row.path == path));
+        let slots = layout.slots(top, bottom, keep);
+        let mut probe = Some(RowProbe::new(self, Some((top, bottom, layout.height()))));
+        self.render_slots(rows, &slots, &mut probe, now, window, cx)
+    }
+
+    fn render_slots(
+        &self,
+        rows: &[Row],
+        slots: &[Slot],
+        probe: &mut Option<RowProbe>,
+        now: Instant,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match slot {
+                // 空白段不许被 flex 压扁(没有内容,min-content 是 0)
+                Slot::Gap(height) => out.push(div().flex_none().h(px(*height)).into_any_element()),
+                Slot::Row(ix) => out.push(self.render_row(rows[*ix].clone(), probe.take(), cx)),
+                Slot::Fold {
+                    header,
+                    clip,
+                    slots,
+                } => {
+                    let key = rows[*header].path.to_string_lossy();
+                    match self.folds.get_at(key.as_ref(), now) {
+                        Some(fold) => {
+                            let children = self.render_slots(rows, slots, probe, now, window, cx);
+                            let col = div().flex().flex_col().children(children);
+                            out.push(fold.render_at(col, window, now));
+                        }
+                        // 量高时还在、这会儿查不到:同一个时刻不会发生,真碰上也按窗高留白
+                        None => out.push(div().flex_none().h(px(*clip)).into_any_element()),
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// 窗口化铺行要的几何,见 [`FileTree::row_geometry`]。
+#[derive(Clone, Copy, Debug)]
+struct RowGeometry {
+    row_height: f32,
+    /// 内容滚过去的距离(≥ 0,gpui 偏移的相反数)。
+    scroll_top: f32,
+    viewport: f32,
+}
+
+/// 列表末尾那块空白落点(拖拽移到项目根、空白处右键)的最小高度。
+const LIST_TAIL_MIN_HEIGHT: f32 = 24.0;
+
+/// 窗口化铺行时可视区上下各多铺的最少高度(px;另取视口高的一半,取大者)。挡住「视口这一帧
+/// 变大 / 偏移被钳回来、而铺行用的还是上一帧几何」那一下露白。
+const MIN_OVERSCAN: f32 = 160.0;
+
+/// [`row_window::Folds`] 的文件树实现:哪些目录行带着在飞的折叠动画、窗高多少。
+struct TreeFolds<'a> {
+    rows: &'a [Row],
+    folds: &'a crate::height_reveal::FoldReveals,
+    now: Instant,
+}
+
+impl TreeFolds<'_> {
+    fn fold(&self, ix: usize) -> Option<&crate::height_reveal::HeightReveal> {
+        let row = &self.rows[ix];
+        if !row.is_dir {
+            return None;
+        }
+        self.folds
+            .get_at(row.path.to_string_lossy().as_ref(), self.now)
+    }
+}
+
+impl row_window::Folds for TreeFolds<'_> {
+    fn is_folding(&self, ix: usize) -> bool {
+        self.fold(ix).is_some()
+    }
+
+    fn clip(&mut self, ix: usize, natural: f32) -> f32 {
+        match self.fold(ix) {
+            Some(fold) => {
+                // 子树自然高按行数算得出来;整块在屏外时不建元素,动画自己的探针量不到
+                fold.set_natural_height(natural);
+                fold.shown_height_at(natural, self.now)
+            }
+            None => natural,
+        }
+    }
+}
+
+/// 挂在建出来的第一行上的探针(prepaint 时跑,那时滚动句柄里已是这一帧的视口与偏移):
+/// 量行高;核对这一帧按上一帧几何铺的区间盖没盖住真实可视区(视口变大、偏移被 gpui
+/// 钳回来时可能盖不住)。行高变了或没盖住就再要一帧,按新几何重铺。
+struct RowProbe {
+    row_height: Rc<Cell<f32>>,
+    scroll: ScrollHandle,
+    /// 这一帧真建了元素的区间 `[top, bottom)` 与行的总高(内容坐标);`None` = 逐行全建。
+    band: Option<(f32, f32, f32)>,
+}
+
+impl RowProbe {
+    fn new(tree: &FileTree, band: Option<(f32, f32, f32)>) -> Self {
+        Self {
+            row_height: tree.row_height.clone(),
+            scroll: tree.list_scroll.clone(),
+            band,
+        }
+    }
+
+    fn into_element(self) -> impl IntoElement {
+        let Self {
+            row_height,
+            scroll,
+            band,
+        } = self;
+        gpui::canvas(
+            move |bounds, window, _cx| {
+                let measured = f32::from(bounds.size.height);
+                let mut stale = (row_height.get() - measured).abs() > 0.01;
+                if stale {
+                    row_height.set(measured);
+                }
+                if let Some((top, bottom, rows_height)) = band {
+                    let view_top = -f32::from(scroll.offset().y);
+                    let view_bottom =
+                        (view_top + f32::from(scroll.bounds().size.height)).min(rows_height);
+                    stale |= view_top < top - 0.5 || view_bottom > bottom + 0.5;
+                }
+                if stale {
+                    window.request_animation_frame();
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 }
 
@@ -2912,12 +3147,12 @@ impl Render for FileTree {
                 self.row_focus(&path, cx);
             }
         }
-        // 兑现等着的滚动(键盘移动 / 定位落地)。行号就是这一帧铺出去的子元素下标;那一行
-        // 已经不在了(这期间被折叠 / 删掉)就作罢
+        // 兑现等着的滚动(键盘移动 / 定位落地)。在飞的折叠动画上面已经清掉,行顶 = 行号 × 行高;
+        // 那一行已经不在了(这期间被折叠 / 删掉)就作罢。先滚再铺行:下面窗口化按滚过去的位置铺
         if let Some(pending) = self.pending_scroll.take()
             && let Some(ix) = rows.iter().position(|row| row.path == pending.path)
         {
-            self.list_scroll.scroll_to_item(ix);
+            self.scroll_row_into_view(ix);
             if pending.focus
                 && let Some(focus) = self.row_focus.get(&pending.path)
             {
@@ -3027,10 +3262,10 @@ impl Render for FileTree {
                 ordinal,
                 total,
             };
-            // 条升起时列表视口逐帧变矮,而 gpui 的 `scroll_to_item` 按**上一帧**的视口算:
+            // 条升起时列表视口逐帧变矮,而滚进可视区按的是**上一帧**的视口:
             // 刚跳到、贴着底边的那一行会被升起的条挤出可视区。所以升起期间每帧把拿着焦点的
             // 行再滚一次(已在视口内就不动),播完再补两帧(第二帧拿到的才是最终视口)。
-            // 在飞的折叠动画期间子元素与行号不 1:1,不滚
+            // 在飞的折叠动画期间行顶不是「行号 × 行高」,不滚
             if self.speed_bar.is_running() {
                 self.speed_scroll_settle = 2;
             }
@@ -3040,7 +3275,7 @@ impl Render for FileTree {
                     window.request_animation_frame();
                 }
                 if let Some(ix) = focused {
-                    self.list_scroll.scroll_to_item(ix);
+                    self.scroll_row_into_view(ix);
                 }
             }
         } else {
@@ -3067,16 +3302,34 @@ impl Render for FileTree {
             .flex_col()
             .flex_1()
             .overflow_y_scroll()
-            // 键盘移动与定位靠它把目标行滚进可视区(子元素下标 = 行号)
+            // 窗口化铺行按它的偏移与视口挑行;键盘移动与定位也靠它把目标行滚进可视区
             .track_scroll(&self.list_scroll);
-        if self.folds.is_animating() {
+        // 这一帧拍平、量高、画折叠窗都取同一个时刻:动画恰好在中途播完时,各取各的
+        // 时钟会一处按「还在裁」、一处按「已展开」,窗高对不上
+        let now = Instant::now();
+        let animating = self.folds.is_animating_at(now);
+        // 收起中的目录子树要挂着收完,得另拍一份含它们的行序;只在展开时与静止行序一样
+        let rows = if self.folds.any_closing_at(now) {
             let mut anim_rows = Vec::new();
-            self.rows_with_closing(&project_id, &root, &root, 0, true, cx, &mut anim_rows);
-            list = list.children(self.render_row_slice(&anim_rows, window, cx));
+            self.rows_with_closing(&project_id, &root, &root, 0, Some(now), cx, &mut anim_rows);
+            anim_rows
         } else {
-            for row in rows {
-                list = list.child(self.render_row(row, cx));
+            rows
+        };
+        list = match self.row_geometry() {
+            Some(geometry) => {
+                list.children(self.render_rows_windowed(&rows, geometry, now, window, cx))
             }
+            // 几何还不知道(首帧 / 列表还没排过版 / 中栏刚打开):逐行全建,第一行上的探针
+            // 量出行高,下一帧起窗口化
+            None => {
+                let mut probe = Some(RowProbe::new(self, None));
+                list.children(self.render_row_slice(&rows, &mut probe, now, window, cx))
+            }
+        };
+        if animating {
+            // 整块落在屏外的折叠窗不建元素,它自己要帧那一步跑不到 —— 在这里替它要
+            window.request_animation_frame();
         }
         let background_target = root.clone();
         let background_drop_id = "background".to_string();
@@ -3092,7 +3345,7 @@ impl Render for FileTree {
             div()
                 .id("file-tree-background")
                 .flex_1()
-                .min_h(px(24.0))
+                .min_h(px(LIST_TAIL_MIN_HEIGHT))
                 .when(background_highlight, |el| {
                     el.bg(ui::with_alpha(ui::accent(), 0.12))
                 })
@@ -3161,17 +3414,24 @@ impl Render for FileTree {
 
         // 文本输入处理器(速搜的字从这里进,见 `impl EntityInputHandler for FileTree`):
         // 焦点在文件树上(某一行或列表容器)才登记。`handle_input` 只认传进去的句柄正是
-        // 当前焦点,而焦点在哪一行要到绘制时才定,所以在 paint 阶段现取。登记了它,
-        // 焦点在树上时输入法才开得起来(gpui 没有输入处理器就把 IME 摘掉)
+        // 当前焦点,所以句柄在 paint 阶段现取。登记了它,焦点在树上时输入法才开得起来
+        // (gpui 没有输入处理器就把 IME 摘掉)。
+        //
+        // 「焦点在不在树上」按句柄认,**不用** `list_focus.contains_focused`:后者查的是
+        // **上一帧**画出来的分派树。速搜 / 键盘把焦点挪到一行上一帧还在屏外、没建元素的
+        // 行(窗口化铺行,见 `render_rows_windowed`)时,这一帧它就判「不在树上」、不登记,
+        // 平台那边没有输入处理器,紧跟着敲的字整个被丢掉(E2E:敲 `pricing` 只收到 `prng`)
+        let tree_focused = self.list_focus.is_focused(window)
+            || self
+                .row_focus
+                .values()
+                .any(|focus| focus.is_focused(window));
         let input_handler = {
             let entity = cx.entity();
-            let list_focus = self.list_focus.clone();
             gpui::canvas(
                 |_, _, _| {},
                 move |bounds, _, window, cx| {
-                    if list_focus.contains_focused(window, cx)
-                        && let Some(focused) = window.focused(cx)
-                    {
+                    if tree_focused && let Some(focused) = window.focused(cx) {
                         window.handle_input(
                             &focused,
                             gpui::ElementInputHandler::new(bounds, entity),
@@ -3455,7 +3715,8 @@ impl FileTree {
             .into_any_element()
     }
 
-    fn render_row(&self, row: Row, cx: &mut Context<Self>) -> AnyElement {
+    /// 建一行。`probe` 给了就挂在这一行上(量行高、核对窗口化铺行的区间,见 [`RowProbe`])。
+    fn render_row(&self, row: Row, probe: Option<RowProbe>, cx: &mut Context<Self>) -> AnyElement {
         let path = row.path.clone();
         let is_dir = row.is_dir;
         let row_for_menu = row.clone();
@@ -3752,6 +4013,7 @@ impl FileTree {
                         .border_color(ui::with_alpha(ui::accent(), 0.75)),
                 )
             })
+            .when_some(probe, |el, probe| el.child(probe.into_element()))
             .into_any_element()
     }
 }
