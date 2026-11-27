@@ -784,3 +784,146 @@ fn 锚点按标题_slug_或_html_id_命中() {
     // 空 id 不命中任何块
     assert!(!block_has_anchor("# x", ""));
 }
+
+// ─── 文首 frontmatter ─────────────────────────────────────────
+
+fn frontmatter_of(segs: &[MdSegment]) -> Option<&str> {
+    match segs.first() {
+        Some(MdSegment::Frontmatter(raw)) => Some(raw),
+        _ => None,
+    }
+}
+
+#[test]
+fn 文首_frontmatter_单独成块_不进大纲也不混进正文() {
+    let src = concat!(
+        "---\n",
+        "title: 示例文档\n",
+        "description: 一行说明\n",
+        "---\n",
+        "\n",
+        "# 正文标题\n",
+        "\n",
+        "段落\n",
+    );
+    let doc = split_md_document(src);
+    assert_eq!(
+        frontmatter_of(&doc.segs),
+        Some("---\ntitle: 示例文档\ndescription: 一行说明\n---"),
+        "{:?}",
+        doc.segs
+    );
+    assert_eq!(outline_of(src), vec![(1, "正文标题".to_string(), 1)]);
+    for seg in &doc.segs[1..] {
+        let MdSegment::Text(text) = seg else {
+            panic!("frontmatter 之后应是正文块:{:?}", doc.segs);
+        };
+        assert!(
+            !text.contains("title:") && !text.contains("description:"),
+            "frontmatter 的行混进了正文块:{:?}",
+            doc.segs
+        );
+    }
+}
+
+#[test]
+fn frontmatter_的末行不再被当成_setext_二级标题() {
+    // 不开扩展时这是「分隔线 + 二级标题 title: 示例」,标题还进了大纲(修之前的 bug)
+    let src = "---\ntitle: 示例\n---\n正文\n";
+    let segs = split_md_blocks(src);
+    assert_eq!(frontmatter_of(&segs), Some("---\ntitle: 示例\n---"));
+    assert!(
+        matches!(&segs[1..], [MdSegment::Text(t)] if t == "正文"),
+        "{segs:?}"
+    );
+    assert!(outline_of(src).is_empty());
+}
+
+#[test]
+fn 文件中间的分隔线照旧是分隔线() {
+    let src = concat!(
+        "开头段落\n",
+        "\n",
+        "---\n",
+        "title: 不是 frontmatter\n",
+        "---\n",
+        "\n",
+        "结尾\n",
+    );
+    let segs = split_md_blocks(src);
+    assert!(
+        !segs
+            .iter()
+            .any(|seg| matches!(seg, MdSegment::Frontmatter(_))),
+        "只有文首才认 frontmatter:{segs:?}"
+    );
+    assert!(
+        matches!(&segs[1], MdSegment::Text(t) if t == "---"),
+        "{segs:?}"
+    );
+    // 中间那段与改动前一样:分隔线 + setext 二级标题
+    assert_eq!(
+        outline_of(src),
+        vec![(2, "title: 不是 frontmatter".to_string(), 2)]
+    );
+}
+
+#[test]
+fn frontmatter_口径_bom_crlf_toml_照认() {
+    let cases = [
+        ("\u{feff}---\ntitle: x\n---\n正文", "---\ntitle: x\n---"),
+        (
+            "---\r\ntitle: x\r\n---\r\n正文\r\n",
+            "---\r\ntitle: x\r\n---",
+        ),
+        ("+++\ntitle = \"x\"\n+++\n正文", "+++\ntitle = \"x\"\n+++"),
+        // 栅栏行尾的空白不碍事
+        ("---  \ntitle: x\n---\t\n正文", "---  \ntitle: x\n---\t"),
+    ];
+    for (src, expected) in cases {
+        let segs = split_md_blocks(src);
+        assert_eq!(frontmatter_of(&segs), Some(expected), "{src:?} → {segs:?}");
+        assert!(
+            matches!(&segs[1..], [MdSegment::Text(t)] if t.trim() == "正文"),
+            "{src:?} → {segs:?}"
+        );
+    }
+}
+
+#[test]
+fn frontmatter_口径_前导空行_缩进_未闭合_都不算() {
+    for src in [
+        "\n---\ntitle: x\n---\n正文",
+        " ---\ntitle: x\n---\n正文",
+        "---\ntitle: x\n\n正文",
+        "--- x\ntitle: y\n---\n正文",
+    ] {
+        let segs = split_md_blocks(src);
+        assert!(
+            !segs
+                .iter()
+                .any(|seg| matches!(seg, MdSegment::Frontmatter(_))),
+            "{src:?} 不该认成 frontmatter:{segs:?}"
+        );
+    }
+    // 前导空行时与改动前一致:分隔线 + setext 二级标题
+    assert_eq!(
+        outline_of("\n---\ntitle: x\n---\n正文"),
+        vec![(2, "title: x".to_string(), 1)]
+    );
+}
+
+#[test]
+fn 整篇交回_text_view_时_frontmatter_仍单独成块() {
+    // 引用定义要共享作用域 → 正文整篇一块;frontmatter 照样切出去
+    let src = "---\ntitle: x\n---\n\n# 一\n\n[链接][ref]\n\n[ref]: https://example.com\n";
+    let doc = split_md_document(src);
+    assert_eq!(doc.segs.len(), 2, "{:?}", doc.segs);
+    assert_eq!(frontmatter_of(&doc.segs), Some("---\ntitle: x\n---"));
+    let MdSegment::Text(rest) = &doc.segs[1] else {
+        panic!("{:?}", doc.segs);
+    };
+    assert!(rest.contains("[链接][ref]") && rest.contains("[ref]: https://example.com"));
+    assert!(!rest.contains("title:"));
+    assert!(doc.outline.is_empty());
+}

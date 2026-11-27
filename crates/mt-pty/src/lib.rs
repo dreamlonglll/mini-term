@@ -24,6 +24,9 @@
 //! 退出 watcher  轮询子进程,退出后回调一次
 //! ```
 //!
+//! 三条线程连同 `Drop` 时销毁 master 的那条一次性线程都带名字
+//! `mt-pty-{reader,writer,exit,close}-<子进程 PID>`,见 `thread_name`。
+//!
 //! [`PtySession::write`] 只做观察器通知 + 入队即返回。写入放到独立线程是因为
 //! 管道写在两种情况下会阻塞:Windows 上多行长文本要逐行喂并让 ConPTY 消化
 //! (`write_chunked` 每行 sleep 1ms,两千行就是两秒),以及子进程停止消费输入
@@ -161,6 +164,9 @@ pub struct PtySession {
     closing: Arc<std::sync::atomic::AtomicBool>,
     /// cwd 命中 WSL UNC 时的重写结果,上层可据此提示用户一次。
     wsl_override: Option<WslOverride>,
+    /// spawn 时记下的子进程 PID,只给 [`Drop`] 里那条线程起名用(见 [`thread_name`]);
+    /// 对外查 PID 仍走 [`PtySession::process_id`]。
+    pid: Option<u32>,
 }
 
 /// 创建 PTY 所需的参数。字段刻意保持贫瘠 —— 现有 `create_pty` 的其余参数
@@ -318,6 +324,7 @@ impl PtySession {
             .with_context(|| format!("spawn `{}` 失败", plan.program))?;
         // slave 必须在 spawn 后立刻丢弃,否则子进程退出时 master 侧读不到 EOF。
         drop(pair.slave);
+        let pid = child.process_id();
 
         let mut reader = pair
             .master
@@ -332,7 +339,7 @@ impl PtySession {
         let autofill_for_reader = Arc::clone(&autofill);
         let writer_for_reader = Arc::clone(&writer);
         std::thread::Builder::new()
-            .name("mt-pty-reader".into())
+            .name(thread_name("reader", pid))
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK];
                 loop {
@@ -350,11 +357,11 @@ impl PtySession {
             })
             .context("起 PTY reader 线程失败")?;
 
-        let write_tx = spawn_writer(writer)?;
+        let write_tx = spawn_writer(writer, pid)?;
 
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(on_exit) = on_exit {
-            spawn_exit_watcher(Arc::clone(&child), Arc::clone(&closing), on_exit);
+            spawn_exit_watcher(Arc::clone(&child), Arc::clone(&closing), on_exit, pid);
         }
 
         Ok(Self {
@@ -366,6 +373,7 @@ impl PtySession {
             last_size: Mutex::new((cols, rows)),
             closing,
             wsl_override: plan.wsl_override,
+            pid,
         })
     }
 
@@ -555,13 +563,32 @@ impl Drop for PtySession {
     /// 阻塞到该控制台会话里的每个进程都退出。子进程里还挂着长跑的 AI 进程时,
     /// 这一下在调用线程上永远不返回 —— 整个 UI 卡死成「未响应」。
     /// 先 kill 让 ConPTY 知道主进程没了,再后台销毁,UI 线程一秒都不等。
+    ///
+    /// 起线程失败照旧 panic:`std::thread::spawn` 本身就是 `Builder::new().spawn(f)
+    /// .expect(..)`,这里只是多了个名字。
     fn drop(&mut self) {
         self.closing
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.child.lock().kill();
         if let Some(master) = self.master.take() {
-            std::thread::spawn(move || drop(master));
+            std::thread::Builder::new()
+                .name(thread_name("close", self.pid))
+                .spawn(move || drop(master))
+                .expect("起 PTY master 销毁线程失败(与 std::thread::spawn 同样 panic)");
         }
+    }
+}
+
+/// 本会话各条线程的名字:`mt-pty-<职责>-<子进程 PID>`,拿不到 PID 时不带后缀。
+///
+/// 本 crate 没有会话 id(模块注释:所有权即生命周期,不设注册表),能把同一会话的
+/// 几条线程串起来、又能在任务管理器 / Process Explorer / 调试器里对上那个 shell 的,
+/// 就是子进程 PID。Linux 的线程名上限 15 字节,超出的尾巴会被截掉(PID 只剩前几位);
+/// Windows 与 macOS 不截。
+fn thread_name(role: &str, pid: Option<u32>) -> String {
+    match pid {
+        Some(pid) => format!("mt-pty-{role}-{pid}"),
+        None => format!("mt-pty-{role}"),
     }
 }
 
@@ -570,10 +597,13 @@ impl Drop for PtySession {
 /// 一次写失败即退出 —— 管道断了之后不会自己好,继续消费队列只是把用户的输入
 /// 悄悄扔掉;线程一退,`Sender` 那头的下一次 `write` 就拿到 `Err`,上层看得见。
 /// 会话被 [`Drop`] 时 `write_tx` 随之丢弃,队列耗尽后线程自然结束。
-fn spawn_writer(writer: Arc<Mutex<BoxedWriter>>) -> Result<mpsc::Sender<Vec<u8>>> {
+fn spawn_writer(
+    writer: Arc<Mutex<BoxedWriter>>,
+    pid: Option<u32>,
+) -> Result<mpsc::Sender<Vec<u8>>> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     std::thread::Builder::new()
-        .name("mt-pty-writer".into())
+        .name(thread_name("writer", pid))
         .spawn(move || {
             for chunk in rx {
                 if let Err(err) = write_chunked(&mut **writer.lock(), &chunk) {
@@ -697,14 +727,18 @@ fn pump_autofill(
 ///
 /// 线程自终结:会话被销毁时 [`Drop`] 会 kill 子进程,下一轮 `try_wait` 即拿到
 /// 结果退出循环(`closing` 已置位,不回调)。
+///
+/// 起线程失败照旧 panic(与此前的 `std::thread::spawn` 等价,见 [`PtySession`] 的
+/// `Drop` 注释);reader / writer 那两条失败是报 `Err` 给 spawn 的调用方,口径不变。
 fn spawn_exit_watcher(
     child: Arc<Mutex<BoxedChild>>,
     closing: Arc<std::sync::atomic::AtomicBool>,
     on_exit: ExitCallback,
+    pid: Option<u32>,
 ) {
     use std::sync::atomic::Ordering;
 
-    std::thread::spawn(move || {
+    let watch = move || {
         let started = Instant::now();
         loop {
             if closing.load(Ordering::Relaxed) {
@@ -731,7 +765,11 @@ fn spawn_exit_watcher(
             }
             return;
         }
-    });
+    };
+    std::thread::Builder::new()
+        .name(thread_name("exit", pid))
+        .spawn(watch)
+        .expect("起 PTY 退出监听线程失败(与 std::thread::spawn 同样 panic)");
 }
 
 #[cfg(test)]
@@ -862,6 +900,38 @@ mod tests {
             output.contains("mt-pty-smoke"),
             "reader 线程未把子进程输出交出来: {output:?}"
         );
+        drop(session);
+    }
+
+    #[test]
+    fn 会话线程按职责与子进程_pid_命名() {
+        assert_eq!(thread_name("exit", Some(42)), "mt-pty-exit-42");
+        assert_eq!(thread_name("reader", None), "mt-pty-reader");
+
+        // 回调就跑在对应的线程上:on_output 在 reader、on_exit 在退出 watcher
+        let thread_now = || std::thread::current().name().map(str::to_owned);
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let session = PtySession::spawn_with_options(
+            smoke_spec(),
+            PtyOptions::default().on_exit(move |_| {
+                let _ = exit_tx.send(thread_now());
+            }),
+            move |_| {
+                let _ = reader_tx.send(thread_now());
+            },
+        )
+        .expect("spawn 失败");
+        let pid = session.process_id();
+
+        let exit_thread = exit_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("退出回调未在 30s 内触发");
+        assert_eq!(exit_thread, Some(thread_name("exit", pid)));
+        let reader_thread = reader_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader 未交出任何输出");
+        assert_eq!(reader_thread, Some(thread_name("reader", pid)));
         drop(session);
     }
 

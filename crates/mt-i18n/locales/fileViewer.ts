@@ -72,6 +72,8 @@ export const fileViewer = {
     lightboxFit: "适应窗口",
     lightboxClose: "关闭（Esc）",
     lightboxHint: "滚轮缩放 · 拖动平移 · 双击适应窗口 · Esc 关闭",
+    copyCode: "复制代码",
+    codeCopied: "已复制",
   },
   en: {
     preview: "Preview",
@@ -146,5 +148,7 @@ export const fileViewer = {
     lightboxFit: "Fit to window",
     lightboxClose: "Close (Esc)",
     lightboxHint: "Scroll to zoom · Drag to pan · Double-click to fit · Esc to close",
+    copyCode: "Copy code",
+    codeCopied: "Copied",
   },
 } as const;

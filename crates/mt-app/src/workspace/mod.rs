@@ -104,7 +104,9 @@ impl DrawerPanel {
 /// 填满,全程零白底空洞、零遮盖终端文字、零外置主题包半透明闪色,且落定切回 `h_resizable`
 /// 零像素宽差。期间经 `mt_ui::terminal::set_grid_resize_frozen(true)` 暂停终端逐帧重排,
 /// 动画结束解冻后一次性完成唯一一次 `emulator.resize` 与去抖 PTY resize。
-/// ⚠️ 项目列表、文件树套着 [`cached_panel`]:动画层只改容器裁切宽度,**不许**改 opacity。
+/// 动画层只改容器裁切宽度,不改 opacity —— 动效口径是方向性位移、不做透明度(见
+/// `motion_kit` 模块注释)。项目列表、文件树套着 [`cached_panel`],但它在 gpui 0.2.2
+/// 时代「祖先改 opacity 会被定死」那条前提在 gpui-fast 下已失效(见该函数注释第 3 条)。
 ///
 /// 半路掉头(收到一半又展开、展开到一半又收)从眼下的位置接着走:进度存成
 /// `ValueTween`,新一场从 [`motion_kit::reversed_progress`] 起步(推导见
@@ -1178,47 +1180,81 @@ impl Workspace {
     }
 }
 
-/// 给一个「数据全从 store 来、自己 observe 了 store」的稳定面板套上 gpui 的
-/// **view 级缓存**。
+/// 给一个「数据全从 store 来」的稳定面板套上 gpui 的 **cached view**
+/// (`AnyView::cached(style)`)。下文的 file:line 都指 `gpui-fast-0.1.17/src/`。
 ///
-/// # 为什么非套不可
+/// # 来历:gpui 0.2.2 时代它是非套不可的
 ///
-/// `gpui::AnyView` 的缓存**只对调过 `.cached(style)` 的 view 生效**
-/// (`gpui-0.2.2/src/view.rs:170-182`:`cached_style` 是 `None` 时 `request_layout`
-/// 无条件重跑 `render`;`prepaint` 走 :197 那条早退,压根到不了 :208-223 那段
-/// 按 `dirty_views` 复用的逻辑)。本仓此前一处都没调过 —— 于是终端每一拍
-/// (30fps,见 [`crate::redraw`])都拖着项目列表 / 文件树 / 面板竖条整套重跑 render。
+/// 这层最早是照 Zed 官方 gpui 0.2.2 写的:那时视图**只有调过 `.cached(style)` 才缓存**,
+/// 普通 `Entity` 子视图每帧无条件重跑 `render`,终端每一拍(30fps,见
+/// [`crate::redraw`])都拖着项目列表 / 文件树 / 终端列表竖条整套重跑。套上之后
+/// 只有被 notify 的那条 view 路径重画,这几块整拍复用上一帧。
 ///
-/// 套上之后:`redraw` 里 notify 的是 `TerminalPane`,`mark_view_dirty` 只沿
-/// **它那条 view 路径**往上标脏(`window.rs:1304-1318`),这几个面板不在路径上,
-/// 整拍跳过 render/prepaint/paint 直接复用上一帧。
+/// # gpui-fast 下它还剩多少收益:很小
 ///
-/// # 套之前必须逐个核实的三件事
+/// gpui-fast **默认开着视图保留**(`fast/retained.rs:293`,只有环境变量
+/// `GPUI_VIEW_RETENTION=0` 才关):任何当元素用的 `Entity` 子视图,只要它 render /
+/// 布局 / prepaint / paint 期间读过的实体与全局都没变、所处的 bounds / content_mask /
+/// text_style / opacity 与上一帧相同、画它时依赖的悬停态也没变,就直接复用上一帧
+/// (约定写在 `fast/retained.rs:562-573`;判定是 :595-633 的 `reusable_retained` /
+/// `reusable_record` 与 :637-645 的 `retained_context_matches`;走的是
+/// `request_view_layout_inner` 里 :1487-1497 那一支和 `prepaint_view_inner` 的
+/// :1622-1629)。终端那一拍只 notify `TerminalPane`,这几块面板**不套缓存也已经
+/// 整块跳过** —— 0.2.2 时代「非套不可」的理由在 gpui-fast 下已经被默认保留覆盖了。
 ///
-/// 1. **render 读到的每一样东西都得能 notify 到这个 view**。缓存的失效条件只有
-///    四条:自身进 `dirty_views`、bounds 变、content_mask 变、text_style 变
-///    (外加 `Window::refresh()` 的全局绕过)。读了不 observe 的东西 = 画面冻结。
-///    几条常见交互态 gpui 自己接好了,不必额外担心:hover 变化会
-///    `cx.notify(current_view)`(`elements/div.rs:2068-2081`)、滚动同理
-///    (:2417-2450)、tooltip 与拖拽期间走 `window.refresh()`
-///    (:2616-2633 / `window.rs:3716-3727`)、`request_animation_frame`
-///    notify 的也是当前 view(`window.rs:1654`)——`mt_ui::motion` 那套补间
-///    因此照常跑。
-/// 2. **别套在 paint 期登记了 `reuse_paint` 不搬的东西的 view 上**。`PaintIndex`
-///    只覆盖 scene / mouse_listeners / input_handlers / cursor_styles /
-///    tab_stops(`window.rs:2293-2329`),**`window_control_hitboxes` 不在里面**
-///    且每帧 `Frame::clear` 清空 —— 用了 `.window_control_area(..)` 的 view
-///    (标题栏)一旦命中缓存就会丢掉拖拽区与最小化/最大化/关闭三键。
-/// 3. **祖先不能在动画里改 opacity**。opacity 是 paint 期烙进图元的
-///    (`window.rs:2896` 一线),`reuse_paint` 原样重放,命中缓存就把上一帧的
-///    透明度定死了。右侧抽屉那两块面板卡在这一条上。
+/// 而 `.cached(style)` 在 gpui-fast 里**不是另一套复用机制**:`AnyView::cached`
+/// (`view.rs:42`)→ `ViewElement::cached`(`view.rs:308`)只是多记一份
+/// `cached_style`,布局 / prepaint / paint 与普通视图走同一组
+/// `retained::request_view_layout` / `prepaint_view` / `paint_view`(`view.rs:348-381`);
+/// 命中时同样是 `reuse_retained_prepaint` + `reuse_retained_paint`
+/// (`fast/retained.rs:1661-1700`、:1946),底下是同一个 `Window::reuse_paint`
+/// (`window.rs:4461`)。与默认保留只差两处:
+///
+/// - 布局按传入的 `style` 起一个占位节点、不量内容(`fast/retained.rs:1478-1485`);
+/// - 失效判据用 `reusable_cached`(`fast/retained.rs:604`)→
+///   `notified_dependencies_changed`(`fast/dependencies.rs:546-551`):读过的实体
+///   **被 notify** 了、或读过的全局变了才重建;只 update 不 notify、或外层视图 render 时
+///   顺手写了它读的实体,都不算 —— 默认保留会把这两种也算上
+///   (`fast/dependencies.rs:514-528`)。
+///
+/// 所以眼下的收益只剩「它读的实体只被 update 而没 notify、或外层 render 时顺手写了
+/// 它读的实体,这块也不重建」,加上一次省掉的内容布局。外层单纯重画、它读的东西
+/// 都没动时,默认保留同样复用。留着是因为无害,不是因为必需。
+///
+/// # 0.2.2 时代套之前要核的三条,在 gpui-fast 下逐条重核
+///
+/// 1. **render 读到的东西都得能让它失效 —— 仍成立,但口径变了**。不再需要
+///    `observe`:render / 布局 / prepaint / paint 期间读过的实体与全局都自动记成依赖,
+///    悬停也是(`fast/retained.rs:562-573` 的约定、:628 的 `hovers_unchanged`);
+///    `Window::refresh()` 照旧整窗绕过(:609 的 `self.refreshing`),
+///    `request_animation_frame` 照旧下一帧 notify 当前视图(`window.rs:3056-3060`),
+///    `mt_ui::motion` 那套补间照常跑。仍然会冻住的是**实体与全局之外**的状态:视图
+///    自己字段里的 `Cell` / `RefCell` 改了不 notify、`Instant::now()` 驱动的变化不
+///    `request_animation_frame`、后台线程直接写的 `Arc<Mutex<..>>` / 原子量。
+///    反过来也要知道:依赖是按**读**记的,不是按订阅记的。面板 render 里读了 store,
+///    store 每次 `changed()`(emit + notify,见 `store::events` 的 `StoreChanged`)都会让
+///    缓存失效 —— 面板里按事件细粒度 `subscribe`、只在相关事件才 notify 自己那一套,
+///    在 0.2.2 下挡得住 OSC 标题之类的热路径,在 gpui-fast 下挡不住重画。
+/// 2. ~~`window_control_hitboxes` 不随 `reuse_paint` 搬运~~ —— **已失效**。gpui-fast
+///    的 `PaintIndex` 多了 `FastPaintIndex::window_control_hitboxes`
+///    (`fast/retained.rs:1204-1217`),`Window::reuse_paint` 第一件事就是
+///    `reuse_paint_records`(`window.rs:4461-4462`),把这一段画过的窗口控制区 hitbox
+///    原样搬进下一帧(`fast/retained.rs:1225-1233`)。标题栏不套缓存如今只是没必要
+///    (它作为普通子视图已在默认保留里),不再是「套了就丢拖拽区与三键」。
+/// 3. ~~祖先在动画里改 opacity 会把透明度定死~~ —— **已失效**。opacity 仍是 paint 期
+///    乘进图元的(`window.rs:4614-4630` 的 `with_element_opacity`),但记录里存着上一帧
+///    画它时的 opacity,prepaint 复用前先比(`fast/retained.rs:641`);只有 paint 时才知道
+///    的变化(祖先的 hover 样式改了 opacity)由 `reuse_retained_paint` 补查(:844),
+///    这一帧沿用旧值、把它标脏并要下一帧重建(:860-872)—— 最多晚一帧,不会定死。
+///    原注释里「右侧抽屉那两块面板卡在这一条上」也不成立了:抽屉现在只做位移动画、
+///    不改 opacity。抽屉面板照旧不套缓存,这里只更正理由。
 ///
 /// # `style` 传什么
 ///
-/// 命中缓存时 `request_layout` 返回的是一个**没有子节点**的占位节点,样式就是
-/// 这里传的这一份(`view.rs:171-176`)。`StyleRefinement::default()` 的 size 是
-/// `auto`,没有子节点即 0×0 —— 面板会整块塌掉。所以必须传一份与该面板
-/// **render 根节点等价**的尺寸样式。
+/// 缓存视图的布局**只按这里传的样式**起一个占位节点、不量内容
+/// (`fast/retained.rs:1478-1485`;`view.rs:249-253`:「Caching requires a definite
+/// size」)。`StyleRefinement::default()` 的 size 是 `auto`,没有子节点即 0×0 ——
+/// 面板会整块塌掉。所以必须传一份与该面板 **render 根节点等价**的尺寸样式。
 fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> gpui::ViewElement<AnyView> {
     AnyView::from(view.clone()).cached(style)
 }

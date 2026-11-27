@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use gpui::{
@@ -15,9 +15,10 @@ use gpui::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::scroll::Scrollbar;
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::text::{MarkdownExtensions, TextView, TextViewStyle};
 use mt_ui::tooltip::TooltipExt as _;
 
+use super::code_copy::{code_copy_actions, reserve_code_actions_space};
 use super::file_kind::file_name_of;
 use super::html_urls::rewrite_html_urls;
 use super::images::{
@@ -201,6 +202,27 @@ fn is_svg_target(url: &str) -> bool {
 }
 
 const MARKDOWN_CONTENT_MAX_WIDTH: f32 = 860.0;
+
+/// frontmatter 那一块([`MdBlock::Frontmatter`])的 TextView 开的扩展。与分块侧的
+/// `split_parse_options`(见 [`super::markdown`])是同一个开关,口径一处说清在那边。
+///
+/// 只开 frontmatter、不注册渲染插件:上游此时把 YAML / TOML 节点画成语言为
+/// `yml` / `toml` 的普通代码块(gpui-base `text/format/markdown.rs` 的 `Node::Yaml`
+/// 那一支),原文一字不改、带高亮,也挂得上复制按钮。gpui-component 另有
+/// `FrontmatterPlugin`(画成键值描述列表),但它只认平铺的纯标量,带引号 / 列表 /
+/// 嵌套的又退回代码块 —— 同一种文件时而表格时而代码,不如一律代码块。
+///
+/// 存成全局一份:`MarkdownExtensions` 每建一次换一个修订号,每帧新建的话 TextView
+/// 每帧都要比一遍解析配置;同一份克隆修订号不变,当场早退。
+static FRONTMATTER_EXTENSIONS: LazyLock<MarkdownExtensions> =
+    LazyLock::new(|| MarkdownExtensions::default().frontmatter());
+
+/// 画 frontmatter 那一块的 TextView。`text` 必须正好是分块切出来的那一段(从文首的
+/// 开栅栏到闭栅栏):它单独解析时开栅栏仍在文首、闭栅栏仍是第一道匹配的栅栏,
+/// 结果只会是一个 YAML / TOML 代码块,所以这一块不必过图片改写与远程清洗。
+fn frontmatter_text_view(id: gpui::SharedString, text: gpui::SharedString) -> TextView {
+    TextView::markdown(id, text).markdown_extensions(FRONTMATTER_EXTENSIONS.clone())
+}
 
 /// 图片该占多宽(逻辑像素):原尺寸与可用宽取小 —— 小图保持原大(原版
 /// `max-width:100%` 也不放大),大图压到可用宽。
@@ -506,6 +528,7 @@ impl FileViewer {
         let key = MermaidKey::new(code, cx);
         // 先记后要:use_asset 一旦调用,资源系统里就有了这个 key 的任务
         self.mermaid_requested.get_mut().insert(key.clone());
+        let copy_feedback = self.code_copy.clone();
         let failure = |id: gpui::SharedString, err: &MermaidError| {
             let reason = format!("{}: {err}", t("fileViewer", "mermaidRenderFailed"));
             div()
@@ -515,9 +538,12 @@ impl FileViewer {
                 .flex_col()
                 .gap(px(6.0))
                 .child(
+                    // 画成了图的那条路上没有代码块、也就没有复制按钮;退回代码块时
+                    // 它就是一块普通代码,与正文里的代码块一样给复制
                     TextView::markdown(id, fallback.clone())
                         .style(style.clone())
-                        .selectable(true),
+                        .selectable(true)
+                        .code_block_actions(code_copy_actions(&copy_feedback, seg_ix)),
                 )
                 .child(
                     div()
@@ -942,6 +968,8 @@ impl FileViewer {
                             sanitize_remote_markdown(&raw).into()
                         },
                     },
+                    // 原样交出去,不过改写与清洗(理由见 MdBlock::Frontmatter)
+                    MdSegment::Frontmatter(raw) => MdBlock::Frontmatter(raw.into()),
                 };
                 (mt, block)
             })
@@ -1052,6 +1080,8 @@ impl FileViewer {
             text.font_size = Some(ui::font_px(11.9).into());
             text.line_height = Some(gpui::relative(1.6));
         }
+        // 右上角常驻复制按钮(见 render_md_item),正文让出那一行
+        let code_block = reserve_code_actions_space(code_block);
         TextViewStyle {
             highlight_theme: cx.theme().highlight_theme.clone(),
             is_dark: cx.theme().mode.is_dark(),
@@ -1310,6 +1340,19 @@ impl FileViewer {
             .style(style.clone())
             .selectable(true)
             .on_link_click(self.preview_link_handler(cx))
+            // 围栏代码块右上角的复制按钮(见 code_copy 模块注释);mermaid 围栏
+            // 在分块时已拆成 MdBlock::Mermaid、画成图,不走这里
+            .code_block_actions(code_copy_actions(&self.code_copy, ix))
+            .into_any_element(),
+            // 只有这一块开 frontmatter(理由见 markdown::split_parse_options):画成
+            // 一个 yml / toml 代码块,同样挂复制按钮
+            MdBlock::Frontmatter(text) => frontmatter_text_view(
+                gpui::SharedString::from(format!("file-viewer-md-frontmatter-{ix}")),
+                text.clone(),
+            )
+            .style(style.clone())
+            .selectable(true)
+            .code_block_actions(code_copy_actions(&self.code_copy, ix))
             .into_any_element(),
             MdBlock::Table(table) => render_md_table(ix, table, &style, window, cx),
             MdBlock::Images(images) => {
@@ -1395,7 +1438,9 @@ impl FileViewer {
                         TextView::html("file-viewer-html-body", source)
                             .style(style)
                             .selectable(true)
-                            .on_link_click(self.preview_link_handler(cx)),
+                            .on_link_click(self.preview_link_handler(cx))
+                            // `<pre>` 也是代码块,与 markdown 预览同一颗复制按钮
+                            .code_block_actions(code_copy_actions(&self.code_copy, 0)),
                     ),
             );
         self.preview_scroll_shell("file-viewer-html-scrollbar", content)

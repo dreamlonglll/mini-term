@@ -1014,10 +1014,11 @@ impl Render for Workspace {
                 self.drawer_drag.is_some() || self.detail_drag.is_some(),
                 |el| el.child(edge_drag_listener(cx.weak_entity())),
             )
-            // ⚠️ 标题栏**不套** [`cached_panel`]:它靠 `.window_control_area(..)`
-            // 在 paint 期登记拖拽区与三键的 hitbox,而 `window_control_hitboxes`
-            // 不在 `PaintIndex` 里、`reuse_paint` 不搬它,每帧还被 `Frame::clear`
-            // 清空 —— 命中一次缓存,那一帧的窗口拖拽与最小化/最大化/关闭就全没了。
+            // 标题栏**不套** [`cached_panel`]。gpui 0.2.2 时代是不能套:`.window_control_area(..)`
+            // 在 paint 期登记的拖拽区与三键 hitbox 不随 `reuse_paint` 搬运,命中一次缓存那一帧
+            // 的窗口拖拽与最小化/最大化/关闭就全没了。gpui-fast 的 `reuse_paint` 已经会搬
+            // (见 `cached_panel` 注释第 2 条),而它作为普通子视图本就在默认视图保留里,
+            // 套了也省不了什么,于是维持原样。
             // 它每帧那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
             .child(self.title_bar.clone())
             // 弹窗开着时背景里的字不参与选区(见 `dialog_host::confine_background`)
