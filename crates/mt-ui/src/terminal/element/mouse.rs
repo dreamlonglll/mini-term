@@ -21,7 +21,7 @@ impl TerminalElement {
     /// `refresh()` 置的是 `Window::refreshing` 位(gpui-pre `window.rs:2248-2253`),
     /// 而 view 级缓存的复用判据里就有 `&& !window.refreshing`
     /// (`view.rs:386-392`)—— 一置位,**全窗所有 `.cached(style)` 的 view 当帧全部作废**。
-    /// 宿主那边 `main.rs::cached_panel` 套着项目列表 / 文件树 / 面板竖条三块,
+    /// 宿主那边 `mt-app` 的 `workspace/mod.rs::cached_panel` 套着项目列表 / 文件树 / 面板竖条三块,
     /// 于是「拖选一次 = 每个 mouse-move 把那三块整套重跑一遍 render」。
     ///
     /// 换成 `cx.notify(view_id)`:`App::notify` 走 `invalidate_view`

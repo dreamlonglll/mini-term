@@ -1295,7 +1295,8 @@ impl TerminalPane {
     ///
     /// gpui-fast 下子视图 `TerminalView` 默认保留复用,只 notify 外壳 `TerminalPane`
     /// 不会重绘 `Arc<TerminalEmulator>` 里的新 grid —— 必须直接标脏 `self.view`;
-    /// 回看浮钮状态未变时不惊动外壳,让 gpui-fast 直接拼接 `TerminalView`。
+    /// 回看浮钮状态未变时不 notify 外壳(外壳仍因子视图脏而跟着重跑一遍 render,
+    /// 见 `terminal_area::leaf::cached_terminal` 注释)。
     pub(crate) fn notify_redraw(&mut self, cx: &mut Context<Self>) {
         self.dirty_while_hidden = false;
         self.notify_view(cx);

@@ -1,15 +1,21 @@
 use super::*;
 
-/// pane 整块跳过 render / prepaint / paint,直接重放上一帧(判据与三条前提见
-/// `main.rs::cached_panel`)。此前每个可见 pane 每帧都要把整屏格子重新过一遍
+/// pane 整块跳过 render / prepaint / paint,直接重放上一帧(判据见
+/// `workspace/mod.rs::cached_panel`)。此前每个可见 pane 每帧都要把整屏格子重新过一遍
 /// 签名、重新出一遍图元 —— 分屏里一个 AI 在刷、另外三个闲着,就是四份的活。
+/// gpui-fast 下普通子视图默认就有这层保留,`.cached` 在这之上只多挡「读过的实体只
+/// update 没 notify」「外层 render 顺手写了它读的实体」两种失效,外加省一次内容布局。
 ///
 /// # 逐条核过的「不 notify 就不会动」清单
 ///
-/// 缓存只在四种情况下失效:本视图(或它的子视图)被 notify、bounds 变、
-/// content_mask 变、`window.refresh()`。终端画面的每一种变化都落在其中之一:
+/// 缓存只在这几种情况下失效:本视图或嵌在它里面的视图被 notify、它读过的实体被
+/// notify 或读过的全局变了、bounds / content_mask / text_style / opacity 变、它依赖的
+/// 悬停态变了、`window.refresh()`。终端画面的每一种变化都落在其中之一:
 ///
-/// - **输出**:reader 线程 → `redraw::request` → 节拍器 notify 的就是 `TerminalPane`;
+/// - **输出**:reader 线程 → `redraw::request` → 节拍器经 `TerminalPane::notify_redraw`
+///   直接标脏子视图 `TerminalView`(回看浮钮状态变了才连带 notify 外壳)。外壳随之
+///   算脏;`TerminalView` 不是 cached 视图,拼接不进 cached 的外壳,于是外壳跟着重跑
+///   一遍 render —— 只是一层薄壳,开销很小;
 /// - **键入 / IME 预编辑 / 粘贴 / 滚轮 / 拖选 / 停留复制 / 滚动条拖动与悬停**:
 ///   `TerminalView` 与终端元素的监听器里全是 `cx.notify(自己)`,沿视图路径标脏到本 pane;
 /// - **滚动条淡出**:paint 里 `request_animation_frame`,下一帧 notify 当前视图;
@@ -26,12 +32,13 @@ use super::*;
 ///   不触发任何 notify,两处已补上显式 notify;
 /// - **pane 尺寸变化 / tab 推入推出动画**:bounds 变,缓存自然未命中。
 ///
-/// 祖先不在动画里改 opacity(push 动画只动 `left`),`window_control_area` 也不在
-/// pane 里,`main.rs::cached_panel` 的第二、三条前提同样满足。
+/// `cached_panel` 注释里 gpui 0.2.2 时代的第二、三条前提(`window_control_area` 不随
+/// `reuse_paint` 搬运、祖先改 opacity 会定死)在 gpui-fast 下已失效;况且祖先也不在
+/// 动画里改 opacity(push 动画只动 `left`),`window_control_area` 也不在 pane 里。
 ///
 /// 占位样式与 `TerminalPane::render` 根节点(两个分支都是 `size_full`)等价。
 /// 占位节点没有子节点、min-content 为 0,**不会**把分栏撑宽 —— 分屏后三栏被
-/// tab 栏撑出窗口那条是 `main.rs::columns_host` 缺 `min_w(0)`,套不套缓存实测
+/// tab 栏撑出窗口那条是 `workspace/mod.rs::columns_host` 缺 `min_w(0)`,套不套缓存实测
 /// bounds 完全相同(见该函数注释)。
 pub(super) fn cached_terminal(entity: Entity<crate::pane::TerminalPane>) -> AnyElement {
     entity

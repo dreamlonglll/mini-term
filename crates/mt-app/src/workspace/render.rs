@@ -1019,7 +1019,7 @@ impl Render for Workspace {
             // 的窗口拖拽与最小化/最大化/关闭就全没了。gpui-fast 的 `reuse_paint` 已经会搬
             // (见 `cached_panel` 注释第 2 条),而它作为普通子视图本就在默认视图保留里,
             // 套了也省不了什么,于是维持原样。
-            // 它每帧那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
+            // 它每次重建都要的那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
             .child(self.title_bar.clone())
             // 弹窗开着时背景里的字不参与选区(见 `dialog_host::confine_background`)
             .child(dialog_host::confine_background(body, window, cx))

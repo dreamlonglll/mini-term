@@ -601,9 +601,10 @@ impl AppStore {
     /// # 为什么合成一个方法
     ///
     /// 拆成两个 getter 就要各扫一遍 `pane_refs(None)`(全项目 flat_map + collect
-    /// 一个 Vec),而标题栏**每帧都要**:它挂了 `window_control_area`,套不了
-    /// view 级缓存(理由见 `main.rs::cached_panel` 与标题栏挂载点的注释),
-    /// 所以那两遍是真的每帧各来一次。
+    /// 一个 Vec),而标题栏每次重建 render 都要这两样。gpui-fast 下标题栏不再每帧
+    /// 重建(它在默认视图保留里,见 `workspace/mod.rs::cached_panel` 与标题栏挂载点的
+    /// 注释),但它读 store,store 每次 `changed()` 都会让它重跑一遍 —— AI 状态
+    /// 切换这类事件可以很密,两遍扫描省一遍照样值。
     ///
     /// 两条结果的 done 判据都取 [`DoneScope::All`](`aiDoneOrder`,不看窗口焦点),
     /// 与标题栏那两处消费点原本的口径逐字一致 —— 托盘用的是

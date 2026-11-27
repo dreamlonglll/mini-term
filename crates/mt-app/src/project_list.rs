@@ -2211,8 +2211,10 @@ struct PendingReveal {
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        // 本视图套了 view 级缓存(`main.rs::cached_panel`),按 `touches_project_list`
-        // 细粒度订阅:OSC 标题(4Hz 热路径)、焦点 pane、AI 标记与文件树展开态不再唤醒本视图。
+        // 本视图套了 view 级缓存(`workspace/mod.rs::cached_panel`),按 `touches_project_list`
+        // 细粒度订阅:OSC 标题、焦点 pane、AI 标记与文件树展开态不在这里 notify 本视图。
+        // ⚠️ 这只省掉本视图自己那次 notify:render 读了 store,gpui-fast 下 store 每次
+        // `changed()`(emit + notify)照样让缓存失效(见 `cached_panel` 注释第 1 条)。
         // 中栏收着时本视图不渲染(这条照样跑):记一笔,再展开时完成标表直接对齐、不补播
         // (见 `sync_done_tags`)。
         cx.subscribe(&store, |this: &mut Self, store, event: &StoreEvent, cx| {
