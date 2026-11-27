@@ -64,7 +64,7 @@
 //! | [`document`] | [`DocumentSession`] 读写状态机(状态转换表在该模块注释里)与行尾三件套 |
 //! | [`file_kind`] | 文件类型判定、路径比对、扩展名 → 语言名 |
 //! | [`preview`] | Markdown / HTML 预览的渲染(`impl FileViewer` 的另一半)与自绘表格、图片占位 |
-//! | [`markdown`] | Markdown 纯逻辑:分块、图片落点、本地图片改写、链接处置、表格排版参数 |
+//! | [`markdown`] | Markdown 纯逻辑:分块(含文首 frontmatter)、图片落点、本地图片改写、链接处置、表格排版参数 |
 //! | [`code_copy`] | 富文本代码块右上角的「复制」按钮(md / html 预览与会话面板共用) |
 //! | [`sanitize`] | 不可信 Markdown(远程文档 / AI 会话正文)清洗 |
 //! | [`html_urls`] | 本地 HTML 的资源 URL 改写(简版渲染用) |

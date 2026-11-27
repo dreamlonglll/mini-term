@@ -30,6 +30,12 @@ use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 // 画出源文本。这里把顶层的 mermaid 围栏拆出来,交给 [`MermaidAsset`] 在后台
 // 线程渲染成位图(Mermaid 文本 → SVG → gpui 的 `SvgRenderer`),画法与本地图片同一套框;
 // 渲染失败时退回代码块 + 一行原因,见 [`FileViewer::render_md_mermaid`]。
+//
+// **文首的 YAML / TOML frontmatter 单独成块**:它不在 CommonMark / GFM 里,不开
+// 扩展时 `---\ntitle: x\n---` 解析成「分隔线 + setext 二级标题」(gpui-base
+// `text/format/markdown.rs` 的 `yaml_frontmatter_is_disabled_by_default`),标题还会
+// 混进大纲。分块按 [`split_parse_options`] 认出它,切成 [`MdSegment::Frontmatter`],
+// 渲染时只给这一块的 TextView 开同一个扩展,见 [`super::FileViewer::render_md_item`]。
 
 /// GFM 表格的列对齐(分隔行的 `:---:` 语法)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +77,9 @@ pub(super) enum MdSegment {
         code: String,
         raw: String,
     },
+    /// 文首的 frontmatter(YAML `---` 或 TOML `+++`),连同上下两道栅栏的原文。
+    /// 只可能是第 0 块,认法见 [`split_parse_options`]
+    Frontmatter(String),
 }
 
 /// 预处理好的一块正文:`Text` 里的图片目标已改写成绝对 `file://`
@@ -88,6 +97,11 @@ pub(super) enum MdBlock {
         code: Arc<str>,
         fallback: gpui::SharedString,
     },
+    /// 见 [`MdSegment::Frontmatter`]。原文**不过**图片改写与远程清洗:那两道都按不开
+    /// frontmatter 的 GFM 解析,会把 YAML 里像图片 / 链接的字面量当成真节点改掉;而
+    /// 这一块渲染时只会被解析成一个代码块(理由见 [`super::FileViewer::render_md_item`]),
+    /// 里面没有任何会取资源或可点的构造
+    Frontmatter(gpui::SharedString),
 }
 
 /// 大纲(目录)里的一条:一个**顶层**标题(`#` 与 `===` 两种写法都算;列表 /
@@ -113,12 +127,52 @@ pub(super) struct MdDocument {
 }
 
 impl MdDocument {
-    fn text_only(source: &str) -> Self {
+    /// 整篇交回 TextView。文首认出了 frontmatter 时它照样单独成块:剩下那段从
+    /// 闭合栅栏之后开始,不开 frontmatter 的 TextView 解析它与在整篇里解析一致
+    /// (frontmatter 是文首一个已闭合的块,不跨进后文的任何容器)。
+    fn text_only(source: &str, frontmatter: Option<(usize, usize)>) -> Self {
+        let mut segs = Vec::new();
+        let body_start = match frontmatter {
+            Some((start, end)) => {
+                segs.push(MdSegment::Frontmatter(source[start..end].to_string()));
+                end
+            }
+            None => 0,
+        };
+        push_markdown_text(source, body_start, source.len(), &mut segs);
         Self {
-            segs: markdown_text_only(source),
+            segs,
             outline: Vec::new(),
         }
     }
+}
+
+/// 分块用的解析选项:GFM 之上开 frontmatter。
+///
+/// frontmatter 的口径以上游(markdown-rs 1.0.0,gpui-base 的
+/// `MarkdownExtensions::frontmatter` 开的就是它)为准:**只认文档最开头** —— 可选
+/// 的 UTF-8 BOM 之后紧跟 `---`(YAML)或 `+++`(TOML),不许前导空行、不许缩进,
+/// 栅栏行除了三个记号只许跟空白,且必须有同样记号的闭合栅栏(没闭合就还是分隔线)。
+/// 见 `markdown-1.0.0/src/construct/document.rs` 的 `start` / `before_frontmatter`
+/// 与 `construct/frontmatter.rs`。CRLF 行尾照认(分词器把 `\r\n` 当一个换行)。
+///
+/// **只有分块这一侧整篇开它**,渲染侧只给切出来的那一块开(见
+/// [`super::FileViewer::render_md_item`]):其余各块在原文里都不在文首,若也开着,
+/// 分隔线夹着列表的 `---\n- a\n---` 这种块单独解析时就会被误认成 frontmatter。
+fn split_parse_options() -> ParseOptions {
+    let mut options = ParseOptions::gfm();
+    options.constructs.frontmatter = true;
+    options
+}
+
+/// 根节点的头一个子节点若是 frontmatter,给出它在源码里的字节区间(含两道栅栏)。
+fn frontmatter_range(node: &MarkdownNode, source: &str) -> Option<(usize, usize)> {
+    if !matches!(node, MarkdownNode::Yaml(_) | MarkdownNode::Toml(_)) {
+        return None;
+    }
+    let position = node.position()?;
+    let (start, end) = (position.start.offset, position.end.offset);
+    (start <= end && source.get(start..end).is_some()).then_some((start, end))
 }
 
 /// 把 markdown 源切成**顶层 AST 块**:确认是顶层 GFM 表格或纯图片段落时才
@@ -132,34 +186,45 @@ impl MdDocument {
 /// `is_last → paragraph_gap = 0`,整篇喂进去相邻段落会贴死(用户对照原版
 /// 实测)。块间距改由 [`block_top_margin`] 自己控,顺带复刻原版「标题前
 /// 间距更大」的非对称节奏(`.md-preview h* { margin-top: 1.4em }`)。
+///
+/// 文首的 frontmatter 先切成第 0 块([`MdSegment::Frontmatter`]),不进大纲;整篇
+/// 只能交回 TextView 的几种退路也保留这一刀(见 [`MdDocument::text_only`])。
 pub(super) fn split_md_document(source: &str) -> MdDocument {
-    let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
-        return MdDocument::text_only(source);
+    let Ok(ast) = markdown::to_mdast(source, &split_parse_options()) else {
+        return MdDocument::text_only(source, None);
     };
+    let Some(children) = ast.children() else {
+        return MdDocument::text_only(source, None);
+    };
+    // frontmatter 只能出现在文首,也就只可能是根的头一个子节点
+    let frontmatter = children
+        .first()
+        .and_then(|node| frontmatter_range(node, source));
+    let body = &children[usize::from(frontmatter.is_some())..];
     // 引用、脚注与嵌套定义可能跨分段消费；遇到这些就整篇交回 TextView。
     // 仅有未被引用的顶层普通定义时可以安全分块，它本身不产生可见内容。
     if markdown_requires_shared_definition_scope(&ast) {
-        return MdDocument::text_only(source);
+        return MdDocument::text_only(source, frontmatter);
     }
-    let Some(children) = ast.children() else {
-        return MdDocument::text_only(source);
-    };
 
-    let mut nodes = Vec::with_capacity(children.len());
-    let mut previous_end = 0usize;
-    for node in children {
+    let mut nodes = Vec::with_capacity(body.len());
+    let mut previous_end = frontmatter.map_or(0, |(_, end)| end);
+    for node in body {
         let Some(position) = node.position() else {
-            return MdDocument::text_only(source);
+            return MdDocument::text_only(source, frontmatter);
         };
         let (start, end) = (position.start.offset, position.end.offset);
         if start > end || start < previous_end || source.get(start..end).is_none() {
-            return MdDocument::text_only(source);
+            return MdDocument::text_only(source, frontmatter);
         }
         nodes.push((node, start, end));
         previous_end = end;
     }
 
     let mut segs = Vec::new();
+    if let Some((start, end)) = frontmatter {
+        segs.push(MdSegment::Frontmatter(source[start..end].to_string()));
+    }
     let mut outline = Vec::new();
     let mut pending_text: Option<(usize, usize)> = None;
     for (node, start, end) in nodes {
@@ -281,12 +346,6 @@ fn markdown_contains_reference_or_definition(node: &MarkdownNode) -> bool {
             .iter()
             .any(markdown_contains_reference_or_definition)
     })
-}
-
-fn markdown_text_only(source: &str) -> Vec<MdSegment> {
-    let mut segs = Vec::new();
-    push_markdown_text(source, 0, source.len(), &mut segs);
-    segs
 }
 
 fn push_markdown_text(source: &str, start: usize, end: usize, segs: &mut Vec<MdSegment>) {
@@ -778,7 +837,11 @@ pub(super) fn block_top_margin(ix: usize, seg: &MdSegment) -> f32 {
     match seg {
         // 图片与表格同档:原版 `.md-preview img` 吃 p 的 0.8em,块级化之后
         // 按「独立块」给 1em(≈13px),与表格一致;mermaid 图表就是一张图
-        MdSegment::Table(_) | MdSegment::Images(_) | MdSegment::Mermaid { .. } => 13.0,
+        // frontmatter 只会是首块(上面已返回 0),列在这里只为穷尽
+        MdSegment::Table(_)
+        | MdSegment::Images(_)
+        | MdSegment::Mermaid { .. }
+        | MdSegment::Frontmatter(_) => 13.0,
         MdSegment::Text(text) => {
             let first = text.trim_start();
             // `#`~`######` + 空格才是标题(# 后无空格在 CommonMark 里不算)
