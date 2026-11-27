@@ -548,11 +548,9 @@ impl SettingsView {
                         .on_click(cx.listener(|this, _, window, cx| this.save_editor(window, cx))),
                     )
                     .child(
+                        // 与 Esc 同一动作(见 `SettingsView::close_editor_form`)
                         ui::ghost_button("editor-cancel", t("settings", "common.cancel")).on_click(
-                            cx.listener(|this, _, _window, cx| {
-                                this.editor_editing = None;
-                                cx.notify();
-                            }),
+                            cx.listener(|this, _, window, cx| this.close_editor_form(window, cx)),
                         ),
                     ),
             )
@@ -639,8 +637,8 @@ impl SettingsView {
                 cx,
             )
         });
-        self.editor_editing = None;
-        cx.notify();
+        // 收表单走 `close_editor_form`:焦点若还在表单的输入框里,交回面板根
+        self.close_editor_form(window, cx);
     }
 
     fn delete_editor(&mut self, idx: usize, cx: &mut Context<Self>) {

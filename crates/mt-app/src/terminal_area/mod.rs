@@ -215,6 +215,9 @@ pub struct TerminalArea {
     /// `fx::leaf_slot`、`note_leaf_tab_swap` 与 `pane_rects`/`tab_rects` 写入,
     /// 防止退场中的旧面板污染活态布局表与点击区。
     rendering_exit: bool,
+    /// 这一帧的键盘焦点组(多分屏时页签条据此区分哪一组在收键盘,见 [`LeafFocusFrame`])。
+    /// `render` 开头按活动布局现算,出场层渲染期间临时换成 [`LeafFocusFrame::exiting`]。
+    leaf_focus: LeafFocusFrame,
     /// 上一次点 ×(tab 上的与控制条的)的时刻,判连点用
     /// (见 [`pane_actions::swallows_close_click`])。
     last_close_click: Option<std::time::Instant>,
@@ -315,6 +318,7 @@ impl TerminalArea {
             area_origin: gpui::Point::default(),
             suppress_leaf: None,
             rendering_exit: false,
+            leaf_focus: LeafFocusFrame::default(),
             last_close_click: None,
             tab_strips: HashMap::new(),
             fx: Rc::default(),
@@ -717,6 +721,11 @@ impl Render for TerminalArea {
             .maximized_pane_id(&project_id)
             .and_then(|id| layout.leaf_of_pane(id))
             .cloned();
+        // 键盘焦点组:键盘输入与快捷键作用的那个 pane(与 Workspace 的 `target_pane` 同一条
+        // 回落链)所在的叶子。最大化时屏上只有一组,不区分(见 [`LeafFocusFrame`])
+        let target_pane = self.store.read(cx).active_pane_id(&project_id);
+        self.leaf_focus =
+            LeafFocusFrame::of(&layout, maximized_leaf.is_some(), target_pane.as_deref());
 
         // ── 检测整块内容换了没(面板切换 / 最大化开合),起方向性 push ──
         // (见文件头「方向性换场」注释)
@@ -927,6 +936,9 @@ impl Render for TerminalArea {
                     .map(|p| p.layout.clone());
                 old_layout.map(|l| {
                     self.rendering_exit = true;
+                    // 旧面板滑走那一程不画焦点组(焦点已跟着人去了新面板),画完换回来
+                    let live_focus =
+                        std::mem::replace(&mut self.leaf_focus, LeafFocusFrame::exiting(&l));
                     let el = self.render_node(
                         &l,
                         &project_id,
@@ -935,6 +947,7 @@ impl Render for TerminalArea {
                         window,
                         cx,
                     );
+                    self.leaf_focus = live_focus;
                     self.rendering_exit = false;
                     el
                 })

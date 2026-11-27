@@ -478,6 +478,29 @@ pub fn close(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
     id.is_some_and(|id| close_layer(id, window, cx))
 }
 
+/// 把键盘焦点交回 `kind` 那一层弹窗(最上面开着的那个)自身。返回有没有交出去。
+///
+/// 给弹窗里的二级表单收起时用(Esc / 「取消」退回列表):焦点原本在表单的输入框里,框一不画,
+/// 焦点就悬空 —— 悬空时按键从窗口根派发,本层的 `"Dialog"` 键位上下文不在派发路径上,
+/// 再按一次 Esc 关不掉弹窗;而 Workspace 的「焦点落空」兜底见弹窗开着就不插手。
+pub fn focus_layer(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
+    let focus = read_host(window, cx, |host| {
+        host.layers
+            .iter()
+            .rev()
+            .find(|layer| !layer.closing && layer.kind == kind)
+            .map(|layer| layer.focus.clone())
+    })
+    .flatten();
+    match focus {
+        Some(focus) => {
+            window.focus(&focus, cx);
+            true
+        }
+        None => false,
+    }
+}
+
 /// 收起一层:开始退场、焦点还给打开前的句柄(最上面那层才还)、清选区、调关窗收尾。
 fn close_layer(id: u64, window: &mut Window, cx: &mut App) -> bool {
     let now = Instant::now();
@@ -1258,6 +1281,33 @@ mod tests {
             assert!(!has_open(window, cx));
             assert!(before.is_focused(window));
         });
+    }
+
+    /// 二级表单收起之后焦点悬空(落在一个不再画出来的句柄上):Esc 走不到弹窗、关不掉;
+    /// [`focus_layer`] 把焦点交回弹窗自身之后 Esc 照常关窗。
+    #[gpui::test]
+    fn 焦点悬空时交回弹窗自身才收得到_esc(cx: &mut TestAppContext) {
+        let cx = test_window(cx);
+        let calls = Rc::new(Calls::default());
+        let stray = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| open_counting(&calls, "k", window, cx));
+        cx.run_until_parked();
+        // 焦点挪到一个不在树上的句柄上(= 表单的输入框收起之后)
+        cx.update(|window, cx| window.focus(&stray, cx));
+        cx.run_until_parked();
+        cx.dispatch_action(Cancel);
+        cx.run_until_parked();
+        assert_eq!(calls.cancel.get(), 0, "焦点悬空:Esc 到不了弹窗");
+        cx.update(|window, cx| {
+            assert!(has_open(window, cx));
+            assert!(!focus_layer("other", window, cx), "种类对不上不交");
+            assert!(focus_layer("k", window, cx));
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(Cancel);
+        cx.run_until_parked();
+        assert_eq!((calls.cancel.get(), calls.close.get()), (1, 1));
+        cx.update(|window, cx| assert!(!has_open(window, cx)));
     }
 
     /// 程序化关闭不调 on_close(prompt.rs 那条「第六条路」的语义)。

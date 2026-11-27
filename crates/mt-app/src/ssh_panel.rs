@@ -429,9 +429,9 @@ fn conn_text_with_name(name: AnyElement, conn: &SshConnection, suffix: &str) -> 
         .flex_col()
         .child(name)
         .child(
-            div()
+            // 等宽走 `ui::mono`(DirectWrite 不认 `"monospace"` 通用族名)
+            ui::mono(div())
                 .truncate()
-                .font_family("monospace")
                 .text_size(ui::font_px(11.0))
                 .text_color(ui::text_muted())
                 .child(SharedString::from(format!(
@@ -940,6 +940,44 @@ impl SshPanel {
     }
 }
 
+/// 面板里按 Esc(弹窗的 `Cancel`)这一下退哪一层。由里往外一次退一层,最外一层才关面板:
+/// 表单里有没保存的连接(含密码),一下 Esc 连面板带草稿全丢太重。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelEsc {
+    /// 拖着连接:取消这次拖拽(Workspace 根上那道 Esc 拦截管不到弹窗层,见 `on_cancel` 处)。
+    StopDrag,
+    /// 左栏的分组改名 / 新建分组输入框开着:撤掉它(它自己的 `on_key_down` 收不到 Esc ——
+    /// gpui 先匹配键位、后跑 key 监听,Esc 先被弹窗的 `Cancel` 拿走了)。
+    CancelInlineEdit,
+    /// 连接表单(新建 / 编辑)开着:收起表单、退回列表,与表单的「取消」同一动作。
+    CloseForm,
+    /// 什么都没开:关面板。
+    ClosePanel,
+}
+
+fn panel_esc(dragging: bool, inline_edit: bool, form_open: bool) -> PanelEsc {
+    if dragging {
+        PanelEsc::StopDrag
+    } else if inline_edit {
+        PanelEsc::CancelInlineEdit
+    } else if form_open {
+        PanelEsc::CloseForm
+    } else {
+        PanelEsc::ClosePanel
+    }
+}
+
+/// 收起连接表单,退回列表(表单的「取消」与 Esc 共用)。关表单 = 放弃正在跑的测试(任务随
+/// 表单 drop,见 `ConnForm::_test_task`)。焦点多半在表单的输入框里,框一收就悬空,交回面板
+/// 自身(见 [`crate::dialog_host::focus_layer`]),再按 Esc 才关得掉面板。
+fn close_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
+    state.update(cx, |panel, cx| {
+        panel.form = None;
+        cx.notify();
+    });
+    crate::dialog_host::focus_layer(kind::SSH_PANEL, window, cx);
+}
+
 /// 打开「SSH 连接」面板。
 pub fn open(window: &mut Window, cx: &mut App) {
     open_with(OpenMode::Browse, window, cx);
@@ -1006,16 +1044,42 @@ fn open_with(mode: OpenMode, window: &mut Window, cx: &mut App) {
             // 面板里有连接表单(含密码 / 私钥路径),误点遮罩关掉会丢未保存内容;
             // Esc 仍可退(原版 `closeOnOverlay={false}`)
             .overlay_closable(false)
+            // Esc 由里往外一次退一层(见 [`panel_esc`]),返回 `false` = 这一下不关面板。
+            //
             // 拖着连接时按 Esc = 取消这次拖拽,**不关面板**。Workspace 根上那道
             // `capture_key_down`(见 `main.rs`)管不到这里:Dialog 画在 Root 层、
             // 不在 Workspace 的派发路径上,Esc 直接进了 Dialog 自己的 `Cancel`。
             // 真机验过:不垫这一层,拖到一半按 Esc 是面板关掉、拖影还钉在屏上。
-            .on_cancel(|_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                if cx.has_active_drag() {
-                    cx.stop_active_drag(window);
-                    return false;
+            //
+            // 焦点在表单输入框里按 Esc 也走到这里:输入框的 `Escape` 处理器以
+            // `cx.propagate()` 收尾,gpui 接着派发下一条匹配的绑定 —— 弹窗的 `Cancel`
+            .on_cancel({
+                let state = state.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let (inline_edit, form_open) = {
+                        let panel = state.read(cx);
+                        (
+                            panel.renaming.is_some() || panel.creating.is_some(),
+                            panel.form.is_some(),
+                        )
+                    };
+                    match panel_esc(cx.has_active_drag(), inline_edit, form_open) {
+                        PanelEsc::StopDrag => {
+                            cx.stop_active_drag(window);
+                            false
+                        }
+                        PanelEsc::CancelInlineEdit => {
+                            state.update(cx, |panel, cx| panel.cancel_edits(cx));
+                            crate::dialog_host::focus_layer(kind::SSH_PANEL, window, cx);
+                            false
+                        }
+                        PanelEsc::CloseForm => {
+                            close_form(&state, window, cx);
+                            false
+                        }
+                        PanelEsc::ClosePanel => true,
+                    }
                 }
-                true
             })
             .child(body)
     });
@@ -1161,6 +1225,9 @@ fn text_field(
 /// 整串再改,按住看不方便。(2026-09-19 补记:原先还记着「它画 `IconName::Eye`,
 /// 0.5.1 不带 svg 资产、本仓没注册 `AssetSource` → 空白」,入口挂上
 /// `gpui_kit_assets::Assets` 后这条作废;交互语义这条仍是决定性的。)
+/// (2026-11 补记:gpui-component 0.10 的 `mask_toggle` 已改成点击切换 ——
+/// `input.rs::render_toggle_mask_button` 的 `on_click → toggle_masked` —— 移动端密钥框与
+/// 远程通知凭据框直接用它;这里的自绘按钮与表单的 `reveal_password` 态绑在一起,不动。)
 fn toggle_password_reveal(
     state: &Entity<SshPanel>,
     password: &Entity<InputState>,
@@ -1245,6 +1312,9 @@ fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
     // 时留在面板上 —— 顶部那行红字要让用户看见,退回去就看不到了
     if is_new && sealed && state.read(cx).return_after_add {
         close_guarded(kind::SSH_PANEL, window, cx);
+    } else if state.read(cx).form.is_none() {
+        // 表单收了、面板还开着:焦点交回面板(理由同 [`close_form`])
+        crate::dialog_host::focus_layer(kind::SSH_PANEL, window, cx);
     }
 }
 
@@ -2390,14 +2460,11 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                     }),
                 )
                 .child(
-                    // 关表单 = 放弃正在跑的测试(任务随表单 drop,见 `ConnForm::_test_task`)
+                    // 与 Esc 同一动作(见 [`close_form`])
                     ui::ghost_button("ssh-form-cancel", t("sshModal", "cancel")).on_click({
                         let state = state.clone();
-                        move |_: &ClickEvent, _window, cx: &mut App| {
-                            state.update(cx, |panel, cx| {
-                                panel.form = None;
-                                cx.notify();
-                            });
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            close_form(&state, window, cx);
                         }
                     }),
                 )
@@ -2586,6 +2653,24 @@ fn field(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Esc 由里往外一次退一层:拖拽 → 行内改名 / 新建分组 → 连接表单 → 才关面板。
+    #[test]
+    fn esc先退表单再关面板() {
+        assert_eq!(panel_esc(false, false, false), PanelEsc::ClosePanel);
+        assert_eq!(
+            panel_esc(false, false, true),
+            PanelEsc::CloseForm,
+            "表单开着:只退回列表,草稿(含密码)不随面板一起丢"
+        );
+        assert_eq!(panel_esc(false, true, true), PanelEsc::CancelInlineEdit);
+        assert_eq!(panel_esc(false, true, false), PanelEsc::CancelInlineEdit);
+        assert_eq!(
+            panel_esc(true, true, true),
+            PanelEsc::StopDrag,
+            "拖着连接时 Esc 只取消拖拽"
+        );
+    }
 
     fn bucket(group: Option<&str>) -> SshGroupBucket {
         SshGroupBucket {

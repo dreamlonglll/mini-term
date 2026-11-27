@@ -161,6 +161,86 @@ pub(super) const TAB_SECONDARY_FONT: f32 = 11.0;
 pub(super) const TAB_UNSEEN_DOT: f32 = 6.0;
 /// 折叠标题条上绿点离 tab 右缘的距离:落在 tab 自己的右内衬里,不占文字的位置。
 pub(super) const COLLAPSED_UNSEEN_INSET: f32 = 2.0;
+/// 焦点组激活胶囊底部那条 accent 底线的粗细与左右内缩(内缩 = 胶囊圆角,线头不压在圆角上)。
+pub(super) const FOCUS_UNDERLINE_H: f32 = 2.0;
+pub(super) const FOCUS_UNDERLINE_INSET: f32 = TAB_CHIP_ROUND;
+
+/// 一组页签条该按哪一档画激活胶囊(见 [`LeafFocusFrame`])。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LeafFocus {
+    /// 屏上只有这一组(单格布局 / 最大化铺满):不区分,激活胶囊照旧 elevated 底 + 描边。
+    Single,
+    /// 多组并排,键盘(打字 + 快捷键)作用在这一组:激活胶囊 elevated 底 + 描边 + accent 底线。
+    Focused,
+    /// 多组并排,焦点在别的组:激活胶囊降为透明底 + 弱描边,仍看得出是本组的激活页。
+    Unfocused,
+}
+
+/// 这一帧终端区的「焦点组」。多分屏时光靠光标分不出键盘在哪一组 —— Beam / Underline
+/// 光标没有实心空心之分,隐藏光标的 TUI(Claude / Codex / htop)干脆没有光标 —— 所以
+/// 页签条要替它画出来。
+///
+/// 焦点组 = 键盘输入与快捷键作用的那一组,取 [`AppStore::active_pane_id`] 所在的叶子:
+/// 逻辑焦点(键盘焦点进了哪个终端,store 跟着记,见 `AppStore::note_terminal_focused`)→
+/// 这个项目上次聚焦的 → 第一个分组的激活页签。焦点在文件树、项目列表这些终端区之外的
+/// 地方时,它停在上次聚焦的那一组 —— 新建 / 分屏 / 关闭快捷键作用的正是这一组。
+/// 逻辑焦点一变 store 发 `FocusedPaneChanged`,终端区订阅着它重画,页签条随之更新。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LeafFocusFrame {
+    /// 屏上并排着 ≥ 2 组(没有最大化)。只有这时才区分焦点组。
+    multi: bool,
+    /// 焦点组的叶子 id。
+    leaf: Option<String>,
+}
+
+impl LeafFocusFrame {
+    /// 活动布局这一帧的焦点组。`target_pane` 是键盘作用的 pane(`AppStore::active_pane_id`)。
+    pub(super) fn of(layout: &SplitNode, maximized: bool, target_pane: Option<&str>) -> Self {
+        let multi = !maximized && layout.leaves().len() >= 2;
+        let leaf = target_pane
+            .filter(|_| multi)
+            .and_then(|pane_id| layout.leaf_of_pane(pane_id))
+            .map(|leaf| leaf.id().to_string());
+        Self { multi, leaf }
+    }
+
+    /// 切面板时滑走的旧面板(出场层):焦点已经跟着人去了新面板,并排的几组一律按
+    /// 非焦点组画 —— 出场那一程只有原先的焦点组少了底线,其余各组不变样。
+    pub(super) fn exiting(layout: &SplitNode) -> Self {
+        Self {
+            multi: layout.leaves().len() >= 2,
+            leaf: None,
+        }
+    }
+
+    /// `leaf_id` 那一组按哪一档画。
+    pub(super) fn of_leaf(&self, leaf_id: &str) -> LeafFocus {
+        if !self.multi {
+            LeafFocus::Single
+        } else if self.leaf.as_deref() == Some(leaf_id) {
+            LeafFocus::Focused
+        } else {
+            LeafFocus::Unfocused
+        }
+    }
+}
+
+/// 焦点组激活胶囊底部的 accent 底线。绝对定位压在胶囊内底边上,不占布局 —— 胶囊的
+/// 描边与内衬三档都一样,切焦点时整条页签栏不横跳。
+///
+/// **是底线不是顶线**:顶线是「哪一页在前台」的标识,归上面那条工作台页签条独占(见
+/// chip 上那段「这一层不画 accent 顶线」);也不是整圈描边 —— 那是早先删掉的方案
+/// (`d3b6aa30`:真机上整圈橙线喧宾夺主)。
+fn focus_underline() -> gpui::Div {
+    div()
+        .absolute()
+        .bottom(px(0.0))
+        .left(px(FOCUS_UNDERLINE_INSET))
+        .right(px(FOCUS_UNDERLINE_INSET))
+        .h(px(FOCUS_UNDERLINE_H))
+        .rounded_full()
+        .bg(ui::accent())
+}
 
 /// tab 上的标题:主段 + 可选副段(`主段 · 副段`)。
 ///
@@ -350,6 +430,9 @@ impl TerminalArea {
             .overflow_x_scroll()
             .track_scroll(&scroll_handle);
 
+        // 这一组是不是键盘焦点组(多分屏时才区分,见 [`LeafFocusFrame`])
+        let leaf_focus = self.leaf_focus.of_leaf(leaf_id);
+
         // tab 焦点句柄先补齐(下面的循环里 `cx` 要交给 listener,腾不出可变借用)
         for pane in panes.iter() {
             if !self.tab_focus.contains_key(&pane.id) {
@@ -395,6 +478,8 @@ impl TerminalArea {
             // 悬停态本来就由下面那个 `on_hover` 维护着(它给缩略图预览用),
             // 这里直接读:chip 的悬停底色与「× 现不现身」都看它
             let is_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
+            // 激活胶囊带不带 elevated 底:非焦点组的那颗降为透明底(见 [`LeafFocus`])
+            let chip_elevated = is_active && leaf_focus != LeafFocus::Unfocused;
             let chip = div()
                 .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
                 .relative()
@@ -444,6 +529,10 @@ impl TerminalArea {
                 // 激活 = elevated 底 + 描边 + 主文色;未激活 = 透明底 + 弱文色;
                 // 悬停未激活 = 一层极淡的底(从前鼠标扫过 chip 毫无反馈,
                 // 只有 500ms 后弹出的缩略图)。
+                //
+                // 多分屏时激活胶囊再分两档,标出键盘在哪一组(见 [`LeafFocus`]):
+                // 焦点组 = 上面那套 + 内底边一条 accent 底线;别的组 = 透明底 + 描边
+                // (描边留着,仍看得出是本组的激活页),悬停时同样铺那层极淡的底。
                 .h(px(TAB_CHIP_H))
                 .flex_none()
                 .flex()
@@ -458,9 +547,12 @@ impl TerminalArea {
                 // 的 chip 内容区少 2px,切 tab 时整条 tab 栏横跳一下
                 .border_1()
                 .when(is_active, |el| {
-                    el.bg(ui::bg_elevated())
-                        .text_color(ui::text_primary())
+                    el.text_color(ui::text_primary())
                         .border_color(ui::border_default())
+                        .when(chip_elevated, |el| el.bg(ui::bg_elevated()))
+                        .when(!chip_elevated && is_hovered, |el| {
+                            el.bg(ui::with_alpha(ui::text_muted(), 0.12))
+                        })
                 })
                 .when(!is_active, |el| {
                     el.text_color(ui::text_muted())
@@ -597,7 +689,7 @@ impl TerminalArea {
                     &pane.shell_name,
                     is_active,
                     // fish 的眼睛是挖空语义,给它 chip 的底色
-                    if is_active {
+                    if chip_elevated {
                         ui::bg_elevated()
                     } else {
                         ui::bg_terminal()
@@ -677,7 +769,11 @@ impl TerminalArea {
                         } else {
                             "×".into_any_element()
                         }),
-                );
+                )
+                // 焦点组的激活胶囊:内底边一条 accent 底线(绝对定位,不占布局)
+                .when(is_active && leaf_focus == LeafFocus::Focused, |el| {
+                    el.child(focus_underline())
+                });
             // 包一层位移补间(见 [`fx`]):新建 / 关闭 / 拖拽落位挤动它时从旧位置滑过来,
             // 新出现时原地裁剪展开。tab 的屏幕矩形也由这一层报 —— 报的是**排版**位置
             // (挪动之前),缩略图锚点 + tab 栏拖拽插入位都要它。**每个 tab 都报**(原先

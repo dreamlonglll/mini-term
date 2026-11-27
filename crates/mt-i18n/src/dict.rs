@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 2060;
+pub const ZH_ENTRY_COUNT: usize = 2061;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 2060;
+pub const EN_ENTRY_COUNT: usize = 2061;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -3051,6 +3051,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("clipboard.smartCopyPasteTitle", "智能 Ctrl+C / Ctrl+V"),
     ("common.add", "添加"),
     ("common.cancel", "取消"),
+    ("common.confirmDelete", "确认删除"),
     ("common.delete", "删除"),
     ("common.edit", "编辑"),
     ("common.namePlaceholder", "名称"),
@@ -3423,6 +3424,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("clipboard.smartCopyPasteTitle", "Smart Ctrl+C / Ctrl+V"),
     ("common.add", "Add"),
     ("common.cancel", "Cancel"),
+    ("common.confirmDelete", "Confirm delete"),
     ("common.delete", "Delete"),
     ("common.edit", "Edit"),
     ("common.namePlaceholder", "Name"),

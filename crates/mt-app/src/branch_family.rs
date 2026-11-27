@@ -361,12 +361,12 @@ impl BranchFamilyPanel {
                     }))
             })
             .tip(tip)
-            // 连线前缀:**等宽字体 + 不换行 + 不截断**,`│├└` 才对得齐
+            // 连线前缀:**等宽字体 + 不换行 + 不截断**,`│├└` 才对得齐。
+            // 等宽走 `ui::mono`(DirectWrite 不认 `"monospace"` 通用族名)
             .when(!row.prefix.is_empty(), |el| {
                 el.child(
-                    div()
+                    ui::mono(div())
                         .flex_none()
-                        .font_family("monospace")
                         .whitespace_nowrap()
                         .text_color(ui::text_muted())
                         .child(row.prefix.clone()),

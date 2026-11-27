@@ -24,9 +24,10 @@
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, Window, canvas, div, fill, point, prelude::FluentBuilder as _, px, size,
+    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, Focusable as _,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas, div, fill, point,
+    prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::AiLauncher;
@@ -277,6 +278,19 @@ pub fn open(window: &mut Window, cx: &mut App) {
             // 面板内有未保存的地址/密钥输入与配对操作,误点外侧关闭会丢内容;
             // Esc 仍可退(原版 `closeOnOverlay={false}`)
             .overlay_closable(false)
+            // 启动器草稿表单开着时,第一下 Esc 只收表单、退回列表(与表单的「取消」同一
+            // 动作),表单不在时 Esc 才关面板。焦点在草稿输入框里也走得到这里:输入框的
+            // `Escape` 以 `cx.propagate()` 收尾,gpui 接着派发弹窗的 `Cancel`
+            .on_cancel({
+                let state = state.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    if esc_closes_panel(state.read(cx).draft.is_some()) {
+                        return true;
+                    }
+                    close_draft(&state, window, cx);
+                    false
+                }
+            })
             .child(body)
     });
 
@@ -602,7 +616,9 @@ fn render_endpoint_section(
                 .mt(px(12.0))
                 .child(field_label(t("mobileRelay", "keyLabel"))),
         )
-        .child(Input::new(&key_input))
+        // 密钥框打码,带「显示明文」切换钮(gpui-component 0.10 的 `mask_toggle` 是点一下
+        // 切换,不是按住才显示,见 `input.rs::render_toggle_mask_button`)
+        .child(Input::new(&key_input).mask_toggle())
         .child(
             div()
                 .mt(px(4.0))
@@ -966,7 +982,7 @@ fn render_draft_form(
                     .opacity(if can_save { 1.0 } else { 0.4 })
                     .on_click({
                         let state = state.clone();
-                        move |_: &ClickEvent, _window, cx| {
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                             let (name, command, shell, id) = {
                                 let panel = state.read(cx);
                                 let Some(draft) = panel.draft.as_ref() else {
@@ -985,26 +1001,46 @@ fn render_draft_form(
                             let next =
                                 upsert_launcher(&all, &id, &name, shell.as_deref(), &command);
                             // 先收表单再落盘(原版同序)
-                            state.update(cx, |panel, cx| {
-                                panel.draft = None;
-                                cx.notify();
-                            });
+                            close_draft(&state, window, cx);
                             save_launchers(&state, next, cx);
                         }
                     }),
             )
             .child(
-                ui::ghost_button("launcher-cancel", t("mobileRelay", "launchers.cancel")).on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, _window, cx| {
-                        state.update(cx, |panel, cx| {
-                            panel.draft = None;
-                            cx.notify();
-                        });
-                    }
-                }),
+                ui::ghost_button("launcher-cancel", t("mobileRelay", "launchers.cancel")).on_click(
+                    {
+                        let state = state.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            close_draft(&state, window, cx);
+                        }
+                    },
+                ),
             ),
     )
+}
+
+/// 这一下 Esc 关不关面板:启动器草稿表单开着时不关,只收表单(一下 Esc 连面板带
+/// 没保存的启动器一起丢太重);表单不在时才关。
+fn esc_closes_panel(draft_open: bool) -> bool {
+    !draft_open
+}
+
+/// 收起启动器草稿表单、退回列表(「保存」「取消」与 Esc 共用)。
+///
+/// 焦点在草稿的输入框里时交回弹窗自身:框一收焦点就悬空,再按 Esc 关不掉面板(见
+/// [`crate::dialog_host::focus_layer`])。焦点在地址 / 密钥框这些常驻的框里就不动它。
+fn close_draft(state: &Entity<MobilePanel>, window: &mut Window, cx: &mut App) {
+    let focus_in_draft = state.read(cx).draft.as_ref().is_some_and(|draft| {
+        draft.name.read(cx).focus_handle(cx).is_focused(window)
+            || draft.command.read(cx).focus_handle(cx).is_focused(window)
+    });
+    state.update(cx, |panel, cx| {
+        panel.draft = None;
+        cx.notify();
+    });
+    if focus_in_draft {
+        crate::dialog_host::focus_layer(kind::MOBILE_RELAY, window, cx);
+    }
 }
 
 fn set_draft_shell(state: &Entity<MobilePanel>, shell: Option<String>, cx: &mut App) {
@@ -1235,4 +1271,16 @@ fn danger_ghost_button(
         .cursor_pointer()
         .hover(|el| el.border_color(ui::color_error()))
         .child(label.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 启动器草稿开着:Esc 只收表单不关面板;表单不在才关。
+    #[test]
+    fn esc先收启动器草稿再关面板() {
+        assert!(!esc_closes_panel(true), "草稿开着:只退回列表");
+        assert!(esc_closes_panel(false));
+    }
 }

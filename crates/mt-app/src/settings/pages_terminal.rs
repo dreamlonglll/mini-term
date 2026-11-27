@@ -45,6 +45,9 @@ impl SettingsView {
                 Some(args) if !args.is_empty() => format!("{} {}", shell.command, args.join(" ")),
                 _ => shell.command.clone(),
             };
+            let delete_pending =
+                pending_delete_matches(self.shell_pending_delete.as_ref(), idx, &shell.name);
+            let shell_name = shell.name.clone();
             rows = rows.child(
                 ui::settings_card()
                     .flex()
@@ -56,6 +59,8 @@ impl SettingsView {
                                 let name = this.store.read(cx).config().available_shells[idx]
                                     .name
                                     .clone();
+                                // 删除确认是就地的:手去点了别处,确认态就撤(同命令库)
+                                this.shell_pending_delete = None;
                                 this.store.update(cx, |store, cx| {
                                     let mut list = store.shell_list();
                                     list.set_default(&name);
@@ -83,7 +88,36 @@ impl SettingsView {
                                     .child(detail),
                             ),
                     )
-                    .child(
+                    .child(if delete_pending {
+                        // 就地二次确认(照命令库的行内删除确认):这一行的按钮换成
+                        // 「确认删除 / 取消」,再点一下才真删。删的是配置里的数据,没有撤销
+                        div()
+                            .flex()
+                            .gap(px(4.0))
+                            .child(
+                                ui::danger_button(
+                                    SharedString::from(format!("shell-del-yes-{idx}")),
+                                    t("settings", "common.confirmDelete"),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.confirm_shell_delete(idx, window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                ui::ghost_button(
+                                    SharedString::from(format!("shell-del-no-{idx}")),
+                                    t("settings", "common.cancel"),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        this.shell_pending_delete = None;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                    } else {
                         div()
                             .flex()
                             .gap(px(4.0))
@@ -92,35 +126,35 @@ impl SettingsView {
                                     SharedString::from(format!("shell-edit-{idx}")),
                                     t("settings", "common.edit"),
                                 )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let shell = this
-                                        .store
-                                        .read(cx)
-                                        .config()
-                                        .available_shells
-                                        .get(idx)
-                                        .cloned();
-                                    this.shell_editing = Some(Some(idx));
-                                    this.fill_shell_form(shell.as_ref(), window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        let shell = this
+                                            .store
+                                            .read(cx)
+                                            .config()
+                                            .available_shells
+                                            .get(idx)
+                                            .cloned();
+                                        this.shell_pending_delete = None;
+                                        this.shell_editing = Some(Some(idx));
+                                        this.fill_shell_form(shell.as_ref(), window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 ui::danger_button(
                                     SharedString::from(format!("shell-del-{idx}")),
                                     t("settings", "common.delete"),
                                 )
-                                .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.store.update(cx, |store, cx| {
-                                        let mut list = store.shell_list();
-                                        list.remove(idx);
-                                        store.apply_shell_list(list, cx);
-                                    });
-                                    // 编辑中的行号会被这次删除搞错位,一并收掉表单
-                                    this.shell_editing = None;
-                                    cx.notify();
-                                })),
-                            ),
-                    ),
+                                .on_click(cx.listener(
+                                    move |this, _, _window, cx| {
+                                        // 第一下只进确认态(换一行点 = 确认态挪到那一行)
+                                        this.shell_pending_delete = Some((idx, shell_name.clone()));
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                    }),
             );
         }
         if editing == Some(None) {
@@ -134,6 +168,7 @@ impl SettingsView {
                     .child(
                         dashed_button("shell-add", t("settings", "terminal.addTerminal")).on_click(
                             cx.listener(|this, _, window, cx| {
+                                this.shell_pending_delete = None;
                                 this.shell_editing = Some(None);
                                 this.fill_shell_form(None, window, cx);
                             }),
@@ -198,6 +233,32 @@ impl SettingsView {
                     )),
             )
             .into_any_element()
+    }
+
+    /// 「确认删除」:核对确认态还指着第 `idx` 行那个 shell(见 [`pending_delete_matches`])
+    /// 才真删;对不上(这期间列表被别处改过)只撤掉确认态,不删。
+    fn confirm_shell_delete(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self
+            .store
+            .read(cx)
+            .shell_list()
+            .shells
+            .get(idx)
+            .map(|s| s.name.clone());
+        let confirmed = current.as_deref().is_some_and(|name| {
+            pending_delete_matches(self.shell_pending_delete.as_ref(), idx, name)
+        });
+        self.shell_pending_delete = None;
+        if confirmed {
+            self.store.update(cx, |store, cx| {
+                let mut list = store.shell_list();
+                list.remove(idx);
+                store.apply_shell_list(list, cx);
+            });
+            // 编辑中的行号会被这次删除搞错位,一并收掉表单
+            self.close_shell_form(window, cx);
+        }
+        cx.notify();
     }
 
     fn fill_shell_form(
@@ -266,21 +327,19 @@ impl SettingsView {
                                 t("settings", "common.save")
                             },
                         )
-                        .on_click(cx.listener(|this, _, _window, cx| this.save_shell(cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.save_shell(window, cx))),
                     )
                     .child(
+                        // 与 Esc 同一动作(见 `SettingsView::close_shell_form`)
                         ui::ghost_button("shell-cancel", t("settings", "common.cancel")).on_click(
-                            cx.listener(|this, _, _window, cx| {
-                                this.shell_editing = None;
-                                cx.notify();
-                            }),
+                            cx.listener(|this, _, window, cx| this.close_shell_form(window, cx)),
                         ),
                     ),
             )
             .into_any_element()
     }
 
-    fn save_shell(&mut self, cx: &mut Context<Self>) {
+    fn save_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.shell_name.read(cx).value().trim().to_string();
         let command = self.shell_command.read(cx).value().trim().to_string();
         if !valid_shell(&name, &command) {
@@ -304,8 +363,8 @@ impl SettingsView {
             }
             store.apply_shell_list(list, cx);
         });
-        self.shell_editing = None;
-        cx.notify();
+        // 收表单走 `close_shell_form`:焦点若还在表单的输入框里,交回面板根
+        self.close_shell_form(window, cx);
     }
 
     // ── clipboard 页 ──
@@ -437,5 +496,32 @@ impl SettingsView {
                     .child(ui::hint(t("settings", "clipboard.remotePasteFooter"))),
             )
             .into_any_element()
+    }
+}
+
+/// 删除确认态 `pending`(点「删除」时记下的 `(行号, shell 名)`)是不是正指着第 `idx` 行、名叫
+/// `name` 的那个 shell。画确认态与「确认删除」点下去那一刻核对都用它:shell 名不保证唯一,
+/// 列表又可能在这期间被改过,行号与名字两样都对得上才算。
+fn pending_delete_matches(pending: Option<&(usize, String)>, idx: usize, name: &str) -> bool {
+    pending.is_some_and(|(at, pending_name)| *at == idx && pending_name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 删除确认态要行号与名字都对得上() {
+        let pending = (1, "pwsh".to_string());
+        assert!(pending_delete_matches(Some(&pending), 1, "pwsh"));
+        assert!(!pending_delete_matches(None, 1, "pwsh"), "没点过删除");
+        assert!(
+            !pending_delete_matches(Some(&pending), 0, "pwsh"),
+            "同名的另一行不算"
+        );
+        assert!(
+            !pending_delete_matches(Some(&pending), 1, "bash"),
+            "行号还在、shell 已经换了(列表被别处改过):不删"
+        );
     }
 }

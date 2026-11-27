@@ -220,10 +220,14 @@ pub fn max_button_face(maximized: bool) -> (&'static [Shape], &'static str) {
 
 /// 状态灯 / 胶囊状态点的取色。**与边条那颗徽标不是一套**:
 /// 这里 `error` 是最高档而不是被压成 idle,另外多一个 `done` 档。
+///
+/// 「等你处理」用 `color_attention` 而不是 `color_warning`:暗色下 warning(#d4a84a)与
+/// ai-working(#f5c518)同是黄调、挤在一起分不出,attention 当初就是为此另立的一档
+/// (见 [`ui::Palette::color_attention`]),页签 / 项目行的第五档灯也是它。
 pub fn light_color(light: TitleBarLight) -> Hsla {
     match light {
         TitleBarLight::Error => ui::color_error(),
-        TitleBarLight::Attention => ui::color_warning(),
+        TitleBarLight::Attention => ui::color_attention(),
         TitleBarLight::Working => ui::color_ai_working(),
         TitleBarLight::Done => ui::color_success(),
         TitleBarLight::Idle => ui::text_muted(),
@@ -1183,6 +1187,8 @@ mod tests {
                 assert!(i == j || a != b, "第 {i} 档与第 {j} 档撞色");
             }
         }
+        // 「等你处理」与页签 / 项目行的第五档灯同色(暗色下 warning 与 ai-working 挤在一起)
+        assert_eq!(colors[1], ui::color_attention());
         // 胶囊/下拉的四档色与状态灯同一张表;SSH 已连接色独立于这五档
         assert_eq!(kind_color(AiProjectKind::Attention), colors[1]);
         assert_eq!(kind_color(AiProjectKind::Working), colors[2]);

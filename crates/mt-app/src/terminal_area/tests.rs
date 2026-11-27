@@ -31,6 +31,69 @@ fn 焦点落空交给活动终端否则落到兜底() {
     );
 }
 
+/// 多分屏的焦点组:屏上并排 ≥ 2 组才区分;键盘作用的 pane(含同组后台 tab)所在的那组
+/// 是焦点组,其余按非焦点组画;单格 / 最大化不区分。
+#[test]
+fn 焦点组只在并排两组以上时区分() {
+    use crate::tree::gen_id;
+    let a = PaneState::new("a");
+    let a2 = PaneState::new("a2");
+    let b = PaneState::new("b");
+    let (a_id, a2_id, b_id) = (a.id.clone(), a2.id.clone(), b.id.clone());
+    let mut left = SplitNode::leaf(a);
+    left.append_pane(Some(&a_id), a2);
+    let right = SplitNode::leaf(b);
+    let (left_id, right_id) = (left.id().to_string(), right.id().to_string());
+    let split = SplitNode::Split {
+        id: gen_id("split"),
+        direction: SplitDirection::Horizontal,
+        sizes: vec![50.0, 50.0],
+        children: vec![left, right],
+    };
+
+    let frame = LeafFocusFrame::of(&split, false, Some(&b_id));
+    assert_eq!(frame.of_leaf(&right_id), LeafFocus::Focused);
+    assert_eq!(frame.of_leaf(&left_id), LeafFocus::Unfocused);
+
+    let frame = LeafFocusFrame::of(&split, false, Some(&a2_id));
+    assert_eq!(
+        frame.of_leaf(&left_id),
+        LeafFocus::Focused,
+        "逻辑焦点停在同组后台 tab 上:那一组仍是焦点组"
+    );
+    assert_eq!(frame.of_leaf(&right_id), LeafFocus::Unfocused);
+
+    let frame = LeafFocusFrame::of(&split, true, Some(&b_id));
+    assert_eq!(
+        (frame.of_leaf(&left_id), frame.of_leaf(&right_id)),
+        (LeafFocus::Single, LeafFocus::Single),
+        "最大化:屏上只有一组,不区分"
+    );
+
+    let frame = LeafFocusFrame::of(&split, false, Some("别的面板上的"));
+    assert_eq!(
+        (frame.of_leaf(&left_id), frame.of_leaf(&right_id)),
+        (LeafFocus::Unfocused, LeafFocus::Unfocused),
+        "目标不在这棵树里:哪组都不认作焦点组"
+    );
+
+    let exiting = LeafFocusFrame::exiting(&split);
+    assert_eq!(
+        (exiting.of_leaf(&left_id), exiting.of_leaf(&right_id)),
+        (LeafFocus::Unfocused, LeafFocus::Unfocused),
+        "滑走的旧面板:焦点已跟着人走"
+    );
+
+    let single = SplitNode::leaf(PaneState::new("x"));
+    let x = single.first_active_pane().unwrap().id.clone();
+    let frame = LeafFocusFrame::of(&single, false, Some(&x));
+    assert_eq!(frame.of_leaf(single.id()), LeafFocus::Single, "单格布局");
+    assert_eq!(
+        LeafFocusFrame::exiting(&single).of_leaf(single.id()),
+        LeafFocus::Single
+    );
+}
+
 #[test]
 fn 切过来那一下凑成的双击不改名() {
     let mut guard = SwitchClickGuard::default();

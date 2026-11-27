@@ -765,10 +765,12 @@ impl TerminalArea {
         // 容器/wrapper/xterm 三层叠加」:背景图主题下 bg_terminal 是半透明 rgba,
         // 这里再刷一层就是透明度叠乘,图被盖死(原版 PaneGroup 根也没有背景)。
         //
-        // 也**不画边框**:原版 PaneGroup 根没有任何 border(`PaneGroup.tsx:393`),
-        // 焦点表达靠激活 tab 的 accent 顶线 + 光标实心/空心两处;此前的
-        // group_focused accent 描边是 GPUI 侧自加的,真机上整圈橙线喧宾夺主
-        // (用户报障),按原版口径删除。
+        // 也**不画边框**:原版 PaneGroup 根没有任何 border(`PaneGroup.tsx:393`);
+        // 此前的 group_focused accent 描边是 GPUI 侧自加的,真机上整圈橙线喧宾夺主
+        // (用户报障),按原版口径删除。多分屏时「键盘在哪一组」改由 tab 栏的激活胶囊
+        // 表达(见 `tab_bar::LeafFocus`):焦点组的胶囊带一条 accent 底线,别的组的
+        // 胶囊降为透明底 + 描边。光标的实心 / 空心只是辅助 —— Beam / Underline 光标与
+        // 隐藏光标的 TUI(Claude / Codex / htop)靠它分不出来。
         // 远程断线覆盖层(判据见上面的 `show_reconnect`)
         let reconnect = show_reconnect
             .then(|| self.render_leaf_reconnect_overlay(project_id, &active_id, leaf_id, cx));

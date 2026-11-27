@@ -324,8 +324,10 @@ use mt_i18n::{
 /// （`gitHistory.retryDiscovery`）。
 /// 2062 → 2060：移除项目行 / worktree 子项行 / 分组行尾冗余的悬浮「···」更多操作按钮，
 /// 收回不再使用的提示文案（`projectList.{group.moreTip,row.moreTip}`）。
+/// 2060 → 2061：设置页删除自定义 Shell 改为就地二次确认，确认按钮的文案
+/// （`settings.common.confirmDelete`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 2060;
+const EXPECTED_ENTRIES_PER_LANG: usize = 2061;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

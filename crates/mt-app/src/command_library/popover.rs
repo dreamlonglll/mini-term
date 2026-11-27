@@ -36,9 +36,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext, ClickEvent, ClipboardItem, Context, Entity, EventEmitter, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, actions, div, prelude::FluentBuilder as _, px,
+    App, AppContext, Bounds, ClickEvent, ClipboardItem, Context, Entity, EventEmitter,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, ScrollHandle,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, canvas,
+    div, point, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SavedCommand;
@@ -83,6 +84,37 @@ fn fold_animates(opened: Instant, now: Instant) -> bool {
     now.saturating_duration_since(opened) >= crate::popover_reveal::REVEAL_OPEN
 }
 
+/// ↑/↓ 挪到的那一行要滚进列表视口:返回新的纵向滚动偏移(gpui 口径:`y ≤ 0`,越往下
+/// 越负);整行已经可见、或者已经滚到头滚不动了,返回 `None`。
+///
+/// 坐标都是窗口坐标、按**这一帧**的偏移排好的:`row_*` 是那一行的上下沿,`view_*` 是列表
+/// 视口的上下沿,`max_scroll` 是最多能往下滚多远(≥ 0)。策略与 gpui `scroll_to_item` 的
+/// 默认一致:露不全就滚最少的那一段;行比视口还高时顶对齐。
+///
+/// 不能直接用 `scroll_to_item`:它按滚动区的**直接子元素**数,而这里的行有的套在分组的
+/// 折叠件(`HeightReveal`)里,分组标题也占位,下标对不上行。
+fn reveal_scroll_y(
+    offset_y: f32,
+    (row_top, row_bottom): (f32, f32),
+    (view_top, view_bottom): (f32, f32),
+    max_scroll: f32,
+) -> Option<f32> {
+    // 视口还没排过版(高度 0):量不准,不动
+    if view_bottom <= view_top {
+        return None;
+    }
+    let target = if row_top < view_top || row_bottom - row_top > view_bottom - view_top {
+        offset_y + (view_top - row_top)
+    } else if row_bottom > view_bottom {
+        offset_y - (row_bottom - view_bottom)
+    } else {
+        return None;
+    };
+    let target = target.clamp(-max_scroll.max(0.0), 0.0);
+    // 夹到头之后与眼下没差别 = 滚不动了。必须收手:探针每帧都在,不收就是一个要帧的死循环
+    ((target - offset_y).abs() > 0.5).then_some(target)
+}
+
 /// 浮层要宿主替它做的事。宿主先关浮层(还焦点),再开对应弹窗 —— 顺序反了
 /// Dialog 抢到的焦点会被焦点还原覆盖掉。
 #[derive(Debug, Clone)]
@@ -109,6 +141,11 @@ pub struct CommandPopover {
     collapsed: HashSet<String>,
     /// 键盘游标:可见行(折叠桶不算)里的第几条。
     cursor: usize,
+    /// 列表的滚动位置。↑/↓ 挪游标时把那一行滚进视口(见 [`Self::cursor_reveal_probe`])。
+    list_scroll: ScrollHandle,
+    /// 游标刚被键盘挪过、还没确认滚进视口。鼠标悬停挪游标不置它 —— 悬停那一行本来就在
+    /// 眼前,跟着滚只会把列表从鼠标底下拽走。
+    reveal_cursor: bool,
     /// 正等二次确认的删除目标(命令 id)。
     pending_delete: Option<String>,
     /// 刚复制了哪条(短暂显示「已复制」)。
@@ -134,10 +171,13 @@ impl CommandPopover {
             &query,
             window,
             |this: &mut Self, _, event: &InputEvent, window, cx| match event {
-                // 关键词一变游标回到第一条,顺带撤掉悬而未决的删除
+                // 关键词一变游标回到第一条,顺带撤掉悬而未决的删除;列表回到顶上
+                // (第一条前面可能还有分组标题,只把那一行滚进来会把标题切掉)
                 InputEvent::Change => {
                     this.cursor = 0;
                     this.pending_delete = None;
+                    this.reveal_cursor = false;
+                    this.list_scroll.set_offset(point(px(0.0), px(0.0)));
                     cx.notify();
                 }
                 InputEvent::PressEnter { .. } => this.run_cursor(true, window, cx),
@@ -150,6 +190,8 @@ impl CommandPopover {
             query,
             collapsed: HashSet::new(),
             cursor: 0,
+            list_scroll: ScrollHandle::new(),
+            reveal_cursor: false,
             pending_delete: None,
             copied: None,
             _copied_timer: None,
@@ -170,6 +212,9 @@ impl CommandPopover {
     ) {
         self.target = Some((project_id, pane_id));
         self.cursor = 0;
+        // 实体跨次打开常驻:上一次滚到的位置不留(游标回到第一条,列表也回到顶上)
+        self.reveal_cursor = false;
+        self.list_scroll.set_offset(point(px(0.0), px(0.0)));
         self.pending_delete = None;
         self.copied = None;
         self._copied_timer = None;
@@ -197,6 +242,8 @@ impl CommandPopover {
         let len = flatten_rows(&self.buckets(cx)).len();
         self.cursor = crate::project_switcher::next_cursor(self.cursor, len, delta);
         self.pending_delete = None;
+        // 列表上限 360px,九行上下光标就出视口了:下一帧把游标那一行滚进来
+        self.reveal_cursor = true;
         cx.notify();
     }
 
@@ -282,6 +329,45 @@ impl CommandPopover {
     }
 
     // ─── 渲染 ─────────────────────────────────────────────
+
+    /// 挂在游标那一行上的探针(不画东西的 canvas):prepaint 时拿到这一行与列表视口的窗口
+    /// 坐标,露不全就改列表的滚动偏移([`reveal_scroll_y`]),下一帧重画(套路同
+    /// `popover_reveal::anchor_probe`:量完不在绘制期 notify,排到下一帧);整行可见即撤掉
+    /// [`Self::reveal_cursor`],探针随之不再挂。
+    fn cursor_reveal_probe(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let entity = cx.entity();
+        let scroll = self.list_scroll.clone();
+        canvas(
+            move |row: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
+                let view = scroll.bounds();
+                let offset = scroll.offset();
+                let next = reveal_scroll_y(
+                    f32::from(offset.y),
+                    (f32::from(row.top()), f32::from(row.bottom())),
+                    (f32::from(view.top()), f32::from(view.bottom())),
+                    f32::from(scroll.max_offset().y),
+                );
+                let moved = entity.update(cx, |this, _| match next {
+                    Some(y) => {
+                        scroll.set_offset(point(offset.x, px(y)));
+                        true
+                    }
+                    None => {
+                        this.reveal_cursor = false;
+                        false
+                    }
+                });
+                if moved {
+                    window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
 
     /// 行尾那种 20×20 的小图标钮。
     fn act_button(
@@ -558,9 +644,14 @@ impl CommandPopover {
                 )
         };
 
+        // 键盘刚挪到这一行:挂探针把它滚进视口(见 [`Self::cursor_reveal_probe`])
+        let reveal = (is_cursor && self.reveal_cursor).then(|| self.cursor_reveal_probe(cx));
+
         div()
             .id(SharedString::from(format!("cmd-row-{id}")))
             .group("cmd-row")
+            // 探针按整行铺(`absolute` + `size_full`),得有个定位锚
+            .relative()
             .flex()
             .items_center()
             .gap(px(8.0))
@@ -619,6 +710,7 @@ impl CommandPopover {
                     ),
             )
             .child(actions)
+            .children(reveal)
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -727,6 +819,7 @@ impl Render for CommandPopover {
             .w_full()
             .max_h(ui::font_px(LIST_MAX_HEIGHT))
             .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
             .py(px(4.0));
 
         if lib_empty {
@@ -848,5 +941,49 @@ mod tests {
         assert!(!fold_animates(t0, t0 + open / 2));
         assert!(fold_animates(t0, t0 + open));
         assert!(fold_animates(t0, t0 + open * 3));
+    }
+
+    /// ↑/↓ 挪游标:整行可见不动;露不全滚最少那一段;行比视口高顶对齐;滚到头就收手。
+    #[test]
+    fn 游标行滚进视口只滚最少的一段() {
+        // 视口 100..460(高 360),最多能往下滚 400
+        let view = (100.0, 460.0);
+        let max = 400.0;
+        assert_eq!(
+            reveal_scroll_y(0.0, (200.0, 230.0), view, max),
+            None,
+            "整行可见:不动"
+        );
+        assert_eq!(
+            reveal_scroll_y(0.0, (440.0, 470.0), view, max),
+            Some(-10.0),
+            "下沿露出 10px:往下滚 10,行底贴视口底"
+        );
+        assert_eq!(
+            reveal_scroll_y(-120.0, (80.0, 110.0), view, max),
+            Some(-100.0),
+            "上沿被切掉 20px:往回滚 20,行顶贴视口顶"
+        );
+        assert_eq!(
+            reveal_scroll_y(-50.0, (60.0, 500.0), view, max),
+            Some(-10.0),
+            "行比视口还高:顶对齐"
+        );
+    }
+
+    #[test]
+    fn 游标行滚到头滚不动就收手() {
+        let view = (100.0, 460.0);
+        // 已经滚到最底(-400),行还在视口下面(布局与偏移一时没对上):夹完等于没动,不再要帧
+        assert_eq!(reveal_scroll_y(-400.0, (470.0, 500.0), view, 400.0), None);
+        // 内容不够一屏(max 0):怎么都滚不动
+        assert_eq!(reveal_scroll_y(0.0, (470.0, 500.0), view, 0.0), None);
+        // 往回滚超过顶:夹到 0
+        assert_eq!(reveal_scroll_y(-10.0, (60.0, 90.0), view, 400.0), Some(0.0));
+        // 视口还没排过版(高度 0):不动
+        assert_eq!(
+            reveal_scroll_y(0.0, (470.0, 500.0), (0.0, 0.0), 400.0),
+            None
+        );
     }
 }

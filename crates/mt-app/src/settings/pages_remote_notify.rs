@@ -75,6 +75,12 @@ impl RemoteField {
             _ => None,
         }
     }
+
+    /// 输入框打码(token 不该明文常驻在屏幕上,与 SSH 密码 / 中转密钥同)。打码的框带
+    /// 「显示明文」切换钮。Webhook URL 虽是凭据但不打码:要能看清改错的那一位。
+    fn masked(self) -> bool {
+        matches!(self, Self::BarkKey | Self::TgToken)
+    }
 }
 
 /// 远程通知页的表单状态(挂在 [`SettingsView`] 上)。
@@ -127,13 +133,13 @@ impl RemoteNotifyForm {
         };
         Self {
             bark_server: field(config.bark.server.clone(), BARK_DEFAULT_SERVER, false),
-            // 凭据框 masked:token 不该明文常驻在屏幕上(与 SSH 密码 / 中转密钥同)
+            // 凭据框 masked(哪几个框打码见 [`RemoteField::masked`])
             bark_key: field(
                 bark_key,
                 t("settings", "remoteNotify.bark.keyPlaceholder"),
-                true,
+                RemoteField::BarkKey.masked(),
             ),
-            tg_token: field(tg_token, "123456789:AAF…", true),
+            tg_token: field(tg_token, "123456789:AAF…", RemoteField::TgToken.masked()),
             tg_chat: field(
                 config.telegram.chat_id.clone(),
                 t("settings", "remoteNotify.telegram.chatPlaceholder"),
@@ -653,6 +659,13 @@ impl SettingsView {
         } else {
             hint_key.map(|key| (t("settings", key), ui::text_muted()))
         };
+        // 打码的框带「显示明文」切换钮(gpui-component 0.10 的 `mask_toggle`:点一下切换,
+        // 不是按住才显示,见 `input.rs::render_toggle_mask_button`)
+        let input = if field.masked() {
+            Input::new(input).mask_toggle()
+        } else {
+            Input::new(input)
+        };
         div()
             .flex()
             .flex_col()
@@ -663,7 +676,7 @@ impl SettingsView {
                     .text_color(ui::text_secondary())
                     .child(t("settings", label_key)),
             )
-            .child(Input::new(input))
+            .child(input)
             .when_some(hint, |el, (text, color)| {
                 el.child(
                     div()

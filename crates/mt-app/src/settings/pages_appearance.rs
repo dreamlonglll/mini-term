@@ -453,6 +453,8 @@ impl SettingsView {
         let active = active_id == Some(card.theme_id.as_str());
         let theme_id = card.theme_id.clone();
         let name = card.name.clone();
+        // 卡片的 hover 组:右下角那颗删除钮平时透明,鼠标进卡片才现身(`group_hover`)
+        let group = SharedString::from(format!("theme-card-group-{idx}"));
 
         // 背景图走**与窗口级同一个** `BackgroundArtElement`:cover 铺满 + focus
         // 百分比定位 + 包声明的压暗纱罩。只是位图换成缩略图(`prepared_image`,
@@ -538,7 +540,7 @@ impl SettingsView {
 
         div()
             .id(SharedString::from(format!("theme-card-{idx}")))
-            .group(SharedString::from(format!("theme-card-group-{idx}")))
+            .group(group.clone())
             // 300 是上限不是定值:面板宽被视口钳到很窄时(内容列 < 300),
             // 定值宽的卡片会横着捅出去被裁掉 —— 与「内容列不许越过面板」同一条
             .w_full()
@@ -595,6 +597,11 @@ impl SettingsView {
                             .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .cursor_pointer()
+                            // 平时透明、鼠标进卡片才现身(与命令库行尾图标钮同一手法)。
+                            // 透明时照样占位、照样吃点击 —— 能点到它的那一刻鼠标必然在卡片上,
+                            // 它也就已经现身了;它本来就不在 Tab 序里,键盘可达性不受影响
+                            .opacity(0.0)
+                            .group_hover(group, |el| el.opacity(1.0))
                             .hover(|el| el.text_color(ui::color_error()))
                             .child("\u{2715}")
                             .on_click(cx.listener({
