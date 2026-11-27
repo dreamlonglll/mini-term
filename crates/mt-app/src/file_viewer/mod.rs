@@ -65,6 +65,7 @@
 //! | [`file_kind`] | 文件类型判定、路径比对、扩展名 → 语言名 |
 //! | [`preview`] | Markdown / HTML 预览的渲染(`impl FileViewer` 的另一半)与自绘表格、图片占位 |
 //! | [`markdown`] | Markdown 纯逻辑:分块、图片落点、本地图片改写、链接处置、表格排版参数 |
+//! | [`code_copy`] | 富文本代码块右上角的「复制」按钮(md / html 预览与会话面板共用) |
 //! | [`sanitize`] | 不可信 Markdown(远程文档 / AI 会话正文)清洗 |
 //! | [`html_urls`] | 本地 HTML 的资源 URL 改写(简版渲染用) |
 //! | [`webview`] | 本地 HTML / PDF 的系统 WebView 预览:资源服务、导航处置 |
@@ -104,6 +105,7 @@ use crate::image_lightbox::ImageLightbox;
 use crate::tab_expansion::TAB_WIDTH;
 use crate::ui;
 
+mod code_copy;
 mod document;
 mod file_kind;
 mod git_blame;
@@ -122,6 +124,7 @@ mod webview;
 // 行尾三件套的对外路径:`tab_expansion` 的单测与文档链接按 `crate::file_viewer::…`
 // 引用。本模块自己已不直接用(读写口径都收进了 `DocumentSession`),所以非测试
 // 构建里它们只剩这个出口
+pub(crate) use code_copy::{CodeCopyFeedback, code_copy_actions, reserve_code_actions_space};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use document::{LineEnding, normalize_to_lf, restore_line_ending};
 pub use file_kind::language_for;
@@ -414,6 +417,9 @@ pub struct FileViewer {
     /// 远程 Markdown 图片按文档、按 URL 记录用户明确批准。未命中时只能画
     /// 占位，绝不能把 URI 交给进程级图片加载器。
     approved_remote_images: HashSet<String>,
+    /// 预览里代码块「复制」按钮刚复制过哪一块(见 [`code_copy`]),按钮据此短暂
+    /// 显示「已复制」。
+    code_copy: Entity<CodeCopyFeedback>,
     /// 本页签向 gpui 资源系统要过的 mermaid 图表(见 [`mermaid::MermaidAsset`])。
     /// gpui 的资源缓存与图集纹理都是**进程级、不自动淘汰**的:一份 2× 栅格的图表动辄
     /// 几 MB,「改一笔源码 → 切预览」一轮就多一份,不收就是显存慢慢被吃光
@@ -550,6 +556,7 @@ impl FileViewer {
             md_list: ListState::new(0, ListAlignment::Top, px(600.0)).measure_all(),
             md_list_sync: std::cell::Cell::new((0, px(0.0))),
             approved_remote_images: HashSet::new(),
+            code_copy: cx.new(|_| CodeCopyFeedback::default()),
             mermaid_requested: RefCell::new(HashSet::new()),
             images_requested: RefCell::new(HashSet::new()),
             image_reload: ReloadDebounce::default(),

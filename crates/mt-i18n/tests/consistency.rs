@@ -324,8 +324,10 @@ use mt_i18n::{
 /// （`gitHistory.retryDiscovery`）。
 /// 2062 → 2060：移除项目行 / worktree 子项行 / 分组行尾冗余的悬浮「···」更多操作按钮，
 /// 收回不再使用的提示文案（`projectList.{group.moreTip,row.moreTip}`）。
+/// 2060 → 2062：Markdown 预览 / 会话正文代码块右上角的复制按钮
+/// （`fileViewer.{copyCode,codeCopied}`）。
 const EXPECTED_NAMESPACES: usize = 39;
-const EXPECTED_ENTRIES_PER_LANG: usize = 2060;
+const EXPECTED_ENTRIES_PER_LANG: usize = 2062;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

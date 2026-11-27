@@ -80,6 +80,7 @@ use mt_config::SshConnection;
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot};
 use mt_ui::tooltip::TooltipExt as _;
 
+use crate::file_viewer::{CodeCopyFeedback, code_copy_actions};
 use crate::i18n::{t, tr};
 use crate::menu;
 use crate::motion_kit::{KeyedSwap, PushAxis, push_pair};
@@ -311,6 +312,8 @@ fn preview_text_style(cx: &mut App) -> TextViewStyle {
         text.font_size = Some(ui::font_px(11.0).into());
         text.line_height = Some(gpui::relative(1.5).into());
     }
+    // 代码块右上角常驻复制按钮(与 md 预览同一颗),正文让出那一行
+    let code_block = crate::file_viewer::reserve_code_actions_space(code_block);
     TextViewStyle {
         highlight_theme: cx.theme().highlight_theme.clone(),
         is_dark: cx.theme().mode.is_dark(),
@@ -599,6 +602,8 @@ pub struct SessionPanel {
     /// 断链的远程项目:列表恒空,头部给一句断链提示。
     remote_broken: bool,
     preview: Option<Preview>,
+    /// 正文代码块「复制」按钮刚复制过哪一块(见 `file_viewer::code_copy`)。
+    code_copy: Entity<CodeCopyFeedback>,
     /// 「列表 ↔ 详情」下钻的横向 push:进详情内容向左推,返回向右推(`motion_kit`,
     /// [`mt_ui::motion::PANEL_SWAP`])。键 = 详情开着没有。
     drill: KeyedSwap<bool>,
@@ -695,6 +700,7 @@ impl SessionPanel {
             remote: false,
             remote_broken: false,
             preview: None,
+            code_copy: cx.new(|_| CodeCopyFeedback::default()),
             drill: KeyedSwap::new(mt_ui::motion::PANEL_SWAP),
             preview_exit: None,
             list_scroll: ScrollHandle::new(),
@@ -1505,7 +1511,8 @@ impl SessionPanel {
                                     rendered_content,
                                 )
                                 .style(text_style.clone())
-                                .selectable(true),
+                                .selectable(true)
+                                .code_block_actions(code_copy_actions(&self.code_copy, ix)),
                             ),
                     ),
             );

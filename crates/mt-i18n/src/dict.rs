@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 39;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 2060;
+pub const ZH_ENTRY_COUNT: usize = 2062;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 2060;
+pub const EN_ENTRY_COUNT: usize = 2062;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -568,6 +568,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("closeTab", "关闭"),
     ("closeToLeft", "关闭左边"),
     ("closeToRight", "关闭右边"),
+    ("codeCopied", "已复制"),
     ("compareDisk", "对比"),
     ("compareFailed", "无法打开对比"),
     ("compareIdentical", "两侧内容相同"),
@@ -576,6 +577,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ 磁盘"),
     ("compareTitle", "对比：{name}"),
     ("compareUnavailable", "磁盘上的文件已不是可对比的文本（二进制或过大）"),
+    ("copyCode", "复制代码"),
     ("deletedOnDisk", "文件已被删除。保存会按原路径重新创建它。"),
     ("dontSave", "不保存"),
     ("encodingTip", "文件编码：{encoding}，保存时按此编码写回"),
@@ -643,6 +645,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("closeTab", "Close"),
     ("closeToLeft", "Close to the Left"),
     ("closeToRight", "Close to the Right"),
+    ("codeCopied", "Copied"),
     ("compareDisk", "Compare"),
     ("compareFailed", "Could not open the comparison"),
     ("compareIdentical", "Both sides are identical"),
@@ -651,6 +654,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("compareTabTitle", "{name} ↔ Disk"),
     ("compareTitle", "Compare: {name}"),
     ("compareUnavailable", "The file on disk is no longer comparable text (binary or too large)"),
+    ("copyCode", "Copy code"),
     ("deletedOnDisk", "This file was deleted. Saving will recreate it at its original path."),
     ("dontSave", "Don't Save"),
     ("encodingTip", "File encoding: {encoding}; saving writes it back in this encoding"),
