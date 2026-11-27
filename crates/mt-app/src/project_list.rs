@@ -2215,6 +2215,8 @@ impl ProjectList {
         // 细粒度订阅:OSC 标题、焦点 pane、AI 标记与文件树展开态不在这里 notify 本视图。
         // ⚠️ 这只省掉本视图自己那次 notify:render 读了 store,gpui-fast 下 store 每次
         // `changed()`(emit + notify)照样让缓存失效(见 `cached_panel` 注释第 1 条)。
+        // 真叫不醒本视图的只有静默事件(OSC 标题,见 `StoreEvent::is_silent`);悬停卡上
+        // 各格的标签带 OSC 副段,卡开着时靠 `keep_preview_alive` 的 500ms 重画跟上。
         // 中栏收着时本视图不渲染(这条照样跑):记一笔,再展开时完成标表直接对齐、不补播
         // (见 `sync_done_tags`)。
         cx.subscribe(&store, |this: &mut Self, store, event: &StoreEvent, cx| {
