@@ -104,6 +104,7 @@ mod secrets;
 mod segment_slider;
 mod session_panel;
 mod settings;
+mod spin_dot;
 mod ssh_activity;
 mod ssh_assoc;
 mod ssh_panel;

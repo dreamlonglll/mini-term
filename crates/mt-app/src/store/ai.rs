@@ -12,7 +12,7 @@ use mt_config::{SavedProjectLayout, SavedSplitNode};
 
 use crate::ai::AiEvent;
 use crate::markers::{self, AiMarker, MarkerBatch};
-use crate::notify::{NotifyPrefs, PaneRef, StatusTransition};
+use crate::notify::{DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
 use crate::tree::{AiSessionRef, PaneStatus, StatusLight};
 
 use super::events::StoreChanged;
@@ -350,6 +350,8 @@ impl AppStore {
                 let mut pane_id = String::new();
                 let mut old_status = PaneStatus::Idle;
                 let mut old_attention = false;
+                // 这条事件有没有改动 pane 上的任何字段(见下面「同值不发」)
+                let mut pane_changed = false;
                 // 远程通知的「哪家 AI」:hook 上报的优先,退到 pane 上已认出的
                 let mut agent: Option<String> = None;
                 'projects: for (pid, state) in self.project_states.iter_mut() {
@@ -372,12 +374,14 @@ impl AppStore {
                             .agent
                             .clone()
                             .or_else(|| pane.ai_agent().map(str::to_string));
+                        let before = pane.clone();
                         layout.update_status_by_pty(
                             change.pty_id,
                             status,
                             attention,
                             change.agent.as_deref(),
                         );
+                        pane_changed = layout.pane_by_pty(change.pty_id) != Some(&before);
                         hit = true;
                         break;
                     }
@@ -398,6 +402,15 @@ impl AppStore {
                 let project_active = self.active_project_id.as_deref() == Some(owner.as_str());
                 let pane_focused = self.focused_pane_id.as_deref() == Some(pane_id.as_str());
 
+                // 这个 pane 在完成账本三份账里的那一格(未读 / 未看 / 完成序)
+                let ledger = |done: &DoneTracker| {
+                    (
+                        done.is_unread(&pane_id),
+                        done.is_unseen(&pane_id),
+                        done.order().get(&pane_id).copied(),
+                    )
+                };
+                let ledger_before = ledger(&self.done);
                 let plan = self.done.apply(
                     &StatusTransition {
                         pane_id: &pane_id,
@@ -411,13 +424,25 @@ impl AppStore {
                     },
                     &self.notify_prefs(),
                 );
+                let ledger_changed = ledger(&self.done) != ledger_before;
+                let mut flag_raised = false;
                 if plan.mark_needs_attention
                     && let Some(state) = self.project_states.get_mut(&owner)
                 {
+                    flag_raised = !state.needs_attention;
                     state.needs_attention = true;
                 }
-                // 完成账本与项目行提示点随状态一起变,同一个事件覆盖(见 `StoreEvent`)
-                cx.changed(StoreEvent::PaneStatusChanged);
+                // 完成账本与项目行提示点随状态一起变,同一个事件覆盖(见 `StoreEvent`)。
+                //
+                // **同值不发**:hook 在工具调用之间交替上报 PreToolUse / PostToolUse,状态
+                // 一直是 ai-working —— mt-ai 的 `StatusEmitter` 只吞「状态与成因都相同」的
+                // 那种,成因一换就放行。pane 字段、完成账本、项目行提示点都没动,也没有
+                // 提醒要做时,这条对任何订阅者都没有新信息;照发的话,render 读了 store 的
+                // 视图(标题栏 / 终端列表竖条 / 工作区外壳……)每条都要整块重建一次。
+                // 成因本身不落 store,`PaneStatusChanged` 的订阅方也只读状态,不必比。
+                if pane_changed || ledger_changed || flag_raised || !plan.is_empty() {
+                    cx.changed(StoreEvent::PaneStatusChanged);
+                }
 
                 if plan.is_empty() {
                     return None;
@@ -601,9 +626,10 @@ impl AppStore {
     /// # 为什么合成一个方法
     ///
     /// 拆成两个 getter 就要各扫一遍 `pane_refs(None)`(全项目 flat_map + collect
-    /// 一个 Vec),而标题栏**每帧都要**:它挂了 `window_control_area`,套不了
-    /// view 级缓存(理由见 `main.rs::cached_panel` 与标题栏挂载点的注释),
-    /// 所以那两遍是真的每帧各来一次。
+    /// 一个 Vec),而标题栏每次重建 render 都要这两样。gpui-fast 下标题栏不再每帧
+    /// 重建(它在默认视图保留里,见 `workspace/mod.rs::cached_panel` 与标题栏挂载点的
+    /// 注释),但它读 store,store 每次 `changed()` 都会让它重跑一遍 —— AI 状态
+    /// 切换这类事件可以很密,两遍扫描省一遍照样值。
     ///
     /// 两条结果的 done 判据都取 [`DoneScope::All`](`aiDoneOrder`,不看窗口焦点),
     /// 与标题栏那两处消费点原本的口径逐字一致 —— 托盘用的是
@@ -1179,5 +1205,76 @@ mod tests {
         assert_eq!(count_unidentified_ai_panes(&state, "claude"), 2);
         assert_eq!(count_unidentified_ai_panes(&state, "codex"), 2);
         assert_eq!(count_unidentified_ai_panes(&state, "pi"), 1);
+    }
+
+    /// 同值不发:hook 在工具调用之间交替报 PreToolUse / PostToolUse,状态一直是
+    /// ai-working,pane、完成账本、项目行提示点都没动 —— 不发 `PaneStatusChanged`
+    /// (每条都发的话,render 读了 store 的视图每条都整块重建)。Stop(ai-working →
+    /// ai-idle)照发;同一回合重复的 Stop 什么都没改,不发;重新开工照发。
+    #[gpui::test]
+    fn 同值ai状态事件不发变更事件(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        const PTY: u32 = 7_007;
+        let config = mt_config::AppConfig {
+            projects: vec![mt_config::ProjectConfig::new("p", "P", "/repo")],
+            ..mt_config::AppConfig::default()
+        };
+        let store = cx.new(|cx| AppStore::git_test_store(config, cx));
+        let mut working = ai_pane(PaneStatus::AiWorking, None, Some("claude"));
+        working.pty_id = Some(PTY);
+        let mut state = ProjectState::new();
+        state.panels.push(panel(vec![working]));
+        let seen: Rc<RefCell<Vec<StoreEvent>>> = Rc::default();
+        cx.update(|cx| {
+            store.update(cx, |store, _| {
+                store.project_states.insert("p".into(), state);
+            });
+            let seen = seen.clone();
+            cx.subscribe(&store, move |_, event: &StoreEvent, _| {
+                seen.borrow_mut().push(*event)
+            })
+            .detach();
+        });
+        let send = |status: &str, cause: &str, cx: &mut gpui::TestAppContext| {
+            let change = mt_ai::StatusChange {
+                pty_id: PTY,
+                status: status.into(),
+                cause: Some(cause.into()),
+                agent: Some("claude".into()),
+            };
+            cx.update(|cx| {
+                store.update(cx, |store, cx| {
+                    store.apply_ai_event(AiEvent::Status(change), cx);
+                })
+            });
+            cx.run_until_parked();
+            let mut seen = seen.borrow_mut();
+            let n = seen
+                .iter()
+                .filter(|event| **event == StoreEvent::PaneStatusChanged)
+                .count();
+            seen.clear();
+            n
+        };
+
+        for cause in ["PreToolUse", "PostToolUse", "PreToolUse", "PostToolUse"] {
+            assert_eq!(send("ai-working", cause, cx), 0, "同值的 {cause} 不该发");
+        }
+        assert_eq!(send("ai-idle", "Stop", cx), 1, "回合做完要发");
+        assert_eq!(send("ai-idle", "Stop", cx), 0, "同一回合重复的 Stop 不该发");
+        assert_eq!(
+            send("ai-working", "UserPromptSubmit", cx),
+            1,
+            "重新开工要发"
+        );
+        cx.update(|cx| {
+            let store = store.read(cx);
+            let pane = store.project_state("p").unwrap().all_panes()[0];
+            assert_eq!(pane.status, PaneStatus::AiWorking);
+        });
+        crate::git::watch::forget_pane(PTY);
     }
 }

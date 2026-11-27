@@ -394,6 +394,43 @@ impl HostState {
             layer.slot = open_below;
         }
     }
+
+    /// [`Self::prune`] 与 [`Self::assign_slots`] 这一刻有没有要改的:都没有就不必可写地借
+    /// 全局(见 [`with_host`])。
+    fn needs_upkeep(&self, now: Instant) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.closing && !layer.presence.mounted_at(now))
+            || self
+                .layers
+                .iter()
+                .filter(|layer| !layer.closing)
+                .enumerate()
+                .any(|(open_below, layer)| layer.slot != open_below)
+    }
+
+    /// 渲染要的那份拷贝(调 builder 时不借着全局),外加「还有没有层在动」。
+    fn layer_views(&self, now: Instant) -> (Vec<LayerView>, bool) {
+        let running = self
+            .layers
+            .iter()
+            .any(|layer| layer.presence.running_at(now));
+        let views = self
+            .layers
+            .iter()
+            .map(|layer| LayerView {
+                id: layer.id,
+                motion: layer.motion,
+                focus: layer.focus.clone(),
+                builder: layer.builder.clone(),
+                progress: layer.presence.value_at(now),
+                closing: layer.closing,
+                slot: layer.slot,
+                size: layer.size.clone(),
+            })
+            .collect();
+        (views, running)
+    }
 }
 
 /// 每扇窗口一份栈。
@@ -402,6 +439,15 @@ struct DialogHosts(HashMap<WindowId, HostState>);
 
 impl Global for DialogHosts {}
 
+/// 可写地借本窗口的栈。
+///
+/// ⚠️ **渲染路径上先只读判断、真要改才走这里**。`default_global` 每调一次都把
+/// [`DialogHosts`] 记成「变了」(gpui-fast `app.rs:2681` 的 `default_global` →
+/// `push_effect` → `fast::dependencies::global_changed`),而根视图 render 里先经
+/// [`has_open`] 读过它。gpui-fast 把「记录期间读过、之后又被写」的全局算作变了
+/// (`fast/dependencies.rs:360-362`、`:553-563`):这个视图的保留记录当帧作废,拼接
+/// (`fast/splice.rs:333`)也走不了 —— 终端每出一帧,`Workspace` 都整棵重跑 render 与
+/// 布局。开 / 关弹窗这类事件路径照常走这里:那时根视图本来就该重画。
 fn with_host<R>(window: &Window, cx: &mut App, f: impl FnOnce(&mut HostState) -> R) -> R {
     let id = window.window_handle().window_id();
     f(cx.default_global::<DialogHosts>().0.entry(id).or_default())
@@ -585,6 +631,11 @@ where
 /// 只在淡入进行中要帧。
 pub fn frost_alpha(target: bool, has_image: bool, window: &mut Window, cx: &mut App) -> f32 {
     let now = Instant::now();
+    // 根视图每帧都调:状态一位不用变时只读,不碰可写的全局(见 [`with_host`])
+    let current = read_host(window, cx, |host| host.frost).flatten();
+    if let Some(presence) = frost_unchanged(current, target, has_image, now) {
+        return presence.drive(window);
+    }
     let presence = with_host(window, cx, |host| {
         let frost = host
             .frost
@@ -593,6 +644,25 @@ pub fn frost_alpha(target: bool, has_image: bool, window: &mut Window, cx: &mut 
         *frost
     });
     presence.drive(window)
+}
+
+/// [`step_frost`] 这一步会不会是空操作:是就交回原样的在场度(没记录过 = 收起)。
+///
+/// - 不该有玻璃 / 没图:要的是「收起且静止」,已经收完了就不用再重置;
+/// - 该有且有图:目标已是全开(淡入中或已到位)就不用再起一场。
+fn frost_unchanged(
+    current: Option<Presence>,
+    target: bool,
+    has_image: bool,
+    now: Instant,
+) -> Option<Presence> {
+    let frost = current.unwrap_or_else(|| Presence::hidden(OVERLAY_IN, OVERLAY_OUT));
+    let unchanged = if !target || !has_image {
+        !frost.target_open() && !frost.mounted_at(now)
+    } else {
+        frost.target_open()
+    };
+    unchanged.then_some(frost)
 }
 
 /// [`frost_alpha`] 的状态机一步(纯逻辑,单测钉语义):没图或不该有玻璃 → 当场归零;
@@ -636,20 +706,26 @@ pub fn shell_frame_with(
     cx: &mut App,
 ) -> Option<ShellFrame> {
     let now = Instant::now();
-    let presence = with_host(window, cx, |host| {
-        let presence = host
-            .shells
-            .entry(key)
-            .or_insert_with(|| Presence::hidden(enter, exit));
-        if open != presence.target_open() {
-            if open {
-                presence.show(now);
-            } else {
-                presence.hide(now);
+    // 根视图每帧都调:开合没变就只读(没记录过又是关着 = 收起,同样不用写),理由见 [`with_host`]
+    let current = read_host(window, cx, |host| host.shells.get(key).copied()).flatten();
+    let presence = match current {
+        Some(presence) if open == presence.target_open() => presence,
+        None if !open => Presence::hidden(enter, exit),
+        _ => with_host(window, cx, |host| {
+            let presence = host
+                .shells
+                .entry(key)
+                .or_insert_with(|| Presence::hidden(enter, exit));
+            if open != presence.target_open() {
+                if open {
+                    presence.show(now);
+                } else {
+                    presence.hide(now);
+                }
             }
-        }
-        *presence
-    });
+            *presence
+        }),
+    };
     if !presence.mounted_at(now) {
         return None;
     }
@@ -729,29 +805,20 @@ struct LayerView {
 /// 退场播完的层在这里出栈;动画进行中顺手要下一帧(通知的是调用方视图)。
 pub fn render_layer(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
     let now = Instant::now();
-    let (views, running) = with_host(window, cx, |host| {
-        host.prune(now);
-        host.assign_slots();
-        let running = host
-            .layers
-            .iter()
-            .any(|layer| layer.presence.running_at(now));
-        let views = host
-            .layers
-            .iter()
-            .map(|layer| LayerView {
-                id: layer.id,
-                motion: layer.motion,
-                focus: layer.focus.clone(),
-                builder: layer.builder.clone(),
-                progress: layer.presence.value_at(now),
-                closing: layer.closing,
-                slot: layer.slot,
-                size: layer.size.clone(),
-            })
-            .collect::<Vec<_>>();
-        (views, running)
-    });
+    // 根视图每帧都调:没有弹窗(绝大多数帧)或栈不用收拾时只读,理由见 [`with_host`]
+    let upkeep = read_host(window, cx, |host| {
+        (!host.layers.is_empty()).then(|| host.needs_upkeep(now))
+    })
+    .flatten()?;
+    let (views, running) = if upkeep {
+        with_host(window, cx, |host| {
+            host.prune(now);
+            host.assign_slots();
+            host.layer_views(now)
+        })
+    } else {
+        read_host(window, cx, |host| host.layer_views(now))?
+    };
     if views.is_empty() {
         return None;
     }
@@ -1528,6 +1595,123 @@ mod tests {
         let mut instant = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
         step_frost(&mut instant, true, true, t0, false);
         assert_eq!(instant.value_at(t0), 1.0, "总开关关掉直接到位");
+    }
+
+    /// 只读预判([`frost_unchanged`])与状态机([`step_frost`])逐态对得上:判「不用改」的,
+    /// 真走一步出来的在场度看上去一模一样;判「要改」的,走一步确实变了。
+    #[test]
+    fn 毛玻璃只读预判与状态机一致() {
+        let t0 = Instant::now();
+        let mut opening = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        opening.retarget(1.0, t0, true);
+        let mut open = Presence::hidden(OVERLAY_IN, OVERLAY_OUT);
+        open.retarget(1.0, t0, false);
+        let mut closing = open;
+        closing.retarget(0.0, t0, true);
+        let states = [
+            None,
+            Some(Presence::hidden(OVERLAY_IN, OVERLAY_OUT)),
+            Some(opening),
+            Some(open),
+            Some(closing),
+        ];
+        let at = [
+            t0,
+            t0 + OVERLAY_IN.duration / 2,
+            t0 + OVERLAY_OUT.duration * 2,
+        ];
+        let looks = |p: &Presence, now| (p.target_open(), p.value_at(now), p.running_at(now));
+        for current in states {
+            for now in at {
+                for (target, has_image) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let mut stepped =
+                        current.unwrap_or_else(|| Presence::hidden(OVERLAY_IN, OVERLAY_OUT));
+                    step_frost(&mut stepped, target, has_image, now, true);
+                    match frost_unchanged(current, target, has_image, now) {
+                        Some(kept) => assert_eq!(
+                            looks(&kept, now),
+                            looks(&stepped, now),
+                            "判了不用改却变了:{current:?} {target} {has_image}"
+                        ),
+                        None => assert_ne!(
+                            current.map(|p| looks(&p, now)),
+                            Some(looks(&stepped, now)),
+                            "判了要改却没变:{current:?} {target} {has_image}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// 栈只在真有活(退场播完要出栈 / 位置档对不上)时才需要可写地借全局。
+    #[gpui::test]
+    fn 弹窗栈只在真有活时才要收拾(cx: &mut TestAppContext) {
+        let (a, b) = handle_pair(cx);
+        let t0 = Instant::now();
+        let mut host = HostState::default();
+        assert!(!host.needs_upkeep(t0), "空栈");
+        host.push("a", a, None, builder(), None, t0, true);
+        let b_id = host.push("b", b, None, builder(), None, t0, true);
+        assert!(!host.needs_upkeep(t0), "push 时位置档已经排好");
+        let t1 = t0 + OVERLAY_IN.duration;
+        host.begin_close(b_id, t1, true, |_, _| false);
+        assert!(!host.needs_upkeep(t1), "退场中还挂着");
+        let t2 = t1 + OVERLAY_OUT.duration + Duration::from_millis(1);
+        assert!(host.needs_upkeep(t2), "退场播完该出栈了");
+        host.prune(t2);
+        host.assign_slots();
+        assert!(!host.needs_upkeep(t2));
+        host.layers[0].slot = 3;
+        assert!(host.needs_upkeep(t2), "位置档对不上");
+    }
+
+    /// 根视图每帧都调这几个入口。没有弹窗时它们只读、不碰可写的全局,gpui-fast 才能把根视图
+    /// 原样留着 —— 子视图单独重画时根视图不跟着重跑 render。此前每帧都可写地借一次全局,
+    /// 根视图「读过的全局变了」,子视图任何一次重画都把它整棵重建。
+    #[gpui::test]
+    fn 无弹窗时根视图不因弹窗宿主每帧重建(cx: &mut TestAppContext) {
+        struct Leaf(Rc<Cell<usize>>);
+        impl Render for Leaf {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div().size_full()
+            }
+        }
+        struct Probe {
+            leaf: gpui::Entity<Leaf>,
+            renders: Rc<Cell<usize>>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                let open = has_open(window, cx);
+                let alpha = frost_alpha(open, false, window, cx);
+                let shell = shell_frame_with("probe", false, OVERLAY_IN, OVERLAY_OUT, window, cx);
+                assert!(alpha == 0.0 && shell.is_none());
+                div()
+                    .size_full()
+                    .child(self.leaf.clone())
+                    .children(render_layer(window, cx))
+            }
+        }
+        cx.update(gpui_component::init);
+        let (renders, leaf_renders) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let leaf = cx.new(|_| Leaf(leaf_renders.clone()));
+        let (_, cx) = cx.add_window_view(|_, _| Probe {
+            leaf: leaf.clone(),
+            renders: renders.clone(),
+        });
+        cx.run_until_parked();
+        let (first, leaf_first) = (renders.get(), leaf_renders.get());
+        for _ in 0..3 {
+            leaf.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        assert_eq!(leaf_renders.get(), leaf_first + 3, "子视图每次都重画了");
+        assert_eq!(renders.get(), first, "根视图没跟着重建");
     }
 
     /// 「还挂着」含自绘模态(用量统计)的退场:毛玻璃快照的去留看它。

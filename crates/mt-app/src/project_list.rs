@@ -633,6 +633,10 @@ fn highlighted_text(text: String, query_lower: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// 画一颗行内状态灯。ai-working 那颗由宿主挂进 [`crate::spin_dot::SpinDots`] 的独立
+/// 小视图(转圈的低频泵只 notify 它,不再每拍重建整个项目列表),其余档位内联。
+type DotFn<'a> = &'a mut dyn FnMut(StatusLight) -> AnyElement;
+
 /// 右侧整合式 AI 活跃胶囊：将 AI 品牌图标组与状态灯合成一枚精致微胶囊，
 /// 让左侧项目名在整栏严格垂直对齐，同时一眼看清「哪家 AI + 当前进度」。
 fn ai_activity_pill(
@@ -640,6 +644,7 @@ fn ai_activity_pill(
     icon_size: f32,
     light: StatusLight,
     include_light: bool,
+    dot: DotFn<'_>,
 ) -> gpui::Div {
     let pill_bg = match light {
         StatusLight::Error => ui::with_alpha(ui::color_error(), 0.12),
@@ -672,7 +677,7 @@ fn ai_activity_pill(
         );
     }
     if include_light && light != StatusLight::Idle {
-        pill = pill.child(ui::status_dot(light));
+        pill = pill.child(dot(light));
     }
     pill
 }
@@ -717,7 +722,9 @@ struct CollapsedSummary {
 }
 
 /// 折叠胶囊 / 折叠分组行上附带的小状态指示器（仅在有需要提醒的状态时出现）。
-fn collapsed_status_indicator(summary: &CollapsedSummary) -> Option<AnyElement> {
+///
+/// `dot` 画 8.5px 的状态灯(见 [`DotFn`];「等你处理」与报错那两档不转,直接内联)。
+fn collapsed_status_indicator(summary: &CollapsedSummary, dot: DotFn<'_>) -> Option<AnyElement> {
     if summary.light >= StatusLight::Attention {
         return Some(
             StatusDot::new(ui::status_kind(summary.light))
@@ -739,13 +746,7 @@ fn collapsed_status_indicator(summary: &CollapsedSummary) -> Option<AnyElement> 
         );
     }
     if summary.light != StatusLight::Idle {
-        return Some(
-            StatusDot::new(ui::status_kind(summary.light))
-                .size(px(8.5))
-                .color(ui::status_color(summary.light))
-                .contrast(ui::bg_elevated())
-                .into_any_element(),
-        );
+        return Some(dot(summary.light));
     }
     if summary.has_ssh {
         return Some(
@@ -1079,6 +1080,7 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
 /// 优先级严格保持 **AI 状态优先**:完成标 > AI/错误/待处理灯(`StatusLight != Idle`) >
 /// 右键「SSH 连接」已连接灯(`◉`)。
 /// 有 AI 品牌图标时将其与状态灯合进精致的「AI 活跃胶囊」；完成标退场期间优先保标。
+#[allow(clippy::too_many_arguments)]
 fn row_right_status(
     id: &str,
     ai_vendors: &[Option<AiVendor>],
@@ -1087,11 +1089,14 @@ fn row_right_status(
     tag: Option<&DoneTagAnim>,
     light: StatusLight,
     ssh_connected: Option<&str>,
+    dot: DotFn<'_>,
 ) -> Vec<AnyElement> {
     let mut parts: Vec<AnyElement> = Vec::with_capacity(2);
     let has_done = tag.is_some() || show_done_tag;
     if !ai_vendors.is_empty() {
-        parts.push(ai_activity_pill(ai_vendors, icon_size, light, !has_done).into_any_element());
+        parts.push(
+            ai_activity_pill(ai_vendors, icon_size, light, !has_done, &mut *dot).into_any_element(),
+        );
     }
     if let Some(tag) = tag {
         let settled = tag.leaving.is_none() && !tag.transition.running();
@@ -1104,7 +1109,7 @@ fn row_right_status(
         parts.push(done_tag(frame, true, &Rc::new(Cell::new(0.0))));
     } else if ai_vendors.is_empty() {
         if light != StatusLight::Idle {
-            parts.push(ui::status_dot(light).into_any_element());
+            parts.push(dot(light));
         } else if let Some(conn_name) = ssh_connected {
             parts.push(
                 div()
@@ -2178,6 +2183,9 @@ pub struct ProjectList {
     /// 中栏收着期间 store 变过(本视图那时不渲染,完成标表没跟上)。下一次 `render`
     /// 按「隔了一阵才再画」对齐完成标表,不补播进出场(见 [`Self::sync_done_tags`])。
     done_tags_stale: bool,
+    /// 行尾 / 折叠胶囊上 ai-working 那颗转圈灯的独立小视图(见 [`crate::spin_dot`]):
+    /// 转圈的低频泵只 notify 它们,不再每 100ms 把整个项目列表重建一遍。
+    spin_dots: crate::spin_dot::SpinDots,
     /// 分组行与 worktree 簇的折叠箭头:只让刚点(或回车 / 空格翻)的那一行转(见 `fold_motion`)。
     chevrons: crate::fold_motion::FlipTweens,
     /// 分组(`grp:{id}`)与 worktree 簇(`wt:{id}`)的高度裁剪展开 / 收起动画(仅在飞期间存活)。
@@ -2211,8 +2219,12 @@ struct PendingReveal {
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        // 本视图套了 view 级缓存(`main.rs::cached_panel`),按 `touches_project_list`
-        // 细粒度订阅:OSC 标题(4Hz 热路径)、焦点 pane、AI 标记与文件树展开态不再唤醒本视图。
+        // 本视图套了 view 级缓存(`workspace/mod.rs::cached_panel`),按 `touches_project_list`
+        // 细粒度订阅:OSC 标题、焦点 pane、AI 标记与文件树展开态不在这里 notify 本视图。
+        // ⚠️ 这只省掉本视图自己那次 notify:render 读了 store,gpui-fast 下 store 每次
+        // `changed()`(emit + notify)照样让缓存失效(见 `cached_panel` 注释第 1 条)。
+        // 真叫不醒本视图的只有静默事件(OSC 标题,见 `StoreEvent::is_silent`);悬停卡上
+        // 各格的标签带 OSC 副段,卡开着时靠 `keep_preview_alive` 的 500ms 重画跟上。
         // 中栏收着时本视图不渲染(这条照样跑):记一笔,再展开时完成标表直接对齐、不补播
         // (见 `sync_done_tags`)。
         cx.subscribe(&store, |this: &mut Self, store, event: &StoreEvent, cx| {
@@ -2299,6 +2311,7 @@ impl ProjectList {
             pending_select_all: None,
             done_tags: HashMap::new(),
             done_tags_stale: false,
+            spin_dots: Default::default(),
             chevrons: crate::fold_motion::FlipTweens::new(mt_ui::motion::CHEVRON_ROTATE),
             folds: crate::height_reveal::FoldReveals::new(mt_ui::motion::SECTION_TOGGLE)
                 .with_max_height(640.0),
@@ -3830,6 +3843,8 @@ impl ProjectList {
 
 impl Render for ProjectList {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 转圈灯新一轮登记(顺手回收上一轮没画到的,见 `crate::spin_dot`)
+        self.spin_dots.begin();
         // 行内重命名的「默认全选」:输入框在**上一帧**才被画进 dispatch tree,
         // 所以派发挂在 `on_next_frame`(那时 rendered_frame 正是这一帧)。
         // 见 `start_rename` 的注释。
@@ -4076,7 +4091,12 @@ impl ProjectList {
 
         let collapsed_active = collapsed && !filtering && collapsed_summary.contains_active;
         let collapsed_ind = (collapsed && !filtering)
-            .then(|| collapsed_status_indicator(collapsed_summary))
+            .then(|| {
+                collapsed_status_indicator(collapsed_summary, &mut |light| {
+                    self.spin_dots
+                        .dot(format!("group:{id}"), light, px(8.5), cx)
+                })
+            })
             .flatten();
         let guides = group_guide_lines(depth);
         let ml = row_left_margin(depth);
@@ -5545,7 +5565,12 @@ impl ProjectList {
             tr!("projectList", "worktreeToggleCollapse", count = count)
         };
         let indicator = collapsed
-            .then(|| collapsed_status_indicator(summary))
+            .then(|| {
+                collapsed_status_indicator(summary, &mut |light| {
+                    self.spin_dots
+                        .dot(format!("wt:{parent_id}"), light, px(8.5), cx)
+                })
+            })
             .flatten();
 
         div()
@@ -5907,6 +5932,19 @@ impl ProjectList {
             } else {
                 ui::with_alpha(ui::accent(), 0.0)
             };
+            let right_status = row_right_status(
+                &row.id,
+                &row.ai_vendors,
+                CHILD_AI_ICON_SIZE,
+                show_done_tag,
+                done_tag,
+                row.light,
+                row.ssh_connected.as_deref(),
+                &mut |light| {
+                    self.spin_dots
+                        .dot(format!("row:{}", row.id), light, px(11.0), cx)
+                },
+            );
 
             let pill = div()
                 .relative()
@@ -5940,15 +5978,7 @@ impl ProjectList {
                         .filter(|r| r.broken)
                         .map(|remote| remote_badge_chip(&row.id, remote)),
                 )
-                .children(row_right_status(
-                    &row.id,
-                    &row.ai_vendors,
-                    CHILD_AI_ICON_SIZE,
-                    show_done_tag,
-                    done_tag,
-                    row.light,
-                    row.ssh_connected.as_deref(),
-                ));
+                .children(right_status);
 
             let row_el = self
                 .project_row_interactions(&row, is_active, tooltip, dragging, filtering, tree, cx)
@@ -6062,6 +6092,17 @@ impl ProjectList {
         } else {
             None
         };
+        // 右侧状态区（AI 活跃胶囊 / 完成标 / 状态灯 / SSH 已连接灯）
+        let right_status = row_right_status(
+            id,
+            &ai_vendors,
+            AI_ICON_SIZE,
+            show_done_tag,
+            done_tag,
+            light,
+            ssh_connected.as_deref(),
+            &mut |light| self.spin_dots.dot(format!("row:{id}"), light, px(11.0), cx),
+        );
 
         let row_el = self
             .project_row_shell(
@@ -6104,16 +6145,7 @@ impl ProjectList {
             .children(toggle_info.map(|(count, collapsed)| {
                 self.worktree_toggle_chip(&row.id, count, collapsed, &row.collapsed_summary, cx)
             }))
-            // 右侧状态区（AI 活跃胶囊 / 完成标 / 状态灯 / SSH 已连接灯）
-            .children(row_right_status(
-                id,
-                &ai_vendors,
-                AI_ICON_SIZE,
-                show_done_tag,
-                done_tag,
-                light,
-                ssh_connected.as_deref(),
-            ));
+            .children(right_status);
 
         let ml = row_left_margin(group_depth);
         let guides = group_guide_lines(group_depth);

@@ -10,12 +10,17 @@
 //!
 //! # 两条通道并存(渐进式)
 //!
-//! - `cx.notify()` **一处没删**:render 里直接读 store 的视图照旧靠它重画;
+//! - `cx.notify()` **除静默事件外一处没删**:render 里直接读 store 的视图照旧靠它重画;
 //! - [`StoreEvent`] 给**非渲染**的观察者:同步托盘、推中转、跑校验、重拉面板数据。
 //!
 //! store 内部改完数据一律走 [`StoreChanged::changed`](先 emit 再 notify)。单测
 //! `store里没有裸notify` 钉死「每一次 notify 都带着事件」—— 新写的 setter 忘了发
 //! 事件会在测试里红,而不是等到真机上「该刷的没刷」。
+//!
+//! 反过来不是每个事件都带 notify:[`StoreEvent::is_silent`] 白名单里的热路径事件
+//! **只 emit 不 notify**。gpui-fast 下 render 读过 store 的视图,store 每 notify 一次就
+//! 失效重建一次,订阅里按 `touches_*` 过滤挡不住(见 `workspace/mod.rs::cached_panel`
+//! 注释第 1 条);静默事件只叫醒在订阅里自己 notify 的那几个读者。
 //!
 //! # 数据 → 事件(订阅之前先查这张表)
 //!
@@ -27,7 +32,7 @@
 //! | 面板与分屏树、pane 增删、PTY 绑定与回收、活动面板 / tab、最大化、面板名 | [`LayoutChanged`] |
 //! | **全部项目的 pane 集合** | [`LayoutChanged`] + [`ProjectsChanged`](删项目连 pane 一起没) |
 //! | `focused_pane_id` | [`FocusedPaneChanged`] |
-//! | pane 的 `status` / `attention` / 检测到的 agent | [`PaneStatusChanged`](补 PTY 时把起不来的 pane 标 error、重连回落 idle 这两处与 [`LayoutChanged`] 同发;PTY 退出 / 起不来落 error 也是它) |
+//! | pane 的 `status` / `attention` / 检测到的 agent | [`PaneStatusChanged`](补 PTY 时把起不来的 pane 标 error、重连回落 idle 这两处与 [`LayoutChanged`] 同发;PTY 退出 / 起不来落 error 也是它;AI 事件什么都没改时不发,见 `apply_ai_event` 的「同值不发」) |
 //! | 项目行完成提示点(`needs_attention`) | [`PaneStatusChanged`](置位)、[`ActiveProjectChanged`](切过去即清) |
 //! | PTY 退出登记(「已断开」遮罩) | [`PaneStatusChanged`](登记)、[`LayoutChanged`] / [`ProjectsChanged`](随 pane 回收) |
 //! | pane 的 AI 会话身份 | [`PaneSessionChanged`] |
@@ -112,7 +117,8 @@ pub enum StoreEvent {
     PaneSshStatusChanged,
     /// 某 pane 的 AI 会话身份写入了(hook 上报 / 续接 / 跳转;手动写入时连带清续接标记)。
     PaneSessionChanged,
-    /// 某 pane 的 OSC 窗口标题变了 —— **热路径**(AI 工作时约 4Hz/pane)。
+    /// 某 pane 的 OSC 窗口标题变了 —— **热路径**(cmd 每条命令都改一次标题,AI 工作时约
+    /// 4Hz/pane)。**静默事件**:只 emit 不 notify,见 [`Self::is_silent`]。
     PaneTitleChanged,
     /// 某 pane 的自定义名变了(F2 / 右键 / 移动端改名)。
     PaneRenamed,
@@ -157,7 +163,8 @@ pub enum ConfigSection {
 
 impl EventEmitter<StoreEvent> for AppStore {}
 
-/// store 内部「改完了」的唯一收口:先发类型化事件,再照旧 notify。
+/// store 内部「改完了」的唯一收口:先发类型化事件,再照旧 notify(静默事件不 notify,
+/// 见 [`StoreEvent::is_silent`])。
 ///
 /// 做成 `Context` 上的方法而不是 `AppStore` 的方法:调用点常常还拿着
 /// `self.project_states` 的可变借用,只借 `cx` 就不会和它打架。
@@ -168,7 +175,9 @@ pub(super) trait StoreChanged {
 impl StoreChanged for Context<'_, AppStore> {
     fn changed(&mut self, event: StoreEvent) {
         self.emit(event);
-        self.notify();
+        if !event.is_silent() {
+            self.notify();
+        }
     }
 }
 
@@ -179,6 +188,32 @@ impl StoreChanged for Context<'_, AppStore> {
 // 每条的依赖清单对应着那个观察者真正读 store 的代码,漏一条就是「该刷的没刷」。
 
 impl StoreEvent {
+    /// **静默事件**:[`StoreChanged::changed`] 对它只 emit、不 notify。
+    ///
+    /// notify 的代价在 gpui-fast 下是「render 读过 store 的视图全部重建」—— 项目列表、
+    /// 终端列表竖条、标题栏、工作区外壳、文件树……一次 cmd 改标题就是六到九个视图。
+    /// 热路径上只有少数视图真读的数据改成只 emit:真读它的视图在订阅里按 `touches_*`
+    /// 自己 notify,其余视图不再被叫醒。
+    ///
+    /// 进白名单的三条前提(单测 `静默事件的渲染读者都自己notify` 钉死前两条):
+    /// 1. render 里读这份数据的视图全都订阅了 store 事件、在对应 `touches_*` 放行时对
+    ///    自己 `cx.notify()` —— 漏一个就是那块界面不刷新;
+    /// 2. `touches_workspace` 不含它。根视图一旦被 notify,其下读过 store 的非 cached 视图
+    ///    会因 store 在这一帧被 update 过照样重建(gpui-fast 的 `inside_notified`,见
+    ///    `fast/dependencies.rs` 的 `dependencies_changed`),静默就白做了;
+    /// 3. 没有观察者靠 notify 取它(`cx.observe(&store)`):眼下全仓没有 observe store 的,
+    ///    非渲染观察者一律走事件。
+    ///
+    /// [`Self::PaneTitleChanged`] 的渲染读者:终端区的页签栏与折叠标题条、tab 悬停卡
+    /// (`TerminalArea`,`touches_terminal_area`)、快速切换弹窗(`ProjectSwitcher`,
+    /// `touches_project_switcher`)。项目行悬停卡上各格的标签也带 OSC 副段,但它不靠
+    /// 事件:卡开着时项目列表按 500ms 节拍自己重画(`ProjectList::keep_preview_alive`,
+    /// 缩略图本来就是这个新鲜度)。其余取标题的地方(worktree 占用清单、远程通知正文)
+    /// 是当场取值,不在渲染路径上。
+    pub fn is_silent(self) -> bool {
+        matches!(self, Self::PaneTitleChanged)
+    }
+
     /// 活动项目(id,或它的路径 / 远程与否)可能变了。
     ///
     /// Git 面板与会话面板据此比对项目路径、决定重拉;全局搜索据此作废旧结果。
@@ -759,11 +794,64 @@ mod tests {
         assert!(StoreEvent::DoneChanged.touches_workspace());
     }
 
+    /// 静默白名单逐条钉死(前提见 [`StoreEvent::is_silent`]):加进来的事件,它的渲染读者
+    /// 必须都在 `touches_*` 里自己 notify,且根视图不被它叫醒。加新的静默事件时在这里
+    /// 补上它的读者清单 —— 漏一个读者,那块界面就停在旧值上。
+    #[test]
+    fn 静默事件的渲染读者都自己notify() {
+        assert_eq!(
+            accepted(StoreEvent::is_silent),
+            vec![StoreEvent::PaneTitleChanged]
+        );
+        for e in accepted(StoreEvent::is_silent) {
+            assert!(!e.touches_workspace(), "{e:?} 会叫醒根视图,静默白做");
+        }
+        // PaneTitleChanged 的读者:终端区(页签栏 / 折叠标题条 / tab 悬停卡)与快速切换弹窗
+        let title = StoreEvent::PaneTitleChanged;
+        assert!(title.touches_terminal_area());
+        assert!(title.touches_project_switcher());
+    }
+
+    /// 收口 [`StoreChanged::changed`]:静默事件照样 emit、不 notify;其余事件 emit + notify。
+    #[gpui::test]
+    fn changed对静默事件只发不通知(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let store = cx.new(|cx| AppStore::git_test_store(mt_config::AppConfig::default(), cx));
+        let notified = Rc::new(Cell::new(0usize));
+        let emitted = Rc::new(Cell::new(0usize));
+        let _subs = cx.update(|cx| {
+            let (n, e) = (notified.clone(), emitted.clone());
+            (
+                cx.observe(&store, move |_, _| n.set(n.get() + 1)),
+                cx.subscribe(&store, move |_, _: &StoreEvent, _| e.set(e.get() + 1)),
+            )
+        });
+        for event in [StoreEvent::PaneTitleChanged, StoreEvent::PaneRenamed] {
+            notified.set(0);
+            emitted.set(0);
+            cx.update(|cx| store.update(cx, |_, cx| cx.changed(event)));
+            cx.run_until_parked();
+            assert_eq!(emitted.get(), 1, "{event:?} 要 emit");
+            assert_eq!(
+                notified.get(),
+                usize::from(!event.is_silent()),
+                "{event:?} 的 notify 次数"
+            );
+        }
+    }
+
     /// 「每一次 notify 都带着事件」的机械护栏:store 目录下除本文件外,
     /// 非注释行里不许出现裸 `cx.notify()` —— 一律走 [`StoreChanged::changed`]。
     ///
     /// 漏发事件的后果是订阅者该刷新的不刷新(比多刷一次严重得多),而这类遗漏
     /// 在代码评审里极难看出来;这里让它在 `cargo test` 里直接红。
+    ///
+    /// 只管这一个方向。反方向「每个事件都带 notify」**不成立**:静默事件只 emit
+    /// (见 [`StoreEvent::is_silent`]),它的渲染读者靠订阅自己 notify —— 由
+    /// `静默事件的渲染读者都自己notify` 与 `changed对静默事件只发不通知` 两条钉着。
     ///
     /// 运行时扫整个目录而不是手列文件:store 新增文件自动纳入,不会漏在护栏外。
     #[test]
