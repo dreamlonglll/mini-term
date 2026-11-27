@@ -429,9 +429,9 @@ fn conn_text_with_name(name: AnyElement, conn: &SshConnection, suffix: &str) -> 
         .flex_col()
         .child(name)
         .child(
-            div()
+            // 等宽走 `ui::mono`(DirectWrite 不认 `"monospace"` 通用族名)
+            ui::mono(div())
                 .truncate()
-                .font_family("monospace")
                 .text_size(ui::font_px(11.0))
                 .text_color(ui::text_muted())
                 .child(SharedString::from(format!(

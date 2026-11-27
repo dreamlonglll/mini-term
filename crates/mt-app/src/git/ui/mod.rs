@@ -179,23 +179,9 @@ pub fn button_hover_bg() -> Hsla {
 
 // ─── 字体 ─────────────────────────────────────────────────────
 
-/// 等宽字体链(哈希、计数、时间、状态字母):各数位等宽,竖着排才对得齐。CJK 回落
-/// 雅黑(「3 小时前」)。
-///
-/// 不用 `"monospace"` 这种泛型族名:Windows 的 DirectWrite 解析不到,会静默回落成
-/// 界面字体(命令库那里踩过)。
-pub fn mono<E: Styled>(mut el: E) -> E {
-    let style = el.text_style();
-    style.font_family = Some("Cascadia Mono".into());
-    style.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
-        "Consolas".into(),
-        "JetBrains Mono".into(),
-        "Menlo".into(),
-        "DejaVu Sans Mono".into(),
-        "Microsoft YaHei".into(),
-    ]));
-    el
-}
+/// 等宽字体链(哈希、计数、时间、状态字母)。实现上提到了 [`crate::ui::mono`](会话树、
+/// SSH 面板等 Git 之外的地方也要用),这里留个再导出,Git 各页的 `git_ui::mono` 不用改。
+pub use crate::ui::mono;
 
 /// 估一段界面文字的宽:全角按 1em、其余按 0.6em。只用来定截断 / 让位的保底(仓库栏的
 /// 仓库名、历史行的提交标题),不求精确。

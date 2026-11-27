@@ -376,6 +376,25 @@ pub fn font_px(base: f32) -> Pixels {
     px(base * scale)
 }
 
+/// 界面里的等宽字体链(哈希、计数、时间、状态字母、树形连线 `│├└`):各字符等宽,
+/// 竖着排才对得齐。CJK 回落雅黑(「3 小时前」)。
+///
+/// ⚠️ 别写 `.font_family("monospace")`:Windows 的 DirectWrite 不认这种 CSS 通用族名
+/// (gpui 的文字系统只映射 `.SystemUIFont` / `.ZedMono` 两个内部名),会静默回落成界面
+/// 字体 —— 命令库与会话树的连线都踩过。
+pub fn mono<E: Styled>(mut el: E) -> E {
+    let style = el.text_style();
+    style.font_family = Some("Cascadia Mono".into());
+    style.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+        "Consolas".into(),
+        "JetBrains Mono".into(),
+        "Menlo".into(),
+        "DejaVu Sans Mono".into(),
+        "Microsoft YaHei".into(),
+    ]));
+    el
+}
+
 /// CSS `font-family` 串的首个族名(剥引号与空白)。
 ///
 /// `'JetBrainsMono Nerd Font', monospace` → `JetBrainsMono Nerd Font`。

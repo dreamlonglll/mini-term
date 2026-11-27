@@ -1835,13 +1835,13 @@ impl SessionPanel {
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
-                    // 树连线前缀:**等宽字体 + 不换行 + 不截断**,`│├└` 才对得齐
+                    // 树连线前缀:**等宽字体 + 不换行 + 不截断**,`│├└` 才对得齐。
+                    // 等宽走 `ui::mono`(DirectWrite 不认 `"monospace"` 通用族名)
                     .when(!prefix.is_empty(), |el| {
                         el.child(
-                            div()
+                            ui::mono(div())
                                 .flex_none()
                                 .mt(px(1.0))
-                                .font_family("monospace")
                                 .whitespace_nowrap()
                                 .text_color(ui::text_muted())
                                 .child(prefix.clone()),
@@ -2002,10 +2002,9 @@ impl SessionPanel {
                             // 显示的字符与 tooltip **相反** —— 文案是「切到 X 视图」。
                             .when(has_project, |el| {
                                 el.child(
-                                    div()
+                                    ui::mono(div())
                                         .id("session-view-toggle")
                                         .px(px(4.0))
-                                        .font_family("monospace")
                                         .text_size(ui::font_px(12.0))
                                         .text_color(ui::text_muted())
                                         .cursor_pointer()
