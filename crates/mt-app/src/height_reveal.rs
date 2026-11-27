@@ -150,6 +150,12 @@ impl HeightReveal {
         (h > 0.0).then_some(h)
     }
 
+    /// 由调用方直接给出内容的自然高度(像素),不等探针量。给窗口化铺行的列表用:内容
+    /// 按行数就能算出自然高,而整块落在屏外时根本不建元素,探针跑不到。
+    pub fn set_natural_height(&self, height: f32) {
+        self.natural.set(height.max(0.0));
+    }
+
     fn effective_natural(&self) -> f32 {
         let h = self.natural.get();
         match self.max_height {
@@ -158,9 +164,9 @@ impl HeightReveal {
         }
     }
 
-    /// 这一帧的画法(见 [`reveal_mode`])。
-    pub fn mode(&self) -> RevealMode {
-        let now = Instant::now();
+    /// `now` 这一刻的画法(见 [`reveal_mode`])。时钟由调用方给:同一帧里先算高度、后画的
+    /// 调用方拿同一个时刻,两处才对得上(见 [`Self::render_at`])。
+    pub fn mode_at(&self, now: Instant) -> RevealMode {
         reveal_mode(
             self.is_open(),
             self.tween.running_at(now),
@@ -172,7 +178,13 @@ impl HeightReveal {
     /// 这一帧外壳占多高:静止展开 = 自然高度(还没量过用 `fallback`),动画中 = 插值高度,
     /// 收起 = 0。给「按固定件高度换算剩余空间」的调用方用(与真正画出来的是同一个数)。
     pub fn shown_height(&self, fallback: f32) -> f32 {
-        match self.mode() {
+        self.shown_height_at(fallback, Instant::now())
+    }
+
+    /// 同 [`Self::shown_height`],时钟由调用方给(见 [`Self::mode_at`])。窗口化铺行的
+    /// 列表先拿它排好外面、再用同一个时刻 [`Self::render_at`]。
+    pub fn shown_height_at(&self, fallback: f32, now: Instant) -> f32 {
+        match self.mode_at(now) {
             RevealMode::Hidden => 0.0,
             RevealMode::MeasuringClose => self.natural_height().unwrap_or(fallback),
             RevealMode::Clipped { height, .. } => height,
@@ -183,7 +195,14 @@ impl HeightReveal {
     /// 把 `child` 包成这一帧的样子。收起且静止时返回一个空的零高 div(调用方最好先看
     /// [`Self::is_mounted`],连它都不挂)。动画中自动要下一帧。
     pub fn render(&self, child: impl IntoElement, window: &Window) -> AnyElement {
-        let mode = self.mode();
+        self.render_at(child, window, Instant::now())
+    }
+
+    /// 同 [`Self::render`],按调用方给的时刻定画法:先用 [`Self::shown_height_at`] 排好
+    /// 外面、再画的调用方,两步用同一个时刻,窗高才是同一个数(动画恰好在两步之间播完时,
+    /// 各取各的时钟会一步按「还在裁」、一步按「已展开」)。
+    pub fn render_at(&self, child: impl IntoElement, window: &Window, now: Instant) -> AnyElement {
+        let mode = self.mode_at(now);
         if matches!(
             mode,
             RevealMode::Clipped { .. } | RevealMode::MeasuringClose
@@ -324,17 +343,37 @@ impl FoldReveals {
 
     /// 取出 `key` 此刻正在跑的补间。
     pub fn get(&self, key: &str) -> Option<&HeightReveal> {
-        self.entries.get(key).filter(|r| r.is_running())
+        self.get_at(key, Instant::now())
     }
 
-    /// `key` 此刻是否正在「收起最后一程」（真实状态已折叠，仍需挂着子项收完）。
-    pub fn is_closing(&self, key: &str) -> bool {
-        self.get(key).is_some_and(|r| !r.is_open())
+    /// 同 [`Self::get`],时钟由调用方给(同一帧里拍平、排版、画三步取同一个时刻,
+    /// 见 [`HeightReveal::render_at`])。
+    pub fn get_at(&self, key: &str, now: Instant) -> Option<&HeightReveal> {
+        self.entries.get(key).filter(|r| r.tween.running_at(now))
+    }
+
+    /// `key` 在 `now` 这一刻是否正在「收起最后一程」（真实状态已折叠，仍需挂着子项收完）。
+    /// 时钟由调用方给:拍平行与画折叠窗取同一个时刻,见 [`HeightReveal::render_at`]。
+    pub fn is_closing_at(&self, key: &str, now: Instant) -> bool {
+        self.get_at(key, now).is_some_and(|r| !r.is_open())
     }
 
     /// 是否有任意条目正在播动画。
     pub fn is_animating(&self) -> bool {
-        self.entries.values().any(|r| r.is_running())
+        self.is_animating_at(Instant::now())
+    }
+
+    /// 同 [`Self::is_animating`],时钟由调用方给。
+    pub fn is_animating_at(&self, now: Instant) -> bool {
+        self.entries.values().any(|r| r.tween.running_at(now))
+    }
+
+    /// `now` 这一刻有没有任何条目在「收起最后一程」。只在展开的动画不必把收起中的子项
+    /// 额外拍进行序(那份与静止时的行序一模一样)。
+    pub fn any_closing_at(&self, now: Instant) -> bool {
+        self.entries
+            .values()
+            .any(|r| r.tween.running_at(now) && !r.is_open())
     }
 
     /// 所有此刻正在「收起最后一程」的 key（供调用方构造临时展开集合）。
@@ -392,10 +431,10 @@ mod tests {
     fn 新建即静止_首次出现不播() {
         let shown = HeightReveal::new(true);
         assert!(shown.is_open() && shown.is_mounted() && !shown.is_running());
-        assert_eq!(shown.mode(), RevealMode::Natural);
+        assert_eq!(shown.mode_at(Instant::now()), RevealMode::Natural);
         let hidden = HeightReveal::new(false);
         assert!(!hidden.is_mounted());
-        assert_eq!(hidden.mode(), RevealMode::Hidden);
+        assert_eq!(hidden.mode_at(Instant::now()), RevealMode::Hidden);
         assert_eq!(hidden.shown_height(36.0), 0.0);
     }
 
@@ -410,7 +449,7 @@ mod tests {
             assert!(reveal.is_mounted() && reveal.is_running());
             assert!(reveal.shown_height(0.0) > 70.0);
             assert!(matches!(
-                reveal.mode(),
+                reveal.mode_at(Instant::now()),
                 RevealMode::Clipped { closing: true, .. }
             ));
         }
@@ -433,8 +472,46 @@ mod tests {
         // 高度上限只钳动画行程，不影响静止 Natural
         let capped = HeightReveal::new(true).with_max_height(200.0);
         capped.natural.set(1200.0);
-        assert_eq!(capped.mode(), RevealMode::Natural);
+        assert_eq!(capped.mode_at(Instant::now()), RevealMode::Natural);
         assert_eq!(capped.effective_natural(), 200.0);
+    }
+
+    #[test]
+    fn 调用方给的自然高与探针量的同口径() {
+        let reveal = HeightReveal::new(false).with_max_height(200.0);
+        reveal.set_natural_height(120.0);
+        assert_eq!(reveal.natural_height(), Some(120.0));
+        reveal.set_natural_height(-5.0);
+        assert_eq!(reveal.natural_height(), None, "负数按没量过");
+        // 封顶照样只钳动画行程
+        reveal.set_natural_height(900.0);
+        assert_eq!(reveal.effective_natural(), 200.0);
+    }
+
+    #[test]
+    fn 同一时刻先算高再画_两步的画法一致() {
+        let t0 = Instant::now();
+        let mut reveal = HeightReveal::with_spec(
+            false,
+            TransitionSpec::exempt(
+                std::time::Duration::from_millis(200),
+                mt_ui::motion::Easing::Linear,
+            ),
+        );
+        reveal.set_natural_height(100.0);
+        reveal.set_open(true);
+        if !mt_ui::motion::animations_enabled() {
+            return;
+        }
+        // 播完之后的时刻:不论现在钟走到哪,按给定时刻判「已展开、外壳自然高」
+        let after = t0 + std::time::Duration::from_secs(5);
+        assert_eq!(reveal.mode_at(after), RevealMode::Natural);
+        assert_eq!(reveal.shown_height_at(0.0, after), 100.0);
+        // 开播那一刻还在裁
+        assert!(matches!(
+            reveal.mode_at(t0),
+            RevealMode::Clipped { closing: false, .. }
+        ));
     }
 
     #[test]
@@ -444,8 +521,18 @@ mod tests {
 
         folds.flip_open("g1", false);
         if mt_ui::motion::animations_enabled() {
+            let now = Instant::now();
             assert!(folds.is_animating());
-            assert!(folds.is_closing("g1"));
+            assert!(folds.is_animating_at(now));
+            assert!(folds.is_closing_at("g1", now));
+            assert!(folds.any_closing_at(now));
+            assert!(folds.get_at("g1", now).is_some());
+            // 播完之后的时刻一律查不到(拍平、量高、画三步拿同一个时刻,结论一致)
+            let later = now + std::time::Duration::from_secs(5);
+            assert!(!folds.is_animating_at(later));
+            assert!(!folds.is_closing_at("g1", later));
+            assert!(!folds.any_closing_at(later));
+            assert!(folds.get_at("g1", later).is_none());
             assert_eq!(folds.closing_keys(), vec!["g1"]);
             // 未量出自然高度前立刻点回展开 → 直接取消，零闪烁
             folds.flip_open("g1", true);
@@ -454,6 +541,10 @@ mod tests {
             // 正常展开并被外部强行改状态 → sync 自动摘除
             folds.flip_open("g2", true);
             assert!(folds.is_animating());
+            assert!(
+                !folds.any_closing_at(Instant::now()),
+                "只在展开,没有收起中的"
+            );
             folds.sync(|key| (key == "g2").then_some(false));
             assert!(!folds.is_animating());
         }
