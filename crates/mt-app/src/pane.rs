@@ -215,6 +215,11 @@ pub enum PaneEvent {
     ResumeCwd(ResumeCwd),
     /// 鼠标右键「SSH 连接」的已连接状态变化(`Some(连接名)` = 已连上,`None` = 已断开/清除)。
     SshConnected(Option<String>),
+    /// 键盘焦点进了这个终端(不论怎么进来的:左键点进去、拖选、弹窗关掉把焦点还回来……)。
+    /// store 据此让逻辑焦点跟上(`AppStore::note_terminal_focused`)—— 大多数路径本来就走
+    /// `AppStore::focus_pane`,但 `TerminalView` 按下左键就自己抢焦点,拖选松手在别的分屏上
+    /// 时那个分组的点击凑不成,逻辑焦点会停在上一组:打字进 A、快捷键落 B、焦点组画在 B。
+    Focused,
 }
 
 /// 续接反查所得的会话启动目录,连同它属于哪个会话。
@@ -309,6 +314,9 @@ pub struct TerminalPane {
     /// 监听 `self.view` 的重绘:gpui-fast 下 `TerminalView` 滚动/翻页时会拼接跳过
     /// `TerminalPane`,这里在 `scrolled_back` 状态翻转时标脏外壳以显隐「回到底部」浮钮。
     _view_sub: Subscription,
+    /// 键盘焦点进终端的监听,见 [`PaneEvent::Focused`]。订阅要 `Window`,建 pane 时手上没有,
+    /// 第一次 render 时补上。
+    _focus_in_sub: Option<Subscription>,
     /// 标记跳转后那 300ms 闪烁的撤销计时器。与 `_tip_timer` 同理必须存句柄:
     /// 连着跳两条时上一个计时器随之被丢弃,否则第一次的到点回调会把第二次刚
     /// 亮起来的那一行提前抹掉。
@@ -879,6 +887,7 @@ impl TerminalPane {
             search_reveal: RevealState::new(),
             _search_sub: None,
             _view_sub: view_sub,
+            _focus_in_sub: None,
             _flash_timer: None,
             pending_marks: Vec::new(),
             _marks_timer: None,
@@ -3265,6 +3274,14 @@ fn request_redraw_if_visible(pane: gpui::WeakEntity<TerminalPane>, pty_id: u32, 
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 键盘焦点进终端 → 告诉 store(见 [`PaneEvent::Focused`])。订阅要 `Window`,
+        // 建 pane 时手上没有,第一次画的时候补上;监听跑在绘制期,`emit` 是延后派发的,
+        // store 在本轮绘制之后才收到
+        if self._focus_in_sub.is_none() {
+            self._focus_in_sub = Some(cx.on_focus_in(&self.focus, window, |_, _, cx| {
+                cx.emit(PaneEvent::Focused)
+            }));
+        }
         // 双保险兜底:若某条切回可见的路径未在切换事件期提前调 `flush_hidden_redraw`,
         // 首次重新渲染外壳时显式在下一帧标脏内部 `TerminalView`(外壳本身此刻正在重跑
         // `sync_scrollback_state`,回看浮钮本帧即同步)。

@@ -671,6 +671,36 @@ impl AppStore {
         cx.changed(StoreEvent::FocusedPaneChanged);
     }
 
+    /// 键盘焦点进了某个终端(`PaneEvent::Focused`):逻辑焦点跟上,不再动键盘焦点本身。
+    ///
+    /// 绝大多数路径本来就走 [`Self::focus_pane`](已经记过,这里对上即返回);这里接住绕开它的
+    /// 那几条 —— `TerminalView` 按下左键就自己抢焦点,而 pane 那一格「点一下记逻辑焦点」要等
+    /// 松手凑成点击,拖选松手落在别的分屏上就凑不成。不跟上的话打字进了 A,快捷键与多分屏的
+    /// 焦点组却还在上一组。只认活动项目里的终端(键盘焦点进得去的也只有画在屏上的这些)。
+    /// 与 `focus_pane` 同口径:焦点给到谁,谁就算看过(页签上的绿点熄灭)。
+    pub(super) fn note_terminal_focused(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        let Some((project_id, pane_id)) = find_pane_of_pty(&self.project_states, pty_id) else {
+            return;
+        };
+        if self.active_project_id.as_deref() != Some(project_id.as_str()) {
+            return;
+        }
+        let Some(state) = self.project_states.get_mut(&project_id) else {
+            return;
+        };
+        if self.focused_pane_id.as_deref() == Some(pane_id.as_str())
+            && state.last_focused_pane_id.as_deref() == Some(pane_id.as_str())
+        {
+            return;
+        }
+        state.last_focused_pane_id = Some(pane_id.clone());
+        if self.window_focused {
+            self.done.mark_seen(&pane_id);
+        }
+        self.focused_pane_id = Some(pane_id);
+        cx.changed(StoreEvent::FocusedPaneChanged);
+    }
+
     /// 当前项目里该操作哪个 pane —— 全部快捷键动作(Workspace 的 `target_pane`)与
     /// 键盘焦点落空后的去处共用这一份。回落链见 [`SplitNode::target_pane`]:逻辑焦点 →
     /// 这个项目上次聚焦的 → 活动面板第一个分组的激活页签。旧版 `resolveActivePane` 以 DOM
@@ -1114,6 +1144,8 @@ impl AppStore {
                 PaneEvent::SshConnected(name) => {
                     store.set_pane_ssh_connected_by_pty(pty_id, name.clone(), cx)
                 }
+                // 键盘焦点进了这个终端:逻辑焦点跟上(多分屏的焦点组、快捷键的目标都看它)
+                PaneEvent::Focused => store.note_terminal_focused(pty_id, cx),
             }
         });
         self.pane_subs.insert(pty_id, sub);
