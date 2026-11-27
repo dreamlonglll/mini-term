@@ -1288,7 +1288,7 @@ body {
   border-radius: 10px;
   color: var(--text-primary);
   font: inherit;
-  font-size: 15px;
+  font-size: 16px; /* iOS Safari 对 <16px 的输入框会自动放大页面 */
   line-height: 1.4;
   padding: 9px 12px;
   min-height: 40px;
@@ -1729,7 +1729,7 @@ body {
   background: var(--bg-surface);
   color: var(--text-primary);
   font: inherit;
-  font-size: 15px;
+  font-size: 16px; /* iOS Safari 对 <16px 的输入框会自动放大页面 */
 }
 
 .history-search-input:focus {
