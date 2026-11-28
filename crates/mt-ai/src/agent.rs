@@ -35,6 +35,10 @@ pub enum AgentKind {
     /// Antigravity CLI(Google,命令名 `agy`):shell 命令 hook(`~/.gemini/config/hooks.json`),
     /// 会话索引是 SQLite、正文是 transcript JSONL(见 `sessions/agy.rs`)
     Agy,
+    /// CodeBuddy Code(命令名 `codebuddy`):hook 与 Claude Code 同构,写进
+    /// `~/.codebuddy/settings.json`;会话记录是 `~/.codebuddy/projects/` 下自有的
+    /// JSONL 形态(见 `sessions/codebuddy.rs`)。
+    CodeBuddy,
 }
 
 /// 会话记录怎么按目录分桶 —— 决定续接 / fork 前要不要先找回会话的启动目录。
@@ -303,9 +307,33 @@ const AGY: AgentSpec = AgentSpec {
     ],
 };
 
+const CODEBUDDY: AgentSpec = AgentSpec {
+    kind: AgentKind::CodeBuddy,
+    key: "codebuddy",
+    // hook sidecar 可能把它识别成 codebuddy-cli,留个别名兜底
+    aliases: &["codebuddy-cli"],
+    // 名字长,包含匹配不会误伤别的家
+    loose_match: true,
+    label: "CodeBuddy",
+    resume: Some("codebuddy --resume {id}"),
+    // CLI 没有 fork 参数
+    fork: None,
+    // 与 Claude 一样按启动目录分桶,且记录里带 cwd 可反查
+    cwd_bucket: CwdBucket::PerCwdLookup,
+    session_log: true,
+    history: true,
+    pastes_clipboard_image: false,
+    permission_request_keeps_working: false,
+    session_end_hook: true,
+    double_ctrl_d_exit: false,
+    print_flags: &[],
+    subcommands: &[],
+    value_flags: &[],
+};
+
 impl AgentKind {
     /// 全部 agent,顺序即输入检测 [`crate::AI_COMMANDS`] 的顺序。
-    pub const ALL: [AgentKind; 7] = [
+    pub const ALL: [AgentKind; 8] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::OpenCode,
@@ -313,6 +341,7 @@ impl AgentKind {
         AgentKind::Grok,
         AgentKind::Omp,
         AgentKind::Agy,
+        AgentKind::CodeBuddy,
     ];
 
     /// 这一家的知识表。
@@ -325,6 +354,7 @@ impl AgentKind {
             AgentKind::Grok => &GROK,
             AgentKind::Omp => &OMP,
             AgentKind::Agy => &AGY,
+            AgentKind::CodeBuddy => &CODEBUDDY,
         }
     }
 
@@ -465,12 +495,21 @@ mod tests {
         }
     }
 
-    /// 输入检测的命令名表与改造前逐字相同(顺序也不变)。
+    /// 输入检测的命令名表:在原有七家后面追加 codebuddy。
     #[test]
     fn 命令名表不变() {
         assert_eq!(
             AGENT_COMMANDS,
-            ["claude", "codex", "opencode", "pi", "grok", "omp", "agy"]
+            [
+                "claude",
+                "codex",
+                "opencode",
+                "pi",
+                "grok",
+                "omp",
+                "agy",
+                "codebuddy"
+            ]
         );
     }
 
@@ -495,6 +534,10 @@ mod tests {
             ("AGY", AgentKind::Agy),
             ("antigravity", AgentKind::Agy),
             ("Antigravity", AgentKind::Agy),
+            ("codebuddy", AgentKind::CodeBuddy),
+            ("CodeBuddy", AgentKind::CodeBuddy),
+            ("codebuddy-cli", AgentKind::CodeBuddy),
+            (" CODEBUDDY ", AgentKind::CodeBuddy),
         ] {
             assert_eq!(AgentKind::parse(raw), Some(kind), "{raw:?}");
         }
@@ -592,6 +635,11 @@ mod tests {
             Some(format!("agy --conversation {ID}"))
         );
         assert_eq!(fork_command(Some("agy"), ID), None, "agy 无 CLI 级 fork");
+        assert_eq!(
+            resume_command(Some("codebuddy"), ID),
+            Some(format!("codebuddy --resume {ID}"))
+        );
+        assert_eq!(fork_command(Some("codebuddy"), ID), None, "无 CLI 级 fork");
     }
 
     /// 不支持续接的 / 认不出的:一律不产出命令,**不再落到 claude**。
@@ -640,13 +688,13 @@ mod tests {
         assert!(session_id_ok(&"a".repeat(128)));
     }
 
-    /// 反查启动目录只对 claude 系开(`~/.claude/projects` 里只有 claude 的桶)。
+    /// 反查启动目录只对记录里带 cwd 的两家开(claude / codebuddy)。
     #[test]
     fn 只有_claude_反查启动目录() {
         for kind in AgentKind::ALL {
             assert_eq!(
                 kind.looks_up_session_cwd(),
-                kind == AgentKind::Claude,
+                kind == AgentKind::Claude || kind == AgentKind::CodeBuddy,
                 "{kind:?}"
             );
         }
@@ -667,7 +715,8 @@ mod tests {
                 AgentKind::Pi,
                 AgentKind::Grok,
                 AgentKind::Omp,
-                AgentKind::Agy
+                AgentKind::Agy,
+                AgentKind::CodeBuddy
             ]
         );
         let with_history: Vec<_> = AgentKind::ALL
@@ -682,10 +731,11 @@ mod tests {
                 AgentKind::Pi,
                 AgentKind::Grok,
                 AgentKind::Omp,
-                AgentKind::Agy
+                AgentKind::Agy,
+                AgentKind::CodeBuddy
             ]
         );
-        // 退出时发 SessionEnd 的:有 hook 的五家;agy 退出不发任何 hook,opencode 没有 hook
+        // 退出时发 SessionEnd 的:有 hook 的几家;agy 退出不发任何 hook,opencode 没有 hook
         let with_session_end: Vec<_> = AgentKind::ALL
             .into_iter()
             .filter(|k| k.spec().session_end_hook)
@@ -697,7 +747,8 @@ mod tests {
                 AgentKind::Codex,
                 AgentKind::Pi,
                 AgentKind::Grok,
-                AgentKind::Omp
+                AgentKind::Omp,
+                AgentKind::CodeBuddy
             ]
         );
         // Ctrl+D 要连按两次才退出的只有 agy

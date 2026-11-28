@@ -290,7 +290,16 @@ fn detect_agent(body: &serde_json::Value, source: Source) -> &'static str {
     // Codex 的 hook payload 固定携带 turn_id，Claude Code 没有该字段；
     // transcript_path 两者都有，不能用来区分。
     if body.get("turn_id").is_some() {
-        "codex"
+        return "codex";
+    }
+    // CodeBuddy 的 hook 与 Claude 同构，但 transcript 落在 ~/.codebuddy/projects
+    // 下；不区分就会被标成 claude-code，镜像绑到同项目 Claude 的最新会话（串台）。
+    let transcript = body
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if transcript.contains(".codebuddy") {
+        "codebuddy"
     } else {
         "claude-code"
     }

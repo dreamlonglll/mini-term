@@ -11,6 +11,7 @@
 
 mod agy;
 mod agy_history;
+mod codebuddy;
 mod codex;
 mod delete;
 mod grok;
@@ -31,6 +32,10 @@ pub use agy::{
 pub use agy_history::{
     agy_dialogue_step_from_line, agy_first_user_text_from_str, agy_message_from_step,
     agy_session_title_from_head, newest_agy_transcript,
+};
+pub use codebuddy::{
+    codebuddy_message_from_line, find_codebuddy_session_file, get_codebuddy_sessions,
+    lookup_codebuddy_session_cwd, newest_codebuddy_session_file, read_codebuddy_session_content,
 };
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
@@ -208,7 +213,9 @@ pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
     if !session_id_path_safe(&session_id) {
         return None;
     }
-    let projects = home_dir()?.join(".claude").join("projects");
+    // Claude 与 CodeBuddy 都按启动目录分桶，先查 Claude，再查 CodeBuddy。
+    let home = home_dir()?;
+    let projects = home.join(".claude").join("projects");
     let target = format!("{}.jsonl", session_id);
     for entry in std::fs::read_dir(&projects).ok()?.flatten() {
         let candidate = entry.path().join(&target);
@@ -233,7 +240,7 @@ pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
             }
         }
     }
-    None
+    lookup_codebuddy_session_cwd(&session_id)
 }
 
 /// cwd 比较用的路径语义。Claude/Codex 的会话文件里记录的是运行时 cwd,
@@ -1137,6 +1144,7 @@ pub fn get_ai_session_content(
         }
         // 会话 id 全局唯一(transcript 在 `brain/<id>/` 下),不按项目定位
         Some(AgentKind::Agy) => read_agy_session_content(&session_id),
+        Some(AgentKind::CodeBuddy) => read_codebuddy_session_content(&session_id, &project_path),
         _ => Err(format!("不支持的会话类型: {}", session_type)),
     }
 }
@@ -1172,6 +1180,7 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     sessions.extend(get_pi_family_sessions(PiFlavor::Pi, &project_path));
     sessions.extend(get_pi_family_sessions(PiFlavor::Omp, &project_path));
     sessions.extend(get_agy_sessions(&project_path));
+    sessions.extend(get_codebuddy_sessions(&project_path));
 
     // 按时间戳降序(最新在前)
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));

@@ -927,6 +927,7 @@ pub fn agent_display_label(agent: &str) -> &'static str {
         Some(mt_ai::AgentKind::Pi) => "pi",
         Some(mt_ai::AgentKind::Omp) => "oh-my-pi",
         Some(mt_ai::AgentKind::OpenCode) => "OpenCode",
+        Some(mt_ai::AgentKind::CodeBuddy) => "CodeBuddy",
         None => "Unknown",
     }
 }
