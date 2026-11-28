@@ -127,10 +127,18 @@ enum Scope {
     Codex,
     Grok,
     Agy,
+    CodeBuddy,
 }
 
 impl Scope {
-    const ALL: [Scope; 5] = [Self::All, Self::Claude, Self::Codex, Self::Grok, Self::Agy];
+    const ALL: [Scope; 6] = [
+        Self::All,
+        Self::Claude,
+        Self::Codex,
+        Self::Grok,
+        Self::Agy,
+        Self::CodeBuddy,
+    ];
 
     /// 稳定标识(元素 id 用;也是落盘的 `usage_scope` 取值,与账本 agent 串同名)。
     /// 理由同 [`UsageRange::key`]。
@@ -141,6 +149,7 @@ impl Scope {
             Self::Codex => "codex",
             Self::Grok => "grok",
             Self::Agy => "agy",
+            Self::CodeBuddy => "codebuddy",
         }
     }
 
@@ -161,6 +170,7 @@ impl Scope {
             Self::Grok => "Grok",
             // 产品名同样不翻译,取 agent 表的展示名(与历史面板等处同一来源)
             Self::Agy => mt_ai::AgentKind::Agy.spec().label,
+            Self::CodeBuddy => mt_ai::AgentKind::CodeBuddy.spec().label,
         }
     }
 
@@ -171,6 +181,7 @@ impl Scope {
             Self::Codex => AgentFilter::Codex,
             Self::Grok => AgentFilter::Grok,
             Self::Agy => AgentFilter::Agy,
+            Self::CodeBuddy => AgentFilter::CodeBuddy,
         }
     }
 }
@@ -3612,6 +3623,7 @@ mod tests {
         assert_eq!(UsageRange::from_key(""), UsageRange::Days30);
         assert_eq!(Scope::from_key("grok"), Scope::Grok);
         assert_eq!(Scope::from_key("agy"), Scope::Agy);
+        assert_eq!(Scope::from_key("codebuddy"), Scope::CodeBuddy);
         assert_eq!(Scope::from_key("gemini"), Scope::All, "认不出回落 all");
         // scope key 即账本 agent 串:筛选项与 mt-usage 的 serde 口径一一对上
         for s in Scope::ALL {
