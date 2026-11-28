@@ -193,6 +193,7 @@ fn hook_binary_name() -> &'static str {
 
 mod agy;
 mod claude;
+mod codebuddy;
 mod codex;
 mod grok;
 mod ts_ext;
@@ -232,6 +233,8 @@ pub enum HookAgent {
     Pi,
     /// Antigravity CLI（agy）：写 `~/.gemini/config/hooks.json` 里我们自己的组
     Agy,
+    /// CodeBuddy Code：写 `~/.codebuddy/settings.json` 的 hooks 段（Claude 同构）
+    CodeBuddy,
 }
 
 impl HookAgent {
@@ -242,6 +245,7 @@ impl HookAgent {
         HookAgent::Omp,
         HookAgent::Pi,
         HookAgent::Agy,
+        HookAgent::CodeBuddy,
     ];
 
     /// 注册目标对应的 agent。标识与展示名都查 [`crate::agent`] 那张表,
@@ -254,6 +258,7 @@ impl HookAgent {
             HookAgent::Omp => AgentKind::Omp,
             HookAgent::Pi => AgentKind::Pi,
             HookAgent::Agy => AgentKind::Agy,
+            HookAgent::CodeBuddy => AgentKind::CodeBuddy,
         }
     }
 
@@ -280,6 +285,7 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.events,
             HookAgent::Pi => PI_EXTENSION.events,
             HookAgent::Agy => AGY_HOOK_EVENTS,
+            HookAgent::CodeBuddy => codebuddy::CODEBUDDY_HOOK_EVENTS,
         }
     }
 
@@ -291,6 +297,7 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.registered_events(),
             HookAgent::Pi => PI_EXTENSION.registered_events(),
             HookAgent::Agy => registered_agy_events(),
+            HookAgent::CodeBuddy => codebuddy::registered_codebuddy_events(),
         }
     }
 
@@ -303,6 +310,7 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.path(),
             HookAgent::Pi => PI_EXTENSION.path(),
             HookAgent::Agy => agy_hooks_path(),
+            HookAgent::CodeBuddy => codebuddy::codebuddy_settings_path(),
         };
         let Some(raw) = raw else {
             return String::new();
@@ -328,6 +336,7 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.register(),
             HookAgent::Pi => PI_EXTENSION.register(),
             HookAgent::Agy => register_agy_hooks(hook_path),
+            HookAgent::CodeBuddy => codebuddy::register_codebuddy_hooks(hook_path),
         }
     }
 
@@ -339,6 +348,7 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.unregister(),
             HookAgent::Pi => PI_EXTENSION.unregister(),
             HookAgent::Agy => unregister_agy_hooks(),
+            HookAgent::CodeBuddy => codebuddy::unregister_codebuddy_hooks(),
         }
     }
 
@@ -357,6 +367,8 @@ impl HookAgent {
             HookAgent::Omp => OMP_EXTENSION.remove_entries(),
             HookAgent::Pi => PI_EXTENSION.remove_entries(),
             HookAgent::Agy => agy_hooks_path().map_or(Ok(0), |path| remove_agy_entries_at(&path)),
+            HookAgent::CodeBuddy => codebuddy::codebuddy_settings_path()
+                .map_or(Ok(0), |path| codebuddy::remove_codebuddy_entries_at(&path)),
         }
     }
 }

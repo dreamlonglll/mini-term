@@ -27,7 +27,7 @@ use super::pricing::{ModelPrice, PricingTable};
 use super::turns::{self, ParsedSession, Turn, UsageTotals};
 use super::{
     AgentFilter, ProviderResolver, SessionJob, collect_agy_jobs, collect_claude_jobs,
-    collect_codex_jobs, collect_grok_jobs,
+    collect_codebuddy_jobs, collect_codex_jobs, collect_grok_jobs,
 };
 
 /// 账本 schema 版本：结构变更时 +1。open 时版本不匹配即删表重建（账本可从
@@ -402,6 +402,9 @@ impl Ledger {
             SessionJob::Codex { path } => turns::parse_codex_session(path, thread_names),
             SessionJob::Grok { dir } => turns::parse_grok_session(dir),
             SessionJob::Agy { conv, transcript } => turns::parse_agy_session(conv, transcript),
+            SessionJob::CodeBuddy { main, subagents } => {
+                turns::parse_codebuddy_session(main, subagents)
+            }
         };
         // 解析失败（文件消失/无读权限）：不记指纹，下轮枚举到再试
         let Some(s) = parsed else { return Ok(false) };
@@ -522,6 +525,7 @@ impl Ledger {
             AgentFilter::Codex => Some("codex"),
             AgentFilter::Grok => Some("grok"),
             AgentFilter::Agy => Some("agy"),
+            AgentFilter::CodeBuddy => Some("codebuddy"),
         };
         let mut stmt = self.conn.prepare_cached(TURNS_IN_WINDOW_SQL)?;
         let mut sessions: Vec<ParsedSession> = Vec::new();
@@ -675,6 +679,11 @@ fn job_fingerprint(job: &SessionJob) -> (PathBuf, i64, i64) {
             turns::mtime_ms(transcript),
             size_of(transcript),
         ),
+        SessionJob::CodeBuddy { main, subagents } => {
+            let mtime = job.mtime_ms();
+            let size = subagents.iter().map(|p| size_of(p)).sum::<i64>() + size_of(main);
+            (main.clone(), mtime, size)
+        }
     }
 }
 
@@ -784,6 +793,7 @@ fn sync_round(db_path: &Path, sink: &SyncSink) {
     let mut jobs: Vec<SessionJob> = Vec::new();
     collect_claude_jobs(&home, &mut jobs);
     collect_codex_jobs(&home, &mut jobs);
+    collect_codebuddy_jobs(&home, &mut jobs);
     if let Some(grok_home) = mt_ai::hook_registry::grok_home() {
         collect_grok_jobs(&grok_home.join("sessions"), &mut jobs);
     }
@@ -1009,6 +1019,9 @@ mod tests {
                 SessionJob::Codex { path } => turns::parse_codex_session(path, &names),
                 SessionJob::Grok { dir } => turns::parse_grok_session(dir),
                 SessionJob::Agy { conv, transcript } => turns::parse_agy_session(conv, transcript),
+                SessionJob::CodeBuddy { main, subagents } => {
+                    turns::parse_codebuddy_session(main, subagents)
+                }
             })
             .collect();
         mem.sort_by(|a, b| a.session_id.cmp(&b.session_id));

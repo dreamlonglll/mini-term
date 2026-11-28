@@ -835,6 +835,202 @@ fn grok_turn_completed(line: &str) -> Option<(Option<String>, serde_json::Value,
 /// 一个 `turn_completed` 可能跨多个模型(主模型 + 子代理/小模型),`modelUsage`
 /// 按模型给出分解:每个模型出一条 Turn,模型维度的排行才不会全压在主模型上。
 /// 缺 `modelUsage`(单模型回合)时退回整轮汇总,模型名取 summary 里的当前模型。
+/// CodeBuddy `model-usage` 行的 token → 互斥计费桶。
+/// `inputTokens` 含 cached 子集、`outputTokens` 含 reasoning 子集，需各自扣掉；
+/// 缓存写取 rawUsage 的 `cache_creation_input_tokens`（OpenAI 口径别名
+/// `prompt_cache_write_tokens` 兜底）。
+fn usage_from_codebuddy(pd: &serde_json::Value) -> UsageTotals {
+    let usage = pd.get("usage");
+    let raw = pd.get("rawUsage");
+    let input = usage.map_or(0, |u| u64_at(u, "inputTokens"));
+    let output = usage.map_or(0, |u| u64_at(u, "outputTokens"));
+    let cached = usage
+        .and_then(|u| u.get("inputTokensDetails"))
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .map_or(0, |d| u64_at(d, "cached_tokens"));
+    let reasoning = usage
+        .and_then(|u| u.get("outputTokensDetails"))
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .map_or(0, |d| u64_at(d, "reasoning_tokens"));
+    let cache_write = raw.map_or(0, |r| {
+        let legacy = u64_at(r, "cache_creation_input_tokens");
+        if legacy > 0 {
+            legacy
+        } else {
+            u64_at(r, "prompt_cache_write_tokens")
+        }
+    });
+    UsageTotals {
+        input: input.saturating_sub(cached),
+        output: output.saturating_sub(reasoning),
+        reasoning,
+        cache_read: cached,
+        cache_write,
+        cache_write_1h: 0,
+    }
+}
+
+/// CodeBuddy 子代理 REPL 的 Bash 命令文本：`arguments.code` 里形如
+/// `Bash({ command: "ls -la" })`，抠出字符串首词给 shell 排行用。
+fn codebuddy_shell_command(args: Option<&serde_json::Value>) -> Option<String> {
+    let code = args?.get("code")?.as_str()?;
+    let marker = "Bash({ command: \"";
+    let start = code.find(marker)? + marker.len();
+    let rest = &code[start..];
+    let end = rest.find('"')?;
+    shell_main_command(&rest[..end])
+}
+
+struct CodeBuddyParsed {
+    turns: Vec<Turn>,
+    tool_uses: Vec<ToolUse>,
+    cwd: Option<String>,
+    title: Option<String>,
+}
+
+/// 逐行解析 CodeBuddy JSONL：`model-usage` 出 turn，`function_call` 出工具/Shell
+/// 事件，`turn-metrics` 给出按 request 的耗时，`ai-title` / message 出标题。
+fn codebuddy_turns_from_lines<'a>(lines: impl Iterator<Item = &'a str>) -> CodeBuddyParsed {
+    use std::collections::HashMap;
+
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut tool_uses: Vec<ToolUse> = Vec::new();
+    let mut durations: HashMap<String, u64> = HashMap::new();
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut cwd: Option<String> = None;
+    let mut title: Option<String> = None;
+
+    for line in lines {
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if cwd.is_none() {
+            cwd = obj.get("cwd").and_then(|v| v.as_str()).map(String::from);
+        }
+        let timestamp_ms = obj.get("timestamp").and_then(|v| v.as_u64()).map(|v| v as i64);
+        let pd = obj.get("providerData");
+        match obj.get("type").and_then(|t| t.as_str()) {
+            Some("turn-metrics") => {
+                if let (Some(req), Some(ms)) = (
+                    pd.and_then(|p| p.get("conversationRequestId")).and_then(|v| v.as_str()),
+                    obj.get("durationMs").and_then(|v| v.as_u64()),
+                ) {
+                    durations.insert(req.to_string(), ms);
+                }
+            }
+            Some("ai-title") => {
+                if title.is_none() {
+                    title = obj.get("aiTitle").and_then(|v| v.as_str()).map(|s| s.chars().take(100).collect());
+                }
+            }
+            Some("message") => {
+                if title.is_none() && obj.get("role").and_then(|v| v.as_str()) == Some("user") {
+                    if let Some(content) = obj.get("content").and_then(|v| v.as_array()) {
+                        let text = content
+                            .iter()
+                            .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("input_text"))
+                            .and_then(|p| p.get("text"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim_start();
+                        if !text.is_empty() && !text.starts_with('<') {
+                            title = Some(text.chars().take(100).collect());
+                        }
+                    }
+                }
+            }
+            Some("model-usage") => {
+                let Some(pd) = pd else { continue };
+                let usage = usage_from_codebuddy(pd);
+                if usage.total() == 0 {
+                    continue;
+                }
+                let model = pd.get("model").and_then(|v| v.as_str()).filter(|m| !m.is_empty()).map(String::from);
+                let message_id = pd.get("messageId").and_then(|v| v.as_str()).map(String::from);
+                let request_id = pd.get("conversationRequestId").and_then(|v| v.as_str());
+                let duration_ms = request_id
+                    .and_then(|r| durations.get(r))
+                    .and_then(|ms| clamp_estimated_duration_ms(*ms as i64));
+                if let Some(ref mid) = message_id {
+                    if let Some(&idx) = by_id.get(mid) {
+                        let existing = &mut turns[idx];
+                        if usage.total() > existing.usage.total() {
+                            existing.usage = usage;
+                            if model.is_some() {
+                                existing.model = model;
+                            }
+                            if timestamp_ms.is_some() {
+                                existing.timestamp_ms = timestamp_ms;
+                            }
+                            existing.duration_ms = duration_ms;
+                        }
+                        continue;
+                    }
+                    by_id.insert(mid.clone(), turns.len());
+                }
+                turns.push(Turn {
+                    message_id,
+                    model,
+                    timestamp_ms,
+                    usage,
+                    duration_ms,
+                });
+            }
+            Some("function_call") => {
+                let Some(name) = obj.get("name").and_then(|v| v.as_str()) else { continue };
+                let dedup_key = obj.get("callId").and_then(|v| v.as_str()).map(String::from);
+                tool_uses.push(ToolUse {
+                    kind: "tool",
+                    name: name.to_string(),
+                    timestamp_ms,
+                    dedup_key: dedup_key.clone(),
+                });
+                if let Some(shell) = codebuddy_shell_command(obj.get("arguments")) {
+                    tool_uses.push(ToolUse {
+                        kind: "shell",
+                        name: shell,
+                        timestamp_ms,
+                        dedup_key,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    CodeBuddyParsed { turns, tool_uses, cwd, title }
+}
+
+/// 解析一个 CodeBuddy 会话：主转录 + 子代理转录（同 Claude 独立计费）。
+pub(crate) fn parse_codebuddy_session(
+    main_path: &Path,
+    subagent_paths: &[std::path::PathBuf],
+) -> Option<ParsedSession> {
+    let session_id = main_path.file_stem()?.to_str()?.to_string();
+    let lines = read_lines(main_path)?;
+    let mut parsed = codebuddy_turns_from_lines(lines.iter().map(String::as_str));
+    for sub in subagent_paths {
+        if let Some(sub_lines) = read_lines(sub) {
+            let sub_parsed = codebuddy_turns_from_lines(sub_lines.iter().map(String::as_str));
+            parsed.turns.extend(sub_parsed.turns);
+            parsed.tool_uses.extend(sub_parsed.tool_uses);
+        }
+    }
+    Some(ParsedSession {
+        agent: "codebuddy",
+        session_id,
+        cwd: parsed.cwd,
+        title: parsed.title,
+        provider: None,
+        mtime_ms: mtime_ms(main_path),
+        turns: parsed.turns,
+        tool_uses: parsed.tool_uses,
+    })
+}
+
 pub(crate) fn parse_grok_session(session_dir: &Path) -> Option<ParsedSession> {
     let session_id = session_dir.file_name()?.to_str()?.to_string();
     let updates = session_dir.join("updates.jsonl");
@@ -1757,5 +1953,36 @@ mod tests {
         assert_eq!(clamp_estimated_duration_ms(200), Some(200));
         assert_eq!(clamp_estimated_duration_ms(600_000), Some(600_000));
         assert_eq!(clamp_estimated_duration_ms(600_001), None);
+    }
+
+    #[test]
+    fn codebuddy_model_usage_buckets_and_tool_events() {
+        let root = std::env::temp_dir().join(format!("mt-cb-usage-{}", std::process::id()));
+        let project = root.join("projects").join("g-Project-stone");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session-1.jsonl");
+        let lines = [
+            r#"{"type":"ai-title","aiTitle":"测试会话","timestamp":1793437248380,"cwd":"g:\\Project\\stone","sessionId":"session-1"}"#,
+            r#"{"type":"turn-metrics","timestamp":1793437747020,"durationMs":263239,"providerData":{"conversationRequestId":"req-1"}}"#,
+            r#"{"type":"model-usage","timestamp":1793437747020,"providerData":{"conversationRequestId":"req-1","messageId":"msg-1","model":"deepseek-v4.1-flash","usage":{"inputTokens":1000,"outputTokens":250,"totalTokens":1250,"inputTokensDetails":[{"cached_tokens":600}],"outputTokensDetails":[{"reasoning_tokens":200}]},"rawUsage":{"cache_creation_input_tokens":100}}}"#,
+            r#"{"type":"function_call","timestamp":1793437748000,"name":"REPL","callId":"call-1","arguments":{"code":"await Bash({ command: \"ls -la\" })"}}"#,
+        ];
+        fs::write(&path, lines.join("\n")).unwrap();
+        let s = parse_codebuddy_session(&path, &[]).unwrap();
+        assert_eq!(s.agent, "codebuddy");
+        assert_eq!(s.session_id, "session-1");
+        assert_eq!(s.title.as_deref(), Some("测试会话"));
+        assert_eq!(s.turns.len(), 1);
+        let t = &s.turns[0];
+        assert_eq!(t.model.as_deref(), Some("deepseek-v4.1-flash"));
+        assert_eq!(t.usage.input, 400);
+        assert_eq!(t.usage.cache_read, 600);
+        assert_eq!(t.usage.cache_write, 100);
+        assert_eq!(t.usage.output, 50);
+        assert_eq!(t.usage.reasoning, 200);
+        assert!(t.duration_ms.is_some());
+        assert!(s.tool_uses.iter().any(|u| u.kind == "tool" && u.name == "REPL"));
+        assert!(s.tool_uses.iter().any(|u| u.kind == "shell" && u.name == "ls"));
+        fs::remove_dir_all(&root).ok();
     }
 }

@@ -61,6 +61,11 @@ enum SessionJob {
         conv: mt_ai::sessions::AgyConversation,
         transcript: PathBuf,
     },
+    /// CodeBuddy 主转录 + 子代理转录（同 Claude，`<id>/subagents/` 下）
+    CodeBuddy {
+        main: PathBuf,
+        subagents: Vec<PathBuf>,
+    },
 }
 
 impl SessionJob {
@@ -76,6 +81,10 @@ impl SessionJob {
             // 条目增删，正文追加不会推进它，增量同步会因此漏掉新回合
             SessionJob::Grok { dir } => turns::mtime_ms(&dir.join("updates.jsonl")),
             SessionJob::Agy { transcript, .. } => turns::mtime_ms(transcript),
+            SessionJob::CodeBuddy { main, subagents } => subagents
+                .iter()
+                .map(|p| turns::mtime_ms(p))
+                .fold(turns::mtime_ms(main), i64::max),
         }
     }
 }
@@ -128,6 +137,39 @@ fn collect_claude_jobs_in_dir(project_path: &Path, jobs: &mut Vec<SessionJob>) {
         // read_dir 顺序平台相关：排序让 noid 顺序号与 parity 结果可复现
         subagents.sort();
         jobs.push(SessionJob::Claude { main: path, subagents });
+    }
+}
+
+/// 枚举 `~/.codebuddy/projects/` 下全部项目的会话（账本要全量历史）。
+/// 与 Claude 一样把 `<id>/subagents/` 里的子代理转录并入主会话计费。
+fn collect_codebuddy_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
+    let projects_dir = home.join(".codebuddy").join("projects");
+    let Ok(project_entries) = fs::read_dir(&projects_dir) else {
+        return;
+    };
+    for project in project_entries.flatten() {
+        let project_path = project.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&project_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mut subagents = Vec::new();
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                collect_jsonl_recursive(&project_path.join(stem).join("subagents"), &mut subagents);
+            }
+            subagents.sort();
+            jobs.push(SessionJob::CodeBuddy {
+                main: path,
+                subagents,
+            });
+        }
     }
 }
 
@@ -306,6 +348,7 @@ pub enum AgentFilter {
     Codex,
     Grok,
     Agy,
+    CodeBuddy,
 }
 
 /// 账本里存的 agent 字符串 → `ParsedSession` 要的 `&'static str`。
@@ -317,7 +360,11 @@ pub(crate) fn agent_from_db(agent: &str) -> &'static str {
         .filter(|k| {
             matches!(
                 k,
-                AgentKind::Claude | AgentKind::Codex | AgentKind::Grok | AgentKind::Agy
+                AgentKind::Claude
+                    | AgentKind::Codex
+                    | AgentKind::Grok
+                    | AgentKind::Agy
+                    | AgentKind::CodeBuddy
             )
         })
         .unwrap_or(AgentKind::Claude)
@@ -350,6 +397,7 @@ mod tests {
         assert_eq!(agent_from_db("codex"), "codex");
         assert_eq!(agent_from_db("grok"), "grok");
         assert_eq!(agent_from_db("agy"), "agy");
+        assert_eq!(agent_from_db("codebuddy"), "codebuddy");
         for other in ["", "omp", "pi", "opencode", "什么鬼"] {
             assert_eq!(agent_from_db(other), "claude", "{other:?}");
         }
@@ -360,6 +408,8 @@ mod tests {
     fn agent_filter_accepts_agy() {
         let f: AgentFilter = serde_json::from_str(r#""agy""#).unwrap();
         assert!(f == AgentFilter::Agy);
+        let f: AgentFilter = serde_json::from_str(r#""codebuddy""#).unwrap();
+        assert!(f == AgentFilter::CodeBuddy);
         assert!(serde_json::from_str::<AgentFilter>(r#""gemini""#).is_err());
     }
 

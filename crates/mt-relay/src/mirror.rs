@@ -64,6 +64,8 @@ pub enum MirrorAgent {
     /// Antigravity CLI:transcript_full.jsonl 一行一步;同 pi 不出提问卡片
     /// (理由见 `MirrorParser::parse_agy_line`)
     Agy,
+    /// CodeBuddy Code:`~/.codebuddy/projects/` 下自有 JSONL,只接文本镜像
+    CodeBuddy,
 }
 
 /// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
@@ -183,6 +185,18 @@ impl MirrorParser {
             MirrorAgent::Omp => self.parse_omp_line(line, out),
             MirrorAgent::Pi => self.parse_pi_line(line, out),
             MirrorAgent::Agy => self.parse_agy_line(line, out),
+            MirrorAgent::CodeBuddy => self.parse_codebuddy_line(line, out),
+        }
+    }
+
+    /// CodeBuddy 行:正文在 `message` 行的 role + content；工具活动暂不接。
+    fn parse_codebuddy_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(raw) = ai_sessions::codebuddy_message_from_line(line) {
+            let is_user_text = raw.role == "user";
+            out.push(self.next_text_message(raw));
+            if is_user_text {
+                self.pending.clear();
+            }
         }
     }
 
@@ -451,7 +465,9 @@ impl MirrorParser {
             MirrorAgent::Grok => "Type your answer here",
             // pi / agy 不出提问卡片(见 `parse_pi_line` / `parse_agy_line`),走不到这里;
             // 按 OMP 写只为穷尽
-            MirrorAgent::Omp | MirrorAgent::Pi | MirrorAgent::Agy => "Other (type your own)",
+            MirrorAgent::Omp | MirrorAgent::Pi | MirrorAgent::Agy | MirrorAgent::CodeBuddy => {
+                "Other (type your own)"
+            }
         };
         for item in &mut question.items {
             // OMP 在追加 Other 前按真实选项范围钳位 recommended。
@@ -827,6 +843,7 @@ fn agent_filter(agent: Option<&str>) -> AgentFilter {
         AgentKind::Omp => AgentFilter::Only(MirrorAgent::Omp),
         AgentKind::Pi => AgentFilter::Only(MirrorAgent::Pi),
         AgentKind::Agy => AgentFilter::Only(MirrorAgent::Agy),
+        AgentKind::CodeBuddy => AgentFilter::Only(MirrorAgent::CodeBuddy),
         AgentKind::OpenCode => AgentFilter::Nothing,
     }
 }
@@ -877,6 +894,12 @@ pub fn resolve_session_file(
     // 只认主会话:同工作区的子代理 transcript 跑着时比主会话新
     consider(MirrorAgent::Agy, &|| {
         fresh_since(ai_sessions::newest_agy_transcript(project_path), min_mtime)
+    });
+    consider(MirrorAgent::CodeBuddy, &|| {
+        fresh_since(
+            ai_sessions::newest_codebuddy_session_file(project_path),
+            min_mtime,
+        )
     });
     best.map(|(path, _, agent)| (path, agent))
 }
@@ -954,6 +977,8 @@ pub fn resolve_session_file_by_id(
         AgentKind::Agy => {
             ai_sessions::find_agy_transcript(session_id).map(|p| (p, MirrorAgent::Agy))
         }
+        AgentKind::CodeBuddy => ai_sessions::find_codebuddy_session_file(project_path, session_id)
+            .map(|p| (p, MirrorAgent::CodeBuddy)),
     }
 }
 

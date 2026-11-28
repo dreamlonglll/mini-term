@@ -189,7 +189,7 @@ fn every_agent_exposes_complete_metadata() {
         assert!(!agent.label().is_empty());
         assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
     }
-    assert_eq!(keys.len(), 6);
+    assert_eq!(keys.len(), 7);
 }
 
 /// key / 展示名改由 agent 表供给后,与改造前逐字相同,且与 serde 名对齐
@@ -203,6 +203,7 @@ fn key_label_come_from_agent_table_unchanged() {
         (HookAgent::Omp, "omp", "oh-my-pi"),
         (HookAgent::Pi, "pi", "pi"),
         (HookAgent::Agy, "agy", "Antigravity CLI"),
+        (HookAgent::CodeBuddy, "codebuddy", "CodeBuddy"),
     ];
     assert_eq!(expected.len(), HookAgent::ALL.len());
     for (agent, key, label) in expected {
