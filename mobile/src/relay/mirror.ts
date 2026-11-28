@@ -20,6 +20,7 @@ import {
   mergeMirrorSnapshot,
   prependOlderMirrorMessages,
 } from './mirrorMerge';
+import { newRequestId } from './requestId';
 import { type MirrorState, type MirrorViewMode, useRelayStore } from './store';
 import { sendToRelay } from './transport';
 
@@ -120,7 +121,7 @@ export function sendMobileCommand(text: string): string | null {
   const mirror = mirrorReady();
   const trimmed = text.trim();
   if (!mirror || !trimmed || mirror.pendingCommandId != null) return null;
-  const commandId = crypto.randomUUID();
+  const commandId = newRequestId();
   useRelayStore.setState({ mirror: beginCommand(mirror, commandId) });
   sendToRelay({ type: 'mobileCommand', paneId: mirror.paneId, commandId, text: trimmed });
   armCommandTimeout(commandId);
@@ -140,7 +141,7 @@ export function answerQuestion(
 ): boolean {
   const mirror = mirrorReady();
   if (!mirror || mirror.pendingCommandId != null) return false;
-  const commandId = crypto.randomUUID();
+  const commandId = newRequestId();
   useRelayStore.setState({ mirror: beginCommand(mirror, commandId, seq) });
   sendToRelay({
     type: 'answerQuestion',
@@ -228,7 +229,7 @@ export function setMirrorViewMode(mode: MirrorViewMode) {
 export function sendTerminalKey(key: TerminalKey): boolean {
   const mirror = mirrorReady();
   if (!mirror) return false;
-  const commandId = crypto.randomUUID();
+  const commandId = newRequestId();
   if (pendingTerminalKeyIds.size > 64) {
     pendingTerminalKeyIds.clear();
   }

@@ -6,6 +6,7 @@
 // - relay/commandSlot.ts   指令单槽状态机(回执、超时 / 断线 / 桌面掉线 → 结果未知、迟到回执升级、重连复位)
 // - navStack.ts            History API 同步规划(含一个模拟浏览器历史栈的端到端推演)
 // - pullGesture.ts         下拉刷新判顶 / 横滑放弃 / 阻尼
+// - relay/requestId.ts     请求 id:非安全上下文(http:// 中转,无 randomUUID)回落 getRandomValues
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const test = require('node:test');
@@ -492,4 +493,40 @@ test('下拉刷新:阻尼与上限', { skip }, async () => {
   assert.equal(pullDistance(100), 50);
   assert.equal(pullDistance(10_000), PULL_MAX);
   assert.ok(pullDistance(PULL_TRIGGER * 2) >= PULL_TRIGGER, '拉到两倍触发距离即可触发');
+});
+
+// ---------------------------------------------------------------------------
+// requestId
+// ---------------------------------------------------------------------------
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test('请求 id:安全上下文直接用 randomUUID', { skip }, async () => {
+  const { newRequestId } = await load('relay/requestId.ts');
+  const fake = {
+    randomUUID: () => 'from-random-uuid',
+    getRandomValues: () => {
+      throw new Error('有 randomUUID 时不该走回落');
+    },
+  };
+  assert.equal(newRequestId(fake), 'from-random-uuid');
+  assert.match(newRequestId(), UUID_V4, '默认取全局 crypto');
+});
+
+test('请求 id:非安全上下文(没有 randomUUID)回落 getRandomValues,仍是 v4 形状且不重复', { skip }, async () => {
+  const { newRequestId } = await load('relay/requestId.ts');
+  // http:// 打开的页面:crypto 只剩 getRandomValues(issue #109)
+  const insecure = { getRandomValues: (buf) => globalThis.crypto.getRandomValues(buf) };
+  const ids = new Set();
+  for (let i = 0; i < 1000; i += 1) {
+    const id = newRequestId(insecure);
+    assert.match(id, UUID_V4);
+    ids.add(id);
+  }
+  assert.equal(ids.size, 1000);
+
+  // 全 0xff / 全 0x00 字节:版本位与变体位照样落对
+  const fill = (v) => ({ getRandomValues: (buf) => buf.fill(v) });
+  assert.equal(newRequestId(fill(0xff)), 'ffffffff-ffff-4fff-bfff-ffffffffffff');
+  assert.equal(newRequestId(fill(0x00)), '00000000-0000-4000-8000-000000000000');
 });

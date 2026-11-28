@@ -5,6 +5,7 @@ import type {
 } from '../protocol';
 import { clearHistoryPreviewTimer } from './history';
 import { openMirror } from './mirror';
+import { newRequestId } from './requestId';
 import {
   type RelayStore,
   findLivePaneForHistory,
@@ -114,7 +115,7 @@ export function startAiSession(
   if (starting) return false;
   if (phase !== 'connected' || desktopOnline === false) return false;
 
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useRelayStore.setState({
     starting: { requestId, mode: 'start', projectName, paneId: null },
     startError: null,
@@ -148,7 +149,7 @@ export function resumeAiSession(
   if (starting) return false;
   if (phase !== 'connected' || desktopOnline === false) return false;
 
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useRelayStore.setState({
     starting: {
       requestId,

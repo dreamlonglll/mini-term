@@ -11,6 +11,7 @@ import type {
   MobileProjectSkills,
   MobileSkillItem,
 } from '../protocol';
+import { newRequestId } from './requestId';
 import { useRelayStore } from './store';
 import { sendToRelay } from './transport';
 
@@ -95,7 +96,7 @@ export function requestProjectFiles(paneId: string, query: string) {
   }
 
   const prev = useAssistStore.getState().files;
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useAssistStore.setState({
     files: {
       paneId,
@@ -136,7 +137,7 @@ export function requestProjectSkills(paneId: string, force = false) {
     return;
   }
 
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useAssistStore.setState({
     skills: {
       paneId,

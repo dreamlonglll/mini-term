@@ -3,6 +3,7 @@ import type {
   MobileSessionContent,
   MobileSessionHistory,
 } from '../protocol';
+import { newRequestId } from './requestId';
 import { useRelayStore } from './store';
 import { sendToRelay } from './transport';
 
@@ -118,7 +119,7 @@ export function openProjectHistory(projectId: string, projectName: string) {
     });
     return;
   }
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useRelayStore.setState({
     historyPreview: null,
     historyList: {
@@ -146,7 +147,7 @@ export function refreshProjectHistory() {
     });
     return;
   }
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useRelayStore.setState({
     historyList: { ...cur, requestId, loading: true, error: null },
   });
@@ -185,7 +186,7 @@ export function openHistoryPreview(
     });
     return;
   }
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   useRelayStore.setState({
     historyPreview: {
       projectId,
@@ -222,7 +223,7 @@ export function loadOlderHistoryPreview() {
   ) {
     return;
   }
-  const requestId = crypto.randomUUID();
+  const requestId = newRequestId();
   clearHistoryPreviewTimer();
   useRelayStore.setState({
     historyPreview: { ...historyPreview, requestId, loadingOlder: true, error: null },
