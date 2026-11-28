@@ -791,9 +791,9 @@ fn sync_round(db_path: &Path, sink: &SyncSink) {
     let Some(home) = dirs::home_dir() else { return };
 
     let mut jobs: Vec<SessionJob> = Vec::new();
-        collect_claude_jobs(&home, &mut jobs);
-        collect_codex_jobs(&home, &mut jobs);
-        collect_codebuddy_jobs(&home, &mut jobs);
+    collect_claude_jobs(&home, &mut jobs);
+    collect_codex_jobs(&home, &mut jobs);
+    collect_codebuddy_jobs(&home, &mut jobs);
     if let Some(grok_home) = mt_ai::hook_registry::grok_home() {
         collect_grok_jobs(&grok_home.join("sessions"), &mut jobs);
     }

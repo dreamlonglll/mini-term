@@ -178,9 +178,11 @@ pub fn codebuddy_message_from_line(line: &str) -> Option<AiSessionMessage> {
         content,
         timestamp: obj
             .get("timestamp")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -224,18 +226,19 @@ pub fn get_codebuddy_sessions(project_path: &str) -> Vec<AiSession> {
                     match v.get("type").and_then(|t| t.as_str()) {
                         Some("ai-title") if title.is_empty() => {
                             title = v
-                                .get("title")
+                                .get("aiTitle")
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("")
                                 .to_string();
                         }
                         Some("message") => {
                             if timestamp.is_empty() {
-                                timestamp = v
-                                    .get("timestamp")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                if let Some(t) = v.get("timestamp") {
+                                    timestamp = match t {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    };
+                                }
                             }
                             if title.is_empty()
                                 && v.get("role").and_then(|r| r.as_str()) == Some("user")
